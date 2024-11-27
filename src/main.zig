@@ -75,6 +75,35 @@ const Url = struct {
         if (self.path) |_| allocator.free(self.path.?);
         allocator.destroy(self);
     }
+
+    fn request(self: *Url, al: std.mem.Allocator) !void {
+        if (self.host) |host| {
+            // Define socker and connect to it.
+            const tcp_stream = try std.net.tcpConnectToHost(al, host, 80);
+
+            // Create the request text, allocating memory as needed
+            const request_content = try std.fmt.allocPrint(al,
+                \\GET {s} HTTP/1.0\r\n
+                \\Host: {s}\r\n
+            , .{ self.path.?, self.host.? });
+            defer al.free(request_content);
+
+            dbg("Request:\n{s}", .{request_content});
+
+            // Send the request
+            try tcp_stream.writeAll(request_content);
+
+            // Create buffer for response
+            const response_buffer = try al.alloc(u8, 1024);
+            defer al.free(response_buffer);
+
+            // Read response
+            const response_length = try tcp_stream.readAll(response_buffer);
+            dbg("Response:\n{s}", .{response_buffer[0..response_length]});
+        } else {
+            return error.NoHostFound;
+        }
+    }
 };
 
 pub fn main() !void {
@@ -102,6 +131,8 @@ pub fn main() !void {
             dbg("Scheme: {s}\n", .{s});
             dbg("Host: {s}\n", .{url.host.?});
             dbg("Path: {s}\n", .{url.path.?});
+
+            try url.request(allocator);
         } else {
             dbgln("No scheme found");
             dbg("{any}\n", .{url});
