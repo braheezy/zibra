@@ -16,7 +16,7 @@ pub fn build(b: *std.Build) void {
     const optimize = b.standardOptimizeOption(.{});
 
     const exe = b.addExecutable(.{
-        .name = "wbe",
+        .name = "zibra",
         .root_source_file = b.path("src/browser.zig"),
         .target = target,
         .optimize = optimize,
