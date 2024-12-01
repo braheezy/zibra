@@ -119,12 +119,15 @@ pub const Url = struct {
 
     fn request(self: *Url, al: std.mem.Allocator, debug: bool) ![]const u8 {
         // Create the request text, allocating memory as needed
-        const request_content = try std.fmt.allocPrint(al,
-            \\GET {s} HTTP/1.0
-            \\
-            \\Host: {s}
-            \\
-        , .{ self.path, self.host });
+        const request_content = try std.fmt.allocPrint(
+            al,
+            "GET {s} HTTP/1.1\r\n" ++
+                "Host: {s}\r\n" ++
+                "Connection: close\r\n" ++
+                "User-Agent: zibra/0.1\r\n" ++
+                "\r\n",
+            .{ self.path, self.host },
+        );
         defer al.free(request_content);
 
         if (debug) dbg("Request:\n{s}", .{request_content});
@@ -157,10 +160,10 @@ pub const Url = struct {
         }
 
         // Create buffer for response
-        // ! If this is a different size, then the response can intermittently fail
-        // ! Seems to be a bug in the std library
+        // ! This is a workaround for a bug in the std library
         // ! https://github.com/ziglang/zig/issues/14573
-        const buffer_size = 10000;
+        // ! Make a super large buffer so the std lib doesn't have to refill it
+        const buffer_size = 30000;
         var temp_buffer: [buffer_size]u8 = undefined;
 
         // Keep reading the response in `buffer_size` chunks, appending
