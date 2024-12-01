@@ -10,7 +10,7 @@ const stdout = std.io.getStdOut().writer();
 
 pub const Url = struct {
     scheme: []const u8 = undefined,
-    host: []const u8 = undefined,
+    host: ?[]const u8 = null,
     path: []const u8 = undefined,
     port: u16 = 80,
     is_https: bool = false,
@@ -30,7 +30,8 @@ pub const Url = struct {
 
         // we only support http and https
         if (!std.mem.eql(u8, scheme, "http") and
-            !std.mem.eql(u8, scheme, "https")) return error.UnsupportedScheme;
+            !std.mem.eql(u8, scheme, "https") and
+            !std.mem.eql(u8, scheme, "file")) return error.UnsupportedScheme;
 
         // get everything after the scheme
         const rest = split_iter.rest();
@@ -65,10 +66,6 @@ pub const Url = struct {
             port = try std.fmt.parseInt(u16, p, 10);
         }
 
-        // allocate memory for the host
-        const host_alloc = try allocator.alloc(u8, host.len);
-        @memcpy(host_alloc, host);
-
         // everything else is the path, allocate memory for it
         // if the path is '/', then this will be an empty string
         const path = split_iter.rest();
@@ -81,7 +78,6 @@ pub const Url = struct {
         // allocate for the URL struct, populate and return it
         var u = try allocator.create(Url);
         u.scheme = scheme_alloc;
-        u.host = host_alloc;
         u.path = path_alloc;
         if (std.mem.eql(u8, scheme, "https")) {
             u.is_https = true;
@@ -99,9 +95,19 @@ pub const Url = struct {
             u.is_https = false;
         }
 
+        // allocate memory for the host, which won't be present in the case of a file scheme
+        if (host.len != 0) {
+            dbgln("Allocating host");
+            const host_alloc = try allocator.alloc(u8, host.len);
+            @memcpy(host_alloc, host);
+            u.host = host_alloc;
+        } else {
+            u.host = null;
+        }
+
         if (debug) {
             dbg("Scheme: {s}\n", .{u.scheme});
-            dbg("Host: {s}\n", .{u.host});
+            if (u.host) |h| dbg("Host: {s}\n", .{h}) else dbgln("Host: n/a");
             dbg("Path: {s}\n", .{u.path});
             dbg("Port: {d}\n", .{u.port});
             dbg("Is HTTPS: {any}\n", .{u.is_https});
@@ -112,12 +118,15 @@ pub const Url = struct {
 
     pub fn free(self: *Url, allocator: std.mem.Allocator) void {
         allocator.free(self.scheme);
-        allocator.free(self.host);
+        if (self.host) |_| {
+            dbgln("Freeing host");
+            allocator.free(self.host.?);
+        }
         allocator.free(self.path);
         allocator.destroy(self);
     }
 
-    fn request(self: *Url, al: std.mem.Allocator, debug: bool) ![]const u8 {
+    fn httpRequest(self: *Url, al: std.mem.Allocator, debug: bool) ![]const u8 {
         // Create the request text, allocating memory as needed
         const request_content = try std.fmt.allocPrint(
             al,
@@ -126,15 +135,15 @@ pub const Url = struct {
                 "Connection: close\r\n" ++
                 "User-Agent: zibra/0.1\r\n" ++
                 "\r\n",
-            .{ self.path, self.host },
+            .{ self.path, self.host.? },
         );
         defer al.free(request_content);
 
         if (debug) dbg("Request:\n{s}", .{request_content});
 
         // Define socker and connect to it.
-        dbg("Connecting to {s}:{d}\n", .{ self.host, self.port });
-        const tcp_stream = try std.net.tcpConnectToHost(al, self.host, self.port);
+        dbg("Connecting to {s}:{d}\n", .{ self.host.?, self.port });
+        const tcp_stream = try std.net.tcpConnectToHost(al, self.host.?, self.port);
         defer tcp_stream.close();
 
         // Create dynamic array to store total response
@@ -151,7 +160,7 @@ pub const Url = struct {
             defer bundle.deinit(al);
 
             // create the tls client
-            tls_client = try std.crypto.tls.Client.init(tcp_stream, bundle, self.host);
+            tls_client = try std.crypto.tls.Client.init(tcp_stream, bundle, self.host.?);
             // Send the request
             try tls_client.writeAll(tcp_stream, request_content);
         } else {
@@ -252,15 +261,37 @@ pub const Url = struct {
         return b;
     }
 
+    fn fileRequest(self: Url, al: std.mem.Allocator, debug: bool) ![]const u8 {
+        const html_file = std.fs.cwd().openFile(self.path, .{}) catch |err| {
+            std.log.err("Failed to open file {s}: {any}", .{ self.path, err });
+            // EX_NOINPUT: cannot open input
+            std.process.exit(66);
+        };
+
+        defer html_file.close();
+        dbgln("File opened");
+
+        const html_content = try html_file.readToEndAlloc(al, 4096);
+        if (debug) dbg("File content:\n{s}", .{html_content});
+        return html_content;
+    }
+
     pub fn load(self: *Url, al: std.mem.Allocator, debug: bool) !void {
-        const body = try self.request(al, debug);
+        var body: []const u8 = undefined;
+        defer al.free(body);
+        if (std.mem.eql(u8, self.scheme, "file")) {
+            dbg("File request: {s}\n", .{self.path});
+            body = try self.fileRequest(al, debug);
+            // return error.UnsupportedScheme;
+        } else {
+            body = try self.httpRequest(al, debug);
+        }
         try show(body);
-        al.free(body);
     }
 };
 
 // Show the body of the response, sans tags
-fn show(body: []const u8) !void {
+pub fn show(body: []const u8) !void {
     var in_tag = false;
     for (body) |c| {
         if (c == '<') {

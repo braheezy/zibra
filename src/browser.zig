@@ -1,6 +1,7 @@
 const std = @import("std");
 
 const Url = @import("url.zig").Url;
+const show = @import("url.zig").show;
 const ArrayList = std.ArrayList;
 const assert = std.debug.assert;
 
@@ -8,6 +9,8 @@ const dbg = std.debug.print;
 fn dbgln(comptime fmt: []const u8) void {
     dbg("{s}\n", .{fmt});
 }
+
+const default_html = @embedFile("default.html");
 
 pub fn main() !void {
     // Memory allocation setup
@@ -21,22 +24,24 @@ pub fn main() !void {
     const args = try std.process.argsAlloc(allocator);
     defer std.process.argsFree(allocator, args);
 
-    if (args.len < 2) {
-        // not enough args, exit
-        std.log.err("Missing input url\n", .{});
-        std.process.exit(64);
-    }
-
     var debug_flag = false;
+    var url_provided = false;
 
     for (args[1..]) |arg| {
         if (std.mem.eql(u8, arg, "-v")) {
             debug_flag = true;
             continue;
         }
+        url_provided = true;
         const url = try Url.init(allocator, arg, debug_flag);
         defer url.free(allocator);
 
+        dbg("Loading {s}\n", .{url.path});
+
         try url.load(allocator, debug_flag);
+    }
+
+    if (!url_provided) {
+        try show(default_html);
     }
 }
