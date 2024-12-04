@@ -33,7 +33,7 @@ pub fn main() !void {
             continue;
         }
         url_provided = true;
-        const url = try Url.init(allocator, arg, debug_flag);
+        var url = try Url.init(allocator, arg, debug_flag);
         defer url.free(allocator);
 
         dbg("Loading {s}\n", .{url.path});

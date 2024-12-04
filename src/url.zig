@@ -14,116 +14,156 @@ pub const Url = struct {
     path: []const u8 = undefined,
     port: u16 = 80,
     is_https: bool = false,
+    mime_type: ?[]const u8 = null,
+    attributes: ?std.ArrayList([]const u8) = null,
 
-    pub fn init(allocator: std.mem.Allocator, url: []const u8, debug: bool) !*Url {
+    pub fn init(allocator: std.mem.Allocator, url: []const u8, debug: bool) !Url {
         // make a copy of the url
         var local_url = ArrayList(u8).init(allocator);
         defer local_url.deinit();
         try local_url.appendSlice(url);
 
-        // split the url by "://"
-        var split_iter = std.mem.splitSequence(u8, local_url.items, "://");
-        const scheme = split_iter.first();
+        if (url.len >= 5 and std.mem.eql(u8, url[0..5], "data:")) {
+            const scheme = url[0..4];
+            var rest = url[5..];
 
-        // delimter not found, bail
-        if (std.mem.eql(u8, scheme, local_url.items)) return error.NoSchemeFound;
-
-        // we only support http and https
-        if (!std.mem.eql(u8, scheme, "http") and
-            !std.mem.eql(u8, scheme, "https") and
-            !std.mem.eql(u8, scheme, "file")) return error.UnsupportedScheme;
-
-        // get everything after the scheme
-        const rest = split_iter.rest();
-        if (rest.len == 0) {
-            return error.NoHostFound;
-        }
-
-        // allocate memory for the scheme
-        const scheme_alloc = try allocator.alloc(u8, scheme.len);
-        @memcpy(scheme_alloc, scheme);
-
-        // gather the rest of the url into a dynamic array
-        var rest_of_url = ArrayList(u8).init(allocator);
-        defer rest_of_url.deinit();
-        try rest_of_url.appendSlice(rest);
-
-        // Append a '/' if it doesn't exist
-        if (!std.mem.containsAtLeast(u8, rest_of_url.items, 1, "/")) {
-            try rest_of_url.append('/');
-        }
-
-        // Split on '/' to find host
-        split_iter = std.mem.splitSequence(u8, rest_of_url.items, "/");
-        var host = split_iter.first();
-
-        // If an optional ':port' is present, parse it
-        var port: ?u16 = null;
-        if (std.mem.containsAtLeast(u8, host, 1, ":")) {
-            var host_iter = std.mem.splitScalar(u8, host, ':');
-            host = host_iter.first();
-            const p = host_iter.next().?;
-            port = try std.fmt.parseInt(u16, p, 10);
-        }
-
-        // everything else is the path, allocate memory for it
-        // if the path is '/', then this will be an empty string
-        const path = split_iter.rest();
-        var path_alloc = try allocator.alloc(u8, path.len + 1);
-
-        // Prepend a '/' to the path
-        path_alloc[0] = '/';
-        @memcpy(path_alloc[1..], path);
-
-        // allocate for the URL struct, populate and return it
-        var u = try allocator.create(Url);
-        u.scheme = scheme_alloc;
-        u.path = path_alloc;
-        if (std.mem.eql(u8, scheme, "https")) {
-            u.is_https = true;
-            if (port) |p| {
-                u.port = p;
+            // find the first comma, everything after is the data
+            var data: []const u8 = undefined;
+            if (std.mem.indexOf(u8, rest, ",")) |comma_index| {
+                data = rest[comma_index + 1 ..];
+                rest = rest[0..comma_index];
             } else {
-                u.port = 443;
+                return error.DataUriBadFormat;
             }
+            // split on ';' to find the mime type and attributes
+            var split_iter = std.mem.splitSequence(u8, rest, ";");
+            const mime_type = split_iter.first();
+            var attributes = std.ArrayList([]const u8).init(allocator);
+            if (!std.mem.eql(u8, mime_type, url)) {
+                while (split_iter.next()) |attr| {
+                    try attributes.append(attr);
+                }
+            }
+
+            var u = Url{};
+
+            const mime_type_alloc = try allocator.alloc(u8, mime_type.len);
+            @memcpy(mime_type_alloc, mime_type);
+
+            const data_alloc = try allocator.alloc(u8, data.len);
+            @memcpy(data_alloc, data);
+
+            const scheme_alloc = try allocator.alloc(u8, scheme.len);
+            @memcpy(scheme_alloc, scheme);
+
+            u.path = data_alloc;
+            u.mime_type = mime_type_alloc;
+            u.scheme = scheme_alloc;
+            u.attributes = attributes;
+
+            return u;
         } else {
-            if (port) |p| {
-                u.port = p;
+
+            // split the url by "://"
+            var split_iter = std.mem.splitSequence(u8, local_url.items, "://");
+            const scheme = split_iter.first();
+
+            // delimter not found, bail
+            if (std.mem.eql(u8, scheme, local_url.items)) return error.NoSchemeFound;
+
+            // we only support http and https
+            if (!std.mem.eql(u8, scheme, "http") and
+                !std.mem.eql(u8, scheme, "https") and
+                !std.mem.eql(u8, scheme, "file")) return error.UnsupportedScheme;
+
+            // get everything after the scheme
+            const rest = split_iter.rest();
+            if (rest.len == 0) {
+                return error.NoHostFound;
+            }
+
+            // allocate memory for the scheme
+            const scheme_alloc = try allocator.alloc(u8, scheme.len);
+            @memcpy(scheme_alloc, scheme);
+
+            // gather the rest of the url into a dynamic array
+            var rest_of_url = ArrayList(u8).init(allocator);
+            defer rest_of_url.deinit();
+            try rest_of_url.appendSlice(rest);
+
+            // Append a '/' if it doesn't exist
+            if (!std.mem.containsAtLeast(u8, rest_of_url.items, 1, "/")) {
+                try rest_of_url.append('/');
+            }
+
+            // Split on '/' to find host
+            split_iter = std.mem.splitSequence(u8, rest_of_url.items, "/");
+            var host = split_iter.first();
+
+            // If an optional ':port' is present, parse it
+            var port: ?u16 = null;
+            if (std.mem.containsAtLeast(u8, host, 1, ":")) {
+                var host_iter = std.mem.splitScalar(u8, host, ':');
+                host = host_iter.first();
+                const p = host_iter.next().?;
+                port = try std.fmt.parseInt(u16, p, 10);
+            }
+
+            // everything else is the path, allocate memory for it
+            // if the path is '/', then this will be an empty string
+            const path = split_iter.rest();
+            var path_alloc = try allocator.alloc(u8, path.len + 1);
+
+            // Prepend a '/' to the path
+            path_alloc[0] = '/';
+            @memcpy(path_alloc[1..], path);
+
+            // allocate for the URL struct, populate and return it
+            var u = Url{};
+            u.scheme = scheme_alloc;
+            u.path = path_alloc;
+            if (std.mem.eql(u8, scheme, "https")) {
+                u.is_https = true;
+                if (port) |p| {
+                    u.port = p;
+                } else {
+                    u.port = 443;
+                }
             } else {
-                u.port = 80;
+                if (port) |p| {
+                    u.port = p;
+                } else {
+                    u.port = 80;
+                }
+                u.is_https = false;
             }
-            u.is_https = false;
-        }
 
-        // allocate memory for the host, which won't be present in the case of a file scheme
-        if (host.len != 0) {
-            dbgln("Allocating host");
-            const host_alloc = try allocator.alloc(u8, host.len);
-            @memcpy(host_alloc, host);
-            u.host = host_alloc;
-        } else {
-            u.host = null;
-        }
+            // allocate memory for the host, which won't be present in the case of a file scheme
+            if (host.len != 0) {
+                const host_alloc = try allocator.alloc(u8, host.len);
+                @memcpy(host_alloc, host);
+                u.host = host_alloc;
+            }
 
-        if (debug) {
-            dbg("Scheme: {s}\n", .{u.scheme});
-            if (u.host) |h| dbg("Host: {s}\n", .{h}) else dbgln("Host: n/a");
-            dbg("Path: {s}\n", .{u.path});
-            dbg("Port: {d}\n", .{u.port});
-            dbg("Is HTTPS: {any}\n", .{u.is_https});
+            if (debug) {
+                dbg("Scheme: {s}\n", .{u.scheme});
+                if (u.host) |h| dbg("Host: {s}\n", .{h}) else dbgln("Host: localhost");
+                dbg("Path: {s}\n", .{u.path});
+                dbg("Port: {d}\n", .{u.port});
+                dbg("Is HTTPS: {any}\n", .{u.is_https});
+            }
+            return u;
         }
-
-        return u;
     }
 
-    pub fn free(self: *Url, allocator: std.mem.Allocator) void {
+    pub fn free(self: Url, allocator: std.mem.Allocator) void {
         allocator.free(self.scheme);
-        if (self.host) |_| {
-            dbgln("Freeing host");
-            allocator.free(self.host.?);
-        }
+        if (self.host) |_| allocator.free(self.host.?);
+
+        if (self.mime_type) |_| allocator.free(self.mime_type.?);
+        if (self.attributes) |_| self.attributes.?.deinit();
+
         allocator.free(self.path);
-        allocator.destroy(self);
     }
 
     fn httpRequest(self: *Url, al: std.mem.Allocator, debug: bool) ![]const u8 {
@@ -277,16 +317,19 @@ pub const Url = struct {
     }
 
     pub fn load(self: *Url, al: std.mem.Allocator, debug: bool) !void {
-        var body: []const u8 = undefined;
-        defer al.free(body);
         if (std.mem.eql(u8, self.scheme, "file")) {
             dbg("File request: {s}\n", .{self.path});
-            body = try self.fileRequest(al, debug);
-            // return error.UnsupportedScheme;
+            const body = try self.fileRequest(al, debug);
+            defer al.free(body);
+            try show(body);
+        } else if (std.mem.eql(u8, self.scheme, "data")) {
+            dbg("Data request: {s}\n", .{self.path});
+            try show(self.path);
         } else {
-            body = try self.httpRequest(al, debug);
+            const body = try self.httpRequest(al, debug);
+            defer al.free(body);
+            try show(body);
         }
-        try show(body);
     }
 };
 
@@ -330,4 +373,42 @@ fn printHeaders(headers: *std.StringHashMap([]const u8)) void {
     while (iter.next()) |entry| {
         dbg("{s}: {s}\n", .{ entry.key_ptr.*, entry.value_ptr.* });
     }
+}
+
+const expect = std.testing.expect;
+
+test "file request" {
+    const url = try Url.init(std.testing.allocator, "file:///test/path.html", false);
+    defer url.free(std.testing.allocator);
+    try expect(std.mem.eql(u8, url.scheme, "file"));
+    try expect(std.mem.eql(u8, url.path, "/test/path.html"));
+}
+
+test "data request" {
+    const url = try Url.init(std.testing.allocator, "data:text/html,Hello%20World!", false);
+    defer url.free(std.testing.allocator);
+    try expect(std.mem.eql(u8, url.scheme, "data"));
+    try expect(std.mem.eql(u8, url.path, "Hello%20World!"));
+    try expect(std.mem.eql(u8, url.mime_type.?, "text/html"));
+}
+
+test "data request with attributes" {
+    const url = try Url.init(std.testing.allocator, "data:text/html;charset=utf-8;base64,SGVsbG8gV29ybGQh", false);
+    defer url.free(std.testing.allocator);
+    try expect(std.mem.eql(u8, url.scheme, "data"));
+    try expect(std.mem.eql(u8, url.path, "SGVsbG8gV29ybGQh"));
+    try expect(std.mem.eql(u8, url.mime_type.?, "text/html"));
+    try expect(url.attributes.?.items.len == 2);
+    try expect(std.mem.eql(u8, url.attributes.?.items[0], "charset=utf-8"));
+    try expect(std.mem.eql(u8, url.attributes.?.items[1], "base64"));
+}
+
+test "http request" {
+    const url = try Url.init(std.testing.allocator, "http://example.com", false);
+    defer url.free(std.testing.allocator);
+    try expect(std.mem.eql(u8, url.scheme, "http"));
+    try expect(std.mem.eql(u8, url.host.?, "example.com"));
+    try expect(std.mem.eql(u8, url.path, "/"));
+    try expect(url.port == 80);
+    try expect(!url.is_https);
 }
