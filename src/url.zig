@@ -336,14 +336,37 @@ pub const Url = struct {
 // Show the body of the response, sans tags
 pub fn show(body: []const u8) !void {
     var in_tag = false;
-    for (body) |c| {
+    var i: usize = 0;
+    while (i < body.len) : (i += 1) {
+        const c = body[i];
         if (c == '<') {
             in_tag = true;
         } else if (c == '>') {
             in_tag = false;
+        } else if (c == '&') {
+            i += try showEntity(body[i..]);
         } else if (!in_tag) {
             try stdout.print("{c}", .{c});
         }
+    }
+}
+
+pub fn showEntity(text: []const u8) !usize {
+    // Find the end of the entity
+    if (std.mem.indexOf(u8, text, ";")) |entity_end_index| {
+        const entity = text[0 .. entity_end_index + 1];
+        if (std.mem.eql(u8, entity, "&amp;")) {
+            try stdout.print("&", .{});
+        } else if (std.mem.eql(u8, entity, "&lt;")) {
+            try stdout.print("<", .{});
+        } else if (std.mem.eql(u8, entity, "&gt;")) {
+            try stdout.print(">", .{});
+        } else {
+            try stdout.print("{s}", .{entity});
+        }
+        return entity.len - 1;
+    } else {
+        return error.EntityNotFound;
     }
 }
 
