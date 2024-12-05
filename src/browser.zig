@@ -2,6 +2,7 @@ const std = @import("std");
 
 const Url = @import("url.zig").Url;
 const show = @import("url.zig").show;
+const loadAll = @import("url.zig").loadAll;
 const ArrayList = std.ArrayList;
 const assert = std.debug.assert;
 
@@ -25,23 +26,27 @@ pub fn main() !void {
     defer std.process.argsFree(allocator, args);
 
     var debug_flag = false;
-    var url_provided = false;
+
+    var urls = ArrayList(Url).init(allocator);
+    defer {
+        for (urls.items) |url| {
+            url.free(allocator);
+        }
+        urls.deinit();
+    }
 
     for (args[1..]) |arg| {
         if (std.mem.eql(u8, arg, "-v")) {
             debug_flag = true;
             continue;
         }
-        url_provided = true;
-        var url = try Url.init(allocator, arg, debug_flag);
-        defer url.free(allocator);
-
-        dbg("Loading {s}\n", .{url.path});
-
-        try url.load(allocator, debug_flag);
+        const url = try Url.init(allocator, arg, debug_flag);
+        try urls.append(url);
     }
 
-    if (!url_provided) {
+    if (urls.items.len == 0) {
         try show(default_html, false);
+    } else {
+        try loadAll(allocator, urls, debug_flag);
     }
 }

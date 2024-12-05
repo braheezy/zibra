@@ -8,6 +8,15 @@ fn dbgln(comptime fmt: []const u8) void {
 
 const stdout = std.io.getStdOut().writer();
 
+// Connection provides a way to handle both TCP and TLS connections
+pub const Connection = union(enum) {
+    Tcp: std.net.Stream,
+    Tls: struct {
+        client: std.crypto.tls.Client,
+        stream: std.net.Stream,
+    },
+};
+
 pub const Url = struct {
     scheme: []const u8 = undefined,
     host: ?[]const u8 = null,
@@ -16,7 +25,7 @@ pub const Url = struct {
     is_https: bool = false,
     mime_type: ?[]const u8 = null,
     attributes: ?std.ArrayList([]const u8) = null,
-    view_content: bool = false,
+    view_source: bool = false,
 
     pub fn init(allocator: std.mem.Allocator, url: []const u8, debug: bool) !Url {
         // make a copy of the url
@@ -24,14 +33,14 @@ pub const Url = struct {
         defer local_url.deinit();
         try local_url.appendSlice(url);
 
+        // check for view-source
         var view_source = false;
-
-        // dbg("URL: {s}\n", .{local_url.items});
         if (url.len >= 12 and std.mem.eql(u8, url[0..12], "view-source:")) {
             local_url.items = local_url.items[12..];
             view_source = true;
         }
 
+        // check for data
         if (url.len >= 5 and std.mem.eql(u8, url[0..5], "data:")) {
             const scheme = url[0..4];
             var rest = url[5..];
@@ -48,7 +57,8 @@ pub const Url = struct {
             var split_iter = std.mem.splitSequence(u8, rest, ";");
             const mime_type = split_iter.first();
             var attributes = std.ArrayList([]const u8).init(allocator);
-            if (!std.mem.eql(u8, mime_type, url)) {
+            const has_attributes = !std.mem.eql(u8, mime_type, url);
+            if (has_attributes) {
                 while (split_iter.next()) |attr| {
                     try attributes.append(attr);
                 }
@@ -56,6 +66,7 @@ pub const Url = struct {
 
             var u = Url{};
 
+            // Allocate memory for strings.
             const mime_type_alloc = try allocator.alloc(u8, mime_type.len);
             @memcpy(mime_type_alloc, mime_type);
 
@@ -69,7 +80,7 @@ pub const Url = struct {
             u.mime_type = mime_type_alloc;
             u.scheme = scheme_alloc;
             u.attributes = attributes;
-            u.view_content = view_source;
+            u.view_source = view_source;
 
             return u;
         } else {
@@ -80,7 +91,6 @@ pub const Url = struct {
             // delimter not found, bail
             if (std.mem.eql(u8, scheme, local_url.items)) return error.NoSchemeFound;
 
-            // we only support http and https
             if (!std.mem.eql(u8, scheme, "http") and
                 !std.mem.eql(u8, scheme, "https") and
                 !std.mem.eql(u8, scheme, "file")) return error.UnsupportedScheme;
@@ -127,10 +137,12 @@ pub const Url = struct {
             path_alloc[0] = '/';
             @memcpy(path_alloc[1..], path);
 
-            // allocate for the URL struct, populate and return it
             var u = Url{};
             u.scheme = scheme_alloc;
             u.path = path_alloc;
+            u.view_source = view_source;
+
+            // handle default port
             if (std.mem.eql(u8, scheme, "https")) {
                 u.is_https = true;
                 if (port) |p| {
@@ -153,7 +165,6 @@ pub const Url = struct {
                 @memcpy(host_alloc, host);
                 u.host = host_alloc;
             }
-            u.view_content = view_source;
 
             if (debug) {
                 dbg("Scheme: {s}\n", .{u.scheme});
@@ -176,13 +187,18 @@ pub const Url = struct {
         allocator.free(self.path);
     }
 
-    fn httpRequest(self: Url, al: std.mem.Allocator, debug: bool) ![]const u8 {
+    fn httpRequest(
+        self: Url,
+        al: std.mem.Allocator,
+        socket_map: *std.StringHashMap(Connection),
+        debug: bool,
+    ) ![]const u8 {
         // Create the request text, allocating memory as needed
         const request_content = try std.fmt.allocPrint(
             al,
             "GET {s} HTTP/1.1\r\n" ++
                 "Host: {s}\r\n" ++
-                "Connection: close\r\n" ++
+                "Connection: keep-alive\r\n" ++
                 "User-Agent: zibra/0.1\r\n" ++
                 "\r\n",
             .{ self.path, self.host.? },
@@ -191,57 +207,79 @@ pub const Url = struct {
 
         if (debug) dbg("Request:\n{s}", .{request_content});
 
-        // Define socker and connect to it.
         dbg("Connecting to {s}:{d}\n", .{ self.host.?, self.port });
-        const tcp_stream = try std.net.tcpConnectToHost(al, self.host.?, self.port);
-        defer tcp_stream.close();
+
+        // Define socker and connect to it. Use an existing one if available
+        var conn = socket_map.get(self.host.?) orelse conn_blk: {
+            // Create socket connection
+            const tcp_stream = try std.net.tcpConnectToHost(
+                al,
+                self.host.?,
+                self.port,
+            );
+            const new_connection: Connection = if (self.is_https) blk: {
+                // create required certificate bundle
+                // ! API changes in zig 0.14.0
+                var bundle = std.crypto.Certificate.Bundle{};
+                try bundle.rescan(al);
+                defer bundle.deinit(al);
+
+                // create the tls client
+                const tls_client = try std.crypto.tls.Client.init(tcp_stream, bundle, self.host.?);
+                break :blk Connection{ .Tls = .{
+                    .client = tls_client,
+                    .stream = tcp_stream,
+                } };
+            } else Connection{ .Tcp = tcp_stream };
+
+            // save the connection for future use
+            try socket_map.put(self.host.?, new_connection);
+            break :conn_blk new_connection;
+        };
+
+        // send the request
+        switch (conn) {
+            .Tcp => |c| try c.writeAll(request_content),
+            .Tls => |*c| try c.client.writeAll(c.stream, request_content),
+        }
 
         // Create dynamic array to store total response
         var response_list = std.ArrayList(u8).init(al);
         defer response_list.deinit();
 
-        // if https, create a TLS client to handle the encryption
-        var tls_client: std.crypto.tls.Client = undefined;
-        if (self.is_https) {
-            // create required certificate bundle
-            // ! API changes in zig 0.14.0
-            var bundle = std.crypto.Certificate.Bundle{};
-            try bundle.rescan(al);
-            defer bundle.deinit(al);
-
-            // create the tls client
-            tls_client = try std.crypto.tls.Client.init(tcp_stream, bundle, self.host.?);
-            // Send the request
-            try tls_client.writeAll(tcp_stream, request_content);
-        } else {
-            // Send the request
-            try tcp_stream.writeAll(request_content);
-        }
-
         // Create buffer for response
-        // ! This is a workaround for a bug in the std library
-        // ! https://github.com/ziglang/zig/issues/14573
-        // ! Make a super large buffer so the std lib doesn't have to refill it
-        const buffer_size = 30000;
+        const buffer_size = 4096;
         var temp_buffer: [buffer_size]u8 = undefined;
+        var bytes_read: usize = 0;
+        var header_end_index: ?usize = null;
 
         // Keep reading the response in `buffer_size` chunks, appending
         // each to the response_list
-        var bytes_read: usize = 0;
         while (true) {
-            if (self.is_https) {
-                bytes_read = try tls_client.readAll(tcp_stream, &temp_buffer);
-            } else {
-                bytes_read = try tcp_stream.readAll(&temp_buffer);
-            }
+            bytes_read = switch (conn) {
+                .Tcp => |c| try c.read(&temp_buffer),
+                .Tls => |*c| try c.client.read(c.stream, &temp_buffer),
+            };
+            // Connection closed prematurely?
+            if (bytes_read == 0) break;
+
             try response_list.appendSlice(temp_buffer[0..bytes_read]);
-            if (bytes_read == 0) {
-                // End of stream
+
+            // see if end of headers is near
+            header_end_index = std.mem.indexOf(u8, response_list.items, "\r\n\r\n");
+            if (header_end_index != null) {
                 break;
             }
         }
+
+        if (header_end_index == null) {
+            return error.NoCompleteHeaders;
+        }
+
         // Flatten the response_list into a single slice
         const response = response_list.items[0..response_list.items.len];
+        const header_section_len = header_end_index.? + 4;
+
         if (debug) dbg("Response:\n{s}", .{response});
 
         // Parse the response line by line
@@ -270,6 +308,7 @@ pub const Url = struct {
             headers.deinit();
         }
 
+        // Parse the headers
         while (response_iter.next()) |header_line| {
             // Empty line indicates end of headers
             if (std.mem.eql(u8, header_line, "")) {
@@ -279,12 +318,12 @@ pub const Url = struct {
             // Split the header line by ':' for the key and value
             var line_iter = std.mem.splitScalar(u8, header_line, ':');
 
-            const header_name = line_iter.next();
-            if (header_name == null) {
+            const header_key = line_iter.next();
+            if (header_key == null) {
                 return error.NoHeaderNameFound;
             }
             // normalize the key to lowercase
-            const lowercase_header_name = try std.ascii.allocLowerString(al, header_name.?);
+            const lowercase_header_name = try std.ascii.allocLowerString(al, header_key.?);
             const result = try headers.getOrPut(lowercase_header_name);
 
             // Remove whitespace because it's insignificant
@@ -303,12 +342,54 @@ pub const Url = struct {
             return error.UnsupportedEncoding;
         }
 
-        // The rest of the response is the body
-        const body = response_iter.rest();
-        const b = try al.alloc(u8, body.len);
-        @memcpy(b, body);
+        // Determine content length to know how much to body to read.
+        var content_length: usize = 0;
+        if (headers.contains("content-length")) {
+            const cl_str = headers.get("content-length").?;
+            content_length = std.fmt.parseInt(usize, cl_str, 10) catch return error.InvalidContentLength;
+        }
 
-        return b;
+        // The body starts right after the headers
+        // Some of the body could have been read from the socket earlier and is in the response_list already
+        const already_have_body = response_list.items[header_section_len..response_list.items.len];
+        var body_list = std.ArrayList(u8).init(al);
+        defer body_list.deinit();
+        try body_list.appendSlice(already_have_body);
+
+        // If we haven't got all the body yet, read more
+        if (content_length > body_list.items.len) {
+            var remaining = content_length - body_list.items.len;
+            while (remaining > 0) {
+                const to_read = if (remaining < buffer_size) remaining else buffer_size;
+                const read_count = switch (conn) {
+                    .Tls => |*c| try c.client.read(c.stream, temp_buffer[0..to_read]),
+                    .Tcp => |c| try c.read(temp_buffer[0..to_read]),
+                };
+                // connection closed prematurely?
+                if (read_count == 0) break;
+
+                try body_list.appendSlice(temp_buffer[0..read_count]);
+                remaining -= read_count;
+            }
+
+            if (body_list.items.len != content_length) {
+                return error.IncompleteBody;
+            }
+        }
+
+        // flatten the body_list into a single slice
+        const final_body = body_list.items[0..body_list.items.len];
+        // allocate memory for the body
+        const body = try al.alloc(u8, final_body.len);
+        @memcpy(body, final_body);
+
+        if (self.is_https) {
+            // Remove the connection from the map
+            // TODO: Somehow reuse the connection for TLS?
+            _ = socket_map.remove(self.host.?);
+        }
+
+        return body;
     }
 
     fn fileRequest(self: Url, al: std.mem.Allocator, debug: bool) ![]const u8 {
@@ -325,22 +406,40 @@ pub const Url = struct {
         return html_content;
     }
 
-    pub fn load(self: Url, al: std.mem.Allocator, debug: bool) !void {
+    pub fn load(self: Url, al: std.mem.Allocator, socket_map: *std.StringHashMap(Connection), debug: bool) !void {
         if (std.mem.eql(u8, self.scheme, "file")) {
             dbg("File request: {s}\n", .{self.path});
             const body = try self.fileRequest(al, debug);
             defer al.free(body);
-            try show(body, self.view_content);
+            try show(body, self.view_source);
         } else if (std.mem.eql(u8, self.scheme, "data")) {
             dbg("Data request: {s}\n", .{self.path});
-            try show(self.path, self.view_content);
+            try show(self.path, self.view_source);
         } else {
-            const body = try self.httpRequest(al, debug);
+            const body = try self.httpRequest(al, socket_map, debug);
             defer al.free(body);
-            try show(body, self.view_content);
+            try show(body, self.view_source);
         }
     }
 };
+
+pub fn loadAll(allocator: std.mem.Allocator, urls: ArrayList(Url), debug: bool) !void {
+    var socket_map = std.StringHashMap(Connection).init(allocator);
+    defer {
+        var sockets_iter = socket_map.valueIterator();
+        while (sockets_iter.next()) |socket| {
+            switch (socket.*) {
+                .Tcp => socket.Tcp.close(),
+                .Tls => socket.Tls.stream.close(),
+            }
+        }
+        socket_map.deinit();
+    }
+
+    for (urls.items) |url| {
+        try url.load(allocator, &socket_map, debug);
+    }
+}
 
 // Show the body of the response, sans tags
 pub fn show(body: []const u8, view_content: bool) !void {
