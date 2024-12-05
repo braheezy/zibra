@@ -42,6 +42,6 @@ pub fn main() !void {
     }
 
     if (!url_provided) {
-        try show(default_html);
+        try show(default_html, false);
     }
 }

@@ -16,12 +16,21 @@ pub const Url = struct {
     is_https: bool = false,
     mime_type: ?[]const u8 = null,
     attributes: ?std.ArrayList([]const u8) = null,
+    view_content: bool = false,
 
     pub fn init(allocator: std.mem.Allocator, url: []const u8, debug: bool) !Url {
         // make a copy of the url
         var local_url = ArrayList(u8).init(allocator);
         defer local_url.deinit();
         try local_url.appendSlice(url);
+
+        var view_source = false;
+
+        // dbg("URL: {s}\n", .{local_url.items});
+        if (url.len >= 12 and std.mem.eql(u8, url[0..12], "view-source:")) {
+            local_url.items = local_url.items[12..];
+            view_source = true;
+        }
 
         if (url.len >= 5 and std.mem.eql(u8, url[0..5], "data:")) {
             const scheme = url[0..4];
@@ -60,10 +69,10 @@ pub const Url = struct {
             u.mime_type = mime_type_alloc;
             u.scheme = scheme_alloc;
             u.attributes = attributes;
+            u.view_content = view_source;
 
             return u;
         } else {
-
             // split the url by "://"
             var split_iter = std.mem.splitSequence(u8, local_url.items, "://");
             const scheme = split_iter.first();
@@ -144,6 +153,7 @@ pub const Url = struct {
                 @memcpy(host_alloc, host);
                 u.host = host_alloc;
             }
+            u.view_content = view_source;
 
             if (debug) {
                 dbg("Scheme: {s}\n", .{u.scheme});
@@ -166,7 +176,7 @@ pub const Url = struct {
         allocator.free(self.path);
     }
 
-    fn httpRequest(self: *Url, al: std.mem.Allocator, debug: bool) ![]const u8 {
+    fn httpRequest(self: Url, al: std.mem.Allocator, debug: bool) ![]const u8 {
         // Create the request text, allocating memory as needed
         const request_content = try std.fmt.allocPrint(
             al,
@@ -309,32 +319,35 @@ pub const Url = struct {
         };
 
         defer html_file.close();
-        dbgln("File opened");
 
         const html_content = try html_file.readToEndAlloc(al, 4096);
         if (debug) dbg("File content:\n{s}", .{html_content});
         return html_content;
     }
 
-    pub fn load(self: *Url, al: std.mem.Allocator, debug: bool) !void {
+    pub fn load(self: Url, al: std.mem.Allocator, debug: bool) !void {
         if (std.mem.eql(u8, self.scheme, "file")) {
             dbg("File request: {s}\n", .{self.path});
             const body = try self.fileRequest(al, debug);
             defer al.free(body);
-            try show(body);
+            try show(body, self.view_content);
         } else if (std.mem.eql(u8, self.scheme, "data")) {
             dbg("Data request: {s}\n", .{self.path});
-            try show(self.path);
+            try show(self.path, self.view_content);
         } else {
             const body = try self.httpRequest(al, debug);
             defer al.free(body);
-            try show(body);
+            try show(body, self.view_content);
         }
     }
 };
 
 // Show the body of the response, sans tags
-pub fn show(body: []const u8) !void {
+pub fn show(body: []const u8, view_content: bool) !void {
+    if (view_content) {
+        try stdout.print("{s}", .{body});
+        return;
+    }
     var in_tag = false;
     var i: usize = 0;
     while (i < body.len) : (i += 1) {
