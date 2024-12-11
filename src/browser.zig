@@ -7,6 +7,7 @@ const ArrayList = std.ArrayList;
 const assert = std.debug.assert;
 
 const dbg = std.debug.print;
+
 fn dbgln(comptime fmt: []const u8) void {
     dbg("{s}\n", .{fmt});
 }

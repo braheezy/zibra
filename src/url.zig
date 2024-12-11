@@ -2,6 +2,7 @@ const std = @import("std");
 const ArrayList = std.ArrayList;
 
 const dbg = std.debug.print;
+
 fn dbgln(comptime fmt: []const u8) void {
     dbg("{s}\n", .{fmt});
 }
@@ -191,8 +192,13 @@ pub const Url = struct {
         self: Url,
         al: std.mem.Allocator,
         socket_map: *std.StringHashMap(Connection),
+        redirect_count: u8,
         debug: bool,
     ) ![]const u8 {
+        // Firefox limits to 20 too.
+        if (redirect_count > 20) {
+            return error.TooManyRedirects;
+        }
         // Create the request text, allocating memory as needed
         const request_content = try std.fmt.allocPrint(
             al,
@@ -248,7 +254,10 @@ pub const Url = struct {
         defer response_list.deinit();
 
         // Create buffer for response
-        const buffer_size = 4096;
+        // ! This is a workaround for a bug in the std library
+        // ! https://github.com/ziglang/zig/issues/14573
+        // ! Make a super large buffer so the std lib doesn't have to refill it
+        const buffer_size = 10000;
         var temp_buffer: [buffer_size]u8 = undefined;
         var bytes_read: usize = 0;
         var header_end_index: ?usize = null;
@@ -276,6 +285,12 @@ pub const Url = struct {
             return error.NoCompleteHeaders;
         }
 
+        if (self.is_https) {
+            // Remove the connection from the map
+            // TODO: Somehow reuse the connection for TLS?
+            _ = socket_map.remove(self.host.?);
+        }
+
         // Flatten the response_list into a single slice
         const response = response_list.items[0..response_list.items.len];
         const header_section_len = header_end_index.? + 4;
@@ -290,11 +305,10 @@ pub const Url = struct {
         );
 
         // The first line has the response status
-        if (response_iter.next()) |status_line| {
-            const version, const status, const explanation = try parseStatus(status_line);
+        const status_line = response_iter.next() orelse return error.NoStatusLineFound;
+        const version, const status, const explanation = try parseStatus(status_line);
 
-            dbg("{s} {s} {s}\n", .{ version, status, explanation });
-        }
+        dbg("{s} {s} {s}\n", .{ version, status, explanation });
 
         // Define a hashmap to store the headers
         var headers = std.StringHashMap([]const u8).init(al);
@@ -342,6 +356,26 @@ pub const Url = struct {
             return error.UnsupportedEncoding;
         }
 
+        if (isRedirectStatusCode(status) and headers.contains("location")) {
+            dbg("Redirecting to {s}\n", .{headers.get("location").?});
+            const location: []const u8 = headers.get("location").?;
+            // In case we need to build up the string, allocate memory for it
+            var new_url_path = try al.alloc(u8, location.len);
+            defer al.free(new_url_path);
+            @memcpy(new_url_path, location);
+
+            // Check if location is relative
+            if (!std.mem.containsAtLeast(u8, location, 1, "://")) {
+                // Free the old path or it will leak!
+                al.free(new_url_path);
+                // build up location reusing current scheme and host
+                new_url_path = try std.fmt.allocPrint(al, "{s}://{s}{s}", .{ self.scheme, self.host.?, location });
+            }
+            const new_url = try Url.init(al, new_url_path, debug);
+            defer new_url.free(al);
+            return new_url.httpRequest(al, socket_map, redirect_count + 1, debug);
+        }
+
         // Determine content length to know how much to body to read.
         var content_length: usize = 0;
         if (headers.contains("content-length")) {
@@ -383,12 +417,6 @@ pub const Url = struct {
         const body = try al.alloc(u8, final_body.len);
         @memcpy(body, final_body);
 
-        if (self.is_https) {
-            // Remove the connection from the map
-            // TODO: Somehow reuse the connection for TLS?
-            _ = socket_map.remove(self.host.?);
-        }
-
         return body;
     }
 
@@ -416,7 +444,7 @@ pub const Url = struct {
             dbg("Data request: {s}\n", .{self.path});
             try show(self.path, self.view_source);
         } else {
-            const body = try self.httpRequest(al, socket_map, debug);
+            const body = try self.httpRequest(al, socket_map, 0, debug);
             defer al.free(body);
             try show(body, self.view_source);
         }
@@ -439,6 +467,14 @@ pub fn loadAll(allocator: std.mem.Allocator, urls: ArrayList(Url), debug: bool) 
     for (urls.items) |url| {
         try url.load(allocator, &socket_map, debug);
     }
+}
+
+pub fn isRedirectStatusCode(status: []const u8) bool {
+    return std.mem.eql(u8, status, "301") or
+        std.mem.eql(u8, status, "302") or
+        std.mem.eql(u8, status, "303") or
+        std.mem.eql(u8, status, "307") or
+        std.mem.eql(u8, status, "308");
 }
 
 // Show the body of the response, sans tags
