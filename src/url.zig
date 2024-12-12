@@ -1,5 +1,6 @@
 const std = @import("std");
 const ArrayList = std.ArrayList;
+const StringHashMap = std.StringHashMap;
 
 const dbg = std.debug.print;
 
@@ -9,6 +10,29 @@ fn dbgln(comptime fmt: []const u8) void {
 
 const stdout = std.io.getStdOut().writer();
 
+pub const Response = struct {
+    status: u16,
+    headers: StringHashMap([]const u8),
+    body: ?[]const u8,
+
+    pub fn free(self: *Response, al: std.mem.Allocator) void {
+        // Free all keys and values
+        var iter = self.headers.iterator();
+        while (iter.next()) |entry| {
+            al.free(entry.key_ptr.*);
+            al.free(entry.value_ptr.*);
+        }
+
+        self.headers.deinit();
+
+        // Free body if it exists
+        if (self.body) |_| al.free(self.body.?);
+
+        // Destroy the Response struct itself
+        al.destroy(self);
+    }
+};
+
 // Connection provides a way to handle both TCP and TLS connections
 pub const Connection = union(enum) {
     Tcp: std.net.Stream,
@@ -16,6 +40,134 @@ pub const Connection = union(enum) {
         client: std.crypto.tls.Client,
         stream: std.net.Stream,
     },
+
+    pub fn sendRequest(self: *Connection, request_content: []const u8) !void {
+        switch (self.*) {
+            .Tcp => |c| try c.writeAll(request_content),
+            .Tls => |*c| {
+                try c.client.writeAll(c.stream, request_content);
+            },
+        }
+    }
+
+    pub fn readHeaderResponse(self: *Connection, al: std.mem.Allocator) !*Response {
+        // Create dynamic array to store total response
+        var response_list = std.ArrayList(u8).init(al);
+        defer response_list.deinit();
+
+        // Create buffer for response
+        // ! This is a workaround for a bug in the std library
+        // ! https://github.com/ziglang/zig/issues/14573
+        // ! Make a super large buffer so the std lib doesn't have to refill it
+        const buffer_size = 30000;
+        var temp_buffer: [buffer_size]u8 = undefined;
+        var header_end_index: ?usize = null;
+
+        // Keep reading the response in `buffer_size` chunks, appending
+        // each to the response_list
+        while (true) {
+            const bytes_read = switch (self.*) {
+                .Tcp => |c| try c.read(&temp_buffer),
+                .Tls => |*c| try c.client.read(c.stream, &temp_buffer),
+            };
+            // Connection closed prematurely?
+            if (bytes_read == 0) break;
+
+            try response_list.appendSlice(temp_buffer[0..bytes_read]);
+
+            // see if end of headers is near
+            header_end_index = std.mem.indexOf(u8, response_list.items, "\r\n\r\n");
+            if (header_end_index != null) {
+                break;
+            }
+        }
+
+        if (header_end_index == null) {
+            return error.NoCompleteHeaders;
+        }
+        // Slice to separate headers and body
+        const header_section_len = header_end_index.? + 4;
+        const headers_data = response_list.items[0..header_end_index.?];
+        const body_start = response_list.items[header_section_len..];
+
+        // Parse the headers
+        const status = try parseStatusLine(headers_data);
+        const headers = try parseHeaders(headers_data, al);
+
+        // Return the `Response` struct
+        const response = try al.create(Response);
+        response.status = status;
+        response.headers = headers;
+
+        response.body = if (body_start.len > 0) blk: {
+            const body_copy = try al.alloc(u8, body_start.len);
+            @memcpy(body_copy, body_start);
+            break :blk body_copy;
+        } else null;
+
+        return response;
+    }
+
+    fn readRemainingBody(
+        self: *Connection,
+        body_list: *std.ArrayList(u8),
+        remaining: usize,
+    ) !void {
+        const buffer_size = 10000;
+        var temp_buffer: [buffer_size]u8 = undefined;
+
+        var to_read = remaining;
+        while (to_read > 0) {
+            const chunk_size = if (to_read < buffer_size) to_read else buffer_size;
+            const bytes_read = switch (self.*) {
+                .Tls => |*c| try c.client.read(c.stream, temp_buffer[0..chunk_size]),
+                .Tcp => |c| try c.read(temp_buffer[0..chunk_size]),
+            };
+
+            if (bytes_read == 0) break; // Connection closed prematurely
+
+            try body_list.appendSlice(temp_buffer[0..bytes_read]);
+            to_read -= bytes_read;
+        }
+
+        if (to_read > 0) {
+            return error.IncompleteBody;
+        }
+    }
+
+    pub fn readBody(
+        self: *Connection,
+        al: std.mem.Allocator,
+        content_length: usize,
+        already_received: ?[]const u8,
+    ) ![]const u8 {
+        // Initialize a list to store the full body
+        var body_list = std.ArrayList(u8).init(al);
+        defer body_list.deinit();
+
+        if (already_received) |data| {
+            // Append the already-received portion of the body
+            try body_list.appendSlice(data);
+        }
+
+        // If there's more body to read, do it in chunks
+        if (content_length > body_list.items.len) {
+            const remaining_to_read = content_length - body_list.items.len;
+            try self.readRemainingBody(&body_list, remaining_to_read);
+        }
+
+        // Validate that we have the full body
+        if (body_list.items.len != content_length) {
+            return error.IncompleteBody;
+        }
+
+        // Flatten the body into a single allocated slice for the final return
+        const final_body = body_list.items[0..body_list.items.len];
+        const body = try al.alloc(u8, final_body.len);
+        @memcpy(body, final_body);
+
+        return body;
+    }
 };
 
 pub const Url = struct {
@@ -188,19 +340,9 @@ pub const Url = struct {
         allocator.free(self.path);
     }
 
-    fn httpRequest(
-        self: Url,
-        al: std.mem.Allocator,
-        socket_map: *std.StringHashMap(Connection),
-        redirect_count: u8,
-        debug: bool,
-    ) ![]const u8 {
-        // Firefox limits to 20 too.
-        if (redirect_count > 20) {
-            return error.TooManyRedirects;
-        }
-        // Create the request text, allocating memory as needed
-        const request_content = try std.fmt.allocPrint(
+    // Helper function to create the HTTP request content.
+    fn createRequestContent(self: Url, al: std.mem.Allocator) ![]const u8 {
+        return std.fmt.allocPrint(
             al,
             "GET {s} HTTP/1.1\r\n" ++
                 "Host: {s}\r\n" ++
@@ -209,21 +351,23 @@ pub const Url = struct {
                 "\r\n",
             .{ self.path, self.host.? },
         );
-        defer al.free(request_content);
+    }
 
-        if (debug) dbg("Request:\n{s}", .{request_content});
-
-        dbg("Connecting to {s}:{d}\n", .{ self.host.?, self.port });
-
-        // Define socker and connect to it. Use an existing one if available
-        var conn = socket_map.get(self.host.?) orelse conn_blk: {
+    // Helper function to retrieve or create a connection.
+    fn getOrCreateConnection(
+        self: Url,
+        al: std.mem.Allocator,
+        socket_map: *std.StringHashMap(Connection),
+    ) !Connection {
+        return socket_map.get(self.host.?) orelse blk: {
             // Create socket connection
             const tcp_stream = try std.net.tcpConnectToHost(
                 al,
                 self.host.?,
                 self.port,
             );
-            const new_connection: Connection = if (self.is_https) blk: {
+
+            const new_connection: Connection = if (self.is_https) conn_blk: {
                 // create required certificate bundle
                 // ! API changes in zig 0.14.0
                 var bundle = std.crypto.Certificate.Bundle{};
@@ -232,7 +376,7 @@ pub const Url = struct {
 
                 // create the tls client
                 const tls_client = try std.crypto.tls.Client.init(tcp_stream, bundle, self.host.?);
-                break :blk Connection{ .Tls = .{
+                break :conn_blk Connection{ .Tls = .{
                     .client = tls_client,
                     .stream = tcp_stream,
                 } };
@@ -240,182 +384,95 @@ pub const Url = struct {
 
             // save the connection for future use
             try socket_map.put(self.host.?, new_connection);
-            break :conn_blk new_connection;
+            break :blk new_connection;
         };
+    }
 
-        // send the request
-        switch (conn) {
-            .Tcp => |c| try c.writeAll(request_content),
-            .Tls => |*c| try c.client.writeAll(c.stream, request_content),
+    fn newRedirectUrl(
+        self: Url,
+        al: std.mem.Allocator,
+        response: *Response,
+        debug: bool,
+    ) !Url {
+        dbg("Redirecting to {s}\n", .{response.headers.get("location").?});
+        const location: []const u8 = response.headers.get("location").?;
+        // In case we need to build up the string, allocate memory for it
+        var new_url_path = try al.alloc(u8, location.len);
+        defer al.free(new_url_path);
+        @memcpy(new_url_path, location);
+
+        // Check if location is relative
+        if (!std.mem.containsAtLeast(u8, location, 1, "://")) {
+            // Free the old path or it will leak!
+            al.free(new_url_path);
+            // build up location reusing current scheme and host
+            new_url_path = try std.fmt.allocPrint(al, "{s}://{s}{s}", .{ self.scheme, self.host.?, location });
+        }
+        const new_url = try Url.init(al, new_url_path, debug);
+        return new_url;
+    }
+
+    fn httpRequest(
+        self: Url,
+        al: std.mem.Allocator,
+        socket_map: *StringHashMap(Connection),
+        redirect_count: u8,
+        debug: bool,
+    ) ![]const u8 {
+        // Firefox limits to 20 too.
+        if (redirect_count > 20) {
+            return error.TooManyRedirects;
         }
 
-        // Create dynamic array to store total response
-        var response_list = std.ArrayList(u8).init(al);
-        defer response_list.deinit();
+        const request_content = try createRequestContent(self, al);
+        defer al.free(request_content);
 
-        // Create buffer for response
-        // ! This is a workaround for a bug in the std library
-        // ! https://github.com/ziglang/zig/issues/14573
-        // ! Make a super large buffer so the std lib doesn't have to refill it
-        const buffer_size = 10000;
-        var temp_buffer: [buffer_size]u8 = undefined;
-        var bytes_read: usize = 0;
-        var header_end_index: ?usize = null;
+        if (debug) dbg("Request:\n{s}", .{request_content});
+        dbg("Connecting to {s}:{d}\n", .{ self.host.?, self.port });
 
-        // Keep reading the response in `buffer_size` chunks, appending
-        // each to the response_list
-        while (true) {
-            bytes_read = switch (conn) {
-                .Tcp => |c| try c.read(&temp_buffer),
-                .Tls => |*c| try c.client.read(c.stream, &temp_buffer),
-            };
-            // Connection closed prematurely?
-            if (bytes_read == 0) break;
+        // Define socker and connect to it. Use an existing one if available
+        var conn = try self.getOrCreateConnection(al, socket_map);
+        try conn.sendRequest(request_content);
 
-            try response_list.appendSlice(temp_buffer[0..bytes_read]);
+        var response = try conn.readHeaderResponse(al);
 
-            // see if end of headers is near
-            header_end_index = std.mem.indexOf(u8, response_list.items, "\r\n\r\n");
-            if (header_end_index != null) {
-                break;
-            }
-        }
+        defer response.free(al);
 
-        if (header_end_index == null) {
-            return error.NoCompleteHeaders;
+        // verify unsupported headers are not present
+        if (response.headers.contains("transfer-encoding") or response.headers.contains("content-encoding")) {
+            return error.UnsupportedEncoding;
         }
 
         if (self.is_https) {
             // Remove the connection from the map
+            // Do this before redirect, which might use TLS again
             // TODO: Somehow reuse the connection for TLS?
             _ = socket_map.remove(self.host.?);
         }
 
-        // Flatten the response_list into a single slice
-        const response = response_list.items[0..response_list.items.len];
-        const header_section_len = header_end_index.? + 4;
-
-        if (debug) dbg("Response:\n{s}", .{response});
-
-        // Parse the response line by line
-        var response_iter = std.mem.splitSequence(
-            u8,
-            response,
-            "\r\n",
-        );
-
-        // The first line has the response status
-        const status_line = response_iter.next() orelse return error.NoStatusLineFound;
-        const version, const status, const explanation = try parseStatus(status_line);
-
-        dbg("{s} {s} {s}\n", .{ version, status, explanation });
-
-        // Define a hashmap to store the headers
-        var headers = std.StringHashMap([]const u8).init(al);
-        defer {
-            // ensure keys are freed too
-            var key_iter = headers.keyIterator();
-            while (key_iter.next()) |key| {
-                al.free(key.*);
-            }
-
-            headers.deinit();
-        }
-
-        // Parse the headers
-        while (response_iter.next()) |header_line| {
-            // Empty line indicates end of headers
-            if (std.mem.eql(u8, header_line, "")) {
-                break;
-            }
-
-            // Split the header line by ':' for the key and value
-            var line_iter = std.mem.splitScalar(u8, header_line, ':');
-
-            const header_key = line_iter.next();
-            if (header_key == null) {
-                return error.NoHeaderNameFound;
-            }
-            // normalize the key to lowercase
-            const lowercase_header_name = try std.ascii.allocLowerString(al, header_key.?);
-            const result = try headers.getOrPut(lowercase_header_name);
-
-            // Remove whitespace because it's insignificant
-            const header_value = std.mem.trim(u8, line_iter.rest(), " ");
-
-            // If duplicate headers are sent, we need to free the duplicated header name
-            // ! If duplicate headers are sent, only the first one will be stored.
-            if (result.found_existing) {
-                al.free(lowercase_header_name);
-            }
-            result.value_ptr.* = header_value;
-        }
-
-        // verify unsupported headers are not present
-        if (headers.contains("transfer-encoding") or headers.contains("content-encoding")) {
-            return error.UnsupportedEncoding;
-        }
-
-        if (isRedirectStatusCode(status) and headers.contains("location")) {
-            dbg("Redirecting to {s}\n", .{headers.get("location").?});
-            const location: []const u8 = headers.get("location").?;
-            // In case we need to build up the string, allocate memory for it
-            var new_url_path = try al.alloc(u8, location.len);
-            defer al.free(new_url_path);
-            @memcpy(new_url_path, location);
-
-            // Check if location is relative
-            if (!std.mem.containsAtLeast(u8, location, 1, "://")) {
-                // Free the old path or it will leak!
-                al.free(new_url_path);
-                // build up location reusing current scheme and host
-                new_url_path = try std.fmt.allocPrint(al, "{s}://{s}{s}", .{ self.scheme, self.host.?, location });
-            }
-            const new_url = try Url.init(al, new_url_path, debug);
+        if (isRedirectStatusCode(response.status) and response.headers.contains("location")) {
+            const new_url = try self.newRedirectUrl(
+                al,
+                response,
+                debug,
+            );
             defer new_url.free(al);
             return new_url.httpRequest(al, socket_map, redirect_count + 1, debug);
         }
 
         // Determine content length to know how much to body to read.
         var content_length: usize = 0;
-        if (headers.contains("content-length")) {
-            const cl_str = headers.get("content-length").?;
+        if (response.headers.contains("content-length")) {
+            const cl_str: []const u8 = response.headers.get("content-length").?;
+            dbg("Content-Length: {s}\n", .{cl_str});
             content_length = std.fmt.parseInt(usize, cl_str, 10) catch return error.InvalidContentLength;
         }
 
-        // The body starts right after the headers
-        // Some of the body could have been read from the socket earlier and is in the response_list already
-        const already_have_body = response_list.items[header_section_len..response_list.items.len];
-        var body_list = std.ArrayList(u8).init(al);
-        defer body_list.deinit();
-        try body_list.appendSlice(already_have_body);
-
-        // If we haven't got all the body yet, read more
-        if (content_length > body_list.items.len) {
-            var remaining = content_length - body_list.items.len;
-            while (remaining > 0) {
-                const to_read = if (remaining < buffer_size) remaining else buffer_size;
-                const read_count = switch (conn) {
-                    .Tls => |*c| try c.client.read(c.stream, temp_buffer[0..to_read]),
-                    .Tcp => |c| try c.read(temp_buffer[0..to_read]),
-                };
-                // connection closed prematurely?
-                if (read_count == 0) break;
-
-                try body_list.appendSlice(temp_buffer[0..read_count]);
-                remaining -= read_count;
-            }
-
-            if (body_list.items.len != content_length) {
-                return error.IncompleteBody;
-            }
-        }
-
-        // flatten the body_list into a single slice
-        const final_body = body_list.items[0..body_list.items.len];
-        // allocate memory for the body
-        const body = try al.alloc(u8, final_body.len);
-        @memcpy(body, final_body);
+        const body = try conn.readBody(
+            al,
+            content_length,
+            response.body,
+        );
 
         return body;
     }
@@ -469,12 +526,8 @@ pub fn loadAll(allocator: std.mem.Allocator, urls: ArrayList(Url), debug: bool) 
     }
 }
 
-pub fn isRedirectStatusCode(status: []const u8) bool {
-    return std.mem.eql(u8, status, "301") or
-        std.mem.eql(u8, status, "302") or
-        std.mem.eql(u8, status, "303") or
-        std.mem.eql(u8, status, "307") or
-        std.mem.eql(u8, status, "308");
+pub fn isRedirectStatusCode(status: u16) bool {
+    return status == 301 or status == 302 or status == 303 or status == 307 or status == 308;
 }
 
 // Show the body of the response, sans tags
@@ -537,8 +590,68 @@ fn parseStatus(line: []const u8) !struct {
     return .{ version.?, status.?, explanation };
 }
 
+fn parseHeaders(data: []const u8, al: std.mem.Allocator) !StringHashMap([]const u8) {
+    // Define a hashmap to store the headers
+    var headers = StringHashMap([]const u8).init(al);
+
+    var lines = std.mem.splitSequence(
+        u8,
+        data,
+        "\r\n",
+    );
+
+    // Parse the headers
+    while (lines.next()) |header_line| {
+        // Empty line indicates end of headers
+        if (std.mem.eql(u8, header_line, "")) {
+            break;
+        }
+
+        // Split the header line by ':' for the key and value
+        var line_iter = std.mem.splitScalar(u8, header_line, ':');
+
+        const header_key = line_iter.next();
+        if (header_key == null) {
+            return error.NoHeaderNameFound;
+        }
+        // normalize the key to lowercase
+        const lowercase_header_name = try std.ascii.allocLowerString(al, header_key.?);
+        const result = try headers.getOrPut(lowercase_header_name);
+
+        // Remove whitespace because it's insignificant
+        const header_value = std.mem.trim(u8, line_iter.rest(), " ");
+
+        // If duplicate headers are sent, we need to free the duplicated header name
+        // ! If duplicate headers are sent, only the first one will be stored.
+        if (result.found_existing) {
+            al.free(lowercase_header_name);
+        }
+        const value_copy = try al.alloc(u8, header_value.len);
+        @memcpy(value_copy, header_value);
+        result.value_ptr.* = value_copy;
+    }
+    return headers;
+}
+
+fn parseStatusLine(headers_data: []const u8) !u16 {
+    var lines = std.mem.splitSequence(u8, headers_data, "\r\n");
+    const status_line = lines.next() orelse return error.NoStatusLineFound;
+
+    dbg("{s}\n", .{status_line});
+
+    // Parse "HTTP/1.1 200 OK"
+    var parts = std.mem.split(u8, status_line, " ");
+    // Skip "HTTP/1.1"
+    _ = parts.next();
+    const status_str = parts.next() orelse return error.NoStatusCodeFound;
+
+    dbg("{s}\n", .{status_str});
+    dbg("len: {d}\n", .{status_str.len});
+    return std.fmt.parseInt(u16, status_str, 10) catch return error.InvalidStatusCode;
+}
+
 // Print the headers
-fn printHeaders(headers: *std.StringHashMap([]const u8)) void {
+fn printHeaders(headers: std.StringHashMap([]const u8)) void {
     dbgln("Headers:");
     var iter = headers.iterator();
     while (iter.next()) |entry| {
