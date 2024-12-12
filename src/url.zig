@@ -1,6 +1,9 @@
 const std = @import("std");
+
 const ArrayList = std.ArrayList;
 const StringHashMap = std.StringHashMap;
+const Cache = @import("cache.zig").Cache;
+const CacheEntry = @import("cache.zig").CacheEntry;
 
 const dbg = std.debug.print;
 
@@ -416,12 +419,24 @@ pub const Url = struct {
         self: Url,
         al: std.mem.Allocator,
         socket_map: *StringHashMap(Connection),
+        cache: *Cache,
         redirect_count: u8,
         debug: bool,
     ) ![]const u8 {
         // Firefox limits to 20 too.
         if (redirect_count > 20) {
             return error.TooManyRedirects;
+        }
+
+        // Check the cache
+        if (cache.get(self.path)) |entry| {
+            const now: u64 = @intCast(std.time.milliTimestamp());
+            if (entry.max_age) |max_age| {
+                if ((now - entry.timestampe) / 1000 <= max_age) {
+                    dbgln("Using cached response");
+                    return entry.body;
+                }
+            }
         }
 
         const request_content = try createRequestContent(self, al);
@@ -435,7 +450,6 @@ pub const Url = struct {
         try conn.sendRequest(request_content);
 
         var response = try conn.readHeaderResponse(al);
-
         defer response.free(al);
 
         // verify unsupported headers are not present
@@ -450,6 +464,26 @@ pub const Url = struct {
             _ = socket_map.remove(self.host.?);
         }
 
+        var cache_entry: ?CacheEntry = if (isCacheableStatusCode(response.status) and response.headers.contains("cache-control")) blk: {
+            const cc = response.headers.get("cache-control").?;
+            if (std.mem.indexOf(u8, cc, "no-store")) |_| {
+                // Don't cache this response
+                break :blk null;
+            } else {
+                var max_age: ?u64 = null;
+                if (std.mem.indexOf(u8, cc, "max-age")) |start| {
+                    // skip max-age=
+                    const max_age_str = cc[start + 8 ..];
+                    max_age = try std.fmt.parseInt(u64, max_age_str, 10);
+                }
+                break :blk .{
+                    .body = "",
+                    .timestampe = @intCast(std.time.milliTimestamp()),
+                    .max_age = max_age,
+                };
+            }
+        } else null;
+
         if (isRedirectStatusCode(response.status) and response.headers.contains("location")) {
             const new_url = try self.newRedirectUrl(
                 al,
@@ -457,7 +491,13 @@ pub const Url = struct {
                 debug,
             );
             defer new_url.free(al);
-            return new_url.httpRequest(al, socket_map, redirect_count + 1, debug);
+            return new_url.httpRequest(
+                al,
+                socket_map,
+                cache,
+                redirect_count + 1,
+                debug,
+            );
         }
 
         // Determine content length to know how much to body to read.
@@ -473,6 +513,14 @@ pub const Url = struct {
             content_length,
             response.body,
         );
+
+        if (cache_entry) |*c| {
+            const body_alloc = try al.alloc(u8, body.len);
+            @memcpy(body_alloc, body);
+            c.*.body = body_alloc;
+            try cache.set(self.path, c.*);
+            cache.evict_if_needed(100);
+        }
 
         return body;
     }
@@ -491,7 +539,13 @@ pub const Url = struct {
         return html_content;
     }
 
-    pub fn load(self: Url, al: std.mem.Allocator, socket_map: *std.StringHashMap(Connection), debug: bool) !void {
+    pub fn load(
+        self: Url,
+        al: std.mem.Allocator,
+        socket_map: *std.StringHashMap(Connection),
+        cache: *Cache,
+        debug: bool,
+    ) !void {
         if (std.mem.eql(u8, self.scheme, "file")) {
             dbg("File request: {s}\n", .{self.path});
             const body = try self.fileRequest(al, debug);
@@ -501,7 +555,13 @@ pub const Url = struct {
             dbg("Data request: {s}\n", .{self.path});
             try show(self.path, self.view_source);
         } else {
-            const body = try self.httpRequest(al, socket_map, 0, debug);
+            const body = try self.httpRequest(
+                al,
+                socket_map,
+                cache,
+                0,
+                debug,
+            );
             defer al.free(body);
             try show(body, self.view_source);
         }
@@ -510,6 +570,7 @@ pub const Url = struct {
 
 pub fn loadAll(allocator: std.mem.Allocator, urls: ArrayList(Url), debug: bool) !void {
     var socket_map = std.StringHashMap(Connection).init(allocator);
+    var cache = try Cache.init(allocator);
     defer {
         var sockets_iter = socket_map.valueIterator();
         while (sockets_iter.next()) |socket| {
@@ -519,15 +580,20 @@ pub fn loadAll(allocator: std.mem.Allocator, urls: ArrayList(Url), debug: bool) 
             }
         }
         socket_map.deinit();
+        cache.free();
     }
 
     for (urls.items) |url| {
-        try url.load(allocator, &socket_map, debug);
+        try url.load(allocator, &socket_map, &cache, debug);
     }
 }
 
 pub fn isRedirectStatusCode(status: u16) bool {
     return status == 301 or status == 302 or status == 303 or status == 307 or status == 308;
+}
+
+pub fn isCacheableStatusCode(status: u16) bool {
+    return status == 200 or status == 203 or status == 204 or status == 206 or status == 300 or status == 301 or status == 404 or status == 405 or status == 410 or status == 414 or status == 501;
 }
 
 // Show the body of the response, sans tags
