@@ -504,7 +504,6 @@ pub const Url = struct {
         var content_length: usize = 0;
         if (response.headers.contains("content-length")) {
             const cl_str: []const u8 = response.headers.get("content-length").?;
-            dbg("Content-Length: {s}\n", .{cl_str});
             content_length = std.fmt.parseInt(usize, cl_str, 10) catch return error.InvalidContentLength;
         }
 
@@ -516,6 +515,7 @@ pub const Url = struct {
 
         if (cache_entry) |*c| {
             const body_alloc = try al.alloc(u8, body.len);
+            defer al.free(body_alloc);
             @memcpy(body_alloc, body);
             c.*.body = body_alloc;
             try cache.set(self.path, c.*);
@@ -711,8 +711,6 @@ fn parseStatusLine(headers_data: []const u8) !u16 {
     _ = parts.next();
     const status_str = parts.next() orelse return error.NoStatusCodeFound;
 
-    dbg("{s}\n", .{status_str});
-    dbg("len: {d}\n", .{status_str.len});
     return std.fmt.parseInt(u16, status_str, 10) catch return error.InvalidStatusCode;
 }
 
