@@ -171,6 +171,77 @@ pub const Connection = union(enum) {
 
         return body;
     }
+
+    fn readChunkedBody(self: *Connection, al: std.mem.Allocator) ![]u8 {
+        var body_list = std.ArrayList(u8).init(al);
+        defer body_list.deinit();
+
+        while (true) {
+            // Read the chunk size line
+            const chunk_size_str = try self.readLine(al);
+            defer al.free(chunk_size_str);
+            const chunk_size = std.fmt.parseInt(usize, std.mem.trimRight(u8, chunk_size_str, " \r\n"), 16) catch return error.InvalidChunkSize;
+            if (chunk_size == 0) break; // End of chunks
+
+            // Allocate memory for the chunk and read it
+            const chunk = try al.alloc(u8, chunk_size);
+            defer al.free(chunk);
+            try self.readExact(chunk);
+
+            // Append the chunk to the body list
+            try body_list.appendSlice(chunk);
+
+            // Consume trailing CRLF
+            const end = try self.readLine(al);
+            al.free(end);
+        }
+
+        // Flatten the body into a single slice
+        return body_list.toOwnedSlice();
+    }
+
+    fn readLine(self: *Connection, al: std.mem.Allocator) ![]u8 {
+        var line = std.ArrayList(u8).init(al); // Replace with your allocator
+
+        const buffer_size = 1; // Read one byte at a time
+        var temp_buffer: [buffer_size]u8 = undefined;
+
+        while (true) {
+            const bytes_read = switch (self.*) {
+                .Tcp => |c| try c.read(&temp_buffer),
+                .Tls => |*c| try c.client.read(c.stream, &temp_buffer),
+            };
+
+            if (bytes_read == 0) break; // Connection closed prematurely
+
+            // Append character to line
+            try line.append(temp_buffer[0]);
+
+            // Check for line termination
+            if (line.items.len >= 2 and std.mem.eql(u8, line.items[line.items.len - 2 ..], "\r\n")) {
+                const f = try line.toOwnedSlice();
+                return f; // Return without CRLF
+            }
+        }
+
+        return error.IncompleteLine; // If no termination found
+    }
+    fn readExact(self: *Connection, buffer: []u8) !void {
+        var total_read: usize = 0;
+
+        while (total_read < buffer.len) {
+            const bytes_read = switch (self.*) {
+                .Tcp => |c| try c.read(buffer[total_read..]),
+                .Tls => |*c| try c.client.read(c.stream, buffer[total_read..]),
+            };
+
+            if (bytes_read == 0) {
+                return error.IncompleteBody; // Connection closed prematurely
+            }
+
+            total_read += bytes_read;
+        }
+    }
 };
 
 pub const Url = struct {
@@ -452,9 +523,42 @@ pub const Url = struct {
         var response = try conn.readHeaderResponse(al);
         defer response.free(al);
 
-        // verify unsupported headers are not present
-        if (response.headers.contains("transfer-encoding") or response.headers.contains("content-encoding")) {
-            return error.UnsupportedEncoding;
+        if (response.headers.contains("transfer-encoding")) {
+            const transfer_encoding = response.headers.get("transfer-encoding").?;
+
+            // check for chunked
+            if (std.mem.indexOf(u8, transfer_encoding, "chunked")) |_| {
+                const body = try conn.readChunkedBody(al);
+                // check for gzip
+                if (response.headers.get("content-encoding")) |enc| {
+                    if (std.mem.indexOf(u8, enc, "gzip")) |_| {
+                        defer al.free(body);
+                        // Create a reader for the gzip-compressed body
+                        var input_stream = std.io.fixedBufferStream(body);
+
+                        // Initialize the gzip decompressor
+                        var decompressor = std.compress.gzip.decompressor(input_stream.reader());
+
+                        // Create an ArrayList to hold the decompressed output
+                        var output = std.ArrayList(u8).init(al);
+                        defer output.deinit();
+
+                        const buffer_size = 1024; // Decompression buffer size
+                        var buffer = try al.alloc(u8, buffer_size);
+                        defer al.free(buffer);
+
+                        while (true) {
+                            const bytes_read = try decompressor.read(buffer);
+                            if (bytes_read == 0) break; // No more data to decompress
+                            try output.appendSlice(buffer[0..bytes_read]);
+                        }
+
+                        // Return the decompressed data as a slice
+                        return output.toOwnedSlice();
+                    }
+                }
+                return body;
+            }
         }
 
         if (self.is_https) {

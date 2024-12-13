@@ -48,6 +48,9 @@ pub fn main() !void {
     if (urls.items.len == 0) {
         try show(default_html, false);
     } else {
-        try loadAll(allocator, urls, debug_flag);
+        loadAll(allocator, urls, debug_flag) catch |err| {
+            dbg("Error: {any}\n", .{err});
+            std.process.exit(1);
+        };
     }
 }
