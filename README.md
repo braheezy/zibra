@@ -27,13 +27,7 @@ cp zig-out/bin/zibra .
 Connecting to example.org:443
 HTTP/1.1 200 OK
 
-
-
     Example Domain
-
-
-
-
 
     body {
         background-color: #f0f0f2;
@@ -44,34 +38,28 @@ HTTP/1.1 200 OK
     }
     div {
         width: 600px;
-        margin: 5em auto;
-        padding: 2em;
-        background-color: #fdfdff;
-        border-radius: 0.5em;
-        box-shadow: 2px 3px 7px 2px rgba(0,0,0,0.02);
-    }
-    a:link, a:visited {
-        color: #38488f;
-        text-decoration: none;
-    }
-    @media (max-width: 700px) {
-        div {
-            margin: 0 auto;
-            width: auto;
-        }
-    }
-
-
-
-
+    ...
 
     Example Domain
     This domain is for use in illustrative examples in documents. You may use this
     domain in literature without prior coordination or asking for permission.
     More information...
-
-
 ```
+
+## Supported Features
+
+`zibra` is small but supports the basics:
+
+- HTTP/1.1
+- HTTPS
+- `file://` URIs
+- `data:` URIs
+- Entity support (`&lt;div&gt` becomes `<div>`)
+- `view-source:`
+- Connections that live beyond single request for `Connection: keep-alive` header
+- Redirects
+- `Cache-Control` header
+- `Content-Encoding: gzip` and `Transfer-Encoding: chunked` headers
 
 ## Development
 
