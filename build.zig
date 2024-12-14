@@ -17,10 +17,16 @@ pub fn build(b: *std.Build) void {
 
     const exe = b.addExecutable(.{
         .name = "zibra",
-        .root_source_file = b.path("src/browser.zig"),
+        .root_source_file = b.path("src/zibra.zig"),
         .target = target,
         .optimize = optimize,
     });
+
+    const sdl_dep = b.dependency("sdl", .{
+        .optimize = optimize,
+        .target = target,
+    });
+    exe.linkLibrary(sdl_dep.artifact("SDL2"));
 
     // This declares intent for the executable to be installed into the
     // standard location when the user invokes the "install" step (the default
