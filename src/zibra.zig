@@ -1,5 +1,7 @@
 const std = @import("std");
 
+const debug = @import("config").debug;
+
 const c = @cImport({
     @cInclude("SDL2/SDL.h");
 });
@@ -28,9 +30,7 @@ pub fn main() !void {
     };
 
     const browser = try Browser.init(allocator);
-    defer browser.free(allocator);
-
-    browser.run();
+    defer browser.free();
 
     // Read arguments
     const args = try std.process.argsAlloc(allocator);
@@ -51,16 +51,18 @@ pub fn main() !void {
             debug_flag = true;
             continue;
         }
-        const url = try Url.init(allocator, arg, debug_flag);
+        const url = try Url.init(allocator, arg);
         try urls.append(url);
     }
 
     if (urls.items.len == 0) {
-        try show(default_html, false);
+        dbgln("showing default html");
+        try browser.lex(default_html, false);
     } else {
-        loadAll(allocator, urls, debug_flag) catch |err| {
+        browser.loadAll(urls) catch |err| {
             dbg("Error: {any}\n", .{err});
             std.process.exit(1);
         };
     }
+    try browser.run();
 }

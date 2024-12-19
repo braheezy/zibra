@@ -1,5 +1,6 @@
 const std = @import("std");
 
+const debug = @import("config").debug;
 const ArrayList = std.ArrayList;
 const StringHashMap = std.StringHashMap;
 const Cache = @import("cache.zig").Cache;
@@ -10,8 +11,6 @@ const dbg = std.debug.print;
 fn dbgln(comptime fmt: []const u8) void {
     dbg("{s}\n", .{fmt});
 }
-
-const stdout = std.io.getStdOut().writer();
 
 pub const Response = struct {
     status: u16,
@@ -254,7 +253,7 @@ pub const Url = struct {
     attributes: ?std.ArrayList([]const u8) = null,
     view_source: bool = false,
 
-    pub fn init(allocator: std.mem.Allocator, url: []const u8, debug: bool) !Url {
+    pub fn init(allocator: std.mem.Allocator, url: []const u8) !Url {
         // make a copy of the url
         var local_url = ArrayList(u8).init(allocator);
         defer local_url.deinit();
@@ -466,7 +465,6 @@ pub const Url = struct {
         self: Url,
         al: std.mem.Allocator,
         response: *Response,
-        debug: bool,
     ) !Url {
         dbg("Redirecting to {s}\n", .{response.headers.get("location").?});
         const location: []const u8 = response.headers.get("location").?;
@@ -482,17 +480,16 @@ pub const Url = struct {
             // build up location reusing current scheme and host
             new_url_path = try std.fmt.allocPrint(al, "{s}://{s}{s}", .{ self.scheme, self.host.?, location });
         }
-        const new_url = try Url.init(al, new_url_path, debug);
+        const new_url = try Url.init(al, new_url_path);
         return new_url;
     }
 
-    fn httpRequest(
+    pub fn httpRequest(
         self: Url,
         al: std.mem.Allocator,
         socket_map: *StringHashMap(Connection),
         cache: *Cache,
         redirect_count: u8,
-        debug: bool,
     ) ![]const u8 {
         // Firefox limits to 20 too.
         if (redirect_count > 20) {
@@ -592,7 +589,6 @@ pub const Url = struct {
             const new_url = try self.newRedirectUrl(
                 al,
                 response,
-                debug,
             );
             defer new_url.free(al);
             return new_url.httpRequest(
@@ -600,7 +596,6 @@ pub const Url = struct {
                 socket_map,
                 cache,
                 redirect_count + 1,
-                debug,
             );
         }
 
@@ -629,7 +624,7 @@ pub const Url = struct {
         return body;
     }
 
-    fn fileRequest(self: Url, al: std.mem.Allocator, debug: bool) ![]const u8 {
+    pub fn fileRequest(self: Url, al: std.mem.Allocator) ![]const u8 {
         const html_file = std.fs.cwd().openFile(self.path, .{}) catch |err| {
             std.log.err("Failed to open file {s}: {any}", .{ self.path, err });
             // EX_NOINPUT: cannot open input
@@ -642,55 +637,7 @@ pub const Url = struct {
         if (debug) dbg("File content:\n{s}", .{html_content});
         return html_content;
     }
-
-    pub fn load(
-        self: Url,
-        al: std.mem.Allocator,
-        socket_map: *std.StringHashMap(Connection),
-        cache: *Cache,
-        debug: bool,
-    ) !void {
-        if (std.mem.eql(u8, self.scheme, "file")) {
-            dbg("File request: {s}\n", .{self.path});
-            const body = try self.fileRequest(al, debug);
-            defer al.free(body);
-            try show(body, self.view_source);
-        } else if (std.mem.eql(u8, self.scheme, "data")) {
-            dbg("Data request: {s}\n", .{self.path});
-            try show(self.path, self.view_source);
-        } else {
-            const body = try self.httpRequest(
-                al,
-                socket_map,
-                cache,
-                0,
-                debug,
-            );
-            defer al.free(body);
-            try show(body, self.view_source);
-        }
-    }
 };
-
-pub fn loadAll(allocator: std.mem.Allocator, urls: ArrayList(Url), debug: bool) !void {
-    var socket_map = std.StringHashMap(Connection).init(allocator);
-    var cache = try Cache.init(allocator);
-    defer {
-        var sockets_iter = socket_map.valueIterator();
-        while (sockets_iter.next()) |socket| {
-            switch (socket.*) {
-                .Tcp => socket.Tcp.close(),
-                .Tls => socket.Tls.stream.close(),
-            }
-        }
-        socket_map.deinit();
-        cache.free();
-    }
-
-    for (urls.items) |url| {
-        try url.load(allocator, &socket_map, &cache, debug);
-    }
-}
 
 pub fn isRedirectStatusCode(status: u16) bool {
     return status == 301 or status == 302 or status == 303 or status == 307 or status == 308;
@@ -698,47 +645,6 @@ pub fn isRedirectStatusCode(status: u16) bool {
 
 pub fn isCacheableStatusCode(status: u16) bool {
     return status == 200 or status == 203 or status == 204 or status == 206 or status == 300 or status == 301 or status == 404 or status == 405 or status == 410 or status == 414 or status == 501;
-}
-
-// Show the body of the response, sans tags
-pub fn show(body: []const u8, view_content: bool) !void {
-    if (view_content) {
-        try stdout.print("{s}", .{body});
-        return;
-    }
-    var in_tag = false;
-    var i: usize = 0;
-    while (i < body.len) : (i += 1) {
-        const c = body[i];
-        if (c == '<') {
-            in_tag = true;
-        } else if (c == '>') {
-            in_tag = false;
-        } else if (c == '&') {
-            i += try showEntity(body[i..]);
-        } else if (!in_tag) {
-            try stdout.print("{c}", .{c});
-        }
-    }
-}
-
-pub fn showEntity(text: []const u8) !usize {
-    // Find the end of the entity
-    if (std.mem.indexOf(u8, text, ";")) |entity_end_index| {
-        const entity = text[0 .. entity_end_index + 1];
-        if (std.mem.eql(u8, entity, "&amp;")) {
-            try stdout.print("&", .{});
-        } else if (std.mem.eql(u8, entity, "&lt;")) {
-            try stdout.print("<", .{});
-        } else if (std.mem.eql(u8, entity, "&gt;")) {
-            try stdout.print(">", .{});
-        } else {
-            try stdout.print("{s}", .{entity});
-        }
-        return entity.len - 1;
-    } else {
-        return error.EntityNotFound;
-    }
 }
 
 // Parse the status line

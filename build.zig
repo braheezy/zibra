@@ -3,7 +3,7 @@ const std = @import("std");
 // Although this function looks imperative, note that its job is to
 // declaratively construct a build graph that will be executed by an external
 // runner.
-pub fn build(b: *std.Build) void {
+pub fn build(b: *std.Build) !void {
     // Standard target options allows the person running `zig build` to choose
     // what target to build for. Here we do not override the defaults, which
     // means any target is allowed, and the default is native. Other options
@@ -22,11 +22,34 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
 
+    // Add dependencies
     const sdl_dep = b.dependency("sdl", .{
         .optimize = optimize,
         .target = target,
     });
-    exe.linkLibrary(sdl_dep.artifact("SDL2"));
+    const sdl_artifact = sdl_dep.artifact("SDL2");
+    for (sdl_artifact.root_module.include_dirs.items) |include_dir| {
+        try exe.root_module.include_dirs.append(b.allocator, include_dir);
+    }
+    const sdl_ttf_dep = b.dependency("sdl_ttf", .{
+        .optimize = optimize,
+        .target = target,
+    });
+    exe.linkLibrary(sdl_ttf_dep.artifact("SDL2_ttf"));
+    exe.linkLibrary(sdl_artifact);
+
+    const known_folders = b.dependency("known-folders", .{}).module("known-folders");
+    exe.root_module.addImport("known-folders", known_folders);
+
+    const zg = b.dependency("zg", .{});
+    exe.root_module.addImport("grapheme", zg.module("grapheme"));
+    exe.root_module.addImport("code_point", zg.module("code_point"));
+
+    // add options
+    const debug = b.option(bool, "debug", "enable debug mode") orelse false;
+    const options = b.addOptions();
+    options.addOption(bool, "debug", debug);
+    exe.root_module.addOptions("config", options);
 
     // This declares intent for the executable to be installed into the
     // standard location when the user invokes the "install" step (the default
