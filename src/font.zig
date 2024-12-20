@@ -307,7 +307,7 @@ pub const FontManager = struct {
             const glyph = try self.getGlyph(font, cluster_bytes);
 
             // Wrap text to the next line if it exceeds the window width
-            if (current_x + glyph.w > window_width) {
+            if (current_x + glyph.w > window_width - browser.h_offset) {
                 current_y += font.line_height;
                 current_x = x;
             }

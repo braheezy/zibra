@@ -22,6 +22,8 @@ const stdout = std.io.getStdOut().writer();
 
 pub const width = 800;
 const height = 600;
+pub const h_offset = 13;
+const v_offset = 18;
 
 pub const Browser = struct {
     allocator: std.mem.Allocator,
@@ -110,8 +112,7 @@ pub const Browser = struct {
             if (self.current_content) |content| {
                 const text = try sliceToSentinelArray(self.allocator, content);
                 defer self.allocator.free(text);
-                try self.font_manager.renderText("Hiragino Sans GB", text, 10, 10);
-                // try self.renderWrappedText(text, 100, 100, 600);
+                try self.font_manager.renderText("Hiragino Sans GB", text, h_offset, v_offset);
             }
 
             // Present the updated frame
@@ -180,6 +181,8 @@ pub const Browser = struct {
 
         var content_builder = std.ArrayList(u8).init(self.allocator);
         defer content_builder.deinit();
+        var temp_line = std.ArrayList(u8).init(self.allocator);
+        defer temp_line.deinit();
 
         var in_tag = false;
         var i: usize = 0;
@@ -187,15 +190,26 @@ pub const Browser = struct {
             const char = body[i];
             if (char == '<') {
                 in_tag = true;
+                if (temp_line.items.len > 0) {
+                    try content_builder.appendSlice(std.mem.trim(u8, temp_line.items, " \r\n\t"));
+                    try content_builder.append('\n'); // Add a newline after a block
+                    temp_line.clearAndFree();
+                }
             } else if (char == '>') {
                 in_tag = false;
             } else if (char == '&') {
                 const entity = try lexEntity(body[i..]);
-                try content_builder.appendSlice(entity);
+                try temp_line.appendSlice(entity);
                 i += entity.len - 1;
             } else if (!in_tag) {
-                try content_builder.append(char);
+                if (char != '\n' and char != '\r') {
+                    try temp_line.append(char);
+                }
             }
+        }
+        // Add remaining content to the final result
+        if (temp_line.items.len > 0) {
+            try content_builder.appendSlice(std.mem.trim(u8, temp_line.items, " \r\n\t"));
         }
 
         const content = try content_builder.toOwnedSlice();
@@ -244,3 +258,5 @@ fn sliceToSentinelArray(allocator: std.mem.Allocator, slice: []const u8) ![:0]co
     @memcpy(arr, slice);
     return arr;
 }
+
+// pub fn layout(text: []const u8)
