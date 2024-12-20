@@ -1,4 +1,5 @@
 const std = @import("std");
+const builtin = @import("builtin");
 
 const known_folders = @import("known-folders");
 const grapheme = @import("grapheme");
@@ -16,6 +17,17 @@ const dbg = std.debug.print;
 fn dbgln(comptime fmt: []const u8) void {
     dbg("{s}\n", .{fmt});
 }
+
+const system_fonts_dirs = switch (builtin.target.os.tag) {
+    .macos => [_][]const u8{
+        "/Library/Fonts",
+        "/System/Library/Fonts",
+    },
+    .linux => [_][]const u8{
+        "/usr/share/fonts/google-noto-sans-cjk-vf-fonts",
+    },
+    else => @compileError("Unsupported operating system"),
+};
 
 pub const Glyph = struct {
     grapheme: []const u8,
@@ -36,6 +48,7 @@ pub const FontManager = struct {
     allocator: std.mem.Allocator,
     renderer: *c.SDL_Renderer,
     fonts: std.StringHashMap(*Font),
+    current_font: *Font,
 
     pub fn init(allocator: std.mem.Allocator, renderer: *c.SDL_Renderer) !*FontManager {
         if (c.TTF_WasInit() == 0) {
@@ -96,12 +109,6 @@ pub const FontManager = struct {
 
     /// Loads a system font by searching standard macOS font directories.
     pub fn loadSystemFont(self: *FontManager, name: []const u8, size: i32) !void {
-        // Hardcoded system font directories on macOS
-        const system_fonts_dirs = [_][]const u8{
-            "/Library/Fonts",
-            "/System/Library/Fonts",
-        };
-
         // Get the user's home directory
         const home_dir = try known_folders.getPath(self.allocator, .home) orelse return error.NoHomeDir;
         defer self.allocator.free(home_dir);
@@ -194,43 +201,14 @@ pub const FontManager = struct {
         }
 
         // Create the Font struct
-        var font = try self.allocator.create(Font);
+        var font: *Font = try self.allocator.create(Font);
         font.font_handle = fh.?;
         font.glyphs = std.StringHashMap(*Glyph).init(self.allocator);
         font.line_height = c.TTF_FontLineSkip(fh.?);
         font.font_rw = null;
 
         try self.fonts.put(name, font);
-    }
-
-    pub fn utf8ToUtf16(utf8: []const u8, allocator: std.mem.Allocator) ![]u16 {
-        // Allocate maximum UTF-16 length
-        const max_len16 = utf8.len * 2;
-        var utf16 = try allocator.alloc(u16, max_len16);
-
-        var index: usize = 0;
-        var iter = code_point.Iterator{ .bytes = utf8 };
-
-        while (iter.next()) |cp| {
-            if (cp.code <= 0xFFFF) {
-                utf16[index] = @intCast(cp.code);
-                index += 1;
-            } else {
-                // Encode as surrogate pair for code points > U+FFFF
-                const code_u32 = @as(u32, cp.code);
-                var t = (code_u32 - 0x10000) >> 10;
-                const high_surrogate: u16 = @intCast(t + 0xD800);
-                t = code_u32 - 0x10000 & 0x3FF;
-                const low_surrogate: u16 = @intCast(t + 0xDC00);
-                utf16[index] = high_surrogate;
-                utf16[index + 1] = low_surrogate;
-                index += 2;
-            }
-        }
-
-        // Shrink allocation to the actual size used
-        const result = try allocator.realloc(utf16, index);
-        return result[0..index];
+        self.current_font = font;
     }
 
     pub fn getGlyph(self: *FontManager, f: *Font, gme: []const u8) !*Glyph {
@@ -284,15 +262,15 @@ pub const FontManager = struct {
         return new_glyph;
     }
 
-    pub fn renderText(self: *FontManager, font_name: []const u8, text: []const u8, x: i32, y: i32) !void {
-        const font = self.fonts.get(font_name) orelse return error.LoadFailed;
+    pub fn renderText(self: *FontManager, text: []const u8, x: i32, y: i32) !void {
+        const font = self.fonts.get(self.current_font) orelse return error.LoadFailed;
         var current_x = x;
         var current_y = y;
 
         const gd = try grapheme.GraphemeData.init(self.allocator);
         defer gd.deinit();
 
-        const window_width: i32 = browser.width; // Replace with your actual window width
+        const window_width: i32 = browser.window_width; // Replace with your actual window width
 
         var iter = grapheme.Iterator.init(text, &gd);
         while (iter.next()) |gc| {

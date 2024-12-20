@@ -1,6 +1,9 @@
 const std = @import("std");
+const builtin = @import("builtin");
 
+const grapheme = @import("grapheme");
 const FontManager = @import("font.zig").FontManager;
+const Glyph = @import("font.zig").Glyph;
 const Url = @import("url.zig").Url;
 const Connection = @import("url.zig").Connection;
 const Cache = @import("cache.zig").Cache;
@@ -20,17 +23,34 @@ fn dbgln(comptime fmt: []const u8) void {
 
 const stdout = std.io.getStdOut().writer();
 
-pub const width = 800;
-const height = 600;
+const font_name = switch (builtin.target.os.tag) {
+    .macos => "Hiragino Sans GB",
+    .linux => "NotoSansCJK-VF",
+    else => @compileError("Unsupported operating system"),
+};
+
+pub const window_width = 800;
+const window_height = 600;
 pub const h_offset = 13;
 const v_offset = 18;
+const scroll_increment = 100;
+
+const DisplayItem = struct {
+    x: i32,
+    y: i32,
+    glyph: *Glyph,
+};
 
 pub const Browser = struct {
     allocator: std.mem.Allocator,
     window: *c.SDL_Window,
     canvas: *c.SDL_Renderer,
-    current_content: ?[]const u8 = null,
     font_manager: *FontManager,
+    socket_map: std.StringHashMap(Connection),
+    cache: Cache,
+    display_list: []DisplayItem,
+    content_height: i32,
+    scroll_offset: i32 = 0,
 
     pub fn init(al: std.mem.Allocator) !*Browser {
         // Initialize SDL
@@ -39,14 +59,21 @@ pub const Browser = struct {
             return error.SDLInitializationFailed;
         }
 
+        const window_flags = switch (builtin.target.os.tag) {
+            .macos => c.SDL_WINDOW_METAL,
+            .windows => c.SDL_WINDOW_VULKAN,
+            .linux => c.SDL_WINDOW_OPENGL,
+            else => c.SDL_WINDOW_OPENGL,
+        };
+
         // Create a window
         const screen = c.SDL_CreateWindow(
             "zibra",
             c.SDL_WINDOWPOS_UNDEFINED,
             c.SDL_WINDOWPOS_UNDEFINED,
-            width,
-            height,
-            c.SDL_WINDOW_METAL,
+            window_width,
+            window_height,
+            window_flags,
         ) orelse
             {
             c.SDL_Log("Unable to create window: %s", c.SDL_GetError());
@@ -61,27 +88,42 @@ pub const Browser = struct {
 
         const font_manager = try FontManager.init(al, renderer);
         // try browser.font_manager.loadFontFromEmbed(32);
-        font_manager.loadSystemFont("Hiragino Sans GB", 16) catch |err| {
+        font_manager.loadSystemFont(font_name, 16) catch |err| {
             font_manager.deinit();
             al.destroy(font_manager);
             return err;
         };
+
+        const socket_map = std.StringHashMap(Connection).init(al);
+        const cache = try Cache.init(al);
 
         var browser = try al.create(Browser);
         browser.window = screen;
         browser.canvas = renderer;
         browser.allocator = al;
         browser.font_manager = font_manager;
+        browser.socket_map = socket_map;
+        browser.cache = cache;
+        browser.scroll_offset = 0;
 
         return browser;
     }
 
     pub fn free(self: *Browser) void {
-        if (self.current_content) |content| {
-            self.allocator.free(content);
-        }
         self.font_manager.deinit();
         self.allocator.destroy(self.font_manager);
+
+        var sockets_iter = self.socket_map.valueIterator();
+        while (sockets_iter.next()) |socket| {
+            switch (socket.*) {
+                .Tcp => socket.Tcp.close(),
+                .Tls => socket.Tls.stream.close(),
+            }
+        }
+        self.socket_map.deinit();
+        self.cache.free();
+
+        self.allocator.free(self.display_list);
 
         c.SDL_DestroyRenderer(self.canvas);
         c.SDL_DestroyWindow(self.window);
@@ -98,8 +140,13 @@ pub const Browser = struct {
             while (c.SDL_PollEvent(&event) != 0) {
                 switch (event.type) {
                     // Quit when the window is closed
-                    c.SDL_QUIT => {
-                        quit = true;
+                    c.SDL_QUIT => quit = true,
+                    c.SDL_KEYDOWN => {
+                        // Handle key presses
+                        const key = event.key.keysym.sym;
+                        if (key == c.SDLK_DOWN) {
+                            updateScroll(self, .ScrollDown);
+                        }
                     },
                     else => {},
                 }
@@ -108,12 +155,7 @@ pub const Browser = struct {
             _ = c.SDL_SetRenderDrawColor(self.canvas, 250, 244, 237, 255);
             _ = c.SDL_RenderClear(self.canvas);
 
-            // Render text
-            if (self.current_content) |content| {
-                const text = try sliceToSentinelArray(self.allocator, content);
-                defer self.allocator.free(text);
-                try self.font_manager.renderText("Hiragino Sans GB", text, h_offset, v_offset);
-            }
+            try self.draw();
 
             // Present the updated frame
             c.SDL_RenderPresent(self.canvas);
@@ -123,30 +165,46 @@ pub const Browser = struct {
         }
     }
 
+    pub fn updateScroll(browser: *Browser, action: enum { ScrollDown }) void {
+        switch (action) {
+            .ScrollDown => {
+                const max_scroll = if (browser.content_height > window_height)
+                    browser.content_height - window_height
+                else
+                    0;
+
+                if (browser.scroll_offset < max_scroll) {
+                    browser.scroll_offset += scroll_increment;
+                    if (browser.scroll_offset > max_scroll) {
+                        browser.scroll_offset = max_scroll;
+                    }
+                }
+            },
+        }
+    }
+
     pub fn load(
         self: *Browser,
         url: Url,
-        socket_map: *std.StringHashMap(Connection),
-        cache: *Cache,
     ) !void {
-        if (std.mem.eql(u8, url.scheme, "file")) {
-            dbg("File request: {s}\n", .{url.path});
-            const body = try url.fileRequest(self.allocator);
-            defer self.allocator.free(body);
-            try self.lex(body, url.view_source);
-        } else if (std.mem.eql(u8, url.scheme, "data")) {
-            dbg("Data request: {s}\n", .{url.path});
-            try self.lex(url.path, url.view_source);
-        } else {
-            const body = try url.httpRequest(
+        dbg("Loading: {s}\n", .{url.path});
+
+        const body = if (std.mem.eql(u8, url.scheme, "file"))
+            try url.fileRequest(self.allocator)
+        else if (std.mem.eql(u8, url.scheme, "data"))
+            url.path
+        else
+            try url.httpRequest(
                 self.allocator,
-                socket_map,
-                cache,
+                &self.socket_map,
+                &self.cache,
                 0,
             );
-            defer self.allocator.free(body);
-            try self.lex(body, url.view_source);
-        }
+        defer self.allocator.free(body);
+
+        const parsed_content = try self.lex(body, url.view_source);
+        defer self.allocator.free(parsed_content);
+        try self.layout(self.allocator, parsed_content);
     }
 
     pub fn loadAll(
@@ -173,10 +231,9 @@ pub const Browser = struct {
     }
 
     // Show the body of the response, sans tags
-    pub fn lex(self: *Browser, body: []const u8, view_content: bool) !void {
+    pub fn lex(self: *Browser, body: []const u8, view_content: bool) ![]const u8 {
         if (view_content) {
-            self.current_content = body;
-            return;
+            return body;
         }
 
         var content_builder = std.ArrayList(u8).init(self.allocator);
@@ -212,9 +269,7 @@ pub const Browser = struct {
             try content_builder.appendSlice(std.mem.trim(u8, temp_line.items, " \r\n\t"));
         }
 
-        const content = try content_builder.toOwnedSlice();
-        // dbg("setting content: {s}\n", .{content});
-        self.current_content = content;
+        return try content_builder.toOwnedSlice();
     }
 
     pub fn lexEntity(text: []const u8) ![]const u8 {
@@ -235,6 +290,27 @@ pub const Browser = struct {
         }
     }
 
+    pub fn draw(self: *Browser) !void {
+        for (self.display_list) |item| {
+            const screen_y = item.y - self.scroll_offset;
+            if (screen_y >= 0 and screen_y < window_height) {
+                var dst_rect: c.SDL_Rect = .{
+                    .x = item.x,
+                    .y = screen_y,
+                    .w = item.glyph.w,
+                    .h = item.glyph.h,
+                };
+
+                _ = c.SDL_RenderCopy(
+                    self.canvas,
+                    item.glyph.texture,
+                    null,
+                    &dst_rect,
+                );
+            }
+        }
+    }
+
     fn drawCircle(self: *Browser, cx: i32, cy: i32, radius: i32, color: struct { u8, u8, u8, u8 }) void {
         _ = c.SDL_SetRenderDrawColor(self.canvas, color[0], color[1], color[2], color[3]);
         var dx = -radius;
@@ -250,6 +326,53 @@ pub const Browser = struct {
         _ = c.SDL_SetRenderDrawColor(self.canvas, 255, 0, 0, 255);
         _ = c.SDL_RenderFillRect(self.canvas, &rect);
     }
+
+    pub fn layout(self: *Browser, al: std.mem.Allocator, text: []const u8) !void {
+        dbg("Layout: {s}\n", .{text});
+        if (!std.unicode.utf8ValidateSlice(text)) {
+            return error.InvalidUTF8;
+        }
+        var display_list = std.ArrayList(DisplayItem).init(al);
+        var cursor_x: i32 = h_offset;
+        var cursor_y: i32 = v_offset;
+
+        const gd = try grapheme.GraphemeData.init(al);
+        defer gd.deinit();
+
+        var iter = grapheme.Iterator.init(text, &gd);
+        while (iter.next()) |gc| {
+            const cluster_bytes = gc.bytes(text);
+
+            // Check for newline character
+            if (cluster_bytes[0] == '\n') {
+                cursor_x = h_offset;
+                cursor_y += self.font_manager.current_font.line_height;
+                continue;
+            }
+
+            // Get or create a Glyph for this grapheme cluster
+            const glyph = try self.font_manager.getGlyph(self.font_manager.current_font, cluster_bytes);
+
+            // Check for line wrapping
+            if (cursor_x + glyph.w > window_width - h_offset) {
+                cursor_x = h_offset;
+                cursor_y += self.font_manager.current_font.line_height;
+            }
+
+            // Add the glyph to the display list
+            try display_list.append(.{
+                .x = cursor_x,
+                .y = cursor_y,
+                .glyph = glyph,
+            });
+
+            // Advance cursor for the next glyph
+            cursor_x += glyph.w;
+        }
+
+        self.content_height = cursor_y + self.font_manager.current_font.line_height;
+        self.display_list = try display_list.toOwnedSlice();
+    }
 };
 
 fn sliceToSentinelArray(allocator: std.mem.Allocator, slice: []const u8) ![:0]const u8 {
@@ -258,5 +381,3 @@ fn sliceToSentinelArray(allocator: std.mem.Allocator, slice: []const u8) ![:0]co
     @memcpy(arr, slice);
     return arr;
 }
-
-// pub fn layout(text: []const u8)

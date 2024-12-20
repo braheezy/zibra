@@ -6,7 +6,8 @@ const c = @cImport({
     @cInclude("SDL2/SDL.h");
 });
 
-const Browser = @import("browser.zig").Browser;
+const browser = @import("browser.zig");
+const Browser = browser.Browser;
 const Url = @import("url.zig").Url;
 const show = @import("url.zig").show;
 const loadAll = @import("url.zig").loadAll;
@@ -21,7 +22,7 @@ fn dbgln(comptime fmt: []const u8) void {
 
 const default_html = @embedFile("default.html");
 
-pub fn main() !void {
+pub fn main() void {
     // Memory allocation setup
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
     const allocator = gpa.allocator();
@@ -29,40 +30,66 @@ pub fn main() !void {
         std.process.exit(1);
     };
 
-    const browser = try Browser.init(allocator);
-    defer browser.free();
+    const b = Browser.init(allocator) catch |err| {
+        dbg("Error: {any}\n", .{err});
+        std.process.exit(1);
+    };
+    defer b.free();
 
     // Read arguments
-    const args = try std.process.argsAlloc(allocator);
+    const args = std.process.argsAlloc(allocator) catch |err| {
+        dbg("Error: {any}\n", .{err});
+        std.process.exit(1);
+    };
     defer std.process.argsFree(allocator, args);
 
     var debug_flag = false;
 
-    var urls = ArrayList(Url).init(allocator);
-    defer {
-        for (urls.items) |url| {
-            url.free(allocator);
-        }
-        urls.deinit();
-    }
+    // var urls = ArrayList(Url).init(allocator);
+    // defer {
+    //     for (urls.items) |url| {
+    //         url.free(allocator);
+    //     }
+    //     urls.deinit();
+    // }
+    var url: ?Url = null;
 
     for (args[1..]) |arg| {
         if (std.mem.eql(u8, arg, "-v")) {
             debug_flag = true;
             continue;
         }
-        const url = try Url.init(allocator, arg);
-        try urls.append(url);
-    }
-
-    if (urls.items.len == 0) {
-        dbgln("showing default html");
-        try browser.lex(default_html, false);
-    } else {
-        browser.loadAll(urls) catch |err| {
+        if (url) |_| {
+            std.log.err("Only one URL is supported at a time.", .{});
+            std.process.exit(1);
+        }
+        url = Url.init(allocator, arg) catch |err| {
             dbg("Error: {any}\n", .{err});
             std.process.exit(1);
         };
     }
-    try browser.run();
+
+    defer if (url) |u| u.free(allocator);
+
+    if (url) |u| {
+        b.load(u) catch |err| {
+            dbg("Error: {any}\n", .{err});
+            std.process.exit(1);
+        };
+    } else {
+        dbgln("showing default html");
+        const parsed_content = b.lex(default_html, false) catch |err| {
+            dbg("Error: {any}\n", .{err});
+            std.process.exit(1);
+        };
+        defer b.allocator.free(parsed_content);
+        b.layout(allocator, parsed_content) catch |err| {
+            dbg("Error: {any}\n", .{err});
+            std.process.exit(1);
+        };
+    }
+    b.run() catch |err| {
+        dbg("Error: {any}\n", .{err});
+        std.process.exit(1);
+    };
 }
