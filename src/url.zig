@@ -60,7 +60,7 @@ pub const Connection = union(enum) {
         // ! This is a workaround for a bug in the std library
         // ! https://github.com/ziglang/zig/issues/14573
         // ! Make a super large buffer so the std lib doesn't have to refill it
-        const buffer_size = 30000;
+        const buffer_size = 20000;
         var temp_buffer: [buffer_size]u8 = undefined;
         var header_end_index: ?usize = null;
 
@@ -114,24 +114,31 @@ pub const Connection = union(enum) {
         body_list: *std.ArrayList(u8),
         remaining: usize,
     ) !void {
-        const buffer_size = 10000;
+
+        // ! This is a workaround for a bug in the std library
+        // ! https://github.com/ziglang/zig/issues/14573
+        // ! Make a super large buffer so the std lib doesn't have to refill it
+        const buffer_size = 30000;
         var temp_buffer: [buffer_size]u8 = undefined;
 
         var to_read = remaining;
         while (to_read > 0) {
-            const chunk_size = if (to_read < buffer_size) to_read else buffer_size;
+            const chunk_size = @min(to_read, buffer_size);
             const bytes_read = switch (self.*) {
                 .Tls => |*c| try c.client.read(c.stream, temp_buffer[0..chunk_size]),
                 .Tcp => |c| try c.read(temp_buffer[0..chunk_size]),
             };
 
-            // Connection closed prematurely
-            if (bytes_read == 0) break;
+            // If bytes_read is 0, the connection was closed unexpectedly
+            if (bytes_read == 0) {
+                return error.IncompleteBody;
+            }
 
             try body_list.appendSlice(temp_buffer[0..bytes_read]);
             to_read -= bytes_read;
         }
 
+        // Final Validation: Ensure we actually read the expected number of bytes
         if (to_read > 0) {
             return error.IncompleteBody;
         }
@@ -624,6 +631,8 @@ pub const Url = struct {
             cache.evict_if_needed(100);
         }
 
+        try printHeaders(al, response.headers);
+
         return body;
     }
 
@@ -728,12 +737,20 @@ fn parseStatusLine(headers_data: []const u8) !u16 {
 }
 
 // Print the headers
-fn printHeaders(headers: std.StringHashMap([]const u8)) void {
-    std.log.info("Headers:", .{});
+fn printHeaders(al: std.mem.Allocator, headers: std.StringHashMap([]const u8)) !void {
+    var headers_list = std.ArrayList(u8).init(al);
+    defer headers_list.deinit();
+
+    try headers_list.appendSlice("Headers:\n");
+
     var iter = headers.iterator();
     while (iter.next()) |entry| {
-        std.log.info("{s}: {s}", .{ entry.key_ptr.*, entry.value_ptr.* });
+        const header_line = try std.fmt.allocPrint(al, "{s}: {s}\n", .{ entry.key_ptr.*, entry.value_ptr.* });
+        defer al.free(header_line);
+        try headers_list.appendSlice(header_line);
     }
+
+    std.log.info("{s}", .{headers_list.items});
 }
 
 const expect = std.testing.expect;

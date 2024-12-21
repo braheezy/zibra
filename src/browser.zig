@@ -35,8 +35,11 @@ const scroll_increment = 100;
 
 // DisplayItem is a struct that holds the position and glyph to be displayed.
 const DisplayItem = struct {
+    // X coordinate of the display item
     x: i32,
+    // Y coordinate of the display item
     y: i32,
+    // Pointer to the glyph to be displayed
     glyph: *Glyph,
 };
 
@@ -147,8 +150,18 @@ pub const Browser = struct {
                     // Handle key presses
                     c.SDL_KEYDOWN => {
                         const key = event.key.keysym.sym;
-                        if (key == c.SDLK_DOWN) {
-                            updateScroll(self, .ScrollDown);
+                        switch (key) {
+                            c.SDLK_DOWN => self.updateScroll(.Down),
+                            c.SDLK_UP => self.updateScroll(.Up),
+                            else => {},
+                        }
+                    },
+                    // Handle mouse wheel events
+                    c.SDL_MOUSEWHEEL => {
+                        if (event.wheel.y > 0) {
+                            self.updateScroll(.Up);
+                        } else if (event.wheel.y < 0) {
+                            self.updateScroll(.Down);
                         }
                     },
                     else => {},
@@ -171,9 +184,15 @@ pub const Browser = struct {
     }
 
     // Update the scroll offset
-    pub fn updateScroll(self: *Browser, action: enum { ScrollDown }) void {
+    pub fn updateScroll(
+        self: *Browser,
+        action: enum {
+            Down,
+            Up,
+        },
+    ) void {
         switch (action) {
-            .ScrollDown => {
+            .Down => {
                 const max_scroll = if (self.content_height > window_height)
                     // Subtract window height to prevent scrolling past the end
                     self.content_height - window_height
@@ -187,6 +206,15 @@ pub const Browser = struct {
                     // Prevent scrolling past the end
                     if (self.scroll_offset > max_scroll) {
                         self.scroll_offset = max_scroll;
+                    }
+                }
+            },
+            .Up => {
+                if (self.scroll_offset > 0) {
+                    self.scroll_offset -= scroll_increment;
+                    // Prevent scrolling past the beginning
+                    if (self.scroll_offset < 0) {
+                        self.scroll_offset = 0;
                     }
                 }
             },
@@ -225,69 +253,93 @@ pub const Browser = struct {
     // Show the body of the response, sans tags
     pub fn lex(self: *Browser, body: []const u8, view_content: bool) ![]const u8 {
         if (view_content) {
-            // they don't want it lexed
             return body;
         }
 
         var content_builder = std.ArrayList(u8).init(self.allocator);
         defer content_builder.deinit();
+
         var temp_line = std.ArrayList(u8).init(self.allocator);
         defer temp_line.deinit();
 
         var in_tag = false;
         var i: usize = 0;
+
         while (i < body.len) : (i += 1) {
             const char = body[i];
+
+            // Entering a tag
             if (char == '<') {
                 in_tag = true;
+
+                // Flush accumulated text before the tag
                 if (temp_line.items.len > 0) {
-                    try content_builder.appendSlice(std.mem.trim(
-                        u8,
-                        temp_line.items,
-                        " \r\n\t",
-                    ));
-                    try content_builder.append('\n');
+                    try content_builder.appendSlice(temp_line.items);
                     temp_line.clearAndFree();
                 }
-            } else if (char == '>') {
+                continue;
+            }
+
+            // Exiting a tag
+            if (char == '>') {
                 in_tag = false;
-            } else if (char == '&') {
-                const entity = try lexEntity(body[i..]);
-                try temp_line.appendSlice(entity);
-                i += entity.len - 1;
-            } else if (!in_tag) {
-                if (char != '\n' and char != '\r') {
-                    try temp_line.append(char);
+                continue;
+            }
+
+            // Inside a tag, skip all characters
+            if (in_tag) {
+                continue;
+            }
+
+            // Handle entities only outside tags
+            if (char == '&') {
+                if (lexEntity(body[i..])) |entity| {
+                    try temp_line.appendSlice(entity);
+                    i += std.mem.indexOf(u8, body[i..], ";").?; // Skip to the end of the entity
+                } else {
+                    try temp_line.append('&');
                 }
+                continue;
+            }
+
+            // Handle regular characters and whitespace
+            if (char == '\n') {
+                // Normalize newlines as spaces
+                try temp_line.append('\n');
+            } else {
+                try temp_line.append(char);
             }
         }
+
         // Add remaining content to the final result
         if (temp_line.items.len > 0) {
-            try content_builder.appendSlice(std.mem.trim(
-                u8,
-                temp_line.items,
-                " \r\n\t",
-            ));
+            try content_builder.appendSlice(temp_line.items);
         }
 
-        return try content_builder.toOwnedSlice();
+        // Trim leading whitespace and newlines
+        const final_content = std.mem.trimLeft(u8, content_builder.items, " \t\n\r");
+
+        return try self.allocator.dupe(u8, final_content);
     }
 
-    pub fn lexEntity(text: []const u8) ![]const u8 {
-        // Find the end of the entity
+    pub fn lexEntity(text: []const u8) ?[]const u8 {
         if (std.mem.indexOf(u8, text, ";")) |entity_end_index| {
             const entity = text[0 .. entity_end_index + 1];
-            if (std.mem.eql(u8, entity, "&amp;")) {
-                return "&";
-            } else if (std.mem.eql(u8, entity, "&lt;")) {
-                return "<";
-            } else if (std.mem.eql(u8, entity, "&gt;")) {
-                return ">";
-            } else {
-                return entity;
-            }
+
+            return if (std.mem.eql(u8, entity, "&amp;"))
+                "&"
+            else if (std.mem.eql(u8, entity, "&lt;"))
+                "<"
+            else if (std.mem.eql(u8, entity, "&gt;"))
+                ">"
+            else if (std.mem.eql(u8, entity, "&quot;"))
+                "\""
+            else if (std.mem.eql(u8, entity, "&apos;"))
+                "'"
+            else
+                null;
         } else {
-            return error.EntityNotFound;
+            return null;
         }
     }
 
@@ -318,7 +370,10 @@ pub const Browser = struct {
         if (!std.unicode.utf8ValidateSlice(text)) {
             return error.InvalidUTF8;
         }
+
         var display_list = std.ArrayList(DisplayItem).init(al);
+        defer display_list.deinit();
+
         var cursor_x: i32 = h_offset;
         var cursor_y: i32 = v_offset;
 
@@ -326,21 +381,51 @@ pub const Browser = struct {
         defer gd.deinit();
 
         var iter = grapheme.Iterator.init(text, &gd);
+        var newline_count: u8 = 0;
+
+        // Skip initial newlines
         while (iter.next()) |gc| {
             const cluster_bytes = gc.bytes(text);
 
-            // Check for newline character
-            if (cluster_bytes[0] == '\n') {
-                cursor_x = h_offset;
-                cursor_y += self.font_manager.current_font.?.line_height;
+            if (std.mem.eql(u8, cluster_bytes, "\n")) {
                 continue;
             }
+
+            // Stop skipping once a non-newline is encountered
+            break;
+        }
+
+        // Reset iterator for normal processing
+        iter = grapheme.Iterator.init(text, &gd);
+        newline_count = 0;
+
+        while (iter.next()) |gc| {
+            const cluster_bytes = gc.bytes(text);
+
+            // Handle newline characters
+            if (std.mem.eql(u8, cluster_bytes, "\n")) {
+                newline_count += 1;
+                cursor_x = h_offset;
+
+                if (newline_count == 1) {
+                    // Single newline → Line break
+                    cursor_y += self.font_manager.current_font.?.line_height;
+                } else if (newline_count == 2) {
+                    // Double newline → Paragraph break
+                    cursor_y += self.font_manager.current_font.?.line_height * 2;
+                }
+
+                continue;
+            }
+
+            // Reset newline counter for non-newline characters
+            newline_count = 0;
 
             // Get or create a Glyph for this grapheme cluster
             const glyph = try self.font_manager.getGlyph(self.font_manager.current_font.?, cluster_bytes);
 
-            // Check for line wrapping
-            if (cursor_x + glyph.w > window_width - h_offset) {
+            // Adjust for line wrapping
+            if (cursor_x + glyph.w > window_width) {
                 cursor_x = h_offset;
                 cursor_y += self.font_manager.current_font.?.line_height;
             }
