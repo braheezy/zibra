@@ -5,12 +5,6 @@
 const std = @import("std");
 const StringHashMap = std.StringHashMap;
 
-const dbg = std.debug.print;
-
-fn dbgln(comptime fmt: []const u8) void {
-    dbg("{s}\n", .{fmt});
-}
-
 pub const CacheEntry = struct {
     body: []const u8,
     timestampe: u64,

@@ -1,6 +1,5 @@
 const std = @import("std");
-
-const debug = @import("config").debug;
+const builtin = @import("builtin");
 
 const c = @cImport({
     @cInclude("SDL2/SDL.h");
@@ -10,7 +9,6 @@ const browser = @import("browser.zig");
 const Browser = browser.Browser;
 const Url = @import("url.zig").Url;
 const show = @import("url.zig").show;
-const loadAll = @import("url.zig").loadAll;
 const ArrayList = std.ArrayList;
 const assert = std.debug.assert;
 
@@ -22,7 +20,21 @@ fn dbgln(comptime fmt: []const u8) void {
 
 const default_html = @embedFile("default.html");
 
+const font_name = switch (builtin.target.os.tag) {
+    .macos => "Hiragino Sans GB",
+    .linux => "NotoSansCJK-VF",
+    else => @compileError("Unsupported operating system"),
+};
+
 pub fn main() void {
+    // Catch and print errors to prevent ugly stack traces.
+    zibra() catch |err| {
+        std.log.err("Error: {any}", .{err});
+        std.process.exit(1);
+    };
+}
+
+fn zibra() !void {
     // Memory allocation setup
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
     const allocator = gpa.allocator();
@@ -30,28 +42,12 @@ pub fn main() void {
         std.process.exit(1);
     };
 
-    const b = Browser.init(allocator) catch |err| {
-        dbg("Error: {any}\n", .{err});
-        std.process.exit(1);
-    };
-    defer b.free();
-
     // Read arguments
-    const args = std.process.argsAlloc(allocator) catch |err| {
-        dbg("Error: {any}\n", .{err});
-        std.process.exit(1);
-    };
+    const args = try std.process.argsAlloc(allocator);
     defer std.process.argsFree(allocator, args);
 
+    // Hold values, if provided
     var debug_flag = false;
-
-    // var urls = ArrayList(Url).init(allocator);
-    // defer {
-    //     for (urls.items) |url| {
-    //         url.free(allocator);
-    //     }
-    //     urls.deinit();
-    // }
     var url: ?Url = null;
 
     for (args[1..]) |arg| {
@@ -61,35 +57,30 @@ pub fn main() void {
         }
         if (url) |_| {
             std.log.err("Only one URL is supported at a time.", .{});
-            std.process.exit(1);
+            return error.BadArguments;
         }
-        url = Url.init(allocator, arg) catch |err| {
-            dbg("Error: {any}\n", .{err});
-            std.process.exit(1);
-        };
+        url = try Url.init(allocator, arg);
     }
 
     defer if (url) |u| u.free(allocator);
 
+    // Initialize browser
+    var b = try Browser.init(allocator);
+    defer b.free();
+
+    // Load fonts
+    try b.font_manager.loadSystemFont(font_name, 16);
+
     if (url) |u| {
-        b.load(u) catch |err| {
-            dbg("Error: {any}\n", .{err});
-            std.process.exit(1);
-        };
+        // Request URL and store response in browser.
+        try b.load(u);
     } else {
-        dbgln("showing default html");
-        const parsed_content = b.lex(default_html, false) catch |err| {
-            dbg("Error: {any}\n", .{err});
-            std.process.exit(1);
-        };
+        std.log.info("showing default html", .{});
+        const parsed_content = try b.lex(default_html, false);
         defer b.allocator.free(parsed_content);
-        b.layout(allocator, parsed_content) catch |err| {
-            dbg("Error: {any}\n", .{err});
-            std.process.exit(1);
-        };
+        try b.layout(allocator, parsed_content);
     }
-    b.run() catch |err| {
-        dbg("Error: {any}\n", .{err});
-        std.process.exit(1);
-    };
+
+    // Start main exec loop
+    try b.run();
 }

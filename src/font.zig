@@ -12,12 +12,6 @@ const c = @cImport({
     @cInclude("SDL2/SDL_ttf.h");
 });
 
-const dbg = std.debug.print;
-
-fn dbgln(comptime fmt: []const u8) void {
-    dbg("{s}\n", .{fmt});
-}
-
 const system_fonts_dirs = switch (builtin.target.os.tag) {
     .macos => [_][]const u8{
         "/Library/Fonts",
@@ -48,24 +42,24 @@ pub const FontManager = struct {
     allocator: std.mem.Allocator,
     renderer: *c.SDL_Renderer,
     fonts: std.StringHashMap(*Font),
-    current_font: *Font,
+    current_font: ?*Font = null,
 
-    pub fn init(allocator: std.mem.Allocator, renderer: *c.SDL_Renderer) !*FontManager {
+    pub fn init(allocator: std.mem.Allocator, renderer: *c.SDL_Renderer) !FontManager {
         if (c.TTF_WasInit() == 0) {
-            dbgln("TTF_Init");
             if (c.TTF_Init() != 0) return error.InitFailed;
         }
 
-        var font_manager = try allocator.create(FontManager);
-        font_manager.allocator = allocator;
-        font_manager.renderer = renderer;
-        font_manager.fonts = std.StringHashMap(*Font).init(allocator);
-
-        return font_manager;
+        return FontManager{
+            .allocator = allocator,
+            .renderer = renderer,
+            .fonts = std.StringHashMap(*Font).init(allocator),
+        };
     }
 
-    pub fn deinit(self: *FontManager) void {
-        var fonts_it = self.fonts.iterator();
+    pub fn deinit(self: FontManager) void {
+        var fonts = self.fonts;
+        defer fonts.deinit();
+        var fonts_it = fonts.iterator();
         while (fonts_it.next()) |entry| {
             var f = entry.value_ptr.*;
 
@@ -76,7 +70,7 @@ pub const FontManager = struct {
                 self.allocator.free(glyph_entry.value_ptr.*.grapheme);
                 self.allocator.destroy(glyph_entry.value_ptr.*);
             }
-            f.glyphs.deinit(); // Free hash map memory
+            f.glyphs.deinit();
 
             c.TTF_CloseFont(f.font_handle);
 
@@ -87,7 +81,6 @@ pub const FontManager = struct {
             self.allocator.destroy(f);
         }
 
-        self.fonts.deinit();
         c.TTF_Quit();
     }
 
@@ -178,11 +171,9 @@ pub const FontManager = struct {
         }
 
         if (font_path == null) {
-            std.debug.print("System font '{s}' not found.\n", .{name});
+            std.log.err("System font '{s}' not found.", .{name});
             return error.FontNotFound;
         }
-
-        std.debug.print("Found system font at: {s}\n", .{font_path.?});
 
         // Null-terminate the font path for TTF_OpenFont
         const font_path_z = try sliceToSentinelArray(self.allocator, font_path.?);
@@ -194,7 +185,7 @@ pub const FontManager = struct {
         if (fh == null) {
             if (c.TTF_GetError()) |e| {
                 if (e[0] != 0) {
-                    std.debug.print("TTF Error in loadSystemFont: {s}\n", .{e});
+                    std.log.err("TTF Error in loadSystemFont: {s}.", .{e});
                 }
             }
             return error.LoadFailed;
@@ -217,8 +208,8 @@ pub const FontManager = struct {
 
         // Check if the glyph is already in the cache
         if (f.glyphs.get(key)) |cached_glyph| {
-            // dbg("cached glyph: {s}\n", .{cached_glyph.grapheme});
-            self.allocator.free(key); // Free the duplicate key since it's not needed
+            // Free the duplicate key since it's not needed
+            self.allocator.free(key);
             return cached_glyph;
         }
 
@@ -234,7 +225,7 @@ pub const FontManager = struct {
         if (glyph_surface == null) {
             self.allocator.free(key);
             if (c.TTF_GetError()) |e| {
-                if (e[0] != 0) std.debug.print("TTF Error in getGlyph: {s}\n", .{e});
+                if (e[0] != 0) std.log.err("TTF Error in getGlyph: {s}.", .{e});
             }
             return error.RenderFailed;
         }
@@ -243,21 +234,19 @@ pub const FontManager = struct {
         // Create a texture from the surface
         const glyph_tex = c.SDL_CreateTextureFromSurface(self.renderer, glyph_surface) orelse {
             self.allocator.free(key);
-            if (c.SDL_GetError()) |e| if (e[0] != 0) std.debug.print("SDL Error in getGlyph: {s}\n", .{e});
+            if (c.SDL_GetError()) |e| if (e[0] != 0) std.log.err("SDL Error in getGlyph: {s}.", .{e});
             return error.RenderFailed;
         };
 
         // Cache and return the new glyph
         const surf = glyph_surface.*;
         var new_glyph = try self.allocator.create(Glyph);
-        new_glyph.grapheme = key; // Assign the allocated key
+        new_glyph.grapheme = key;
         new_glyph.texture = glyph_tex;
         new_glyph.w = surf.w;
         new_glyph.h = surf.h;
 
-        // dbg("new glyph in cache: {s} ", .{gme});
         try f.glyphs.put(key, new_glyph);
-        // dbg("cache count: {d}\n", .{f.glyphs.count()});
 
         return new_glyph;
     }
@@ -270,7 +259,7 @@ pub const FontManager = struct {
         const gd = try grapheme.GraphemeData.init(self.allocator);
         defer gd.deinit();
 
-        const window_width: i32 = browser.window_width; // Replace with your actual window width
+        const window_width: i32 = browser.window_width;
 
         var iter = grapheme.Iterator.init(text, &gd);
         while (iter.next()) |gc| {

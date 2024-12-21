@@ -23,50 +23,59 @@ fn dbgln(comptime fmt: []const u8) void {
 
 const stdout = std.io.getStdOut().writer();
 
-const font_name = switch (builtin.target.os.tag) {
-    .macos => "Hiragino Sans GB",
-    .linux => "NotoSansCJK-VF",
-    else => @compileError("Unsupported operating system"),
-};
-
+// *********************************************************
+// * App Settings
+// *********************************************************
 pub const window_width = 800;
 const window_height = 600;
 pub const h_offset = 13;
 const v_offset = 18;
 const scroll_increment = 100;
+// *********************************************************
 
+// DisplayItem is a struct that holds the position and glyph to be displayed.
 const DisplayItem = struct {
     x: i32,
     y: i32,
     glyph: *Glyph,
 };
 
+// Browser is the main struct that holds the state of the browser.
 pub const Browser = struct {
+    // Memory allocator for the browser
     allocator: std.mem.Allocator,
+    // SDL window handle
     window: *c.SDL_Window,
+    // SDL renderer handle
     canvas: *c.SDL_Renderer,
-    font_manager: *FontManager,
+    // Font manager for handling fonts and glyphs
+    font_manager: FontManager,
+    // Map of active connections. The key is the host and the value a Connection to use.
     socket_map: std.StringHashMap(Connection),
+    // Cache for storing fetched resources
     cache: Cache,
-    display_list: []DisplayItem,
-    content_height: i32,
+    // List of items to be displayed
+    display_list: ?[]DisplayItem = null,
+    // Total height of the content
+    content_height: i32 = 0,
+    // Current scroll offset
     scroll_offset: i32 = 0,
 
-    pub fn init(al: std.mem.Allocator) !*Browser {
+    // Create a new Browser instance
+    pub fn init(al: std.mem.Allocator) !Browser {
         // Initialize SDL
         if (c.SDL_Init(c.SDL_INIT_VIDEO) != 0) {
             c.SDL_Log("Unable to initialize SDL: %s", c.SDL_GetError());
             return error.SDLInitializationFailed;
         }
 
+        // Create a window with correct OS graphics
         const window_flags = switch (builtin.target.os.tag) {
             .macos => c.SDL_WINDOW_METAL,
             .windows => c.SDL_WINDOW_VULKAN,
             .linux => c.SDL_WINDOW_OPENGL,
             else => c.SDL_WINDOW_OPENGL,
         };
-
-        // Create a window
         const screen = c.SDL_CreateWindow(
             "zibra",
             c.SDL_WINDOWPOS_UNDEFINED,
@@ -86,33 +95,22 @@ pub const Browser = struct {
             return error.SDLInitializationFailed;
         };
 
-        const font_manager = try FontManager.init(al, renderer);
-        // try browser.font_manager.loadFontFromEmbed(32);
-        font_manager.loadSystemFont(font_name, 16) catch |err| {
-            font_manager.deinit();
-            al.destroy(font_manager);
-            return err;
+        return Browser{
+            .allocator = al,
+            .window = screen,
+            .canvas = renderer,
+            .font_manager = try FontManager.init(al, renderer),
+            .socket_map = std.StringHashMap(Connection).init(al),
+            .cache = try Cache.init(al),
         };
-
-        const socket_map = std.StringHashMap(Connection).init(al);
-        const cache = try Cache.init(al);
-
-        var browser = try al.create(Browser);
-        browser.window = screen;
-        browser.canvas = renderer;
-        browser.allocator = al;
-        browser.font_manager = font_manager;
-        browser.socket_map = socket_map;
-        browser.cache = cache;
-        browser.scroll_offset = 0;
-
-        return browser;
     }
 
-    pub fn free(self: *Browser) void {
+    // Free the resources used by the browser
+    pub fn free(self: Browser) void {
+        // clean up hash map for fonts
         self.font_manager.deinit();
-        self.allocator.destroy(self.font_manager);
 
+        // clean up hash map for sockets, including values
         var sockets_iter = self.socket_map.valueIterator();
         while (sockets_iter.next()) |socket| {
             switch (socket.*) {
@@ -120,29 +118,34 @@ pub const Browser = struct {
                 .Tls => socket.Tls.stream.close(),
             }
         }
-        self.socket_map.deinit();
-        self.cache.free();
 
-        self.allocator.free(self.display_list);
+        // make mutable copies to free the resources
+        var cache = self.cache;
+        cache.free();
+        var socket_map = self.socket_map;
+        socket_map.deinit();
 
+        // free display list slice
+        if (self.display_list) |items| self.allocator.free(items);
+
+        // clean up sdl resources
         c.SDL_DestroyRenderer(self.canvas);
         c.SDL_DestroyWindow(self.window);
         c.SDL_Quit();
-        self.allocator.destroy(self);
     }
 
+    // Run the browser event loop
     pub fn run(self: *Browser) !void {
         var quit = false;
-        // dbg("text: {s}\n", .{self.current_content.?});
         while (!quit) {
-            var event: c.SDL_Event = undefined;
             // Handle events
+            var event: c.SDL_Event = undefined;
             while (c.SDL_PollEvent(&event) != 0) {
                 switch (event.type) {
                     // Quit when the window is closed
                     c.SDL_QUIT => quit = true,
+                    // Handle key presses
                     c.SDL_KEYDOWN => {
-                        // Handle key presses
                         const key = event.key.keysym.sym;
                         if (key == c.SDLK_DOWN) {
                             updateScroll(self, .ScrollDown);
@@ -151,44 +154,53 @@ pub const Browser = struct {
                     else => {},
                 }
             }
+
             // Clear canvas with off-white
             _ = c.SDL_SetRenderDrawColor(self.canvas, 250, 244, 237, 255);
             _ = c.SDL_RenderClear(self.canvas);
 
+            // draw browser content
             try self.draw();
 
             // Present the updated frame
             c.SDL_RenderPresent(self.canvas);
 
-            // we delay for 17ms to get 60fps
+            // delay for 17ms to get 60fps
             c.SDL_Delay(17);
         }
     }
 
-    pub fn updateScroll(browser: *Browser, action: enum { ScrollDown }) void {
+    // Update the scroll offset
+    pub fn updateScroll(self: *Browser, action: enum { ScrollDown }) void {
         switch (action) {
             .ScrollDown => {
-                const max_scroll = if (browser.content_height > window_height)
-                    browser.content_height - window_height
+                const max_scroll = if (self.content_height > window_height)
+                    // Subtract window height to prevent scrolling past the end
+                    self.content_height - window_height
                 else
+                    // No scrolling needed, content fits in window
                     0;
 
-                if (browser.scroll_offset < max_scroll) {
-                    browser.scroll_offset += scroll_increment;
-                    if (browser.scroll_offset > max_scroll) {
-                        browser.scroll_offset = max_scroll;
+                // Only scroll if there is content to scroll
+                if (self.scroll_offset < max_scroll) {
+                    self.scroll_offset += scroll_increment;
+                    // Prevent scrolling past the end
+                    if (self.scroll_offset > max_scroll) {
+                        self.scroll_offset = max_scroll;
                     }
                 }
             },
         }
     }
 
+    // Send request to a URL, load response into browser
     pub fn load(
         self: *Browser,
         url: Url,
     ) !void {
-        dbg("Loading: {s}\n", .{url.path});
+        std.log.info("Loading: {s}", .{url.path});
 
+        // Do the request, getting back the body of the response.
         const body = if (std.mem.eql(u8, url.scheme, "file"))
             try url.fileRequest(self.allocator)
         else if (std.mem.eql(u8, url.scheme, "data"))
@@ -202,37 +214,18 @@ pub const Browser = struct {
             );
         defer self.allocator.free(body);
 
+        // Clean up the response for display
         const parsed_content = try self.lex(body, url.view_source);
         defer self.allocator.free(parsed_content);
+
+        // Arrange the response for display
         try self.layout(self.allocator, parsed_content);
-    }
-
-    pub fn loadAll(
-        self: *Browser,
-        urls: ArrayList(Url),
-    ) !void {
-        var socket_map = std.StringHashMap(Connection).init(self.allocator);
-        var cache = try Cache.init(self.allocator);
-        defer {
-            var sockets_iter = socket_map.valueIterator();
-            while (sockets_iter.next()) |socket| {
-                switch (socket.*) {
-                    .Tcp => socket.Tcp.close(),
-                    .Tls => socket.Tls.stream.close(),
-                }
-            }
-            socket_map.deinit();
-            cache.free();
-        }
-
-        for (urls.items) |url| {
-            try self.load(url, &socket_map, &cache);
-        }
     }
 
     // Show the body of the response, sans tags
     pub fn lex(self: *Browser, body: []const u8, view_content: bool) ![]const u8 {
         if (view_content) {
+            // they don't want it lexed
             return body;
         }
 
@@ -248,8 +241,12 @@ pub const Browser = struct {
             if (char == '<') {
                 in_tag = true;
                 if (temp_line.items.len > 0) {
-                    try content_builder.appendSlice(std.mem.trim(u8, temp_line.items, " \r\n\t"));
-                    try content_builder.append('\n'); // Add a newline after a block
+                    try content_builder.appendSlice(std.mem.trim(
+                        u8,
+                        temp_line.items,
+                        " \r\n\t",
+                    ));
+                    try content_builder.append('\n');
                     temp_line.clearAndFree();
                 }
             } else if (char == '>') {
@@ -266,7 +263,11 @@ pub const Browser = struct {
         }
         // Add remaining content to the final result
         if (temp_line.items.len > 0) {
-            try content_builder.appendSlice(std.mem.trim(u8, temp_line.items, " \r\n\t"));
+            try content_builder.appendSlice(std.mem.trim(
+                u8,
+                temp_line.items,
+                " \r\n\t",
+            ));
         }
 
         return try content_builder.toOwnedSlice();
@@ -290,8 +291,9 @@ pub const Browser = struct {
         }
     }
 
-    pub fn draw(self: *Browser) !void {
-        for (self.display_list) |item| {
+    // Draw the browser content
+    pub fn draw(self: Browser) !void {
+        for (self.display_list.?) |item| {
             const screen_y = item.y - self.scroll_offset;
             if (screen_y >= 0 and screen_y < window_height) {
                 var dst_rect: c.SDL_Rect = .{
@@ -311,24 +313,8 @@ pub const Browser = struct {
         }
     }
 
-    fn drawCircle(self: *Browser, cx: i32, cy: i32, radius: i32, color: struct { u8, u8, u8, u8 }) void {
-        _ = c.SDL_SetRenderDrawColor(self.canvas, color[0], color[1], color[2], color[3]);
-        var dx = -radius;
-        while (dx < radius + 1) : (dx += 1) {
-            const term: usize = @intCast(radius * radius - dx * dx);
-            const dy: i32 = @intCast(std.math.sqrt(term));
-            _ = c.SDL_RenderDrawLine(self.canvas, cx + dx, cy - dy, cx + dx, cy + dy);
-        }
-    }
-
-    fn drawRectangle(self: *Browser, x: c_int, y: c_int, w: c_int, h: c_int) void {
-        const rect = c.SDL_Rect{ .x = x, .y = y, .w = w, .h = h };
-        _ = c.SDL_SetRenderDrawColor(self.canvas, 255, 0, 0, 255);
-        _ = c.SDL_RenderFillRect(self.canvas, &rect);
-    }
-
+    // Arrange the content for display
     pub fn layout(self: *Browser, al: std.mem.Allocator, text: []const u8) !void {
-        dbg("Layout: {s}\n", .{text});
         if (!std.unicode.utf8ValidateSlice(text)) {
             return error.InvalidUTF8;
         }
@@ -346,17 +332,17 @@ pub const Browser = struct {
             // Check for newline character
             if (cluster_bytes[0] == '\n') {
                 cursor_x = h_offset;
-                cursor_y += self.font_manager.current_font.line_height;
+                cursor_y += self.font_manager.current_font.?.line_height;
                 continue;
             }
 
             // Get or create a Glyph for this grapheme cluster
-            const glyph = try self.font_manager.getGlyph(self.font_manager.current_font, cluster_bytes);
+            const glyph = try self.font_manager.getGlyph(self.font_manager.current_font.?, cluster_bytes);
 
             // Check for line wrapping
             if (cursor_x + glyph.w > window_width - h_offset) {
                 cursor_x = h_offset;
-                cursor_y += self.font_manager.current_font.line_height;
+                cursor_y += self.font_manager.current_font.?.line_height;
             }
 
             // Add the glyph to the display list
@@ -370,11 +356,12 @@ pub const Browser = struct {
             cursor_x += glyph.w;
         }
 
-        self.content_height = cursor_y + self.font_manager.current_font.line_height;
+        self.content_height = cursor_y + self.font_manager.current_font.?.line_height;
         self.display_list = try display_list.toOwnedSlice();
     }
 };
 
+// helper function to convert a slice to a sentinel array, because C expects that for strings
 fn sliceToSentinelArray(allocator: std.mem.Allocator, slice: []const u8) ![:0]const u8 {
     const len = slice.len;
     const arr = try allocator.allocSentinel(u8, len, 0);

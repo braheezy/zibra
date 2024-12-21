@@ -1,6 +1,5 @@
 const std = @import("std");
 
-const debug = @import("config").debug;
 const ArrayList = std.ArrayList;
 const StringHashMap = std.StringHashMap;
 const Cache = @import("cache.zig").Cache;
@@ -126,7 +125,8 @@ pub const Connection = union(enum) {
                 .Tcp => |c| try c.read(temp_buffer[0..chunk_size]),
             };
 
-            if (bytes_read == 0) break; // Connection closed prematurely
+            // Connection closed prematurely
+            if (bytes_read == 0) break;
 
             try body_list.appendSlice(temp_buffer[0..bytes_read]);
             to_read -= bytes_read;
@@ -180,7 +180,7 @@ pub const Connection = union(enum) {
             const chunk_size_str = try self.readLine(al);
             defer al.free(chunk_size_str);
             const chunk_size = std.fmt.parseInt(usize, std.mem.trimRight(u8, chunk_size_str, " \r\n"), 16) catch return error.InvalidChunkSize;
-            if (chunk_size == 0) break; // End of chunks
+            if (chunk_size == 0) break;
 
             // Allocate memory for the chunk and read it
             const chunk = try al.alloc(u8, chunk_size);
@@ -200,9 +200,9 @@ pub const Connection = union(enum) {
     }
 
     fn readLine(self: *Connection, al: std.mem.Allocator) ![]u8 {
-        var line = std.ArrayList(u8).init(al); // Replace with your allocator
+        var line = std.ArrayList(u8).init(al);
 
-        const buffer_size = 1; // Read one byte at a time
+        const buffer_size = 1;
         var temp_buffer: [buffer_size]u8 = undefined;
 
         while (true) {
@@ -211,7 +211,8 @@ pub const Connection = union(enum) {
                 .Tls => |*c| try c.client.read(c.stream, &temp_buffer),
             };
 
-            if (bytes_read == 0) break; // Connection closed prematurely
+            // Connection closed prematurely
+            if (bytes_read == 0) break;
 
             // Append character to line
             try line.append(temp_buffer[0]);
@@ -219,11 +220,12 @@ pub const Connection = union(enum) {
             // Check for line termination
             if (line.items.len >= 2 and std.mem.eql(u8, line.items[line.items.len - 2 ..], "\r\n")) {
                 const f = try line.toOwnedSlice();
-                return f; // Return without CRLF
+                // Return without CRLF
+                return f;
             }
         }
 
-        return error.IncompleteLine; // If no termination found
+        return error.IncompleteLine;
     }
     fn readExact(self: *Connection, buffer: []u8) !void {
         var total_read: usize = 0;
@@ -235,7 +237,8 @@ pub const Connection = union(enum) {
             };
 
             if (bytes_read == 0) {
-                return error.IncompleteBody; // Connection closed prematurely
+                // Connection closed prematurely
+                return error.IncompleteBody;
             }
 
             total_read += bytes_read;
@@ -392,13 +395,14 @@ pub const Url = struct {
                 u.host = host_alloc;
             }
 
-            if (debug) {
-                dbg("Scheme: {s}\n", .{u.scheme});
-                if (u.host) |h| dbg("Host: {s}\n", .{h}) else dbgln("Host: localhost");
-                dbg("Path: {s}\n", .{u.path});
-                dbg("Port: {d}\n", .{u.port});
-                dbg("Is HTTPS: {any}\n", .{u.is_https});
-            }
+            std.log.debug("\nScheme: {s}\nHost: {s}\nPath: {s}\nPort: {d}\nIs HTTPS: {any}", .{
+                u.scheme,
+                u.host orelse "localhost",
+                u.path,
+                u.port,
+                u.is_https,
+            });
+
             return u;
         }
     }
@@ -466,7 +470,7 @@ pub const Url = struct {
         al: std.mem.Allocator,
         response: *Response,
     ) !Url {
-        dbg("Redirecting to {s}\n", .{response.headers.get("location").?});
+        std.log.info("Redirecting to {s}", .{response.headers.get("location").?});
         const location: []const u8 = response.headers.get("location").?;
         // In case we need to build up the string, allocate memory for it
         var new_url_path = try al.alloc(u8, location.len);
@@ -501,7 +505,6 @@ pub const Url = struct {
             const now: u64 = @intCast(std.time.milliTimestamp());
             if (entry.max_age) |max_age| {
                 if ((now - entry.timestampe) / 1000 <= max_age) {
-                    dbgln("Using cached response");
                     return entry.body;
                 }
             }
@@ -510,8 +513,8 @@ pub const Url = struct {
         const request_content = try createRequestContent(self, al);
         defer al.free(request_content);
 
-        if (debug) dbg("Request:\n{s}", .{request_content});
-        dbg("Connecting to {s}:{d}\n", .{ self.host.?, self.port });
+        std.log.debug("Request:\n{s}", .{request_content});
+        std.log.info("Connecting to {s}:{d}", .{ self.host.?, self.port });
 
         // Define socker and connect to it. Use an existing one if available
         var conn = try self.getOrCreateConnection(al, socket_map);
@@ -540,13 +543,13 @@ pub const Url = struct {
                         var output = std.ArrayList(u8).init(al);
                         defer output.deinit();
 
-                        const buffer_size = 1024; // Decompression buffer size
+                        const buffer_size = 1024;
                         var buffer = try al.alloc(u8, buffer_size);
                         defer al.free(buffer);
 
                         while (true) {
                             const bytes_read = try decompressor.read(buffer);
-                            if (bytes_read == 0) break; // No more data to decompress
+                            if (bytes_read == 0) break;
                             try output.appendSlice(buffer[0..bytes_read]);
                         }
 
@@ -634,7 +637,7 @@ pub const Url = struct {
         defer html_file.close();
 
         const html_content = try html_file.readToEndAlloc(al, 4096);
-        if (debug) dbg("File content:\n{s}", .{html_content});
+        std.log.debug("File content:\n{s}", .{html_content});
         return html_content;
     }
 };
@@ -713,7 +716,7 @@ fn parseStatusLine(headers_data: []const u8) !u16 {
     var lines = std.mem.splitSequence(u8, headers_data, "\r\n");
     const status_line = lines.next() orelse return error.NoStatusLineFound;
 
-    dbg("{s}\n", .{status_line});
+    std.log.info("{s}", .{status_line});
 
     // Parse "HTTP/1.1 200 OK"
     var parts = std.mem.split(u8, status_line, " ");
@@ -726,10 +729,10 @@ fn parseStatusLine(headers_data: []const u8) !u16 {
 
 // Print the headers
 fn printHeaders(headers: std.StringHashMap([]const u8)) void {
-    dbgln("Headers:");
+    std.log.info("Headers:", .{});
     var iter = headers.iterator();
     while (iter.next()) |entry| {
-        dbg("{s}: {s}\n", .{ entry.key_ptr.*, entry.value_ptr.* });
+        std.log.info("{s}: {s}", .{ entry.key_ptr.*, entry.value_ptr.* });
     }
 }
 

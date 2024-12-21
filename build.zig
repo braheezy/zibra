@@ -13,6 +13,7 @@ pub fn build(b: *std.Build) !void {
     // Standard optimization options allow the person running `zig build` to select
     // between Debug, ReleaseSafe, ReleaseFast, and ReleaseSmall. Here we do not
     // set a preferred release mode, allowing the user to decide how to optimize.
+    // Default is Debug.
     const optimize = b.standardOptimizeOption(.{});
 
     const exe = b.addExecutable(.{
@@ -44,12 +45,6 @@ pub fn build(b: *std.Build) !void {
     const zg = b.dependency("zg", .{});
     exe.root_module.addImport("grapheme", zg.module("grapheme"));
     exe.root_module.addImport("code_point", zg.module("code_point"));
-
-    // add options
-    const debug = b.option(bool, "debug", "enable debug mode") orelse false;
-    const options = b.addOptions();
-    options.addOption(bool, "debug", debug);
-    exe.root_module.addOptions("config", options);
 
     // This declares intent for the executable to be installed into the
     // standard location when the user invokes the "install" step (the default
