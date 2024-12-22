@@ -73,3 +73,7 @@ zig build test
 ```
 
 To test chunked gzip responses, run `gzipServer.py` locally.
+
+## Known Issues
+
+- On Mac, the content is stretched while the window is being resized. Apparently this is known behavior in SDL2 because Mac blocks the main thread while the mouse is being held down to resize windows, preventing SDL from rendering the content properly...I think.

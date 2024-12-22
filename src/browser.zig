@@ -26,9 +26,9 @@ const stdout = std.io.getStdOut().writer();
 // *********************************************************
 // * App Settings
 // *********************************************************
-pub const window_width = 800;
-const window_height = 600;
-pub const h_offset = 13;
+const initial_window_width = 800;
+const initial_window_height = 600;
+const h_offset = 13;
 const v_offset = 18;
 const scroll_increment = 100;
 // *********************************************************
@@ -59,10 +59,15 @@ pub const Browser = struct {
     cache: Cache,
     // List of items to be displayed
     display_list: ?[]DisplayItem = null,
+    // Current content to be displayed
+    current_content: ?[]const u8 = null,
     // Total height of the content
     content_height: i32 = 0,
     // Current scroll offset
     scroll_offset: i32 = 0,
+    // Window dimensions
+    window_width: i32 = initial_window_width,
+    window_height: i32 = initial_window_height,
 
     // Create a new Browser instance
     pub fn init(al: std.mem.Allocator) !Browser {
@@ -83,9 +88,9 @@ pub const Browser = struct {
             "zibra",
             c.SDL_WINDOWPOS_UNDEFINED,
             c.SDL_WINDOWPOS_UNDEFINED,
-            window_width,
-            window_height,
-            window_flags,
+            initial_window_width,
+            initial_window_height,
+            window_flags | c.SDL_WINDOW_RESIZABLE,
         ) orelse
             {
             c.SDL_Log("Unable to create window: %s", c.SDL_GetError());
@@ -140,22 +145,15 @@ pub const Browser = struct {
     // Run the browser event loop
     pub fn run(self: *Browser) !void {
         var quit = false;
+
         while (!quit) {
-            // Handle events
             var event: c.SDL_Event = undefined;
+
             while (c.SDL_PollEvent(&event) != 0) {
                 switch (event.type) {
                     // Quit when the window is closed
                     c.SDL_QUIT => quit = true,
-                    // Handle key presses
-                    c.SDL_KEYDOWN => {
-                        const key = event.key.keysym.sym;
-                        switch (key) {
-                            c.SDLK_DOWN => self.updateScroll(.Down),
-                            c.SDLK_UP => self.updateScroll(.Up),
-                            else => {},
-                        }
-                    },
+                    c.SDL_KEYDOWN => self.handleKeyEvent(event.key.keysym.sym),
                     // Handle mouse wheel events
                     c.SDL_MOUSEWHEEL => {
                         if (event.wheel.y > 0) {
@@ -163,6 +161,9 @@ pub const Browser = struct {
                         } else if (event.wheel.y < 0) {
                             self.updateScroll(.Down);
                         }
+                    },
+                    c.SDL_WINDOWEVENT => {
+                        try self.handleWindowEvent(event.window);
                     },
                     else => {},
                 }
@@ -183,6 +184,59 @@ pub const Browser = struct {
         }
     }
 
+    pub fn handleResize(self: *Browser) !void {
+        // Adjust renderer viewport to match new window size
+        _ = c.SDL_RenderSetViewport(self.canvas, null);
+
+        // Re-run layout with existing content
+        if (self.current_content) |text| {
+            if (self.display_list) |list| {
+                self.allocator.free(list);
+                self.display_list = null;
+            }
+            try self.layout(text);
+        }
+    }
+
+    pub fn handleWindowEvent(self: *Browser, window_event: c.SDL_WindowEvent) !void {
+        const data1 = window_event.data1;
+        const data2 = window_event.data2;
+
+        switch (window_event.event) {
+            c.SDL_WINDOWEVENT_RESIZED, c.SDL_WINDOWEVENT_SIZE_CHANGED => {
+                self.window_width = data1;
+                self.window_height = data2;
+
+                _ = c.SDL_RenderSetViewport(self.canvas, null);
+
+                if (self.current_content) |text| {
+                    if (self.display_list) |list| {
+                        self.allocator.free(list);
+                        self.display_list = null;
+                    }
+                    try self.layout(text);
+                }
+
+                _ = c.SDL_SetRenderDrawColor(self.canvas, 250, 244, 237, 255);
+                _ = c.SDL_RenderClear(self.canvas);
+                try self.draw();
+                c.SDL_RenderPresent(self.canvas);
+            },
+            c.SDL_WINDOWEVENT_EXPOSED, c.SDL_WINDOWEVENT_MAXIMIZED, c.SDL_WINDOWEVENT_RESTORED => {
+                try self.handleResize();
+            },
+            else => {},
+        }
+    }
+
+    fn handleKeyEvent(self: *Browser, key: c.SDL_Keycode) void {
+        switch (key) {
+            c.SDLK_DOWN => self.updateScroll(.Down),
+            c.SDLK_UP => self.updateScroll(.Up),
+            else => {},
+        }
+    }
+
     // Update the scroll offset
     pub fn updateScroll(
         self: *Browser,
@@ -193,9 +247,9 @@ pub const Browser = struct {
     ) void {
         switch (action) {
             .Down => {
-                const max_scroll = if (self.content_height > window_height)
+                const max_scroll = if (self.content_height > self.window_height)
                     // Subtract window height to prevent scrolling past the end
-                    self.content_height - window_height
+                    self.content_height - self.window_height
                 else
                     // No scrolling needed, content fits in window
                     0;
@@ -247,7 +301,7 @@ pub const Browser = struct {
         defer self.allocator.free(parsed_content);
 
         // Arrange the response for display
-        try self.layout(self.allocator, parsed_content);
+        try self.layout(parsed_content);
     }
 
     // Show the body of the response, sans tags
@@ -347,7 +401,7 @@ pub const Browser = struct {
     pub fn draw(self: Browser) !void {
         for (self.display_list.?) |item| {
             const screen_y = item.y - self.scroll_offset;
-            if (screen_y >= 0 and screen_y < window_height) {
+            if (screen_y >= 0 and screen_y < self.window_height) {
                 var dst_rect: c.SDL_Rect = .{
                     .x = item.x,
                     .y = screen_y,
@@ -366,18 +420,18 @@ pub const Browser = struct {
     }
 
     // Arrange the content for display
-    pub fn layout(self: *Browser, al: std.mem.Allocator, text: []const u8) !void {
+    pub fn layout(self: *Browser, text: []const u8) !void {
         if (!std.unicode.utf8ValidateSlice(text)) {
             return error.InvalidUTF8;
         }
 
-        var display_list = std.ArrayList(DisplayItem).init(al);
+        var display_list = std.ArrayList(DisplayItem).init(self.allocator);
         defer display_list.deinit();
 
         var cursor_x: i32 = h_offset;
         var cursor_y: i32 = v_offset;
 
-        const gd = try grapheme.GraphemeData.init(al);
+        const gd = try grapheme.GraphemeData.init(self.allocator);
         defer gd.deinit();
 
         var iter = grapheme.Iterator.init(text, &gd);
@@ -425,7 +479,7 @@ pub const Browser = struct {
             const glyph = try self.font_manager.getGlyph(self.font_manager.current_font.?, cluster_bytes);
 
             // Adjust for line wrapping
-            if (cursor_x + glyph.w > window_width) {
+            if (cursor_x + glyph.w > self.window_width) {
                 cursor_x = h_offset;
                 cursor_y += self.font_manager.current_font.?.line_height;
             }

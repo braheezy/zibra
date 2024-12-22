@@ -78,7 +78,7 @@ fn zibra() !void {
         std.log.info("showing default html", .{});
         const parsed_content = try b.lex(default_html, false);
         defer b.allocator.free(parsed_content);
-        try b.layout(allocator, parsed_content);
+        try b.layout(parsed_content);
     }
 
     // Start main exec loop
