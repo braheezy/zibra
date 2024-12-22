@@ -31,6 +31,7 @@ const initial_window_height = 600;
 const h_offset = 13;
 const v_offset = 18;
 const scroll_increment = 100;
+const scrollbar_width = 10;
 // *********************************************************
 
 // DisplayItem is a struct that holds the position and glyph to be displayed.
@@ -417,6 +418,42 @@ pub const Browser = struct {
                 );
             }
         }
+
+        self.drawScrollbar();
+    }
+
+    pub fn drawScrollbar(self: Browser) void {
+        if (self.content_height <= self.window_height) {
+            // No scrollbar needed if content fits in the window
+            return;
+        }
+
+        // Calculate scrollbar thumb size and position
+        const track_height = self.window_height;
+        const thumb_height: i32 = @intFromFloat(@as(f32, @floatFromInt(self.window_height)) * (@as(f32, @floatFromInt(self.window_height)) / @as(f32, @floatFromInt(self.content_height))));
+        const max_scroll = self.content_height - self.window_height;
+        const thumb_y: i32 = @intFromFloat(@as(f32, @floatFromInt(self.scroll_offset)) / @as(f32, @floatFromInt(max_scroll)) * (@as(f32, @floatFromInt(self.window_height)) - @as(f32, @floatFromInt(thumb_height))));
+
+        // Draw scrollbar track (background)
+        var track_rect: c.SDL_Rect = .{
+            .x = self.window_width - scrollbar_width,
+            .y = 0,
+            .w = scrollbar_width,
+            .h = track_height,
+        };
+        // Light gray
+        _ = c.SDL_SetRenderDrawColor(self.canvas, 200, 200, 200, 255);
+        _ = c.SDL_RenderFillRect(self.canvas, &track_rect);
+
+        // Draw scrollbar thumb (movable part)
+        var thumb_rect: c.SDL_Rect = .{
+            .x = self.window_width - scrollbar_width,
+            .y = thumb_y,
+            .w = scrollbar_width,
+            .h = thumb_height,
+        };
+        _ = c.SDL_SetRenderDrawColor(self.canvas, 0, 102, 204, 255); // Blue
+        _ = c.SDL_RenderFillRect(self.canvas, &thumb_rect);
     }
 
     // Arrange the content for display
@@ -479,7 +516,7 @@ pub const Browser = struct {
             const glyph = try self.font_manager.getGlyph(self.font_manager.current_font.?, cluster_bytes);
 
             // Adjust for line wrapping
-            if (cursor_x + glyph.w > self.window_width) {
+            if (cursor_x + glyph.w > self.window_width - scrollbar_width) {
                 cursor_x = h_offset;
                 cursor_y += self.font_manager.current_font.?.line_height;
             }
