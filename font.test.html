@@ -1,0 +1,37 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Font Verification Test</title>
+</head>
+<body>
+    <h1>Font Verification Test Page</h1>
+
+    <section class="latin">
+        <h2>Latin Text</h2>
+        <p>
+            The quick brown fox jumps over the lazy dog.
+            Lorem ipsum dolor sit amet, consectetur adipiscing elit.
+        </p>
+    </section>
+
+    <section class="cjk">
+        <h2>CJK Text</h2>
+        <p>
+            C: 你好，世界！这是一个测试页面。
+            J: こんにちは、世界！これはテストページです。
+            K: 안녕하세요, 세계! 이것은 테스트 페이지입니다.
+        </p>
+    </section>
+
+
+
+    <section class="fallback">
+        <h2>Fallback Text</h2>
+        <p>
+            If the above text does not display correctly, this fallback text will still render in monospace.
+        </p>
+    </section>
+</body>
+</html>

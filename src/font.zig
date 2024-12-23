@@ -12,20 +12,86 @@ const c = @cImport({
     @cInclude("SDL2/SDL_ttf.h");
 });
 
-const system_fonts_dirs = switch (builtin.target.os.tag) {
-    .macos => [_][]const u8{
-        "/Library/Fonts",
-        "/System/Library/Fonts",
+pub const FontCategory = enum {
+    latin,
+    cjk,
+    emoji,
+    fallback,
+};
+
+pub const UnicodeRange = struct {
+    start: u21,
+    end: u21,
+};
+
+pub const FontCategoryRanges = struct {
+    latin: []const UnicodeRange,
+    cjk: []const UnicodeRange,
+    emoji: []const UnicodeRange,
+};
+
+const unicode_ranges = FontCategoryRanges{
+    .latin = &[_]UnicodeRange{
+        .{ .start = 0x0000, .end = 0x024F }, // Basic Latin + Latin-1 Supplement
+        .{ .start = 0x1E00, .end = 0x1EFF }, // Latin Extended Additional
     },
-    .linux => [_][]const u8{
-        "/usr/share/fonts/google-noto-sans-cjk-vf-fonts",
+    .cjk = &[_]UnicodeRange{
+        .{ .start = 0x4E00, .end = 0x9FFF }, // CJK Unified Ideographs
+        .{ .start = 0x3400, .end = 0x4DBF }, // CJK Unified Ideographs Extension A
+        .{ .start = 0x3000, .end = 0x303F }, // CJK Symbols and Punctuation
+        .{ .start = 0xFF00, .end = 0xFFEF }, // Fullwidth Forms
+        .{ .start = 0x3040, .end = 0x309F }, // Hiragana
+        .{ .start = 0x30A0, .end = 0x30FF }, // Katakana
+        .{ .start = 0xAC00, .end = 0xD7A3 }, // Hangul Syllables
+    },
+    .emoji = &[_]UnicodeRange{
+        .{ .start = 0x1F300, .end = 0x1F5FF }, // Miscellaneous Symbols and Pictographs
+        .{ .start = 0x1F600, .end = 0x1F64F }, // Emoticons
+    },
+};
+
+const fo = 128512;
+
+const FontEntry = struct {
+    name: []const u8,
+    category: FontCategory,
+};
+
+const system_fonts = switch (builtin.target.os.tag) {
+    .macos => struct {
+        paths: []const []const u8,
+        fonts: []const FontEntry,
+    }{
+        .paths = &[_][]const u8{
+            "/Library/Fonts",
+            "/System/Library/Fonts",
+        },
+        .fonts = &[_]FontEntry{
+            .{ .name = "Courier", .category = .latin },
+            .{ .name = "CJKSymbolsFallback", .category = .cjk },
+            .{ .name = "Apple Color Emoji", .category = .emoji },
+        },
+    },
+    .linux => struct {
+        paths: []const []const u8,
+        fonts: []const FontEntry,
+    }{
+        .paths = &[_][]const u8{
+            "/usr/share/fonts",
+            "/usr/local/share/fonts",
+        },
+        .fonts = &[_]FontEntry{
+            .{ .name = "NotoSerif-Regular", .category = .latin },
+            .{ .name = "NotoSerifCJK-Regular", .category = .cjk },
+            .{ .name = "NotoColorEmoji", .category = .emoji },
+        },
     },
     else => @compileError("Unsupported operating system"),
 };
 
 pub const Glyph = struct {
     grapheme: []const u8,
-    texture: *c.SDL_Texture,
+    texture: ?*c.SDL_Texture,
     w: i32,
     h: i32,
 };
@@ -66,7 +132,7 @@ pub const FontManager = struct {
             // Destroy glyph textures
             var glyphs_it = f.glyphs.iterator();
             while (glyphs_it.next()) |glyph_entry| {
-                c.SDL_DestroyTexture(glyph_entry.value_ptr.*.texture);
+                c.SDL_DestroyTexture(glyph_entry.value_ptr.*.texture.?);
                 self.allocator.free(glyph_entry.value_ptr.*.grapheme);
                 self.allocator.destroy(glyph_entry.value_ptr.*);
             }
@@ -100,43 +166,29 @@ pub const FontManager = struct {
         try self.fonts.put(name, font);
     }
 
-    /// Loads a system font by searching standard macOS font directories.
-    pub fn loadSystemFont(self: *FontManager, name: []const u8, size: i32) !void {
-        // Get the user's home directory
+    fn collectFontPaths(self: *FontManager) !std.ArrayList([]const u8) {
+        var paths = std.ArrayList([]const u8).init(self.allocator);
+
+        // Add user font directory first to prefer them.
         const home_dir = try known_folders.getPath(self.allocator, .home) orelse return error.NoHomeDir;
         defer self.allocator.free(home_dir);
 
-        // Construct the user fonts directory: ~/Library/Fonts
         const user_fonts_dir = try std.fmt.allocPrint(self.allocator, "{s}/Library/Fonts", .{home_dir});
-        defer self.allocator.free(user_fonts_dir);
+        try paths.append(user_fonts_dir);
 
-        // We'll store all directories to search
-        var expanded_font_dirs = std.ArrayList([]const u8).init(self.allocator);
-        defer {
-            for (expanded_font_dirs.items) |dir| {
-                self.allocator.free(dir);
-            }
-            expanded_font_dirs.deinit();
+        // Add system font directories
+        for (system_fonts.paths) |dir| {
+            const copy = try self.allocator.dupe(u8, dir);
+            try paths.append(copy);
         }
 
-        // Add the user fonts directory
-        {
-            const copy = try self.allocator.dupe(u8, user_fonts_dir);
-            try expanded_font_dirs.append(copy);
-        }
+        return paths;
+    }
 
-        // Add the system font directories
-        for (system_fonts_dirs) |sys_dir| {
-            const copy = try self.allocator.dupe(u8, sys_dir);
-            try expanded_font_dirs.append(copy);
-        }
-
-        // Known font file extensions
+    fn tryLoadFontFromPaths(self: *FontManager, name: []const u8, paths: []const []const u8, size: i32) !bool {
         const extensions = [_][]const u8{ ".ttf", ".otf", ".ttc" };
 
-        var font_path: ?[]const u8 = null;
-
-        search_dirs: for (expanded_font_dirs.items) |dir| {
+        for (paths) |dir| {
             var dir_path = std.fs.cwd().openDir(dir, .{ .iterate = true }) catch continue;
             defer dir_path.close();
 
@@ -145,80 +197,260 @@ pub const FontManager = struct {
                 if (file_entry.kind != .file) continue;
 
                 const filename = file_entry.name;
-                // Check if filename ends with a known extension
-                var matched = false;
-                var base_name: []const u8 = filename;
                 for (extensions) |ext| {
                     if (std.ascii.endsWithIgnoreCase(filename, ext)) {
-                        // Strip the extension from the filename
-                        const base_len = filename.len - ext.len;
-                        base_name = filename[0..base_len];
-                        matched = true;
-                        break;
+                        const base_name = filename[0 .. filename.len - ext.len];
+                        if (std.ascii.eqlIgnoreCase(base_name, name)) {
+                            const font_path = try std.fmt.allocPrint(self.allocator, "{s}/{s}", .{ dir, filename });
+                            defer self.allocator.free(font_path);
+
+                            return self.loadFontAtPath(font_path, name, size);
+                        }
                     }
                 }
-
-                if (!matched) continue;
-
-                // Now check for exact (case-insensitive) equality
-                if (std.ascii.eqlIgnoreCase(base_name, name)) {
-                    font_path = try std.fmt.allocPrint(self.allocator, "{s}/{s}", .{ dir, filename });
-                    break;
-                }
             }
-
-            if (font_path != null) break :search_dirs;
         }
 
-        if (font_path == null) {
-            std.log.err("System font '{s}' not found.", .{name});
-            return error.FontNotFound;
-        }
+        return false;
+    }
 
-        // Null-terminate the font path for TTF_OpenFont
-        const font_path_z = try sliceToSentinelArray(self.allocator, font_path.?);
-        defer self.allocator.free(font_path_z);
-        defer self.allocator.free(font_path.?);
+    fn loadFontAtPath(self: *FontManager, path: []const u8, name: []const u8, size: i32) !bool {
+        const path_z = try sliceToSentinelArray(self.allocator, path);
+        defer self.allocator.free(path_z);
 
-        // Open the font using TTF_OpenFont
-        const fh = c.TTF_OpenFont(font_path_z, size);
+        const fh = c.TTF_OpenFont(path_z, size);
         if (fh == null) {
-            if (c.TTF_GetError()) |e| {
-                if (e[0] != 0) {
-                    std.log.err("TTF Error in loadSystemFont: {s}.", .{e});
-                }
-            }
-            return error.LoadFailed;
+            if (c.TTF_GetError()) |e| if (e[0] != 0) {
+                std.log.err("TTF Error in loadFontAtPath: {s}", .{e});
+            };
+            return false;
         }
 
-        // Create the Font struct
         var font: *Font = try self.allocator.create(Font);
         font.font_handle = fh.?;
         font.glyphs = std.StringHashMap(*Glyph).init(self.allocator);
-        font.line_height = c.TTF_FontLineSkip(fh.?);
+        font.line_height = c.TTF_FontLineSkip(fh);
         font.font_rw = null;
 
         try self.fonts.put(name, font);
-        self.current_font = font;
+        if (self.current_font == null) {
+            self.current_font = font;
+        }
+
+        return true;
     }
 
-    pub fn getGlyph(self: *FontManager, f: *Font, gme: []const u8) !*Glyph {
+    /// Load all standard system fonts (Latin, CJK, Emoji)
+    pub fn loadSystemFont(self: *FontManager, size: i32) !void {
+        // Add user font directory to search paths
+        var search_paths = try self.collectFontPaths();
+        defer {
+            for (search_paths.items) |dir| {
+                self.allocator.free(dir);
+            }
+            search_paths.deinit();
+        }
+
+        // Iterate through font categories in order of priority
+        const categories = [_]FontCategory{ .latin, .cjk, .emoji };
+        for (categories) |category| {
+            for (system_fonts.fonts) |font| {
+                if (font.category != category) continue; // Skip fonts not matching the current category
+
+                if (try self.tryLoadFontFromPaths(font.name, search_paths.items, size)) {
+                    std.log.info("Loaded {s} font: {s}", .{ @tagName(category), font.name });
+                    break; // Stop searching for this category once loaded
+                } else {
+                    std.log.warn("Failed to load {s} font: {s}", .{ @tagName(category), font.name });
+                }
+            }
+        }
+
+        // Ensure at least one font is loaded
+        if (self.fonts.count() == 0) {
+            std.debug.print("No fonts found\n", .{});
+            return error.NoFontsLoaded;
+        }
+
+        // Set the current font if not already set
+        if (self.current_font == null) {
+            var it = self.fonts.iterator();
+            self.current_font = it.next().?.value_ptr.*;
+        }
+
+        // Get the user's home directory
+        // const home_dir = try known_folders.getPath(self.allocator, .home) orelse return error.NoHomeDir;
+        // defer self.allocator.free(home_dir);
+
+        // // Construct the user fonts directory: ~/Library/Fonts
+        // const user_fonts_dir = try std.fmt.allocPrint(self.allocator, "{s}/Library/Fonts", .{home_dir});
+        // defer self.allocator.free(user_fonts_dir);
+
+        // // We'll store all directories to search
+        // var expanded_font_dirs = std.ArrayList([]const u8).init(self.allocator);
+        // defer {
+        //     for (expanded_font_dirs.items) |dir| {
+        //         self.allocator.free(dir);
+        //     }
+        //     expanded_font_dirs.deinit();
+        // }
+
+        // // Add the user fonts directory
+        // {
+        //     const copy = try self.allocator.dupe(u8, user_fonts_dir);
+        //     try expanded_font_dirs.append(copy);
+        // }
+
+        // // Add the system font directories
+        // for (system_fonts_dirs) |sys_dir| {
+        //     const copy = try self.allocator.dupe(u8, sys_dir);
+        //     try expanded_font_dirs.append(copy);
+        // }
+
+        // // Known font file extensions
+        // const extensions = [_][]const u8{ ".ttf", ".otf", ".ttc" };
+
+        // var font_path: ?[]const u8 = null;
+
+        // search_dirs: for (expanded_font_dirs.items) |dir| {
+        //     var dir_path = std.fs.cwd().openDir(dir, .{ .iterate = true }) catch continue;
+        //     defer dir_path.close();
+
+        //     var dir_entries = dir_path.iterate();
+        //     while (try dir_entries.next()) |file_entry| {
+        //         if (file_entry.kind != .file) continue;
+
+        //         const filename = file_entry.name;
+        //         // Check if filename ends with a known extension
+        //         var matched = false;
+        //         var base_name: []const u8 = filename;
+        //         for (extensions) |ext| {
+        //             if (std.ascii.endsWithIgnoreCase(filename, ext)) {
+        //                 // Strip the extension from the filename
+        //                 const base_len = filename.len - ext.len;
+        //                 base_name = filename[0..base_len];
+        //                 matched = true;
+        //                 break;
+        //             }
+        //         }
+
+        //         if (!matched) continue;
+
+        //         // Now check for exact (case-insensitive) equality
+        //         if (std.ascii.eqlIgnoreCase(base_name, name)) {
+        //             font_path = try std.fmt.allocPrint(self.allocator, "{s}/{s}", .{ dir, filename });
+        //             break;
+        //         }
+        //     }
+
+        //     if (font_path != null) break :search_dirs;
+        // }
+
+        // if (font_path == null) {
+        //     std.log.err("System font '{s}' not found.", .{name});
+        //     return error.FontNotFound;
+        // }
+
+        // // Null-terminate the font path for TTF_OpenFont
+        // const font_path_z = try sliceToSentinelArray(self.allocator, font_path.?);
+        // defer self.allocator.free(font_path_z);
+        // defer self.allocator.free(font_path.?);
+
+        // // Open the font using TTF_OpenFont
+        // const fh = c.TTF_OpenFont(font_path_z, size);
+        // if (fh == null) {
+        //     if (c.TTF_GetError()) |e| {
+        //         if (e[0] != 0) {
+        //             std.log.err("TTF Error in loadSystemFont: {s}.", .{e});
+        //         }
+        //     }
+        //     return error.LoadFailed;
+        // }
+
+        // // Create the Font struct
+        // var font: *Font = try self.allocator.create(Font);
+        // font.font_handle = fh.?;
+        // font.glyphs = std.StringHashMap(*Glyph).init(self.allocator);
+        // font.line_height = c.TTF_FontLineSkip(fh.?);
+        // font.font_rw = null;
+
+        // try self.fonts.put(name, font);
+        // self.current_font = font;
+    }
+
+    const ZERO_WIDTH_CODEPOINTS = [_]u21{
+        0x200B, // Zero-Width Space
+        0x200C, // Zero-Width Non-Joiner
+        0x200D, // Zero-Width Joiner
+        0xFEFF, // Zero-Width No-Break Space (BOM)
+    };
+
+    fn isZeroWidth(codepoint: u21) bool {
+        for (ZERO_WIDTH_CODEPOINTS) |zw_cp| {
+            if (codepoint == zw_cp) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    pub fn getGlyph(self: *FontManager, gme: []const u8) !*Glyph {
+        var iter = code_point.Iterator{ .bytes = gme };
+
+        const codepoint = iter.next() orelse {
+            std.log.warn("Failed to extract code point from grapheme: {s}", .{gme});
+            return error.InvalidGrapheme;
+        };
+
+        // Select the font based on the code point
+        const font = self.pickFontForCharacter(codepoint.code) orelse {
+            std.log.warn("No font found for codepoint: {d}", .{codepoint.code});
+            return error.NoFontForGlyph;
+        };
+
         // Duplicate the grapheme to ensure consistent memory allocation for the key
         const key = try self.allocator.dupe(u8, gme);
 
         // Check if the glyph is already in the cache
-        if (f.glyphs.get(key)) |cached_glyph| {
-            // Free the duplicate key since it's not needed
+        if (font.glyphs.get(key)) |cached_glyph| {
             self.allocator.free(key);
             return cached_glyph;
+        }
+
+        if (isZeroWidth(codepoint.code)) {
+            std.log.debug("Skipping rendering for zero-width codepoint: {d}", .{codepoint.code});
+
+            // Create a placeholder glyph with zero dimensions
+            var new_glyph = try self.allocator.create(Glyph);
+            new_glyph.grapheme = key;
+            new_glyph.texture = null; // No texture needed
+            new_glyph.w = 0;
+            new_glyph.h = 0;
+
+            try font.glyphs.put(key, new_glyph);
+            return new_glyph;
         }
 
         // Render the grapheme using TTF_RenderUTF8_Solid
         const sentinel_gme = try sliceToSentinelArray(self.allocator, gme);
         defer self.allocator.free(sentinel_gme);
 
+        std.log.info("SDL_ttf Version: {d}.{d}.{d}", .{ c.SDL_TTF_MAJOR_VERSION, c.SDL_TTF_MINOR_VERSION, c.SDL_TTF_PATCHLEVEL });
+
+        std.debug.print("making test surface\n", .{});
+        const test_surface = c.TTF_RenderUTF8_Blended(font.font_handle, "😀\x00", // Smiling face emoji with sentinel
+            c.SDL_Color{ .r = 0x00, .g = 0x00, .b = 0x00, .a = 0xFF });
+
+        if (test_surface == null) {
+            if (c.TTF_GetError()) |e| {
+                std.log.err("Test SDL_ttf Error: {s}", .{e});
+            }
+            return error.RenderFailed;
+        }
+        defer c.SDL_FreeSurface(test_surface);
+
         const glyph_surface = c.TTF_RenderUTF8_Solid(
-            f.font_handle,
+            font.font_handle,
             sentinel_gme,
             c.SDL_Color{ .r = 0x00, .g = 0x00, .b = 0x00, .a = 0xFF },
         );
@@ -246,7 +478,7 @@ pub const FontManager = struct {
         new_glyph.w = surf.w;
         new_glyph.h = surf.h;
 
-        try f.glyphs.put(key, new_glyph);
+        try font.glyphs.put(key, new_glyph);
 
         return new_glyph;
     }
@@ -271,7 +503,7 @@ pub const FontManager = struct {
 
             // For each grapheme cluster, render it as a single unit
             const cluster_bytes = gc.bytes(text);
-            const glyph = try self.getGlyph(font, cluster_bytes);
+            const glyph = try self.getGlyph(cluster_bytes);
 
             // Wrap text to the next line if it exceeds the window width
             if (current_x + glyph.w > window_width - browser.h_offset) {
@@ -286,9 +518,44 @@ pub const FontManager = struct {
                 .h = glyph.h,
             };
 
-            _ = c.SDL_RenderCopy(self.renderer, glyph.texture, null, &dst_rect);
+            _ = c.SDL_RenderCopy(self.renderer, glyph.texture.?, null, &dst_rect);
             current_x += glyph.w;
         }
+    }
+
+    fn pickFontForCharacter(self: *FontManager, codepoint: u21) ?*Font {
+        const categories = [_]FontCategory{ .latin, .cjk, .emoji };
+
+        std.debug.print("finding font for {d}\n", .{codepoint});
+        for (categories) |category| {
+            const ranges = switch (category) {
+                .latin => unicode_ranges.latin,
+                .cjk => unicode_ranges.cjk,
+                .emoji => unicode_ranges.emoji,
+                else => continue,
+            };
+
+            for (ranges) |range| {
+                std.debug.print("checking range {d} - {d}\n", .{ range.start, range.end });
+                if (codepoint >= range.start and codepoint <= range.end) {
+                    // Search fonts matching the category
+                    var it = self.fonts.iterator();
+                    while (it.next()) |entry| {
+                        const font_name = entry.key_ptr.*;
+                        const font = entry.value_ptr.*;
+
+                        // Check the font's category by matching against system_fonts.fonts
+                        for (system_fonts.fonts) |sf| {
+                            if (std.mem.eql(u8, sf.name, font_name) and sf.category == category) {
+                                return font;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        return null; // No matching font found
     }
 };
 

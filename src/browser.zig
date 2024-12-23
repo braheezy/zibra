@@ -513,7 +513,7 @@ pub const Browser = struct {
             newline_count = 0;
 
             // Get or create a Glyph for this grapheme cluster
-            const glyph = try self.font_manager.getGlyph(self.font_manager.current_font.?, cluster_bytes);
+            const glyph = try self.font_manager.getGlyph(cluster_bytes);
 
             // Adjust for line wrapping
             if (cursor_x + glyph.w > self.window_width - scrollbar_width) {

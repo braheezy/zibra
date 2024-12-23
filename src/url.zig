@@ -646,7 +646,6 @@ pub const Url = struct {
         defer html_file.close();
 
         const html_content = try html_file.readToEndAlloc(al, 4096);
-        std.log.debug("File content:\n{s}", .{html_content});
         return html_content;
     }
 };

@@ -20,12 +20,6 @@ fn dbgln(comptime fmt: []const u8) void {
 
 const default_html = @embedFile("default.html");
 
-const font_name = switch (builtin.target.os.tag) {
-    .macos => "Hiragino Sans GB",
-    .linux => "NotoSansCJK-VF",
-    else => @compileError("Unsupported operating system"),
-};
-
 pub fn main() void {
     // Catch and print errors to prevent ugly stack traces.
     zibra() catch |err| {
@@ -69,7 +63,7 @@ fn zibra() !void {
     defer b.free();
 
     // Load fonts
-    try b.font_manager.loadSystemFont(font_name, 16);
+    try b.font_manager.loadSystemFont(16);
 
     if (url) |u| {
         // Request URL and store response in browser.
