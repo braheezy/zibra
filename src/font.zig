@@ -65,10 +65,11 @@ const system_fonts = switch (builtin.target.os.tag) {
         .paths = &[_][]const u8{
             "/Library/Fonts",
             "/System/Library/Fonts",
+            "/System/Library/Fonts/Supplemental",
         },
         .fonts = &[_]FontEntry{
-            .{ .name = "Courier", .category = .latin },
-            .{ .name = "CJKSymbolsFallback", .category = .cjk },
+            .{ .name = "Arial Unicode", .category = .latin },
+            .{ .name = "Arial Unicode", .category = .cjk },
             .{ .name = "Apple Color Emoji", .category = .emoji },
         },
     },
@@ -99,7 +100,7 @@ pub const Glyph = struct {
 pub const Font = struct {
     font_handle: *c.TTF_Font,
     // Glyph cache or atlas.
-    glyphs: std.StringHashMap(*Glyph),
+    glyphs: std.StringHashMap(Glyph),
     line_height: i32,
     font_rw: ?*c.SDL_RWops,
 };
@@ -107,24 +108,29 @@ pub const Font = struct {
 pub const FontManager = struct {
     allocator: std.mem.Allocator,
     renderer: *c.SDL_Renderer,
-    fonts: std.StringHashMap(*Font),
+    fonts: std.StringHashMap(Font),
     current_font: ?*Font = null,
 
-    pub fn init(allocator: std.mem.Allocator, renderer: *c.SDL_Renderer) !FontManager {
+    pub fn init(allocator: std.mem.Allocator, renderer: *c.SDL_Renderer) !*FontManager {
         if (c.TTF_WasInit() == 0) {
             if (c.TTF_Init() != 0) return error.InitFailed;
         }
 
-        return FontManager{
-            .allocator = allocator,
-            .renderer = renderer,
-            .fonts = std.StringHashMap(*Font).init(allocator),
-        };
+        var font_manager = try allocator.create(FontManager);
+        font_manager.allocator = allocator;
+        font_manager.renderer = renderer;
+        font_manager.fonts = std.StringHashMap(Font).init(allocator);
+        return font_manager;
+
+        // return FontManager{
+        //     .allocator = allocator,
+        //     .renderer = renderer,
+        //     .fonts = std.StringHashMap(Font).init(allocator),
+        // };
     }
 
-    pub fn deinit(self: FontManager) void {
+    pub fn deinit(self: *FontManager) void {
         var fonts = self.fonts;
-        defer fonts.deinit();
         var fonts_it = fonts.iterator();
         while (fonts_it.next()) |entry| {
             var f = entry.value_ptr.*;
@@ -134,7 +140,6 @@ pub const FontManager = struct {
             while (glyphs_it.next()) |glyph_entry| {
                 c.SDL_DestroyTexture(glyph_entry.value_ptr.*.texture.?);
                 self.allocator.free(glyph_entry.value_ptr.*.grapheme);
-                self.allocator.destroy(glyph_entry.value_ptr.*);
             }
             f.glyphs.deinit();
 
@@ -143,9 +148,9 @@ pub const FontManager = struct {
             if (f.font_rw) |rw| {
                 std.debug.assert(c.SDL_RWclose(rw) == 0);
             }
-
-            self.allocator.destroy(f);
         }
+
+        fonts.deinit();
 
         c.TTF_Quit();
     }
@@ -226,15 +231,17 @@ pub const FontManager = struct {
             return false;
         }
 
-        var font: *Font = try self.allocator.create(Font);
-        font.font_handle = fh.?;
-        font.glyphs = std.StringHashMap(*Glyph).init(self.allocator);
-        font.line_height = c.TTF_FontLineSkip(fh);
-        font.font_rw = null;
+        // var font: *Font = try self.allocator.create(Font);
+        const font = Font{
+            .font_handle = fh.?,
+            .glyphs = std.StringHashMap(Glyph).init(self.allocator),
+            .line_height = c.TTF_FontLineSkip(fh),
+            .font_rw = null,
+        };
 
         try self.fonts.put(name, font);
         if (self.current_font == null) {
-            self.current_font = font;
+            self.current_font = self.fonts.get(name);
         }
 
         return true;
@@ -378,23 +385,7 @@ pub const FontManager = struct {
         // self.current_font = font;
     }
 
-    const ZERO_WIDTH_CODEPOINTS = [_]u21{
-        0x200B, // Zero-Width Space
-        0x200C, // Zero-Width Non-Joiner
-        0x200D, // Zero-Width Joiner
-        0xFEFF, // Zero-Width No-Break Space (BOM)
-    };
-
-    fn isZeroWidth(codepoint: u21) bool {
-        for (ZERO_WIDTH_CODEPOINTS) |zw_cp| {
-            if (codepoint == zw_cp) {
-                return true;
-            }
-        }
-        return false;
-    }
-
-    pub fn getGlyph(self: *FontManager, gme: []const u8) !*Glyph {
+    pub fn getGlyph(self: *FontManager, gme: []const u8) !Glyph {
         var iter = code_point.Iterator{ .bytes = gme };
 
         const codepoint = iter.next() orelse {
@@ -403,59 +394,30 @@ pub const FontManager = struct {
         };
 
         // Select the font based on the code point
-        const font = self.pickFontForCharacter(codepoint.code) orelse {
+        var font = self.pickFontForCharacter(codepoint.code) orelse {
             std.log.warn("No font found for codepoint: {d}", .{codepoint.code});
             return error.NoFontForGlyph;
         };
 
-        // Duplicate the grapheme to ensure consistent memory allocation for the key
-        const key = try self.allocator.dupe(u8, gme);
-
         // Check if the glyph is already in the cache
-        if (font.glyphs.get(key)) |cached_glyph| {
-            self.allocator.free(key);
+        if (font.glyphs.get(gme)) |cached_glyph| {
             return cached_glyph;
         }
 
-        if (isZeroWidth(codepoint.code)) {
-            std.log.debug("Skipping rendering for zero-width codepoint: {d}", .{codepoint.code});
-
-            // Create a placeholder glyph with zero dimensions
-            var new_glyph = try self.allocator.create(Glyph);
-            new_glyph.grapheme = key;
-            new_glyph.texture = null; // No texture needed
-            new_glyph.w = 0;
-            new_glyph.h = 0;
-
-            try font.glyphs.put(key, new_glyph);
-            return new_glyph;
-        }
+        // Duplicate the grapheme to ensure consistent memory allocation for the key
+        // const key = try self.allocator.dupe(u8, gme);
 
         // Render the grapheme using TTF_RenderUTF8_Solid
         const sentinel_gme = try sliceToSentinelArray(self.allocator, gme);
         defer self.allocator.free(sentinel_gme);
 
-        std.log.info("SDL_ttf Version: {d}.{d}.{d}", .{ c.SDL_TTF_MAJOR_VERSION, c.SDL_TTF_MINOR_VERSION, c.SDL_TTF_PATCHLEVEL });
-
-        std.debug.print("making test surface\n", .{});
-        const test_surface = c.TTF_RenderUTF8_Blended(font.font_handle, "😀\x00", // Smiling face emoji with sentinel
-            c.SDL_Color{ .r = 0x00, .g = 0x00, .b = 0x00, .a = 0xFF });
-
-        if (test_surface == null) {
-            if (c.TTF_GetError()) |e| {
-                std.log.err("Test SDL_ttf Error: {s}", .{e});
-            }
-            return error.RenderFailed;
-        }
-        defer c.SDL_FreeSurface(test_surface);
-
-        const glyph_surface = c.TTF_RenderUTF8_Solid(
+        const glyph_surface = c.TTF_RenderUTF8_Blended(
             font.font_handle,
             sentinel_gme,
             c.SDL_Color{ .r = 0x00, .g = 0x00, .b = 0x00, .a = 0xFF },
         );
         if (glyph_surface == null) {
-            self.allocator.free(key);
+            // self.allocator.free(key);
             if (c.TTF_GetError()) |e| {
                 if (e[0] != 0) std.log.err("TTF Error in getGlyph: {s}.", .{e});
             }
@@ -465,20 +427,22 @@ pub const FontManager = struct {
 
         // Create a texture from the surface
         const glyph_tex = c.SDL_CreateTextureFromSurface(self.renderer, glyph_surface) orelse {
-            self.allocator.free(key);
+            // self.allocator.free(key);
             if (c.SDL_GetError()) |e| if (e[0] != 0) std.log.err("SDL Error in getGlyph: {s}.", .{e});
             return error.RenderFailed;
         };
 
         // Cache and return the new glyph
         const surf = glyph_surface.*;
-        var new_glyph = try self.allocator.create(Glyph);
-        new_glyph.grapheme = key;
-        new_glyph.texture = glyph_tex;
-        new_glyph.w = surf.w;
-        new_glyph.h = surf.h;
+        // var new_glyph = try self.allocator.create(Glyph);
+        const new_glyph = Glyph{
+            .grapheme = gme,
+            .texture = glyph_tex,
+            .w = surf.w,
+            .h = surf.h,
+        };
 
-        try font.glyphs.put(key, new_glyph);
+        try font.glyphs.put(gme, new_glyph);
 
         return new_glyph;
     }
@@ -523,10 +487,9 @@ pub const FontManager = struct {
         }
     }
 
-    fn pickFontForCharacter(self: *FontManager, codepoint: u21) ?*Font {
+    fn pickFontForCharacter(self: *FontManager, codepoint: u21) ?Font {
         const categories = [_]FontCategory{ .latin, .cjk, .emoji };
 
-        std.debug.print("finding font for {d}\n", .{codepoint});
         for (categories) |category| {
             const ranges = switch (category) {
                 .latin => unicode_ranges.latin,
@@ -536,7 +499,6 @@ pub const FontManager = struct {
             };
 
             for (ranges) |range| {
-                std.debug.print("checking range {d} - {d}\n", .{ range.start, range.end });
                 if (codepoint >= range.start and codepoint <= range.end) {
                     // Search fonts matching the category
                     var it = self.fonts.iterator();

@@ -41,7 +41,7 @@ const DisplayItem = struct {
     // Y coordinate of the display item
     y: i32,
     // Pointer to the glyph to be displayed
-    glyph: *Glyph,
+    glyph: Glyph,
 };
 
 // Browser is the main struct that holds the state of the browser.
@@ -53,7 +53,7 @@ pub const Browser = struct {
     // SDL renderer handle
     canvas: *c.SDL_Renderer,
     // Font manager for handling fonts and glyphs
-    font_manager: FontManager,
+    font_manager: *FontManager,
     // Map of active connections. The key is the host and the value a Connection to use.
     socket_map: std.StringHashMap(Connection),
     // Cache for storing fetched resources

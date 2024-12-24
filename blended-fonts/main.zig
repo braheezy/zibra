@@ -31,7 +31,7 @@ pub fn main() !void {
     ) orelse {
         std.log.err("SDL_CreateWindow Error: {s}", .{c.SDL_GetError()});
         return error.WindowCreationFailed;
-    };
+    }
     defer c.SDL_DestroyWindow(window);
 
     // Create SDL Renderer
@@ -39,10 +39,11 @@ pub fn main() !void {
         window,
         -1,
         c.SDL_RENDERER_ACCELERATED | c.SDL_RENDERER_PRESENTVSYNC,
-    ) orelse {
+    );
+    if (renderer == null) {
         std.log.err("SDL_CreateRenderer Error: {s}", .{c.SDL_GetError()});
         return error.RendererCreationFailed;
-    };
+    }
     defer c.SDL_DestroyRenderer(renderer);
 
     // Load Font
@@ -50,7 +51,7 @@ pub fn main() !void {
     const font = c.TTF_OpenFont(font_path, 48) orelse {
         std.log.err("TTF_OpenFont Error: {s}", .{c.TTF_GetError()});
         return error.FontLoadFailed;
-    };
+    }
     defer c.TTF_CloseFont(font);
 
     _ = c.SDL_SetRenderDrawColor(renderer, 255, 255, 255, 255); // Set background to white

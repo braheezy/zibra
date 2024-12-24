@@ -1,4 +1,5 @@
 const std = @import("std");
+const builtin = @import("builtin");
 
 // Although this function looks imperative, note that its job is to
 // declaratively construct a build graph that will be executed by an external
@@ -17,27 +18,38 @@ pub fn build(b: *std.Build) !void {
     const optimize = b.standardOptimizeOption(.{});
 
     const exe = b.addExecutable(.{
-        .name = "zibra",
+        .name = "blended-fonts",
         .root_source_file = b.path("main.zig"),
         .target = target,
         .optimize = optimize,
     });
 
     // Add dependencies
-    const sdl_dep = b.dependency("sdl", .{
-        .optimize = optimize,
-        .target = target,
-    });
-    const sdl_artifact = sdl_dep.artifact("SDL2");
-    for (sdl_artifact.root_module.include_dirs.items) |include_dir| {
-        try exe.root_module.include_dirs.append(b.allocator, include_dir);
+    if (builtin.target.os.tag == .macos) {
+        // allyourcodebase/SDL_ttf doesn't work on macos
+        // `brew install sdl2_ttf`
+        exe.addLibraryPath(.{ .cwd_relative = "/opt/homebrew/lib" });
+        exe.addIncludePath(.{ .cwd_relative = "/opt/homebrew/include" });
+
+        exe.linkSystemLibrary("SDL2");
+        exe.linkSystemLibrary("SDL2_ttf");
+    } else {
+        const sdl_dep = b.dependency("sdl", .{
+            .optimize = optimize,
+            .target = target,
+        });
+        const sdl_artifact = sdl_dep.artifact("SDL2");
+        for (sdl_artifact.root_module.include_dirs.items) |include_dir| {
+            try exe.root_module.include_dirs.append(b.allocator, include_dir);
+        }
+        exe.linkLibrary(sdl_artifact);
+
+        const sdl_ttf_dep = b.dependency("sdl_ttf", .{
+            .optimize = optimize,
+            .target = target,
+        });
+        exe.linkLibrary(sdl_ttf_dep.artifact("SDL2_ttf"));
     }
-    const sdl_ttf_dep = b.dependency("sdl_ttf", .{
-        .optimize = optimize,
-        .target = target,
-    });
-    exe.linkLibrary(sdl_ttf_dep.artifact("SDL2_ttf"));
-    exe.linkLibrary(sdl_artifact);
 
     const known_folders = b.dependency("known-folders", .{}).module("known-folders");
     exe.root_module.addImport("known-folders", known_folders);
