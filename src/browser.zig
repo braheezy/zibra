@@ -53,7 +53,7 @@ pub const Browser = struct {
     // SDL renderer handle
     canvas: *c.SDL_Renderer,
     // Font manager for handling fonts and glyphs
-    font_manager: *FontManager,
+    font_manager: FontManager,
     // Map of active connections. The key is the host and the value a Connection to use.
     socket_map: std.StringHashMap(Connection),
     // Cache for storing fetched resources
@@ -124,7 +124,7 @@ pub const Browser = struct {
         std.debug.print("freeing browser\n", .{});
         // clean up hash map for fonts
         self.font_manager.deinit();
-        self.allocator.destroy(self.font_manager);
+        // self.allocator.destroy(self.font_manager);
 
         // clean up hash map for sockets, including values
         var sockets_iter = self.socket_map.valueIterator();

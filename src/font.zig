@@ -113,26 +113,23 @@ pub const FontManager = struct {
     renderer: *c.SDL_Renderer,
     fonts: std.StringHashMap(*Font),
     current_font: ?*Font = null,
-    min_line_height: i32,
+    min_line_height: i32 = std.math.maxInt(i32),
 
-    pub fn init(allocator: std.mem.Allocator, renderer: *c.SDL_Renderer) !*FontManager {
+    pub fn init(allocator: std.mem.Allocator, renderer: *c.SDL_Renderer) !FontManager {
         if (c.TTF_WasInit() == 0) {
             if (c.TTF_Init() != 0) return error.InitFailed;
         }
 
-        var font_manager = try allocator.create(FontManager);
-        font_manager.allocator = allocator;
-        font_manager.renderer = renderer;
-        font_manager.fonts = std.StringHashMap(*Font).init(allocator);
-
-        font_manager.*.current_font = null;
-        font_manager.min_line_height = std.math.maxInt(i32);
-        return font_manager;
+        return FontManager{
+            .allocator = allocator,
+            .renderer = renderer,
+            .fonts = std.StringHashMap(*Font).init(allocator),
+        };
     }
 
-    pub fn deinit(self: *FontManager) void {
+    pub fn deinit(self: FontManager) void {
         std.debug.print("freeing font manager\n", .{});
-        // var fonts = self.fonts;
+
         var fonts_it = self.fonts.iterator();
         while (fonts_it.next()) |entry| {
             var f = entry.value_ptr.*;
@@ -141,7 +138,6 @@ pub const FontManager = struct {
             var glyphs_it = f.glyphs.iterator();
             while (glyphs_it.next()) |glyph_entry| {
                 c.SDL_DestroyTexture(glyph_entry.value_ptr.*.texture.?);
-                // self.allocator.free(glyph_entry.value_ptr.*.grapheme);
             }
             f.glyphs.deinit();
 
@@ -153,7 +149,8 @@ pub const FontManager = struct {
             self.allocator.destroy(f);
         }
 
-        self.fonts.deinit();
+        var fonts = self.fonts;
+        fonts.deinit();
 
         c.TTF_Quit();
     }
