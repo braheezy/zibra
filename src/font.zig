@@ -50,8 +50,6 @@ const unicode_ranges = FontCategoryRanges{
     },
 };
 
-const fo = 128512;
-
 const FontEntry = struct {
     name: []const u8,
     category: FontCategory,
@@ -80,10 +78,15 @@ const system_fonts = switch (builtin.target.os.tag) {
         .paths = &[_][]const u8{
             "/usr/share/fonts",
             "/usr/local/share/fonts",
+            "/usr/share/fonts/google-noto",
+            "/usr/share/fonts/google-noto-sans-cjk-vf-fonts",
+            "/usr/share/fonts/google-noto-color-emoji-fonts",
+            "/home/braheezy/zibra",
+            "/usr/share/fonts/twemoji",
         },
         .fonts = &[_]FontEntry{
-            .{ .name = "NotoSerif-Regular", .category = .latin },
-            .{ .name = "NotoSerifCJK-Regular", .category = .cjk },
+            .{ .name = "NotoSans-Regular", .category = .latin },
+            .{ .name = "NotoSansCJK-VF", .category = .cjk },
             .{ .name = "NotoColorEmoji", .category = .emoji },
         },
     },
@@ -108,8 +111,9 @@ pub const Font = struct {
 pub const FontManager = struct {
     allocator: std.mem.Allocator,
     renderer: *c.SDL_Renderer,
-    fonts: std.StringHashMap(Font),
+    fonts: std.StringHashMap(*Font),
     current_font: ?*Font = null,
+    min_line_height: i32,
 
     pub fn init(allocator: std.mem.Allocator, renderer: *c.SDL_Renderer) !*FontManager {
         if (c.TTF_WasInit() == 0) {
@@ -119,19 +123,17 @@ pub const FontManager = struct {
         var font_manager = try allocator.create(FontManager);
         font_manager.allocator = allocator;
         font_manager.renderer = renderer;
-        font_manager.fonts = std.StringHashMap(Font).init(allocator);
-        return font_manager;
+        font_manager.fonts = std.StringHashMap(*Font).init(allocator);
 
-        // return FontManager{
-        //     .allocator = allocator,
-        //     .renderer = renderer,
-        //     .fonts = std.StringHashMap(Font).init(allocator),
-        // };
+        font_manager.*.current_font = null;
+        font_manager.min_line_height = std.math.maxInt(i32);
+        return font_manager;
     }
 
     pub fn deinit(self: *FontManager) void {
-        var fonts = self.fonts;
-        var fonts_it = fonts.iterator();
+        std.debug.print("freeing font manager\n", .{});
+        // var fonts = self.fonts;
+        var fonts_it = self.fonts.iterator();
         while (fonts_it.next()) |entry| {
             var f = entry.value_ptr.*;
 
@@ -139,7 +141,7 @@ pub const FontManager = struct {
             var glyphs_it = f.glyphs.iterator();
             while (glyphs_it.next()) |glyph_entry| {
                 c.SDL_DestroyTexture(glyph_entry.value_ptr.*.texture.?);
-                self.allocator.free(glyph_entry.value_ptr.*.grapheme);
+                // self.allocator.free(glyph_entry.value_ptr.*.grapheme);
             }
             f.glyphs.deinit();
 
@@ -148,9 +150,10 @@ pub const FontManager = struct {
             if (f.font_rw) |rw| {
                 std.debug.assert(c.SDL_RWclose(rw) == 0);
             }
+            self.allocator.destroy(f);
         }
 
-        fonts.deinit();
+        self.fonts.deinit();
 
         c.TTF_Quit();
     }
@@ -220,10 +223,11 @@ pub const FontManager = struct {
     }
 
     fn loadFontAtPath(self: *FontManager, path: []const u8, name: []const u8, size: i32) !bool {
+        std.debug.print("loading font {s} at path {s} with size {d}\n", .{ name, path, size });
         const path_z = try sliceToSentinelArray(self.allocator, path);
         defer self.allocator.free(path_z);
 
-        const fh = c.TTF_OpenFont(path_z, size);
+        const fh = c.TTF_OpenFontIndex(path_z, size, 0);
         if (fh == null) {
             if (c.TTF_GetError()) |e| if (e[0] != 0) {
                 std.log.err("TTF Error in loadFontAtPath: {s}", .{e});
@@ -231,8 +235,12 @@ pub const FontManager = struct {
             return false;
         }
 
-        // var font: *Font = try self.allocator.create(Font);
-        const font = Font{
+        if (c.TTF_SetFontSize(fh, size) != 0) {
+            std.log.warn("Failed to set explicit font pixel size: {s}", .{c.TTF_GetError()});
+        }
+
+        const font = try self.allocator.create(Font);
+        font.* = Font{
             .font_handle = fh.?,
             .glyphs = std.StringHashMap(Glyph).init(self.allocator),
             .line_height = c.TTF_FontLineSkip(fh),
@@ -240,6 +248,13 @@ pub const FontManager = struct {
         };
 
         try self.fonts.put(name, font);
+
+        if (font.line_height < self.min_line_height) {
+            self.min_line_height = font.line_height;
+            std.debug.print("Updated min_line_height: {d}\n", .{self.min_line_height});
+        }
+
+        std.debug.print("font {s} line height: {d}\n", .{ name, font.line_height });
         if (self.current_font == null) {
             self.current_font = self.fonts.get(name);
         }
@@ -264,8 +279,14 @@ pub const FontManager = struct {
             for (system_fonts.fonts) |font| {
                 if (font.category != category) continue; // Skip fonts not matching the current category
 
+                // const emoji_scale_factor = 2.0;
+                // const size_float: f32 = @floatFromInt(size);
+                // const emoji_size: i32 = @intFromFloat(size_float * emoji_scale_factor);
+                // const font_size = if (category == .emoji) emoji_size else size;
+
                 if (try self.tryLoadFontFromPaths(font.name, search_paths.items, size)) {
-                    std.log.info("Loaded {s} font: {s}", .{ @tagName(category), font.name });
+                    std.log.info("Loaded {s} font at size {d}: {s}", .{ @tagName(category), size, font.name });
+
                     break; // Stop searching for this category once loaded
                 } else {
                     std.log.warn("Failed to load {s} font: {s}", .{ @tagName(category), font.name });
@@ -284,7 +305,6 @@ pub const FontManager = struct {
             var it = self.fonts.iterator();
             self.current_font = it.next().?.value_ptr.*;
         }
-
         // Get the user's home directory
         // const home_dir = try known_folders.getPath(self.allocator, .home) orelse return error.NoHomeDir;
         // defer self.allocator.free(home_dir);
@@ -404,9 +424,6 @@ pub const FontManager = struct {
             return cached_glyph;
         }
 
-        // Duplicate the grapheme to ensure consistent memory allocation for the key
-        // const key = try self.allocator.dupe(u8, gme);
-
         // Render the grapheme using TTF_RenderUTF8_Solid
         const sentinel_gme = try sliceToSentinelArray(self.allocator, gme);
         defer self.allocator.free(sentinel_gme);
@@ -417,7 +434,6 @@ pub const FontManager = struct {
             c.SDL_Color{ .r = 0x00, .g = 0x00, .b = 0x00, .a = 0xFF },
         );
         if (glyph_surface == null) {
-            // self.allocator.free(key);
             if (c.TTF_GetError()) |e| {
                 if (e[0] != 0) std.log.err("TTF Error in getGlyph: {s}.", .{e});
             }
@@ -425,21 +441,63 @@ pub const FontManager = struct {
         }
         defer c.SDL_FreeSurface(glyph_surface);
 
-        // Create a texture from the surface
+        // Create a texture from the final surface
         const glyph_tex = c.SDL_CreateTextureFromSurface(self.renderer, glyph_surface) orelse {
-            // self.allocator.free(key);
             if (c.SDL_GetError()) |e| if (e[0] != 0) std.log.err("SDL Error in getGlyph: {s}.", .{e});
             return error.RenderFailed;
         };
+        // Enable linear filtering for smooth scaling
+        if (c.SDL_SetTextureScaleMode(glyph_tex, c.SDL_ScaleModeLinear) != 0) {
+            std.log.err("Failed to set texture scale mode: {s}", .{c.SDL_GetError()});
+        }
 
-        // Cache and return the new glyph
         const surf = glyph_surface.*;
-        // var new_glyph = try self.allocator.create(Glyph);
-        const new_glyph = Glyph{
+
+        const is_emoji = isCodepointEmoji(codepoint.code);
+
+        const new_glyph = if (!is_emoji) Glyph{
             .grapheme = gme,
             .texture = glyph_tex,
             .w = surf.w,
             .h = surf.h,
+        } else blk: {
+            // Get text height from the current font
+            var miny: i32 = 0;
+            var maxy: i32 = 0;
+            var advance: i32 = 0;
+
+            if (c.TTF_GlyphMetrics32(
+                font.font_handle,
+                codepoint.code,
+                null,
+                null,
+                &miny,
+                &maxy,
+                &advance,
+            ) != 0) {
+                std.log.err("Failed to get glyph metrics: {s}", .{c.TTF_GetError()});
+            }
+
+            // const text_height = maxy - miny; // Approximate visual text height
+            const text_height: i32 = self.min_line_height;
+
+            // Scale emoji proportionally
+            var tmp1: f32 = @floatFromInt(text_height);
+            const tmp2: f32 = @floatFromInt(surf.h);
+            const emoji_scale_factor = tmp1 / tmp2;
+
+            tmp1 = @floatFromInt(surf.w);
+            const emoji_width: i32 = @intFromFloat(tmp1 * emoji_scale_factor);
+            const emoji_height: i32 = @intFromFloat(tmp2 * emoji_scale_factor);
+
+            std.debug.print("emoji_scale_factor: {d}, emoji width: {d}, emoji height: {d}, text_height: {d}\n", .{ emoji_scale_factor, emoji_width, emoji_height, text_height });
+
+            break :blk Glyph{
+                .grapheme = gme,
+                .texture = glyph_tex,
+                .w = emoji_width,
+                .h = emoji_height,
+            };
         };
 
         try font.glyphs.put(gme, new_glyph);
@@ -487,7 +545,7 @@ pub const FontManager = struct {
         }
     }
 
-    fn pickFontForCharacter(self: *FontManager, codepoint: u21) ?Font {
+    fn pickFontForCharacter(self: *FontManager, codepoint: u21) ?*Font {
         const categories = [_]FontCategory{ .latin, .cjk, .emoji };
 
         for (categories) |category| {
@@ -526,4 +584,13 @@ fn sliceToSentinelArray(allocator: std.mem.Allocator, slice: []const u8) ![:0]co
     const arr = try allocator.allocSentinel(u8, len, 0);
     @memcpy(arr, slice);
     return arr;
+}
+
+fn isCodepointEmoji(codepoint: u21) bool {
+    for (unicode_ranges.emoji) |range| {
+        if (codepoint >= range.start and codepoint <= range.end) {
+            return true;
+        }
+    }
+    return false;
 }

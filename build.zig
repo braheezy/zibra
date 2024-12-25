@@ -34,21 +34,9 @@ pub fn build(b: *std.Build) !void {
         exe.linkSystemLibrary("SDL2");
         exe.linkSystemLibrary("SDL2_ttf");
     } else {
-        const sdl_dep = b.dependency("sdl", .{
-            .optimize = optimize,
-            .target = target,
-        });
-        const sdl_artifact = sdl_dep.artifact("SDL2");
-        for (sdl_artifact.root_module.include_dirs.items) |include_dir| {
-            try exe.root_module.include_dirs.append(b.allocator, include_dir);
-        }
-        exe.linkLibrary(sdl_artifact);
-
-        const sdl_ttf_dep = b.dependency("sdl_ttf", .{
-            .optimize = optimize,
-            .target = target,
-        });
-        exe.linkLibrary(sdl_ttf_dep.artifact("SDL2_ttf"));
+        exe.linkLibC();
+        exe.linkSystemLibrary("SDL2");
+        exe.linkSystemLibrary("SDL2_ttf");
     }
 
     const known_folders = b.dependency("known-folders", .{}).module("known-folders");

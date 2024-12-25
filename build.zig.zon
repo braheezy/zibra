@@ -23,14 +23,6 @@
     // Once all dependencies are fetched, `zig build` no longer requires
     // internet connectivity.
     .dependencies = .{
-        .sdl = .{
-            .url = "https://github.com/allyourcodebase/SDL/archive/7e4fc30b201d266f197fef4153f7e046bd189a7c.tar.gz",
-            .hash = "1220c57b0bec66a2378e90cd7a79e36f9e7f60c02acca769ab3e6f974d4ef6766418",
-        },
-        .sdl_ttf = .{
-            .url = "https://github.com/allyourcodebase/SDL_ttf/archive/8d951496c0638ca7cbcec1eb5a9b3fe1e358241f.tar.gz",
-            .hash = "1220ffe43566e6406bc15a7c3ad46294f3e4e45e9e323bd2b4e020d3f4b22df5fd83",
-        },
         .@"known-folders" = .{
             .url = "git+https://github.com/ziglibs/known-folders.git#1cceeb70e77dec941a4178160ff6c8d05a74de6f",
             .hash = "12205f5e7505c96573f6fc5144592ec38942fb0a326d692f9cddc0c7dd38f9028f29",

@@ -72,11 +72,14 @@ pub const Browser = struct {
 
     // Create a new Browser instance
     pub fn init(al: std.mem.Allocator) !Browser {
+        std.debug.print("browser.init\n", .{});
         // Initialize SDL
         if (c.SDL_Init(c.SDL_INIT_VIDEO) != 0) {
             c.SDL_Log("Unable to initialize SDL: %s", c.SDL_GetError());
             return error.SDLInitializationFailed;
         }
+
+        std.debug.print("here\n", .{});
 
         // Create a window with correct OS graphics
         const window_flags = switch (builtin.target.os.tag) {
@@ -104,11 +107,13 @@ pub const Browser = struct {
             return error.SDLInitializationFailed;
         };
 
+        const font_manager = try FontManager.init(al, renderer);
+
         return Browser{
             .allocator = al,
             .window = screen,
             .canvas = renderer,
-            .font_manager = try FontManager.init(al, renderer),
+            .font_manager = font_manager,
             .socket_map = std.StringHashMap(Connection).init(al),
             .cache = try Cache.init(al),
         };
@@ -116,8 +121,10 @@ pub const Browser = struct {
 
     // Free the resources used by the browser
     pub fn free(self: Browser) void {
+        std.debug.print("freeing browser\n", .{});
         // clean up hash map for fonts
         self.font_manager.deinit();
+        self.allocator.destroy(self.font_manager);
 
         // clean up hash map for sockets, including values
         var sockets_iter = self.socket_map.valueIterator();
