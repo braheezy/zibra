@@ -404,7 +404,7 @@ pub const Url = struct {
 
             std.log.debug("\nScheme: {s}\nHost: {s}\nPath: {s}\nPort: {d}\nIs HTTPS: {any}", .{
                 u.scheme,
-                u.host orelse "localhost",
+                u.host orelse "null",
                 u.path,
                 u.port,
                 u.is_https,
