@@ -31,13 +31,9 @@
             .url = "https://codeberg.org/atman/zg/archive/v0.13.4.tar.gz",
             .hash = "1220fe42e39fd141c84fd7d5cf69945309bb47253033e68788f99bdfe5585fbc711a",
         },
-        .ada = .{
-            .url = "https://github.com/braheezy/ada-zig/archive/04c601a.tar.gz",
-            .hash = "12209cb9c44252e94d0ccb592532fbc6342894edefe42d6fa8b21710e253e6623a43",
-        },
-        .adac = .{
-            .url = "https://github.com/ada-url/ada/releases/download/v2.9.2/singleheader.zip",
-            .hash = "12203c1e5180542d91598d61cf1ce220a4c65e09b04e41d60ce1c1e3480ec2a1dfe7",
+        .@"ada-zig" = .{
+            .url = "https://github.com/braheezy/ada-zig/archive/6e62fef7b595f8f478bea4e5e316a1187480e6c6.tar.gz",
+            .hash = "1220c580aaabae3d02d816d7027d934503cd771fd403d5d6c2138f125ab3d345da2d",
         },
     },
     // Specifies the set of files and directories that are included in this package.

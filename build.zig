@@ -1,20 +1,8 @@
 const std = @import("std");
 const builtin = @import("builtin");
 
-// Although this function looks imperative, note that its job is to
-// declaratively construct a build graph that will be executed by an external
-// runner.
 pub fn build(b: *std.Build) !void {
-    // Standard target options allows the person running `zig build` to choose
-    // what target to build for. Here we do not override the defaults, which
-    // means any target is allowed, and the default is native. Other options
-    // for restricting supported target set are available.
     const target = b.standardTargetOptions(.{});
-
-    // Standard optimization options allow the person running `zig build` to select
-    // between Debug, ReleaseSafe, ReleaseFast, and ReleaseSmall. Here we do not
-    // set a preferred release mode, allowing the user to decide how to optimize.
-    // Default is Debug.
     const optimize = b.standardOptimizeOption(.{});
 
     const exe = b.addExecutable(.{
@@ -30,8 +18,6 @@ pub fn build(b: *std.Build) !void {
         // `brew install sdl2_ttf`
         exe.addLibraryPath(.{ .cwd_relative = "/opt/homebrew/lib" });
         exe.addIncludePath(.{ .cwd_relative = "/opt/homebrew/include" });
-    } else {
-        exe.linkLibC();
     }
 
     exe.linkSystemLibrary("SDL2");
@@ -44,8 +30,7 @@ pub fn build(b: *std.Build) !void {
     exe.root_module.addImport("grapheme", zg.module("grapheme"));
     exe.root_module.addImport("code_point", zg.module("code_point"));
 
-    const ada_dep = b.dependency("ada", .{});
-    // // exe.linkLibrary("lib/libada.a");
+    const ada_dep = b.dependency("ada-zig", .{});
     exe.root_module.addImport("ada", ada_dep.module("ada"));
     // exe.addLibraryPath(b.path("lib"));
     // exe.linkSystemLibrary("ada");
