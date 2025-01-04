@@ -220,6 +220,10 @@ pub const FontManager = struct {
     }
 
     fn loadFontAtPath(self: *FontManager, path: []const u8, name: []const u8, size: i32) !bool {
+        if (self.fonts.get(name)) |_| {
+            return true;
+        }
+
         std.debug.print("loading font {s} at path {s} with size {d}\n", .{ name, path, size });
         const path_z = try sliceToSentinelArray(self.allocator, path);
         defer self.allocator.free(path_z);

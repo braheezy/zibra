@@ -30,14 +30,12 @@ pub fn build(b: *std.Build) !void {
         // `brew install sdl2_ttf`
         exe.addLibraryPath(.{ .cwd_relative = "/opt/homebrew/lib" });
         exe.addIncludePath(.{ .cwd_relative = "/opt/homebrew/include" });
-
-        exe.linkSystemLibrary("SDL2");
-        exe.linkSystemLibrary("SDL2_ttf");
     } else {
         exe.linkLibC();
-        exe.linkSystemLibrary("SDL2");
-        exe.linkSystemLibrary("SDL2_ttf");
     }
+
+    exe.linkSystemLibrary("SDL2");
+    exe.linkSystemLibrary("SDL2_ttf");
 
     const known_folders = b.dependency("known-folders", .{}).module("known-folders");
     exe.root_module.addImport("known-folders", known_folders);
@@ -45,6 +43,12 @@ pub fn build(b: *std.Build) !void {
     const zg = b.dependency("zg", .{});
     exe.root_module.addImport("grapheme", zg.module("grapheme"));
     exe.root_module.addImport("code_point", zg.module("code_point"));
+
+    const ada_dep = b.dependency("ada", .{});
+    // // exe.linkLibrary("lib/libada.a");
+    exe.root_module.addImport("ada", ada_dep.module("ada"));
+    // exe.addLibraryPath(b.path("lib"));
+    // exe.linkSystemLibrary("ada");
 
     // This declares intent for the executable to be installed into the
     // standard location when the user invokes the "install" step (the default
