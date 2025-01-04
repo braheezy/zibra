@@ -72,14 +72,11 @@ pub const Browser = struct {
 
     // Create a new Browser instance
     pub fn init(al: std.mem.Allocator) !Browser {
-        std.debug.print("browser.init\n", .{});
         // Initialize SDL
         if (c.SDL_Init(c.SDL_INIT_VIDEO) != 0) {
             c.SDL_Log("Unable to initialize SDL: %s", c.SDL_GetError());
             return error.SDLInitializationFailed;
         }
-
-        std.debug.print("here\n", .{});
 
         // Create a window with correct OS graphics
         const window_flags = switch (builtin.target.os.tag) {
@@ -121,10 +118,8 @@ pub const Browser = struct {
 
     // Free the resources used by the browser
     pub fn free(self: Browser) void {
-        std.debug.print("freeing browser\n", .{});
         // clean up hash map for fonts
         self.font_manager.deinit();
-        // self.allocator.destroy(self.font_manager);
 
         // clean up hash map for sockets, including values
         var sockets_iter = self.socket_map.valueIterator();
@@ -291,10 +286,12 @@ pub const Browser = struct {
         std.log.info("Loading: {s}", .{url.path});
 
         // Do the request, getting back the body of the response.
-        const body = if (std.mem.eql(u8, url.scheme, "file"))
+        const body = if (std.mem.eql(u8, url.scheme, "file:"))
             try url.fileRequest(self.allocator)
-        else if (std.mem.eql(u8, url.scheme, "data"))
+        else if (std.mem.eql(u8, url.scheme, "data:"))
             url.path
+        else if (std.mem.eql(u8, url.scheme, "about:"))
+            url.aboutRequest()
         else
             try url.httpRequest(
                 self.allocator,
@@ -302,7 +299,12 @@ pub const Browser = struct {
                 &self.cache,
                 0,
             );
-        defer self.allocator.free(body);
+
+        defer {
+            if (!std.mem.eql(u8, url.scheme, "about:")) {
+                self.allocator.free(body);
+            }
+        }
 
         // Clean up the response for display
         const parsed_content = try self.lex(body, url.view_source);
@@ -317,7 +319,6 @@ pub const Browser = struct {
         if (view_content) {
             return body;
         }
-
         var content_builder = std.ArrayList(u8).init(self.allocator);
         defer content_builder.deinit();
 
@@ -407,6 +408,9 @@ pub const Browser = struct {
 
     // Draw the browser content
     pub fn draw(self: Browser) !void {
+        if (self.display_list == null) {
+            return;
+        }
         for (self.display_list.?) |item| {
             const screen_y = item.y - self.scroll_offset;
             if (screen_y >= 0 and screen_y < self.window_height) {

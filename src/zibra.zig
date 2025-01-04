@@ -53,10 +53,19 @@ fn zibra() !void {
             std.log.err("Only one URL is supported at a time.", .{});
             return error.BadArguments;
         }
-        url = try Url.init(allocator, arg);
+        url = Url.init(allocator, arg) catch |err| blk: {
+            if (err == error.InvalidUrl) {
+                break :blk try Url.init(allocator, "about:blank");
+            } else {
+                return err;
+            }
+        };
     }
 
     defer if (url) |u| u.free(allocator);
+
+    dbg("url.scheme: {s}\n", .{url.?.scheme});
+    dbg("url.path: {s}\n", .{url.?.path});
 
     // Initialize browser
     var b = try Browser.init(allocator);

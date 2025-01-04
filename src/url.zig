@@ -393,6 +393,13 @@ pub const Url = struct {
         return new_url;
     }
 
+    pub fn aboutRequest(self: Url) []const u8 {
+        // This is a special case for about:blank
+        // We might support more about pages eventually
+        _ = self;
+        return "<html><body></body></html>";
+    }
+
     pub fn httpRequest(
         self: Url,
         al: std.mem.Allocator,
