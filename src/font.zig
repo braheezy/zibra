@@ -395,46 +395,6 @@ pub const FontManager = struct {
         return new_glyph;
     }
 
-    pub fn renderText(self: *FontManager, text: []const u8, x: i32, y: i32) !void {
-        const font = self.fonts.get(self.current_font) orelse return error.LoadFailed;
-        var current_x = x;
-        var current_y = y;
-
-        const gd = try grapheme.GraphemeData.init(self.allocator);
-        defer gd.deinit();
-
-        const window_width: i32 = browser.window_width;
-
-        var iter = grapheme.Iterator.init(text, &gd);
-        while (iter.next()) |gc| {
-            if (gc.bytes(text)[0] == '\n') {
-                current_y += font.line_height;
-                current_x = x;
-                continue;
-            }
-
-            // For each grapheme cluster, render it as a single unit
-            const cluster_bytes = gc.bytes(text);
-            const glyph = try self.getGlyph(cluster_bytes);
-
-            // Wrap text to the next line if it exceeds the window width
-            if (current_x + glyph.w > window_width - browser.h_offset) {
-                current_y += font.line_height;
-                current_x = x;
-            }
-
-            var dst_rect: c.SDL_Rect = .{
-                .x = current_x,
-                .y = current_y,
-                .w = glyph.w,
-                .h = glyph.h,
-            };
-
-            _ = c.SDL_RenderCopy(self.renderer, glyph.texture.?, null, &dst_rect);
-            current_x += glyph.w;
-        }
-    }
-
     fn pickFontForCharacter(self: *FontManager, codepoint: u21) ?*Font {
         const categories = [_]FontCategory{ .latin, .cjk, .emoji };
 

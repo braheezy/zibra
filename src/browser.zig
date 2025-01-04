@@ -69,6 +69,8 @@ pub const Browser = struct {
     // Window dimensions
     window_width: i32 = initial_window_width,
     window_height: i32 = initial_window_height,
+    // Flag to indicate if text should be right-to-left
+    rtl_text: bool = false,
 
     // Create a new Browser instance
     pub fn init(al: std.mem.Allocator) !Browser {
@@ -476,71 +478,101 @@ pub const Browser = struct {
         var display_list = std.ArrayList(DisplayItem).init(self.allocator);
         defer display_list.deinit();
 
-        var cursor_x: i32 = h_offset;
+        var cursor_x: i32 = if (self.rtl_text) self.window_width - scrollbar_width - h_offset else h_offset;
         var cursor_y: i32 = v_offset;
 
         const gd = try grapheme.GraphemeData.init(self.allocator);
         defer gd.deinit();
 
         var iter = grapheme.Iterator.init(text, &gd);
-        var newline_count: u8 = 0;
-
-        // Skip initial newlines
-        while (iter.next()) |gc| {
-            const cluster_bytes = gc.bytes(text);
-
-            if (std.mem.eql(u8, cluster_bytes, "\n")) {
-                continue;
-            }
-
-            // Stop skipping once a non-newline is encountered
-            break;
-        }
-
-        // Reset iterator for normal processing
-        iter = grapheme.Iterator.init(text, &gd);
-        newline_count = 0;
+        var line_graphemes = std.ArrayList([]const u8).init(self.allocator);
+        defer line_graphemes.deinit();
 
         while (iter.next()) |gc| {
             const cluster_bytes = gc.bytes(text);
 
-            // Handle newline characters
+            // Handle newline characters (end of a line)
             if (std.mem.eql(u8, cluster_bytes, "\n")) {
-                newline_count += 1;
-                cursor_x = h_offset;
-
-                if (newline_count == 1) {
-                    // Single newline → Line break
-                    cursor_y += self.font_manager.current_font.?.line_height;
-                } else if (newline_count == 2) {
-                    // Double newline → Paragraph break
-                    cursor_y += self.font_manager.current_font.?.line_height * 2;
+                if (self.rtl_text) {
+                    std.mem.reverse([]const u8, line_graphemes.items);
                 }
 
+                // Process the collected line
+                for (line_graphemes.items) |gme| {
+                    const glyph = try self.font_manager.getGlyph(gme);
+
+                    // Adjust for line wrapping
+                    if (self.rtl_text) {
+                        if (cursor_x - glyph.w < h_offset) {
+                            cursor_x = self.window_width - scrollbar_width - h_offset;
+                            cursor_y += self.font_manager.current_font.?.line_height;
+                        }
+                    } else {
+                        if (cursor_x + glyph.w > self.window_width - scrollbar_width) {
+                            cursor_x = h_offset;
+                            cursor_y += self.font_manager.current_font.?.line_height;
+                        }
+                    }
+
+                    try display_list.append(.{
+                        .x = if (self.rtl_text) cursor_x - glyph.w else cursor_x,
+                        .y = cursor_y,
+                        .glyph = glyph,
+                    });
+
+                    if (self.rtl_text) {
+                        cursor_x -= glyph.w;
+                    } else {
+                        cursor_x += glyph.w;
+                    }
+                }
+
+                // Move to the next line
+                cursor_x = if (self.rtl_text) self.window_width - scrollbar_width - h_offset else h_offset;
+                cursor_y += self.font_manager.current_font.?.line_height;
+
+                // Clear the current line's graphemes
+                line_graphemes.clearRetainingCapacity();
                 continue;
             }
 
-            // Reset newline counter for non-newline characters
-            newline_count = 0;
+            // Collect graphemes for the current line
+            try line_graphemes.append(cluster_bytes);
+        }
 
-            // Get or create a Glyph for this grapheme cluster
-            const glyph = try self.font_manager.getGlyph(cluster_bytes);
-
-            // Adjust for line wrapping
-            if (cursor_x + glyph.w > self.window_width - scrollbar_width) {
-                cursor_x = h_offset;
-                cursor_y += self.font_manager.current_font.?.line_height;
+        // Process the final line if there are remaining graphemes
+        if (line_graphemes.items.len > 0) {
+            if (self.rtl_text) {
+                std.mem.reverse([]const u8, line_graphemes.items);
             }
 
-            // Add the glyph to the display list
-            try display_list.append(.{
-                .x = cursor_x,
-                .y = cursor_y,
-                .glyph = glyph,
-            });
+            for (line_graphemes.items) |gme| {
+                const glyph = try self.font_manager.getGlyph(gme);
 
-            // Advance cursor for the next glyph
-            cursor_x += glyph.w;
+                if (self.rtl_text) {
+                    if (cursor_x - glyph.w < h_offset) {
+                        cursor_x = self.window_width - scrollbar_width - h_offset;
+                        cursor_y += self.font_manager.current_font.?.line_height;
+                    }
+                } else {
+                    if (cursor_x + glyph.w > self.window_width - scrollbar_width) {
+                        cursor_x = h_offset;
+                        cursor_y += self.font_manager.current_font.?.line_height;
+                    }
+                }
+
+                try display_list.append(.{
+                    .x = if (self.rtl_text) cursor_x - glyph.w else cursor_x,
+                    .y = cursor_y,
+                    .glyph = glyph,
+                });
+
+                if (self.rtl_text) {
+                    cursor_x -= glyph.w;
+                } else {
+                    cursor_x += glyph.w;
+                }
+            }
         }
 
         self.content_height = cursor_y + self.font_manager.current_font.?.line_height;

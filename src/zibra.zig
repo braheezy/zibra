@@ -41,12 +41,12 @@ fn zibra() !void {
     defer std.process.argsFree(allocator, args);
 
     // Hold values, if provided
-    var debug_flag = false;
+    var rtl_flag = false;
     var url: ?Url = null;
 
     for (args[1..]) |arg| {
-        if (std.mem.eql(u8, arg, "-v")) {
-            debug_flag = true;
+        if (std.mem.eql(u8, arg, "-rtl")) {
+            rtl_flag = true;
             continue;
         }
         if (url) |_| {
@@ -64,12 +64,10 @@ fn zibra() !void {
 
     defer if (url) |u| u.free(allocator);
 
-    dbg("url.scheme: {s}\n", .{url.?.scheme});
-    dbg("url.path: {s}\n", .{url.?.path});
-
     // Initialize browser
     var b = try Browser.init(allocator);
     defer b.free();
+    b.rtl_text = rtl_flag;
 
     // Load fonts
     try b.font_manager.loadSystemFont(16);
