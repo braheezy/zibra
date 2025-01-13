@@ -2,8 +2,11 @@ const std = @import("std");
 const builtin = @import("builtin");
 
 const grapheme = @import("grapheme");
+const code_point = @import("code_point");
 const FontManager = @import("font.zig").FontManager;
 const Glyph = @import("font.zig").Glyph;
+const FontWeight = @import("font.zig").FontWeight;
+const FontSlant = @import("font.zig").FontSlant;
 const Url = @import("url.zig").Url;
 const Connection = @import("url.zig").Connection;
 const Cache = @import("cache.zig").Cache;
@@ -44,6 +47,16 @@ const DisplayItem = struct {
     glyph: Glyph,
 };
 
+pub const TokenType = enum {
+    Text,
+    Tag,
+};
+
+pub const Token = struct {
+    ty: TokenType,
+    content: []const u8, // For text tokens, the text; for tag tokens, the tag name
+};
+
 // Browser is the main struct that holds the state of the browser.
 pub const Browser = struct {
     // Memory allocator for the browser
@@ -61,7 +74,7 @@ pub const Browser = struct {
     // List of items to be displayed
     display_list: ?[]DisplayItem = null,
     // Current content to be displayed
-    current_content: ?[]const u8 = null,
+    current_content: ?[]const Token = null,
     // Total height of the content
     content_height: i32 = 0,
     // Current scroll offset
@@ -308,24 +321,134 @@ pub const Browser = struct {
             }
         }
 
-        // Clean up the response for display
-        const parsed_content = try self.lex(body, url.view_source);
-        defer self.allocator.free(parsed_content);
+        if (url.view_source) {
+            // If “view_source” is true, maybe you do NOTHING but show raw text.
+            // Or you still produce tokens, up to you.
+            // Minimal approach: return an empty token list or a single text token:
+            var plain = std.ArrayList(Token).init(self.allocator);
+            defer plain.deinit();
 
-        // Arrange the response for display
-        try self.layout(parsed_content);
+            const body_copy = try self.allocator.dupe(u8, body);
+            defer self.allocator.free(body_copy);
+
+            try plain.append(Token{ .ty = .Text, .content = body_copy });
+
+            const plain_tokens_slice = try plain.toOwnedSlice();
+            try self.layout(plain_tokens_slice);
+        } else {
+            var tokens_array = try self.lexTokens(body);
+            // defer { };
+
+            const tok_slice = try tokens_array.toOwnedSlice();
+            try self.layout(tok_slice);
+        }
     }
 
     // Show the body of the response, sans tags
-    pub fn lex(self: *Browser, body: []const u8, view_content: bool) ![]const u8 {
-        if (view_content) {
-            return body;
-        }
-        var content_builder = std.ArrayList(u8).init(self.allocator);
-        defer content_builder.deinit();
+    // pub fn lex(self: *Browser, body: []const u8, view_content: bool) ![]const u8 {
+    //     if (view_content) {
+    //         return body;
+    //     }
+    //     var content_builder = std.ArrayList(u8).init(self.allocator);
+    //     defer content_builder.deinit();
 
-        var temp_line = std.ArrayList(u8).init(self.allocator);
-        defer temp_line.deinit();
+    //     var temp_line = std.ArrayList(u8).init(self.allocator);
+    //     defer temp_line.deinit();
+
+    //     var tag_buffer = std.ArrayList(u8).init(self.allocator);
+    //     defer tag_buffer.deinit();
+
+    //     var in_tag = false;
+    //     var i: usize = 0;
+
+    //     while (i < body.len) : (i += 1) {
+    //         const char = body[i];
+
+    //         // Entering a tag
+    //         if (char == '<') {
+    //             in_tag = true;
+
+    //             // Flush any text we had *outside* of a tag
+    //             if (temp_line.items.len > 0) {
+    //                 try content_builder.appendSlice(temp_line.items);
+    //                 temp_line.clearAndFree();
+    //             }
+
+    //             // Clear the tag_buffer to start fresh
+    //             tag_buffer.clearRetainingCapacity();
+    //             continue;
+    //         }
+
+    //         // Exiting a tag
+    //         if (char == '>') {
+    //             in_tag = false;
+
+    //             // Now tag_buffer contains something like "p" or "/p" or "h1"
+    //             const tag_text = tag_buffer.items;
+
+    //             if (std.mem.eql(u8, tag_text, "p") or std.mem.eql(u8, tag_text, "/p")) {
+    //                 // Paragraph break -> two newlines
+    //                 try content_builder.appendSlice("\n\n");
+    //             } else if (std.mem.eql(u8, tag_text, "br")) {
+    //                 // Single line break
+    //                 try content_builder.appendSlice("\n");
+    //             } else if (std.mem.eql(u8, tag_text, "h1") or std.mem.eql(u8, tag_text, "/h1") or
+    //                 std.mem.eql(u8, tag_text, "h2") or std.mem.eql(u8, tag_text, "/h2") or
+    //                 std.mem.eql(u8, tag_text, "h3") or std.mem.eql(u8, tag_text, "/h3"))
+    //             {
+    //                 // For headings, add two newlines so it stands out
+    //                 try content_builder.appendSlice("\n\n");
+    //             }
+    //             // else skip other tags
+
+    //             continue;
+    //         }
+
+    //         // If we're inside a tag, accumulate chars into tag_buffer
+    //         if (in_tag) {
+    //             try tag_buffer.append(char);
+    //             continue;
+    //         }
+
+    //         // Handle entities only outside tags
+    //         if (char == '&') {
+    //             if (lexEntity(body[i..])) |entity| {
+    //                 try temp_line.appendSlice(entity);
+    //                 i += std.mem.indexOf(u8, body[i..], ";").?; // Skip to the end of the entity
+    //             } else {
+    //                 try temp_line.append('&');
+    //             }
+    //             continue;
+    //         }
+
+    //         // If it's a newline, keep it (we can interpret them as spaces later)
+    //         if (char == '\n') {
+    //             try temp_line.append('\n');
+    //         } else {
+    //             try temp_line.append(char);
+    //         }
+    //     }
+
+    //     // Add remaining content to the final result
+    //     if (temp_line.items.len > 0) {
+    //         try content_builder.appendSlice(temp_line.items);
+    //     }
+
+    //     // Trim leading whitespace and newlines
+    //     const final_content = std.mem.trimLeft(u8, content_builder.items, " \t\n\r");
+
+    //     return try self.allocator.dupe(u8, final_content);
+    // }
+
+    pub fn lexTokens(self: *Browser, body: []const u8) !std.ArrayList(Token) {
+        // We'll store tokens here
+        var tokens = std.ArrayList(Token).init(self.allocator);
+
+        var temp_text = std.ArrayList(u8).init(self.allocator);
+        defer temp_text.deinit();
+
+        var tag_buffer = std.ArrayList(u8).init(self.allocator);
+        defer tag_buffer.deinit();
 
         var in_tag = false;
         var i: usize = 0;
@@ -333,58 +456,66 @@ pub const Browser = struct {
         while (i < body.len) : (i += 1) {
             const char = body[i];
 
-            // Entering a tag
             if (char == '<') {
+                // We’re entering a tag
+                // If we have accumulated text, flush it to a TEXT token
+                if (temp_text.items.len > 0) {
+                    try tokens.append(Token{
+                        .ty = .Text,
+                        .content = try self.allocator.dupe(u8, temp_text.items),
+                    });
+                    temp_text.clearRetainingCapacity();
+                }
+
                 in_tag = true;
-
-                // Flush accumulated text before the tag
-                if (temp_line.items.len > 0) {
-                    try content_builder.appendSlice(temp_line.items);
-                    temp_line.clearAndFree();
-                }
+                tag_buffer.clearRetainingCapacity();
                 continue;
             }
 
-            // Exiting a tag
             if (char == '>') {
+                // We’re leaving a tag
                 in_tag = false;
+
+                // Now tag_buffer has something like "b", "/b", "p", "/p"
+                // We'll produce a TAG token
+                try tokens.append(Token{
+                    .ty = .Tag,
+                    .content = try self.allocator.dupe(u8, tag_buffer.items),
+                });
                 continue;
             }
 
-            // Inside a tag, skip all characters
             if (in_tag) {
+                // Accumulate chars inside the < > pair
+                try tag_buffer.append(char);
                 continue;
             }
 
-            // Handle entities only outside tags
+            // Outside a tag
             if (char == '&') {
+                // Entities
                 if (lexEntity(body[i..])) |entity| {
-                    try temp_line.appendSlice(entity);
-                    i += std.mem.indexOf(u8, body[i..], ";").?; // Skip to the end of the entity
+                    try temp_text.appendSlice(entity);
+                    i += std.mem.indexOf(u8, body[i..], ";").?;
                 } else {
-                    try temp_line.append('&');
+                    try temp_text.append('&');
                 }
                 continue;
             }
 
-            // Handle regular characters and whitespace
-            if (char == '\n') {
-                // Normalize newlines as spaces
-                try temp_line.append('\n');
-            } else {
-                try temp_line.append(char);
-            }
+            // If it’s a raw newline, keep it as is. We will handle it in layout.
+            try temp_text.append(char);
         }
 
-        // Add remaining content to the final result
-        if (temp_line.items.len > 0) {
-            try content_builder.appendSlice(temp_line.items);
+        // If there's leftover text at the end, produce a final TEXT token
+        if (temp_text.items.len > 0) {
+            try tokens.append(Token{
+                .ty = .Text,
+                .content = try self.allocator.dupe(u8, temp_text.items),
+            });
         }
 
-        // Trim leading whitespace and newlines
-        const final_content = std.mem.trimLeft(u8, content_builder.items, " \t\n\r");
-
-        return try self.allocator.dupe(u8, final_content);
+        return tokens;
     }
 
     pub fn lexEntity(text: []const u8) ?[]const u8 {
@@ -470,113 +601,211 @@ pub const Browser = struct {
     }
 
     // Arrange the content for display
-    pub fn layout(self: *Browser, text: []const u8) !void {
-        if (!std.unicode.utf8ValidateSlice(text)) {
-            return error.InvalidUTF8;
-        }
-
+    pub fn layout(self: *Browser, tokens: []const Token) !void {
         var display_list = std.ArrayList(DisplayItem).init(self.allocator);
         defer display_list.deinit();
 
-        var cursor_x: i32 = if (self.rtl_text) self.window_width - scrollbar_width - h_offset else h_offset;
+        var is_bold: bool = false;
+        var is_italic: bool = false;
+
+        var cursor_x: i32 = if (self.rtl_text)
+            self.window_width - scrollbar_width - h_offset
+        else
+            h_offset;
+
         var cursor_y: i32 = v_offset;
 
-        const gd = try grapheme.GraphemeData.init(self.allocator);
+        const line_height = self.font_manager.current_font.?.line_height;
+
+        for (tokens) |tok| {
+            switch (tok.ty) {
+                /////////////////////////////////////////////////////////////////////
+                // TEXT TOKEN: inline by default, no forced break at the end
+                /////////////////////////////////////////////////////////////////////
+                .Text => {
+                    // Make a local copy
+                    var text_copy = try self.allocator.dupe(u8, tok.content);
+                    defer self.allocator.free(text_copy);
+
+                    // Convert literal \n in HTML to space so it doesn't cause a line break
+                    for (text_copy, 0..) |byte, idx| {
+                        if (byte == '\n') text_copy[idx] = ' ';
+                    }
+
+                    // Split on spaces/tabs, measure, and place graphemes inline
+                    var word_tokenizer = std.mem.tokenizeSequence(u8, text_copy, " \t\r");
+                    var local_x = cursor_x;
+
+                    while (word_tokenizer.next()) |word| {
+                        if (word.len == 0) continue;
+
+                        const measured_w = try self.measureWordWidthWithStyle(word, is_bold, is_italic);
+
+                        // line wrapping if word doesn't fit horizontally
+                        if (self.rtl_text) {
+                            if (local_x - measured_w < h_offset) {
+                                local_x = self.window_width - scrollbar_width - h_offset;
+                                cursor_y += line_height;
+                            }
+                        } else {
+                            if (local_x + measured_w > (self.window_width - scrollbar_width)) {
+                                local_x = h_offset;
+                                cursor_y += line_height;
+                            }
+                        }
+
+                        // Render each grapheme
+                        var gd = try grapheme.GraphemeData.init(self.allocator);
+                        defer gd.deinit();
+                        var g_iter = grapheme.Iterator.init(word, &gd);
+
+                        var graphemes_array = std.ArrayList([]const u8).init(self.allocator);
+                        defer graphemes_array.deinit();
+
+                        while (g_iter.next()) |gc| {
+                            try graphemes_array.append(gc.bytes(word));
+                        }
+                        if (self.rtl_text) {
+                            std.mem.reverse([]const u8, graphemes_array.items);
+                        }
+
+                        var glyph_x = local_x;
+                        for (graphemes_array.items) |gme| {
+                            const weight: FontWeight = if (is_bold) .Bold else .Normal;
+                            const slantness: FontSlant = if (is_italic) .Italic else .Roman;
+                            const glyph = try self.font_manager.getStyledGlyph(gme, weight, slantness);
+
+                            try display_list.append(.{
+                                .x = if (self.rtl_text) glyph_x - glyph.w else glyph_x,
+                                .y = cursor_y,
+                                .glyph = glyph,
+                            });
+
+                            if (self.rtl_text) {
+                                glyph_x -= glyph.w;
+                            } else {
+                                glyph_x += glyph.w;
+                            }
+                        }
+
+                        local_x = glyph_x;
+                    }
+
+                    // After finishing this Text token, do NOT line-break
+                    // let it remain on the same line
+                    cursor_x = local_x;
+                },
+
+                /////////////////////////////////////////////////////////////////////
+                // TAG TOKEN: line breaks only for <p>, <br>, toggle is_bold/is_italic for <b>, <i>
+                /////////////////////////////////////////////////////////////////////
+                .Tag => {
+                    const lower_copy = try self.allocator.dupe(u8, tok.content);
+                    defer self.allocator.free(lower_copy);
+                    _ = std.ascii.lowerString(lower_copy, tok.content);
+
+                    const t = std.mem.trim(u8, lower_copy, " \t\r\n");
+
+                    // Bold/italic toggles
+                    if (std.mem.eql(u8, t, "b")) {
+                        is_bold = true;
+                        std.debug.print("<b> => is_bold = true\n", .{});
+                    } else if (std.mem.eql(u8, t, "/b")) {
+                        is_bold = false;
+                        std.debug.print("</b> => is_bold = false\n", .{});
+                    } else if (std.mem.eql(u8, t, "i")) {
+                        std.debug.print("<i> => is_italic = true\n", .{});
+                        is_italic = true;
+                    } else if (std.mem.eql(u8, t, "/i")) {
+                        std.debug.print("<i> => is_italic = false\n", .{});
+                        is_italic = false;
+                    }
+                    // Paragraph => line break plus extra gap
+                    else if (std.mem.eql(u8, t, "p") or std.mem.eql(u8, t, "/p")) {
+                        cursor_y += line_height * 2;
+                        cursor_x = if (self.rtl_text)
+                            self.window_width - scrollbar_width - h_offset
+                        else
+                            h_offset;
+                    }
+                    // <br> => single line break
+                    else if (std.mem.eql(u8, t, "br")) {
+                        cursor_y += line_height;
+                        cursor_x = if (self.rtl_text)
+                            self.window_width - scrollbar_width - h_offset
+                        else
+                            h_offset;
+                    } else {
+                        // skip others
+                    }
+                },
+            }
+        }
+
+        self.content_height = cursor_y;
+        self.display_list = try display_list.toOwnedSlice();
+    }
+
+    /// Measures how many pixels wide `word` would occupy if we render it grapheme-by-grapheme.
+    fn measureWordWidth(self: *Browser, word: []const u8) !i32 {
+        var total_w: i32 = 0;
+
+        var gd = try grapheme.GraphemeData.init(self.allocator);
         defer gd.deinit();
 
-        var iter = grapheme.Iterator.init(text, &gd);
-        var line_graphemes = std.ArrayList([]const u8).init(self.allocator);
-        defer line_graphemes.deinit();
+        var g_iter = grapheme.Iterator.init(word, &gd);
+        while (g_iter.next()) |gc| {
+            const cluster_bytes = gc.bytes(word);
+            const glyph = try self.font_manager.getGlyph(cluster_bytes);
+            total_w += glyph.w;
+        }
+        return total_w;
+    }
 
-        while (iter.next()) |gc| {
-            const cluster_bytes = gc.bytes(text);
+    /// Measures a word by summing the widths of its graphemes under the current style.
+    fn measureWordWidthWithStyle(self: *Browser, word: []const u8, bold: bool, italic: bool) !i32 {
+        // 1) Determine the right font or fallback
+        const weight: FontWeight = if (bold) .Bold else .Normal;
+        const slant: FontSlant = if (italic) .Italic else .Roman;
 
-            // Handle newline characters (end of a line)
-            if (std.mem.eql(u8, cluster_bytes, "\n")) {
-                if (self.rtl_text) {
-                    std.mem.reverse([]const u8, line_graphemes.items);
-                }
+        var styled_font = self.font_manager.pickFontForCharacterStyle(
+            firstCodePoint(word),
+            weight,
+            slant,
+        );
+        var style_set = false;
+        if (styled_font == null) {
+            // fallback
+            styled_font = self.font_manager.pickFontForCharacter(firstCodePoint(word));
+            if (styled_font == null) return error.NoFontForGlyph;
 
-                // Process the collected line
-                for (line_graphemes.items) |gme| {
-                    const glyph = try self.font_manager.getGlyph(gme);
-
-                    // Adjust for line wrapping
-                    if (self.rtl_text) {
-                        if (cursor_x - glyph.w < h_offset) {
-                            cursor_x = self.window_width - scrollbar_width - h_offset;
-                            cursor_y += self.font_manager.current_font.?.line_height;
-                        }
-                    } else {
-                        if (cursor_x + glyph.w > self.window_width - scrollbar_width) {
-                            cursor_x = h_offset;
-                            cursor_y += self.font_manager.current_font.?.line_height;
-                        }
-                    }
-
-                    try display_list.append(.{
-                        .x = if (self.rtl_text) cursor_x - glyph.w else cursor_x,
-                        .y = cursor_y,
-                        .glyph = glyph,
-                    });
-
-                    if (self.rtl_text) {
-                        cursor_x -= glyph.w;
-                    } else {
-                        cursor_x += glyph.w;
-                    }
-                }
-
-                // Move to the next line
-                cursor_x = if (self.rtl_text) self.window_width - scrollbar_width - h_offset else h_offset;
-                cursor_y += self.font_manager.current_font.?.line_height;
-
-                // Clear the current line's graphemes
-                line_graphemes.clearRetainingCapacity();
-                continue;
-            }
-
-            // Collect graphemes for the current line
-            try line_graphemes.append(cluster_bytes);
+            // Synthetic styling
+            var new_style: c_int = 0;
+            if (bold) new_style |= c.TTF_STYLE_BOLD;
+            if (italic) new_style |= c.TTF_STYLE_ITALIC;
+            c.TTF_SetFontStyle(styled_font.?.font_handle, new_style);
+            style_set = true;
         }
 
-        // Process the final line if there are remaining graphemes
-        if (line_graphemes.items.len > 0) {
-            if (self.rtl_text) {
-                std.mem.reverse([]const u8, line_graphemes.items);
-            }
+        const fh = styled_font.?.font_handle;
 
-            for (line_graphemes.items) |gme| {
-                const glyph = try self.font_manager.getGlyph(gme);
+        // 2) Use TTF_SizeUTF8 to measure the entire word
+        var w: c_int = 0;
+        var h: c_int = 0;
 
-                if (self.rtl_text) {
-                    if (cursor_x - glyph.w < h_offset) {
-                        cursor_x = self.window_width - scrollbar_width - h_offset;
-                        cursor_y += self.font_manager.current_font.?.line_height;
-                    }
-                } else {
-                    if (cursor_x + glyph.w > self.window_width - scrollbar_width) {
-                        cursor_x = h_offset;
-                        cursor_y += self.font_manager.current_font.?.line_height;
-                    }
-                }
+        // Convert word to a null-terminated sentinel
+        const sentinel = try sliceToSentinelArray(self.allocator, word);
+        defer self.allocator.free(sentinel);
 
-                try display_list.append(.{
-                    .x = if (self.rtl_text) cursor_x - glyph.w else cursor_x,
-                    .y = cursor_y,
-                    .glyph = glyph,
-                });
-
-                if (self.rtl_text) {
-                    cursor_x -= glyph.w;
-                } else {
-                    cursor_x += glyph.w;
-                }
-            }
+        if (c.TTF_SizeUTF8(fh, sentinel, &w, &h) != 0) {
+            if (style_set) c.TTF_SetFontStyle(fh, c.TTF_STYLE_NORMAL);
+            return error.RenderFailed;
         }
 
-        self.content_height = cursor_y + self.font_manager.current_font.?.line_height;
-        self.display_list = try display_list.toOwnedSlice();
+        // 3) Restore synthetic style if needed
+        if (style_set) c.TTF_SetFontStyle(fh, c.TTF_STYLE_NORMAL);
+
+        return w;
     }
 };
 
@@ -586,4 +815,10 @@ fn sliceToSentinelArray(allocator: std.mem.Allocator, slice: []const u8) ![:0]co
     const arr = try allocator.allocSentinel(u8, len, 0);
     @memcpy(arr, slice);
     return arr;
+}
+
+fn firstCodePoint(word: []const u8) u21 {
+    var it = code_point.Iterator{ .bytes = word };
+    if (it.next()) |cp| return cp.code;
+    return 0; // fallback if empty
 }

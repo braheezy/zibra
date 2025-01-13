@@ -12,6 +12,16 @@ const c = @cImport({
     @cInclude("SDL2/SDL_ttf.h");
 });
 
+pub const FontWeight = enum {
+    Normal,
+    Bold,
+};
+
+pub const FontSlant = enum {
+    Roman,
+    Italic,
+};
+
 pub const FontCategory = enum {
     latin,
     cjk,
@@ -53,6 +63,8 @@ const unicode_ranges = FontCategoryRanges{
 const FontEntry = struct {
     name: []const u8,
     category: FontCategory,
+    weight: FontWeight,
+    slant: FontSlant,
 };
 
 const system_fonts = switch (builtin.target.os.tag) {
@@ -66,9 +78,24 @@ const system_fonts = switch (builtin.target.os.tag) {
             "/System/Library/Fonts/Supplemental",
         },
         .fonts = &[_]FontEntry{
-            .{ .name = "Arial Unicode", .category = .latin },
-            .{ .name = "Arial Unicode", .category = .cjk },
-            .{ .name = "Apple Color Emoji", .category = .emoji },
+            .{
+                .name = "Arial Unicode",
+                .category = .latin,
+                .weight = .Normal,
+                .slant = .Roman,
+            },
+            .{
+                .name = "Arial Unicode",
+                .category = .cjk,
+                .weight = .Normal,
+                .slant = .Roman,
+            },
+            .{
+                .name = "Apple Color Emoji",
+                .category = .emoji,
+                .weight = .Normal,
+                .slant = .Roman,
+            },
         },
     },
     .linux => struct {
@@ -85,9 +112,43 @@ const system_fonts = switch (builtin.target.os.tag) {
             "/usr/share/fonts/twemoji",
         },
         .fonts = &[_]FontEntry{
-            .{ .name = "NotoSans-Regular", .category = .latin },
-            .{ .name = "NotoSansCJK-VF", .category = .cjk },
-            .{ .name = "NotoColorEmoji", .category = .emoji },
+            .{
+                .name = "NotoSans-Regular",
+                .category = .latin,
+                .weight = .Normal,
+                .slant = .Roman,
+            },
+            .{
+                .name = "NotoSans-Bold",
+                .category = .latin,
+                .weight = .Bold,
+                .slant = .Roman,
+            },
+            .{
+                .name = "NotoSans-Italic",
+                .category = .latin,
+                .weight = .Normal,
+                .slant = .Italic,
+            },
+            .{
+                .name = "NotoSans-BoldItalic",
+                .category = .latin,
+                .weight = .Bold,
+                .slant = .Italic,
+            },
+
+            .{
+                .name = "NotoSansCJK-VF",
+                .category = .cjk,
+                .weight = .Normal,
+                .slant = .Roman,
+            },
+            .{
+                .name = "NotoColorEmoji",
+                .category = .emoji,
+                .weight = .Normal,
+                .slant = .Roman,
+            },
         },
     },
     else => @compileError("Unsupported operating system"),
@@ -100,10 +161,15 @@ pub const Glyph = struct {
     h: i32,
 };
 
+const CacheEntry = struct {
+    glyphs_by_style: std.AutoHashMap(u8, Glyph),
+};
+
 pub const Font = struct {
+    name: []const u8,
     font_handle: *c.TTF_Font,
     // Glyph cache or atlas.
-    glyphs: std.StringHashMap(Glyph),
+    glyphs: std.StringHashMap(CacheEntry),
     line_height: i32,
     font_rw: ?*c.SDL_RWops,
 };
@@ -132,10 +198,23 @@ pub const FontManager = struct {
         while (fonts_it.next()) |entry| {
             var f = entry.value_ptr.*;
 
-            // Destroy glyph textures
-            var glyphs_it = f.glyphs.iterator();
-            while (glyphs_it.next()) |glyph_entry| {
-                c.SDL_DestroyTexture(glyph_entry.value_ptr.*.texture.?);
+            var outer_it = f.glyphs.iterator();
+            while (outer_it.next()) |outer_entry| {
+                // This pointer was allocated once in getOrPut(stable_key).
+                // Freed here exactly once.
+                self.allocator.free(outer_entry.key_ptr.*);
+
+                // For each style => destroy the texture
+                var cache_entry = outer_entry.value_ptr.*;
+                var style_it = cache_entry.glyphs_by_style.iterator();
+                while (style_it.next()) |style_entry| {
+                    c.SDL_DestroyTexture(style_entry.value_ptr.*.texture.?);
+
+                    // ***No further free for .grapheme***
+                    // Because style_entry.value_ptr.*.grapheme == outer_entry.key_ptr.*
+                    // Freed exactly once above
+                }
+                cache_entry.glyphs_by_style.deinit();
             }
             f.glyphs.deinit();
 
@@ -175,9 +254,6 @@ pub const FontManager = struct {
         // Add user font directory first to prefer them.
         const home_dir = try known_folders.getPath(self.allocator, .home) orelse return error.NoHomeDir;
         defer self.allocator.free(home_dir);
-
-        const user_fonts_dir = try std.fmt.allocPrint(self.allocator, "{s}/Library/Fonts", .{home_dir});
-        try paths.append(user_fonts_dir);
 
         // Add system font directories
         for (system_fonts.paths) |dir| {
@@ -239,8 +315,9 @@ pub const FontManager = struct {
 
         const font = try self.allocator.create(Font);
         font.* = Font{
+            .name = name,
             .font_handle = fh.?,
-            .glyphs = std.StringHashMap(Glyph).init(self.allocator),
+            .glyphs = std.StringHashMap(CacheEntry).init(self.allocator),
             .line_height = c.TTF_FontLineSkip(fh),
             .font_rw = null,
         };
@@ -277,8 +354,6 @@ pub const FontManager = struct {
 
                 if (try self.tryLoadFontFromPaths(font.name, search_paths.items, size)) {
                     std.log.debug("Loaded {s} font at size {d}: {s}", .{ @tagName(category), size, font.name });
-
-                    break; // Stop searching for this category once loaded
                 } else {
                     std.log.warn("Failed to load {s} font: {s}", .{ @tagName(category), font.name });
                 }
@@ -297,105 +372,104 @@ pub const FontManager = struct {
         }
     }
 
-    pub fn getGlyph(self: *FontManager, gme: []const u8) !Glyph {
+    pub fn getStyledGlyph(
+        self: *FontManager,
+        gme: []const u8,
+        weight: FontWeight,
+        slant: FontSlant,
+    ) !Glyph {
         var iter = code_point.Iterator{ .bytes = gme };
+        const codepoint = iter.next() orelse return error.InvalidGrapheme;
 
-        const codepoint = iter.next() orelse {
-            std.log.warn("Failed to extract code point from grapheme: {s}", .{gme});
-            return error.InvalidGrapheme;
-        };
+        // 1) pick or fallback to a styled font
+        var styled_font = self.pickFontForCharacterStyle(codepoint.code, weight, slant);
+        var style_set = false;
+        if (styled_font == null) {
+            std.debug.print("styled fallback\n", .{});
+            styled_font = self.pickFontForCharacter(codepoint.code);
+            if (styled_font == null) return error.NoFontForGlyph;
 
-        // Select the font based on the code point
-        var font = self.pickFontForCharacter(codepoint.code) orelse {
-            std.log.warn("No font found for codepoint: {d}", .{codepoint.code});
-            return error.NoFontForGlyph;
-        };
+            var new_style: c_int = 0;
+            if (weight == .Bold) new_style |= c.TTF_STYLE_BOLD;
+            if (slant == .Italic) new_style |= c.TTF_STYLE_ITALIC;
+            c.TTF_SetFontStyle(styled_font.?.font_handle, new_style);
+            style_set = true;
+        }
+        const font = styled_font.?;
 
-        // Check if the glyph is already in the cache
-        if (font.glyphs.get(gme)) |cached_glyph| {
+        // 2) Outer map key duplication for the *first* time we see `gme`
+        const stable_key = try self.allocator.dupe(u8, gme);
+        var maybe_outer = font.glyphs.get(stable_key);
+
+        var cache_entry_ptr: ?*CacheEntry = null;
+
+        var stable_grapheme_for_glyph: []const u8 = undefined;
+
+        if (maybe_outer) |_| {
+            // Outer key found => re-use existing cache
+            self.allocator.free(stable_key);
+            cache_entry_ptr = &maybe_outer.?; // same outer map entry
+        } else {
+            // Not in outer map => create once
+            const new_entry = CacheEntry{
+                .glyphs_by_style = std.AutoHashMap(u8, Glyph).init(self.allocator),
+            };
+            try font.glyphs.put(stable_key, new_entry);
+
+            // Now fetch it to proceed
+            var inserted = font.glyphs.get(stable_key).?;
+            cache_entry_ptr = &inserted;
+        }
+
+        stable_grapheme_for_glyph = stable_key;
+        const cache_entry = cache_entry_ptr.?;
+
+        // 3) Inner map for style
+        const style_key = styleToKey(weight, slant);
+        const maybe_cached = cache_entry.glyphs_by_style.get(style_key);
+        if (maybe_cached) |cached_glyph| {
+            if (style_set) c.TTF_SetFontStyle(font.font_handle, c.TTF_STYLE_NORMAL);
             return cached_glyph;
         }
 
-        // Render the grapheme using TTF_RenderUTF8_Solid
+        // 4) Render a new glyph once
         const sentinel_gme = try sliceToSentinelArray(self.allocator, gme);
         defer self.allocator.free(sentinel_gme);
 
         const glyph_surface = c.TTF_RenderUTF8_Blended(
             font.font_handle,
             sentinel_gme,
-            c.SDL_Color{ .r = 0x00, .g = 0x00, .b = 0x00, .a = 0xFF },
+            c.SDL_Color{ .r = 0, .g = 0, .b = 0, .a = 255 },
         );
         if (glyph_surface == null) {
-            if (c.TTF_GetError()) |e| {
-                if (e[0] != 0) std.log.err("TTF Error in getGlyph: {s}.", .{e});
-            }
+            if (style_set) c.TTF_SetFontStyle(font.font_handle, c.TTF_STYLE_NORMAL);
             return error.RenderFailed;
         }
         defer c.SDL_FreeSurface(glyph_surface);
 
-        // Create a texture from the final surface
         const glyph_tex = c.SDL_CreateTextureFromSurface(self.renderer, glyph_surface) orelse {
-            if (c.SDL_GetError()) |e| if (e[0] != 0) std.log.err("SDL Error in getGlyph: {s}.", .{e});
+            if (style_set) c.TTF_SetFontStyle(font.font_handle, c.TTF_STYLE_NORMAL);
             return error.RenderFailed;
         };
-        // Enable linear filtering for smooth scaling
         if (c.SDL_SetTextureScaleMode(glyph_tex, c.SDL_ScaleModeLinear) != 0) {
-            std.log.err("Failed to set texture scale mode: {s}", .{c.SDL_GetError()});
+            std.log.err("Scale mode error: {s}", .{c.SDL_GetError()});
         }
 
         const surf = glyph_surface.*;
-
-        const is_emoji = isCodepointEmoji(codepoint.code);
-
-        const new_glyph = if (!is_emoji) Glyph{
-            .grapheme = gme,
+        const new_glyph = Glyph{
+            .grapheme = stable_grapheme_for_glyph, // same stable pointer
             .texture = glyph_tex,
             .w = surf.w,
             .h = surf.h,
-        } else blk: {
-            // Get text height from the current font
-            var miny: i32 = 0;
-            var maxy: i32 = 0;
-            var advance: i32 = 0;
-
-            if (c.TTF_GlyphMetrics32(
-                font.font_handle,
-                codepoint.code,
-                null,
-                null,
-                &miny,
-                &maxy,
-                &advance,
-            ) != 0) {
-                std.log.err("Failed to get glyph metrics: {s}", .{c.TTF_GetError()});
-            }
-
-            // const text_height = maxy - miny; // Approximate visual text height
-            const text_height: i32 = self.min_line_height;
-
-            // Scale emoji proportionally
-            var tmp1: f32 = @floatFromInt(text_height);
-            const tmp2: f32 = @floatFromInt(surf.h);
-            const emoji_scale_factor = tmp1 / tmp2;
-
-            tmp1 = @floatFromInt(surf.w);
-            const emoji_width: i32 = @intFromFloat(tmp1 * emoji_scale_factor);
-            const emoji_height: i32 = @intFromFloat(tmp2 * emoji_scale_factor);
-
-            break :blk Glyph{
-                .grapheme = gme,
-                .texture = glyph_tex,
-                .w = emoji_width,
-                .h = emoji_height,
-            };
         };
 
-        try font.glyphs.put(gme, new_glyph);
+        try cache_entry.glyphs_by_style.put(style_key, new_glyph);
 
+        if (style_set) c.TTF_SetFontStyle(font.font_handle, c.TTF_STYLE_NORMAL);
         return new_glyph;
     }
 
-    fn pickFontForCharacter(self: *FontManager, codepoint: u21) ?*Font {
+    pub fn pickFontForCharacter(self: *FontManager, codepoint: u21) ?*Font {
         const categories = [_]FontCategory{ .latin, .cjk, .emoji };
 
         for (categories) |category| {
@@ -426,6 +500,37 @@ pub const FontManager = struct {
 
         return null; // No matching font found
     }
+
+    pub fn pickFontForCharacterStyle(
+        self: *FontManager,
+        codepoint: u21,
+        weight: FontWeight,
+        slant: FontSlant,
+    ) ?*Font {
+        // 1) Figure out the script
+        const category = getCategory(codepoint) orelse return null;
+
+        // 2) Search for a loaded font that matches this script + weight + slant
+        var it = self.fonts.iterator();
+        while (it.next()) |entry| {
+            const font_name = entry.key_ptr.*;
+            const font_ptr = entry.value_ptr.*;
+
+            // We must look up which category/weight/slant this font_name represents
+            // by comparing to system_fonts. For instance:
+            for (system_fonts.fonts) |sf| {
+                if (std.mem.eql(u8, sf.name, font_name)) {
+                    if (sf.category == category and sf.weight == weight and sf.slant == slant) {
+                        return font_ptr;
+                    }
+                }
+            }
+        }
+
+        // If we didn’t find an exact match, fallback to "Normal Roman"
+        // or whatever logic you like.
+        return self.pickFontForCharacter(codepoint);
+    }
 };
 
 fn sliceToSentinelArray(allocator: std.mem.Allocator, slice: []const u8) ![:0]const u8 {
@@ -442,4 +547,31 @@ fn isCodepointEmoji(codepoint: u21) bool {
         }
     }
     return false;
+}
+
+fn getCategory(codepoint: u21) ?FontCategory {
+    // basically the same logic you had in pickFontForCharacter
+    const categories = [_]FontCategory{ .latin, .cjk, .emoji };
+    for (categories) |category| {
+        const ranges = switch (category) {
+            .latin => unicode_ranges.latin,
+            .cjk => unicode_ranges.cjk,
+            .emoji => unicode_ranges.emoji,
+        };
+        for (ranges) |range| {
+            if (codepoint >= range.start and codepoint <= range.end) {
+                return category;
+            }
+        }
+    }
+    return null;
+}
+
+pub fn styleToKey(weight: FontWeight, slant: FontSlant) u8 {
+    // bit 0 = bold flag
+    // bit 1 = italic flag
+    var bits: u8 = 0;
+    if (weight == .Bold) bits |= 1;
+    if (slant == .Italic) bits |= 2;
+    return bits;
 }

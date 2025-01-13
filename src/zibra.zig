@@ -77,9 +77,18 @@ fn zibra() !void {
         try b.load(u);
     } else {
         std.log.info("showing default html", .{});
-        const parsed_content = try b.lex(default_html, false);
-        defer b.allocator.free(parsed_content);
-        try b.layout(parsed_content);
+        // 1) Lex the default_html into tokens
+        var tokens = try b.lexTokens(default_html);
+        defer {
+            // Free each token’s content
+            for (tokens.items) |tok| {
+                b.allocator.free(tok.content);
+            }
+            tokens.deinit();
+        }
+
+        // 2) Pass tokens to layout
+        try b.layout(tokens.items);
     }
 
     // Start main exec loop

@@ -78,24 +78,4 @@ To test chunked gzip responses, run `gzipServer.py` locally.
 
 - On Mac, the content is stretched while the window is being resized. Apparently this is known behavior in SDL2 because Mac blocks the main thread while the mouse is being held down to resize windows, preventing SDL from rendering the content properly...I think.
 
-## Font Plan
-
-I am working better font support. Here is a summary of the goals:
-
-- Basic support for Windows, Mac, and Linux
-- Look for system fonts using common, known paths and font names
-- Have embedded fallback fonts (Noto Serif, Noto Serif Emoji, single-weight)
-- 3 fonts are loaded: Latin, CJK, Emoji
-- Each font gets it's own glyph atlas instead of font manager
-- When drawing a glyph, a match is found in Latin then CJK then Emoji
-
-In your response, work through 1-2 features at a time, with code implementations that have minimal explanations but good comments explaining what's being done.
-
-I am in the middle of adding the idea of font categories. finish the refactor:
-
-<section class="emoji">
-        <h2>Emoji Text</h2>
-        <p>
-            😀 😍 🚀 🎉 🌟 🐱 🍕 💻 📱 ❤️
-        </p>
-    </section>
+---
