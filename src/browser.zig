@@ -132,7 +132,7 @@ pub const Browser = struct {
     }
 
     // Free the resources used by the browser
-    pub fn free(self: Browser) void {
+    pub fn free(self: *Browser) void {
         // clean up hash map for fonts
         self.font_manager.deinit();
 

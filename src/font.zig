@@ -193,15 +193,13 @@ pub const FontManager = struct {
         };
     }
 
-    pub fn deinit(self: FontManager) void {
+    pub fn deinit(self: *FontManager) void {
         var fonts_it = self.fonts.iterator();
         while (fonts_it.next()) |entry| {
             var f = entry.value_ptr.*;
 
             var outer_it = f.glyphs.iterator();
             while (outer_it.next()) |outer_entry| {
-                // This pointer was allocated once in getOrPut(stable_key).
-                // Freed here exactly once.
                 self.allocator.free(outer_entry.key_ptr.*);
 
                 // For each style => destroy the texture
@@ -209,10 +207,6 @@ pub const FontManager = struct {
                 var style_it = cache_entry.glyphs_by_style.iterator();
                 while (style_it.next()) |style_entry| {
                     c.SDL_DestroyTexture(style_entry.value_ptr.*.texture.?);
-
-                    // ***No further free for .grapheme***
-                    // Because style_entry.value_ptr.*.grapheme == outer_entry.key_ptr.*
-                    // Freed exactly once above
                 }
                 cache_entry.glyphs_by_style.deinit();
             }
@@ -226,8 +220,9 @@ pub const FontManager = struct {
             self.allocator.destroy(f);
         }
 
-        var fonts = self.fonts;
-        fonts.deinit();
+        self.fonts.deinit();
+
+        std.debug.print("current font glyphs count: {d}\n", .{self.fonts.count()});
 
         c.TTF_Quit();
     }
@@ -381,7 +376,6 @@ pub const FontManager = struct {
         var iter = code_point.Iterator{ .bytes = gme };
         const codepoint = iter.next() orelse return error.InvalidGrapheme;
 
-        // 1) pick or fallback to a styled font
         var styled_font = self.pickFontForCharacterStyle(codepoint.code, weight, slant);
         var style_set = false;
         if (styled_font == null) {
@@ -397,42 +391,37 @@ pub const FontManager = struct {
         }
         const font = styled_font.?;
 
-        // 2) Outer map key duplication for the *first* time we see `gme`
         const stable_key = try self.allocator.dupe(u8, gme);
-        var maybe_outer = font.glyphs.get(stable_key);
-
-        var cache_entry_ptr: ?*CacheEntry = null;
-
+        const maybe_outer = font.glyphs.get(stable_key);
+        var cache_entry_opt: ?CacheEntry = null;
         var stable_grapheme_for_glyph: []const u8 = undefined;
 
-        if (maybe_outer) |_| {
-            // Outer key found => re-use existing cache
+        if (maybe_outer) |outer| {
+            stable_grapheme_for_glyph = gme;
             self.allocator.free(stable_key);
-            cache_entry_ptr = &maybe_outer.?; // same outer map entry
+            cache_entry_opt = outer;
         } else {
-            // Not in outer map => create once
             const new_entry = CacheEntry{
                 .glyphs_by_style = std.AutoHashMap(u8, Glyph).init(self.allocator),
             };
             try font.glyphs.put(stable_key, new_entry);
-
-            // Now fetch it to proceed
-            var inserted = font.glyphs.get(stable_key).?;
-            cache_entry_ptr = &inserted;
+            stable_grapheme_for_glyph = stable_key;
+            const found = font.glyphs.get(stable_key);
+            if (found) |entry| {
+                cache_entry_opt = entry;
+            } else {
+                return error.RenderFailed;
+            }
         }
 
-        stable_grapheme_for_glyph = stable_key;
-        const cache_entry = cache_entry_ptr.?;
+        var cache_entry = cache_entry_opt.?;
 
-        // 3) Inner map for style
         const style_key = styleToKey(weight, slant);
-        const maybe_cached = cache_entry.glyphs_by_style.get(style_key);
-        if (maybe_cached) |cached_glyph| {
+        if (cache_entry.glyphs_by_style.get(style_key)) |cached_glyph| {
             if (style_set) c.TTF_SetFontStyle(font.font_handle, c.TTF_STYLE_NORMAL);
             return cached_glyph;
         }
 
-        // 4) Render a new glyph once
         const sentinel_gme = try sliceToSentinelArray(self.allocator, gme);
         defer self.allocator.free(sentinel_gme);
 
@@ -457,13 +446,11 @@ pub const FontManager = struct {
 
         const surf = glyph_surface.*;
         const new_glyph = Glyph{
-            .grapheme = stable_grapheme_for_glyph, // same stable pointer
+            .grapheme = stable_grapheme_for_glyph,
             .texture = glyph_tex,
             .w = surf.w,
             .h = surf.h,
         };
-
-        try cache_entry.glyphs_by_style.put(style_key, new_glyph);
 
         if (style_set) c.TTF_SetFontStyle(font.font_handle, c.TTF_STYLE_NORMAL);
         return new_glyph;
