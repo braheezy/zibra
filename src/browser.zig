@@ -344,102 +344,6 @@ pub const Browser = struct {
         }
     }
 
-    // Show the body of the response, sans tags
-    // pub fn lex(self: *Browser, body: []const u8, view_content: bool) ![]const u8 {
-    //     if (view_content) {
-    //         return body;
-    //     }
-    //     var content_builder = std.ArrayList(u8).init(self.allocator);
-    //     defer content_builder.deinit();
-
-    //     var temp_line = std.ArrayList(u8).init(self.allocator);
-    //     defer temp_line.deinit();
-
-    //     var tag_buffer = std.ArrayList(u8).init(self.allocator);
-    //     defer tag_buffer.deinit();
-
-    //     var in_tag = false;
-    //     var i: usize = 0;
-
-    //     while (i < body.len) : (i += 1) {
-    //         const char = body[i];
-
-    //         // Entering a tag
-    //         if (char == '<') {
-    //             in_tag = true;
-
-    //             // Flush any text we had *outside* of a tag
-    //             if (temp_line.items.len > 0) {
-    //                 try content_builder.appendSlice(temp_line.items);
-    //                 temp_line.clearAndFree();
-    //             }
-
-    //             // Clear the tag_buffer to start fresh
-    //             tag_buffer.clearRetainingCapacity();
-    //             continue;
-    //         }
-
-    //         // Exiting a tag
-    //         if (char == '>') {
-    //             in_tag = false;
-
-    //             // Now tag_buffer contains something like "p" or "/p" or "h1"
-    //             const tag_text = tag_buffer.items;
-
-    //             if (std.mem.eql(u8, tag_text, "p") or std.mem.eql(u8, tag_text, "/p")) {
-    //                 // Paragraph break -> two newlines
-    //                 try content_builder.appendSlice("\n\n");
-    //             } else if (std.mem.eql(u8, tag_text, "br")) {
-    //                 // Single line break
-    //                 try content_builder.appendSlice("\n");
-    //             } else if (std.mem.eql(u8, tag_text, "h1") or std.mem.eql(u8, tag_text, "/h1") or
-    //                 std.mem.eql(u8, tag_text, "h2") or std.mem.eql(u8, tag_text, "/h2") or
-    //                 std.mem.eql(u8, tag_text, "h3") or std.mem.eql(u8, tag_text, "/h3"))
-    //             {
-    //                 // For headings, add two newlines so it stands out
-    //                 try content_builder.appendSlice("\n\n");
-    //             }
-    //             // else skip other tags
-
-    //             continue;
-    //         }
-
-    //         // If we're inside a tag, accumulate chars into tag_buffer
-    //         if (in_tag) {
-    //             try tag_buffer.append(char);
-    //             continue;
-    //         }
-
-    //         // Handle entities only outside tags
-    //         if (char == '&') {
-    //             if (lexEntity(body[i..])) |entity| {
-    //                 try temp_line.appendSlice(entity);
-    //                 i += std.mem.indexOf(u8, body[i..], ";").?; // Skip to the end of the entity
-    //             } else {
-    //                 try temp_line.append('&');
-    //             }
-    //             continue;
-    //         }
-
-    //         // If it's a newline, keep it (we can interpret them as spaces later)
-    //         if (char == '\n') {
-    //             try temp_line.append('\n');
-    //         } else {
-    //             try temp_line.append(char);
-    //         }
-    //     }
-
-    //     // Add remaining content to the final result
-    //     if (temp_line.items.len > 0) {
-    //         try content_builder.appendSlice(temp_line.items);
-    //     }
-
-    //     // Trim leading whitespace and newlines
-    //     const final_content = std.mem.trimLeft(u8, content_builder.items, " \t\n\r");
-
-    //     return try self.allocator.dupe(u8, final_content);
-    // }
-
     pub fn lexTokens(self: *Browser, body: []const u8) !std.ArrayList(Token) {
         // We'll store tokens here
         var tokens = std.ArrayList(Token).init(self.allocator);
@@ -675,6 +579,19 @@ pub const Browser = struct {
                             const slantness: FontSlant = if (is_italic) .Italic else .Roman;
                             const glyph = try self.font_manager.getStyledGlyph(gme, weight, slantness);
 
+                            // Line wrapping check before placing the glyph
+                            if (self.rtl_text) {
+                                if (glyph_x - glyph.w < h_offset) {
+                                    glyph_x = self.window_width - scrollbar_width - h_offset;
+                                    cursor_y += line_height;
+                                }
+                            } else {
+                                if (glyph_x + glyph.w > (self.window_width - scrollbar_width)) {
+                                    glyph_x = h_offset;
+                                    cursor_y += line_height;
+                                }
+                            }
+
                             try display_list.append(.{
                                 .x = if (self.rtl_text) glyph_x - glyph.w else glyph_x,
                                 .y = cursor_y,
@@ -744,22 +661,6 @@ pub const Browser = struct {
 
         self.content_height = cursor_y;
         self.display_list = try display_list.toOwnedSlice();
-    }
-
-    /// Measures how many pixels wide `word` would occupy if we render it grapheme-by-grapheme.
-    fn measureWordWidth(self: *Browser, word: []const u8) !i32 {
-        var total_w: i32 = 0;
-
-        var gd = try grapheme.GraphemeData.init(self.allocator);
-        defer gd.deinit();
-
-        var g_iter = grapheme.Iterator.init(word, &gd);
-        while (g_iter.next()) |gc| {
-            const cluster_bytes = gc.bytes(word);
-            const glyph = try self.font_manager.getGlyph(cluster_bytes);
-            total_w += glyph.w;
-        }
-        return total_w;
     }
 
     /// Measures a word by summing the widths of its graphemes under the current style.

@@ -445,11 +445,49 @@ pub const FontManager = struct {
         }
 
         const surf = glyph_surface.*;
-        const new_glyph = Glyph{
+        const is_emoji = isCodepointEmoji(codepoint.code);
+
+        const new_glyph = if (!is_emoji) Glyph{
             .grapheme = stable_grapheme_for_glyph,
             .texture = glyph_tex,
             .w = surf.w,
             .h = surf.h,
+        } else blk: {
+            // Get text height from the current font
+            var miny: i32 = 0;
+            var maxy: i32 = 0;
+            var advance: i32 = 0;
+
+            if (c.TTF_GlyphMetrics32(
+                font.font_handle,
+                codepoint.code,
+                null,
+                null,
+                &miny,
+                &maxy,
+                &advance,
+            ) != 0) {
+                std.log.err("Failed to get glyph metrics: {s}", .{c.TTF_GetError()});
+            }
+
+            // const text_height = maxy - miny; // Approximate visual text height
+            const text_height: i32 = self.min_line_height;
+
+            // Scale emoji proportionally
+            var tmp1: f32 = @floatFromInt(text_height);
+            const tmp2: f32 = @floatFromInt(surf.h);
+            const emoji_scale_factor = tmp1 / tmp2;
+
+            tmp1 = @floatFromInt(surf.w);
+            const emoji_width: i32 = @intFromFloat(tmp1 * emoji_scale_factor);
+            const emoji_height: i32 = @intFromFloat(tmp2 * emoji_scale_factor);
+
+            break :blk Glyph{
+                .grapheme = gme,
+                .texture = glyph_tex,
+                .w = emoji_width,
+                .h = emoji_height,
+            };
         };
 
         if (style_set) c.TTF_SetFontStyle(font.font_handle, c.TTF_STYLE_NORMAL);
