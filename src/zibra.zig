@@ -68,9 +68,6 @@ fn zibra() !void {
     var b = try Browser.init(allocator, rtl_flag);
     defer b.free();
 
-    // Load fonts
-    try b.layout_engine.font_manager.loadSystemFont(16);
-
     if (url) |u| {
         // Request URL and store response in browser.
         try b.load(u);

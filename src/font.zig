@@ -180,7 +180,7 @@ pub const Glyph = struct {
 };
 
 const CacheEntry = struct {
-    glyphs_by_style: std.AutoHashMap(u8, Glyph),
+    glyphs_by_style: std.AutoHashMap(u32, Glyph),
 };
 
 pub const Font = struct {
@@ -198,6 +198,7 @@ pub const FontManager = struct {
     fonts: std.StringHashMap(*Font),
     current_font: ?*Font = null,
     min_line_height: i32 = std.math.maxInt(i32),
+    loaded_sizes: std.AutoHashMap(i32, void),
 
     pub fn init(allocator: std.mem.Allocator, renderer: *c.SDL_Renderer) !FontManager {
         if (c.TTF_WasInit() == 0) {
@@ -208,6 +209,7 @@ pub const FontManager = struct {
             .allocator = allocator,
             .renderer = renderer,
             .fonts = std.StringHashMap(*Font).init(allocator),
+            .loaded_sizes = std.AutoHashMap(i32, void).init(allocator),
         };
     }
 
@@ -239,6 +241,7 @@ pub const FontManager = struct {
         }
 
         self.fonts.deinit();
+        self.loaded_sizes.deinit();
 
         std.debug.print("current font glyphs count: {d}\n", .{self.fonts.count()});
 
@@ -390,7 +393,10 @@ pub const FontManager = struct {
         gme: []const u8,
         weight: FontWeight,
         slant: FontSlant,
+        size: i32,
     ) !Glyph {
+        try self.ensureFontSize(size);
+
         var iter = code_point.Iterator{ .bytes = gme };
         const codepoint = iter.next() orelse return error.InvalidGrapheme;
 
@@ -420,7 +426,7 @@ pub const FontManager = struct {
             cache_entry_opt = outer;
         } else {
             const new_entry = CacheEntry{
-                .glyphs_by_style = std.AutoHashMap(u8, Glyph).init(self.allocator),
+                .glyphs_by_style = std.AutoHashMap(u32, Glyph).init(self.allocator),
             };
             try font.glyphs.put(stable_key, new_entry);
             stable_grapheme_for_glyph = stable_key;
@@ -434,10 +440,15 @@ pub const FontManager = struct {
 
         var cache_entry = cache_entry_opt.?;
 
-        const style_key = styleToKey(weight, slant);
+        const style_key = createGlyphKey(weight, slant, size);
         if (cache_entry.glyphs_by_style.get(style_key)) |cached_glyph| {
             if (style_set) c.TTF_SetFontStyle(font.font_handle, c.TTF_STYLE_NORMAL);
             return cached_glyph;
+        }
+
+        // Set the font size before rendering
+        if (c.TTF_SetFontSize(font.font_handle, size) != 0) {
+            std.log.warn("Failed to set font size: {s}", .{c.TTF_GetError()});
         }
 
         const sentinel_gme = try sliceToSentinelArray(self.allocator, gme);
@@ -510,6 +521,15 @@ pub const FontManager = struct {
 
         if (style_set) c.TTF_SetFontStyle(font.font_handle, c.TTF_STYLE_NORMAL);
         return new_glyph;
+    }
+
+    fn ensureFontSize(self: *FontManager, size: i32) !void {
+        if (self.loaded_sizes.contains(size)) return;
+
+        // Load all system fonts at this new size
+        std.log.info("Loading system fonts at size {d}", .{size});
+        try self.loadSystemFont(size);
+        try self.loaded_sizes.put(size, {});
     }
 
     pub fn pickFontForCharacter(self: *FontManager, codepoint: u21) ?*Font {
@@ -610,11 +630,11 @@ fn getCategory(codepoint: u21) ?FontCategory {
     return null;
 }
 
-pub fn styleToKey(weight: FontWeight, slant: FontSlant) u8 {
+fn createGlyphKey(weight: FontWeight, slant: FontSlant, size: i32) u32 {
     // bit 0 = bold flag
     // bit 1 = italic flag
     var bits: u8 = 0;
     if (weight == .Bold) bits |= 1;
     if (slant == .Italic) bits |= 2;
-    return bits;
+    return (@as(u32, @intCast(size)) << 8) | bits;
 }

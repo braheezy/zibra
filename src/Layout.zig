@@ -26,8 +26,7 @@ font_manager: font.FontManager,
 window_width: i32,
 window_height: i32,
 rtl_text: bool = false,
-
-// Layout cursor state
+size: i32 = 16,
 cursor_x: i32,
 cursor_y: i32,
 is_bold: bool = false,
@@ -58,6 +57,9 @@ pub fn init(
         .content_height = 0,
         .display_list = std.ArrayList(DisplayItem).init(allocator),
     };
+
+    try layout.font_manager.loadSystemFont(layout.size);
+
     return layout;
 }
 
@@ -151,7 +153,12 @@ fn handleTextToken(
         for (graphemes_array.items) |gme| {
             const weight: FontWeight = if (self.is_bold) .Bold else .Normal;
             const slantness: FontSlant = if (self.is_italic) .Italic else .Roman;
-            const glyph = try self.font_manager.getStyledGlyph(gme, weight, slantness);
+            const glyph = try self.font_manager.getStyledGlyph(
+                gme,
+                weight,
+                slantness,
+                self.size,
+            );
 
             // Line wrapping check before placing the glyph
             if (self.rtl_text) {
@@ -203,6 +210,14 @@ fn handleTagToken(self: *Layout, content: []const u8, line_height: i32) !void {
         self.is_italic = true;
     } else if (std.mem.eql(u8, t, "/i")) {
         self.is_italic = false;
+    } else if (std.mem.eql(u8, t, "big")) {
+        self.size += 2;
+    } else if (std.mem.eql(u8, t, "small")) {
+        self.size -= 2;
+    } else if (std.mem.eql(u8, t, "/big")) {
+        self.size -= 2;
+    } else if (std.mem.eql(u8, t, "/small")) {
+        self.size += 2;
     }
     // Paragraph => line break plus extra gap
     else if (std.mem.eql(u8, t, "p") or std.mem.eql(u8, t, "/p")) {
