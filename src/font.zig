@@ -79,7 +79,7 @@ const system_fonts = switch (builtin.target.os.tag) {
         },
         .fonts = &[_]FontEntry{
             .{
-                .name = "Arial Unicode",
+                .name = "Arial",
                 .category = .latin,
                 .weight = .Normal,
                 .slant = .Roman,
@@ -95,6 +95,24 @@ const system_fonts = switch (builtin.target.os.tag) {
                 .category = .emoji,
                 .weight = .Normal,
                 .slant = .Roman,
+            },
+            .{
+                .name = "Arial Bold",
+                .category = .latin,
+                .weight = .Bold,
+                .slant = .Roman,
+            },
+            .{
+                .name = "Arial Italic",
+                .category = .latin,
+                .weight = .Normal,
+                .slant = .Italic,
+            },
+            .{
+                .name = "Arial Bold Italic",
+                .category = .latin,
+                .weight = .Bold,
+                .slant = .Italic,
             },
         },
     },

@@ -65,12 +65,11 @@ fn zibra() !void {
     defer if (url) |u| u.free(allocator);
 
     // Initialize browser
-    var b = try Browser.init(allocator);
+    var b = try Browser.init(allocator, rtl_flag);
     defer b.free();
-    b.rtl_text = rtl_flag;
 
     // Load fonts
-    try b.font_manager.loadSystemFont(16);
+    try b.layout_engine.font_manager.loadSystemFont(16);
 
     if (url) |u| {
         // Request URL and store response in browser.

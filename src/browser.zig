@@ -12,7 +12,7 @@ const Connection = @import("url.zig").Connection;
 const Cache = @import("cache.zig").Cache;
 const ArrayList = std.ArrayList;
 const font_assets = @import("font-assets");
-
+const Layout = @import("Layout.zig");
 const c = @cImport({
     @cInclude("SDL2/SDL.h");
     @cInclude("SDL2/SDL_ttf.h");
@@ -31,14 +31,14 @@ const stdout = std.io.getStdOut().writer();
 // *********************************************************
 const initial_window_width = 800;
 const initial_window_height = 600;
-const h_offset = 13;
-const v_offset = 18;
+pub const h_offset = 13;
+pub const v_offset = 18;
 const scroll_increment = 100;
-const scrollbar_width = 10;
+pub const scrollbar_width = 10;
 // *********************************************************
 
 // DisplayItem is a struct that holds the position and glyph to be displayed.
-const DisplayItem = struct {
+pub const DisplayItem = struct {
     // X coordinate of the display item
     x: i32,
     // Y coordinate of the display item
@@ -65,8 +65,6 @@ pub const Browser = struct {
     window: *c.SDL_Window,
     // SDL renderer handle
     canvas: *c.SDL_Renderer,
-    // Font manager for handling fonts and glyphs
-    font_manager: FontManager,
     // Map of active connections. The key is the host and the value a Connection to use.
     socket_map: std.StringHashMap(Connection),
     // Cache for storing fetched resources
@@ -82,11 +80,10 @@ pub const Browser = struct {
     // Window dimensions
     window_width: i32 = initial_window_width,
     window_height: i32 = initial_window_height,
-    // Flag to indicate if text should be right-to-left
-    rtl_text: bool = false,
+    layout_engine: *Layout,
 
     // Create a new Browser instance
-    pub fn init(al: std.mem.Allocator) !Browser {
+    pub fn init(al: std.mem.Allocator, rtl_flag: bool) !Browser {
         // Initialize SDL
         if (c.SDL_Init(c.SDL_INIT_VIDEO) != 0) {
             c.SDL_Log("Unable to initialize SDL: %s", c.SDL_GetError());
@@ -119,23 +116,24 @@ pub const Browser = struct {
             return error.SDLInitializationFailed;
         };
 
-        const font_manager = try FontManager.init(al, renderer);
-
         return Browser{
             .allocator = al,
             .window = screen,
             .canvas = renderer,
-            .font_manager = font_manager,
             .socket_map = std.StringHashMap(Connection).init(al),
             .cache = try Cache.init(al),
+            .layout_engine = try Layout.init(
+                al,
+                renderer,
+                initial_window_width,
+                initial_window_height,
+                rtl_flag,
+            ),
         };
     }
 
     // Free the resources used by the browser
     pub fn free(self: *Browser) void {
-        // clean up hash map for fonts
-        self.font_manager.deinit();
-
         // clean up hash map for sockets, including values
         var sockets_iter = self.socket_map.valueIterator();
         while (sockets_iter.next()) |socket| {
@@ -153,6 +151,9 @@ pub const Browser = struct {
 
         // free display list slice
         if (self.display_list) |items| self.allocator.free(items);
+
+        // clean up layout
+        self.layout_engine.deinit();
 
         // clean up sdl resources
         c.SDL_DestroyRenderer(self.canvas);
@@ -506,220 +507,12 @@ pub const Browser = struct {
 
     // Arrange the content for display
     pub fn layout(self: *Browser, tokens: []const Token) !void {
-        var display_list = std.ArrayList(DisplayItem).init(self.allocator);
-        defer display_list.deinit();
-
-        var is_bold: bool = false;
-        var is_italic: bool = false;
-
-        var cursor_x: i32 = if (self.rtl_text)
-            self.window_width - scrollbar_width - h_offset
-        else
-            h_offset;
-
-        var cursor_y: i32 = v_offset;
-
-        const line_height = self.font_manager.current_font.?.line_height;
-
-        for (tokens) |tok| {
-            switch (tok.ty) {
-                /////////////////////////////////////////////////////////////////////
-                // TEXT TOKEN: inline by default, no forced break at the end
-                /////////////////////////////////////////////////////////////////////
-                .Text => {
-                    // Make a local copy
-                    var text_copy = try self.allocator.dupe(u8, tok.content);
-                    defer self.allocator.free(text_copy);
-
-                    // Convert literal \n in HTML to space so it doesn't cause a line break
-                    for (text_copy, 0..) |byte, idx| {
-                        if (byte == '\n') text_copy[idx] = ' ';
-                    }
-
-                    // Split on spaces/tabs, measure, and place graphemes inline
-                    var word_tokenizer = std.mem.tokenizeSequence(u8, text_copy, " \t\r");
-                    var local_x = cursor_x;
-
-                    while (word_tokenizer.next()) |word| {
-                        if (word.len == 0) continue;
-
-                        const measured_w = try self.measureWordWidthWithStyle(word, is_bold, is_italic);
-
-                        // line wrapping if word doesn't fit horizontally
-                        if (self.rtl_text) {
-                            if (local_x - measured_w < h_offset) {
-                                local_x = self.window_width - scrollbar_width - h_offset;
-                                cursor_y += line_height;
-                            }
-                        } else {
-                            if (local_x + measured_w > (self.window_width - scrollbar_width)) {
-                                local_x = h_offset;
-                                cursor_y += line_height;
-                            }
-                        }
-
-                        // Render each grapheme
-                        var gd = try grapheme.GraphemeData.init(self.allocator);
-                        defer gd.deinit();
-                        var g_iter = grapheme.Iterator.init(word, &gd);
-
-                        var graphemes_array = std.ArrayList([]const u8).init(self.allocator);
-                        defer graphemes_array.deinit();
-
-                        while (g_iter.next()) |gc| {
-                            try graphemes_array.append(gc.bytes(word));
-                        }
-                        if (self.rtl_text) {
-                            std.mem.reverse([]const u8, graphemes_array.items);
-                        }
-
-                        var glyph_x = local_x;
-                        for (graphemes_array.items) |gme| {
-                            const weight: FontWeight = if (is_bold) .Bold else .Normal;
-                            const slantness: FontSlant = if (is_italic) .Italic else .Roman;
-                            const glyph = try self.font_manager.getStyledGlyph(gme, weight, slantness);
-
-                            // Line wrapping check before placing the glyph
-                            if (self.rtl_text) {
-                                if (glyph_x - glyph.w < h_offset) {
-                                    glyph_x = self.window_width - scrollbar_width - h_offset;
-                                    cursor_y += line_height;
-                                }
-                            } else {
-                                if (glyph_x + glyph.w > (self.window_width - scrollbar_width)) {
-                                    glyph_x = h_offset;
-                                    cursor_y += line_height;
-                                }
-                            }
-
-                            try display_list.append(.{
-                                .x = if (self.rtl_text) glyph_x - glyph.w else glyph_x,
-                                .y = cursor_y,
-                                .glyph = glyph,
-                            });
-
-                            if (self.rtl_text) {
-                                glyph_x -= glyph.w;
-                            } else {
-                                glyph_x += glyph.w;
-                            }
-                        }
-
-                        local_x = glyph_x;
-                    }
-
-                    // After finishing this Text token, do NOT line-break
-                    // let it remain on the same line
-                    cursor_x = local_x;
-                },
-
-                /////////////////////////////////////////////////////////////////////
-                // TAG TOKEN: line breaks only for <p>, <br>, toggle is_bold/is_italic for <b>, <i>
-                /////////////////////////////////////////////////////////////////////
-                .Tag => {
-                    const lower_copy = try self.allocator.dupe(u8, tok.content);
-                    defer self.allocator.free(lower_copy);
-                    _ = std.ascii.lowerString(lower_copy, tok.content);
-
-                    const t = std.mem.trim(u8, lower_copy, " \t\r\n");
-
-                    // Bold/italic toggles
-                    if (std.mem.eql(u8, t, "b")) {
-                        is_bold = true;
-                        std.debug.print("<b> => is_bold = true\n", .{});
-                    } else if (std.mem.eql(u8, t, "/b")) {
-                        is_bold = false;
-                        std.debug.print("</b> => is_bold = false\n", .{});
-                    } else if (std.mem.eql(u8, t, "i")) {
-                        std.debug.print("<i> => is_italic = true\n", .{});
-                        is_italic = true;
-                    } else if (std.mem.eql(u8, t, "/i")) {
-                        std.debug.print("<i> => is_italic = false\n", .{});
-                        is_italic = false;
-                    }
-                    // Paragraph => line break plus extra gap
-                    else if (std.mem.eql(u8, t, "p") or std.mem.eql(u8, t, "/p")) {
-                        cursor_y += line_height * 2;
-                        cursor_x = if (self.rtl_text)
-                            self.window_width - scrollbar_width - h_offset
-                        else
-                            h_offset;
-                    }
-                    // <br> => single line break
-                    else if (std.mem.eql(u8, t, "br")) {
-                        cursor_y += line_height;
-                        cursor_x = if (self.rtl_text)
-                            self.window_width - scrollbar_width - h_offset
-                        else
-                            h_offset;
-                    } else {
-                        // skip others
-                    }
-                },
-            }
+        // Free existing display list if it exists
+        if (self.display_list) |items| {
+            self.allocator.free(items);
         }
 
-        self.content_height = cursor_y;
-        self.display_list = try display_list.toOwnedSlice();
-    }
-
-    /// Measures a word by summing the widths of its graphemes under the current style.
-    fn measureWordWidthWithStyle(self: *Browser, word: []const u8, bold: bool, italic: bool) !i32 {
-        // 1) Determine the right font or fallback
-        const weight: FontWeight = if (bold) .Bold else .Normal;
-        const slant: FontSlant = if (italic) .Italic else .Roman;
-
-        var styled_font = self.font_manager.pickFontForCharacterStyle(
-            firstCodePoint(word),
-            weight,
-            slant,
-        );
-        var style_set = false;
-        if (styled_font == null) {
-            // fallback
-            styled_font = self.font_manager.pickFontForCharacter(firstCodePoint(word));
-            if (styled_font == null) return error.NoFontForGlyph;
-
-            // Synthetic styling
-            var new_style: c_int = 0;
-            if (bold) new_style |= c.TTF_STYLE_BOLD;
-            if (italic) new_style |= c.TTF_STYLE_ITALIC;
-            c.TTF_SetFontStyle(styled_font.?.font_handle, new_style);
-            style_set = true;
-        }
-
-        const fh = styled_font.?.font_handle;
-
-        // 2) Use TTF_SizeUTF8 to measure the entire word
-        var w: c_int = 0;
-        var h: c_int = 0;
-
-        // Convert word to a null-terminated sentinel
-        const sentinel = try sliceToSentinelArray(self.allocator, word);
-        defer self.allocator.free(sentinel);
-
-        if (c.TTF_SizeUTF8(fh, sentinel, &w, &h) != 0) {
-            if (style_set) c.TTF_SetFontStyle(fh, c.TTF_STYLE_NORMAL);
-            return error.RenderFailed;
-        }
-
-        // 3) Restore synthetic style if needed
-        if (style_set) c.TTF_SetFontStyle(fh, c.TTF_STYLE_NORMAL);
-
-        return w;
+        self.display_list = try self.layout_engine.layoutTokens(tokens);
+        self.content_height = self.layout_engine.content_height;
     }
 };
-
-// helper function to convert a slice to a sentinel array, because C expects that for strings
-fn sliceToSentinelArray(allocator: std.mem.Allocator, slice: []const u8) ![:0]const u8 {
-    const len = slice.len;
-    const arr = try allocator.allocSentinel(u8, len, 0);
-    @memcpy(arr, slice);
-    return arr;
-}
-
-fn firstCodePoint(word: []const u8) u21 {
-    var it = code_point.Iterator{ .bytes = word };
-    if (it.next()) |cp| return cp.code;
-    return 0; // fallback if empty
-}
