@@ -17,6 +17,15 @@ const c = @cImport({
     @cInclude("SDL2/SDL_ttf.h");
 });
 
+const LineItem = struct {
+    x: i32,
+    glyph: font.Glyph,
+    /// The glyph's ascent (from font metrics)
+    ascent: i32,
+    /// The glyph's descent as a positive value (–TTF_FontDescent)
+    descent: i32,
+};
+
 const Layout = @This();
 
 // Layout state
@@ -26,11 +35,12 @@ font_manager: font.FontManager,
 window_width: i32,
 window_height: i32,
 rtl_text: bool = false,
-size: i32 = 16,
+size: i32 = 32,
 cursor_x: i32,
 cursor_y: i32,
 is_bold: bool = false,
 is_italic: bool = false,
+// Final content height after layout
 content_height: i32 = 0,
 display_list: std.ArrayList(DisplayItem),
 
@@ -75,34 +85,72 @@ pub fn layoutTokens(self: *Layout, tokens: []const Token) ![]DisplayItem {
         self.window_width - scrollbar_width - h_offset
     else
         h_offset;
-
     self.cursor_y = v_offset;
 
-    const line_height = self.font_manager.current_font.?.line_height;
+    var line_buffer = std.ArrayList(LineItem).init(self.allocator);
+    defer line_buffer.deinit();
 
     for (tokens) |tok| {
         switch (tok.ty) {
             .Text => {
-                try self.handleTextToken(tok.content, line_height);
+                try self.handleTextToken(tok.content, &line_buffer);
             },
 
             .Tag => {
-                try self.handleTagToken(tok.content, line_height);
+                try self.handleTagToken(tok.content, &line_buffer);
             },
         }
     }
 
+    // Flush any remaining items on the last line.
+    try self.flushLine(&line_buffer);
     self.content_height = self.cursor_y;
     return try self.display_list.toOwnedSlice();
 }
 
+fn flushLine(self: *Layout, line_buffer: *std.ArrayList(LineItem)) !void {
+    // Nothing to flush? Return.
+    if (line_buffer.items.len == 0) return;
+
+    var max_ascent: i32 = 0;
+    var max_descent: i32 = 0;
+    for (line_buffer.items) |item| {
+        if (item.ascent > max_ascent) {
+            max_ascent = item.ascent;
+        }
+        if (item.descent > max_descent) {
+            max_descent = item.descent;
+        }
+    }
+    // The common baseline is determined by the current cursor_y + max_ascent.
+    const baseline = self.cursor_y + max_ascent;
+
+    // Adjust each glyph's y coordinate so that its baseline aligns to our common baseline.
+    for (line_buffer.items) |item| {
+        const final_y = baseline - item.ascent;
+        try self.display_list.append(DisplayItem{
+            .x = item.x,
+            .y = final_y,
+            .glyph = item.glyph,
+        });
+    }
+    line_buffer.clearRetainingCapacity();
+    // Start the next line at baseline plus the maximum descent.
+    self.cursor_y = baseline + max_descent;
+    // Reset the horizontal cursor.
+    self.cursor_x = if (self.rtl_text)
+        self.window_width - scrollbar_width - h_offset
+    else
+        h_offset;
+}
+
+/// Modified text token handler now collects all glyphs into the line buffer.
+/// It also checks line–wrapping on a per–word and per–glyph basis.
 fn handleTextToken(
     self: *Layout,
     content: []const u8,
-    line_height: i32,
+    line_buffer: *std.ArrayList(LineItem),
 ) !void {
-    // TEXT TOKEN: inline by default, no forced break at the end
-
     // Make a local copy
     var text_copy = try self.allocator.dupe(u8, content);
     defer self.allocator.free(text_copy);
@@ -114,7 +162,6 @@ fn handleTextToken(
 
     // Split on spaces/tabs, measure, and place graphemes inline
     var word_tokenizer = std.mem.tokenizeSequence(u8, text_copy, " \t\r");
-    var local_x = self.cursor_x;
 
     while (word_tokenizer.next()) |word| {
         if (word.len == 0) continue;
@@ -123,14 +170,12 @@ fn handleTextToken(
 
         // line wrapping if word doesn't fit horizontally
         if (self.rtl_text) {
-            if (local_x - measured_w < h_offset) {
-                local_x = self.window_width - scrollbar_width - h_offset;
-                self.cursor_y += line_height;
+            if (self.cursor_x - measured_w < h_offset) {
+                try self.flushLine(line_buffer);
             }
         } else {
-            if (local_x + measured_w > (self.window_width - scrollbar_width)) {
-                local_x = h_offset;
-                self.cursor_y += line_height;
+            if (self.cursor_x + measured_w > (self.window_width - scrollbar_width)) {
+                try self.flushLine(line_buffer);
             }
         }
 
@@ -149,7 +194,7 @@ fn handleTextToken(
             std.mem.reverse([]const u8, graphemes_array.items);
         }
 
-        var glyph_x = local_x;
+        // Process each grapheme: get its glyph and record metrics.
         for (graphemes_array.items) |gme| {
             const weight: FontWeight = if (self.is_bold) .Bold else .Normal;
             const slantness: FontSlant = if (self.is_italic) .Italic else .Roman;
@@ -162,39 +207,53 @@ fn handleTextToken(
 
             // Line wrapping check before placing the glyph
             if (self.rtl_text) {
-                if (glyph_x - glyph.w < h_offset) {
-                    glyph_x = self.window_width - scrollbar_width - h_offset;
-                    self.cursor_y += line_height;
+                if (self.cursor_x - glyph.w < h_offset) {
+                    try self.flushLine(line_buffer);
                 }
             } else {
-                if (glyph_x + glyph.w > (self.window_width - scrollbar_width)) {
-                    glyph_x = h_offset;
-                    self.cursor_y += line_height;
+                if (self.cursor_x + glyph.w > (self.window_width - scrollbar_width)) {
+                    try self.flushLine(line_buffer);
                 }
             }
 
-            try self.display_list.append(.{
-                .x = if (self.rtl_text) glyph_x - glyph.w else glyph_x,
-                .y = self.cursor_y,
+            // Retrieve the font metrics from the current font.
+            const current_font = self.font_manager.current_font.?;
+            const fh = current_font.font_handle;
+            const ascent = c.TTF_FontAscent(fh);
+            const descent = -c.TTF_FontDescent(fh);
+
+            // Append a new line item into our line buffer.
+            try line_buffer.append(.{
+                .x = self.cursor_x,
                 .glyph = glyph,
+                .ascent = ascent,
+                .descent = descent,
             });
 
+            // Update cursor position after adding the glyph
             if (self.rtl_text) {
-                glyph_x -= glyph.w;
+                self.cursor_x -= glyph.w;
             } else {
-                glyph_x += glyph.w;
+                self.cursor_x += glyph.w;
             }
         }
 
-        local_x = glyph_x;
+        // Add space after word (unless it's the last word)
+        if (word_tokenizer.peek() != null) {
+            if (self.rtl_text) {
+                self.cursor_x -= @divTrunc(self.size, 2);
+            } else {
+                self.cursor_x += @divTrunc(self.size, 2);
+            }
+        }
     }
-
-    // After finishing this Text token, do NOT line-break
-    // let it remain on the same line
-    self.cursor_x = local_x;
 }
 
-fn handleTagToken(self: *Layout, content: []const u8, line_height: i32) !void {
+fn handleTagToken(
+    self: *Layout,
+    content: []const u8,
+    line_buffer: *std.ArrayList(LineItem),
+) !void {
     const lower_copy = try self.allocator.dupe(u8, content);
     defer self.allocator.free(lower_copy);
     _ = std.ascii.lowerString(lower_copy, content);
@@ -211,17 +270,31 @@ fn handleTagToken(self: *Layout, content: []const u8, line_height: i32) !void {
     } else if (std.mem.eql(u8, t, "/i")) {
         self.is_italic = false;
     } else if (std.mem.eql(u8, t, "big")) {
-        self.size += 2;
+        self.size += 4;
     } else if (std.mem.eql(u8, t, "small")) {
-        self.size -= 2;
+        self.size -= 4;
     } else if (std.mem.eql(u8, t, "/big")) {
-        self.size -= 2;
+        self.size -= 4;
     } else if (std.mem.eql(u8, t, "/small")) {
-        self.size += 2;
+        self.size += 4;
     }
-    // Paragraph => line break plus extra gap
-    else if (std.mem.eql(u8, t, "p") or std.mem.eql(u8, t, "/p")) {
-        self.cursor_y += line_height * 2;
+    // Paragraph handling: flush current line and add vertical spacing
+    else if (std.mem.eql(u8, t, "p")) {
+        // Flush any content in the current line
+        try self.flushLine(line_buffer);
+        // Add extra vertical spacing before paragraph
+        self.cursor_y += self.size;
+        // Reset horizontal position
+        self.cursor_x = if (self.rtl_text)
+            self.window_width - scrollbar_width - h_offset
+        else
+            h_offset;
+    } else if (std.mem.eql(u8, t, "/p")) {
+        // Flush the paragraph's content
+        try self.flushLine(line_buffer);
+        // Add extra vertical spacing after paragraph
+        self.cursor_y += self.size;
+        // Reset horizontal position
         self.cursor_x = if (self.rtl_text)
             self.window_width - scrollbar_width - h_offset
         else
@@ -229,7 +302,7 @@ fn handleTagToken(self: *Layout, content: []const u8, line_height: i32) !void {
     }
     // <br> => single line break
     else if (std.mem.eql(u8, t, "br")) {
-        self.cursor_y += line_height;
+        try self.flushLine(line_buffer);
         self.cursor_x = if (self.rtl_text)
             self.window_width - scrollbar_width - h_offset
         else
