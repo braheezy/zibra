@@ -274,6 +274,9 @@ pub const Url = struct {
         u.scheme = ada_url.getProtocol();
         u.host = ada_url.getHost();
         u.path = ada_url.getPathname();
+        u.is_https = std.mem.eql(u8, u.scheme, "https:");
+        u.port = if (u.is_https) 443 else 80;
+        std.debug.print("scheme: {s}\n", .{u.scheme});
 
         if (std.mem.eql(u8, u.scheme, "view-source:")) {
             u.view_source = true;
@@ -408,7 +411,7 @@ pub const Url = struct {
         redirect_count: u8,
     ) ![]const u8 {
         // Firefox limits to 20 too.
-        if (redirect_count > 20) {
+        if (redirect_count > 5) {
             return error.TooManyRedirects;
         }
 

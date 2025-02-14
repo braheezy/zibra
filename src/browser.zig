@@ -55,6 +55,10 @@ pub const TokenType = enum {
 pub const Token = struct {
     ty: TokenType,
     content: []const u8, // For text tokens, the text; for tag tokens, the tag name
+
+    pub fn deinit(self: Token, allocator: std.mem.Allocator) void {
+        allocator.free(self.content);
+    }
 };
 
 // Browser is the main struct that holds the state of the browser.
@@ -338,10 +342,14 @@ pub const Browser = struct {
             try self.layout(plain_tokens_slice);
         } else {
             var tokens_array = try self.lexTokens(body);
-            // defer { };
+            defer {
+                for (tokens_array.items) |token| {
+                    token.deinit(self.allocator);
+                }
+                tokens_array.deinit();
+            }
 
-            const tok_slice = try tokens_array.toOwnedSlice();
-            try self.layout(tok_slice);
+            try self.layout(tokens_array.items);
         }
     }
 

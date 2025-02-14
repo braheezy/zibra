@@ -454,14 +454,37 @@ pub const FontManager = struct {
         const sentinel_gme = try sliceToSentinelArray(self.allocator, gme);
         defer self.allocator.free(sentinel_gme);
 
-        const glyph_surface = c.TTF_RenderUTF8_Blended(
+        var glyph_surface = c.TTF_RenderUTF8_Blended(
             font.font_handle,
             sentinel_gme,
             c.SDL_Color{ .r = 0, .g = 0, .b = 0, .a = 255 },
         );
         if (glyph_surface == null) {
-            if (style_set) c.TTF_SetFontStyle(font.font_handle, c.TTF_STYLE_NORMAL);
-            return error.RenderFailed;
+            const err_msg = c.TTF_GetError();
+            // If it's a zero-width character, substitute with a space
+            if (std.mem.indexOf(u8, std.mem.span(err_msg), "zero width") != null) {
+                // Create a new sentinel array for space character
+                const space_sentinel = try self.allocator.allocSentinel(u8, 1, 0);
+                defer self.allocator.free(space_sentinel);
+                space_sentinel[0] = ' ';
+
+                const space_surface = c.TTF_RenderUTF8_Blended(
+                    font.font_handle,
+                    space_sentinel,
+                    c.SDL_Color{ .r = 0, .g = 0, .b = 0, .a = 255 },
+                );
+                if (space_surface == null) {
+                    if (style_set) c.TTF_SetFontStyle(font.font_handle, c.TTF_STYLE_NORMAL);
+                    return error.RenderFailed;
+                }
+                glyph_surface = space_surface;
+            } else {
+                // For other rendering errors, still fail
+                if (style_set) c.TTF_SetFontStyle(font.font_handle, c.TTF_STYLE_NORMAL);
+                std.debug.print("failed to render glyph: {s}\n", .{sentinel_gme});
+                std.debug.print("error: {s}\n", .{err_msg});
+                return error.RenderFailed;
+            }
         }
         defer c.SDL_FreeSurface(glyph_surface);
 
@@ -526,9 +549,13 @@ pub const FontManager = struct {
     fn ensureFontSize(self: *FontManager, size: i32) !void {
         if (self.loaded_sizes.contains(size)) return;
 
-        // Load all system fonts at this new size
-        std.log.info("Loading system fonts at size {d}", .{size});
-        try self.loadSystemFont(size);
+        var it = self.fonts.iterator();
+        while (it.next()) |entry| {
+            const font = entry.value_ptr.*;
+            if (c.TTF_SetFontSize(font.font_handle, size) != 0) {
+                std.log.warn("Failed to set font size: {s}", .{c.TTF_GetError()});
+            }
+        }
         try self.loaded_sizes.put(size, {});
     }
 
