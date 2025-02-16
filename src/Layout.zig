@@ -112,6 +112,7 @@ fn flushLine(self: *Layout, line_buffer: *std.ArrayList(LineItem)) !void {
     // Nothing to flush? Return.
     if (line_buffer.items.len == 0) return;
 
+    // === PASS 1: Collect line metrics ===
     var max_ascent: i32 = 0;
     var max_descent: i32 = 0;
     for (line_buffer.items) |item| {
@@ -122,26 +123,38 @@ fn flushLine(self: *Layout, line_buffer: *std.ArrayList(LineItem)) !void {
             max_descent = item.descent;
         }
     }
-    // The common baseline is determined by the current cursor_y + max_ascent.
+    // Compute the total natural line height.
+    const line_height = max_ascent + max_descent;
+    // Extra leading (for example, 25% of the line height) improves readability.
+    const extra_leading: i32 = @intFromFloat(@as(f32, @floatFromInt(line_height)) * 0.25);
+    // The common baseline is determined by taking the starting y plus the maximum ascent.
     const baseline = self.cursor_y + max_ascent;
 
-    // Adjust each glyph's y coordinate so that its baseline aligns to our common baseline.
+    // === PASS 2: Update the y coordinate for each glyph ===
     for (line_buffer.items) |item| {
+        // Adjust the individual glyph's position so that its baseline
+        // (at y = item.ascent) aligns with our common baseline.
         const final_y = baseline - item.ascent;
         try self.display_list.append(DisplayItem{
             .x = item.x,
             .y = final_y,
             .glyph = item.glyph,
+            // Include additional fields as necessary…
         });
     }
+
+    // Advance the cursor_y: new line starts after the current line's descent plus extra leading.
+    self.cursor_y = baseline + max_descent + extra_leading;
+
+    // Reset the horizontal position (depending on text direction).
+    if (self.rtl_text) {
+        self.cursor_x = self.window_width - scrollbar_width - h_offset;
+    } else {
+        self.cursor_x = h_offset;
+    }
+
+    // Clear the line buffer for the next line.
     line_buffer.clearRetainingCapacity();
-    // Start the next line at baseline plus the maximum descent.
-    self.cursor_y = baseline + max_descent;
-    // Reset the horizontal cursor.
-    self.cursor_x = if (self.rtl_text)
-        self.window_width - scrollbar_width - h_offset
-    else
-        h_offset;
 }
 
 /// Modified text token handler now collects all glyphs into the line buffer.
@@ -216,18 +229,12 @@ fn handleTextToken(
                 }
             }
 
-            // Retrieve the font metrics from the current font.
-            const current_font = self.font_manager.current_font.?;
-            const fh = current_font.font_handle;
-            const ascent = c.TTF_FontAscent(fh);
-            const descent = -c.TTF_FontDescent(fh);
-
-            // Append a new line item into our line buffer.
+            // Remove the font metrics query since we now have them in the glyph
             try line_buffer.append(.{
                 .x = self.cursor_x,
                 .glyph = glyph,
-                .ascent = ascent,
-                .descent = descent,
+                .ascent = glyph.ascent, // Use metrics from the glyph
+                .descent = glyph.descent, // Use metrics from the glyph
             });
 
             // Update cursor position after adding the glyph

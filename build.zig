@@ -32,8 +32,6 @@ pub fn build(b: *std.Build) !void {
 
     const ada_dep = b.dependency("ada-zig", .{});
     exe.root_module.addImport("ada", ada_dep.module("ada"));
-    // exe.addLibraryPath(b.path("lib"));
-    // exe.linkSystemLibrary("ada");
 
     // This declares intent for the executable to be installed into the
     // standard location when the user invokes the "install" step (the default

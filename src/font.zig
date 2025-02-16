@@ -177,17 +177,15 @@ pub const Glyph = struct {
     texture: ?*c.SDL_Texture,
     w: i32,
     h: i32,
-};
-
-const CacheEntry = struct {
-    glyphs_by_style: std.AutoHashMap(u32, Glyph),
+    ascent: i32,
+    descent: i32,
 };
 
 pub const Font = struct {
     name: []const u8,
     font_handle: *c.TTF_Font,
     // Glyph cache or atlas.
-    glyphs: std.StringHashMap(CacheEntry),
+    glyphs: std.AutoHashMap(u64, Glyph),
     line_height: i32,
     font_rw: ?*c.SDL_RWops,
 };
@@ -220,15 +218,11 @@ pub const FontManager = struct {
 
             var outer_it = f.glyphs.iterator();
             while (outer_it.next()) |outer_entry| {
-                self.allocator.free(outer_entry.key_ptr.*);
+                // self.allocator.free(outer_entry.key_ptr.*);
 
                 // For each style => destroy the texture
-                var cache_entry = outer_entry.value_ptr.*;
-                var style_it = cache_entry.glyphs_by_style.iterator();
-                while (style_it.next()) |style_entry| {
-                    c.SDL_DestroyTexture(style_entry.value_ptr.*.texture.?);
-                }
-                cache_entry.glyphs_by_style.deinit();
+                const cache_entry = outer_entry.value_ptr.*;
+                c.SDL_DestroyTexture(cache_entry.texture.?);
             }
             f.glyphs.deinit();
 
@@ -333,7 +327,7 @@ pub const FontManager = struct {
         font.* = Font{
             .name = name,
             .font_handle = fh.?,
-            .glyphs = std.StringHashMap(CacheEntry).init(self.allocator),
+            .glyphs = std.AutoHashMap(u64, Glyph).init(self.allocator),
             .line_height = c.TTF_FontLineSkip(fh),
             .font_rw = null,
         };
@@ -406,7 +400,6 @@ pub const FontManager = struct {
             std.debug.print("styled fallback\n", .{});
             styled_font = self.pickFontForCharacter(codepoint.code);
             if (styled_font == null) return error.NoFontForGlyph;
-
             var new_style: c_int = 0;
             if (weight == .Bold) new_style |= c.TTF_STYLE_BOLD;
             if (slant == .Italic) new_style |= c.TTF_STYLE_ITALIC;
@@ -415,42 +408,19 @@ pub const FontManager = struct {
         }
         const font = styled_font.?;
 
-        const stable_key = try self.allocator.dupe(u8, gme);
-        const maybe_outer = font.glyphs.get(stable_key);
-        var cache_entry_opt: ?CacheEntry = null;
-        var stable_grapheme_for_glyph: []const u8 = undefined;
-
-        if (maybe_outer) |outer| {
-            stable_grapheme_for_glyph = gme;
-            self.allocator.free(stable_key);
-            cache_entry_opt = outer;
-        } else {
-            const new_entry = CacheEntry{
-                .glyphs_by_style = std.AutoHashMap(u32, Glyph).init(self.allocator),
-            };
-            try font.glyphs.put(stable_key, new_entry);
-            stable_grapheme_for_glyph = stable_key;
-            const found = font.glyphs.get(stable_key);
-            if (found) |entry| {
-                cache_entry_opt = entry;
-            } else {
-                return error.RenderFailed;
-            }
-        }
-
-        var cache_entry = cache_entry_opt.?;
-
-        const style_key = createGlyphKey(weight, slant, size);
-        if (cache_entry.glyphs_by_style.get(style_key)) |cached_glyph| {
+        // Use a single cache key that combines grapheme, weight, slant, and size.
+        const key = newGlyphCacheKey(gme, weight, slant, size);
+        if (font.glyphs.get(key)) |cached_glyph| {
             if (style_set) c.TTF_SetFontStyle(font.font_handle, c.TTF_STYLE_NORMAL);
             return cached_glyph;
         }
 
-        // Set the font size before rendering
+        // Set the font size before rendering.
         if (c.TTF_SetFontSize(font.font_handle, size) != 0) {
             std.log.warn("Failed to set font size: {s}", .{c.TTF_GetError()});
         }
 
+        // Convert the grapheme to a null-terminated string.
         const sentinel_gme = try sliceToSentinelArray(self.allocator, gme);
         defer self.allocator.free(sentinel_gme);
 
@@ -461,13 +431,11 @@ pub const FontManager = struct {
         );
         if (glyph_surface == null) {
             const err_msg = c.TTF_GetError();
-            // If it's a zero-width character, substitute with a space
+            // For zero-width characters, substitute with a space.
             if (std.mem.indexOf(u8, std.mem.span(err_msg), "zero width") != null) {
-                // Create a new sentinel array for space character
                 const space_sentinel = try self.allocator.allocSentinel(u8, 1, 0);
                 defer self.allocator.free(space_sentinel);
                 space_sentinel[0] = ' ';
-
                 const space_surface = c.TTF_RenderUTF8_Blended(
                     font.font_handle,
                     space_sentinel,
@@ -479,7 +447,6 @@ pub const FontManager = struct {
                 }
                 glyph_surface = space_surface;
             } else {
-                // For other rendering errors, still fail
                 if (style_set) c.TTF_SetFontStyle(font.font_handle, c.TTF_STYLE_NORMAL);
                 std.debug.print("failed to render glyph: {s}\n", .{sentinel_gme});
                 std.debug.print("error: {s}\n", .{err_msg});
@@ -498,18 +465,20 @@ pub const FontManager = struct {
 
         const surf = glyph_surface.*;
         const is_emoji = isCodepointEmoji(codepoint.code);
+        const ascent = c.TTF_FontAscent(font.font_handle);
+        const descent = -c.TTF_FontDescent(font.font_handle); // Make positive
 
         const new_glyph = if (!is_emoji) Glyph{
-            .grapheme = stable_grapheme_for_glyph,
+            .grapheme = gme,
             .texture = glyph_tex,
             .w = surf.w,
             .h = surf.h,
+            .ascent = ascent,
+            .descent = descent,
         } else blk: {
-            // Get text height from the current font
             var miny: i32 = 0;
             var maxy: i32 = 0;
             var advance: i32 = 0;
-
             if (c.TTF_GlyphMetrics32(
                 font.font_handle,
                 codepoint.code,
@@ -521,27 +490,24 @@ pub const FontManager = struct {
             ) != 0) {
                 std.log.err("Failed to get glyph metrics: {s}", .{c.TTF_GetError()});
             }
-
-            // const text_height = maxy - miny; // Approximate visual text height
             const text_height: i32 = self.min_line_height;
-
-            // Scale emoji proportionally
             var tmp1: f32 = @floatFromInt(text_height);
             const tmp2: f32 = @floatFromInt(surf.h);
             const emoji_scale_factor = tmp1 / tmp2;
-
             tmp1 = @floatFromInt(surf.w);
             const emoji_width: i32 = @intFromFloat(tmp1 * emoji_scale_factor);
             const emoji_height: i32 = @intFromFloat(tmp2 * emoji_scale_factor);
-
             break :blk Glyph{
                 .grapheme = gme,
                 .texture = glyph_tex,
                 .w = emoji_width,
                 .h = emoji_height,
+                .ascent = ascent,
+                .descent = descent,
             };
         };
 
+        try font.glyphs.put(key, new_glyph);
         if (style_set) c.TTF_SetFontStyle(font.font_handle, c.TTF_STYLE_NORMAL);
         return new_glyph;
     }
@@ -617,7 +583,7 @@ pub const FontManager = struct {
             }
         }
 
-        // If we didn’t find an exact match, fallback to "Normal Roman"
+        // If we didn't find an exact match, fallback to "Normal Roman"
         // or whatever logic you like.
         return self.pickFontForCharacter(codepoint);
     }
@@ -657,11 +623,21 @@ fn getCategory(codepoint: u21) ?FontCategory {
     return null;
 }
 
-fn createGlyphKey(weight: FontWeight, slant: FontSlant, size: i32) u32 {
-    // bit 0 = bold flag
-    // bit 1 = italic flag
+fn hash_combine(seed: u64, value: u64) u64 {
+    // A common hash combine (borrowed from boost::hash_combine)
+    return seed ^ (value +% 0x9e3779b97f4a7c15 +% (seed << 6) +% (seed >> 2));
+}
+
+fn newGlyphCacheKey(gme: []const u8, weight: FontWeight, slant: FontSlant, size: i32) u64 {
+    // Prepare style bits: bit 0 for Bold, bit 1 for Italic.
     var bits: u8 = 0;
     if (weight == .Bold) bits |= 1;
     if (slant == .Italic) bits |= 2;
-    return (@as(u32, @intCast(size)) << 8) | bits;
+
+    const grapheme_hash = std.hash.Fnv1a_64.hash(gme);
+
+    // Combine the hashed grapheme, the size, and the style bits.
+    var key = hash_combine(grapheme_hash, @as(u64, @intCast(size)));
+    key = hash_combine(key, @as(u64, bits));
+    return key;
 }
