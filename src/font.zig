@@ -57,6 +57,7 @@ const unicode_ranges = FontCategoryRanges{
     .emoji = &[_]UnicodeRange{
         .{ .start = 0x1F300, .end = 0x1F5FF }, // Miscellaneous Symbols and Pictographs
         .{ .start = 0x1F600, .end = 0x1F64F }, // Emoticons
+        .{ .start = 0x1F900, .end = 0x1F9FF }, // Supplemental Symbols and Pictographs
     },
 };
 
@@ -190,10 +191,18 @@ pub const Font = struct {
     font_rw: ?*c.SDL_RWops,
 };
 
+pub const FontKey = struct {
+    category: FontCategory,
+    weight: FontWeight,
+    slant: FontSlant,
+};
+
 pub const FontManager = struct {
     allocator: std.mem.Allocator,
     renderer: *c.SDL_Renderer,
     fonts: std.StringHashMap(*Font),
+    styled_fonts: std.AutoHashMap(FontKey, *Font),
+    category_fonts: std.AutoHashMap(FontCategory, *Font),
     current_font: ?*Font = null,
     min_line_height: i32 = std.math.maxInt(i32),
     loaded_sizes: std.AutoHashMap(i32, void),
@@ -207,6 +216,8 @@ pub const FontManager = struct {
             .allocator = allocator,
             .renderer = renderer,
             .fonts = std.StringHashMap(*Font).init(allocator),
+            .styled_fonts = std.AutoHashMap(FontKey, *Font).init(allocator),
+            .category_fonts = std.AutoHashMap(FontCategory, *Font).init(allocator),
             .loaded_sizes = std.AutoHashMap(i32, void).init(allocator),
         };
     }
@@ -234,10 +245,10 @@ pub const FontManager = struct {
             self.allocator.destroy(f);
         }
 
+        self.styled_fonts.deinit();
+        self.category_fonts.deinit();
         self.fonts.deinit();
         self.loaded_sizes.deinit();
-
-        std.debug.print("current font glyphs count: {d}\n", .{self.fonts.count()});
 
         c.TTF_Quit();
     }
@@ -304,9 +315,7 @@ pub const FontManager = struct {
     }
 
     fn loadFontAtPath(self: *FontManager, path: []const u8, name: []const u8, size: i32) !bool {
-        if (self.fonts.get(name)) |_| {
-            return true;
-        }
+        if (self.fonts.get(name)) |_| return true;
 
         const path_z = try sliceToSentinelArray(self.allocator, path);
         defer self.allocator.free(path_z);
@@ -340,6 +349,26 @@ pub const FontManager = struct {
 
         if (self.current_font == null) {
             self.current_font = self.fonts.get(name);
+        }
+
+        // After loading font, find its metadata in system_fonts
+        for (system_fonts.fonts) |sf| {
+            if (std.mem.eql(u8, sf.name, name)) {
+                // Add to styled_fonts map
+                const key = FontKey{
+                    .category = sf.category,
+                    .weight = sf.weight,
+                    .slant = sf.slant,
+                };
+                try self.styled_fonts.put(key, font);
+
+                // If this is a "normal" font (Normal weight, Roman slant),
+                // add/update it as the category font
+                if (sf.weight == .Normal and sf.slant == .Roman) {
+                    try self.category_fonts.put(sf.category, font);
+                }
+                break;
+            }
         }
 
         return true;
@@ -493,7 +522,8 @@ pub const FontManager = struct {
             const text_height: i32 = self.min_line_height;
             var tmp1: f32 = @floatFromInt(text_height);
             const tmp2: f32 = @floatFromInt(surf.h);
-            const emoji_scale_factor = tmp1 / tmp2;
+            // Multiply by 1.2 to make the emoji 20% larger than before.
+            const emoji_scale_factor = (tmp1 / tmp2) * 1.2;
             tmp1 = @floatFromInt(surf.w);
             const emoji_width: i32 = @intFromFloat(tmp1 * emoji_scale_factor);
             const emoji_height: i32 = @intFromFloat(tmp2 * emoji_scale_factor);
@@ -502,8 +532,8 @@ pub const FontManager = struct {
                 .texture = glyph_tex,
                 .w = emoji_width,
                 .h = emoji_height,
-                .ascent = ascent,
-                .descent = descent,
+                .ascent = @divTrunc(3 * self.min_line_height, 4),
+                .descent = @divTrunc(self.min_line_height, 4),
             };
         };
 
@@ -563,29 +593,21 @@ pub const FontManager = struct {
         weight: FontWeight,
         slant: FontSlant,
     ) ?*Font {
-        // 1) Figure out the script
+        // 1) Get category
         const category = getCategory(codepoint) orelse return null;
 
-        // 2) Search for a loaded font that matches this script + weight + slant
-        var it = self.fonts.iterator();
-        while (it.next()) |entry| {
-            const font_name = entry.key_ptr.*;
-            const font_ptr = entry.value_ptr.*;
-
-            // We must look up which category/weight/slant this font_name represents
-            // by comparing to system_fonts. For instance:
-            for (system_fonts.fonts) |sf| {
-                if (std.mem.eql(u8, sf.name, font_name)) {
-                    if (sf.category == category and sf.weight == weight and sf.slant == slant) {
-                        return font_ptr;
-                    }
-                }
-            }
+        // 2) Try exact style match
+        const key = FontKey{
+            .category = category,
+            .weight = weight,
+            .slant = slant,
+        };
+        if (self.styled_fonts.get(key)) |font| {
+            return font;
         }
 
-        // If we didn't find an exact match, fallback to "Normal Roman"
-        // or whatever logic you like.
-        return self.pickFontForCharacter(codepoint);
+        // 3) Fallback to normal style for this category
+        return self.category_fonts.get(category);
     }
 };
 
@@ -605,7 +627,7 @@ fn isCodepointEmoji(codepoint: u21) bool {
     return false;
 }
 
-fn getCategory(codepoint: u21) ?FontCategory {
+pub fn getCategory(codepoint: u21) ?FontCategory {
     // basically the same logic you had in pickFontForCharacter
     const categories = [_]FontCategory{ .latin, .cjk, .emoji };
     for (categories) |category| {
@@ -628,7 +650,7 @@ fn hash_combine(seed: u64, value: u64) u64 {
     return seed ^ (value +% 0x9e3779b97f4a7c15 +% (seed << 6) +% (seed >> 2));
 }
 
-fn newGlyphCacheKey(gme: []const u8, weight: FontWeight, slant: FontSlant, size: i32) u64 {
+pub fn newGlyphCacheKey(gme: []const u8, weight: FontWeight, slant: FontSlant, size: i32) u64 {
     // Prepare style bits: bit 0 for Bold, bit 1 for Italic.
     var bits: u8 = 0;
     if (weight == .Bold) bits |= 1;

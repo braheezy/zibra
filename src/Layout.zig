@@ -11,6 +11,7 @@ const FontSlant = font.FontSlant;
 const scrollbar_width = browser.scrollbar_width;
 const h_offset = browser.h_offset;
 const v_offset = browser.v_offset;
+const newGlyphCacheKey = font.newGlyphCacheKey;
 
 const c = @cImport({
     @cInclude("SDL2/SDL.h");
@@ -26,7 +27,15 @@ const LineItem = struct {
     descent: i32,
 };
 
-const Layout = @This();
+// Add this struct to cache word measurements
+const WordCache = struct {
+    width: i32,
+    graphemes: []const []const u8,
+};
+
+const getCategory = @import("font.zig").getCategory;
+
+pub const Layout = @This();
 
 // Layout state
 allocator: std.mem.Allocator,
@@ -44,6 +53,11 @@ is_italic: bool = false,
 content_height: i32 = 0,
 display_list: std.ArrayList(DisplayItem),
 
+// Add cache as field
+word_cache: std.AutoHashMap(u64, WordCache),
+
+grapheme_data: grapheme.GraphemeData,
+
 pub fn init(
     allocator: std.mem.Allocator,
     renderer: *c.SDL_Renderer,
@@ -53,6 +67,7 @@ pub fn init(
 ) !*Layout {
     const font_manager = try font.FontManager.init(allocator, renderer);
     const layout = try allocator.create(Layout);
+    const grapheme_data = try grapheme.GraphemeData.init(allocator);
 
     layout.* = Layout{
         .allocator = allocator,
@@ -66,6 +81,8 @@ pub fn init(
         .is_italic = false,
         .content_height = 0,
         .display_list = std.ArrayList(DisplayItem).init(allocator),
+        .word_cache = std.AutoHashMap(u64, WordCache).init(allocator),
+        .grapheme_data = grapheme_data,
     };
 
     try layout.font_manager.loadSystemFont(layout.size);
@@ -77,10 +94,19 @@ pub fn deinit(self: *Layout) void {
     // clean up hash map for fonts
     self.font_manager.deinit();
 
+    var it = self.word_cache.iterator();
+    while (it.next()) |entry| {
+        self.allocator.free(entry.value_ptr.graphemes);
+    }
+    self.word_cache.deinit();
+
+    self.grapheme_data.deinit();
+
     self.allocator.destroy(self);
 }
 
 pub fn layoutTokens(self: *Layout, tokens: []const Token) ![]DisplayItem {
+    std.debug.print("layoutTokens: {d}\n", .{tokens.len});
     self.cursor_x = if (self.rtl_text)
         self.window_width - scrollbar_width - h_offset
     else
@@ -164,95 +190,45 @@ fn handleTextToken(
     content: []const u8,
     line_buffer: *std.ArrayList(LineItem),
 ) !void {
-    // Make a local copy
-    var text_copy = try self.allocator.dupe(u8, content);
-    defer self.allocator.free(text_copy);
+    // Replace newline characters with spaces in a stack buffer.
+    var buf: [4096]u8 = undefined;
+    const text = if (content.len < buf.len) blk: {
+        @memcpy(buf[0..content.len], content);
+        for (buf[0..content.len]) |*byte| {
+            if (byte.* == '\n') byte.* = ' ';
+        }
+        break :blk buf[0..content.len];
+    } else content;
 
-    // Convert literal \n in HTML to space so it doesn't cause a line break
-    for (text_copy, 0..) |byte, idx| {
-        if (byte == '\n') text_copy[idx] = ' ';
-    }
+    // Use the current style settings.
+    const weight: font.FontWeight = if (self.is_bold) .Bold else .Normal;
+    const slant: font.FontSlant = if (self.is_italic) .Italic else .Roman;
 
-    // Split on spaces/tabs, measure, and place graphemes inline
-    var word_tokenizer = std.mem.tokenizeSequence(u8, text_copy, " \t\r");
+    // Unified grapheme iteration: regardless of script, process each grapheme.
+    var g_iter = grapheme.Iterator.init(text, &self.grapheme_data);
+    while (g_iter.next()) |gc| {
+        const gme = gc.bytes(text);
+        const glyph = try self.font_manager.getStyledGlyph(
+            gme,
+            weight,
+            slant,
+            self.size,
+        );
 
-    while (word_tokenizer.next()) |word| {
-        if (word.len == 0) continue;
-
-        const measured_w = try self.measureWordWidthWithStyle(word, self.is_bold, self.is_italic);
-
-        // line wrapping if word doesn't fit horizontally
-        if (self.rtl_text) {
-            if (self.cursor_x - measured_w < h_offset) {
-                try self.flushLine(line_buffer);
-            }
-        } else {
-            if (self.cursor_x + measured_w > (self.window_width - scrollbar_width)) {
-                try self.flushLine(line_buffer);
-            }
+        // Check available horizontal space.
+        // (The available area is window_width minus both the scrollbar and the right margin [h_offset].)
+        if (self.cursor_x + glyph.w > (self.window_width - scrollbar_width - h_offset)) {
+            try self.flushLine(line_buffer);
         }
 
-        // Render each grapheme
-        var gd = try grapheme.GraphemeData.init(self.allocator);
-        defer gd.deinit();
-        var g_iter = grapheme.Iterator.init(word, &gd);
-
-        var graphemes_array = std.ArrayList([]const u8).init(self.allocator);
-        defer graphemes_array.deinit();
-
-        while (g_iter.next()) |gc| {
-            try graphemes_array.append(gc.bytes(word));
-        }
-        if (self.rtl_text) {
-            std.mem.reverse([]const u8, graphemes_array.items);
-        }
-
-        // Process each grapheme: get its glyph and record metrics.
-        for (graphemes_array.items) |gme| {
-            const weight: FontWeight = if (self.is_bold) .Bold else .Normal;
-            const slantness: FontSlant = if (self.is_italic) .Italic else .Roman;
-            const glyph = try self.font_manager.getStyledGlyph(
-                gme,
-                weight,
-                slantness,
-                self.size,
-            );
-
-            // Line wrapping check before placing the glyph
-            if (self.rtl_text) {
-                if (self.cursor_x - glyph.w < h_offset) {
-                    try self.flushLine(line_buffer);
-                }
-            } else {
-                if (self.cursor_x + glyph.w > (self.window_width - scrollbar_width)) {
-                    try self.flushLine(line_buffer);
-                }
-            }
-
-            // Remove the font metrics query since we now have them in the glyph
-            try line_buffer.append(.{
-                .x = self.cursor_x,
-                .glyph = glyph,
-                .ascent = glyph.ascent, // Use metrics from the glyph
-                .descent = glyph.descent, // Use metrics from the glyph
-            });
-
-            // Update cursor position after adding the glyph
-            if (self.rtl_text) {
-                self.cursor_x -= glyph.w;
-            } else {
-                self.cursor_x += glyph.w;
-            }
-        }
-
-        // Add space after word (unless it's the last word)
-        if (word_tokenizer.peek() != null) {
-            if (self.rtl_text) {
-                self.cursor_x -= @divTrunc(self.size, 2);
-            } else {
-                self.cursor_x += @divTrunc(self.size, 2);
-            }
-        }
+        // Append the glyph to the line and update the cursor.
+        try line_buffer.append(LineItem{
+            .x = self.cursor_x,
+            .glyph = glyph,
+            .ascent = glyph.ascent,
+            .descent = glyph.descent,
+        });
+        self.cursor_x += glyph.w;
     }
 }
 
@@ -317,64 +293,4 @@ fn handleTagToken(
     } else {
         // skip others
     }
-}
-
-/// Measures a word by summing the widths of its graphemes under the current style.
-fn measureWordWidthWithStyle(self: *Layout, word: []const u8, bold: bool, italic: bool) !i32 {
-    // 1) Determine the right font or fallback
-    const weight: FontWeight = if (bold) .Bold else .Normal;
-    const slant: FontSlant = if (italic) .Italic else .Roman;
-
-    var styled_font = self.font_manager.pickFontForCharacterStyle(
-        firstCodePoint(word),
-        weight,
-        slant,
-    );
-    var style_set = false;
-    if (styled_font == null) {
-        // fallback
-        styled_font = self.font_manager.pickFontForCharacter(firstCodePoint(word));
-        if (styled_font == null) return error.NoFontForGlyph;
-
-        // Synthetic styling
-        var new_style: c_int = 0;
-        if (bold) new_style |= c.TTF_STYLE_BOLD;
-        if (italic) new_style |= c.TTF_STYLE_ITALIC;
-        c.TTF_SetFontStyle(styled_font.?.font_handle, new_style);
-        style_set = true;
-    }
-
-    const fh = styled_font.?.font_handle;
-
-    // 2) Use TTF_SizeUTF8 to measure the entire word
-    var w: c_int = 0;
-    var h: c_int = 0;
-
-    // Convert word to a null-terminated sentinel
-    const sentinel = try sliceToSentinelArray(self.allocator, word);
-    defer self.allocator.free(sentinel);
-
-    if (c.TTF_SizeUTF8(fh, sentinel, &w, &h) != 0) {
-        if (style_set) c.TTF_SetFontStyle(fh, c.TTF_STYLE_NORMAL);
-        return error.RenderFailed;
-    }
-
-    // 3) Restore synthetic style if needed
-    if (style_set) c.TTF_SetFontStyle(fh, c.TTF_STYLE_NORMAL);
-
-    return w;
-}
-
-fn firstCodePoint(word: []const u8) u21 {
-    var it = code_point.Iterator{ .bytes = word };
-    if (it.next()) |cp| return cp.code;
-    return 0; // fallback if empty
-}
-
-// helper function to convert a slice to a sentinel array, because C expects that for strings
-fn sliceToSentinelArray(allocator: std.mem.Allocator, slice: []const u8) ![:0]const u8 {
-    const len = slice.len;
-    const arr = try allocator.allocSentinel(u8, len, 0);
-    @memcpy(arr, slice);
-    return arr;
 }
