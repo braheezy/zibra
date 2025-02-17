@@ -1,6 +1,9 @@
 const std = @import("std");
 const builtin = @import("builtin");
 
+const token = @import("token.zig");
+const Token = token.Token;
+
 const grapheme = @import("grapheme");
 const code_point = @import("code_point");
 const FontManager = @import("font.zig").FontManager;
@@ -47,19 +50,19 @@ pub const DisplayItem = struct {
     glyph: Glyph,
 };
 
-pub const TokenType = enum {
-    Text,
-    Tag,
-};
+// pub const TokenType = enum {
+//     Text,
+//     Tag,
+// };
 
-pub const Token = struct {
-    ty: TokenType,
-    content: []const u8, // For text tokens, the text; for tag tokens, the tag name
+// pub const Token = struct {
+//     ty: TokenType,
+//     content: []const u8, // For text tokens, the text; for tag tokens, the tag name
 
-    pub fn deinit(self: Token, allocator: std.mem.Allocator) void {
-        allocator.free(self.content);
-    }
-};
+//     pub fn deinit(self: Token, allocator: std.mem.Allocator) void {
+//         allocator.free(self.content);
+//     }
+// };
 
 // Browser is the main struct that holds the state of the browser.
 pub const Browser = struct {
@@ -336,15 +339,15 @@ pub const Browser = struct {
             const body_copy = try self.allocator.dupe(u8, body);
             defer self.allocator.free(body_copy);
 
-            try plain.append(Token{ .ty = .Text, .content = body_copy });
+            try plain.append(Token{ .text = body_copy });
 
             const plain_tokens_slice = try plain.toOwnedSlice();
             try self.layout(plain_tokens_slice);
         } else {
             var tokens_array = try self.lexTokens(body);
             defer {
-                for (tokens_array.items) |token| {
-                    token.deinit(self.allocator);
+                for (tokens_array.items) |tk| {
+                    tk.deinit(self.allocator);
                 }
                 tokens_array.deinit();
             }
@@ -374,8 +377,7 @@ pub const Browser = struct {
                 // If we have accumulated text, flush it to a TEXT token
                 if (temp_text.items.len > 0) {
                     try tokens.append(Token{
-                        .ty = .Text,
-                        .content = try self.allocator.dupe(u8, temp_text.items),
+                        .text = try self.allocator.dupe(u8, temp_text.items),
                     });
                     temp_text.clearRetainingCapacity();
                 }
@@ -390,11 +392,10 @@ pub const Browser = struct {
                 in_tag = false;
 
                 // Now tag_buffer has something like "b", "/b", "p", "/p"
-                // We'll produce a TAG token
-                try tokens.append(Token{
-                    .ty = .Tag,
-                    .content = try self.allocator.dupe(u8, tag_buffer.items),
-                });
+                // Duplicate the tag content then initialize a Tag.
+                const tag_content = try self.allocator.dupe(u8, tag_buffer.items);
+                const tag_ptr = try token.Tag.init(self.allocator, tag_content);
+                try tokens.append(Token{ .tag = tag_ptr });
                 continue;
             }
 
@@ -423,8 +424,7 @@ pub const Browser = struct {
         // If there's leftover text at the end, produce a final TEXT token
         if (temp_text.items.len > 0) {
             try tokens.append(Token{
-                .ty = .Text,
-                .content = try self.allocator.dupe(u8, temp_text.items),
+                .text = try self.allocator.dupe(u8, temp_text.items),
             });
         }
 

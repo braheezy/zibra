@@ -3,9 +3,9 @@ const font = @import("font.zig");
 const browser = @import("browser.zig");
 const code_point = @import("code_point");
 const grapheme = @import("grapheme");
-
+const token = @import("token.zig");
 const DisplayItem = browser.DisplayItem;
-const Token = browser.Token;
+const Token = token.Token;
 const FontWeight = font.FontWeight;
 const FontSlant = font.FontSlant;
 const scrollbar_width = browser.scrollbar_width;
@@ -117,13 +117,13 @@ pub fn layoutTokens(self: *Layout, tokens: []const Token) ![]DisplayItem {
     defer line_buffer.deinit();
 
     for (tokens) |tok| {
-        switch (tok.ty) {
-            .Text => {
-                try self.handleTextToken(tok.content, &line_buffer);
+        switch (tok) {
+            .text => {
+                try self.handleTextToken(tok.text, &line_buffer);
             },
 
-            .Tag => {
-                try self.handleTagToken(tok.content, &line_buffer);
+            .tag => {
+                try self.handleTagToken(tok.tag, &line_buffer);
             },
         }
     }
@@ -234,12 +234,12 @@ fn handleTextToken(
 
 fn handleTagToken(
     self: *Layout,
-    content: []const u8,
+    tag: *token.Tag,
     line_buffer: *std.ArrayList(LineItem),
 ) !void {
-    const lower_copy = try self.allocator.dupe(u8, content);
+    const lower_copy = try self.allocator.dupe(u8, tag.name);
     defer self.allocator.free(lower_copy);
-    _ = std.ascii.lowerString(lower_copy, content);
+    _ = std.ascii.lowerString(lower_copy, tag.name);
 
     const t = std.mem.trim(u8, lower_copy, " \t\r\n");
 

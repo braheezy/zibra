@@ -78,7 +78,7 @@ fn zibra() !void {
         defer {
             // Free each token’s content
             for (tokens.items) |tok| {
-                b.allocator.free(tok.content);
+                tok.deinit(allocator);
             }
             tokens.deinit();
         }
