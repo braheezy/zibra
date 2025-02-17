@@ -49,6 +49,7 @@ cursor_x: i32,
 cursor_y: i32,
 is_bold: bool = false,
 is_italic: bool = false,
+is_title: bool = false,
 // Final content height after layout
 content_height: i32 = 0,
 display_list: std.ArrayList(DisplayItem),
@@ -137,6 +138,34 @@ pub fn layoutTokens(self: *Layout, tokens: []const Token) ![]DisplayItem {
 fn flushLine(self: *Layout, line_buffer: *std.ArrayList(LineItem)) !void {
     // Nothing to flush? Return.
     if (line_buffer.items.len == 0) return;
+
+    if (self.is_title) {
+        // Determine the bounding x-coordinates from the line items.
+        var min_x: i32 = line_buffer.items[0].x;
+        var max_x: i32 = line_buffer.items[0].x + line_buffer.items[0].glyph.w;
+        for (line_buffer.items) |item| {
+            if (item.x < min_x) {
+                min_x = item.x;
+            }
+            const item_right = item.x + item.glyph.w;
+            if (item_right > max_x) {
+                max_x = item_right;
+            }
+        }
+        const line_width: i32 = max_x - min_x;
+        // Compute available width:
+        // Here we assume h_offset defines the left/right content margin, and scrollbar_width is reserved.
+        const available_width: i32 = self.window_width - scrollbar_width - (h_offset * 2);
+        // Compute new left offset so that the line is centered.
+        const new_x_offset: i32 = h_offset + @divTrunc(available_width - line_width, 2);
+        const shift: i32 = new_x_offset - min_x;
+        // Adjust all glyph positions for centering.
+        for (line_buffer.items) |*item| {
+            item.x += shift;
+        }
+        // Reset the is_title state since the title line has been centered.
+        self.is_title = false;
+    }
 
     // === PASS 1: Collect line metrics ===
     var max_ascent: i32 = 0;
@@ -237,60 +266,54 @@ fn handleTagToken(
     tag: *token.Tag,
     line_buffer: *std.ArrayList(LineItem),
 ) !void {
-    const lower_copy = try self.allocator.dupe(u8, tag.name);
-    defer self.allocator.free(lower_copy);
-    _ = std.ascii.lowerString(lower_copy, tag.name);
-
-    const t = std.mem.trim(u8, lower_copy, " \t\r\n");
-
-    // Bold/italic toggles
-    if (std.mem.eql(u8, t, "b")) {
-        self.is_bold = true;
-    } else if (std.mem.eql(u8, t, "/b")) {
-        self.is_bold = false;
-    } else if (std.mem.eql(u8, t, "i")) {
-        self.is_italic = true;
-    } else if (std.mem.eql(u8, t, "/i")) {
-        self.is_italic = false;
-    } else if (std.mem.eql(u8, t, "big")) {
-        self.size += 4;
-    } else if (std.mem.eql(u8, t, "small")) {
-        self.size -= 4;
-    } else if (std.mem.eql(u8, t, "/big")) {
-        self.size -= 4;
-    } else if (std.mem.eql(u8, t, "/small")) {
-        self.size += 4;
-    }
-    // Paragraph handling: flush current line and add vertical spacing
-    else if (std.mem.eql(u8, t, "p")) {
-        // Flush any content in the current line
+    if (std.mem.eql(u8, tag.name, "b")) {
+        if (tag.is_closing) {
+            std.log.info("Closing bold tag", .{});
+        }
+        self.is_bold = !tag.is_closing;
+    } else if (std.mem.eql(u8, tag.name, "i")) {
+        self.is_italic = !tag.is_closing;
+    } else if (std.mem.eql(u8, tag.name, "big")) {
+        if (!tag.is_closing) {
+            self.size += 4;
+        } else {
+            self.size -= 4;
+        }
+    } else if (std.mem.eql(u8, tag.name, "small")) {
+        if (!tag.is_closing) {
+            self.size -= 4;
+        } else {
+            self.size += 4;
+        }
+    } else if (std.mem.eql(u8, tag.name, "p")) {
+        // Flush the current line and add vertical spacing.
         try self.flushLine(line_buffer);
-        // Add extra vertical spacing before paragraph
         self.cursor_y += self.size;
-        // Reset horizontal position
         self.cursor_x = if (self.rtl_text)
             self.window_width - scrollbar_width - h_offset
         else
             h_offset;
-    } else if (std.mem.eql(u8, t, "/p")) {
-        // Flush the paragraph's content
-        try self.flushLine(line_buffer);
-        // Add extra vertical spacing after paragraph
-        self.cursor_y += self.size;
-        // Reset horizontal position
-        self.cursor_x = if (self.rtl_text)
-            self.window_width - scrollbar_width - h_offset
-        else
-            h_offset;
-    }
-    // <br> => single line break
-    else if (std.mem.eql(u8, t, "br")) {
+    } else if (std.mem.eql(u8, tag.name, "br")) {
+        // A <br> tag always triggers a line break.
         try self.flushLine(line_buffer);
         self.cursor_x = if (self.rtl_text)
             self.window_width - scrollbar_width - h_offset
         else
             h_offset;
+    } else if (std.mem.eql(u8, tag.name, "h1")) {
+        if (tag.attributes) |attributes| {
+            if (attributes.get("class")) |id| {
+                if (std.mem.eql(u8, id, "title")) {
+                    self.is_title = true;
+                }
+            }
+        }
     } else {
-        // skip others
+        // For other tags you can now use the attributes parsed into tag.attributes.
+        // For example, if there's an inline style attribute, you might inspect it like so:
+        // if (tag.attributes.get("style")) |style_val| {
+        //     // Process the style value as needed.
+        // }
+        // Otherwise, skip tags that don't affect formatting.
     }
 }

@@ -330,7 +330,7 @@ pub const Browser = struct {
         }
 
         if (url.view_source) {
-            // If “view_source” is true, maybe you do NOTHING but show raw text.
+            // If "view_source" is true, maybe you do NOTHING but show raw text.
             // Or you still produce tokens, up to you.
             // Minimal approach: return an empty token list or a single text token:
             var plain = std.ArrayList(Token).init(self.allocator);
@@ -352,6 +352,7 @@ pub const Browser = struct {
                 tokens_array.deinit();
             }
 
+            // Update the SDL window title based on the <title> tag.
             try self.layout(tokens_array.items);
         }
     }
@@ -373,7 +374,7 @@ pub const Browser = struct {
             const char = body[i];
 
             if (char == '<') {
-                // We’re entering a tag
+                // We're entering a tag
                 // If we have accumulated text, flush it to a TEXT token
                 if (temp_text.items.len > 0) {
                     try tokens.append(Token{
@@ -388,13 +389,11 @@ pub const Browser = struct {
             }
 
             if (char == '>') {
-                // We’re leaving a tag
+                // We're leaving a tag
                 in_tag = false;
 
                 // Now tag_buffer has something like "b", "/b", "p", "/p"
-                // Duplicate the tag content then initialize a Tag.
-                const tag_content = try self.allocator.dupe(u8, tag_buffer.items);
-                const tag_ptr = try token.Tag.init(self.allocator, tag_content);
+                const tag_ptr = try token.Tag.init(self.allocator, tag_buffer.items);
                 try tokens.append(Token{ .tag = tag_ptr });
                 continue;
             }
@@ -417,7 +416,7 @@ pub const Browser = struct {
                 continue;
             }
 
-            // If it’s a raw newline, keep it as is. We will handle it in layout.
+            // If it's a raw newline, keep it as is. We will handle it in layout.
             try temp_text.append(char);
         }
 
