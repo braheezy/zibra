@@ -180,6 +180,7 @@ pub const Glyph = struct {
     h: i32,
     ascent: i32,
     descent: i32,
+    is_superscript: bool = false,
 };
 
 pub const Font = struct {

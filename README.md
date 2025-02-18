@@ -19,32 +19,13 @@ zig build
 cp zig-out/bin/zibra .
 ```
 
-`zibra` takes one or more URLs and displays the result in raw text on the command line.
+`zibra` (optionally) takes one URL and displays the result in a window:
 
 ```sh
 > zibra https://example.org
-
-Connecting to example.org:443
-HTTP/1.1 200 OK
-
-    Example Domain
-
-    body {
-        background-color: #f0f0f2;
-        margin: 0;
-        padding: 0;
-        font-family: -apple-system, system-ui, BlinkMacSystemFont, "Segoe UI", "Open Sans", "Helvetica Neue", Helvetica, Arial, sans-serif;
-
-    }
-    div {
-        width: 600px;
-    ...
-
-    Example Domain
-    This domain is for use in illustrative examples in documents. You may use this
-    domain in literature without prior coordination or asking for permission.
-    More information...
 ```
+
+Run without a URL for a default HTML.
 
 ## Supported Features
 
@@ -60,6 +41,14 @@ HTTP/1.1 200 OK
 - Redirects
 - `Cache-Control` header
 - `Content-Encoding: gzip` and `Transfer-Encoding: chunked` headers
+- Emojis and CJK text
+- Various tags for styling:
+  - `<b>Bold</b>`
+  - `<i>Italic</i>`
+  - `<big>Larger text</big>`
+  - `<small>Smaller text</small>`
+  - `<sup>Superscript</sup>`
+  - `<h1 class="title">Centered title</h1>`: An `h1` with `class` set to `title` will be centered
 
 ## Development
 

@@ -50,6 +50,7 @@ cursor_y: i32,
 is_bold: bool = false,
 is_italic: bool = false,
 is_title: bool = false,
+is_superscript: bool = false,
 // Final content height after layout
 content_height: i32 = 0,
 display_list: std.ArrayList(DisplayItem),
@@ -139,6 +140,7 @@ fn flushLine(self: *Layout, line_buffer: *std.ArrayList(LineItem)) !void {
     // Nothing to flush? Return.
     if (line_buffer.items.len == 0) return;
 
+    // === Handle title centering if needed ===
     if (self.is_title) {
         // Determine the bounding x-coordinates from the line items.
         var min_x: i32 = line_buffer.items[0].x;
@@ -169,46 +171,50 @@ fn flushLine(self: *Layout, line_buffer: *std.ArrayList(LineItem)) !void {
 
     // === PASS 1: Collect line metrics ===
     var max_ascent: i32 = 0;
+    var max_normal_ascent: i32 = 0; // Track max ascent of normal (non-superscript) text
     var max_descent: i32 = 0;
+
     for (line_buffer.items) |item| {
-        if (item.ascent > max_ascent) {
-            max_ascent = item.ascent;
-        }
-        if (item.descent > max_descent) {
-            max_descent = item.descent;
+        if (item.glyph.is_superscript) {
+            if (item.ascent > max_ascent) max_ascent = item.ascent;
+            if (item.descent > max_descent) max_descent = item.descent;
+        } else {
+            if (item.ascent > max_ascent) max_ascent = item.ascent;
+            if (item.ascent > max_normal_ascent) max_normal_ascent = item.ascent;
+            if (item.descent > max_descent) max_descent = item.descent;
         }
     }
-    // Compute the total natural line height.
+
     const line_height = max_ascent + max_descent;
-    // Extra leading (for example, 25% of the line height) improves readability.
     const extra_leading: i32 = @intFromFloat(@as(f32, @floatFromInt(line_height)) * 0.25);
-    // The common baseline is determined by taking the starting y plus the maximum ascent.
     const baseline = self.cursor_y + max_ascent;
 
-    // === PASS 2: Update the y coordinate for each glyph ===
+    // === PASS 2: Position glyphs ===
     for (line_buffer.items) |item| {
-        // Adjust the individual glyph's position so that its baseline
-        // (at y = item.ascent) aligns with our common baseline.
-        const final_y = baseline - item.ascent;
+        var final_y: i32 = undefined;
+
+        if (item.glyph.is_superscript) {
+            // Position superscript so its top aligns with normal text top
+            final_y = self.cursor_y; // Start at line top
+        } else {
+            // Normal baseline alignment
+            final_y = baseline - item.ascent;
+        }
+
         try self.display_list.append(DisplayItem{
             .x = item.x,
             .y = final_y,
             .glyph = item.glyph,
-            // Include additional fields as necessary…
         });
     }
 
-    // Advance the cursor_y: new line starts after the current line's descent plus extra leading.
+    // Advance cursor_y and reset cursor_x
     self.cursor_y = baseline + max_descent + extra_leading;
+    self.cursor_x = if (self.rtl_text)
+        self.window_width - scrollbar_width - h_offset
+    else
+        h_offset;
 
-    // Reset the horizontal position (depending on text direction).
-    if (self.rtl_text) {
-        self.cursor_x = self.window_width - scrollbar_width - h_offset;
-    } else {
-        self.cursor_x = h_offset;
-    }
-
-    // Clear the line buffer for the next line.
     line_buffer.clearRetainingCapacity();
 }
 
@@ -237,12 +243,13 @@ fn handleTextToken(
     var g_iter = grapheme.Iterator.init(text, &self.grapheme_data);
     while (g_iter.next()) |gc| {
         const gme = gc.bytes(text);
-        const glyph = try self.font_manager.getStyledGlyph(
+        var glyph = try self.font_manager.getStyledGlyph(
             gme,
             weight,
             slant,
-            self.size,
+            if (self.is_superscript) @divTrunc(self.size, 2) else self.size,
         );
+        glyph.is_superscript = self.is_superscript;
 
         // Check available horizontal space.
         // (The available area is window_width minus both the scrollbar and the right margin [h_offset].)
@@ -308,6 +315,8 @@ fn handleTagToken(
                 }
             }
         }
+    } else if (std.mem.eql(u8, tag.name, "sup")) {
+        self.is_superscript = !tag.is_closing;
     } else {
         // For other tags you can now use the attributes parsed into tag.attributes.
         // For example, if there's an inline style attribute, you might inspect it like so:
