@@ -75,16 +75,9 @@ fn zibra() !void {
         std.log.info("showing default html", .{});
         // 1) Lex the default_html into tokens
         var tokens = try b.lexTokens(default_html);
-        defer {
-            // Free each token’s content
-            for (tokens.items) |tok| {
-                tok.deinit(allocator);
-            }
-            tokens.deinit();
-        }
 
-        // 2) Pass tokens to layout
-        try b.layout(tokens.items);
+        b.current_content = try tokens.toOwnedSlice();
+        try b.layout(b.current_content.?);
     }
 
     // Start main exec loop

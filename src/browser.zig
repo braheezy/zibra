@@ -158,6 +158,12 @@ pub const Browser = struct {
 
         // free display list slice
         if (self.display_list) |items| self.allocator.free(items);
+        if (self.current_content) |items| {
+            for (items) |item| {
+                item.deinit(self.allocator);
+            }
+            self.allocator.free(items);
+        }
 
         // clean up layout
         self.layout_engine.deinit();
@@ -210,30 +216,21 @@ pub const Browser = struct {
         }
     }
 
-    pub fn handleResize(self: *Browser) !void {
-        // Adjust renderer viewport to match new window size
-        _ = c.SDL_RenderSetViewport(self.canvas, null);
-
-        // Re-run layout with existing content
-        if (self.current_content) |text| {
-            if (self.display_list) |list| {
-                self.allocator.free(list);
-                self.display_list = null;
-            }
-            try self.layout(text);
-        }
-    }
-
     pub fn handleWindowEvent(self: *Browser, window_event: c.SDL_WindowEvent) !void {
         const data1 = window_event.data1;
         const data2 = window_event.data2;
 
         switch (window_event.event) {
             c.SDL_WINDOWEVENT_RESIZED, c.SDL_WINDOWEVENT_SIZE_CHANGED => {
+                // Adjust renderer viewport to match new window size
+                _ = c.SDL_RenderSetViewport(self.canvas, null);
+
                 self.window_width = data1;
                 self.window_height = data2;
 
-                _ = c.SDL_RenderSetViewport(self.canvas, null);
+                // Update layout engine's window dimensions
+                self.layout_engine.window_width = data1;
+                self.layout_engine.window_height = data2;
 
                 if (self.current_content) |text| {
                     if (self.display_list) |list| {
@@ -243,13 +240,11 @@ pub const Browser = struct {
                     try self.layout(text);
                 }
 
+                // Force a clear and redraw
                 _ = c.SDL_SetRenderDrawColor(self.canvas, 250, 244, 237, 255);
                 _ = c.SDL_RenderClear(self.canvas);
                 try self.draw();
                 c.SDL_RenderPresent(self.canvas);
-            },
-            c.SDL_WINDOWEVENT_EXPOSED, c.SDL_WINDOWEVENT_MAXIMIZED, c.SDL_WINDOWEVENT_RESTORED => {
-                try self.handleResize();
             },
             else => {},
         }
@@ -345,15 +340,17 @@ pub const Browser = struct {
             try self.layout(plain_tokens_slice);
         } else {
             var tokens_array = try self.lexTokens(body);
-            defer {
-                for (tokens_array.items) |tk| {
-                    tk.deinit(self.allocator);
-                }
-                tokens_array.deinit();
-            }
+            // defer {
+            //     for (tokens_array.items) |tk| {
+            //         tk.deinit(self.allocator);
+            //     }
+            //     tokens_array.deinit();
+            // }
 
             // Update the SDL window title based on the <title> tag.
-            try self.layout(tokens_array.items);
+            std.log.info("Updating current content with {d} tokens", .{tokens_array.items.len});
+            self.current_content = try tokens_array.toOwnedSlice();
+            try self.layout(self.current_content.?);
         }
     }
 

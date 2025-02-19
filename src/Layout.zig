@@ -274,9 +274,6 @@ fn handleTagToken(
     line_buffer: *std.ArrayList(LineItem),
 ) !void {
     if (std.mem.eql(u8, tag.name, "b")) {
-        if (tag.is_closing) {
-            std.log.info("Closing bold tag", .{});
-        }
         self.is_bold = !tag.is_closing;
     } else if (std.mem.eql(u8, tag.name, "i")) {
         self.is_italic = !tag.is_closing;
