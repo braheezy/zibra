@@ -12,6 +12,8 @@ const c = @cImport({
     @cInclude("SDL2/SDL_ttf.h");
 });
 
+pub const hyphen_codepoint = 0x00AD;
+
 pub const FontWeight = enum {
     Normal,
     Bold,
@@ -181,6 +183,7 @@ pub const Glyph = struct {
     ascent: i32,
     descent: i32,
     is_superscript: bool = false,
+    is_soft_hyphen: bool = false,
 };
 
 pub const Font = struct {
@@ -423,6 +426,18 @@ pub const FontManager = struct {
 
         var iter = code_point.Iterator{ .bytes = gme };
         const codepoint = iter.next() orelse return error.InvalidGrapheme;
+
+        if (codepoint.code == hyphen_codepoint) {
+            return Glyph{
+                .grapheme = gme,
+                .texture = null,
+                .w = 0,
+                .h = 0,
+                .ascent = 0,
+                .descent = 0,
+                .is_soft_hyphen = true,
+            };
+        }
 
         var styled_font = self.pickFontForCharacterStyle(codepoint.code, weight, slant);
         var style_set = false;

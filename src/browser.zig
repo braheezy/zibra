@@ -2,19 +2,18 @@ const std = @import("std");
 const builtin = @import("builtin");
 
 const token = @import("token.zig");
+const font = @import("font.zig");
 const Token = token.Token;
-
 const grapheme = @import("grapheme");
 const code_point = @import("code_point");
-const FontManager = @import("font.zig").FontManager;
-const Glyph = @import("font.zig").Glyph;
-const FontWeight = @import("font.zig").FontWeight;
-const FontSlant = @import("font.zig").FontSlant;
+const FontManager = font.FontManager;
+const Glyph = font.Glyph;
+const FontWeight = font.FontWeight;
+const FontSlant = font.FontSlant;
 const Url = @import("url.zig").Url;
 const Connection = @import("url.zig").Connection;
 const Cache = @import("cache.zig").Cache;
 const ArrayList = std.ArrayList;
-const font_assets = @import("font-assets");
 const Layout = @import("Layout.zig");
 const c = @cImport({
     @cInclude("SDL2/SDL.h");
@@ -49,20 +48,6 @@ pub const DisplayItem = struct {
     // Pointer to the glyph to be displayed
     glyph: Glyph,
 };
-
-// pub const TokenType = enum {
-//     Text,
-//     Tag,
-// };
-
-// pub const Token = struct {
-//     ty: TokenType,
-//     content: []const u8, // For text tokens, the text; for tag tokens, the tag name
-
-//     pub fn deinit(self: Token, allocator: std.mem.Allocator) void {
-//         allocator.free(self.content);
-//     }
-// };
 
 // Browser is the main struct that holds the state of the browser.
 pub const Browser = struct {
@@ -340,12 +325,6 @@ pub const Browser = struct {
             try self.layout(plain_tokens_slice);
         } else {
             var tokens_array = try self.lexTokens(body);
-            // defer {
-            //     for (tokens_array.items) |tk| {
-            //         tk.deinit(self.allocator);
-            //     }
-            //     tokens_array.deinit();
-            // }
 
             // Update the SDL window title based on the <title> tag.
             std.log.info("Updating current content with {d} tokens", .{tokens_array.items.len});
@@ -441,6 +420,8 @@ pub const Browser = struct {
                 "\""
             else if (std.mem.eql(u8, entity, "&apos;"))
                 "'"
+            else if (std.mem.eql(u8, entity, "&shy;"))
+                "\u{00AD}" // Unicode soft hyphen
             else
                 null;
         } else {

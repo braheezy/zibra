@@ -35,8 +35,13 @@ Run without a URL for a default HTML.
 - HTTPS
 - `file://` URIs
 - `data:` URIs
-- Entity support (`&lt;div&gt` becomes `<div>`)
-- `view-source:`
+- Entity support:
+  - `&amp;` → `&` (ampersand)
+  - `&lt;` → `<` (less than)
+  - `&gt;` → `>` (greater than)
+  - `&quot;` → `"` (quotation mark)
+  - `&apos;` → `'` (apostrophe)
+  - `&shy;` → `­` (soft hyphen)
 - Connections that live beyond single request for `Connection: keep-alive` header
 - Redirects
 - `Cache-Control` header

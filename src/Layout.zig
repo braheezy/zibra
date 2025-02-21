@@ -239,7 +239,9 @@ fn handleTextToken(
     const weight: font.FontWeight = if (self.is_bold) .Bold else .Normal;
     const slant: font.FontSlant = if (self.is_italic) .Italic else .Roman;
 
-    // Unified grapheme iteration: regardless of script, process each grapheme.
+    // Track the last soft hyphen position in the current line
+    var last_hyphen_idx: ?usize = null;
+
     var g_iter = grapheme.Iterator.init(text, &self.grapheme_data);
     while (g_iter.next()) |gc| {
         const gme = gc.bytes(text);
@@ -251,13 +253,37 @@ fn handleTextToken(
         );
         glyph.is_superscript = self.is_superscript;
 
-        // Check available horizontal space.
-        // (The available area is window_width minus both the scrollbar and the right margin [h_offset].)
-        if (self.cursor_x + glyph.w > (self.window_width - scrollbar_width - h_offset)) {
-            try self.flushLine(line_buffer);
+        // Skip rendering soft hyphens but remember their position
+        if (glyph.is_soft_hyphen) {
+            last_hyphen_idx = line_buffer.items.len;
+            continue;
         }
 
-        // Append the glyph to the line and update the cursor.
+        // If we'll exceed the line width...
+        if (self.cursor_x + glyph.w > (self.window_width - scrollbar_width - h_offset)) {
+            // If we have a soft hyphen, add visible hyphen and break there
+            if (last_hyphen_idx) |_| {
+                // Get a visible hyphen glyph
+                const hyphen_glyph = try self.font_manager.getStyledGlyph(
+                    "-",
+                    weight,
+                    slant,
+                    if (self.is_superscript) @divTrunc(self.size, 2) else self.size,
+                );
+
+                // Add the hyphen at the break point
+                try line_buffer.append(LineItem{
+                    .x = self.cursor_x,
+                    .glyph = hyphen_glyph,
+                    .ascent = hyphen_glyph.ascent,
+                    .descent = hyphen_glyph.descent,
+                });
+            }
+            try self.flushLine(line_buffer);
+            last_hyphen_idx = null;
+        }
+
+        // Normal glyph handling (unchanged)
         try line_buffer.append(LineItem{
             .x = self.cursor_x,
             .glyph = glyph,
