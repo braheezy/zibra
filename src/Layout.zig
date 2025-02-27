@@ -51,6 +51,7 @@ is_bold: bool = false,
 is_italic: bool = false,
 is_title: bool = false,
 is_superscript: bool = false,
+is_small_caps: bool = false,
 // Final content height after layout
 content_height: i32 = 0,
 display_list: std.ArrayList(DisplayItem),
@@ -245,12 +246,43 @@ fn handleTextToken(
     var g_iter = grapheme.Iterator.init(text, &self.grapheme_data);
     while (g_iter.next()) |gc| {
         const gme = gc.bytes(text);
-        var glyph = try self.font_manager.getStyledGlyph(
-            gme,
-            weight,
-            slant,
-            if (self.is_superscript) @divTrunc(self.size, 2) else self.size,
-        );
+
+        // Handle small caps rendering
+        var glyph: font.Glyph = undefined;
+        if (self.is_small_caps) {
+            // Check if the grapheme is a lowercase letter
+            const is_lowercase = for (gme) |byte| {
+                if (byte >= 'a' and byte <= 'z') break true;
+            } else false;
+
+            if (is_lowercase) {
+                // Convert to uppercase and render at smaller size with bold
+                var upper_buf: [4]u8 = undefined;
+                const upper_len = std.ascii.upperString(&upper_buf, gme);
+                glyph = try self.font_manager.getStyledGlyph(
+                    upper_buf[0..upper_len.len],
+                    .Bold, // Force bold for small caps
+                    slant,
+                    @divTrunc(self.size * 4, 5), // Make it ~80% of normal size
+                );
+            } else {
+                // Regular rendering for non-lowercase characters
+                glyph = try self.font_manager.getStyledGlyph(
+                    gme,
+                    weight,
+                    slant,
+                    self.size,
+                );
+            }
+        } else {
+            // Normal rendering (existing code)
+            glyph = try self.font_manager.getStyledGlyph(
+                gme,
+                weight,
+                slant,
+                if (self.is_superscript) @divTrunc(self.size, 2) else self.size,
+            );
+        }
         glyph.is_superscript = self.is_superscript;
 
         // Skip rendering soft hyphens but remember their position
@@ -303,6 +335,8 @@ fn handleTagToken(
         self.is_bold = !tag.is_closing;
     } else if (std.mem.eql(u8, tag.name, "i")) {
         self.is_italic = !tag.is_closing;
+    } else if (std.mem.eql(u8, tag.name, "abbr")) {
+        self.is_small_caps = !tag.is_closing;
     } else if (std.mem.eql(u8, tag.name, "big")) {
         if (!tag.is_closing) {
             self.size += 4;
