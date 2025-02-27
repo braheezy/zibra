@@ -28,6 +28,7 @@ pub const FontCategory = enum {
     latin,
     cjk,
     emoji,
+    monospace,
 };
 
 pub const UnicodeRange = struct {
@@ -117,6 +118,18 @@ const system_fonts = switch (builtin.target.os.tag) {
                 .weight = .Bold,
                 .slant = .Italic,
             },
+            .{
+                .name = "Andale Mono",
+                .category = .monospace,
+                .weight = .Normal,
+                .slant = .Roman,
+            },
+            .{
+                .name = "Andale Mono",
+                .category = .monospace,
+                .weight = .Normal,
+                .slant = .Italic,
+            },
         },
     },
     .linux => struct {
@@ -169,6 +182,30 @@ const system_fonts = switch (builtin.target.os.tag) {
                 .category = .emoji,
                 .weight = .Normal,
                 .slant = .Roman,
+            },
+            .{
+                .name = "DejaVuSansMono",
+                .category = .monospace,
+                .weight = .Normal,
+                .slant = .Roman,
+            },
+            .{
+                .name = "DejaVuSansMono-Bold",
+                .category = .monospace,
+                .weight = .Bold,
+                .slant = .Roman,
+            },
+            .{
+                .name = "DejaVuSansMono-Oblique",
+                .category = .monospace,
+                .weight = .Normal,
+                .slant = .Italic,
+            },
+            .{
+                .name = "DejaVuSansMono-BoldOblique",
+                .category = .monospace,
+                .weight = .Bold,
+                .slant = .Italic,
             },
         },
     },
@@ -390,7 +427,7 @@ pub const FontManager = struct {
         }
 
         // Iterate through font categories in order of priority
-        const categories = [_]FontCategory{ .latin, .cjk, .emoji };
+        const categories = [_]FontCategory{ .latin, .cjk, .emoji, .monospace };
         for (categories) |category| {
             for (system_fonts.fonts) |font| {
                 if (font.category != category) continue; // Skip fonts not matching the current category
@@ -421,6 +458,7 @@ pub const FontManager = struct {
         weight: FontWeight,
         slant: FontSlant,
         size: i32,
+        use_monospace: bool,
     ) !Glyph {
         try self.ensureFontSize(size);
 
@@ -439,17 +477,39 @@ pub const FontManager = struct {
             };
         }
 
-        var styled_font = self.pickFontForCharacterStyle(codepoint.code, weight, slant);
+        var styled_font = self.pickFontForCharacterStyle(
+            codepoint.code,
+            weight,
+            slant,
+            use_monospace,
+        );
         var style_set = false;
+        var synthetic_bold = false;
+
         if (styled_font == null) {
-            std.debug.print("styled fallback\n", .{});
-            styled_font = self.pickFontForCharacter(codepoint.code);
-            if (styled_font == null) return error.NoFontForGlyph;
-            var new_style: c_int = 0;
-            if (weight == .Bold) new_style |= c.TTF_STYLE_BOLD;
-            if (slant == .Italic) new_style |= c.TTF_STYLE_ITALIC;
-            c.TTF_SetFontStyle(styled_font.?.font_handle, new_style);
-            style_set = true;
+            std.debug.print("trying again\n", .{});
+            // Try again with normal weight for monospace
+            if (use_monospace and weight == .Bold) {
+                styled_font = self.pickFontForCharacterStyle(
+                    codepoint.code,
+                    .Normal,
+                    slant,
+                    use_monospace,
+                );
+                if (styled_font != null) {
+                    synthetic_bold = true; // Mark for synthetic bold rendering
+                }
+            }
+
+            if (styled_font == null) {
+                styled_font = self.pickFontForCharacter(codepoint.code);
+                if (styled_font == null) return error.NoFontForGlyph;
+                var new_style: c_int = 0;
+                if (weight == .Bold) new_style |= c.TTF_STYLE_BOLD;
+                if (slant == .Italic) new_style |= c.TTF_STYLE_ITALIC;
+                c.TTF_SetFontStyle(styled_font.?.font_handle, new_style);
+                style_set = true;
+            }
         }
         const font = styled_font.?;
 
@@ -499,6 +559,38 @@ pub const FontManager = struct {
             }
         }
         defer c.SDL_FreeSurface(glyph_surface);
+
+        // Apply synthetic bold effect before creating texture
+        if (synthetic_bold) {
+            std.debug.print("using synthetic bold\n", .{});
+            const bold_offset = @max(1, @divTrunc(size, 24));
+
+            // Create a new surface for the bold effect
+            const bold_surface = c.SDL_CreateRGBSurface(
+                0,
+                glyph_surface.*.w + bold_offset,
+                glyph_surface.*.h,
+                32,
+                0xFF000000,
+                0x00FF0000,
+                0x0000FF00,
+                0x000000FF,
+            );
+
+            // Copy original glyph multiple times with offset
+            _ = c.SDL_BlitSurface(glyph_surface, null, bold_surface, null);
+            var rect = c.SDL_Rect{
+                .x = bold_offset,
+                .y = 0,
+                .w = glyph_surface.*.w,
+                .h = glyph_surface.*.h,
+            };
+            _ = c.SDL_BlitSurface(glyph_surface, null, bold_surface, &rect);
+
+            // Replace original surface with bold version
+            c.SDL_FreeSurface(glyph_surface);
+            glyph_surface = bold_surface;
+        }
 
         const glyph_tex = c.SDL_CreateTextureFromSurface(self.renderer, glyph_surface) orelse {
             if (style_set) c.TTF_SetFontStyle(font.font_handle, c.TTF_STYLE_NORMAL);
@@ -555,6 +647,7 @@ pub const FontManager = struct {
 
         try font.glyphs.put(key, new_glyph);
         if (style_set) c.TTF_SetFontStyle(font.font_handle, c.TTF_STYLE_NORMAL);
+
         return new_glyph;
     }
 
@@ -572,13 +665,14 @@ pub const FontManager = struct {
     }
 
     pub fn pickFontForCharacter(self: *FontManager, codepoint: u21) ?*Font {
-        const categories = [_]FontCategory{ .latin, .cjk, .emoji };
+        const categories = [_]FontCategory{ .latin, .cjk, .emoji, .monospace };
 
         for (categories) |category| {
             const ranges = switch (category) {
                 .latin => unicode_ranges.latin,
                 .cjk => unicode_ranges.cjk,
                 .emoji => unicode_ranges.emoji,
+                .monospace => unicode_ranges.latin, // Monospace uses Latin ranges
             };
 
             for (ranges) |range| {
@@ -608,9 +702,10 @@ pub const FontManager = struct {
         codepoint: u21,
         weight: FontWeight,
         slant: FontSlant,
+        use_monospace: bool,
     ) ?*Font {
         // 1) Get category
-        const category = getCategory(codepoint) orelse return null;
+        const category = if (use_monospace) .monospace else getCategory(codepoint) orelse return null;
 
         // 2) Try exact style match
         const key = FontKey{
@@ -622,8 +717,10 @@ pub const FontManager = struct {
             return font;
         }
 
+        std.debug.print("fallback\n", .{});
+
         // 3) Fallback to normal style for this category
-        return self.category_fonts.get(category);
+        return null;
     }
 };
 
@@ -644,13 +741,13 @@ fn isCodepointEmoji(codepoint: u21) bool {
 }
 
 pub fn getCategory(codepoint: u21) ?FontCategory {
-    // basically the same logic you had in pickFontForCharacter
-    const categories = [_]FontCategory{ .latin, .cjk, .emoji };
+    const categories = [_]FontCategory{ .latin, .cjk, .emoji, .monospace };
     for (categories) |category| {
         const ranges = switch (category) {
             .latin => unicode_ranges.latin,
             .cjk => unicode_ranges.cjk,
             .emoji => unicode_ranges.emoji,
+            .monospace => unicode_ranges.latin, // Monospace uses Latin ranges
         };
         for (ranges) |range| {
             if (codepoint >= range.start and codepoint <= range.end) {

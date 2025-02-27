@@ -8,6 +8,7 @@ const DisplayItem = browser.DisplayItem;
 const Token = token.Token;
 const FontWeight = font.FontWeight;
 const FontSlant = font.FontSlant;
+const FontCategory = font.FontCategory;
 const scrollbar_width = browser.scrollbar_width;
 const h_offset = browser.h_offset;
 const v_offset = browser.v_offset;
@@ -60,6 +61,10 @@ display_list: std.ArrayList(DisplayItem),
 word_cache: std.AutoHashMap(u64, WordCache),
 
 grapheme_data: grapheme.GraphemeData,
+
+is_preformatted: bool = false,
+prev_font_category: ?FontCategory = null,
+current_font_category: FontCategory = .latin,
 
 pub fn init(
     allocator: std.mem.Allocator,
@@ -226,6 +231,11 @@ fn handleTextToken(
     content: []const u8,
     line_buffer: *std.ArrayList(LineItem),
 ) !void {
+    if (self.is_preformatted) {
+        try self.handlePreformattedText(content, line_buffer);
+        return;
+    }
+
     // Replace newline characters with spaces in a stack buffer.
     var buf: [4096]u8 = undefined;
     const text = if (content.len < buf.len) blk: {
@@ -264,6 +274,7 @@ fn handleTextToken(
                     .Bold, // Force bold for small caps
                     slant,
                     @divTrunc(self.size * 4, 5), // Make it ~80% of normal size
+                    false,
                 );
             } else {
                 // Regular rendering for non-lowercase characters
@@ -272,6 +283,7 @@ fn handleTextToken(
                     weight,
                     slant,
                     self.size,
+                    false,
                 );
             }
         } else {
@@ -281,6 +293,7 @@ fn handleTextToken(
                 weight,
                 slant,
                 if (self.is_superscript) @divTrunc(self.size, 2) else self.size,
+                false,
             );
         }
         glyph.is_superscript = self.is_superscript;
@@ -301,6 +314,7 @@ fn handleTextToken(
                     weight,
                     slant,
                     if (self.is_superscript) @divTrunc(self.size, 2) else self.size,
+                    false,
                 );
 
                 // Add the hyphen at the break point
@@ -316,6 +330,58 @@ fn handleTextToken(
         }
 
         // Normal glyph handling (unchanged)
+        try line_buffer.append(LineItem{
+            .x = self.cursor_x,
+            .glyph = glyph,
+            .ascent = glyph.ascent,
+            .descent = glyph.descent,
+        });
+        self.cursor_x += glyph.w;
+    }
+}
+
+fn handlePreformattedText(
+    self: *Layout,
+    content: []const u8,
+    line_buffer: *std.ArrayList(LineItem),
+) !void {
+    std.debug.print("handlePreformattedText: {any}\n", .{self.is_preformatted});
+    // Save current font category and switch to monospace
+    if (!self.is_preformatted) {
+        self.prev_font_category = self.current_font_category;
+        self.current_font_category = .monospace;
+    }
+
+    var g_iter = grapheme.Iterator.init(content, &self.grapheme_data);
+    while (g_iter.next()) |gc| {
+        const gme = gc.bytes(content);
+
+        // Get glyph with current style settings
+        const weight: font.FontWeight = if (self.is_bold) .Bold else .Normal;
+        const slant: font.FontSlant = if (self.is_italic) .Italic else .Roman;
+
+        const glyph = try self.font_manager.getStyledGlyph(
+            gme,
+            weight,
+            slant,
+            self.size,
+            true,
+        );
+
+        // Handle newlines in preformatted text
+        if (std.mem.eql(u8, gme, "\n")) {
+            try self.flushLine(line_buffer);
+            self.cursor_x = h_offset;
+            continue;
+        }
+
+        // Check if we need to wrap (only at window edge)
+        if (self.cursor_x + glyph.w > (self.window_width - scrollbar_width - h_offset)) {
+            try self.flushLine(line_buffer);
+            self.cursor_x = h_offset;
+        }
+
+        // Add glyph to line buffer
         try line_buffer.append(LineItem{
             .x = self.cursor_x,
             .glyph = glyph,
@@ -374,6 +440,19 @@ fn handleTagToken(
         }
     } else if (std.mem.eql(u8, tag.name, "sup")) {
         self.is_superscript = !tag.is_closing;
+    } else if (std.mem.eql(u8, tag.name, "pre")) {
+        if (tag.is_closing) {
+            try self.flushLine(line_buffer);
+            self.is_preformatted = false;
+            // Restore previous font category
+            if (self.prev_font_category) |category| {
+                self.current_font_category = category;
+                self.prev_font_category = null;
+            }
+        } else {
+            try self.flushLine(line_buffer);
+            self.is_preformatted = true;
+        }
     } else {
         // For other tags you can now use the attributes parsed into tag.attributes.
         // For example, if there's an inline style attribute, you might inspect it like so:

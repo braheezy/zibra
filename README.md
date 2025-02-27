@@ -55,6 +55,7 @@ Run without a URL for a default HTML.
   - `<sup>Superscript</sup>`
   - `<h1 class="title">Centered title</h1>`: An `h1` with `class` set to `title` will be centered
   - `<abbr>Abbreviations</abbr>`
+  - `<pre>Preformatted text</pre>`: Including bold and italic variants
 
 ## Development
 
