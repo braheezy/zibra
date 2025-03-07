@@ -1,55 +1,24 @@
 .{
-    // This is the default name used by packages depending on this one. For
-    // example, when a user runs `zig fetch --save <url>`, this field is used
-    // as the key in the `dependencies` table. Although the user can choose a
-    // different name, most users will stick with this provided value.
-    //
-    // It is redundant to include "zig" in this name because it is already
-    // within the Zig package namespace.
-    .name = "web-browswer-engineering",
-
-    // This is a [Semantic Version](https://semver.org/).
-    // In a future version of Zig it will be used for package deduplication.
+    .name = .zibra,
     .version = "0.0.0",
-
-    // This field is optional.
-    // This is currently advisory only; Zig does not yet do anything
-    // with this value.
-    //.minimum_zig_version = "0.11.0",
-
-    // This field is optional.
-    // Each dependency must either provide a `url` and `hash`, or a `path`.
-    // `zig build --fetch` can be used to fetch all dependencies of a package, recursively.
-    // Once all dependencies are fetched, `zig build` no longer requires
-    // internet connectivity.
     .dependencies = .{
-        .@"known-folders" = .{
-            .url = "git+https://github.com/ziglibs/known-folders.git#1cceeb70e77dec941a4178160ff6c8d05a74de6f",
-            .hash = "12205f5e7505c96573f6fc5144592ec38942fb0a326d692f9cddc0c7dd38f9028f29",
-        },
         .zg = .{
-            .url = "https://codeberg.org/atman/zg/archive/v0.13.4.tar.gz",
-            .hash = "1220fe42e39fd141c84fd7d5cf69945309bb47253033e68788f99bdfe5585fbc711a",
+            .url = "git+https://codeberg.org/atman/zg.git#4a002763419a34d61dcbb1f415821b83b9bf8ddc",
+            .hash = "zg-0.13.4-AAAAAGiZ7QLz4pvECFa_wG4O4TP4FLABHHbemH2KakWM",
         },
-        .@"ada-zig" = .{
-            .url = "https://github.com/braheezy/ada-zig/archive/6e62fef7b595f8f478bea4e5e316a1187480e6c6.tar.gz",
-            .hash = "1220c580aaabae3d02d816d7027d934503cd771fd403d5d6c2138f125ab3d345da2d",
+        .adazig = .{
+            .url = "git+https://github.com/braheezy/ada-zig?ref=3.1.3#1f4b6038a55bf73e98a4587c40abc027dca4f5da",
+            .hash = "adazig-3.1.3-t4eT-gRgAABTQFewAqt0BeucaLhVWVZFjbDSqW-bDnp3",
+        },
+        .known_folders = .{
+            .url = "git+https://github.com/ziglibs/known-folders.git#aa24df42183ad415d10bc0a33e6238c437fc0f59",
+            .hash = "known_folders-0.0.0-Fy-PJtLDAADGDOwYwMkVydMSTp_aN-nfjCZw6qPQ2ECL",
         },
     },
-    // Specifies the set of files and directories that are included in this package.
-    // Only files and directories listed here are included in the `hash` that
-    // is computed for this package. Only files listed here will remain on disk
-    // when using the zig package manager. As a rule of thumb, one should list
-    // files required for compilation plus any license(s).
-    // Paths are relative to the build root. Use the empty string (`""`) to refer to
-    // the build root itself.
-    // A directory listed here means that all files within, recursively, are included.
+    .fingerprint = 0x5f81e20e918f49dc,
     .paths = .{
         "build.zig",
         "build.zig.zon",
         "src",
-        // For example...
-        //"LICENSE",
-        //"README.md",
     },
 }

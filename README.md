@@ -22,7 +22,7 @@ cp zig-out/bin/zibra .
 `zibra` (optionally) takes one URL and displays the result in a window:
 
 ```sh
-> zibra https://example.org
+zibra https://example.org
 ```
 
 Run without a URL for a default HTML.

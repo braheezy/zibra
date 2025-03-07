@@ -345,7 +345,6 @@ fn handlePreformattedText(
     content: []const u8,
     line_buffer: *std.ArrayList(LineItem),
 ) !void {
-    std.debug.print("handlePreformattedText: {any}\n", .{self.is_preformatted});
     // Save current font category and switch to monospace
     if (!self.is_preformatted) {
         self.prev_font_category = self.current_font_category;

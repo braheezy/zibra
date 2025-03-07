@@ -59,10 +59,7 @@ pub const Connection = union(enum) {
         defer response_list.deinit();
 
         // Create buffer for response
-        // ! This is a workaround for a bug in the std library
-        // ! https://github.com/ziglang/zig/issues/14573
-        // ! Make a super large buffer so the std lib doesn't have to refill it
-        const buffer_size = 20000;
+        const buffer_size = 200;
         var temp_buffer: [buffer_size]u8 = undefined;
         var header_end_index: ?usize = null;
 
@@ -116,11 +113,7 @@ pub const Connection = union(enum) {
         body_list: *std.ArrayList(u8),
         remaining: usize,
     ) !void {
-
-        // ! This is a workaround for a bug in the std library
-        // ! https://github.com/ziglang/zig/issues/14573
-        // ! Make a super large buffer so the std lib doesn't have to refill it
-        const buffer_size = 30000;
+        const buffer_size = 200;
         var temp_buffer: [buffer_size]u8 = undefined;
 
         var to_read = remaining;
@@ -354,13 +347,16 @@ pub const Url = struct {
 
             const new_connection: Connection = if (self.is_https) conn_blk: {
                 // create required certificate bundle
-                // ! API changes in zig 0.14.0
                 var bundle = std.crypto.Certificate.Bundle{};
                 try bundle.rescan(al);
                 defer bundle.deinit(al);
 
                 // create the tls client
-                const tls_client = try std.crypto.tls.Client.init(tcp_stream, bundle, self.host.?);
+                const options = std.crypto.tls.Client.Options{
+                    .host = .{ .explicit = self.host.? },
+                    .ca = .{ .bundle = bundle },
+                };
+                const tls_client = try std.crypto.tls.Client.init(tcp_stream, options);
                 break :conn_blk Connection{ .Tls = .{
                     .client = tls_client,
                     .stream = tcp_stream,
@@ -635,7 +631,7 @@ fn parseStatusLine(headers_data: []const u8) !u16 {
     std.log.info("{s}", .{status_line});
 
     // Parse "HTTP/1.1 200 OK"
-    var parts = std.mem.split(u8, status_line, " ");
+    var parts = std.mem.splitScalar(u8, status_line, ' ');
     // Skip "HTTP/1.1"
     _ = parts.next();
     const status_str = parts.next() orelse return error.NoStatusCodeFound;
