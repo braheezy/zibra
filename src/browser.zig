@@ -98,9 +98,9 @@ pub const Browser = struct {
             window_flags | c.SDL_WINDOW_RESIZABLE,
         ) orelse
             {
-            c.SDL_Log("Unable to create window: %s", c.SDL_GetError());
-            return error.SDLInitializationFailed;
-        };
+                c.SDL_Log("Unable to create window: %s", c.SDL_GetError());
+                return error.SDLInitializationFailed;
+            };
 
         // Create a renderer, which will be used to draw to the window
         const renderer = c.SDL_CreateRenderer(screen, -1, c.SDL_RENDERER_ACCELERATED) orelse {
@@ -281,15 +281,8 @@ pub const Browser = struct {
         }
     }
 
-    // Send request to a URL, load response into browser
-    pub fn load(
-        self: *Browser,
-        url: Url,
-    ) !void {
-        std.log.info("Loading: {s}", .{url.path});
-
-        // Do the request, getting back the body of the response.
-        const body = if (std.mem.eql(u8, url.scheme, "file:"))
+    pub fn fetchBody(self: *Browser, url: Url) ![]const u8 {
+        return if (std.mem.eql(u8, url.scheme, "file:"))
             try url.fileRequest(self.allocator)
         else if (std.mem.eql(u8, url.scheme, "data:"))
             url.path
@@ -302,12 +295,19 @@ pub const Browser = struct {
                 &self.cache,
                 0,
             );
+    }
 
-        defer {
-            if (!std.mem.eql(u8, url.scheme, "about:")) {
-                self.allocator.free(body);
-            }
-        }
+    // Send request to a URL, load response into browser
+    pub fn load(
+        self: *Browser,
+        url: Url,
+    ) !void {
+        std.log.info("Loading: {s}", .{url.path});
+
+        // Do the request, getting back the body of the response.
+        const body = try self.fetchBody(url);
+
+        defer if (!std.mem.eql(u8, url.scheme, "about:")) self.allocator.free(body);
 
         if (url.view_source) {
             // If "view_source" is true, maybe you do NOTHING but show raw text.

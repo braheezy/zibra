@@ -487,7 +487,6 @@ pub const FontManager = struct {
         var synthetic_bold = false;
 
         if (styled_font == null) {
-            std.debug.print("trying again\n", .{});
             // Try again with normal weight for monospace
             if (use_monospace and weight == .Bold) {
                 styled_font = self.pickFontForCharacterStyle(
@@ -562,7 +561,6 @@ pub const FontManager = struct {
 
         // Apply synthetic bold effect before creating texture
         if (synthetic_bold) {
-            std.debug.print("using synthetic bold\n", .{});
             const bold_offset = @max(1, @divTrunc(size, 24));
 
             // Create a new surface for the bold effect
@@ -716,8 +714,6 @@ pub const FontManager = struct {
         if (self.styled_fonts.get(key)) |font| {
             return font;
         }
-
-        std.debug.print("fallback\n", .{});
 
         // 3) Fallback to normal style for this category
         return null;

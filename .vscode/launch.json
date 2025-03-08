@@ -9,10 +9,10 @@
       "request": "launch",
       "name": "Debug",
       "program": "${workspaceFolder}/zig-out/bin/zibra",
-      "args": [],
+      "args": ["-t"],
       "cwd": "${workspaceFolder}",
       "internalConsoleOptions": "openOnSessionStart",
-      "preLaunchTask": "build",
+      "preLaunchTask": "build"
     }
   ]
 }

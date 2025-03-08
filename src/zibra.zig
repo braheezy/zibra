@@ -11,6 +11,8 @@ const Url = @import("url.zig").Url;
 const show = @import("url.zig").show;
 const ArrayList = std.ArrayList;
 const assert = std.debug.assert;
+const parser = @import("parser.zig");
+const HTMLParser = parser.HTMLParser;
 
 const dbg = std.debug.print;
 
@@ -39,7 +41,11 @@ fn zibra() !void {
         };
     };
     defer if (is_debug) {
-        _ = debug_allocator.deinit();
+        if (debug_allocator.deinit() == .leak) {
+            std.process.exit(1);
+        }
+    } else {
+        std.log.info("not debug", .{});
     };
 
     // Read arguments
@@ -49,10 +55,15 @@ fn zibra() !void {
     // Hold values, if provided
     var rtl_flag = false;
     var url: ?Url = null;
+    var print_tree = false;
 
     for (args[1..]) |arg| {
         if (std.mem.eql(u8, arg, "-rtl")) {
             rtl_flag = true;
+            continue;
+        }
+        if (std.mem.eql(u8, arg, "-t")) {
+            print_tree = true;
             continue;
         }
         if (url) |_| {
@@ -75,9 +86,24 @@ fn zibra() !void {
     defer b.free();
 
     if (url) |u| {
+        if (print_tree) {
+            const body = try b.fetchBody(u);
+            var html_parser = try HTMLParser.init(allocator, body);
+            defer html_parser.deinit(allocator);
+            try html_parser.prettyPrint(try html_parser.parse(), 0);
+            return;
+        }
         // Request URL and store response in browser.
         try b.load(u);
     } else {
+        if (print_tree) {
+            var html_parser = try HTMLParser.init(allocator, default_html);
+            defer html_parser.deinit(allocator);
+            const root = try html_parser.parse();
+            try html_parser.prettyPrint(root, 0);
+            return;
+        }
+
         std.log.info("showing default html", .{});
         // 1) Lex the default_html into tokens
         var tokens = try b.lexTokens(default_html);
@@ -88,4 +114,8 @@ fn zibra() !void {
 
     // Start main exec loop
     try b.run();
+}
+
+test {
+    _ = @import("parser.zig");
 }
