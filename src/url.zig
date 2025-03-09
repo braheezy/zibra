@@ -165,12 +165,7 @@ pub const Connection = union(enum) {
             return error.IncompleteBody;
         }
 
-        // Flatten the body into a single allocated slice for the final return
-        const final_body = body_list.items[0..body_list.items.len];
-        const body = try al.alloc(u8, final_body.len);
-        @memcpy(body, final_body);
-
-        return body;
+        return body_list.toOwnedSlice();
     }
 
     fn readChunkedBody(self: *Connection, al: std.mem.Allocator) ![]u8 {

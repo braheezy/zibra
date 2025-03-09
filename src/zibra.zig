@@ -88,9 +88,18 @@ fn zibra() !void {
     if (url) |u| {
         if (print_tree) {
             const body = try b.fetchBody(u);
+            // TODO: Refactor so a hidden allocation doesn't happen. This happens
+            //       fetching a body may involve an HTTP request, and we provide the browser
+            //       socket map and cache and those were allocated by the Browser's allocator.
+            defer allocator.free(body);
+
             var html_parser = try HTMLParser.init(allocator, body);
             defer html_parser.deinit(allocator);
-            try html_parser.prettyPrint(try html_parser.parse(), 0);
+
+            const root = try html_parser.parse();
+            defer root.deinit(allocator);
+
+            try html_parser.prettyPrint(root, 0);
             return;
         }
         // Request URL and store response in browser.
@@ -100,6 +109,7 @@ fn zibra() !void {
             var html_parser = try HTMLParser.init(allocator, default_html);
             defer html_parser.deinit(allocator);
             const root = try html_parser.parse();
+            defer root.deinit(allocator);
             try html_parser.prettyPrint(root, 0);
             return;
         }
