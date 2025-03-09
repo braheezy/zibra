@@ -1,5 +1,8 @@
 # zibra
 
+> [!WARNING]
+> This project is actively in work! `HEAD` usually works but it may be broken or produce nasty results.
+
 This repo holds my Zig code for the browser implemented in [Web Browser Engineering](https://browser.engineering/).
 
 ## Usage
