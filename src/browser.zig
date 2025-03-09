@@ -15,6 +15,9 @@ const Connection = @import("url.zig").Connection;
 const Cache = @import("cache.zig").Cache;
 const ArrayList = std.ArrayList;
 const Layout = @import("Layout.zig");
+const parser = @import("parser.zig");
+const HTMLParser = parser.HTMLParser;
+const Node = parser.Node;
 const c = @cImport({
     @cInclude("SDL2/SDL.h");
     @cInclude("SDL2/SDL_ttf.h");
@@ -65,6 +68,8 @@ pub const Browser = struct {
     display_list: ?[]DisplayItem = null,
     // Current content to be displayed
     current_content: ?[]const Token = null,
+    // Current HTML node tree (when using parser)
+    current_node: ?Node = null,
     // Total height of the content
     content_height: i32 = 0,
     // Current scroll offset
@@ -148,6 +153,11 @@ pub const Browser = struct {
                 item.deinit(self.allocator);
             }
             self.allocator.free(items);
+        }
+
+        // Free the node tree if it exists
+        if (self.current_node) |node| {
+            node.deinit(self.allocator);
         }
 
         // clean up layout
@@ -324,109 +334,37 @@ pub const Browser = struct {
             const plain_tokens_slice = try plain.toOwnedSlice();
             try self.layout(plain_tokens_slice);
         } else {
-            var tokens_array = try self.lexTokens(body);
+            // Parse HTML into a node tree
+            var html_parser = try HTMLParser.init(self.allocator, body);
+            defer html_parser.deinit(self.allocator);
 
-            // Update the SDL window title based on the <title> tag.
-            std.log.info("Updating current content with {d} tokens", .{tokens_array.items.len});
-            self.current_content = try tokens_array.toOwnedSlice();
-            try self.layout(self.current_content.?);
+            // Clear any previous node tree
+            if (self.current_node) |node| {
+                node.deinit(self.allocator);
+                self.current_node = null;
+            }
+
+            // Parse the HTML and store the root node
+            self.current_node = try html_parser.parse();
+
+            // Layout using the HTML node tree
+            try self.layoutWithNodes();
         }
     }
 
-    pub fn lexTokens(self: *Browser, body: []const u8) !std.ArrayList(Token) {
-        // We'll store tokens here
-        var tokens = std.ArrayList(Token).init(self.allocator);
-
-        var temp_text = std.ArrayList(u8).init(self.allocator);
-        defer temp_text.deinit();
-
-        var tag_buffer = std.ArrayList(u8).init(self.allocator);
-        defer tag_buffer.deinit();
-
-        var in_tag = false;
-        var i: usize = 0;
-
-        while (i < body.len) : (i += 1) {
-            const char = body[i];
-
-            if (char == '<') {
-                // We're entering a tag
-                // If we have accumulated text, flush it to a TEXT token
-                if (temp_text.items.len > 0) {
-                    try tokens.append(Token{
-                        .text = try self.allocator.dupe(u8, temp_text.items),
-                    });
-                    temp_text.clearRetainingCapacity();
-                }
-
-                in_tag = true;
-                tag_buffer.clearRetainingCapacity();
-                continue;
-            }
-
-            if (char == '>') {
-                // We're leaving a tag
-                in_tag = false;
-
-                // Now tag_buffer has something like "b", "/b", "p", "/p"
-                const tag_ptr = try token.Tag.init(self.allocator, tag_buffer.items);
-                try tokens.append(Token{ .tag = tag_ptr });
-                continue;
-            }
-
-            if (in_tag) {
-                // Accumulate chars inside the < > pair
-                try tag_buffer.append(char);
-                continue;
-            }
-
-            // Outside a tag
-            if (char == '&') {
-                // Entities
-                if (lexEntity(body[i..])) |entity| {
-                    try temp_text.appendSlice(entity);
-                    i += std.mem.indexOf(u8, body[i..], ";").?;
-                } else {
-                    try temp_text.append('&');
-                }
-                continue;
-            }
-
-            // If it's a raw newline, keep it as is. We will handle it in layout.
-            try temp_text.append(char);
+    // New method to layout using HTML nodes
+    pub fn layoutWithNodes(self: *Browser) !void {
+        if (self.current_node == null) {
+            return error.NoNodeTree;
         }
 
-        // If there's leftover text at the end, produce a final TEXT token
-        if (temp_text.items.len > 0) {
-            try tokens.append(Token{
-                .text = try self.allocator.dupe(u8, temp_text.items),
-            });
+        // Free existing display list if it exists
+        if (self.display_list) |items| {
+            self.allocator.free(items);
         }
 
-        return tokens;
-    }
-
-    pub fn lexEntity(text: []const u8) ?[]const u8 {
-        if (std.mem.indexOf(u8, text, ";")) |entity_end_index| {
-            const entity = text[0 .. entity_end_index + 1];
-
-            return if (std.mem.eql(u8, entity, "&amp;"))
-                "&"
-            else if (std.mem.eql(u8, entity, "&lt;"))
-                "<"
-            else if (std.mem.eql(u8, entity, "&gt;"))
-                ">"
-            else if (std.mem.eql(u8, entity, "&quot;"))
-                "\""
-            else if (std.mem.eql(u8, entity, "&apos;"))
-                "'"
-            else if (std.mem.eql(u8, entity, "&shy;"))
-                "\u{00AD}" // Unicode soft hyphen
-            else
-                null;
-        } else {
-            return null;
-        }
+        self.display_list = try self.layout_engine.layoutNodes(self.current_node.?);
+        self.content_height = self.layout_engine.content_height;
     }
 
     // Draw the browser content

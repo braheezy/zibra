@@ -159,6 +159,8 @@ pub const Node = union(enum) {
         };
     }
 
+    // allocate a string from node (because we may need to build up attribtues)
+    // caller must free the string
     pub fn asString(self: *const Node, al: std.mem.Allocator) ![]const u8 {
         var result = std.ArrayList(u8).init(al);
         errdefer result.deinit();

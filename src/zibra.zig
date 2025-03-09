@@ -115,11 +115,16 @@ fn zibra() !void {
         }
 
         std.log.info("showing default html", .{});
-        // 1) Lex the default_html into tokens
-        var tokens = try b.lexTokens(default_html);
 
-        b.current_content = try tokens.toOwnedSlice();
-        try b.layout(b.current_content.?);
+        // Parse default HTML into a node tree instead of tokenizing it
+        var html_parser = try HTMLParser.init(allocator, default_html);
+        defer html_parser.deinit(allocator);
+
+        // Parse the HTML and store the root node in the browser
+        b.current_node = try html_parser.parse();
+
+        // Layout using HTML nodes
+        try b.layoutWithNodes();
     }
 
     // Start main exec loop

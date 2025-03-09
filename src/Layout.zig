@@ -4,8 +4,10 @@ const browser = @import("browser.zig");
 const code_point = @import("code_point");
 const grapheme = @import("grapheme");
 const token = @import("token.zig");
+const parser = @import("parser.zig");
 const DisplayItem = browser.DisplayItem;
 const Token = token.Token;
+const Node = parser.Node;
 const FontWeight = font.FontWeight;
 const FontSlant = font.FontSlant;
 const FontCategory = font.FontCategory;
@@ -142,6 +144,109 @@ pub fn layoutTokens(self: *Layout, tokens: []const Token) ![]DisplayItem {
     return try self.display_list.toOwnedSlice();
 }
 
+pub fn layoutNodes(self: *Layout, root: Node) ![]DisplayItem {
+    std.debug.print("layoutNodes\n", .{});
+    self.cursor_x = if (self.rtl_text)
+        self.window_width - scrollbar_width - h_offset
+    else
+        h_offset;
+    self.cursor_y = v_offset;
+
+    var line_buffer = std.ArrayList(LineItem).init(self.allocator);
+    defer line_buffer.deinit();
+
+    // Process the node tree recursively
+    try self.recurseNode(root, &line_buffer);
+
+    // Flush any remaining items on the last line
+    try self.flushLine(&line_buffer);
+    self.content_height = self.cursor_y;
+    return try self.display_list.toOwnedSlice();
+}
+
+fn recurseNode(self: *Layout, node: Node, line_buffer: *std.ArrayList(LineItem)) !void {
+    switch (node) {
+        .text => |t| {
+            try self.handleTextToken(t.text, line_buffer);
+        },
+        .element => |e| {
+            try self.openTag(e.tag, e.attributes, line_buffer);
+
+            for (e.children.items) |child| {
+                try self.recurseNode(child, line_buffer);
+            }
+
+            try self.closeTag(e.tag, line_buffer);
+        },
+    }
+}
+
+fn openTag(self: *Layout, tag: []const u8, attributes: ?std.StringHashMap([]const u8), line_buffer: *std.ArrayList(LineItem)) !void {
+    if (std.mem.eql(u8, tag, "b")) {
+        self.is_bold = true;
+    } else if (std.mem.eql(u8, tag, "i")) {
+        self.is_italic = true;
+    } else if (std.mem.eql(u8, tag, "abbr")) {
+        self.is_small_caps = true;
+    } else if (std.mem.eql(u8, tag, "big")) {
+        self.size += 4;
+    } else if (std.mem.eql(u8, tag, "small")) {
+        self.size -= 4;
+    } else if (std.mem.eql(u8, tag, "p")) {
+        // Flush the current line and add vertical spacing.
+        try self.flushLine(line_buffer);
+        self.cursor_y += self.size;
+        self.cursor_x = if (self.rtl_text)
+            self.window_width - scrollbar_width - h_offset
+        else
+            h_offset;
+    } else if (std.mem.eql(u8, tag, "br")) {
+        // A <br> tag always triggers a line break.
+        try self.flushLine(line_buffer);
+        self.cursor_x = if (self.rtl_text)
+            self.window_width - scrollbar_width - h_offset
+        else
+            h_offset;
+    } else if (std.mem.eql(u8, tag, "h1")) {
+        if (attributes) |attrs| {
+            if (attrs.get("class")) |id| {
+                if (std.mem.eql(u8, id, "title")) {
+                    self.is_title = true;
+                }
+            }
+        }
+    } else if (std.mem.eql(u8, tag, "sup")) {
+        self.is_superscript = true;
+    } else if (std.mem.eql(u8, tag, "pre")) {
+        try self.flushLine(line_buffer);
+        self.is_preformatted = true;
+    }
+}
+
+fn closeTag(self: *Layout, tag: []const u8, line_buffer: *std.ArrayList(LineItem)) !void {
+    if (std.mem.eql(u8, tag, "b")) {
+        self.is_bold = false;
+    } else if (std.mem.eql(u8, tag, "i")) {
+        self.is_italic = false;
+    } else if (std.mem.eql(u8, tag, "abbr")) {
+        self.is_small_caps = false;
+    } else if (std.mem.eql(u8, tag, "big")) {
+        self.size -= 4;
+    } else if (std.mem.eql(u8, tag, "small")) {
+        self.size += 4;
+    } else if (std.mem.eql(u8, tag, "sup")) {
+        self.is_superscript = false;
+    } else if (std.mem.eql(u8, tag, "pre")) {
+        try self.flushLine(line_buffer);
+        self.is_preformatted = false;
+        // Restore previous font category
+        if (self.prev_font_category) |category| {
+            self.current_font_category = category;
+            self.prev_font_category = null;
+        }
+    }
+}
+
 fn flushLine(self: *Layout, line_buffer: *std.ArrayList(LineItem)) !void {
     // Nothing to flush? Return.
     if (line_buffer.items.len == 0) return;
@@ -253,9 +358,77 @@ fn handleTextToken(
     // Track the last soft hyphen position in the current line
     var last_hyphen_idx: ?usize = null;
 
-    var g_iter = grapheme.Iterator.init(text, &self.grapheme_data);
-    while (g_iter.next()) |gc| {
-        const gme = gc.bytes(text);
+    // Process entities before grapheme iteration
+    var i: usize = 0;
+    while (i < text.len) {
+        if (text[i] == '&') {
+            // Check if this is an entity
+            if (lexEntityAt(text, i)) |entity| {
+                if (std.mem.eql(u8, entity.replacement, "\u{00AD}")) {
+                    // Soft hyphen - remember position but don't render
+                    last_hyphen_idx = line_buffer.items.len;
+                    i += entity.len;
+                    continue;
+                }
+
+                // Process the entity
+                var glyph = try self.font_manager.getStyledGlyph(entity.replacement, weight, slant, if (self.is_superscript) @divTrunc(self.size, 2) else self.size, false);
+                glyph.is_superscript = self.is_superscript;
+
+                // Check if we'll exceed line width
+                if (self.cursor_x + glyph.w > (self.window_width - scrollbar_width - h_offset)) {
+                    // If we have a soft hyphen, add visible hyphen and break there
+                    if (last_hyphen_idx != null) {
+                        const hyphen_glyph = try self.font_manager.getStyledGlyph(
+                            "-",
+                            weight,
+                            slant,
+                            if (self.is_superscript) @divTrunc(self.size, 2) else self.size,
+                            false,
+                        );
+                        try line_buffer.append(LineItem{
+                            .x = self.cursor_x,
+                            .glyph = hyphen_glyph,
+                            .ascent = hyphen_glyph.ascent,
+                            .descent = hyphen_glyph.descent,
+                        });
+                    }
+                    try self.flushLine(line_buffer);
+                    last_hyphen_idx = null;
+                }
+
+                // Add the entity glyph
+                try line_buffer.append(LineItem{
+                    .x = self.cursor_x,
+                    .glyph = glyph,
+                    .ascent = glyph.ascent,
+                    .descent = glyph.descent,
+                });
+                self.cursor_x += glyph.w;
+
+                // Skip past the entity
+                i += entity.len;
+                continue;
+            }
+        }
+
+        // Find next grapheme boundary
+        var g_end = i;
+        while (g_end < text.len) {
+            if (text[g_end] == '&') break; // Stop at potential entity
+
+            g_end += 1;
+            if (g_end < text.len) {
+                if ((text[g_end] & 0xC0) != 0x80) break; // Not a continuation byte
+            }
+        }
+
+        if (g_end == i) {
+            // Process single character (not part of any grapheme cluster)
+            g_end = i + 1;
+        }
+
+        const gme = text[i..g_end];
 
         // Handle small caps rendering
         var glyph: font.Glyph = undefined;
@@ -298,9 +471,16 @@ fn handleTextToken(
         }
         glyph.is_superscript = self.is_superscript;
 
+        // Check for soft hyphen character (U+00AD)
+        const is_soft_hyphen = (gme.len == 2 and gme[0] == 0xC2 and gme[1] == 0xAD) or
+            std.mem.eql(u8, gme, "\u{00AD}");
+
+        glyph.is_soft_hyphen = is_soft_hyphen;
+
         // Skip rendering soft hyphens but remember their position
         if (glyph.is_soft_hyphen) {
             last_hyphen_idx = line_buffer.items.len;
+            i = g_end;
             continue;
         }
 
@@ -337,7 +517,40 @@ fn handleTextToken(
             .descent = glyph.descent,
         });
         self.cursor_x += glyph.w;
+
+        i = g_end;
     }
+}
+
+// Entity handling function that takes a position in text
+fn lexEntityAt(text: []const u8, pos: usize) ?struct { replacement: []const u8, len: usize } {
+    if (pos >= text.len or text[pos] != '&') return null;
+
+    // Find the entity end (semicolon)
+    var end_idx: usize = pos + 1;
+    while (end_idx < text.len and end_idx < pos + 8) : (end_idx += 1) {
+        if (text[end_idx] == ';') break;
+    }
+
+    // If no semicolon found or it's the last character, not an entity
+    if (end_idx >= text.len or text[end_idx] != ';') return null;
+
+    const entity = text[pos .. end_idx + 1];
+
+    if (std.mem.eql(u8, entity, "&amp;"))
+        return .{ .replacement = "&", .len = 5 };
+    if (std.mem.eql(u8, entity, "&lt;"))
+        return .{ .replacement = "<", .len = 4 };
+    if (std.mem.eql(u8, entity, "&gt;"))
+        return .{ .replacement = ">", .len = 4 };
+    if (std.mem.eql(u8, entity, "&quot;"))
+        return .{ .replacement = "\"", .len = 6 };
+    if (std.mem.eql(u8, entity, "&apos;"))
+        return .{ .replacement = "'", .len = 6 };
+    if (std.mem.eql(u8, entity, "&shy;"))
+        return .{ .replacement = "\u{00AD}", .len = 5 }; // Unicode soft hyphen
+
+    return null;
 }
 
 fn handlePreformattedText(
