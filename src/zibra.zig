@@ -30,6 +30,7 @@ pub fn main() void {
     };
 }
 
+// Dead code eliminates this if not used.
 var debug_allocator: std.heap.DebugAllocator(.{}) = .init;
 fn zibra() !void {
     // Memory allocation setup
@@ -44,8 +45,6 @@ fn zibra() !void {
         if (debug_allocator.deinit() == .leak) {
             std.process.exit(1);
         }
-    } else {
-        std.log.info("not debug", .{});
     };
 
     // Read arguments

@@ -145,7 +145,6 @@ pub fn layoutTokens(self: *Layout, tokens: []const Token) ![]DisplayItem {
 }
 
 pub fn layoutNodes(self: *Layout, root: Node) ![]DisplayItem {
-    std.debug.print("layoutNodes\n", .{});
     self.cursor_x = if (self.rtl_text)
         self.window_width - scrollbar_width - h_offset
     else
