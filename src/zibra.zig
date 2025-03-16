@@ -71,7 +71,32 @@ fn zibra() !void {
         }
         url = Url.init(allocator, arg) catch |err| blk: {
             if (err == error.InvalidUrl) {
-                break :blk try Url.init(allocator, "about:blank");
+                // Attempt to treat the URL as a local file path
+                const cwd = try std.fs.cwd().realpathAlloc(allocator, ".");
+                defer allocator.free(cwd);
+
+                const absolute_path = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ cwd, arg });
+                defer allocator.free(absolute_path);
+
+                // Check if the file exists before creating a file URL
+                const file_exists = std.fs.cwd().access(arg, .{}) catch |access_err| {
+                    std.log.warn("File '{s}' does not exist or is not accessible: {any}", .{ arg, access_err });
+                    // Fallback to about:blank if the file doesn't exist
+                    break :blk try Url.init(allocator, "about:blank");
+                };
+                _ = file_exists;
+
+                const file_url = try std.fmt.allocPrint(allocator, "file://{s}", .{absolute_path});
+                defer allocator.free(file_url);
+
+                // Try to initialize the URL with the file path
+                // This should always succeed since file:// URLs are valid,
+                // but we'll handle errors just in case
+                break :blk Url.init(allocator, file_url) catch |file_err| {
+                    std.log.warn("Failed to create URL from file path: {any}", .{file_err});
+                    // Fallback to "about:blank" if there's any issue
+                    break :blk try Url.init(allocator, "about:blank");
+                };
             } else {
                 return err;
             }

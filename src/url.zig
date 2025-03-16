@@ -255,6 +255,7 @@ pub const Url = struct {
     view_source: bool = false,
 
     pub fn init(allocator: std.mem.Allocator, url: []const u8) !Url {
+        std.debug.print("checking url: {s}\n", .{url});
         const ada_url = try ada.Url.init(url);
 
         var u = Url{ .ada_url = ada_url };
