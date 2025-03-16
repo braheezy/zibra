@@ -59,6 +59,10 @@ Run without a URL for a default HTML.
   - `<h1 class="title">Centered title</h1>`: An `h1` with `class` set to `title` will be centered
   - `<abbr>Abbreviations</abbr>`
   - `<pre>Preformatted text</pre>`: Including bold and italic variants
+- HTML parsing features:
+  - Automatic insertion of implicit `<html>`, `<head>`, and `<body>` tags
+  - Proper handling of self-closing tags like `<img />`, `<br />`, and `<input />`
+  - Support for quoted, unquoted, and boolean HTML attributes
 
 ## Development
 
