@@ -320,19 +320,7 @@ pub const Browser = struct {
         defer if (!std.mem.eql(u8, url.scheme, "about:")) self.allocator.free(body);
 
         if (url.view_source) {
-            // If "view_source" is true, maybe you do NOTHING but show raw text.
-            // Or you still produce tokens, up to you.
-            // Minimal approach: return an empty token list or a single text token:
-            var plain = std.ArrayList(Token).init(self.allocator);
-            defer plain.deinit();
-
-            const body_copy = try self.allocator.dupe(u8, body);
-            defer self.allocator.free(body_copy);
-
-            try plain.append(Token{ .text = body_copy });
-
-            const plain_tokens_slice = try plain.toOwnedSlice();
-            try self.layout(plain_tokens_slice);
+            try self.layout(&.{.{ .text = body }});
         } else {
             // Parse HTML into a node tree
             var html_parser = try HTMLParser.init(self.allocator, body);

@@ -269,6 +269,22 @@ pub const Url = struct {
 
         if (std.mem.eql(u8, u.scheme, "view-source:")) {
             u.view_source = true;
+
+            // Extract the actual URL after view-source:
+            const actual_url = url[std.mem.indexOf(u8, url, ":").? + 1 ..];
+
+            // Create a new URL object for the actual URL
+            const actual_ada_url = try ada.Url.init(actual_url);
+
+            // Update the URL properties with the actual URL's properties
+            u.scheme = actual_ada_url.getProtocol();
+            u.host = actual_ada_url.getHost();
+            u.path = actual_ada_url.getPathname();
+            u.is_https = std.mem.eql(u8, u.scheme, "https:");
+            u.port = if (u.is_https) 443 else 80;
+
+            // Free the temporary ada_url
+            ada_url.free();
         }
 
         if (std.mem.eql(u8, u.scheme, "data:")) {
