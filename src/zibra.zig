@@ -156,5 +156,5 @@ fn zibra() !void {
 }
 
 test {
-    _ = @import("parser.zig");
+    _ = @import("parser_test.zig");
 }
