@@ -328,8 +328,144 @@ fn flushLine(self: *Layout, line_buffer: *std.ArrayList(LineItem)) !void {
     line_buffer.clearRetainingCapacity();
 }
 
-/// Modified text token handler now collects all glyphs into the line buffer.
-/// It also checks line–wrapping on a per–word and per–glyph basis.
+// Add a common function for handling individual graphemes
+fn processGrapheme(
+    self: *Layout,
+    gme: []const u8,
+    line_buffer: *std.ArrayList(LineItem),
+    options: struct {
+        force_newline: bool = false,
+        is_superscript: bool = false,
+        is_small_caps: bool = false,
+    },
+) !void {
+    // Extract first code point to determine character category
+    var cp_iter = code_point.Iterator{ .bytes = gme };
+    const first_cp = cp_iter.next() orelse return error.InvalidUtf8;
+
+    // Determine font category based on code point
+    const category = getCategory(first_cp.code);
+
+    // Determine if we should use monospace font
+    // Only use monospace for ASCII and Latin characters in preformatted mode
+    // For emoji and CJK, use their specialized fonts even in preformatted mode
+    const use_monospace = self.is_preformatted and
+        (category == null or category.? == .latin or category.? == .monospace);
+
+    // Update current font category if needed
+    if (category != null and category.? != self.current_font_category) {
+        self.prev_font_category = self.current_font_category;
+        self.current_font_category = category.?;
+    }
+
+    // Use the current style settings
+    const weight: font.FontWeight = if (self.is_bold) .Bold else .Normal;
+    const slant: font.FontSlant = if (self.is_italic) .Italic else .Roman;
+
+    // Handle small caps rendering
+    var glyph: font.Glyph = undefined;
+    if (options.is_small_caps) {
+        // Check if the grapheme is a lowercase letter
+        const is_lowercase = for (gme) |byte| {
+            if (byte >= 'a' and byte <= 'z') break true;
+        } else false;
+
+        if (is_lowercase) {
+            // Convert to uppercase and render at smaller size with bold
+            var upper_buf: [4]u8 = undefined;
+            const upper_len = std.ascii.upperString(&upper_buf, gme);
+            glyph = try self.font_manager.getStyledGlyph(
+                upper_buf[0..upper_len.len],
+                .Bold, // Force bold for small caps
+                slant,
+                @divTrunc(self.size * 4, 5), // Make it ~80% of normal size
+                use_monospace,
+            );
+        } else {
+            // Regular rendering for non-lowercase characters
+            glyph = try self.font_manager.getStyledGlyph(
+                gme,
+                weight,
+                slant,
+                self.size,
+                use_monospace,
+            );
+        }
+    } else {
+        // Normal rendering
+        glyph = try self.font_manager.getStyledGlyph(
+            gme,
+            weight,
+            slant,
+            if (options.is_superscript) @divTrunc(self.size, 2) else self.size,
+            use_monospace,
+        );
+    }
+
+    glyph.is_superscript = options.is_superscript;
+
+    // Check for soft hyphen character (U+00AD)
+    const is_soft_hyphen = (gme.len == 2 and gme[0] == 0xC2 and gme[1] == 0xAD) or
+        std.mem.eql(u8, gme, "\u{00AD}");
+    glyph.is_soft_hyphen = is_soft_hyphen;
+
+    // Skip rendering soft hyphens
+    if (glyph.is_soft_hyphen) {
+        return;
+    }
+
+    // Handle newlines explicitly
+    if (std.mem.eql(u8, gme, "\n") or options.force_newline) {
+        try self.flushLine(line_buffer);
+        self.cursor_x = if (self.rtl_text)
+            self.window_width - scrollbar_width - h_offset
+        else
+            h_offset;
+        return;
+    }
+
+    // Check if we need to wrap (only at window edge)
+    if (self.cursor_x + glyph.w > (self.window_width - scrollbar_width - h_offset)) {
+        try self.flushLine(line_buffer);
+        self.cursor_x = if (self.rtl_text)
+            self.window_width - scrollbar_width - h_offset
+        else
+            h_offset;
+    }
+
+    // Add glyph to line buffer
+    try line_buffer.append(LineItem{
+        .x = self.cursor_x,
+        .glyph = glyph,
+        .ascent = glyph.ascent,
+        .descent = glyph.descent,
+    });
+    self.cursor_x += glyph.w;
+}
+
+// Update handlePreformattedText to use the common processGrapheme function
+fn handlePreformattedText(
+    self: *Layout,
+    content: []const u8,
+    line_buffer: *std.ArrayList(LineItem),
+) !void {
+    // Save current font category and switch to monospace
+    if (!self.is_preformatted) {
+        self.prev_font_category = self.current_font_category;
+        self.current_font_category = .monospace;
+    }
+
+    var g_iter = grapheme.Iterator.init(content, &self.grapheme_data);
+    while (g_iter.next()) |gc| {
+        const gme = gc.bytes(content);
+        try self.processGrapheme(gme, line_buffer, .{
+            .is_superscript = self.is_superscript,
+            .is_small_caps = self.is_small_caps,
+        });
+    }
+}
+
+// Update handleTextToken to use the common processGrapheme function
 fn handleTextToken(
     self: *Layout,
     content: []const u8,
@@ -350,10 +486,6 @@ fn handleTextToken(
         break :blk buf[0..content.len];
     } else content;
 
-    // Use the current style settings.
-    const weight: font.FontWeight = if (self.is_bold) .Bold else .Normal;
-    const slant: font.FontSlant = if (self.is_italic) .Italic else .Roman;
-
     // Track the last soft hyphen position in the current line
     var last_hyphen_idx: ?usize = null;
 
@@ -370,40 +502,11 @@ fn handleTextToken(
                     continue;
                 }
 
-                // Process the entity
-                var glyph = try self.font_manager.getStyledGlyph(entity.replacement, weight, slant, if (self.is_superscript) @divTrunc(self.size, 2) else self.size, false);
-                glyph.is_superscript = self.is_superscript;
-
-                // Check if we'll exceed line width
-                if (self.cursor_x + glyph.w > (self.window_width - scrollbar_width - h_offset)) {
-                    // If we have a soft hyphen, add visible hyphen and break there
-                    if (last_hyphen_idx != null) {
-                        const hyphen_glyph = try self.font_manager.getStyledGlyph(
-                            "-",
-                            weight,
-                            slant,
-                            if (self.is_superscript) @divTrunc(self.size, 2) else self.size,
-                            false,
-                        );
-                        try line_buffer.append(LineItem{
-                            .x = self.cursor_x,
-                            .glyph = hyphen_glyph,
-                            .ascent = hyphen_glyph.ascent,
-                            .descent = hyphen_glyph.descent,
-                        });
-                    }
-                    try self.flushLine(line_buffer);
-                    last_hyphen_idx = null;
-                }
-
-                // Add the entity glyph
-                try line_buffer.append(LineItem{
-                    .x = self.cursor_x,
-                    .glyph = glyph,
-                    .ascent = glyph.ascent,
-                    .descent = glyph.descent,
+                // Process the entity using our common function
+                try self.processGrapheme(entity.replacement, line_buffer, .{
+                    .is_superscript = self.is_superscript,
+                    .is_small_caps = self.is_small_caps,
                 });
-                self.cursor_x += glyph.w;
 
                 // Skip past the entity
                 i += entity.len;
@@ -429,93 +532,11 @@ fn handleTextToken(
 
         const gme = text[i..g_end];
 
-        // Handle small caps rendering
-        var glyph: font.Glyph = undefined;
-        if (self.is_small_caps) {
-            // Check if the grapheme is a lowercase letter
-            const is_lowercase = for (gme) |byte| {
-                if (byte >= 'a' and byte <= 'z') break true;
-            } else false;
-
-            if (is_lowercase) {
-                // Convert to uppercase and render at smaller size with bold
-                var upper_buf: [4]u8 = undefined;
-                const upper_len = std.ascii.upperString(&upper_buf, gme);
-                glyph = try self.font_manager.getStyledGlyph(
-                    upper_buf[0..upper_len.len],
-                    .Bold, // Force bold for small caps
-                    slant,
-                    @divTrunc(self.size * 4, 5), // Make it ~80% of normal size
-                    false,
-                );
-            } else {
-                // Regular rendering for non-lowercase characters
-                glyph = try self.font_manager.getStyledGlyph(
-                    gme,
-                    weight,
-                    slant,
-                    self.size,
-                    false,
-                );
-            }
-        } else {
-            // Normal rendering (existing code)
-            glyph = try self.font_manager.getStyledGlyph(
-                gme,
-                weight,
-                slant,
-                if (self.is_superscript) @divTrunc(self.size, 2) else self.size,
-                false,
-            );
-        }
-        glyph.is_superscript = self.is_superscript;
-
-        // Check for soft hyphen character (U+00AD)
-        const is_soft_hyphen = (gme.len == 2 and gme[0] == 0xC2 and gme[1] == 0xAD) or
-            std.mem.eql(u8, gme, "\u{00AD}");
-
-        glyph.is_soft_hyphen = is_soft_hyphen;
-
-        // Skip rendering soft hyphens but remember their position
-        if (glyph.is_soft_hyphen) {
-            last_hyphen_idx = line_buffer.items.len;
-            i = g_end;
-            continue;
-        }
-
-        // If we'll exceed the line width...
-        if (self.cursor_x + glyph.w > (self.window_width - scrollbar_width - h_offset)) {
-            // If we have a soft hyphen, add visible hyphen and break there
-            if (last_hyphen_idx) |_| {
-                // Get a visible hyphen glyph
-                const hyphen_glyph = try self.font_manager.getStyledGlyph(
-                    "-",
-                    weight,
-                    slant,
-                    if (self.is_superscript) @divTrunc(self.size, 2) else self.size,
-                    false,
-                );
-
-                // Add the hyphen at the break point
-                try line_buffer.append(LineItem{
-                    .x = self.cursor_x,
-                    .glyph = hyphen_glyph,
-                    .ascent = hyphen_glyph.ascent,
-                    .descent = hyphen_glyph.descent,
-                });
-            }
-            try self.flushLine(line_buffer);
-            last_hyphen_idx = null;
-        }
-
-        // Normal glyph handling (unchanged)
-        try line_buffer.append(LineItem{
-            .x = self.cursor_x,
-            .glyph = glyph,
-            .ascent = glyph.ascent,
-            .descent = glyph.descent,
+        // Process the grapheme using our common function
+        try self.processGrapheme(gme, line_buffer, .{
+            .is_superscript = self.is_superscript,
+            .is_small_caps = self.is_small_caps,
         });
-        self.cursor_x += glyph.w;
 
         i = g_end;
     }
@@ -550,57 +571,6 @@ fn lexEntityAt(text: []const u8, pos: usize) ?struct { replacement: []const u8, 
         return .{ .replacement = "\u{00AD}", .len = 5 }; // Unicode soft hyphen
 
     return null;
-}
-
-fn handlePreformattedText(
-    self: *Layout,
-    content: []const u8,
-    line_buffer: *std.ArrayList(LineItem),
-) !void {
-    // Save current font category and switch to monospace
-    if (!self.is_preformatted) {
-        self.prev_font_category = self.current_font_category;
-        self.current_font_category = .monospace;
-    }
-
-    var g_iter = grapheme.Iterator.init(content, &self.grapheme_data);
-    while (g_iter.next()) |gc| {
-        const gme = gc.bytes(content);
-
-        // Get glyph with current style settings
-        const weight: font.FontWeight = if (self.is_bold) .Bold else .Normal;
-        const slant: font.FontSlant = if (self.is_italic) .Italic else .Roman;
-
-        const glyph = try self.font_manager.getStyledGlyph(
-            gme,
-            weight,
-            slant,
-            self.size,
-            true,
-        );
-
-        // Handle newlines in preformatted text
-        if (std.mem.eql(u8, gme, "\n")) {
-            try self.flushLine(line_buffer);
-            self.cursor_x = h_offset;
-            continue;
-        }
-
-        // Check if we need to wrap (only at window edge)
-        if (self.cursor_x + glyph.w > (self.window_width - scrollbar_width - h_offset)) {
-            try self.flushLine(line_buffer);
-            self.cursor_x = h_offset;
-        }
-
-        // Add glyph to line buffer
-        try line_buffer.append(LineItem{
-            .x = self.cursor_x,
-            .glyph = glyph,
-            .ascent = glyph.ascent,
-            .descent = glyph.descent,
-        });
-        self.cursor_x += glyph.w;
-    }
 }
 
 fn handleTagToken(
@@ -672,4 +642,129 @@ fn handleTagToken(
         // }
         // Otherwise, skip tags that don't affect formatting.
     }
+}
+
+// Update layoutSourceCode to format HTML source with tags in normal font and content in bold
+pub fn layoutSourceCode(self: *Layout, source: []const u8) ![]DisplayItem {
+    std.debug.print("layoutSourceCode: {d} bytes\n", .{source.len});
+    self.cursor_x = h_offset;
+    self.cursor_y = v_offset;
+
+    // Save current state
+    const original_preformatted = self.is_preformatted;
+    const original_font_category = self.current_font_category;
+    const original_is_bold = self.is_bold;
+
+    // Start with preformatted mode on for whitespace preservation
+    // but use normal font for initial state
+    self.is_preformatted = true; // Keep preformatted for all content to preserve whitespace
+    self.current_font_category = .latin; // Start with normal font
+    self.is_bold = false; // Start with normal weight
+
+    var line_buffer = std.ArrayList(LineItem).init(self.allocator);
+    defer line_buffer.deinit();
+
+    // Process the source character by character to apply different styles to tags and content
+    var i: usize = 0;
+    var in_tag = false;
+    var in_comment = false;
+    var in_string = false;
+    var string_delimiter: u8 = 0;
+
+    // Process the source character by character
+    while (i < source.len) {
+        // Check for tag start
+        if (i + 1 < source.len and source[i] == '<') {
+            // We're entering a tag
+            in_tag = true;
+            self.is_bold = false;
+            self.is_preformatted = false; // Turn off preformatted for tags
+            self.current_font_category = .latin; // Use regular document font for tags
+
+            // Process the '<' character
+            var g_iter = grapheme.Iterator.init(source[i .. i + 1], &self.grapheme_data);
+            if (g_iter.next()) |gc| {
+                const gme = gc.bytes(source[i..]);
+                try self.processGrapheme(gme, &line_buffer, .{
+                    .is_superscript = self.is_superscript,
+                    .is_small_caps = self.is_small_caps,
+                });
+            }
+            i += 1;
+
+            // Check for comment
+            if (i + 2 < source.len and source[i] == '!' and source[i + 1] == '-' and source[i + 2] == '-') {
+                in_comment = true;
+            }
+
+            continue;
+        }
+
+        // Check for tag end
+        if (in_tag and source[i] == '>') {
+            // We're exiting a tag
+            in_tag = false;
+            in_comment = false;
+            in_string = false;
+
+            // Process the '>' character
+            var g_iter = grapheme.Iterator.init(source[i .. i + 1], &self.grapheme_data);
+            if (g_iter.next()) |gc| {
+                const gme = gc.bytes(source[i..]);
+                try self.processGrapheme(gme, &line_buffer, .{
+                    .is_superscript = self.is_superscript,
+                    .is_small_caps = self.is_small_caps,
+                });
+            }
+            i += 1;
+
+            // After exiting a tag, text content should be bold and preformatted
+            self.is_bold = true;
+            self.is_preformatted = true; // Turn on preformatted for text content
+            self.current_font_category = .monospace; // Use monospace for text content
+
+            continue;
+        }
+
+        // Handle string boundaries within tags
+        if (in_tag and !in_comment) {
+            if (!in_string and (source[i] == '"' or source[i] == '\'')) {
+                in_string = true;
+                string_delimiter = source[i];
+            } else if (in_string and source[i] == string_delimiter) {
+                in_string = false;
+            }
+        }
+
+        // Handle comment end
+        if (in_comment and i + 2 < source.len and
+            source[i] == '-' and source[i + 1] == '-' and source[i + 2] == '>')
+        {
+            // Let the tag end logic handle this in the next iteration
+        }
+
+        // Process current character
+        var g_iter = grapheme.Iterator.init(source[i..], &self.grapheme_data);
+        if (g_iter.next()) |gc| {
+            const gme = gc.bytes(source[i..]);
+            try self.processGrapheme(gme, &line_buffer, .{
+                .is_superscript = self.is_superscript,
+                .is_small_caps = self.is_small_caps,
+            });
+            i += gme.len;
+        } else {
+            i += 1; // Fallback in case of invalid UTF-8
+        }
+    }
+
+    // Flush any remaining items on the last line
+    try self.flushLine(&line_buffer);
+
+    // Restore original state
+    self.is_preformatted = original_preformatted;
+    self.current_font_category = original_font_category;
+    self.is_bold = original_is_bold;
+
+    self.content_height = self.cursor_y;
+    return try self.display_list.toOwnedSlice();
 }

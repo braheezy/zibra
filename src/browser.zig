@@ -320,7 +320,12 @@ pub const Browser = struct {
         defer if (!std.mem.eql(u8, url.scheme, "about:")) self.allocator.free(body);
 
         if (url.view_source) {
-            try self.layout(&.{.{ .text = body }});
+            // Use the new layoutSourceCode function for view-source mode
+            if (self.display_list) |items| {
+                self.allocator.free(items);
+            }
+            self.display_list = try self.layout_engine.layoutSourceCode(body);
+            self.content_height = self.layout_engine.content_height;
         } else {
             // Parse HTML into a node tree
             var html_parser = try HTMLParser.init(self.allocator, body);

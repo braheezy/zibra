@@ -31,8 +31,8 @@ pub fn main() void {
 }
 
 // Dead code eliminates this if not used.
-var debug_allocator: std.heap.DebugAllocator(.{}) = .init;
 fn zibra() !void {
+    var debug_allocator: std.heap.DebugAllocator(.{}) = .init;
     // Memory allocation setup
     const allocator, const is_debug = gpa: {
         if (builtin.os.tag == .wasi) break :gpa .{ std.heap.wasm_allocator, false };
