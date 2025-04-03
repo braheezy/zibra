@@ -768,3 +768,118 @@ pub fn layoutSourceCode(self: *Layout, source: []const u8) ![]DisplayItem {
     self.content_height = self.cursor_y;
     return try self.display_list.toOwnedSlice();
 }
+
+// New layout tree structures
+pub const DocumentLayout = struct {
+    node: Node,
+    parent: ?*DocumentLayout = null,
+    children: std.ArrayList(*BlockLayout),
+    allocator: std.mem.Allocator,
+
+    pub fn init(allocator: std.mem.Allocator, node: Node) !*DocumentLayout {
+        const document = try allocator.create(DocumentLayout);
+        document.* = DocumentLayout{
+            .node = node,
+            .parent = null,
+            .children = std.ArrayList(*BlockLayout).init(allocator),
+            .allocator = allocator,
+        };
+        return document;
+    }
+
+    pub fn deinit(self: *DocumentLayout) void {
+        for (self.children.items) |child| {
+            child.deinit();
+            self.allocator.destroy(child);
+        }
+        self.children.deinit();
+    }
+
+    pub fn layout(self: *DocumentLayout, layout_engine: *Layout) !void {
+        // Create a BlockLayout for the root node
+        const child = try BlockLayout.init(self.allocator, self.node, self, null);
+        try self.children.append(child);
+        try child.layout(layout_engine);
+    }
+};
+
+pub const BlockLayout = struct {
+    node: Node,
+    parent: ?*DocumentLayout,
+    previous: ?*BlockLayout,
+    children: std.ArrayList(*BlockLayout),
+    allocator: std.mem.Allocator,
+
+    // Layout properties that will be computed
+    x: i32 = 0,
+    y: i32 = 0,
+    width: i32 = 0,
+    height: i32 = 0,
+
+    pub fn init(allocator: std.mem.Allocator, node: Node, parent: ?*DocumentLayout, previous: ?*BlockLayout) !*BlockLayout {
+        const block = try allocator.create(BlockLayout);
+        block.* = BlockLayout{
+            .node = node,
+            .parent = parent,
+            .previous = previous,
+            .children = std.ArrayList(*BlockLayout).init(allocator),
+            .allocator = allocator,
+        };
+        return block;
+    }
+
+    pub fn deinit(self: *BlockLayout) void {
+        for (self.children.items) |child| {
+            child.deinit();
+            self.allocator.destroy(child);
+        }
+        self.children.deinit();
+    }
+
+    pub fn layout(self: *BlockLayout, layout_engine: *Layout) !void {
+        // For leaf nodes with text content, use the existing layout approach
+        switch (self.node) {
+            .text => {
+                // This will be a leaf node - implement text layout
+                var line_buffer = std.ArrayList(LineItem).init(self.allocator);
+                defer line_buffer.deinit();
+
+                try layout_engine.handleTextToken(self.node.text.text, &line_buffer);
+                try layout_engine.flushLine(&line_buffer);
+
+                // Store position and dimensions
+                self.x = layout_engine.cursor_x;
+                self.y = layout_engine.cursor_y - layout_engine.size;
+                self.height = layout_engine.size;
+                // Width calculation would need to be more sophisticated
+            },
+            .element => |e| {
+                // Create child BlockLayout objects for element children
+                var previous: ?*BlockLayout = null;
+                for (e.children.items) |child| {
+                    const next = try BlockLayout.init(self.allocator, child, self.parent, previous);
+                    try self.children.append(next);
+                    previous = next;
+                }
+
+                // Recursively layout children
+                for (self.children.items) |child| {
+                    try child.layout(layout_engine);
+                }
+
+                // Update this block's dimensions based on children
+                self.height = 0;
+                for (self.children.items) |child| {
+                    self.height += child.height;
+                }
+            },
+        }
+    }
+};
+
+// Extend Layout to support the new tree-based approach
+pub fn createLayoutTree(self: *Layout, root: Node) !*DocumentLayout {
+    const document = try DocumentLayout.init(self.allocator, root);
+    try document.layout(self);
+    return document;
+}

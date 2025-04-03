@@ -70,6 +70,8 @@ pub const Browser = struct {
     current_content: ?[]const Token = null,
     // Current HTML node tree (when using parser)
     current_node: ?Node = null,
+    // Layout tree for the document
+    document_layout: ?*Layout.DocumentLayout = null,
     // Total height of the content
     content_height: i32 = 0,
     // Current scroll offset
@@ -345,10 +347,10 @@ pub const Browser = struct {
         }
     }
 
-    // New method to layout using HTML nodes
+    // New method to layout using HTML nodes with the tree-based layout
     pub fn layoutWithNodes(self: *Browser) !void {
         if (self.current_node == null) {
-            return error.NoNodeTree;
+            return error.NoNodeToLayout;
         }
 
         // Free existing display list if it exists
@@ -356,7 +358,16 @@ pub const Browser = struct {
             self.allocator.free(items);
         }
 
+        // Create display list for drawing
         self.display_list = try self.layout_engine.layoutNodes(self.current_node.?);
+
+        // Also create a layout tree for future use
+        if (self.document_layout != null) {
+            self.document_layout.?.deinit();
+        }
+        self.document_layout = try self.layout_engine.createLayoutTree(self.current_node.?);
+
+        // Set content height from the layout engine
         self.content_height = self.layout_engine.content_height;
     }
 
@@ -430,5 +441,36 @@ pub const Browser = struct {
 
         self.display_list = try self.layout_engine.layoutTokens(tokens);
         self.content_height = self.layout_engine.content_height;
+    }
+
+    // Ensure we clean up the document_layout in deinit
+    pub fn deinit(self: *Browser) void {
+        // Close all connections
+        var it = self.socket_map.iterator();
+        while (it.next()) |entry| {
+            entry.value_ptr.deinit();
+        }
+        self.socket_map.deinit();
+
+        // Free cache
+        self.cache.deinit();
+
+        // Clean up any display list
+        if (self.display_list) |list| {
+            self.allocator.free(list);
+        }
+
+        // Clean up document layout tree
+        if (self.document_layout) |doc| {
+            doc.deinit();
+            self.allocator.destroy(doc);
+        }
+
+        // clean up layout
+        self.layout_engine.deinit();
+
+        c.SDL_DestroyRenderer(self.canvas);
+        c.SDL_DestroyWindow(self.window);
+        c.SDL_Quit();
     }
 };
