@@ -358,16 +358,20 @@ pub const Browser = struct {
             self.allocator.free(items);
         }
 
-        // Create display list for drawing
-        self.display_list = try self.layout_engine.layoutNodes(self.current_node.?);
-
-        // Also create a layout tree for future use
+        // Clear previous document layout if it exists
         if (self.document_layout != null) {
             self.document_layout.?.deinit();
+            self.allocator.destroy(self.document_layout.?);
+            self.document_layout = null;
         }
+
+        // Create the layout tree
         self.document_layout = try self.layout_engine.createLayoutTree(self.current_node.?);
 
-        // Set content height from the layout engine
+        // Continue using existing display list for drawing
+        self.display_list = try self.layout_engine.layoutNodes(self.current_node.?);
+
+        // Update content height from the layout engine
         self.content_height = self.layout_engine.content_height;
     }
 

@@ -16,6 +16,9 @@ const h_offset = browser.h_offset;
 const v_offset = browser.v_offset;
 const newGlyphCacheKey = font.newGlyphCacheKey;
 
+// Define the list of HTML block elements
+const BLOCK_ELEMENTS = [_][]const u8{ "html", "body", "article", "section", "nav", "aside", "h1", "h2", "h3", "h4", "h5", "h6", "hgroup", "header", "footer", "address", "p", "hr", "pre", "blockquote", "ol", "ul", "menu", "li", "dl", "dt", "dd", "figure", "figcaption", "main", "div", "table", "form", "fieldset", "legend", "details", "summary" };
+
 const c = @cImport({
     @cInclude("SDL2/SDL.h");
     @cInclude("SDL2/SDL_ttf.h");
@@ -775,6 +778,8 @@ pub const DocumentLayout = struct {
     parent: ?*DocumentLayout = null,
     children: std.ArrayList(*BlockLayout),
     allocator: std.mem.Allocator,
+    // Overall document height after layout
+    height: i32 = 0,
 
     pub fn init(allocator: std.mem.Allocator, node: Node) !*DocumentLayout {
         const document = try allocator.create(DocumentLayout);
@@ -799,7 +804,30 @@ pub const DocumentLayout = struct {
         // Create a BlockLayout for the root node
         const child = try BlockLayout.init(self.allocator, self.node, self, null);
         try self.children.append(child);
+
+        // Layout the child (which will recursively layout its children)
         try child.layout(layout_engine);
+
+        // Once the initial layout is done, position all blocks vertically
+        try self.positionBlocks(child, v_offset);
+
+        // Set the overall document height
+        self.height = layout_engine.content_height;
+    }
+
+    // Position blocks vertically by setting their y-coordinates
+    fn positionBlocks(self: *DocumentLayout, block: *BlockLayout, start_y: i32) !void {
+        // Set the y-coordinate for this block
+        block.y = start_y;
+
+        // If this is a block element with children, position them vertically
+        if (std.mem.eql(u8, block.layout_mode(), "block")) {
+            var current_y = start_y;
+            for (block.children.items) |child| {
+                try self.positionBlocks(child, current_y);
+                current_y += child.height;
+            }
+        }
     }
 };
 
@@ -816,6 +844,9 @@ pub const BlockLayout = struct {
     width: i32 = 0,
     height: i32 = 0,
 
+    // Display list for inline content
+    display_list: std.ArrayList(DisplayItem),
+
     pub fn init(allocator: std.mem.Allocator, node: Node, parent: ?*DocumentLayout, previous: ?*BlockLayout) !*BlockLayout {
         const block = try allocator.create(BlockLayout);
         block.* = BlockLayout{
@@ -824,6 +855,7 @@ pub const BlockLayout = struct {
             .previous = previous,
             .children = std.ArrayList(*BlockLayout).init(allocator),
             .allocator = allocator,
+            .display_list = std.ArrayList(DisplayItem).init(allocator),
         };
         return block;
     }
@@ -834,45 +866,103 @@ pub const BlockLayout = struct {
             self.allocator.destroy(child);
         }
         self.children.deinit();
+        self.display_list.deinit();
     }
 
-    pub fn layout(self: *BlockLayout, layout_engine: *Layout) !void {
-        // For leaf nodes with text content, use the existing layout approach
+    // Determine the layout mode for this block
+    pub fn layout_mode(self: *const BlockLayout) []const u8 {
         switch (self.node) {
-            .text => {
-                // This will be a leaf node - implement text layout
-                var line_buffer = std.ArrayList(LineItem).init(self.allocator);
-                defer line_buffer.deinit();
-
-                try layout_engine.handleTextToken(self.node.text.text, &line_buffer);
-                try layout_engine.flushLine(&line_buffer);
-
-                // Store position and dimensions
-                self.x = layout_engine.cursor_x;
-                self.y = layout_engine.cursor_y - layout_engine.size;
-                self.height = layout_engine.size;
-                // Width calculation would need to be more sophisticated
-            },
+            .text => return "inline",
             .element => |e| {
-                // Create child BlockLayout objects for element children
+                // Check if any of the children are block elements
+                for (e.children.items) |child| {
+                    switch (child) {
+                        .element => |child_e| {
+                            // Check if this is a block element
+                            for (BLOCK_ELEMENTS) |block_tag| {
+                                if (std.mem.eql(u8, child_e.tag, block_tag)) {
+                                    return "block";
+                                }
+                            }
+                        },
+                        else => {},
+                    }
+                }
+
+                // If it has any children, use inline mode
+                if (e.children.items.len > 0) {
+                    return "inline";
+                } else {
+                    return "block";
+                }
+            },
+        }
+    }
+
+    // Create child block layouts for element children
+    pub fn layout_intermediate(self: *BlockLayout) !void {
+        switch (self.node) {
+            .text => {}, // Text nodes don't have children
+            .element => |e| {
                 var previous: ?*BlockLayout = null;
                 for (e.children.items) |child| {
                     const next = try BlockLayout.init(self.allocator, child, self.parent, previous);
                     try self.children.append(next);
                     previous = next;
                 }
-
-                // Recursively layout children
-                for (self.children.items) |child| {
-                    try child.layout(layout_engine);
-                }
-
-                // Update this block's dimensions based on children
-                self.height = 0;
-                for (self.children.items) |child| {
-                    self.height += child.height;
-                }
             },
+        }
+    }
+
+    pub fn layout(self: *BlockLayout, layout_engine: *Layout) !void {
+        const mode = self.layout_mode();
+
+        if (std.mem.eql(u8, mode, "block")) {
+            // Block mode: create child layouts and stack them vertically
+            try self.layout_intermediate();
+
+            // Recursively layout children
+            for (self.children.items) |child| {
+                try child.layout(layout_engine);
+            }
+
+            // Update this block's dimensions based on children
+            self.height = 0;
+            for (self.children.items) |child| {
+                self.height += child.height;
+            }
+        } else {
+            // Inline mode: use the existing text layout approach
+            var line_buffer = std.ArrayList(LineItem).init(self.allocator);
+            defer line_buffer.deinit();
+
+            // Save current position
+            const original_x = layout_engine.cursor_x;
+            const original_y = layout_engine.cursor_y;
+
+            // Process node recursively
+            switch (self.node) {
+                .text => |t| {
+                    try layout_engine.handleTextToken(t.text, &line_buffer);
+                },
+                .element => |e| {
+                    try layout_engine.openTag(e.tag, e.attributes, &line_buffer);
+
+                    for (e.children.items) |child| {
+                        try layout_engine.recurseNode(child, &line_buffer);
+                    }
+
+                    try layout_engine.closeTag(e.tag, &line_buffer);
+                },
+            }
+
+            try layout_engine.flushLine(&line_buffer);
+
+            // Store position and dimensions
+            self.x = original_x;
+            self.y = original_y;
+            self.height = layout_engine.cursor_y - original_y;
+            self.width = layout_engine.window_width - scrollbar_width - (2 * h_offset);
         }
     }
 };
