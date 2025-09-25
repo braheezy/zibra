@@ -1,7 +1,7 @@
 .{
     .name = .zibra,
     .version = "0.0.0",
-    .minimum_zig_version = "0.14.0",
+    .minimum_zig_version = "0.15.1",
     .dependencies = .{
         .zg = .{
             .url = "git+https://codeberg.org/chaten/zg#749197a3f9d25e211615960c02380a3d659b20f9",
