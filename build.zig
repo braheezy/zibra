@@ -33,7 +33,7 @@ pub fn build(b: *std.Build) !void {
     source_module.addImport("known-folders", known_folders);
 
     const zg = b.dependency("zg", .{});
-    source_module.addImport("grapheme", zg.module("grapheme"));
+    source_module.addImport("grapheme", zg.module("Graphemes"));
     source_module.addImport("code_point", zg.module("code_point"));
 
     const ada_dep = b.dependency("adazig", .{});

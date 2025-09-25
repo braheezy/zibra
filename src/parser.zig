@@ -70,7 +70,7 @@ const Element = struct {
             .tag = tag,
             .parent = parent,
             .attributes = null,
-            .children = std.ArrayList(Node).init(allocator),
+            .children = std.ArrayList(Node).empty,
         };
 
         // Only parse attributes if there's a space in the tag
@@ -84,11 +84,11 @@ const Element = struct {
         return e;
     }
 
-    pub fn deinit(self: Element, allocator: std.mem.Allocator) void {
-        for (self.children.items) |child| {
+    pub fn deinit(self: *Element, allocator: std.mem.Allocator) void {
+        for (self.children.items) |*child| {
             child.deinit(allocator);
         }
-        self.children.deinit();
+        self.children.deinit(allocator);
 
         if (self.attributes) |attributes| {
             var attrs = attributes;
@@ -183,18 +183,18 @@ pub const Node = union(enum) {
     text: Text,
     element: Element,
 
-    pub fn deinit(self: Node, allocator: std.mem.Allocator) void {
-        switch (self) {
+    pub fn deinit(self: *Node, allocator: std.mem.Allocator) void {
+        switch (self.*) {
             .text => {},
             .element => |*e| e.deinit(allocator),
         }
     }
 
-    pub fn appendChild(self: *Node, child: Node) !void {
+    pub fn appendChild(self: *Node, allocator: std.mem.Allocator, child: Node) !void {
         switch (self.*) {
             .text => unreachable,
             .element => |*e| {
-                try e.children.append(child);
+                try e.children.append(allocator, child);
             },
         }
     }
@@ -209,37 +209,37 @@ pub const Node = union(enum) {
     // allocate a string from node (because we may need to build up attribtues)
     // caller must free the string
     pub fn asString(self: *const Node, al: std.mem.Allocator) ![]const u8 {
-        var result = std.ArrayList(u8).init(al);
-        errdefer result.deinit();
+        var result = std.ArrayList(u8).empty;
+        errdefer result.deinit(al);
 
         switch (self.*) {
             .text => |t| {
-                try result.appendSlice(t.text);
+                try result.appendSlice(al, t.text);
             },
             .element => |e| {
-                try result.append('<');
-                try result.appendSlice(e.tag);
+                try result.append(al, '<');
+                try result.appendSlice(al, e.tag);
 
                 if (e.attributes) |attrs| {
                     var it = attrs.iterator();
                     while (it.next()) |entry| {
-                        try result.append(' ');
-                        try result.appendSlice(entry.key_ptr.*);
+                        try result.append(al, ' ');
+                        try result.appendSlice(al, entry.key_ptr.*);
 
                         // Only add ="value" if the attribute has a value
                         if (entry.value_ptr.*.len > 0) {
-                            try result.appendSlice("=\"");
-                            try result.appendSlice(entry.value_ptr.*);
-                            try result.append('"');
+                            try result.appendSlice(al, "=\"");
+                            try result.appendSlice(al, entry.value_ptr.*);
+                            try result.append(al, '"');
                         }
                     }
                 }
 
-                try result.append('>');
+                try result.append(al, '>');
             },
         }
 
-        return result.toOwnedSlice();
+        return result.toOwnedSlice(al);
     }
 };
 
@@ -257,7 +257,7 @@ pub const HTMLParser = struct {
         const parser = try allocator.create(HTMLParser);
         parser.* = HTMLParser{
             .body = body,
-            .unfinished = std.ArrayList(Node).init(allocator),
+            .unfinished = std.ArrayList(Node).empty,
             .allocator = allocator,
             .head_found = false,
             .use_implicit_tags = true,
@@ -267,7 +267,7 @@ pub const HTMLParser = struct {
     }
 
     pub fn deinit(self: *HTMLParser, allocator: std.mem.Allocator) void {
-        self.unfinished.deinit();
+        self.unfinished.deinit(self.allocator);
         allocator.destroy(self);
     }
 
@@ -380,7 +380,7 @@ pub const HTMLParser = struct {
         );
 
         const node = Node{ .text = text_node };
-        try parent.appendChild(node);
+        try parent.appendChild(self.allocator, node);
     }
 
     // Process an HTML tag (opening, closing, or self-closing)
@@ -446,7 +446,7 @@ pub const HTMLParser = struct {
     fn createTopLevelElement(self: *HTMLParser, tag_slice: []const u8) !void {
         const element = try Element.init(self.allocator, tag_slice, null);
         const node = Node{ .element = element };
-        try self.unfinished.append(node);
+        try self.unfinished.append(self.allocator, node);
     }
 
     // Handle a closing tag by finding its matching opening tag and closing everything up to it
@@ -487,8 +487,8 @@ pub const HTMLParser = struct {
     // This implements the browser behavior for cases like <b>Bold <i>both</b> italic</i>
     fn handleOverlappingFormattingElements(self: *HTMLParser, index: usize) !void {
         // Collect formatting elements that will be implicitly closed
-        var formatting_to_reopen = std.ArrayList([]const u8).init(self.allocator);
-        defer formatting_to_reopen.deinit();
+        var formatting_to_reopen = std.ArrayList([]const u8).empty;
+        defer formatting_to_reopen.deinit(self.allocator);
 
         // Identify formatting elements that need to be reopened
         var j: usize = self.unfinished.items.len - 1;
@@ -497,7 +497,7 @@ pub const HTMLParser = struct {
             if (element.* == .element) {
                 const tag = element.element.tag;
                 if (isFormattingElement(tag)) {
-                    try formatting_to_reopen.append(tag);
+                    try formatting_to_reopen.append(self.allocator, tag);
                 }
             }
             j -= 1;
@@ -522,13 +522,13 @@ pub const HTMLParser = struct {
         while (self.unfinished.items.len - 1 > index) {
             const node = self.unfinished.pop() orelse unreachable;
             const parent = &self.unfinished.items[self.unfinished.items.len - 1];
-            try parent.appendChild(node);
+            try parent.appendChild(self.allocator, node);
         }
 
         // Now close the target tag itself
         const node = self.unfinished.pop() orelse unreachable;
         const parent = &self.unfinished.items[self.unfinished.items.len - 1];
-        try parent.appendChild(node);
+        try parent.appendChild(self.allocator, node);
     }
 
     // Handle a self-closing tag by creating it and appending it to its parent
@@ -549,7 +549,7 @@ pub const HTMLParser = struct {
         );
 
         const node = Node{ .element = element };
-        try parent.appendChild(node);
+        try parent.appendChild(self.allocator, node);
     }
 
     // Handle an opening tag by creating it and adding it to the unfinished stack
@@ -567,7 +567,7 @@ pub const HTMLParser = struct {
         );
 
         const node = Node{ .element = element };
-        try self.unfinished.append(node);
+        try self.unfinished.append(self.allocator, node);
 
         // Mark when we've found a head tag
         if (std.mem.eql(u8, tag_name, "head")) {
@@ -638,7 +638,7 @@ pub const HTMLParser = struct {
             null,
         );
         const html_node = Node{ .element = html_element };
-        try self.unfinished.append(html_node);
+        try self.unfinished.append(self.allocator, html_node);
     }
 
     // Ensure a HEAD element exists if needed
@@ -650,7 +650,7 @@ pub const HTMLParser = struct {
                 &self.unfinished.items[0],
             );
             const head_node = Node{ .element = head_element };
-            try self.unfinished.append(head_node);
+            try self.unfinished.append(self.allocator, head_node);
             self.head_found = true;
         }
     }
@@ -663,7 +663,7 @@ pub const HTMLParser = struct {
             &self.unfinished.items[0],
         );
         const body_node = Node{ .element = body_element };
-        try self.unfinished.append(body_node);
+        try self.unfinished.append(self.allocator, body_node);
     }
 
     // Ensure both HEAD and BODY elements exist
@@ -676,12 +676,12 @@ pub const HTMLParser = struct {
                 &self.unfinished.items[0],
             );
             const head_node = Node{ .element = head_element };
-            try self.unfinished.append(head_node);
+            try self.unfinished.append(self.allocator, head_node);
             self.head_found = true;
 
             // Close the head immediately since we're about to see a body element
             const head_closed = self.unfinished.pop() orelse unreachable;
-            try self.unfinished.items[0].appendChild(head_closed);
+            try self.unfinished.items[0].appendChild(self.allocator, head_closed);
         }
 
         // Then add body
@@ -691,7 +691,7 @@ pub const HTMLParser = struct {
     // Close the HEAD element and open a BODY element
     fn closeHeadAndOpenBody(self: *HTMLParser) !void {
         const head_closed = self.unfinished.pop() orelse unreachable;
-        try self.unfinished.items[0].appendChild(head_closed);
+        try self.unfinished.items[0].appendChild(self.allocator, head_closed);
 
         // Add body
         const body_element = try Element.init(
@@ -700,7 +700,7 @@ pub const HTMLParser = struct {
             &self.unfinished.items[0],
         );
         const body_node = Node{ .element = body_element };
-        try self.unfinished.append(body_node);
+        try self.unfinished.append(self.allocator, body_node);
     }
 
     // Handle elements that can't contain themselves (p, li)
@@ -786,7 +786,7 @@ pub const HTMLParser = struct {
         while (self.unfinished.items.len > 1) {
             const node = self.unfinished.pop() orelse unreachable;
             const parent = &self.unfinished.items[self.unfinished.items.len - 1];
-            try parent.appendChild(node);
+            try parent.appendChild(self.allocator, node);
         }
 
         // Return the root node
@@ -834,7 +834,7 @@ pub const HTMLParser = struct {
 
             // Close the head
             const head_closed = self.unfinished.pop() orelse unreachable;
-            try self.unfinished.items[0].appendChild(head_closed);
+            try self.unfinished.items[0].appendChild(self.allocator, head_closed);
 
             // Add a body element
             try self.ensureBodyElement();

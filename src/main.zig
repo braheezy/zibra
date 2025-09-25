@@ -4,9 +4,8 @@ const builtin = @import("builtin");
 const Browser = @import("browser.zig").Browser;
 const Url = @import("url.zig").Url;
 
-const c = @cImport({
-    @cInclude("SDL2/SDL.h");
-});
+const sdl = @import("sdl.zig");
+const c = sdl.c;
 
 pub fn main() void {
     // Catch and print errors to prevent ugly stack traces.

@@ -23,10 +23,8 @@ fn isBlockElement(tag: []const u8) bool {
     return false;
 }
 
-const c = @cImport({
-    @cInclude("SDL2/SDL.h");
-    @cInclude("SDL2/SDL_ttf.h");
-});
+const sdl = @import("sdl.zig");
+const c = sdl.c;
 
 const LineItem = struct {
     x: i32,
@@ -71,8 +69,6 @@ current_display_target: *std.ArrayList(DisplayItem),
 
 // Add cache as field
 word_cache: std.AutoHashMap(u64, WordCache),
-
-grapheme_data: grapheme.GraphemeData,
 
 is_preformatted: bool = false,
 prev_font_category: ?FontCategory = null,
@@ -137,7 +133,6 @@ pub fn init(
 ) !*Layout {
     const font_manager = try font.FontManager.init(allocator, renderer);
     const layout = try allocator.create(Layout);
-    const grapheme_data = try grapheme.GraphemeData.init(allocator);
 
     layout.* = Layout{
         .allocator = allocator,
@@ -152,10 +147,9 @@ pub fn init(
         .is_bold = false,
         .is_italic = false,
         .content_height = 0,
-        .display_list = std.ArrayList(DisplayItem).init(allocator),
+        .display_list = std.ArrayList(DisplayItem).empty,
         .current_display_target = undefined,
         .word_cache = std.AutoHashMap(u64, WordCache).init(allocator),
-        .grapheme_data = grapheme_data,
     };
 
     layout.current_display_target = &layout.display_list;
@@ -175,9 +169,7 @@ pub fn deinit(self: *Layout) void {
     }
     self.word_cache.deinit();
 
-    self.grapheme_data.deinit();
-
-    self.display_list.deinit();
+    self.display_list.deinit(self.allocator);
 
     self.allocator.destroy(self);
 }
@@ -321,11 +313,11 @@ fn flushLine(self: *Layout, line_buffer: *std.ArrayList(LineItem)) !void {
             final_y = baseline - item.ascent;
         }
 
-        try self.current_display_target.append(DisplayItem{ .glyph = .{
+        try self.current_display_target.append(self.allocator, DisplayItem{ .glyph = .{
             .x = item.x,
             .y = final_y,
             .glyph = item.glyph,
-        }});
+        } });
     }
 
     // Advance cursor_y and reset cursor_x
@@ -435,7 +427,7 @@ fn processGrapheme(
     }
 
     // Add glyph to line buffer
-    try line_buffer.append(LineItem{
+    try line_buffer.append(self.allocator, LineItem{
         .x = self.cursor_x,
         .glyph = glyph,
         .ascent = glyph.ascent,
@@ -456,7 +448,9 @@ fn handlePreformattedText(
         self.current_font_category = .monospace;
     }
 
-    var g_iter = grapheme.Iterator.init(content, &self.grapheme_data);
+    const grapheme_data = try grapheme.init(self.allocator);
+    defer grapheme_data.deinit(self.allocator);
+    var g_iter = grapheme_data.iterator(content);
     while (g_iter.next()) |gc| {
         const gme = gc.bytes(content);
         try self.processGrapheme(gme, line_buffer, .{
@@ -594,8 +588,8 @@ pub fn layoutSourceCode(self: *Layout, source: []const u8) ![]DisplayItem {
     self.current_font_category = .latin; // Start with normal font
     self.is_bold = false; // Start with normal weight
 
-    var line_buffer = std.ArrayList(LineItem).init(self.allocator);
-    defer line_buffer.deinit();
+    var line_buffer = std.ArrayList(LineItem).empty;
+    defer line_buffer.deinit(self.allocator);
 
     // Process the source character by character to apply different styles to tags and content
     var i: usize = 0;
@@ -615,7 +609,9 @@ pub fn layoutSourceCode(self: *Layout, source: []const u8) ![]DisplayItem {
             self.current_font_category = .latin; // Use regular document font for tags
 
             // Process the '<' character
-            var g_iter = grapheme.Iterator.init(source[i .. i + 1], &self.grapheme_data);
+            const grapheme_data = try grapheme.init(self.allocator);
+            defer grapheme_data.deinit(self.allocator);
+            var g_iter = grapheme_data.iterator(source[i .. i + 1]);
             if (g_iter.next()) |gc| {
                 const gme = gc.bytes(source[i..]);
                 try self.processGrapheme(gme, &line_buffer, .{
@@ -641,7 +637,9 @@ pub fn layoutSourceCode(self: *Layout, source: []const u8) ![]DisplayItem {
             in_string = false;
 
             // Process the '>' character
-            var g_iter = grapheme.Iterator.init(source[i .. i + 1], &self.grapheme_data);
+            const grapheme_data = try grapheme.init(self.allocator);
+            defer grapheme_data.deinit(self.allocator);
+            var g_iter = grapheme_data.iterator(source[i .. i + 1]);
             if (g_iter.next()) |gc| {
                 const gme = gc.bytes(source[i..]);
                 try self.processGrapheme(gme, &line_buffer, .{
@@ -677,7 +675,9 @@ pub fn layoutSourceCode(self: *Layout, source: []const u8) ![]DisplayItem {
         }
 
         // Process current character
-        var g_iter = grapheme.Iterator.init(source[i..], &self.grapheme_data);
+        const grapheme_data = try grapheme.init(self.allocator);
+        defer grapheme_data.deinit(self.allocator);
+        var g_iter = grapheme_data.iterator(source[i..]);
         if (g_iter.next()) |gc| {
             const gme = gc.bytes(source[i..]);
             try self.processGrapheme(gme, &line_buffer, .{
@@ -699,7 +699,7 @@ pub fn layoutSourceCode(self: *Layout, source: []const u8) ![]DisplayItem {
     self.is_bold = original_is_bold;
 
     self.content_height = self.cursor_y;
-    return try self.display_list.toOwnedSlice();
+    return try self.display_list.toOwnedSlice(self.allocator);
 }
 
 pub const DocumentLayout = struct {
@@ -716,7 +716,7 @@ pub const DocumentLayout = struct {
         document.* = DocumentLayout{
             .allocator = allocator,
             .node = node,
-            .children = std.ArrayList(*BlockLayout).init(allocator),
+            .children = std.ArrayList(*BlockLayout).empty,
         };
         return document;
     }
@@ -726,7 +726,7 @@ pub const DocumentLayout = struct {
             child.deinit();
             self.allocator.destroy(child);
         }
-        self.children.deinit();
+        self.children.deinit(self.allocator);
     }
 
     pub fn layout(self: *DocumentLayout, engine: *Layout) !void {
@@ -740,7 +740,7 @@ pub const DocumentLayout = struct {
         }
         self.children.clearRetainingCapacity();
         const child = try BlockLayout.init(self.allocator, self.node, self, null, null);
-        try self.children.append(child);
+        try self.children.append(self.allocator, child);
 
         try child.layout(engine);
         self.height = child.height;
@@ -774,8 +774,8 @@ pub const BlockLayout = struct {
             .document = document,
             .parent_block = parent_block,
             .previous = previous,
-            .children = std.ArrayList(*BlockLayout).init(allocator),
-            .display_list = std.ArrayList(DisplayItem).init(allocator),
+            .children = std.ArrayList(*BlockLayout).empty,
+            .display_list = std.ArrayList(DisplayItem).empty,
         };
         return block;
     }
@@ -785,8 +785,8 @@ pub const BlockLayout = struct {
             child.deinit();
             self.allocator.destroy(child);
         }
-        self.children.deinit();
-        self.display_list.deinit();
+        self.children.deinit(self.allocator);
+        self.display_list.deinit(self.allocator);
     }
 
     fn isBlockContainer(self: *const BlockLayout) bool {
@@ -832,7 +832,7 @@ pub const BlockLayout = struct {
                     var previous: ?*BlockLayout = null;
                     for (e.children.items) |child_node| {
                         const child = try BlockLayout.init(self.allocator, child_node, self.document, self, previous);
-                        try self.children.append(child);
+                        try self.children.append(self.allocator, child);
                         previous = child;
                     }
                 },
@@ -875,8 +875,8 @@ fn layoutInlineBlock(self: *Layout, block: *BlockLayout) !void {
 
     self.current_display_target = &block.display_list;
 
-    var line_buffer = std.ArrayList(LineItem).init(self.allocator);
-    defer line_buffer.deinit();
+    var line_buffer = std.ArrayList(LineItem).empty;
+    defer line_buffer.deinit(self.allocator);
 
     switch (block.node) {
         .text => |t| {
@@ -906,8 +906,8 @@ fn addBackgroundIfNeeded(self: *Layout, block: *const BlockLayout) !void {
                     .x2 = block.x + block.width,
                     .y2 = block.y + block.height,
                     .color = browser.Color{ .r = 230, .g = 230, .b = 230, .a = 255 },
-                }};
-                try self.display_list.append(rect);
+                } };
+                try self.display_list.append(self.allocator, rect);
             }
         },
         else => {},
@@ -918,7 +918,7 @@ fn paintBlock(self: *Layout, block: *BlockLayout) !void {
     try addBackgroundIfNeeded(self, block);
 
     for (block.display_list.items) |item| {
-        try self.display_list.append(item);
+        try self.display_list.append(self.allocator, item);
     }
 
     for (block.children.items) |child| {
@@ -941,5 +941,5 @@ pub fn paintDocument(self: *Layout, document: *DocumentLayout) ![]DisplayItem {
     }
 
     self.content_height = document.height + v_offset;
-    return try self.display_list.toOwnedSlice();
+    return try self.display_list.toOwnedSlice(self.allocator);
 }

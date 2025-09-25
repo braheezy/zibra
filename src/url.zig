@@ -39,24 +39,26 @@ pub const Response = struct {
 // Connection provides a way to handle both TCP and TLS connections
 pub const Connection = union(enum) {
     Tcp: std.net.Stream,
-    Tls: struct {
-        client: std.crypto.tls.Client,
-        stream: std.net.Stream,
-    },
+    // TODO: Implement HTTPS support with new TLS API
+    // Tls: struct {
+    //     client: std.crypto.tls.Client,
+    //     stream: std.net.Stream,
+    // },
 
     pub fn sendRequest(self: *Connection, request_content: []const u8) !void {
         switch (self.*) {
             .Tcp => |c| try c.writeAll(request_content),
-            .Tls => |*c| {
-                try c.client.writeAll(c.stream, request_content);
-            },
+            // TODO: Implement HTTPS support with new TLS API
+            // .Tls => |*c| {
+            //     try c.client.writeAll(c.stream, request_content);
+            // },
         }
     }
 
     pub fn readHeaderResponse(self: *Connection, al: std.mem.Allocator) !*Response {
         // Create dynamic array to store total response
-        var response_list = std.ArrayList(u8).init(al);
-        defer response_list.deinit();
+        var response_list = std.ArrayList(u8).empty;
+        defer response_list.deinit(al);
 
         // Create buffer for response
         const buffer_size = 200;
@@ -68,12 +70,13 @@ pub const Connection = union(enum) {
         while (true) {
             const bytes_read = switch (self.*) {
                 .Tcp => |c| try c.read(&temp_buffer),
-                .Tls => |*c| try c.client.read(c.stream, &temp_buffer),
+                // TODO: Implement HTTPS support with new TLS API
+                // .Tls => |*c| try c.client.read(c.stream, &temp_buffer),
             };
             // Connection closed prematurely?
             if (bytes_read == 0) break;
 
-            try response_list.appendSlice(temp_buffer[0..bytes_read]);
+            try response_list.appendSlice(al, temp_buffer[0..bytes_read]);
 
             // see if end of headers is near
             header_end_index = std.mem.indexOf(u8, response_list.items, "\r\n\r\n");
@@ -110,6 +113,7 @@ pub const Connection = union(enum) {
 
     fn readRemainingBody(
         self: *Connection,
+        al: std.mem.Allocator,
         body_list: *std.ArrayList(u8),
         remaining: usize,
     ) !void {
@@ -120,7 +124,8 @@ pub const Connection = union(enum) {
         while (to_read > 0) {
             const chunk_size = @min(to_read, buffer_size);
             const bytes_read = switch (self.*) {
-                .Tls => |*c| try c.client.read(c.stream, temp_buffer[0..chunk_size]),
+                // TODO: Implement HTTPS support with new TLS API
+                // .Tls => |*c| try c.client.read(c.stream, temp_buffer[0..chunk_size]),
                 .Tcp => |c| try c.read(temp_buffer[0..chunk_size]),
             };
 
@@ -129,7 +134,7 @@ pub const Connection = union(enum) {
                 return error.IncompleteBody;
             }
 
-            try body_list.appendSlice(temp_buffer[0..bytes_read]);
+            try body_list.appendSlice(al, temp_buffer[0..bytes_read]);
             to_read -= bytes_read;
         }
 
@@ -146,18 +151,18 @@ pub const Connection = union(enum) {
         already_received: ?[]const u8,
     ) ![]const u8 {
         // Initialize a list to store the full body
-        var body_list = std.ArrayList(u8).init(al);
-        defer body_list.deinit();
+        var body_list = std.ArrayList(u8).empty;
+        defer body_list.deinit(al);
 
         if (already_received) |data| {
             // Append the already-received portion of the body
-            try body_list.appendSlice(data);
+            try body_list.appendSlice(al, data);
         }
 
         // If there's more body to read, do it in chunks
         if (content_length > body_list.items.len) {
             const remaining_to_read = content_length - body_list.items.len;
-            try self.readRemainingBody(&body_list, remaining_to_read);
+            try self.readRemainingBody(al, &body_list, remaining_to_read);
         }
 
         // Validate that we have the full body
@@ -165,12 +170,12 @@ pub const Connection = union(enum) {
             return error.IncompleteBody;
         }
 
-        return body_list.toOwnedSlice();
+        return body_list.toOwnedSlice(al);
     }
 
     fn readChunkedBody(self: *Connection, al: std.mem.Allocator) ![]u8 {
-        var body_list = std.ArrayList(u8).init(al);
-        defer body_list.deinit();
+        var body_list = std.ArrayList(u8).empty;
+        defer body_list.deinit(al);
 
         while (true) {
             // Read the chunk size line
@@ -185,7 +190,7 @@ pub const Connection = union(enum) {
             try self.readExact(chunk);
 
             // Append the chunk to the body list
-            try body_list.appendSlice(chunk);
+            try body_list.appendSlice(al, chunk);
 
             // Consume trailing CRLF
             const end = try self.readLine(al);
@@ -193,11 +198,11 @@ pub const Connection = union(enum) {
         }
 
         // Flatten the body into a single slice
-        return body_list.toOwnedSlice();
+        return body_list.toOwnedSlice(al);
     }
 
     fn readLine(self: *Connection, al: std.mem.Allocator) ![]u8 {
-        var line = std.ArrayList(u8).init(al);
+        var line = std.ArrayList(u8).empty;
 
         const buffer_size = 1;
         var temp_buffer: [buffer_size]u8 = undefined;
@@ -205,18 +210,19 @@ pub const Connection = union(enum) {
         while (true) {
             const bytes_read = switch (self.*) {
                 .Tcp => |c| try c.read(&temp_buffer),
-                .Tls => |*c| try c.client.read(c.stream, &temp_buffer),
+                // TODO: Implement HTTPS support with new TLS API
+                // .Tls => |*c| try c.client.read(c.stream, &temp_buffer),
             };
 
             // Connection closed prematurely
             if (bytes_read == 0) break;
 
             // Append character to line
-            try line.append(temp_buffer[0]);
+            try line.append(al, temp_buffer[0]);
 
             // Check for line termination
             if (line.items.len >= 2 and std.mem.eql(u8, line.items[line.items.len - 2 ..], "\r\n")) {
-                const f = try line.toOwnedSlice();
+                const f = try line.toOwnedSlice(al);
                 // Return without CRLF
                 return f;
             }
@@ -230,7 +236,8 @@ pub const Connection = union(enum) {
         while (total_read < buffer.len) {
             const bytes_read = switch (self.*) {
                 .Tcp => |c| try c.read(buffer[total_read..]),
-                .Tls => |*c| try c.client.read(c.stream, buffer[total_read..]),
+                // TODO: Implement HTTPS support with new TLS API
+                // .Tls => |*c| try c.client.read(c.stream, buffer[total_read..]),
             };
 
             if (bytes_read == 0) {
@@ -303,11 +310,11 @@ pub const Url = struct {
             // split on ';' to find the mime type and attributes
             var split_iter = std.mem.splitSequence(u8, rest, ";");
             const mime_type = split_iter.first();
-            var attributes = std.ArrayList([]const u8).init(allocator);
+            var attributes = std.ArrayList([]const u8).empty;
             const has_attributes = !std.mem.eql(u8, mime_type, url);
             if (has_attributes) {
                 while (split_iter.next()) |attr| {
-                    try attributes.append(attr);
+                    try attributes.append(allocator, attr);
                 }
             }
             // Allocate memory for strings.
@@ -326,7 +333,10 @@ pub const Url = struct {
 
     pub fn free(self: Url, allocator: std.mem.Allocator) void {
         if (self.mime_type) |_| allocator.free(self.mime_type.?);
-        if (self.attributes) |_| self.attributes.?.deinit();
+        if (self.attributes) |attrs| {
+            var a = attrs;
+            a.deinit(allocator);
+        }
         self.ada_url.free();
     }
 
@@ -357,23 +367,9 @@ pub const Url = struct {
                 self.port,
             );
 
-            const new_connection: Connection = if (self.is_https) conn_blk: {
-                // create required certificate bundle
-                var bundle = std.crypto.Certificate.Bundle{};
-                try bundle.rescan(al);
-                defer bundle.deinit(al);
-
-                // create the tls client
-                const options = std.crypto.tls.Client.Options{
-                    .host = .{ .explicit = self.host.? },
-                    .ca = .{ .bundle = bundle },
-                };
-                const tls_client = try std.crypto.tls.Client.init(tcp_stream, options);
-                break :conn_blk Connection{ .Tls = .{
-                    .client = tls_client,
-                    .stream = tcp_stream,
-                } };
-            } else Connection{ .Tcp = tcp_stream };
+            // TODO: Implement HTTPS support with new TLS API
+            // For now, treat all connections as HTTP
+            const new_connection: Connection = Connection{ .Tcp = tcp_stream };
 
             // save the connection for future use
             try socket_map.put(self.host.?, new_connection);
@@ -453,32 +449,34 @@ pub const Url = struct {
             if (std.mem.indexOf(u8, transfer_encoding, "chunked")) |_| {
                 const body = try conn.readChunkedBody(al);
                 // check for gzip
-                if (response.headers.get("content-encoding")) |enc| {
-                    if (std.mem.indexOf(u8, enc, "gzip")) |_| {
-                        defer al.free(body);
-                        // Create a reader for the gzip-compressed body
-                        var input_stream = std.io.fixedBufferStream(body);
-
-                        // Initialize the gzip decompressor
-                        var decompressor = std.compress.gzip.decompressor(input_stream.reader());
-
-                        // Create an ArrayList to hold the decompressed output
-                        var output = std.ArrayList(u8).init(al);
-                        defer output.deinit();
-
-                        const buffer_size = 1024;
-                        var buffer = try al.alloc(u8, buffer_size);
-                        defer al.free(buffer);
-
-                        while (true) {
-                            const bytes_read = try decompressor.read(buffer);
-                            if (bytes_read == 0) break;
-                            try output.appendSlice(buffer[0..bytes_read]);
-                        }
-
-                        // Return the decompressed data as a slice
-                        return output.toOwnedSlice();
-                    }
+                if (response.headers.get("content-encoding")) |_| {
+                    // TODO: Implement gzip decompression with new flate API
+                    // if (std.mem.indexOf(u8, enc, "gzip")) |_| {
+                    //     defer al.free(body);
+                    //     // Create a reader for the gzip-compressed body
+                    //     var input_stream = std.io.fixedBufferStream(body);
+                    //
+                    //     // Initialize the gzip decompressor
+                    //     var reader = input_stream.reader();
+                    //     var decompressor = std.compress.flate.Decompress.init(&reader, .gzip, &[_]u8{});
+                    //
+                    //     // Create an ArrayList to hold the decompressed output
+                    //     var output = std.ArrayList(u8).empty;
+                    //     defer output.deinit(al);
+                    //
+                    //     const buffer_size = 1024;
+                    //     var buffer = try al.alloc(u8, buffer_size);
+                    //     defer al.free(buffer);
+                    //
+                    //     while (true) {
+                    //         const bytes_read = try decompressor.read(buffer);
+                    //         if (bytes_read == 0) break;
+                    //         try output.appendSlice(al, buffer[0..bytes_read]);
+                    //     }
+                    //
+                    //     // Return the decompressed data as a slice
+                    //     return output.toOwnedSlice(al);
+                    // }
                 }
                 return body;
             }
@@ -653,16 +651,16 @@ fn parseStatusLine(headers_data: []const u8) !u16 {
 
 // Print the headers
 fn printHeaders(al: std.mem.Allocator, headers: std.StringHashMap([]const u8)) !void {
-    var headers_list = std.ArrayList(u8).init(al);
-    defer headers_list.deinit();
+    var headers_list = std.ArrayList(u8).empty;
+    defer headers_list.deinit(al);
 
-    try headers_list.appendSlice("Headers:\n");
+    try headers_list.appendSlice(al, "Headers:\n");
 
     var iter = headers.iterator();
     while (iter.next()) |entry| {
         const header_line = try std.fmt.allocPrint(al, "{s}: {s}\n", .{ entry.key_ptr.*, entry.value_ptr.* });
         defer al.free(header_line);
-        try headers_list.appendSlice(header_line);
+        try headers_list.appendSlice(al, header_line);
     }
 
     std.log.info("{s}", .{headers_list.items});

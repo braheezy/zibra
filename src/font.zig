@@ -7,10 +7,8 @@ const code_point = @import("code_point");
 
 const browser = @import("browser.zig");
 
-const c = @cImport({
-    @cInclude("SDL2/SDL.h");
-    @cInclude("SDL2/SDL_ttf.h");
-});
+const sdl = @import("sdl.zig");
+const c = sdl.c;
 
 pub const hyphen_codepoint = 0x00AD;
 
@@ -311,7 +309,7 @@ pub const FontManager = struct {
     }
 
     fn collectFontPaths(self: *FontManager) !std.ArrayList([]const u8) {
-        var paths = std.ArrayList([]const u8).init(self.allocator);
+        var paths = std.ArrayList([]const u8).empty;
 
         // Add user font directory first to prefer them.
         const home_dir = try known_folders.getPath(self.allocator, .home) orelse return error.NoHomeDir;
@@ -320,7 +318,7 @@ pub const FontManager = struct {
         // Add system font directories
         for (system_fonts.paths) |dir| {
             const copy = try self.allocator.dupe(u8, dir);
-            try paths.append(copy);
+            try paths.append(self.allocator, copy);
         }
 
         return paths;
@@ -423,7 +421,7 @@ pub const FontManager = struct {
             for (search_paths.items) |dir| {
                 self.allocator.free(dir);
             }
-            search_paths.deinit();
+            search_paths.deinit(self.allocator);
         }
 
         // Iterate through font categories in order of priority

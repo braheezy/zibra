@@ -18,10 +18,8 @@ const Layout = @import("Layout.zig");
 const parser = @import("parser.zig");
 const HTMLParser = parser.HTMLParser;
 const Node = parser.Node;
-const c = @cImport({
-    @cInclude("SDL2/SDL.h");
-    @cInclude("SDL2/SDL_ttf.h");
-});
+const sdl = @import("sdl.zig");
+const c = sdl.c;
 
 const dbg = std.debug.print;
 
@@ -149,7 +147,8 @@ pub const Browser = struct {
         while (sockets_iter.next()) |socket| {
             switch (socket.*) {
                 .Tcp => socket.Tcp.close(),
-                .Tls => socket.Tls.stream.close(),
+                // TODO: Implement HTTPS support with new TLS API
+                // .Tls => socket.Tls.stream.close(),
             }
         }
 
@@ -169,8 +168,9 @@ pub const Browser = struct {
         }
 
         // Free the node tree if it exists
-        if (self.current_node) |node| {
-            node.deinit(self.allocator);
+        if (self.current_node) |node_val| {
+            var node = node_val;
+            Node.deinit(&node, self.allocator);
             self.current_node = null;
         }
 
@@ -338,7 +338,8 @@ pub const Browser = struct {
             }
 
             if (self.current_node) |node| {
-                node.deinit(self.allocator);
+                var n = node;
+                n.deinit(self.allocator);
                 self.current_node = null;
             }
 
@@ -351,7 +352,8 @@ pub const Browser = struct {
 
             // Clear any previous node tree
             if (self.current_node) |node| {
-                node.deinit(self.allocator);
+                var n = node;
+                n.deinit(self.allocator);
                 self.current_node = null;
             }
 

@@ -1,9 +1,8 @@
 const std = @import("std");
 const builtin = @import("builtin");
 
-const c = @cImport({
-    @cInclude("SDL2/SDL.h");
-});
+const sdl = @import("sdl.zig");
+const c = sdl.c;
 
 const browser = @import("browser.zig");
 const Browser = browser.Browser;
@@ -120,7 +119,7 @@ fn zibra() !void {
             var html_parser = try HTMLParser.init(allocator, body);
             defer html_parser.deinit(allocator);
 
-            const root = try html_parser.parse();
+            var root = try html_parser.parse();
             defer root.deinit(allocator);
 
             try html_parser.prettyPrint(root, 0);
@@ -132,7 +131,7 @@ fn zibra() !void {
         if (print_tree) {
             var html_parser = try HTMLParser.init(allocator, default_html);
             defer html_parser.deinit(allocator);
-            const root = try html_parser.parse();
+            var root = try html_parser.parse();
             defer root.deinit(allocator);
             try html_parser.prettyPrint(root, 0);
             return;
