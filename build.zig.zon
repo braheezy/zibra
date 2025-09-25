@@ -1,6 +1,7 @@
 .{
     .name = .zibra,
     .version = "0.0.0",
+    .minimum_zig_version = "0.14.0",
     .dependencies = .{
         .zg = .{
             .url = "git+https://codeberg.org/atman/zg.git#4a002763419a34d61dcbb1f415821b83b9bf8ddc",

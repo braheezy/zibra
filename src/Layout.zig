@@ -3,10 +3,8 @@ const font = @import("font.zig");
 const browser = @import("browser.zig");
 const code_point = @import("code_point");
 const grapheme = @import("grapheme");
-const token = @import("token.zig");
 const parser = @import("parser.zig");
 const DisplayItem = browser.DisplayItem;
-const Token = token.Token;
 const Node = parser.Node;
 const FontWeight = font.FontWeight;
 const FontSlant = font.FontSlant;
@@ -14,10 +12,16 @@ const FontCategory = font.FontCategory;
 const scrollbar_width = browser.scrollbar_width;
 const h_offset = browser.h_offset;
 const v_offset = browser.v_offset;
-const newGlyphCacheKey = font.newGlyphCacheKey;
 
 // Define the list of HTML block elements
 const BLOCK_ELEMENTS = [_][]const u8{ "html", "body", "article", "section", "nav", "aside", "h1", "h2", "h3", "h4", "h5", "h6", "hgroup", "header", "footer", "address", "p", "hr", "pre", "blockquote", "ol", "ul", "menu", "li", "dl", "dt", "dd", "figure", "figcaption", "main", "div", "table", "form", "fieldset", "legend", "details", "summary" };
+
+fn isBlockElement(tag: []const u8) bool {
+    for (BLOCK_ELEMENTS) |candidate| {
+        if (std.mem.eql(u8, tag, candidate)) return true;
+    }
+    return false;
+}
 
 const c = @cImport({
     @cInclude("SDL2/SDL.h");
@@ -53,6 +57,8 @@ rtl_text: bool = false,
 size: i32 = 16,
 cursor_x: i32,
 cursor_y: i32,
+line_left: i32,
+line_right: i32,
 is_bold: bool = false,
 is_italic: bool = false,
 is_title: bool = false,
@@ -61,6 +67,7 @@ is_small_caps: bool = false,
 // Final content height after layout
 content_height: i32 = 0,
 display_list: std.ArrayList(DisplayItem),
+current_display_target: *std.ArrayList(DisplayItem),
 
 // Add cache as field
 word_cache: std.AutoHashMap(u64, WordCache),
@@ -70,6 +77,56 @@ grapheme_data: grapheme.GraphemeData,
 is_preformatted: bool = false,
 prev_font_category: ?FontCategory = null,
 current_font_category: FontCategory = .latin,
+
+const InlineSnapshot = struct {
+    cursor_x: i32,
+    cursor_y: i32,
+    line_left: i32,
+    line_right: i32,
+    size: i32,
+    is_bold: bool,
+    is_italic: bool,
+    is_title: bool,
+    is_superscript: bool,
+    is_small_caps: bool,
+    is_preformatted: bool,
+    prev_font_category: ?FontCategory,
+    current_font_category: FontCategory,
+};
+
+fn snapshotInlineState(self: *const Layout) InlineSnapshot {
+    return InlineSnapshot{
+        .cursor_x = self.cursor_x,
+        .cursor_y = self.cursor_y,
+        .line_left = self.line_left,
+        .line_right = self.line_right,
+        .size = self.size,
+        .is_bold = self.is_bold,
+        .is_italic = self.is_italic,
+        .is_title = self.is_title,
+        .is_superscript = self.is_superscript,
+        .is_small_caps = self.is_small_caps,
+        .is_preformatted = self.is_preformatted,
+        .prev_font_category = self.prev_font_category,
+        .current_font_category = self.current_font_category,
+    };
+}
+
+fn restoreInlineState(self: *Layout, snapshot: InlineSnapshot) void {
+    self.cursor_x = snapshot.cursor_x;
+    self.cursor_y = snapshot.cursor_y;
+    self.line_left = snapshot.line_left;
+    self.line_right = snapshot.line_right;
+    self.size = snapshot.size;
+    self.is_bold = snapshot.is_bold;
+    self.is_italic = snapshot.is_italic;
+    self.is_title = snapshot.is_title;
+    self.is_superscript = snapshot.is_superscript;
+    self.is_small_caps = snapshot.is_small_caps;
+    self.is_preformatted = snapshot.is_preformatted;
+    self.prev_font_category = snapshot.prev_font_category;
+    self.current_font_category = snapshot.current_font_category;
+}
 
 pub fn init(
     allocator: std.mem.Allocator,
@@ -90,13 +147,18 @@ pub fn init(
         .rtl_text = rtl_text,
         .cursor_x = if (rtl_text) window_width - scrollbar_width - h_offset else h_offset,
         .cursor_y = v_offset,
+        .line_left = h_offset,
+        .line_right = window_width - scrollbar_width - h_offset,
         .is_bold = false,
         .is_italic = false,
         .content_height = 0,
         .display_list = std.ArrayList(DisplayItem).init(allocator),
+        .current_display_target = undefined,
         .word_cache = std.AutoHashMap(u64, WordCache).init(allocator),
         .grapheme_data = grapheme_data,
     };
+
+    layout.current_display_target = &layout.display_list;
 
     try layout.font_manager.loadSystemFont(layout.size);
 
@@ -115,55 +177,9 @@ pub fn deinit(self: *Layout) void {
 
     self.grapheme_data.deinit();
 
+    self.display_list.deinit();
+
     self.allocator.destroy(self);
-}
-
-pub fn layoutTokens(self: *Layout, tokens: []const Token) ![]DisplayItem {
-    std.debug.print("layoutTokens: {d}\n", .{tokens.len});
-    self.cursor_x = if (self.rtl_text)
-        self.window_width - scrollbar_width - h_offset
-    else
-        h_offset;
-    self.cursor_y = v_offset;
-
-    var line_buffer = std.ArrayList(LineItem).init(self.allocator);
-    defer line_buffer.deinit();
-
-    for (tokens) |tok| {
-        switch (tok) {
-            .text => {
-                try self.handleTextToken(tok.text, &line_buffer);
-            },
-
-            .tag => {
-                try self.handleTagToken(tok.tag, &line_buffer);
-            },
-        }
-    }
-
-    // Flush any remaining items on the last line.
-    try self.flushLine(&line_buffer);
-    self.content_height = self.cursor_y;
-    return try self.display_list.toOwnedSlice();
-}
-
-pub fn layoutNodes(self: *Layout, root: Node) ![]DisplayItem {
-    self.cursor_x = if (self.rtl_text)
-        self.window_width - scrollbar_width - h_offset
-    else
-        h_offset;
-    self.cursor_y = v_offset;
-
-    var line_buffer = std.ArrayList(LineItem).init(self.allocator);
-    defer line_buffer.deinit();
-
-    // Process the node tree recursively
-    try self.recurseNode(root, &line_buffer);
-
-    // Flush any remaining items on the last line
-    try self.flushLine(&line_buffer);
-    self.content_height = self.cursor_y;
-    return try self.display_list.toOwnedSlice();
 }
 
 fn recurseNode(self: *Layout, node: Node, line_buffer: *std.ArrayList(LineItem)) !void {
@@ -198,17 +214,11 @@ fn openTag(self: *Layout, tag: []const u8, attributes: ?std.StringHashMap([]cons
         // Flush the current line and add vertical spacing.
         try self.flushLine(line_buffer);
         self.cursor_y += self.size;
-        self.cursor_x = if (self.rtl_text)
-            self.window_width - scrollbar_width - h_offset
-        else
-            h_offset;
+        self.cursor_x = if (self.rtl_text) self.line_right else self.line_left;
     } else if (std.mem.eql(u8, tag, "br")) {
         // A <br> tag always triggers a line break.
         try self.flushLine(line_buffer);
-        self.cursor_x = if (self.rtl_text)
-            self.window_width - scrollbar_width - h_offset
-        else
-            h_offset;
+        self.cursor_x = if (self.rtl_text) self.line_right else self.line_left;
     } else if (std.mem.eql(u8, tag, "h1")) {
         if (attributes) |attrs| {
             if (attrs.get("class")) |id| {
@@ -268,11 +278,8 @@ fn flushLine(self: *Layout, line_buffer: *std.ArrayList(LineItem)) !void {
             }
         }
         const line_width: i32 = max_x - min_x;
-        // Compute available width:
-        // Here we assume h_offset defines the left/right content margin, and scrollbar_width is reserved.
-        const available_width: i32 = self.window_width - scrollbar_width - (h_offset * 2);
-        // Compute new left offset so that the line is centered.
-        const new_x_offset: i32 = h_offset + @divTrunc(available_width - line_width, 2);
+        const available_width: i32 = self.line_right - self.line_left;
+        const new_x_offset: i32 = self.line_left + @divTrunc(available_width - line_width, 2);
         const shift: i32 = new_x_offset - min_x;
         // Adjust all glyph positions for centering.
         for (line_buffer.items) |*item| {
@@ -314,19 +321,16 @@ fn flushLine(self: *Layout, line_buffer: *std.ArrayList(LineItem)) !void {
             final_y = baseline - item.ascent;
         }
 
-        try self.display_list.append(DisplayItem{
+        try self.current_display_target.append(DisplayItem{ .glyph = .{
             .x = item.x,
             .y = final_y,
             .glyph = item.glyph,
-        });
+        }});
     }
 
     // Advance cursor_y and reset cursor_x
     self.cursor_y = baseline + max_descent + extra_leading;
-    self.cursor_x = if (self.rtl_text)
-        self.window_width - scrollbar_width - h_offset
-    else
-        h_offset;
+    self.cursor_x = if (self.rtl_text) self.line_right else self.line_left;
 
     line_buffer.clearRetainingCapacity();
 }
@@ -420,20 +424,14 @@ fn processGrapheme(
     // Handle newlines explicitly
     if (std.mem.eql(u8, gme, "\n") or options.force_newline) {
         try self.flushLine(line_buffer);
-        self.cursor_x = if (self.rtl_text)
-            self.window_width - scrollbar_width - h_offset
-        else
-            h_offset;
+        self.cursor_x = if (self.rtl_text) self.line_right else self.line_left;
         return;
     }
 
     // Check if we need to wrap (only at window edge)
-    if (self.cursor_x + glyph.w > (self.window_width - scrollbar_width - h_offset)) {
+    if (self.cursor_x + glyph.w > self.line_right) {
         try self.flushLine(line_buffer);
-        self.cursor_x = if (self.rtl_text)
-            self.window_width - scrollbar_width - h_offset
-        else
-            h_offset;
+        self.cursor_x = if (self.rtl_text) self.line_right else self.line_left;
     }
 
     // Add glyph to line buffer
@@ -576,82 +574,14 @@ fn lexEntityAt(text: []const u8, pos: usize) ?struct { replacement: []const u8, 
     return null;
 }
 
-fn handleTagToken(
-    self: *Layout,
-    tag: *token.Tag,
-    line_buffer: *std.ArrayList(LineItem),
-) !void {
-    if (std.mem.eql(u8, tag.name, "b")) {
-        self.is_bold = !tag.is_closing;
-    } else if (std.mem.eql(u8, tag.name, "i")) {
-        self.is_italic = !tag.is_closing;
-    } else if (std.mem.eql(u8, tag.name, "abbr")) {
-        self.is_small_caps = !tag.is_closing;
-    } else if (std.mem.eql(u8, tag.name, "big")) {
-        if (!tag.is_closing) {
-            self.size += 4;
-        } else {
-            self.size -= 4;
-        }
-    } else if (std.mem.eql(u8, tag.name, "small")) {
-        if (!tag.is_closing) {
-            self.size -= 4;
-        } else {
-            self.size += 4;
-        }
-    } else if (std.mem.eql(u8, tag.name, "p")) {
-        // Flush the current line and add vertical spacing.
-        try self.flushLine(line_buffer);
-        self.cursor_y += self.size;
-        self.cursor_x = if (self.rtl_text)
-            self.window_width - scrollbar_width - h_offset
-        else
-            h_offset;
-    } else if (std.mem.eql(u8, tag.name, "br")) {
-        // A <br> tag always triggers a line break.
-        try self.flushLine(line_buffer);
-        self.cursor_x = if (self.rtl_text)
-            self.window_width - scrollbar_width - h_offset
-        else
-            h_offset;
-    } else if (std.mem.eql(u8, tag.name, "h1")) {
-        if (tag.attributes) |attributes| {
-            if (attributes.get("class")) |id| {
-                if (std.mem.eql(u8, id, "title")) {
-                    self.is_title = true;
-                }
-            }
-        }
-    } else if (std.mem.eql(u8, tag.name, "sup")) {
-        self.is_superscript = !tag.is_closing;
-    } else if (std.mem.eql(u8, tag.name, "pre")) {
-        if (tag.is_closing) {
-            try self.flushLine(line_buffer);
-            self.is_preformatted = false;
-            // Restore previous font category
-            if (self.prev_font_category) |category| {
-                self.current_font_category = category;
-                self.prev_font_category = null;
-            }
-        } else {
-            try self.flushLine(line_buffer);
-            self.is_preformatted = true;
-        }
-    } else {
-        // For other tags you can now use the attributes parsed into tag.attributes.
-        // For example, if there's an inline style attribute, you might inspect it like so:
-        // if (tag.attributes.get("style")) |style_val| {
-        //     // Process the style value as needed.
-        // }
-        // Otherwise, skip tags that don't affect formatting.
-    }
-}
-
 // Update layoutSourceCode to format HTML source with tags in normal font and content in bold
 pub fn layoutSourceCode(self: *Layout, source: []const u8) ![]DisplayItem {
     std.debug.print("layoutSourceCode: {d} bytes\n", .{source.len});
-    self.cursor_x = h_offset;
+    self.current_display_target = &self.display_list;
+    self.cursor_x = if (self.rtl_text) self.line_right else self.line_left;
     self.cursor_y = v_offset;
+    self.line_left = h_offset;
+    self.line_right = self.window_width - scrollbar_width - h_offset;
 
     // Save current state
     const original_preformatted = self.is_preformatted;
@@ -772,22 +702,21 @@ pub fn layoutSourceCode(self: *Layout, source: []const u8) ![]DisplayItem {
     return try self.display_list.toOwnedSlice();
 }
 
-// New layout tree structures
 pub const DocumentLayout = struct {
-    node: Node,
-    parent: ?*DocumentLayout = null,
-    children: std.ArrayList(*BlockLayout),
     allocator: std.mem.Allocator,
-    // Overall document height after layout
+    node: Node,
+    children: std.ArrayList(*BlockLayout),
+    x: i32 = 0,
+    y: i32 = 0,
+    width: i32 = 0,
     height: i32 = 0,
 
     pub fn init(allocator: std.mem.Allocator, node: Node) !*DocumentLayout {
         const document = try allocator.create(DocumentLayout);
         document.* = DocumentLayout{
-            .node = node,
-            .parent = null,
-            .children = std.ArrayList(*BlockLayout).init(allocator),
             .allocator = allocator,
+            .node = node,
+            .children = std.ArrayList(*BlockLayout).init(allocator),
         };
         return document;
     }
@@ -800,61 +729,52 @@ pub const DocumentLayout = struct {
         self.children.deinit();
     }
 
-    pub fn layout(self: *DocumentLayout, layout_engine: *Layout) !void {
-        // Create a BlockLayout for the root node
-        const child = try BlockLayout.init(self.allocator, self.node, self, null);
+    pub fn layout(self: *DocumentLayout, engine: *Layout) !void {
+        self.x = h_offset;
+        self.y = v_offset;
+        self.width = engine.window_width - scrollbar_width - (2 * h_offset);
+
+        for (self.children.items) |child| {
+            child.deinit();
+            self.allocator.destroy(child);
+        }
+        self.children.clearRetainingCapacity();
+        const child = try BlockLayout.init(self.allocator, self.node, self, null, null);
         try self.children.append(child);
 
-        // Layout the child (which will recursively layout its children)
-        try child.layout(layout_engine);
-
-        // Once the initial layout is done, position all blocks vertically
-        try self.positionBlocks(child, v_offset);
-
-        // Set the overall document height
-        self.height = layout_engine.content_height;
-    }
-
-    // Position blocks vertically by setting their y-coordinates
-    fn positionBlocks(self: *DocumentLayout, block: *BlockLayout, start_y: i32) !void {
-        // Set the y-coordinate for this block
-        block.y = start_y;
-
-        // If this is a block element with children, position them vertically
-        if (std.mem.eql(u8, block.layout_mode(), "block")) {
-            var current_y = start_y;
-            for (block.children.items) |child| {
-                try self.positionBlocks(child, current_y);
-                current_y += child.height;
-            }
-        }
+        try child.layout(engine);
+        self.height = child.height;
     }
 };
 
 pub const BlockLayout = struct {
+    allocator: std.mem.Allocator,
     node: Node,
-    parent: ?*DocumentLayout,
+    document: *DocumentLayout,
+    parent_block: ?*BlockLayout,
     previous: ?*BlockLayout,
     children: std.ArrayList(*BlockLayout),
-    allocator: std.mem.Allocator,
-
-    // Layout properties that will be computed
+    display_list: std.ArrayList(DisplayItem),
     x: i32 = 0,
     y: i32 = 0,
     width: i32 = 0,
     height: i32 = 0,
 
-    // Display list for inline content
-    display_list: std.ArrayList(DisplayItem),
-
-    pub fn init(allocator: std.mem.Allocator, node: Node, parent: ?*DocumentLayout, previous: ?*BlockLayout) !*BlockLayout {
+    pub fn init(
+        allocator: std.mem.Allocator,
+        node: Node,
+        document: *DocumentLayout,
+        parent_block: ?*BlockLayout,
+        previous: ?*BlockLayout,
+    ) !*BlockLayout {
         const block = try allocator.create(BlockLayout);
         block.* = BlockLayout{
+            .allocator = allocator,
             .node = node,
-            .parent = parent,
+            .document = document,
+            .parent_block = parent_block,
             .previous = previous,
             .children = std.ArrayList(*BlockLayout).init(allocator),
-            .allocator = allocator,
             .display_list = std.ArrayList(DisplayItem).init(allocator),
         };
         return block;
@@ -869,107 +789,157 @@ pub const BlockLayout = struct {
         self.display_list.deinit();
     }
 
-    // Determine the layout mode for this block
-    pub fn layout_mode(self: *const BlockLayout) []const u8 {
+    fn isBlockContainer(self: *const BlockLayout) bool {
         switch (self.node) {
-            .text => return "inline",
+            .text => return false,
             .element => |e| {
-                // Check if any of the children are block elements
+                // Follow the chapter-5 heuristic: if any child is a known block
+                // element we treat this layout box as block-level. Otherwise,
+                // mixed inline content stays inline unless the element is empty,
+                // in which case it acts like an empty block box (matching the
+                // Python reference implementation).
                 for (e.children.items) |child| {
                     switch (child) {
                         .element => |child_e| {
-                            // Check if this is a block element
-                            for (BLOCK_ELEMENTS) |block_tag| {
-                                if (std.mem.eql(u8, child_e.tag, block_tag)) {
-                                    return "block";
-                                }
-                            }
+                            if (isBlockElement(child_e.tag)) return true;
                         },
                         else => {},
                     }
                 }
-
-                // If it has any children, use inline mode
-                if (e.children.items.len > 0) {
-                    return "inline";
-                } else {
-                    return "block";
-                }
+                return e.children.items.len == 0;
             },
         }
     }
 
-    // Create child block layouts for element children
-    pub fn layout_intermediate(self: *BlockLayout) !void {
-        switch (self.node) {
-            .text => {}, // Text nodes don't have children
-            .element => |e| {
-                var previous: ?*BlockLayout = null;
-                for (e.children.items) |child| {
-                    const next = try BlockLayout.init(self.allocator, child, self.parent, previous);
-                    try self.children.append(next);
-                    previous = next;
-                }
-            },
-        }
-    }
+    pub fn layout(self: *BlockLayout, engine: *Layout) !void {
+        const parent_x = if (self.parent_block) |pb| pb.x else self.document.x;
+        const parent_y = if (self.parent_block) |pb| pb.y else self.document.y;
+        const parent_width = if (self.parent_block) |pb| pb.width else self.document.width;
 
-    pub fn layout(self: *BlockLayout, layout_engine: *Layout) !void {
-        const mode = self.layout_mode();
+        self.x = parent_x;
+        self.width = parent_width;
+        self.y = if (self.previous) |prev| prev.y + prev.height else parent_y;
 
-        if (std.mem.eql(u8, mode, "block")) {
-            // Block mode: create child layouts and stack them vertically
-            try self.layout_intermediate();
-
-            // Recursively layout children
+        const is_block = self.isBlockContainer();
+        if (is_block) {
             for (self.children.items) |child| {
-                try child.layout(layout_engine);
+                child.deinit();
+                self.allocator.destroy(child);
+            }
+            self.children.clearRetainingCapacity();
+            switch (self.node) {
+                .element => |e| {
+                    var previous: ?*BlockLayout = null;
+                    for (e.children.items) |child_node| {
+                        const child = try BlockLayout.init(self.allocator, child_node, self.document, self, previous);
+                        try self.children.append(child);
+                        previous = child;
+                    }
+                },
+                else => {},
             }
 
-            // Update this block's dimensions based on children
             self.height = 0;
             for (self.children.items) |child| {
+                try child.layout(engine);
                 self.height += child.height;
             }
         } else {
-            // Inline mode: use the existing text layout approach
-            var line_buffer = std.ArrayList(LineItem).init(self.allocator);
-            defer line_buffer.deinit();
-
-            // Save current position
-            const original_x = layout_engine.cursor_x;
-            const original_y = layout_engine.cursor_y;
-
-            // Process node recursively
-            switch (self.node) {
-                .text => |t| {
-                    try layout_engine.handleTextToken(t.text, &line_buffer);
-                },
-                .element => |e| {
-                    try layout_engine.openTag(e.tag, e.attributes, &line_buffer);
-
-                    for (e.children.items) |child| {
-                        try layout_engine.recurseNode(child, &line_buffer);
-                    }
-
-                    try layout_engine.closeTag(e.tag, &line_buffer);
-                },
-            }
-
-            try layout_engine.flushLine(&line_buffer);
-
-            // Store position and dimensions
-            self.x = original_x;
-            self.y = original_y;
-            self.height = layout_engine.cursor_y - original_y;
-            self.width = layout_engine.window_width - scrollbar_width - (2 * h_offset);
+            self.display_list.clearRetainingCapacity();
+            try engine.layoutInlineBlock(self);
         }
     }
 };
 
-// Extend Layout to support the new tree-based approach
-pub fn createLayoutTree(self: *Layout, root: Node) !*DocumentLayout {
+fn layoutInlineBlock(self: *Layout, block: *BlockLayout) !void {
+    const snapshot = snapshotInlineState(self);
+    const previous_target = self.current_display_target;
+    defer {
+        restoreInlineState(self, snapshot);
+        self.current_display_target = previous_target;
+    }
+
+    self.line_left = block.x;
+    self.line_right = block.x + block.width;
+    self.cursor_x = if (self.rtl_text) self.line_right else self.line_left;
+    self.cursor_y = block.y;
+    self.size = 16;
+    self.is_bold = false;
+    self.is_italic = false;
+    self.is_title = false;
+    self.is_superscript = false;
+    self.is_small_caps = false;
+    self.is_preformatted = false;
+    self.prev_font_category = null;
+    self.current_font_category = .latin;
+
+    self.current_display_target = &block.display_list;
+
+    var line_buffer = std.ArrayList(LineItem).init(self.allocator);
+    defer line_buffer.deinit();
+
+    switch (block.node) {
+        .text => |t| {
+            try self.handleTextToken(t.text, &line_buffer);
+        },
+        .element => |e| {
+            try self.openTag(e.tag, e.attributes, &line_buffer);
+            for (e.children.items) |child| {
+                try self.recurseNode(child, &line_buffer);
+            }
+            try self.closeTag(e.tag, &line_buffer);
+        },
+    }
+
+    try self.flushLine(&line_buffer);
+    block.height = self.cursor_y - block.y;
+    if (block.height < 0) block.height = 0;
+}
+
+fn addBackgroundIfNeeded(self: *Layout, block: *const BlockLayout) !void {
+    switch (block.node) {
+        .element => |e| {
+            if (std.mem.eql(u8, e.tag, "pre") and block.height > 0) {
+                const rect = DisplayItem{ .rect = .{
+                    .x1 = block.x,
+                    .y1 = block.y,
+                    .x2 = block.x + block.width,
+                    .y2 = block.y + block.height,
+                    .color = browser.Color{ .r = 230, .g = 230, .b = 230, .a = 255 },
+                }};
+                try self.display_list.append(rect);
+            }
+        },
+        else => {},
+    }
+}
+
+fn paintBlock(self: *Layout, block: *BlockLayout) !void {
+    try addBackgroundIfNeeded(self, block);
+
+    for (block.display_list.items) |item| {
+        try self.display_list.append(item);
+    }
+
+    for (block.children.items) |child| {
+        try paintBlock(self, child);
+    }
+}
+
+pub fn buildDocument(self: *Layout, root: Node) !*DocumentLayout {
     const document = try DocumentLayout.init(self.allocator, root);
     try document.layout(self);
     return document;
+}
+
+pub fn paintDocument(self: *Layout, document: *DocumentLayout) ![]DisplayItem {
+    self.display_list.clearRetainingCapacity();
+    self.current_display_target = &self.display_list;
+
+    for (document.children.items) |child| {
+        try paintBlock(self, child);
+    }
+
+    self.content_height = document.height + v_offset;
+    return try self.display_list.toOwnedSlice();
 }

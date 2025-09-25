@@ -42,14 +42,27 @@ const scroll_increment = 100;
 pub const scrollbar_width = 10;
 // *********************************************************
 
-// DisplayItem is a struct that holds the position and glyph to be displayed.
-pub const DisplayItem = struct {
-    // X coordinate of the display item
-    x: i32,
-    // Y coordinate of the display item
-    y: i32,
-    // Pointer to the glyph to be displayed
-    glyph: Glyph,
+// Display items are the drawing commands emitted by layout.
+pub const Color = struct {
+    r: u8,
+    g: u8,
+    b: u8,
+    a: u8 = 255,
+};
+
+pub const DisplayItem = union(enum) {
+    glyph: struct {
+        x: i32,
+        y: i32,
+        glyph: Glyph,
+    },
+    rect: struct {
+        x1: i32,
+        y1: i32,
+        x2: i32,
+        y2: i32,
+        color: Color,
+    },
 };
 
 // Browser is the main struct that holds the state of the browser.
@@ -66,8 +79,6 @@ pub const Browser = struct {
     cache: Cache,
     // List of items to be displayed
     display_list: ?[]DisplayItem = null,
-    // Current content to be displayed
-    current_content: ?[]const Token = null,
     // Current HTML node tree (when using parser)
     current_node: ?Node = null,
     // Layout tree for the document
@@ -150,16 +161,17 @@ pub const Browser = struct {
 
         // free display list slice
         if (self.display_list) |items| self.allocator.free(items);
-        if (self.current_content) |items| {
-            for (items) |item| {
-                item.deinit(self.allocator);
-            }
-            self.allocator.free(items);
+
+        if (self.document_layout) |doc| {
+            doc.deinit();
+            self.allocator.destroy(doc);
+            self.document_layout = null;
         }
 
         // Free the node tree if it exists
         if (self.current_node) |node| {
             node.deinit(self.allocator);
+            self.current_node = null;
         }
 
         // clean up layout
@@ -228,14 +240,6 @@ pub const Browser = struct {
                 // Update layout engine's window dimensions
                 self.layout_engine.window_width = data1;
                 self.layout_engine.window_height = data2;
-
-                if (self.current_content) |text| {
-                    if (self.display_list) |list| {
-                        self.allocator.free(list);
-                        self.display_list = null;
-                    }
-                    try self.layout(text);
-                }
 
                 // Force a clear and redraw
                 _ = c.SDL_SetRenderDrawColor(self.canvas, 250, 244, 237, 255);
@@ -326,6 +330,18 @@ pub const Browser = struct {
             if (self.display_list) |items| {
                 self.allocator.free(items);
             }
+
+            if (self.document_layout) |doc| {
+                doc.deinit();
+                self.allocator.destroy(doc);
+                self.document_layout = null;
+            }
+
+            if (self.current_node) |node| {
+                node.deinit(self.allocator);
+                self.current_node = null;
+            }
+
             self.display_list = try self.layout_engine.layoutSourceCode(body);
             self.content_height = self.layout_engine.content_height;
         } else {
@@ -365,11 +381,11 @@ pub const Browser = struct {
             self.document_layout = null;
         }
 
-        // Create the layout tree
-        self.document_layout = try self.layout_engine.createLayoutTree(self.current_node.?);
+        // Create and layout the document tree
+        self.document_layout = try self.layout_engine.buildDocument(self.current_node.?);
 
-        // Continue using existing display list for drawing
-        self.display_list = try self.layout_engine.layoutNodes(self.current_node.?);
+        // Paint the document to produce draw commands
+        self.display_list = try self.layout_engine.paintDocument(self.document_layout.?);
 
         // Update content height from the layout engine
         self.content_height = self.layout_engine.content_height;
@@ -381,21 +397,50 @@ pub const Browser = struct {
             return;
         }
         for (self.display_list.?) |item| {
-            const screen_y = item.y - self.scroll_offset;
-            if (screen_y >= 0 and screen_y < self.window_height) {
-                var dst_rect: c.SDL_Rect = .{
-                    .x = item.x,
-                    .y = screen_y,
-                    .w = item.glyph.w,
-                    .h = item.glyph.h,
-                };
+            switch (item) {
+                .glyph => |glyph_item| {
+                    const screen_y = glyph_item.y - self.scroll_offset;
+                    if (screen_y >= 0 and screen_y < self.window_height) {
+                        var dst_rect: c.SDL_Rect = .{
+                            .x = glyph_item.x,
+                            .y = screen_y,
+                            .w = glyph_item.glyph.w,
+                            .h = glyph_item.glyph.h,
+                        };
 
-                _ = c.SDL_RenderCopy(
-                    self.canvas,
-                    item.glyph.texture,
-                    null,
-                    &dst_rect,
-                );
+                        _ = c.SDL_RenderCopy(
+                            self.canvas,
+                            glyph_item.glyph.texture,
+                            null,
+                            &dst_rect,
+                        );
+                    }
+                },
+                .rect => |rect_item| {
+                    const top = rect_item.y1 - self.scroll_offset;
+                    const bottom = rect_item.y2 - self.scroll_offset;
+                    if (bottom > 0 and top < self.window_height) {
+                        const width = rect_item.x2 - rect_item.x1;
+                        const height = bottom - top;
+                        if (width > 0 and height > 0) {
+                            _ = c.SDL_SetRenderDrawColor(
+                                self.canvas,
+                                rect_item.color.r,
+                                rect_item.color.g,
+                                rect_item.color.b,
+                                rect_item.color.a,
+                            );
+
+                            var rect: c.SDL_Rect = .{
+                                .x = rect_item.x1,
+                                .y = top,
+                                .w = width,
+                                .h = height,
+                            };
+                            _ = c.SDL_RenderFillRect(self.canvas, &rect);
+                        }
+                    }
+                },
             }
         }
 
@@ -434,17 +479,6 @@ pub const Browser = struct {
         };
         _ = c.SDL_SetRenderDrawColor(self.canvas, 0, 102, 204, 255); // Blue
         _ = c.SDL_RenderFillRect(self.canvas, &thumb_rect);
-    }
-
-    // Arrange the content for display
-    pub fn layout(self: *Browser, tokens: []const Token) !void {
-        // Free existing display list if it exists
-        if (self.display_list) |items| {
-            self.allocator.free(items);
-        }
-
-        self.display_list = try self.layout_engine.layoutTokens(tokens);
-        self.content_height = self.layout_engine.content_height;
     }
 
     // Ensure we clean up the document_layout in deinit
