@@ -33,6 +33,8 @@ const LineItem = struct {
     ascent: i32,
     /// The glyph's descent as a positive value (–TTF_FontDescent)
     descent: i32,
+    /// Color to use when rendering this glyph
+    color: browser.Color,
 };
 
 // Add this struct to cache word measurements
@@ -62,6 +64,8 @@ is_italic: bool = false,
 is_title: bool = false,
 is_superscript: bool = false,
 is_small_caps: bool = false,
+text_color: browser.Color = .{ .r = 0, .g = 0, .b = 0, .a = 255 }, // black
+style_stack: std.ArrayList(StyleSnapshot) = undefined,
 // Final content height after layout
 content_height: i32 = 0,
 display_list: std.ArrayList(DisplayItem),
@@ -88,6 +92,7 @@ const InlineSnapshot = struct {
     is_preformatted: bool,
     prev_font_category: ?FontCategory,
     current_font_category: FontCategory,
+    text_color: browser.Color,
 };
 
 fn snapshotInlineState(self: *const Layout) InlineSnapshot {
@@ -105,6 +110,7 @@ fn snapshotInlineState(self: *const Layout) InlineSnapshot {
         .is_preformatted = self.is_preformatted,
         .prev_font_category = self.prev_font_category,
         .current_font_category = self.current_font_category,
+        .text_color = self.text_color,
     };
 }
 
@@ -122,6 +128,7 @@ fn restoreInlineState(self: *Layout, snapshot: InlineSnapshot) void {
     self.is_preformatted = snapshot.is_preformatted;
     self.prev_font_category = snapshot.prev_font_category;
     self.current_font_category = snapshot.current_font_category;
+    self.text_color = snapshot.text_color;
 }
 
 pub fn init(
@@ -156,6 +163,7 @@ pub fn init(
 
     try layout.font_manager.loadSystemFont(layout.size);
 
+    layout.style_stack = std.ArrayList(StyleSnapshot).empty;
     return layout;
 }
 
@@ -170,6 +178,7 @@ pub fn deinit(self: *Layout) void {
     self.word_cache.deinit();
 
     self.display_list.deinit(self.allocator);
+    self.style_stack.deinit(self.allocator);
 
     self.allocator.destroy(self);
 }
@@ -180,74 +189,80 @@ fn recurseNode(self: *Layout, node: Node, line_buffer: *std.ArrayList(LineItem))
             try self.handleTextToken(t.text, line_buffer);
         },
         .element => |e| {
-            try self.openTag(e.tag, e.attributes, line_buffer);
+            // Apply CSS styles before processing this element
+            try self.applyNodeStyles(e, line_buffer);
+
+            // Handle br tag for line breaks
+            if (std.mem.eql(u8, e.tag, "br")) {
+                try self.flushLine(line_buffer);
+            }
 
             for (e.children.items) |child| {
                 try self.recurseNode(child, line_buffer);
             }
 
-            try self.closeTag(e.tag, line_buffer);
+            // Restore styles after closing this element
+            try self.restoreNodeStyles(line_buffer);
         },
     }
 }
 
-fn openTag(self: *Layout, tag: []const u8, attributes: ?std.StringHashMap([]const u8), line_buffer: *std.ArrayList(LineItem)) !void {
-    if (std.mem.eql(u8, tag, "b")) {
-        self.is_bold = true;
-    } else if (std.mem.eql(u8, tag, "i")) {
-        self.is_italic = true;
-    } else if (std.mem.eql(u8, tag, "abbr")) {
-        self.is_small_caps = true;
-    } else if (std.mem.eql(u8, tag, "big")) {
-        self.size += 4;
-    } else if (std.mem.eql(u8, tag, "small")) {
-        self.size -= 4;
-    } else if (std.mem.eql(u8, tag, "p")) {
-        // Flush the current line and add vertical spacing.
-        try self.flushLine(line_buffer);
-        self.cursor_y += self.size;
-        self.cursor_x = if (self.rtl_text) self.line_right else self.line_left;
-    } else if (std.mem.eql(u8, tag, "br")) {
-        // A <br> tag always triggers a line break.
-        try self.flushLine(line_buffer);
-        self.cursor_x = if (self.rtl_text) self.line_right else self.line_left;
-    } else if (std.mem.eql(u8, tag, "h1")) {
-        if (attributes) |attrs| {
-            if (attrs.get("class")) |id| {
-                if (std.mem.eql(u8, id, "title")) {
-                    self.is_title = true;
-                }
+const StyleSnapshot = struct {
+    is_bold: bool,
+    is_italic: bool,
+    size: i32,
+    text_color: browser.Color,
+};
+
+fn applyNodeStyles(self: *Layout, element: parser.Element, _: *std.ArrayList(LineItem)) !void {
+    // Save current style state
+    const snapshot = StyleSnapshot{
+        .is_bold = self.is_bold,
+        .is_italic = self.is_italic,
+        .size = self.size,
+        .text_color = self.text_color,
+    };
+    try self.style_stack.append(self.allocator, snapshot);
+
+    if (element.style) |style_map| {
+        // Apply font-weight
+        if (style_map.get("font-weight")) |weight_str| {
+            self.is_bold = std.mem.eql(u8, weight_str, "bold");
+        }
+
+        // Apply font-style
+        if (style_map.get("font-style")) |style_str| {
+            self.is_italic = std.mem.eql(u8, style_str, "italic");
+        }
+
+        // Apply font-size
+        if (style_map.get("font-size")) |size_str| {
+            if (std.mem.endsWith(u8, size_str, "px")) {
+                const size_num_str = size_str[0 .. size_str.len - 2];
+                if (std.fmt.parseFloat(f64, size_num_str)) |size_float| {
+                    // Convert CSS pixels to our size (multiply by 0.75 for points)
+                    self.size = @intFromFloat(size_float * 0.75);
+                } else |_| {}
             }
         }
-    } else if (std.mem.eql(u8, tag, "sup")) {
-        self.is_superscript = true;
-    } else if (std.mem.eql(u8, tag, "pre")) {
-        try self.flushLine(line_buffer);
-        self.is_preformatted = true;
+
+        // Apply color
+        if (style_map.get("color")) |color_str| {
+            if (parseColor(color_str)) |color| {
+                self.text_color = color;
+            }
+        }
     }
 }
 
-fn closeTag(self: *Layout, tag: []const u8, line_buffer: *std.ArrayList(LineItem)) !void {
-    if (std.mem.eql(u8, tag, "b")) {
-        self.is_bold = false;
-    } else if (std.mem.eql(u8, tag, "i")) {
-        self.is_italic = false;
-    } else if (std.mem.eql(u8, tag, "abbr")) {
-        self.is_small_caps = false;
-    } else if (std.mem.eql(u8, tag, "big")) {
-        self.size -= 4;
-    } else if (std.mem.eql(u8, tag, "small")) {
-        self.size += 4;
-    } else if (std.mem.eql(u8, tag, "sup")) {
-        self.is_superscript = false;
-    } else if (std.mem.eql(u8, tag, "pre")) {
-        try self.flushLine(line_buffer);
-        self.is_preformatted = false;
-        // Restore previous font category
-        if (self.prev_font_category) |category| {
-            self.current_font_category = category;
-            self.prev_font_category = null;
-        }
+fn restoreNodeStyles(self: *Layout, _: *std.ArrayList(LineItem)) !void {
+    // Restore the previous style state
+    if (self.style_stack.items.len > 0) {
+        const snapshot = self.style_stack.pop() orelse return;
+        self.is_bold = snapshot.is_bold;
+        self.is_italic = snapshot.is_italic;
+        self.size = snapshot.size;
+        self.text_color = snapshot.text_color;
     }
 }
 
@@ -313,11 +328,14 @@ fn flushLine(self: *Layout, line_buffer: *std.ArrayList(LineItem)) !void {
             final_y = baseline - item.ascent;
         }
 
-        try self.current_display_target.append(self.allocator, DisplayItem{ .glyph = .{
-            .x = item.x,
-            .y = final_y,
-            .glyph = item.glyph,
-        } });
+        try self.current_display_target.append(self.allocator, DisplayItem{
+            .glyph = .{
+                .x = item.x,
+                .y = final_y,
+                .glyph = item.glyph,
+                .color = item.color, // Use the color captured when item was added to line buffer
+            },
+        });
     }
 
     // Advance cursor_y and reset cursor_x
@@ -426,12 +444,13 @@ fn processGrapheme(
         self.cursor_x = if (self.rtl_text) self.line_right else self.line_left;
     }
 
-    // Add glyph to line buffer
+    // Add glyph to line buffer with current text color
     try line_buffer.append(self.allocator, LineItem{
         .x = self.cursor_x,
         .glyph = glyph,
         .ascent = glyph.ascent,
         .descent = glyph.descent,
+        .color = self.text_color, // Capture color at time of adding to buffer
     });
     self.cursor_x += glyph.w;
 }
@@ -869,6 +888,7 @@ fn layoutInlineBlock(self: *Layout, block: *BlockLayout) !void {
     self.is_title = false;
     self.is_superscript = false;
     self.is_small_caps = false;
+    self.text_color = .{ .r = 0, .g = 0, .b = 0, .a = 255 }; // Reset to black
     self.is_preformatted = false;
     self.prev_font_category = null;
     self.current_font_category = .latin;
@@ -883,11 +903,19 @@ fn layoutInlineBlock(self: *Layout, block: *BlockLayout) !void {
             try self.handleTextToken(t.text, &line_buffer);
         },
         .element => |e| {
-            try self.openTag(e.tag, e.attributes, &line_buffer);
+            // Apply CSS styles for this block element
+            try self.applyNodeStyles(e, &line_buffer);
+
+            // Handle br tag for line breaks
+            if (std.mem.eql(u8, e.tag, "br")) {
+                try self.flushLine(&line_buffer);
+            }
+
             for (e.children.items) |child| {
                 try self.recurseNode(child, &line_buffer);
             }
-            try self.closeTag(e.tag, &line_buffer);
+
+            try self.restoreNodeStyles(&line_buffer);
         },
     }
 
@@ -896,16 +924,76 @@ fn layoutInlineBlock(self: *Layout, block: *BlockLayout) !void {
     if (block.height < 0) block.height = 0;
 }
 
+fn parseColor(color_str: []const u8) ?browser.Color {
+    // Handle named colors
+    if (std.mem.eql(u8, color_str, "red")) {
+        return browser.Color{ .r = 255, .g = 0, .b = 0, .a = 255 };
+    } else if (std.mem.eql(u8, color_str, "green")) {
+        return browser.Color{ .r = 0, .g = 128, .b = 0, .a = 255 };
+    } else if (std.mem.eql(u8, color_str, "blue")) {
+        return browser.Color{ .r = 0, .g = 0, .b = 255, .a = 255 };
+    } else if (std.mem.eql(u8, color_str, "yellow")) {
+        return browser.Color{ .r = 255, .g = 255, .b = 0, .a = 255 };
+    } else if (std.mem.eql(u8, color_str, "gray") or std.mem.eql(u8, color_str, "grey")) {
+        return browser.Color{ .r = 128, .g = 128, .b = 128, .a = 255 };
+    } else if (std.mem.eql(u8, color_str, "lightgray") or std.mem.eql(u8, color_str, "lightgrey")) {
+        return browser.Color{ .r = 211, .g = 211, .b = 211, .a = 255 };
+    } else if (std.mem.eql(u8, color_str, "white")) {
+        return browser.Color{ .r = 255, .g = 255, .b = 255, .a = 255 };
+    } else if (std.mem.eql(u8, color_str, "black")) {
+        return browser.Color{ .r = 0, .g = 0, .b = 0, .a = 255 };
+    } else if (std.mem.eql(u8, color_str, "orange")) {
+        return browser.Color{ .r = 255, .g = 165, .b = 0, .a = 255 };
+    } else if (std.mem.eql(u8, color_str, "purple")) {
+        return browser.Color{ .r = 128, .g = 0, .b = 128, .a = 255 };
+    } else if (std.mem.eql(u8, color_str, "pink")) {
+        return browser.Color{ .r = 255, .g = 192, .b = 203, .a = 255 };
+    } else if (std.mem.eql(u8, color_str, "lightblue")) {
+        return browser.Color{ .r = 173, .g = 216, .b = 230, .a = 255 };
+    } else if (std.mem.eql(u8, color_str, "lightgreen")) {
+        return browser.Color{ .r = 144, .g = 238, .b = 144, .a = 255 };
+    } else if (std.mem.eql(u8, color_str, "cyan")) {
+        return browser.Color{ .r = 0, .g = 255, .b = 255, .a = 255 };
+    } else if (std.mem.eql(u8, color_str, "magenta")) {
+        return browser.Color{ .r = 255, .g = 0, .b = 255, .a = 255 };
+    }
+    // TODO: Handle hex colors like #ff0000
+    return null;
+}
+
 fn addBackgroundIfNeeded(self: *Layout, block: *const BlockLayout) !void {
     switch (block.node) {
         .element => |e| {
-            if (std.mem.eql(u8, e.tag, "pre") and block.height > 0) {
+            if (block.height <= 0) return;
+
+            // Check for background-color in the style attribute
+            const bgcolor_str = if (e.style) |style|
+                style.get("background-color")
+            else
+                null;
+
+            // Determine the background color
+            var color: ?browser.Color = null;
+
+            if (bgcolor_str) |bg| {
+                // Don't draw if explicitly transparent
+                if (std.mem.eql(u8, bg, "transparent")) {
+                    return;
+                }
+                color = parseColor(bg);
+            } else if (std.mem.eql(u8, e.tag, "pre")) {
+                // Default gray background for pre tags if no style specified
+                color = browser.Color{ .r = 230, .g = 230, .b = 230, .a = 255 };
+            }
+
+            // Draw the background rectangle if we have a color
+            if (color) |col| {
                 const rect = DisplayItem{ .rect = .{
                     .x1 = block.x,
                     .y1 = block.y,
                     .x2 = block.x + block.width,
                     .y2 = block.y + block.height,
-                    .color = browser.Color{ .r = 230, .g = 230, .b = 230, .a = 255 },
+                    .color = col,
                 } };
                 try self.display_list.append(self.allocator, rect);
             }

@@ -529,7 +529,7 @@ pub const FontManager = struct {
         var glyph_surface = c.TTF_RenderUTF8_Blended(
             font.font_handle,
             sentinel_gme,
-            c.SDL_Color{ .r = 0, .g = 0, .b = 0, .a = 255 },
+            c.SDL_Color{ .r = 255, .g = 255, .b = 255, .a = 255 },
         );
         if (glyph_surface == null) {
             const err_msg = c.TTF_GetError();
@@ -541,7 +541,7 @@ pub const FontManager = struct {
                 const space_surface = c.TTF_RenderUTF8_Blended(
                     font.font_handle,
                     space_sentinel,
-                    c.SDL_Color{ .r = 0, .g = 0, .b = 0, .a = 255 },
+                    c.SDL_Color{ .r = 255, .g = 255, .b = 255, .a = 255 },
                 );
                 if (space_surface == null) {
                     if (style_set) c.TTF_SetFontStyle(font.font_handle, c.TTF_STYLE_NORMAL);

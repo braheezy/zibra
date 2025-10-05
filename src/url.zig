@@ -56,14 +56,20 @@ pub const Url = struct {
 
         var u = Url{ .ada_url = ada_url };
 
-        u.scheme = ada_url.getProtocol();
+        // Get the protocol (e.g., "https:") and strip the trailing colon
+        const protocol = ada_url.getProtocol();
+        u.scheme = if (std.mem.endsWith(u8, protocol, ":"))
+            protocol[0 .. protocol.len - 1]
+        else
+            protocol;
+
         u.host = ada_url.getHost();
         u.path = ada_url.getPathname();
-        u.is_https = std.mem.eql(u8, u.scheme, "https:");
+        u.is_https = std.mem.eql(u8, u.scheme, "https");
         u.port = if (u.is_https) 443 else 80;
         std.debug.print("scheme: {s}\n", .{u.scheme});
 
-        if (std.mem.eql(u8, u.scheme, "view-source:")) {
+        if (std.mem.eql(u8, u.scheme, "view-source")) {
             u.view_source = true;
 
             // Extract the actual URL after view-source:
@@ -72,18 +78,23 @@ pub const Url = struct {
             // Create a new URL object for the actual URL
             const actual_ada_url = try ada.Url.init(actual_url);
 
-            // Update the URL properties with the actual URL's properties
-            u.scheme = actual_ada_url.getProtocol();
+            // Update the URL properties with the actual URL's properties (strip colon)
+            const actual_protocol = actual_ada_url.getProtocol();
+            u.scheme = if (std.mem.endsWith(u8, actual_protocol, ":"))
+                actual_protocol[0 .. actual_protocol.len - 1]
+            else
+                actual_protocol;
+
             u.host = actual_ada_url.getHost();
             u.path = actual_ada_url.getPathname();
-            u.is_https = std.mem.eql(u8, u.scheme, "https:");
+            u.is_https = std.mem.eql(u8, u.scheme, "https");
             u.port = if (u.is_https) 443 else 80;
 
             // Free the temporary ada_url
             ada_url.free();
         }
 
-        if (std.mem.eql(u8, u.scheme, "data:")) {
+        if (std.mem.eql(u8, u.scheme, "data")) {
             // ! ada will eventually support parsing data urls
             // ! https://github.com/ada-url/ada/pull/756/
             var rest = u.path;
@@ -129,6 +140,92 @@ pub const Url = struct {
         self.ada_url.free();
     }
 
+    /// Resolve a relative URL against this URL
+    /// Handles:
+    /// - Normal URLs with "://" (returned as-is)
+    /// - Host-relative URLs starting with "/" (reuse scheme and host)
+    /// - Path-relative URLs (resolve relative to current path)
+    /// - Scheme-relative URLs starting with "//" (reuse scheme)
+    /// - Parent directory navigation with "../"
+    pub fn resolve(self: Url, allocator: std.mem.Allocator, relative_url: []const u8) !Url {
+        // If it's already a full URL, just parse and return it
+        if (std.mem.indexOf(u8, relative_url, "://") != null) {
+            return try Url.init(allocator, relative_url);
+        }
+
+        var resolved_url = std.ArrayList(u8).empty;
+        defer resolved_url.deinit(allocator);
+
+        // If it starts with "//", it's scheme-relative
+        if (std.mem.startsWith(u8, relative_url, "//")) {
+            // Use current scheme with the rest of the URL
+            try resolved_url.appendSlice(allocator, self.scheme);
+            try resolved_url.append(allocator, ':');
+            try resolved_url.appendSlice(allocator, relative_url);
+            return try Url.init(allocator, resolved_url.items);
+        }
+
+        // If it doesn't start with "/", it's path-relative
+        if (!std.mem.startsWith(u8, relative_url, "/")) {
+            // Get the directory part of the current path
+            var dir = self.path;
+            if (std.mem.lastIndexOf(u8, dir, "/")) |last_slash| {
+                dir = dir[0..last_slash];
+            } else {
+                dir = "";
+            }
+
+            // Handle parent directory navigation (..)
+            var working_dir = try allocator.alloc(u8, dir.len);
+            defer allocator.free(working_dir);
+            @memcpy(working_dir, dir);
+            var working_dir_len = dir.len;
+
+            var remaining_url = relative_url;
+            while (std.mem.startsWith(u8, remaining_url, "../")) {
+                // Remove one "../" from the URL
+                remaining_url = remaining_url[3..];
+
+                // Remove one directory level from working_dir
+                if (std.mem.lastIndexOf(u8, working_dir[0..working_dir_len], "/")) |last_slash| {
+                    working_dir_len = last_slash;
+                } else {
+                    working_dir_len = 0;
+                }
+            }
+
+            // Build the resolved path
+            try resolved_url.appendSlice(allocator, self.scheme);
+            try resolved_url.appendSlice(allocator, "://");
+            try resolved_url.appendSlice(allocator, self.host.?);
+            if (self.port != 80 and self.port != 443) {
+                try resolved_url.append(allocator, ':');
+                const port_str = try std.fmt.allocPrint(allocator, "{d}", .{self.port});
+                defer allocator.free(port_str);
+                try resolved_url.appendSlice(allocator, port_str);
+            }
+            try resolved_url.appendSlice(allocator, working_dir[0..working_dir_len]);
+            try resolved_url.append(allocator, '/');
+            try resolved_url.appendSlice(allocator, remaining_url);
+
+            return try Url.init(allocator, resolved_url.items);
+        }
+
+        // It's host-relative (starts with "/")
+        try resolved_url.appendSlice(allocator, self.scheme);
+        try resolved_url.appendSlice(allocator, "://");
+        try resolved_url.appendSlice(allocator, self.host.?);
+        if (self.port != 80 and self.port != 443) {
+            try resolved_url.append(allocator, ':');
+            const port_str = try std.fmt.allocPrint(allocator, "{d}", .{self.port});
+            defer allocator.free(port_str);
+            try resolved_url.appendSlice(allocator, port_str);
+        }
+        try resolved_url.appendSlice(allocator, relative_url);
+
+        return try Url.init(allocator, resolved_url.items);
+    }
+
     // Old HTTP helper functions removed - std.http.Client handles this now
 
     pub fn aboutRequest(self: Url) []const u8 {
@@ -158,7 +255,7 @@ pub const Url = struct {
         // Build full URL for std.http.Client
         const url_str = try std.fmt.allocPrint(
             al,
-            "{s}//{s}{s}",
+            "{s}://{s}{s}",
             .{ self.scheme, self.host.?, self.path },
         );
         defer al.free(url_str);

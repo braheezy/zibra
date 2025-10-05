@@ -11,13 +11,13 @@ const Glyph = font.Glyph;
 const FontWeight = font.FontWeight;
 const FontSlant = font.FontSlant;
 const Url = @import("url.zig").Url;
-const Connection = @import("url.zig").Connection;
 const Cache = @import("cache.zig").Cache;
 const ArrayList = std.ArrayList;
 const Layout = @import("Layout.zig");
 const parser = @import("parser.zig");
 const HTMLParser = parser.HTMLParser;
 const Node = parser.Node;
+const CSSParser = @import("cssParser.zig").CSSParser;
 const sdl = @import("sdl.zig");
 const c = sdl.c;
 
@@ -28,6 +28,9 @@ fn dbgln(comptime fmt: []const u8) void {
 }
 
 const stdout = std.io.getStdOut().writer();
+
+// Default browser stylesheet - defines default styling for HTML elements
+const DEFAULT_STYLE_SHEET = @embedFile("browser.css");
 
 // *********************************************************
 // * App Settings
@@ -53,6 +56,7 @@ pub const DisplayItem = union(enum) {
         x: i32,
         y: i32,
         glyph: Glyph,
+        color: Color,
     },
     rect: struct {
         x1: i32,
@@ -71,8 +75,8 @@ pub const Browser = struct {
     window: *c.SDL_Window,
     // SDL renderer handle
     canvas: *c.SDL_Renderer,
-    // Map of active connections. The key is the host and the value a Connection to use.
-    socket_map: std.StringHashMap(Connection),
+    // HTTP client for making requests (handles both HTTP and HTTPS)
+    http_client: std.http.Client,
     // Cache for storing fetched resources
     cache: Cache,
     // List of items to be displayed
@@ -89,6 +93,8 @@ pub const Browser = struct {
     window_width: i32 = initial_window_width,
     window_height: i32 = initial_window_height,
     layout_engine: *Layout,
+    // Default browser stylesheet rules
+    default_style_sheet_rules: []CSSParser.CSSRule,
 
     // Create a new Browser instance
     pub fn init(al: std.mem.Allocator, rtl_flag: bool) !Browser {
@@ -124,11 +130,16 @@ pub const Browser = struct {
             return error.SDLInitializationFailed;
         };
 
+        // Parse the default browser stylesheet
+        var css_parser = try CSSParser.init(al, DEFAULT_STYLE_SHEET);
+        defer css_parser.deinit(al);
+        const default_rules = try css_parser.parse(al);
+
         return Browser{
             .allocator = al,
             .window = screen,
             .canvas = renderer,
-            .socket_map = std.StringHashMap(Connection).init(al),
+            .http_client = .{ .allocator = al },
             .cache = try Cache.init(al),
             .layout_engine = try Layout.init(
                 al,
@@ -137,50 +148,14 @@ pub const Browser = struct {
                 initial_window_height,
                 rtl_flag,
             ),
+            .default_style_sheet_rules = default_rules,
         };
     }
 
     // Free the resources used by the browser
+    // Deprecated: use deinit() instead
     pub fn free(self: *Browser) void {
-        // clean up hash map for sockets, including values
-        var sockets_iter = self.socket_map.valueIterator();
-        while (sockets_iter.next()) |socket| {
-            switch (socket.*) {
-                .Tcp => socket.Tcp.close(),
-                // TODO: Implement HTTPS support with new TLS API
-                // .Tls => socket.Tls.stream.close(),
-            }
-        }
-
-        // make mutable copies to free the resources
-        var cache = self.cache;
-        cache.free();
-        var socket_map = self.socket_map;
-        socket_map.deinit();
-
-        // free display list slice
-        if (self.display_list) |items| self.allocator.free(items);
-
-        if (self.document_layout) |doc| {
-            doc.deinit();
-            self.allocator.destroy(doc);
-            self.document_layout = null;
-        }
-
-        // Free the node tree if it exists
-        if (self.current_node) |node_val| {
-            var node = node_val;
-            Node.deinit(&node, self.allocator);
-            self.current_node = null;
-        }
-
-        // clean up layout
-        self.layout_engine.deinit();
-
-        // clean up sdl resources
-        c.SDL_DestroyRenderer(self.canvas);
-        c.SDL_DestroyWindow(self.window);
-        c.SDL_Quit();
+        self.deinit();
     }
 
     // Run the browser event loop
@@ -210,8 +185,8 @@ pub const Browser = struct {
                 }
             }
 
-            // Clear canvas with off-white
-            _ = c.SDL_SetRenderDrawColor(self.canvas, 250, 244, 237, 255);
+            // Clear canvas with white background
+            _ = c.SDL_SetRenderDrawColor(self.canvas, 255, 255, 255, 255);
             _ = c.SDL_RenderClear(self.canvas);
 
             // draw browser content
@@ -242,7 +217,7 @@ pub const Browser = struct {
                 self.layout_engine.window_height = data2;
 
                 // Force a clear and redraw
-                _ = c.SDL_SetRenderDrawColor(self.canvas, 250, 244, 237, 255);
+                _ = c.SDL_SetRenderDrawColor(self.canvas, 255, 255, 255, 255);
                 _ = c.SDL_RenderClear(self.canvas);
                 try self.draw();
                 c.SDL_RenderPresent(self.canvas);
@@ -307,9 +282,8 @@ pub const Browser = struct {
         else
             try url.httpRequest(
                 self.allocator,
-                &self.socket_map,
+                &self.http_client,
                 &self.cache,
-                0,
             );
     }
 
@@ -360,6 +334,121 @@ pub const Browser = struct {
             // Parse the HTML and store the root node
             self.current_node = try html_parser.parse();
 
+            // Find all linked stylesheets
+            var node_list = std.ArrayList(*parser.Node).empty;
+            defer node_list.deinit(self.allocator);
+            try parser.treeToList(self.allocator, &self.current_node.?, &node_list);
+
+            // Collect stylesheet URLs from <link rel="stylesheet" href="..."> elements
+            var stylesheet_urls = std.ArrayList([]const u8).empty;
+            defer {
+                for (stylesheet_urls.items) |href| {
+                    self.allocator.free(href);
+                }
+                stylesheet_urls.deinit(self.allocator);
+            }
+
+            for (node_list.items) |node| {
+                switch (node.*) {
+                    .element => |e| {
+                        if (std.mem.eql(u8, e.tag, "link")) {
+                            if (e.attributes) |attrs| {
+                                const rel = attrs.get("rel");
+                                const href = attrs.get("href");
+
+                                if (rel != null and href != null and
+                                    std.mem.eql(u8, rel.?, "stylesheet"))
+                                {
+                                    // Copy the href string for later use
+                                    const href_copy = try self.allocator.alloc(u8, href.?.len);
+                                    @memcpy(href_copy, href.?);
+                                    try stylesheet_urls.append(self.allocator, href_copy);
+                                }
+                            }
+                        }
+                    },
+                    .text => {},
+                }
+            }
+
+            // Create an arena allocator for CSS parsing
+            // All CSS string data will be allocated in this arena and freed at once
+            var css_arena = std.heap.ArenaAllocator.init(self.allocator);
+            defer css_arena.deinit();
+            const css_allocator = css_arena.allocator();
+
+            // Load and parse external stylesheets
+            var all_rules = std.ArrayList(CSSParser.CSSRule).empty;
+
+            // Track how many default rules we have so we don't double-free them
+            const default_rules_count = self.default_style_sheet_rules.len;
+
+            defer {
+                // Only deinit rules that were allocated in this function (external stylesheets)
+                // Skip the first default_rules_count rules as they're owned by the browser
+                // Note: Property strings are in the arena, only need to free selectors
+                if (all_rules.items.len > default_rules_count) {
+                    for (all_rules.items[default_rules_count..]) |*rule| {
+                        var mutable_rule = rule;
+                        mutable_rule.deinit(css_allocator);
+                    }
+                }
+                all_rules.deinit(self.allocator);
+            }
+
+            // Start with default browser stylesheet rules (shallow copy, browser still owns them)
+            for (self.default_style_sheet_rules) |rule| {
+                try all_rules.append(self.allocator, rule);
+            }
+
+            // Download and parse each linked stylesheet
+            for (stylesheet_urls.items) |href| {
+                std.log.info("Loading stylesheet: {s}", .{href});
+
+                // Resolve relative URL against the current page URL
+                const stylesheet_url = url.resolve(self.allocator, href) catch |err| {
+                    std.log.warn("Failed to resolve stylesheet URL {s}: {}", .{ href, err });
+                    continue;
+                };
+                defer stylesheet_url.free(self.allocator);
+
+                // Fetch the stylesheet
+                const css_text = self.fetchBody(stylesheet_url) catch |err| {
+                    std.log.warn("Failed to load stylesheet {s}: {}", .{ href, err });
+                    continue;
+                };
+                // Copy css_text into the arena so property strings stay alive
+                const css_text_copy = try css_allocator.dupe(u8, css_text);
+                self.allocator.free(css_text);
+
+                // Parse the stylesheet using the CSS arena allocator
+                var css_parser = try CSSParser.init(css_allocator, css_text_copy);
+                defer css_parser.deinit(css_allocator);
+
+                const parsed_rules = css_parser.parse(css_allocator) catch |err| {
+                    std.log.warn("Failed to parse stylesheet {s}: {}", .{ href, err });
+                    continue;
+                };
+
+                // Add the parsed rules to our collection
+                for (parsed_rules) |rule| {
+                    try all_rules.append(self.allocator, rule);
+                }
+
+                // Note: parsed_rules slice is in the arena, will be freed automatically
+            }
+
+            // Sort rules by cascade priority (more specific selectors override less specific)
+            // Stable sort preserves file order for rules with equal priority
+            std.mem.sort(CSSParser.CSSRule, all_rules.items, {}, struct {
+                fn lessThan(_: void, a: CSSParser.CSSRule, b: CSSParser.CSSRule) bool {
+                    return a.cascadePriority() < b.cascadePriority();
+                }
+            }.lessThan);
+
+            // Apply all stylesheet rules and inline styles (sorted by cascade order)
+            try parser.style(self.allocator, &self.current_node.?, all_rules.items);
+
             // Layout using the HTML node tree
             try self.layoutWithNodes();
         }
@@ -409,6 +498,14 @@ pub const Browser = struct {
                             .w = glyph_item.glyph.w,
                             .h = glyph_item.glyph.h,
                         };
+
+                        // Apply text color to the glyph texture
+                        _ = c.SDL_SetTextureColorMod(
+                            glyph_item.glyph.texture,
+                            glyph_item.color.r,
+                            glyph_item.color.g,
+                            glyph_item.color.b,
+                        );
 
                         _ = c.SDL_RenderCopy(
                             self.canvas,
@@ -486,14 +583,11 @@ pub const Browser = struct {
     // Ensure we clean up the document_layout in deinit
     pub fn deinit(self: *Browser) void {
         // Close all connections
-        var it = self.socket_map.iterator();
-        while (it.next()) |entry| {
-            entry.value_ptr.deinit();
-        }
-        self.socket_map.deinit();
+        self.http_client.deinit();
 
         // Free cache
-        self.cache.deinit();
+        var cache = self.cache;
+        cache.free();
 
         // Clean up any display list
         if (self.display_list) |list| {
@@ -505,6 +599,19 @@ pub const Browser = struct {
             doc.deinit();
             self.allocator.destroy(doc);
         }
+
+        // Clean up the current HTML node tree
+        if (self.current_node) |node_val| {
+            var node = node_val;
+            Node.deinit(&node, self.allocator);
+        }
+
+        // Clean up default stylesheet rules
+        for (self.default_style_sheet_rules) |*rule| {
+            var mutable_rule = rule;
+            mutable_rule.deinit(self.allocator);
+        }
+        self.allocator.free(self.default_style_sheet_rules);
 
         // clean up layout
         self.layout_engine.deinit();

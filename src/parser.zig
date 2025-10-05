@@ -1,4 +1,5 @@
 const std = @import("std");
+pub const CSSParser = @import("cssParser.zig").CSSParser;
 
 // These tags can look like <tag /> and don't need a closing tag.
 // HTML has specific elements that are self-closing by definition
@@ -59,18 +60,23 @@ const Text = struct {
     }
 };
 
-const Element = struct {
+pub const Element = struct {
     tag: []const u8,
     attributes: ?std.StringHashMap([]const u8) = null,
+    style: ?std.StringHashMap([]const u8) = null,
     parent: ?*Node = null,
     children: std.ArrayList(Node),
+    // Track strings we've allocated (like resolved percentage font sizes) so we can free them
+    owned_strings: ?std.ArrayList([]const u8) = null,
 
     pub fn init(allocator: std.mem.Allocator, tag: []const u8, parent: ?*Node) !Element {
         var e = Element{
             .tag = tag,
             .parent = parent,
             .attributes = null,
+            .style = null,
             .children = std.ArrayList(Node).empty,
+            .owned_strings = null,
         };
 
         // Only parse attributes if there's a space in the tag
@@ -93,6 +99,20 @@ const Element = struct {
         if (self.attributes) |attributes| {
             var attrs = attributes;
             attrs.deinit();
+        }
+
+        if (self.style) |styles| {
+            var s = styles;
+            s.deinit();
+        }
+
+        // Free any strings we allocated (like resolved percentage font sizes)
+        if (self.owned_strings) |owned| {
+            for (owned.items) |str| {
+                allocator.free(str);
+            }
+            var o = owned;
+            o.deinit(allocator);
         }
     }
 
@@ -841,3 +861,145 @@ pub const HTMLParser = struct {
         }
     }
 };
+
+// Inherited CSS properties with their default values
+const InheritedProperty = struct {
+    name: []const u8,
+    default_value: []const u8,
+};
+
+const INHERITED_PROPERTIES = [_]InheritedProperty{
+    .{ .name = "font-size", .default_value = "16px" },
+    .{ .name = "font-style", .default_value = "normal" },
+    .{ .name = "font-weight", .default_value = "normal" },
+    .{ .name = "color", .default_value = "black" },
+};
+
+// Helper to get a default parent style map with inherited defaults
+fn getDefaultParentStyle(allocator: std.mem.Allocator) !std.StringHashMap([]const u8) {
+    var parent_style = std.StringHashMap([]const u8).init(allocator);
+    for (INHERITED_PROPERTIES) |prop| {
+        try parent_style.put(prop.name, prop.default_value);
+    }
+    return parent_style;
+}
+
+// Parse inline styles from the style attribute and apply CSS rules to the node tree
+// This function recurses through the HTML tree to process all elements
+pub fn style(allocator: std.mem.Allocator, node: *Node, rules: []const CSSParser.CSSRule) !void {
+    var default_parent = try getDefaultParentStyle(allocator);
+    defer default_parent.deinit();
+    const empty_ancestors = &[_]*Node{};
+    try styleWithParent(allocator, node, rules, &default_parent, empty_ancestors);
+}
+
+fn styleWithParent(allocator: std.mem.Allocator, node: *Node, rules: []const CSSParser.CSSRule, parent_style: *const std.StringHashMap([]const u8), ancestor_chain: []const *Node) !void {
+    switch (node.*) {
+        .text => {
+            // Text nodes don't have styles
+            return;
+        },
+        .element => |*e| {
+            // Initialize empty style map
+            e.style = std.StringHashMap([]const u8).init(allocator);
+
+            // First, inherit properties from parent
+            for (INHERITED_PROPERTIES) |prop| {
+                const value = parent_style.get(prop.name) orelse prop.default_value;
+                try e.style.?.put(prop.name, value);
+            }
+
+            // Second, apply styles from CSS rules (can override inherited values)
+            for (rules) |rule| {
+                if (rule.selector.matches(node, ancestor_chain)) {
+                    // This rule matches, copy all its properties
+                    var it = rule.properties.iterator();
+                    while (it.next()) |entry| {
+                        try e.style.?.put(entry.key_ptr.*, entry.value_ptr.*);
+                    }
+                }
+            }
+
+            // Third, apply inline styles from the style attribute (overrides everything)
+            if (e.attributes) |attrs| {
+                if (attrs.get("style")) |style_attr| {
+                    // The style_attr string is owned by the element's attributes map,
+                    // so it will live as long as the element. We can parse it directly.
+                    var css_parser = try CSSParser.init(allocator, style_attr);
+                    defer css_parser.deinit(allocator);
+
+                    var parsed_styles = try css_parser.body(allocator);
+                    defer parsed_styles.deinit();
+
+                    // Copy parsed styles to the element's style map (overriding everything else)
+                    // Since style_attr lives in attributes, these slices are safe to store
+                    var it = parsed_styles.iterator();
+                    while (it.next()) |entry| {
+                        try e.style.?.put(entry.key_ptr.*, entry.value_ptr.*);
+                    }
+                }
+            }
+
+            // Fourth, resolve percentage font sizes to absolute pixels
+            if (e.style.?.get("font-size")) |font_size| {
+                if (std.mem.endsWith(u8, font_size, "%")) {
+                    // Get parent font size from inherited value
+                    const parent_font_size = parent_style.get("font-size") orelse "16px";
+
+                    // Parse the percentage (e.g., "150%" -> 150)
+                    const pct_str = font_size[0 .. font_size.len - 1];
+                    const node_pct = try std.fmt.parseFloat(f64, pct_str);
+
+                    // Parse parent font size (e.g., "16px" -> 16)
+                    const parent_px_str = parent_font_size[0 .. parent_font_size.len - 2];
+                    const parent_px = try std.fmt.parseFloat(f64, parent_px_str);
+
+                    // Calculate absolute size
+                    const absolute_px = (node_pct / 100.0) * parent_px;
+
+                    // Format back to string with "px"
+                    const resolved_size = try std.fmt.allocPrint(allocator, "{d:.1}px", .{absolute_px});
+
+                    // Track this allocated string so we can free it later
+                    if (e.owned_strings == null) {
+                        e.owned_strings = std.ArrayList([]const u8).empty;
+                    }
+                    try e.owned_strings.?.append(allocator, resolved_size);
+
+                    try e.style.?.put("font-size", resolved_size);
+                }
+            }
+
+            // Finally, recursively process all children with this element's computed style
+            // Build new ancestor chain by appending current node
+            var new_ancestors = try allocator.alloc(*Node, ancestor_chain.len + 1);
+            defer allocator.free(new_ancestors);
+
+            // Copy existing ancestors
+            for (ancestor_chain, 0..) |ancestor, i| {
+                new_ancestors[i] = ancestor;
+            }
+            // Add current node as the most recent ancestor
+            new_ancestors[ancestor_chain.len] = node;
+
+            for (e.children.items) |*child| {
+                try styleWithParent(allocator, child, rules, &e.style.?, new_ancestors);
+            }
+        },
+    }
+}
+
+/// Convert a tree structure into a flat list of nodes
+/// Works on both HTML and layout trees
+pub fn treeToList(allocator: std.mem.Allocator, node: *Node, list: *std.ArrayList(*Node)) !void {
+    try list.append(allocator, node);
+
+    switch (node.*) {
+        .text => {},
+        .element => |*e| {
+            for (e.children.items) |*child| {
+                try treeToList(allocator, child, list);
+            }
+        },
+    }
+}

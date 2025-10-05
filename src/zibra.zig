@@ -106,7 +106,7 @@ fn zibra() !void {
 
     // Initialize browser
     var b = try Browser.init(allocator, rtl_flag);
-    defer b.free();
+    defer b.deinit();
 
     if (url) |u| {
         if (print_tree) {
@@ -145,6 +145,10 @@ fn zibra() !void {
 
         // Parse the HTML and store the root node in the browser
         b.current_node = try html_parser.parse();
+
+        // Apply default browser stylesheet and inline styles
+        // TODO: Load and parse external stylesheets from <link> and <style> tags
+        try parser.style(allocator, &b.current_node.?, b.default_style_sheet_rules);
 
         // Layout using HTML nodes
         try b.layoutWithNodes();
