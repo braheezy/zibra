@@ -125,8 +125,8 @@ fn zibra() !void {
             try html_parser.prettyPrint(root, 0);
             return;
         }
-        // Request URL and store response in browser.
-        try b.load(u);
+        // Create a new tab and load the URL
+        try b.newTab(u);
     } else {
         if (print_tree) {
             var html_parser = try HTMLParser.init(allocator, default_html);
@@ -137,21 +137,9 @@ fn zibra() !void {
             return;
         }
 
-        std.log.info("showing default html", .{});
-
-        // Parse default HTML into a node tree instead of tokenizing it
-        var html_parser = try HTMLParser.init(allocator, default_html);
-        defer html_parser.deinit(allocator);
-
-        // Parse the HTML and store the root node in the browser
-        b.current_node = try html_parser.parse();
-
-        // Apply default browser stylesheet and inline styles
-        // TODO: Load and parse external stylesheets from <link> and <style> tags
-        try parser.style(allocator, &b.current_node.?, b.default_style_sheet_rules);
-
-        // Layout using HTML nodes
-        try b.layoutWithNodes();
+        // Create a new tab with the default HTML
+        const about_url = try Url.init(allocator, "about:blank");
+        try b.newTab(about_url);
     }
 
     // Start main exec loop

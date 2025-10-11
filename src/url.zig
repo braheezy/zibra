@@ -292,6 +292,44 @@ pub const Url = struct {
         const html_content = try html_file.readToEndAlloc(al, 4096);
         return html_content;
     }
+
+    /// Convert URL to string representation
+    /// Returns a formatted URL string, hiding default ports
+    pub fn toString(self: Url, buffer: []u8) ![]const u8 {
+        // Handle special schemes
+        if (std.mem.eql(u8, self.scheme, "data")) {
+            return std.fmt.bufPrint(buffer, "data:{s}", .{self.path});
+        }
+
+        if (std.mem.eql(u8, self.scheme, "about")) {
+            return std.fmt.bufPrint(buffer, "about:{s}", .{self.path});
+        }
+
+        if (std.mem.eql(u8, self.scheme, "file")) {
+            return std.fmt.bufPrint(buffer, "file://{s}", .{self.path});
+        }
+
+        // For http/https, check if we should show port
+        const host_str = self.host orelse return error.NoHost;
+
+        const show_port = (std.mem.eql(u8, self.scheme, "https") and self.port != 443) or
+            (std.mem.eql(u8, self.scheme, "http") and self.port != 80);
+
+        if (show_port) {
+            return std.fmt.bufPrint(buffer, "{s}://{s}:{d}{s}", .{
+                self.scheme,
+                host_str,
+                self.port,
+                self.path,
+            });
+        } else {
+            return std.fmt.bufPrint(buffer, "{s}://{s}{s}", .{
+                self.scheme,
+                host_str,
+                self.path,
+            });
+        }
+    }
 };
 
 pub fn isRedirectStatusCode(status: u16) bool {

@@ -721,6 +721,206 @@ pub fn layoutSourceCode(self: *Layout, source: []const u8) ![]DisplayItem {
     return try self.display_list.toOwnedSlice(self.allocator);
 }
 
+// Text layout for individual words
+pub const TextLayout = struct {
+    allocator: std.mem.Allocator,
+    node: Node,
+    word: []const u8,
+    parent: *LineLayout,
+    previous: ?*TextLayout,
+    x: i32 = 0,
+    y: i32 = 0,
+    width: i32 = 0,
+    height: i32 = 0,
+    font_size: i32 = 16,
+    font_weight: FontWeight = .Normal,
+    font_slant: FontSlant = .Roman,
+    color: browser.Color = .{ .r = 0, .g = 0, .b = 0, .a = 255 },
+    // Store font metrics for baseline calculation
+    ascent: i32 = 0,
+    descent: i32 = 0,
+
+    pub fn init(
+        allocator: std.mem.Allocator,
+        node: Node,
+        word: []const u8,
+        parent: *LineLayout,
+        previous: ?*TextLayout,
+    ) !*TextLayout {
+        const text = try allocator.create(TextLayout);
+        text.* = TextLayout{
+            .allocator = allocator,
+            .node = node,
+            .word = word,
+            .parent = parent,
+            .previous = previous,
+        };
+        return text;
+    }
+
+    pub fn deinit(self: *TextLayout) void {
+        _ = self;
+        // Word is not owned by TextLayout, so we don't free it
+        // The node is part of the HTML tree and managed elsewhere
+    }
+
+    pub fn layout(self: *TextLayout, engine: *Layout) !void {
+        // Get font properties from node style
+        // In a real browser, we'd read from self.node.style
+        // For now, use the engine's current style state
+        self.font_weight = if (engine.is_bold) .Bold else .Normal;
+        self.font_slant = if (engine.is_italic) .Italic else .Roman;
+        self.font_size = engine.size;
+        self.color = engine.text_color;
+
+        // Measure the word to get its width
+        const glyph = try engine.font_manager.getStyledGlyph(
+            self.word,
+            self.font_weight,
+            self.font_slant,
+            self.font_size,
+            false,
+        );
+
+        self.width = glyph.w;
+
+        // Store font metrics for baseline calculation
+        self.ascent = glyph.ascent;
+        self.descent = glyph.descent;
+
+        // Height is the line spacing (ascent + descent)
+        self.height = self.ascent + self.descent;
+
+        // Compute x position (horizontal stacking with space between words)
+        if (self.previous) |prev| {
+            // Measure a space character
+            const space_glyph = try engine.font_manager.getStyledGlyph(
+                " ",
+                prev.font_weight,
+                prev.font_slant,
+                prev.font_size,
+                false,
+            );
+            const space = space_glyph.w;
+            self.x = prev.x + space + prev.width;
+        } else {
+            self.x = self.parent.x;
+        }
+
+        // y position is computed by LineLayout after baseline is determined
+    }
+
+    pub fn paint(self: *TextLayout, engine: *Layout) !void {
+        // Paint the word using the stored font properties
+        const glyph = try engine.font_manager.getStyledGlyph(
+            self.word,
+            self.font_weight,
+            self.font_slant,
+            self.font_size,
+            false,
+        );
+
+        try engine.display_list.append(engine.allocator, DisplayItem{
+            .glyph = .{
+                .x = self.x,
+                .y = self.y,
+                .glyph = glyph,
+                .color = self.color,
+            },
+        });
+    }
+};
+
+// Line layout for each line of text
+pub const LineLayout = struct {
+    allocator: std.mem.Allocator,
+    node: Node,
+    parent: *BlockLayout,
+    previous: ?*LineLayout,
+    children: std.ArrayList(*TextLayout),
+    x: i32 = 0,
+    y: i32 = 0,
+    width: i32 = 0,
+    height: i32 = 0,
+
+    pub fn init(
+        allocator: std.mem.Allocator,
+        node: Node,
+        parent: *BlockLayout,
+        previous: ?*LineLayout,
+    ) !*LineLayout {
+        const line = try allocator.create(LineLayout);
+        line.* = LineLayout{
+            .allocator = allocator,
+            .node = node,
+            .parent = parent,
+            .previous = previous,
+            .children = std.ArrayList(*TextLayout).empty,
+        };
+        return line;
+    }
+
+    pub fn deinit(self: *LineLayout) void {
+        for (self.children.items) |child| {
+            child.deinit();
+            self.allocator.destroy(child);
+        }
+        self.children.deinit(self.allocator);
+    }
+
+    pub fn layout(self: *LineLayout, engine: *Layout) !void {
+        // Position the line relative to parent block
+        self.width = self.parent.width;
+        self.x = self.parent.x;
+
+        // Position is below previous line, or at parent's y
+        if (self.previous) |prev| {
+            self.y = prev.y + prev.height;
+        } else {
+            self.y = self.parent.y;
+        }
+
+        // Layout each word in the line (computes x, width, height, font metrics)
+        for (self.children.items) |word| {
+            try word.layout(engine);
+        }
+
+        // Compute the line's baseline from maximum ascent
+        var max_ascent: i32 = 0;
+        for (self.children.items) |word| {
+            if (word.ascent > max_ascent) {
+                max_ascent = word.ascent;
+            }
+        }
+
+        // Baseline with 1.25 leading factor
+        const baseline = self.y + @as(i32, @intFromFloat(1.25 * @as(f32, @floatFromInt(max_ascent))));
+
+        // Position each word vertically relative to baseline
+        for (self.children.items) |word| {
+            word.y = baseline - word.ascent;
+        }
+
+        // Compute maximum descent
+        var max_descent: i32 = 0;
+        for (self.children.items) |word| {
+            if (word.descent > max_descent) {
+                max_descent = word.descent;
+            }
+        }
+
+        // Compute line height with 1.25 leading factor
+        self.height = @intFromFloat(1.25 * @as(f32, @floatFromInt(max_ascent + max_descent)));
+    }
+
+    pub fn paint(self: *LineLayout, engine: *Layout) !void {
+        // Paint each word in the line
+        for (self.children.items) |text| {
+            try text.paint(engine);
+        }
+    }
+};
+
 pub const DocumentLayout = struct {
     allocator: std.mem.Allocator,
     node: Node,
@@ -766,18 +966,38 @@ pub const DocumentLayout = struct {
     }
 };
 
+// Union type to handle both block and line children
+pub const LayoutChild = union(enum) {
+    block: *BlockLayout,
+    line: *LineLayout,
+
+    pub fn deinit(self: LayoutChild, allocator: std.mem.Allocator) void {
+        switch (self) {
+            .block => |b| {
+                b.deinit();
+                allocator.destroy(b);
+            },
+            .line => |l| {
+                l.deinit();
+                allocator.destroy(l);
+            },
+        }
+    }
+};
+
 pub const BlockLayout = struct {
     allocator: std.mem.Allocator,
     node: Node,
     document: *DocumentLayout,
     parent_block: ?*BlockLayout,
     previous: ?*BlockLayout,
-    children: std.ArrayList(*BlockLayout),
+    children: std.ArrayList(LayoutChild),
     display_list: std.ArrayList(DisplayItem),
     x: i32 = 0,
     y: i32 = 0,
     width: i32 = 0,
     height: i32 = 0,
+    cursor_x: i32 = 0,
 
     pub fn init(
         allocator: std.mem.Allocator,
@@ -793,7 +1013,7 @@ pub const BlockLayout = struct {
             .document = document,
             .parent_block = parent_block,
             .previous = previous,
-            .children = std.ArrayList(*BlockLayout).empty,
+            .children = std.ArrayList(LayoutChild).empty,
             .display_list = std.ArrayList(DisplayItem).empty,
         };
         return block;
@@ -801,8 +1021,7 @@ pub const BlockLayout = struct {
 
     pub fn deinit(self: *BlockLayout) void {
         for (self.children.items) |child| {
-            child.deinit();
-            self.allocator.destroy(child);
+            child.deinit(self.allocator);
         }
         self.children.deinit(self.allocator);
         self.display_list.deinit(self.allocator);
@@ -830,6 +1049,50 @@ pub const BlockLayout = struct {
         }
     }
 
+    // Create a new line for inline content
+    fn newLine(self: *BlockLayout) !void {
+        self.cursor_x = 0;
+        const last_line: ?*LineLayout = if (self.children.items.len > 0) blk: {
+            const last_child = self.children.items[self.children.items.len - 1];
+            break :blk if (last_child == .line) last_child.line else null;
+        } else null;
+
+        const new_line = try LineLayout.init(self.allocator, self.node, self, last_line);
+        try self.children.append(self.allocator, .{ .line = new_line });
+    }
+
+    // Add a word to the current line
+    fn word(self: *BlockLayout, node: Node, word_text: []const u8, font_mgr: *font.FontManager, width: i32) !void {
+        // Get the current line (should be the last child)
+        if (self.children.items.len == 0) {
+            try self.newLine();
+        }
+
+        const last_child = &self.children.items[self.children.items.len - 1];
+        if (last_child.* != .line) {
+            // If last child isn't a line, create a new line
+            try self.newLine();
+        }
+
+        const line = self.children.items[self.children.items.len - 1].line;
+
+        // Check if we need to wrap to a new line
+        if (self.cursor_x + width > self.width and self.cursor_x > 0) {
+            try self.newLine();
+        }
+
+        const previous_word: ?*TextLayout = if (line.children.items.len > 0)
+            line.children.items[line.children.items.len - 1]
+        else
+            null;
+
+        const text = try TextLayout.init(self.allocator, node, word_text, line, previous_word);
+        try line.children.append(self.allocator, text);
+        self.cursor_x += width;
+
+        _ = font_mgr; // Will use this later for measuring
+    }
+
     pub fn layout(self: *BlockLayout, engine: *Layout) !void {
         const parent_x = if (self.parent_block) |pb| pb.x else self.document.x;
         const parent_y = if (self.parent_block) |pb| pb.y else self.document.y;
@@ -841,31 +1104,45 @@ pub const BlockLayout = struct {
 
         const is_block = self.isBlockContainer();
         if (is_block) {
+            // Clear existing children
             for (self.children.items) |child| {
-                child.deinit();
-                self.allocator.destroy(child);
+                child.deinit(self.allocator);
             }
             self.children.clearRetainingCapacity();
+
+            // Create block children
             switch (self.node) {
                 .element => |e| {
                     var previous: ?*BlockLayout = null;
                     for (e.children.items) |child_node| {
                         const child = try BlockLayout.init(self.allocator, child_node, self.document, self, previous);
-                        try self.children.append(self.allocator, child);
+                        try self.children.append(self.allocator, .{ .block = child });
                         previous = child;
                     }
                 },
                 else => {},
             }
 
+            // Layout all children and compute height
             self.height = 0;
             for (self.children.items) |child| {
-                try child.layout(engine);
-                self.height += child.height;
+                switch (child) {
+                    .block => |b| {
+                        try b.layout(engine);
+                        self.height += b.height;
+                    },
+                    .line => |l| {
+                        try l.layout(engine);
+                        self.height += l.height;
+                    },
+                }
             }
         } else {
+            // Inline layout mode - use the old approach for now
+            // TODO: Refactor to populate LineLayout and TextLayout objects
             self.display_list.clearRetainingCapacity();
             try engine.layoutInlineBlock(self);
+            // Height is set by layoutInlineBlock
         }
     }
 };
@@ -1010,7 +1287,10 @@ fn paintBlock(self: *Layout, block: *BlockLayout) !void {
     }
 
     for (block.children.items) |child| {
-        try paintBlock(self, child);
+        switch (child) {
+            .block => |b| try paintBlock(self, b),
+            .line => |l| try l.paint(self),
+        }
     }
 }
 
@@ -1030,4 +1310,50 @@ pub fn paintDocument(self: *Layout, document: *DocumentLayout) ![]DisplayItem {
 
     self.content_height = document.height + v_offset;
     return try self.display_list.toOwnedSlice(self.allocator);
+}
+
+// Layout object that can be clicked
+pub const LayoutObject = union(enum) {
+    text: *TextLayout,
+    line: *LineLayout,
+    block: *BlockLayout,
+
+    pub fn getNode(self: LayoutObject) Node {
+        return switch (self) {
+            .text => |t| t.node,
+            .line => |l| l.node,
+            .block => |b| b.node,
+        };
+    }
+
+    pub fn getBounds(self: LayoutObject) struct { x: i32, y: i32, width: i32, height: i32 } {
+        return switch (self) {
+            .text => |t| .{ .x = t.x, .y = t.y, .width = t.width, .height = t.height },
+            .line => |l| .{ .x = l.x, .y = l.y, .width = l.width, .height = l.height },
+            .block => |b| .{ .x = b.x, .y = b.y, .width = b.width, .height = b.height },
+        };
+    }
+};
+
+// Flatten the layout tree into a list
+pub fn layoutTreeToList(document: *DocumentLayout, list: *std.ArrayList(LayoutObject)) !void {
+    for (document.children.items) |child| {
+        try blockToList(child, list);
+    }
+}
+
+fn blockToList(block: *BlockLayout, list: *std.ArrayList(LayoutObject)) !void {
+    try list.append(block.allocator, .{ .block = block });
+
+    for (block.children.items) |child| {
+        switch (child) {
+            .block => |b| try blockToList(b, list),
+            .line => |l| {
+                try list.append(block.allocator, .{ .line = l });
+                for (l.children.items) |text| {
+                    try list.append(block.allocator, .{ .text = text });
+                }
+            },
+        }
+    }
 }

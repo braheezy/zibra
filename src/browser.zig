@@ -51,6 +51,19 @@ pub const Color = struct {
     a: u8 = 255,
 };
 
+// Rectangle helper for layout bounds
+pub const Rect = struct {
+    left: i32,
+    top: i32,
+    right: i32,
+    bottom: i32,
+
+    pub fn containsPoint(self: Rect, x: i32, y: i32) bool {
+        return x >= self.left and x < self.right and
+            y >= self.top and y < self.bottom;
+    }
+};
+
 pub const DisplayItem = union(enum) {
     glyph: struct {
         x: i32,
@@ -65,9 +78,509 @@ pub const DisplayItem = union(enum) {
         y2: i32,
         color: Color,
     },
+    line: struct {
+        x1: i32,
+        y1: i32,
+        x2: i32,
+        y2: i32,
+        color: Color,
+        thickness: i32,
+    },
+    outline: struct {
+        rect: Rect,
+        color: Color,
+        thickness: i32,
+    },
 };
 
-// Browser is the main struct that holds the state of the browser.
+// Chrome represents the browser UI (tab bar, buttons, etc.)
+pub const Chrome = struct {
+    font_size: i32 = 20,
+    font_height: i32 = 0,
+    padding: i32 = 5,
+    tabbar_top: i32 = 0,
+    tabbar_bottom: i32 = 0,
+    urlbar_top: i32 = 0,
+    urlbar_bottom: i32 = 0,
+    newtab_rect: Rect = undefined,
+    back_rect: Rect = undefined,
+    address_rect: Rect = undefined,
+    bottom: i32 = 0,
+    // Address bar editing state
+    focus: ?[]const u8 = null,
+    address_bar: std.ArrayList(u8) = undefined,
+    allocator: std.mem.Allocator = undefined,
+
+    pub fn init(font_manager: *font.FontManager, window_width: i32, allocator: std.mem.Allocator) !Chrome {
+        var chrome = Chrome{
+            .address_bar = std.ArrayList(u8).empty,
+            .allocator = allocator,
+        };
+
+        // Measure font height
+        const test_glyph = try font_manager.getStyledGlyph(
+            "X",
+            .Normal,
+            .Roman,
+            chrome.font_size,
+            false,
+        );
+        chrome.font_height = test_glyph.ascent + test_glyph.descent;
+
+        // Calculate tabbar bounds
+        chrome.tabbar_top = 0;
+        chrome.tabbar_bottom = chrome.font_height + 2 * chrome.padding;
+
+        // Calculate URL bar bounds
+        chrome.urlbar_top = chrome.tabbar_bottom;
+        chrome.urlbar_bottom = chrome.urlbar_top + chrome.font_height + 2 * chrome.padding;
+        chrome.bottom = chrome.urlbar_bottom;
+
+        // Calculate new tab button bounds
+        const plus_glyph = try font_manager.getStyledGlyph(
+            "+",
+            .Normal,
+            .Roman,
+            chrome.font_size,
+            false,
+        );
+        const plus_width = plus_glyph.w + 2 * chrome.padding;
+        chrome.newtab_rect = Rect{
+            .left = chrome.padding,
+            .top = chrome.padding,
+            .right = chrome.padding + plus_width,
+            .bottom = chrome.padding + chrome.font_height,
+        };
+
+        // Calculate back button bounds
+        const back_glyph = try font_manager.getStyledGlyph(
+            "<",
+            .Normal,
+            .Roman,
+            chrome.font_size,
+            false,
+        );
+        const back_width = back_glyph.w + 2 * chrome.padding;
+        chrome.back_rect = Rect{
+            .left = chrome.padding,
+            .top = chrome.urlbar_top + chrome.padding,
+            .right = chrome.padding + back_width,
+            .bottom = chrome.urlbar_bottom - chrome.padding,
+        };
+
+        // Calculate address bar bounds
+        chrome.address_rect = Rect{
+            .left = chrome.back_rect.right + chrome.padding,
+            .top = chrome.urlbar_top + chrome.padding,
+            .right = window_width - chrome.padding,
+            .bottom = chrome.urlbar_bottom - chrome.padding,
+        };
+
+        return chrome;
+    }
+
+    pub fn deinit(self: *Chrome) void {
+        self.address_bar.deinit(self.allocator);
+    }
+
+    pub fn tabRect(self: *const Chrome, i: usize) Rect {
+        const tabs_start = self.newtab_rect.right + self.padding;
+        const tab_width = 100; // Approximate width for "Tab X"
+        const idx: i32 = @intCast(i);
+        return Rect{
+            .left = tabs_start + tab_width * idx,
+            .top = self.tabbar_top,
+            .right = tabs_start + tab_width * (idx + 1),
+            .bottom = self.tabbar_bottom,
+        };
+    }
+
+    pub fn paint(self: *const Chrome, allocator: std.mem.Allocator, browser: *const Browser) !std.ArrayList(DisplayItem) {
+        var cmds = std.ArrayList(DisplayItem).empty;
+
+        // Draw white background for chrome
+        try cmds.append(allocator, .{ .rect = .{
+            .x1 = 0,
+            .y1 = 0,
+            .x2 = browser.window_width,
+            .y2 = self.bottom,
+            .color = .{ .r = 255, .g = 255, .b = 255, .a = 255 },
+        } });
+
+        // Draw bottom border of chrome
+        try cmds.append(allocator, .{ .line = .{
+            .x1 = 0,
+            .y1 = self.bottom,
+            .x2 = browser.window_width,
+            .y2 = self.bottom,
+            .color = .{ .r = 0, .g = 0, .b = 0, .a = 255 },
+            .thickness = 1,
+        } });
+
+        // Draw new tab button outline
+        try cmds.append(allocator, .{ .outline = .{
+            .rect = self.newtab_rect,
+            .color = .{ .r = 0, .g = 0, .b = 0, .a = 255 },
+            .thickness = 1,
+        } });
+
+        // Draw "+" text
+        const plus_glyph = try browser.layout_engine.font_manager.getStyledGlyph(
+            "+",
+            .Normal,
+            .Roman,
+            self.font_size,
+            false,
+        );
+        try cmds.append(allocator, .{ .glyph = .{
+            .x = self.newtab_rect.left + self.padding,
+            .y = self.newtab_rect.top,
+            .glyph = plus_glyph,
+            .color = .{ .r = 0, .g = 0, .b = 0, .a = 255 },
+        } });
+
+        // Draw tabs
+        for (browser.tabs.items, 0..) |tab, i| {
+            const bounds = self.tabRect(i);
+
+            // Draw left border
+            try cmds.append(allocator, .{ .line = .{
+                .x1 = bounds.left,
+                .y1 = 0,
+                .x2 = bounds.left,
+                .y2 = bounds.bottom,
+                .color = .{ .r = 0, .g = 0, .b = 0, .a = 255 },
+                .thickness = 1,
+            } });
+
+            // Draw right border
+            try cmds.append(allocator, .{ .line = .{
+                .x1 = bounds.right,
+                .y1 = 0,
+                .x2 = bounds.right,
+                .y2 = bounds.bottom,
+                .color = .{ .r = 0, .g = 0, .b = 0, .a = 255 },
+                .thickness = 1,
+            } });
+
+            // If this is the active tab, draw the file folder effect
+            if (browser.active_tab_index) |active_idx| {
+                if (i == active_idx) {
+                    // Draw line from left edge to tab start
+                    try cmds.append(allocator, .{ .line = .{
+                        .x1 = 0,
+                        .y1 = bounds.bottom,
+                        .x2 = bounds.left,
+                        .y2 = bounds.bottom,
+                        .color = .{ .r = 0, .g = 0, .b = 0, .a = 255 },
+                        .thickness = 1,
+                    } });
+
+                    // Draw line from tab end to right edge
+                    try cmds.append(allocator, .{ .line = .{
+                        .x1 = bounds.right,
+                        .y1 = bounds.bottom,
+                        .x2 = browser.window_width,
+                        .y2 = bounds.bottom,
+                        .color = .{ .r = 0, .g = 0, .b = 0, .a = 255 },
+                        .thickness = 1,
+                    } });
+                }
+            }
+
+            // Draw tab label
+            var tab_label_buf: [20]u8 = undefined;
+            const tab_label = try std.fmt.bufPrint(&tab_label_buf, "Tab {d}", .{i});
+            const tab_glyph = try browser.layout_engine.font_manager.getStyledGlyph(
+                tab_label,
+                .Normal,
+                .Roman,
+                self.font_size,
+                false,
+            );
+            try cmds.append(allocator, .{ .glyph = .{
+                .x = bounds.left + self.padding,
+                .y = bounds.top + self.padding,
+                .glyph = tab_glyph,
+                .color = .{ .r = 0, .g = 0, .b = 0, .a = 255 },
+            } });
+
+            _ = tab; // Silence unused variable warning
+        }
+
+        // Draw back button
+        try cmds.append(allocator, .{ .outline = .{
+            .rect = self.back_rect,
+            .color = .{ .r = 0, .g = 0, .b = 0, .a = 255 },
+            .thickness = 1,
+        } });
+
+        const back_glyph = try browser.layout_engine.font_manager.getStyledGlyph(
+            "<",
+            .Normal,
+            .Roman,
+            self.font_size,
+            false,
+        );
+        try cmds.append(allocator, .{ .glyph = .{
+            .x = self.back_rect.left + self.padding,
+            .y = self.back_rect.top,
+            .glyph = back_glyph,
+            .color = .{ .r = 0, .g = 0, .b = 0, .a = 255 },
+        } });
+
+        // Draw address bar
+        try cmds.append(allocator, .{ .outline = .{
+            .rect = self.address_rect,
+            .color = .{ .r = 0, .g = 0, .b = 0, .a = 255 },
+            .thickness = 1,
+        } });
+
+        // Draw address bar content (either typed text or current URL)
+        if (self.focus) |focus_str| {
+            if (std.mem.eql(u8, focus_str, "address bar")) {
+                // Draw the typed text
+                if (self.address_bar.items.len > 0) {
+                    const addr_glyph = try browser.layout_engine.font_manager.getStyledGlyph(
+                        self.address_bar.items,
+                        .Normal,
+                        .Roman,
+                        self.font_size,
+                        false,
+                    );
+                    try cmds.append(allocator, .{ .glyph = .{
+                        .x = self.address_rect.left + self.padding,
+                        .y = self.address_rect.top,
+                        .glyph = addr_glyph,
+                        .color = .{ .r = 0, .g = 0, .b = 0, .a = 255 },
+                    } });
+                }
+
+                // Draw cursor
+                const cursor_x = if (self.address_bar.items.len > 0) blk: {
+                    const cursor_glyph = try browser.layout_engine.font_manager.getStyledGlyph(
+                        self.address_bar.items,
+                        .Normal,
+                        .Roman,
+                        self.font_size,
+                        false,
+                    );
+                    break :blk self.address_rect.left + self.padding + cursor_glyph.w;
+                } else self.address_rect.left + self.padding;
+
+                try cmds.append(allocator, .{
+                    .line = .{
+                        .x1 = cursor_x,
+                        .y1 = self.address_rect.top,
+                        .x2 = cursor_x,
+                        .y2 = self.address_rect.bottom,
+                        .color = .{ .r = 255, .g = 0, .b = 0, .a = 255 }, // Red cursor
+                        .thickness = 1,
+                    },
+                });
+            }
+        } else {
+            // Draw current URL if there's an active tab
+            if (browser.activeTab()) |active_tab| {
+                if (active_tab.current_url) |url| {
+                    var url_buf: [512]u8 = undefined;
+                    const url_str = url.toString(&url_buf) catch "(invalid url)";
+                    const url_glyph = try browser.layout_engine.font_manager.getStyledGlyph(
+                        url_str,
+                        .Normal,
+                        .Roman,
+                        self.font_size,
+                        false,
+                    );
+                    try cmds.append(allocator, .{ .glyph = .{
+                        .x = self.address_rect.left + self.padding,
+                        .y = self.address_rect.top,
+                        .glyph = url_glyph,
+                        .color = .{ .r = 0, .g = 0, .b = 0, .a = 255 },
+                    } });
+                }
+            }
+        }
+
+        return cmds;
+    }
+
+    pub fn click(self: *Chrome, browser: *Browser, x: i32, y: i32) !void {
+        // Clear focus by default
+        self.focus = null;
+
+        // Check if clicked on new tab button
+        if (self.newtab_rect.containsPoint(x, y)) {
+            const url = try Url.init(browser.allocator, "https://browser.engineering/");
+            browser.newTab(url) catch |err| {
+                std.log.err("Failed to create new tab: {any}", .{err});
+            };
+            return;
+        }
+
+        // Check if clicked on back button
+        if (self.back_rect.containsPoint(x, y)) {
+            if (browser.activeTab()) |tab| {
+                tab.goBack(browser) catch |err| {
+                    std.log.err("Failed to go back: {any}", .{err});
+                };
+            }
+            return;
+        }
+
+        // Check if clicked on address bar
+        if (self.address_rect.containsPoint(x, y)) {
+            self.focus = "address bar";
+            self.address_bar.clearRetainingCapacity();
+            return;
+        }
+
+        // Check if clicked on a tab
+        for (0..browser.tabs.items.len) |i| {
+            if (self.tabRect(i).containsPoint(x, y)) {
+                browser.active_tab_index = i;
+                return;
+            }
+        }
+    }
+
+    pub fn keypress(self: *Chrome, char: u8) !void {
+        if (self.focus) |focus_str| {
+            if (std.mem.eql(u8, focus_str, "address bar")) {
+                try self.address_bar.append(self.allocator, char);
+            }
+        }
+    }
+
+    pub fn backspace(self: *Chrome) void {
+        if (self.focus) |focus_str| {
+            if (std.mem.eql(u8, focus_str, "address bar")) {
+                if (self.address_bar.items.len > 0) {
+                    _ = self.address_bar.pop();
+                }
+            }
+        }
+    }
+
+    pub fn enter(self: *Chrome, browser: *Browser) !void {
+        if (self.focus) |focus_str| {
+            if (std.mem.eql(u8, focus_str, "address bar")) {
+                if (self.address_bar.items.len > 0) {
+                    // Create URL from address bar content
+                    const url = Url.init(browser.allocator, self.address_bar.items) catch |err| {
+                        std.log.err("Invalid URL: {any}", .{err});
+                        // Clear focus even on error
+                        self.focus = null;
+                        return;
+                    };
+
+                    // Load it in the active tab
+                    if (browser.activeTab()) |tab| {
+                        browser.loadInTab(tab, url) catch |err| {
+                            std.log.err("Failed to load URL: {any}", .{err});
+                        };
+                    }
+
+                    // Clear focus
+                    self.focus = null;
+                }
+            }
+        }
+    }
+};
+
+// Tab represents a single web page
+pub const Tab = struct {
+    // Memory allocator
+    allocator: std.mem.Allocator,
+    // List of items to be displayed
+    display_list: ?[]DisplayItem = null,
+    // Current HTML node tree
+    current_node: ?Node = null,
+    // Current HTML source (must be kept alive while current_node exists)
+    current_html_source: ?[]const u8 = null,
+    // Layout tree for the document
+    document_layout: ?*Layout.DocumentLayout = null,
+    // Total height of the content
+    content_height: i32 = 0,
+    // Current scroll offset
+    scroll_offset: i32 = 0,
+    // Current URL being displayed
+    current_url: ?Url = null,
+    // Available height for tab content (window height minus chrome height)
+    tab_height: i32 = 0,
+    // History of visited URLs
+    history: std.ArrayList(Url),
+
+    pub fn init(allocator: std.mem.Allocator, tab_height: i32) Tab {
+        return Tab{
+            .allocator = allocator,
+            .tab_height = tab_height,
+            .history = std.ArrayList(Url).empty,
+        };
+    }
+
+    pub fn deinit(self: *Tab) void {
+        // Clean up any display list
+        if (self.display_list) |list| {
+            self.allocator.free(list);
+        }
+
+        // Clean up document layout tree
+        if (self.document_layout) |doc| {
+            doc.deinit();
+            self.allocator.destroy(doc);
+        }
+
+        // Clean up the current HTML node tree
+        if (self.current_node) |node_val| {
+            var node = node_val;
+            Node.deinit(&node, self.allocator);
+        }
+
+        // Clean up the current HTML source
+        if (self.current_html_source) |source| {
+            self.allocator.free(source);
+        }
+
+        // Clean up history
+        self.history.deinit(self.allocator);
+    }
+
+    // Scroll the tab down
+    pub fn scrollDown(self: *Tab) void {
+        const max_y = @max(self.content_height - self.tab_height, 0);
+        if (self.scroll_offset + scroll_increment <= max_y) {
+            self.scroll_offset += scroll_increment;
+        } else {
+            self.scroll_offset = max_y;
+        }
+    }
+
+    // Scroll the tab up
+    pub fn scrollUp(self: *Tab) void {
+        if (self.scroll_offset > 0) {
+            self.scroll_offset -= scroll_increment;
+            if (self.scroll_offset < 0) {
+                self.scroll_offset = 0;
+            }
+        }
+    }
+
+    // Go back in history
+    pub fn goBack(self: *Tab, browser: *Browser) !void {
+        if (self.history.items.len > 1) {
+            // Remove current page (we already checked length > 1)
+            _ = self.history.pop().?;
+            // Get previous page and load it (which will add it back to history)
+            const back_url = self.history.pop().?;
+            try browser.loadInTab(self, back_url);
+            try browser.draw();
+        }
+    }
+};
+
+// Browser manages the window and tabs
 pub const Browser = struct {
     // Memory allocator for the browser
     allocator: std.mem.Allocator,
@@ -79,22 +592,18 @@ pub const Browser = struct {
     http_client: std.http.Client,
     // Cache for storing fetched resources
     cache: Cache,
-    // List of items to be displayed
-    display_list: ?[]DisplayItem = null,
-    // Current HTML node tree (when using parser)
-    current_node: ?Node = null,
-    // Layout tree for the document
-    document_layout: ?*Layout.DocumentLayout = null,
-    // Total height of the content
-    content_height: i32 = 0,
-    // Current scroll offset
-    scroll_offset: i32 = 0,
     // Window dimensions
     window_width: i32 = initial_window_width,
     window_height: i32 = initial_window_height,
     layout_engine: *Layout,
     // Default browser stylesheet rules
     default_style_sheet_rules: []CSSParser.CSSRule,
+    // List of tabs
+    tabs: std.ArrayList(*Tab),
+    // Index of the active tab
+    active_tab_index: ?usize = null,
+    // Browser chrome (UI)
+    chrome: Chrome = undefined,
 
     // Create a new Browser instance
     pub fn init(al: std.mem.Allocator, rtl_flag: bool) !Browser {
@@ -135,27 +644,54 @@ pub const Browser = struct {
         defer css_parser.deinit(al);
         const default_rules = try css_parser.parse(al);
 
+        const layout_engine = try Layout.init(
+            al,
+            renderer,
+            initial_window_width,
+            initial_window_height,
+            rtl_flag,
+        );
+
         return Browser{
             .allocator = al,
             .window = screen,
             .canvas = renderer,
             .http_client = .{ .allocator = al },
             .cache = try Cache.init(al),
-            .layout_engine = try Layout.init(
-                al,
-                renderer,
-                initial_window_width,
-                initial_window_height,
-                rtl_flag,
-            ),
+            .layout_engine = layout_engine,
             .default_style_sheet_rules = default_rules,
+            .tabs = std.ArrayList(*Tab).empty,
+            .chrome = try Chrome.init(&layout_engine.font_manager, initial_window_width, al),
         };
+    }
+
+    // Get the active tab (if any)
+    fn activeTab(self: *const Browser) ?*Tab {
+        if (self.active_tab_index) |idx| {
+            if (idx < self.tabs.items.len) {
+                return self.tabs.items[idx];
+            }
+        }
+        return null;
     }
 
     // Free the resources used by the browser
     // Deprecated: use deinit() instead
     pub fn free(self: *Browser) void {
         self.deinit();
+    }
+
+    // Create a new tab and load a URL into it
+    pub fn newTab(self: *Browser, url: Url) !void {
+        const tab_height = self.window_height - self.chrome.bottom;
+        const tab = try self.allocator.create(Tab);
+        tab.* = Tab.init(self.allocator, tab_height);
+
+        try self.tabs.append(self.allocator, tab);
+        self.active_tab_index = self.tabs.items.len - 1;
+
+        try self.loadInTab(tab, url);
+        try self.draw();
     }
 
     // Run the browser event loop
@@ -169,13 +705,34 @@ pub const Browser = struct {
                 switch (event.type) {
                     // Quit when the window is closed
                     c.SDL_QUIT => quit = true,
-                    c.SDL_KEYDOWN => self.handleKeyEvent(event.key.keysym.sym),
+                    c.SDL_KEYDOWN => {
+                        try self.handleKeyEvent(event.key.keysym.sym);
+                    },
+                    c.SDL_TEXTINPUT => {
+                        // Handle text input for address bar
+                        const text = std.mem.sliceTo(&event.text.text, 0);
+                        for (text) |char| {
+                            if (char >= 0x20 and char < 0x7f) {
+                                try self.chrome.keypress(char);
+                            }
+                        }
+                        try self.draw();
+                    },
                     // Handle mouse wheel events
                     c.SDL_MOUSEWHEEL => {
-                        if (event.wheel.y > 0) {
-                            self.updateScroll(.Up);
-                        } else if (event.wheel.y < 0) {
-                            self.updateScroll(.Down);
+                        if (self.activeTab()) |tab| {
+                            if (event.wheel.y > 0) {
+                                tab.scrollUp();
+                            } else if (event.wheel.y < 0) {
+                                tab.scrollDown();
+                            }
+                            try self.draw();
+                        }
+                    },
+                    // Handle mouse button clicks
+                    c.SDL_MOUSEBUTTONDOWN => {
+                        if (event.button.button == c.SDL_BUTTON_LEFT) {
+                            try self.handleClick(event.button.x, event.button.y);
                         }
                     },
                     c.SDL_WINDOWEVENT => {
@@ -185,11 +742,7 @@ pub const Browser = struct {
                 }
             }
 
-            // Clear canvas with white background
-            _ = c.SDL_SetRenderDrawColor(self.canvas, 255, 255, 255, 255);
-            _ = c.SDL_RenderClear(self.canvas);
-
-            // draw browser content
+            // Draw browser content (includes canvas clear)
             try self.draw();
 
             // Present the updated frame
@@ -226,58 +779,133 @@ pub const Browser = struct {
         }
     }
 
-    fn handleKeyEvent(self: *Browser, key: c.SDL_Keycode) void {
-        switch (key) {
-            c.SDLK_DOWN => self.updateScroll(.Down),
-            c.SDLK_UP => self.updateScroll(.Up),
-            else => {},
+    fn handleKeyEvent(self: *Browser, key: c.SDL_Keycode) !void {
+        // Handle Backspace key
+        if (key == c.SDLK_BACKSPACE) {
+            self.chrome.backspace();
+            try self.draw();
+            return;
         }
+
+        // Handle Enter/Return key
+        if (key == c.SDLK_RETURN or key == c.SDLK_RETURN2) {
+            try self.chrome.enter(self);
+            try self.draw();
+            return;
+        }
+
+        // Handle scrolling keys
+        if (self.activeTab()) |tab| {
+            switch (key) {
+                c.SDLK_DOWN => {
+                    tab.scrollDown();
+                    try self.draw();
+                },
+                c.SDLK_UP => {
+                    tab.scrollUp();
+                    try self.draw();
+                },
+                else => {},
+            }
+        }
+    }
+
+    // Handle mouse clicks to navigate links
+    fn handleClick(self: *Browser, screen_x: i32, screen_y: i32) !void {
+        std.debug.print("Click detected at screen ({d}, {d})\n", .{ screen_x, screen_y });
+
+        // Check if click is in chrome area
+        if (screen_y < self.chrome.bottom) {
+            try self.chrome.click(self, screen_x, screen_y);
+            try self.draw();
+            return;
+        }
+
+        // Click is in tab content area
+        const tab = self.activeTab() orelse return;
+        const tab_y = screen_y - self.chrome.bottom;
+
+        // Convert screen coordinates to page coordinates
+        const page_x = screen_x;
+        const page_y = tab_y + tab.scroll_offset;
+
+        std.debug.print("Page coordinates: ({d}, {d})\n", .{ page_x, page_y });
+
+        // Only proceed if we have the HTML tree
+        const root_node = tab.current_node orelse {
+            std.debug.print("No current_node\n", .{});
+            return;
+        };
+
+        std.debug.print("Current URL: {s}\n", .{if (tab.current_url) |url| url.path else "none"});
+
+        // For now, use a simple approach: collect all nodes and check bounds
+        // TODO: Use the layout tree when LineLayout/TextLayout are fully implemented
+        var node_list = std.ArrayList(*Node).empty;
+        defer node_list.deinit(self.allocator);
+
+        var root_mut = root_node;
+        try parser.treeToList(self.allocator, &root_mut, &node_list);
+
+        std.debug.print("Found {d} nodes in tree\n", .{node_list.items.len});
+
+        // Find clickable elements (links) and check if click is within their bounds
+        // For now, we'll just search for <a> elements in the tree
+        // and try to find one that might contain the click
+        var link_count: usize = 0;
+        var element_count: usize = 0;
+        for (node_list.items) |node_ptr| {
+            switch (node_ptr.*) {
+                .element => |e| {
+                    element_count += 1;
+                    std.debug.print("Element #{d}: tag='{s}'\n", .{ element_count, e.tag });
+                    if (std.mem.eql(u8, e.tag, "a")) {
+                        link_count += 1;
+                        if (e.attributes) |attrs| {
+                            std.debug.print("Link has {d} attributes\n", .{attrs.count()});
+                            if (attrs.get("href")) |href| {
+                                std.debug.print("Found link #{d}: {s}\n", .{ link_count, href });
+                                // Resolve the URL relative to current page
+                                if (tab.current_url) |current_url| {
+                                    const resolved_url = try current_url.resolve(self.allocator, href);
+                                    std.debug.print("Resolved to: {s}\n", .{resolved_url.path});
+                                    std.debug.print("Loading link: {s}\n", .{href});
+                                    self.loadInTab(tab, resolved_url) catch |err| {
+                                        std.log.err("Failed to load URL {s}: {any}", .{ href, err });
+                                        return;
+                                    };
+                                    self.draw() catch |err| {
+                                        std.log.err("Failed to draw after loading: {any}", .{err});
+                                    };
+                                    return;
+                                } else {
+                                    std.debug.print("No current_url to resolve against\n", .{});
+                                }
+                            } else {
+                                std.debug.print("Link #{d} has no href\n", .{link_count});
+                            }
+                        } else {
+                            std.debug.print("Link #{d} has no attributes\n", .{link_count});
+                        }
+                    }
+                },
+                .text => |t| {
+                    std.debug.print("Text node: '{s}'\n", .{t.text[0..@min(20, t.text.len)]});
+                },
+            }
+        }
+
+        std.debug.print("No links found to click\n", .{});
+        // TODO: Implement proper hit testing when layout tree is complete
     }
 
     // Update the scroll offset
-    pub fn updateScroll(
-        self: *Browser,
-        action: enum {
-            Down,
-            Up,
-        },
-    ) void {
-        switch (action) {
-            .Down => {
-                const max_scroll = if (self.content_height > self.window_height)
-                    // Subtract window height to prevent scrolling past the end
-                    self.content_height - self.window_height
-                else
-                    // No scrolling needed, content fits in window
-                    0;
-
-                // Only scroll if there is content to scroll
-                if (self.scroll_offset < max_scroll) {
-                    self.scroll_offset += scroll_increment;
-                    // Prevent scrolling past the end
-                    if (self.scroll_offset > max_scroll) {
-                        self.scroll_offset = max_scroll;
-                    }
-                }
-            },
-            .Up => {
-                if (self.scroll_offset > 0) {
-                    self.scroll_offset -= scroll_increment;
-                    // Prevent scrolling past the beginning
-                    if (self.scroll_offset < 0) {
-                        self.scroll_offset = 0;
-                    }
-                }
-            },
-        }
-    }
-
     pub fn fetchBody(self: *Browser, url: Url) ![]const u8 {
-        return if (std.mem.eql(u8, url.scheme, "file:"))
+        return if (std.mem.eql(u8, url.scheme, "file"))
             try url.fileRequest(self.allocator)
-        else if (std.mem.eql(u8, url.scheme, "data:"))
+        else if (std.mem.eql(u8, url.scheme, "data"))
             url.path
-        else if (std.mem.eql(u8, url.scheme, "about:"))
+        else if (std.mem.eql(u8, url.scheme, "about"))
             url.aboutRequest()
         else
             try url.httpRequest(
@@ -287,57 +915,76 @@ pub const Browser = struct {
             );
     }
 
-    // Send request to a URL, load response into browser
-    pub fn load(
+    // Send request to a URL, load response into a tab
+    pub fn loadInTab(
         self: *Browser,
+        tab: *Tab,
         url: Url,
     ) !void {
         std.log.info("Loading: {s}", .{url.path});
 
+        // Add URL to history
+        try tab.history.append(self.allocator, url);
+
+        // Store the current URL for resolving relative links
+        tab.current_url = url;
+
         // Do the request, getting back the body of the response.
         const body = try self.fetchBody(url);
 
-        defer if (!std.mem.eql(u8, url.scheme, "about:")) self.allocator.free(body);
+        // Free previous HTML source if it exists
+        if (tab.current_html_source) |old_source| {
+            self.allocator.free(old_source);
+            tab.current_html_source = null;
+        }
 
         if (url.view_source) {
             // Use the new layoutSourceCode function for view-source mode
-            if (self.display_list) |items| {
+            defer if (!std.mem.eql(u8, url.scheme, "about")) self.allocator.free(body);
+
+            if (tab.display_list) |items| {
                 self.allocator.free(items);
             }
 
-            if (self.document_layout) |doc| {
+            if (tab.document_layout) |doc| {
                 doc.deinit();
                 self.allocator.destroy(doc);
-                self.document_layout = null;
+                tab.document_layout = null;
             }
 
-            if (self.current_node) |node| {
+            if (tab.current_node) |node| {
                 var n = node;
                 n.deinit(self.allocator);
-                self.current_node = null;
+                tab.current_node = null;
             }
 
-            self.display_list = try self.layout_engine.layoutSourceCode(body);
-            self.content_height = self.layout_engine.content_height;
+            tab.display_list = try self.layout_engine.layoutSourceCode(body);
+            tab.content_height = self.layout_engine.content_height;
         } else {
             // Parse HTML into a node tree
             var html_parser = try HTMLParser.init(self.allocator, body);
             defer html_parser.deinit(self.allocator);
 
             // Clear any previous node tree
-            if (self.current_node) |node| {
+            if (tab.current_node) |node| {
                 var n = node;
                 n.deinit(self.allocator);
-                self.current_node = null;
+                tab.current_node = null;
             }
 
             // Parse the HTML and store the root node
-            self.current_node = try html_parser.parse();
+            tab.current_node = try html_parser.parse();
+
+            // Store the HTML source (it contains slices used by the tree)
+            // Only store if it's not an about: URL (those return static strings)
+            if (!std.mem.eql(u8, url.scheme, "about")) {
+                tab.current_html_source = body;
+            }
 
             // Find all linked stylesheets
             var node_list = std.ArrayList(*parser.Node).empty;
             defer node_list.deinit(self.allocator);
-            try parser.treeToList(self.allocator, &self.current_node.?, &node_list);
+            try parser.treeToList(self.allocator, &tab.current_node.?, &node_list);
 
             // Collect stylesheet URLs from <link rel="stylesheet" href="..."> elements
             var stylesheet_urls = std.ArrayList([]const u8).empty;
@@ -447,121 +1094,202 @@ pub const Browser = struct {
             }.lessThan);
 
             // Apply all stylesheet rules and inline styles (sorted by cascade order)
-            try parser.style(self.allocator, &self.current_node.?, all_rules.items);
+            try parser.style(self.allocator, &tab.current_node.?, all_rules.items);
 
             // Layout using the HTML node tree
-            try self.layoutWithNodes();
+            try self.layoutTabNodes(tab);
         }
     }
 
-    // New method to layout using HTML nodes with the tree-based layout
-    pub fn layoutWithNodes(self: *Browser) !void {
-        if (self.current_node == null) {
+    // Layout a tab's HTML nodes with the tree-based layout
+    pub fn layoutTabNodes(self: *Browser, tab: *Tab) !void {
+        if (tab.current_node == null) {
             return error.NoNodeToLayout;
         }
 
         // Free existing display list if it exists
-        if (self.display_list) |items| {
+        if (tab.display_list) |items| {
             self.allocator.free(items);
         }
 
         // Clear previous document layout if it exists
-        if (self.document_layout != null) {
-            self.document_layout.?.deinit();
-            self.allocator.destroy(self.document_layout.?);
-            self.document_layout = null;
+        if (tab.document_layout != null) {
+            tab.document_layout.?.deinit();
+            self.allocator.destroy(tab.document_layout.?);
+            tab.document_layout = null;
         }
 
         // Create and layout the document tree
-        self.document_layout = try self.layout_engine.buildDocument(self.current_node.?);
+        tab.document_layout = try self.layout_engine.buildDocument(tab.current_node.?);
 
         // Paint the document to produce draw commands
-        self.display_list = try self.layout_engine.paintDocument(self.document_layout.?);
+        tab.display_list = try self.layout_engine.paintDocument(tab.document_layout.?);
 
         // Update content height from the layout engine
-        self.content_height = self.layout_engine.content_height;
+        tab.content_height = self.layout_engine.content_height;
     }
 
     // Draw the browser content
-    pub fn draw(self: Browser) !void {
-        if (self.display_list == null) {
+    pub fn draw(self: *Browser) !void {
+        // Clear the canvas
+        _ = c.SDL_SetRenderDrawColor(self.canvas, 255, 255, 255, 255);
+        _ = c.SDL_RenderClear(self.canvas);
+
+        // Only draw the active tab
+        const tab = self.activeTab() orelse {
+            // Draw just the chrome if no tabs
+            var chrome_cmds = try self.chrome.paint(self.allocator, self);
+            defer chrome_cmds.deinit(self.allocator);
+            for (chrome_cmds.items) |item| {
+                try self.drawDisplayItem(item, 0);
+            }
             return;
-        }
-        for (self.display_list.?) |item| {
-            switch (item) {
-                .glyph => |glyph_item| {
-                    const screen_y = glyph_item.y - self.scroll_offset;
-                    if (screen_y >= 0 and screen_y < self.window_height) {
-                        var dst_rect: c.SDL_Rect = .{
-                            .x = glyph_item.x,
-                            .y = screen_y,
-                            .w = glyph_item.glyph.w,
-                            .h = glyph_item.glyph.h,
-                        };
+        };
 
-                        // Apply text color to the glyph texture
-                        _ = c.SDL_SetTextureColorMod(
-                            glyph_item.glyph.texture,
-                            glyph_item.color.r,
-                            glyph_item.color.g,
-                            glyph_item.color.b,
-                        );
-
-                        _ = c.SDL_RenderCopy(
-                            self.canvas,
-                            glyph_item.glyph.texture,
-                            null,
-                            &dst_rect,
-                        );
-                    }
-                },
-                .rect => |rect_item| {
-                    const top = rect_item.y1 - self.scroll_offset;
-                    const bottom = rect_item.y2 - self.scroll_offset;
-                    if (bottom > 0 and top < self.window_height) {
-                        const width = rect_item.x2 - rect_item.x1;
-                        const height = bottom - top;
-                        if (width > 0 and height > 0) {
-                            _ = c.SDL_SetRenderDrawColor(
-                                self.canvas,
-                                rect_item.color.r,
-                                rect_item.color.g,
-                                rect_item.color.b,
-                                rect_item.color.a,
-                            );
-
-                            var rect: c.SDL_Rect = .{
-                                .x = rect_item.x1,
-                                .y = top,
-                                .w = width,
-                                .h = height,
-                            };
-                            _ = c.SDL_RenderFillRect(self.canvas, &rect);
-                        }
-                    }
-                },
+        if (tab.display_list) |display_list| {
+            for (display_list) |item| {
+                // Offset by chrome height and scroll
+                try self.drawDisplayItem(item, tab.scroll_offset - self.chrome.bottom);
             }
         }
 
-        self.drawScrollbar();
+        // Draw chrome on top
+        var chrome_cmds = try self.chrome.paint(self.allocator, self);
+        defer chrome_cmds.deinit(self.allocator);
+        for (chrome_cmds.items) |item| {
+            try self.drawDisplayItem(item, 0);
+        }
+
+        self.drawScrollbar(tab);
     }
 
-    pub fn drawScrollbar(self: Browser) void {
-        if (self.content_height <= self.window_height) {
+    fn drawDisplayItem(self: *Browser, item: DisplayItem, scroll_offset: i32) !void {
+        switch (item) {
+            .glyph => |glyph_item| {
+                const screen_y = glyph_item.y - scroll_offset;
+                if (screen_y >= 0 and screen_y < self.window_height) {
+                    var dst_rect: c.SDL_Rect = .{
+                        .x = glyph_item.x,
+                        .y = screen_y,
+                        .w = glyph_item.glyph.w,
+                        .h = glyph_item.glyph.h,
+                    };
+
+                    // Apply text color to the glyph texture
+                    _ = c.SDL_SetTextureColorMod(
+                        glyph_item.glyph.texture,
+                        glyph_item.color.r,
+                        glyph_item.color.g,
+                        glyph_item.color.b,
+                    );
+
+                    _ = c.SDL_RenderCopy(
+                        self.canvas,
+                        glyph_item.glyph.texture,
+                        null,
+                        &dst_rect,
+                    );
+                }
+            },
+            .rect => |rect_item| {
+                const top = rect_item.y1 - scroll_offset;
+                const bottom = rect_item.y2 - scroll_offset;
+                if (bottom > 0 and top < self.window_height) {
+                    const width = rect_item.x2 - rect_item.x1;
+                    const height = bottom - top;
+                    if (width > 0 and height > 0) {
+                        _ = c.SDL_SetRenderDrawColor(
+                            self.canvas,
+                            rect_item.color.r,
+                            rect_item.color.g,
+                            rect_item.color.b,
+                            rect_item.color.a,
+                        );
+
+                        var rect: c.SDL_Rect = .{
+                            .x = rect_item.x1,
+                            .y = top,
+                            .w = width,
+                            .h = height,
+                        };
+                        _ = c.SDL_RenderFillRect(self.canvas, &rect);
+                    }
+                }
+            },
+            .line => |line_item| {
+                const y1 = line_item.y1 - scroll_offset;
+                const y2 = line_item.y2 - scroll_offset;
+                _ = c.SDL_SetRenderDrawColor(
+                    self.canvas,
+                    line_item.color.r,
+                    line_item.color.g,
+                    line_item.color.b,
+                    line_item.color.a,
+                );
+                // SDL doesn't have line thickness directly, draw as rect for thickness > 1
+                if (line_item.thickness == 1) {
+                    _ = c.SDL_RenderDrawLine(self.canvas, line_item.x1, y1, line_item.x2, y2);
+                } else {
+                    // Draw thick line as rectangle
+                    const is_horizontal = (line_item.y1 == line_item.y2);
+                    if (is_horizontal) {
+                        const width: i32 = @intCast(@abs(line_item.x2 - line_item.x1));
+                        var rect: c.SDL_Rect = .{
+                            .x = @min(line_item.x1, line_item.x2),
+                            .y = y1 - @divTrunc(line_item.thickness, 2),
+                            .w = width,
+                            .h = line_item.thickness,
+                        };
+                        _ = c.SDL_RenderFillRect(self.canvas, &rect);
+                    } else {
+                        const height: i32 = @intCast(@abs(y2 - y1));
+                        var rect: c.SDL_Rect = .{
+                            .x = line_item.x1 - @divTrunc(line_item.thickness, 2),
+                            .y = @min(y1, y2),
+                            .w = line_item.thickness,
+                            .h = height,
+                        };
+                        _ = c.SDL_RenderFillRect(self.canvas, &rect);
+                    }
+                }
+            },
+            .outline => |outline_item| {
+                const r = outline_item.rect;
+                const top = r.top - scroll_offset;
+                const bottom = r.bottom - scroll_offset;
+                _ = c.SDL_SetRenderDrawColor(
+                    self.canvas,
+                    outline_item.color.r,
+                    outline_item.color.g,
+                    outline_item.color.b,
+                    outline_item.color.a,
+                );
+                // Draw four lines for the outline
+                _ = c.SDL_RenderDrawLine(self.canvas, r.left, top, r.right, top); // top
+                _ = c.SDL_RenderDrawLine(self.canvas, r.right, top, r.right, bottom); // right
+                _ = c.SDL_RenderDrawLine(self.canvas, r.right, bottom, r.left, bottom); // bottom
+                _ = c.SDL_RenderDrawLine(self.canvas, r.left, bottom, r.left, top); // left
+            },
+        }
+    }
+
+    pub fn drawScrollbar(self: *Browser, tab: *Tab) void {
+        const tab_height = self.window_height - self.chrome.bottom;
+        if (tab.content_height <= tab_height) {
             // No scrollbar needed if content fits in the window
             return;
         }
 
-        // Calculate scrollbar thumb size and position
-        const track_height = self.window_height;
-        const thumb_height: i32 = @intFromFloat(@as(f32, @floatFromInt(self.window_height)) * (@as(f32, @floatFromInt(self.window_height)) / @as(f32, @floatFromInt(self.content_height))));
-        const max_scroll = self.content_height - self.window_height;
-        const thumb_y: i32 = @intFromFloat(@as(f32, @floatFromInt(self.scroll_offset)) / @as(f32, @floatFromInt(max_scroll)) * (@as(f32, @floatFromInt(self.window_height)) - @as(f32, @floatFromInt(thumb_height))));
+        // Calculate scrollbar thumb size and position (accounting for chrome height)
+        const track_height = tab_height;
+        const thumb_height: i32 = @intFromFloat(@as(f32, @floatFromInt(tab_height)) * (@as(f32, @floatFromInt(tab_height)) / @as(f32, @floatFromInt(tab.content_height))));
+        const max_scroll = tab.content_height - tab_height;
+        const thumb_y_offset: i32 = @intFromFloat(@as(f32, @floatFromInt(tab.scroll_offset)) / @as(f32, @floatFromInt(max_scroll)) * (@as(f32, @floatFromInt(tab_height)) - @as(f32, @floatFromInt(thumb_height))));
 
-        // Draw scrollbar track (background)
+        // Draw scrollbar track (background) - start below chrome
         var track_rect: c.SDL_Rect = .{
             .x = self.window_width - scrollbar_width,
-            .y = 0,
+            .y = self.chrome.bottom,
             .w = scrollbar_width,
             .h = track_height,
         };
@@ -569,10 +1297,10 @@ pub const Browser = struct {
         _ = c.SDL_SetRenderDrawColor(self.canvas, 200, 200, 200, 255);
         _ = c.SDL_RenderFillRect(self.canvas, &track_rect);
 
-        // Draw scrollbar thumb (movable part)
+        // Draw scrollbar thumb (movable part) - offset by chrome height
         var thumb_rect: c.SDL_Rect = .{
             .x = self.window_width - scrollbar_width,
-            .y = thumb_y,
+            .y = self.chrome.bottom + thumb_y_offset,
             .w = scrollbar_width,
             .h = thumb_height,
         };
@@ -589,22 +1317,15 @@ pub const Browser = struct {
         var cache = self.cache;
         cache.free();
 
-        // Clean up any display list
-        if (self.display_list) |list| {
-            self.allocator.free(list);
-        }
+        // Clean up chrome
+        self.chrome.deinit();
 
-        // Clean up document layout tree
-        if (self.document_layout) |doc| {
-            doc.deinit();
-            self.allocator.destroy(doc);
+        // Clean up all tabs
+        for (self.tabs.items) |tab| {
+            tab.deinit();
+            self.allocator.destroy(tab);
         }
-
-        // Clean up the current HTML node tree
-        if (self.current_node) |node_val| {
-            var node = node_val;
-            Node.deinit(&node, self.allocator);
-        }
+        self.tabs.deinit(self.allocator);
 
         // Clean up default stylesheet rules
         for (self.default_style_sheet_rules) |*rule| {
