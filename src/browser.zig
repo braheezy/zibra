@@ -523,6 +523,8 @@ pub const Tab = struct {
     rules: std.ArrayList(CSSParser.CSSRule),
     // Number of default browser rules (these are borrowed, not owned)
     default_rules_count: usize = 0,
+    // CSS text buffers from external stylesheets (need to be freed)
+    css_texts: std.ArrayList([]const u8),
 
     pub fn init(allocator: std.mem.Allocator, tab_height: i32) Tab {
         return Tab{
@@ -533,6 +535,7 @@ pub const Tab = struct {
             .nodes = null,
             .rules = std.ArrayList(CSSParser.CSSRule).empty,
             .default_rules_count = 0,
+            .css_texts = std.ArrayList([]const u8).empty,
         };
     }
 
@@ -577,6 +580,12 @@ pub const Tab = struct {
             }
         }
         self.rules.deinit(self.allocator);
+
+        // Clean up CSS text buffers from external stylesheets
+        for (self.css_texts.items) |css_text| {
+            self.allocator.free(css_text);
+        }
+        self.css_texts.deinit(self.allocator);
 
         // Clean up history
         self.history.deinit(self.allocator);
@@ -1285,11 +1294,8 @@ pub const Browser = struct {
                 }
             }
 
-            // Create an arena allocator for CSS parsing
-            // All CSS string data will be allocated in this arena and freed at once
-            var css_arena = std.heap.ArenaAllocator.init(self.allocator);
-            defer css_arena.deinit();
-            const css_allocator = css_arena.allocator();
+            // Note: We use self.allocator directly for CSS parsing instead of an arena
+            // because the CSS rules need to live as long as the Tab (for re-rendering)
 
             // Load and parse external stylesheets
             var all_rules = std.ArrayList(CSSParser.CSSRule).empty;
@@ -1300,11 +1306,10 @@ pub const Browser = struct {
             defer {
                 // Only deinit rules that were allocated in this function (external stylesheets)
                 // Skip the first default_rules_count rules as they're owned by the browser
-                // Note: Property strings are in the arena, only need to free selectors
                 if (all_rules.items.len > default_rules_count) {
                     for (all_rules.items[default_rules_count..]) |*rule| {
                         var mutable_rule = rule;
-                        mutable_rule.deinit(css_allocator);
+                        mutable_rule.deinit(self.allocator);
                     }
                 }
                 all_rules.deinit(self.allocator);
@@ -1331,25 +1336,30 @@ pub const Browser = struct {
                     std.log.warn("Failed to load stylesheet {s}: {}", .{ href, err });
                     continue;
                 };
-                // Copy css_text into the arena so property strings stay alive
-                const css_text_copy = try css_allocator.dupe(u8, css_text);
-                self.allocator.free(css_text);
 
-                // Parse the stylesheet using the CSS arena allocator
-                var css_parser = try CSSParser.init(css_allocator, css_text_copy);
-                defer css_parser.deinit(css_allocator);
+                // Parse the stylesheet using self.allocator
+                // (CSS rules need to live as long as the Tab)
+                var css_parser = try CSSParser.init(self.allocator, css_text);
+                defer css_parser.deinit(self.allocator);
 
-                const parsed_rules = css_parser.parse(css_allocator) catch |err| {
+                const parsed_rules = css_parser.parse(self.allocator) catch |err| {
                     std.log.warn("Failed to parse stylesheet {s}: {}", .{ href, err });
+                    // Free css_text before continuing
+                    self.allocator.free(css_text);
                     continue;
                 };
+
+                // Store css_text so it can be freed when the Tab is destroyed
+                // (CSS rules reference strings within this text)
+                try tab.css_texts.append(self.allocator, css_text);
 
                 // Add the parsed rules to our collection
                 for (parsed_rules) |rule| {
                     try all_rules.append(self.allocator, rule);
                 }
 
-                // Note: parsed_rules slice is in the arena, will be freed automatically
+                // Free the parsed_rules slice (the rules themselves are now in all_rules)
+                self.allocator.free(parsed_rules);
             }
 
             // Sort rules by cascade priority (more specific selectors override less specific)
