@@ -110,7 +110,7 @@ fn zibra() !void {
 
     if (url) |u| {
         if (print_tree) {
-            const body = try b.fetchBody(u);
+            const body = try b.fetchBody(u, null);
             // TODO: Refactor so a hidden allocation doesn't happen. This happens
             //       fetching a body may involve an HTTP request, and we provide the browser
             //       socket map and cache and those were allocated by the Browser's allocator.

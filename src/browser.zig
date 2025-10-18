@@ -43,6 +43,27 @@ const scroll_increment = 100;
 pub const scrollbar_width = 10;
 // *********************************************************
 
+// Percent-encode a string for use in form data (application/x-www-form-urlencoded)
+// Encodes special characters as %XX where XX is the hex code
+fn percentEncode(allocator: std.mem.Allocator, input: []const u8, output: *std.ArrayList(u8)) !void {
+    for (input) |byte| {
+        // Unreserved characters (don't need encoding): A-Z a-z 0-9 - _ . ~
+        if ((byte >= 'A' and byte <= 'Z') or
+            (byte >= 'a' and byte <= 'z') or
+            (byte >= '0' and byte <= '9') or
+            byte == '-' or byte == '_' or byte == '.' or byte == '~')
+        {
+            try output.append(allocator, byte);
+        } else {
+            // Encode as %XX
+            const hex = "0123456789ABCDEF";
+            try output.append(allocator, '%');
+            try output.append(allocator, hex[byte >> 4]);
+            try output.append(allocator, hex[byte & 0x0F]);
+        }
+    }
+}
+
 // Display items are the drawing commands emitted by layout.
 pub const Color = struct {
     r: u8,
@@ -110,6 +131,10 @@ pub const Chrome = struct {
     focus: ?[]const u8 = null,
     address_bar: std.ArrayList(u8) = undefined,
     allocator: std.mem.Allocator = undefined,
+    // Cached URL string for display (owned, must be freed)
+    cached_url_str: ?[]u8 = null,
+    // Cached display list (owned, must be freed)
+    cached_display_list: ?[]DisplayItem = null,
 
     pub fn init(font_manager: *font.FontManager, window_width: i32, allocator: std.mem.Allocator) !Chrome {
         var chrome = Chrome{
@@ -181,6 +206,12 @@ pub const Chrome = struct {
 
     pub fn deinit(self: *Chrome) void {
         self.address_bar.deinit(self.allocator);
+        if (self.cached_url_str) |url_str| {
+            self.allocator.free(url_str);
+        }
+        if (self.cached_display_list) |list| {
+            self.allocator.free(list);
+        }
     }
 
     pub fn tabRect(self: *const Chrome, i: usize) Rect {
@@ -195,7 +226,16 @@ pub const Chrome = struct {
         };
     }
 
-    pub fn paint(self: *const Chrome, allocator: std.mem.Allocator, browser: *const Browser) !std.ArrayList(DisplayItem) {
+    pub fn paint(self: *Chrome, allocator: std.mem.Allocator, browser: *const Browser) !std.ArrayList(DisplayItem) {
+        // Free the old display list if it exists
+        if (self.cached_display_list) |old_list| {
+            allocator.free(old_list);
+            self.cached_display_list = null;
+        }
+
+        // Note: We don't free cached_url_str here anymore - it's managed in the URL drawing code
+        // and only freed/reallocated when the URL actually changes
+
         var cmds = std.ArrayList(DisplayItem).empty;
 
         // Draw white background for chrome
@@ -383,8 +423,31 @@ pub const Chrome = struct {
             // Draw current URL if there's an active tab
             if (browser.activeTab()) |active_tab| {
                 if (active_tab.current_url) |url| {
+                    // Get URL string into a temporary buffer
                     var url_buf: [512]u8 = undefined;
-                    const url_str = url.toString(&url_buf) catch "(invalid url)";
+                    const url_str_temp = url.toString(&url_buf) catch "(invalid url)";
+
+                    // Only allocate a new string if the URL has changed or we don't have one cached
+                    const needs_new_string = if (self.cached_url_str) |cached|
+                        !std.mem.eql(u8, cached, url_str_temp)
+                    else
+                        true;
+
+                    if (needs_new_string) {
+                        // Free old cached URL if it exists
+                        if (self.cached_url_str) |old_url| {
+                            allocator.free(old_url);
+                        }
+
+                        // Allocate new URL string on the heap
+                        const url_str = try allocator.alloc(u8, url_str_temp.len);
+                        @memcpy(url_str, url_str_temp);
+                        self.cached_url_str = url_str;
+                    }
+
+                    // Use the cached URL string (which is now stable)
+                    const url_str = self.cached_url_str.?;
+
                     const url_glyph = try browser.layout_engine.font_manager.getStyledGlyph(
                         url_str,
                         .Normal,
@@ -480,7 +543,7 @@ pub const Chrome = struct {
 
                     // Load it in the active tab
                     if (browser.activeTab()) |tab| {
-                        browser.loadInTab(tab, url) catch |err| {
+                        browser.loadInTab(tab, url, null) catch |err| {
                             std.log.err("Failed to load URL: {any}", .{err});
                         };
                     }
@@ -618,7 +681,7 @@ pub const Tab = struct {
             _ = self.history.pop().?;
             // Get previous page and load it (which will add it back to history)
             const back_url = self.history.pop().?;
-            try browser.loadInTab(self, back_url);
+            try browser.loadInTab(self, back_url, null);
             try browser.draw();
         }
     }
@@ -636,6 +699,8 @@ pub const Tab = struct {
 
     // Handle click on tab content
     pub fn click(self: *Tab, browser: *Browser, x: i32, y: i32) !void {
+        std.log.info("Tab.click at ({}, {})", .{ x, y });
+
         // Clear previous focus
         if (self.focus) |focus_node| {
             switch (focus_node.*) {
@@ -646,19 +711,22 @@ pub const Tab = struct {
         }
 
         // Hit test using the input bounds map from the layout engine
+        std.log.info("Checking {} input bounds", .{browser.layout_engine.input_bounds.count()});
         var it = browser.layout_engine.input_bounds.iterator();
         while (it.next()) |entry| {
             const node_ptr = entry.key_ptr.*;
             const bounds = entry.value_ptr.*;
 
-            // Check if click is within this input's bounds
+            // Check if click is within this element's bounds
             if (x >= bounds.x and x < bounds.x + bounds.width and
                 y >= bounds.y and y < bounds.y + bounds.height)
             {
-                // Found the clicked input - focus it
+                // Found the clicked element
                 switch (node_ptr.*) {
                     .element => |*e| {
+                        std.log.info("Clicked element: {s}", .{e.tag});
                         if (std.mem.eql(u8, e.tag, "input")) {
+                            std.log.info("Input clicked", .{});
                             // Clear the input value when focusing
                             if (e.attributes) |*attrs| {
                                 try attrs.put("value", "");
@@ -666,6 +734,11 @@ pub const Tab = struct {
                             e.is_focused = true;
                             self.focus = node_ptr;
                             break;
+                        } else if (std.mem.eql(u8, e.tag, "button")) {
+                            std.log.info("Button clicked - calling submitForm", .{});
+                            // Button clicked - submit the form
+                            try self.submitForm(browser, node_ptr);
+                            return;
                         }
                     },
                     else => {},
@@ -673,8 +746,148 @@ pub const Tab = struct {
             }
         }
 
+        std.log.info("No element clicked, re-rendering", .{});
         // Re-render to show changes
         try self.render(browser);
+    }
+
+    // Submit a form when a button is clicked
+    fn submitForm(self: *Tab, browser: *Browser, button_node: *Node) !void {
+        // IMPORTANT: We cannot traverse parent pointers here because loadInTab
+        // will free the tree, invalidating all pointers. Instead, we search
+        // the entire tree from the root to find which form contains this button.
+
+        std.log.info("submitForm called", .{});
+
+        if (self.current_node == null) {
+            std.log.warn("No current_node", .{});
+            return;
+        }
+
+        // Get all nodes in the tree
+        var node_list = std.ArrayList(*Node).empty;
+        defer node_list.deinit(self.allocator);
+        try parser.treeToList(self.allocator, &self.current_node.?, &node_list);
+
+        std.log.info("Found {} nodes in tree", .{node_list.items.len});
+
+        // Find all form elements
+        for (node_list.items) |node_ptr| {
+            switch (node_ptr.*) {
+                .element => |e| {
+                    if (std.mem.eql(u8, e.tag, "form")) {
+                        std.log.info("Found form element", .{});
+                        // Check if this form contains the button
+                        var form_nodes = std.ArrayList(*Node).empty;
+                        defer form_nodes.deinit(self.allocator);
+                        try parser.treeToList(self.allocator, node_ptr, &form_nodes);
+
+                        std.log.info("Form has {} child nodes", .{form_nodes.items.len});
+
+                        for (form_nodes.items) |form_child| {
+                            if (form_child == button_node) {
+                                std.log.info("Found button in form!", .{});
+                                // Found the form containing this button
+                                if (e.attributes) |attrs| {
+                                    if (attrs.get("action")) |action| {
+                                        std.log.info("Form action: {s}", .{action});
+                                        // Copy the action string before we free the tree
+                                        const action_copy = try self.allocator.alloc(u8, action.len);
+                                        @memcpy(action_copy, action);
+                                        defer self.allocator.free(action_copy);
+
+                                        try self.submitFormData(browser, node_ptr, action_copy);
+                                        return;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                },
+                .text => {},
+            }
+        }
+
+        std.log.warn("No form found containing button", .{});
+    }
+
+    // Collect form inputs and submit via POST
+    fn submitFormData(self: *Tab, browser: *Browser, form_node: *Node, action: []const u8) !void {
+        // Get all descendents of the form
+        var node_list = std.ArrayList(*Node).empty;
+        defer node_list.deinit(self.allocator);
+
+        try parser.treeToList(self.allocator, form_node, &node_list);
+
+        // Collect all input elements with name attributes
+        var inputs = std.ArrayList(*Node).empty;
+        defer inputs.deinit(self.allocator);
+
+        for (node_list.items) |node_ptr| {
+            switch (node_ptr.*) {
+                .element => |e| {
+                    if (std.mem.eql(u8, e.tag, "input")) {
+                        if (e.attributes) |attrs| {
+                            if (attrs.get("name")) |_| {
+                                try inputs.append(self.allocator, node_ptr);
+                            }
+                        }
+                    }
+                },
+                else => {},
+            }
+        }
+
+        // Build the form-encoded body
+        var body = std.ArrayList(u8).empty;
+        defer body.deinit(self.allocator);
+
+        for (inputs.items, 0..) |input_node, i| {
+            switch (input_node.*) {
+                .element => |e| {
+                    if (e.attributes) |attrs| {
+                        const name = attrs.get("name") orelse continue;
+                        const value = attrs.get("value") orelse "";
+
+                        // Add ampersand separator (except for first item)
+                        if (i > 0) {
+                            try body.append(self.allocator, '&');
+                        }
+
+                        // Percent-encode and append name=value
+                        try percentEncode(self.allocator, name, &body);
+                        try body.append(self.allocator, '=');
+                        try percentEncode(self.allocator, value, &body);
+                    }
+                },
+                else => {},
+            }
+        }
+
+        // Get the form body
+        const body_slice = try body.toOwnedSlice(self.allocator);
+        defer self.allocator.free(body_slice);
+
+        // Log the form submission
+        std.log.info("Form submission to {s}: {s}", .{ action, body_slice });
+
+        // For file:// URLs, we can't actually submit forms, so just log it
+        if (self.current_url) |url| {
+            if (std.mem.eql(u8, url.scheme, "file")) {
+                std.log.info("Skipping form submission for file:// URL", .{});
+                return;
+            }
+        }
+
+        // Resolve the action URL against the current page URL
+        const form_url = self.current_url.?.resolve(self.allocator, action) catch |err| {
+            std.log.warn("Failed to resolve form action URL: {}", .{err});
+            return;
+        };
+        defer form_url.free(self.allocator);
+
+        // Load the URL with the POST body
+        try browser.loadInTab(self, form_url, body_slice);
     }
 
     // Cycle focus to the next input element (for Tab key)
@@ -916,7 +1129,7 @@ pub const Browser = struct {
         try self.tabs.append(self.allocator, tab);
         self.active_tab_index = self.tabs.items.len - 1;
 
-        try self.loadInTab(tab, url);
+        try self.loadInTab(tab, url, null);
         try self.draw();
     }
 
@@ -1144,7 +1357,7 @@ pub const Browser = struct {
                                     const resolved_url = try current_url.resolve(self.allocator, href);
                                     std.debug.print("Resolved to: {s}\n", .{resolved_url.path});
                                     std.debug.print("Loading link: {s}\n", .{href});
-                                    self.loadInTab(tab, resolved_url) catch |err| {
+                                    self.loadInTab(tab, resolved_url, null) catch |err| {
                                         std.log.err("Failed to load URL {s}: {any}", .{ href, err });
                                         return;
                                     };
@@ -1176,7 +1389,7 @@ pub const Browser = struct {
     }
 
     // Update the scroll offset
-    pub fn fetchBody(self: *Browser, url: Url) ![]const u8 {
+    pub fn fetchBody(self: *Browser, url: Url, payload: ?[]const u8) ![]const u8 {
         return if (std.mem.eql(u8, url.scheme, "file"))
             try url.fileRequest(self.allocator)
         else if (std.mem.eql(u8, url.scheme, "data"))
@@ -1188,6 +1401,7 @@ pub const Browser = struct {
                 self.allocator,
                 &self.http_client,
                 &self.cache,
+                payload,
             );
     }
 
@@ -1196,6 +1410,7 @@ pub const Browser = struct {
         self: *Browser,
         tab: *Tab,
         url: Url,
+        payload: ?[]const u8,
     ) !void {
         std.log.info("Loading: {s}", .{url.path});
 
@@ -1206,7 +1421,7 @@ pub const Browser = struct {
         tab.current_url = url;
 
         // Do the request, getting back the body of the response.
-        const body = try self.fetchBody(url);
+        const body = try self.fetchBody(url, payload);
 
         // Free previous HTML source if it exists
         if (tab.current_html_source) |old_source| {
@@ -1332,7 +1547,7 @@ pub const Browser = struct {
                 defer stylesheet_url.free(self.allocator);
 
                 // Fetch the stylesheet
-                const css_text = self.fetchBody(stylesheet_url) catch |err| {
+                const css_text = self.fetchBody(stylesheet_url, null) catch |err| {
                     std.log.warn("Failed to load stylesheet {s}: {}", .{ href, err });
                     continue;
                 };
@@ -1370,8 +1585,21 @@ pub const Browser = struct {
                 }
             }.lessThan);
 
-            // Store rules in tab for re-rendering
-            // Just clear the list - we don't own the property hashmaps
+            // Clean up old CSS rules and texts before replacing them
+            // First, free the property hashmaps for external stylesheet rules (not default rules)
+            if (tab.rules.items.len > tab.default_rules_count) {
+                for (tab.rules.items[tab.default_rules_count..]) |*rule| {
+                    rule.properties.deinit();
+                }
+            }
+
+            // Free old CSS text buffers
+            for (tab.css_texts.items) |old_css_text| {
+                self.allocator.free(old_css_text);
+            }
+            tab.css_texts.clearRetainingCapacity();
+
+            // Now clear the rules list
             tab.rules.clearRetainingCapacity();
 
             // Track how many default rules we have (these are borrowed, not owned)

@@ -219,6 +219,8 @@ pub const Node = union(enum) {
             .text => unreachable,
             .element => |*e| {
                 try e.children.append(allocator, child);
+                // Note: Parent pointers are fixed after the tree is fully built
+                // to avoid issues with ArrayList reallocation invalidating pointers
             },
         }
     }
@@ -398,9 +400,10 @@ pub const HTMLParser = struct {
         const parent = &self.unfinished.items[self.unfinished.items.len - 1];
 
         // Create text node and append directly
+        // Don't pass parent pointer - let appendChild set it
         const text_node = try Text.init(
             text_slice,
-            parent,
+            null,
         );
 
         const node = Node{ .text = text_node };
@@ -566,10 +569,11 @@ pub const HTMLParser = struct {
         const parent = &self.unfinished.items[self.unfinished.items.len - 1];
 
         // Create element directly
+        // Don't pass parent pointer - let appendChild set it
         const element = try Element.init(
             self.allocator,
             tag_slice,
-            parent,
+            null,
         );
 
         const node = Node{ .element = element };
@@ -578,16 +582,12 @@ pub const HTMLParser = struct {
 
     // Handle an opening tag by creating it and adding it to the unfinished stack
     fn handleOpeningTag(self: *HTMLParser, tag_slice: []const u8, tag_name: []const u8) !void {
-        const parent: ?*Node = if (self.unfinished.items.len > 0)
-            &self.unfinished.items[self.unfinished.items.len - 1]
-        else
-            null;
-
         // Create element directly
+        // Don't pass parent pointer - it will be set when added to parent
         const element = try Element.init(
             self.allocator,
             tag_slice,
-            parent,
+            null,
         );
 
         const node = Node{ .element = element };
@@ -671,7 +671,7 @@ pub const HTMLParser = struct {
             const head_element = try Element.init(
                 self.allocator,
                 "head",
-                &self.unfinished.items[0],
+                null,
             );
             const head_node = Node{ .element = head_element };
             try self.unfinished.append(self.allocator, head_node);
@@ -684,7 +684,7 @@ pub const HTMLParser = struct {
         const body_element = try Element.init(
             self.allocator,
             "body",
-            &self.unfinished.items[0],
+            null,
         );
         const body_node = Node{ .element = body_element };
         try self.unfinished.append(self.allocator, body_node);
@@ -697,7 +697,7 @@ pub const HTMLParser = struct {
             const head_element = try Element.init(
                 self.allocator,
                 "head",
-                &self.unfinished.items[0],
+                null,
             );
             const head_node = Node{ .element = head_element };
             try self.unfinished.append(self.allocator, head_node);
@@ -721,7 +721,7 @@ pub const HTMLParser = struct {
         const body_element = try Element.init(
             self.allocator,
             "body",
-            &self.unfinished.items[0],
+            null,
         );
         const body_node = Node{ .element = body_element };
         try self.unfinished.append(self.allocator, body_node);
@@ -814,7 +814,27 @@ pub const HTMLParser = struct {
         }
 
         // Return the root node
-        return self.unfinished.pop() orelse unreachable;
+        var root = self.unfinished.pop() orelse unreachable;
+
+        // Fix all parent pointers now that the tree is stable
+        fixParentPointers(&root, null);
+
+        return root;
+    }
+
+    // Recursively fix parent pointers throughout the tree
+    fn fixParentPointers(node: *Node, parent: ?*Node) void {
+        switch (node.*) {
+            .element => |*e| {
+                e.parent = parent;
+                for (e.children.items) |*child| {
+                    fixParentPointers(child, node);
+                }
+            },
+            .text => |*t| {
+                t.parent = parent;
+            },
+        }
     }
 
     pub fn prettyPrint(self: *HTMLParser, node: Node, indent: usize) !void {

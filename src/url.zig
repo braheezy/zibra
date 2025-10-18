@@ -240,14 +240,17 @@ pub const Url = struct {
         al: std.mem.Allocator,
         http_client: *std.http.Client,
         cache: *Cache,
+        payload: ?[]const u8,
     ) ![]const u8 {
-        // Check the cache
-        if (cache.get(self.path)) |entry| {
-            const now: u64 = @intCast(std.time.milliTimestamp());
-            if (entry.max_age) |max_age| {
-                if ((now - entry.timestampe) / 1000 <= max_age) {
-                    std.log.info("Cache hit for {s}", .{self.path});
-                    return entry.body;
+        // Check the cache (only for GET requests)
+        if (payload == null) {
+            if (cache.get(self.path)) |entry| {
+                const now: u64 = @intCast(std.time.milliTimestamp());
+                if (entry.max_age) |max_age| {
+                    if ((now - entry.timestampe) / 1000 <= max_age) {
+                        std.log.info("Cache hit for {s}", .{self.path});
+                        return entry.body;
+                    }
                 }
             }
         }
@@ -261,17 +264,30 @@ pub const Url = struct {
         defer al.free(url_str);
 
         const uri = try std.Uri.parse(url_str);
-        std.log.info("Fetching: {s}", .{url_str});
+
+        const method_str = if (payload != null) "POST" else "GET";
+        std.log.info("{s} {s}", .{ method_str, url_str });
 
         // Use std.Io.Writer.Allocating to capture response body
         var allocating_writer = std.Io.Writer.Allocating.init(al);
         defer allocating_writer.deinit();
 
+        // Determine method based on whether we have a payload
+        const method: std.http.Method = if (payload != null) .POST else .GET;
+
         // Use std.http.Client.fetch - handles both HTTP and HTTPS!
+        var headers_buf: [1]std.http.Header = undefined;
+        const extra_headers = if (payload != null) blk: {
+            headers_buf[0] = .{ .name = "Content-Type", .value = "application/x-www-form-urlencoded" };
+            break :blk headers_buf[0..1];
+        } else &[_]std.http.Header{};
+
         const result = try http_client.fetch(.{
             .location = .{ .uri = uri },
-            .method = .GET,
+            .method = method,
             .response_writer = &allocating_writer.writer,
+            .payload = payload,
+            .extra_headers = extra_headers,
         });
 
         const body = try allocating_writer.toOwnedSlice();
