@@ -45,6 +45,14 @@ const WordCache = struct {
 
 const getCategory = @import("font.zig").getCategory;
 
+// Bounding box for hit testing
+pub const Bounds = struct {
+    x: i32,
+    y: i32,
+    width: i32,
+    height: i32,
+};
+
 pub const Layout = @This();
 
 // Layout state
@@ -73,6 +81,9 @@ current_display_target: *std.ArrayList(DisplayItem),
 
 // Add cache as field
 word_cache: std.AutoHashMap(u64, WordCache),
+
+// Map of input element nodes to their bounding boxes for hit testing
+input_bounds: std.AutoHashMap(*Node, Bounds),
 
 is_preformatted: bool = false,
 prev_font_category: ?FontCategory = null,
@@ -157,6 +168,7 @@ pub fn init(
         .display_list = std.ArrayList(DisplayItem).empty,
         .current_display_target = undefined,
         .word_cache = std.AutoHashMap(u64, WordCache).init(allocator),
+        .input_bounds = std.AutoHashMap(*Node, Bounds).init(allocator),
     };
 
     layout.current_display_target = &layout.display_list;
@@ -177,13 +189,15 @@ pub fn deinit(self: *Layout) void {
     }
     self.word_cache.deinit();
 
+    self.input_bounds.deinit();
+
     self.display_list.deinit(self.allocator);
     self.style_stack.deinit(self.allocator);
 
     self.allocator.destroy(self);
 }
 
-fn recurseNode(self: *Layout, node: Node, line_buffer: *std.ArrayList(LineItem)) !void {
+fn recurseNode(self: *Layout, node: Node, node_ptr: ?*Node, line_buffer: *std.ArrayList(LineItem)) !void {
     switch (node) {
         .text => |t| {
             try self.handleTextToken(t.text, line_buffer);
@@ -195,16 +209,156 @@ fn recurseNode(self: *Layout, node: Node, line_buffer: *std.ArrayList(LineItem))
             // Handle br tag for line breaks
             if (std.mem.eql(u8, e.tag, "br")) {
                 try self.flushLine(line_buffer);
-            }
-
-            for (e.children.items) |child| {
-                try self.recurseNode(child, line_buffer);
+            } else if (std.mem.eql(u8, e.tag, "input") or std.mem.eql(u8, e.tag, "button")) {
+                // Handle input and button elements - render as inline widgets
+                try self.handleInputElement(node, node_ptr, line_buffer);
+            } else {
+                for (e.children.items) |*child| {
+                    try self.recurseNode(child.*, child, line_buffer);
+                }
             }
 
             // Restore styles after closing this element
             try self.restoreNodeStyles(line_buffer);
         },
     }
+}
+
+fn handleInputElement(self: *Layout, node: Node, node_ptr: ?*Node, line_buffer: *std.ArrayList(LineItem)) !void {
+    const element = switch (node) {
+        .element => |e| e,
+        else => return,
+    };
+
+    // Get background color from style
+    var bgcolor = browser.Color{ .r = 173, .g = 216, .b = 230, .a = 255 }; // lightblue default
+    if (element.style) |style| {
+        if (style.get("background-color")) |bg| {
+            if (parseColor(bg)) |col| {
+                bgcolor = col;
+            }
+        }
+    }
+
+    // Fixed width for input elements
+    const widget_width = INPUT_WIDTH_PX;
+
+    // Check if we need to wrap to a new line
+    if (self.cursor_x + widget_width > self.line_right) {
+        try self.flushLine(line_buffer);
+        self.cursor_x = if (self.rtl_text) self.line_right else self.line_left;
+    }
+
+    // Get font metrics for sizing
+    const weight: font.FontWeight = if (self.is_bold) .Bold else .Normal;
+    const slant: font.FontSlant = if (self.is_italic) .Italic else .Roman;
+    const glyph = try self.font_manager.getStyledGlyph(
+        "X",
+        weight,
+        slant,
+        self.size,
+        false,
+    );
+
+    const widget_height = glyph.ascent + glyph.descent;
+
+    // Store bounds for hit testing if we have a node pointer
+    if (node_ptr) |ptr| {
+        try self.input_bounds.put(ptr, .{
+            .x = self.cursor_x,
+            .y = self.cursor_y,
+            .width = widget_width,
+            .height = widget_height,
+        });
+    }
+
+    // Draw the background rectangle
+    try self.current_display_target.append(self.allocator, DisplayItem{
+        .rect = .{
+            .x1 = self.cursor_x,
+            .y1 = self.cursor_y,
+            .x2 = self.cursor_x + widget_width,
+            .y2 = self.cursor_y + widget_height,
+            .color = bgcolor,
+        },
+    });
+
+    // Get the text to display
+    var text: []const u8 = "";
+    if (std.mem.eql(u8, element.tag, "input")) {
+        // For input elements, get the value attribute
+        if (element.attributes) |attrs| {
+            text = attrs.get("value") orelse "";
+        }
+    } else if (std.mem.eql(u8, element.tag, "button")) {
+        // For button elements, get text content
+        if (element.children.items.len == 1) {
+            switch (element.children.items[0]) {
+                .text => |t| {
+                    text = t.text;
+                },
+                else => {
+                    std.debug.print("Ignoring HTML contents inside button\n", .{});
+                },
+            }
+        }
+    }
+
+    // Draw the text if we have any, and track cursor position
+    var text_x = self.cursor_x + 2; // Small padding from left edge
+    const baseline_y = self.cursor_y + glyph.ascent;
+
+    if (text.len > 0) {
+        const grapheme_data = try grapheme.init(self.allocator);
+        defer grapheme_data.deinit(self.allocator);
+        var g_iter = grapheme_data.iterator(text);
+
+        while (g_iter.next()) |gc| {
+            const gme = gc.bytes(text);
+            const text_glyph = try self.font_manager.getStyledGlyph(
+                gme,
+                weight,
+                slant,
+                self.size,
+                false,
+            );
+
+            try self.current_display_target.append(self.allocator, DisplayItem{
+                .glyph = .{
+                    .x = text_x,
+                    .y = baseline_y - text_glyph.ascent,
+                    .glyph = text_glyph,
+                    .color = self.text_color,
+                },
+            });
+            text_x += text_glyph.w;
+        }
+    }
+
+    // Draw cursor if this input element is focused
+    if (element.is_focused) {
+        try self.current_display_target.append(self.allocator, DisplayItem{
+            .line = .{
+                .x1 = text_x,
+                .y1 = self.cursor_y,
+                .x2 = text_x,
+                .y2 = self.cursor_y + widget_height,
+                .color = .{ .r = 0, .g = 0, .b = 0, .a = 255 },
+                .thickness = 1,
+            },
+        });
+    }
+
+    // Flush any pending text in the line buffer before the widget
+    try self.flushLine(line_buffer);
+
+    // Advance cursor_y to account for widget height
+    const widget_bottom = self.cursor_y + widget_height;
+    const extra_leading: i32 = @intFromFloat(@as(f32, @floatFromInt(widget_height)) * 0.25);
+    self.cursor_y = widget_bottom + extra_leading;
+
+    // Reset cursor_x for next line
+    self.cursor_x = if (self.rtl_text) self.line_right else self.line_left;
 }
 
 const StyleSnapshot = struct {
@@ -721,6 +875,166 @@ pub fn layoutSourceCode(self: *Layout, source: []const u8) ![]DisplayItem {
     return try self.display_list.toOwnedSlice(self.allocator);
 }
 
+const INPUT_WIDTH_PX: i32 = 200;
+
+// Input layout for form widgets (input and button elements)
+pub const InputLayout = struct {
+    allocator: std.mem.Allocator,
+    node: Node,
+    parent: *LineLayout,
+    previous: ?*anyopaque, // Can be TextLayout or InputLayout
+    x: i32 = 0,
+    y: i32 = 0,
+    width: i32 = 0,
+    height: i32 = 0,
+    font_size: i32 = 16,
+    font_weight: FontWeight = .Normal,
+    font_slant: FontSlant = .Roman,
+    color: browser.Color = .{ .r = 0, .g = 0, .b = 0, .a = 255 },
+    bgcolor: browser.Color = .{ .r = 173, .g = 216, .b = 230, .a = 255 }, // lightblue
+    ascent: i32 = 0,
+    descent: i32 = 0,
+
+    pub fn init(
+        allocator: std.mem.Allocator,
+        node: Node,
+        parent: *LineLayout,
+        previous: ?*anyopaque,
+    ) !*InputLayout {
+        const input = try allocator.create(InputLayout);
+        input.* = InputLayout{
+            .allocator = allocator,
+            .node = node,
+            .parent = parent,
+            .previous = previous,
+        };
+        return input;
+    }
+
+    pub fn deinit(self: *InputLayout) void {
+        _ = self;
+        // Node is part of the HTML tree and managed elsewhere
+    }
+
+    pub fn layout(self: *InputLayout, engine: *Layout) !void {
+        // Fixed width for input elements
+        self.width = INPUT_WIDTH_PX;
+
+        // Get font properties from node style
+        self.font_weight = if (engine.is_bold) .Bold else .Normal;
+        self.font_slant = if (engine.is_italic) .Italic else .Roman;
+        self.font_size = engine.size;
+        self.color = engine.text_color;
+
+        // Get background color from node style
+        switch (self.node) {
+            .element => |e| {
+                if (e.style) |style| {
+                    if (style.get("background-color")) |bg| {
+                        if (parseColor(bg)) |col| {
+                            self.bgcolor = col;
+                        }
+                    }
+                }
+            },
+            else => {},
+        }
+
+        // Use a sample character to get font metrics
+        const glyph = try engine.font_manager.getStyledGlyph(
+            "X",
+            self.font_weight,
+            self.font_slant,
+            self.font_size,
+            false,
+        );
+
+        self.ascent = glyph.ascent;
+        self.descent = glyph.descent;
+        self.height = self.ascent + self.descent;
+
+        // Compute x position - similar to TextLayout but works with previous of any type
+        // For now, we'll set x to parent.x and let LineLayout position us
+        self.x = self.parent.x;
+    }
+
+    pub fn paint(self: *InputLayout, engine: *Layout) !void {
+        // Draw background rectangle
+        if (self.bgcolor.a > 0) {
+            try engine.display_list.append(engine.allocator, DisplayItem{
+                .rect = .{
+                    .x1 = self.x,
+                    .y1 = self.y,
+                    .x2 = self.x + self.width,
+                    .y2 = self.y + self.height,
+                    .color = self.bgcolor,
+                },
+            });
+        }
+
+        // Get the text to display
+        var text: []const u8 = "";
+        switch (self.node) {
+            .element => |e| {
+                if (std.mem.eql(u8, e.tag, "input")) {
+                    // For input elements, get the value attribute
+                    if (e.attributes) |attrs| {
+                        text = attrs.get("value") orelse "";
+                    }
+                } else if (std.mem.eql(u8, e.tag, "button")) {
+                    // For button elements, get text content
+                    if (e.children.items.len == 1) {
+                        switch (e.children.items[0]) {
+                            .text => |t| {
+                                text = t.text;
+                            },
+                            else => {
+                                std.debug.print("Ignoring HTML contents inside button\n", .{});
+                            },
+                        }
+                    }
+                }
+            },
+            else => {},
+        }
+
+        // Draw the text if we have any
+        if (text.len > 0) {
+            // Render each grapheme
+            const grapheme_data = try grapheme.init(engine.allocator);
+            defer grapheme_data.deinit(engine.allocator);
+            var g_iter = grapheme_data.iterator(text);
+            var text_x = self.x + 2; // Small padding from left edge
+
+            while (g_iter.next()) |gc| {
+                const gme = gc.bytes(text);
+                const glyph = try engine.font_manager.getStyledGlyph(
+                    gme,
+                    self.font_weight,
+                    self.font_slant,
+                    self.font_size,
+                    false,
+                );
+
+                try engine.display_list.append(engine.allocator, DisplayItem{
+                    .glyph = .{
+                        .x = text_x,
+                        .y = self.y,
+                        .glyph = glyph,
+                        .color = self.color,
+                    },
+                });
+                text_x += glyph.w;
+            }
+        }
+    }
+
+    pub fn shouldPaint(self: *const InputLayout) bool {
+        _ = self;
+        return true;
+    }
+};
+
 // Text layout for individual words
 pub const TextLayout = struct {
     allocator: std.mem.Allocator,
@@ -829,6 +1143,11 @@ pub const TextLayout = struct {
             },
         });
     }
+
+    pub fn shouldPaint(self: *const TextLayout) bool {
+        _ = self;
+        return true;
+    }
 };
 
 // Line layout for each line of text
@@ -919,6 +1238,11 @@ pub const LineLayout = struct {
             try text.paint(engine);
         }
     }
+
+    pub fn shouldPaint(self: *const LineLayout) bool {
+        _ = self;
+        return true;
+    }
 };
 
 pub const DocumentLayout = struct {
@@ -963,6 +1287,11 @@ pub const DocumentLayout = struct {
 
         try child.layout(engine);
         self.height = child.height;
+    }
+
+    pub fn shouldPaint(self: *const DocumentLayout) bool {
+        _ = self;
+        return true;
     }
 };
 
@@ -1031,6 +1360,11 @@ pub const BlockLayout = struct {
         switch (self.node) {
             .text => return false,
             .element => |e| {
+                // Input and button elements are always inline, even though they may have no children
+                if (std.mem.eql(u8, e.tag, "input") or std.mem.eql(u8, e.tag, "button")) {
+                    return false;
+                }
+
                 // Follow the chapter-5 heuristic: if any child is a known block
                 // element we treat this layout box as block-level. Otherwise,
                 // mixed inline content stays inline unless the element is empty,
@@ -1145,6 +1479,17 @@ pub const BlockLayout = struct {
             // Height is set by layoutInlineBlock
         }
     }
+
+    pub fn shouldPaint(self: *const BlockLayout) bool {
+        switch (self.node) {
+            .text => return true,
+            .element => |e| {
+                // Don't paint background for input/button in BlockLayout
+                // They paint themselves in InputLayout
+                return !std.mem.eql(u8, e.tag, "input") and !std.mem.eql(u8, e.tag, "button");
+            },
+        }
+    }
 };
 
 fn layoutInlineBlock(self: *Layout, block: *BlockLayout) !void {
@@ -1188,8 +1533,8 @@ fn layoutInlineBlock(self: *Layout, block: *BlockLayout) !void {
                 try self.flushLine(&line_buffer);
             }
 
-            for (e.children.items) |child| {
-                try self.recurseNode(child, &line_buffer);
+            for (e.children.items) |*child| {
+                try self.recurseNode(child.*, child, &line_buffer);
             }
 
             try self.restoreNodeStyles(&line_buffer);
@@ -1239,6 +1584,9 @@ fn parseColor(color_str: []const u8) ?browser.Color {
 }
 
 fn addBackgroundIfNeeded(self: *Layout, block: *const BlockLayout) !void {
+    // Skip painting if shouldPaint returns false
+    if (!block.shouldPaint()) return;
+
     switch (block.node) {
         .element => |e| {
             if (block.height <= 0) return;

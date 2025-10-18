@@ -50,12 +50,14 @@ const Text = struct {
     text: []const u8,
     parent: ?*Node = null,
     children: ?std.ArrayList(Node) = null,
+    is_focused: bool = false,
 
     pub fn init(text: []const u8, parent: ?*Node) !Text {
         return Text{
             .text = text,
             .parent = parent,
             .children = null,
+            .is_focused = false,
         };
     }
 };
@@ -68,6 +70,7 @@ pub const Element = struct {
     children: std.ArrayList(Node),
     // Track strings we've allocated (like resolved percentage font sizes) so we can free them
     owned_strings: ?std.ArrayList([]const u8) = null,
+    is_focused: bool = false,
 
     pub fn init(allocator: std.mem.Allocator, tag: []const u8, parent: ?*Node) !Element {
         var e = Element{
@@ -77,6 +80,7 @@ pub const Element = struct {
             .style = null,
             .children = std.ArrayList(Node).empty,
             .owned_strings = null,
+            .is_focused = false,
         };
 
         // Only parse attributes if there's a space in the tag

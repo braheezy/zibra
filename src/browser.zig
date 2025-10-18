@@ -462,6 +462,10 @@ pub const Chrome = struct {
         }
     }
 
+    pub fn blur(self: *Chrome) void {
+        self.focus = null;
+    }
+
     pub fn enter(self: *Chrome, browser: *Browser) !void {
         if (self.focus) |focus_str| {
             if (std.mem.eql(u8, focus_str, "address bar")) {
@@ -511,12 +515,24 @@ pub const Tab = struct {
     tab_height: i32 = 0,
     // History of visited URLs
     history: std.ArrayList(Url),
+    // Currently focused input element (if any)
+    focus: ?*Node = null,
+    // Cached nodes for re-rendering without reloading
+    nodes: ?Node = null,
+    // CSS rules for styling
+    rules: std.ArrayList(CSSParser.CSSRule),
+    // Number of default browser rules (these are borrowed, not owned)
+    default_rules_count: usize = 0,
 
     pub fn init(allocator: std.mem.Allocator, tab_height: i32) Tab {
         return Tab{
             .allocator = allocator,
             .tab_height = tab_height,
             .history = std.ArrayList(Url).empty,
+            .focus = null,
+            .nodes = null,
+            .rules = std.ArrayList(CSSParser.CSSRule).empty,
+            .default_rules_count = 0,
         };
     }
 
@@ -538,10 +554,29 @@ pub const Tab = struct {
             Node.deinit(&node, self.allocator);
         }
 
+        // Clean up cached nodes if different from current_node
+        if (self.nodes) |node_val| {
+            // Only deinit if it's not the same as current_node
+            if (self.current_node == null or !std.meta.eql(node_val, self.current_node.?)) {
+                var node = node_val;
+                Node.deinit(&node, self.allocator);
+            }
+        }
+
         // Clean up the current HTML source
         if (self.current_html_source) |source| {
             self.allocator.free(source);
         }
+
+        // Clean up CSS rules
+        // First N rules (default_rules_count) are borrowed from Browser - don't free their properties
+        // Remaining rules are from external stylesheets - need to free their property hashmaps
+        if (self.rules.items.len > self.default_rules_count) {
+            for (self.rules.items[self.default_rules_count..]) |*rule| {
+                rule.properties.deinit();
+            }
+        }
+        self.rules.deinit(self.allocator);
 
         // Clean up history
         self.history.deinit(self.allocator);
@@ -578,6 +613,186 @@ pub const Tab = struct {
             try browser.draw();
         }
     }
+
+    // Re-render the page without reloading (style, layout, paint)
+    pub fn render(self: *Tab, browser: *Browser) !void {
+        if (self.current_node == null) return;
+
+        // Re-apply styles with current rules
+        try parser.style(browser.allocator, &self.current_node.?, self.rules.items);
+
+        // Re-layout and paint
+        try browser.layoutTabNodes(self);
+    }
+
+    // Handle click on tab content
+    pub fn click(self: *Tab, browser: *Browser, x: i32, y: i32) !void {
+        // Clear previous focus
+        if (self.focus) |focus_node| {
+            switch (focus_node.*) {
+                .element => |*e| e.is_focused = false,
+                else => {},
+            }
+            self.focus = null;
+        }
+
+        // Hit test using the input bounds map from the layout engine
+        var it = browser.layout_engine.input_bounds.iterator();
+        while (it.next()) |entry| {
+            const node_ptr = entry.key_ptr.*;
+            const bounds = entry.value_ptr.*;
+
+            // Check if click is within this input's bounds
+            if (x >= bounds.x and x < bounds.x + bounds.width and
+                y >= bounds.y and y < bounds.y + bounds.height)
+            {
+                // Found the clicked input - focus it
+                switch (node_ptr.*) {
+                    .element => |*e| {
+                        if (std.mem.eql(u8, e.tag, "input")) {
+                            // Clear the input value when focusing
+                            if (e.attributes) |*attrs| {
+                                try attrs.put("value", "");
+                            }
+                            e.is_focused = true;
+                            self.focus = node_ptr;
+                            break;
+                        }
+                    },
+                    else => {},
+                }
+            }
+        }
+
+        // Re-render to show changes
+        try self.render(browser);
+    }
+
+    // Cycle focus to the next input element (for Tab key)
+    pub fn cycleFocus(self: *Tab, browser: *Browser) !void {
+        // Find all input elements
+        const root_node = self.current_node orelse return;
+
+        var node_list = std.ArrayList(*Node).empty;
+        defer node_list.deinit(self.allocator);
+
+        var root_mut = root_node;
+        try parser.treeToList(self.allocator, &root_mut, &node_list);
+
+        // Collect all input elements
+        var input_elements = std.ArrayList(*Node).empty;
+        defer input_elements.deinit(self.allocator);
+
+        for (node_list.items) |node_ptr| {
+            switch (node_ptr.*) {
+                .element => |e| {
+                    if (std.mem.eql(u8, e.tag, "input")) {
+                        try input_elements.append(self.allocator, node_ptr);
+                    }
+                },
+                else => {},
+            }
+        }
+
+        if (input_elements.items.len == 0) return;
+
+        // Clear current focus
+        if (self.focus) |focus_node| {
+            switch (focus_node.*) {
+                .element => |*e| e.is_focused = false,
+                else => {},
+            }
+        }
+
+        // Find next input to focus
+        var next_index: usize = 0;
+        if (self.focus) |current_focus| {
+            for (input_elements.items, 0..) |elem, i| {
+                if (elem == current_focus) {
+                    next_index = (i + 1) % input_elements.items.len;
+                    break;
+                }
+            }
+        }
+
+        // Focus the next input element
+        const to_focus = input_elements.items[next_index];
+        switch (to_focus.*) {
+            .element => |*e| e.is_focused = true,
+            else => {},
+        }
+        self.focus = to_focus;
+
+        // Re-render to show changes
+        try self.render(browser);
+    }
+
+    // Clear focus (for Escape key)
+    pub fn clearFocus(self: *Tab, browser: *Browser) !void {
+        if (self.focus) |focus_node| {
+            switch (focus_node.*) {
+                .element => |*e| e.is_focused = false,
+                else => {},
+            }
+            self.focus = null;
+            try self.render(browser);
+        }
+    }
+
+    // Handle keypress in focused input
+    pub fn keypress(self: *Tab, browser: *Browser, char: u8) !void {
+        if (self.focus) |focus_node| {
+            switch (focus_node.*) {
+                .element => |*e| {
+                    if (std.mem.eql(u8, e.tag, "input")) {
+                        if (e.attributes) |*attrs| {
+                            const old_value = attrs.get("value") orelse "";
+                            // Append the character
+                            var new_value = try self.allocator.alloc(u8, old_value.len + 1);
+                            @memcpy(new_value[0..old_value.len], old_value);
+                            new_value[old_value.len] = char;
+                            try attrs.put("value", new_value);
+                            // Track this allocation so we can free it later
+                            if (e.owned_strings == null) {
+                                e.owned_strings = std.ArrayList([]const u8).empty;
+                            }
+                            try e.owned_strings.?.append(self.allocator, new_value);
+                        }
+                        try self.render(browser);
+                    }
+                },
+                else => {},
+            }
+        }
+    }
+
+    // Handle backspace in focused input
+    pub fn backspace(self: *Tab, browser: *Browser) !void {
+        if (self.focus) |focus_node| {
+            switch (focus_node.*) {
+                .element => |*e| {
+                    if (std.mem.eql(u8, e.tag, "input")) {
+                        if (e.attributes) |*attrs| {
+                            const old_value = attrs.get("value") orelse "";
+                            if (old_value.len > 0) {
+                                // Remove the last character
+                                const new_value = try self.allocator.alloc(u8, old_value.len - 1);
+                                @memcpy(new_value, old_value[0 .. old_value.len - 1]);
+                                try attrs.put("value", new_value);
+                                // Track this allocation
+                                if (e.owned_strings == null) {
+                                    e.owned_strings = std.ArrayList([]const u8).empty;
+                                }
+                                try e.owned_strings.?.append(self.allocator, new_value);
+                            }
+                            try self.render(browser);
+                        }
+                    }
+                },
+                else => {},
+            }
+        }
+    }
 };
 
 // Browser manages the window and tabs
@@ -604,6 +819,8 @@ pub const Browser = struct {
     active_tab_index: ?usize = null,
     // Browser chrome (UI)
     chrome: Chrome = undefined,
+    // Focus tracking: null means nothing focused, "content" means page content
+    focus: ?[]const u8 = null,
 
     // Create a new Browser instance
     pub fn init(al: std.mem.Allocator, rtl_flag: bool) !Browser {
@@ -626,7 +843,7 @@ pub const Browser = struct {
             c.SDL_WINDOWPOS_UNDEFINED,
             initial_window_width,
             initial_window_height,
-            window_flags | c.SDL_WINDOW_RESIZABLE,
+            window_flags,
         ) orelse
             {
                 c.SDL_Log("Unable to create window: %s", c.SDL_GetError());
@@ -709,11 +926,20 @@ pub const Browser = struct {
                         try self.handleKeyEvent(event.key.keysym.sym);
                     },
                     c.SDL_TEXTINPUT => {
-                        // Handle text input for address bar
+                        // Handle text input
                         const text = std.mem.sliceTo(&event.text.text, 0);
                         for (text) |char| {
                             if (char >= 0x20 and char < 0x7f) {
+                                // Try chrome first
                                 try self.chrome.keypress(char);
+                                // If focus is on content, send to active tab
+                                if (self.focus) |focus_str| {
+                                    if (std.mem.eql(u8, focus_str, "content")) {
+                                        if (self.activeTab()) |tab| {
+                                            try tab.keypress(self, char);
+                                        }
+                                    }
+                                }
                             }
                         }
                         try self.draw();
@@ -780,9 +1006,44 @@ pub const Browser = struct {
     }
 
     fn handleKeyEvent(self: *Browser, key: c.SDL_Keycode) !void {
+        // Handle Tab key to cycle through input elements
+        if (key == c.SDLK_TAB) {
+            if (self.focus) |focus_str| {
+                if (std.mem.eql(u8, focus_str, "content")) {
+                    if (self.activeTab()) |tab| {
+                        try tab.cycleFocus(self);
+                    }
+                }
+            }
+            return;
+        }
+
+        // Handle Escape key to clear focus
+        if (key == c.SDLK_ESCAPE) {
+            if (self.focus) |focus_str| {
+                if (std.mem.eql(u8, focus_str, "content")) {
+                    if (self.activeTab()) |tab| {
+                        try tab.clearFocus(self);
+                    }
+                    // Also clear browser focus
+                    self.focus = null;
+                }
+            }
+            try self.draw();
+            return;
+        }
+
         // Handle Backspace key
         if (key == c.SDLK_BACKSPACE) {
             self.chrome.backspace();
+            // Also send to tab if content is focused
+            if (self.focus) |focus_str| {
+                if (std.mem.eql(u8, focus_str, "content")) {
+                    if (self.activeTab()) |tab| {
+                        try tab.backspace(self);
+                    }
+                }
+            }
             try self.draw();
             return;
         }
@@ -816,12 +1077,16 @@ pub const Browser = struct {
 
         // Check if click is in chrome area
         if (screen_y < self.chrome.bottom) {
+            self.focus = null;
             try self.chrome.click(self, screen_x, screen_y);
             try self.draw();
             return;
         }
 
-        // Click is in tab content area
+        // Click is in tab content area - set focus and blur chrome
+        self.focus = "content";
+        self.chrome.blur();
+
         const tab = self.activeTab() orelse return;
         const tab_y = screen_y - self.chrome.bottom;
 
@@ -896,7 +1161,9 @@ pub const Browser = struct {
         }
 
         std.debug.print("No links found to click\n", .{});
-        // TODO: Implement proper hit testing when layout tree is complete
+
+        // Handle input element clicks
+        try tab.click(self, page_x, page_y);
     }
 
     // Update the scroll offset
@@ -1093,8 +1360,20 @@ pub const Browser = struct {
                 }
             }.lessThan);
 
+            // Store rules in tab for re-rendering
+            // Just clear the list - we don't own the property hashmaps
+            tab.rules.clearRetainingCapacity();
+
+            // Track how many default rules we have (these are borrowed, not owned)
+            tab.default_rules_count = default_rules_count;
+
+            // Copy all rules to tab (first N are borrowed, rest are owned)
+            for (all_rules.items) |rule| {
+                try tab.rules.append(self.allocator, rule);
+            }
+
             // Apply all stylesheet rules and inline styles (sorted by cascade order)
-            try parser.style(self.allocator, &tab.current_node.?, all_rules.items);
+            try parser.style(self.allocator, &tab.current_node.?, tab.rules.items);
 
             // Layout using the HTML node tree
             try self.layoutTabNodes(tab);
