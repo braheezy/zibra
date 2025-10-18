@@ -39,6 +39,14 @@ pub fn build(b: *std.Build) !void {
     const ada_dep = b.dependency("adazig", .{});
     source_module.addImport("ada", ada_dep.module("ada"));
 
+    const kiesel_dep = b.dependency("kiesel", .{
+        .target = target,
+        .optimize = optimize,
+        .@"enable-temporal" = false,
+        .@"enable-intl" = false,
+    });
+    source_module.addImport("kiesel", kiesel_dep.module("kiesel"));
+
     const run_cmd = b.addRunArtifact(exe);
     run_cmd.step.dependOn(b.getInstallStep());
 

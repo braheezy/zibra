@@ -4,6 +4,7 @@ const builtin = @import("builtin");
 const sdl = @import("sdl.zig");
 const c = sdl.c;
 
+const js = @import("js.zig");
 const browser = @import("browser.zig");
 const Browser = browser.Browser;
 const Url = @import("url.zig").Url;
@@ -21,7 +22,7 @@ fn dbgln(comptime fmt: []const u8) void {
 
 const default_html = @embedFile("default.html");
 
-pub fn main() void {
+pub fn main() !void {
     // Catch and print errors to prevent ugly stack traces.
     zibra() catch |err| {
         std.log.err("Error: {any}", .{err});
@@ -45,6 +46,15 @@ fn zibra() !void {
             std.process.exit(1);
         }
     };
+
+    // Test JS engine (disabled - now integrated into browser)
+    // const js_exec = try js.init(allocator);
+    // defer js_exec.deinit(allocator);
+    // const source_text =
+    //     \\Array(16).join("wat" - 1) + " Batman!"
+    // ;
+    // const result = try js_exec.evaluate(source_text);
+    // std.debug.print("Result: {f}\n", .{result.fmtPretty()});
 
     // Read arguments
     const args = try std.process.argsAlloc(allocator);

@@ -15,6 +15,9 @@
             .url = "git+https://github.com/ziglibs/known-folders#ab5cf5feb936fa3b72c95d3ad0c0c67791937ba1",
             .hash = "known_folders-0.0.0-Fy-PJtTTAADUOhGKM0sxzG4eMkNQxRvx9e5dfHVyaeA3",
         },
+        .kiesel = .{
+            .path = "kiesel",
+        },
     },
     .fingerprint = 0x5f81e20e918f49dc,
     .paths = .{

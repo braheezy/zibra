@@ -197,16 +197,24 @@ pub const Url = struct {
             // Build the resolved path
             try resolved_url.appendSlice(allocator, self.scheme);
             try resolved_url.appendSlice(allocator, "://");
-            try resolved_url.appendSlice(allocator, self.host.?);
-            if (self.port != 80 and self.port != 443) {
-                try resolved_url.append(allocator, ':');
-                const port_str = try std.fmt.allocPrint(allocator, "{d}", .{self.port});
-                defer allocator.free(port_str);
-                try resolved_url.appendSlice(allocator, port_str);
+
+            // For file:// URLs, there's no host
+            if (std.mem.eql(u8, self.scheme, "file")) {
+                try resolved_url.appendSlice(allocator, working_dir[0..working_dir_len]);
+                try resolved_url.append(allocator, '/');
+                try resolved_url.appendSlice(allocator, remaining_url);
+            } else {
+                try resolved_url.appendSlice(allocator, self.host.?);
+                if (self.port != 80 and self.port != 443) {
+                    try resolved_url.append(allocator, ':');
+                    const port_str = try std.fmt.allocPrint(allocator, "{d}", .{self.port});
+                    defer allocator.free(port_str);
+                    try resolved_url.appendSlice(allocator, port_str);
+                }
+                try resolved_url.appendSlice(allocator, working_dir[0..working_dir_len]);
+                try resolved_url.append(allocator, '/');
+                try resolved_url.appendSlice(allocator, remaining_url);
             }
-            try resolved_url.appendSlice(allocator, working_dir[0..working_dir_len]);
-            try resolved_url.append(allocator, '/');
-            try resolved_url.appendSlice(allocator, remaining_url);
 
             return try Url.init(allocator, resolved_url.items);
         }
@@ -214,14 +222,20 @@ pub const Url = struct {
         // It's host-relative (starts with "/")
         try resolved_url.appendSlice(allocator, self.scheme);
         try resolved_url.appendSlice(allocator, "://");
-        try resolved_url.appendSlice(allocator, self.host.?);
-        if (self.port != 80 and self.port != 443) {
-            try resolved_url.append(allocator, ':');
-            const port_str = try std.fmt.allocPrint(allocator, "{d}", .{self.port});
-            defer allocator.free(port_str);
-            try resolved_url.appendSlice(allocator, port_str);
+
+        // For file:// URLs, there's no host
+        if (std.mem.eql(u8, self.scheme, "file")) {
+            try resolved_url.appendSlice(allocator, relative_url);
+        } else {
+            try resolved_url.appendSlice(allocator, self.host.?);
+            if (self.port != 80 and self.port != 443) {
+                try resolved_url.append(allocator, ':');
+                const port_str = try std.fmt.allocPrint(allocator, "{d}", .{self.port});
+                defer allocator.free(port_str);
+                try resolved_url.appendSlice(allocator, port_str);
+            }
+            try resolved_url.appendSlice(allocator, relative_url);
         }
-        try resolved_url.appendSlice(allocator, relative_url);
 
         return try Url.init(allocator, resolved_url.items);
     }

@@ -20,6 +20,7 @@ const Node = parser.Node;
 const CSSParser = @import("cssParser.zig").CSSParser;
 const sdl = @import("sdl.zig");
 const c = sdl.c;
+const js_module = @import("js.zig");
 
 const dbg = std.debug.print;
 
@@ -588,6 +589,8 @@ pub const Tab = struct {
     default_rules_count: usize = 0,
     // CSS text buffers from external stylesheets (need to be freed)
     css_texts: std.ArrayList([]const u8),
+    // Dynamically allocated text strings (e.g., from JavaScript results) that need to be freed
+    dynamic_texts: std.ArrayList([]const u8),
 
     pub fn init(allocator: std.mem.Allocator, tab_height: i32) Tab {
         return Tab{
@@ -599,6 +602,7 @@ pub const Tab = struct {
             .rules = std.ArrayList(CSSParser.CSSRule).empty,
             .default_rules_count = 0,
             .css_texts = std.ArrayList([]const u8).empty,
+            .dynamic_texts = std.ArrayList([]const u8).empty,
         };
     }
 
@@ -649,6 +653,12 @@ pub const Tab = struct {
             self.allocator.free(css_text);
         }
         self.css_texts.deinit(self.allocator);
+
+        // Clean up dynamically allocated text strings
+        for (self.dynamic_texts.items) |text| {
+            self.allocator.free(text);
+        }
+        self.dynamic_texts.deinit(self.allocator);
 
         // Clean up history
         self.history.deinit(self.allocator);
@@ -1043,6 +1053,8 @@ pub const Browser = struct {
     chrome: Chrome = undefined,
     // Focus tracking: null means nothing focused, "content" means page content
     focus: ?[]const u8 = null,
+    // JavaScript engine
+    js_engine: *js_module,
 
     // Create a new Browser instance
     pub fn init(al: std.mem.Allocator, rtl_flag: bool) !Browser {
@@ -1091,6 +1103,10 @@ pub const Browser = struct {
             rtl_flag,
         );
 
+        // Initialize JavaScript engine
+        const js_engine = try js_module.init(al);
+        errdefer js_engine.deinit(al);
+
         return Browser{
             .allocator = al,
             .window = screen,
@@ -1101,6 +1117,7 @@ pub const Browser = struct {
             .default_style_sheet_rules = default_rules,
             .tabs = std.ArrayList(*Tab).empty,
             .chrome = try Chrome.init(&layout_engine.font_manager, initial_window_width, al),
+            .js_engine = js_engine,
         };
     }
 
@@ -1472,10 +1489,115 @@ pub const Browser = struct {
                 tab.current_html_source = body;
             }
 
-            // Find all linked stylesheets
+            // Find all scripts and stylesheets
             var node_list = std.ArrayList(*parser.Node).empty;
             defer node_list.deinit(self.allocator);
             try parser.treeToList(self.allocator, &tab.current_node.?, &node_list);
+
+            // Collect script URLs from <script src="..."> elements
+            var script_urls = std.ArrayList([]const u8).empty;
+            defer {
+                for (script_urls.items) |src| {
+                    self.allocator.free(src);
+                }
+                script_urls.deinit(self.allocator);
+            }
+
+            for (node_list.items) |node| {
+                switch (node.*) {
+                    .element => |e| {
+                        if (std.mem.eql(u8, e.tag, "script")) {
+                            if (e.attributes) |attrs| {
+                                if (attrs.get("src")) |src| {
+                                    // Copy the src string for later use
+                                    const src_copy = try self.allocator.alloc(u8, src.len);
+                                    @memcpy(src_copy, src);
+                                    try script_urls.append(self.allocator, src_copy);
+                                }
+                            }
+                        }
+                    },
+                    .text => {},
+                }
+            }
+
+            // Load and execute each script
+            for (script_urls.items) |src| {
+                std.log.info("Loading script: {s}", .{src});
+
+                // Resolve relative URL against the current page URL
+                const script_url = url.resolve(self.allocator, src) catch |err| {
+                    std.log.warn("Failed to resolve script URL {s}: {}", .{ src, err });
+                    continue;
+                };
+                defer script_url.free(self.allocator);
+
+                // Fetch the script
+                const script_body = self.fetchBody(script_url, null) catch |err| {
+                    std.log.warn("Failed to load script {s}: {}", .{ src, err });
+                    continue;
+                };
+
+                // Only free if it's not a static string (data: and about: return static/borrowed strings)
+                const should_free = !std.mem.eql(u8, script_url.scheme, "data") and
+                    !std.mem.eql(u8, script_url.scheme, "about");
+                defer if (should_free) self.allocator.free(script_body);
+
+                // Execute the script
+                std.log.info("========== Executing script ==========", .{});
+                const result = self.js_engine.evaluate(script_body) catch |err| {
+                    std.log.err("Script {s} crashed: {}", .{ src, err });
+                    continue;
+                };
+
+                // Format result to a stack buffer for logging
+                var result_buf: [4096]u8 = undefined;
+                const result_str = js_module.formatValue(result, &result_buf) catch |err| {
+                    std.log.err("Failed to format script result: {}", .{err});
+                    continue;
+                };
+
+                std.log.info("Script result: {s}", .{result_str});
+                std.log.info("======================================", .{});
+
+                // Only inject non-undefined results into the DOM
+                if (!std.mem.eql(u8, result_str, "undefined")) {
+                    // Inject the result into the DOM as a text node in the body
+                    // We need to allocate the string so it can be owned by the DOM tree
+                    const result_text = try self.allocator.alloc(u8, result_str.len);
+                    @memcpy(result_text, result_str);
+                    // Track this allocation so it can be freed later
+                    try tab.dynamic_texts.append(self.allocator, result_text);
+
+                    // Find the body element
+                    var body_node: ?*Node = null;
+                    for (node_list.items) |node| {
+                        switch (node.*) {
+                            .element => |e| {
+                                if (std.mem.eql(u8, e.tag, "body")) {
+                                    body_node = node;
+                                    break;
+                                }
+                            },
+                            .text => {},
+                        }
+                    }
+
+                    if (body_node) |body_elem| {
+                        // Create a text node with the result
+                        const text_node = Node{ .text = .{
+                            .text = result_text,
+                            .parent = body_elem,
+                        } };
+
+                        // Append it to the body
+                        try body_elem.appendChild(self.allocator, text_node);
+                    } else {
+                        // If we couldn't find the body, free the allocated text
+                        self.allocator.free(result_text);
+                    }
+                }
+            }
 
             // Collect stylesheet URLs from <link rel="stylesheet" href="..."> elements
             var stylesheet_urls = std.ArrayList([]const u8).empty;
@@ -1846,13 +1968,15 @@ pub const Browser = struct {
 
         // Clean up default stylesheet rules
         for (self.default_style_sheet_rules) |*rule| {
-            var mutable_rule = rule;
-            mutable_rule.deinit(self.allocator);
+            rule.deinit(self.allocator);
         }
         self.allocator.free(self.default_style_sheet_rules);
 
         // clean up layout
         self.layout_engine.deinit();
+
+        // Clean up JavaScript engine
+        self.js_engine.deinit(self.allocator);
 
         c.SDL_DestroyRenderer(self.canvas);
         c.SDL_DestroyWindow(self.window);
