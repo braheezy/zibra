@@ -621,7 +621,7 @@ pub const Tab = struct {
         // Clean up the current HTML node tree
         if (self.current_node) |node_val| {
             var node = node_val;
-            Node.deinit(&node, self.allocator);
+            node.deinit(self.allocator);
         }
 
         // Clean up cached nodes if different from current_node
@@ -1483,11 +1483,19 @@ pub const Browser = struct {
             // Parse the HTML and store the root node
             tab.current_node = try html_parser.parse();
 
+            // IMPORTANT: Fix parent pointers after copying the tree
+            // The parse() method returns the tree by value, which copies it,
+            // but the parent pointers still point to the old locations
+            parser.fixParentPointers(&tab.current_node.?, null);
+
             // Store the HTML source (it contains slices used by the tree)
             // Only store if it's not an about: URL (those return static strings)
             if (!std.mem.eql(u8, url.scheme, "about")) {
                 tab.current_html_source = body;
             }
+
+            // Update the JS engine with the current nodes for DOM API
+            self.js_engine.setNodes(&tab.current_node.?);
 
             // Find all scripts and stylesheets
             var node_list = std.ArrayList(*parser.Node).empty;
@@ -1592,6 +1600,15 @@ pub const Browser = struct {
 
                         // Append it to the body
                         try body_elem.appendChild(self.allocator, text_node);
+
+                        // IMPORTANT: Fix parent pointers after modifying the tree
+                        // ArrayList reallocation can invalidate existing parent pointers
+                        parser.fixParentPointers(&tab.current_node.?, null);
+
+                        // IMPORTANT: Recreate node_list after modifying the tree
+                        // The old node_list contains stale pointers after appendChild
+                        node_list.clearRetainingCapacity();
+                        try parser.treeToList(self.allocator, &tab.current_node.?, &node_list);
                     } else {
                         // If we couldn't find the body, free the allocated text
                         self.allocator.free(result_text);

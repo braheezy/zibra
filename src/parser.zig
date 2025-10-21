@@ -269,6 +269,21 @@ pub const Node = union(enum) {
     }
 };
 
+// Public function to fix parent pointers after modifying the tree
+pub fn fixParentPointers(node: *Node, parent: ?*Node) void {
+    switch (node.*) {
+        .element => |*e| {
+            e.parent = parent;
+            for (e.children.items) |*child| {
+                fixParentPointers(child, node);
+            }
+        },
+        .text => |*t| {
+            t.parent = parent;
+        },
+    }
+}
+
 pub const HTMLParser = struct {
     body: []const u8,
     unfinished: std.ArrayList(Node) = undefined,
@@ -820,21 +835,6 @@ pub const HTMLParser = struct {
         fixParentPointers(&root, null);
 
         return root;
-    }
-
-    // Recursively fix parent pointers throughout the tree
-    fn fixParentPointers(node: *Node, parent: ?*Node) void {
-        switch (node.*) {
-            .element => |*e| {
-                e.parent = parent;
-                for (e.children.items) |*child| {
-                    fixParentPointers(child, node);
-                }
-            },
-            .text => |*t| {
-                t.parent = parent;
-            },
-        }
     }
 
     pub fn prettyPrint(self: *HTMLParser, node: Node, indent: usize) !void {
