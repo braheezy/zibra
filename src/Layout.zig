@@ -35,6 +35,8 @@ const LineItem = struct {
     descent: i32,
     /// Color to use when rendering this glyph
     color: browser.Color,
+    /// Pointer to the DOM node that produced this glyph (if available)
+    node_ptr: ?*Node,
 };
 
 // Add this struct to cache word measurements
@@ -51,6 +53,11 @@ pub const Bounds = struct {
     y: i32,
     width: i32,
     height: i32,
+};
+
+const LinkBoundEntry = struct {
+    node: *Node,
+    bounds: Bounds,
 };
 
 pub const Layout = @This();
@@ -84,6 +91,8 @@ word_cache: std.AutoHashMap(u64, WordCache),
 
 // Map of input element nodes to their bounding boxes for hit testing
 input_bounds: std.AutoHashMap(*Node, Bounds),
+// Collected bounds for anchor elements
+link_bounds: std.ArrayList(LinkBoundEntry),
 
 is_preformatted: bool = false,
 prev_font_category: ?FontCategory = null,
@@ -169,6 +178,7 @@ pub fn init(
         .current_display_target = undefined,
         .word_cache = std.AutoHashMap(u64, WordCache).init(allocator),
         .input_bounds = std.AutoHashMap(*Node, Bounds).init(allocator),
+        .link_bounds = std.ArrayList(LinkBoundEntry).empty,
     };
 
     layout.current_display_target = &layout.display_list;
@@ -190,6 +200,7 @@ pub fn deinit(self: *Layout) void {
     self.word_cache.deinit();
 
     self.input_bounds.deinit();
+    self.link_bounds.deinit(self.allocator);
 
     self.display_list.deinit(self.allocator);
     self.style_stack.deinit(self.allocator);
@@ -200,7 +211,7 @@ pub fn deinit(self: *Layout) void {
 fn recurseNode(self: *Layout, node: Node, node_ptr: ?*Node, line_buffer: *std.ArrayList(LineItem)) !void {
     switch (node) {
         .text => |t| {
-            try self.handleTextToken(t.text, line_buffer);
+            try self.handleTextToken(t.text, line_buffer, node_ptr);
         },
         .element => |e| {
             // Apply CSS styles before processing this element
@@ -482,6 +493,10 @@ fn flushLine(self: *Layout, line_buffer: *std.ArrayList(LineItem)) !void {
             final_y = baseline - item.ascent;
         }
 
+        if (item.node_ptr) |ptr| {
+            try self.recordLinkBounds(ptr, item.x, final_y, item.glyph.w, item.glyph.h);
+        }
+
         try self.current_display_target.append(self.allocator, DisplayItem{
             .glyph = .{
                 .x = item.x,
@@ -504,6 +519,7 @@ fn processGrapheme(
     self: *Layout,
     gme: []const u8,
     line_buffer: *std.ArrayList(LineItem),
+    node_ptr: ?*Node,
     options: struct {
         force_newline: bool = false,
         is_superscript: bool = false,
@@ -605,8 +621,62 @@ fn processGrapheme(
         .ascent = glyph.ascent,
         .descent = glyph.descent,
         .color = self.text_color, // Capture color at time of adding to buffer
+        .node_ptr = node_ptr,
     });
     self.cursor_x += glyph.w;
+}
+
+fn recordLinkBounds(self: *Layout, node_ptr: *Node, x: i32, y: i32, width: i32, height: i32) !void {
+    if (width <= 0 or height <= 0) return;
+
+    var current: ?*Node = node_ptr;
+    while (current) |ptr| {
+        switch (ptr.*) {
+            .element => |*el| {
+                if (std.mem.eql(u8, el.tag, "a")) {
+                    const right = x + width;
+                    const bottom = y + height;
+
+                    var maybe_entry: ?*LinkBoundEntry = null;
+                    for (self.link_bounds.items) |*entry| {
+                        if (entry.node == ptr) {
+                            maybe_entry = entry;
+                            break;
+                        }
+                    }
+
+                    if (maybe_entry) |entry| {
+                        const existing_right = entry.bounds.x + entry.bounds.width;
+                        const existing_bottom = entry.bounds.y + entry.bounds.height;
+
+                        if (x < entry.bounds.x) entry.bounds.x = x;
+                        if (y < entry.bounds.y) entry.bounds.y = y;
+
+                        const new_right = if (right > existing_right) right else existing_right;
+                        const new_bottom = if (bottom > existing_bottom) bottom else existing_bottom;
+
+                        entry.bounds.width = new_right - entry.bounds.x;
+                        entry.bounds.height = new_bottom - entry.bounds.y;
+                    } else {
+                        try self.link_bounds.append(self.allocator, .{
+                            .node = ptr,
+                            .bounds = .{
+                                .x = x,
+                                .y = y,
+                                .width = width,
+                                .height = height,
+                            },
+                        });
+                    }
+                    return;
+                }
+                current = el.parent;
+            },
+            .text => |*txt| {
+                current = txt.parent;
+            },
+        }
+    }
 }
 
 // Update handlePreformattedText to use the common processGrapheme function
@@ -614,6 +684,7 @@ fn handlePreformattedText(
     self: *Layout,
     content: []const u8,
     line_buffer: *std.ArrayList(LineItem),
+    node_ptr: ?*Node,
 ) !void {
     // Save current font category and switch to monospace
     if (!self.is_preformatted) {
@@ -626,7 +697,7 @@ fn handlePreformattedText(
     var g_iter = grapheme_data.iterator(content);
     while (g_iter.next()) |gc| {
         const gme = gc.bytes(content);
-        try self.processGrapheme(gme, line_buffer, .{
+        try self.processGrapheme(gme, line_buffer, node_ptr, .{
             .is_superscript = self.is_superscript,
             .is_small_caps = self.is_small_caps,
         });
@@ -638,9 +709,10 @@ fn handleTextToken(
     self: *Layout,
     content: []const u8,
     line_buffer: *std.ArrayList(LineItem),
+    node_ptr: ?*Node,
 ) !void {
     if (self.is_preformatted) {
-        try self.handlePreformattedText(content, line_buffer);
+        try self.handlePreformattedText(content, line_buffer, node_ptr);
         return;
     }
 
@@ -671,7 +743,7 @@ fn handleTextToken(
                 }
 
                 // Process the entity using our common function
-                try self.processGrapheme(entity.replacement, line_buffer, .{
+                try self.processGrapheme(entity.replacement, line_buffer, node_ptr, .{
                     .is_superscript = self.is_superscript,
                     .is_small_caps = self.is_small_caps,
                 });
@@ -701,7 +773,7 @@ fn handleTextToken(
         const gme = text[i..g_end];
 
         // Process the grapheme using our common function
-        try self.processGrapheme(gme, line_buffer, .{
+        try self.processGrapheme(gme, line_buffer, node_ptr, .{
             .is_superscript = self.is_superscript,
             .is_small_caps = self.is_small_caps,
         });
@@ -787,7 +859,7 @@ pub fn layoutSourceCode(self: *Layout, source: []const u8) ![]DisplayItem {
             var g_iter = grapheme_data.iterator(source[i .. i + 1]);
             if (g_iter.next()) |gc| {
                 const gme = gc.bytes(source[i..]);
-                try self.processGrapheme(gme, &line_buffer, .{
+                try self.processGrapheme(gme, &line_buffer, null, .{
                     .is_superscript = self.is_superscript,
                     .is_small_caps = self.is_small_caps,
                 });
@@ -815,7 +887,7 @@ pub fn layoutSourceCode(self: *Layout, source: []const u8) ![]DisplayItem {
             var g_iter = grapheme_data.iterator(source[i .. i + 1]);
             if (g_iter.next()) |gc| {
                 const gme = gc.bytes(source[i..]);
-                try self.processGrapheme(gme, &line_buffer, .{
+                try self.processGrapheme(gme, &line_buffer, null, .{
                     .is_superscript = self.is_superscript,
                     .is_small_caps = self.is_small_caps,
                 });
@@ -853,7 +925,7 @@ pub fn layoutSourceCode(self: *Layout, source: []const u8) ![]DisplayItem {
         var g_iter = grapheme_data.iterator(source[i..]);
         if (g_iter.next()) |gc| {
             const gme = gc.bytes(source[i..]);
-            try self.processGrapheme(gme, &line_buffer, .{
+            try self.processGrapheme(gme, &line_buffer, null, .{
                 .is_superscript = self.is_superscript,
                 .is_small_caps = self.is_small_caps,
             });
@@ -1277,6 +1349,9 @@ pub const DocumentLayout = struct {
         self.y = v_offset;
         self.width = engine.window_width - scrollbar_width - (2 * h_offset);
 
+        engine.input_bounds.clearRetainingCapacity();
+        engine.link_bounds.clearRetainingCapacity();
+
         for (self.children.items) |child| {
             child.deinit();
             self.allocator.destroy(child);
@@ -1522,7 +1597,7 @@ fn layoutInlineBlock(self: *Layout, block: *BlockLayout) !void {
 
     switch (block.node) {
         .text => |t| {
-            try self.handleTextToken(t.text, &line_buffer);
+            try self.handleTextToken(t.text, &line_buffer, null);
         },
         .element => |e| {
             // Apply CSS styles for this block element

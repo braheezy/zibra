@@ -7,6 +7,18 @@ const StringHashMap = std.StringHashMap;
 const Cache = @import("cache.zig").Cache;
 const CacheEntry = @import("cache.zig").CacheEntry;
 
+pub const SameSiteMode = enum { none, lax };
+
+pub const CookieEntry = struct {
+    value: []u8,
+    same_site: SameSiteMode = .none,
+};
+
+pub const HttpResponse = struct {
+    body: []const u8,
+    csp_header: ?[]u8 = null,
+};
+
 const dbg = std.debug.print;
 
 fn dbgln(comptime fmt: []const u8) void {
@@ -66,7 +78,16 @@ pub const Url = struct {
         u.host = ada_url.getHost();
         u.path = ada_url.getPathname();
         u.is_https = std.mem.eql(u8, u.scheme, "https");
-        u.port = if (u.is_https) 443 else 80;
+        if (ada_url.getPort()) |port_slice| {
+            const parsed = std.fmt.parseInt(u16, port_slice, 10) catch 0;
+            if (parsed != 0) {
+                u.port = parsed;
+            } else {
+                u.port = if (u.is_https) 443 else 80;
+            }
+        } else {
+            u.port = if (u.is_https) 443 else 80;
+        }
         std.debug.print("scheme: {s}\n", .{u.scheme});
 
         if (std.mem.eql(u8, u.scheme, "view-source")) {
@@ -204,8 +225,9 @@ pub const Url = struct {
                 try resolved_url.append(allocator, '/');
                 try resolved_url.appendSlice(allocator, remaining_url);
             } else {
-                try resolved_url.appendSlice(allocator, self.host.?);
-                if (self.port != 80 and self.port != 443) {
+                const host = self.host.?;
+                try resolved_url.appendSlice(allocator, host);
+                if (!hostHasExplicitPort(host) and self.port != 80 and self.port != 443) {
                     try resolved_url.append(allocator, ':');
                     const port_str = try std.fmt.allocPrint(allocator, "{d}", .{self.port});
                     defer allocator.free(port_str);
@@ -227,8 +249,9 @@ pub const Url = struct {
         if (std.mem.eql(u8, self.scheme, "file")) {
             try resolved_url.appendSlice(allocator, relative_url);
         } else {
-            try resolved_url.appendSlice(allocator, self.host.?);
-            if (self.port != 80 and self.port != 443) {
+            const host = self.host.?;
+            try resolved_url.appendSlice(allocator, host);
+            if (!hostHasExplicitPort(host) and self.port != 80 and self.port != 443) {
                 try resolved_url.append(allocator, ':');
                 const port_str = try std.fmt.allocPrint(allocator, "{d}", .{self.port});
                 defer allocator.free(port_str);
@@ -238,6 +261,28 @@ pub const Url = struct {
         }
 
         return try Url.init(allocator, resolved_url.items);
+    }
+
+    /// Determine if two URLs share the same origin (scheme, host, and port)
+    pub fn sameOrigin(self: Url, other: Url) bool {
+        if (!std.mem.eql(u8, self.scheme, other.scheme)) return false;
+
+        const host_self_opt = self.host;
+        const host_other_opt = other.host;
+
+        if (host_self_opt) |host_self| {
+            const host_other = host_other_opt orelse return false;
+            if (!std.ascii.eqlIgnoreCase(host_self, host_other)) return false;
+        } else if (host_other_opt != null) {
+            return false;
+        }
+
+        return self.port == other.port;
+    }
+
+    fn hostHasExplicitPort(host: []const u8) bool {
+        if (std.mem.startsWith(u8, host, "[")) return false;
+        return std.mem.lastIndexOfScalar(u8, host, ':') != null;
     }
 
     // Old HTTP helper functions removed - std.http.Client handles this now
@@ -254,8 +299,10 @@ pub const Url = struct {
         al: std.mem.Allocator,
         http_client: *std.http.Client,
         cache: *Cache,
+        cookie_jar: *std.StringHashMap(CookieEntry),
+        referrer: ?Url,
         payload: ?[]const u8,
-    ) ![]const u8 {
+    ) !HttpResponse {
         // Check the cache (only for GET requests)
         if (payload == null) {
             if (cache.get(self.path)) |entry| {
@@ -263,18 +310,27 @@ pub const Url = struct {
                 if (entry.max_age) |max_age| {
                     if ((now - entry.timestampe) / 1000 <= max_age) {
                         std.log.info("Cache hit for {s}", .{self.path});
-                        return entry.body;
+                        return HttpResponse{ .body = entry.body, .csp_header = null };
                     }
                 }
             }
         }
 
         // Build full URL for std.http.Client
-        const url_str = try std.fmt.allocPrint(
-            al,
-            "{s}://{s}{s}",
-            .{ self.scheme, self.host.?, self.path },
-        );
+        var url_builder = std.ArrayList(u8).empty;
+        defer url_builder.deinit(al);
+        try url_builder.appendSlice(al, self.scheme);
+        try url_builder.appendSlice(al, "://");
+        const host_str = self.host.?;
+        try url_builder.appendSlice(al, host_str);
+        if (!hostHasExplicitPort(host_str) and self.port != 80 and self.port != 443) {
+            try url_builder.append(al, ':');
+            const port_str = try std.fmt.allocPrint(al, "{d}", .{self.port});
+            defer al.free(port_str);
+            try url_builder.appendSlice(al, port_str);
+        }
+        try url_builder.appendSlice(al, self.path);
+        const url_str = try url_builder.toOwnedSlice(al);
         defer al.free(url_str);
 
         const uri = try std.Uri.parse(url_str);
@@ -282,32 +338,218 @@ pub const Url = struct {
         const method_str = if (payload != null) "POST" else "GET";
         std.log.info("{s} {s}", .{ method_str, url_str });
 
-        // Use std.Io.Writer.Allocating to capture response body
-        var allocating_writer = std.Io.Writer.Allocating.init(al);
-        defer allocating_writer.deinit();
-
-        // Determine method based on whether we have a payload
+        // Build the outgoing header list (Content-Type + Cookie when available)
+        var header_storage: [2]std.http.Header = undefined;
+        var header_count: usize = 0;
         const method: std.http.Method = if (payload != null) .POST else .GET;
 
-        // Use std.http.Client.fetch - handles both HTTP and HTTPS!
-        var headers_buf: [1]std.http.Header = undefined;
-        const extra_headers = if (payload != null) blk: {
-            headers_buf[0] = .{ .name = "Content-Type", .value = "application/x-www-form-urlencoded" };
-            break :blk headers_buf[0..1];
-        } else &[_]std.http.Header{};
+        if (self.host) |host_slice| {
+            if (cookie_jar.get(host_slice)) |entry| {
+                var allow_cookie = true;
+                if (entry.same_site == .lax and method != .GET) {
+                    if (referrer) |ref| {
+                        if (ref.host) |ref_host| {
+                            allow_cookie = std.ascii.eqlIgnoreCase(host_slice, ref_host);
+                        } else {
+                            allow_cookie = false;
+                        }
+                    }
+                }
 
-        const result = try http_client.fetch(.{
-            .location = .{ .uri = uri },
-            .method = method,
-            .response_writer = &allocating_writer.writer,
-            .payload = payload,
-            .extra_headers = extra_headers,
-        });
+                if (allow_cookie) {
+                    header_storage[header_count] = .{
+                        .name = "Cookie",
+                        .value = entry.value,
+                    };
+                    header_count += 1;
+                }
+            }
+        }
 
-        const body = try allocating_writer.toOwnedSlice();
-        std.log.info("Received {d} bytes, status: {d}", .{ body.len, @intFromEnum(result.status) });
+        if (payload != null) {
+            header_storage[header_count] = .{
+                .name = "Content-Type",
+                .value = "application/x-www-form-urlencoded",
+            };
+            header_count += 1;
+        }
 
-        return body;
+        const extra_headers = if (header_count == 0)
+            &[_]std.http.Header{}
+        else
+            header_storage[0..header_count];
+
+        const RedirectBehavior = std.http.Client.Request.RedirectBehavior;
+        const redirect_behavior: RedirectBehavior = if (payload == null)
+            @enumFromInt(3)
+        else
+            .unhandled;
+
+        var csp_header: ?[]u8 = null;
+        var csp_header_cleanup = true;
+        defer if (csp_header_cleanup) if (csp_header) |hdr| al.free(hdr);
+
+        const max_attempts: usize = 2;
+        var attempt: usize = 0;
+        var redirect_buffer: [8 * 1024]u8 = undefined;
+
+        request_loop: while (attempt < max_attempts) : (attempt += 1) {
+            var req = try http_client.request(method, uri, .{
+                .redirect_behavior = redirect_behavior,
+                .extra_headers = extra_headers,
+            });
+            defer req.deinit();
+
+            if (payload) |body_payload| {
+                req.transfer_encoding = .{ .content_length = body_payload.len };
+                var body_writer = req.sendBody(&.{}) catch |err| {
+                    if (err == error.WriteFailed and attempt + 1 < max_attempts) {
+                        continue :request_loop;
+                    }
+                    return err;
+                };
+
+                body_writer.writer.writeAll(body_payload) catch |err| {
+                    if (err == error.WriteFailed and attempt + 1 < max_attempts) {
+                        continue :request_loop;
+                    }
+                    return err;
+                };
+
+                body_writer.end() catch |err| {
+                    if (err == error.WriteFailed and attempt + 1 < max_attempts) {
+                        continue :request_loop;
+                    }
+                    return err;
+                };
+            } else {
+                req.sendBodiless() catch |err| {
+                    if (err == error.WriteFailed and attempt + 1 < max_attempts) {
+                        continue :request_loop;
+                    }
+                    return err;
+                };
+            }
+
+            var response = req.receiveHead(redirect_buffer[0..]) catch |err| {
+                if (err == error.HttpConnectionClosing and attempt + 1 < max_attempts) {
+                    continue :request_loop;
+                }
+                return err;
+            };
+
+            if (self.host) |host_slice| {
+                const cookie_host = host_slice;
+                var header_it = response.head.iterateHeaders();
+                while (header_it.next()) |header| {
+                    if (std.ascii.eqlIgnoreCase(header.name, "set-cookie")) {
+                        var raw_value = std.mem.trim(u8, header.value, " ");
+                        var same_site_mode: SameSiteMode = .none;
+
+                        if (std.mem.indexOfScalar(u8, raw_value, ';')) |semicolon| {
+                            const attributes_slice = raw_value[semicolon + 1 ..];
+                            raw_value = std.mem.trim(u8, raw_value[0..semicolon], " ");
+
+                            var attr_iter = std.mem.tokenizeScalar(u8, attributes_slice, ';');
+                            while (attr_iter.next()) |attr_raw| {
+                                const attr_trimmed = std.mem.trim(u8, attr_raw, " ");
+                                if (attr_trimmed.len == 0) continue;
+
+                                if (std.mem.indexOfScalar(u8, attr_trimmed, '=')) |eq_index| {
+                                    const key = std.mem.trim(u8, attr_trimmed[0..eq_index], " ");
+                                    const value = std.mem.trim(u8, attr_trimmed[eq_index + 1 ..], " ");
+                                    if (std.ascii.eqlIgnoreCase(key, "samesite")) {
+                                        if (std.ascii.eqlIgnoreCase(value, "lax")) {
+                                            same_site_mode = .lax;
+                                        } else {
+                                            same_site_mode = .none;
+                                        }
+                                    }
+                                } else if (std.ascii.eqlIgnoreCase(attr_trimmed, "samesite")) {
+                                    same_site_mode = .lax;
+                                }
+                            }
+                        }
+
+                        const cookie_copy = try al.alloc(u8, raw_value.len);
+                        @memcpy(cookie_copy, raw_value);
+
+                        if (cookie_jar.getPtr(cookie_host)) |entry_ptr| {
+                            al.free(entry_ptr.value);
+                            entry_ptr.* = CookieEntry{
+                                .value = cookie_copy,
+                                .same_site = same_site_mode,
+                            };
+                        } else {
+                            const host_copy = try al.alloc(u8, cookie_host.len);
+                            @memcpy(host_copy, cookie_host);
+                            const new_entry = CookieEntry{
+                                .value = cookie_copy,
+                                .same_site = same_site_mode,
+                            };
+                            cookie_jar.put(host_copy, new_entry) catch |err| {
+                                al.free(cookie_copy);
+                                al.free(host_copy);
+                                return err;
+                            };
+                        }
+                    } else if (std.ascii.eqlIgnoreCase(header.name, "content-security-policy")) {
+                        if (csp_header) |existing| {
+                            al.free(existing);
+                        }
+                        const trimmed = std.mem.trim(u8, header.value, " ");
+                        const copy = try al.alloc(u8, trimmed.len);
+                        @memcpy(copy, trimmed);
+                        csp_header = copy;
+                    }
+                }
+            }
+
+            var allocating_writer = std.Io.Writer.Allocating.init(al);
+            defer allocating_writer.deinit();
+
+            var owned_decompress_buffer: ?[]u8 = null;
+            const decompress_buffer: []u8 = switch (response.head.content_encoding) {
+                .identity => &.{},
+                .zstd => blk: {
+                    const buf = try al.alloc(u8, std.compress.zstd.default_window_len);
+                    owned_decompress_buffer = buf;
+                    break :blk buf;
+                },
+                .deflate, .gzip => blk: {
+                    const buf = try al.alloc(u8, std.compress.flate.max_window_len);
+                    owned_decompress_buffer = buf;
+                    break :blk buf;
+                },
+                .compress => return error.UnsupportedCompressionMethod,
+            };
+            defer if (owned_decompress_buffer) |buf| al.free(buf);
+
+            var transfer_buffer: [64]u8 = undefined;
+            var decompress_state: std.http.Decompress = undefined;
+            const reader = response.readerDecompressing(&transfer_buffer, &decompress_state, decompress_buffer);
+
+            const response_writer: *std.Io.Writer = &allocating_writer.writer;
+            _ = reader.streamRemaining(response_writer) catch |err| switch (err) {
+                error.ReadFailed => return response.bodyErr().?,
+                else => |e| return e,
+            };
+
+            const body = try allocating_writer.toOwnedSlice();
+            std.log.info("Received {d} bytes, status: {d}", .{
+                body.len,
+                @intFromEnum(response.head.status),
+            });
+
+            const result = HttpResponse{
+                .body = body,
+                .csp_header = csp_header,
+            };
+            csp_header_cleanup = false;
+            return result;
+        }
+
+        unreachable;
     }
 
     pub fn fileRequest(self: Url, al: std.mem.Allocator) ![]const u8 {

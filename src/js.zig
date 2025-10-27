@@ -12,6 +12,31 @@ const Selector = @import("selector.zig").Selector;
 
 const Js = @This();
 
+pub const RenderCallbackFn = *const fn (context: ?*anyopaque) anyerror!void;
+
+const RenderCallback = struct {
+    function: ?RenderCallbackFn = null,
+    context: ?*anyopaque = null,
+};
+
+pub const XhrResult = struct {
+    data: []const u8,
+    allocator: ?std.mem.Allocator = null,
+    should_free: bool = false,
+};
+
+pub const XhrCallbackFn = *const fn (
+    context: ?*anyopaque,
+    method: []const u8,
+    url: []const u8,
+    body: ?[]const u8,
+) anyerror!XhrResult;
+
+const XhrCallback = struct {
+    function: ?XhrCallbackFn = null,
+    context: ?*anyopaque = null,
+};
+
 platform: Agent.Platform,
 agent: Agent,
 realm: *Realm,
@@ -22,6 +47,8 @@ handle_to_node: std.AutoHashMap(u32, *Node),
 next_handle: u32,
 // Reference to the current tab's nodes (borrowed, not owned)
 current_nodes: ?*Node,
+render_callback: RenderCallback,
+xhr_callback: XhrCallback,
 
 pub fn init(allocator: std.mem.Allocator) !*Js {
     const self = try allocator.create(Js);
@@ -46,6 +73,8 @@ pub fn init(allocator: std.mem.Allocator) !*Js {
     self.handle_to_node = std.AutoHashMap(u32, *Node).init(allocator);
     self.next_handle = 0;
     self.current_nodes = null;
+    self.render_callback = .{};
+    self.xhr_callback = .{};
 
     // Set up console.log
     try self.setupConsole();
@@ -137,14 +166,71 @@ pub fn evaluate(self: *Js, code: []const u8) !Value {
         \\  this.handle = handle;
         \\}
         \\
+        \\function XMLHttpRequest() {}
+        \\
+        \\XMLHttpRequest.prototype.open = function(method, url, is_async) {
+        \\  if (is_async) throw new Error("Asynchronous XHR is not supported");
+        \\  this.__method = method;
+        \\  this.__url = url;
+        \\};
+        \\
+        \\XMLHttpRequest.prototype.send = function(body) {
+        \\  var payload = body == null ? null : body.toString();
+        \\  var response = __native.xhrSend(this.__method || "GET", this.__url, payload);
+        \\  this.responseText = response;
+        \\};
+        \\
+        \\function Event(type) {
+        \\  this.type = type;
+        \\  this.do_default = true;
+        \\}
+        \\
+        \\Event.prototype.preventDefault = function() {
+        \\  this.do_default = false;
+        \\};
+        \\
+        \\var LISTENERS = {};
+        \\
+        \\Node.prototype.addEventListener = function(type, listener) {
+        \\  if (!LISTENERS[this.handle]) LISTENERS[this.handle] = {};
+        \\  var dict = LISTENERS[this.handle];
+        \\  if (!dict[type]) dict[type] = [];
+        \\  var list = dict[type];
+        \\  list.push(listener);
+        \\};
+        \\
+        \\Node.prototype.dispatchEvent = function(evt) {
+        \\  var event = typeof evt === "string" ? new Event(evt) : evt;
+        \\  var handle = this.handle;
+        \\  var list = (LISTENERS[handle] && LISTENERS[handle][event.type]) || [];
+        \\  for (var i = 0; i < list.length; i++) {
+        \\    list[i].call(this, event);
+        \\  }
+        \\  return event.do_default;
+        \\};
+        \\
         \\// Add getAttribute method to Node prototype
         \\Node.prototype.getAttribute = function(name) {
         \\  return __native.getAttribute(this.handle, name);
         \\};
         \\
-        \\// Add innerHTML method to Node prototype
-        \\Node.prototype.innerHTML = function(html) {
-        \\  return __native.innerHTML(this.handle, html);
+        \\// Add innerHTML setter to Node prototype
+        \\Object.defineProperty(Node.prototype, "innerHTML", {
+        \\  set: function(value) {
+        \\    var text = value == null ? "" : value.toString();
+        \\    __native.innerHTML(this.handle, text);
+        \\  }
+        \\});
+        \\
+        \\__native.dispatchEvent = function(handle, type) {
+        \\  return new Node(handle).dispatchEvent(new Event(type));
+        \\};
+        \\
+        \\globalThis.Event = Event;
+        \\globalThis.XMLHttpRequest = XMLHttpRequest;
+        \\
+        \\globalThis.__resetEventListeners = function() {
+        \\  LISTENERS = {};
         \\};
         \\
         \\// Wrap document.querySelectorAll to return Node objects
@@ -206,6 +292,26 @@ pub fn setNodes(self: *Js, nodes: ?*Node) void {
     self.node_to_handle.clearRetainingCapacity();
     self.handle_to_node.clearRetainingCapacity();
     self.next_handle = 0;
+    // Reset JavaScript-side listener state when the DOM changes
+    self.resetEventListenersImpl();
+    if (nodes == null) {
+        self.render_callback = .{};
+        self.xhr_callback = .{};
+    }
+}
+
+pub fn setRenderCallback(self: *Js, callback: ?RenderCallbackFn, context: ?*anyopaque) void {
+    self.render_callback = .{
+        .function = callback,
+        .context = context,
+    };
+}
+
+pub fn setXhrCallback(self: *Js, callback: ?XhrCallbackFn, context: ?*anyopaque) void {
+    self.xhr_callback = .{
+        .function = callback,
+        .context = context,
+    };
 }
 
 /// Get or create a handle for a node
@@ -228,12 +334,62 @@ fn getNode(self: *Js, handle: u32) ?*Node {
     return self.handle_to_node.get(handle);
 }
 
+fn requestRender(self: *Js) void {
+    if (self.render_callback.function) |callback| {
+        const context = self.render_callback.context orelse return;
+        callback(context) catch |err| {
+            std.log.warn("Render callback failed: {}", .{err});
+        };
+    }
+}
+
+/// Dispatch an event to the JavaScript environment for the given node
+/// Returns true if the default action was prevented.
+pub fn dispatchEvent(self: *Js, event_type: []const u8, node: *Node) !bool {
+    if (self.current_nodes == null) return false;
+
+    const handle = try self.getHandle(node);
+
+    const type_value = try kiesel.types.String.fromUtf8(&self.agent, event_type);
+    const type_js_value = Value.from(type_value);
+    const handle_value = Value.from(@as(f64, @floatFromInt(handle)));
+
+    const dispatch_key = kiesel.types.PropertyKey.from("__native");
+    const native_value = try self.realm.global_object.get(&self.agent, dispatch_key);
+    if (!native_value.isObject()) return false;
+    const native_obj = native_value.asObject();
+    const dispatch_property = kiesel.types.PropertyKey.from("dispatchEvent");
+    const dispatch_value = try native_obj.internal_methods.get(
+        &self.agent,
+        native_obj,
+        dispatch_property,
+        native_value,
+    );
+
+    if (!dispatch_value.isCallable()) return false;
+
+    const result = try dispatch_value.call(&self.agent, .undefined, &.{ handle_value, type_js_value });
+    const do_default = result.toBoolean();
+    return !do_default;
+}
+
+fn resetEventListenersImpl(self: *Js) void {
+    const reset_key = kiesel.types.PropertyKey.from("__resetEventListeners");
+    const reset_value = self.realm.global_object.get(&self.agent, reset_key) catch return;
+    if (!reset_value.isCallable()) return;
+    _ = reset_value.call(&self.agent, .undefined, &.{}) catch return;
+}
+
+fn stringToJsValue(self: *Js, text: []const u8) !Value {
+    const js_string = try kiesel.types.String.fromUtf8(&self.agent, text);
+    return Value.from(js_string);
+}
+
 /// Set up the document object with DOM API
 fn setupDocument(self: *Js) !void {
     const builtins = kiesel.builtins;
     const PropertyKey = kiesel.types.PropertyKey;
     const SafePointer = kiesel.types.SafePointer;
-
     // Store self pointer in a SafePointer for passing to builtin functions
     const self_ptr = SafePointer.make(*Js, self);
 
@@ -319,6 +475,27 @@ fn setupDocument(self: *Js) !void {
         PropertyKey.from("innerHTML"),
         .{
             .value_or_accessor = .{ .value = Value.from(inner_html_fn) },
+            .attributes = .builtin_default,
+        },
+    );
+
+    // Create xhrSend function with self pointer
+    const xhr_send_fn = try kiesel.builtins.createBuiltinFunction(
+        &self.agent,
+        .{ .function = xhrSend },
+        3,
+        "xhrSend",
+        .{
+            .realm = self.realm,
+            .additional_fields = self_ptr,
+        },
+    );
+
+    try native_obj.definePropertyDirect(
+        &self.agent,
+        PropertyKey.from("xhrSend"),
+        .{
+            .value_or_accessor = .{ .value = Value.from(xhr_send_fn) },
             .attributes = .builtin_default,
         },
     );
@@ -565,6 +742,62 @@ fn innerHTML(agent: *Agent, this_value: Value, arguments: kiesel.types.Arguments
     const html_str = try html_arg.asString().toUtf8(js_instance.allocator);
     defer js_instance.allocator.free(html_str);
 
+    var builder = std.ArrayList(u8).empty;
+    defer builder.deinit(js_instance.allocator);
+
+    try builder.appendSlice(js_instance.allocator, "<html><body>");
+    try builder.appendSlice(js_instance.allocator, html_str);
+    try builder.appendSlice(js_instance.allocator, "</body></html>");
+
+    const wrapped_html = try builder.toOwnedSlice(js_instance.allocator);
+    var wrapped_cleanup = true;
+    defer if (wrapped_cleanup) js_instance.allocator.free(wrapped_html);
+
+    var html_parser = parser.HTMLParser.init(js_instance.allocator, wrapped_html) catch |err| {
+        std.log.err("Failed to init HTML parser: {}", .{err});
+        return agent.throwException(
+            .syntax_error,
+            "Invalid HTML",
+            .{},
+        );
+    };
+    defer html_parser.deinit(js_instance.allocator);
+
+    html_parser.use_implicit_tags = false;
+
+    var parsed_node = html_parser.parse() catch |err| {
+        std.log.err("Failed to parse HTML: {}", .{err});
+        return agent.throwException(
+            .syntax_error,
+            "Invalid HTML",
+            .{},
+        );
+    };
+    defer parsed_node.deinit(js_instance.allocator);
+
+    var body_children = std.ArrayList(Node).empty;
+
+    switch (parsed_node) {
+        .element => |*html_elem| {
+            var idx: usize = 0;
+            body_search: while (idx < html_elem.children.items.len) : (idx += 1) {
+                const child = &html_elem.children.items[idx];
+                switch (child.*) {
+                    .element => |*child_elem| {
+                        if (std.mem.eql(u8, child_elem.tag, "body")) {
+                            body_children = child_elem.children;
+                            child_elem.children = std.ArrayList(Node).empty;
+                            break :body_search;
+                        }
+                    },
+                    else => {},
+                }
+            }
+        },
+        .text => {},
+    }
+    defer body_children.deinit(js_instance.allocator);
+
     // Parse the HTML and replace the node's children
     switch (node.*) {
         .element => |*e| {
@@ -574,37 +807,19 @@ fn innerHTML(agent: *Agent, this_value: Value, arguments: kiesel.types.Arguments
             }
             e.children.clearRetainingCapacity();
 
-            // Parse the new HTML
-            var html_parser = parser.HTMLParser.init(js_instance.allocator, html_str) catch |err| {
-                std.log.err("Failed to init HTML parser: {}", .{err});
-                return agent.throwException(
-                    .syntax_error,
-                    "Invalid HTML",
-                    .{},
-                );
-            };
-            defer html_parser.deinit(js_instance.allocator);
-
-            const new_node = html_parser.parse() catch |err| {
-                std.log.err("Failed to parse HTML: {}", .{err});
-                return agent.throwException(
-                    .syntax_error,
-                    "Invalid HTML",
-                    .{},
-                );
-            };
-
-            // Add the parsed content as children
-            switch (new_node) {
-                .element => |new_elem| {
-                    for (new_elem.children.items) |child| {
-                        try e.children.append(js_instance.allocator, child);
-                    }
-                },
-                .text => |new_text| {
-                    try e.children.append(js_instance.allocator, Node{ .text = new_text });
-                },
+            for (body_children.items) |child| {
+                try e.children.append(js_instance.allocator, child);
             }
+
+            if (e.owned_strings == null) {
+                e.owned_strings = std.ArrayList([]const u8).empty;
+            }
+            try e.owned_strings.?.append(js_instance.allocator, wrapped_html);
+            wrapped_cleanup = false;
+
+            parser.fixParentPointers(node, e.parent);
+
+            js_instance.requestRender();
 
             return .undefined;
         },
@@ -617,4 +832,99 @@ fn innerHTML(agent: *Agent, this_value: Value, arguments: kiesel.types.Arguments
             );
         },
     }
+}
+
+/// __native.xhrSend implementation
+fn xhrSend(agent: *Agent, this_value: Value, arguments: kiesel.types.Arguments) Agent.Error!Value {
+    _ = this_value;
+
+    const function_obj = agent.activeFunctionObject();
+    const builtin_fn = function_obj.as(kiesel.builtins.BuiltinFunction);
+    const js_instance = builtin_fn.fields.additional_fields.cast(*Js);
+
+    const callback = js_instance.xhr_callback.function orelse
+        return agent.throwException(.type_error, "XMLHttpRequest is not available", .{});
+    const callback_context = js_instance.xhr_callback.context;
+
+    const method_arg = arguments.get(0);
+    if (!method_arg.isString()) {
+        return agent.throwException(.type_error, "XMLHttpRequest method must be a string", .{});
+    }
+    const method_slice = try method_arg.asString().toUtf8(js_instance.allocator);
+    defer js_instance.allocator.free(method_slice);
+
+    const url_arg = arguments.get(1);
+    if (!url_arg.isString()) {
+        return agent.throwException(.type_error, "XMLHttpRequest URL must be a string", .{});
+    }
+    const url_slice = try url_arg.asString().toUtf8(js_instance.allocator);
+    defer js_instance.allocator.free(url_slice);
+
+    var owned_body_slice: ?[]const u8 = null;
+    if (arguments.count() >= 3) {
+        const body_arg = arguments.get(2);
+        if (!body_arg.isUndefined() and !body_arg.isNull()) {
+            if (!body_arg.isString()) {
+                return agent.throwException(.type_error, "XMLHttpRequest body must be a string", .{});
+            }
+            owned_body_slice = try body_arg.asString().toUtf8(js_instance.allocator);
+        }
+    }
+    defer if (owned_body_slice) |slice| js_instance.allocator.free(slice);
+
+    const payload = owned_body_slice;
+
+    const result = callback(callback_context, method_slice, url_slice, payload) catch |err| {
+        if (err == error.CrossOriginBlocked) {
+            return agent.throwException(.type_error, "Cross-origin XMLHttpRequest not allowed", .{});
+        }
+        if (err == error.CspViolation) {
+            return agent.throwException(.type_error, "XMLHttpRequest blocked by Content-Security-Policy", .{});
+        }
+        std.log.err("XMLHttpRequest failed: {}", .{err});
+        return agent.throwException(.type_error, "XMLHttpRequest failed", .{});
+    };
+
+    const js_string = try kiesel.types.String.fromUtf8(agent, result.data);
+
+    if (result.should_free) {
+        if (result.allocator) |alloc| {
+            alloc.free(result.data);
+        } else {
+            js_instance.allocator.free(result.data);
+        }
+    }
+
+    return Value.from(js_string);
+}
+
+/// Escape a string for safe embedding in JavaScript source
+fn quoteJsString(allocator: std.mem.Allocator, input: []const u8) ![]u8 {
+    var builder = std.ArrayList(u8).init(allocator);
+    errdefer builder.deinit();
+
+    try builder.append(allocator, '"');
+    for (input) |ch| {
+        switch (ch) {
+            '\\' => {
+                try builder.appendSlice(allocator, "\\\\");
+            },
+            '"' => {
+                try builder.appendSlice(allocator, "\\\"");
+            },
+            '\n' => {
+                try builder.appendSlice(allocator, "\\n");
+            },
+            '\r' => {
+                try builder.appendSlice(allocator, "\\r");
+            },
+            '\t' => {
+                try builder.appendSlice(allocator, "\\t");
+            },
+            else => try builder.append(allocator, ch),
+        }
+    }
+    try builder.append(allocator, '"');
+
+    return builder.toOwnedSlice();
 }

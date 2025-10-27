@@ -120,11 +120,13 @@ fn zibra() !void {
 
     if (url) |u| {
         if (print_tree) {
-            const body = try b.fetchBody(u, null);
+            const response = try b.fetchBody(u, null, null);
+            defer if (response.csp_header) |hdr| allocator.free(hdr);
+            const body = response.body;
             // TODO: Refactor so a hidden allocation doesn't happen. This happens
             //       fetching a body may involve an HTTP request, and we provide the browser
             //       socket map and cache and those were allocated by the Browser's allocator.
-            defer allocator.free(body);
+            defer if (!std.mem.eql(u8, u.scheme, "data") and !std.mem.eql(u8, u.scheme, "about")) allocator.free(body);
 
             var html_parser = try HTMLParser.init(allocator, body);
             defer html_parser.deinit(allocator);
@@ -137,6 +139,7 @@ fn zibra() !void {
         }
         // Create a new tab and load the URL
         try b.newTab(u);
+        url = null;
     } else {
         if (print_tree) {
             var html_parser = try HTMLParser.init(allocator, default_html);

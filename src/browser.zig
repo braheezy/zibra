@@ -10,7 +10,8 @@ const FontManager = font.FontManager;
 const Glyph = font.Glyph;
 const FontWeight = font.FontWeight;
 const FontSlant = font.FontSlant;
-const Url = @import("url.zig").Url;
+const url_module = @import("url.zig");
+const Url = url_module.Url;
 const Cache = @import("cache.zig").Cache;
 const ArrayList = std.ArrayList;
 const Layout = @import("Layout.zig");
@@ -423,10 +424,10 @@ pub const Chrome = struct {
         } else {
             // Draw current URL if there's an active tab
             if (browser.activeTab()) |active_tab| {
-                if (active_tab.current_url) |url| {
+                if (active_tab.current_url) |url_ptr| {
                     // Get URL string into a temporary buffer
                     var url_buf: [512]u8 = undefined;
-                    const url_str_temp = url.toString(&url_buf) catch "(invalid url)";
+                    const url_str_temp = url_ptr.*.toString(&url_buf) catch "(invalid url)";
 
                     // Only allocate a new string if the URL has changed or we don't have one cached
                     const needs_new_string = if (self.cached_url_str) |cached|
@@ -544,9 +545,22 @@ pub const Chrome = struct {
 
                     // Load it in the active tab
                     if (browser.activeTab()) |tab| {
-                        browser.loadInTab(tab, url, null) catch |err| {
-                            std.log.err("Failed to load URL: {any}", .{err});
+                        const url_ptr = browser.allocator.create(Url) catch |alloc_err| {
+                            std.log.err("Failed to allocate URL: {any}", .{alloc_err});
+                            return;
                         };
+                        url_ptr.* = url;
+                        var load_success = false;
+                        defer if (!load_success) {
+                            url_ptr.*.free(browser.allocator);
+                            browser.allocator.destroy(url_ptr);
+                        };
+
+                        browser.loadInTab(tab, url_ptr, null) catch |err| {
+                            std.log.err("Failed to load URL: {any}", .{err});
+                            return;
+                        };
+                        load_success = true;
                     }
 
                     // Clear focus
@@ -555,6 +569,11 @@ pub const Chrome = struct {
             }
         }
     }
+};
+
+const JsRenderContext = struct {
+    browser_ptr: ?*anyopaque = null,
+    tab_ptr: ?*anyopaque = null,
 };
 
 // Tab represents a single web page
@@ -574,11 +593,11 @@ pub const Tab = struct {
     // Current scroll offset
     scroll_offset: i32 = 0,
     // Current URL being displayed
-    current_url: ?Url = null,
+    current_url: ?*Url = null,
     // Available height for tab content (window height minus chrome height)
     tab_height: i32 = 0,
-    // History of visited URLs
-    history: std.ArrayList(Url),
+    // History of visited URLs (owns Url pointers)
+    history: std.ArrayList(*Url),
     // Currently focused input element (if any)
     focus: ?*Node = null,
     // Cached nodes for re-rendering without reloading
@@ -591,18 +610,25 @@ pub const Tab = struct {
     css_texts: std.ArrayList([]const u8),
     // Dynamically allocated text strings (e.g., from JavaScript results) that need to be freed
     dynamic_texts: std.ArrayList([]const u8),
+    // Context passed to the JS engine for DOM mutation callbacks
+    js_render_context: JsRenderContext = .{},
+    js_render_context_initialized: bool = false,
+    // Parsed Content-Security-Policy allowed origins (lowercase origin strings)
+    allowed_origins: ?std.ArrayList([]const u8) = null,
 
     pub fn init(allocator: std.mem.Allocator, tab_height: i32) Tab {
         return Tab{
             .allocator = allocator,
             .tab_height = tab_height,
-            .history = std.ArrayList(Url).empty,
+            .history = std.ArrayList(*Url).empty,
             .focus = null,
             .nodes = null,
             .rules = std.ArrayList(CSSParser.CSSRule).empty,
             .default_rules_count = 0,
             .css_texts = std.ArrayList([]const u8).empty,
             .dynamic_texts = std.ArrayList([]const u8).empty,
+            .js_render_context = .{},
+            .js_render_context_initialized = false,
         };
     }
 
@@ -660,8 +686,129 @@ pub const Tab = struct {
         }
         self.dynamic_texts.deinit(self.allocator);
 
+        if (self.allowed_origins) |origins| {
+            for (origins.items) |origin| {
+                self.allocator.free(origin);
+            }
+            var list = origins;
+            list.deinit(self.allocator);
+            self.allowed_origins = null;
+        }
+
         // Clean up history
+        for (self.history.items) |url_ptr| {
+            url_ptr.*.free(self.allocator);
+            self.allocator.destroy(url_ptr);
+        }
         self.history.deinit(self.allocator);
+    }
+
+    fn clearAllowedOrigins(self: *Tab) void {
+        if (self.allowed_origins) |origins| {
+            for (origins.items) |origin| {
+                self.allocator.free(origin);
+            }
+            var list = origins;
+            list.deinit(self.allocator);
+            self.allowed_origins = null;
+        }
+    }
+
+    fn allocLowercase(self: *Tab, text: []const u8) ![]const u8 {
+        const copy = try self.allocator.alloc(u8, text.len);
+        for (copy, 0..) |*ch, idx| {
+            ch.* = std.ascii.toLower(text[idx]);
+        }
+        return copy;
+    }
+
+    pub fn allowedRequest(self: *Tab, target_url: Url) bool {
+        const origins = self.allowed_origins orelse return true;
+
+        var origin_buffer: [256]u8 = undefined;
+        const host = target_url.host orelse return true;
+        const origin_str = std.fmt.bufPrint(&origin_buffer, "{s}://{s}:{d}", .{ target_url.scheme, host, target_url.port }) catch return false;
+
+        var lower_buffer: [256]u8 = undefined;
+        if (origin_str.len > lower_buffer.len) return false;
+        for (origin_str, 0..) |ch, idx| {
+            lower_buffer[idx] = std.ascii.toLower(ch);
+        }
+        const normalized = lower_buffer[0..origin_str.len];
+
+        for (origins.items) |allowed| {
+            if (allowed.len == normalized.len and std.mem.eql(u8, allowed, normalized)) {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    fn applyContentSecurityPolicy(self: *Tab, header: []const u8) !void {
+        var directives = std.mem.tokenizeScalar(u8, header, ';');
+        while (directives.next()) |directive_raw| {
+            const trimmed = std.mem.trim(u8, directive_raw, " ");
+            if (trimmed.len == 0) continue;
+
+            var tokens = std.mem.tokenizeScalar(u8, trimmed, ' ');
+            const directive_name = tokens.next() orelse continue;
+            if (!std.ascii.eqlIgnoreCase(directive_name, "default-src")) continue;
+
+            var origins_list = std.ArrayList([]const u8).empty;
+            var assigned = false;
+            errdefer {
+                if (!assigned) {
+                    for (origins_list.items) |origin| self.allocator.free(origin);
+                    origins_list.deinit(self.allocator);
+                }
+            }
+
+            while (tokens.next()) |origin_token| {
+                var trimmed_origin = std.mem.trim(u8, origin_token, " ");
+                if (trimmed_origin.len == 0) continue;
+                if (trimmed_origin[trimmed_origin.len - 1] == ';') {
+                    trimmed_origin = std.mem.trimRight(u8, trimmed_origin, ";");
+                }
+                if (trimmed_origin.len == 0) continue;
+
+                if (std.ascii.eqlIgnoreCase(trimmed_origin, "'self'") or
+                    std.ascii.eqlIgnoreCase(trimmed_origin, "self"))
+                {
+                    if (self.current_url) |current_ptr| {
+                        const host = current_ptr.*.host orelse continue;
+                        const normalized = try std.fmt.allocPrint(self.allocator, "{s}://{s}:{d}", .{
+                            current_ptr.*.scheme,
+                            host,
+                            current_ptr.*.port,
+                        });
+                        defer self.allocator.free(normalized);
+
+                        const lowered = try self.allocLowercase(normalized);
+                        try origins_list.append(self.allocator, lowered);
+                    }
+                    continue;
+                }
+
+                const origin_url = url_module.Url.init(self.allocator, trimmed_origin) catch |err| {
+                    std.log.warn("Failed to parse CSP origin {s}: {}", .{ trimmed_origin, err });
+                    continue;
+                };
+                defer origin_url.free(self.allocator);
+
+                const host = origin_url.host orelse continue;
+
+                const normalized = try std.fmt.allocPrint(self.allocator, "{s}://{s}:{d}", .{ origin_url.scheme, host, origin_url.port });
+                defer self.allocator.free(normalized);
+
+                const lowered = try self.allocLowercase(normalized);
+                try origins_list.append(self.allocator, lowered);
+            }
+
+            self.allowed_origins = origins_list;
+            assigned = true;
+            return;
+        }
     }
 
     // Scroll the tab down
@@ -688,10 +835,18 @@ pub const Tab = struct {
     pub fn goBack(self: *Tab, browser: *Browser) !void {
         if (self.history.items.len > 1) {
             // Remove current page (we already checked length > 1)
-            _ = self.history.pop().?;
+            if (self.history.pop()) |current_ptr| {
+                current_ptr.*.free(self.allocator);
+                self.allocator.destroy(current_ptr);
+                self.current_url = null;
+            }
             // Get previous page and load it (which will add it back to history)
-            const back_url = self.history.pop().?;
-            try browser.loadInTab(self, back_url, null);
+            if (self.history.pop()) |back_ptr| {
+                browser.loadInTab(self, back_ptr, null) catch |err| {
+                    try self.history.append(self.allocator, back_ptr);
+                    return err;
+                };
+            }
             try browser.draw();
         }
     }
@@ -723,6 +878,7 @@ pub const Tab = struct {
         // Hit test using the input bounds map from the layout engine
         std.log.info("Checking {} input bounds", .{browser.layout_engine.input_bounds.count()});
         var it = browser.layout_engine.input_bounds.iterator();
+        var handled = false;
         while (it.next()) |entry| {
             const node_ptr = entry.key_ptr.*;
             const bounds = entry.value_ptr.*;
@@ -737,16 +893,34 @@ pub const Tab = struct {
                         std.log.info("Clicked element: {s}", .{e.tag});
                         if (std.mem.eql(u8, e.tag, "input")) {
                             std.log.info("Input clicked", .{});
+                            const prevent_default = browser.js_engine.dispatchEvent("click", node_ptr) catch |err| blk: {
+                                std.log.warn("Failed to dispatch click event: {}", .{err});
+                                break :blk false;
+                            };
+                            if (prevent_default) {
+                                std.log.info("Default click prevented for input", .{});
+                                return;
+                            }
                             // Clear the input value when focusing
                             if (e.attributes) |*attrs| {
                                 try attrs.put("value", "");
                             }
                             e.is_focused = true;
                             self.focus = node_ptr;
+                            handled = true;
                             break;
                         } else if (std.mem.eql(u8, e.tag, "button")) {
                             std.log.info("Button clicked - calling submitForm", .{});
+                            const prevent_default = browser.js_engine.dispatchEvent("click", node_ptr) catch |err| blk: {
+                                std.log.warn("Failed to dispatch click event: {}", .{err});
+                                break :blk false;
+                            };
+                            if (prevent_default) {
+                                std.log.info("Default click prevented for button", .{});
+                                return;
+                            }
                             // Button clicked - submit the form
+                            handled = true;
                             try self.submitForm(browser, node_ptr);
                             return;
                         }
@@ -756,8 +930,10 @@ pub const Tab = struct {
             }
         }
 
-        std.log.info("No element clicked, re-rendering", .{});
-        // Re-render to show changes
+        if (!handled) {
+            std.log.info("No element clicked, re-rendering", .{});
+        }
+        // Re-render to show changes or reset focus styling
         try self.render(browser);
     }
 
@@ -797,6 +973,14 @@ pub const Tab = struct {
                         for (form_nodes.items) |form_child| {
                             if (form_child == button_node) {
                                 std.log.info("Found button in form!", .{});
+                                const prevent_default = browser.js_engine.dispatchEvent("submit", node_ptr) catch |err| blk: {
+                                    std.log.warn("Failed to dispatch submit event: {}", .{err});
+                                    break :blk false;
+                                };
+                                if (prevent_default) {
+                                    std.log.info("Default submit prevented", .{});
+                                    return;
+                                }
                                 // Found the form containing this button
                                 if (e.attributes) |attrs| {
                                     if (attrs.get("action")) |action| {
@@ -882,22 +1066,37 @@ pub const Tab = struct {
         std.log.info("Form submission to {s}: {s}", .{ action, body_slice });
 
         // For file:// URLs, we can't actually submit forms, so just log it
-        if (self.current_url) |url| {
-            if (std.mem.eql(u8, url.scheme, "file")) {
+        if (self.current_url) |url_ptr| {
+            if (std.mem.eql(u8, url_ptr.*.scheme, "file")) {
                 std.log.info("Skipping form submission for file:// URL", .{});
                 return;
             }
         }
 
         // Resolve the action URL against the current page URL
-        const form_url = self.current_url.?.resolve(self.allocator, action) catch |err| {
+        var form_url = self.current_url.?.*.resolve(self.allocator, action) catch |err| {
             std.log.warn("Failed to resolve form action URL: {}", .{err});
             return;
         };
-        defer form_url.free(self.allocator);
 
         // Load the URL with the POST body
-        try browser.loadInTab(self, form_url, body_slice);
+        const form_url_ptr = browser.allocator.create(Url) catch |alloc_err| {
+            std.log.err("Failed to allocate form URL: {any}", .{alloc_err});
+            form_url.free(self.allocator);
+            return;
+        };
+        form_url_ptr.* = form_url;
+        var load_success = false;
+        defer if (!load_success) {
+            form_url_ptr.*.free(browser.allocator);
+            browser.allocator.destroy(form_url_ptr);
+        };
+
+        browser.loadInTab(self, form_url_ptr, body_slice) catch |err| {
+            std.log.err("Failed to submit form: {any}", .{err});
+            return;
+        };
+        load_success = true;
     }
 
     // Cycle focus to the next input element (for Tab key)
@@ -974,6 +1173,14 @@ pub const Tab = struct {
     // Handle keypress in focused input
     pub fn keypress(self: *Tab, browser: *Browser, char: u8) !void {
         if (self.focus) |focus_node| {
+            const prevent_default = browser.js_engine.dispatchEvent("keydown", focus_node) catch |err| blk: {
+                std.log.warn("Failed to dispatch keydown event: {}", .{err});
+                break :blk false;
+            };
+            if (prevent_default) {
+                std.log.info("Default keydown prevented", .{});
+                return;
+            }
             switch (focus_node.*) {
                 .element => |*e| {
                     if (std.mem.eql(u8, e.tag, "input")) {
@@ -1039,6 +1246,8 @@ pub const Browser = struct {
     http_client: std.http.Client,
     // Cache for storing fetched resources
     cache: Cache,
+    // Shared cookie storage across tabs
+    cookie_jar: std.StringHashMap(url_module.CookieEntry),
     // Window dimensions
     window_width: i32 = initial_window_width,
     window_height: i32 = initial_window_height,
@@ -1113,6 +1322,7 @@ pub const Browser = struct {
             .canvas = renderer,
             .http_client = .{ .allocator = al },
             .cache = try Cache.init(al),
+            .cookie_jar = std.StringHashMap(url_module.CookieEntry).init(al),
             .layout_engine = layout_engine,
             .default_style_sheet_rules = default_rules,
             .tabs = std.ArrayList(*Tab).empty,
@@ -1146,7 +1356,16 @@ pub const Browser = struct {
         try self.tabs.append(self.allocator, tab);
         self.active_tab_index = self.tabs.items.len - 1;
 
-        try self.loadInTab(tab, url, null);
+        const url_ptr = try self.allocator.create(Url);
+        url_ptr.* = url;
+        var load_success = false;
+        defer if (!load_success) {
+            url_ptr.*.free(self.allocator);
+            self.allocator.destroy(url_ptr);
+        };
+
+        try self.loadInTab(tab, url_ptr, null);
+        load_success = true;
         try self.draw();
     }
 
@@ -1336,109 +1555,125 @@ pub const Browser = struct {
         std.debug.print("Page coordinates: ({d}, {d})\n", .{ page_x, page_y });
 
         // Only proceed if we have the HTML tree
-        const root_node = tab.current_node orelse {
+        if (tab.current_node == null) {
             std.debug.print("No current_node\n", .{});
             return;
-        };
+        }
 
-        std.debug.print("Current URL: {s}\n", .{if (tab.current_url) |url| url.path else "none"});
+        std.debug.print("Current URL: {s}\n", .{if (tab.current_url) |url_ptr| url_ptr.*.path else "none"});
 
-        // For now, use a simple approach: collect all nodes and check bounds
-        // TODO: Use the layout tree when LineLayout/TextLayout are fully implemented
-        var node_list = std.ArrayList(*Node).empty;
-        defer node_list.deinit(self.allocator);
+        var handled_link = false;
+        for (self.layout_engine.link_bounds.items) |entry| {
+            const bounds = entry.bounds;
+            if (page_x >= bounds.x and page_x < bounds.x + bounds.width and
+                page_y >= bounds.y and page_y < bounds.y + bounds.height)
+            {
+                const link_node = entry.node;
+                const prevent_default = self.js_engine.dispatchEvent("click", link_node) catch |err| blk: {
+                    std.log.warn("Failed to dispatch click event: {}", .{err});
+                    break :blk false;
+                };
+                if (prevent_default) {
+                    std.debug.print("Click default prevented for link\n", .{});
+                    return;
+                }
 
-        var root_mut = root_node;
-        try parser.treeToList(self.allocator, &root_mut, &node_list);
-
-        std.debug.print("Found {d} nodes in tree\n", .{node_list.items.len});
-
-        // Find clickable elements (links) and check if click is within their bounds
-        // For now, we'll just search for <a> elements in the tree
-        // and try to find one that might contain the click
-        var link_count: usize = 0;
-        var element_count: usize = 0;
-        for (node_list.items) |node_ptr| {
-            switch (node_ptr.*) {
-                .element => |e| {
-                    element_count += 1;
-                    std.debug.print("Element #{d}: tag='{s}'\n", .{ element_count, e.tag });
-                    if (std.mem.eql(u8, e.tag, "a")) {
-                        link_count += 1;
-                        if (e.attributes) |attrs| {
-                            std.debug.print("Link has {d} attributes\n", .{attrs.count()});
+                switch (link_node.*) {
+                    .element => |*link_element| {
+                        if (link_element.attributes) |attrs| {
                             if (attrs.get("href")) |href| {
-                                std.debug.print("Found link #{d}: {s}\n", .{ link_count, href });
-                                // Resolve the URL relative to current page
-                                if (tab.current_url) |current_url| {
-                                    const resolved_url = try current_url.resolve(self.allocator, href);
-                                    std.debug.print("Resolved to: {s}\n", .{resolved_url.path});
+                                if (tab.current_url) |current_url_ptr| {
+                                    var resolved_url = try current_url_ptr.*.resolve(self.allocator, href);
                                     std.debug.print("Loading link: {s}\n", .{href});
-                                    self.loadInTab(tab, resolved_url, null) catch |err| {
+
+                                    const new_url_ptr = self.allocator.create(Url) catch |alloc_err| {
+                                        std.log.err("Failed to allocate URL: {any}", .{alloc_err});
+                                        resolved_url.free(self.allocator);
+                                        return;
+                                    };
+                                    new_url_ptr.* = resolved_url;
+                                    var load_success = false;
+                                    defer if (!load_success) {
+                                        new_url_ptr.*.free(self.allocator);
+                                        self.allocator.destroy(new_url_ptr);
+                                    };
+
+                                    self.loadInTab(tab, new_url_ptr, null) catch |err| {
                                         std.log.err("Failed to load URL {s}: {any}", .{ href, err });
                                         return;
                                     };
+                                    load_success = true;
+
                                     self.draw() catch |err| {
                                         std.log.err("Failed to draw after loading: {any}", .{err});
                                     };
-                                    return;
+                                    handled_link = true;
                                 } else {
                                     std.debug.print("No current_url to resolve against\n", .{});
                                 }
-                            } else {
-                                std.debug.print("Link #{d} has no href\n", .{link_count});
                             }
-                        } else {
-                            std.debug.print("Link #{d} has no attributes\n", .{link_count});
                         }
-                    }
-                },
-                .text => |t| {
-                    std.debug.print("Text node: '{s}'\n", .{t.text[0..@min(20, t.text.len)]});
-                },
+                    },
+                    else => {},
+                }
+
+                if (handled_link) {
+                    return;
+                }
             }
         }
-
-        std.debug.print("No links found to click\n", .{});
 
         // Handle input element clicks
         try tab.click(self, page_x, page_y);
     }
 
     // Update the scroll offset
-    pub fn fetchBody(self: *Browser, url: Url, payload: ?[]const u8) ![]const u8 {
-        return if (std.mem.eql(u8, url.scheme, "file"))
-            try url.fileRequest(self.allocator)
-        else if (std.mem.eql(u8, url.scheme, "data"))
-            url.path
-        else if (std.mem.eql(u8, url.scheme, "about"))
-            url.aboutRequest()
-        else
-            try url.httpRequest(
-                self.allocator,
-                &self.http_client,
-                &self.cache,
-                payload,
-            );
+    pub fn fetchBody(self: *Browser, url: Url, referrer: ?Url, payload: ?[]const u8) !url_module.HttpResponse {
+        if (std.mem.eql(u8, url.scheme, "file")) {
+            const content = try url.fileRequest(self.allocator);
+            return .{ .body = content, .csp_header = null };
+        } else if (std.mem.eql(u8, url.scheme, "data")) {
+            return .{ .body = url.path, .csp_header = null };
+        } else if (std.mem.eql(u8, url.scheme, "about")) {
+            return .{ .body = url.aboutRequest(), .csp_header = null };
+        }
+
+        return try url.httpRequest(
+            self.allocator,
+            &self.http_client,
+            &self.cache,
+            &self.cookie_jar,
+            referrer,
+            payload,
+        );
     }
 
     // Send request to a URL, load response into a tab
     pub fn loadInTab(
         self: *Browser,
         tab: *Tab,
-        url: Url,
+        url: *Url,
         payload: ?[]const u8,
     ) !void {
-        std.log.info("Loading: {s}", .{url.path});
+        std.log.info("Loading: {s}", .{url.*.path});
 
-        // Add URL to history
-        try tab.history.append(self.allocator, url);
-
-        // Store the current URL for resolving relative links
-        tab.current_url = url;
+        var referrer_value: ?Url = null;
+        if (tab.current_url) |ref_ptr| {
+            referrer_value = ref_ptr.*;
+        }
 
         // Do the request, getting back the body of the response.
-        const body = try self.fetchBody(url, payload);
+        const response = try self.fetchBody(url.*, referrer_value, payload);
+        defer if (response.csp_header) |hdr| self.allocator.free(hdr);
+
+        tab.clearAllowedOrigins();
+        if (response.csp_header) |hdr| {
+            tab.applyContentSecurityPolicy(hdr) catch |err| {
+                std.log.warn("Failed to apply Content-Security-Policy: {}", .{err});
+            };
+        }
+
+        const body = response.body;
 
         // Free previous HTML source if it exists
         if (tab.current_html_source) |old_source| {
@@ -1446,9 +1681,9 @@ pub const Browser = struct {
             tab.current_html_source = null;
         }
 
-        if (url.view_source) {
+        if (url.*.view_source) {
             // Use the new layoutSourceCode function for view-source mode
-            defer if (!std.mem.eql(u8, url.scheme, "about")) self.allocator.free(body);
+            defer if (!std.mem.eql(u8, url.*.scheme, "about")) self.allocator.free(body);
 
             if (tab.display_list) |items| {
                 self.allocator.free(items);
@@ -1465,6 +1700,10 @@ pub const Browser = struct {
                 n.deinit(self.allocator);
                 tab.current_node = null;
             }
+
+            tab.js_render_context = .{};
+            tab.js_render_context_initialized = false;
+            self.js_engine.setNodes(null);
 
             tab.display_list = try self.layout_engine.layoutSourceCode(body);
             tab.content_height = self.layout_engine.content_height;
@@ -1490,12 +1729,23 @@ pub const Browser = struct {
 
             // Store the HTML source (it contains slices used by the tree)
             // Only store if it's not an about: URL (those return static strings)
-            if (!std.mem.eql(u8, url.scheme, "about")) {
+            if (!std.mem.eql(u8, url.*.scheme, "about")) {
                 tab.current_html_source = body;
             }
 
             // Update the JS engine with the current nodes for DOM API
             self.js_engine.setNodes(&tab.current_node.?);
+            tab.js_render_context.browser_ptr = @as(?*anyopaque, @ptrCast(self));
+            tab.js_render_context.tab_ptr = @as(?*anyopaque, @ptrCast(tab));
+            tab.js_render_context_initialized = true;
+            self.js_engine.setRenderCallback(
+                jsRenderCallback,
+                @ptrCast(&tab.js_render_context),
+            );
+            self.js_engine.setXhrCallback(
+                jsXhrCallback,
+                @ptrCast(&tab.js_render_context),
+            );
 
             // Find all scripts and stylesheets
             var node_list = std.ArrayList(*parser.Node).empty;
@@ -1534,22 +1784,31 @@ pub const Browser = struct {
                 std.log.info("Loading script: {s}", .{src});
 
                 // Resolve relative URL against the current page URL
-                const script_url = url.resolve(self.allocator, src) catch |err| {
+                const script_url = url.*.resolve(self.allocator, src) catch |err| {
                     std.log.warn("Failed to resolve script URL {s}: {}", .{ src, err });
                     continue;
                 };
                 defer script_url.free(self.allocator);
 
+                if (!tab.allowedRequest(script_url)) {
+                    std.log.warn("Blocked script {s} due to CSP", .{src});
+                    continue;
+                }
+
                 // Fetch the script
-                const script_body = self.fetchBody(script_url, null) catch |err| {
+                const script_response = self.fetchBody(script_url, url.*, null) catch |err| {
                     std.log.warn("Failed to load script {s}: {}", .{ src, err });
                     continue;
                 };
+                defer if (script_response.csp_header) |hdr| self.allocator.free(hdr);
 
-                // Only free if it's not a static string (data: and about: return static/borrowed strings)
-                const should_free = !std.mem.eql(u8, script_url.scheme, "data") and
-                    !std.mem.eql(u8, script_url.scheme, "about");
-                defer if (should_free) self.allocator.free(script_body);
+                var script_body = script_response.body;
+                if (std.mem.eql(u8, script_url.scheme, "data") or std.mem.eql(u8, script_url.scheme, "about")) {
+                    const copy = try self.allocator.alloc(u8, script_body.len);
+                    @memcpy(copy, script_body);
+                    script_body = copy;
+                }
+                defer self.allocator.free(script_body);
 
                 // Execute the script
                 std.log.info("========== Executing script ==========", .{});
@@ -1679,22 +1938,35 @@ pub const Browser = struct {
                 std.log.info("Loading stylesheet: {s}", .{href});
 
                 // Resolve relative URL against the current page URL
-                const stylesheet_url = url.resolve(self.allocator, href) catch |err| {
+                const stylesheet_url = url.*.resolve(self.allocator, href) catch |err| {
                     std.log.warn("Failed to resolve stylesheet URL {s}: {}", .{ href, err });
                     continue;
                 };
                 defer stylesheet_url.free(self.allocator);
 
+                if (!tab.allowedRequest(stylesheet_url)) {
+                    std.log.warn("Blocked stylesheet {s} due to CSP", .{href});
+                    continue;
+                }
+
                 // Fetch the stylesheet
-                const css_text = self.fetchBody(stylesheet_url, null) catch |err| {
+                const css_response = self.fetchBody(stylesheet_url, url.*, null) catch |err| {
                     std.log.warn("Failed to load stylesheet {s}: {}", .{ href, err });
                     continue;
                 };
+                defer if (css_response.csp_header) |hdr| self.allocator.free(hdr);
 
-                // Parse the stylesheet using self.allocator
-                // (CSS rules need to live as long as the Tab)
-                var css_parser = try CSSParser.init(self.allocator, css_text);
-                defer css_parser.deinit(self.allocator);
+                var css_text = css_response.body;
+                if (std.mem.eql(u8, stylesheet_url.scheme, "data") or std.mem.eql(u8, stylesheet_url.scheme, "about")) {
+                    const copy = try self.allocator.alloc(u8, css_text.len);
+                    @memcpy(copy, css_text);
+                    css_text = copy;
+                }
+
+            // Parse the stylesheet using self.allocator
+            // (CSS rules need to live as long as the Tab)
+            var css_parser = try CSSParser.init(self.allocator, css_text);
+            defer css_parser.deinit(self.allocator);
 
                 const parsed_rules = css_parser.parse(self.allocator) catch |err| {
                     std.log.warn("Failed to parse stylesheet {s}: {}", .{ href, err });
@@ -1707,13 +1979,13 @@ pub const Browser = struct {
                 // (CSS rules reference strings within this text)
                 try tab.css_texts.append(self.allocator, css_text);
 
-                // Add the parsed rules to our collection
-                for (parsed_rules) |rule| {
-                    try all_rules.append(self.allocator, rule);
-                }
+            // Add the parsed rules to our collection
+            for (parsed_rules) |rule| {
+                try all_rules.append(self.allocator, rule);
+            }
 
-                // Free the parsed_rules slice (the rules themselves are now in all_rules)
-                self.allocator.free(parsed_rules);
+            // Free the parsed_rules slice (the rules themselves are now in all_rules)
+            self.allocator.free(parsed_rules);
             }
 
             // Sort rules by cascade priority (more specific selectors override less specific)
@@ -1755,6 +2027,10 @@ pub const Browser = struct {
             // Layout using the HTML node tree
             try self.layoutTabNodes(tab);
         }
+
+        // Record navigation history and update current URL ownership
+        try tab.history.append(self.allocator, url);
+        tab.current_url = url;
     }
 
     // Layout a tab's HTML nodes with the tree-based layout
@@ -1976,6 +2252,14 @@ pub const Browser = struct {
         // Clean up chrome
         self.chrome.deinit();
 
+        // Free cookie jar values and map storage
+        var cookie_it = self.cookie_jar.iterator();
+        while (cookie_it.next()) |entry| {
+            self.allocator.free(entry.value_ptr.value);
+            self.allocator.free(entry.key_ptr.*);
+        }
+        self.cookie_jar.deinit();
+
         // Clean up all tabs
         for (self.tabs.items) |tab| {
             tab.deinit();
@@ -2000,3 +2284,104 @@ pub const Browser = struct {
         c.SDL_Quit();
     }
 };
+
+fn jsRenderCallback(context: ?*anyopaque) anyerror!void {
+    const ctx_ptr = context orelse return;
+    const raw_ctx: *align(1) JsRenderContext = @ptrCast(ctx_ptr);
+    const ctx: *JsRenderContext = @alignCast(raw_ctx);
+
+    const browser_ptr = ctx.browser_ptr orelse return;
+    const tab_ptr = ctx.tab_ptr orelse return;
+
+    const raw_browser: *align(1) Browser = @ptrCast(browser_ptr);
+    const browser: *Browser = @alignCast(raw_browser);
+
+    const raw_tab: *align(1) Tab = @ptrCast(tab_ptr);
+    const tab: *Tab = @alignCast(raw_tab);
+
+    try tab.render(browser);
+}
+
+fn jsXhrCallback(
+    context: ?*anyopaque,
+    method: []const u8,
+    url_str: []const u8,
+    body: ?[]const u8,
+) anyerror!js_module.XhrResult {
+    _ = method;
+
+    const ctx_ptr = context orelse return error.MissingJsContext;
+    const raw_ctx: *align(1) JsRenderContext = @ptrCast(ctx_ptr);
+    const ctx: *JsRenderContext = @alignCast(raw_ctx);
+
+    const browser_ptr = ctx.browser_ptr orelse return error.MissingJsContext;
+    const tab_ptr = ctx.tab_ptr orelse return error.MissingJsContext;
+
+    const raw_browser: *align(1) Browser = @ptrCast(browser_ptr);
+    const browser: *Browser = @alignCast(raw_browser);
+
+    const raw_tab: *align(1) Tab = @ptrCast(tab_ptr);
+    const tab: *Tab = @alignCast(raw_tab);
+
+    const allocator = browser.allocator;
+
+    var resolved_url: Url = undefined;
+    if (tab.current_url) |current_ptr| {
+        resolved_url = current_ptr.*.resolve(allocator, url_str) catch |err| blk: {
+            std.log.warn("Failed to resolve XHR URL {s} relative to page: {}", .{ url_str, err });
+            break :blk try Url.init(allocator, url_str);
+        };
+    } else {
+        resolved_url = try Url.init(allocator, url_str);
+    }
+    defer resolved_url.free(allocator);
+
+    if (tab.current_url) |current_ptr| {
+        if (!current_ptr.*.sameOrigin(resolved_url)) {
+            const current_host = current_ptr.*.host orelse "";
+            const target_host = resolved_url.host orelse "";
+            std.log.warn(
+                "Blocked cross-origin XHR {s}://{s}:{d} -> {s}://{s}:{d}",
+                .{ current_ptr.*.scheme, current_host, current_ptr.*.port, resolved_url.scheme, target_host, resolved_url.port },
+            );
+            return error.CrossOriginBlocked;
+        }
+    }
+
+    if (!tab.allowedRequest(resolved_url)) {
+        const target_host = resolved_url.host orelse "";
+        std.log.warn(
+            "Blocked XHR to {s}://{s}:{d} due to CSP",
+            .{ resolved_url.scheme, target_host, resolved_url.port },
+        );
+        return error.CspViolation;
+    }
+
+    var current_url_value: ?Url = null;
+    if (tab.current_url) |cur_ptr| {
+        current_url_value = cur_ptr.*;
+    }
+
+    const response = try browser.fetchBody(resolved_url, current_url_value, body);
+    defer if (response.csp_header) |hdr| allocator.free(hdr);
+
+    var response_body = response.body;
+
+    var should_free_response = true;
+    var response_allocator: ?std.mem.Allocator = allocator;
+
+    if (std.mem.eql(u8, resolved_url.scheme, "data")) {
+        const copy = try allocator.alloc(u8, response_body.len);
+        @memcpy(copy, response_body);
+        response_body = copy;
+    } else if (std.mem.eql(u8, resolved_url.scheme, "about")) {
+        should_free_response = false;
+        response_allocator = null;
+    }
+
+    return .{
+        .data = response_body,
+        .allocator = response_allocator,
+        .should_free = should_free_response,
+    };
+}
