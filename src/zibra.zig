@@ -1,9 +1,6 @@
 const std = @import("std");
 const builtin = @import("builtin");
 
-const sdl = @import("sdl.zig");
-const c = sdl.c;
-
 const js = @import("js.zig");
 const browser = @import("browser.zig");
 const Browser = browser.Browser;
