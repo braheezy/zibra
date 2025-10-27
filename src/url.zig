@@ -583,9 +583,12 @@ pub const Url = struct {
 
         // For http/https, check if we should show port
         const host_str = self.host orelse return error.NoHost;
+        const has_explicit_port = hostHasExplicitPort(host_str);
 
-        const show_port = (std.mem.eql(u8, self.scheme, "https") and self.port != 443) or
-            (std.mem.eql(u8, self.scheme, "http") and self.port != 80);
+        const show_port = !has_explicit_port and (
+            (std.mem.eql(u8, self.scheme, "https") and self.port != 443) or
+            (std.mem.eql(u8, self.scheme, "http") and self.port != 80)
+        );
 
         if (show_port) {
             return std.fmt.bufPrint(buffer, "{s}://{s}:{d}{s}", .{
