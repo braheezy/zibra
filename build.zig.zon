@@ -18,6 +18,15 @@
         .kiesel = .{
             .path = "kiesel",
         },
+        // .sdl = .{
+        //     .url = "git+https://github.com/braheezy/SDL.zig#e3a687e0a6629f9d22aba0b48d4665a722eadab8",
+        //     .hash = "SDL2-0.0.0-yMCQisChBAC4SNhkNVPyqfXMSXMtjeXjNAgnNlitn7mF",
+        // },
+        .sdl = .{
+            // .url = "git+https://github.com/braheezy/SDL.zig#845f57d177659f504c94362d509edefced57c761",
+            // .hash = "SDL2-0.0.0-yMCQip2jBABrGbQeterIV1OiqmLt73CFz2LnHde16kdS",
+            .path = "my-SDL.zig",
+        },
     },
     .fingerprint = 0x5f81e20e918f49dc,
     .paths = .{

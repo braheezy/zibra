@@ -13,6 +13,8 @@ const scrollbar_width = browser.scrollbar_width;
 const h_offset = browser.h_offset;
 const v_offset = browser.v_offset;
 
+const sdl2 = @import("sdl");
+
 // Define the list of HTML block elements
 const BLOCK_ELEMENTS = [_][]const u8{ "html", "body", "article", "section", "nav", "aside", "h1", "h2", "h3", "h4", "h5", "h6", "hgroup", "header", "footer", "address", "p", "hr", "pre", "blockquote", "ol", "ul", "menu", "li", "dl", "dt", "dd", "figure", "figcaption", "main", "div", "table", "form", "fieldset", "legend", "details", "summary" };
 
@@ -153,7 +155,7 @@ fn restoreInlineState(self: *Layout, snapshot: InlineSnapshot) void {
 
 pub fn init(
     allocator: std.mem.Allocator,
-    renderer: *c.SDL_Renderer,
+    renderer: sdl2.Renderer,
     window_width: i32,
     window_height: i32,
     rtl_text: bool,

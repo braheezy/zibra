@@ -1,21 +1,27 @@
 const std = @import("std");
 const builtin = @import("builtin");
+const sdl = @import("sdl");
 
 pub fn build(b: *std.Build) !void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
+
+    const sdk = sdl.init(b, .{});
+    const sdl_mod = sdk.getWrapperModule();
 
     const source_module = b.createModule(.{
         .root_source_file = b.path("src/zibra.zig"),
         .target = target,
         .optimize = optimize,
     });
+    source_module.addImport("sdl", sdl_mod);
 
     const exe = b.addExecutable(.{
         .name = "zibra",
         .root_module = source_module,
     });
 
+    sdk.link(exe, .static, sdl.Library.SDL2);
     b.installArtifact(exe);
 
     // Add dependencies

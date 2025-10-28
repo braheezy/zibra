@@ -19,11 +19,13 @@ const parser = @import("parser.zig");
 const HTMLParser = parser.HTMLParser;
 const Node = parser.Node;
 const CSSParser = @import("cssParser.zig").CSSParser;
-const sdl = @import("sdl.zig");
-const c = sdl.c;
 const js_module = @import("js.zig");
 const Tab = @import("tab.zig");
 const Chrome = @import("chrome.zig");
+
+const sdl = @import("sdl.zig");
+const c = sdl.c;
+const sdl2 = @import("sdl");
 
 // Default browser stylesheet - defines default styling for HTML elements
 const DEFAULT_STYLE_SHEET = @embedFile("browser.css");
@@ -98,9 +100,9 @@ pub const Browser = struct {
     // Memory allocator for the browser
     allocator: std.mem.Allocator,
     // SDL window handle
-    window: *c.SDL_Window,
+    window: sdl2.Window,
     // SDL renderer handle
-    canvas: *c.SDL_Renderer,
+    canvas: sdl2.Renderer,
     // HTTP client for making requests (handles both HTTP and HTTPS)
     http_client: std.http.Client,
     // Cache for storing fetched resources
@@ -127,36 +129,26 @@ pub const Browser = struct {
     // Create a new Browser instance
     pub fn init(al: std.mem.Allocator, rtl_flag: bool) !Browser {
         // Initialize SDL
-        if (c.SDL_Init(c.SDL_INIT_VIDEO) != 0) {
-            c.SDL_Log("Unable to initialize SDL: %s", c.SDL_GetError());
-            return error.SDLInitializationFailed;
-        }
+        try sdl2.init(.{
+            .video = true,
+        });
 
         // Create a window with correct OS graphics
-        const window_flags = switch (builtin.target.os.tag) {
-            .macos => c.SDL_WINDOW_METAL,
-            .windows => c.SDL_WINDOW_VULKAN,
-            .linux => c.SDL_WINDOW_OPENGL,
-            else => c.SDL_WINDOW_OPENGL,
-        };
-        const screen = c.SDL_CreateWindow(
+        const screen = try sdl2.createWindow(
             "zibra",
-            c.SDL_WINDOWPOS_UNDEFINED,
-            c.SDL_WINDOWPOS_UNDEFINED,
+            .default,
+            .default,
             initial_window_width,
             initial_window_height,
-            window_flags,
-        ) orelse
-            {
-                c.SDL_Log("Unable to create window: %s", c.SDL_GetError());
-                return error.SDLInitializationFailed;
-            };
+            .{ .resizable = true },
+        );
 
         // Create a renderer, which will be used to draw to the window
-        const renderer = c.SDL_CreateRenderer(screen, -1, c.SDL_RENDERER_ACCELERATED) orelse {
-            c.SDL_Log("Unable to create renderer: %s", c.SDL_GetError());
-            return error.SDLInitializationFailed;
-        };
+        const renderer = try sdl2.createRenderer(
+            screen,
+            null,
+            .{ .accelerated = true },
+        );
 
         // Parse the default browser stylesheet
         var css_parser = try CSSParser.init(al, DEFAULT_STYLE_SHEET);
@@ -296,95 +288,94 @@ pub const Browser = struct {
         }
     }
 
-    pub fn handleWindowEvent(self: *Browser, window_event: c.SDL_WindowEvent) !void {
-        const data1 = window_event.data1;
-        const data2 = window_event.data2;
-
-        switch (window_event.event) {
-            c.SDL_WINDOWEVENT_RESIZED, c.SDL_WINDOWEVENT_SIZE_CHANGED => {
+    pub fn handleWindowEvent(self: *Browser, window_event: sdl2.WindowEvent) !void {
+        switch (window_event.type) {
+            .resized, .size_changed => |size| {
                 // Adjust renderer viewport to match new window size
-                _ = c.SDL_RenderSetViewport(self.canvas, null);
+                try self.canvas.setViewport(null);
 
-                self.window_width = data1;
-                self.window_height = data2;
+                self.window_width = size.width;
+                self.window_height = size.height;
 
                 // Update layout engine's window dimensions
-                self.layout_engine.window_width = data1;
-                self.layout_engine.window_height = data2;
+                self.layout_engine.window_width = size.width;
+                self.layout_engine.window_height = size.height;
 
                 // Force a clear and redraw
-                _ = c.SDL_SetRenderDrawColor(self.canvas, 255, 255, 255, 255);
-                _ = c.SDL_RenderClear(self.canvas);
+                try self.canvas.setColor(.{ .r = 255, .g = 255, .b = 255, .a = 255 });
+                try self.canvas.clear();
                 try self.draw();
-                c.SDL_RenderPresent(self.canvas);
+                try self.canvas.present();
             },
             else => {},
         }
     }
 
-    fn handleKeyEvent(self: *Browser, key: c.SDL_Keycode) !void {
-        // Handle Tab key to cycle through input elements
-        if (key == c.SDLK_TAB) {
-            if (self.focus) |focus_str| {
-                if (std.mem.eql(u8, focus_str, "content")) {
-                    if (self.activeTab()) |tab| {
-                        try tab.cycleFocus(self);
+    fn handleKeyEvent(self: *Browser, key: sdl2.Keycode) !void {
+        switch (key) {
+            // Handle Tab key to cycle through input elements
+            .tab => {
+                if (self.focus) |focus_str| {
+                    if (std.mem.eql(u8, focus_str, "content")) {
+                        if (self.activeTab()) |tab| {
+                            try tab.cycleFocus(self);
+                        }
                     }
                 }
-            }
-            return;
-        }
-
-        // Handle Escape key to clear focus
-        if (key == c.SDLK_ESCAPE) {
-            if (self.focus) |focus_str| {
-                if (std.mem.eql(u8, focus_str, "content")) {
-                    if (self.activeTab()) |tab| {
-                        try tab.clearFocus(self);
-                    }
-                    // Also clear browser focus
-                    self.focus = null;
-                }
-            }
-            try self.draw();
-            return;
-        }
-
-        // Handle Backspace key
-        if (key == c.SDLK_BACKSPACE) {
-            self.chrome.backspace();
-            // Also send to tab if content is focused
-            if (self.focus) |focus_str| {
-                if (std.mem.eql(u8, focus_str, "content")) {
-                    if (self.activeTab()) |tab| {
-                        try tab.backspace(self);
+                return;
+            },
+            // Handle Escape key to clear focus
+            .escape => {
+                if (self.focus) |focus_str| {
+                    if (std.mem.eql(u8, focus_str, "content")) {
+                        if (self.activeTab()) |tab| {
+                            try tab.clearFocus(self);
+                        }
+                        // Also clear browser focus
+                        self.focus = null;
                     }
                 }
-            }
-            try self.draw();
-            return;
-        }
+                try self.draw();
+                return;
+            },
 
-        // Handle Enter/Return key
-        if (key == c.SDLK_RETURN or key == c.SDLK_RETURN2) {
-            try self.chrome.enter(self);
-            try self.draw();
-            return;
-        }
+            // Handle Backspace key
+            .backspace => {
+                self.chrome.backspace();
+                // Also send to tab if content is focused
+                if (self.focus) |focus_str| {
+                    if (std.mem.eql(u8, focus_str, "content")) {
+                        if (self.activeTab()) |tab| {
+                            try tab.backspace(self);
+                        }
+                    }
+                }
+                try self.draw();
+                return;
+            },
 
-        // Handle scrolling keys
-        if (self.activeTab()) |tab| {
-            switch (key) {
-                c.SDLK_DOWN => {
-                    tab.scrollDown();
-                    try self.draw();
-                },
-                c.SDLK_UP => {
-                    tab.scrollUp();
-                    try self.draw();
-                },
-                else => {},
-            }
+            // Handle Enter/Return key
+            .@"return", .return_2 => {
+                try self.chrome.enter(self);
+                try self.draw();
+                return;
+            },
+            else => {
+                // Handle scrolling keys
+                if (self.activeTab()) |tab| {
+                    switch (key) {
+                        .down => {
+                            tab.scrollDown();
+                            try self.draw();
+                        },
+                        .up => {
+                            tab.scrollUp();
+                            try self.draw();
+                        },
+                        else => {},
+                    }
+                }
+            },
         }
     }
 
@@ -923,8 +914,8 @@ pub const Browser = struct {
     // Draw the browser content
     pub fn draw(self: *Browser) !void {
         // Clear the canvas
-        _ = c.SDL_SetRenderDrawColor(self.canvas, 255, 255, 255, 255);
-        _ = c.SDL_RenderClear(self.canvas);
+        try self.canvas.setColorRGB(255, 255, 255);
+        try self.canvas.clear();
 
         // Only draw the active tab
         const tab = self.activeTab() orelse {
@@ -951,7 +942,7 @@ pub const Browser = struct {
             try self.drawDisplayItem(item, 0);
         }
 
-        self.drawScrollbar(tab);
+        try self.drawScrollbar(tab);
     }
 
     fn drawDisplayItem(self: *Browser, item: DisplayItem, scroll_offset: i32) !void {
@@ -959,27 +950,21 @@ pub const Browser = struct {
             .glyph => |glyph_item| {
                 const screen_y = glyph_item.y - scroll_offset;
                 if (screen_y >= 0 and screen_y < self.window_height) {
-                    var dst_rect: c.SDL_Rect = .{
+                    const dst_rect: sdl2.Rectangle = .{
                         .x = glyph_item.x,
                         .y = screen_y,
-                        .w = glyph_item.glyph.w,
-                        .h = glyph_item.glyph.h,
+                        .width = glyph_item.glyph.w,
+                        .height = glyph_item.glyph.h,
                     };
 
                     // Apply text color to the glyph texture
-                    _ = c.SDL_SetTextureColorMod(
-                        glyph_item.glyph.texture,
-                        glyph_item.color.r,
-                        glyph_item.color.g,
-                        glyph_item.color.b,
-                    );
+                    try glyph_item.glyph.texture.?.setColorMod(.{
+                        .r = glyph_item.color.r,
+                        .g = glyph_item.color.g,
+                        .b = glyph_item.color.b,
+                    });
 
-                    _ = c.SDL_RenderCopy(
-                        self.canvas,
-                        glyph_item.glyph.texture,
-                        null,
-                        &dst_rect,
-                    );
+                    try self.canvas.copy(glyph_item.glyph.texture.?, dst_rect, null);
                 }
             },
             .rect => |rect_item| {
@@ -989,58 +974,56 @@ pub const Browser = struct {
                     const width = rect_item.x2 - rect_item.x1;
                     const height = bottom - top;
                     if (width > 0 and height > 0) {
-                        _ = c.SDL_SetRenderDrawColor(
-                            self.canvas,
-                            rect_item.color.r,
-                            rect_item.color.g,
-                            rect_item.color.b,
-                            rect_item.color.a,
-                        );
+                        try self.canvas.setColor(.{
+                            .r = rect_item.color.r,
+                            .g = rect_item.color.g,
+                            .b = rect_item.color.b,
+                            .a = rect_item.color.a,
+                        });
 
-                        var rect: c.SDL_Rect = .{
+                        const rect: sdl2.Rectangle = .{
                             .x = rect_item.x1,
                             .y = top,
-                            .w = width,
-                            .h = height,
+                            .width = width,
+                            .height = height,
                         };
-                        _ = c.SDL_RenderFillRect(self.canvas, &rect);
+                        try self.canvas.fillRect(rect);
                     }
                 }
             },
             .line => |line_item| {
                 const y1 = line_item.y1 - scroll_offset;
                 const y2 = line_item.y2 - scroll_offset;
-                _ = c.SDL_SetRenderDrawColor(
-                    self.canvas,
-                    line_item.color.r,
-                    line_item.color.g,
-                    line_item.color.b,
-                    line_item.color.a,
-                );
+                try self.canvas.setColor(.{
+                    .r = line_item.color.r,
+                    .g = line_item.color.g,
+                    .b = line_item.color.b,
+                    .a = line_item.color.a,
+                });
                 // SDL doesn't have line thickness directly, draw as rect for thickness > 1
                 if (line_item.thickness == 1) {
-                    _ = c.SDL_RenderDrawLine(self.canvas, line_item.x1, y1, line_item.x2, y2);
+                    try self.canvas.drawLine(line_item.x1, y1, line_item.x2, y2);
                 } else {
                     // Draw thick line as rectangle
                     const is_horizontal = (line_item.y1 == line_item.y2);
                     if (is_horizontal) {
                         const width: i32 = @intCast(@abs(line_item.x2 - line_item.x1));
-                        var rect: c.SDL_Rect = .{
+                        const rect: sdl2.Rectangle = .{
                             .x = @min(line_item.x1, line_item.x2),
                             .y = y1 - @divTrunc(line_item.thickness, 2),
-                            .w = width,
-                            .h = line_item.thickness,
+                            .width = width,
+                            .height = line_item.thickness,
                         };
-                        _ = c.SDL_RenderFillRect(self.canvas, &rect);
+                        try self.canvas.fillRect(rect);
                     } else {
                         const height: i32 = @intCast(@abs(y2 - y1));
-                        var rect: c.SDL_Rect = .{
+                        const rect: sdl2.Rectangle = .{
                             .x = line_item.x1 - @divTrunc(line_item.thickness, 2),
                             .y = @min(y1, y2),
-                            .w = line_item.thickness,
-                            .h = height,
+                            .width = line_item.thickness,
+                            .height = height,
                         };
-                        _ = c.SDL_RenderFillRect(self.canvas, &rect);
+                        try self.canvas.fillRect(rect);
                     }
                 }
             },
@@ -1048,23 +1031,22 @@ pub const Browser = struct {
                 const r = outline_item.rect;
                 const top = r.top - scroll_offset;
                 const bottom = r.bottom - scroll_offset;
-                _ = c.SDL_SetRenderDrawColor(
-                    self.canvas,
-                    outline_item.color.r,
-                    outline_item.color.g,
-                    outline_item.color.b,
-                    outline_item.color.a,
-                );
+                try self.canvas.setColor(.{
+                    .r = outline_item.color.r,
+                    .g = outline_item.color.g,
+                    .b = outline_item.color.b,
+                    .a = outline_item.color.a,
+                });
                 // Draw four lines for the outline
-                _ = c.SDL_RenderDrawLine(self.canvas, r.left, top, r.right, top); // top
-                _ = c.SDL_RenderDrawLine(self.canvas, r.right, top, r.right, bottom); // right
-                _ = c.SDL_RenderDrawLine(self.canvas, r.right, bottom, r.left, bottom); // bottom
-                _ = c.SDL_RenderDrawLine(self.canvas, r.left, bottom, r.left, top); // left
+                try self.canvas.drawLine(r.left, top, r.right, top); // top
+                try self.canvas.drawLine(r.right, top, r.right, bottom); // right
+                try self.canvas.drawLine(r.right, bottom, r.left, bottom); // bottom
+                try self.canvas.drawLine(r.left, bottom, r.left, top); // left
             },
         }
     }
 
-    pub fn drawScrollbar(self: *Browser, tab: *Tab) void {
+    pub fn drawScrollbar(self: *Browser, tab: *Tab) !void {
         const tab_height = self.window_height - self.chrome.bottom;
         if (tab.content_height <= tab_height) {
             // No scrollbar needed if content fits in the window
@@ -1078,25 +1060,35 @@ pub const Browser = struct {
         const thumb_y_offset: i32 = @intFromFloat(@as(f32, @floatFromInt(tab.scroll_offset)) / @as(f32, @floatFromInt(max_scroll)) * (@as(f32, @floatFromInt(tab_height)) - @as(f32, @floatFromInt(thumb_height))));
 
         // Draw scrollbar track (background) - start below chrome
-        var track_rect: c.SDL_Rect = .{
+        const track_rect: sdl2.Rectangle = .{
             .x = self.window_width - scrollbar_width,
             .y = self.chrome.bottom,
-            .w = scrollbar_width,
-            .h = track_height,
+            .width = scrollbar_width,
+            .height = track_height,
         };
         // Light gray
-        _ = c.SDL_SetRenderDrawColor(self.canvas, 200, 200, 200, 255);
-        _ = c.SDL_RenderFillRect(self.canvas, &track_rect);
+        try self.canvas.setColor(.{
+            .r = 200,
+            .g = 200,
+            .b = 200,
+            .a = 255,
+        });
+        try self.canvas.fillRect(track_rect);
 
         // Draw scrollbar thumb (movable part) - offset by chrome height
-        var thumb_rect: c.SDL_Rect = .{
+        const thumb_rect: sdl2.Rectangle = .{
             .x = self.window_width - scrollbar_width,
             .y = self.chrome.bottom + thumb_y_offset,
-            .w = scrollbar_width,
-            .h = thumb_height,
+            .width = scrollbar_width,
+            .height = thumb_height,
         };
-        _ = c.SDL_SetRenderDrawColor(self.canvas, 0, 102, 204, 255); // Blue
-        _ = c.SDL_RenderFillRect(self.canvas, &thumb_rect);
+        try self.canvas.setColor(.{
+            .r = 0,
+            .g = 102,
+            .b = 204,
+            .a = 255,
+        });
+        try self.canvas.fillRect(thumb_rect);
     }
 
     // Ensure we clean up the document_layout in deinit
@@ -1138,9 +1130,10 @@ pub const Browser = struct {
         // Clean up JavaScript engine
         self.js_engine.deinit(self.allocator);
 
-        c.SDL_DestroyRenderer(self.canvas);
-        c.SDL_DestroyWindow(self.window);
-        c.SDL_Quit();
+        // c.SDL_DestroyRenderer(self.canvas);
+        // c.SDL_DestroyWindow(self.window);
+        // c.SDL_Quit();
+        sdl2.quit();
     }
 };
 
