@@ -4,12 +4,9 @@ const builtin = @import("builtin");
 const known_folders = @import("known-folders");
 const grapheme = @import("grapheme");
 const code_point = @import("code_point");
+const sdl2 = @import("sdl");
 
 const browser = @import("browser.zig");
-
-const sdl = @import("sdl.zig");
-const c = sdl.c;
-const sdl2 = @import("sdl");
 
 pub const hyphen_codepoint = 0x00AD;
 
@@ -220,15 +217,15 @@ pub const Glyph = struct {
     descent: i32,
     is_superscript: bool = false,
     is_soft_hyphen: bool = false,
+    preserve_texture_color: bool = false,
 };
 
 pub const Font = struct {
     name: []const u8,
-    font_handle: *sdl2.ttf.Font,
+    font_handle: sdl2.ttf.Font,
     // Glyph cache or atlas.
     glyphs: std.AutoHashMap(u64, Glyph),
     line_height: i32,
-    font_rw: ?*c.SDL_RWops,
 };
 
 pub const FontKey = struct {
@@ -274,10 +271,6 @@ pub const FontManager = struct {
             f.glyphs.deinit();
 
             f.font_handle.close();
-
-            // if (f.font_rw) |rw| {
-            //     _ = rw.close();
-            // }
             self.allocator.destroy(f);
         }
 
@@ -292,15 +285,11 @@ pub const FontManager = struct {
     pub fn loadFontFromEmbed(self: *FontManager, size: i32) !void {
         const embed_file = @embedFile("ocraext.ttf");
         const name = "ocraext";
-        // const font_rw = c.SDL_RWFromConstMem(@ptrCast(&embed_file[0]), @as(c_int, embed_file.len)) orelse return error.LoadFailed;
-        // // Note: TTF_OpenFontRW does not copy data, must keep it valid
-        // const fh = c.TTF_OpenFontRW(font_rw, 0, size) orelse return error.LoadFailed;
 
         var font: *Font = try self.allocator.create(Font);
         font.font_handle = sdl2.ttf.openFontMem(embed_file, false, size) orelse return error.LoadFailed;
         font.glyphs = std.StringHashMap(Glyph).init(self.allocator);
         font.line_height = font.font_handle.lineSkip();
-        // font.font_rw = font_rw;
 
         try self.fonts.put(name, font);
     }
@@ -357,26 +346,13 @@ pub const FontManager = struct {
         defer self.allocator.free(path_z);
 
         var fh = sdl2.ttf.openFontIndex(path_z, size, 0) catch return false;
-        // const fh = c.TTF_OpenFontIndex(path_z, size, 0);
-        // if (fh == null) {
-        //     if (c.TTF_GetError()) |e| if (e[0] != 0) {
-        //         std.log.err("TTF Error in loadFontAtPath: {s}", .{e});
-        //     };
-        //     return false;
-        // }
-
-        // fh.setSize(size);
-        // if (c.TTF_SetFontSize(fh, size) != 0) {
-        //     std.log.warn("Failed to set explicit font pixel size: {s}", .{c.TTF_GetError()});
-        // }
 
         const font = try self.allocator.create(Font);
         font.* = Font{
             .name = name,
-            .font_handle = &fh,
+            .font_handle = fh,
             .glyphs = std.AutoHashMap(u64, Glyph).init(self.allocator),
             .line_height = fh.lineSkip(),
-            .font_rw = null,
         };
 
         try self.fonts.put(name, font);
@@ -524,31 +500,10 @@ pub const FontManager = struct {
         const sentinel_gme = try sliceToSentinelArray(self.allocator, gme);
         defer self.allocator.free(sentinel_gme);
 
-        var glyph_surface = font.font_handle.renderUtf8Blended(
+        var glyph_surface = try font.font_handle.renderUtf8Blended(
             sentinel_gme,
             .{ .r = 255, .g = 255, .b = 255, .a = 255 },
-        ) catch blk: {
-            const err_msg = c.TTF_GetError();
-            // For zero-width characters, substitute with a space.
-            if (std.mem.indexOf(u8, std.mem.span(err_msg), "zero width") != null) {
-                const space_sentinel = try self.allocator.allocSentinel(u8, 1, 0);
-                defer self.allocator.free(space_sentinel);
-                space_sentinel[0] = ' ';
-                const space_surface = font.font_handle.renderUtf8Blended(
-                    space_sentinel,
-                    .{ .r = 255, .g = 255, .b = 255, .a = 255 },
-                ) catch {
-                    if (style_set) font.font_handle.setStyle(.{});
-                    return error.RenderFailed;
-                };
-                break :blk space_surface;
-            } else {
-                if (style_set) font.font_handle.setStyle(.{});
-                std.debug.print("failed to render glyph: {s}\n", .{sentinel_gme});
-                std.debug.print("error: {s}\n", .{err_msg});
-                return error.RenderFailed;
-            }
-        };
+        );
         defer glyph_surface.destroy();
 
         // Apply synthetic bold effect before creating texture
@@ -561,17 +516,6 @@ pub const FontManager = struct {
                 @intCast(glyph_surface.ptr.h),
                 .abgr8888,
             );
-            // const bold_surface = c.SDL_CreateRGBSurface(
-            //     0,
-            //     glyph_surface.*.w + bold_offset,
-            //     glyph_surface.*.h,
-            //     32,
-            //     0xFF000000,
-            //     0x00FF0000,
-            //     0x0000FF00,
-            //     0x000000FF,
-            // );
-
             // Copy original glyph multiple times with offset
             try sdl2.blit(
                 glyph_surface,
@@ -608,20 +552,6 @@ pub const FontManager = struct {
             .ascent = ascent,
             .descent = descent,
         } else blk: {
-            // var miny: i32 = 0;
-            // var maxy: i32 = 0;
-            // var advance: i32 = 0;
-            // if (c.TTF_GlyphMetrics32(
-            //     font.font_handle,
-            //     codepoint.code,
-            //     null,
-            //     null,
-            //     &miny,
-            //     &maxy,
-            //     &advance,
-            // ) != 0) {
-            //     std.log.err("Failed to get glyph metrics: {s}", .{c.TTF_GetError()});
-            // }
             const text_height: i32 = self.min_line_height;
             var tmp1: f32 = @floatFromInt(text_height);
             const tmp2: f32 = @floatFromInt(surf.h);
@@ -637,6 +567,7 @@ pub const FontManager = struct {
                 .h = emoji_height,
                 .ascent = @divTrunc(3 * self.min_line_height, 4),
                 .descent = @divTrunc(self.min_line_height, 4),
+                .preserve_texture_color = true,
             };
         };
 

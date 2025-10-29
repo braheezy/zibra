@@ -1,11 +1,13 @@
 const std = @import("std");
 const builtin = @import("builtin");
 
+const grapheme = @import("grapheme");
+const code_point = @import("code_point");
+const sdl2 = @import("sdl");
+
 const token = @import("token.zig");
 const font = @import("font.zig");
 const Token = token.Token;
-const grapheme = @import("grapheme");
-const code_point = @import("code_point");
 const FontManager = font.FontManager;
 const Glyph = font.Glyph;
 const FontWeight = font.FontWeight;
@@ -22,10 +24,6 @@ const CSSParser = @import("cssParser.zig").CSSParser;
 const js_module = @import("js.zig");
 const Tab = @import("tab.zig");
 const Chrome = @import("chrome.zig");
-
-const sdl = @import("sdl.zig");
-const c = sdl.c;
-const sdl2 = @import("sdl");
 
 // Default browser stylesheet - defines default styling for HTML elements
 const DEFAULT_STYLE_SHEET = @embedFile("browser.css");
@@ -225,18 +223,16 @@ pub const Browser = struct {
         var quit = false;
 
         while (!quit) {
-            var event: c.SDL_Event = undefined;
-
-            while (c.SDL_PollEvent(&event) != 0) {
-                switch (event.type) {
+            while (sdl2.pollEvent()) |event| {
+                switch (event) {
                     // Quit when the window is closed
-                    c.SDL_QUIT => quit = true,
-                    c.SDL_KEYDOWN => {
-                        try self.handleKeyEvent(event.key.keysym.sym);
+                    .quit => quit = true,
+                    .key_down => |kb_event| {
+                        try self.handleKeyEvent(kb_event.keycode);
                     },
-                    c.SDL_TEXTINPUT => {
+                    .text_input => |text_event| {
                         // Handle text input
-                        const text = std.mem.sliceTo(&event.text.text, 0);
+                        const text = std.mem.sliceTo(&text_event.text, 0);
                         for (text) |char| {
                             if (char >= 0x20 and char < 0x7f) {
                                 // Try chrome first
@@ -254,24 +250,24 @@ pub const Browser = struct {
                         try self.draw();
                     },
                     // Handle mouse wheel events
-                    c.SDL_MOUSEWHEEL => {
+                    .mouse_wheel => |wheel_event| {
                         if (self.activeTab()) |tab| {
-                            if (event.wheel.y > 0) {
+                            if (wheel_event.delta_y > 0) {
                                 tab.scrollUp();
-                            } else if (event.wheel.y < 0) {
+                            } else if (wheel_event.delta_y < 0) {
                                 tab.scrollDown();
                             }
                             try self.draw();
                         }
                     },
                     // Handle mouse button clicks
-                    c.SDL_MOUSEBUTTONDOWN => {
-                        if (event.button.button == c.SDL_BUTTON_LEFT) {
-                            try self.handleClick(event.button.x, event.button.y);
+                    .mouse_button_down => |button_event| {
+                        if (button_event.button == .left) {
+                            try self.handleClick(button_event.x, button_event.y);
                         }
                     },
-                    c.SDL_WINDOWEVENT => {
-                        try self.handleWindowEvent(event.window);
+                    .window => |window_event| {
+                        try self.handleWindowEvent(window_event);
                     },
                     else => {},
                 }
@@ -281,10 +277,10 @@ pub const Browser = struct {
             try self.draw();
 
             // Present the updated frame
-            c.SDL_RenderPresent(self.canvas);
+            self.canvas.present();
 
             // delay for 17ms to get 60fps
-            c.SDL_Delay(17);
+            sdl2.delay(17);
         }
     }
 
@@ -305,7 +301,7 @@ pub const Browser = struct {
                 try self.canvas.setColor(.{ .r = 255, .g = 255, .b = 255, .a = 255 });
                 try self.canvas.clear();
                 try self.draw();
-                try self.canvas.present();
+                self.canvas.present();
             },
             else => {},
         }
@@ -957,12 +953,20 @@ pub const Browser = struct {
                         .height = glyph_item.glyph.h,
                     };
 
-                    // Apply text color to the glyph texture
-                    try glyph_item.glyph.texture.?.setColorMod(.{
-                        .r = glyph_item.color.r,
-                        .g = glyph_item.color.g,
-                        .b = glyph_item.color.b,
-                    });
+                    // Apply text color to the glyph texture unless the glyph carries its own colors (e.g. emoji)
+                    if (glyph_item.glyph.preserve_texture_color) {
+                        try glyph_item.glyph.texture.?.setColorMod(.{
+                            .r = 255,
+                            .g = 255,
+                            .b = 255,
+                        });
+                    } else {
+                        try glyph_item.glyph.texture.?.setColorMod(.{
+                            .r = glyph_item.color.r,
+                            .g = glyph_item.color.g,
+                            .b = glyph_item.color.b,
+                        });
+                    }
 
                     try self.canvas.copy(glyph_item.glyph.texture.?, dst_rect, null);
                 }
@@ -1130,9 +1134,6 @@ pub const Browser = struct {
         // Clean up JavaScript engine
         self.js_engine.deinit(self.allocator);
 
-        // c.SDL_DestroyRenderer(self.canvas);
-        // c.SDL_DestroyWindow(self.window);
-        // c.SDL_Quit();
         sdl2.quit();
     }
 };
