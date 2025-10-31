@@ -4,11 +4,9 @@ const builtin = @import("builtin");
 const known_folders = @import("known-folders");
 const grapheme = @import("grapheme");
 const code_point = @import("code_point");
+const sdl2 = @import("sdl");
 
 const browser = @import("browser.zig");
-
-const sdl = @import("sdl.zig");
-const c = sdl.c;
 
 pub const hyphen_codepoint = 0x00AD;
 
@@ -212,22 +210,22 @@ const system_fonts = switch (builtin.target.os.tag) {
 
 pub const Glyph = struct {
     grapheme: []const u8,
-    texture: ?*c.SDL_Texture,
+    texture: ?sdl2.Texture,
     w: i32,
     h: i32,
     ascent: i32,
     descent: i32,
     is_superscript: bool = false,
     is_soft_hyphen: bool = false,
+    preserve_texture_color: bool = false,
 };
 
 pub const Font = struct {
     name: []const u8,
-    font_handle: *c.TTF_Font,
+    font_handle: sdl2.ttf.Font,
     // Glyph cache or atlas.
     glyphs: std.AutoHashMap(u64, Glyph),
     line_height: i32,
-    font_rw: ?*c.SDL_RWops,
 };
 
 pub const FontKey = struct {
@@ -238,7 +236,7 @@ pub const FontKey = struct {
 
 pub const FontManager = struct {
     allocator: std.mem.Allocator,
-    renderer: *c.SDL_Renderer,
+    renderer: sdl2.Renderer,
     fonts: std.StringHashMap(*Font),
     styled_fonts: std.AutoHashMap(FontKey, *Font),
     category_fonts: std.AutoHashMap(FontCategory, *Font),
@@ -246,10 +244,8 @@ pub const FontManager = struct {
     min_line_height: i32 = std.math.maxInt(i32),
     loaded_sizes: std.AutoHashMap(i32, void),
 
-    pub fn init(allocator: std.mem.Allocator, renderer: *c.SDL_Renderer) !FontManager {
-        if (c.TTF_WasInit() == 0) {
-            if (c.TTF_Init() != 0) return error.InitFailed;
-        }
+    pub fn init(allocator: std.mem.Allocator, renderer: sdl2.Renderer) !FontManager {
+        try sdl2.ttf.init();
 
         return FontManager{
             .allocator = allocator,
@@ -268,19 +264,15 @@ pub const FontManager = struct {
 
             var outer_it = f.glyphs.iterator();
             while (outer_it.next()) |outer_entry| {
-                // self.allocator.free(outer_entry.key_ptr.*);
-
                 // For each style => destroy the texture
                 const cache_entry = outer_entry.value_ptr.*;
-                c.SDL_DestroyTexture(cache_entry.texture.?);
+                if (cache_entry.texture) |texture| {
+                    texture.destroy();
+                }
             }
             f.glyphs.deinit();
 
-            c.TTF_CloseFont(f.font_handle);
-
-            if (f.font_rw) |rw| {
-                std.debug.assert(c.SDL_RWclose(rw) == 0);
-            }
+            f.font_handle.close();
             self.allocator.destroy(f);
         }
 
@@ -289,23 +281,27 @@ pub const FontManager = struct {
         self.fonts.deinit();
         self.loaded_sizes.deinit();
 
-        c.TTF_Quit();
+        sdl2.ttf.quit();
     }
 
     pub fn loadFontFromEmbed(self: *FontManager, size: i32) !void {
         const embed_file = @embedFile("ocraext.ttf");
         const name = "ocraext";
-        const font_rw = c.SDL_RWFromConstMem(@ptrCast(&embed_file[0]), @as(c_int, embed_file.len)) orelse return error.LoadFailed;
-        // Note: TTF_OpenFontRW does not copy data, must keep it valid
-        const fh = c.TTF_OpenFontRW(font_rw, 0, size) orelse return error.LoadFailed;
 
         var font: *Font = try self.allocator.create(Font);
-        font.font_handle = fh;
-        font.glyphs = std.StringHashMap(Glyph).init(self.allocator);
-        font.line_height = c.TTF_FontLineSkip(fh);
-        font.font_rw = font_rw;
+        font.font_handle = sdl2.ttf.openFontMem(embed_file, false, size) orelse return error.LoadFailed;
+        font.glyphs = std.AutoHashMap(u64, Glyph).init(self.allocator);
+        font.line_height = font.font_handle.lineSkip();
 
         try self.fonts.put(name, font);
+
+        if (font.line_height < self.min_line_height) {
+            self.min_line_height = font.line_height;
+        }
+
+        if (self.current_font == null) {
+            self.current_font = self.fonts.get(name);
+        }
     }
 
     fn collectFontPaths(self: *FontManager) !std.ArrayList([]const u8) {
@@ -314,6 +310,16 @@ pub const FontManager = struct {
         // Add user font directory first to prefer them.
         const home_dir = try known_folders.getPath(self.allocator, .home) orelse return error.NoHomeDir;
         defer self.allocator.free(home_dir);
+
+        const user_suffixes = switch (builtin.target.os.tag) {
+            .macos => &[_][]const u8{ "/Library/Fonts" },
+            .linux => &[_][]const u8{ "/.local/share/fonts", "/.fonts" },
+            else => &[_][]const u8{},
+        };
+        for (user_suffixes) |suffix| {
+            const user_path = try std.fmt.allocPrint(self.allocator, "{s}{s}", .{ home_dir, suffix });
+            try paths.append(self.allocator, user_path);
+        }
 
         // Add system font directories
         for (system_fonts.paths) |dir| {
@@ -359,25 +365,14 @@ pub const FontManager = struct {
         const path_z = try sliceToSentinelArray(self.allocator, path);
         defer self.allocator.free(path_z);
 
-        const fh = c.TTF_OpenFontIndex(path_z, size, 0);
-        if (fh == null) {
-            if (c.TTF_GetError()) |e| if (e[0] != 0) {
-                std.log.err("TTF Error in loadFontAtPath: {s}", .{e});
-            };
-            return false;
-        }
-
-        if (c.TTF_SetFontSize(fh, size) != 0) {
-            std.log.warn("Failed to set explicit font pixel size: {s}", .{c.TTF_GetError()});
-        }
+        var fh = sdl2.ttf.openFontIndex(path_z, size, 0) catch return false;
 
         const font = try self.allocator.create(Font);
         font.* = Font{
             .name = name,
-            .font_handle = fh.?,
+            .font_handle = fh,
             .glyphs = std.AutoHashMap(u64, Glyph).init(self.allocator),
-            .line_height = c.TTF_FontLineSkip(fh),
-            .font_rw = null,
+            .line_height = fh.lineSkip(),
         };
 
         try self.fonts.put(name, font);
@@ -501,10 +496,11 @@ pub const FontManager = struct {
             if (styled_font == null) {
                 styled_font = self.pickFontForCharacter(codepoint.code);
                 if (styled_font == null) return error.NoFontForGlyph;
-                var new_style: c_int = 0;
-                if (weight == .Bold) new_style |= c.TTF_STYLE_BOLD;
-                if (slant == .Italic) new_style |= c.TTF_STYLE_ITALIC;
-                c.TTF_SetFontStyle(styled_font.?.font_handle, new_style);
+                const new_style: sdl2.ttf.Font.Style = .{
+                    .bold = weight == .Bold,
+                    .italic = slant == .Italic,
+                };
+                styled_font.?.font_handle.setStyle(new_style);
                 style_set = true;
             }
         }
@@ -513,93 +509,60 @@ pub const FontManager = struct {
         // Use a single cache key that combines grapheme, weight, slant, and size.
         const key = newGlyphCacheKey(gme, weight, slant, size);
         if (font.glyphs.get(key)) |cached_glyph| {
-            if (style_set) c.TTF_SetFontStyle(font.font_handle, c.TTF_STYLE_NORMAL);
+            if (style_set) font.font_handle.setStyle(.{});
             return cached_glyph;
         }
 
         // Set the font size before rendering.
-        if (c.TTF_SetFontSize(font.font_handle, size) != 0) {
-            std.log.warn("Failed to set font size: {s}", .{c.TTF_GetError()});
-        }
+        font.font_handle.setSize(size);
 
         // Convert the grapheme to a null-terminated string.
         const sentinel_gme = try sliceToSentinelArray(self.allocator, gme);
         defer self.allocator.free(sentinel_gme);
 
-        var glyph_surface = c.TTF_RenderUTF8_Blended(
-            font.font_handle,
+        var glyph_surface = try font.font_handle.renderUtf8Blended(
             sentinel_gme,
-            c.SDL_Color{ .r = 255, .g = 255, .b = 255, .a = 255 },
+            .{ .r = 255, .g = 255, .b = 255, .a = 255 },
         );
-        if (glyph_surface == null) {
-            const err_msg = c.TTF_GetError();
-            // For zero-width characters, substitute with a space.
-            if (std.mem.indexOf(u8, std.mem.span(err_msg), "zero width") != null) {
-                const space_sentinel = try self.allocator.allocSentinel(u8, 1, 0);
-                defer self.allocator.free(space_sentinel);
-                space_sentinel[0] = ' ';
-                const space_surface = c.TTF_RenderUTF8_Blended(
-                    font.font_handle,
-                    space_sentinel,
-                    c.SDL_Color{ .r = 255, .g = 255, .b = 255, .a = 255 },
-                );
-                if (space_surface == null) {
-                    if (style_set) c.TTF_SetFontStyle(font.font_handle, c.TTF_STYLE_NORMAL);
-                    return error.RenderFailed;
-                }
-                glyph_surface = space_surface;
-            } else {
-                if (style_set) c.TTF_SetFontStyle(font.font_handle, c.TTF_STYLE_NORMAL);
-                std.debug.print("failed to render glyph: {s}\n", .{sentinel_gme});
-                std.debug.print("error: {s}\n", .{err_msg});
-                return error.RenderFailed;
-            }
-        }
-        defer c.SDL_FreeSurface(glyph_surface);
+        defer glyph_surface.destroy();
 
         // Apply synthetic bold effect before creating texture
         if (synthetic_bold) {
             const bold_offset = @max(1, @divTrunc(size, 24));
 
             // Create a new surface for the bold effect
-            const bold_surface = c.SDL_CreateRGBSurface(
-                0,
-                glyph_surface.*.w + bold_offset,
-                glyph_surface.*.h,
-                32,
-                0xFF000000,
-                0x00FF0000,
-                0x0000FF00,
-                0x000000FF,
+            const bold_surface = try sdl2.createRgbSurfaceWithFormat(
+                @intCast(glyph_surface.ptr.w + bold_offset),
+                @intCast(glyph_surface.ptr.h),
+                .abgr8888,
             );
-
             // Copy original glyph multiple times with offset
-            _ = c.SDL_BlitSurface(glyph_surface, null, bold_surface, null);
-            var rect = c.SDL_Rect{
+            try sdl2.blit(
+                glyph_surface,
+                null,
+                bold_surface,
+                null,
+            );
+            var rect = sdl2.Rectangle{
                 .x = bold_offset,
                 .y = 0,
-                .w = glyph_surface.*.w,
-                .h = glyph_surface.*.h,
+                .width = glyph_surface.ptr.w,
+                .height = glyph_surface.ptr.h,
             };
-            _ = c.SDL_BlitSurface(glyph_surface, null, bold_surface, &rect);
+            try sdl2.blit(glyph_surface, null, bold_surface, &rect);
 
             // Replace original surface with bold version
-            c.SDL_FreeSurface(glyph_surface);
+            glyph_surface.destroy();
             glyph_surface = bold_surface;
         }
 
-        const glyph_tex = c.SDL_CreateTextureFromSurface(self.renderer, glyph_surface) orelse {
-            if (style_set) c.TTF_SetFontStyle(font.font_handle, c.TTF_STYLE_NORMAL);
-            return error.RenderFailed;
-        };
-        if (c.SDL_SetTextureScaleMode(glyph_tex, c.SDL_ScaleModeLinear) != 0) {
-            std.log.err("Scale mode error: {s}", .{c.SDL_GetError()});
-        }
+        const glyph_tex = try sdl2.createTextureFromSurface(self.renderer, glyph_surface);
+        try glyph_tex.setScaleMode(.linear);
 
-        const surf = glyph_surface.*;
+        const surf = glyph_surface.ptr;
         const is_emoji = isCodepointEmoji(codepoint.code);
-        const ascent = c.TTF_FontAscent(font.font_handle);
-        const descent = -c.TTF_FontDescent(font.font_handle); // Make positive
+        const ascent = font.font_handle.ascent();
+        const descent = -font.font_handle.descent(); // Make positive
 
         const new_glyph = if (!is_emoji) Glyph{
             .grapheme = gme,
@@ -609,20 +572,6 @@ pub const FontManager = struct {
             .ascent = ascent,
             .descent = descent,
         } else blk: {
-            var miny: i32 = 0;
-            var maxy: i32 = 0;
-            var advance: i32 = 0;
-            if (c.TTF_GlyphMetrics32(
-                font.font_handle,
-                codepoint.code,
-                null,
-                null,
-                &miny,
-                &maxy,
-                &advance,
-            ) != 0) {
-                std.log.err("Failed to get glyph metrics: {s}", .{c.TTF_GetError()});
-            }
             const text_height: i32 = self.min_line_height;
             var tmp1: f32 = @floatFromInt(text_height);
             const tmp2: f32 = @floatFromInt(surf.h);
@@ -638,11 +587,12 @@ pub const FontManager = struct {
                 .h = emoji_height,
                 .ascent = @divTrunc(3 * self.min_line_height, 4),
                 .descent = @divTrunc(self.min_line_height, 4),
+                .preserve_texture_color = true,
             };
         };
 
         try font.glyphs.put(key, new_glyph);
-        if (style_set) c.TTF_SetFontStyle(font.font_handle, c.TTF_STYLE_NORMAL);
+        if (style_set) font.font_handle.setStyle(.{});
 
         return new_glyph;
     }
@@ -653,9 +603,7 @@ pub const FontManager = struct {
         var it = self.fonts.iterator();
         while (it.next()) |entry| {
             const font = entry.value_ptr.*;
-            if (c.TTF_SetFontSize(font.font_handle, size) != 0) {
-                std.log.warn("Failed to set font size: {s}", .{c.TTF_GetError()});
-            }
+            font.font_handle.setSize(size);
         }
         try self.loaded_sizes.put(size, {});
     }

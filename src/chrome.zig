@@ -272,33 +272,33 @@ pub fn paint(self: *Chrome, allocator: std.mem.Allocator, b: *const Browser) !st
     if (self.focus) |focus_str| {
         if (std.mem.eql(u8, focus_str, "address bar")) {
             // Draw the typed text
+            var cursor_x = self.address_rect.left + self.padding;
             if (self.address_bar.items.len > 0) {
-                const addr_glyph = try b.layout_engine.font_manager.getStyledGlyph(
-                    self.address_bar.items,
-                    .Normal,
-                    .Roman,
-                    self.font_size,
-                    false,
-                );
-                try cmds.append(allocator, .{ .glyph = .{
-                    .x = self.address_rect.left + self.padding,
-                    .y = self.address_rect.top,
-                    .glyph = addr_glyph,
-                    .color = .{ .r = 0, .g = 0, .b = 0, .a = 255 },
-                } });
+                const address_text: []const u8 = self.address_bar.items;
+                var idx: usize = 0;
+                var text_x = cursor_x;
+                while (idx < address_text.len) {
+                    const advance = std.unicode.utf8ByteSequenceLength(address_text[idx]) catch 1;
+                    const next_idx = @min(address_text.len, idx + advance);
+                    const gme = address_text[idx..next_idx];
+                    const addr_glyph = try b.layout_engine.font_manager.getStyledGlyph(
+                        gme,
+                        .Normal,
+                        .Roman,
+                        self.font_size,
+                        false,
+                    );
+                    try cmds.append(allocator, .{ .glyph = .{
+                        .x = text_x,
+                        .y = self.address_rect.top,
+                        .glyph = addr_glyph,
+                        .color = .{ .r = 0, .g = 0, .b = 0, .a = 255 },
+                    } });
+                    text_x += addr_glyph.w;
+                    idx = next_idx;
+                }
+                cursor_x = text_x;
             }
-
-            // Draw cursor
-            const cursor_x = if (self.address_bar.items.len > 0) blk: {
-                const cursor_glyph = try b.layout_engine.font_manager.getStyledGlyph(
-                    self.address_bar.items,
-                    .Normal,
-                    .Roman,
-                    self.font_size,
-                    false,
-                );
-                break :blk self.address_rect.left + self.padding + cursor_glyph.w;
-            } else self.address_rect.left + self.padding;
 
             try cmds.append(allocator, .{
                 .line = .{
@@ -340,19 +340,29 @@ pub fn paint(self: *Chrome, allocator: std.mem.Allocator, b: *const Browser) !st
                 // Use the cached URL string (which is now stable)
                 const url_str = self.cached_url_str.?;
 
-                const url_glyph = try b.layout_engine.font_manager.getStyledGlyph(
-                    url_str,
-                    .Normal,
-                    .Roman,
-                    self.font_size,
-                    false,
-                );
-                try cmds.append(allocator, .{ .glyph = .{
-                    .x = self.address_rect.left + self.padding,
-                    .y = self.address_rect.top,
-                    .glyph = url_glyph,
-                    .color = .{ .r = 0, .g = 0, .b = 0, .a = 255 },
-                } });
+                const url_text: []const u8 = url_str;
+                var idx: usize = 0;
+                var text_x = self.address_rect.left + self.padding;
+                while (idx < url_text.len) {
+                    const advance = std.unicode.utf8ByteSequenceLength(url_text[idx]) catch 1;
+                    const next_idx = @min(url_text.len, idx + advance);
+                    const gme = url_text[idx..next_idx];
+                    const url_glyph = try b.layout_engine.font_manager.getStyledGlyph(
+                        gme,
+                        .Normal,
+                        .Roman,
+                        self.font_size,
+                        false,
+                    );
+                    try cmds.append(allocator, .{ .glyph = .{
+                        .x = text_x,
+                        .y = self.address_rect.top,
+                        .glyph = url_glyph,
+                        .color = .{ .r = 0, .g = 0, .b = 0, .a = 255 },
+                    } });
+                    text_x += url_glyph.w;
+                    idx = next_idx;
+                }
             }
         }
     }
@@ -419,6 +429,8 @@ pub fn backspace(self: *Chrome) void {
 
 pub fn blur(self: *Chrome) void {
     self.focus = null;
+    self.address_bar.clearAndFree(self.allocator);
+    self.address_bar = std.ArrayList(u8).empty;
 }
 
 pub fn enter(self: *Chrome, b: *Browser) !void {
@@ -455,6 +467,8 @@ pub fn enter(self: *Chrome, b: *Browser) !void {
 
                 // Clear focus
                 self.focus = null;
+                self.address_bar.clearAndFree(self.allocator);
+                self.address_bar = std.ArrayList(u8).empty;
             }
         }
     }
