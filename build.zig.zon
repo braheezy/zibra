@@ -3,29 +3,34 @@
     .version = "0.0.0",
     .minimum_zig_version = "0.15.1",
     .dependencies = .{
+        // For Unicode text processing
         .zg = .{
             .url = "git+https://codeberg.org/chaten/zg#749197a3f9d25e211615960c02380a3d659b20f9",
             .hash = "zg-0.15.1-oGqU3M0-tALZCy7boQS86znlBloyKx6--JriGlY0Paa9",
         },
+        // For URL parsing
         .adazig = .{
             .url = "git+https://github.com/braheezy/ada-zig?ref=3.3.0#be92d04eeca6401f0d4ff41a493d5b8658ba7a5b",
             .hash = "adazig-3.3.0-t4eT-oRlAACE_weWUFiOuG8aAfK-gMa1t6PbBW0p_Zcr",
         },
+        // The locations of folders
         .known_folders = .{
             .url = "git+https://github.com/ziglibs/known-folders#ab5cf5feb936fa3b72c95d3ad0c0c67791937ba1",
             .hash = "known_folders-0.0.0-Fy-PJtTTAADUOhGKM0sxzG4eMkNQxRvx9e5dfHVyaeA3",
         },
+        // Javascript runtime
         .kiesel = .{
             .path = "kiesel",
         },
-        // .sdl = .{
-        //     .url = "git+https://github.com/braheezy/SDL.zig#e3a687e0a6629f9d22aba0b48d4665a722eadab8",
-        //     .hash = "SDL2-0.0.0-yMCQisChBAC4SNhkNVPyqfXMSXMtjeXjNAgnNlitn7mF",
-        // },
+        // For 2d graphics
+        .z2d = .{
+            .path = "z2d",
+        },
+        // Graphics + input handling
+        // update with --save=sdl
         .sdl = .{
-            // .url = "git+https://github.com/braheezy/SDL.zig#845f57d177659f504c94362d509edefced57c761",
-            // .hash = "SDL2-0.0.0-yMCQip2jBABrGbQeterIV1OiqmLt73CFz2LnHde16kdS",
-            .path = "my-SDL.zig",
+            .url = "git+https://github.com/ikskuh/SDL.zig#827ad6a03ef1ad390b1ae8d96521b7cd3aaa19ff",
+            .hash = "SDL2-0.0.0-yMCQioGqBABWVG7BzbU3WEU6dyYDF0EojBS8CZRlFw-7",
         },
     },
     .fingerprint = 0x5f81e20e918f49dc,

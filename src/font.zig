@@ -266,7 +266,9 @@ pub const FontManager = struct {
             while (outer_it.next()) |outer_entry| {
                 // For each style => destroy the texture
                 const cache_entry = outer_entry.value_ptr.*;
-                cache_entry.texture.?.destroy();
+                if (cache_entry.texture) |texture| {
+                    texture.destroy();
+                }
             }
             f.glyphs.deinit();
 
@@ -288,10 +290,18 @@ pub const FontManager = struct {
 
         var font: *Font = try self.allocator.create(Font);
         font.font_handle = sdl2.ttf.openFontMem(embed_file, false, size) orelse return error.LoadFailed;
-        font.glyphs = std.StringHashMap(Glyph).init(self.allocator);
+        font.glyphs = std.AutoHashMap(u64, Glyph).init(self.allocator);
         font.line_height = font.font_handle.lineSkip();
 
         try self.fonts.put(name, font);
+
+        if (font.line_height < self.min_line_height) {
+            self.min_line_height = font.line_height;
+        }
+
+        if (self.current_font == null) {
+            self.current_font = self.fonts.get(name);
+        }
     }
 
     fn collectFontPaths(self: *FontManager) !std.ArrayList([]const u8) {
@@ -300,6 +310,16 @@ pub const FontManager = struct {
         // Add user font directory first to prefer them.
         const home_dir = try known_folders.getPath(self.allocator, .home) orelse return error.NoHomeDir;
         defer self.allocator.free(home_dir);
+
+        const user_suffixes = switch (builtin.target.os.tag) {
+            .macos => &[_][]const u8{ "/Library/Fonts" },
+            .linux => &[_][]const u8{ "/.local/share/fonts", "/.fonts" },
+            else => &[_][]const u8{},
+        };
+        for (user_suffixes) |suffix| {
+            const user_path = try std.fmt.allocPrint(self.allocator, "{s}{s}", .{ home_dir, suffix });
+            try paths.append(self.allocator, user_path);
+        }
 
         // Add system font directories
         for (system_fonts.paths) |dir| {
