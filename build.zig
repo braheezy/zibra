@@ -35,6 +35,9 @@ pub fn build(b: *std.Build) !void {
     const ada_dep = b.dependency("adazig", .{});
     source_module.addImport("ada", ada_dep.module("ada"));
 
+    const z2d_dep = b.dependency("z2d", .{});
+    source_module.addImport("z2d", z2d_dep.module("z2d"));
+
     const kiesel_dep = b.dependency("kiesel", .{
         .target = target,
         .optimize = optimize,

@@ -4,6 +4,8 @@ const builtin = @import("builtin");
 const grapheme = @import("grapheme");
 const code_point = @import("code_point");
 const sdl2 = @import("sdl");
+const z2d = @import("z2d");
+const compositor = z2d.compositor;
 
 const token = @import("token.zig");
 const font = @import("font.zig");
@@ -44,6 +46,10 @@ pub const Color = struct {
     g: u8,
     b: u8,
     a: u8 = 255,
+
+    pub fn toZ2dRgba(self: Color) z2d.pixel.RGBA {
+        return .{ .r = self.r, .g = self.g, .b = self.b, .a = self.a };
+    }
 };
 
 // Rectangle helper for layout bounds
@@ -73,6 +79,14 @@ pub const DisplayItem = union(enum) {
         y2: i32,
         color: Color,
     },
+    rounded_rect: struct {
+        x1: i32,
+        y1: i32,
+        x2: i32,
+        y2: i32,
+        radius: f64,
+        color: Color,
+    },
     line: struct {
         x1: i32,
         y1: i32,
@@ -85,6 +99,11 @@ pub const DisplayItem = union(enum) {
         rect: Rect,
         color: Color,
         thickness: i32,
+    },
+    blend: struct {
+        opacity: f64,
+        blend_mode: ?[]const u8,
+        children: []DisplayItem,
     },
 };
 
@@ -101,6 +120,14 @@ pub const Browser = struct {
     window: sdl2.Window,
     // SDL renderer handle
     canvas: sdl2.Renderer,
+    // z2d surface for drawing (RGBA format like the tutorial)
+    root_surface: z2d.Surface,
+    // z2d context for drawing operations
+    context: z2d.Context,
+    // Separate surface for browser chrome (UI)
+    chrome_surface: z2d.Surface,
+    // Separate surface for current tab content (can be taller than window)
+    tab_surface: ?z2d.Surface,
     // HTTP client for making requests (handles both HTTP and HTTPS)
     http_client: std.http.Client,
     // Cache for storing fetched resources
@@ -161,14 +188,26 @@ pub const Browser = struct {
             rtl_flag,
         );
 
+        // Create z2d surface for drawing (RGBA format like the tutorial)
+        var root_surface = try z2d.Surface.init(.image_surface_rgba, al, initial_window_width, initial_window_height);
+        errdefer root_surface.deinit(al);
+
+        // Create z2d context for drawing operations
+        var context = z2d.Context.init(al, &root_surface);
+        errdefer context.deinit();
+
         // Initialize JavaScript engine
         const js_engine = try js_module.init(al);
         errdefer js_engine.deinit(al);
 
-        return Browser{
+        var browser = Browser{
             .allocator = al,
             .window = screen,
             .canvas = renderer,
+            .root_surface = root_surface,
+            .context = context,
+            .chrome_surface = undefined, // Will be set below
+            .tab_surface = null,
             .http_client = .{ .allocator = al },
             .cache = try Cache.init(al),
             .cookie_jar = std.StringHashMap(url_module.CookieEntry).init(al),
@@ -178,6 +217,12 @@ pub const Browser = struct {
             .chrome = try Chrome.init(&layout_engine.font_manager, initial_window_width, al),
             .js_engine = js_engine,
         };
+
+        // Create chrome surface (fixed height based on chrome.bottom)
+        browser.chrome_surface = try z2d.Surface.init(.image_surface_rgba, al, initial_window_width, @intCast(browser.chrome.bottom));
+        errdefer browser.chrome_surface.deinit(al);
+
+        return browser;
     }
 
     // Get the active tab (if any)
@@ -215,6 +260,8 @@ pub const Browser = struct {
 
         try self.loadInTab(tab, url_ptr, null);
         load_success = true;
+        try self.rasterChrome();
+        try self.rasterTab();
         try self.draw();
     }
 
@@ -226,11 +273,16 @@ pub const Browser = struct {
             while (sdl2.pollEvent()) |event| {
                 switch (event) {
                     // Quit when the window is closed
-                    .quit => quit = true,
+                    .quit => {
+                        quit = true;
+                        break; // Exit event loop immediately
+                    },
                     .key_down => |kb_event| {
+                        if (quit) break;
                         try self.handleKeyEvent(kb_event.keycode);
                     },
                     .text_input => |text_event| {
+                        if (quit) break;
                         // Handle text input
                         const text = std.mem.sliceTo(&text_event.text, 0);
                         for (text) |char| {
@@ -247,37 +299,47 @@ pub const Browser = struct {
                                 }
                             }
                         }
-                        try self.draw();
+                        if (!quit) {
+                            try self.rasterChrome();
+                            try self.draw();
+                        }
                     },
                     // Handle mouse wheel events
                     .mouse_wheel => |wheel_event| {
+                        if (quit) break;
                         if (self.activeTab()) |tab| {
                             if (wheel_event.delta_y > 0) {
                                 tab.scrollUp();
                             } else if (wheel_event.delta_y < 0) {
                                 tab.scrollDown();
                             }
-                            try self.draw();
+                            if (!quit) {
+                                try self.draw();
+                            }
                         }
                     },
                     // Handle mouse button clicks
                     .mouse_button_down => |button_event| {
+                        if (quit) break;
                         if (button_event.button == .left) {
                             try self.handleClick(button_event.x, button_event.y);
                         }
                     },
                     .window => |window_event| {
+                        if (quit) break;
                         try self.handleWindowEvent(window_event);
                     },
                     else => {},
                 }
+                if (quit) break; // Exit inner event loop if quit was set
             }
 
-            // Draw browser content (includes canvas clear)
-            try self.draw();
-
-            // Present the updated frame
-            self.canvas.present();
+            // Draw browser content (includes canvas clear) - skip if quitting
+            if (!quit) {
+                try self.draw();
+                // Present the updated frame
+                self.canvas.present();
+            }
 
             // delay for 17ms to get 60fps
             sdl2.delay(17);
@@ -297,9 +359,28 @@ pub const Browser = struct {
                 self.layout_engine.window_width = size.width;
                 self.layout_engine.window_height = size.height;
 
-                // Force a clear and redraw
+                // Recreate z2d surfaces with new dimensions
+                self.context.deinit();
+                self.root_surface.deinit(self.allocator);
+                self.root_surface = try z2d.Surface.init(.image_surface_rgba, self.allocator, size.width, size.height);
+                self.context = z2d.Context.init(self.allocator, &self.root_surface);
+
+                // Recreate chrome surface with new width
+                self.chrome_surface.deinit(self.allocator);
+                self.chrome_surface = try z2d.Surface.init(.image_surface_rgba, self.allocator, size.width, @intCast(self.chrome.bottom));
+
+                // Recreate tab surface if it exists
+                if (self.tab_surface) |*tab_surface| {
+                    const tab_height = tab_surface.getHeight();
+                    tab_surface.deinit(self.allocator);
+                    self.tab_surface = try z2d.Surface.init(.image_surface_rgba, self.allocator, size.width, tab_height);
+                }
+
+                // Force re-raster and redraw
                 try self.canvas.setColor(.{ .r = 255, .g = 255, .b = 255, .a = 255 });
                 try self.canvas.clear();
+                try self.rasterChrome();
+                try self.rasterTab();
                 try self.draw();
                 self.canvas.present();
             },
@@ -331,6 +412,7 @@ pub const Browser = struct {
                         self.focus = null;
                     }
                 }
+                try self.rasterChrome();
                 try self.draw();
                 return;
             },
@@ -346,6 +428,7 @@ pub const Browser = struct {
                         }
                     }
                 }
+                try self.rasterChrome();
                 try self.draw();
                 return;
             },
@@ -353,6 +436,7 @@ pub const Browser = struct {
             // Handle Enter/Return key
             .@"return", .return_2 => {
                 try self.chrome.enter(self);
+                try self.rasterChrome();
                 try self.draw();
                 return;
             },
@@ -377,12 +461,15 @@ pub const Browser = struct {
 
     // Handle mouse clicks to navigate links
     fn handleClick(self: *Browser, screen_x: i32, screen_y: i32) !void {
+        // Skip expensive operations if we're shutting down
+        // (This prevents memory leaks from hash map allocations during shutdown)
         std.debug.print("Click detected at screen ({d}, {d})\n", .{ screen_x, screen_y });
 
         // Check if click is in chrome area
         if (screen_y < self.chrome.bottom) {
             self.focus = null;
             try self.chrome.click(self, screen_x, screen_y);
+            try self.rasterChrome();
             try self.draw();
             return;
         }
@@ -408,6 +495,7 @@ pub const Browser = struct {
 
         std.debug.print("Current URL: {s}\n", .{if (tab.current_url) |url_ptr| url_ptr.*.path else "none"});
 
+        const old_url = if (tab.current_url) |url_ptr| url_ptr.* else null;
         var handled_link = false;
         for (self.layout_engine.link_bounds.items) |entry| {
             const bounds = entry.bounds;
@@ -450,9 +538,12 @@ pub const Browser = struct {
                                     };
                                     load_success = true;
 
-                                    self.draw() catch |err| {
-                                        std.log.err("Failed to draw after loading: {any}", .{err});
-                                    };
+                                    // Check if URL changed and re-raster chrome if needed
+                                    if (old_url == null or !std.mem.eql(u8, old_url.?.path, new_url_ptr.*.path)) {
+                                        try self.rasterChrome();
+                                    }
+                                    try self.rasterTab();
+                                    try self.draw();
                                     handled_link = true;
                                 } else {
                                     std.debug.print("No current_url to resolve against\n", .{});
@@ -907,150 +998,411 @@ pub const Browser = struct {
         tab.content_height = self.layout_engine.content_height;
     }
 
-    // Draw the browser content
+    // Raster the browser chrome to the chrome surface
+    pub fn rasterChrome(self: *Browser) !void {
+        // Create a temporary context for the chrome surface
+        var chrome_context = z2d.Context.init(self.allocator, &self.chrome_surface);
+        defer chrome_context.deinit();
+
+        // Clear chrome surface (white background)
+        chrome_context.setSource(.{ .opaque_pattern = .{ .pixel = .{ .rgba = .{ .r = 255, .g = 255, .b = 255, .a = 255 } } } });
+        try chrome_context.moveTo(0, 0);
+        try chrome_context.lineTo(@floatFromInt(self.window_width), 0);
+        try chrome_context.lineTo(@floatFromInt(self.window_width), @floatFromInt(self.chrome.bottom));
+        try chrome_context.lineTo(0, @floatFromInt(self.chrome.bottom));
+        try chrome_context.closePath();
+        try chrome_context.fill();
+
+        // Draw chrome content
+        var chrome_cmds = try self.chrome.paint(self.allocator, self);
+        defer chrome_cmds.deinit(self.allocator);
+        for (chrome_cmds.items) |item| {
+            try self.drawDisplayItemZ2dContext(&chrome_context, item, 0);
+        }
+    }
+
+    // Raster the current tab to the tab surface
+    pub fn rasterTab(self: *Browser) !void {
+        const tab = self.activeTab() orelse return;
+
+        // Calculate required tab surface height
+        const tab_height = @max(tab.content_height, self.window_height - self.chrome.bottom);
+
+        // Create or resize tab surface if needed
+        if (self.tab_surface) |*existing_surface| {
+            const current_height = existing_surface.getHeight();
+            if (current_height != tab_height) {
+                // Need to recreate surface with new height
+                existing_surface.deinit(self.allocator);
+                self.tab_surface = try z2d.Surface.init(.image_surface_rgba, self.allocator, self.window_width, tab_height);
+            }
+        } else {
+            // Create new tab surface
+            self.tab_surface = try z2d.Surface.init(.image_surface_rgba, self.allocator, self.window_width, tab_height);
+        }
+
+        // Create a temporary context for the tab surface
+        var tab_context = z2d.Context.init(self.allocator, &self.tab_surface.?);
+        defer tab_context.deinit();
+
+        // Clear tab surface (white background)
+        tab_context.setSource(.{ .opaque_pattern = .{ .pixel = .{ .rgba = .{ .r = 255, .g = 255, .b = 255, .a = 255 } } } });
+        try tab_context.moveTo(0, 0);
+        try tab_context.lineTo(@floatFromInt(self.window_width), 0);
+        try tab_context.lineTo(@floatFromInt(self.window_width), @floatFromInt(tab_height));
+        try tab_context.lineTo(0, @floatFromInt(tab_height));
+        try tab_context.closePath();
+        try tab_context.fill();
+
+        // Draw tab content (no scroll offset since we're drawing the full tab)
+        if (tab.display_list) |display_list| {
+            for (display_list) |item| {
+                try self.drawDisplayItemZ2dContext(&tab_context, item, 0);
+            }
+        }
+    }
+
+    // Draw the browser content (composite from pre-rastered surfaces)
     pub fn draw(self: *Browser) !void {
-        // Clear the canvas
-        try self.canvas.setColorRGB(255, 255, 255);
+        // Skip drawing if window dimensions are invalid
+        if (self.window_width <= 0 or self.window_height <= 0) {
+            return;
+        }
+
+        // Recreate the context to avoid corruption issues
+        self.context.deinit();
+        self.context = z2d.Context.init(self.allocator, &self.root_surface);
+
+        // Clear the SDL canvas to black
+        try self.canvas.setColorRGB(0, 0, 0);
         try self.canvas.clear();
 
-        // Only draw the active tab
+        // Clear the root surface to white (to test if texture is being drawn)
+        const white_pixel = z2d.pixel.Pixel{ .rgba = .{ .r = 255, .g = 255, .b = 255, .a = 255 } };
+        self.root_surface.paintPixel(white_pixel);
+
+        // Draw chrome content (from pre-rastered chrome surface if available, otherwise draw directly)
+        var chrome_cmds = try self.chrome.paint(self.allocator, self);
+        defer chrome_cmds.deinit(self.allocator);
+        for (chrome_cmds.items) |item| {
+            try self.drawDisplayItemZ2d(item, 0);
+        }
+
+        // Draw tab content
         const tab = self.activeTab() orelse {
-            // Draw just the chrome if no tabs
-            var chrome_cmds = try self.chrome.paint(self.allocator, self);
-            defer chrome_cmds.deinit(self.allocator);
-            for (chrome_cmds.items) |item| {
-                try self.drawDisplayItem(item, 0);
-            }
+            // No tab, just copy to SDL
+            try self.copyZ2dToSDL();
             return;
         };
 
         if (tab.display_list) |display_list| {
             for (display_list) |item| {
                 // Offset by chrome height and scroll
-                try self.drawDisplayItem(item, tab.scroll_offset - self.chrome.bottom);
+                try self.drawDisplayItemZ2d(item, tab.scroll_offset - self.chrome.bottom);
             }
         }
 
-        // Draw chrome on top
-        var chrome_cmds = try self.chrome.paint(self.allocator, self);
-        defer chrome_cmds.deinit(self.allocator);
-        for (chrome_cmds.items) |item| {
-            try self.drawDisplayItem(item, 0);
-        }
+        try self.drawScrollbarZ2d(tab);
 
-        try self.drawScrollbar(tab);
+        // Copy composited root surface to SDL for display
+        try self.copyZ2dToSDL();
     }
 
-    fn drawDisplayItem(self: *Browser, item: DisplayItem, scroll_offset: i32) !void {
+    // Copy z2d surface to SDL for display (surface handoff)
+    fn copyZ2dToSDL(self: *Browser) !void {
+        // Get the pixel data from the z2d surface
+        const surface_width = self.root_surface.getWidth();
+        const surface_height = self.root_surface.getHeight();
+
+        // Get the underlying pixel buffer from z2d surface
+        const pixel_data = switch (self.root_surface) {
+            .image_surface_rgba => |*img_surface| img_surface.buf,
+            else => return error.UnsupportedSurfaceType,
+        };
+
+        // Create an SDL texture and copy the pixel data
+        // Use RGBA8888 to match z2d's pixel format directly
+        const texture = try sdl2.createTexture(
+            self.canvas,
+            .rgba8888,
+            .streaming,
+            @intCast(surface_width),
+            @intCast(surface_height),
+        );
+
+        // Set blend mode to blend (for alpha transparency)
+        try texture.setBlendMode(.blend);
+
+        // Lock the texture to get writable pixel buffer
+        var pixel_data_result = try texture.lock(null);
+
+        // Get the pixel pointer and stride
+        const pixels: [*]u8 = pixel_data_result.pixels;
+        const stride = pixel_data_result.stride;
+
+        // Copy pixels from z2d to SDL texture
+        // Both use RGBA format, so we can copy directly
+        const bytes_per_pixel = 4;
+        for (0..@intCast(surface_height)) |y| {
+            const src_row_start = y * @as(usize, @intCast(surface_width));
+            const dst_row_start = y * stride;
+
+            for (0..@intCast(surface_width)) |x| {
+                const src_idx = src_row_start + x;
+                const dst_idx = dst_row_start + x * bytes_per_pixel;
+
+                const src_pixel = pixel_data[src_idx];
+
+                // Direct copy - both are RGBA
+                pixels[dst_idx + 0] = src_pixel.r;
+                pixels[dst_idx + 1] = src_pixel.g;
+                pixels[dst_idx + 2] = src_pixel.b;
+                pixels[dst_idx + 3] = src_pixel.a;
+            }
+        }
+
+        // MUST unlock before copying to canvas
+        pixel_data_result.release();
+
+        // Copy texture to renderer
+        try self.canvas.copy(texture, null, null);
+
+        // Now we can destroy the texture after it's been copied to the render target
+        texture.destroy();
+    }
+
+    // Draw a display item using the browser's context
+    fn drawDisplayItemZ2d(self: *Browser, item: DisplayItem, scroll_offset: i32) !void {
+        try self.drawDisplayItemZ2dContext(&self.context, item, scroll_offset);
+    }
+
+    // Draw a display item using a specific z2d context
+    fn drawDisplayItemZ2dContext(self: *Browser, context: *z2d.Context, item: DisplayItem, scroll_offset: i32) !void {
         switch (item) {
-            .glyph => |glyph_item| {
-                const screen_y = glyph_item.y - scroll_offset;
-                if (screen_y >= 0 and screen_y < self.window_height) {
-                    const dst_rect: sdl2.Rectangle = .{
-                        .x = glyph_item.x,
-                        .y = screen_y,
-                        .width = glyph_item.glyph.w,
-                        .height = glyph_item.glyph.h,
-                    };
-
-                    // Apply text color to the glyph texture unless the glyph carries its own colors (e.g. emoji)
-                    if (glyph_item.glyph.preserve_texture_color) {
-                        try glyph_item.glyph.texture.?.setColorMod(.{
-                            .r = 255,
-                            .g = 255,
-                            .b = 255,
-                        });
-                    } else {
-                        try glyph_item.glyph.texture.?.setColorMod(.{
-                            .r = glyph_item.color.r,
-                            .g = glyph_item.color.g,
-                            .b = glyph_item.color.b,
-                        });
-                    }
-
-                    try self.canvas.copy(glyph_item.glyph.texture.?, dst_rect, null);
-                }
+            .glyph => {
+                // Skip text rendering for now - tutorial hasn't covered this yet
             },
             .rect => |rect_item| {
                 const top = rect_item.y1 - scroll_offset;
                 const bottom = rect_item.y2 - scroll_offset;
-                if (bottom > 0 and top < self.window_height) {
-                    const width = rect_item.x2 - rect_item.x1;
-                    const height = bottom - top;
-                    if (width > 0 and height > 0) {
-                        try self.canvas.setColor(.{
-                            .r = rect_item.color.r,
-                            .g = rect_item.color.g,
-                            .b = rect_item.color.b,
-                            .a = rect_item.color.a,
-                        });
+                const width = rect_item.x2 - rect_item.x1;
+                const height = bottom - top;
 
-                        const rect: sdl2.Rectangle = .{
-                            .x = rect_item.x1,
-                            .y = top,
-                            .width = width,
-                            .height = height,
-                        };
-                        try self.canvas.fillRect(rect);
+                // Only draw if rect has valid dimensions and is visible
+                if (width > 1 and height > 1 and bottom > 0 and top < self.window_height) {
+                    // Reset path first to ensure clean state
+                    context.resetPath();
+
+                    // Set source color for filling
+                    context.setSource(.{ .opaque_pattern = .{ .pixel = .{ .rgba = rect_item.color.toZ2dRgba() } } });
+
+                    // Create rectangle path
+                    try context.moveTo(@floatFromInt(rect_item.x1), @floatFromInt(top));
+                    try context.lineTo(@floatFromInt(rect_item.x2), @floatFromInt(top));
+                    try context.lineTo(@floatFromInt(rect_item.x2), @floatFromInt(bottom));
+                    try context.lineTo(@floatFromInt(rect_item.x1), @floatFromInt(bottom));
+                    try context.closePath();
+
+                    // Fill and reset path after
+                    try context.fill();
+                    context.resetPath();
+                }
+            },
+            .rounded_rect => |rounded_item| {
+                const top = rounded_item.y1 - scroll_offset;
+                const bottom = rounded_item.y2 - scroll_offset;
+                if (bottom > 0 and top < self.window_height) {
+                    const width = rounded_item.x2 - rounded_item.x1;
+                    const height = bottom - top;
+                    if (width > 1 and height > 1) {
+                        context.resetPath();
+                        // Set source color for filling
+                        context.setSource(.{ .opaque_pattern = .{ .pixel = .{ .rgba = rounded_item.color.toZ2dRgba() } } });
+
+                        // Clamp radius to not exceed half the width or height
+                        const max_radius = @min(@as(f64, @floatFromInt(width)) / 2.0, @as(f64, @floatFromInt(height)) / 2.0);
+                        const radius = @min(rounded_item.radius, max_radius);
+
+                        const x1 = @as(f64, @floatFromInt(rounded_item.x1));
+                        const y1 = @as(f64, @floatFromInt(top));
+                        const x2 = x1 + @as(f64, @floatFromInt(width));
+                        const y2 = y1 + @as(f64, @floatFromInt(height));
+
+                        // Only draw rounded corners if radius is meaningful
+                        if (radius > 0.5) {
+                            // Create rounded rectangle path using arcs
+                            // Top-left corner
+                            try context.moveTo(x1 + radius, y1);
+                            try context.arc(x1 + radius, y1 + radius, radius, -std.math.pi, -std.math.pi / 2.0);
+
+                            // Top-right corner
+                            try context.arc(x2 - radius, y1 + radius, radius, -std.math.pi / 2.0, 0);
+
+                            // Bottom-right corner
+                            try context.arc(x2 - radius, y2 - radius, radius, 0, std.math.pi / 2.0);
+
+                            // Bottom-left corner
+                            try context.arc(x1 + radius, y2 - radius, radius, std.math.pi / 2.0, std.math.pi);
+
+                            try context.closePath();
+                            try context.fill();
+                        } else {
+                            // Draw regular rectangle if radius is too small
+                            try context.moveTo(x1, y1);
+                            try context.lineTo(x2, y1);
+                            try context.lineTo(x2, y2);
+                            try context.lineTo(x1, y2);
+                            try context.closePath();
+                            try context.fill();
+                        }
                     }
                 }
             },
             .line => |line_item| {
                 const y1 = line_item.y1 - scroll_offset;
                 const y2 = line_item.y2 - scroll_offset;
-                try self.canvas.setColor(.{
-                    .r = line_item.color.r,
-                    .g = line_item.color.g,
-                    .b = line_item.color.b,
-                    .a = line_item.color.a,
-                });
-                // SDL doesn't have line thickness directly, draw as rect for thickness > 1
-                if (line_item.thickness == 1) {
-                    try self.canvas.drawLine(line_item.x1, y1, line_item.x2, y2);
-                } else {
-                    // Draw thick line as rectangle
-                    const is_horizontal = (line_item.y1 == line_item.y2);
-                    if (is_horizontal) {
-                        const width: i32 = @intCast(@abs(line_item.x2 - line_item.x1));
-                        const rect: sdl2.Rectangle = .{
-                            .x = @min(line_item.x1, line_item.x2),
-                            .y = y1 - @divTrunc(line_item.thickness, 2),
-                            .width = width,
-                            .height = line_item.thickness,
-                        };
-                        try self.canvas.fillRect(rect);
-                    } else {
-                        const height: i32 = @intCast(@abs(y2 - y1));
-                        const rect: sdl2.Rectangle = .{
-                            .x = line_item.x1 - @divTrunc(line_item.thickness, 2),
-                            .y = @min(y1, y2),
-                            .width = line_item.thickness,
-                            .height = height,
-                        };
-                        try self.canvas.fillRect(rect);
-                    }
+
+                // Only draw if line has non-zero length
+                const dx = line_item.x2 - line_item.x1;
+                const dy = y2 - y1;
+                if (dx != 0 or dy != 0) {
+                    // Set source color and line width
+                    context.resetPath();
+                    context.setSource(.{ .opaque_pattern = .{ .pixel = .{ .rgba = line_item.color.toZ2dRgba() } } });
+                    context.setLineWidth(@floatFromInt(line_item.thickness));
+
+                    // Draw the line
+                    try context.moveTo(@floatFromInt(line_item.x1), @floatFromInt(y1));
+                    try context.lineTo(@floatFromInt(line_item.x2), @floatFromInt(y2));
+                    try context.stroke();
+                    context.resetPath();
                 }
             },
             .outline => |outline_item| {
                 const r = outline_item.rect;
                 const top = r.top - scroll_offset;
                 const bottom = r.bottom - scroll_offset;
-                try self.canvas.setColor(.{
-                    .r = outline_item.color.r,
-                    .g = outline_item.color.g,
-                    .b = outline_item.color.b,
-                    .a = outline_item.color.a,
-                });
-                // Draw four lines for the outline
-                try self.canvas.drawLine(r.left, top, r.right, top); // top
-                try self.canvas.drawLine(r.right, top, r.right, bottom); // right
-                try self.canvas.drawLine(r.right, bottom, r.left, bottom); // bottom
-                try self.canvas.drawLine(r.left, bottom, r.left, top); // left
+
+                const width = r.right - r.left;
+                const height = bottom - top;
+
+                // Only draw if outline has valid dimensions
+                if (width > 1 and height > 1) {
+                    // Set source color and line width (assuming 1 pixel outline)
+                    context.resetPath();
+                    context.setSource(.{ .opaque_pattern = .{ .pixel = .{ .rgba = outline_item.color.toZ2dRgba() } } });
+                    context.setLineWidth(1.0);
+
+                    // Draw rectangle outline
+                    try context.moveTo(@floatFromInt(r.left), @floatFromInt(top));
+                    try context.lineTo(@floatFromInt(r.right), @floatFromInt(top));
+                    try context.lineTo(@floatFromInt(r.right), @floatFromInt(bottom));
+                    try context.lineTo(@floatFromInt(r.left), @floatFromInt(bottom));
+                    try context.closePath();
+                    try context.stroke();
+                }
+            },
+            .blend => |blend_item| {
+                // For blend operations, only create a layer if we have opacity < 1 or a blend mode
+                const should_save_layer = blend_item.opacity < 1.0 or blend_item.blend_mode != null;
+
+                if (should_save_layer) {
+                    // Save current operator for restoration
+                    const original_operator = context.getOperator();
+
+                    // Set blend mode if specified
+                    if (blend_item.blend_mode) |mode| {
+                        const blend_operator = self.parseBlendMode(mode);
+                        context.setOperator(blend_operator);
+                    }
+
+                    // Draw children with opacity applied to their colors (since z2d doesn't have layered alpha)
+                    for (blend_item.children) |child_item| {
+                        if (blend_item.opacity < 1.0) {
+                            var modified_item = child_item;
+                            modified_item = self.applyOpacityToDisplayItem(modified_item, blend_item.opacity);
+                            try self.drawDisplayItemZ2dContext(context, modified_item, scroll_offset);
+                        } else {
+                            try self.drawDisplayItemZ2dContext(context, child_item, scroll_offset);
+                        }
+                    }
+
+                    // Restore original operator
+                    context.setOperator(original_operator);
+                } else {
+                    // No layer needed, just draw children directly
+                    for (blend_item.children) |child_item| {
+                        try self.drawDisplayItemZ2dContext(context, child_item, scroll_offset);
+                    }
+                }
             },
         }
     }
 
-    pub fn drawScrollbar(self: *Browser, tab: *Tab) !void {
+    // Parse CSS blend mode string to z2d compositing operator
+    fn parseBlendMode(self: *Browser, blend_mode_str: []const u8) compositor.Operator {
+        _ = self;
+        if (std.mem.eql(u8, blend_mode_str, "multiply")) {
+            return .multiply;
+        } else if (std.mem.eql(u8, blend_mode_str, "screen")) {
+            return .screen;
+        } else if (std.mem.eql(u8, blend_mode_str, "overlay")) {
+            return .overlay;
+        } else if (std.mem.eql(u8, blend_mode_str, "darken")) {
+            return .darken;
+        } else if (std.mem.eql(u8, blend_mode_str, "lighten")) {
+            return .lighten;
+        } else if (std.mem.eql(u8, blend_mode_str, "color-dodge")) {
+            return .color_dodge;
+        } else if (std.mem.eql(u8, blend_mode_str, "color-burn")) {
+            return .color_burn;
+        } else if (std.mem.eql(u8, blend_mode_str, "hard-light")) {
+            return .hard_light;
+        } else if (std.mem.eql(u8, blend_mode_str, "soft-light")) {
+            return .soft_light;
+        } else if (std.mem.eql(u8, blend_mode_str, "difference")) {
+            return .difference;
+        } else if (std.mem.eql(u8, blend_mode_str, "exclusion")) {
+            return .exclusion;
+        } else if (std.mem.eql(u8, blend_mode_str, "dst_in")) {
+            return .dst_in;
+        } else {
+            // Default to src_over for unknown blend modes
+            return .src_over;
+        }
+    }
+
+    // Apply opacity to a display item's colors
+    fn applyOpacityToDisplayItem(self: *Browser, item: DisplayItem, opacity: f64) DisplayItem {
+        _ = self; // Used for context
+        var result = item;
+
+        switch (result) {
+            .glyph => |*glyph_item| {
+                glyph_item.color.a = @as(u8, @intFromFloat(@round(@as(f64, @floatFromInt(glyph_item.color.a)) * opacity)));
+            },
+            .rect => |*rect_item| {
+                rect_item.color.a = @as(u8, @intFromFloat(@round(@as(f64, @floatFromInt(rect_item.color.a)) * opacity)));
+            },
+            .rounded_rect => |*rounded_item| {
+                rounded_item.color.a = @as(u8, @intFromFloat(@round(@as(f64, @floatFromInt(rounded_item.color.a)) * opacity)));
+            },
+            .line => |*line_item| {
+                line_item.color.a = @as(u8, @intFromFloat(@round(@as(f64, @floatFromInt(line_item.color.a)) * opacity)));
+            },
+            .outline => |*outline_item| {
+                outline_item.color.a = @as(u8, @intFromFloat(@round(@as(f64, @floatFromInt(outline_item.color.a)) * opacity)));
+            },
+            .blend => |*blend_item| {
+                // For nested blend operations, multiply the opacities
+                blend_item.opacity *= opacity;
+            },
+        }
+
+        return result;
+    }
+
+    fn drawScrollbarZ2d(self: *Browser, tab: *Tab) !void {
         const tab_height = self.window_height - self.chrome.bottom;
         if (tab.content_height <= tab_height) {
             // No scrollbar needed if content fits in the window
@@ -1064,39 +1416,38 @@ pub const Browser = struct {
         const thumb_y_offset: i32 = @intFromFloat(@as(f32, @floatFromInt(tab.scroll_offset)) / @as(f32, @floatFromInt(max_scroll)) * (@as(f32, @floatFromInt(tab_height)) - @as(f32, @floatFromInt(thumb_height))));
 
         // Draw scrollbar track (background) - start below chrome
-        const track_rect: sdl2.Rectangle = .{
-            .x = self.window_width - scrollbar_width,
-            .y = self.chrome.bottom,
-            .width = scrollbar_width,
-            .height = track_height,
-        };
-        // Light gray
-        try self.canvas.setColor(.{
-            .r = 200,
-            .g = 200,
-            .b = 200,
-            .a = 255,
-        });
-        try self.canvas.fillRect(track_rect);
+        self.context.setSource(.{ .opaque_pattern = .{ .pixel = .{ .rgba = .{ .r = 200, .g = 200, .b = 200, .a = 255 } } } }); // Light gray
+        const track_x = self.window_width - scrollbar_width;
+        const track_y = self.chrome.bottom;
+        try self.context.moveTo(@floatFromInt(track_x), @floatFromInt(track_y));
+        try self.context.lineTo(@floatFromInt(track_x + scrollbar_width), @floatFromInt(track_y));
+        try self.context.lineTo(@floatFromInt(track_x + scrollbar_width), @floatFromInt(track_y + track_height));
+        try self.context.lineTo(@floatFromInt(track_x), @floatFromInt(track_y + track_height));
+        try self.context.closePath();
+        try self.context.fill();
 
         // Draw scrollbar thumb (movable part) - offset by chrome height
-        const thumb_rect: sdl2.Rectangle = .{
-            .x = self.window_width - scrollbar_width,
-            .y = self.chrome.bottom + thumb_y_offset,
-            .width = scrollbar_width,
-            .height = thumb_height,
-        };
-        try self.canvas.setColor(.{
-            .r = 0,
-            .g = 102,
-            .b = 204,
-            .a = 255,
-        });
-        try self.canvas.fillRect(thumb_rect);
+        self.context.setSource(.{ .opaque_pattern = .{ .pixel = .{ .rgba = .{ .r = 0, .g = 102, .b = 204, .a = 255 } } } }); // Blue
+        const thumb_x = self.window_width - scrollbar_width;
+        const thumb_y = self.chrome.bottom + thumb_y_offset;
+        try self.context.moveTo(@floatFromInt(thumb_x), @floatFromInt(thumb_y));
+        try self.context.lineTo(@floatFromInt(thumb_x + scrollbar_width), @floatFromInt(thumb_y));
+        try self.context.lineTo(@floatFromInt(thumb_x + scrollbar_width), @floatFromInt(thumb_y + thumb_height));
+        try self.context.lineTo(@floatFromInt(thumb_x), @floatFromInt(thumb_y + thumb_height));
+        try self.context.closePath();
+        try self.context.fill();
     }
 
     // Ensure we clean up the document_layout in deinit
     pub fn deinit(self: *Browser) void {
+        // Clean up z2d surfaces and context
+        self.context.deinit();
+        self.root_surface.deinit(self.allocator);
+        self.chrome_surface.deinit(self.allocator);
+        if (self.tab_surface) |*tab_surface| {
+            tab_surface.deinit(self.allocator);
+        }
+
         // Close all connections
         self.http_client.deinit();
 

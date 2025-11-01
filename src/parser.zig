@@ -924,6 +924,11 @@ fn styleWithParent(allocator: std.mem.Allocator, node: *Node, rules: []const CSS
             return;
         },
         .element => |*e| {
+            // Deinitialize existing style map if it exists (from previous render)
+            if (e.style) |existing_style| {
+                var style_map = existing_style;
+                style_map.deinit();
+            }
             // Initialize empty style map
             e.style = std.StringHashMap([]const u8).init(allocator);
 

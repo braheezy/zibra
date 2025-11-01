@@ -900,8 +900,8 @@ fn xhrSend(agent: *Agent, this_value: Value, arguments: kiesel.types.Arguments) 
 
 /// Escape a string for safe embedding in JavaScript source
 fn quoteJsString(allocator: std.mem.Allocator, input: []const u8) ![]u8 {
-    var builder = std.ArrayList(u8).init(allocator);
-    errdefer builder.deinit();
+    var builder = std.ArrayList(u8).empty;
+    errdefer builder.deinit(allocator);
 
     try builder.append(allocator, '"');
     for (input) |ch| {

@@ -1033,9 +1033,18 @@ pub const InputLayout = struct {
     }
 
     pub fn paint(self: *InputLayout, engine: *Layout) !void {
+        var commands = std.ArrayList(DisplayItem).empty;
+        defer commands.deinit(engine.allocator);
+        try self.paintToList(&commands, engine);
+        for (commands.items) |cmd| {
+            try engine.display_list.append(engine.allocator, cmd);
+        }
+    }
+
+    pub fn paintToList(self: *InputLayout, commands: *std.ArrayList(DisplayItem), engine: *Layout) !void {
         // Draw background rectangle
         if (self.bgcolor.a > 0) {
-            try engine.display_list.append(engine.allocator, DisplayItem{
+            try commands.append(engine.allocator, DisplayItem{
                 .rect = .{
                     .x1 = self.x,
                     .y1 = self.y,
@@ -1090,7 +1099,7 @@ pub const InputLayout = struct {
                     false,
                 );
 
-                try engine.display_list.append(engine.allocator, DisplayItem{
+                try commands.append(engine.allocator, DisplayItem{
                     .glyph = .{
                         .x = text_x,
                         .y = self.y,
@@ -1199,6 +1208,15 @@ pub const TextLayout = struct {
     }
 
     pub fn paint(self: *TextLayout, engine: *Layout) !void {
+        var commands = std.ArrayList(DisplayItem).empty;
+        defer commands.deinit(engine.allocator);
+        try self.paintToList(&commands, engine);
+        for (commands.items) |cmd| {
+            try engine.display_list.append(engine.allocator, cmd);
+        }
+    }
+
+    pub fn paintToList(self: *TextLayout, commands: *std.ArrayList(DisplayItem), engine: *Layout) !void {
         // Paint the word using the stored font properties
         const glyph = try engine.font_manager.getStyledGlyph(
             self.word,
@@ -1208,7 +1226,7 @@ pub const TextLayout = struct {
             false,
         );
 
-        try engine.display_list.append(engine.allocator, DisplayItem{
+        try commands.append(self.allocator, DisplayItem{
             .glyph = .{
                 .x = self.x,
                 .y = self.y,
@@ -1307,9 +1325,18 @@ pub const LineLayout = struct {
     }
 
     pub fn paint(self: *LineLayout, engine: *Layout) !void {
+        var commands = std.ArrayList(DisplayItem).empty;
+        defer commands.deinit(engine.allocator);
+        try self.paintToList(&commands, engine);
+        for (commands.items) |cmd| {
+            try engine.display_list.append(engine.allocator, cmd);
+        }
+    }
+
+    pub fn paintToList(self: *LineLayout, commands: *std.ArrayList(DisplayItem), engine: *Layout) !void {
         // Paint each word in the line
         for (self.children.items) |text| {
-            try text.paint(engine);
+            try text.paintToList(commands, engine);
         }
     }
 
@@ -1624,6 +1651,22 @@ fn layoutInlineBlock(self: *Layout, block: *BlockLayout) !void {
 }
 
 fn parseColor(color_str: []const u8) ?browser.Color {
+    // Handle hex colors like #rrggbbaa (with alpha)
+    if (color_str.len == 9 and color_str[0] == '#') {
+        const r = std.fmt.parseInt(u8, color_str[1..3], 16) catch return null;
+        const g = std.fmt.parseInt(u8, color_str[3..5], 16) catch return null;
+        const b = std.fmt.parseInt(u8, color_str[5..7], 16) catch return null;
+        const a = std.fmt.parseInt(u8, color_str[7..9], 16) catch return null;
+        return browser.Color{ .r = r, .g = g, .b = b, .a = a };
+    }
+    // Handle hex colors like #rrggbb (opaque)
+    else if (color_str.len == 7 and color_str[0] == '#') {
+        const r = std.fmt.parseInt(u8, color_str[1..3], 16) catch return null;
+        const g = std.fmt.parseInt(u8, color_str[3..5], 16) catch return null;
+        const b = std.fmt.parseInt(u8, color_str[5..7], 16) catch return null;
+        return browser.Color{ .r = r, .g = g, .b = b, .a = 255 };
+    }
+
     // Handle named colors
     if (std.mem.eql(u8, color_str, "red")) {
         return browser.Color{ .r = 255, .g = 0, .b = 0, .a = 255 };
@@ -1655,8 +1698,9 @@ fn parseColor(color_str: []const u8) ?browser.Color {
         return browser.Color{ .r = 0, .g = 255, .b = 255, .a = 255 };
     } else if (std.mem.eql(u8, color_str, "magenta")) {
         return browser.Color{ .r = 255, .g = 0, .b = 255, .a = 255 };
+    } else if (std.mem.eql(u8, color_str, "orangered")) {
+        return browser.Color{ .r = 255, .g = 69, .b = 0, .a = 255 };
     }
-    // TODO: Handle hex colors like #ff0000
     return null;
 }
 
@@ -1671,6 +1715,12 @@ fn addBackgroundIfNeeded(self: *Layout, block: *const BlockLayout) !void {
             // Check for background-color in the style attribute
             const bgcolor_str = if (e.style) |style|
                 style.get("background-color")
+            else
+                null;
+
+            // Check for border-radius
+            const border_radius_str = if (e.style) |style|
+                style.get("border-radius")
             else
                 null;
 
@@ -1690,32 +1740,40 @@ fn addBackgroundIfNeeded(self: *Layout, block: *const BlockLayout) !void {
 
             // Draw the background rectangle if we have a color
             if (color) |col| {
-                const rect = DisplayItem{ .rect = .{
-                    .x1 = block.x,
-                    .y1 = block.y,
-                    .x2 = block.x + block.width,
-                    .y2 = block.y + block.height,
-                    .color = col,
-                } };
-                try self.display_list.append(self.allocator, rect);
+                // Parse border-radius if present
+                var radius: f64 = 0.0;
+                if (border_radius_str) |br_str| {
+                    if (std.mem.endsWith(u8, br_str, "px")) {
+                        const radius_str = br_str[0 .. br_str.len - 2];
+                        radius = std.fmt.parseFloat(f64, radius_str) catch 0.0;
+                    }
+                }
+
+                if (radius > 0.0) {
+                    // Use rounded rectangle
+                    const rounded_rect = DisplayItem{ .rounded_rect = .{
+                        .x1 = block.x,
+                        .y1 = block.y,
+                        .x2 = block.x + block.width,
+                        .y2 = block.y + block.height,
+                        .radius = radius,
+                        .color = col,
+                    } };
+                    try self.display_list.append(self.allocator, rounded_rect);
+                } else {
+                    // Use regular rectangle
+                    const rect = DisplayItem{ .rect = .{
+                        .x1 = block.x,
+                        .y1 = block.y,
+                        .x2 = block.x + block.width,
+                        .y2 = block.y + block.height,
+                        .color = col,
+                    } };
+                    try self.display_list.append(self.allocator, rect);
+                }
             }
         },
         else => {},
-    }
-}
-
-fn paintBlock(self: *Layout, block: *BlockLayout) !void {
-    try addBackgroundIfNeeded(self, block);
-
-    for (block.display_list.items) |item| {
-        try self.display_list.append(self.allocator, item);
-    }
-
-    for (block.children.items) |child| {
-        switch (child) {
-            .block => |b| try paintBlock(self, b),
-            .line => |l| try l.paint(self),
-        }
     }
 }
 
@@ -1727,14 +1785,259 @@ pub fn buildDocument(self: *Layout, root: Node) !*DocumentLayout {
 
 pub fn paintDocument(self: *Layout, document: *DocumentLayout) ![]DisplayItem {
     self.display_list.clearRetainingCapacity();
-    self.current_display_target = &self.display_list;
 
     for (document.children.items) |child| {
-        try paintBlock(self, child);
+        try paintBlockTree(self, child);
     }
 
     self.content_height = document.height + v_offset;
     return try self.display_list.toOwnedSlice(self.allocator);
+}
+
+// Paint a block and its subtree, applying stacking context effects
+fn paintBlockTree(self: *Layout, block: *BlockLayout) !void {
+    // Only paint if the block should be painted
+    if (!block.shouldPaint()) return;
+
+    // Collect all display commands for this block and its subtree
+    var commands = std.ArrayList(DisplayItem).empty;
+    defer commands.deinit(self.allocator);
+
+    // Add the block's own background/borders
+    try addBackgroundIfNeeded(self, block);
+
+    // Add the block's display items (from children like text, etc.)
+    for (block.display_list.items) |item| {
+        try commands.append(self.allocator, item);
+    }
+
+    // Recursively paint children
+    for (block.children.items) |child| {
+        switch (child) {
+            .block => |b| try paintBlockTreeRecursive(&commands, self, b),
+            .line => |l| try l.paintToList(&commands, self),
+        }
+    }
+
+    // Apply visual effects (opacity, etc.) to wrap the entire subtree
+    const final_commands = try applyPaintEffects(self, block, commands.items);
+
+    // Add the final commands to the display list
+    for (final_commands) |cmd| {
+        try self.display_list.append(self.allocator, cmd);
+    }
+}
+
+// Recursively paint a block's subtree into a command list (without applying effects)
+fn paintBlockTreeRecursive(commands: *std.ArrayList(DisplayItem), self: *Layout, block: *BlockLayout) !void {
+    if (!block.shouldPaint()) return;
+
+    // Add background/borders
+    try addBackgroundIfNeededToList(self.allocator, commands, block);
+
+    // Add display items (from text, etc.)
+    for (block.display_list.items) |item| {
+        try commands.append(self.allocator, item);
+    }
+
+    // Recursively paint children - collect their commands
+    for (block.children.items) |child| {
+        switch (child) {
+            .block => |b| try paintBlockTreeRecursive(commands, self, b),
+            .line => |l| try l.paintToList(commands, self),
+        }
+    }
+}
+
+// Apply visual effects like opacity, blend modes, and clipping to a list of display commands
+fn applyPaintEffects(self: *Layout, block: *BlockLayout, commands: []DisplayItem) ![]DisplayItem {
+    // Check for opacity, blend mode, and overflow clipping
+    var opacity: f64 = 1.0;
+    var blend_mode: ?[]const u8 = null;
+    var should_clip = false;
+    var border_radius: f64 = 0.0;
+
+    if (block.node == .element) {
+        const elem = block.node.element;
+        if (elem.style) |style| {
+            if (style.get("opacity")) |op_str| {
+                opacity = std.fmt.parseFloat(f64, op_str) catch 1.0;
+                opacity = @max(0.0, @min(1.0, opacity)); // Clamp to valid range
+            }
+            if (style.get("mix-blend-mode")) |blend_str| {
+                blend_mode = blend_str;
+            }
+            if (std.mem.eql(u8, style.get("overflow") orelse "visible", "clip")) {
+                should_clip = true;
+                if (style.get("border-radius")) |radius_str| {
+                    // Parse border-radius (e.g., "30px" -> 30.0)
+                    if (std.mem.endsWith(u8, radius_str, "px")) {
+                        const radius_value = radius_str[0 .. radius_str.len - 2];
+                        border_radius = std.fmt.parseFloat(f64, radius_value) catch 0.0;
+                    }
+                }
+            }
+        }
+    }
+
+    // Start with the original commands
+    var current_commands = commands;
+
+    // Apply clipping first if needed
+    if (should_clip and border_radius > 0) {
+        // Create a clipping mask using dst_in blend mode
+        // The mask is a white rounded rectangle that will clip the content
+        const mask_commands = try self.allocator.alloc(DisplayItem, 1);
+        mask_commands[0] = DisplayItem{
+            .rounded_rect = .{
+                .x1 = block.x,
+                .y1 = block.y,
+                .x2 = block.x + block.width,
+                .y2 = block.y + block.height,
+                .radius = border_radius,
+                .color = browser.Color{ .r = 255, .g = 255, .b = 255, .a = 255 }, // White mask
+            },
+        };
+
+        // Copy the original commands
+        const content_commands = try self.allocator.alloc(DisplayItem, current_commands.len);
+        @memcpy(content_commands, current_commands);
+
+        // Create the clipping blend that applies dst_in to mask the content
+        const clip_blend_mode = try self.allocator.alloc(u8, 6);
+        @memcpy(clip_blend_mode, "dst_in");
+
+        const clip_mask_commands = try self.allocator.alloc(DisplayItem, 1);
+        clip_mask_commands[0] = DisplayItem{
+            .rounded_rect = .{
+                .x1 = block.x,
+                .y1 = block.y,
+                .x2 = block.x + block.width,
+                .y2 = block.y + block.height,
+                .radius = border_radius,
+                .color = browser.Color{ .r = 255, .g = 255, .b = 255, .a = 255 },
+            },
+        };
+
+        const clip_blend = DisplayItem{
+            .blend = .{
+                .opacity = 1.0, // No opacity for clipping blend
+                .blend_mode = clip_blend_mode,
+                .children = clip_mask_commands,
+            },
+        };
+
+        // Append the clipping blend to the commands
+        const new_commands = try self.allocator.alloc(DisplayItem, current_commands.len + 1);
+        @memcpy(new_commands[0..current_commands.len], current_commands);
+        new_commands[current_commands.len] = clip_blend;
+        current_commands = new_commands;
+    }
+
+    // Create a single merged blend operation for opacity and blend mode
+    var final_blend_mode: ?[]const u8 = null;
+    if (blend_mode) |mode| {
+        // Copy the blend mode string since it needs to be owned by the DisplayItem
+        final_blend_mode = try self.allocator.alloc(u8, mode.len);
+        @memcpy(@constCast(final_blend_mode.?), mode);
+    }
+
+    // Only create a blend operation if we have effects to apply
+    if (opacity < 1.0 or final_blend_mode != null) {
+        const wrapped_commands = try self.allocator.alloc(DisplayItem, current_commands.len);
+        @memcpy(wrapped_commands, current_commands);
+
+        const blend_item = DisplayItem{
+            .blend = .{
+                .opacity = opacity,
+                .blend_mode = final_blend_mode,
+                .children = wrapped_commands,
+            },
+        };
+
+        const result = try self.allocator.alloc(DisplayItem, 1);
+        result[0] = blend_item;
+        return result;
+    } else {
+        // No effects, return commands as-is
+        const result = try self.allocator.alloc(DisplayItem, current_commands.len);
+        @memcpy(result, current_commands);
+        return result;
+    }
+}
+
+// Add background/borders to a specific command list instead of the global display list
+fn addBackgroundIfNeededToList(allocator: std.mem.Allocator, commands: *std.ArrayList(DisplayItem), block: *const BlockLayout) !void {
+    // Skip painting if shouldPaint returns false
+    if (!block.shouldPaint()) return;
+
+    switch (block.node) {
+        .element => |e| {
+            if (block.height <= 0) return;
+
+            // Check for background-color in the style attribute
+            const bgcolor_str = if (e.style) |style|
+                style.get("background-color")
+            else
+                null;
+
+            // Check for border-radius
+            const border_radius_str = if (e.style) |style|
+                style.get("border-radius")
+            else
+                null;
+
+            // Determine the background color
+            var color: ?browser.Color = null;
+
+            if (bgcolor_str) |bg| {
+                // Don't draw if explicitly transparent
+                if (std.mem.eql(u8, bg, "transparent")) {
+                    return;
+                }
+                color = parseColor(bg);
+            } else if (std.mem.eql(u8, e.tag, "pre")) {
+                // Default gray background for pre tags if no style specified
+                color = browser.Color{ .r = 230, .g = 230, .b = 230, .a = 255 };
+            }
+
+            // Draw the background rectangle if we have a color
+            if (color) |col| {
+                // Parse border-radius if present
+                var radius: f64 = 0.0;
+                if (border_radius_str) |br_str| {
+                    if (std.mem.endsWith(u8, br_str, "px")) {
+                        const radius_str = br_str[0 .. br_str.len - 2];
+                        radius = std.fmt.parseFloat(f64, radius_str) catch 0.0;
+                    }
+                }
+
+                if (radius > 0.0) {
+                    // Use rounded rectangle
+                    const rounded_rect = DisplayItem{ .rounded_rect = .{
+                        .x1 = block.x,
+                        .y1 = block.y,
+                        .x2 = block.x + block.width,
+                        .y2 = block.y + block.height,
+                        .radius = radius,
+                        .color = col,
+                    } };
+                    try commands.append(allocator, rounded_rect);
+                } else {
+                    // Use regular rectangle
+                    const rect = DisplayItem{ .rect = .{
+                        .x1 = block.x,
+                        .y1 = block.y,
+                        .x2 = block.x + block.width,
+                        .y2 = block.y + block.height,
+                        .color = col,
+                    } };
+                    try commands.append(allocator, rect);
+                }
+            }
+        },
+        else => {},
+    }
 }
 
 // Layout object that can be clicked
