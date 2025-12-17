@@ -1,22 +1,24 @@
 const std = @import("std");
-const browser = @import("browser.zig");
+const browser_mod = @import("browser.zig");
 const url_module = @import("url.zig");
 const parser = @import("parser.zig");
 const Layout = @import("Layout.zig");
 const CSSParser = @import("cssParser.zig");
+const task = @import("task.zig");
+const MeasureTime = @import("measure_time.zig").MeasureTime;
 
 const Url = url_module.Url;
-const Browser = browser.Browser;
-const JsRenderContext = browser.JsRenderContext;
-const DisplayItem = browser.DisplayItem;
+const Browser = browser_mod.Browser;
+const JsRenderContext = browser_mod.JsRenderContext;
+const DisplayItem = browser_mod.DisplayItem;
+const TaskRunner = task.TaskRunner;
 const Node = parser.Node;
-
-const scroll_increment = 100;
 
 // Tab represents a single web page
 pub const Tab = @This();
 // Memory allocator
 allocator: std.mem.Allocator,
+browser: *Browser,
 // List of items to be displayed
 display_list: ?[]DisplayItem = null,
 // Current HTML node tree
@@ -28,7 +30,7 @@ document_layout: ?*Layout.DocumentLayout = null,
 // Total height of the content
 content_height: i32 = 0,
 // Current scroll offset
-scroll_offset: i32 = 0,
+scroll: i32 = 0,
 // Current URL being displayed
 current_url: ?*Url = null,
 // Available height for tab content (window height minus chrome height)
@@ -50,12 +52,19 @@ dynamic_texts: std.ArrayList([]const u8),
 // Context passed to the JS engine for DOM mutation callbacks
 js_render_context: JsRenderContext = .{},
 js_render_context_initialized: bool = false,
+js_generation: u64 = 0,
 // Parsed Content-Security-Policy allowed origins (lowercase origin strings)
 allowed_origins: ?std.ArrayList([]const u8) = null,
+// Pending asynchronous work for this tab
+task_runner: TaskRunner,
+async_thread_refs: std.atomic.Value(usize) = std.atomic.Value(usize).init(0),
+needs_render: bool = true,
+scroll_changed_in_tab: bool = false,
 
-pub fn init(allocator: std.mem.Allocator, tab_height: i32) Tab {
-    return Tab{
+pub fn init(allocator: std.mem.Allocator, tab_height: i32, measure: *MeasureTime) !Tab {
+    var tab = Tab{
         .allocator = allocator,
+        .browser = undefined,
         .tab_height = tab_height,
         .history = std.ArrayList(*Url).empty,
         .focus = null,
@@ -66,10 +75,17 @@ pub fn init(allocator: std.mem.Allocator, tab_height: i32) Tab {
         .dynamic_texts = std.ArrayList([]const u8).empty,
         .js_render_context = .{},
         .js_render_context_initialized = false,
+        .task_runner = TaskRunner.init(allocator, measure),
     };
+    try tab.task_runner.start();
+    return tab;
 }
 
 pub fn deinit(self: *Tab) void {
+    self.invalidateJsContext();
+    self.waitForAsyncThreads();
+    self.task_runner.shutdown();
+
     // Clean up any display list
     if (self.display_list) |list| {
         self.allocator.free(list);
@@ -138,6 +154,8 @@ pub fn deinit(self: *Tab) void {
         self.allocator.destroy(url_ptr);
     }
     self.history.deinit(self.allocator);
+
+    self.task_runner.deinit();
 }
 
 pub fn clearAllowedOrigins(self: *Tab) void {
@@ -159,7 +177,14 @@ fn allocLowercase(self: *Tab, text: []const u8) ![]const u8 {
     return copy;
 }
 
-pub fn allowedRequest(self: *Tab, target_url: Url) bool {
+pub fn allowedRequest(self: *Tab, target_url: Url, base_url: ?*const Url) bool {
+    const page_url = base_url orelse self.current_url;
+    if (page_url) |current| {
+        if (current.*.sameOrigin(target_url)) {
+            return true;
+        }
+    }
+
     const origins = self.allowed_origins orelse return true;
 
     var origin_buffer: [256]u8 = undefined;
@@ -182,10 +207,11 @@ pub fn allowedRequest(self: *Tab, target_url: Url) bool {
     return false;
 }
 
-pub fn applyContentSecurityPolicy(self: *Tab, header: []const u8) !void {
+pub fn applyContentSecurityPolicy(self: *Tab, header: []const u8, base_url: Url) !void {
+    const whitespace = " \t\r\n";
     var directives = std.mem.tokenizeScalar(u8, header, ';');
     while (directives.next()) |directive_raw| {
-        const trimmed = std.mem.trim(u8, directive_raw, " ");
+        const trimmed = std.mem.trim(u8, directive_raw, whitespace);
         if (trimmed.len == 0) continue;
 
         var tokens = std.mem.tokenizeScalar(u8, trimmed, ' ');
@@ -202,22 +228,18 @@ pub fn applyContentSecurityPolicy(self: *Tab, header: []const u8) !void {
         }
 
         while (tokens.next()) |origin_token| {
-            var trimmed_origin = std.mem.trim(u8, origin_token, " ");
-            if (trimmed_origin.len == 0) continue;
-            if (trimmed_origin[trimmed_origin.len - 1] == ';') {
-                trimmed_origin = std.mem.trimRight(u8, trimmed_origin, ";");
-            }
+            const semicolon_trimmed = std.mem.trimRight(u8, origin_token, ";\r\n \t");
+            const trimmed_origin = std.mem.trim(u8, semicolon_trimmed, whitespace);
             if (trimmed_origin.len == 0) continue;
 
             if (std.ascii.eqlIgnoreCase(trimmed_origin, "'self'") or
                 std.ascii.eqlIgnoreCase(trimmed_origin, "self"))
             {
-                if (self.current_url) |current_ptr| {
-                    const host = current_ptr.*.host orelse continue;
+                if (base_url.host) |host| {
                     const normalized = try std.fmt.allocPrint(self.allocator, "{s}://{s}:{d}", .{
-                        current_ptr.*.scheme,
+                        base_url.scheme,
                         host,
-                        current_ptr.*.port,
+                        base_url.port,
                     });
                     defer self.allocator.free(normalized);
 
@@ -248,23 +270,24 @@ pub fn applyContentSecurityPolicy(self: *Tab, header: []const u8) !void {
     }
 }
 
-// Scroll the tab down
-pub fn scrollDown(self: *Tab) void {
-    const max_y = @max(self.content_height - self.tab_height, 0);
-    if (self.scroll_offset + scroll_increment <= max_y) {
-        self.scroll_offset += scroll_increment;
-    } else {
-        self.scroll_offset = max_y;
-    }
+pub fn invalidateJsContext(self: *Tab) void {
+    self.js_generation +%= 1;
+    self.js_render_context.setGeneration(self.js_generation);
+    self.js_render_context.setPointers(null, null);
+    self.js_render_context_initialized = false;
 }
 
-// Scroll the tab up
-pub fn scrollUp(self: *Tab) void {
-    if (self.scroll_offset > 0) {
-        self.scroll_offset -= scroll_increment;
-        if (self.scroll_offset < 0) {
-            self.scroll_offset = 0;
-        }
+pub fn retainAsyncThread(self: *Tab) void {
+    _ = self.async_thread_refs.fetchAdd(1, .seq_cst);
+}
+
+pub fn releaseAsyncThread(self: *Tab) void {
+    _ = self.async_thread_refs.fetchSub(1, .seq_cst);
+}
+
+fn waitForAsyncThreads(self: *Tab) void {
+    while (self.async_thread_refs.load(.seq_cst) != 0) {
+        std.Thread.yield() catch {};
     }
 }
 
@@ -279,7 +302,7 @@ pub fn goBack(self: *Tab, b: *Browser) !void {
         }
         // Get previous page and load it (which will add it back to history)
         if (self.history.pop()) |back_ptr| {
-            b.loadInTab(self, back_ptr, null) catch |err| {
+            b.scheduleLoad(self, back_ptr, null) catch |err| {
                 try self.history.append(self.allocator, back_ptr);
                 return err;
             };
@@ -288,20 +311,78 @@ pub fn goBack(self: *Tab, b: *Browser) !void {
     }
 }
 
+pub fn setNeedsRender(self: *Tab) void {
+    self.needs_render = true;
+    self.browser.setNeedsAnimationFrame(self);
+    self.browser.scheduleAnimationFrame();
+}
+
+fn clampScroll(self: *Tab, scroll: i32) i32 {
+    const height_delta = self.content_height - self.tab_height;
+    const maxscroll = if (height_delta > 0) height_delta else 0;
+    if (scroll < 0) return 0;
+    if (scroll > maxscroll) return maxscroll;
+    return scroll;
+}
+
 // Re-render the page without reloading (style, layout, paint)
 pub fn render(self: *Tab, b: *Browser) !void {
-    if (self.current_node == null) return;
+    if (!self.needs_render) return;
+    self.needs_render = false;
+    errdefer self.needs_render = true;
+    const trace_render = b.measure.begin("render");
+    defer if (trace_render) b.measure.end("render");
+
+    if (self.current_node == null) {
+        return;
+    }
 
     // Re-apply styles with current rules
     try parser.style(b.allocator, &self.current_node.?, self.rules.items);
 
     // Re-layout and paint
     try b.layoutTabNodes(self);
+    const clamped_scroll = self.clampScroll(self.scroll);
+    if (clamped_scroll != self.scroll) {
+        self.scroll_changed_in_tab = true;
+        self.scroll = clamped_scroll;
+    }
+    b.setNeedsRasterAndDraw();
+}
+
+pub fn runAnimationFrame(self: *Tab, scroll: i32) void {
+    if (self.js_render_context_initialized) {
+        self.browser.js_engine.runAnimationFrameHandlers();
+    }
+
+    if (!self.scroll_changed_in_tab) {
+        self.scroll = scroll;
+    }
+
+    self.render(self.browser) catch |err| {
+        std.log.warn("Animation frame render failed: {}", .{err});
+    };
+
+    var commit_scroll: ?i32 = null;
+    if (self.scroll_changed_in_tab) {
+        commit_scroll = self.scroll;
+    }
+
+    const commit_data = browser_mod.CommitData{
+        .url = self.current_url orelse null,
+        .display_list = self.display_list,
+        .scroll = commit_scroll,
+        .height = self.content_height,
+    };
+    self.display_list = null;
+    self.browser.commit(self, commit_data);
+    self.scroll_changed_in_tab = false;
 }
 
 // Handle click on tab content
 pub fn click(self: *Tab, b: *Browser, x: i32, y: i32) !void {
     std.log.info("Tab.click at ({}, {})", .{ x, y });
+    try self.render(b);
 
     // Clear previous focus
     if (self.focus) |focus_node| {
@@ -310,6 +391,7 @@ pub fn click(self: *Tab, b: *Browser, x: i32, y: i32) !void {
             else => {},
         }
         self.focus = null;
+        self.setNeedsRender();
     }
 
     // Hit test using the input bounds map from the layout engine
@@ -344,6 +426,7 @@ pub fn click(self: *Tab, b: *Browser, x: i32, y: i32) !void {
                         }
                         e.is_focused = true;
                         self.focus = node_ptr;
+                        self.setNeedsRender();
                         handled = true;
                         break;
                     } else if (std.mem.eql(u8, e.tag, "button")) {
@@ -370,8 +453,6 @@ pub fn click(self: *Tab, b: *Browser, x: i32, y: i32) !void {
     if (!handled) {
         std.log.info("No element clicked, re-rendering", .{});
     }
-    // Re-render to show changes or reset focus styling
-    try self.render(b);
 }
 
 // Submit a form when a button is clicked
@@ -497,7 +578,10 @@ fn submitFormData(self: *Tab, b: *Browser, form_node: *Node, action: []const u8)
 
     // Get the form body
     const body_slice = try body.toOwnedSlice(self.allocator);
-    defer self.allocator.free(body_slice);
+    var body_owned = true;
+    defer if (body_owned) {
+        self.allocator.free(body_slice);
+    };
 
     // Log the form submission
     std.log.info("Form submission to {s}: {s}", .{ action, body_slice });
@@ -523,21 +607,23 @@ fn submitFormData(self: *Tab, b: *Browser, form_node: *Node, action: []const u8)
         return;
     };
     form_url_ptr.* = form_url;
-    var load_success = false;
-    defer if (!load_success) {
+    var url_owned = true;
+    defer if (url_owned) {
         form_url_ptr.*.free(b.allocator);
         b.allocator.destroy(form_url_ptr);
     };
 
-    b.loadInTab(self, form_url_ptr, body_slice) catch |err| {
+    b.scheduleLoad(self, form_url_ptr, body_slice) catch |err| {
         std.log.err("Failed to submit form: {any}", .{err});
         return;
     };
-    load_success = true;
+    url_owned = false;
+    body_owned = false;
 }
 
 // Cycle focus to the next input element (for Tab key)
 pub fn cycleFocus(self: *Tab, b: *Browser) !void {
+    _ = b;
     // Find all input elements
     const root_node = self.current_node orelse return;
 
@@ -591,19 +677,19 @@ pub fn cycleFocus(self: *Tab, b: *Browser) !void {
     }
     self.focus = to_focus;
 
-    // Re-render to show changes
-    try self.render(b);
+    self.setNeedsRender();
 }
 
 // Clear focus (for Escape key)
 pub fn clearFocus(self: *Tab, b: *Browser) !void {
+    _ = b;
     if (self.focus) |focus_node| {
         switch (focus_node.*) {
             .element => |*e| e.is_focused = false,
             else => {},
         }
         self.focus = null;
-        try self.render(b);
+        self.setNeedsRender();
     }
 }
 
@@ -634,7 +720,7 @@ pub fn keypress(self: *Tab, b: *Browser, char: u8) !void {
                         }
                         try e.owned_strings.?.append(self.allocator, new_value);
                     }
-                    try self.render(b);
+                    self.setNeedsRender();
                 }
             },
             else => {},
@@ -644,6 +730,7 @@ pub fn keypress(self: *Tab, b: *Browser, char: u8) !void {
 
 // Handle backspace in focused input
 pub fn backspace(self: *Tab, b: *Browser) !void {
+    _ = b;
     if (self.focus) |focus_node| {
         switch (focus_node.*) {
             .element => |*e| {
@@ -661,7 +748,7 @@ pub fn backspace(self: *Tab, b: *Browser) !void {
                             }
                             try e.owned_strings.?.append(self.allocator, new_value);
                         }
-                        try self.render(b);
+                        self.setNeedsRender();
                     }
                 }
             },

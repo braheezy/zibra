@@ -19,6 +19,24 @@ const RenderCallback = struct {
     context: ?*anyopaque = null,
 };
 
+pub const AnimationFrameCallbackFn = *const fn (context: ?*anyopaque) anyerror!void;
+
+const AnimationFrameCallback = struct {
+    function: ?AnimationFrameCallbackFn = null,
+    context: ?*anyopaque = null,
+};
+
+pub const SetTimeoutCallbackFn = *const fn (
+    context: ?*anyopaque,
+    handle: u32,
+    delay_ms: u32,
+) anyerror!void;
+
+const SetTimeoutCallback = struct {
+    function: ?SetTimeoutCallbackFn = null,
+    context: ?*anyopaque = null,
+};
+
 pub const XhrResult = struct {
     data: []const u8,
     allocator: ?std.mem.Allocator = null,
@@ -30,6 +48,8 @@ pub const XhrCallbackFn = *const fn (
     method: []const u8,
     url: []const u8,
     body: ?[]const u8,
+    is_async: bool,
+    handle: u32,
 ) anyerror!XhrResult;
 
 const XhrCallback = struct {
@@ -48,7 +68,9 @@ next_handle: u32,
 // Reference to the current tab's nodes (borrowed, not owned)
 current_nodes: ?*Node,
 render_callback: RenderCallback,
+set_timeout_callback: SetTimeoutCallback,
 xhr_callback: XhrCallback,
+animation_frame_callback: AnimationFrameCallback,
 
 pub fn init(allocator: std.mem.Allocator) !*Js {
     const self = try allocator.create(Js);
@@ -74,7 +96,9 @@ pub fn init(allocator: std.mem.Allocator) !*Js {
     self.next_handle = 0;
     self.current_nodes = null;
     self.render_callback = .{};
+    self.set_timeout_callback = .{};
     self.xhr_callback = .{};
+    self.animation_frame_callback = .{};
 
     // Set up console.log
     try self.setupConsole();
@@ -166,18 +190,35 @@ pub fn evaluate(self: *Js, code: []const u8) !Value {
         \\  this.handle = handle;
         \\}
         \\
-        \\function XMLHttpRequest() {}
+        \\var XHR_REQUESTS = {};
+        \\
+        \\function XMLHttpRequest() {
+        \\  this.handle = Object.keys(XHR_REQUESTS).length;
+        \\  XHR_REQUESTS[this.handle] = this;
+        \\  this.is_async = true;
+        \\  this.__method = "GET";
+        \\  this.__url = "";
+        \\}
         \\
         \\XMLHttpRequest.prototype.open = function(method, url, is_async) {
-        \\  if (is_async) throw new Error("Asynchronous XHR is not supported");
+        \\  var flag = (is_async === undefined) ? true : !!is_async;
+        \\  this.is_async = flag;
         \\  this.__method = method;
         \\  this.__url = url;
         \\};
         \\
         \\XMLHttpRequest.prototype.send = function(body) {
         \\  var payload = body == null ? null : body.toString();
-        \\  var response = __native.xhrSend(this.__method || "GET", this.__url, payload);
-        \\  this.responseText = response;
+        \\  var response = __native.xhrSend(
+        \\    this.__method || "GET",
+        \\    this.__url,
+        \\    payload,
+        \\    !!this.is_async,
+        \\    this.handle
+        \\  );
+        \\  if (!this.is_async) {
+        \\    this.responseText = response;
+        \\  }
         \\};
         \\
         \\function Event(type) {
@@ -231,6 +272,46 @@ pub fn evaluate(self: *Js, code: []const u8) !Value {
         \\
         \\globalThis.__resetEventListeners = function() {
         \\  LISTENERS = {};
+        \\};
+        \\
+        \\var SET_TIMEOUT_REQUESTS = {};
+        \\var NEXT_TIMEOUT_HANDLE = 0;
+        \\
+        \\globalThis.__runSetTimeout = function(handle) {
+        \\  var callback = SET_TIMEOUT_REQUESTS[handle];
+        \\  if (callback) callback();
+        \\};
+        \\
+        \\globalThis.setTimeout = function(callback, timeout) {
+        \\  var handle = NEXT_TIMEOUT_HANDLE++;
+        \\  SET_TIMEOUT_REQUESTS[handle] = callback;
+        \\  __native.setTimeout(handle, timeout || 0);
+        \\  return handle;
+        \\};
+        \\
+        \\var RAF_LISTENERS = [];
+        \\
+        \\function __runRAFHandlers() {
+        \\  var handlers_copy = RAF_LISTENERS;
+        \\  RAF_LISTENERS = [];
+        \\  for (var i = 0; i < handlers_copy.length; i++) {
+        \\    handlers_copy[i]();
+        \\  }
+        \\}
+        \\
+        \\globalThis.requestAnimationFrame = function(fn) {
+        \\  RAF_LISTENERS.push(fn);
+        \\  __native.requestAnimationFrame();
+        \\};
+        \\
+        \\globalThis.__runXHROnload = function(body, handle) {
+        \\  var obj = XHR_REQUESTS[handle];
+        \\  if (!obj) return;
+        \\  var evt = new Event('load');
+        \\  obj.responseText = body;
+        \\  if (obj.onload) {
+        \\    obj.onload(evt);
+        \\  }
         \\};
         \\
         \\// Wrap document.querySelectorAll to return Node objects
@@ -297,6 +378,8 @@ pub fn setNodes(self: *Js, nodes: ?*Node) void {
     if (nodes == null) {
         self.render_callback = .{};
         self.xhr_callback = .{};
+        self.set_timeout_callback = .{};
+        self.animation_frame_callback = .{};
     }
 }
 
@@ -309,6 +392,20 @@ pub fn setRenderCallback(self: *Js, callback: ?RenderCallbackFn, context: ?*anyo
 
 pub fn setXhrCallback(self: *Js, callback: ?XhrCallbackFn, context: ?*anyopaque) void {
     self.xhr_callback = .{
+        .function = callback,
+        .context = context,
+    };
+}
+
+pub fn setSetTimeoutCallback(self: *Js, callback: ?SetTimeoutCallbackFn, context: ?*anyopaque) void {
+    self.set_timeout_callback = .{
+        .function = callback,
+        .context = context,
+    };
+}
+
+pub fn setAnimationFrameCallback(self: *Js, callback: ?AnimationFrameCallbackFn, context: ?*anyopaque) void {
+    self.animation_frame_callback = .{
         .function = callback,
         .context = context,
     };
@@ -373,6 +470,27 @@ pub fn dispatchEvent(self: *Js, event_type: []const u8, node: *Node) !bool {
     return !do_default;
 }
 
+pub fn runTimeoutCallback(self: *Js, handle: u32) !void {
+    const key = kiesel.types.PropertyKey.from("__runSetTimeout");
+    const fn_value = self.realm.global_object.get(&self.agent, key) catch {
+        return error.MissingSetTimeout;
+    };
+    if (!fn_value.isCallable()) {
+        return error.MissingSetTimeout;
+    }
+    const handle_value = Value.from(@as(f64, @floatFromInt(handle)));
+    _ = try fn_value.call(&self.agent, .undefined, &.{ handle_value });
+}
+
+pub fn runAnimationFrameHandlers(self: *Js) void {
+    const key = kiesel.types.PropertyKey.from("__runRAFHandlers");
+    const fn_value = self.realm.global_object.get(&self.agent, key) catch return;
+    if (!fn_value.isCallable()) return;
+    _ = fn_value.call(&self.agent, .undefined, &.{}) catch |err| {
+        std.log.warn("requestAnimationFrame handler failed: {}", .{err});
+    };
+}
+
 fn resetEventListenersImpl(self: *Js) void {
     const reset_key = kiesel.types.PropertyKey.from("__resetEventListeners");
     const reset_value = self.realm.global_object.get(&self.agent, reset_key) catch return;
@@ -383,6 +501,16 @@ fn resetEventListenersImpl(self: *Js) void {
 fn stringToJsValue(self: *Js, text: []const u8) !Value {
     const js_string = try kiesel.types.String.fromUtf8(&self.agent, text);
     return Value.from(js_string);
+}
+
+pub fn runXhrOnload(self: *Js, handle: u32, body: []const u8) !void {
+    const key = kiesel.types.PropertyKey.from("__runXHROnload");
+    const fn_value = try self.realm.global_object.get(&self.agent, key);
+    if (!fn_value.isCallable()) return error.MissingXhrCallback;
+
+    const body_value = try self.stringToJsValue(body);
+    const handle_value = Value.from(@as(f64, @floatFromInt(handle)));
+    _ = try fn_value.call(&self.agent, .undefined, &.{ body_value, handle_value });
 }
 
 /// Set up the document object with DOM API
@@ -413,7 +541,7 @@ fn setupDocument(self: *Js) !void {
         &self.agent,
         PropertyKey.from("querySelectorAll"),
         .{
-            .value_or_accessor = .{ .value = Value.from(query_selector_all_fn) },
+            .value_or_accessor = .{ .value = Value.from(&query_selector_all_fn.object) },
             .attributes = .builtin_default,
         },
     );
@@ -452,7 +580,7 @@ fn setupDocument(self: *Js) !void {
         &self.agent,
         PropertyKey.from("getAttribute"),
         .{
-            .value_or_accessor = .{ .value = Value.from(get_attribute_fn) },
+            .value_or_accessor = .{ .value = Value.from(&get_attribute_fn.object) },
             .attributes = .builtin_default,
         },
     );
@@ -474,7 +602,7 @@ fn setupDocument(self: *Js) !void {
         &self.agent,
         PropertyKey.from("innerHTML"),
         .{
-            .value_or_accessor = .{ .value = Value.from(inner_html_fn) },
+            .value_or_accessor = .{ .value = Value.from(&inner_html_fn.object) },
             .attributes = .builtin_default,
         },
     );
@@ -483,7 +611,7 @@ fn setupDocument(self: *Js) !void {
     const xhr_send_fn = try kiesel.builtins.createBuiltinFunction(
         &self.agent,
         .{ .function = xhrSend },
-        3,
+        5,
         "xhrSend",
         .{
             .realm = self.realm,
@@ -495,7 +623,47 @@ fn setupDocument(self: *Js) !void {
         &self.agent,
         PropertyKey.from("xhrSend"),
         .{
-            .value_or_accessor = .{ .value = Value.from(xhr_send_fn) },
+            .value_or_accessor = .{ .value = Value.from(&xhr_send_fn.object) },
+            .attributes = .builtin_default,
+        },
+    );
+
+    const set_timeout_fn = try kiesel.builtins.createBuiltinFunction(
+        &self.agent,
+        .{ .function = setTimeoutNative },
+        2,
+        "setTimeout",
+        .{
+            .realm = self.realm,
+            .additional_fields = self_ptr,
+        },
+    );
+
+    try native_obj.definePropertyDirect(
+        &self.agent,
+        PropertyKey.from("setTimeout"),
+        .{
+            .value_or_accessor = .{ .value = Value.from(&set_timeout_fn.object) },
+            .attributes = .builtin_default,
+        },
+    );
+
+    const request_animation_fn = try kiesel.builtins.createBuiltinFunction(
+        &self.agent,
+        .{ .function = requestAnimationFrameNative },
+        0,
+        "requestAnimationFrame",
+        .{
+            .realm = self.realm,
+            .additional_fields = self_ptr,
+        },
+    );
+
+    try native_obj.definePropertyDirect(
+        &self.agent,
+        PropertyKey.from("requestAnimationFrame"),
+        .{
+            .value_or_accessor = .{ .value = Value.from(&request_animation_fn.object) },
             .attributes = .builtin_default,
         },
     );
@@ -517,25 +685,12 @@ fn setupDocument(self: *Js) !void {
 
 /// document.querySelectorAll implementation
 fn querySelectorAll(agent: *Agent, this_value: Value, arguments: kiesel.types.Arguments) Agent.Error!Value {
-    std.log.info("querySelectorAll called", .{});
-
-    // Get the Js instance from the function's additional_fields
     const function_obj = agent.activeFunctionObject();
-    std.log.info("Got function object", .{});
-
     const builtin_fn = function_obj.as(kiesel.builtins.BuiltinFunction);
-    std.log.info("Cast to builtin function", .{});
-
     const js_instance = builtin_fn.fields.additional_fields.cast(*Js);
-    std.log.info("Got JS instance", .{});
-
     _ = this_value;
 
-    // Get the selector string argument
-    std.log.info("Getting selector argument", .{});
     const selector_arg = arguments.get(0);
-    std.log.info("Got selector argument", .{});
-
     if (!selector_arg.isString()) {
         return agent.throwException(
             .type_error,
@@ -543,59 +698,32 @@ fn querySelectorAll(agent: *Agent, this_value: Value, arguments: kiesel.types.Ar
             .{},
         );
     }
-    std.log.info("Selector is a string", .{});
 
-    // Convert the selector to a Zig string
-    std.log.info("Converting selector to UTF-8", .{});
     const selector_str = try selector_arg.asString().toUtf8(js_instance.allocator);
     defer js_instance.allocator.free(selector_str);
-    std.log.info("Selector string: {s}", .{selector_str});
 
-    // Parse the selector
-    std.log.info("Initializing CSS parser", .{});
-    var css_parser = CSSParser.init(js_instance.allocator, selector_str) catch |err| {
-        std.log.err("Failed to init CSS parser: {}", .{err});
-        return agent.throwException(
-            .syntax_error,
-            "Invalid selector",
-            .{},
-        );
+    var css_parser = CSSParser.init(js_instance.allocator, selector_str) catch {
+        return agent.throwException(.syntax_error, "Invalid selector", .{});
     };
     defer css_parser.deinit(js_instance.allocator);
-    std.log.info("CSS parser initialized", .{});
 
-    std.log.info("Parsing selector", .{});
-    var selector = css_parser.selector(js_instance.allocator) catch |err| {
-        std.log.err("Failed to parse selector: {}", .{err});
-        return agent.throwException(
-            .syntax_error,
-            "Invalid selector",
-            .{},
-        );
+    var selector = css_parser.selector(js_instance.allocator) catch {
+        return agent.throwException(.syntax_error, "Invalid selector", .{});
     };
-    std.log.info("Selector parsed", .{});
 
-    // Get all nodes from the current tree
-    std.log.info("Checking for current_nodes", .{});
     if (js_instance.current_nodes == null) {
-        std.log.info("No current nodes, returning empty array", .{});
-        // Return empty array if no nodes
         const empty_array = try kiesel.builtins.arrayCreate(agent, 0, null);
-        return Value.from(empty_array);
+        return Value.from(&empty_array.object);
     }
-    std.log.info("Have current nodes", .{});
 
-    std.log.info("Creating node list", .{});
     var node_list = std.ArrayList(*Node).empty;
     defer node_list.deinit(js_instance.allocator);
     try parser.treeToList(js_instance.allocator, js_instance.current_nodes.?, &node_list);
 
-    // Find matching nodes
     var matching_handles = std.ArrayList(u32).empty;
     defer matching_handles.deinit(js_instance.allocator);
 
     for (node_list.items) |node| {
-        // Build ancestor chain for this node
         var ancestors = std.ArrayList(*Node).empty;
 
         var current = node;
@@ -622,22 +750,20 @@ fn querySelectorAll(agent: *Agent, this_value: Value, arguments: kiesel.types.Ar
         ancestors.deinit(js_instance.allocator);
     }
 
-    // Clean up selector
     selector.deinit(js_instance.allocator);
 
-    // Create a JavaScript array with the handles
     const result_array = try kiesel.builtins.arrayCreate(agent, @intCast(matching_handles.items.len), null);
 
     for (matching_handles.items, 0..) |handle, i| {
         const handle_value = Value.from(@as(f64, @floatFromInt(handle)));
-        try result_array.createDataPropertyDirect(
+        try result_array.object.createDataPropertyDirect(
             agent,
             kiesel.types.PropertyKey.from(@as(kiesel.types.PropertyKey.IntegerIndex, @intCast(i))),
             handle_value,
         );
     }
 
-    return Value.from(result_array);
+    return Value.from(&result_array.object);
 }
 
 /// __native.getAttribute implementation
@@ -874,7 +1000,25 @@ fn xhrSend(agent: *Agent, this_value: Value, arguments: kiesel.types.Arguments) 
 
     const payload = owned_body_slice;
 
-    const result = callback(callback_context, method_slice, url_slice, payload) catch |err| {
+    const is_async = if (arguments.count() >= 4)
+        arguments.get(3).toBoolean()
+    else
+        false;
+
+    if (arguments.count() < 5) {
+        return agent.throwException(.type_error, "XMLHttpRequest handle missing", .{});
+    }
+    const handle_arg = arguments.get(4);
+    if (!handle_arg.isNumber()) {
+        return agent.throwException(.type_error, "XMLHttpRequest handle must be numeric", .{});
+    }
+    const raw_handle = handle_arg.asNumber().asFloat();
+    if (std.math.isNan(raw_handle)) {
+        return agent.throwException(.type_error, "Invalid XMLHttpRequest handle", .{});
+    }
+    const handle: u32 = @intFromFloat(raw_handle);
+
+    const result = callback(callback_context, method_slice, url_slice, payload, is_async, handle) catch |err| {
         if (err == error.CrossOriginBlocked) {
             return agent.throwException(.type_error, "Cross-origin XMLHttpRequest not allowed", .{});
         }
@@ -884,6 +1028,10 @@ fn xhrSend(agent: *Agent, this_value: Value, arguments: kiesel.types.Arguments) 
         std.log.err("XMLHttpRequest failed: {}", .{err});
         return agent.throwException(.type_error, "XMLHttpRequest failed", .{});
     };
+
+    if (is_async) {
+        return .undefined;
+    }
 
     const js_string = try kiesel.types.String.fromUtf8(agent, result.data);
 
@@ -896,6 +1044,73 @@ fn xhrSend(agent: *Agent, this_value: Value, arguments: kiesel.types.Arguments) 
     }
 
     return Value.from(js_string);
+}
+
+fn setTimeoutNative(agent: *Agent, this_value: Value, arguments: kiesel.types.Arguments) Agent.Error!Value {
+    _ = this_value;
+
+    const function_obj = agent.activeFunctionObject();
+    const builtin_fn = function_obj.as(kiesel.builtins.BuiltinFunction);
+    const js_instance = builtin_fn.fields.additional_fields.cast(*Js);
+
+    const handle_arg = arguments.get(0);
+    if (!handle_arg.isNumber()) {
+        return agent.throwException(
+            .type_error,
+            "setTimeout requires a numeric handle",
+            .{},
+        );
+    }
+
+    const raw_handle = handle_arg.asNumber().asFloat();
+    if (std.math.isNan(raw_handle)) {
+        return agent.throwException(
+            .type_error,
+            "setTimeout handle must be a valid number",
+            .{},
+        );
+    }
+    const handle: u32 = @intFromFloat(raw_handle);
+
+    var delay_ms: u32 = 0;
+    if (arguments.count() >= 2) {
+        const delay_arg = arguments.get(1);
+        if (delay_arg.isNumber()) {
+            const delay_float = delay_arg.asNumber().asFloat();
+            if (!std.math.isNan(delay_float) and delay_float > 0) {
+                const max_delay = @as(f64, @floatFromInt(std.math.maxInt(u32)));
+                const clamped = @min(delay_float, max_delay);
+                delay_ms = @intFromFloat(clamped);
+            }
+        }
+    }
+
+    if (js_instance.set_timeout_callback.function) |callback| {
+        const callback_context = js_instance.set_timeout_callback.context;
+        callback(callback_context, handle, delay_ms) catch |err| {
+            std.log.warn("Failed to schedule setTimeout callback: {}", .{err});
+        };
+    }
+
+    return .undefined;
+}
+
+fn requestAnimationFrameNative(agent: *Agent, this_value: Value, arguments: kiesel.types.Arguments) Agent.Error!Value {
+    _ = this_value;
+    _ = arguments;
+
+    const function_obj = agent.activeFunctionObject();
+    const builtin_fn = function_obj.as(kiesel.builtins.BuiltinFunction);
+    const js_instance = builtin_fn.fields.additional_fields.cast(*Js);
+
+    if (js_instance.animation_frame_callback.function) |callback| {
+        const callback_context = js_instance.animation_frame_callback.context;
+        callback(callback_context) catch |err| {
+            std.log.warn("Failed to schedule animation frame: {}", .{err});
+        };
+    }
+
+    return .undefined;
 }
 
 /// Escape a string for safe embedding in JavaScript source

@@ -36,7 +36,7 @@ def handle_connection(conx):
     if "cookie" not in headers:
         template = "Set-Cookie: token={}; SameSite=Lax\r\n"
         response += template.format(token)
-    csp = "default-src http://localhost:8000"
+    csp = "default-src 'self'"
     response += "Content-Security-Policy: {}\r\n".format(csp)
     response += "\r\n" + body
     conx.send(response.encode('utf8'))
@@ -59,6 +59,9 @@ def do_request(session, method, url, headers, body):
     elif method == "GET" and url == "/comment.js":
         with open("comment9.js") as f:
             return "200 OK", f.read()
+    elif method == "GET" and url == "/eventloop.js":
+        with open("eventloop.js") as f:
+            return "200 OK", f.read()
     elif method == "GET" and url == "/comment.css":
         with open("comment9.css") as f:
             return "200 OK", f.read()
@@ -71,6 +74,10 @@ def do_request(session, method, url, headers, body):
     elif method == "POST" and url == "/":
         params = form_decode(body)
         return do_login(session, params)
+    elif method == "GET" and url == "/count":
+        return "200 OK", show_count()
+    elif method == "GET" and url == "/xhr":
+        return "200 OK", "XHR OK"
     else:
         return "404 Not Found", not_found(url, method)
 
@@ -103,6 +110,16 @@ def show_comments(session):
     out += "<label></label>"
     out += "<script src=/comment.js></script>"
     out += "<script src=https://example.com/evil.js></script>"
+    return out
+
+def show_count():
+    out = "<!doctype html>"
+    out += "<div>";
+    out += "  Let's count up to 99!"
+    out += "</div>";
+    out += "<div>Output</div>"
+    out += "<div>XHR result pending</div>"
+    out += "<script src=/eventloop.js></script>"
     return out
 
 def login_form(session):
@@ -146,6 +163,7 @@ if __name__ == "__main__":
     s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     s.bind(('', 8005))
     s.listen()
+    print("Listening on port 8005...")
 
     while True:
         conx, addr = s.accept()

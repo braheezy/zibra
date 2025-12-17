@@ -23,8 +23,6 @@ bottom: i32 = 0,
 focus: ?[]const u8 = null,
 address_bar: std.ArrayList(u8) = undefined,
 allocator: std.mem.Allocator = undefined,
-// Cached URL string for display (owned, must be freed)
-cached_url_str: ?[]u8 = null,
 // Cached display list (owned, must be freed)
 cached_display_list: ?[]DisplayItem = null,
 
@@ -98,9 +96,6 @@ pub fn init(font_manager: *font.FontManager, window_width: i32, allocator: std.m
 
 pub fn deinit(self: *Chrome) void {
     self.address_bar.deinit(self.allocator);
-    if (self.cached_url_str) |url_str| {
-        self.allocator.free(url_str);
-    }
     if (self.cached_display_list) |list| {
         self.allocator.free(list);
     }
@@ -125,7 +120,6 @@ pub fn paint(self: *Chrome, allocator: std.mem.Allocator, b: *const Browser) !st
         self.cached_display_list = null;
     }
 
-    // Note: We don't free cached_url_str here anymore - it's managed in the URL drawing code
     // and only freed/reallocated when the URL actually changes
 
     var cmds = std.ArrayList(DisplayItem).empty;
@@ -312,57 +306,28 @@ pub fn paint(self: *Chrome, allocator: std.mem.Allocator, b: *const Browser) !st
             });
         }
     } else {
-        // Draw current URL if there's an active tab
-        if (b.activeTab()) |active_tab| {
-            if (active_tab.current_url) |url_ptr| {
-                // Get URL string into a temporary buffer
-                var url_buf: [512]u8 = undefined;
-                const url_str_temp = url_ptr.*.toString(&url_buf) catch "(invalid url)";
-
-                // Only allocate a new string if the URL has changed or we don't have one cached
-                const needs_new_string = if (self.cached_url_str) |cached|
-                    !std.mem.eql(u8, cached, url_str_temp)
-                else
-                    true;
-
-                if (needs_new_string) {
-                    // Free old cached URL if it exists
-                    if (self.cached_url_str) |old_url| {
-                        allocator.free(old_url);
-                    }
-
-                    // Allocate new URL string on the heap
-                    const url_str = try allocator.alloc(u8, url_str_temp.len);
-                    @memcpy(url_str, url_str_temp);
-                    self.cached_url_str = url_str;
-                }
-
-                // Use the cached URL string (which is now stable)
-                const url_str = self.cached_url_str.?;
-
-                const url_text: []const u8 = url_str;
-                var idx: usize = 0;
-                var text_x = self.address_rect.left + self.padding;
-                while (idx < url_text.len) {
-                    const advance = std.unicode.utf8ByteSequenceLength(url_text[idx]) catch 1;
-                    const next_idx = @min(url_text.len, idx + advance);
-                    const gme = url_text[idx..next_idx];
-                    const url_glyph = try b.layout_engine.font_manager.getStyledGlyph(
-                        gme,
-                        .Normal,
-                        .Roman,
-                        self.font_size,
-                        false,
-                    );
-                    try cmds.append(allocator, .{ .glyph = .{
-                        .x = text_x,
-                        .y = self.address_rect.top,
-                        .glyph = url_glyph,
-                        .color = .{ .r = 0, .g = 0, .b = 0, .a = 255 },
-                    } });
-                    text_x += url_glyph.w;
-                    idx = next_idx;
-                }
+        if (b.active_tab_url) |url_text| {
+            var idx: usize = 0;
+            var text_x = self.address_rect.left + self.padding;
+            while (idx < url_text.len) {
+                const advance = std.unicode.utf8ByteSequenceLength(url_text[idx]) catch 1;
+                const next_idx = @min(url_text.len, idx + advance);
+                const gme = url_text[idx..next_idx];
+                const url_glyph = try b.layout_engine.font_manager.getStyledGlyph(
+                    gme,
+                    .Normal,
+                    .Roman,
+                    self.font_size,
+                    false,
+                );
+                try cmds.append(allocator, .{ .glyph = .{
+                    .x = text_x,
+                    .y = self.address_rect.top,
+                    .glyph = url_glyph,
+                    .color = .{ .r = 0, .g = 0, .b = 0, .a = 255 },
+                } });
+                text_x += url_glyph.w;
+                idx = next_idx;
             }
         }
     }
@@ -370,7 +335,7 @@ pub fn paint(self: *Chrome, allocator: std.mem.Allocator, b: *const Browser) !st
     return cmds;
 }
 
-pub fn click(self: *Chrome, b: *Browser, x: i32, y: i32) !void {
+pub fn click(self: *Chrome, b: *Browser, x: i32, y: i32) !bool {
     // Clear focus by default
     self.focus = null;
 
@@ -380,7 +345,7 @@ pub fn click(self: *Chrome, b: *Browser, x: i32, y: i32) !void {
         b.newTab(url) catch |err| {
             std.log.err("Failed to create new tab: {any}", .{err});
         };
-        return;
+        return true;
     }
 
     // Check if clicked on back button
@@ -390,41 +355,50 @@ pub fn click(self: *Chrome, b: *Browser, x: i32, y: i32) !void {
                 std.log.err("Failed to go back: {any}", .{err});
             };
         }
-        return;
+        return true;
     }
 
     // Check if clicked on address bar
     if (self.address_rect.containsPoint(x, y)) {
         self.focus = "address bar";
         self.address_bar.clearRetainingCapacity();
-        return;
+        return true;
     }
 
     // Check if clicked on a tab
     for (0..b.tabs.items.len) |i| {
         if (self.tabRect(i).containsPoint(x, y)) {
-            b.active_tab_index = i;
-            return;
+            if (b.active_tab_index == null or b.active_tab_index.? != i) {
+                b.active_tab_index = i;
+                return true;
+            }
+            return false;
         }
     }
+
+    return false;
 }
 
-pub fn keypress(self: *Chrome, char: u8) !void {
+pub fn keypress(self: *Chrome, char: u8) !bool {
     if (self.focus) |focus_str| {
         if (std.mem.eql(u8, focus_str, "address bar")) {
             try self.address_bar.append(self.allocator, char);
+            return true;
         }
     }
+    return false;
 }
 
-pub fn backspace(self: *Chrome) void {
+pub fn backspace(self: *Chrome) bool {
     if (self.focus) |focus_str| {
         if (std.mem.eql(u8, focus_str, "address bar")) {
             if (self.address_bar.items.len > 0) {
                 _ = self.address_bar.pop();
+                return true;
             }
         }
     }
+    return false;
 }
 
 pub fn blur(self: *Chrome) void {
@@ -433,43 +407,41 @@ pub fn blur(self: *Chrome) void {
     self.address_bar = std.ArrayList(u8).empty;
 }
 
-pub fn enter(self: *Chrome, b: *Browser) !void {
+pub fn enter(self: *Chrome, b: *Browser) !bool {
     if (self.focus) |focus_str| {
         if (std.mem.eql(u8, focus_str, "address bar")) {
-            if (self.address_bar.items.len > 0) {
-                // Create URL from address bar content
-                const url = Url.init(b.allocator, self.address_bar.items) catch |err| {
-                    std.log.err("Invalid URL: {any}", .{err});
-                    // Clear focus even on error
-                    self.focus = null;
-                    return;
+            if (self.address_bar.items.len == 0) return false;
+
+            const url = Url.init(b.allocator, self.address_bar.items) catch |err| {
+                std.log.err("Invalid URL: {any}", .{err});
+                self.focus = null;
+                return false;
+            };
+
+            if (b.activeTab()) |tab| {
+                const url_ptr = b.allocator.create(Url) catch |alloc_err| {
+                    std.log.err("Failed to allocate URL: {any}", .{alloc_err});
+                    return false;
+                };
+                url_ptr.* = url;
+                var url_owned = true;
+                defer if (url_owned) {
+                    url_ptr.*.free(b.allocator);
+                    b.allocator.destroy(url_ptr);
                 };
 
-                // Load it in the active tab
-                if (b.activeTab()) |tab| {
-                    const url_ptr = b.allocator.create(Url) catch |alloc_err| {
-                        std.log.err("Failed to allocate URL: {any}", .{alloc_err});
-                        return;
-                    };
-                    url_ptr.* = url;
-                    var load_success = false;
-                    defer if (!load_success) {
-                        url_ptr.*.free(b.allocator);
-                        b.allocator.destroy(url_ptr);
-                    };
-
-                    b.loadInTab(tab, url_ptr, null) catch |err| {
-                        std.log.err("Failed to load URL: {any}", .{err});
-                        return;
-                    };
-                    load_success = true;
-                }
-
-                // Clear focus
-                self.focus = null;
-                self.address_bar.clearAndFree(self.allocator);
-                self.address_bar = std.ArrayList(u8).empty;
+                b.scheduleLoad(tab, url_ptr, null) catch |err| {
+                    std.log.err("Failed to load URL: {any}", .{err});
+                    return false;
+                };
+                url_owned = false;
             }
+
+            self.focus = null;
+            self.address_bar.clearAndFree(self.allocator);
+            self.address_bar = std.ArrayList(u8).empty;
+            return true;
         }
     }
+    return false;
 }

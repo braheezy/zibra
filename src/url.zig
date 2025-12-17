@@ -531,8 +531,17 @@ pub const Url = struct {
 
             const response_writer: *std.Io.Writer = &allocating_writer.writer;
             _ = reader.streamRemaining(response_writer) catch |err| switch (err) {
-                error.ReadFailed => return response.bodyErr().?,
-                else => |e| return e,
+                error.ReadFailed => blk: {
+                    if (response.bodyErr()) |inner_err| {
+                        std.log.warn("response.bodyErr for {s}: {}", .{ url_str, inner_err });
+                        return inner_err;
+                    }
+                    break :blk;
+                },
+                else => |e| {
+                    std.log.warn("streamRemaining failed for {s}: {}", .{ url_str, e });
+                    return e;
+                },
             };
 
             const body = try allocating_writer.toOwnedSlice();
