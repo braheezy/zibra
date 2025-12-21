@@ -263,6 +263,14 @@ pub fn evaluate(self: *Js, code: []const u8) !Value {
         \\  }
         \\});
         \\
+        \\// Add style setter to Node prototype
+        \\Object.defineProperty(Node.prototype, "style", {
+        \\  set: function(value) {
+        \\    var text = value == null ? "" : value.toString();
+        \\    __native.style_set(this.handle, text);
+        \\  }
+        \\});
+        \\
         \\__native.dispatchEvent = function(handle, type) {
         \\  return new Node(handle).dispatchEvent(new Event(type));
         \\};
@@ -511,6 +519,14 @@ pub fn runXhrOnload(self: *Js, handle: u32, body: []const u8) !void {
     const body_value = try self.stringToJsValue(body);
     const handle_value = Value.from(@as(f64, @floatFromInt(handle)));
     _ = try fn_value.call(&self.agent, .undefined, &.{ body_value, handle_value });
+}
+
+test "Node.prototype.style setter is defined" {
+    var js = try Js.init(std.testing.allocator);
+    defer js.deinit(std.testing.allocator);
+
+    const result = try js.evaluate("Object.getOwnPropertyDescriptor(Node.prototype, 'style') !== undefined");
+    try std.testing.expect(result.toBoolean());
 }
 
 /// Set up the document object with DOM API

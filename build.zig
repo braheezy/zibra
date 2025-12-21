@@ -54,4 +54,15 @@ pub fn build(b: *std.Build) !void {
     }
     const run_step = b.step("run", "Run the app");
     run_step.dependOn(&run_cmd.step);
+
+    const js_test_module = b.createModule(.{
+        .root_source_file = b.path("src/js.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    js_test_module.addImport("kiesel", kiesel_dep.module("kiesel"));
+    const js_tests = b.addTest(.{ .root_module = js_test_module });
+    const js_tests_run = b.addRunArtifact(js_tests);
+    const test_step = b.step("test", "Run tests");
+    test_step.dependOn(&js_tests_run.step);
 }
