@@ -574,6 +574,53 @@ test "native style_set updates element style attribute" {
     }
 }
 
+const RenderTestContext = struct {
+    called: *bool,
+};
+
+fn renderTestCallback(context: ?*anyopaque) anyerror!void {
+    const ctx_ptr = context orelse return;
+    const raw_ctx: *align(1) RenderTestContext = @ptrCast(ctx_ptr);
+    const ctx: *RenderTestContext = @alignCast(raw_ctx);
+    ctx.called.* = true;
+}
+
+test "native style_set requests render" {
+    var js = try Js.init(std.testing.allocator);
+    defer js.deinit(std.testing.allocator);
+
+    const element = try parser.Element.init(std.testing.allocator, "div", null);
+    var node = Node{ .element = element };
+    defer node.deinit(std.testing.allocator);
+
+    const handle = try js.getHandle(&node);
+
+    var called = false;
+    var ctx = RenderTestContext{ .called = &called };
+    js.setRenderCallback(renderTestCallback, @ptrCast(&ctx));
+
+    const SafePointer = kiesel.types.SafePointer;
+    const builtins = kiesel.builtins;
+    const self_ptr = SafePointer.make(*Js, js);
+    const style_fn = try builtins.createBuiltinFunction(
+        &js.agent,
+        .{ .function = styleSet },
+        2,
+        "style_set",
+        .{
+            .realm = js.realm,
+            .additional_fields = self_ptr,
+        },
+    );
+
+    const handle_value = Value.from(@as(f64, @floatFromInt(handle)));
+    const style_js = try kiesel.types.String.fromUtf8(&js.agent, "opacity: 0.5");
+    const style_value = Value.from(&style_fn.object);
+    _ = try style_value.call(&js.agent, .undefined, &.{ handle_value, Value.from(style_js) });
+
+    try std.testing.expect(called);
+}
+
 /// Set up the document object with DOM API
 fn setupDocument(self: *Js) !void {
     const builtins = kiesel.builtins;
@@ -1070,6 +1117,8 @@ fn styleSet(agent: *Agent, this_value: Value, arguments: kiesel.types.Arguments)
             }
             try e.owned_strings.?.append(js_instance.allocator, owned_style);
             try e.attributes.?.put("style", owned_style);
+
+            js_instance.requestRender();
 
             return .undefined;
         },
