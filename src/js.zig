@@ -529,6 +529,14 @@ test "Node.prototype.style setter is defined" {
     try std.testing.expect(result.toBoolean());
 }
 
+test "__native.style_set is exposed" {
+    var js = try Js.init(std.testing.allocator);
+    defer js.deinit(std.testing.allocator);
+
+    const result = try js.evaluate("typeof __native.style_set === 'function'");
+    try std.testing.expect(result.toBoolean());
+}
+
 test "native style_set updates element style attribute" {
     var js = try Js.init(std.testing.allocator);
     defer js.deinit(std.testing.allocator);
@@ -705,12 +713,34 @@ fn setupDocument(self: *Js) !void {
         },
     );
 
+    // Create style_set function with self pointer
+    const style_set_fn = try kiesel.builtins.createBuiltinFunction(
+        &self.agent,
+        .{ .function = styleSet },
+        2,
+        "style_set",
+        .{
+            .realm = self.realm,
+            .additional_fields = self_ptr,
+        },
+    );
+
     // Add innerHTML to __native
     try native_obj.definePropertyDirect(
         &self.agent,
         PropertyKey.from("innerHTML"),
         .{
             .value_or_accessor = .{ .value = Value.from(&inner_html_fn.object) },
+            .attributes = .builtin_default,
+        },
+    );
+
+    // Add style_set to __native
+    try native_obj.definePropertyDirect(
+        &self.agent,
+        PropertyKey.from("style_set"),
+        .{
+            .value_or_accessor = .{ .value = Value.from(&style_set_fn.object) },
             .attributes = .builtin_default,
         },
     );
