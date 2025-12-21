@@ -529,6 +529,51 @@ test "Node.prototype.style setter is defined" {
     try std.testing.expect(result.toBoolean());
 }
 
+test "native style_set updates element style attribute" {
+    var js = try Js.init(std.testing.allocator);
+    defer js.deinit(std.testing.allocator);
+
+    const element = try parser.Element.init(std.testing.allocator, "div", null);
+    var node = Node{ .element = element };
+    defer node.deinit(std.testing.allocator);
+
+    const handle = try js.getHandle(&node);
+
+    const SafePointer = kiesel.types.SafePointer;
+    const builtins = kiesel.builtins;
+    const self_ptr = SafePointer.make(*Js, js);
+    const style_fn = try builtins.createBuiltinFunction(
+        &js.agent,
+        .{ .function = styleSet },
+        2,
+        "style_set",
+        .{
+            .realm = js.realm,
+            .additional_fields = self_ptr,
+        },
+    );
+
+    const handle_value = Value.from(@as(f64, @floatFromInt(handle)));
+    const style_js = try kiesel.types.String.fromUtf8(&js.agent, "opacity: 0.5");
+    const style_value = Value.from(&style_fn.object);
+    _ = try style_value.call(&js.agent, .undefined, &.{ handle_value, Value.from(style_js) });
+
+    switch (node) {
+        .element => |e| {
+            const attrs = e.attributes orelse {
+                try std.testing.expect(false);
+                return;
+            };
+            const style_attr = attrs.get("style") orelse {
+                try std.testing.expect(false);
+                return;
+            };
+            try std.testing.expectEqualStrings("opacity: 0.5", style_attr);
+        },
+        else => try std.testing.expect(false),
+    }
+}
+
 /// Set up the document object with DOM API
 fn setupDocument(self: *Js) !void {
     const builtins = kiesel.builtins;
@@ -970,6 +1015,68 @@ fn innerHTML(agent: *Agent, this_value: Value, arguments: kiesel.types.Arguments
             return agent.throwException(
                 .type_error,
                 "Text nodes do not support innerHTML",
+                .{},
+            );
+        },
+    }
+}
+
+/// __native.style_set implementation
+fn styleSet(agent: *Agent, this_value: Value, arguments: kiesel.types.Arguments) Agent.Error!Value {
+    const function_obj = agent.activeFunctionObject();
+    const builtin_fn = function_obj.as(kiesel.builtins.BuiltinFunction);
+    const js_instance = builtin_fn.fields.additional_fields.cast(*Js);
+
+    _ = this_value;
+
+    const handle_arg = arguments.get(0);
+    if (!handle_arg.isNumber()) {
+        return agent.throwException(
+            .type_error,
+            "style_set requires a numeric handle as first argument",
+            .{},
+        );
+    }
+
+    const handle: u32 = @intFromFloat(handle_arg.asNumber().asFloat());
+
+    const node = js_instance.getNode(handle) orelse return agent.throwException(
+        .internal_error,
+        "Invalid node handle",
+        .{},
+    );
+
+    const style_arg = arguments.get(1);
+    if (!style_arg.isString()) {
+        return agent.throwException(
+            .type_error,
+            "style_set requires a string as second argument",
+            .{},
+        );
+    }
+
+    const style_str = try style_arg.asString().toUtf8(js_instance.allocator);
+    defer js_instance.allocator.free(style_str);
+
+    switch (node.*) {
+        .element => |*e| {
+            if (e.attributes == null) {
+                e.attributes = std.StringHashMap([]const u8).init(js_instance.allocator);
+            }
+
+            const owned_style = try js_instance.allocator.dupe(u8, style_str);
+            if (e.owned_strings == null) {
+                e.owned_strings = std.ArrayList([]const u8).empty;
+            }
+            try e.owned_strings.?.append(js_instance.allocator, owned_style);
+            try e.attributes.?.put("style", owned_style);
+
+            return .undefined;
+        },
+        .text => {
+            return agent.throwException(
+                .type_error,
+                "Text nodes do not support style",
                 .{},
             );
         },
