@@ -82,9 +82,13 @@ pub fn init(allocator: std.mem.Allocator, tab_height: i32, measure: *MeasureTime
 }
 
 pub fn deinit(self: *Tab) void {
+    std.debug.print("tab.deinit: invalidateJsContext\n", .{});
     self.invalidateJsContext();
+    std.debug.print("tab.deinit: waitForAsyncThreads\n", .{});
     self.waitForAsyncThreads();
+    std.debug.print("tab.deinit: task_runner.shutdown\n", .{});
     self.task_runner.shutdown();
+    std.debug.print("tab.deinit: task_runner.shutdown done\n", .{});
 
     // Clean up any display list
     if (self.display_list) |list| {

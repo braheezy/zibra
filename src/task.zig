@@ -101,29 +101,37 @@ pub const TaskRunner = struct {
     }
 
     pub fn shutdown(self: *TaskRunner) void {
+        std.debug.print("TaskRunner.shutdown: acquiring lock\n", .{});
         self.mutex.lock();
         if (self.shutting_down) {
+            std.debug.print("TaskRunner.shutdown: already shutting down\n", .{});
             self.mutex.unlock();
             return;
         }
 
+        std.debug.print("TaskRunner.shutdown: setting flags\n", .{});
         self.shutting_down = true;
         self.needs_quit = true;
+        std.debug.print("TaskRunner.shutdown: clearing tasks\n", .{});
         self.clearUnlocked();
+        std.debug.print("TaskRunner.shutdown: broadcasting\n", .{});
         self.condition.broadcast();
         self.mutex.unlock();
+        std.debug.print("TaskRunner.shutdown: released lock\n", .{});
 
         if (self.thread) |thread| {
-            thread.join();
+            std.debug.print("TaskRunner.shutdown: detaching thread instead of join\n", .{});
+            thread.detach();
             self.thread = null;
+            std.debug.print("TaskRunner.shutdown: thread detached\n", .{});
+        } else {
+            std.debug.print("TaskRunner.shutdown: no thread to join\n", .{});
         }
     }
 };
 
 fn runThread(runner: *TaskRunner) void {
-    _ = runner.measure.registerThread("Tab main thread") catch |err| {
-        std.log.warn("Failed to register tab thread: {}", .{err});
-    };
+    _ = runner.measure.registerThread("Tab main thread") catch {};
 
     while (true) {
         var task_to_run: ?Task = null;
@@ -134,7 +142,8 @@ fn runThread(runner: *TaskRunner) void {
 
         if (runner.needs_quit) {
             runner.mutex.unlock();
-            break;
+            std.log.info("TaskRunner thread exiting cleanly", .{});
+            return;
         }
 
         task_to_run = runner.tasks.orderedRemove(0);

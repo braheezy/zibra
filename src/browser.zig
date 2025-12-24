@@ -177,12 +177,15 @@ pub const Browser = struct {
     animation_timer_active: bool = false,
     needs_raster_and_draw: bool = true,
     needs_animation_frame: bool = false,
+    shutting_down: bool = false,
     measure: MeasureTime,
     lock: std.Thread.Mutex = .{},
     active_tab_url: ?[]u8 = null,
     active_tab_scroll: i32 = 0,
     active_tab_height: i32 = 0,
     active_tab_display_list: ?[]DisplayItem = null,
+    // Cached SDL texture for GPU-accelerated rendering
+    cached_texture: ?sdl2.Texture = null,
 
     // Create a new Browser instance
     pub fn init(al: std.mem.Allocator, rtl_flag: bool) !Browser {
@@ -207,6 +210,21 @@ pub const Browser = struct {
             null,
             .{ .accelerated = true },
         );
+
+        // Log the SDL renderer backend to confirm hardware acceleration
+        const renderer_info = try renderer.getInfo();
+        const renderer_name = std.mem.span(renderer_info.name);
+        std.log.info("SDL renderer backend: {s}", .{renderer_name});
+
+        // Create persistent streaming texture for GPU-accelerated rendering
+        const cached_texture = try sdl2.createTexture(
+            renderer,
+            .rgba8888,
+            .streaming,
+            initial_window_width,
+            initial_window_height,
+        );
+        try cached_texture.setBlendMode(.blend);
 
         // Parse the default browser stylesheet
         var css_parser = try CSSParser.init(al, DEFAULT_STYLE_SHEET);
@@ -252,6 +270,7 @@ pub const Browser = struct {
             .chrome = try Chrome.init(&layout_engine.font_manager, initial_window_width, al),
             .js_engine = js_engine,
             .measure = measure,
+            .cached_texture = cached_texture,
         };
 
         // Create chrome surface (fixed height based on chrome.bottom)
@@ -374,79 +393,84 @@ pub const Browser = struct {
         self.scheduleAnimationFrame();
 
         while (!quit) {
-            while (sdl2.pollEvent()) |event| {
-                switch (event) {
-                    // Quit when the window is closed
-                    .quit => {
-                        quit = true;
-                        break; // Exit event loop immediately
-                    },
-                    .key_down => |kb_event| {
-                        if (quit) break;
-                        try self.handleKeyEvent(kb_event.keycode);
-                    },
-                    .text_input => |text_event| {
-                        if (quit) break;
-                        const text = std.mem.sliceTo(&text_event.text, 0);
-                        var chrome_changed = false;
-                        for (text) |char| {
-                            if (char >= 0x20 and char < 0x7f) {
-                                if (try self.chrome.keypress(char)) {
-                                    chrome_changed = true;
-                                }
-                                if (self.focus) |focus_str| {
-                                    if (std.mem.eql(u8, focus_str, "content")) {
-                                        if (self.activeTab()) |tab| {
-                                            self.scheduleTabKeypressTask(tab, char);
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                        if (!quit and chrome_changed) {
-                            self.setNeedsRasterAndDraw();
-                            try self.rasterAndDraw();
-                        }
-                    },
-                    // Handle mouse wheel events
-                    .mouse_wheel => |wheel_event| {
-                        if (quit) break;
-                        if (wheel_event.delta_y > 0) {
-                            self.handleScroll(-scroll_step);
-                        } else if (wheel_event.delta_y < 0) {
-                            self.handleScroll(scroll_step);
-                        }
-                        if (!quit) {
-                            try self.rasterAndDraw();
-                        }
-                    },
-                    // Handle mouse button clicks
-                    .mouse_button_down => |button_event| {
-                        if (quit) break;
-                        if (button_event.button == .left) {
-                            try self.handleClick(button_event.x, button_event.y);
-                        }
-                    },
-                    .window => |window_event| {
-                        if (quit) break;
-                        try self.handleWindowEvent(window_event);
-                    },
-                    else => {},
+            // Use waitEventTimeout to be responsive to system events while still
+            // limiting frame rate. This prevents the macOS beach ball by waking
+            // immediately when events arrive instead of blocking in delay().
+            if (sdl2.waitEventTimeout(17)) |event| {
+                if (try self.handleEvent(event)) {
+                    quit = true;
                 }
-                if (quit) break; // Exit inner event loop if quit was set
+
+                // Process any additional pending events without blocking
+                while (sdl2.pollEvent()) |extra_event| {
+                    if (try self.handleEvent(extra_event)) {
+                        quit = true;
+                        break;
+                    }
+                }
             }
 
             if (!quit) {
                 try self.rasterAndDraw();
-            }
-
-            if (!quit) {
                 self.scheduleAnimationFrame();
             }
-
-            // delay for 17ms to get 60fps
-            sdl2.delay(17);
         }
+
+        // Signal shutdown to background threads before cleanup
+        self.lock.lock();
+        self.shutting_down = true;
+        self.lock.unlock();
+
+        // Give background threads a moment to notice shutdown
+        std.Thread.sleep(50_000_000); // 50ms
+    }
+
+    // Handle a single SDL event. Returns true if quit was requested.
+    fn handleEvent(self: *Browser, event: sdl2.Event) !bool {
+        switch (event) {
+            .quit => return true,
+            .key_down => |kb_event| {
+                try self.handleKeyEvent(kb_event.keycode);
+            },
+            .text_input => |text_event| {
+                const text = std.mem.sliceTo(&text_event.text, 0);
+                var chrome_changed = false;
+                for (text) |char| {
+                    if (char >= 0x20 and char < 0x7f) {
+                        if (try self.chrome.keypress(char)) {
+                            chrome_changed = true;
+                        }
+                        if (self.focus) |focus_str| {
+                            if (std.mem.eql(u8, focus_str, "content")) {
+                                if (self.activeTab()) |tab| {
+                                    self.scheduleTabKeypressTask(tab, char);
+                                }
+                            }
+                        }
+                    }
+                }
+                if (chrome_changed) {
+                    self.setNeedsRasterAndDraw();
+                }
+            },
+            .mouse_wheel => |wheel_event| {
+                if (wheel_event.delta_y > 0) {
+                    self.handleScroll(-scroll_step);
+                } else if (wheel_event.delta_y < 0) {
+                    self.handleScroll(scroll_step);
+                }
+            },
+            .mouse_button_down => |button_event| {
+                if (button_event.button == .left) {
+                    try self.handleClick(button_event.x, button_event.y);
+                }
+            },
+            .window => |window_event| {
+                try self.handleWindowEvent(window_event);
+            },
+            else => {},
+        }
+        return false;
     }
 
     pub fn handleWindowEvent(self: *Browser, window_event: sdl2.WindowEvent) !void {
@@ -478,6 +502,19 @@ pub const Browser = struct {
                     tab_surface.deinit(self.allocator);
                     self.tab_surface = try z2d.Surface.init(.image_surface_rgba, self.allocator, size.width, tab_height);
                 }
+
+                // Recreate cached SDL texture with new dimensions
+                if (self.cached_texture) |tex| {
+                    tex.destroy();
+                }
+                self.cached_texture = try sdl2.createTexture(
+                    self.canvas,
+                    .rgba8888,
+                    .streaming,
+                    @intCast(size.width),
+                    @intCast(size.height),
+                );
+                try self.cached_texture.?.setBlendMode(.blend);
 
                 // Force re-raster and redraw
                 try self.canvas.setColor(.{ .r = 255, .g = 255, .b = 255, .a = 255 });
@@ -1202,7 +1239,7 @@ pub const Browser = struct {
 
     pub fn scheduleAnimationFrame(self: *Browser) void {
         self.lock.lock();
-        if (self.animation_timer_active or !self.needs_animation_frame or self.activeTab() == null) {
+        if (self.shutting_down or self.animation_timer_active or !self.needs_animation_frame or self.activeTab() == null) {
             self.lock.unlock();
             return;
         }
@@ -1478,7 +1515,10 @@ pub const Browser = struct {
     }
 
     // Copy z2d surface to SDL for display (surface handoff)
+    // Uses persistent cached texture to avoid per-frame texture churn
     fn copyZ2dToSDL(self: *Browser) !void {
+        const texture = self.cached_texture orelse return error.NoCachedTexture;
+
         // Get the pixel data from the z2d surface
         const surface_width = self.root_surface.getWidth();
         const surface_height = self.root_surface.getHeight();
@@ -1489,20 +1529,7 @@ pub const Browser = struct {
             else => return error.UnsupportedSurfaceType,
         };
 
-        // Create an SDL texture and copy the pixel data
-        // Use RGBA8888 to match z2d's pixel format directly
-        const texture = try sdl2.createTexture(
-            self.canvas,
-            .rgba8888,
-            .streaming,
-            @intCast(surface_width),
-            @intCast(surface_height),
-        );
-
-        // Set blend mode to blend (for alpha transparency)
-        try texture.setBlendMode(.blend);
-
-        // Lock the texture to get writable pixel buffer
+        // Lock the cached texture to get writable pixel buffer
         var pixel_data_result = try texture.lock(null);
 
         // Get the pixel pointer and stride
@@ -1533,11 +1560,8 @@ pub const Browser = struct {
         // MUST unlock before copying to canvas
         pixel_data_result.release();
 
-        // Copy texture to renderer
+        // Copy texture to renderer (texture persists for next frame)
         try self.canvas.copy(texture, null, null);
-
-        // Now we can destroy the texture after it's been copied to the render target
-        texture.destroy();
     }
 
     // Draw a display item using the browser's context
@@ -1811,23 +1835,37 @@ pub const Browser = struct {
 
     // Ensure we clean up the document_layout in deinit
     pub fn deinit(self: *Browser) void {
+        std.debug.print("deinit: starting cleanup\n", .{});
         // Clean up z2d surfaces and context
         self.context.deinit();
+        std.debug.print("deinit: context done\n", .{});
         self.root_surface.deinit(self.allocator);
+        std.debug.print("deinit: root_surface done\n", .{});
         self.chrome_surface.deinit(self.allocator);
+        std.debug.print("deinit: chrome_surface done\n", .{});
         if (self.tab_surface) |*tab_surface| {
             tab_surface.deinit(self.allocator);
         }
+        std.debug.print("deinit: tab_surface done\n", .{});
+
+        // Clean up cached SDL texture
+        if (self.cached_texture) |tex| {
+            tex.destroy();
+        }
+        std.debug.print("deinit: cached_texture done\n", .{});
 
         // Close all connections
         self.http_client.deinit();
+        std.debug.print("deinit: http_client done\n", .{});
 
         // Free cache
         var cache = self.cache;
         cache.free();
+        std.debug.print("deinit: cache done\n", .{});
 
         // Clean up chrome
         self.chrome.deinit();
+        std.debug.print("deinit: chrome done\n", .{});
 
         // Free cookie jar values and map storage
         var cookie_it = self.cookie_jar.iterator();
@@ -1836,13 +1874,18 @@ pub const Browser = struct {
             self.allocator.free(entry.key_ptr.*);
         }
         self.cookie_jar.deinit();
+        std.debug.print("deinit: cookie_jar done\n", .{});
 
         // Clean up all tabs
+        std.debug.print("deinit: cleaning up {} tabs\n", .{self.tabs.items.len});
         for (self.tabs.items) |tab| {
+            std.debug.print("deinit: tab.deinit starting\n", .{});
             tab.deinit();
+            std.debug.print("deinit: tab.deinit done, destroying\n", .{});
             self.allocator.destroy(tab);
         }
         self.tabs.deinit(self.allocator);
+        std.debug.print("deinit: tabs done\n", .{});
 
         if (self.active_tab_display_list) |list| {
             self.allocator.free(list);
@@ -1850,22 +1893,28 @@ pub const Browser = struct {
         if (self.active_tab_url) |url| {
             self.allocator.free(url);
         }
+        std.debug.print("deinit: display_list and url done\n", .{});
 
         // Clean up default stylesheet rules
         for (self.default_style_sheet_rules) |*rule| {
             rule.deinit(self.allocator);
         }
         self.allocator.free(self.default_style_sheet_rules);
+        std.debug.print("deinit: stylesheet rules done\n", .{});
 
         // clean up layout
         self.layout_engine.deinit();
+        std.debug.print("deinit: layout_engine done\n", .{});
 
         // Clean up JavaScript engine
         self.js_engine.deinit(self.allocator);
+        std.debug.print("deinit: js_engine done\n", .{});
 
         self.measure.finish();
+        std.debug.print("deinit: measure done\n", .{});
 
         sdl2.quit();
+        std.debug.print("deinit: sdl2.quit done\n", .{});
     }
 };
 
@@ -2462,6 +2511,12 @@ fn runAnimationTimerThread(ctx: *AnimationTimerContext) void {
     std.Thread.sleep(refresh_rate_ns);
 
     browser.lock.lock();
+    // Check if browser is shutting down before accessing any resources
+    if (browser.shutting_down) {
+        browser.animation_timer_active = false;
+        browser.lock.unlock();
+        return;
+    }
     const tab = browser.activeTab() orelse {
         browser.animation_timer_active = false;
         browser.lock.unlock();
