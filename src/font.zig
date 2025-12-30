@@ -218,6 +218,8 @@ pub const Glyph = struct {
     is_superscript: bool = false,
     is_soft_hyphen: bool = false,
     preserve_texture_color: bool = false,
+    /// Pixel data for z2d software rendering (RGBA format, alpha mask from font)
+    pixels: ?[]u8 = null,
 };
 
 pub const Font = struct {
@@ -264,10 +266,14 @@ pub const FontManager = struct {
 
             var outer_it = f.glyphs.iterator();
             while (outer_it.next()) |outer_entry| {
-                // For each style => destroy the texture
+                // For each style => destroy the texture and free pixel data
                 const cache_entry = outer_entry.value_ptr.*;
                 if (cache_entry.texture) |texture| {
                     texture.destroy();
+                }
+                // Free the pixel data used for z2d software rendering
+                if (cache_entry.pixels) |pixels| {
+                    self.allocator.free(pixels);
                 }
             }
             f.glyphs.deinit();
@@ -564,6 +570,41 @@ pub const FontManager = struct {
         const ascent = font.font_handle.ascent();
         const descent = -font.font_handle.descent(); // Make positive
 
+        // Extract pixel data from surface for z2d software rendering
+        // The surface pixels contain alpha values from the font rendering
+        const pixel_data: ?[]u8 = blk: {
+            if (surf.pixels) |pixels_ptr| {
+                const w: usize = @intCast(surf.w);
+                const h: usize = @intCast(surf.h);
+                const pitch: usize = @intCast(surf.pitch);
+
+                // Allocate space for RGBA data (4 bytes per pixel)
+                const data = self.allocator.alloc(u8, w * h * 4) catch break :blk null;
+
+                // Copy pixel data row by row (respecting pitch)
+                // SDL_TTF renderUtf8Blended returns ARGB8888 format
+                // On little-endian: byte 0=B, byte 1=G, byte 2=R, byte 3=A
+                const src_bytes: [*]const u8 = @ptrCast(pixels_ptr);
+                for (0..h) |y| {
+                    for (0..w) |x| {
+                        const src_idx = y * pitch + x * 4;
+                        const dst_idx = (y * w + x) * 4;
+                        // Convert from ARGB8888 (BGRA in memory) to RGBA
+                        const b = src_bytes[src_idx + 0];
+                        const g = src_bytes[src_idx + 1];
+                        const r = src_bytes[src_idx + 2];
+                        const a = src_bytes[src_idx + 3];
+                        data[dst_idx + 0] = r;
+                        data[dst_idx + 1] = g;
+                        data[dst_idx + 2] = b;
+                        data[dst_idx + 3] = a;
+                    }
+                }
+                break :blk data;
+            }
+            break :blk null;
+        };
+
         const new_glyph = if (!is_emoji) Glyph{
             .grapheme = gme,
             .texture = glyph_tex,
@@ -571,6 +612,7 @@ pub const FontManager = struct {
             .h = surf.h,
             .ascent = ascent,
             .descent = descent,
+            .pixels = pixel_data,
         } else blk: {
             const text_height: i32 = self.min_line_height;
             var tmp1: f32 = @floatFromInt(text_height);
@@ -588,6 +630,7 @@ pub const FontManager = struct {
                 .ascent = @divTrunc(3 * self.min_line_height, 4),
                 .descent = @divTrunc(self.min_line_height, 4),
                 .preserve_texture_color = true,
+                .pixels = pixel_data,
             };
         };
 

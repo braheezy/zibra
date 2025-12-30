@@ -68,6 +68,170 @@ pub const Rect = struct {
         return x >= self.left and x < self.right and
             y >= self.top and y < self.bottom;
     }
+
+    pub fn width(self: Rect) i32 {
+        return self.right - self.left;
+    }
+
+    pub fn height(self: Rect) i32 {
+        return self.bottom - self.top;
+    }
+
+    /// Expand bounds by the given amount in all directions
+    pub fn outset(self: Rect, amount: i32) Rect {
+        return .{
+            .left = self.left - amount,
+            .top = self.top - amount,
+            .right = self.right + amount,
+            .bottom = self.bottom + amount,
+        };
+    }
+
+    /// Contract bounds by the given amount in all directions
+    pub fn inset(self: Rect, amount: i32) Rect {
+        return .{
+            .left = self.left + amount,
+            .top = self.top + amount,
+            .right = self.right - amount,
+            .bottom = self.bottom - amount,
+        };
+    }
+};
+
+/// A composited layer stores display items that can be rasterized once and reused.
+/// Layers are created for elements with visual effects like opacity or blend modes.
+pub const CompositedLayer = struct {
+    /// The display items to rasterize into this layer
+    display_items: []DisplayItem,
+    /// Cached raster surface (null until first rasterized)
+    surface: ?z2d.Surface = null,
+    /// Bounds of the layer in document coordinates (with 1px outset for edge artifacts)
+    bounds: Rect,
+    /// Whether this layer needs to be re-rasterized
+    needs_raster: bool = true,
+    /// Opacity to apply when compositing this layer
+    opacity: f64 = 1.0,
+    /// Blend mode to apply when compositing
+    blend_mode: ?[]const u8 = null,
+    /// DOM node pointer for identifying this layer across frames
+    node: ?*anyopaque = null,
+
+    pub fn init(display_items: []DisplayItem, bounds: Rect, opacity: f64, blend_mode: ?[]const u8, node: ?*anyopaque) CompositedLayer {
+        // Add 1px outset to avoid raster edge artifacts
+        return .{
+            .display_items = display_items,
+            .bounds = bounds.outset(1),
+            .opacity = opacity,
+            .blend_mode = blend_mode,
+            .node = node,
+        };
+    }
+
+    pub fn deinit(self: *CompositedLayer, allocator: std.mem.Allocator) void {
+        if (self.surface) |*surface| {
+            surface.deinit(allocator);
+            self.surface = null;
+        }
+        if (self.display_items.len > 0) {
+            freeLayerItems(allocator, self.display_items);
+            self.display_items = &.{};
+        }
+    }
+
+    /// Check if another layer can be merged into this one.
+    /// Layers can merge if they have identical visual-effect ancestry (same opacity and blend_mode).
+    pub fn can_merge(self: *const CompositedLayer, other_opacity: f64, other_blend_mode: ?[]const u8) bool {
+        // Must have same opacity
+        if (self.opacity != other_opacity) return false;
+
+        // Must have same blend mode
+        if (self.blend_mode == null and other_blend_mode == null) return true;
+        if (self.blend_mode == null or other_blend_mode == null) return false;
+        return std.mem.eql(u8, self.blend_mode.?, other_blend_mode.?);
+    }
+
+    /// Add display items to this layer, expanding bounds as needed.
+    /// Returns true if items were added, false if incompatible.
+    pub fn add(self: *CompositedLayer, allocator: std.mem.Allocator, items: []DisplayItem, item_bounds: Rect) !void {
+        // Expand bounds to include new items (remove 1px outset, expand, re-add)
+        const inner_bounds = self.bounds.inset(1);
+        const new_bounds = Rect{
+            .left = @min(inner_bounds.left, item_bounds.left),
+            .top = @min(inner_bounds.top, item_bounds.top),
+            .right = @max(inner_bounds.right, item_bounds.right),
+            .bottom = @max(inner_bounds.bottom, item_bounds.bottom),
+        };
+        self.bounds = new_bounds.outset(1);
+
+        // Combine display items
+        const old_items = self.display_items;
+        const new_items = try allocator.alloc(DisplayItem, old_items.len + items.len);
+        @memcpy(new_items[0..old_items.len], old_items);
+        @memcpy(new_items[old_items.len..], items);
+        self.display_items = new_items;
+        if (old_items.len > 0) {
+            allocator.free(old_items);
+        }
+        if (items.len > 0) {
+            allocator.free(items);
+        }
+
+        // Mark for re-rasterization since content changed
+        self.needs_raster = true;
+    }
+
+    fn freeLayerItems(allocator: std.mem.Allocator, items: []DisplayItem) void {
+        if (items.len == 0) return;
+        for (items) |item| {
+            switch (item) {
+                .transform => |t| {
+                    freeLayerItems(allocator, t.children);
+                },
+                else => {},
+            }
+        }
+        allocator.free(items);
+    }
+
+    /// Rasterize the layer's display items to its cached surface
+    pub fn raster(self: *CompositedLayer, allocator: std.mem.Allocator, browser: *Browser) anyerror!void {
+        if (!self.needs_raster and self.surface != null) return;
+
+        const layer_width: i32 = @max(1, self.bounds.width());
+        const layer_height: i32 = @max(1, self.bounds.height());
+
+        // Create or recreate surface if needed
+        if (self.surface) |*existing| {
+            if (existing.getWidth() != layer_width or existing.getHeight() != layer_height) {
+                existing.deinit(allocator);
+                self.surface = null;
+            }
+        }
+
+        if (self.surface == null) {
+            self.surface = try z2d.Surface.init(.image_surface_rgba, allocator, layer_width, layer_height);
+        }
+
+        var ctx = z2d.Context.init(allocator, &self.surface.?);
+        defer ctx.deinit();
+
+        // Clear to transparent
+        ctx.setSource(.{ .opaque_pattern = .{ .pixel = .{ .rgba = .{ .r = 0, .g = 0, .b = 0, .a = 0 } } } });
+        try ctx.moveTo(0, 0);
+        try ctx.lineTo(@floatFromInt(layer_width), 0);
+        try ctx.lineTo(@floatFromInt(layer_width), @floatFromInt(layer_height));
+        try ctx.lineTo(0, @floatFromInt(layer_height));
+        try ctx.closePath();
+        try ctx.fill();
+
+        // Draw display items offset by layer bounds (absolute to local mapping)
+        // Items are stored in absolute coordinates, so we offset by bounds origin to draw in layer space
+        for (self.display_items) |item| {
+            try browser.drawDisplayItemZ2dContextForLayer(&ctx, item, self.bounds.left, self.bounds.top);
+        }
+
+        self.needs_raster = false;
+    }
 };
 
 pub const DisplayItem = union(enum) {
@@ -109,7 +273,171 @@ pub const DisplayItem = union(enum) {
         opacity: f64,
         blend_mode: ?[]const u8,
         children: []DisplayItem,
+        node: ?*anyopaque = null, // Reference back to the DOM node that created this effect
+        parent: ?*const DisplayItem = null, // Parent blend for walking up the tree
+        needs_compositing: bool = false, // True if this blend or descendants require composited layers
     },
+    /// Draw a pre-rasterized composited layer
+    draw_composited_layer: struct {
+        layer: *CompositedLayer,
+    },
+    /// Apply a 2D translation transform to children
+    transform: struct {
+        translate_x: i32,
+        translate_y: i32,
+        children: []DisplayItem,
+        node: ?*anyopaque = null,
+    },
+
+    // Debug print a display item with indentation
+    pub fn debugPrint(self: DisplayItem, indent: usize) void {
+        const indent_str = "  ";
+        var i: usize = 0;
+        while (i < indent) : (i += 1) {
+            std.debug.print("{s}", .{indent_str});
+        }
+
+        switch (self) {
+            .glyph => |g| {
+                std.debug.print("Glyph({d},{d}) color=({d},{d},{d},{d})\n", .{
+                    g.x, g.y, g.color.r, g.color.g, g.color.b, g.color.a,
+                });
+            },
+            .rect => |r| {
+                std.debug.print("Rect({d},{d})-({d},{d}) color=({d},{d},{d},{d})\n", .{
+                    r.x1, r.y1, r.x2, r.y2, r.color.r, r.color.g, r.color.b, r.color.a,
+                });
+            },
+            .rounded_rect => |r| {
+                std.debug.print("RoundedRect({d},{d})-({d},{d}) r={d:.1} color=({d},{d},{d},{d})\n", .{
+                    r.x1, r.y1, r.x2, r.y2, r.radius, r.color.r, r.color.g, r.color.b, r.color.a,
+                });
+            },
+            .line => |l| {
+                std.debug.print("Line({d},{d})-({d},{d}) t={d}\n", .{
+                    l.x1, l.y1, l.x2, l.y2, l.thickness,
+                });
+            },
+            .outline => |o| {
+                std.debug.print("Outline({d},{d})-({d},{d}) t={d}\n", .{
+                    o.rect.left, o.rect.top, o.rect.right, o.rect.bottom, o.thickness,
+                });
+            },
+            .blend => |b| {
+                std.debug.print("Blend(opacity={d:.2}, mode={s}, children={d})\n", .{
+                    b.opacity,
+                    if (b.blend_mode) |mode| mode else "normal",
+                    b.children.len,
+                });
+                for (b.children) |child| {
+                    child.debugPrint(indent + 1);
+                }
+            },
+            .draw_composited_layer => |dcl| {
+                std.debug.print("DrawCompositedLayer(bounds=({d},{d})-({d},{d}), opacity={d:.2})\n", .{
+                    dcl.layer.bounds.left,
+                    dcl.layer.bounds.top,
+                    dcl.layer.bounds.right,
+                    dcl.layer.bounds.bottom,
+                    dcl.layer.opacity,
+                });
+            },
+            .transform => |t| {
+                std.debug.print("Transform(translate=({d},{d}), {d} children)\n", .{
+                    t.translate_x,
+                    t.translate_y,
+                    t.children.len,
+                });
+                for (t.children) |child| {
+                    child.debugPrint(indent + 1);
+                }
+            },
+        }
+    }
+
+    // Debug print an entire display list as a tree
+    pub fn debugPrintList(items: []const DisplayItem) void {
+        std.debug.print("=== Display List ({d} items) ===\n", .{items.len});
+        for (items) |item| {
+            item.debugPrint(0);
+        }
+        std.debug.print("=== End Display List ===\n", .{});
+    }
+
+    // Set parent pointers recursively on a display list
+    // This should be called after the display list is constructed
+    pub fn setParentPointers(items: []DisplayItem, parent: ?*const DisplayItem) void {
+        for (items) |*item| {
+            switch (item.*) {
+                .blend => |*b| {
+                    b.parent = parent;
+                    // Recursively set parent pointers on children
+                    setParentPointers(b.children, item);
+                },
+                else => {}, // Leaf nodes don't have parent pointers
+            }
+        }
+    }
+
+    // Walk up the parent chain from this item (only works for blend items)
+    pub fn getAncestorChain(self: *const DisplayItem, allocator: std.mem.Allocator) ![]const *const DisplayItem {
+        var ancestors = std.ArrayList(*const DisplayItem).init(allocator);
+        var current: ?*const DisplayItem = self;
+        while (current) |item| {
+            switch (item.*) {
+                .blend => |b| {
+                    try ancestors.append(item);
+                    current = b.parent;
+                },
+                else => break,
+            }
+        }
+        return ancestors.toOwnedSlice();
+    }
+
+    // Check if display list contains any opacity effects (opacity < 1.0)
+    pub fn hasOpacityEffects(items: []const DisplayItem) bool {
+        for (items) |item| {
+            switch (item) {
+                .blend => |b| {
+                    if (b.opacity < 1.0) return true;
+                    if (hasOpacityEffects(b.children)) return true;
+                },
+                else => {},
+            }
+        }
+        return false;
+    }
+
+    // Debug print the display list if it contains opacity effects
+    pub fn debugPrintIfHasOpacity(items: []const DisplayItem) void {
+        if (hasOpacityEffects(items)) {
+            std.debug.print("\n=== Opacity Frame Detected ===\n", .{});
+            debugPrintList(items);
+        }
+    }
+
+    pub fn freeList(allocator: std.mem.Allocator, items: []DisplayItem) void {
+        for (items) |item| {
+            freeItem(allocator, item);
+        }
+        allocator.free(items);
+    }
+
+    fn freeItem(allocator: std.mem.Allocator, item: DisplayItem) void {
+        switch (item) {
+            .blend => |b| {
+                if (b.blend_mode) |mode| {
+                    allocator.free(mode);
+                }
+                freeList(allocator, b.children);
+            },
+            .transform => |t| {
+                freeList(allocator, t.children);
+            },
+            else => {},
+        }
+    }
 };
 
 pub const JsRenderContext = struct {
@@ -175,7 +503,9 @@ pub const Browser = struct {
     // JavaScript engine
     js_engine: *js_module,
     animation_timer_active: bool = false,
-    needs_raster_and_draw: bool = true,
+    needs_composite: bool = true,
+    needs_raster: bool = true,
+    needs_draw: bool = true,
     needs_animation_frame: bool = false,
     shutting_down: bool = false,
     measure: MeasureTime,
@@ -184,8 +514,14 @@ pub const Browser = struct {
     active_tab_scroll: i32 = 0,
     active_tab_height: i32 = 0,
     active_tab_display_list: ?[]DisplayItem = null,
+    // Composited layers for caching rasterized content
+    composited_layers: std.ArrayList(CompositedLayer),
+    // Draw list created from composite phase
+    tab_draw_list: std.ArrayList(DisplayItem),
     // Cached SDL texture for GPU-accelerated rendering
     cached_texture: ?sdl2.Texture = null,
+    // Debug flag to visualize composited layer boundaries
+    debug_layer_borders: bool = false,
 
     // Create a new Browser instance
     pub fn init(al: std.mem.Allocator, rtl_flag: bool) !Browser {
@@ -201,7 +537,7 @@ pub const Browser = struct {
             .default,
             initial_window_width,
             initial_window_height,
-            .{ .resizable = true },
+            .{}, // Not resizable
         );
 
         // Create a renderer, which will be used to draw to the window
@@ -217,9 +553,10 @@ pub const Browser = struct {
         std.log.info("SDL renderer backend: {s}", .{renderer_name});
 
         // Create persistent streaming texture for GPU-accelerated rendering
+        // Use ABGR8888 to match z2d's RGBA memory layout (r at lowest address)
         const cached_texture = try sdl2.createTexture(
             renderer,
-            .rgba8888,
+            .abgr8888,
             .streaming,
             initial_window_width,
             initial_window_height,
@@ -271,6 +608,8 @@ pub const Browser = struct {
             .js_engine = js_engine,
             .measure = measure,
             .cached_texture = cached_texture,
+            .composited_layers = std.ArrayList(CompositedLayer).empty,
+            .tab_draw_list = std.ArrayList(DisplayItem).empty,
         };
 
         // Create chrome surface (fixed height based on chrome.bottom)
@@ -312,7 +651,9 @@ pub const Browser = struct {
                 const new_scroll = self.clampScroll(self.active_tab_scroll + delta);
                 if (new_scroll != self.active_tab_scroll) {
                     self.active_tab_scroll = new_scroll;
-                    self.needs_raster_and_draw = true;
+                    self.needs_composite = true;
+                    self.needs_raster = true;
+                    self.needs_draw = true;
                     self.needs_animation_frame = true;
                     self.animation_timer_active = false;
                     should_schedule = true;
@@ -344,6 +685,22 @@ pub const Browser = struct {
                 self.allocator.free(url);
             }
             self.active_tab_url = null;
+
+            // Clear compositing state when switching tabs
+            for (self.composited_layers.items) |*layer| {
+                layer.deinit(self.allocator);
+            }
+            self.composited_layers.items.len = 0;
+            self.tab_draw_list.items.len = 0;
+            if (self.active_tab_display_list) |old_list| {
+                DisplayItem.freeList(self.allocator, old_list);
+            }
+            self.active_tab_display_list = null;
+
+            // Reset all dirty flags to force full rebuild
+            self.needs_composite = true;
+            self.needs_raster = true;
+            self.needs_draw = true;
             self.needs_animation_frame = true;
             self.animation_timer_active = false;
             should_schedule = true;
@@ -368,9 +725,11 @@ pub const Browser = struct {
         defer if (!tab_inited) {
             self.allocator.destroy(tab);
         };
-        tab.* = try Tab.init(self.allocator, tab_height, &self.measure);
-        tab_inited = true;
+        tab.* = Tab.init(self.allocator, tab_height, &self.measure);
         tab.browser = self;
+        // Start the task runner thread now that the Tab is in its final memory location
+        try tab.start();
+        tab_inited = true;
 
         try self.tabs.append(self.allocator, tab);
         self.setActiveTab(tab);
@@ -411,7 +770,7 @@ pub const Browser = struct {
             }
 
             if (!quit) {
-                try self.rasterAndDraw();
+                try self.compositeRasterAndDraw();
                 self.scheduleAnimationFrame();
             }
         }
@@ -450,7 +809,7 @@ pub const Browser = struct {
                     }
                 }
                 if (chrome_changed) {
-                    self.setNeedsRasterAndDraw();
+                    self.setNeedsCompositeRasterDraw();
                 }
             },
             .mouse_wheel => |wheel_event| {
@@ -507,9 +866,10 @@ pub const Browser = struct {
                 if (self.cached_texture) |tex| {
                     tex.destroy();
                 }
+                // Use ABGR8888 to match z2d's RGBA memory layout
                 self.cached_texture = try sdl2.createTexture(
                     self.canvas,
-                    .rgba8888,
+                    .abgr8888,
                     .streaming,
                     @intCast(size.width),
                     @intCast(size.height),
@@ -519,8 +879,8 @@ pub const Browser = struct {
                 // Force re-raster and redraw
                 try self.canvas.setColor(.{ .r = 255, .g = 255, .b = 255, .a = 255 });
                 try self.canvas.clear();
-                self.setNeedsRasterAndDraw();
-                try self.rasterAndDraw();
+                self.setNeedsCompositeRasterDraw();
+                try self.compositeRasterAndDraw();
             },
             else => {},
         }
@@ -559,8 +919,8 @@ pub const Browser = struct {
                         self.scheduleTabClearFocusTask(active_tab);
                     }
                 }
-                self.setNeedsRasterAndDraw();
-                try self.rasterAndDraw();
+                self.setNeedsCompositeRasterDraw();
+                try self.compositeRasterAndDraw();
                 return;
             },
             .backspace => {
@@ -575,19 +935,19 @@ pub const Browser = struct {
                     }
                 }
                 if (chrome_changed) {
-                    self.setNeedsRasterAndDraw();
-                    try self.rasterAndDraw();
+                    self.setNeedsCompositeRasterDraw();
+                    try self.compositeRasterAndDraw();
                 }
                 return;
             },
             .down => {
                 self.handleScroll(scroll_step);
-                try self.rasterAndDraw();
+                try self.compositeRasterAndDraw();
                 return;
             },
             .up => {
                 self.handleScroll(-scroll_step);
-                try self.rasterAndDraw();
+                try self.compositeRasterAndDraw();
                 return;
             },
             else => {},
@@ -604,8 +964,8 @@ pub const Browser = struct {
             self.focus = null;
             self.lock.unlock();
             if (try self.chrome.click(self, screen_x, screen_y)) {
-                self.setNeedsRasterAndDraw();
-                try self.rasterAndDraw();
+                self.setNeedsCompositeRasterDraw();
+                try self.compositeRasterAndDraw();
             }
             return;
         }
@@ -619,8 +979,8 @@ pub const Browser = struct {
         self.chrome.blur();
         self.lock.unlock();
 
-        self.setNeedsRasterAndDraw();
-        try self.rasterAndDraw();
+        self.setNeedsCompositeRasterDraw();
+        try self.compositeRasterAndDraw();
 
         const tab_y = screen_y - chrome_bottom;
         const page_x = screen_x;
@@ -677,8 +1037,8 @@ pub const Browser = struct {
                                     };
                                     url_owned = false;
 
-                                    self.setNeedsRasterAndDraw();
-                                    try self.rasterAndDraw();
+                                    self.setNeedsCompositeRasterDraw();
+                                    try self.compositeRasterAndDraw();
                                     handled_link = true;
                                 } else {
                                     std.debug.print("No current_url to resolve against\n", .{});
@@ -862,7 +1222,7 @@ pub const Browser = struct {
             defer if (!std.mem.eql(u8, url.*.scheme, "about")) self.allocator.free(body);
 
             if (tab.display_list) |items| {
-                self.allocator.free(items);
+                DisplayItem.freeList(self.allocator, items);
             }
 
             if (tab.document_layout) |doc| {
@@ -1320,10 +1680,298 @@ pub const Browser = struct {
         tab.document_layout = try self.layout_engine.buildDocument(tab.current_node.?);
 
         // Paint the document to produce draw commands
+        if (tab.display_list) |items| {
+            DisplayItem.freeList(self.allocator, items);
+        }
         tab.display_list = try self.layout_engine.paintDocument(tab.document_layout.?);
+
+        // Debug: print display list tree once when opacity effects are present
+        if (tab.display_list) |list| {
+            const S = struct {
+                var printed: bool = false;
+            };
+            if (!S.printed and DisplayItem.hasOpacityEffects(list)) {
+                DisplayItem.debugPrintIfHasOpacity(list);
+                S.printed = true;
+            }
+        }
 
         // Update content height from the layout engine
         tab.content_height = self.layout_engine.content_height;
+    }
+
+    /// Build composited layers from the display list
+    /// Returns true if layers were rebuilt, false if using cached layers
+    pub fn composite(self: *Browser) !bool {
+        if (self.active_tab_display_list == null) return false;
+
+        // Clear existing layers (they'll be rebuilt)
+        for (self.composited_layers.items) |*layer| {
+            layer.deinit(self.allocator);
+        }
+        self.composited_layers.items.len = 0;
+
+        // Walk the display list and create layers for blend items
+        for (self.active_tab_display_list.?) |item| {
+            try self.compositeItem(item);
+        }
+
+        // Log layer count for optimization verification
+        std.log.debug("Compositing complete: {} layers created", .{self.composited_layers.items.len});
+
+        return true;
+    }
+
+    /// Recursively process a display item for compositing
+    fn compositeItem(self: *Browser, item: DisplayItem) !void {
+        switch (item) {
+            .blend => |blend_item| {
+                // Use the pre-computed needs_compositing flag
+                const needs_layer = blend_item.needs_compositing;
+
+                if (needs_layer) {
+                    // Flatten the subtree to collect all non-composited items
+                    var flattened = std.ArrayList(DisplayItem).empty;
+                    defer flattened.deinit(self.allocator);
+                    try self.flattenSubtree(blend_item.children, &flattened);
+
+                    // Convert to owned slice for the layer
+                    const flattened_items = try self.allocator.alloc(DisplayItem, flattened.items.len);
+                    @memcpy(flattened_items, flattened.items);
+
+                    // Calculate bounds from flattened children
+                    var bounds = Rect{ .left = std.math.maxInt(i32), .top = std.math.maxInt(i32), .right = std.math.minInt(i32), .bottom = std.math.minInt(i32) };
+                    for (flattened_items) |child| {
+                        const child_bounds = self.getDisplayItemBounds(child);
+                        bounds.left = @min(bounds.left, child_bounds.left);
+                        bounds.top = @min(bounds.top, child_bounds.top);
+                        bounds.right = @max(bounds.right, child_bounds.right);
+                        bounds.bottom = @max(bounds.bottom, child_bounds.bottom);
+                    }
+
+                    // Try to merge with the last layer if compatible
+                    const can_merge = if (self.composited_layers.items.len > 0) blk: {
+                        const last_layer = &self.composited_layers.items[self.composited_layers.items.len - 1];
+                        break :blk last_layer.can_merge(blend_item.opacity, blend_item.blend_mode);
+                    } else false;
+
+                    if (can_merge) {
+                        // Merge into existing layer
+                        const last_layer = &self.composited_layers.items[self.composited_layers.items.len - 1];
+                        try last_layer.add(self.allocator, flattened_items, bounds);
+                    } else {
+                        // Create a new composited layer for this blend
+                        const layer = CompositedLayer.init(
+                            flattened_items,
+                            bounds,
+                            blend_item.opacity,
+                            blend_item.blend_mode,
+                            blend_item.node,
+                        );
+                        try self.composited_layers.append(self.allocator, layer);
+                    }
+                } else {
+                    // No layer needed, recurse into children
+                    for (blend_item.children) |child| {
+                        try self.compositeItem(child);
+                    }
+                }
+            },
+            .transform => |transform_item| {
+                // Recurse into transform children - they may contain composited blends
+                for (transform_item.children) |child| {
+                    try self.compositeItem(child);
+                }
+            },
+            else => {
+                // Primitive items don't need compositing decisions
+            },
+        }
+    }
+
+    /// Flatten a subtree of display items by recursively expanding non-composited blends.
+    /// This collects all primitive items from a subtree into a flat list for efficient rasterization.
+    fn flattenSubtree(self: *Browser, items: []DisplayItem, result: *std.ArrayList(DisplayItem)) !void {
+        for (items) |item| {
+            switch (item) {
+                .blend => |blend_item| {
+                    if (blend_item.needs_compositing) {
+                        // Composited blends stay as-is (they'll create their own layer)
+                        try result.append(self.allocator, item);
+                    } else {
+                        // Non-composited blends are flattened - recurse into children
+                        try self.flattenSubtree(blend_item.children, result);
+                    }
+                },
+                .transform => |transform_item| {
+                    // Transforms need to be preserved to apply translation during rendering
+                    // Recursively flatten children but wrap them in the transform
+                    var flattened_children = std.ArrayList(DisplayItem).empty;
+                    defer flattened_children.deinit(self.allocator);
+                    try self.flattenSubtree(transform_item.children, &flattened_children);
+
+                    if (flattened_children.items.len > 0) {
+                        // Create a new transform with the flattened children
+                        const children_copy = try self.allocator.alloc(DisplayItem, flattened_children.items.len);
+                        @memcpy(children_copy, flattened_children.items);
+                        try result.append(self.allocator, .{
+                            .transform = .{
+                                .translate_x = transform_item.translate_x,
+                                .translate_y = transform_item.translate_y,
+                                .children = children_copy,
+                                .node = transform_item.node,
+                            },
+                        });
+                    }
+                },
+                else => {
+                    // Primitive items are added directly
+                    try result.append(self.allocator, item);
+                },
+            }
+        }
+    }
+
+    /// Get the bounding rect of a display item
+    fn getDisplayItemBounds(self: *Browser, item: DisplayItem) Rect {
+        return switch (item) {
+            .glyph => |g| Rect{
+                .left = g.x,
+                .top = g.y,
+                .right = g.x + g.glyph.w,
+                .bottom = g.y + g.glyph.h,
+            },
+            .rect => |r| Rect{
+                .left = r.x1,
+                .top = r.y1,
+                .right = r.x2,
+                .bottom = r.y2,
+            },
+            .rounded_rect => |r| Rect{
+                .left = r.x1,
+                .top = r.y1,
+                .right = r.x2,
+                .bottom = r.y2,
+            },
+            .line => |l| Rect{
+                .left = @min(l.x1, l.x2),
+                .top = @min(l.y1, l.y2),
+                .right = @max(l.x1, l.x2) + l.thickness,
+                .bottom = @max(l.y1, l.y2) + l.thickness,
+            },
+            .outline => |o| Rect{
+                .left = o.rect.left,
+                .top = o.rect.top,
+                .right = o.rect.right,
+                .bottom = o.rect.bottom,
+            },
+            .blend => |b| blk: {
+                var bounds = Rect{ .left = std.math.maxInt(i32), .top = std.math.maxInt(i32), .right = std.math.minInt(i32), .bottom = std.math.minInt(i32) };
+                for (b.children) |child| {
+                    const child_bounds = self.getDisplayItemBounds(child);
+                    bounds.left = @min(bounds.left, child_bounds.left);
+                    bounds.top = @min(bounds.top, child_bounds.top);
+                    bounds.right = @max(bounds.right, child_bounds.right);
+                    bounds.bottom = @max(bounds.bottom, child_bounds.bottom);
+                }
+                break :blk bounds;
+            },
+            .draw_composited_layer => |dcl| dcl.layer.bounds,
+            .transform => |t| blk: {
+                // Get children bounds and apply translation offset
+                var bounds = Rect{ .left = std.math.maxInt(i32), .top = std.math.maxInt(i32), .right = std.math.minInt(i32), .bottom = std.math.minInt(i32) };
+                for (t.children) |child| {
+                    const child_bounds = self.getDisplayItemBounds(child);
+                    bounds.left = @min(bounds.left, child_bounds.left);
+                    bounds.top = @min(bounds.top, child_bounds.top);
+                    bounds.right = @max(bounds.right, child_bounds.right);
+                    bounds.bottom = @max(bounds.bottom, child_bounds.bottom);
+                }
+                // Apply translation to get absolute bounds
+                break :blk Rect{
+                    .left = bounds.left + t.translate_x,
+                    .top = bounds.top + t.translate_y,
+                    .right = bounds.right + t.translate_x,
+                    .bottom = bounds.bottom + t.translate_y,
+                };
+            },
+        };
+    }
+
+    /// Build a draw list from composited layers
+    pub fn paint_draw_list(self: *Browser) !void {
+        self.tab_draw_list.items.len = 0;
+
+        if (self.active_tab_display_list == null) return;
+
+        // Walk the display list and emit draw commands
+        var layer_index: usize = 0;
+        for (self.active_tab_display_list.?) |item| {
+            try self.paintItem(item, &layer_index);
+        }
+    }
+
+    /// Recursively emit draw commands for an item
+    fn paintItem(self: *Browser, item: DisplayItem, layer_index: *usize) !void {
+        switch (item) {
+            .blend => |blend_item| {
+                // Use the pre-computed needs_compositing flag
+                if (blend_item.needs_compositing) {
+                    // Emit a DrawCompositedLayer pointing to the corresponding layer
+                    if (layer_index.* < self.composited_layers.items.len) {
+                        try self.tab_draw_list.append(self.allocator, .{
+                            .draw_composited_layer = .{
+                                .layer = &self.composited_layers.items[layer_index.*],
+                            },
+                        });
+                        layer_index.* += 1;
+                    }
+                } else {
+                    // No layer, emit children directly
+                    for (blend_item.children) |child| {
+                        try self.paintItem(child, layer_index);
+                    }
+                }
+            },
+            .transform => |transform_item| {
+                // Transforms preserve their structure but recurse for composited content
+                // We need to collect children and emit a transform wrapping them
+                var transformed_children = std.ArrayList(DisplayItem).empty;
+                defer transformed_children.deinit(self.allocator);
+
+                // Save original draw list length
+                const original_len = self.tab_draw_list.items.len;
+
+                // Recurse into children
+                for (transform_item.children) |child| {
+                    try self.paintItem(child, layer_index);
+                }
+
+                // Collect newly added items
+                if (self.tab_draw_list.items.len > original_len) {
+                    const new_items = self.tab_draw_list.items[original_len..];
+                    const children_copy = try self.allocator.alloc(DisplayItem, new_items.len);
+                    @memcpy(children_copy, new_items);
+
+                    // Remove the newly added items
+                    self.tab_draw_list.items.len = original_len;
+
+                    // Emit transform wrapping those items
+                    try self.tab_draw_list.append(self.allocator, .{
+                        .transform = .{
+                            .translate_x = transform_item.translate_x,
+                            .translate_y = transform_item.translate_y,
+                            .children = children_copy,
+                            .node = transform_item.node,
+                        },
+                    });
+                }
+            },
+            else => {
+                // Primitive items go directly to the draw list
+                try self.tab_draw_list.append(self.allocator, item);
+            },
+        }
     }
 
     // Raster the browser chrome to the chrome surface
@@ -1349,8 +1997,20 @@ pub const Browser = struct {
         }
     }
 
-    // Raster the current tab to the tab surface
+    // Raster the current tab to the tab surface using composited layers
     pub fn rasterTab(self: *Browser) !void {
+        if (self.active_tab_display_list == null) return;
+
+        // Build composited layers and draw list
+        _ = try self.composite();
+        try self.paint_draw_list();
+
+        // Raster to surfaces
+        try self.rasterTabSurfaces();
+    }
+
+    // Raster tab content to surfaces (without rebuilding composite/draw lists)
+    fn rasterTabSurfaces(self: *Browser) !void {
         if (self.active_tab_display_list == null) return;
 
         const tab_height = @max(self.active_tab_height, self.window_height - self.chrome.bottom);
@@ -1376,31 +2036,61 @@ pub const Browser = struct {
         try tab_context.closePath();
         try tab_context.fill();
 
-        if (self.active_tab_display_list) |display_list| {
-            for (display_list) |item| {
-                try self.drawDisplayItemZ2dContext(&tab_context, item, 0);
-            }
+        // Draw from the composited draw list
+        for (self.tab_draw_list.items) |item| {
+            try self.drawDisplayItemZ2dContext(&tab_context, item, 0);
         }
     }
 
-    fn rasterAndDraw(self: *Browser) !void {
+    fn compositeRasterAndDraw(self: *Browser) !void {
         self.lock.lock();
         defer self.lock.unlock();
 
-        if (!self.needs_raster_and_draw) return;
-        const trace_raster = self.measure.begin("raster_and_draw");
-        defer if (trace_raster) self.measure.end("raster_and_draw");
-        try self.rasterChrome();
-        try self.rasterTab();
-        try self.draw();
-        self.canvas.present();
-        self.needs_raster_and_draw = false;
+        // Check if any phase is needed
+        if (!self.needs_composite and !self.needs_raster and !self.needs_draw) return;
+
+        const trace_raster = self.measure.begin("composite_raster_draw");
+        defer if (trace_raster) self.measure.end("composite_raster_draw");
+
+        // Log which phases will run for animation debugging
+        std.log.debug("compositeRasterAndDraw: composite={} raster={} draw={}", .{
+            self.needs_composite,
+            self.needs_raster,
+            self.needs_draw,
+        });
+
+        // Composite phase: rebuild composited layers from display list
+        if (self.needs_composite) {
+            _ = try self.composite();
+            try self.paint_draw_list();
+            self.needs_composite = false;
+            // Compositing implies we need to raster the new layers
+            self.needs_raster = true;
+        }
+
+        // Raster phase: render layers to surfaces
+        if (self.needs_raster) {
+            try self.rasterChrome();
+            try self.rasterTabSurfaces();
+            self.needs_raster = false;
+            // Rastering implies we need to draw
+            self.needs_draw = true;
+        }
+
+        // Draw phase: composite surfaces to screen
+        if (self.needs_draw) {
+            try self.draw();
+            self.canvas.present();
+            self.needs_draw = false;
+        }
     }
 
-    pub fn setNeedsRasterAndDraw(self: *Browser) void {
+    pub fn setNeedsCompositeRasterDraw(self: *Browser) void {
         self.lock.lock();
         defer self.lock.unlock();
-        self.needs_raster_and_draw = true;
+        self.needs_composite = true;
+        self.needs_raster = true;
+        self.needs_draw = true;
     }
 
     pub fn setNeedsAnimationFrame(self: *Browser, tab: *Tab) void {
@@ -1419,16 +2109,29 @@ pub const Browser = struct {
 
         if (self.activeTab() != tab) {
             if (data.display_list) |list| {
-                self.allocator.free(list);
+                DisplayItem.freeList(self.allocator, list);
             }
             return;
         }
 
+        var has_display_list_change = false;
         if (data.display_list) |list| {
             if (self.active_tab_display_list) |old_list| {
-                self.allocator.free(old_list);
+                DisplayItem.freeList(self.allocator, old_list);
             }
             self.active_tab_display_list = list;
+            // Set parent pointers for tree traversal
+            DisplayItem.setParentPointers(list, null);
+
+            // Debug: print display list tree once when opacity effects are present
+            const S = struct {
+                var printed_opacity_debug: bool = false;
+            };
+            if (!S.printed_opacity_debug and DisplayItem.hasOpacityEffects(list)) {
+                DisplayItem.debugPrintIfHasOpacity(list);
+                S.printed_opacity_debug = true;
+            }
+            has_display_list_change = true;
         }
         if (data.scroll) |scroll| {
             self.active_tab_scroll = scroll;
@@ -1442,7 +2145,57 @@ pub const Browser = struct {
         }
 
         self.animation_timer_active = false;
-        self.needs_raster_and_draw = true;
+
+        // Determine which phases need to run based on what changed
+        if (has_display_list_change) {
+            // Full display list change requires recomposite/raster/draw
+            self.needs_composite = true;
+            self.needs_raster = true;
+            self.needs_draw = true;
+        } else if (data.composited_updates.len > 0) {
+            // Composited updates (e.g., opacity animation) only need draw
+            // Apply the composited updates to existing layers
+            for (data.composited_updates) |update| {
+                self.applyCompositedUpdate(update);
+            }
+            self.needs_draw = true;
+        }
+    }
+
+    /// Apply a composited update to the matching layer
+    fn applyCompositedUpdate(self: *Browser, update: Tab.CompositedUpdate) void {
+        // Find the blend item in the display list with matching node pointer
+        if (self.active_tab_display_list) |display_list| {
+            self.applyCompositedUpdateToList(display_list, update);
+        }
+    }
+
+    /// Recursively search display list and update matching blend items
+    fn applyCompositedUpdateToList(self: *Browser, items: []DisplayItem, update: Tab.CompositedUpdate) void {
+        for (items) |*item| {
+            switch (item.*) {
+                .blend => |*blend| {
+                    if (blend.node == update.node) {
+                        blend.opacity = update.opacity;
+                        // Also update the corresponding composited layer
+                        self.updateLayerOpacity(update.node, update.opacity);
+                    }
+                    // Recurse into children
+                    self.applyCompositedUpdateToList(blend.children, update);
+                },
+                else => {},
+            }
+        }
+    }
+
+    /// Update opacity on composited layer matching the node
+    fn updateLayerOpacity(self: *Browser, node: *anyopaque, opacity: f64) void {
+        for (self.composited_layers.items) |*layer| {
+            if (layer.node == node) {
+                layer.opacity = opacity;
+                return;
+            }
+        }
     }
 
     fn updateActiveTabUrl(self: *Browser, url: *Url) void {
@@ -1501,11 +2254,11 @@ pub const Browser = struct {
             try self.drawDisplayItemZ2d(item, 0);
         }
 
-        // Draw tab content if we have a committed display list
-        if (self.active_tab_display_list) |display_list| {
-            for (display_list) |item| {
-                try self.drawDisplayItemZ2d(item, self.active_tab_scroll - self.chrome.bottom);
-            }
+        // Draw tab content from the composited draw list (not the original display list)
+        // This ensures blend items with dst_in are properly composited within layers
+        // instead of being applied directly to the root surface (which would clear the background)
+        for (self.tab_draw_list.items) |item| {
+            try self.drawDisplayItemZ2d(item, self.active_tab_scroll - self.chrome.bottom);
         }
 
         try self.drawScrollbarZ2d();
@@ -1537,7 +2290,7 @@ pub const Browser = struct {
         const stride = pixel_data_result.stride;
 
         // Copy pixels from z2d to SDL texture
-        // Both use RGBA format, so we can copy directly
+        // Both use ABGR8888 format (z2d RGBA has r at lowest address)
         const bytes_per_pixel = 4;
         for (0..@intCast(surface_height)) |y| {
             const src_row_start = y * @as(usize, @intCast(surface_width));
@@ -1549,7 +2302,7 @@ pub const Browser = struct {
 
                 const src_pixel = pixel_data[src_idx];
 
-                // Direct copy - both are RGBA
+                // Direct copy - z2d RGBA matches SDL ABGR8888 layout
                 pixels[dst_idx + 0] = src_pixel.r;
                 pixels[dst_idx + 1] = src_pixel.g;
                 pixels[dst_idx + 2] = src_pixel.b;
@@ -1572,8 +2325,48 @@ pub const Browser = struct {
     // Draw a display item using a specific z2d context
     fn drawDisplayItemZ2dContext(self: *Browser, context: *z2d.Context, item: DisplayItem, scroll_offset: i32) !void {
         switch (item) {
-            .glyph => {
-                // Skip text rendering for now - tutorial hasn't covered this yet
+            .glyph => |glyph_item| {
+                // Render glyph using pixel data stored in the Glyph struct
+                if (glyph_item.glyph.pixels) |pixels| {
+                    const glyph_y = glyph_item.y - scroll_offset;
+                    const glyph_x = glyph_item.x;
+                    const w: usize = @intCast(glyph_item.glyph.w);
+                    const h: usize = @intCast(glyph_item.glyph.h);
+
+                    // Draw each pixel of the glyph
+                    for (0..h) |py| {
+                        const dest_y = glyph_y + @as(i32, @intCast(py));
+                        if (dest_y < 0 or dest_y >= self.window_height) continue;
+
+                        for (0..w) |px| {
+                            const dest_x = glyph_x + @as(i32, @intCast(px));
+                            if (dest_x < 0 or dest_x >= self.window_width) continue;
+
+                            const idx = (py * w + px) * 4;
+                            // Glyph pixels are white with alpha - blend with the glyph color
+                            const alpha = pixels[idx + 3];
+                            if (alpha > 0) {
+                                // Blend glyph alpha with the requested color
+                                const final_alpha = @as(u8, @intFromFloat(@as(f64, @floatFromInt(alpha)) * @as(f64, @floatFromInt(glyph_item.color.a)) / 255.0));
+                                if (final_alpha > 0) {
+                                    context.resetPath();
+                                    context.setSource(.{ .opaque_pattern = .{ .pixel = .{ .rgba = .{
+                                        .r = glyph_item.color.r,
+                                        .g = glyph_item.color.g,
+                                        .b = glyph_item.color.b,
+                                        .a = final_alpha,
+                                    } } } });
+                                    context.moveTo(@floatFromInt(dest_x), @floatFromInt(dest_y)) catch continue;
+                                    context.lineTo(@floatFromInt(dest_x + 1), @floatFromInt(dest_y)) catch continue;
+                                    context.lineTo(@floatFromInt(dest_x + 1), @floatFromInt(dest_y + 1)) catch continue;
+                                    context.lineTo(@floatFromInt(dest_x), @floatFromInt(dest_y + 1)) catch continue;
+                                    context.closePath() catch continue;
+                                    context.fill() catch continue;
+                                }
+                            }
+                        }
+                    }
+                }
             },
             .rect => |rect_item| {
                 const top = rect_item.y1 - scroll_offset;
@@ -1729,7 +2522,693 @@ pub const Browser = struct {
                     }
                 }
             },
+            .draw_composited_layer => |dcl| {
+                // Ensure the layer is rasterized
+                try dcl.layer.raster(self.allocator, self);
+
+                if (dcl.layer.surface) |*layer_surface| {
+                    // Draw the layer surface at its position with opacity
+                    const layer_y = dcl.layer.bounds.top - scroll_offset;
+
+                    // Get the pixel data from both surfaces
+                    const layer_pixels = switch (layer_surface.*) {
+                        .image_surface_rgba => |*img_surface| img_surface.buf,
+                        else => return error.UnsupportedSurfaceType,
+                    };
+
+                    // Get the root surface pixel buffer for direct writing
+                    const root_pixels = switch (self.root_surface) {
+                        .image_surface_rgba => |*img_surface| img_surface.buf,
+                        else => return error.UnsupportedSurfaceType,
+                    };
+                    const root_width: usize = @intCast(self.root_surface.getWidth());
+
+                    // Composite the layer onto the root surface using direct pixel writes
+                    const layer_width: usize = @intCast(layer_surface.getWidth());
+                    const layer_height: usize = @intCast(layer_surface.getHeight());
+
+                    // DEBUG: Count non-zero alpha pixels and find lightblue pixels
+                    var nonzero_count: usize = 0;
+                    var lightblue_count: usize = 0;
+                    var lightgreen_count: usize = 0;
+                    for (layer_pixels) |pixel| {
+                        if (pixel.a > 0) {
+                            nonzero_count += 1;
+                            // lightblue = (173,216,230), lightgreen = (144,238,144)
+                            if (pixel.r >= 170 and pixel.r <= 176 and pixel.g >= 213 and pixel.g <= 219 and pixel.b >= 227 and pixel.b <= 233) {
+                                lightblue_count += 1;
+                            }
+                            if (pixel.r >= 141 and pixel.r <= 147 and pixel.g >= 235 and pixel.g <= 241 and pixel.b >= 141 and pixel.b <= 147) {
+                                lightgreen_count += 1;
+                            }
+                        }
+                    }
+                    std.debug.print("DEBUG compositing layer: bounds({},{}-{},{}) size {}x{} scroll={} layer_y={} opacity={d:.2} nonzero={} lightblue={} lightgreen={}\n", .{
+                        dcl.layer.bounds.left, dcl.layer.bounds.top, dcl.layer.bounds.right, dcl.layer.bounds.bottom,
+                        layer_width, layer_height, scroll_offset, layer_y, dcl.layer.opacity,
+                        nonzero_count, lightblue_count, lightgreen_count,
+                    });
+
+                    var composited_lightblue: usize = 0;
+                    var composited_lightgreen: usize = 0;
+                    var first_lightblue_printed = false;
+
+                    for (0..layer_height) |row| {
+                        const y: i32 = @intCast(row);
+                        const dest_y = layer_y + y;
+                        if (dest_y < 0 or dest_y >= self.window_height) continue;
+
+                        for (0..layer_width) |col| {
+                            const x: i32 = @intCast(col);
+                            const dest_x = dcl.layer.bounds.left + x;
+                            if (dest_x < 0 or dest_x >= self.window_width) continue;
+
+                            const pixel_idx = row * layer_width + col;
+                            const pixel = layer_pixels[pixel_idx];
+
+                            // Apply layer opacity
+                            const alpha: f64 = @as(f64, @floatFromInt(pixel.a)) / 255.0 * dcl.layer.opacity;
+                            if (alpha > 0.01) {
+                                // Track lightblue and lightgreen pixels being composited
+                                const is_lightblue = pixel.r >= 170 and pixel.r <= 176 and pixel.g >= 213 and pixel.g <= 219 and pixel.b >= 227 and pixel.b <= 233;
+                                if (is_lightblue) {
+                                    composited_lightblue += 1;
+                                    if (!first_lightblue_printed) {
+                                        std.debug.print("DEBUG first lightblue pixel: local({},{}) dest({},{}) color=({},{},{},{}) alpha={d:.2}\n", .{
+                                            col, row, dest_x, dest_y, pixel.r, pixel.g, pixel.b, pixel.a, alpha,
+                                        });
+                                        first_lightblue_printed = true;
+                                    }
+                                }
+                                if (pixel.r >= 141 and pixel.r <= 147 and pixel.g >= 235 and pixel.g <= 241 and pixel.b >= 141 and pixel.b <= 147) {
+                                    composited_lightgreen += 1;
+                                }
+
+                                // Direct pixel write to root surface with alpha blending
+                                const dest_x_usize: usize = @intCast(dest_x);
+                                const dest_y_usize: usize = @intCast(dest_y);
+                                const dest_idx = dest_y_usize * root_width + dest_x_usize;
+
+                                // Get the existing pixel from root surface
+                                const dst = root_pixels[dest_idx];
+
+                                // Source pixel with layer opacity applied
+                                const src_alpha: f64 = alpha;
+                                const src_r: f64 = @floatFromInt(pixel.r);
+                                const src_g: f64 = @floatFromInt(pixel.g);
+                                const src_b: f64 = @floatFromInt(pixel.b);
+
+                                // Destination pixel
+                                const dst_alpha: f64 = @as(f64, @floatFromInt(dst.a)) / 255.0;
+                                const dst_r: f64 = @floatFromInt(dst.r);
+                                const dst_g: f64 = @floatFromInt(dst.g);
+                                const dst_b: f64 = @floatFromInt(dst.b);
+
+                                // Standard "over" compositing: src over dst
+                                // out_alpha = src_alpha + dst_alpha * (1 - src_alpha)
+                                // out_color = (src_color * src_alpha + dst_color * dst_alpha * (1 - src_alpha)) / out_alpha
+                                const out_alpha = src_alpha + dst_alpha * (1.0 - src_alpha);
+                                if (out_alpha > 0.001) {
+                                    const out_r = (src_r * src_alpha + dst_r * dst_alpha * (1.0 - src_alpha)) / out_alpha;
+                                    const out_g = (src_g * src_alpha + dst_g * dst_alpha * (1.0 - src_alpha)) / out_alpha;
+                                    const out_b = (src_b * src_alpha + dst_b * dst_alpha * (1.0 - src_alpha)) / out_alpha;
+
+                                    root_pixels[dest_idx] = .{
+                                        .r = @intFromFloat(@min(255.0, @max(0.0, out_r))),
+                                        .g = @intFromFloat(@min(255.0, @max(0.0, out_g))),
+                                        .b = @intFromFloat(@min(255.0, @max(0.0, out_b))),
+                                        .a = @intFromFloat(@min(255.0, out_alpha * 255.0)),
+                                    };
+                                }
+                            }
+                        }
+                    }
+                    std.debug.print("DEBUG composited pixels: lightblue={} lightgreen={}\n", .{ composited_lightblue, composited_lightgreen });
+
+                    // Draw debug border if enabled
+                    if (self.debug_layer_borders) {
+                        const border_y = layer_y;
+                        const border_x = dcl.layer.bounds.left;
+                        const border_w = dcl.layer.bounds.width();
+                        const border_h = dcl.layer.bounds.height();
+
+                        // Use a bright color (magenta) for visibility
+                        context.setSource(.{ .opaque_pattern = .{ .pixel = .{ .rgba = .{ .r = 255, .g = 0, .b = 255, .a = 255 } } } });
+                        context.resetPath();
+
+                        // Draw top border
+                        try context.moveTo(@floatFromInt(border_x), @floatFromInt(border_y));
+                        try context.lineTo(@floatFromInt(border_x + border_w), @floatFromInt(border_y));
+                        try context.lineTo(@floatFromInt(border_x + border_w), @floatFromInt(border_y + 2));
+                        try context.lineTo(@floatFromInt(border_x), @floatFromInt(border_y + 2));
+                        try context.closePath();
+                        try context.fill();
+
+                        // Draw bottom border
+                        try context.moveTo(@floatFromInt(border_x), @floatFromInt(border_y + border_h - 2));
+                        try context.lineTo(@floatFromInt(border_x + border_w), @floatFromInt(border_y + border_h - 2));
+                        try context.lineTo(@floatFromInt(border_x + border_w), @floatFromInt(border_y + border_h));
+                        try context.lineTo(@floatFromInt(border_x), @floatFromInt(border_y + border_h));
+                        try context.closePath();
+                        try context.fill();
+
+                        // Draw left border
+                        try context.moveTo(@floatFromInt(border_x), @floatFromInt(border_y));
+                        try context.lineTo(@floatFromInt(border_x + 2), @floatFromInt(border_y));
+                        try context.lineTo(@floatFromInt(border_x + 2), @floatFromInt(border_y + border_h));
+                        try context.lineTo(@floatFromInt(border_x), @floatFromInt(border_y + border_h));
+                        try context.closePath();
+                        try context.fill();
+
+                        // Draw right border
+                        try context.moveTo(@floatFromInt(border_x + border_w - 2), @floatFromInt(border_y));
+                        try context.lineTo(@floatFromInt(border_x + border_w), @floatFromInt(border_y));
+                        try context.lineTo(@floatFromInt(border_x + border_w), @floatFromInt(border_y + border_h));
+                        try context.lineTo(@floatFromInt(border_x + border_w - 2), @floatFromInt(border_y + border_h));
+                        try context.closePath();
+                        try context.fill();
+                    }
+                }
+            },
+            .transform => |t| {
+                // Apply translation by adjusting scroll offset for children
+                const new_scroll_offset = scroll_offset - t.translate_y;
+                for (t.children) |child| {
+                    // Recursively draw children with adjusted offset
+                    // For x translation, we need to handle it differently since scroll is y-only
+                    try self.drawDisplayItemZ2dContextWithTransform(context, child, new_scroll_offset, t.translate_x);
+                }
+            },
         }
+    }
+
+    // Draw a display item with both scroll offset and x translation
+    fn drawDisplayItemZ2dContextWithTransform(self: *Browser, context: *z2d.Context, item: DisplayItem, scroll_offset: i32, x_offset: i32) !void {
+        switch (item) {
+            .glyph => |glyph_item| {
+                // Render glyph with x offset applied
+                if (glyph_item.glyph.pixels) |pixels| {
+                    const glyph_y = glyph_item.y - scroll_offset;
+                    const glyph_x = glyph_item.x + x_offset;
+                    const w: usize = @intCast(glyph_item.glyph.w);
+                    const h: usize = @intCast(glyph_item.glyph.h);
+
+                    for (0..h) |py| {
+                        const dest_y = glyph_y + @as(i32, @intCast(py));
+                        if (dest_y < 0 or dest_y >= self.window_height) continue;
+
+                        for (0..w) |px| {
+                            const dest_x = glyph_x + @as(i32, @intCast(px));
+                            if (dest_x < 0 or dest_x >= self.window_width) continue;
+
+                            const idx = (py * w + px) * 4;
+                            const alpha = pixels[idx + 3];
+                            if (alpha > 0) {
+                                const final_alpha = @as(u8, @intFromFloat(@as(f64, @floatFromInt(alpha)) * @as(f64, @floatFromInt(glyph_item.color.a)) / 255.0));
+                                if (final_alpha > 0) {
+                                    context.resetPath();
+                                    context.setSource(.{ .opaque_pattern = .{ .pixel = .{ .rgba = .{
+                                        .r = glyph_item.color.r,
+                                        .g = glyph_item.color.g,
+                                        .b = glyph_item.color.b,
+                                        .a = final_alpha,
+                                    } } } });
+                                    context.moveTo(@floatFromInt(dest_x), @floatFromInt(dest_y)) catch continue;
+                                    context.lineTo(@floatFromInt(dest_x + 1), @floatFromInt(dest_y)) catch continue;
+                                    context.lineTo(@floatFromInt(dest_x + 1), @floatFromInt(dest_y + 1)) catch continue;
+                                    context.lineTo(@floatFromInt(dest_x), @floatFromInt(dest_y + 1)) catch continue;
+                                    context.closePath() catch continue;
+                                    context.fill() catch continue;
+                                }
+                            }
+                        }
+                    }
+                }
+            },
+            .rect => |rect_item| {
+                const top = rect_item.y1 - scroll_offset;
+                const bottom = rect_item.y2 - scroll_offset;
+                const left = rect_item.x1 + x_offset;
+                const right = rect_item.x2 + x_offset;
+                const width = right - left;
+                const height = bottom - top;
+
+                if (width > 1 and height > 1 and bottom > 0 and top < self.window_height) {
+                    context.resetPath();
+                    context.setSource(.{ .opaque_pattern = .{ .pixel = .{ .rgba = .{
+                        .r = rect_item.color.r,
+                        .g = rect_item.color.g,
+                        .b = rect_item.color.b,
+                        .a = rect_item.color.a,
+                    } } } });
+                    try context.moveTo(@floatFromInt(left), @floatFromInt(top));
+                    try context.lineTo(@floatFromInt(right), @floatFromInt(top));
+                    try context.lineTo(@floatFromInt(right), @floatFromInt(bottom));
+                    try context.lineTo(@floatFromInt(left), @floatFromInt(bottom));
+                    try context.closePath();
+                    try context.fill();
+                }
+            },
+            .rounded_rect => |rr| {
+                const top = rr.y1 - scroll_offset;
+                const bottom = rr.y2 - scroll_offset;
+                const left = rr.x1 + x_offset;
+                const right = rr.x2 + x_offset;
+                if (bottom > 0 and top < self.window_height) {
+                    // Draw as a regular rect for simplicity in transformed context
+                    context.resetPath();
+                    context.setSource(.{ .opaque_pattern = .{ .pixel = .{ .rgba = .{
+                        .r = rr.color.r,
+                        .g = rr.color.g,
+                        .b = rr.color.b,
+                        .a = rr.color.a,
+                    } } } });
+                    try context.moveTo(@floatFromInt(left), @floatFromInt(top));
+                    try context.lineTo(@floatFromInt(right), @floatFromInt(top));
+                    try context.lineTo(@floatFromInt(right), @floatFromInt(bottom));
+                    try context.lineTo(@floatFromInt(left), @floatFromInt(bottom));
+                    try context.closePath();
+                    try context.fill();
+                }
+            },
+            .line => |l| {
+                const y1 = l.y1 - scroll_offset;
+                const y2 = l.y2 - scroll_offset;
+                const x1 = l.x1 + x_offset;
+                const x2 = l.x2 + x_offset;
+                context.resetPath();
+                context.setSource(.{ .opaque_pattern = .{ .pixel = .{ .rgba = .{
+                    .r = l.color.r,
+                    .g = l.color.g,
+                    .b = l.color.b,
+                    .a = l.color.a,
+                } } } });
+                try context.moveTo(@floatFromInt(x1), @floatFromInt(y1));
+                try context.lineTo(@floatFromInt(x2), @floatFromInt(y2));
+                try context.stroke();
+            },
+            .outline => |o| {
+                const top = o.rect.top - scroll_offset;
+                const bottom = o.rect.bottom - scroll_offset;
+                const left = o.rect.left + x_offset;
+                const right = o.rect.right + x_offset;
+                context.resetPath();
+                context.setSource(.{ .opaque_pattern = .{ .pixel = .{ .rgba = .{
+                    .r = o.color.r,
+                    .g = o.color.g,
+                    .b = o.color.b,
+                    .a = o.color.a,
+                } } } });
+                try context.moveTo(@floatFromInt(left), @floatFromInt(top));
+                try context.lineTo(@floatFromInt(right), @floatFromInt(top));
+                try context.lineTo(@floatFromInt(right), @floatFromInt(bottom));
+                try context.lineTo(@floatFromInt(left), @floatFromInt(bottom));
+                try context.closePath();
+                try context.stroke();
+            },
+            .blend => |blend_item| {
+                // For blends, apply opacity and recurse into children with the transform applied
+                const should_apply_opacity = blend_item.opacity < 1.0 or blend_item.blend_mode != null;
+
+                if (should_apply_opacity) {
+                    const original_operator = context.getOperator();
+                    if (blend_item.blend_mode) |mode| {
+                        context.setOperator(self.parseBlendMode(mode));
+                    }
+
+                    for (blend_item.children) |child| {
+                        if (blend_item.opacity < 1.0) {
+                            var modified_item = child;
+                            modified_item = self.applyOpacityToDisplayItem(modified_item, blend_item.opacity);
+                            try self.drawDisplayItemZ2dContextWithTransform(context, modified_item, scroll_offset, x_offset);
+                        } else {
+                            try self.drawDisplayItemZ2dContextWithTransform(context, child, scroll_offset, x_offset);
+                        }
+                    }
+
+                    context.setOperator(original_operator);
+                } else {
+                    for (blend_item.children) |child| {
+                        try self.drawDisplayItemZ2dContextWithTransform(context, child, scroll_offset, x_offset);
+                    }
+                }
+            },
+            .draw_composited_layer => |dcl| {
+                // For composited layers, draw at transformed position
+                try dcl.layer.raster(self.allocator, self);
+                if (dcl.layer.surface) |*layer_surface| {
+                    const layer_y = dcl.layer.bounds.top - scroll_offset;
+                    const layer_x = dcl.layer.bounds.left + x_offset;
+                    const layer_pixels = switch (layer_surface.*) {
+                        .image_surface_rgba => |*img| img.buf,
+                        else => return error.UnsupportedSurfaceType,
+                    };
+                    const layer_width: usize = @intCast(layer_surface.getWidth());
+                    const layer_height: usize = @intCast(layer_surface.getHeight());
+                    for (0..layer_height) |row| {
+                        const y: i32 = @intCast(row);
+                        const dest_y = layer_y + y;
+                        if (dest_y < 0 or dest_y >= self.window_height) continue;
+                        for (0..layer_width) |col| {
+                            const x: i32 = @intCast(col);
+                            const dest_x = layer_x + x;
+                            if (dest_x < 0 or dest_x >= self.window_width) continue;
+                            const pixel = layer_pixels[row * layer_width + col];
+                            const alpha: f64 = @as(f64, @floatFromInt(pixel.a)) / 255.0 * dcl.layer.opacity;
+                            if (alpha > 0.01) {
+                                context.resetPath();
+                                context.setSource(.{ .opaque_pattern = .{ .pixel = .{ .rgba = .{
+                                    .r = pixel.r,
+                                    .g = pixel.g,
+                                    .b = pixel.b,
+                                    .a = @intFromFloat(alpha * 255.0),
+                                } } } });
+                                try context.moveTo(@floatFromInt(dest_x), @floatFromInt(dest_y));
+                                try context.lineTo(@floatFromInt(dest_x + 1), @floatFromInt(dest_y));
+                                try context.lineTo(@floatFromInt(dest_x + 1), @floatFromInt(dest_y + 1));
+                                try context.lineTo(@floatFromInt(dest_x), @floatFromInt(dest_y + 1));
+                                try context.closePath();
+                                try context.fill();
+                            }
+                        }
+                    }
+                }
+            },
+            .transform => |t| {
+                // Nested transform: combine offsets
+                for (t.children) |child| {
+                    try self.drawDisplayItemZ2dContextWithTransform(context, child, scroll_offset - t.translate_y, x_offset + t.translate_x);
+                }
+            },
+        }
+    }
+
+    /// Draw a display item for a composited layer, mapping from absolute to local coordinates
+    /// This function offsets all coordinates by the layer's origin to draw in layer-local space
+    fn drawDisplayItemZ2dContextForLayer(self: *Browser, context: *z2d.Context, item: DisplayItem, layer_x: i32, layer_y: i32) !void {
+        switch (item) {
+            .glyph => |glyph_item| {
+                // Render glyph in layer-local coordinates
+                if (glyph_item.glyph.pixels) |pixels| {
+                    const glyph_x = glyph_item.x - layer_x;
+                    const glyph_y = glyph_item.y - layer_y;
+                    const w: usize = @intCast(glyph_item.glyph.w);
+                    const h: usize = @intCast(glyph_item.glyph.h);
+
+                    for (0..h) |py| {
+                        const dest_y = glyph_y + @as(i32, @intCast(py));
+
+                        for (0..w) |px| {
+                            const dest_x = glyph_x + @as(i32, @intCast(px));
+
+                            const idx = (py * w + px) * 4;
+                            const alpha = pixels[idx + 3];
+                            if (alpha > 0) {
+                                const final_alpha = @as(u8, @intFromFloat(@as(f64, @floatFromInt(alpha)) * @as(f64, @floatFromInt(glyph_item.color.a)) / 255.0));
+                                if (final_alpha > 0) {
+                                    context.resetPath();
+                                    context.setSource(.{ .opaque_pattern = .{ .pixel = .{ .rgba = .{
+                                        .r = glyph_item.color.r,
+                                        .g = glyph_item.color.g,
+                                        .b = glyph_item.color.b,
+                                        .a = final_alpha,
+                                    } } } });
+                                    context.moveTo(@floatFromInt(dest_x), @floatFromInt(dest_y)) catch continue;
+                                    context.lineTo(@floatFromInt(dest_x + 1), @floatFromInt(dest_y)) catch continue;
+                                    context.lineTo(@floatFromInt(dest_x + 1), @floatFromInt(dest_y + 1)) catch continue;
+                                    context.lineTo(@floatFromInt(dest_x), @floatFromInt(dest_y + 1)) catch continue;
+                                    context.closePath() catch continue;
+                                    context.fill() catch continue;
+                                }
+                            }
+                        }
+                    }
+                }
+            },
+            .rect => |rect_item| {
+                // Map absolute coordinates to layer-local space
+                const left = rect_item.x1 - layer_x;
+                const right = rect_item.x2 - layer_x;
+                const top = rect_item.y1 - layer_y;
+                const bottom = rect_item.y2 - layer_y;
+                const width = right - left;
+                const height = bottom - top;
+
+                if (width > 1 and height > 1) {
+                    context.resetPath();
+                    context.setSource(.{ .opaque_pattern = .{ .pixel = .{ .rgba = rect_item.color.toZ2dRgba() } } });
+                    try context.moveTo(@floatFromInt(left), @floatFromInt(top));
+                    try context.lineTo(@floatFromInt(right), @floatFromInt(top));
+                    try context.lineTo(@floatFromInt(right), @floatFromInt(bottom));
+                    try context.lineTo(@floatFromInt(left), @floatFromInt(bottom));
+                    try context.closePath();
+                    try context.fill();
+                    context.resetPath();
+                }
+            },
+            .rounded_rect => |rr| {
+                const left = rr.x1 - layer_x;
+                const right = rr.x2 - layer_x;
+                const top = rr.y1 - layer_y;
+                const bottom = rr.y2 - layer_y;
+                const width = right - left;
+                const height = bottom - top;
+
+                std.debug.print("DEBUG rounded_rect: abs({},{}-{},{}) layer_offset({},{}) local({},{}-{},{}) size {}x{} color=({},{},{},{})\n", .{
+                    rr.x1, rr.y1, rr.x2, rr.y2,
+                    layer_x, layer_y,
+                    left, top, right, bottom,
+                    width, height,
+                    rr.color.r, rr.color.g, rr.color.b, rr.color.a,
+                });
+
+                if (width > 1 and height > 1) {
+                    context.resetPath();
+                    context.setSource(.{ .opaque_pattern = .{ .pixel = .{ .rgba = rr.color.toZ2dRgba() } } });
+                    // Draw as regular rect (rounded rect requires more complex path)
+                    try context.moveTo(@floatFromInt(left), @floatFromInt(top));
+                    try context.lineTo(@floatFromInt(right), @floatFromInt(top));
+                    try context.lineTo(@floatFromInt(right), @floatFromInt(bottom));
+                    try context.lineTo(@floatFromInt(left), @floatFromInt(bottom));
+                    try context.closePath();
+                    try context.fill();
+                    context.resetPath();
+                }
+            },
+            .line => |line_item| {
+                const x1 = line_item.x1 - layer_x;
+                const x2 = line_item.x2 - layer_x;
+                const y1 = line_item.y1 - layer_y;
+                const y2 = line_item.y2 - layer_y;
+
+                context.resetPath();
+                context.setSource(.{ .opaque_pattern = .{ .pixel = .{ .rgba = line_item.color.toZ2dRgba() } } });
+                try context.moveTo(@floatFromInt(x1), @floatFromInt(y1));
+                try context.lineTo(@floatFromInt(x2), @floatFromInt(y2));
+                try context.stroke();
+                context.resetPath();
+            },
+            .outline => |outline_item| {
+                const left = outline_item.rect.left - layer_x;
+                const right = outline_item.rect.right - layer_x;
+                const top = outline_item.rect.top - layer_y;
+                const bottom = outline_item.rect.bottom - layer_y;
+
+                context.resetPath();
+                context.setSource(.{ .opaque_pattern = .{ .pixel = .{ .rgba = outline_item.color.toZ2dRgba() } } });
+                try context.moveTo(@floatFromInt(left), @floatFromInt(top));
+                try context.lineTo(@floatFromInt(right), @floatFromInt(top));
+                try context.lineTo(@floatFromInt(right), @floatFromInt(bottom));
+                try context.lineTo(@floatFromInt(left), @floatFromInt(bottom));
+                try context.closePath();
+                try context.stroke();
+                context.resetPath();
+            },
+            .blend => |blend_item| {
+                // Check if this is a dst_in clipping blend
+                const is_dst_in_clip = if (blend_item.blend_mode) |mode|
+                    std.mem.eql(u8, mode, "dst_in")
+                else
+                    false;
+
+                if (is_dst_in_clip) {
+                    // TEMPORARILY DISABLED: dst_in clipping to debug lightblue rect issue
+                    // For dst_in clipping, don't use the unbounded operator.
+                    // Instead, apply clip mask manually after content is drawn.
+                    // The mask shape is in blend_item.children[0]
+                    std.debug.print("DEBUG dst_in clip: SKIPPED layer_offset({},{}) children={}\n", .{ layer_x, layer_y, blend_item.children.len });
+                    // if (blend_item.children.len > 0) {
+                    //     try self.applyClipMaskForLayer(context, blend_item.children[0], layer_x, layer_y);
+                    // }
+                } else {
+                    // Apply opacity and recursively draw children in layer space
+                    const should_apply_opacity = blend_item.opacity < 1.0 or blend_item.blend_mode != null;
+
+                    std.debug.print("DEBUG blend: opacity={d:.2} blend_mode={s} should_apply={} children={}\n", .{
+                        blend_item.opacity,
+                        if (blend_item.blend_mode) |m| m else "null",
+                        should_apply_opacity,
+                        blend_item.children.len,
+                    });
+
+                    if (should_apply_opacity) {
+                        const original_operator = context.getOperator();
+                        if (blend_item.blend_mode) |mode| {
+                            context.setOperator(self.parseBlendMode(mode));
+                        }
+
+                        for (blend_item.children, 0..) |child, i| {
+                            std.debug.print("DEBUG blend child[{}]: type={s}\n", .{ i, @tagName(child) });
+                            if (blend_item.opacity < 1.0) {
+                                var modified_item = child;
+                                modified_item = self.applyOpacityToDisplayItem(modified_item, blend_item.opacity);
+                                try self.drawDisplayItemZ2dContextForLayer(context, modified_item, layer_x, layer_y);
+                            } else {
+                                try self.drawDisplayItemZ2dContextForLayer(context, child, layer_x, layer_y);
+                            }
+                        }
+
+                        context.setOperator(original_operator);
+                    } else {
+                        for (blend_item.children) |child| {
+                            try self.drawDisplayItemZ2dContextForLayer(context, child, layer_x, layer_y);
+                        }
+                    }
+                }
+            },
+            .draw_composited_layer => {
+                // Nested composited layers shouldn't appear in flattened content
+                // They would have been handled by the compositing pass
+            },
+            .transform => |t| {
+                // Apply transform offsets to the layer coordinates
+                std.debug.print("DEBUG transform: translate({},{}) layer_offset({},{}) -> ({},{})\n", .{
+                    t.translate_x, t.translate_y, layer_x, layer_y,
+                    layer_x - t.translate_x, layer_y - t.translate_y,
+                });
+                for (t.children) |child| {
+                    try self.drawDisplayItemZ2dContextForLayer(context, child, layer_x - t.translate_x, layer_y - t.translate_y);
+                }
+            },
+        }
+    }
+
+    /// Apply a clip mask by clearing pixels outside the mask shape
+    /// This implements dst_in clipping by manually setting outside pixels to transparent
+    /// IMPORTANT: Only clears pixels WITHIN the mask's bounding box that are outside the shape
+    /// (e.g., corner pixels for rounded rects). Does NOT clear pixels outside the bounding box
+    /// to avoid affecting other content in the same layer.
+    fn applyClipMaskForLayer(self: *Browser, context: *z2d.Context, mask_item: DisplayItem, layer_x: i32, layer_y: i32) !void {
+        _ = self;
+
+        switch (mask_item) {
+            .rounded_rect => |rr| {
+                // Get surface from context - we need direct pixel access
+                const surface = context.surface;
+                const surface_width = surface.getWidth();
+                const surface_height = surface.getHeight();
+
+                // Map mask coordinates to layer-local space
+                const mask_left = rr.x1 - layer_x;
+                const mask_right = rr.x2 - layer_x;
+                const mask_top = rr.y1 - layer_y;
+                const mask_bottom = rr.y2 - layer_y;
+                const radius = rr.radius;
+
+                // Get pixel buffer
+                const pixel_buf = switch (surface.*) {
+                    .image_surface_rgba => |*img| img.buf,
+                    else => return,
+                };
+
+                // Only iterate over pixels WITHIN the mask's bounding box
+                // Clear corner pixels that are outside the rounded shape
+                const start_y: usize = @intCast(@max(0, mask_top));
+                const end_y: usize = @intCast(@min(surface_height, @max(0, mask_bottom)));
+                const start_x: usize = @intCast(@max(0, mask_left));
+                const end_x: usize = @intCast(@min(surface_width, @max(0, mask_right)));
+
+                for (start_y..end_y) |y_idx| {
+                    const y: i32 = @intCast(y_idx);
+                    for (start_x..end_x) |x_idx| {
+                        const x: i32 = @intCast(x_idx);
+
+                        // Check if point is outside the rounded rect (in the corners)
+                        if (!isPointInRoundedRect(x, y, mask_left, mask_top, mask_right, mask_bottom, radius)) {
+                            // Clear this corner pixel to transparent
+                            const idx = y_idx * @as(usize, @intCast(surface_width)) + x_idx;
+                            pixel_buf[idx] = .{ .r = 0, .g = 0, .b = 0, .a = 0 };
+                        }
+                    }
+                }
+            },
+            .rect => |_| {
+                // For regular rects, nothing to clip - the content already fills the rect
+                // No corner pixels to clear
+            },
+            else => {
+                // Other shapes not supported for clipping yet
+            },
+        }
+    }
+
+    /// Check if a point is inside a rounded rectangle
+    fn isPointInRoundedRect(x: i32, y: i32, left: i32, top: i32, right: i32, bottom: i32, radius: f64) bool {
+        // First check if outside the bounding rect
+        if (x < left or x >= right or y < top or y >= bottom) {
+            return false;
+        }
+
+        // Check corners
+        const r: i32 = @intFromFloat(radius);
+        const width = right - left;
+        const height = bottom - top;
+
+        // If radius is larger than half the width/height, clamp it
+        const effective_r = @min(r, @min(@divTrunc(width, 2), @divTrunc(height, 2)));
+
+        // Check if in corner regions
+        const in_left_region = x < left + effective_r;
+        const in_right_region = x >= right - effective_r;
+        const in_top_region = y < top + effective_r;
+        const in_bottom_region = y >= bottom - effective_r;
+
+        // Check each corner
+        if (in_left_region and in_top_region) {
+            // Top-left corner
+            const cx = left + effective_r;
+            const cy = top + effective_r;
+            const dx = x - cx;
+            const dy = y - cy;
+            return dx * dx + dy * dy <= effective_r * effective_r;
+        }
+        if (in_right_region and in_top_region) {
+            // Top-right corner
+            const cx = right - effective_r;
+            const cy = top + effective_r;
+            const dx = x - cx;
+            const dy = y - cy;
+            return dx * dx + dy * dy <= effective_r * effective_r;
+        }
+        if (in_left_region and in_bottom_region) {
+            // Bottom-left corner
+            const cx = left + effective_r;
+            const cy = bottom - effective_r;
+            const dx = x - cx;
+            const dy = y - cy;
+            return dx * dx + dy * dy <= effective_r * effective_r;
+        }
+        if (in_right_region and in_bottom_region) {
+            // Bottom-right corner
+            const cx = right - effective_r;
+            const cy = bottom - effective_r;
+            const dx = x - cx;
+            const dy = y - cy;
+            return dx * dx + dy * dy <= effective_r * effective_r;
+        }
+
+        // Not in a corner region, so inside the rounded rect
+        return true;
     }
 
     // Parse CSS blend mode string to z2d compositing operator
@@ -1787,8 +3266,18 @@ pub const Browser = struct {
                 outline_item.color.a = @as(u8, @intFromFloat(@round(@as(f64, @floatFromInt(outline_item.color.a)) * opacity)));
             },
             .blend => |*blend_item| {
-                // For nested blend operations, multiply the opacities
-                blend_item.opacity *= opacity;
+                // For nested blend operations with blend modes (like dst_in for clipping),
+                // do NOT multiply opacity - the mask needs full opacity to work correctly
+                if (blend_item.blend_mode == null) {
+                    blend_item.opacity *= opacity;
+                }
+                // Blends with modes (clipping masks) keep their original opacity
+            },
+            .draw_composited_layer => {
+                // Composited layers handle their own opacity
+            },
+            .transform => {
+                // Transform items don't have direct color, opacity applied to children
             },
         }
 
@@ -1835,37 +3324,28 @@ pub const Browser = struct {
 
     // Ensure we clean up the document_layout in deinit
     pub fn deinit(self: *Browser) void {
-        std.debug.print("deinit: starting cleanup\n", .{});
         // Clean up z2d surfaces and context
         self.context.deinit();
-        std.debug.print("deinit: context done\n", .{});
         self.root_surface.deinit(self.allocator);
-        std.debug.print("deinit: root_surface done\n", .{});
         self.chrome_surface.deinit(self.allocator);
-        std.debug.print("deinit: chrome_surface done\n", .{});
         if (self.tab_surface) |*tab_surface| {
             tab_surface.deinit(self.allocator);
         }
-        std.debug.print("deinit: tab_surface done\n", .{});
 
         // Clean up cached SDL texture
         if (self.cached_texture) |tex| {
             tex.destroy();
         }
-        std.debug.print("deinit: cached_texture done\n", .{});
 
         // Close all connections
         self.http_client.deinit();
-        std.debug.print("deinit: http_client done\n", .{});
 
         // Free cache
         var cache = self.cache;
         cache.free();
-        std.debug.print("deinit: cache done\n", .{});
 
         // Clean up chrome
         self.chrome.deinit();
-        std.debug.print("deinit: chrome done\n", .{});
 
         // Free cookie jar values and map storage
         var cookie_it = self.cookie_jar.iterator();
@@ -1874,47 +3354,43 @@ pub const Browser = struct {
             self.allocator.free(entry.key_ptr.*);
         }
         self.cookie_jar.deinit();
-        std.debug.print("deinit: cookie_jar done\n", .{});
 
         // Clean up all tabs
-        std.debug.print("deinit: cleaning up {} tabs\n", .{self.tabs.items.len});
         for (self.tabs.items) |tab| {
-            std.debug.print("deinit: tab.deinit starting\n", .{});
             tab.deinit();
-            std.debug.print("deinit: tab.deinit done, destroying\n", .{});
             self.allocator.destroy(tab);
         }
         self.tabs.deinit(self.allocator);
-        std.debug.print("deinit: tabs done\n", .{});
 
         if (self.active_tab_display_list) |list| {
-            self.allocator.free(list);
+            DisplayItem.freeList(self.allocator, list);
         }
         if (self.active_tab_url) |url| {
             self.allocator.free(url);
         }
-        std.debug.print("deinit: display_list and url done\n", .{});
+
+        // Clean up composited layers
+        for (self.composited_layers.items) |*layer| {
+            layer.deinit(self.allocator);
+        }
+        self.composited_layers.deinit(self.allocator);
+        self.tab_draw_list.deinit(self.allocator);
 
         // Clean up default stylesheet rules
         for (self.default_style_sheet_rules) |*rule| {
             rule.deinit(self.allocator);
         }
         self.allocator.free(self.default_style_sheet_rules);
-        std.debug.print("deinit: stylesheet rules done\n", .{});
 
         // clean up layout
         self.layout_engine.deinit();
-        std.debug.print("deinit: layout_engine done\n", .{});
 
         // Clean up JavaScript engine
         self.js_engine.deinit(self.allocator);
-        std.debug.print("deinit: js_engine done\n", .{});
 
         self.measure.finish();
-        std.debug.print("deinit: measure done\n", .{});
 
         sdl2.quit();
-        std.debug.print("deinit: sdl2.quit done\n", .{});
     }
 };
 
@@ -1923,6 +3399,7 @@ pub const CommitData = struct {
     display_list: ?[]DisplayItem,
     scroll: ?i32,
     height: i32,
+    composited_updates: []const Tab.CompositedUpdate = &.{},
 };
 
 const LoadTaskContext = struct {

@@ -51,13 +51,34 @@ pub fn literal(self: *CSSParser, lit: u8) !void {
     self.pos += 1;
 }
 
+/// Read a CSS value until `;` or `}`, trimming trailing whitespace
+pub fn value(self: *CSSParser) ![]const u8 {
+    const start = self.pos;
+    while (self.pos < self.string.len) {
+        const c = self.string[self.pos];
+        if (c == ';' or c == '}') {
+            break;
+        }
+        self.pos += 1;
+    }
+    if (self.pos <= start) {
+        return error.InvalidValue;
+    }
+    // Trim trailing whitespace
+    var end = self.pos;
+    while (end > start and std.ascii.isWhitespace(self.string[end - 1])) {
+        end -= 1;
+    }
+    return self.string[start..end];
+}
+
 pub fn pair(self: *CSSParser) !struct { property: []const u8, value: []const u8 } {
     const property = try self.word();
     self.whitespace();
     try self.literal(':');
     self.whitespace();
-    const value = try self.word();
-    return .{ .property = property, .value = value };
+    const val = try self.value();
+    return .{ .property = property, .value = val };
 }
 
 pub fn body(self: *CSSParser, allocator: std.mem.Allocator) !std.StringHashMap([]const u8) {

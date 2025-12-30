@@ -28,6 +28,76 @@ fn isBlockElement(tag: []const u8) bool {
 const sdl = @import("sdl.zig");
 const c = sdl.c;
 
+// Assume 60 fps for frame calculations
+const FRAMES_PER_SECOND: u32 = 60;
+
+/// Parse a transition value like "opacity 2s" into property name and frame count
+/// Returns null if parsing fails
+fn parseTransitionValue(value: []const u8) ?struct { property: []const u8, frames: u32 } {
+    // Split on whitespace
+    var parts = std.mem.tokenizeAny(u8, value, " \t");
+    const property = parts.next() orelse return null;
+    const duration_str = parts.next() orelse return null;
+
+    // Parse duration (e.g., "2s" or "500ms")
+    var frames: u32 = 0;
+    if (std.mem.endsWith(u8, duration_str, "ms")) {
+        // Milliseconds
+        const ms_str = duration_str[0 .. duration_str.len - 2];
+        const ms = std.fmt.parseFloat(f64, ms_str) catch return null;
+        frames = @intFromFloat(ms / 1000.0 * @as(f64, FRAMES_PER_SECOND));
+    } else if (std.mem.endsWith(u8, duration_str, "s")) {
+        // Seconds
+        const s_str = duration_str[0 .. duration_str.len - 1];
+        const s = std.fmt.parseFloat(f64, s_str) catch return null;
+        frames = @intFromFloat(s * @as(f64, FRAMES_PER_SECOND));
+    } else {
+        return null;
+    }
+
+    return .{ .property = property, .frames = @max(1, frames) };
+}
+
+/// Parse a translate transform value like "translate(10px, 20px)" into x and y offsets
+/// Returns null if parsing fails
+fn parseTranslate(value: []const u8) ?struct { x: i32, y: i32 } {
+    // Look for "translate(" prefix
+    const prefix = "translate(";
+    if (!std.mem.startsWith(u8, value, prefix)) return null;
+
+    // Find the closing paren
+    const start = prefix.len;
+    const end = std.mem.indexOf(u8, value[start..], ")") orelse return null;
+    const args = value[start .. start + end];
+
+    // Split on comma
+    var parts = std.mem.tokenizeAny(u8, args, ", \t");
+    const x_str = parts.next() orelse return null;
+    const y_str = parts.next() orelse "0px"; // Default y to 0 if not specified
+
+    // Parse x value (e.g., "10px")
+    var x: i32 = 0;
+    if (std.mem.endsWith(u8, x_str, "px")) {
+        const num_str = x_str[0 .. x_str.len - 2];
+        x = std.fmt.parseInt(i32, num_str, 10) catch return null;
+    } else {
+        // Try parsing as plain number
+        x = std.fmt.parseInt(i32, x_str, 10) catch return null;
+    }
+
+    // Parse y value (e.g., "20px")
+    var y: i32 = 0;
+    if (std.mem.endsWith(u8, y_str, "px")) {
+        const num_str = y_str[0 .. y_str.len - 2];
+        y = std.fmt.parseInt(i32, num_str, 10) catch return null;
+    } else {
+        // Try parsing as plain number
+        y = std.fmt.parseInt(i32, y_str, 10) catch return null;
+    }
+
+    return .{ .x = x, .y = y };
+}
+
 const LineItem = struct {
     x: i32,
     glyph: font.Glyph,
@@ -95,6 +165,10 @@ word_cache: std.AutoHashMap(u64, WordCache),
 input_bounds: std.AutoHashMap(*Node, Bounds),
 // Collected bounds for anchor elements
 link_bounds: std.ArrayList(LinkBoundEntry),
+
+// Cumulative transform offset for hit testing (tracks nested transforms)
+transform_offset_x: i32 = 0,
+transform_offset_y: i32 = 0,
 
 is_preformatted: bool = false,
 prev_font_category: ?FontCategory = null,
@@ -276,10 +350,11 @@ fn handleInputElement(self: *Layout, node: Node, node_ptr: ?*Node, line_buffer: 
     const widget_height = glyph.ascent + glyph.descent;
 
     // Store bounds for hit testing if we have a node pointer
+    // Include transform offset for absolute positioning
     if (node_ptr) |ptr| {
         try self.input_bounds.put(ptr, .{
-            .x = self.cursor_x,
-            .y = self.cursor_y,
+            .x = self.cursor_x + self.transform_offset_x,
+            .y = self.cursor_y + self.transform_offset_y,
             .width = widget_width,
             .height = widget_height,
         });
@@ -379,15 +454,19 @@ const StyleSnapshot = struct {
     is_italic: bool,
     size: i32,
     text_color: browser.Color,
+    transform_offset_x: i32,
+    transform_offset_y: i32,
 };
 
 fn applyNodeStyles(self: *Layout, element: parser.Element, _: *std.ArrayList(LineItem)) !void {
-    // Save current style state
+    // Save current style state including transform offsets
     const snapshot = StyleSnapshot{
         .is_bold = self.is_bold,
         .is_italic = self.is_italic,
         .size = self.size,
         .text_color = self.text_color,
+        .transform_offset_x = self.transform_offset_x,
+        .transform_offset_y = self.transform_offset_y,
     };
     try self.style_stack.append(self.allocator, snapshot);
 
@@ -419,17 +498,27 @@ fn applyNodeStyles(self: *Layout, element: parser.Element, _: *std.ArrayList(Lin
                 self.text_color = color;
             }
         }
+
+        // Apply transform to cumulative offset for hit testing
+        if (style_map.get("transform")) |transform_str| {
+            if (parseTranslate(transform_str)) |translate| {
+                self.transform_offset_x += translate.x;
+                self.transform_offset_y += translate.y;
+            }
+        }
     }
 }
 
 fn restoreNodeStyles(self: *Layout, _: *std.ArrayList(LineItem)) !void {
-    // Restore the previous style state
+    // Restore the previous style state including transform offsets
     if (self.style_stack.items.len > 0) {
         const snapshot = self.style_stack.pop() orelse return;
         self.is_bold = snapshot.is_bold;
         self.is_italic = snapshot.is_italic;
         self.size = snapshot.size;
         self.text_color = snapshot.text_color;
+        self.transform_offset_x = snapshot.transform_offset_x;
+        self.transform_offset_y = snapshot.transform_offset_y;
     }
 }
 
@@ -1826,26 +1915,44 @@ fn paintBlockTree(self: *Layout, block: *BlockLayout) !void {
     for (final_commands) |cmd| {
         try self.display_list.append(self.allocator, cmd);
     }
+    if (final_commands.len > 0) {
+        self.allocator.free(final_commands);
+    }
 }
 
-// Recursively paint a block's subtree into a command list (without applying effects)
+// Recursively paint a block's subtree into a command list, applying effects for each block
 fn paintBlockTreeRecursive(commands: *std.ArrayList(DisplayItem), self: *Layout, block: *BlockLayout) !void {
     if (!block.shouldPaint()) return;
 
-    // Add background/borders
-    try addBackgroundIfNeededToList(self.allocator, commands, block);
+    // Collect this block's own commands
+    var block_commands = std.ArrayList(DisplayItem).empty;
+    defer block_commands.deinit(self.allocator);
+
+    // Add background/borders for this block
+    try addBackgroundIfNeededToList(self.allocator, &block_commands, block);
 
     // Add display items (from text, etc.)
     for (block.display_list.items) |item| {
-        try commands.append(self.allocator, item);
+        try block_commands.append(self.allocator, item);
     }
 
     // Recursively paint children - collect their commands
     for (block.children.items) |child| {
         switch (child) {
-            .block => |b| try paintBlockTreeRecursive(commands, self, b),
-            .line => |l| try l.paintToList(commands, self),
+            .block => |b| try paintBlockTreeRecursive(&block_commands, self, b),
+            .line => |l| try l.paintToList(&block_commands, self),
         }
+    }
+
+    // Apply visual effects (opacity, transform, etc.) for this block
+    const final_commands = try applyPaintEffects(self, block, block_commands.items);
+
+    // Add the wrapped commands to the parent's list
+    for (final_commands) |cmd| {
+        try commands.append(self.allocator, cmd);
+    }
+    if (final_commands.len > 0) {
+        self.allocator.free(final_commands);
     }
 }
 
@@ -1856,13 +1963,26 @@ fn applyPaintEffects(self: *Layout, block: *BlockLayout, commands: []DisplayItem
     var blend_mode: ?[]const u8 = null;
     var should_clip = false;
     var border_radius: f64 = 0.0;
+    var transform_x: i32 = 0;
+    var transform_y: i32 = 0;
+    var has_transform = false;
 
     if (block.node == .element) {
         const elem = block.node.element;
         if (elem.style) |style| {
-            if (style.get("opacity")) |op_str| {
-                opacity = std.fmt.parseFloat(f64, op_str) catch 1.0;
-                opacity = @max(0.0, @min(1.0, opacity)); // Clamp to valid range
+            // Check for active opacity animation first
+            if (elem.animations) |animations| {
+                if (animations.get("opacity")) |anim| {
+                    opacity = anim.getValue();
+                    opacity = @max(0.0, @min(1.0, opacity)); // Clamp to valid range
+                }
+            }
+            // Fall back to style value if no animation
+            if (opacity == 1.0) {
+                if (style.get("opacity")) |op_str| {
+                    opacity = std.fmt.parseFloat(f64, op_str) catch 1.0;
+                    opacity = @max(0.0, @min(1.0, opacity)); // Clamp to valid range
+                }
             }
             if (style.get("mix-blend-mode")) |blend_str| {
                 blend_mode = blend_str;
@@ -1877,32 +1997,26 @@ fn applyPaintEffects(self: *Layout, block: *BlockLayout, commands: []DisplayItem
                     }
                 }
             }
+            // Parse transform: translate(xpx, ypx)
+            if (style.get("transform")) |transform_str| {
+                if (parseTranslate(transform_str)) |translate| {
+                    transform_x = translate.x;
+                    transform_y = translate.y;
+                    has_transform = true;
+                }
+            }
         }
     }
 
     // Start with the original commands
     var current_commands = commands;
+    var owned_commands: ?[]DisplayItem = null;
+    defer if (owned_commands) |owned| self.allocator.free(owned);
 
     // Apply clipping first if needed
     if (should_clip and border_radius > 0) {
-        // Create a clipping mask using dst_in blend mode
-        // The mask is a white rounded rectangle that will clip the content
-        const mask_commands = try self.allocator.alloc(DisplayItem, 1);
-        mask_commands[0] = DisplayItem{
-            .rounded_rect = .{
-                .x1 = block.x,
-                .y1 = block.y,
-                .x2 = block.x + block.width,
-                .y2 = block.y + block.height,
-                .radius = border_radius,
-                .color = browser.Color{ .r = 255, .g = 255, .b = 255, .a = 255 }, // White mask
-            },
-        };
-
-        // Copy the original commands
-        const content_commands = try self.allocator.alloc(DisplayItem, current_commands.len);
-        @memcpy(content_commands, current_commands);
-
+        // Create a clipping mask using dst_in blend mode.
+        // The mask is a white rounded rectangle that will clip the content.
         // Create the clipping blend that applies dst_in to mask the content
         const clip_blend_mode = try self.allocator.alloc(u8, 6);
         @memcpy(clip_blend_mode, "dst_in");
@@ -1924,6 +2038,7 @@ fn applyPaintEffects(self: *Layout, block: *BlockLayout, commands: []DisplayItem
                 .opacity = 1.0, // No opacity for clipping blend
                 .blend_mode = clip_blend_mode,
                 .children = clip_mask_commands,
+                .needs_compositing = true, // Has blend mode, needs compositing
             },
         };
 
@@ -1932,6 +2047,7 @@ fn applyPaintEffects(self: *Layout, block: *BlockLayout, commands: []DisplayItem
         @memcpy(new_commands[0..current_commands.len], current_commands);
         new_commands[current_commands.len] = clip_blend;
         current_commands = new_commands;
+        owned_commands = new_commands;
     }
 
     // Create a single merged blend operation for opacity and blend mode
@@ -1947,18 +2063,67 @@ fn applyPaintEffects(self: *Layout, block: *BlockLayout, commands: []DisplayItem
         const wrapped_commands = try self.allocator.alloc(DisplayItem, current_commands.len);
         @memcpy(wrapped_commands, current_commands);
 
+        // Get pointer to the element for identifying this blend across frames
+        const node_ptr: ?*anyopaque = if (block.node == .element)
+            @ptrCast(&block.node.element)
+        else
+            null;
+
+        // Determine if this blend needs compositing (does actual work)
+        const needs_compositing = opacity < 1.0 or final_blend_mode != null;
+
         const blend_item = DisplayItem{
             .blend = .{
                 .opacity = opacity,
                 .blend_mode = final_blend_mode,
                 .children = wrapped_commands,
+                .node = node_ptr,
+                .needs_compositing = needs_compositing,
             },
         };
 
         const result = try self.allocator.alloc(DisplayItem, 1);
         result[0] = blend_item;
+
+        // Wrap in transform if needed
+        if (has_transform) {
+            const transform_item = DisplayItem{
+                .transform = .{
+                    .translate_x = transform_x,
+                    .translate_y = transform_y,
+                    .children = result,
+                    .node = node_ptr,
+                },
+            };
+            const transform_result = try self.allocator.alloc(DisplayItem, 1);
+            transform_result[0] = transform_item;
+            return transform_result;
+        }
         return result;
     } else {
+        // No blend effects, but may still have transform
+        if (has_transform) {
+            const wrapped_for_transform = try self.allocator.alloc(DisplayItem, current_commands.len);
+            @memcpy(wrapped_for_transform, current_commands);
+
+            const node_ptr: ?*anyopaque = if (block.node == .element)
+                @ptrCast(&block.node.element)
+            else
+                null;
+
+            const transform_item = DisplayItem{
+                .transform = .{
+                    .translate_x = transform_x,
+                    .translate_y = transform_y,
+                    .children = wrapped_for_transform,
+                    .node = node_ptr,
+                },
+            };
+            const result = try self.allocator.alloc(DisplayItem, 1);
+            result[0] = transform_item;
+            return result;
+        }
+
         // No effects, return commands as-is
         const result = try self.allocator.alloc(DisplayItem, current_commands.len);
         @memcpy(result, current_commands);

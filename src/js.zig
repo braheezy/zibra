@@ -9,8 +9,62 @@ const parser = @import("parser.zig");
 const Node = parser.Node;
 const CSSParser = @import("cssParser.zig").CSSParser;
 const Selector = @import("selector.zig").Selector;
+const NumericAnimation = parser.NumericAnimation;
 
 const Js = @This();
+
+// Assume 60 fps for frame calculations
+const FRAMES_PER_SECOND: u32 = 60;
+
+/// Parse a simple inline style string like "opacity: 0.5; transition: opacity 2s"
+fn parseInlineStyle(allocator: std.mem.Allocator, style_str: []const u8) !std.StringHashMap([]const u8) {
+    var result = std.StringHashMap([]const u8).init(allocator);
+    errdefer result.deinit();
+
+    var parts = std.mem.tokenizeAny(u8, style_str, ";");
+    while (parts.next()) |part| {
+        const trimmed = std.mem.trim(u8, part, " \t\n\r");
+        if (trimmed.len == 0) continue;
+
+        if (std.mem.indexOf(u8, trimmed, ":")) |colon_idx| {
+            const property = std.mem.trim(u8, trimmed[0..colon_idx], " \t");
+            const value = std.mem.trim(u8, trimmed[colon_idx + 1 ..], " \t");
+            try result.put(property, value);
+        }
+    }
+    return result;
+}
+
+/// Parse a transition value like "opacity 2s" into property name and frame count
+fn parseTransitionValue(value: []const u8) ?struct { property: []const u8, frames: u32 } {
+    var parts = std.mem.tokenizeAny(u8, value, " \t");
+    const property = parts.next() orelse return null;
+    const duration_str = parts.next() orelse return null;
+
+    var frames: u32 = 0;
+    if (std.mem.endsWith(u8, duration_str, "ms")) {
+        const ms_str = duration_str[0 .. duration_str.len - 2];
+        const ms = std.fmt.parseFloat(f64, ms_str) catch return null;
+        frames = @intFromFloat(ms / 1000.0 * @as(f64, FRAMES_PER_SECOND));
+    } else if (std.mem.endsWith(u8, duration_str, "s")) {
+        const s_str = duration_str[0 .. duration_str.len - 1];
+        const s = std.fmt.parseFloat(f64, s_str) catch return null;
+        frames = @intFromFloat(s * @as(f64, FRAMES_PER_SECOND));
+    } else {
+        return null;
+    }
+
+    return .{ .property = property, .frames = @max(1, frames) };
+}
+
+/// Start an opacity animation on an element
+fn startOpacityAnimation(allocator: std.mem.Allocator, elem: *parser.Element, start: f64, end: f64, frames: u32) !void {
+    if (elem.animations == null) {
+        elem.animations = std.StringHashMap(NumericAnimation).init(allocator);
+    }
+    const animation = NumericAnimation.init(start, end, frames);
+    try elem.animations.?.put("opacity", animation);
+}
 
 pub const RenderCallbackFn = *const fn (context: ?*anyopaque) anyerror!void;
 
@@ -1141,12 +1195,46 @@ fn styleSet(agent: *Agent, this_value: Value, arguments: kiesel.types.Arguments)
                 e.attributes = std.StringHashMap([]const u8).init(js_instance.allocator);
             }
 
+            // Get old opacity value for transition detection
+            var old_opacity: ?f64 = null;
+            if (e.style) |style| {
+                if (style.get("opacity")) |op_str| {
+                    old_opacity = std.fmt.parseFloat(f64, op_str) catch null;
+                }
+            }
+
             const owned_style = try js_instance.allocator.dupe(u8, style_str);
             if (e.owned_strings == null) {
                 e.owned_strings = std.ArrayList([]const u8).empty;
             }
             try e.owned_strings.?.append(js_instance.allocator, owned_style);
             try e.attributes.?.put("style", owned_style);
+
+            // Parse new style to check for opacity changes and transitions
+            const style_result = parseInlineStyle(js_instance.allocator, style_str);
+            if (style_result) |ns| {
+                var new_style = ns;
+                defer new_style.deinit();
+
+                // Check for transition definition
+                if (new_style.get("transition")) |transition_str| {
+                    // Parse transition value (e.g., "opacity 2s")
+                    if (parseTransitionValue(transition_str)) |transition| {
+                        if (std.mem.eql(u8, transition.property, "opacity")) {
+                            // Get new opacity value
+                            if (new_style.get("opacity")) |new_op_str| {
+                                const new_opacity = std.fmt.parseFloat(f64, new_op_str) catch null;
+                                if (new_opacity != null and old_opacity != null and old_opacity.? != new_opacity.?) {
+                                    // Start animation from old to new value
+                                    startOpacityAnimation(js_instance.allocator, e, old_opacity.?, new_opacity.?, transition.frames) catch |err| {
+                                        std.log.warn("Failed to start opacity animation: {}", .{err});
+                                    };
+                                }
+                            }
+                        }
+                    }
+                }
+            } else |_| {}
 
             js_instance.requestRender();
 

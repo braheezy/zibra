@@ -14,6 +14,12 @@ const DisplayItem = browser_mod.DisplayItem;
 const TaskRunner = task.TaskRunner;
 const Node = parser.Node;
 
+/// Represents a composited visual effect update (e.g., opacity change during animation)
+pub const CompositedUpdate = struct {
+    node: *anyopaque, // Pointer to the element that owns this effect
+    opacity: f64, // New opacity value
+};
+
 // Tab represents a single web page
 pub const Tab = @This();
 // Memory allocator
@@ -58,11 +64,16 @@ allowed_origins: ?std.ArrayList([]const u8) = null,
 // Pending asynchronous work for this tab
 task_runner: TaskRunner,
 async_thread_refs: std.atomic.Value(usize) = std.atomic.Value(usize).init(0),
-needs_render: bool = true,
+// Separate dirty flags for render phases
+needs_style: bool = true,
+needs_layout: bool = true,
+needs_paint: bool = true,
 scroll_changed_in_tab: bool = false,
+// Composited visual effect updates for the current frame
+composited_updates: std.ArrayList(CompositedUpdate),
 
-pub fn init(allocator: std.mem.Allocator, tab_height: i32, measure: *MeasureTime) !Tab {
-    var tab = Tab{
+pub fn init(allocator: std.mem.Allocator, tab_height: i32, measure: *MeasureTime) Tab {
+    return Tab{
         .allocator = allocator,
         .browser = undefined,
         .tab_height = tab_height,
@@ -76,23 +87,23 @@ pub fn init(allocator: std.mem.Allocator, tab_height: i32, measure: *MeasureTime
         .js_render_context = .{},
         .js_render_context_initialized = false,
         .task_runner = TaskRunner.init(allocator, measure),
+        .composited_updates = std.ArrayList(CompositedUpdate).empty,
     };
-    try tab.task_runner.start();
-    return tab;
+}
+
+/// Start the task runner thread. Must be called after the Tab is in its final memory location.
+pub fn start(self: *Tab) !void {
+    try self.task_runner.start();
 }
 
 pub fn deinit(self: *Tab) void {
-    std.debug.print("tab.deinit: invalidateJsContext\n", .{});
     self.invalidateJsContext();
-    std.debug.print("tab.deinit: waitForAsyncThreads\n", .{});
     self.waitForAsyncThreads();
-    std.debug.print("tab.deinit: task_runner.shutdown\n", .{});
     self.task_runner.shutdown();
-    std.debug.print("tab.deinit: task_runner.shutdown done\n", .{});
 
     // Clean up any display list
     if (self.display_list) |list| {
-        self.allocator.free(list);
+        DisplayItem.freeList(self.allocator, list);
     }
 
     // Clean up document layout tree
@@ -316,7 +327,15 @@ pub fn goBack(self: *Tab, b: *Browser) !void {
 }
 
 pub fn setNeedsRender(self: *Tab) void {
-    self.needs_render = true;
+    self.needs_style = true;
+    self.needs_layout = true;
+    self.needs_paint = true;
+    self.browser.setNeedsAnimationFrame(self);
+    self.browser.scheduleAnimationFrame();
+}
+
+pub fn setNeedsPaint(self: *Tab) void {
+    self.needs_paint = true;
     self.browser.setNeedsAnimationFrame(self);
     self.browser.scheduleAnimationFrame();
 }
@@ -331,27 +350,43 @@ fn clampScroll(self: *Tab, scroll: i32) i32 {
 
 // Re-render the page without reloading (style, layout, paint)
 pub fn render(self: *Tab, b: *Browser) !void {
-    if (!self.needs_render) return;
-    self.needs_render = false;
-    errdefer self.needs_render = true;
+    // Check if any render phase is needed
+    if (!self.needs_style and !self.needs_layout and !self.needs_paint) return;
+
     const trace_render = b.measure.begin("render");
     defer if (trace_render) b.measure.end("render");
 
     if (self.current_node == null) {
+        self.needs_style = false;
+        self.needs_layout = false;
+        self.needs_paint = false;
         return;
     }
 
-    // Re-apply styles with current rules
-    try parser.style(b.allocator, &self.current_node.?, self.rules.items);
-
-    // Re-layout and paint
-    try b.layoutTabNodes(self);
-    const clamped_scroll = self.clampScroll(self.scroll);
-    if (clamped_scroll != self.scroll) {
-        self.scroll_changed_in_tab = true;
-        self.scroll = clamped_scroll;
+    // Style phase
+    if (self.needs_style) {
+        self.needs_style = false;
+        errdefer self.needs_style = true;
+        try parser.style(b.allocator, &self.current_node.?, self.rules.items);
     }
-    b.setNeedsRasterAndDraw();
+
+    // Layout phase (also does paint since they're combined in layoutTabNodes)
+    if (self.needs_layout or self.needs_paint) {
+        self.needs_layout = false;
+        self.needs_paint = false;
+        errdefer {
+            self.needs_layout = true;
+            self.needs_paint = true;
+        }
+        try b.layoutTabNodes(self);
+        const clamped_scroll = self.clampScroll(self.scroll);
+        if (clamped_scroll != self.scroll) {
+            self.scroll_changed_in_tab = true;
+            self.scroll = clamped_scroll;
+        }
+    }
+
+    b.setNeedsCompositeRasterDraw();
 }
 
 pub fn runAnimationFrame(self: *Tab, scroll: i32) void {
@@ -363,24 +398,88 @@ pub fn runAnimationFrame(self: *Tab, scroll: i32) void {
         self.scroll = scroll;
     }
 
-    self.render(self.browser) catch |err| {
-        std.log.warn("Animation frame render failed: {}", .{err});
-    };
+    // Clear previous frame's composited updates
+    self.composited_updates.items.len = 0;
+
+    // Advance CSS transition animations
+    var animations_running = false;
+    if (self.current_node) |*root| {
+        animations_running = self.advanceAnimations(root);
+    }
+
+    // If animations are running, schedule the next frame
+    if (animations_running) {
+        self.browser.scheduleAnimationFrame();
+    }
+
+    // Only run full render if there are non-composited changes
+    // Composited-only updates (like opacity) skip layout and paint
+    const has_composited_updates = self.composited_updates.items.len > 0;
+    const needs_full_render = self.needs_style or self.needs_layout or self.needs_paint;
+
+    if (needs_full_render) {
+        self.render(self.browser) catch |err| {
+            std.log.warn("Animation frame render failed: {}", .{err});
+        };
+    }
 
     var commit_scroll: ?i32 = null;
     if (self.scroll_changed_in_tab) {
         commit_scroll = self.scroll;
     }
 
-    const commit_data = browser_mod.CommitData{
-        .url = self.current_url orelse null,
-        .display_list = self.display_list,
-        .scroll = commit_scroll,
-        .height = self.content_height,
-    };
-    self.display_list = null;
-    self.browser.commit(self, commit_data);
+    // Only commit if we have something to send
+    if (needs_full_render or has_composited_updates) {
+        const commit_data = browser_mod.CommitData{
+            .url = self.current_url orelse null,
+            .display_list = self.display_list,
+            .scroll = commit_scroll,
+            .height = self.content_height,
+            .composited_updates = self.composited_updates.items,
+        };
+        self.display_list = null;
+        self.browser.commit(self, commit_data);
+    }
     self.scroll_changed_in_tab = false;
+}
+
+/// Advance all animations in the node tree, returns true if any animations are still running
+fn advanceAnimations(self: *Tab, node: *parser.Node) bool {
+    var any_running = false;
+
+    switch (node.*) {
+        .element => |*elem| {
+            // Advance animations on this element
+            if (elem.animations) |*animations| {
+                var it = animations.iterator();
+                while (it.next()) |entry| {
+                    const anim = entry.value_ptr;
+                    if (!anim.isComplete()) {
+                        _ = anim.advance();
+                        any_running = true;
+
+                        // Record composited update for opacity animations
+                        if (std.mem.eql(u8, entry.key_ptr.*, "opacity")) {
+                            self.composited_updates.append(self.allocator, .{
+                                .node = @ptrCast(elem),
+                                .opacity = anim.getValue(),
+                            }) catch {};
+                        }
+                    }
+                }
+            }
+
+            // Recurse into children
+            for (elem.children.items) |*child| {
+                if (self.advanceAnimations(child)) {
+                    any_running = true;
+                }
+            }
+        },
+        .text => {},
+    }
+
+    return any_running;
 }
 
 // Handle click on tab content

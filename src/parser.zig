@@ -1,6 +1,43 @@
 const std = @import("std");
 pub const CSSParser = @import("cssParser.zig").CSSParser;
 
+/// Animation state for a numeric CSS property transition
+pub const NumericAnimation = struct {
+    start_value: f64,
+    end_value: f64,
+    current_frame: u32,
+    total_frames: u32,
+
+    pub fn init(start: f64, end: f64, frames: u32) NumericAnimation {
+        return .{
+            .start_value = start,
+            .end_value = end,
+            .current_frame = 0,
+            .total_frames = frames,
+        };
+    }
+
+    /// Get the current interpolated value
+    pub fn getValue(self: NumericAnimation) f64 {
+        if (self.total_frames == 0) return self.end_value;
+        const t: f64 = @as(f64, @floatFromInt(self.current_frame)) / @as(f64, @floatFromInt(self.total_frames));
+        return self.start_value + (self.end_value - self.start_value) * t;
+    }
+
+    /// Advance the animation by one frame, returns true if animation is complete
+    pub fn advance(self: *NumericAnimation) bool {
+        if (self.current_frame < self.total_frames) {
+            self.current_frame += 1;
+        }
+        return self.current_frame >= self.total_frames;
+    }
+
+    /// Check if animation is complete
+    pub fn isComplete(self: NumericAnimation) bool {
+        return self.current_frame >= self.total_frames;
+    }
+};
+
 // These tags can look like <tag /> and don't need a closing tag.
 // HTML has specific elements that are self-closing by definition
 const self_closing_tags = [_][]const u8{
@@ -71,6 +108,8 @@ pub const Element = struct {
     // Track strings we've allocated (like resolved percentage font sizes) so we can free them
     owned_strings: ?std.ArrayList([]const u8) = null,
     is_focused: bool = false,
+    // Animation state for CSS transitions, keyed by property name (e.g., "opacity")
+    animations: ?std.StringHashMap(NumericAnimation) = null,
 
     pub fn init(allocator: std.mem.Allocator, tag: []const u8, parent: ?*Node) !Element {
         var e = Element{
@@ -81,6 +120,7 @@ pub const Element = struct {
             .children = std.ArrayList(Node).empty,
             .owned_strings = null,
             .is_focused = false,
+            .animations = null,
         };
 
         // Only parse attributes if there's a space in the tag
@@ -117,6 +157,12 @@ pub const Element = struct {
             }
             var o = owned;
             o.deinit(allocator);
+        }
+
+        // Free animations map
+        if (self.animations) |animations| {
+            var a = animations;
+            a.deinit();
         }
     }
 
