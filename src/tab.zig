@@ -14,11 +14,35 @@ const DisplayItem = browser_mod.DisplayItem;
 const AccessibilitySettings = browser_mod.AccessibilitySettings;
 const TaskRunner = task.TaskRunner;
 const Node = parser.Node;
+const Bounds = Layout.Bounds;
 
 /// Represents a composited visual effect update (e.g., opacity change during animation)
 pub const CompositedUpdate = struct {
     node: *anyopaque, // Pointer to the element that owns this effect
     opacity: f64, // New opacity value
+};
+
+pub const AccessibilityNode = struct {
+    role: []const u8,
+    name: []const u8,
+    bounds: Bounds,
+    children: std.ArrayList(*AccessibilityNode),
+    dom_node: ?*Node,
+    live: ?LiveSetting = null,
+    last_announced: ?[]const u8 = null,
+
+    pub fn deinit(self: *AccessibilityNode, allocator: std.mem.Allocator) void {
+        for (self.children.items) |child| {
+            child.deinit(allocator);
+            allocator.destroy(child);
+        }
+        self.children.deinit(allocator);
+    }
+};
+
+pub const LiveSetting = enum {
+    polite,
+    assertive,
 };
 
 // Tab represents a single web page
@@ -73,6 +97,18 @@ needs_paint: bool = true,
 scroll_changed_in_tab: bool = false,
 // Composited visual effect updates for the current frame
 composited_updates: std.ArrayList(CompositedUpdate),
+// Root of the accessibility tree
+accessibility_root: ?*AccessibilityNode = null,
+// Focused accessibility node
+accessibility_focused: ?*AccessibilityNode = null,
+// Hovered accessibility node (for screen reader hover)
+accessibility_hovered: ?*AccessibilityNode = null,
+// Pending polite announcements
+accessibility_polite_queue: std.ArrayList(*AccessibilityNode),
+// Highlighted accessibility node for voice commands
+accessibility_highlight: ?*AccessibilityNode = null,
+// Owned strings for accessibility names/labels
+accessibility_strings: std.ArrayList([]const u8),
 
 pub fn init(allocator: std.mem.Allocator, tab_height: i32, measure: *MeasureTime) Tab {
     return Tab{
@@ -91,6 +127,12 @@ pub fn init(allocator: std.mem.Allocator, tab_height: i32, measure: *MeasureTime
         .js_render_context_initialized = false,
         .task_runner = TaskRunner.init(allocator, measure),
         .composited_updates = std.ArrayList(CompositedUpdate).empty,
+        .accessibility_root = null,
+        .accessibility_focused = null,
+        .accessibility_hovered = null,
+        .accessibility_polite_queue = std.ArrayList(*AccessibilityNode).empty,
+        .accessibility_highlight = null,
+        .accessibility_strings = std.ArrayList([]const u8).empty,
     };
 }
 
@@ -188,6 +230,12 @@ pub fn deinit(self: *Tab) void {
         self.allowed_origins = null;
     }
 
+    self.clearAccessibilityTree();
+    for (self.accessibility_strings.items) |value| {
+        self.allocator.free(value);
+    }
+    self.accessibility_strings.deinit(self.allocator);
+
     // Clean up history
     for (self.history.items) |url_ptr| {
         url_ptr.*.free(self.allocator);
@@ -196,6 +244,7 @@ pub fn deinit(self: *Tab) void {
     self.history.deinit(self.allocator);
 
     self.task_runner.deinit();
+    self.accessibility_polite_queue.deinit(self.allocator);
 }
 
 pub fn clearAllowedOrigins(self: *Tab) void {
@@ -620,6 +669,7 @@ pub fn click(self: *Tab, b: *Browser, x: i32, y: i32) !void {
                         }
                         e.is_focused = true;
                         self.focus = node_ptr;
+                        self.updateAccessibilityFocus(b);
                         self.setNeedsRender();
                         handled = true;
                         break;
@@ -912,6 +962,7 @@ pub fn cycleFocus(self: *Tab, b: *Browser, reverse: bool) !void {
         else => {},
     }
     self.focus = to_focus;
+    self.updateAccessibilityFocus(b);
     b.lock.lock();
     b.focus = "content";
     b.lock.unlock();
@@ -986,13 +1037,13 @@ pub fn activateFocusedElement(self: *Tab, b: *Browser) !void {
 
 // Clear focus (for Escape key)
 pub fn clearFocus(self: *Tab, b: *Browser) !void {
-    _ = b;
     if (self.focus) |focus_node| {
         switch (focus_node.*) {
             .element => |*e| e.is_focused = false,
             else => {},
         }
         self.focus = null;
+        self.updateAccessibilityFocus(b);
         self.setNeedsRender();
     }
 }
@@ -1059,6 +1110,515 @@ pub fn backspace(self: *Tab, b: *Browser) !void {
             else => {},
         }
     }
+}
+
+pub fn buildAccessibilityTree(self: *Tab, b: *Browser) !void {
+    const previous_root = self.accessibility_root;
+    self.accessibility_root = null;
+
+    self.clearAccessibilityTree();
+    for (self.accessibility_strings.items) |value| {
+        self.allocator.free(value);
+    }
+    self.accessibility_strings.clearRetainingCapacity();
+
+    if (self.current_node == null) return;
+
+    var bounds_map = std.AutoHashMap(*Node, Bounds).init(self.allocator);
+    defer bounds_map.deinit();
+
+    for (b.layout_engine.accessibility_bounds.items) |entry| {
+        if (bounds_map.getPtr(entry.node)) |existing| {
+            mergeBounds(existing, entry.bounds);
+        } else {
+            try bounds_map.put(entry.node, entry.bounds);
+        }
+    }
+
+    var root_children = std.ArrayList(*AccessibilityNode).empty;
+    switch (self.current_node.?) {
+        .text => {},
+        .element => |*root_element| {
+            for (root_element.children.items) |*child| {
+                try self.appendAccessibilityNodes(&root_children, child, &bounds_map);
+            }
+        },
+    }
+
+    const root_bounds = Bounds{
+        .x = 0,
+        .y = 0,
+        .width = b.layout_engine.window_width,
+        .height = self.content_height,
+    };
+    const root_name = try self.copyAccessibilityString("document");
+    const root = try self.createAccessibilityNode("document", root_name, root_bounds, null, root_children);
+    self.accessibility_root = root;
+    self.accessibility_focused = self.findAccessibilityNodeForDom(self.accessibility_root, self.focus);
+    self.accessibility_hovered = null;
+
+    if (previous_root) |old_root| {
+        self.handleLiveRegionUpdates(old_root, root);
+        old_root.deinit(self.allocator);
+        self.allocator.destroy(old_root);
+    }
+    if (self.accessibility_focused != null and self.accessibility.screen_reader) {
+        self.speakAccessibilityNode(self.accessibility_focused.?, "focus");
+    }
+}
+
+fn createAccessibilityNode(
+    self: *Tab,
+    role: []const u8,
+    name: []const u8,
+    bounds: Bounds,
+    dom_node: ?*Node,
+    children: std.ArrayList(*AccessibilityNode),
+) !*AccessibilityNode {
+    const node = try self.allocator.create(AccessibilityNode);
+    node.* = .{
+        .role = role,
+        .name = name,
+        .bounds = bounds,
+        .children = children,
+        .dom_node = dom_node,
+    };
+    return node;
+}
+
+fn appendAccessibilityNodes(
+    self: *Tab,
+    out: *std.ArrayList(*AccessibilityNode),
+    node_ptr: *Node,
+    bounds_map: *std.AutoHashMap(*Node, Bounds),
+) !void {
+    switch (node_ptr.*) {
+        .text => {},
+        .element => |*e| {
+            if (isAriaHidden(e)) return;
+            if (isPresentationalTag(e.tag)) {
+                for (e.children.items) |*child| {
+                    try self.appendAccessibilityNodes(out, child, bounds_map);
+                }
+                return;
+            }
+
+            var children = std.ArrayList(*AccessibilityNode).empty;
+            for (e.children.items) |*child| {
+                try self.appendAccessibilityNodes(&children, child, bounds_map);
+            }
+
+            const role = accessibilityRole(e);
+            const name = try self.accessibilityName(node_ptr, e);
+            const bounds = bounds_map.get(node_ptr) orelse Bounds{ .x = 0, .y = 0, .width = 0, .height = 0 };
+            const node = try self.createAccessibilityNode(role, name, bounds, node_ptr, children);
+            node.live = liveSettingFromAttributes(e);
+            try out.append(self.allocator, node);
+        },
+    }
+}
+
+fn isPresentationalTag(tag: []const u8) bool {
+    return std.mem.eql(u8, tag, "script") or
+        std.mem.eql(u8, tag, "style") or
+        std.mem.eql(u8, tag, "head") or
+        std.mem.eql(u8, tag, "meta") or
+        std.mem.eql(u8, tag, "link") or
+        std.mem.eql(u8, tag, "title") or
+        std.mem.eql(u8, tag, "br");
+}
+
+fn isAriaHidden(element: *const parser.Element) bool {
+    if (element.attributes) |attrs| {
+        if (attrs.get("aria-hidden")) |value| {
+            return std.mem.eql(u8, std.mem.trim(u8, value, " \t\r\n"), "true");
+        }
+    }
+    return false;
+}
+
+fn accessibilityRole(element: *const parser.Element) []const u8 {
+    if (std.mem.eql(u8, element.tag, "a")) return "link";
+    if (std.mem.eql(u8, element.tag, "button")) return "button";
+    if (std.mem.eql(u8, element.tag, "input")) {
+        if (element.attributes) |attrs| {
+            if (attrs.get("type")) |raw_type| {
+                if (std.mem.eql(u8, raw_type, "submit") or std.mem.eql(u8, raw_type, "button")) {
+                    return "button";
+                }
+            }
+        }
+        return "textbox";
+    }
+    if (std.mem.startsWith(u8, element.tag, "h") and element.tag.len == 2) return "heading";
+    if (std.mem.eql(u8, element.tag, "p")) return "paragraph";
+    if (std.mem.eql(u8, element.tag, "img")) return "img";
+    if (std.mem.eql(u8, element.tag, "ul") or std.mem.eql(u8, element.tag, "ol")) return "list";
+    if (std.mem.eql(u8, element.tag, "li")) return "listitem";
+    if (std.mem.eql(u8, element.tag, "form")) return "form";
+    return "generic";
+}
+
+fn accessibilityName(self: *Tab, node_ptr: *Node, element: *const parser.Element) ![]const u8 {
+    if (element.attributes) |attrs| {
+        if (attrs.get("aria-label")) |label| {
+            return self.copyAccessibilityString(label);
+        }
+    }
+
+    if (std.mem.eql(u8, element.tag, "input")) {
+        if (element.attributes) |attrs| {
+            if (attrs.get("value")) |value| {
+                if (value.len > 0) return self.copyAccessibilityString(value);
+            }
+            if (attrs.get("placeholder")) |placeholder| {
+                if (placeholder.len > 0) return self.copyAccessibilityString(placeholder);
+            }
+        }
+        return self.copyAccessibilityString("input");
+    }
+
+    if (std.mem.eql(u8, element.tag, "img")) {
+        if (element.attributes) |attrs| {
+            if (attrs.get("alt")) |alt| {
+                if (alt.len > 0) return self.copyAccessibilityString(alt);
+            }
+        }
+        return self.copyAccessibilityString("image");
+    }
+
+    if (std.mem.eql(u8, element.tag, "a")) {
+        const text = try self.collectText(node_ptr);
+        if (text.len > 0) return text;
+        if (element.attributes) |attrs| {
+            if (attrs.get("href")) |href| {
+                if (href.len > 0) return self.copyAccessibilityString(href);
+            }
+        }
+    }
+
+    const text = try self.collectText(node_ptr);
+    if (text.len > 0) return text;
+    return self.copyAccessibilityString("");
+}
+
+fn liveSettingFromAttributes(element: *const parser.Element) ?LiveSetting {
+    if (element.attributes) |attrs| {
+        if (attrs.get("aria-live")) |value| {
+            const trimmed = std.mem.trim(u8, value, " \t\r\n");
+            if (std.mem.eql(u8, trimmed, "off")) return null;
+            if (std.mem.eql(u8, trimmed, "assertive")) return .assertive;
+            if (std.mem.eql(u8, trimmed, "polite")) return .polite;
+        }
+    }
+    return null;
+}
+
+fn findLiveSettingInTree(node: *AccessibilityNode) ?LiveSetting {
+    if (node.live) |setting| return setting;
+    for (node.children.items) |child| {
+        if (findLiveSettingInTree(child)) |setting| return setting;
+    }
+    return null;
+}
+
+fn collectText(self: *Tab, node_ptr: *Node) ![]const u8 {
+    var buffer = std.ArrayList(u8).empty;
+    defer buffer.deinit(self.allocator);
+    try self.collectTextImpl(node_ptr, &buffer);
+    const trimmed = std.mem.trim(u8, buffer.items, " \t\r\n");
+    return self.copyAccessibilityString(trimmed);
+}
+
+fn collectTextImpl(self: *Tab, node_ptr: *Node, buffer: *std.ArrayList(u8)) !void {
+    switch (node_ptr.*) {
+        .text => |t| {
+            try buffer.appendSlice(self.allocator, t.text);
+        },
+        .element => |*e| {
+            for (e.children.items) |*child| {
+                try self.collectTextImpl(child, buffer);
+            }
+        },
+    }
+}
+
+fn copyAccessibilityString(self: *Tab, value: []const u8) ![]const u8 {
+    const duped = try self.allocator.alloc(u8, value.len);
+    @memcpy(duped, value);
+    try self.accessibility_strings.append(self.allocator, duped);
+    return duped;
+}
+
+fn mergeBounds(existing: *Bounds, incoming: Bounds) void {
+    const existing_right = existing.x + existing.width;
+    const existing_bottom = existing.y + existing.height;
+    const incoming_right = incoming.x + incoming.width;
+    const incoming_bottom = incoming.y + incoming.height;
+    if (incoming.x < existing.x) existing.x = incoming.x;
+    if (incoming.y < existing.y) existing.y = incoming.y;
+    const new_right = if (incoming_right > existing_right) incoming_right else existing_right;
+    const new_bottom = if (incoming_bottom > existing_bottom) incoming_bottom else existing_bottom;
+    existing.width = new_right - existing.x;
+    existing.height = new_bottom - existing.y;
+}
+
+pub fn accessibilityHitTest(self: *Tab, x: i32, y: i32) ?*AccessibilityNode {
+    const root = self.accessibility_root orelse return null;
+    return self.hitTestAccessibilityNode(root, x, y);
+}
+
+pub fn updateAccessibilityFocus(self: *Tab, b: *Browser) void {
+    _ = b;
+    self.accessibility_focused = self.findAccessibilityNodeForDom(self.accessibility_root, self.focus);
+    if (self.accessibility_focused != null and self.accessibility.screen_reader) {
+        self.speakAccessibilityNode(self.accessibility_focused.?, "focus");
+    }
+}
+
+pub fn updateAccessibilityHover(self: *Tab, node: ?*AccessibilityNode) void {
+    if (self.accessibility_hovered == node) return;
+    self.accessibility_hovered = node;
+    if (node != null and self.accessibility.screen_reader) {
+        self.speakAccessibilityNode(node.?, "hover");
+    }
+}
+
+fn speakAccessibilityNode(self: *Tab, node: *AccessibilityNode, reason: []const u8) void {
+    _ = self;
+    var value_buf: [128]u8 = undefined;
+    var value_text: []const u8 = "";
+    if (node.dom_node) |dom| {
+        switch (dom.*) {
+            .element => |*e| {
+                if (std.mem.eql(u8, e.tag, "input")) {
+                    if (e.attributes) |attrs| {
+                        if (attrs.get("value")) |val| {
+                            value_text = val;
+                        }
+                    }
+                }
+            },
+            else => {},
+        }
+    }
+
+    if (value_text.len > 0) {
+        const formatted = std.fmt.bufPrint(&value_buf, "{s} {s} value {s}", .{
+            node.role,
+            node.name,
+            value_text,
+        }) catch return;
+        std.log.info("screen reader {s}: {s}", .{ reason, formatted });
+        return;
+    }
+
+    if (node.name.len > 0) {
+        std.log.info("screen reader {s}: {s} {s}", .{ reason, node.role, node.name });
+    } else {
+        std.log.info("screen reader {s}: {s}", .{ reason, node.role });
+    }
+}
+
+fn findLiveSetting(node: *AccessibilityNode) ?LiveSetting {
+    if (node.live) |setting| return setting;
+    return null;
+}
+
+fn handleLiveRegionUpdates(self: *Tab, old_root: *AccessibilityNode, new_root: *AccessibilityNode) void {
+    if (!self.accessibility.screen_reader) return;
+    self.syncLiveRegionAnnounce(old_root, new_root);
+    self.flushPoliteAnnouncements();
+}
+
+fn syncLiveRegionAnnounce(self: *Tab, old_node: *AccessibilityNode, new_node: *AccessibilityNode) void {
+    const parent_setting = findLiveSetting(new_node);
+    self.checkLiveRegionChange(old_node, new_node, parent_setting);
+}
+
+fn checkLiveRegionChange(self: *Tab, old_node: *AccessibilityNode, new_node: *AccessibilityNode, live_setting: ?LiveSetting) void {
+    if (live_setting) |setting| {
+        const old_text = old_node.name;
+        const new_text = new_node.name;
+        if (!std.mem.eql(u8, old_text, new_text) and new_text.len > 0) {
+            if (setting == .assertive) {
+                self.accessibility_polite_queue.clearRetainingCapacity();
+                self.speakAccessibilityNode(new_node, "assertive");
+            } else {
+                _ = self.accessibility_polite_queue.append(self.allocator, new_node) catch {};
+            }
+        }
+    }
+}
+
+fn syncLiveRegionAnnounceFromParent(
+    self: *Tab,
+    old_node: *AccessibilityNode,
+    new_node: *AccessibilityNode,
+    inherited_live: ?LiveSetting,
+) void {
+    const live_setting = new_node.live orelse inherited_live;
+    self.checkLiveRegionChange(old_node, new_node, live_setting);
+
+    const child_count = @min(old_node.children.items.len, new_node.children.items.len);
+    var idx: usize = 0;
+    while (idx < child_count) : (idx += 1) {
+        self.syncLiveRegionAnnounceFromParent(
+            old_node.children.items[idx],
+            new_node.children.items[idx],
+            live_setting,
+        );
+    }
+}
+
+fn flushPoliteAnnouncements(self: *Tab) void {
+    for (self.accessibility_polite_queue.items) |node| {
+        self.speakAccessibilityNode(node, "polite");
+    }
+    self.accessibility_polite_queue.clearRetainingCapacity();
+}
+
+pub fn readAccessibilityDocument(self: *Tab) void {
+    if (!self.accessibility.screen_reader) return;
+    const root = self.accessibility_root orelse return;
+    self.readAccessibilityNode(root);
+}
+
+fn readAccessibilityNode(self: *Tab, node: *AccessibilityNode) void {
+    self.speakAccessibilityNode(node, "document");
+    for (node.children.items) |child| {
+        self.readAccessibilityNode(child);
+    }
+}
+
+pub fn handleVoiceCommand(self: *Tab, b: *Browser, command: []const u8) void {
+    if (self.accessibility_root == null) return;
+
+    if (std.mem.eql(u8, command, "read page")) {
+        self.readAccessibilityDocument();
+        return;
+    }
+    if (std.mem.eql(u8, command, "focus next")) {
+        self.cycleFocus(b, false) catch |err| {
+            std.log.warn("Failed to focus next: {}", .{err});
+        };
+        return;
+    }
+    if (std.mem.eql(u8, command, "focus prev")) {
+        self.cycleFocus(b, true) catch |err| {
+            std.log.warn("Failed to focus previous: {}", .{err});
+        };
+        return;
+    }
+    if (std.mem.eql(u8, command, "scroll down")) {
+        b.handleScroll(100);
+        return;
+    }
+    if (std.mem.eql(u8, command, "scroll up")) {
+        b.handleScroll(-100);
+        return;
+    }
+
+    if (std.mem.startsWith(u8, command, "click ")) {
+        const query = std.mem.trim(u8, command["click ".len..], " \t\r\n");
+        if (query.len == 0) return;
+        self.commandClick(query);
+        return;
+    }
+
+    std.log.info("voice command: unknown '{s}'", .{command});
+}
+
+fn commandClick(self: *Tab, query: []const u8) void {
+    const root = self.accessibility_root orelse return;
+    if (self.findAccessibilityByName(root, query)) |node| {
+        self.accessibility_highlight = node;
+        if (node.dom_node) |dom| {
+            self.focus = dom;
+            if (self.focus) |focus_node| {
+                switch (focus_node.*) {
+                    .element => |*e| e.is_focused = true,
+                    else => {},
+                }
+            }
+            self.updateAccessibilityFocus(self.browser);
+            self.activateFocusedElement(self.browser) catch |err| {
+                std.log.warn("Failed to activate element: {}", .{err});
+            };
+            self.setNeedsRender();
+        }
+    } else {
+        std.log.info("voice command: no match for '{s}'", .{query});
+    }
+}
+
+fn findAccessibilityByName(self: *Tab, node: *AccessibilityNode, query: []const u8) ?*AccessibilityNode {
+    if (node.name.len > 0 and std.mem.containsAtLeast(u8, node.name, 1, query)) {
+        return node;
+    }
+    for (node.children.items) |child| {
+        if (self.findAccessibilityByName(child, query)) |hit| {
+            return hit;
+        }
+    }
+    return null;
+}
+
+fn hitTestAccessibilityNode(self: *Tab, node: *AccessibilityNode, x: i32, y: i32) ?*AccessibilityNode {
+    if (!boundsContains(node.bounds, x, y)) return null;
+    for (node.children.items) |child| {
+        if (self.hitTestAccessibilityNode(child, x, y)) |hit| {
+            return hit;
+        }
+    }
+    return node;
+}
+
+fn boundsContains(bounds: Bounds, x: i32, y: i32) bool {
+    return x >= bounds.x and x < bounds.x + bounds.width and y >= bounds.y and y < bounds.y + bounds.height;
+}
+
+fn findAccessibilityNodeForDom(self: *Tab, root: ?*AccessibilityNode, dom_node: ?*Node) ?*AccessibilityNode {
+    const root_node = root orelse return null;
+    const target = dom_node orelse return null;
+    if (root_node.dom_node == target) return root_node;
+    for (root_node.children.items) |child| {
+        if (findAccessibilityNodeForDom(self, child, dom_node)) |hit| {
+            return hit;
+        }
+    }
+    return null;
+}
+
+pub fn dumpAccessibilityTree(self: *Tab) void {
+    const root = self.accessibility_root orelse return;
+    dumpAccessibilityNode(root, 0);
+}
+
+fn dumpAccessibilityNode(node: *AccessibilityNode, indent: usize) void {
+    var i: usize = 0;
+    while (i < indent) : (i += 1) {
+        std.debug.print("  ", .{});
+    }
+    std.debug.print(
+        "{s} \"{s}\" ({d},{d},{d},{d})\n",
+        .{ node.role, node.name, node.bounds.x, node.bounds.y, node.bounds.width, node.bounds.height },
+    );
+    for (node.children.items) |child| {
+        dumpAccessibilityNode(child, indent + 1);
+    }
+}
+
+fn clearAccessibilityTree(self: *Tab) void {
+    if (self.accessibility_root) |root| {
+        root.deinit(self.allocator);
+        self.allocator.destroy(root);
+    }
+    self.accessibility_root = null;
+    self.accessibility_focused = null;
+    self.accessibility_hovered = null;
+    self.accessibility_polite_queue.clearRetainingCapacity();
+    self.accessibility_highlight = null;
 }
 
 // Percent-encode a string for use in form data (application/x-www-form-urlencoded)

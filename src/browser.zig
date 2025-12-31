@@ -45,6 +45,36 @@ const scroll_step: i32 = 100;
 const refresh_rate_ns: u64 = 33_000_000; // ~30 FPS
 // *********************************************************
 
+const WindowPos = struct {
+    x: c_int,
+    y: c_int,
+};
+
+fn windowPositionForFocusedDisplay() ?WindowPos {
+    var mouse_x: c_int = 0;
+    var mouse_y: c_int = 0;
+    _ = sdl2.c.SDL_GetGlobalMouseState(&mouse_x, &mouse_y);
+
+    const display_count = sdl2.c.SDL_GetNumVideoDisplays();
+    if (display_count <= 0) return null;
+
+    var display_index: c_int = 0;
+    while (display_index < display_count) : (display_index += 1) {
+        var bounds: sdl2.c.SDL_Rect = undefined;
+        if (sdl2.c.SDL_GetDisplayBounds(display_index, &bounds) != 0) continue;
+
+        if (mouse_x >= bounds.x and mouse_x < bounds.x + bounds.w and
+            mouse_y >= bounds.y and mouse_y < bounds.y + bounds.h)
+        {
+            const centered_x = bounds.x + @divTrunc(bounds.w - @as(c_int, initial_window_width), 2);
+            const centered_y = bounds.y + @divTrunc(bounds.h - @as(c_int, initial_window_height), 2);
+            return .{ .x = centered_x, .y = centered_y };
+        }
+    }
+
+    return null;
+}
+
 pub const AccessibilitySettings = struct {
     zoom: f32 = 1.0,
     prefers_dark: bool = false,
@@ -549,15 +579,24 @@ pub const Browser = struct {
             .video = true,
         });
 
+        const preferred_position = windowPositionForFocusedDisplay();
+        const window_x: sdl2.WindowPosition = if (preferred_position) |pos| .{ .absolute = pos.x } else .default;
+        const window_y: sdl2.WindowPosition = if (preferred_position) |pos| .{ .absolute = pos.y } else .default;
+        const window_visibility: sdl2.WindowFlags.Visibility = if (preferred_position != null) .hidden else .default;
+
         // Create a window with correct OS graphics
         const screen = try sdl2.createWindow(
             "zibra",
-            .default,
-            .default,
+            window_x,
+            window_y,
             initial_window_width,
             initial_window_height,
-            .{}, // Not resizable
+            .{ .vis = window_visibility }, // Not resizable
         );
+        if (preferred_position) |pos| {
+            try screen.setPosition(.{ .x = pos.x, .y = pos.y });
+            screen.setVisible(true);
+        }
 
         // Create a renderer, which will be used to draw to the window
         const renderer = try sdl2.createRenderer(
@@ -893,6 +932,9 @@ pub const Browser = struct {
                     try self.handleClick(button_event.x, button_event.y);
                 }
             },
+            .mouse_motion => |motion_event| {
+                try self.handleHover(motion_event.x, motion_event.y);
+            },
             .window => |window_event| {
                 try self.handleWindowEvent(window_event);
             },
@@ -1008,7 +1050,20 @@ pub const Browser = struct {
                     tab.accessibility.screen_reader = !tab.accessibility.screen_reader;
                     tab.setNeedsRender();
                     tab.logAccessibilitySettings("toggle screen_reader");
+                    if (tab.accessibility.screen_reader) {
+                        tab.dumpAccessibilityTree();
+                    }
                 }
+                return;
+            },
+            .f4 => {
+                if (self.activeTab()) |tab| {
+                    tab.readAccessibilityDocument();
+                }
+                return;
+            },
+            .f5 => {
+                self.handleVoiceCommand();
                 return;
             },
             .tab => {
@@ -1204,6 +1259,47 @@ pub const Browser = struct {
         }
 
         self.scheduleTabClickTask(tab, page_x, page_y);
+    }
+
+    fn handleHover(self: *Browser, screen_x: i32, screen_y: i32) !void {
+        self.lock.lock();
+        const tab = self.activeTab();
+        const chrome_bottom = self.chrome.bottom;
+        const screen_reader_on = if (tab) |active| active.accessibility.screen_reader else false;
+        self.lock.unlock();
+
+        if (!screen_reader_on) return;
+        const active_tab = tab orelse return;
+        if (screen_y < chrome_bottom) {
+            active_tab.updateAccessibilityHover(null);
+            return;
+        }
+
+        const tab_y = screen_y - chrome_bottom;
+        const zoom = self.activeZoom();
+        const page_x = if (zoom == 1.0) screen_x else @as(i32, @intFromFloat(@as(f32, @floatFromInt(screen_x)) / zoom));
+        const page_y = (if (zoom == 1.0) tab_y else @as(i32, @intFromFloat(@as(f32, @floatFromInt(tab_y)) / zoom))) + active_tab.scroll;
+
+        const hit = active_tab.accessibilityHitTest(page_x, page_y);
+        active_tab.updateAccessibilityHover(hit);
+    }
+
+    fn handleVoiceCommand(self: *Browser) void {
+        var buf: [256]u8 = undefined;
+        const stdin = std.fs.File.stdin();
+        var reader = std.fs.File.deprecatedReader(stdin);
+        std.log.info("voice command> ", .{});
+        const line = reader.readUntilDelimiterOrEof(&buf, '\n') catch |err| {
+            std.log.warn("Failed to read command: {}", .{err});
+            return;
+        };
+        const raw = line orelse return;
+        const command = std.mem.trim(u8, raw, " \t\r\n");
+        if (command.len == 0) return;
+
+        if (self.activeTab()) |tab| {
+            tab.handleVoiceCommand(self, command);
+        }
     }
 
     fn scheduleTabClickTask(self: *Browser, tab: *Tab, x: i32, y: i32) void {
@@ -1887,6 +1983,41 @@ pub const Browser = struct {
         }
         tab.display_list = try self.layout_engine.paintDocument(tab.document_layout.?);
 
+        var focus_items = std.ArrayList(DisplayItem).empty;
+        defer focus_items.deinit(self.allocator);
+        const focus_color = Color{ .r = 0x3b, .g = 0x82, .b = 0xf6, .a = 0xff };
+        const highlight_color = Color{ .r = 0xf5, .g = 0x9e, .b = 0x0b, .a = 0xff };
+
+        if (tab.focus) |focus_node| {
+            for (self.layout_engine.focus_bounds.items) |entry| {
+                if (entry.node == focus_node) {
+                    self.appendOutline(&focus_items, focus_color, entry.bounds) catch |err| {
+                        std.log.warn("Failed to append focus outline: {}", .{err});
+                    };
+                }
+            }
+        }
+
+        if (tab.accessibility_highlight) |highlight_node| {
+            if (highlight_node.dom_node) |dom| {
+                for (self.layout_engine.focus_bounds.items) |entry| {
+                    if (entry.node == dom) {
+                        self.appendOutline(&focus_items, highlight_color, entry.bounds) catch |err| {
+                            std.log.warn("Failed to append highlight outline: {}", .{err});
+                        };
+                    }
+                }
+            }
+        }
+
+        if (focus_items.items.len > 0 and tab.display_list != null) {
+            var combined = std.ArrayList(DisplayItem).empty;
+            try combined.appendSlice(self.allocator, tab.display_list.?);
+            try combined.appendSlice(self.allocator, focus_items.items);
+            DisplayItem.freeList(self.allocator, tab.display_list.?);
+            tab.display_list = try combined.toOwnedSlice(self.allocator);
+        }
+
         // Debug: print display list tree once when opacity effects are present
         if (tab.display_list) |list| {
             const S = struct {
@@ -1900,6 +2031,10 @@ pub const Browser = struct {
 
         // Update content height from the layout engine
         tab.content_height = self.layout_engine.content_height;
+
+        tab.buildAccessibilityTree(self) catch |err| {
+            std.log.warn("Failed to build accessibility tree: {}", .{err});
+        };
     }
 
     /// Build composited layers from the display list
@@ -1922,6 +2057,26 @@ pub const Browser = struct {
         std.log.debug("Compositing complete: {} layers created", .{self.composited_layers.items.len});
 
         return true;
+    }
+
+    fn appendOutline(self: *Browser, items: *std.ArrayList(DisplayItem), color: Color, bounds: Layout.Bounds) !void {
+        const padding: i32 = 2;
+        const left = bounds.x - padding;
+        const top = bounds.y - padding;
+        const right = bounds.x + bounds.width + padding;
+        const bottom = bounds.y + bounds.height + padding;
+        try items.append(self.allocator, .{
+            .outline = .{
+                .rect = .{
+                    .left = left,
+                    .top = top,
+                    .right = right,
+                    .bottom = bottom,
+                },
+                .color = color,
+                .thickness = 2,
+            },
+        });
     }
 
     /// Recursively process a display item for compositing

@@ -135,6 +135,16 @@ const LinkBoundEntry = struct {
     bounds: Bounds,
 };
 
+const FocusBoundEntry = struct {
+    node: *Node,
+    bounds: Bounds,
+};
+
+const AccessibilityBoundEntry = struct {
+    node: *Node,
+    bounds: Bounds,
+};
+
 pub const Layout = @This();
 
 // Layout state
@@ -173,6 +183,10 @@ word_cache: std.AutoHashMap(u64, WordCache),
 input_bounds: std.AutoHashMap(*Node, Bounds),
 // Collected bounds for anchor elements
 link_bounds: std.ArrayList(LinkBoundEntry),
+// Per-line bounds for focusable elements
+focus_bounds: std.ArrayList(FocusBoundEntry),
+// Per-line bounds for accessible elements
+accessibility_bounds: std.ArrayList(AccessibilityBoundEntry),
 
 // Cumulative transform offset for hit testing (tracks nested transforms)
 transform_offset_x: i32 = 0,
@@ -355,6 +369,8 @@ pub fn init(
         .word_cache = std.AutoHashMap(u64, WordCache).init(allocator),
         .input_bounds = std.AutoHashMap(*Node, Bounds).init(allocator),
         .link_bounds = std.ArrayList(LinkBoundEntry).empty,
+        .focus_bounds = std.ArrayList(FocusBoundEntry).empty,
+        .accessibility_bounds = std.ArrayList(AccessibilityBoundEntry).empty,
     };
 
     layout.current_display_target = &layout.display_list;
@@ -379,6 +395,8 @@ pub fn deinit(self: *Layout) void {
 
     self.input_bounds.deinit();
     self.link_bounds.deinit(self.allocator);
+    self.focus_bounds.deinit(self.allocator);
+    self.accessibility_bounds.deinit(self.allocator);
 
     self.display_list.deinit(self.allocator);
     self.style_stack.deinit(self.allocator);
@@ -459,6 +477,20 @@ fn handleInputElement(self: *Layout, node: Node, node_ptr: ?*Node, line_buffer: 
             .y = self.cursor_y + self.transform_offset_y,
             .width = widget_width,
             .height = widget_height,
+        });
+        const bounds = Bounds{
+            .x = self.cursor_x + self.transform_offset_x,
+            .y = self.cursor_y + self.transform_offset_y,
+            .width = widget_width,
+            .height = widget_height,
+        };
+        try self.focus_bounds.append(self.allocator, .{
+            .node = ptr,
+            .bounds = bounds,
+        });
+        try self.accessibility_bounds.append(self.allocator, .{
+            .node = ptr,
+            .bounds = bounds,
         });
     }
 
@@ -682,6 +714,11 @@ fn flushLine(self: *Layout, line_buffer: *std.ArrayList(LineItem)) !void {
     const extra_leading: i32 = @intFromFloat(@as(f32, @floatFromInt(line_height)) * 0.25);
     const baseline = self.cursor_y + max_ascent;
 
+    var focus_map = std.AutoHashMap(*Node, Bounds).init(self.allocator);
+    defer focus_map.deinit();
+    var accessibility_map = std.AutoHashMap(*Node, Bounds).init(self.allocator);
+    defer accessibility_map.deinit();
+
     // === PASS 2: Position glyphs ===
     for (line_buffer.items) |item| {
         var final_y: i32 = undefined;
@@ -696,6 +733,48 @@ fn flushLine(self: *Layout, line_buffer: *std.ArrayList(LineItem)) !void {
 
         if (item.node_ptr) |ptr| {
             try self.recordLinkBounds(ptr, item.x, final_y, item.width, item.height);
+            if (findFocusableNode(ptr)) |focus_node| {
+                const right = item.x + item.width;
+                const bottom = final_y + item.height;
+                if (focus_map.getPtr(focus_node)) |existing| {
+                    const existing_right = existing.x + existing.width;
+                    const existing_bottom = existing.y + existing.height;
+                    if (item.x < existing.x) existing.x = item.x;
+                    if (final_y < existing.y) existing.y = final_y;
+                    const new_right = if (right > existing_right) right else existing_right;
+                    const new_bottom = if (bottom > existing_bottom) bottom else existing_bottom;
+                    existing.width = new_right - existing.x;
+                    existing.height = new_bottom - existing.y;
+                } else {
+                    try focus_map.put(focus_node, .{
+                        .x = item.x,
+                        .y = final_y,
+                        .width = item.width,
+                        .height = item.height,
+                    });
+                }
+            }
+            if (findAccessibleNode(ptr)) |accessible_node| {
+                const right = item.x + item.width;
+                const bottom = final_y + item.height;
+                if (accessibility_map.getPtr(accessible_node)) |existing| {
+                    const existing_right = existing.x + existing.width;
+                    const existing_bottom = existing.y + existing.height;
+                    if (item.x < existing.x) existing.x = item.x;
+                    if (final_y < existing.y) existing.y = final_y;
+                    const new_right = if (right > existing_right) right else existing_right;
+                    const new_bottom = if (bottom > existing_bottom) bottom else existing_bottom;
+                    existing.width = new_right - existing.x;
+                    existing.height = new_bottom - existing.y;
+                } else {
+                    try accessibility_map.put(accessible_node, .{
+                        .x = item.x,
+                        .y = final_y,
+                        .width = item.width,
+                        .height = item.height,
+                    });
+                }
+            }
         }
 
         try self.current_display_target.append(self.allocator, DisplayItem{
@@ -705,6 +784,22 @@ fn flushLine(self: *Layout, line_buffer: *std.ArrayList(LineItem)) !void {
                 .glyph = item.glyph,
                 .color = item.color, // Use the color captured when item was added to line buffer
             },
+        });
+    }
+
+    var focus_it = focus_map.iterator();
+    while (focus_it.next()) |entry| {
+        try self.focus_bounds.append(self.allocator, .{
+            .node = entry.key_ptr.*,
+            .bounds = entry.value_ptr.*,
+        });
+    }
+
+    var accessibility_it = accessibility_map.iterator();
+    while (accessibility_it.next()) |entry| {
+        try self.accessibility_bounds.append(self.allocator, .{
+            .node = entry.key_ptr.*,
+            .bounds = entry.value_ptr.*,
         });
     }
 
@@ -885,6 +980,82 @@ fn recordLinkBounds(self: *Layout, node_ptr: *Node, x: i32, y: i32, width: i32, 
             },
         }
     }
+}
+
+fn isTabIndexFocusable(element: *const parser.Element) bool {
+    if (element.attributes) |attrs| {
+        if (attrs.get("tabindex")) |raw| {
+            const trimmed = std.mem.trim(u8, raw, " \t\r\n");
+            if (trimmed.len == 0) return true;
+            const idx = std.fmt.parseInt(i32, trimmed, 10) catch return true;
+            return idx >= 0;
+        }
+    }
+    return false;
+}
+
+fn isElementFocusable(element: *const parser.Element) bool {
+    if (std.mem.eql(u8, element.tag, "input") or std.mem.eql(u8, element.tag, "button")) {
+        return true;
+    }
+    if (std.mem.eql(u8, element.tag, "a")) {
+        if (element.attributes) |attrs| {
+            return attrs.get("href") != null or isTabIndexFocusable(element);
+        }
+    }
+    return isTabIndexFocusable(element);
+}
+
+fn findFocusableNode(node_ptr: *Node) ?*Node {
+    var current: ?*Node = node_ptr;
+    while (current) |ptr| {
+        switch (ptr.*) {
+            .element => |*el| {
+                if (isElementFocusable(el)) return ptr;
+                current = el.parent;
+            },
+            .text => |*txt| {
+                current = txt.parent;
+            },
+        }
+    }
+    return null;
+}
+
+fn isPresentationalTag(tag: []const u8) bool {
+    return std.mem.eql(u8, tag, "script") or
+        std.mem.eql(u8, tag, "style") or
+        std.mem.eql(u8, tag, "head") or
+        std.mem.eql(u8, tag, "meta") or
+        std.mem.eql(u8, tag, "link") or
+        std.mem.eql(u8, tag, "title") or
+        std.mem.eql(u8, tag, "br");
+}
+
+fn isElementAccessible(element: *const parser.Element) bool {
+    if (isPresentationalTag(element.tag)) return false;
+    if (element.attributes) |attrs| {
+        if (attrs.get("aria-hidden")) |value| {
+            if (std.mem.eql(u8, std.mem.trim(u8, value, " \t\r\n"), "true")) return false;
+        }
+    }
+    return true;
+}
+
+fn findAccessibleNode(node_ptr: *Node) ?*Node {
+    var current: ?*Node = node_ptr;
+    while (current) |ptr| {
+        switch (ptr.*) {
+            .element => |*el| {
+                if (isElementAccessible(el)) return ptr;
+                current = el.parent;
+            },
+            .text => |*txt| {
+                current = txt.parent;
+            },
+        }
+    }
+    return null;
 }
 
 // Update handlePreformattedText to use the common processGrapheme function
@@ -1578,6 +1749,8 @@ pub const DocumentLayout = struct {
 
         engine.input_bounds.clearRetainingCapacity();
         engine.link_bounds.clearRetainingCapacity();
+        engine.focus_bounds.clearRetainingCapacity();
+        engine.accessibility_bounds.clearRetainingCapacity();
 
         for (self.children.items) |child| {
             child.deinit();
