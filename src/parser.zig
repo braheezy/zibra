@@ -943,6 +943,7 @@ const INHERITED_PROPERTIES = [_]InheritedProperty{
     .{ .name = "font-style", .default_value = "normal" },
     .{ .name = "font-weight", .default_value = "normal" },
     .{ .name = "color", .default_value = "black" },
+    .{ .name = "color-scheme", .default_value = "light dark" },
 };
 
 // Helper to get a default parent style map with inherited defaults
@@ -1000,7 +1001,7 @@ fn styleWithParent(allocator: std.mem.Allocator, node: *Node, rules: []const CSS
                 if (attrs.get("style")) |style_attr| {
                     // The style_attr string is owned by the element's attributes map,
                     // so it will live as long as the element. We can parse it directly.
-                    var css_parser = try CSSParser.init(allocator, style_attr);
+                    var css_parser = try CSSParser.init(allocator, style_attr, false);
                     defer css_parser.deinit(allocator);
 
                     var parsed_styles = try css_parser.body(allocator);

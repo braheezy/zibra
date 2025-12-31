@@ -6,27 +6,32 @@ pub const MeasureTime = struct {
         name: []u8,
     };
 
-    file: std.fs.File,
+    file: ?std.fs.File,
     allocator: std.mem.Allocator,
     needs_comma: bool,
     lock: std.Thread.Mutex = .{},
     thread_infos: std.ArrayList(ThreadInfo),
+    enabled: bool,
 
     pub fn init(allocator: std.mem.Allocator) !MeasureTime {
-        const cwd = std.fs.cwd();
-        const file = try cwd.createFile(
-            "browser.trace",
-            .{
-                .truncate = true,
-                .mode = 0o644,
-            },
-        );
-        try file.writeAll("{\"traceEvents\": [");
-        const ts = @divFloor(std.time.nanoTimestamp(), 1000);
-        const metadata = try std.fmt.allocPrint(allocator, "{{ \"name\": \"process_name\", \"ph\": \"M\", \"ts\": {d}, \"pid\": 1, \"cat\": \"__metadata\", \"args\": {{\"name\": \"Browser\"}}}}", .{ts});
-        defer allocator.free(metadata);
-        try file.writeAll(metadata);
-        try file.sync();
+        const enabled = isTracingEnabled(allocator);
+        var file: ?std.fs.File = null;
+        if (enabled) {
+            const cwd = std.fs.cwd();
+            const trace_file = try cwd.createFile(
+                "browser.trace",
+                .{
+                    .truncate = true,
+                    .mode = 0o644,
+                },
+            );
+            try trace_file.writeAll("{\"traceEvents\": [");
+            const ts = @divFloor(std.time.nanoTimestamp(), 1000);
+            const metadata = try std.fmt.allocPrint(allocator, "{{ \"name\": \"process_name\", \"ph\": \"M\", \"ts\": {d}, \"pid\": 1, \"cat\": \"__metadata\", \"args\": {{\"name\": \"Browser\"}}}}", .{ts});
+            defer allocator.free(metadata);
+            try trace_file.writeAll(metadata);
+            file = trace_file;
+        }
 
         const thread_infos = std.ArrayList(ThreadInfo).empty;
         return MeasureTime{
@@ -35,14 +40,17 @@ pub const MeasureTime = struct {
             .needs_comma = true,
             .lock = .{},
             .thread_infos = thread_infos,
+            .enabled = enabled,
         };
     }
 
     pub fn time(self: *MeasureTime, name: []const u8) !void {
+        if (!self.enabled) return;
         try self.writeEvent("B", name);
     }
 
     pub fn stop(self: *MeasureTime, name: []const u8) !void {
+        if (!self.enabled) return;
         try self.writeEvent("E", name);
     }
 
@@ -60,6 +68,7 @@ pub const MeasureTime = struct {
     }
 
     pub fn registerThread(self: *MeasureTime, name: []const u8) !void {
+        if (!self.enabled) return;
         const tid = std.Thread.getCurrentId();
         self.lock.lock();
         defer self.lock.unlock();
@@ -76,23 +85,26 @@ pub const MeasureTime = struct {
     }
 
     fn writeEvent(self: *MeasureTime, ph: []const u8, name: []const u8) !void {
+        if (!self.enabled) return;
+        const file = self.file orelse return;
         self.lock.lock();
         defer self.lock.unlock();
 
         if (self.needs_comma) {
-            try self.file.writeAll(", ");
+            try file.writeAll(", ");
         }
         const ts = @divFloor(std.time.nanoTimestamp(), 1000);
         const tid = std.Thread.getCurrentId();
         const tid_num = @as(usize, tid);
         const event = try std.fmt.allocPrint(self.allocator, "{{ \"ph\": \"{s}\", \"cat\": \"_\", \"name\": \"{s}\", \"ts\": {d}, \"pid\": 1, \"tid\": {d} }}", .{ ph, name, ts, tid_num });
         defer self.allocator.free(event);
-        try self.file.writeAll(event);
+        try file.writeAll(event);
         self.needs_comma = true;
-        try self.file.sync();
     }
 
     pub fn finish(self: *MeasureTime) void {
+        if (!self.enabled) return;
+        const file = self.file orelse return;
         self.lock.lock();
         defer self.lock.unlock();
 
@@ -139,11 +151,11 @@ pub const MeasureTime = struct {
             std.mem.copyForwards(u8, metadata[write_index .. write_index + metadata_suffix.len], metadata_suffix);
 
             if (self.needs_comma) {
-                _ = self.file.writeAll(", ") catch |err| {
+                _ = file.writeAll(", ") catch |err| {
                     std.log.warn("Failed to write trace comma: {}", .{err});
                 };
             }
-            _ = self.file.writeAll(metadata) catch |err| {
+            _ = file.writeAll(metadata) catch |err| {
                 std.log.warn("Failed to write thread metadata: {}", .{err});
             };
             self.needs_comma = true;
@@ -151,12 +163,19 @@ pub const MeasureTime = struct {
         }
         self.thread_infos.deinit(self.allocator);
 
-        _ = self.file.writeAll("]}") catch |err| {
+        _ = file.writeAll("]}") catch |err| {
             std.log.warn("Failed to finish trace file: {}", .{err});
         };
-        _ = self.file.sync() catch |err| {
+        _ = file.sync() catch |err| {
             std.log.warn("Failed to sync trace file: {}", .{err});
         };
-        self.file.close();
+        file.close();
+    }
+
+    fn isTracingEnabled(allocator: std.mem.Allocator) bool {
+        const env = std.process.getEnvVarOwned(allocator, "ZIBRA_TRACE") catch return false;
+        defer allocator.free(env);
+        if (env.len == 0) return false;
+        return !std.mem.eql(u8, env, "0");
     }
 };

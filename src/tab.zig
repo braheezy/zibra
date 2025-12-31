@@ -11,6 +11,7 @@ const Url = url_module.Url;
 const Browser = browser_mod.Browser;
 const JsRenderContext = browser_mod.JsRenderContext;
 const DisplayItem = browser_mod.DisplayItem;
+const AccessibilitySettings = browser_mod.AccessibilitySettings;
 const TaskRunner = task.TaskRunner;
 const Node = parser.Node;
 
@@ -25,6 +26,7 @@ pub const Tab = @This();
 // Memory allocator
 allocator: std.mem.Allocator,
 browser: *Browser,
+accessibility: AccessibilitySettings = .{},
 // List of items to be displayed
 display_list: ?[]DisplayItem = null,
 // Current HTML node tree
@@ -76,6 +78,7 @@ pub fn init(allocator: std.mem.Allocator, tab_height: i32, measure: *MeasureTime
     return Tab{
         .allocator = allocator,
         .browser = undefined,
+        .accessibility = .{ .dark_palette = .{} },
         .tab_height = tab_height,
         .history = std.ArrayList(*Url).empty,
         .focus = null,
@@ -89,6 +92,30 @@ pub fn init(allocator: std.mem.Allocator, tab_height: i32, measure: *MeasureTime
         .task_runner = TaskRunner.init(allocator, measure),
         .composited_updates = std.ArrayList(CompositedUpdate).empty,
     };
+}
+
+pub fn logAccessibilitySettings(self: *const Tab, reason: []const u8) void {
+    std.log.info(
+        "Accessibility settings ({s}): zoom={d:.2} prefers_dark={} reduce_motion={} screen_reader={}",
+        .{
+            reason,
+            self.accessibility.zoom,
+            self.accessibility.prefers_dark,
+            self.accessibility.reduce_motion,
+            self.accessibility.screen_reader,
+        },
+    );
+}
+
+pub fn setZoom(self: *Tab, zoom: f32) void {
+    const clamped = std.math.clamp(zoom, 0.5, 3.0);
+    if (self.accessibility.zoom == clamped) return;
+    self.accessibility.zoom = clamped;
+    self.setNeedsRender();
+}
+
+pub fn adjustZoom(self: *Tab, delta: f32) void {
+    self.setZoom(self.accessibility.zoom + delta);
 }
 
 /// Start the task runner thread. Must be called after the Tab is in its final memory location.
@@ -132,12 +159,10 @@ pub fn deinit(self: *Tab) void {
         self.allocator.free(source);
     }
 
-    // Clean up CSS rules
-    // First N rules (default_rules_count) are borrowed from Browser - don't free their properties
-    // Remaining rules are from external stylesheets - need to free their property hashmaps
-    if (self.rules.items.len > self.default_rules_count) {
-        for (self.rules.items[self.default_rules_count..]) |*rule| {
-            rule.properties.deinit();
+    // Clean up CSS rules (only owned rules should be deinitialized here)
+    for (self.rules.items) |*rule| {
+        if (rule.owned) {
+            rule.deinit(self.allocator);
         }
     }
     self.rules.deinit(self.allocator);
@@ -340,8 +365,42 @@ pub fn setNeedsPaint(self: *Tab) void {
     self.browser.scheduleAnimationFrame();
 }
 
+fn refreshFocusState(self: *Tab) !void {
+    if (self.focus == null or self.current_node == null) return;
+
+    var node_list = std.ArrayList(*Node).empty;
+    defer node_list.deinit(self.allocator);
+
+    var root_mut = self.current_node.?;
+    try parser.treeToList(self.allocator, &root_mut, &node_list);
+
+    var found = false;
+    for (node_list.items) |node_ptr| {
+        if (node_ptr == self.focus.?) {
+            found = true;
+            switch (node_ptr.*) {
+                .element => |*e| e.is_focused = true,
+                else => {},
+            }
+            break;
+        }
+    }
+
+    if (!found) {
+        if (self.focus) |focus_node| {
+            switch (focus_node.*) {
+                .element => |*e| e.is_focused = false,
+                else => {},
+            }
+        }
+        self.focus = null;
+    }
+}
+
 fn clampScroll(self: *Tab, scroll: i32) i32 {
-    const height_delta = self.content_height - self.tab_height;
+    const zoom = if (self.accessibility.zoom > 0) self.accessibility.zoom else 1.0;
+    const visible_height = if (zoom == 1.0) self.tab_height else @as(i32, @intFromFloat(@as(f32, @floatFromInt(self.tab_height)) / zoom));
+    const height_delta = self.content_height - visible_height;
     const maxscroll = if (height_delta > 0) height_delta else 0;
     if (scroll < 0) return 0;
     if (scroll > maxscroll) return maxscroll;
@@ -353,6 +412,11 @@ pub fn render(self: *Tab, b: *Browser) !void {
     // Check if any render phase is needed
     if (!self.needs_style and !self.needs_layout and !self.needs_paint) return;
 
+    const profiling = b.profiling_enabled;
+    const render_start = if (profiling) std.time.nanoTimestamp() else 0;
+    var style_ns: u64 = 0;
+    var layout_ns: u64 = 0;
+
     const trace_render = b.measure.begin("render");
     defer if (trace_render) b.measure.end("render");
 
@@ -363,11 +427,18 @@ pub fn render(self: *Tab, b: *Browser) !void {
         return;
     }
 
+    b.layout_engine.accessibility = self.accessibility;
+    try self.refreshFocusState();
+
     // Style phase
     if (self.needs_style) {
         self.needs_style = false;
         errdefer self.needs_style = true;
+        const style_start = if (profiling) std.time.nanoTimestamp() else 0;
         try parser.style(b.allocator, &self.current_node.?, self.rules.items);
+        if (profiling) {
+            style_ns = @as(u64, @intCast(std.time.nanoTimestamp() - style_start));
+        }
     }
 
     // Layout phase (also does paint since they're combined in layoutTabNodes)
@@ -378,7 +449,11 @@ pub fn render(self: *Tab, b: *Browser) !void {
             self.needs_layout = true;
             self.needs_paint = true;
         }
+        const layout_start = if (profiling) std.time.nanoTimestamp() else 0;
         try b.layoutTabNodes(self);
+        if (profiling) {
+            layout_ns = @as(u64, @intCast(std.time.nanoTimestamp() - layout_start));
+        }
         const clamped_scroll = self.clampScroll(self.scroll);
         if (clamped_scroll != self.scroll) {
             self.scroll_changed_in_tab = true;
@@ -387,6 +462,18 @@ pub fn render(self: *Tab, b: *Browser) !void {
     }
 
     b.setNeedsCompositeRasterDraw();
+
+    if (profiling) {
+        const total_ns = @as(u64, @intCast(std.time.nanoTimestamp() - render_start));
+        std.log.info(
+            "profile: render total={}ms style={}ms layout={}ms",
+            .{
+                @divTrunc(total_ns, 1_000_000),
+                @divTrunc(style_ns, 1_000_000),
+                @divTrunc(layout_ns, 1_000_000),
+            },
+        );
+    }
 }
 
 pub fn runAnimationFrame(self: *Tab, scroll: i32) void {
@@ -435,6 +522,8 @@ pub fn runAnimationFrame(self: *Tab, scroll: i32) void {
             .display_list = self.display_list,
             .scroll = commit_scroll,
             .height = self.content_height,
+            .zoom = self.accessibility.zoom,
+            .prefers_dark = self.accessibility.prefers_dark,
             .composited_updates = self.composited_updates.items,
         };
         self.display_list = null;
@@ -485,7 +574,9 @@ fn advanceAnimations(self: *Tab, node: *parser.Node) bool {
 // Handle click on tab content
 pub fn click(self: *Tab, b: *Browser, x: i32, y: i32) !void {
     std.log.info("Tab.click at ({}, {})", .{ x, y });
-    try self.render(b);
+    if (b.layout_engine.input_bounds.count() == 0) {
+        try self.render(b);
+    }
 
     // Clear previous focus
     if (self.focus) |focus_node| {
@@ -555,6 +646,20 @@ pub fn click(self: *Tab, b: *Browser, x: i32, y: i32) !void {
 
     if (!handled) {
         std.log.info("No element clicked, re-rendering", .{});
+        var bounds_it = b.layout_engine.input_bounds.iterator();
+        while (bounds_it.next()) |entry| {
+            const node_ptr = entry.key_ptr.*;
+            const bounds = entry.value_ptr.*;
+            switch (node_ptr.*) {
+                .element => |e| {
+                    std.log.info(
+                        "Input bounds {s}: x={} y={} w={} h={} click=({}, {})",
+                        .{ e.tag, bounds.x, bounds.y, bounds.width, bounds.height, x, y },
+                    );
+                },
+                else => {},
+            }
+        }
     }
 }
 
@@ -725,9 +830,31 @@ fn submitFormData(self: *Tab, b: *Browser, form_node: *Node, action: []const u8)
 }
 
 // Cycle focus to the next input element (for Tab key)
-pub fn cycleFocus(self: *Tab, b: *Browser) !void {
-    _ = b;
-    // Find all input elements
+fn isTabIndexFocusable(element: *const parser.Element) bool {
+    if (element.attributes) |attrs| {
+        if (attrs.get("tabindex")) |raw| {
+            const trimmed = std.mem.trim(u8, raw, " \t\r\n");
+            if (trimmed.len == 0) return true;
+            const idx = std.fmt.parseInt(i32, trimmed, 10) catch return true;
+            return idx >= 0;
+        }
+    }
+    return false;
+}
+
+fn isElementFocusable(element: *const parser.Element) bool {
+    if (std.mem.eql(u8, element.tag, "input") or std.mem.eql(u8, element.tag, "button")) {
+        return true;
+    }
+    if (std.mem.eql(u8, element.tag, "a")) {
+        if (element.attributes) |attrs| {
+            return attrs.get("href") != null or isTabIndexFocusable(element);
+        }
+    }
+    return isTabIndexFocusable(element);
+}
+
+fn collectFocusableElements(self: *Tab, out: *std.ArrayList(*Node)) !void {
     const root_node = self.current_node orelse return;
 
     var node_list = std.ArrayList(*Node).empty;
@@ -736,22 +863,23 @@ pub fn cycleFocus(self: *Tab, b: *Browser) !void {
     var root_mut = root_node;
     try parser.treeToList(self.allocator, &root_mut, &node_list);
 
-    // Collect all input elements
-    var input_elements = std.ArrayList(*Node).empty;
-    defer input_elements.deinit(self.allocator);
-
     for (node_list.items) |node_ptr| {
         switch (node_ptr.*) {
             .element => |e| {
-                if (std.mem.eql(u8, e.tag, "input")) {
-                    try input_elements.append(self.allocator, node_ptr);
+                if (isElementFocusable(&e)) {
+                    try out.append(self.allocator, node_ptr);
                 }
             },
             else => {},
         }
     }
+}
 
-    if (input_elements.items.len == 0) return;
+pub fn cycleFocus(self: *Tab, b: *Browser, reverse: bool) !void {
+    var focusables = std.ArrayList(*Node).empty;
+    defer focusables.deinit(self.allocator);
+    try self.collectFocusableElements(&focusables);
+    if (focusables.items.len == 0) return;
 
     // Clear current focus
     if (self.focus) |focus_node| {
@@ -761,26 +889,99 @@ pub fn cycleFocus(self: *Tab, b: *Browser) !void {
         }
     }
 
-    // Find next input to focus
-    var next_index: usize = 0;
+    var found_index: ?usize = null;
     if (self.focus) |current_focus| {
-        for (input_elements.items, 0..) |elem, i| {
+        for (focusables.items, 0..) |elem, i| {
             if (elem == current_focus) {
-                next_index = (i + 1) % input_elements.items.len;
+                found_index = i;
                 break;
             }
         }
     }
 
-    // Focus the next input element
-    const to_focus = input_elements.items[next_index];
+    const next_index = if (found_index) |i| blk: {
+        if (reverse) {
+            break :blk if (i == 0) focusables.items.len - 1 else i - 1;
+        }
+        break :blk (i + 1) % focusables.items.len;
+    } else if (reverse) focusables.items.len - 1 else 0;
+
+    const to_focus = focusables.items[next_index];
     switch (to_focus.*) {
         .element => |*e| e.is_focused = true,
         else => {},
     }
     self.focus = to_focus;
+    b.lock.lock();
+    b.focus = "content";
+    b.lock.unlock();
 
     self.setNeedsRender();
+}
+
+pub fn activateFocusedElement(self: *Tab, b: *Browser) !void {
+    if (self.focus == null) return;
+    const node_ptr = self.focus.?;
+
+    switch (node_ptr.*) {
+        .element => |*e| {
+            if (std.mem.eql(u8, e.tag, "input")) {
+                if (e.attributes) |attrs| {
+                    if (attrs.get("type")) |raw_type| {
+                        if (std.mem.eql(u8, raw_type, "submit") or std.mem.eql(u8, raw_type, "button")) {
+                            const prevent_default = b.js_engine.dispatchEvent("click", node_ptr) catch |err| blk: {
+                                std.log.warn("Failed to dispatch click event: {}", .{err});
+                                break :blk false;
+                            };
+                            if (prevent_default) return;
+                            try self.submitForm(b, node_ptr);
+                        }
+                    }
+                }
+                return;
+            }
+
+            if (std.mem.eql(u8, e.tag, "button")) {
+                const prevent_default = b.js_engine.dispatchEvent("click", node_ptr) catch |err| blk: {
+                    std.log.warn("Failed to dispatch click event: {}", .{err});
+                    break :blk false;
+                };
+                if (prevent_default) return;
+                try self.submitForm(b, node_ptr);
+                return;
+            }
+
+            if (std.mem.eql(u8, e.tag, "a")) {
+                const prevent_default = b.js_engine.dispatchEvent("click", node_ptr) catch |err| blk: {
+                    std.log.warn("Failed to dispatch click event: {}", .{err});
+                    break :blk false;
+                };
+                if (prevent_default) return;
+                if (e.attributes) |attrs| {
+                    if (attrs.get("href")) |href| {
+                        if (self.current_url) |current_url_ptr| {
+                            const resolved_url = try current_url_ptr.*.resolve(self.allocator, href);
+                            const url_ptr = try self.allocator.create(Url);
+                            url_ptr.* = resolved_url;
+                            b.scheduleLoad(self, url_ptr, null) catch |err| {
+                                std.log.err("Failed to schedule load for {s}: {any}", .{ href, err });
+                                url_ptr.*.free(self.allocator);
+                                self.allocator.destroy(url_ptr);
+                            };
+                            return;
+                        }
+                    }
+                }
+            }
+
+            const prevent_default = b.js_engine.dispatchEvent("click", node_ptr) catch |err| blk: {
+                std.log.warn("Failed to dispatch click event: {}", .{err});
+                break :blk false;
+            };
+            _ = prevent_default;
+        },
+        else => {},
+    }
 }
 
 // Clear focus (for Escape key)

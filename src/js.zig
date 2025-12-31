@@ -894,7 +894,7 @@ fn querySelectorAll(agent: *Agent, this_value: Value, arguments: kiesel.types.Ar
     const selector_str = try selector_arg.asString().toUtf8(js_instance.allocator);
     defer js_instance.allocator.free(selector_str);
 
-    var css_parser = CSSParser.init(js_instance.allocator, selector_str) catch {
+    var css_parser = CSSParser.init(js_instance.allocator, selector_str, false) catch {
         return agent.throwException(.syntax_error, "Invalid selector", .{});
     };
     defer css_parser.deinit(js_instance.allocator);

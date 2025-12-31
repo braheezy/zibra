@@ -45,6 +45,14 @@ const scroll_step: i32 = 100;
 const refresh_rate_ns: u64 = 33_000_000; // ~30 FPS
 // *********************************************************
 
+pub const AccessibilitySettings = struct {
+    zoom: f32 = 1.0,
+    prefers_dark: bool = false,
+    screen_reader: bool = false,
+    reduce_motion: bool = false,
+    dark_palette: ?DarkPalette = null,
+};
+
 // Display items are the drawing commands emitted by layout.
 pub const Color = struct {
     r: u8,
@@ -55,6 +63,13 @@ pub const Color = struct {
     pub fn toZ2dRgba(self: Color) z2d.pixel.RGBA {
         return .{ .r = self.r, .g = self.g, .b = self.b, .a = self.a };
     }
+};
+
+pub const DarkPalette = struct {
+    background: Color = .{ .r = 18, .g = 18, .b = 18, .a = 255 },
+    text: Color = .{ .r = 230, .g = 230, .b = 230, .a = 255 },
+    control_background: Color = .{ .r = 35, .g = 35, .b = 35, .a = 255 },
+    control_text: Color = .{ .r = 230, .g = 230, .b = 230, .a = 255 },
 };
 
 // Rectangle helper for layout bounds
@@ -226,8 +241,9 @@ pub const CompositedLayer = struct {
 
         // Draw display items offset by layer bounds (absolute to local mapping)
         // Items are stored in absolute coordinates, so we offset by bounds origin to draw in layer space
+        const zoom = if (browser.active_tab_zoom > 0) browser.active_tab_zoom else 1.0;
         for (self.display_items) |item| {
-            try browser.drawDisplayItemZ2dContextForLayer(&ctx, item, self.bounds.left, self.bounds.top);
+            try browser.drawDisplayItemZ2dContextForLayer(&ctx, item, self.bounds.left, self.bounds.top, zoom);
         }
 
         self.needs_raster = false;
@@ -513,6 +529,8 @@ pub const Browser = struct {
     active_tab_url: ?[]u8 = null,
     active_tab_scroll: i32 = 0,
     active_tab_height: i32 = 0,
+    active_tab_zoom: f32 = 1.0,
+    active_tab_prefers_dark: bool = false,
     active_tab_display_list: ?[]DisplayItem = null,
     // Composited layers for caching rasterized content
     composited_layers: std.ArrayList(CompositedLayer),
@@ -522,6 +540,7 @@ pub const Browser = struct {
     cached_texture: ?sdl2.Texture = null,
     // Debug flag to visualize composited layer boundaries
     debug_layer_borders: bool = false,
+    profiling_enabled: bool = false,
 
     // Create a new Browser instance
     pub fn init(al: std.mem.Allocator, rtl_flag: bool) !Browser {
@@ -547,6 +566,9 @@ pub const Browser = struct {
             .{ .accelerated = true },
         );
 
+        // Enable SDL text input so TextInput events fire for typing.
+        sdl2.startTextInput();
+
         // Log the SDL renderer backend to confirm hardware acceleration
         const renderer_info = try renderer.getInfo();
         const renderer_name = std.mem.span(renderer_info.name);
@@ -564,9 +586,12 @@ pub const Browser = struct {
         try cached_texture.setBlendMode(.blend);
 
         // Parse the default browser stylesheet
-        var css_parser = try CSSParser.init(al, DEFAULT_STYLE_SHEET);
+        var css_parser = try CSSParser.init(al, DEFAULT_STYLE_SHEET, false);
         defer css_parser.deinit(al);
         const default_rules = try css_parser.parse(al);
+        for (default_rules) |*rule| {
+            rule.owned = false;
+        }
 
         const layout_engine = try Layout.init(
             al,
@@ -589,6 +614,7 @@ pub const Browser = struct {
         errdefer js_engine.deinit(al);
 
         const measure = try MeasureTime.init(al);
+        const profiling_enabled = isProfilingEnabled(al);
 
         var browser = Browser{
             .allocator = al,
@@ -610,6 +636,7 @@ pub const Browser = struct {
             .cached_texture = cached_texture,
             .composited_layers = std.ArrayList(CompositedLayer).empty,
             .tab_draw_list = std.ArrayList(DisplayItem).empty,
+            .profiling_enabled = profiling_enabled,
         };
 
         // Create chrome surface (fixed height based on chrome.bottom)
@@ -623,6 +650,13 @@ pub const Browser = struct {
         return browser;
     }
 
+    fn isProfilingEnabled(allocator: std.mem.Allocator) bool {
+        const env = std.process.getEnvVarOwned(allocator, "ZIBRA_PROFILE") catch return false;
+        defer allocator.free(env);
+        if (env.len == 0) return false;
+        return !std.mem.eql(u8, env, "0");
+    }
+
     // Get the active tab (if any)
     pub fn activeTab(self: *const Browser) ?*Tab {
         if (self.active_tab_index) |idx| {
@@ -633,8 +667,42 @@ pub const Browser = struct {
         return null;
     }
 
+    fn activeZoom(self: *const Browser) f32 {
+        return if (self.active_tab_zoom > 0) self.active_tab_zoom else 1.0;
+    }
+
+    fn scalePx(self: *const Browser, value: i32) i32 {
+        const zoom = self.activeZoom();
+        if (zoom == 1.0) return value;
+        return @intFromFloat(@as(f32, @floatFromInt(value)) * zoom);
+    }
+
+    fn scalePxF(self: *const Browser, value: f64) f64 {
+        const zoom = self.activeZoom();
+        if (zoom == 1.0) return value;
+        return value * @as(f64, zoom);
+    }
+
+    fn scalePxWithZoom(self: *const Browser, value: i32, zoom: f32) i32 {
+        _ = self;
+        if (zoom == 1.0) return value;
+        return @intFromFloat(@as(f32, @floatFromInt(value)) * zoom);
+    }
+
+    fn scalePxFWithZoom(self: *const Browser, value: f64, zoom: f32) f64 {
+        _ = self;
+        if (zoom == 1.0) return value;
+        return value * @as(f64, zoom);
+    }
+
+    fn visibleTabHeightCss(self: *const Browser) i32 {
+        const zoom = self.activeZoom();
+        if (zoom == 1.0) return self.window_height - self.chrome.bottom;
+        return @intFromFloat(@as(f32, @floatFromInt(self.window_height - self.chrome.bottom)) / zoom);
+    }
+
     fn clampScroll(self: *Browser, scroll: i32) i32 {
-        const visible = self.window_height - self.chrome.bottom;
+        const visible = self.visibleTabHeightCss();
         const max_height = @max(self.active_tab_height, visible);
         const maxscroll = @max(max_height - visible, 0);
         if (scroll < 0) return 0;
@@ -681,6 +749,8 @@ pub const Browser = struct {
         if (found_idx) |idx| {
             self.active_tab_index = idx;
             self.active_tab_scroll = 0;
+            self.active_tab_zoom = tab.accessibility.zoom;
+            self.active_tab_prefers_dark = tab.accessibility.prefers_dark;
             if (self.active_tab_url) |url| {
                 self.allocator.free(url);
             }
@@ -727,6 +797,7 @@ pub const Browser = struct {
         };
         tab.* = Tab.init(self.allocator, tab_height, &self.measure);
         tab.browser = self;
+        tab.logAccessibilitySettings("init");
         // Start the task runner thread now that the Tab is in its final memory location
         try tab.start();
         tab_inited = true;
@@ -789,7 +860,7 @@ pub const Browser = struct {
         switch (event) {
             .quit => return true,
             .key_down => |kb_event| {
-                try self.handleKeyEvent(kb_event.keycode);
+                try self.handleKeyEvent(kb_event.keycode, kb_event.modifiers);
             },
             .text_input => |text_event| {
                 const text = std.mem.sliceTo(&text_event.text, 0);
@@ -799,11 +870,9 @@ pub const Browser = struct {
                         if (try self.chrome.keypress(char)) {
                             chrome_changed = true;
                         }
-                        if (self.focus) |focus_str| {
-                            if (std.mem.eql(u8, focus_str, "content")) {
-                                if (self.activeTab()) |tab| {
-                                    self.scheduleTabKeypressTask(tab, char);
-                                }
+                        if (self.activeTab()) |tab| {
+                            if ((self.focus != null and std.mem.eql(u8, self.focus.?, "content")) or tab.focus != null) {
+                                self.scheduleTabKeypressTask(tab, char);
                             }
                         }
                     }
@@ -886,16 +955,91 @@ pub const Browser = struct {
         }
     }
 
-    fn handleKeyEvent(self: *Browser, key: sdl2.Keycode) !void {
+    fn handleKeyEvent(self: *Browser, key: sdl2.Keycode, modifiers: sdl2.KeyModifierSet) !void {
         switch (key) {
+            .equals => {
+                if (self.activeTab()) |tab| {
+                    tab.adjustZoom(0.1);
+                    tab.logAccessibilitySettings("zoom in");
+                }
+                return;
+            },
+            .minus => {
+                if (self.activeTab()) |tab| {
+                    tab.adjustZoom(-0.1);
+                    tab.logAccessibilitySettings("zoom out");
+                }
+                return;
+            },
+            .@"0" => {
+                if (self.activeTab()) |tab| {
+                    tab.setZoom(1.0);
+                    tab.logAccessibilitySettings("zoom reset");
+                }
+                return;
+            },
+            .f1 => {
+                if (self.activeTab()) |tab| {
+                    tab.accessibility.prefers_dark = !tab.accessibility.prefers_dark;
+                    self.rebuildTabStyleRules(tab) catch |err| {
+                        std.log.warn("Failed to rebuild styles for prefers-color-scheme: {}", .{err});
+                    };
+                    tab.setNeedsRender();
+                    self.active_tab_prefers_dark = tab.accessibility.prefers_dark;
+                    tab.logAccessibilitySettings("toggle prefers_dark");
+                }
+                self.lock.lock();
+                self.needs_animation_frame = true;
+                self.animation_timer_active = false;
+                self.lock.unlock();
+                self.scheduleAnimationFrame();
+                return;
+            },
+            .f2 => {
+                if (self.activeTab()) |tab| {
+                    tab.accessibility.reduce_motion = !tab.accessibility.reduce_motion;
+                    tab.setNeedsRender();
+                    tab.logAccessibilitySettings("toggle reduce_motion");
+                }
+                return;
+            },
+            .f3 => {
+                if (self.activeTab()) |tab| {
+                    tab.accessibility.screen_reader = !tab.accessibility.screen_reader;
+                    tab.setNeedsRender();
+                    tab.logAccessibilitySettings("toggle screen_reader");
+                }
+                return;
+            },
             .tab => {
                 self.lock.lock();
-                const should_cycle = if (self.focus) |focus_str| std.mem.eql(u8, focus_str, "content") else false;
                 const tab = self.activeTab();
+                if (tab != null) {
+                    self.focus = "content";
+                    self.chrome.blur();
+                }
                 self.lock.unlock();
-                if (should_cycle) {
+                if (tab) |active_tab| {
+                    const reverse = modifiers.get(.left_shift) or modifiers.get(.right_shift);
+                    active_tab.cycleFocus(self, reverse) catch |err| {
+                        std.log.warn("Failed to cycle focus: {}", .{err});
+                    };
+                }
+                return;
+            },
+            .@"return", .space => {
+                self.lock.lock();
+                const tab = self.activeTab();
+                const should_activate = if (self.focus) |focus_str|
+                    std.mem.eql(u8, focus_str, "content")
+                else
+                    tab != null and tab.?.focus != null;
+                self.lock.unlock();
+                if (should_activate) {
                     if (tab) |active_tab| {
-                        self.scheduleTabCycleFocusTask(active_tab);
+                        active_tab.activateFocusedElement(self) catch |err| {
+                            std.log.warn("Failed to activate focused element: {}", .{err});
+                        };
                     }
                 }
                 return;
@@ -926,8 +1070,11 @@ pub const Browser = struct {
             .backspace => {
                 const chrome_changed = self.chrome.backspace();
                 self.lock.lock();
-                const should_backspace = if (self.focus) |focus_str| std.mem.eql(u8, focus_str, "content") else false;
                 const tab = self.activeTab();
+                const should_backspace = if (self.focus) |focus_str|
+                    std.mem.eql(u8, focus_str, "content")
+                else
+                    tab != null and tab.?.focus != null;
                 self.lock.unlock();
                 if (should_backspace) {
                     if (tab) |active_tab| {
@@ -983,8 +1130,9 @@ pub const Browser = struct {
         try self.compositeRasterAndDraw();
 
         const tab_y = screen_y - chrome_bottom;
-        const page_x = screen_x;
-        const page_y = tab_y + tab.scroll;
+        const zoom = self.activeZoom();
+        const page_x = if (zoom == 1.0) screen_x else @as(i32, @intFromFloat(@as(f32, @floatFromInt(screen_x)) / zoom));
+        const page_y = (if (zoom == 1.0) tab_y else @as(i32, @intFromFloat(@as(f32, @floatFromInt(tab_y)) / zoom))) + tab.scroll;
 
         std.debug.print("Page coordinates: ({d}, {d})\n", .{ page_x, page_y });
 
@@ -1109,8 +1257,8 @@ pub const Browser = struct {
         };
     }
 
-    fn scheduleTabCycleFocusTask(self: *Browser, tab: *Tab) void {
-        const ctx = TabCycleFocusTaskContext.create(self.allocator, self, tab) catch |err| {
+    fn scheduleTabCycleFocusTask(self: *Browser, tab: *Tab, reverse: bool) void {
+        const ctx = TabCycleFocusTaskContext.create(self.allocator, self, tab, reverse) catch |err| {
             std.log.err("Failed to allocate cycle focus task: {}", .{err});
             return;
         };
@@ -1121,6 +1269,23 @@ pub const Browser = struct {
         );
         tab.task_runner.schedule(task_instance) catch |err| {
             std.log.err("Failed to schedule cycle focus: {}", .{err});
+            ctx.destroy();
+            return;
+        };
+    }
+
+    fn scheduleTabActivateTask(self: *Browser, tab: *Tab) void {
+        const ctx = TabActivateTaskContext.create(self.allocator, self, tab) catch |err| {
+            std.log.err("Failed to allocate activate task: {}", .{err});
+            return;
+        };
+        const task_instance = Task.init(
+            ctx.toOpaque(),
+            TabActivateTaskContext.runOpaque,
+            TabActivateTaskContext.cleanupOpaque,
+        );
+        tab.task_runner.schedule(task_instance) catch |err| {
+            std.log.err("Failed to schedule activate: {}", .{err});
             ctx.destroy();
             return;
         };
@@ -1220,6 +1385,8 @@ pub const Browser = struct {
         if (url.*.view_source) {
             // Use the new layoutSourceCode function for view-source mode
             defer if (!std.mem.eql(u8, url.*.scheme, "about")) self.allocator.free(body);
+
+            self.layout_engine.accessibility = tab.accessibility;
 
             if (tab.display_list) |items| {
                 DisplayItem.freeList(self.allocator, items);
@@ -1354,17 +1521,14 @@ pub const Browser = struct {
             // Track how many default rules we have so we don't double-free them
             const default_rules_count = self.default_style_sheet_rules.len;
 
-            defer {
-                // Only deinit rules that were allocated in this function (external stylesheets)
-                // Skip the first default_rules_count rules as they're owned by the browser
-                if (all_rules.items.len > default_rules_count) {
-                    for (all_rules.items[default_rules_count..]) |*rule| {
-                        var mutable_rule = rule;
-                        mutable_rule.deinit(self.allocator);
+            errdefer {
+                for (all_rules.items) |*rule| {
+                    if (rule.owned) {
+                        rule.deinit(self.allocator);
                     }
                 }
-                all_rules.deinit(self.allocator);
             }
+            defer all_rules.deinit(self.allocator);
 
             // Start with default browser stylesheet rules (shallow copy, browser still owns them)
             for (self.default_style_sheet_rules) |rule| {
@@ -1403,7 +1567,7 @@ pub const Browser = struct {
 
                 // Parse the stylesheet using self.allocator
                 // (CSS rules need to live as long as the Tab)
-                var css_parser = try CSSParser.init(self.allocator, css_text);
+                var css_parser = try CSSParser.init(self.allocator, css_text, tab.accessibility.prefers_dark);
                 defer css_parser.deinit(self.allocator);
 
                 const parsed_rules = css_parser.parse(self.allocator) catch |err| {
@@ -1435,10 +1599,9 @@ pub const Browser = struct {
             }.lessThan);
 
             // Clean up old CSS rules and texts before replacing them
-            // First, free the property hashmaps for external stylesheet rules (not default rules)
-            if (tab.rules.items.len > tab.default_rules_count) {
-                for (tab.rules.items[tab.default_rules_count..]) |*rule| {
-                    rule.properties.deinit();
+            for (tab.rules.items) |*rule| {
+                if (rule.owned) {
+                    rule.deinit(self.allocator);
                 }
             }
 
@@ -1454,7 +1617,7 @@ pub const Browser = struct {
             // Track how many default rules we have (these are borrowed, not owned)
             tab.default_rules_count = default_rules_count;
 
-            // Copy all rules to tab (first N are borrowed, rest are owned)
+            // Copy all rules to tab (ownership is tracked per-rule)
             for (all_rules.items) |rule| {
                 try tab.rules.append(self.allocator, rule);
             }
@@ -1663,11 +1826,50 @@ pub const Browser = struct {
         thread.detach();
     }
 
+    fn rebuildTabStyleRules(self: *Browser, tab: *Tab) !void {
+        const default_rules_count = self.default_style_sheet_rules.len;
+
+        for (tab.rules.items) |*rule| {
+            if (rule.owned) {
+                rule.deinit(self.allocator);
+            }
+        }
+        tab.rules.clearRetainingCapacity();
+        tab.default_rules_count = default_rules_count;
+
+        for (self.default_style_sheet_rules) |rule| {
+            try tab.rules.append(self.allocator, rule);
+        }
+
+        for (tab.css_texts.items) |css_text| {
+            var css_parser = try CSSParser.init(self.allocator, css_text, tab.accessibility.prefers_dark);
+            defer css_parser.deinit(self.allocator);
+
+            const parsed_rules = css_parser.parse(self.allocator) catch |err| {
+                std.log.warn("Failed to parse stylesheet on rebuild: {}", .{err});
+                continue;
+            };
+
+            for (parsed_rules) |rule| {
+                try tab.rules.append(self.allocator, rule);
+            }
+            self.allocator.free(parsed_rules);
+        }
+
+        std.mem.sort(CSSParser.CSSRule, tab.rules.items, {}, struct {
+            fn lessThan(_: void, a: CSSParser.CSSRule, b: CSSParser.CSSRule) bool {
+                return a.cascadePriority() < b.cascadePriority();
+            }
+        }.lessThan);
+    }
+
     // Layout a tab's HTML nodes with the tree-based layout
     pub fn layoutTabNodes(self: *Browser, tab: *Tab) !void {
         if (tab.current_node == null) {
             return error.NoNodeToLayout;
         }
+
+        self.layout_engine.accessibility = tab.accessibility;
 
         // Clear previous document layout if it exists
         if (tab.document_layout != null) {
@@ -1836,34 +2038,34 @@ pub const Browser = struct {
     fn getDisplayItemBounds(self: *Browser, item: DisplayItem) Rect {
         return switch (item) {
             .glyph => |g| Rect{
-                .left = g.x,
-                .top = g.y,
-                .right = g.x + g.glyph.w,
-                .bottom = g.y + g.glyph.h,
+                .left = self.scalePx(g.x),
+                .top = self.scalePx(g.y),
+                .right = self.scalePx(g.x) + g.glyph.w,
+                .bottom = self.scalePx(g.y) + g.glyph.h,
             },
             .rect => |r| Rect{
-                .left = r.x1,
-                .top = r.y1,
-                .right = r.x2,
-                .bottom = r.y2,
+                .left = self.scalePx(r.x1),
+                .top = self.scalePx(r.y1),
+                .right = self.scalePx(r.x2),
+                .bottom = self.scalePx(r.y2),
             },
             .rounded_rect => |r| Rect{
-                .left = r.x1,
-                .top = r.y1,
-                .right = r.x2,
-                .bottom = r.y2,
+                .left = self.scalePx(r.x1),
+                .top = self.scalePx(r.y1),
+                .right = self.scalePx(r.x2),
+                .bottom = self.scalePx(r.y2),
             },
             .line => |l| Rect{
-                .left = @min(l.x1, l.x2),
-                .top = @min(l.y1, l.y2),
-                .right = @max(l.x1, l.x2) + l.thickness,
-                .bottom = @max(l.y1, l.y2) + l.thickness,
+                .left = self.scalePx(@min(l.x1, l.x2)),
+                .top = self.scalePx(@min(l.y1, l.y2)),
+                .right = self.scalePx(@max(l.x1, l.x2)) + self.scalePx(l.thickness),
+                .bottom = self.scalePx(@max(l.y1, l.y2)) + self.scalePx(l.thickness),
             },
             .outline => |o| Rect{
-                .left = o.rect.left,
-                .top = o.rect.top,
-                .right = o.rect.right,
-                .bottom = o.rect.bottom,
+                .left = self.scalePx(o.rect.left),
+                .top = self.scalePx(o.rect.top),
+                .right = self.scalePx(o.rect.right),
+                .bottom = self.scalePx(o.rect.bottom),
             },
             .blend => |b| blk: {
                 var bounds = Rect{ .left = std.math.maxInt(i32), .top = std.math.maxInt(i32), .right = std.math.minInt(i32), .bottom = std.math.minInt(i32) };
@@ -1889,10 +2091,10 @@ pub const Browser = struct {
                 }
                 // Apply translation to get absolute bounds
                 break :blk Rect{
-                    .left = bounds.left + t.translate_x,
-                    .top = bounds.top + t.translate_y,
-                    .right = bounds.right + t.translate_x,
-                    .bottom = bounds.bottom + t.translate_y,
+                    .left = bounds.left + self.scalePx(t.translate_x),
+                    .top = bounds.top + self.scalePx(t.translate_y),
+                    .right = bounds.right + self.scalePx(t.translate_x),
+                    .bottom = bounds.bottom + self.scalePx(t.translate_y),
                 };
             },
         };
@@ -1993,7 +2195,7 @@ pub const Browser = struct {
         var chrome_cmds = try self.chrome.paint(self.allocator, self);
         defer chrome_cmds.deinit(self.allocator);
         for (chrome_cmds.items) |item| {
-            try self.drawDisplayItemZ2dContext(&chrome_context, item, 0);
+            try self.drawDisplayItemZ2dContext(&chrome_context, item, 0, 1.0);
         }
     }
 
@@ -2013,7 +2215,8 @@ pub const Browser = struct {
     fn rasterTabSurfaces(self: *Browser) !void {
         if (self.active_tab_display_list == null) return;
 
-        const tab_height = @max(self.active_tab_height, self.window_height - self.chrome.bottom);
+        const scaled_height = self.scalePx(self.active_tab_height);
+        const tab_height = @max(scaled_height, self.window_height - self.chrome.bottom);
 
         if (self.tab_surface) |*existing_surface| {
             const current_height = existing_surface.getHeight();
@@ -2037,8 +2240,9 @@ pub const Browser = struct {
         try tab_context.fill();
 
         // Draw from the composited draw list
+        const zoom = self.activeZoom();
         for (self.tab_draw_list.items) |item| {
-            try self.drawDisplayItemZ2dContext(&tab_context, item, 0);
+            try self.drawDisplayItemZ2dContext(&tab_context, item, 0, zoom);
         }
     }
 
@@ -2048,6 +2252,12 @@ pub const Browser = struct {
 
         // Check if any phase is needed
         if (!self.needs_composite and !self.needs_raster and !self.needs_draw) return;
+
+        const profiling = self.profiling_enabled;
+        const start_ns = if (profiling) std.time.nanoTimestamp() else 0;
+        var composite_ns: u64 = 0;
+        var raster_ns: u64 = 0;
+        var draw_ns: u64 = 0;
 
         const trace_raster = self.measure.begin("composite_raster_draw");
         defer if (trace_raster) self.measure.end("composite_raster_draw");
@@ -2061,27 +2271,52 @@ pub const Browser = struct {
 
         // Composite phase: rebuild composited layers from display list
         if (self.needs_composite) {
+            const phase_start = if (profiling) std.time.nanoTimestamp() else 0;
             _ = try self.composite();
             try self.paint_draw_list();
             self.needs_composite = false;
             // Compositing implies we need to raster the new layers
             self.needs_raster = true;
+            if (profiling) {
+                composite_ns = @as(u64, @intCast(std.time.nanoTimestamp() - phase_start));
+            }
         }
 
         // Raster phase: render layers to surfaces
         if (self.needs_raster) {
+            const phase_start = if (profiling) std.time.nanoTimestamp() else 0;
             try self.rasterChrome();
             try self.rasterTabSurfaces();
             self.needs_raster = false;
             // Rastering implies we need to draw
             self.needs_draw = true;
+            if (profiling) {
+                raster_ns = @as(u64, @intCast(std.time.nanoTimestamp() - phase_start));
+            }
         }
 
         // Draw phase: composite surfaces to screen
         if (self.needs_draw) {
+            const phase_start = if (profiling) std.time.nanoTimestamp() else 0;
             try self.draw();
             self.canvas.present();
             self.needs_draw = false;
+            if (profiling) {
+                draw_ns = @as(u64, @intCast(std.time.nanoTimestamp() - phase_start));
+            }
+        }
+
+        if (profiling) {
+            const total_ns = @as(u64, @intCast(std.time.nanoTimestamp() - start_ns));
+            std.log.info(
+                "profile: composite total={}ms comp={}ms raster={}ms draw={}ms",
+                .{
+                    @divTrunc(total_ns, 1_000_000),
+                    @divTrunc(composite_ns, 1_000_000),
+                    @divTrunc(raster_ns, 1_000_000),
+                    @divTrunc(draw_ns, 1_000_000),
+                },
+            );
         }
     }
 
@@ -2105,12 +2340,12 @@ pub const Browser = struct {
 
     pub fn commit(self: *Browser, tab: *Tab, data: CommitData) void {
         self.lock.lock();
-        defer self.lock.unlock();
 
         if (self.activeTab() != tab) {
             if (data.display_list) |list| {
                 DisplayItem.freeList(self.allocator, list);
             }
+            self.lock.unlock();
             return;
         }
 
@@ -2137,6 +2372,8 @@ pub const Browser = struct {
             self.active_tab_scroll = scroll;
         }
         self.active_tab_height = data.height;
+        self.active_tab_zoom = data.zoom;
+        self.active_tab_prefers_dark = data.prefers_dark;
 
         if (data.url) |url| {
             self.updateActiveTabUrl(url);
@@ -2145,6 +2382,7 @@ pub const Browser = struct {
         }
 
         self.animation_timer_active = false;
+        const should_schedule_animation = self.needs_animation_frame;
 
         // Determine which phases need to run based on what changed
         if (has_display_list_change) {
@@ -2159,6 +2397,11 @@ pub const Browser = struct {
                 self.applyCompositedUpdate(update);
             }
             self.needs_draw = true;
+        }
+
+        self.lock.unlock();
+        if (should_schedule_animation) {
+            self.scheduleAnimationFrame();
         }
     }
 
@@ -2239,27 +2482,29 @@ pub const Browser = struct {
         self.context.deinit();
         self.context = z2d.Context.init(self.allocator, &self.root_surface);
 
-        // Clear the SDL canvas to black
-        try self.canvas.setColorRGB(0, 0, 0);
-        try self.canvas.clear();
-
-        // Clear the root surface to white (to test if texture is being drawn)
-        const white_pixel = z2d.pixel.Pixel{ .rgba = .{ .r = 255, .g = 255, .b = 255, .a = 255 } };
-        self.root_surface.paintPixel(white_pixel);
-
-        // Draw chrome content (from pre-rastered chrome surface if available, otherwise draw directly)
-        var chrome_cmds = try self.chrome.paint(self.allocator, self);
-        defer chrome_cmds.deinit(self.allocator);
-        for (chrome_cmds.items) |item| {
-            try self.drawDisplayItemZ2d(item, 0);
+        // Composite the pre-rastered tab surface and chrome surface.
+        if (self.tab_surface) |*tab_surface| {
+            const zoom = self.activeZoom();
+            const scroll_offset = self.scalePxWithZoom(self.active_tab_scroll, zoom);
+            const tab_y = self.chrome.bottom - scroll_offset;
+            z2d.Surface.composite(
+                &self.root_surface,
+                tab_surface,
+                .src_over,
+                0,
+                tab_y,
+                .{},
+            );
         }
 
-        // Draw tab content from the composited draw list (not the original display list)
-        // This ensures blend items with dst_in are properly composited within layers
-        // instead of being applied directly to the root surface (which would clear the background)
-        for (self.tab_draw_list.items) |item| {
-            try self.drawDisplayItemZ2d(item, self.active_tab_scroll - self.chrome.bottom);
-        }
+        z2d.Surface.composite(
+            &self.root_surface,
+            &self.chrome_surface,
+            .src_over,
+            0,
+            0,
+            .{},
+        );
 
         try self.drawScrollbarZ2d();
 
@@ -2318,18 +2563,21 @@ pub const Browser = struct {
     }
 
     // Draw a display item using the browser's context
-    fn drawDisplayItemZ2d(self: *Browser, item: DisplayItem, scroll_offset: i32) !void {
-        try self.drawDisplayItemZ2dContext(&self.context, item, scroll_offset);
+    fn drawDisplayItemZ2d(self: *Browser, item: DisplayItem, scroll_offset: i32, zoom: f32) !void {
+        try self.drawDisplayItemZ2dContext(&self.context, item, scroll_offset, zoom);
     }
 
     // Draw a display item using a specific z2d context
-    fn drawDisplayItemZ2dContext(self: *Browser, context: *z2d.Context, item: DisplayItem, scroll_offset: i32) !void {
+    fn drawDisplayItemZ2dContext(self: *Browser, context: *z2d.Context, item: DisplayItem, scroll_offset: i32, zoom: f32) !void {
         switch (item) {
             .glyph => |glyph_item| {
+                if (self.drawGlyphFast(context, glyph_item, scroll_offset, zoom)) {
+                    return;
+                }
                 // Render glyph using pixel data stored in the Glyph struct
                 if (glyph_item.glyph.pixels) |pixels| {
-                    const glyph_y = glyph_item.y - scroll_offset;
-                    const glyph_x = glyph_item.x;
+                    const glyph_y = self.scalePxWithZoom(glyph_item.y, zoom) - scroll_offset;
+                    const glyph_x = self.scalePxWithZoom(glyph_item.x, zoom);
                     const w: usize = @intCast(glyph_item.glyph.w);
                     const h: usize = @intCast(glyph_item.glyph.h);
 
@@ -2369,9 +2617,11 @@ pub const Browser = struct {
                 }
             },
             .rect => |rect_item| {
-                const top = rect_item.y1 - scroll_offset;
-                const bottom = rect_item.y2 - scroll_offset;
-                const width = rect_item.x2 - rect_item.x1;
+                const left = self.scalePxWithZoom(rect_item.x1, zoom);
+                const right = self.scalePxWithZoom(rect_item.x2, zoom);
+                const top = self.scalePxWithZoom(rect_item.y1, zoom) - scroll_offset;
+                const bottom = self.scalePxWithZoom(rect_item.y2, zoom) - scroll_offset;
+                const width = right - left;
                 const height = bottom - top;
 
                 // Only draw if rect has valid dimensions and is visible
@@ -2383,10 +2633,10 @@ pub const Browser = struct {
                     context.setSource(.{ .opaque_pattern = .{ .pixel = .{ .rgba = rect_item.color.toZ2dRgba() } } });
 
                     // Create rectangle path
-                    try context.moveTo(@floatFromInt(rect_item.x1), @floatFromInt(top));
-                    try context.lineTo(@floatFromInt(rect_item.x2), @floatFromInt(top));
-                    try context.lineTo(@floatFromInt(rect_item.x2), @floatFromInt(bottom));
-                    try context.lineTo(@floatFromInt(rect_item.x1), @floatFromInt(bottom));
+                    try context.moveTo(@floatFromInt(left), @floatFromInt(top));
+                    try context.lineTo(@floatFromInt(right), @floatFromInt(top));
+                    try context.lineTo(@floatFromInt(right), @floatFromInt(bottom));
+                    try context.lineTo(@floatFromInt(left), @floatFromInt(bottom));
                     try context.closePath();
 
                     // Fill and reset path after
@@ -2395,10 +2645,12 @@ pub const Browser = struct {
                 }
             },
             .rounded_rect => |rounded_item| {
-                const top = rounded_item.y1 - scroll_offset;
-                const bottom = rounded_item.y2 - scroll_offset;
+                const left = self.scalePxWithZoom(rounded_item.x1, zoom);
+                const right = self.scalePxWithZoom(rounded_item.x2, zoom);
+                const top = self.scalePxWithZoom(rounded_item.y1, zoom) - scroll_offset;
+                const bottom = self.scalePxWithZoom(rounded_item.y2, zoom) - scroll_offset;
                 if (bottom > 0 and top < self.window_height) {
-                    const width = rounded_item.x2 - rounded_item.x1;
+                    const width = right - left;
                     const height = bottom - top;
                     if (width > 1 and height > 1) {
                         context.resetPath();
@@ -2407,9 +2659,9 @@ pub const Browser = struct {
 
                         // Clamp radius to not exceed half the width or height
                         const max_radius = @min(@as(f64, @floatFromInt(width)) / 2.0, @as(f64, @floatFromInt(height)) / 2.0);
-                        const radius = @min(rounded_item.radius, max_radius);
+                        const radius = @min(self.scalePxFWithZoom(rounded_item.radius, zoom), max_radius);
 
-                        const x1 = @as(f64, @floatFromInt(rounded_item.x1));
+                        const x1 = @as(f64, @floatFromInt(left));
                         const y1 = @as(f64, @floatFromInt(top));
                         const x2 = x1 + @as(f64, @floatFromInt(width));
                         const y2 = y1 + @as(f64, @floatFromInt(height));
@@ -2445,31 +2697,35 @@ pub const Browser = struct {
                 }
             },
             .line => |line_item| {
-                const y1 = line_item.y1 - scroll_offset;
-                const y2 = line_item.y2 - scroll_offset;
+                const x1 = self.scalePxWithZoom(line_item.x1, zoom);
+                const x2 = self.scalePxWithZoom(line_item.x2, zoom);
+                const y1 = self.scalePxWithZoom(line_item.y1, zoom) - scroll_offset;
+                const y2 = self.scalePxWithZoom(line_item.y2, zoom) - scroll_offset;
 
                 // Only draw if line has non-zero length
-                const dx = line_item.x2 - line_item.x1;
+                const dx = x2 - x1;
                 const dy = y2 - y1;
                 if (dx != 0 or dy != 0) {
                     // Set source color and line width
                     context.resetPath();
                     context.setSource(.{ .opaque_pattern = .{ .pixel = .{ .rgba = line_item.color.toZ2dRgba() } } });
-                    context.setLineWidth(@floatFromInt(line_item.thickness));
+                    context.setLineWidth(@floatFromInt(@max(1, self.scalePxWithZoom(line_item.thickness, zoom))));
 
                     // Draw the line
-                    try context.moveTo(@floatFromInt(line_item.x1), @floatFromInt(y1));
-                    try context.lineTo(@floatFromInt(line_item.x2), @floatFromInt(y2));
+                    try context.moveTo(@floatFromInt(x1), @floatFromInt(y1));
+                    try context.lineTo(@floatFromInt(x2), @floatFromInt(y2));
                     try context.stroke();
                     context.resetPath();
                 }
             },
             .outline => |outline_item| {
                 const r = outline_item.rect;
-                const top = r.top - scroll_offset;
-                const bottom = r.bottom - scroll_offset;
+                const left = self.scalePxWithZoom(r.left, zoom);
+                const right = self.scalePxWithZoom(r.right, zoom);
+                const top = self.scalePxWithZoom(r.top, zoom) - scroll_offset;
+                const bottom = self.scalePxWithZoom(r.bottom, zoom) - scroll_offset;
 
-                const width = r.right - r.left;
+                const width = right - left;
                 const height = bottom - top;
 
                 // Only draw if outline has valid dimensions
@@ -2477,13 +2733,13 @@ pub const Browser = struct {
                     // Set source color and line width (assuming 1 pixel outline)
                     context.resetPath();
                     context.setSource(.{ .opaque_pattern = .{ .pixel = .{ .rgba = outline_item.color.toZ2dRgba() } } });
-                    context.setLineWidth(1.0);
+                    context.setLineWidth(@floatFromInt(@max(1, self.scalePxWithZoom(outline_item.thickness, zoom))));
 
                     // Draw rectangle outline
-                    try context.moveTo(@floatFromInt(r.left), @floatFromInt(top));
-                    try context.lineTo(@floatFromInt(r.right), @floatFromInt(top));
-                    try context.lineTo(@floatFromInt(r.right), @floatFromInt(bottom));
-                    try context.lineTo(@floatFromInt(r.left), @floatFromInt(bottom));
+                    try context.moveTo(@floatFromInt(left), @floatFromInt(top));
+                    try context.lineTo(@floatFromInt(right), @floatFromInt(top));
+                    try context.lineTo(@floatFromInt(right), @floatFromInt(bottom));
+                    try context.lineTo(@floatFromInt(left), @floatFromInt(bottom));
                     try context.closePath();
                     try context.stroke();
                 }
@@ -2507,9 +2763,9 @@ pub const Browser = struct {
                         if (blend_item.opacity < 1.0) {
                             var modified_item = child_item;
                             modified_item = self.applyOpacityToDisplayItem(modified_item, blend_item.opacity);
-                            try self.drawDisplayItemZ2dContext(context, modified_item, scroll_offset);
+                            try self.drawDisplayItemZ2dContext(context, modified_item, scroll_offset, zoom);
                         } else {
-                            try self.drawDisplayItemZ2dContext(context, child_item, scroll_offset);
+                            try self.drawDisplayItemZ2dContext(context, child_item, scroll_offset, zoom);
                         }
                     }
 
@@ -2518,7 +2774,7 @@ pub const Browser = struct {
                 } else {
                     // No layer needed, just draw children directly
                     for (blend_item.children) |child_item| {
-                        try self.drawDisplayItemZ2dContext(context, child_item, scroll_offset);
+                        try self.drawDisplayItemZ2dContext(context, child_item, scroll_offset, zoom);
                     }
                 }
             },
@@ -2692,24 +2948,97 @@ pub const Browser = struct {
             },
             .transform => |t| {
                 // Apply translation by adjusting scroll offset for children
-                const new_scroll_offset = scroll_offset - t.translate_y;
+                const new_scroll_offset = scroll_offset - self.scalePxWithZoom(t.translate_y, zoom);
                 for (t.children) |child| {
                     // Recursively draw children with adjusted offset
                     // For x translation, we need to handle it differently since scroll is y-only
-                    try self.drawDisplayItemZ2dContextWithTransform(context, child, new_scroll_offset, t.translate_x);
+                    try self.drawDisplayItemZ2dContextWithTransform(
+                        context,
+                        child,
+                        new_scroll_offset,
+                        self.scalePxWithZoom(t.translate_x, zoom),
+                        zoom,
+                    );
                 }
             },
         }
     }
 
+    fn drawGlyphFast(self: *Browser, context: *z2d.Context, glyph_item: anytype, scroll_offset: i32, zoom: f32) bool {
+        const pixels = glyph_item.glyph.pixels orelse return false;
+        const img_surface = switch (context.surface.*) {
+            .image_surface_rgba => |*img| img,
+            else => return false,
+        };
+
+        const surface_width = img_surface.width;
+        const surface_height = img_surface.height;
+        const glyph_y = self.scalePxWithZoom(glyph_item.y, zoom) - scroll_offset;
+        const glyph_x = self.scalePxWithZoom(glyph_item.x, zoom);
+        const w: i32 = glyph_item.glyph.w;
+        const h: i32 = glyph_item.glyph.h;
+
+        if (w <= 0 or h <= 0) return true;
+
+        const color = glyph_item.color;
+        const max_x = glyph_x + w;
+        const max_y = glyph_y + h;
+
+        const start_x = if (glyph_x < 0) -glyph_x else 0;
+        const start_y = if (glyph_y < 0) -glyph_y else 0;
+        const end_x = if (max_x > surface_width) w - (max_x - surface_width) else w;
+        const end_y = if (max_y > surface_height) h - (max_y - surface_height) else h;
+
+        if (end_x <= start_x or end_y <= start_y) return true;
+
+        const buf = img_surface.buf;
+        const surface_w_usize: usize = @intCast(surface_width);
+
+        var y: i32 = start_y;
+        while (y < end_y) : (y += 1) {
+            const dest_y = glyph_y + y;
+            const row_start = @as(usize, @intCast(dest_y)) * surface_w_usize;
+            const src_row_start = @as(usize, @intCast(y)) * @as(usize, @intCast(w));
+
+            var x: i32 = start_x;
+            while (x < end_x) : (x += 1) {
+                const dest_x = glyph_x + x;
+                const dst_idx = row_start + @as(usize, @intCast(dest_x));
+                const src_idx = (src_row_start + @as(usize, @intCast(x))) * 4;
+
+                const alpha = pixels[src_idx + 3];
+                if (alpha == 0) continue;
+
+                const final_alpha: u8 = @intCast((@as(u16, alpha) * @as(u16, color.a)) / 255);
+                if (final_alpha == 0) continue;
+
+                const src_a: u16 = final_alpha;
+                const inv_a: u16 = 255 - src_a;
+                const src_r: u16 = (@as(u16, color.r) * src_a) / 255;
+                const src_g: u16 = (@as(u16, color.g) * src_a) / 255;
+                const src_b: u16 = (@as(u16, color.b) * src_a) / 255;
+
+                const dst = buf[dst_idx];
+                const out_r: u8 = @intCast(src_r + (@as(u16, dst.r) * inv_a) / 255);
+                const out_g: u8 = @intCast(src_g + (@as(u16, dst.g) * inv_a) / 255);
+                const out_b: u8 = @intCast(src_b + (@as(u16, dst.b) * inv_a) / 255);
+                const out_a: u8 = @intCast(src_a + (@as(u16, dst.a) * inv_a) / 255);
+
+                buf[dst_idx] = .{ .r = out_r, .g = out_g, .b = out_b, .a = out_a };
+            }
+        }
+
+        return true;
+    }
+
     // Draw a display item with both scroll offset and x translation
-    fn drawDisplayItemZ2dContextWithTransform(self: *Browser, context: *z2d.Context, item: DisplayItem, scroll_offset: i32, x_offset: i32) !void {
+    fn drawDisplayItemZ2dContextWithTransform(self: *Browser, context: *z2d.Context, item: DisplayItem, scroll_offset: i32, x_offset: i32, zoom: f32) !void {
         switch (item) {
             .glyph => |glyph_item| {
                 // Render glyph with x offset applied
                 if (glyph_item.glyph.pixels) |pixels| {
-                    const glyph_y = glyph_item.y - scroll_offset;
-                    const glyph_x = glyph_item.x + x_offset;
+                    const glyph_y = self.scalePxWithZoom(glyph_item.y, zoom) - scroll_offset;
+                    const glyph_x = self.scalePxWithZoom(glyph_item.x, zoom) + x_offset;
                     const w: usize = @intCast(glyph_item.glyph.w);
                     const h: usize = @intCast(glyph_item.glyph.h);
 
@@ -2746,10 +3075,10 @@ pub const Browser = struct {
                 }
             },
             .rect => |rect_item| {
-                const top = rect_item.y1 - scroll_offset;
-                const bottom = rect_item.y2 - scroll_offset;
-                const left = rect_item.x1 + x_offset;
-                const right = rect_item.x2 + x_offset;
+                const top = self.scalePxWithZoom(rect_item.y1, zoom) - scroll_offset;
+                const bottom = self.scalePxWithZoom(rect_item.y2, zoom) - scroll_offset;
+                const left = self.scalePxWithZoom(rect_item.x1, zoom) + x_offset;
+                const right = self.scalePxWithZoom(rect_item.x2, zoom) + x_offset;
                 const width = right - left;
                 const height = bottom - top;
 
@@ -2770,10 +3099,10 @@ pub const Browser = struct {
                 }
             },
             .rounded_rect => |rr| {
-                const top = rr.y1 - scroll_offset;
-                const bottom = rr.y2 - scroll_offset;
-                const left = rr.x1 + x_offset;
-                const right = rr.x2 + x_offset;
+                const top = self.scalePxWithZoom(rr.y1, zoom) - scroll_offset;
+                const bottom = self.scalePxWithZoom(rr.y2, zoom) - scroll_offset;
+                const left = self.scalePxWithZoom(rr.x1, zoom) + x_offset;
+                const right = self.scalePxWithZoom(rr.x2, zoom) + x_offset;
                 if (bottom > 0 and top < self.window_height) {
                     // Draw as a regular rect for simplicity in transformed context
                     context.resetPath();
@@ -2792,10 +3121,10 @@ pub const Browser = struct {
                 }
             },
             .line => |l| {
-                const y1 = l.y1 - scroll_offset;
-                const y2 = l.y2 - scroll_offset;
-                const x1 = l.x1 + x_offset;
-                const x2 = l.x2 + x_offset;
+                const y1 = self.scalePxWithZoom(l.y1, zoom) - scroll_offset;
+                const y2 = self.scalePxWithZoom(l.y2, zoom) - scroll_offset;
+                const x1 = self.scalePxWithZoom(l.x1, zoom) + x_offset;
+                const x2 = self.scalePxWithZoom(l.x2, zoom) + x_offset;
                 context.resetPath();
                 context.setSource(.{ .opaque_pattern = .{ .pixel = .{ .rgba = .{
                     .r = l.color.r,
@@ -2803,15 +3132,16 @@ pub const Browser = struct {
                     .b = l.color.b,
                     .a = l.color.a,
                 } } } });
+                context.setLineWidth(@floatFromInt(@max(1, self.scalePxWithZoom(l.thickness, zoom))));
                 try context.moveTo(@floatFromInt(x1), @floatFromInt(y1));
                 try context.lineTo(@floatFromInt(x2), @floatFromInt(y2));
                 try context.stroke();
             },
             .outline => |o| {
-                const top = o.rect.top - scroll_offset;
-                const bottom = o.rect.bottom - scroll_offset;
-                const left = o.rect.left + x_offset;
-                const right = o.rect.right + x_offset;
+                const top = self.scalePxWithZoom(o.rect.top, zoom) - scroll_offset;
+                const bottom = self.scalePxWithZoom(o.rect.bottom, zoom) - scroll_offset;
+                const left = self.scalePxWithZoom(o.rect.left, zoom) + x_offset;
+                const right = self.scalePxWithZoom(o.rect.right, zoom) + x_offset;
                 context.resetPath();
                 context.setSource(.{ .opaque_pattern = .{ .pixel = .{ .rgba = .{
                     .r = o.color.r,
@@ -2819,6 +3149,7 @@ pub const Browser = struct {
                     .b = o.color.b,
                     .a = o.color.a,
                 } } } });
+                context.setLineWidth(@floatFromInt(@max(1, self.scalePxWithZoom(o.thickness, zoom))));
                 try context.moveTo(@floatFromInt(left), @floatFromInt(top));
                 try context.lineTo(@floatFromInt(right), @floatFromInt(top));
                 try context.lineTo(@floatFromInt(right), @floatFromInt(bottom));
@@ -2840,16 +3171,16 @@ pub const Browser = struct {
                         if (blend_item.opacity < 1.0) {
                             var modified_item = child;
                             modified_item = self.applyOpacityToDisplayItem(modified_item, blend_item.opacity);
-                            try self.drawDisplayItemZ2dContextWithTransform(context, modified_item, scroll_offset, x_offset);
+                            try self.drawDisplayItemZ2dContextWithTransform(context, modified_item, scroll_offset, x_offset, zoom);
                         } else {
-                            try self.drawDisplayItemZ2dContextWithTransform(context, child, scroll_offset, x_offset);
+                            try self.drawDisplayItemZ2dContextWithTransform(context, child, scroll_offset, x_offset, zoom);
                         }
                     }
 
                     context.setOperator(original_operator);
                 } else {
                     for (blend_item.children) |child| {
-                        try self.drawDisplayItemZ2dContextWithTransform(context, child, scroll_offset, x_offset);
+                        try self.drawDisplayItemZ2dContextWithTransform(context, child, scroll_offset, x_offset, zoom);
                     }
                 }
             },
@@ -2897,7 +3228,13 @@ pub const Browser = struct {
             .transform => |t| {
                 // Nested transform: combine offsets
                 for (t.children) |child| {
-                    try self.drawDisplayItemZ2dContextWithTransform(context, child, scroll_offset - t.translate_y, x_offset + t.translate_x);
+                    try self.drawDisplayItemZ2dContextWithTransform(
+                        context,
+                        child,
+                        scroll_offset - self.scalePxWithZoom(t.translate_y, zoom),
+                        x_offset + self.scalePxWithZoom(t.translate_x, zoom),
+                        zoom,
+                    );
                 }
             },
         }
@@ -2905,13 +3242,13 @@ pub const Browser = struct {
 
     /// Draw a display item for a composited layer, mapping from absolute to local coordinates
     /// This function offsets all coordinates by the layer's origin to draw in layer-local space
-    fn drawDisplayItemZ2dContextForLayer(self: *Browser, context: *z2d.Context, item: DisplayItem, layer_x: i32, layer_y: i32) !void {
+    fn drawDisplayItemZ2dContextForLayer(self: *Browser, context: *z2d.Context, item: DisplayItem, layer_x: i32, layer_y: i32, zoom: f32) !void {
         switch (item) {
             .glyph => |glyph_item| {
                 // Render glyph in layer-local coordinates
                 if (glyph_item.glyph.pixels) |pixels| {
-                    const glyph_x = glyph_item.x - layer_x;
-                    const glyph_y = glyph_item.y - layer_y;
+                    const glyph_x = self.scalePxWithZoom(glyph_item.x, zoom) - layer_x;
+                    const glyph_y = self.scalePxWithZoom(glyph_item.y, zoom) - layer_y;
                     const w: usize = @intCast(glyph_item.glyph.w);
                     const h: usize = @intCast(glyph_item.glyph.h);
 
@@ -2947,10 +3284,10 @@ pub const Browser = struct {
             },
             .rect => |rect_item| {
                 // Map absolute coordinates to layer-local space
-                const left = rect_item.x1 - layer_x;
-                const right = rect_item.x2 - layer_x;
-                const top = rect_item.y1 - layer_y;
-                const bottom = rect_item.y2 - layer_y;
+                const left = self.scalePxWithZoom(rect_item.x1, zoom) - layer_x;
+                const right = self.scalePxWithZoom(rect_item.x2, zoom) - layer_x;
+                const top = self.scalePxWithZoom(rect_item.y1, zoom) - layer_y;
+                const bottom = self.scalePxWithZoom(rect_item.y2, zoom) - layer_y;
                 const width = right - left;
                 const height = bottom - top;
 
@@ -2967,10 +3304,10 @@ pub const Browser = struct {
                 }
             },
             .rounded_rect => |rr| {
-                const left = rr.x1 - layer_x;
-                const right = rr.x2 - layer_x;
-                const top = rr.y1 - layer_y;
-                const bottom = rr.y2 - layer_y;
+                const left = self.scalePxWithZoom(rr.x1, zoom) - layer_x;
+                const right = self.scalePxWithZoom(rr.x2, zoom) - layer_x;
+                const top = self.scalePxWithZoom(rr.y1, zoom) - layer_y;
+                const bottom = self.scalePxWithZoom(rr.y2, zoom) - layer_y;
                 const width = right - left;
                 const height = bottom - top;
 
@@ -2996,26 +3333,28 @@ pub const Browser = struct {
                 }
             },
             .line => |line_item| {
-                const x1 = line_item.x1 - layer_x;
-                const x2 = line_item.x2 - layer_x;
-                const y1 = line_item.y1 - layer_y;
-                const y2 = line_item.y2 - layer_y;
+                const x1 = self.scalePxWithZoom(line_item.x1, zoom) - layer_x;
+                const x2 = self.scalePxWithZoom(line_item.x2, zoom) - layer_x;
+                const y1 = self.scalePxWithZoom(line_item.y1, zoom) - layer_y;
+                const y2 = self.scalePxWithZoom(line_item.y2, zoom) - layer_y;
 
                 context.resetPath();
                 context.setSource(.{ .opaque_pattern = .{ .pixel = .{ .rgba = line_item.color.toZ2dRgba() } } });
+                context.setLineWidth(@floatFromInt(@max(1, self.scalePxWithZoom(line_item.thickness, zoom))));
                 try context.moveTo(@floatFromInt(x1), @floatFromInt(y1));
                 try context.lineTo(@floatFromInt(x2), @floatFromInt(y2));
                 try context.stroke();
                 context.resetPath();
             },
             .outline => |outline_item| {
-                const left = outline_item.rect.left - layer_x;
-                const right = outline_item.rect.right - layer_x;
-                const top = outline_item.rect.top - layer_y;
-                const bottom = outline_item.rect.bottom - layer_y;
+                const left = self.scalePxWithZoom(outline_item.rect.left, zoom) - layer_x;
+                const right = self.scalePxWithZoom(outline_item.rect.right, zoom) - layer_x;
+                const top = self.scalePxWithZoom(outline_item.rect.top, zoom) - layer_y;
+                const bottom = self.scalePxWithZoom(outline_item.rect.bottom, zoom) - layer_y;
 
                 context.resetPath();
                 context.setSource(.{ .opaque_pattern = .{ .pixel = .{ .rgba = outline_item.color.toZ2dRgba() } } });
+                context.setLineWidth(@floatFromInt(@max(1, self.scalePxWithZoom(outline_item.thickness, zoom))));
                 try context.moveTo(@floatFromInt(left), @floatFromInt(top));
                 try context.lineTo(@floatFromInt(right), @floatFromInt(top));
                 try context.lineTo(@floatFromInt(right), @floatFromInt(bottom));
@@ -3038,7 +3377,7 @@ pub const Browser = struct {
                     // The mask shape is in blend_item.children[0]
                     std.debug.print("DEBUG dst_in clip: SKIPPED layer_offset({},{}) children={}\n", .{ layer_x, layer_y, blend_item.children.len });
                     // if (blend_item.children.len > 0) {
-                    //     try self.applyClipMaskForLayer(context, blend_item.children[0], layer_x, layer_y);
+                    //     try self.applyClipMaskForLayer(context, blend_item.children[0], layer_x, layer_y, zoom);
                     // }
                 } else {
                     // Apply opacity and recursively draw children in layer space
@@ -3062,16 +3401,16 @@ pub const Browser = struct {
                             if (blend_item.opacity < 1.0) {
                                 var modified_item = child;
                                 modified_item = self.applyOpacityToDisplayItem(modified_item, blend_item.opacity);
-                                try self.drawDisplayItemZ2dContextForLayer(context, modified_item, layer_x, layer_y);
+                                try self.drawDisplayItemZ2dContextForLayer(context, modified_item, layer_x, layer_y, zoom);
                             } else {
-                                try self.drawDisplayItemZ2dContextForLayer(context, child, layer_x, layer_y);
+                                try self.drawDisplayItemZ2dContextForLayer(context, child, layer_x, layer_y, zoom);
                             }
                         }
 
                         context.setOperator(original_operator);
                     } else {
                         for (blend_item.children) |child| {
-                            try self.drawDisplayItemZ2dContextForLayer(context, child, layer_x, layer_y);
+                            try self.drawDisplayItemZ2dContextForLayer(context, child, layer_x, layer_y, zoom);
                         }
                     }
                 }
@@ -3084,10 +3423,16 @@ pub const Browser = struct {
                 // Apply transform offsets to the layer coordinates
                 std.debug.print("DEBUG transform: translate({},{}) layer_offset({},{}) -> ({},{})\n", .{
                     t.translate_x, t.translate_y, layer_x, layer_y,
-                    layer_x - t.translate_x, layer_y - t.translate_y,
+                    layer_x - self.scalePxWithZoom(t.translate_x, zoom), layer_y - self.scalePxWithZoom(t.translate_y, zoom),
                 });
                 for (t.children) |child| {
-                    try self.drawDisplayItemZ2dContextForLayer(context, child, layer_x - t.translate_x, layer_y - t.translate_y);
+                    try self.drawDisplayItemZ2dContextForLayer(
+                        context,
+                        child,
+                        layer_x - self.scalePxWithZoom(t.translate_x, zoom),
+                        layer_y - self.scalePxWithZoom(t.translate_y, zoom),
+                        zoom,
+                    );
                 }
             },
         }
@@ -3098,9 +3443,7 @@ pub const Browser = struct {
     /// IMPORTANT: Only clears pixels WITHIN the mask's bounding box that are outside the shape
     /// (e.g., corner pixels for rounded rects). Does NOT clear pixels outside the bounding box
     /// to avoid affecting other content in the same layer.
-    fn applyClipMaskForLayer(self: *Browser, context: *z2d.Context, mask_item: DisplayItem, layer_x: i32, layer_y: i32) !void {
-        _ = self;
-
+    fn applyClipMaskForLayer(self: *Browser, context: *z2d.Context, mask_item: DisplayItem, layer_x: i32, layer_y: i32, zoom: f32) !void {
         switch (mask_item) {
             .rounded_rect => |rr| {
                 // Get surface from context - we need direct pixel access
@@ -3109,11 +3452,11 @@ pub const Browser = struct {
                 const surface_height = surface.getHeight();
 
                 // Map mask coordinates to layer-local space
-                const mask_left = rr.x1 - layer_x;
-                const mask_right = rr.x2 - layer_x;
-                const mask_top = rr.y1 - layer_y;
-                const mask_bottom = rr.y2 - layer_y;
-                const radius = rr.radius;
+                const mask_left = self.scalePxWithZoom(rr.x1, zoom) - layer_x;
+                const mask_right = self.scalePxWithZoom(rr.x2, zoom) - layer_x;
+                const mask_top = self.scalePxWithZoom(rr.y1, zoom) - layer_y;
+                const mask_bottom = self.scalePxWithZoom(rr.y2, zoom) - layer_y;
+                const radius = self.scalePxFWithZoom(rr.radius, zoom);
 
                 // Get pixel buffer
                 const pixel_buf = switch (surface.*) {
@@ -3286,13 +3629,15 @@ pub const Browser = struct {
 
     fn drawScrollbarZ2d(self: *Browser) !void {
         const tab_height = self.window_height - self.chrome.bottom;
-        if (self.active_tab_height <= tab_height) {
+        const zoom = self.activeZoom();
+        const visible_css = if (zoom == 1.0) tab_height else @as(i32, @intFromFloat(@as(f32, @floatFromInt(tab_height)) / zoom));
+        if (self.active_tab_height <= visible_css) {
             return;
         }
 
         const track_height = tab_height;
-        const thumb_height: i32 = @intFromFloat(@as(f32, @floatFromInt(tab_height)) * (@as(f32, @floatFromInt(tab_height)) / @as(f32, @floatFromInt(self.active_tab_height))));
-        const max_scroll = self.active_tab_height - tab_height;
+        const thumb_height: i32 = @intFromFloat(@as(f32, @floatFromInt(tab_height)) * (@as(f32, @floatFromInt(visible_css)) / @as(f32, @floatFromInt(self.active_tab_height))));
+        const max_scroll = self.active_tab_height - visible_css;
         const thumb_y_offset: i32 = @intFromFloat(
             @as(f32, @floatFromInt(self.active_tab_scroll)) /
                 @as(f32, @floatFromInt(max_scroll)) *
@@ -3399,6 +3744,8 @@ pub const CommitData = struct {
     display_list: ?[]DisplayItem,
     scroll: ?i32,
     height: i32,
+    zoom: f32,
+    prefers_dark: bool,
     composited_updates: []const Tab.CompositedUpdate = &.{},
 };
 
@@ -3615,17 +3962,20 @@ const TabCycleFocusTaskContext = struct {
     allocator: std.mem.Allocator,
     browser: *Browser,
     tab: *Tab,
+    reverse: bool,
 
     pub fn create(
         allocator: std.mem.Allocator,
         browser: *Browser,
         tab: *Tab,
+        reverse: bool,
     ) !*TabCycleFocusTaskContext {
         const ctx = try allocator.create(TabCycleFocusTaskContext);
         ctx.* = .{
             .allocator = allocator,
             .browser = browser,
             .tab = tab,
+            .reverse = reverse,
         };
         return ctx;
     }
@@ -3635,7 +3985,7 @@ const TabCycleFocusTaskContext = struct {
     }
 
     fn run(self: *TabCycleFocusTaskContext) !void {
-        try self.tab.cycleFocus(self.browser);
+        try self.tab.cycleFocus(self.browser, self.reverse);
     }
 
     fn toOpaque(self: *TabCycleFocusTaskContext) *anyopaque {
@@ -3653,6 +4003,51 @@ const TabCycleFocusTaskContext = struct {
 
     fn cleanupOpaque(context: *anyopaque) void {
         TabCycleFocusTaskContext.fromOpaque(context).destroy();
+    }
+};
+
+const TabActivateTaskContext = struct {
+    allocator: std.mem.Allocator,
+    browser: *Browser,
+    tab: *Tab,
+
+    pub fn create(
+        allocator: std.mem.Allocator,
+        browser: *Browser,
+        tab: *Tab,
+    ) !*TabActivateTaskContext {
+        const ctx = try allocator.create(TabActivateTaskContext);
+        ctx.* = .{
+            .allocator = allocator,
+            .browser = browser,
+            .tab = tab,
+        };
+        return ctx;
+    }
+
+    fn destroy(self: *TabActivateTaskContext) void {
+        self.allocator.destroy(self);
+    }
+
+    fn run(self: *TabActivateTaskContext) !void {
+        try self.tab.activateFocusedElement(self.browser);
+    }
+
+    fn toOpaque(self: *TabActivateTaskContext) *anyopaque {
+        return @ptrCast(self);
+    }
+
+    fn fromOpaque(context: *anyopaque) *TabActivateTaskContext {
+        const raw: *align(1) TabActivateTaskContext = @ptrCast(context);
+        return @alignCast(raw);
+    }
+
+    fn runOpaque(context: *anyopaque) anyerror!void {
+        try TabActivateTaskContext.fromOpaque(context).run();
+    }
+
+    fn cleanupOpaque(context: *anyopaque) void {
+        TabActivateTaskContext.fromOpaque(context).destroy();
     }
 };
 
@@ -4085,9 +4480,27 @@ const AnimationRenderTaskContext = struct {
 
     fn run(self: *AnimationRenderTaskContext) !void {
         if (self.tab.js_generation != self.generation) {
+            self.browser.lock.lock();
+            self.browser.animation_timer_active = false;
+            const should_reschedule = self.browser.needs_animation_frame;
+            self.browser.lock.unlock();
+            if (should_reschedule) {
+                self.browser.scheduleAnimationFrame();
+            }
             return;
         }
         self.tab.runAnimationFrame(self.scroll);
+
+        self.browser.lock.lock();
+        const should_clear = self.browser.animation_timer_active;
+        const should_reschedule = self.browser.needs_animation_frame;
+        if (should_clear) {
+            self.browser.animation_timer_active = false;
+        }
+        self.browser.lock.unlock();
+        if (should_clear and should_reschedule) {
+            self.browser.scheduleAnimationFrame();
+        }
     }
 };
 

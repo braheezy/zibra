@@ -12,6 +12,7 @@ const FontCategory = font.FontCategory;
 const scrollbar_width = browser.scrollbar_width;
 const h_offset = browser.h_offset;
 const v_offset = browser.v_offset;
+const GraphemeData = @TypeOf(grapheme.init(std.heap.page_allocator) catch unreachable);
 
 const sdl2 = @import("sdl");
 
@@ -105,6 +106,8 @@ const LineItem = struct {
     ascent: i32,
     /// The glyph's descent as a positive value (–TTF_FontDescent)
     descent: i32,
+    width: i32,
+    height: i32,
     /// Color to use when rendering this glyph
     color: browser.Color,
     /// Pointer to the DOM node that produced this glyph (if available)
@@ -137,11 +140,16 @@ pub const Layout = @This();
 // Layout state
 allocator: std.mem.Allocator,
 // Font manager for handling fonts and glyphs
-font_manager: font.FontManager,
-window_width: i32,
-window_height: i32,
-rtl_text: bool = false,
-size: i32 = 16,
+    font_manager: font.FontManager,
+    grapheme_data: GraphemeData,
+    window_width: i32,
+    window_height: i32,
+    rtl_text: bool = false,
+    accessibility: browser.AccessibilitySettings = .{},
+    color_scheme_dark: bool = false,
+    document_color_scheme_dark: bool = false,
+    default_font_size: i32 = 16,
+    size: i32 = 16,
 cursor_x: i32,
 cursor_y: i32,
 line_left: i32,
@@ -227,6 +235,94 @@ fn restoreInlineState(self: *Layout, snapshot: InlineSnapshot) void {
     self.text_color = snapshot.text_color;
 }
 
+fn zoom(self: *const Layout) f32 {
+    return if (self.accessibility.zoom > 0) self.accessibility.zoom else 1.0;
+}
+
+fn toLayoutPx(self: *const Layout, device_px: i32) i32 {
+    const z = self.zoom();
+    if (z == 1.0) return device_px;
+    return @intFromFloat(@as(f32, @floatFromInt(device_px)) / z);
+}
+
+fn toDevicePx(self: *const Layout, layout_px: i32) i32 {
+    const z = self.zoom();
+    if (z == 1.0) return layout_px;
+    return @intFromFloat(@as(f32, @floatFromInt(layout_px)) * z);
+}
+
+fn scaledFontSize(self: *const Layout, css_size: i32) i32 {
+    const scaled = self.toDevicePx(css_size);
+    return if (scaled < 1) 1 else scaled;
+}
+
+fn layoutWindowWidth(self: *const Layout) i32 {
+    return self.toLayoutPx(self.window_width);
+}
+
+fn layoutScrollbarWidth(self: *const Layout) i32 {
+    return self.toLayoutPx(scrollbar_width);
+}
+
+const ColorSchemeSupport = struct {
+    light: bool,
+    dark: bool,
+};
+
+fn parseColorSchemeValue(value: []const u8) ColorSchemeSupport {
+    var supports_light = false;
+    var supports_dark = false;
+    var tokens = std.mem.tokenizeAny(u8, value, " \t");
+    while (tokens.next()) |token| {
+        if (std.mem.eql(u8, token, "light")) {
+            supports_light = true;
+        } else if (std.mem.eql(u8, token, "dark")) {
+            supports_dark = true;
+        }
+    }
+    return .{ .light = supports_light, .dark = supports_dark };
+}
+
+fn resolveColorScheme(self: *const Layout, value: []const u8) bool {
+    const support = parseColorSchemeValue(value);
+    if (!support.light and !support.dark) return self.accessibility.prefers_dark;
+    if (support.light and support.dark) return self.accessibility.prefers_dark;
+    if (support.dark) return true;
+    return false;
+}
+
+fn remapColor(self: *const Layout, color: browser.Color) browser.Color {
+    if (!self.color_scheme_dark or color.a == 0) return color;
+
+    if (self.accessibility.dark_palette) |palette| {
+        if (color.r == 0 and color.g == 0 and color.b == 0) {
+            return palette.text;
+        }
+        if (color.r == 255 and color.g == 255 and color.b == 255) {
+            return palette.background;
+        }
+        if ((color.r == 173 and color.g == 216 and color.b == 230) or
+            (color.r == 255 and color.g == 165 and color.b == 0))
+        {
+            return palette.control_background;
+        }
+    }
+
+    const clamp_channel = struct {
+        fn clamp(value: u8) u8 {
+            const v: i32 = value;
+            return @intCast(std.math.clamp(v, 24, 231));
+        }
+    }.clamp;
+
+    return .{
+        .r = clamp_channel(255 - color.r),
+        .g = clamp_channel(255 - color.g),
+        .b = clamp_channel(255 - color.b),
+        .a = color.a,
+    };
+}
+
 pub fn init(
     allocator: std.mem.Allocator,
     renderer: sdl2.Renderer,
@@ -237,16 +333,20 @@ pub fn init(
     const font_manager = try font.FontManager.init(allocator, renderer);
     const layout = try allocator.create(Layout);
 
+    const layout_width = window_width;
+    const scrollbar_width_css = scrollbar_width;
+
     layout.* = Layout{
         .allocator = allocator,
         .font_manager = font_manager,
+        .grapheme_data = undefined,
         .window_width = window_width,
         .window_height = window_height,
         .rtl_text = rtl_text,
-        .cursor_x = if (rtl_text) window_width - scrollbar_width - h_offset else h_offset,
+        .cursor_x = if (rtl_text) layout_width - scrollbar_width_css - h_offset else h_offset,
         .cursor_y = v_offset,
         .line_left = h_offset,
-        .line_right = window_width - scrollbar_width - h_offset,
+        .line_right = layout_width - scrollbar_width_css - h_offset,
         .is_bold = false,
         .is_italic = false,
         .content_height = 0,
@@ -259,7 +359,8 @@ pub fn init(
 
     layout.current_display_target = &layout.display_list;
 
-    try layout.font_manager.loadSystemFont(layout.size);
+    try layout.font_manager.loadSystemFont(layout.scaledFontSize(layout.size));
+    layout.grapheme_data = try grapheme.init(allocator);
 
     layout.style_stack = std.ArrayList(StyleSnapshot).empty;
     return layout;
@@ -267,6 +368,7 @@ pub fn init(
 
 pub fn deinit(self: *Layout) void {
     // clean up hash map for fonts
+    self.grapheme_data.deinit(self.allocator);
     self.font_manager.deinit();
 
     var it = self.word_cache.iterator();
@@ -343,11 +445,11 @@ fn handleInputElement(self: *Layout, node: Node, node_ptr: ?*Node, line_buffer: 
         "X",
         weight,
         slant,
-        self.size,
+        self.scaledFontSize(self.size),
         false,
     );
 
-    const widget_height = glyph.ascent + glyph.descent;
+    const widget_height = self.toLayoutPx(glyph.ascent + glyph.descent);
 
     // Store bounds for hit testing if we have a node pointer
     // Include transform offset for absolute positioning
@@ -367,7 +469,7 @@ fn handleInputElement(self: *Layout, node: Node, node_ptr: ?*Node, line_buffer: 
             .y1 = self.cursor_y,
             .x2 = self.cursor_x + widget_width,
             .y2 = self.cursor_y + widget_height,
-            .color = bgcolor,
+            .color = self.remapColor(bgcolor),
         },
     });
 
@@ -394,12 +496,10 @@ fn handleInputElement(self: *Layout, node: Node, node_ptr: ?*Node, line_buffer: 
 
     // Draw the text if we have any, and track cursor position
     var text_x = self.cursor_x + 2; // Small padding from left edge
-    const baseline_y = self.cursor_y + glyph.ascent;
+    const baseline_y = self.cursor_y + self.toLayoutPx(glyph.ascent);
 
     if (text.len > 0) {
-        const grapheme_data = try grapheme.init(self.allocator);
-        defer grapheme_data.deinit(self.allocator);
-        var g_iter = grapheme_data.iterator(text);
+        var g_iter = self.grapheme_data.iterator(text);
 
         while (g_iter.next()) |gc| {
             const gme = gc.bytes(text);
@@ -407,19 +507,19 @@ fn handleInputElement(self: *Layout, node: Node, node_ptr: ?*Node, line_buffer: 
                 gme,
                 weight,
                 slant,
-                self.size,
+                self.scaledFontSize(self.size),
                 false,
             );
 
             try self.current_display_target.append(self.allocator, DisplayItem{
                 .glyph = .{
                     .x = text_x,
-                    .y = baseline_y - text_glyph.ascent,
+                    .y = baseline_y - self.toLayoutPx(text_glyph.ascent),
                     .glyph = text_glyph,
-                    .color = self.text_color,
+                    .color = self.remapColor(self.text_color),
                 },
             });
-            text_x += text_glyph.w;
+            text_x += self.toLayoutPx(text_glyph.w);
         }
     }
 
@@ -431,7 +531,7 @@ fn handleInputElement(self: *Layout, node: Node, node_ptr: ?*Node, line_buffer: 
                 .y1 = self.cursor_y,
                 .x2 = text_x,
                 .y2 = self.cursor_y + widget_height,
-                .color = .{ .r = 0, .g = 0, .b = 0, .a = 255 },
+                .color = self.remapColor(.{ .r = 0, .g = 0, .b = 0, .a = 255 }),
                 .thickness = 1,
             },
         });
@@ -456,6 +556,7 @@ const StyleSnapshot = struct {
     text_color: browser.Color,
     transform_offset_x: i32,
     transform_offset_y: i32,
+    color_scheme_dark: bool,
 };
 
 fn applyNodeStyles(self: *Layout, element: parser.Element, _: *std.ArrayList(LineItem)) !void {
@@ -467,6 +568,7 @@ fn applyNodeStyles(self: *Layout, element: parser.Element, _: *std.ArrayList(Lin
         .text_color = self.text_color,
         .transform_offset_x = self.transform_offset_x,
         .transform_offset_y = self.transform_offset_y,
+        .color_scheme_dark = self.color_scheme_dark,
     };
     try self.style_stack.append(self.allocator, snapshot);
 
@@ -506,6 +608,13 @@ fn applyNodeStyles(self: *Layout, element: parser.Element, _: *std.ArrayList(Lin
                 self.transform_offset_y += translate.y;
             }
         }
+
+        if (style_map.get("color-scheme")) |scheme| {
+            self.color_scheme_dark = self.resolveColorScheme(scheme);
+            if (std.mem.eql(u8, element.tag, "html") or std.mem.eql(u8, element.tag, "body")) {
+                self.document_color_scheme_dark = self.color_scheme_dark;
+            }
+        }
     }
 }
 
@@ -519,6 +628,7 @@ fn restoreNodeStyles(self: *Layout, _: *std.ArrayList(LineItem)) !void {
         self.text_color = snapshot.text_color;
         self.transform_offset_x = snapshot.transform_offset_x;
         self.transform_offset_y = snapshot.transform_offset_y;
+        self.color_scheme_dark = snapshot.color_scheme_dark;
     }
 }
 
@@ -530,12 +640,12 @@ fn flushLine(self: *Layout, line_buffer: *std.ArrayList(LineItem)) !void {
     if (self.is_title) {
         // Determine the bounding x-coordinates from the line items.
         var min_x: i32 = line_buffer.items[0].x;
-        var max_x: i32 = line_buffer.items[0].x + line_buffer.items[0].glyph.w;
+        var max_x: i32 = line_buffer.items[0].x + line_buffer.items[0].width;
         for (line_buffer.items) |item| {
             if (item.x < min_x) {
                 min_x = item.x;
             }
-            const item_right = item.x + item.glyph.w;
+            const item_right = item.x + item.width;
             if (item_right > max_x) {
                 max_x = item_right;
             }
@@ -585,7 +695,7 @@ fn flushLine(self: *Layout, line_buffer: *std.ArrayList(LineItem)) !void {
         }
 
         if (item.node_ptr) |ptr| {
-            try self.recordLinkBounds(ptr, item.x, final_y, item.glyph.w, item.glyph.h);
+            try self.recordLinkBounds(ptr, item.x, final_y, item.width, item.height);
         }
 
         try self.current_display_target.append(self.allocator, DisplayItem{
@@ -656,7 +766,7 @@ fn processGrapheme(
                 upper_buf[0..upper_len.len],
                 .Bold, // Force bold for small caps
                 slant,
-                @divTrunc(self.size * 4, 5), // Make it ~80% of normal size
+                self.scaledFontSize(@divTrunc(self.size * 4, 5)), // Make it ~80% of normal size
                 use_monospace,
             );
         } else {
@@ -665,7 +775,7 @@ fn processGrapheme(
                 gme,
                 weight,
                 slant,
-                self.size,
+                self.scaledFontSize(self.size),
                 use_monospace,
             );
         }
@@ -675,7 +785,7 @@ fn processGrapheme(
             gme,
             weight,
             slant,
-            if (options.is_superscript) @divTrunc(self.size, 2) else self.size,
+            self.scaledFontSize(if (options.is_superscript) @divTrunc(self.size, 2) else self.size),
             use_monospace,
         );
     }
@@ -699,8 +809,13 @@ fn processGrapheme(
         return;
     }
 
+    const glyph_width = self.toLayoutPx(glyph.w);
+    const glyph_height = self.toLayoutPx(glyph.h);
+    const glyph_ascent = self.toLayoutPx(glyph.ascent);
+    const glyph_descent = self.toLayoutPx(glyph.descent);
+
     // Check if we need to wrap (only at window edge)
-    if (self.cursor_x + glyph.w > self.line_right) {
+    if (self.cursor_x + glyph_width > self.line_right) {
         try self.flushLine(line_buffer);
         self.cursor_x = if (self.rtl_text) self.line_right else self.line_left;
     }
@@ -709,12 +824,14 @@ fn processGrapheme(
     try line_buffer.append(self.allocator, LineItem{
         .x = self.cursor_x,
         .glyph = glyph,
-        .ascent = glyph.ascent,
-        .descent = glyph.descent,
-        .color = self.text_color, // Capture color at time of adding to buffer
+        .ascent = glyph_ascent,
+        .descent = glyph_descent,
+        .width = glyph_width,
+        .height = glyph_height,
+        .color = self.remapColor(self.text_color), // Capture remapped color at time of adding to buffer
         .node_ptr = node_ptr,
     });
-    self.cursor_x += glyph.w;
+    self.cursor_x += glyph_width;
 }
 
 fn recordLinkBounds(self: *Layout, node_ptr: *Node, x: i32, y: i32, width: i32, height: i32) !void {
@@ -783,9 +900,7 @@ fn handlePreformattedText(
         self.current_font_category = .monospace;
     }
 
-    const grapheme_data = try grapheme.init(self.allocator);
-    defer grapheme_data.deinit(self.allocator);
-    var g_iter = grapheme_data.iterator(content);
+    var g_iter = self.grapheme_data.iterator(content);
     while (g_iter.next()) |gc| {
         const gme = gc.bytes(content);
         try self.processGrapheme(gme, line_buffer, node_ptr, .{
@@ -911,7 +1026,8 @@ pub fn layoutSourceCode(self: *Layout, source: []const u8) ![]DisplayItem {
     self.cursor_x = if (self.rtl_text) self.line_right else self.line_left;
     self.cursor_y = v_offset;
     self.line_left = h_offset;
-    self.line_right = self.window_width - scrollbar_width - h_offset;
+    self.line_right = self.layoutWindowWidth() - self.layoutScrollbarWidth() - h_offset;
+    self.size = self.default_font_size;
 
     // Save current state
     const original_preformatted = self.is_preformatted;
@@ -945,9 +1061,7 @@ pub fn layoutSourceCode(self: *Layout, source: []const u8) ![]DisplayItem {
             self.current_font_category = .latin; // Use regular document font for tags
 
             // Process the '<' character
-            const grapheme_data = try grapheme.init(self.allocator);
-            defer grapheme_data.deinit(self.allocator);
-            var g_iter = grapheme_data.iterator(source[i .. i + 1]);
+            var g_iter = self.grapheme_data.iterator(source[i .. i + 1]);
             if (g_iter.next()) |gc| {
                 const gme = gc.bytes(source[i..]);
                 try self.processGrapheme(gme, &line_buffer, null, .{
@@ -973,9 +1087,7 @@ pub fn layoutSourceCode(self: *Layout, source: []const u8) ![]DisplayItem {
             in_string = false;
 
             // Process the '>' character
-            const grapheme_data = try grapheme.init(self.allocator);
-            defer grapheme_data.deinit(self.allocator);
-            var g_iter = grapheme_data.iterator(source[i .. i + 1]);
+            var g_iter = self.grapheme_data.iterator(source[i .. i + 1]);
             if (g_iter.next()) |gc| {
                 const gme = gc.bytes(source[i..]);
                 try self.processGrapheme(gme, &line_buffer, null, .{
@@ -1011,9 +1123,7 @@ pub fn layoutSourceCode(self: *Layout, source: []const u8) ![]DisplayItem {
         }
 
         // Process current character
-        const grapheme_data = try grapheme.init(self.allocator);
-        defer grapheme_data.deinit(self.allocator);
-        var g_iter = grapheme_data.iterator(source[i..]);
+        var g_iter = self.grapheme_data.iterator(source[i..]);
         if (g_iter.next()) |gc| {
             const gme = gc.bytes(source[i..]);
             try self.processGrapheme(gme, &line_buffer, null, .{
@@ -1086,7 +1196,7 @@ pub const InputLayout = struct {
         // Get font properties from node style
         self.font_weight = if (engine.is_bold) .Bold else .Normal;
         self.font_slant = if (engine.is_italic) .Italic else .Roman;
-        self.font_size = engine.size;
+        self.font_size = engine.scaledFontSize(engine.size);
         self.color = engine.text_color;
 
         // Get background color from node style
@@ -1112,8 +1222,8 @@ pub const InputLayout = struct {
             false,
         );
 
-        self.ascent = glyph.ascent;
-        self.descent = glyph.descent;
+        self.ascent = engine.toLayoutPx(glyph.ascent);
+        self.descent = engine.toLayoutPx(glyph.descent);
         self.height = self.ascent + self.descent;
 
         // Compute x position - similar to TextLayout but works with previous of any type
@@ -1132,14 +1242,15 @@ pub const InputLayout = struct {
 
     pub fn paintToList(self: *InputLayout, commands: *std.ArrayList(DisplayItem), engine: *Layout) !void {
         // Draw background rectangle
-        if (self.bgcolor.a > 0) {
+        const remapped_bg = engine.remapColor(self.bgcolor);
+        if (remapped_bg.a > 0) {
             try commands.append(engine.allocator, DisplayItem{
                 .rect = .{
                     .x1 = self.x,
                     .y1 = self.y,
                     .x2 = self.x + self.width,
                     .y2 = self.y + self.height,
-                    .color = self.bgcolor,
+                    .color = remapped_bg,
                 },
             });
         }
@@ -1173,9 +1284,7 @@ pub const InputLayout = struct {
         // Draw the text if we have any
         if (text.len > 0) {
             // Render each grapheme
-            const grapheme_data = try grapheme.init(engine.allocator);
-            defer grapheme_data.deinit(engine.allocator);
-            var g_iter = grapheme_data.iterator(text);
+            var g_iter = engine.grapheme_data.iterator(text);
             var text_x = self.x + 2; // Small padding from left edge
 
             while (g_iter.next()) |gc| {
@@ -1193,10 +1302,10 @@ pub const InputLayout = struct {
                         .x = text_x,
                         .y = self.y,
                         .glyph = glyph,
-                        .color = self.color,
+                        .color = engine.remapColor(self.color),
                     },
                 });
-                text_x += glyph.w;
+                text_x += engine.toLayoutPx(glyph.w);
             }
         }
     }
@@ -1256,7 +1365,7 @@ pub const TextLayout = struct {
         // For now, use the engine's current style state
         self.font_weight = if (engine.is_bold) .Bold else .Normal;
         self.font_slant = if (engine.is_italic) .Italic else .Roman;
-        self.font_size = engine.size;
+        self.font_size = engine.scaledFontSize(engine.size);
         self.color = engine.text_color;
 
         // Measure the word to get its width
@@ -1268,11 +1377,11 @@ pub const TextLayout = struct {
             false,
         );
 
-        self.width = glyph.w;
+        self.width = engine.toLayoutPx(glyph.w);
 
         // Store font metrics for baseline calculation
-        self.ascent = glyph.ascent;
-        self.descent = glyph.descent;
+        self.ascent = engine.toLayoutPx(glyph.ascent);
+        self.descent = engine.toLayoutPx(glyph.descent);
 
         // Height is the line spacing (ascent + descent)
         self.height = self.ascent + self.descent;
@@ -1287,7 +1396,7 @@ pub const TextLayout = struct {
                 prev.font_size,
                 false,
             );
-            const space = space_glyph.w;
+            const space = engine.toLayoutPx(space_glyph.w);
             self.x = prev.x + space + prev.width;
         } else {
             self.x = self.parent.x;
@@ -1320,7 +1429,7 @@ pub const TextLayout = struct {
                 .x = self.x,
                 .y = self.y,
                 .glyph = glyph,
-                .color = self.color,
+                .color = engine.remapColor(self.color),
             },
         });
     }
@@ -1465,7 +1574,7 @@ pub const DocumentLayout = struct {
     pub fn layout(self: *DocumentLayout, engine: *Layout) !void {
         self.x = h_offset;
         self.y = v_offset;
-        self.width = engine.window_width - scrollbar_width - (2 * h_offset);
+        self.width = engine.layoutWindowWidth() - engine.layoutScrollbarWidth() - (2 * h_offset);
 
         engine.input_bounds.clearRetainingCapacity();
         engine.link_bounds.clearRetainingCapacity();
@@ -1697,7 +1806,7 @@ fn layoutInlineBlock(self: *Layout, block: *BlockLayout) !void {
     self.line_right = block.x + block.width;
     self.cursor_x = if (self.rtl_text) self.line_right else self.line_left;
     self.cursor_y = block.y;
-    self.size = 16;
+    self.size = self.default_font_size;
     self.is_bold = false;
     self.is_italic = false;
     self.is_title = false;
@@ -1829,6 +1938,7 @@ fn addBackgroundIfNeeded(self: *Layout, block: *const BlockLayout) !void {
 
             // Draw the background rectangle if we have a color
             if (color) |col| {
+                const remapped = self.remapColor(col);
                 // Parse border-radius if present
                 var radius: f64 = 0.0;
                 if (border_radius_str) |br_str| {
@@ -1846,7 +1956,7 @@ fn addBackgroundIfNeeded(self: *Layout, block: *const BlockLayout) !void {
                         .x2 = block.x + block.width,
                         .y2 = block.y + block.height,
                         .radius = radius,
-                        .color = col,
+                        .color = remapped,
                     } };
                     try self.display_list.append(self.allocator, rounded_rect);
                 } else {
@@ -1856,7 +1966,7 @@ fn addBackgroundIfNeeded(self: *Layout, block: *const BlockLayout) !void {
                         .y1 = block.y,
                         .x2 = block.x + block.width,
                         .y2 = block.y + block.height,
-                        .color = col,
+                        .color = remapped,
                     } };
                     try self.display_list.append(self.allocator, rect);
                 }
@@ -1867,6 +1977,8 @@ fn addBackgroundIfNeeded(self: *Layout, block: *const BlockLayout) !void {
 }
 
 pub fn buildDocument(self: *Layout, root: Node) !*DocumentLayout {
+    self.color_scheme_dark = self.resolveColorScheme("light dark");
+    self.document_color_scheme_dark = self.color_scheme_dark;
     const document = try DocumentLayout.init(self.allocator, root);
     try document.layout(self);
     return document;
@@ -1874,6 +1986,23 @@ pub fn buildDocument(self: *Layout, root: Node) !*DocumentLayout {
 
 pub fn paintDocument(self: *Layout, document: *DocumentLayout) ![]DisplayItem {
     self.display_list.clearRetainingCapacity();
+
+    if (self.document_color_scheme_dark) {
+        const height = document.height + v_offset;
+        const width = self.layoutWindowWidth();
+        const bg_color = if (self.accessibility.dark_palette) |palette|
+            palette.background
+        else
+            browser.Color{ .r = 18, .g = 18, .b = 18, .a = 255 };
+        const bg = DisplayItem{ .rect = .{
+            .x1 = 0,
+            .y1 = 0,
+            .x2 = width,
+            .y2 = height,
+            .color = bg_color,
+        } };
+        try self.display_list.append(self.allocator, bg);
+    }
 
     for (document.children.items) |child| {
         try paintBlockTree(self, child);
@@ -1929,7 +2058,7 @@ fn paintBlockTreeRecursive(commands: *std.ArrayList(DisplayItem), self: *Layout,
     defer block_commands.deinit(self.allocator);
 
     // Add background/borders for this block
-    try addBackgroundIfNeededToList(self.allocator, &block_commands, block);
+    try addBackgroundIfNeededToList(self, &block_commands, block);
 
     // Add display items (from text, etc.)
     for (block.display_list.items) |item| {
@@ -2132,7 +2261,7 @@ fn applyPaintEffects(self: *Layout, block: *BlockLayout, commands: []DisplayItem
 }
 
 // Add background/borders to a specific command list instead of the global display list
-fn addBackgroundIfNeededToList(allocator: std.mem.Allocator, commands: *std.ArrayList(DisplayItem), block: *const BlockLayout) !void {
+fn addBackgroundIfNeededToList(self: *Layout, commands: *std.ArrayList(DisplayItem), block: *const BlockLayout) !void {
     // Skip painting if shouldPaint returns false
     if (!block.shouldPaint()) return;
 
@@ -2168,6 +2297,7 @@ fn addBackgroundIfNeededToList(allocator: std.mem.Allocator, commands: *std.Arra
 
             // Draw the background rectangle if we have a color
             if (color) |col| {
+                const remapped = self.remapColor(col);
                 // Parse border-radius if present
                 var radius: f64 = 0.0;
                 if (border_radius_str) |br_str| {
@@ -2185,9 +2315,9 @@ fn addBackgroundIfNeededToList(allocator: std.mem.Allocator, commands: *std.Arra
                         .x2 = block.x + block.width,
                         .y2 = block.y + block.height,
                         .radius = radius,
-                        .color = col,
+                        .color = remapped,
                     } };
-                    try commands.append(allocator, rounded_rect);
+                    try commands.append(self.allocator, rounded_rect);
                 } else {
                     // Use regular rectangle
                     const rect = DisplayItem{ .rect = .{
@@ -2195,9 +2325,9 @@ fn addBackgroundIfNeededToList(allocator: std.mem.Allocator, commands: *std.Arra
                         .y1 = block.y,
                         .x2 = block.x + block.width,
                         .y2 = block.y + block.height,
-                        .color = col,
+                        .color = remapped,
                     } };
-                    try commands.append(allocator, rect);
+                    try commands.append(self.allocator, rect);
                 }
             }
         },

@@ -8,12 +8,14 @@ pub const CSSParser = @This();
 
 string: []const u8,
 pos: usize,
+prefers_dark: bool,
 
-pub fn init(allocator: std.mem.Allocator, string: []const u8) !*CSSParser {
+pub fn init(allocator: std.mem.Allocator, string: []const u8, prefers_dark: bool) !*CSSParser {
     const parser = try allocator.create(CSSParser);
     parser.* = CSSParser{
         .string = string,
         .pos = 0,
+        .prefers_dark = prefers_dark,
     };
     return parser;
 }
@@ -126,6 +128,37 @@ pub fn ignoreUntil(self: *CSSParser, chars: []const u8) ?u8 {
     return null;
 }
 
+fn findMatchingBrace(self: *CSSParser, start: usize) ?usize {
+    if (start >= self.string.len or self.string[start] != '{') return null;
+    var depth: i32 = 0;
+    var i = start;
+    while (i < self.string.len) : (i += 1) {
+        const c = self.string[i];
+        if (c == '{') {
+            depth += 1;
+        } else if (c == '}') {
+            depth -= 1;
+            if (depth == 0) return i;
+        }
+    }
+    return null;
+}
+
+fn prefersColorSchemeMatch(self: *CSSParser, allocator: std.mem.Allocator, prelude: []const u8) ?bool {
+    const lower = std.ascii.allocLowerString(allocator, prelude) catch return null;
+    defer allocator.free(lower);
+
+    if (std.mem.indexOf(u8, lower, "prefers-color-scheme") == null) return null;
+
+    const has_dark = std.mem.indexOf(u8, lower, "dark") != null;
+    const has_light = std.mem.indexOf(u8, lower, "light") != null;
+
+    if (has_dark and has_light) return self.prefers_dark;
+    if (has_dark) return self.prefers_dark;
+    if (has_light) return !self.prefers_dark;
+    return null;
+}
+
 /// Parse a CSS selector (tag selector or descendant selector)
 /// Note: Using word() for tag names means .class and #id selectors
 /// are mis-parsed as tag selectors, but this won't cause harm since
@@ -173,6 +206,7 @@ pub fn selector(self: *CSSParser, allocator: std.mem.Allocator) !Selector {
 pub const CSSRule = struct {
     selector: Selector,
     properties: std.StringHashMap([]const u8),
+    owned: bool = true,
 
     pub fn deinit(self: *CSSRule, allocator: std.mem.Allocator) void {
         // Free the selector's allocated memory (pass pointer since deinit expects *Selector)
@@ -202,6 +236,49 @@ pub fn parse(self: *CSSParser, allocator: std.mem.Allocator) ![]CSSRule {
 
     while (self.pos < self.string.len) {
         self.whitespace();
+        if (self.pos >= self.string.len) break;
+
+        if (self.string[self.pos] == '@') {
+            if (std.mem.startsWith(u8, self.string[self.pos..], "@media")) {
+                const prelude_start = self.pos + "@media".len;
+                const brace_idx = std.mem.indexOfPos(u8, self.string, prelude_start, "{") orelse break;
+                const prelude = self.string[prelude_start..brace_idx];
+                const block_end = self.findMatchingBrace(brace_idx) orelse break;
+
+                if (self.prefersColorSchemeMatch(allocator, prelude)) |matches| {
+                    if (matches) {
+                        var media_parser = try CSSParser.init(
+                            allocator,
+                            self.string[brace_idx + 1 .. block_end],
+                            self.prefers_dark,
+                        );
+                        defer media_parser.deinit(allocator);
+
+                        const media_rules = try media_parser.parse(allocator);
+                        defer allocator.free(media_rules);
+
+                        for (media_rules) |rule| {
+                            try rules.append(allocator, rule);
+                        }
+                    }
+                }
+
+                self.pos = block_end + 1;
+                continue;
+            }
+
+            const why = self.ignoreUntil(";{") orelse break;
+            if (why == ';') {
+                _ = self.literal(';') catch {};
+                self.whitespace();
+                continue;
+            }
+            if (why == '{') {
+                const block_end = self.findMatchingBrace(self.pos) orelse break;
+                self.pos = block_end + 1;
+                continue;
+            }
+        }
 
         // Try to parse a complete rule, but catch errors and skip the rule
         const rule_result = blk: {
@@ -275,6 +352,7 @@ pub fn parse(self: *CSSParser, allocator: std.mem.Allocator) ![]CSSRule {
             break :blk CSSRule{
                 .selector = sel,
                 .properties = properties,
+                .owned = true,
             };
         };
 
