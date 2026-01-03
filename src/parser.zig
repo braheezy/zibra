@@ -1,4 +1,5 @@
 const std = @import("std");
+const zigimg = @import("zigimg");
 pub const CSSParser = @import("cssParser.zig").CSSParser;
 
 /// Animation state for a numeric CSS property transition
@@ -110,6 +111,7 @@ pub const Element = struct {
     is_focused: bool = false,
     // Animation state for CSS transitions, keyed by property name (e.g., "opacity")
     animations: ?std.StringHashMap(NumericAnimation) = null,
+    image_data: ?ImageData = null,
 
     pub fn init(allocator: std.mem.Allocator, tag: []const u8, parent: ?*Node) !Element {
         var e = Element{
@@ -121,6 +123,7 @@ pub const Element = struct {
             .owned_strings = null,
             .is_focused = false,
             .animations = null,
+            .image_data = null,
         };
 
         // Only parse attributes if there's a space in the tag
@@ -157,6 +160,10 @@ pub const Element = struct {
             }
             var o = owned;
             o.deinit(allocator);
+        }
+
+        if (self.image_data) |*image_data| {
+            image_data.deinit(allocator);
         }
 
         // Free animations map
@@ -245,6 +252,18 @@ pub const Element = struct {
             }
 
             try self.attributes.?.put(attr_name_slice, value_slice);
+        }
+    }
+};
+
+pub const ImageData = struct {
+    encoded_bytes: ?[]const u8,
+    image: zigimg.Image,
+
+    pub fn deinit(self: *ImageData, allocator: std.mem.Allocator) void {
+        self.image.deinit(allocator);
+        if (self.encoded_bytes) |bytes| {
+            allocator.free(bytes);
         }
     }
 };

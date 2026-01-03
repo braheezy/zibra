@@ -118,13 +118,14 @@ pub const Url = struct {
         if (std.mem.eql(u8, u.scheme, "data")) {
             // ! ada will eventually support parsing data urls
             // ! https://github.com/ada-url/ada/pull/756/
-            var rest = u.path;
+            const colon_index = std.mem.indexOfScalar(u8, url, ':') orelse return error.DataUriBadFormat;
+            var rest = url[colon_index + 1 ..];
 
             // find the first comma, everything after is the data
             var data: []const u8 = undefined;
             if (std.mem.indexOf(u8, rest, ",")) |comma_index| {
-                rest = rest[0..comma_index];
                 data = rest[comma_index + 1 ..];
+                rest = rest[0..comma_index];
             } else {
                 return error.DataUriBadFormat;
             }
@@ -132,28 +133,46 @@ pub const Url = struct {
             var split_iter = std.mem.splitSequence(u8, rest, ";");
             const mime_type = split_iter.first();
             var attributes = std.ArrayList([]const u8).empty;
-            const has_attributes = !std.mem.eql(u8, mime_type, url);
-            if (has_attributes) {
-                while (split_iter.next()) |attr| {
-                    try attributes.append(allocator, attr);
+            var is_base64 = false;
+            while (split_iter.next()) |attr| {
+                if (std.ascii.eqlIgnoreCase(attr, "base64")) {
+                    is_base64 = true;
                 }
+                try attributes.append(allocator, attr);
             }
             // Allocate memory for strings.
             const mime_type_alloc = try allocator.alloc(u8, mime_type.len);
             @memcpy(mime_type_alloc, mime_type);
 
-            const data_alloc = try allocator.alloc(u8, data.len);
-            @memcpy(data_alloc, data);
+            const data_alloc = if (is_base64) blk: {
+                const decoder = &std.base64.standard.Decoder;
+                const decoded_len = try decoder.calcSizeForSlice(data);
+                const decoded = try allocator.alloc(u8, decoded_len);
+                errdefer allocator.free(decoded);
+                try decoder.decode(decoded, data);
+                break :blk decoded;
+            } else blk: {
+                const copy = try allocator.alloc(u8, data.len);
+                @memcpy(copy, data);
+                break :blk copy;
+            };
 
             u.path = data_alloc;
             u.mime_type = mime_type_alloc;
-            u.attributes = attributes;
+            if (attributes.items.len > 0) {
+                u.attributes = attributes;
+            } else {
+                attributes.deinit(allocator);
+            }
         }
         return u;
     }
 
     pub fn free(self: Url, allocator: std.mem.Allocator) void {
         if (self.mime_type) |_| allocator.free(self.mime_type.?);
+        if (std.mem.eql(u8, self.scheme, "data")) {
+            allocator.free(self.path);
+        }
         if (self.attributes) |attrs| {
             var a = attrs;
             a.deinit(allocator);
@@ -171,6 +190,13 @@ pub const Url = struct {
     pub fn resolve(self: Url, allocator: std.mem.Allocator, relative_url: []const u8) !Url {
         // If it's already a full URL, just parse and return it
         if (std.mem.indexOf(u8, relative_url, "://") != null) {
+            return try Url.init(allocator, relative_url);
+        }
+
+        if (std.mem.startsWith(u8, relative_url, "data:") or
+            std.mem.startsWith(u8, relative_url, "about:") or
+            std.mem.startsWith(u8, relative_url, "file:"))
+        {
             return try Url.init(allocator, relative_url);
         }
 
@@ -562,15 +588,11 @@ pub const Url = struct {
     }
 
     pub fn fileRequest(self: Url, al: std.mem.Allocator) ![]const u8 {
-        const html_file = std.fs.cwd().openFile(self.path, .{}) catch |err| {
-            std.log.err("Failed to open file {s}: {any}", .{ self.path, err });
-            // EX_NOINPUT: cannot open input
-            std.process.exit(66);
-        };
+        const html_file = try std.fs.cwd().openFile(self.path, .{});
 
         defer html_file.close();
 
-        const html_content = try html_file.readToEndAlloc(al, 4096);
+        const html_content = try html_file.readToEndAlloc(al, std.math.maxInt(usize));
         return html_content;
     }
 

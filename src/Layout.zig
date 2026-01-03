@@ -99,19 +99,148 @@ fn parseTranslate(value: []const u8) ?struct { x: i32, y: i32 } {
     return .{ .x = x, .y = y };
 }
 
+const EmbedLayout = struct {
+    width: i32 = 0,
+    height: i32 = 0,
+    ascent: i32 = 0,
+    descent: i32 = 0,
+
+    pub fn appendInline(
+        self: *const EmbedLayout,
+        engine: *Layout,
+        line_buffer: *std.ArrayList(LineItem),
+        node_ptr: ?*Node,
+        payload: LineItemPayload,
+    ) !void {
+        if (self.width <= 0 or self.height <= 0) return;
+
+        if (engine.cursor_x + self.width > engine.line_right) {
+            try engine.flushLine(line_buffer);
+            engine.cursor_x = if (engine.rtl_text) engine.line_right else engine.line_left;
+        }
+
+        try line_buffer.append(engine.allocator, LineItem{
+            .x = engine.cursor_x,
+            .ascent = self.ascent,
+            .descent = self.descent,
+            .width = self.width,
+            .height = self.height,
+            .node_ptr = node_ptr,
+            .payload = payload,
+        });
+        engine.cursor_x += self.width;
+    }
+};
+
+pub const ImageLayout = struct {
+    embed: EmbedLayout = .{},
+    pixels: []const u8,
+    source_width: i32,
+    source_height: i32,
+    opacity: f64 = 1.0,
+
+    pub fn init(
+        layout_width: i32,
+        layout_height: i32,
+        image_data: ?parser.ImageData,
+    ) ImageLayout {
+        const empty_pixels = &[_]u8{};
+        const src_width: i32 = if (image_data) |data| @intCast(data.image.width) else 0;
+        const src_height: i32 = if (image_data) |data| @intCast(data.image.height) else 0;
+        return .{
+            .embed = .{
+                .width = layout_width,
+                .height = layout_height,
+                .ascent = layout_height,
+                .descent = 0,
+            },
+            .pixels = if (image_data) |data| data.image.rawBytes() else empty_pixels,
+            .source_width = src_width,
+            .source_height = src_height,
+            .opacity = 1.0,
+        };
+    }
+};
+
+pub const IframeLayout = struct {
+    embed: EmbedLayout = .{},
+    bgcolor: browser.Color,
+    border_color: browser.Color,
+    border_thickness: i32 = 1,
+
+    pub fn init(layout_width: i32, layout_height: i32) IframeLayout {
+        return .{
+            .embed = .{
+                .width = layout_width,
+                .height = layout_height,
+                .ascent = layout_height,
+                .descent = 0,
+            },
+            .bgcolor = .{ .r = 0xf2, .g = 0xf2, .b = 0xf2, .a = 0xff },
+            .border_color = .{ .r = 0x33, .g = 0x33, .b = 0x33, .a = 0xff },
+            .border_thickness = 1,
+        };
+    }
+
+    pub fn paintAt(
+        self: *const IframeLayout,
+        commands: *std.ArrayList(DisplayItem),
+        engine: *Layout,
+        x: i32,
+        y: i32,
+    ) !void {
+        const bg = engine.remapColor(self.bgcolor);
+        if (bg.a > 0) {
+            try commands.append(engine.allocator, DisplayItem{
+                .rect = .{
+                    .x1 = x,
+                    .y1 = y,
+                    .x2 = x + self.embed.width,
+                    .y2 = y + self.embed.height,
+                    .color = bg,
+                },
+            });
+        }
+
+        const border = engine.remapColor(self.border_color);
+        if (border.a > 0) {
+            try commands.append(engine.allocator, DisplayItem{
+                .outline = .{
+                    .rect = .{
+                        .left = x,
+                        .top = y,
+                        .right = x + self.embed.width,
+                        .bottom = y + self.embed.height,
+                    },
+                    .color = border,
+                    .thickness = self.border_thickness,
+                },
+            });
+        }
+    }
+};
+
+const LineItemPayload = union(enum) {
+    glyph: struct {
+        glyph: font.Glyph,
+        color: browser.Color,
+    },
+    input: InputLayout,
+    image: ImageLayout,
+    iframe: IframeLayout,
+};
+
 const LineItem = struct {
     x: i32,
-    glyph: font.Glyph,
-    /// The glyph's ascent (from font metrics)
+    /// The glyph's ascent or image height (from font metrics)
     ascent: i32,
     /// The glyph's descent as a positive value (–TTF_FontDescent)
     descent: i32,
     width: i32,
     height: i32,
-    /// Color to use when rendering this glyph
-    color: browser.Color,
-    /// Pointer to the DOM node that produced this glyph (if available)
+    /// Pointer to the DOM node that produced this item (if available)
     node_ptr: ?*Node,
+    payload: LineItemPayload,
 };
 
 // Add this struct to cache word measurements
@@ -131,6 +260,11 @@ pub const Bounds = struct {
 };
 
 const LinkBoundEntry = struct {
+    node: *Node,
+    bounds: Bounds,
+};
+
+const IframeBoundEntry = struct {
     node: *Node,
     bounds: Bounds,
 };
@@ -183,6 +317,8 @@ word_cache: std.AutoHashMap(u64, WordCache),
 input_bounds: std.AutoHashMap(*Node, Bounds),
 // Collected bounds for anchor elements
 link_bounds: std.ArrayList(LinkBoundEntry),
+// Collected bounds for iframe elements
+iframe_bounds: std.ArrayList(IframeBoundEntry),
 // Per-line bounds for focusable elements
 focus_bounds: std.ArrayList(FocusBoundEntry),
 // Per-line bounds for accessible elements
@@ -297,6 +433,15 @@ fn parseColorSchemeValue(value: []const u8) ColorSchemeSupport {
     return .{ .light = supports_light, .dark = supports_dark };
 }
 
+fn parseLengthAttribute(value: []const u8) ?i32 {
+    if (value.len == 0) return null;
+    if (std.mem.endsWith(u8, value, "px")) {
+        const num_str = value[0 .. value.len - 2];
+        return std.fmt.parseInt(i32, num_str, 10) catch null;
+    }
+    return std.fmt.parseInt(i32, value, 10) catch null;
+}
+
 fn resolveColorScheme(self: *const Layout, value: []const u8) bool {
     const support = parseColorSchemeValue(value);
     if (!support.light and !support.dark) return self.accessibility.prefers_dark;
@@ -369,6 +514,7 @@ pub fn init(
         .word_cache = std.AutoHashMap(u64, WordCache).init(allocator),
         .input_bounds = std.AutoHashMap(*Node, Bounds).init(allocator),
         .link_bounds = std.ArrayList(LinkBoundEntry).empty,
+        .iframe_bounds = std.ArrayList(IframeBoundEntry).empty,
         .focus_bounds = std.ArrayList(FocusBoundEntry).empty,
         .accessibility_bounds = std.ArrayList(AccessibilityBoundEntry).empty,
     };
@@ -395,6 +541,7 @@ pub fn deinit(self: *Layout) void {
 
     self.input_bounds.deinit();
     self.link_bounds.deinit(self.allocator);
+    self.iframe_bounds.deinit(self.allocator);
     self.focus_bounds.deinit(self.allocator);
     self.accessibility_bounds.deinit(self.allocator);
 
@@ -407,9 +554,18 @@ pub fn deinit(self: *Layout) void {
 fn recurseNode(self: *Layout, node: Node, node_ptr: ?*Node, line_buffer: *std.ArrayList(LineItem)) !void {
     switch (node) {
         .text => |t| {
+            if (t.parent) |parent| {
+                switch (parent.*) {
+                    .element => |e| {
+                        if (isNonRenderTag(e.tag)) return;
+                    },
+                    else => {},
+                }
+            }
             try self.handleTextToken(t.text, line_buffer, node_ptr);
         },
         .element => |e| {
+            if (isNonRenderTag(e.tag)) return;
             // Apply CSS styles before processing this element
             try self.applyNodeStyles(e, line_buffer);
 
@@ -419,6 +575,10 @@ fn recurseNode(self: *Layout, node: Node, node_ptr: ?*Node, line_buffer: *std.Ar
             } else if (std.mem.eql(u8, e.tag, "input") or std.mem.eql(u8, e.tag, "button")) {
                 // Handle input and button elements - render as inline widgets
                 try self.handleInputElement(node, node_ptr, line_buffer);
+            } else if (std.mem.eql(u8, e.tag, "img")) {
+                try self.handleImageElement(node, node_ptr, line_buffer);
+            } else if (std.ascii.eqlIgnoreCase(e.tag, "iframe")) {
+                try self.handleIframeElement(node, node_ptr, line_buffer);
             } else {
                 for (e.children.items) |*child| {
                     try self.recurseNode(child.*, child, line_buffer);
@@ -431,154 +591,121 @@ fn recurseNode(self: *Layout, node: Node, node_ptr: ?*Node, line_buffer: *std.Ar
     }
 }
 
+fn isNonRenderTag(tag: []const u8) bool {
+    return std.ascii.eqlIgnoreCase(tag, "script") or
+        std.ascii.eqlIgnoreCase(tag, "style") or
+        std.ascii.eqlIgnoreCase(tag, "head") or
+        std.ascii.eqlIgnoreCase(tag, "meta") or
+        std.ascii.eqlIgnoreCase(tag, "link") or
+        std.ascii.eqlIgnoreCase(tag, "title");
+}
+
 fn handleInputElement(self: *Layout, node: Node, node_ptr: ?*Node, line_buffer: *std.ArrayList(LineItem)) !void {
     const element = switch (node) {
         .element => |e| e,
         else => return,
     };
 
-    // Get background color from style
-    var bgcolor = browser.Color{ .r = 173, .g = 216, .b = 230, .a = 255 }; // lightblue default
-    if (element.style) |style| {
-        if (style.get("background-color")) |bg| {
-            if (parseColor(bg)) |col| {
-                bgcolor = col;
-            }
-        }
-    }
+    var input_layout = InputLayout{};
+    try input_layout.measure(self, element);
 
-    // Fixed width for input elements
-    const widget_width = INPUT_WIDTH_PX;
-
-    // Check if we need to wrap to a new line
-    if (self.cursor_x + widget_width > self.line_right) {
-        try self.flushLine(line_buffer);
-        self.cursor_x = if (self.rtl_text) self.line_right else self.line_left;
-    }
-
-    // Get font metrics for sizing
-    const weight: font.FontWeight = if (self.is_bold) .Bold else .Normal;
-    const slant: font.FontSlant = if (self.is_italic) .Italic else .Roman;
-    const glyph = try self.font_manager.getStyledGlyph(
-        "X",
-        weight,
-        slant,
-        self.scaledFontSize(self.size),
-        false,
-    );
-
-    const widget_height = self.toLayoutPx(glyph.ascent + glyph.descent);
-
-    // Store bounds for hit testing if we have a node pointer
-    // Include transform offset for absolute positioning
-    if (node_ptr) |ptr| {
-        try self.input_bounds.put(ptr, .{
-            .x = self.cursor_x + self.transform_offset_x,
-            .y = self.cursor_y + self.transform_offset_y,
-            .width = widget_width,
-            .height = widget_height,
-        });
-        const bounds = Bounds{
-            .x = self.cursor_x + self.transform_offset_x,
-            .y = self.cursor_y + self.transform_offset_y,
-            .width = widget_width,
-            .height = widget_height,
-        };
-        try self.focus_bounds.append(self.allocator, .{
-            .node = ptr,
-            .bounds = bounds,
-        });
-        try self.accessibility_bounds.append(self.allocator, .{
-            .node = ptr,
-            .bounds = bounds,
-        });
-    }
-
-    // Draw the background rectangle
-    try self.current_display_target.append(self.allocator, DisplayItem{
-        .rect = .{
-            .x1 = self.cursor_x,
-            .y1 = self.cursor_y,
-            .x2 = self.cursor_x + widget_width,
-            .y2 = self.cursor_y + widget_height,
-            .color = self.remapColor(bgcolor),
-        },
+    try input_layout.embed.appendInline(self, line_buffer, node_ptr, .{
+        .input = input_layout,
     });
+}
 
-    // Get the text to display
-    var text: []const u8 = "";
-    if (std.mem.eql(u8, element.tag, "input")) {
-        // For input elements, get the value attribute
-        if (element.attributes) |attrs| {
-            text = attrs.get("value") orelse "";
+fn handleImageElement(self: *Layout, node: Node, node_ptr: ?*Node, line_buffer: *std.ArrayList(LineItem)) !void {
+    const element = switch (node) {
+        .element => |e| e,
+        else => return,
+    };
+
+    var width_attr: ?i32 = null;
+    var height_attr: ?i32 = null;
+    if (element.attributes) |attrs| {
+        if (attrs.get("width")) |width_str| {
+            width_attr = parseLengthAttribute(width_str);
         }
-    } else if (std.mem.eql(u8, element.tag, "button")) {
-        // For button elements, get text content
-        if (element.children.items.len == 1) {
-            switch (element.children.items[0]) {
-                .text => |t| {
-                    text = t.text;
-                },
-                else => {
-                    std.debug.print("Ignoring HTML contents inside button\n", .{});
-                },
-            }
+        if (attrs.get("height")) |height_str| {
+            height_attr = parseLengthAttribute(height_str);
         }
     }
 
-    // Draw the text if we have any, and track cursor position
-    var text_x = self.cursor_x + 2; // Small padding from left edge
-    const baseline_y = self.cursor_y + self.toLayoutPx(glyph.ascent);
+    const image_data = element.image_data;
+    const intrinsic_width: i32 = if (image_data) |data|
+        self.toLayoutPx(@intCast(data.image.width))
+    else
+        0;
+    const intrinsic_height: i32 = if (image_data) |data|
+        self.toLayoutPx(@intCast(data.image.height))
+    else
+        0;
 
-    if (text.len > 0) {
-        var g_iter = self.grapheme_data.iterator(text);
+    var layout_width: i32 = 0;
+    var layout_height: i32 = 0;
 
-        while (g_iter.next()) |gc| {
-            const gme = gc.bytes(text);
-            const text_glyph = try self.font_manager.getStyledGlyph(
-                gme,
-                weight,
-                slant,
-                self.scaledFontSize(self.size),
-                false,
-            );
+    if (width_attr != null and height_attr != null) {
+        layout_width = width_attr.?;
+        layout_height = height_attr.?;
+    } else if (width_attr != null) {
+        layout_width = width_attr.?;
+        if (intrinsic_width > 0 and intrinsic_height > 0) {
+            layout_height = @divTrunc(layout_width * intrinsic_height, intrinsic_width);
+        } else {
+            layout_height = layout_width;
+        }
+    } else if (height_attr != null) {
+        layout_height = height_attr.?;
+        if (intrinsic_width > 0 and intrinsic_height > 0) {
+            layout_width = @divTrunc(layout_height * intrinsic_width, intrinsic_height);
+        } else {
+            layout_width = layout_height;
+        }
+    } else {
+        layout_width = intrinsic_width;
+        layout_height = intrinsic_height;
+    }
 
-            try self.current_display_target.append(self.allocator, DisplayItem{
-                .glyph = .{
-                    .x = text_x,
-                    .y = baseline_y - self.toLayoutPx(text_glyph.ascent),
-                    .glyph = text_glyph,
-                    .color = self.remapColor(self.text_color),
-                },
-            });
-            text_x += self.toLayoutPx(text_glyph.w);
+    if (layout_width <= 0 or layout_height <= 0) return;
+
+    var image_layout = ImageLayout.init(layout_width, layout_height, image_data);
+    try image_layout.embed.appendInline(self, line_buffer, node_ptr, .{
+        .image = image_layout,
+    });
+}
+
+fn handleIframeElement(self: *Layout, node: Node, node_ptr: ?*Node, line_buffer: *std.ArrayList(LineItem)) !void {
+    const element = switch (node) {
+        .element => |e| e,
+        else => return,
+    };
+
+    var width_attr: ?i32 = null;
+    var height_attr: ?i32 = null;
+    if (element.attributes) |attrs| {
+        if (attrs.get("width")) |width_str| {
+            width_attr = parseLengthAttribute(width_str);
+        }
+        if (attrs.get("height")) |height_str| {
+            height_attr = parseLengthAttribute(height_str);
         }
     }
 
-    // Draw cursor if this input element is focused
-    if (element.is_focused) {
-        try self.current_display_target.append(self.allocator, DisplayItem{
-            .line = .{
-                .x1 = text_x,
-                .y1 = self.cursor_y,
-                .x2 = text_x,
-                .y2 = self.cursor_y + widget_height,
-                .color = self.remapColor(.{ .r = 0, .g = 0, .b = 0, .a = 255 }),
-                .thickness = 1,
-            },
-        });
+    var layout_width: i32 = 300;
+    var layout_height: i32 = 150;
+    if (width_attr != null) {
+        layout_width = width_attr.?;
+    }
+    if (height_attr != null) {
+        layout_height = height_attr.?;
     }
 
-    // Flush any pending text in the line buffer before the widget
-    try self.flushLine(line_buffer);
+    if (layout_width <= 0 or layout_height <= 0) return;
 
-    // Advance cursor_y to account for widget height
-    const widget_bottom = self.cursor_y + widget_height;
-    const extra_leading: i32 = @intFromFloat(@as(f32, @floatFromInt(widget_height)) * 0.25);
-    self.cursor_y = widget_bottom + extra_leading;
-
-    // Reset cursor_x for next line
-    self.cursor_x = if (self.rtl_text) self.line_right else self.line_left;
+    var iframe_layout = IframeLayout.init(layout_width, layout_height);
+    try iframe_layout.embed.appendInline(self, line_buffer, node_ptr, .{
+        .iframe = iframe_layout,
+    });
 }
 
 const StyleSnapshot = struct {
@@ -700,7 +827,13 @@ fn flushLine(self: *Layout, line_buffer: *std.ArrayList(LineItem)) !void {
     var max_descent: i32 = 0;
 
     for (line_buffer.items) |item| {
-        if (item.glyph.is_superscript) {
+        const is_superscript = switch (item.payload) {
+            .glyph => |glyph_payload| glyph_payload.glyph.is_superscript,
+            .input => false,
+            .image => false,
+            .iframe => false,
+        };
+        if (is_superscript) {
             if (item.ascent > max_ascent) max_ascent = item.ascent;
             if (item.descent > max_descent) max_descent = item.descent;
         } else {
@@ -723,7 +856,13 @@ fn flushLine(self: *Layout, line_buffer: *std.ArrayList(LineItem)) !void {
     for (line_buffer.items) |item| {
         var final_y: i32 = undefined;
 
-        if (item.glyph.is_superscript) {
+        const is_superscript = switch (item.payload) {
+            .glyph => |glyph_payload| glyph_payload.glyph.is_superscript,
+            .input => false,
+            .image => false,
+            .iframe => false,
+        };
+        if (is_superscript) {
             // Position superscript so its top aligns with normal text top
             final_y = self.cursor_y; // Start at line top
         } else {
@@ -732,6 +871,14 @@ fn flushLine(self: *Layout, line_buffer: *std.ArrayList(LineItem)) !void {
         }
 
         if (item.node_ptr) |ptr| {
+            if (item.payload == .input) {
+                try self.input_bounds.put(ptr, .{
+                    .x = item.x,
+                    .y = final_y,
+                    .width = item.width,
+                    .height = item.height,
+                });
+            }
             try self.recordLinkBounds(ptr, item.x, final_y, item.width, item.height);
             if (findFocusableNode(ptr)) |focus_node| {
                 const right = item.x + item.width;
@@ -777,14 +924,61 @@ fn flushLine(self: *Layout, line_buffer: *std.ArrayList(LineItem)) !void {
             }
         }
 
-        try self.current_display_target.append(self.allocator, DisplayItem{
-            .glyph = .{
-                .x = item.x,
-                .y = final_y,
-                .glyph = item.glyph,
-                .color = item.color, // Use the color captured when item was added to line buffer
+        switch (item.payload) {
+            .glyph => |glyph_payload| {
+                try self.current_display_target.append(self.allocator, DisplayItem{
+                    .glyph = .{
+                        .x = item.x,
+                        .y = final_y,
+                        .glyph = glyph_payload.glyph,
+                        .color = glyph_payload.color, // Use the color captured when item was added to line buffer
+                    },
+                });
             },
-        });
+            .input => |input_payload| {
+                try input_payload.paintAt(self.current_display_target, self, item.x, final_y);
+            },
+            .image => |image_payload| {
+                try self.current_display_target.append(self.allocator, DisplayItem{
+                    .image = .{
+                        .x1 = item.x,
+                        .y1 = final_y,
+                        .x2 = item.x + item.width,
+                        .y2 = final_y + item.height,
+                        .source_width = image_payload.source_width,
+                        .source_height = image_payload.source_height,
+                        .pixels = image_payload.pixels,
+                        .opacity = image_payload.opacity,
+                    },
+                });
+            },
+            .iframe => |iframe_payload| {
+                if (item.node_ptr) |ptr| {
+                    try self.current_display_target.append(self.allocator, DisplayItem{
+                        .iframe = .{
+                            .rect = .{
+                                .left = item.x,
+                                .top = final_y,
+                                .right = item.x + item.width,
+                                .bottom = final_y + item.height,
+                            },
+                            .node = ptr,
+                        },
+                    });
+                    try self.iframe_bounds.append(self.allocator, .{
+                        .node = ptr,
+                        .bounds = .{
+                            .x = item.x,
+                            .y = final_y,
+                            .width = item.width,
+                            .height = item.height,
+                        },
+                    });
+                } else {
+                    try iframe_payload.paintAt(self.current_display_target, self, item.x, final_y);
+                }
+            },
+        }
     }
 
     var focus_it = focus_map.iterator();
@@ -918,13 +1112,17 @@ fn processGrapheme(
     // Add glyph to line buffer with current text color
     try line_buffer.append(self.allocator, LineItem{
         .x = self.cursor_x,
-        .glyph = glyph,
         .ascent = glyph_ascent,
         .descent = glyph_descent,
         .width = glyph_width,
         .height = glyph_height,
-        .color = self.remapColor(self.text_color), // Capture remapped color at time of adding to buffer
         .node_ptr = node_ptr,
+        .payload = .{
+            .glyph = .{
+                .glyph = glyph,
+                .color = self.remapColor(self.text_color),
+            },
+        },
     });
     self.cursor_x += glyph_width;
 }
@@ -1323,68 +1521,46 @@ const INPUT_WIDTH_PX: i32 = 200;
 
 // Input layout for form widgets (input and button elements)
 pub const InputLayout = struct {
-    allocator: std.mem.Allocator,
-    node: Node,
-    parent: *LineLayout,
-    previous: ?*anyopaque, // Can be TextLayout or InputLayout
-    x: i32 = 0,
-    y: i32 = 0,
-    width: i32 = 0,
-    height: i32 = 0,
+    embed: EmbedLayout = .{},
     font_size: i32 = 16,
     font_weight: FontWeight = .Normal,
     font_slant: FontSlant = .Roman,
     color: browser.Color = .{ .r = 0, .g = 0, .b = 0, .a = 255 },
     bgcolor: browser.Color = .{ .r = 173, .g = 216, .b = 230, .a = 255 }, // lightblue
-    ascent: i32 = 0,
-    descent: i32 = 0,
+    text: []const u8 = "",
+    is_focused: bool = false,
 
-    pub fn init(
-        allocator: std.mem.Allocator,
-        node: Node,
-        parent: *LineLayout,
-        previous: ?*anyopaque,
-    ) !*InputLayout {
-        const input = try allocator.create(InputLayout);
-        input.* = InputLayout{
-            .allocator = allocator,
-            .node = node,
-            .parent = parent,
-            .previous = previous,
-        };
-        return input;
-    }
-
-    pub fn deinit(self: *InputLayout) void {
-        _ = self;
-        // Node is part of the HTML tree and managed elsewhere
-    }
-
-    pub fn layout(self: *InputLayout, engine: *Layout) !void {
-        // Fixed width for input elements
-        self.width = INPUT_WIDTH_PX;
-
-        // Get font properties from node style
+    pub fn measure(self: *InputLayout, engine: *Layout, element: parser.Element) !void {
         self.font_weight = if (engine.is_bold) .Bold else .Normal;
         self.font_slant = if (engine.is_italic) .Italic else .Roman;
         self.font_size = engine.scaledFontSize(engine.size);
         self.color = engine.text_color;
 
-        // Get background color from node style
-        switch (self.node) {
-            .element => |e| {
-                if (e.style) |style| {
-                    if (style.get("background-color")) |bg| {
-                        if (parseColor(bg)) |col| {
-                            self.bgcolor = col;
-                        }
-                    }
+        if (element.style) |style| {
+            if (style.get("background-color")) |bg| {
+                if (parseColor(bg)) |col| {
+                    self.bgcolor = col;
                 }
-            },
-            else => {},
+            }
         }
 
-        // Use a sample character to get font metrics
+        if (std.mem.eql(u8, element.tag, "input")) {
+            if (element.attributes) |attrs| {
+                self.text = attrs.get("value") orelse "";
+            }
+        } else if (std.mem.eql(u8, element.tag, "button")) {
+            if (element.children.items.len == 1) {
+                switch (element.children.items[0]) {
+                    .text => |t| {
+                        self.text = t.text;
+                    },
+                    else => {
+                        std.debug.print("Ignoring HTML contents inside button\n", .{});
+                    },
+                }
+            }
+        }
+
         const glyph = try engine.font_manager.getStyledGlyph(
             "X",
             self.font_weight,
@@ -1393,73 +1569,34 @@ pub const InputLayout = struct {
             false,
         );
 
-        self.ascent = engine.toLayoutPx(glyph.ascent);
-        self.descent = engine.toLayoutPx(glyph.descent);
-        self.height = self.ascent + self.descent;
-
-        // Compute x position - similar to TextLayout but works with previous of any type
-        // For now, we'll set x to parent.x and let LineLayout position us
-        self.x = self.parent.x;
+        self.embed.width = INPUT_WIDTH_PX;
+        self.embed.ascent = engine.toLayoutPx(glyph.ascent);
+        self.embed.descent = engine.toLayoutPx(glyph.descent);
+        self.embed.height = self.embed.ascent + self.embed.descent;
+        self.is_focused = element.is_focused;
     }
 
-    pub fn paint(self: *InputLayout, engine: *Layout) !void {
-        var commands = std.ArrayList(DisplayItem).empty;
-        defer commands.deinit(engine.allocator);
-        try self.paintToList(&commands, engine);
-        for (commands.items) |cmd| {
-            try engine.display_list.append(engine.allocator, cmd);
-        }
-    }
-
-    pub fn paintToList(self: *InputLayout, commands: *std.ArrayList(DisplayItem), engine: *Layout) !void {
-        // Draw background rectangle
+    pub fn paintAt(self: *const InputLayout, commands: *std.ArrayList(DisplayItem), engine: *Layout, x: i32, y: i32) !void {
         const remapped_bg = engine.remapColor(self.bgcolor);
         if (remapped_bg.a > 0) {
             try commands.append(engine.allocator, DisplayItem{
                 .rect = .{
-                    .x1 = self.x,
-                    .y1 = self.y,
-                    .x2 = self.x + self.width,
-                    .y2 = self.y + self.height,
+                    .x1 = x,
+                    .y1 = y,
+                    .x2 = x + self.embed.width,
+                    .y2 = y + self.embed.height,
                     .color = remapped_bg,
                 },
             });
         }
 
-        // Get the text to display
-        var text: []const u8 = "";
-        switch (self.node) {
-            .element => |e| {
-                if (std.mem.eql(u8, e.tag, "input")) {
-                    // For input elements, get the value attribute
-                    if (e.attributes) |attrs| {
-                        text = attrs.get("value") orelse "";
-                    }
-                } else if (std.mem.eql(u8, e.tag, "button")) {
-                    // For button elements, get text content
-                    if (e.children.items.len == 1) {
-                        switch (e.children.items[0]) {
-                            .text => |t| {
-                                text = t.text;
-                            },
-                            else => {
-                                std.debug.print("Ignoring HTML contents inside button\n", .{});
-                            },
-                        }
-                    }
-                }
-            },
-            else => {},
-        }
-
-        // Draw the text if we have any
-        if (text.len > 0) {
-            // Render each grapheme
-            var g_iter = engine.grapheme_data.iterator(text);
-            var text_x = self.x + 2; // Small padding from left edge
+        if (self.text.len > 0) {
+            var g_iter = engine.grapheme_data.iterator(self.text);
+            var text_x = x + 2;
+            const baseline_y = y + self.embed.ascent;
 
             while (g_iter.next()) |gc| {
-                const gme = gc.bytes(text);
+                const gme = gc.bytes(self.text);
                 const glyph = try engine.font_manager.getStyledGlyph(
                     gme,
                     self.font_weight,
@@ -1471,19 +1608,27 @@ pub const InputLayout = struct {
                 try commands.append(engine.allocator, DisplayItem{
                     .glyph = .{
                         .x = text_x,
-                        .y = self.y,
+                        .y = baseline_y - engine.toLayoutPx(glyph.ascent),
                         .glyph = glyph,
                         .color = engine.remapColor(self.color),
                     },
                 });
                 text_x += engine.toLayoutPx(glyph.w);
             }
-        }
-    }
 
-    pub fn shouldPaint(self: *const InputLayout) bool {
-        _ = self;
-        return true;
+            if (self.is_focused) {
+                try commands.append(engine.allocator, DisplayItem{
+                    .line = .{
+                        .x1 = text_x,
+                        .y1 = y,
+                        .x2 = text_x,
+                        .y2 = y + self.embed.height,
+                        .color = engine.remapColor(.{ .r = 0, .g = 0, .b = 0, .a = 255 }),
+                        .thickness = 1,
+                    },
+                });
+            }
+        }
     }
 };
 
@@ -1749,6 +1894,7 @@ pub const DocumentLayout = struct {
 
         engine.input_bounds.clearRetainingCapacity();
         engine.link_bounds.clearRetainingCapacity();
+        engine.iframe_bounds.clearRetainingCapacity();
         engine.focus_bounds.clearRetainingCapacity();
         engine.accessibility_bounds.clearRetainingCapacity();
 
@@ -1757,7 +1903,7 @@ pub const DocumentLayout = struct {
             self.allocator.destroy(child);
         }
         self.children.clearRetainingCapacity();
-        const child = try BlockLayout.init(self.allocator, self.node, self, null, null);
+        const child = try BlockLayout.init(self.allocator, self.node, null, self, null, null);
         try self.children.append(self.allocator, child);
 
         try child.layout(engine);
@@ -1792,6 +1938,7 @@ pub const LayoutChild = union(enum) {
 pub const BlockLayout = struct {
     allocator: std.mem.Allocator,
     node: Node,
+    node_ptr: ?*Node,
     document: *DocumentLayout,
     parent_block: ?*BlockLayout,
     previous: ?*BlockLayout,
@@ -1806,6 +1953,7 @@ pub const BlockLayout = struct {
     pub fn init(
         allocator: std.mem.Allocator,
         node: Node,
+        node_ptr: ?*Node,
         document: *DocumentLayout,
         parent_block: ?*BlockLayout,
         previous: ?*BlockLayout,
@@ -1814,6 +1962,7 @@ pub const BlockLayout = struct {
         block.* = BlockLayout{
             .allocator = allocator,
             .node = node,
+            .node_ptr = node_ptr,
             .document = document,
             .parent_block = parent_block,
             .previous = previous,
@@ -1835,8 +1984,10 @@ pub const BlockLayout = struct {
         switch (self.node) {
             .text => return false,
             .element => |e| {
-                // Input and button elements are always inline, even though they may have no children
-                if (std.mem.eql(u8, e.tag, "input") or std.mem.eql(u8, e.tag, "button")) {
+                // Input, button, and iframe elements are always inline, even though they may have no children
+                if (std.ascii.eqlIgnoreCase(e.tag, "input") or std.ascii.eqlIgnoreCase(e.tag, "button") or
+                    std.ascii.eqlIgnoreCase(e.tag, "img") or std.ascii.eqlIgnoreCase(e.tag, "iframe"))
+                {
                     return false;
                 }
 
@@ -1911,7 +2062,15 @@ pub const BlockLayout = struct {
         self.width = parent_width;
         self.y = if (self.previous) |prev| prev.y + prev.height else parent_y;
 
-        const is_block = self.isBlockContainer();
+        var is_block = self.isBlockContainer();
+        if (self.node == .element) {
+            const tag = self.node.element.tag;
+            if (std.ascii.eqlIgnoreCase(tag, "input") or std.ascii.eqlIgnoreCase(tag, "button") or
+                std.ascii.eqlIgnoreCase(tag, "img") or std.ascii.eqlIgnoreCase(tag, "iframe"))
+            {
+                is_block = false;
+            }
+        }
         if (is_block) {
             // Clear existing children
             for (self.children.items) |child| {
@@ -1923,8 +2082,8 @@ pub const BlockLayout = struct {
             switch (self.node) {
                 .element => |e| {
                     var previous: ?*BlockLayout = null;
-                    for (e.children.items) |child_node| {
-                        const child = try BlockLayout.init(self.allocator, child_node, self.document, self, previous);
+                    for (e.children.items) |*child_node| {
+                        const child = try BlockLayout.init(self.allocator, child_node.*, child_node, self.document, self, previous);
                         try self.children.append(self.allocator, .{ .block = child });
                         previous = child;
                     }
@@ -2008,8 +2167,16 @@ fn layoutInlineBlock(self: *Layout, block: *BlockLayout) !void {
                 try self.flushLine(&line_buffer);
             }
 
-            for (e.children.items) |*child| {
-                try self.recurseNode(child.*, child, &line_buffer);
+            if (std.ascii.eqlIgnoreCase(e.tag, "input") or std.ascii.eqlIgnoreCase(e.tag, "button")) {
+                try self.handleInputElement(block.node, block.node_ptr, &line_buffer);
+            } else if (std.ascii.eqlIgnoreCase(e.tag, "img")) {
+                try self.handleImageElement(block.node, block.node_ptr, &line_buffer);
+            } else if (std.ascii.eqlIgnoreCase(e.tag, "iframe")) {
+                try self.handleIframeElement(block.node, block.node_ptr, &line_buffer);
+            } else {
+                for (e.children.items) |*child| {
+                    try self.recurseNode(child.*, child, &line_buffer);
+                }
             }
 
             try self.restoreNodeStyles(&line_buffer);

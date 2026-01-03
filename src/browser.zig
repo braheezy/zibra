@@ -6,6 +6,7 @@ const code_point = @import("code_point");
 const sdl2 = @import("sdl");
 const z2d = @import("z2d");
 const compositor = z2d.compositor;
+const zigimg = @import("zigimg");
 
 const token = @import("token.zig");
 const font = @import("font.zig");
@@ -22,9 +23,12 @@ const Layout = @import("Layout.zig");
 const parser = @import("parser.zig");
 const HTMLParser = parser.HTMLParser;
 const Node = parser.Node;
+const ImageData = parser.ImageData;
 const CSSParser = @import("cssParser.zig").CSSParser;
 const js_module = @import("js.zig");
-const Tab = @import("tab.zig");
+const tab_module = @import("tab.zig");
+const Tab = tab_module.Tab;
+const Frame = tab_module.Frame;
 const Chrome = @import("chrome.zig");
 const task_module = @import("task.zig");
 const Task = task_module.Task;
@@ -38,6 +42,62 @@ const DEFAULT_STYLE_SHEET = @embedFile("browser.css");
 // *********************************************************
 const initial_window_width = 800;
 const initial_window_height = 600;
+
+pub fn decodeUtf8Replace(allocator: std.mem.Allocator, input: []const u8) ![]u8 {
+    var output = std.ArrayList(u8).empty;
+    errdefer output.deinit(allocator);
+
+    const replacement = "\xEF\xBF\xBD";
+    var i: usize = 0;
+    while (i < input.len) {
+        const seq_len = std.unicode.utf8ByteSequenceLength(input[i]) catch {
+            try output.appendSlice(allocator, replacement);
+            i += 1;
+            continue;
+        };
+
+        if (i + seq_len > input.len) {
+            try output.appendSlice(allocator, replacement);
+            break;
+        }
+
+        const slice = input[i .. i + seq_len];
+        if (std.unicode.utf8ValidateSlice(slice)) {
+            try output.appendSlice(allocator, slice);
+            i += seq_len;
+        } else {
+            try output.appendSlice(allocator, replacement);
+            i += 1;
+        }
+    }
+
+    return output.toOwnedSlice(allocator);
+}
+
+fn createBrokenImage(allocator: std.mem.Allocator) !zigimg.Image {
+    const width: usize = 16;
+    const height: usize = 16;
+    const pixel_count = width * height;
+    var pixels = try allocator.alloc(u8, pixel_count * 4);
+    errdefer allocator.free(pixels);
+
+    var idx: usize = 0;
+    for (0..height) |y| {
+        for (0..width) |x| {
+            const is_cross = x == y or x + y == width - 1;
+            const r: u8 = if (is_cross) 0xCC else 0xEE;
+            const g: u8 = if (is_cross) 0x33 else 0xEE;
+            const b: u8 = if (is_cross) 0x33 else 0xEE;
+            pixels[idx] = r;
+            pixels[idx + 1] = g;
+            pixels[idx + 2] = b;
+            pixels[idx + 3] = 0xFF;
+            idx += 4;
+        }
+    }
+
+    return zigimg.Image.fromRawPixelsOwned(width, height, pixels, .rgba32);
+}
 pub const h_offset = 13;
 pub const v_offset = 18;
 pub const scrollbar_width = 10;
@@ -178,7 +238,7 @@ pub const CompositedLayer = struct {
             self.surface = null;
         }
         if (self.display_items.len > 0) {
-            freeLayerItems(allocator, self.display_items);
+            DisplayItem.freeList(allocator, self.display_items);
             self.display_items = &.{};
         }
     }
@@ -188,6 +248,11 @@ pub const CompositedLayer = struct {
     pub fn can_merge(self: *const CompositedLayer, other_opacity: f64, other_blend_mode: ?[]const u8) bool {
         // Must have same opacity
         if (self.opacity != other_opacity) return false;
+
+        // dst_in masks should never merge because they clip different content.
+        if (self.blend_mode) |mode| {
+            if (std.mem.eql(u8, mode, "dst_in")) return false;
+        }
 
         // Must have same blend mode
         if (self.blend_mode == null and other_blend_mode == null) return true;
@@ -223,19 +288,6 @@ pub const CompositedLayer = struct {
 
         // Mark for re-rasterization since content changed
         self.needs_raster = true;
-    }
-
-    fn freeLayerItems(allocator: std.mem.Allocator, items: []DisplayItem) void {
-        if (items.len == 0) return;
-        for (items) |item| {
-            switch (item) {
-                .transform => |t| {
-                    freeLayerItems(allocator, t.children);
-                },
-                else => {},
-            }
-        }
-        allocator.free(items);
     }
 
     /// Rasterize the layer's display items to its cached surface
@@ -280,6 +332,17 @@ pub const CompositedLayer = struct {
     }
 };
 
+pub const ImageDisplayItem = struct {
+    x1: i32,
+    y1: i32,
+    x2: i32,
+    y2: i32,
+    source_width: i32,
+    source_height: i32,
+    pixels: []const u8,
+    opacity: f64 = 1.0,
+};
+
 pub const DisplayItem = union(enum) {
     glyph: struct {
         x: i32,
@@ -293,6 +356,11 @@ pub const DisplayItem = union(enum) {
         x2: i32,
         y2: i32,
         color: Color,
+    },
+    image: ImageDisplayItem,
+    iframe: struct {
+        rect: Rect,
+        node: *Node,
     },
     rounded_rect: struct {
         x1: i32,
@@ -352,6 +420,19 @@ pub const DisplayItem = union(enum) {
             .rect => |r| {
                 std.debug.print("Rect({d},{d})-({d},{d}) color=({d},{d},{d},{d})\n", .{
                     r.x1, r.y1, r.x2, r.y2, r.color.r, r.color.g, r.color.b, r.color.a,
+                });
+            },
+            .image => |img| {
+                std.debug.print("Image({d},{d})-({d},{d}) src=({d}x{d})\n", .{
+                    img.x1, img.y1, img.x2, img.y2, img.source_width, img.source_height,
+                });
+            },
+            .iframe => |iframe_item| {
+                std.debug.print("Iframe({d},{d})-({d},{d})\n", .{
+                    iframe_item.rect.left,
+                    iframe_item.rect.top,
+                    iframe_item.rect.right,
+                    iframe_item.rect.bottom,
                 });
             },
             .rounded_rect => |r| {
@@ -470,6 +551,12 @@ pub const DisplayItem = union(enum) {
         allocator.free(items);
     }
 
+    pub fn freeItems(allocator: std.mem.Allocator, items: []DisplayItem) void {
+        for (items) |item| {
+            freeItem(allocator, item);
+        }
+    }
+
     fn freeItem(allocator: std.mem.Allocator, item: DisplayItem) void {
         switch (item) {
             .blend => |b| {
@@ -489,11 +576,21 @@ pub const DisplayItem = union(enum) {
 pub const JsRenderContext = struct {
     browser_ptr: ?*anyopaque = null,
     tab_ptr: ?*anyopaque = null,
+    js_context: ?*js_module = null,
+    window_id: u32 = 0,
     generation: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
 
-    pub fn setPointers(self: *JsRenderContext, browser_ptr: ?*anyopaque, tab_ptr: ?*anyopaque) void {
+    pub fn setPointers(
+        self: *JsRenderContext,
+        browser_ptr: ?*anyopaque,
+        tab_ptr: ?*anyopaque,
+        js_context: ?*js_module,
+        window_id: u32,
+    ) void {
         self.browser_ptr = browser_ptr;
         self.tab_ptr = tab_ptr;
+        self.js_context = js_context;
+        self.window_id = window_id;
     }
 
     pub fn setGeneration(self: *JsRenderContext, generation: u64) void {
@@ -546,8 +643,6 @@ pub const Browser = struct {
     chrome: Chrome = undefined,
     // Focus tracking: null means nothing focused, "content" means page content
     focus: ?[]const u8 = null,
-    // JavaScript engine
-    js_engine: *js_module,
     animation_timer_active: bool = false,
     needs_composite: bool = true,
     needs_raster: bool = true,
@@ -648,10 +743,6 @@ pub const Browser = struct {
         var context = z2d.Context.init(al, &root_surface);
         errdefer context.deinit();
 
-        // Initialize JavaScript engine
-        const js_engine = try js_module.init(al);
-        errdefer js_engine.deinit(al);
-
         const measure = try MeasureTime.init(al);
         const profiling_enabled = isProfilingEnabled(al);
 
@@ -670,7 +761,6 @@ pub const Browser = struct {
             .default_style_sheet_rules = default_rules,
             .tabs = std.ArrayList(*Tab).empty,
             .chrome = try Chrome.init(&layout_engine.font_manager, initial_window_width, al),
-            .js_engine = js_engine,
             .measure = measure,
             .cached_texture = cached_texture,
             .composited_layers = std.ArrayList(CompositedLayer).empty,
@@ -753,11 +843,17 @@ pub const Browser = struct {
         var should_schedule = false;
         self.lock.lock();
         const tab = self.activeTab();
-        if (tab) |_| {
-            if (self.active_tab_height > 0) {
-                const new_scroll = self.clampScroll(self.active_tab_scroll + delta);
-                if (new_scroll != self.active_tab_scroll) {
-                    self.active_tab_scroll = new_scroll;
+        if (tab) |active| {
+            const target_frame = active.focused_frame orelse active.root_frame;
+            if (target_frame) |frame| {
+                const new_scroll = active.clampScrollForFrame(frame, frame.scroll + delta);
+                if (new_scroll != frame.scroll) {
+                    frame.scroll = new_scroll;
+                    if (frame == active.root_frame) {
+                        self.active_tab_scroll = new_scroll;
+                    } else {
+                        active.setNeedsPaint();
+                    }
                     self.needs_composite = true;
                     self.needs_raster = true;
                     self.needs_draw = true;
@@ -800,7 +896,10 @@ pub const Browser = struct {
                 layer.deinit(self.allocator);
             }
             self.composited_layers.items.len = 0;
-            self.tab_draw_list.items.len = 0;
+            if (self.tab_draw_list.items.len > 0) {
+                DisplayItem.freeItems(self.allocator, self.tab_draw_list.items);
+                self.tab_draw_list.items.len = 0;
+            }
             if (self.active_tab_display_list) |old_list| {
                 DisplayItem.freeList(self.allocator, old_list);
             }
@@ -900,6 +999,9 @@ pub const Browser = struct {
             .quit => return true,
             .key_down => |kb_event| {
                 try self.handleKeyEvent(kb_event.keycode, kb_event.modifiers);
+                if (kb_event.keycode == .escape) {
+                    return true;
+                }
             },
             .text_input => |text_event| {
                 const text = std.mem.sliceTo(&text_event.text, 0);
@@ -910,7 +1012,8 @@ pub const Browser = struct {
                             chrome_changed = true;
                         }
                         if (self.activeTab()) |tab| {
-                            if ((self.focus != null and std.mem.eql(u8, self.focus.?, "content")) or tab.focus != null) {
+                            const frame_focus = if (tab.root_frame) |frame| frame.focus != null else false;
+                            if ((self.focus != null and std.mem.eql(u8, self.focus.?, "content")) or frame_focus) {
                                 self.scheduleTabKeypressTask(tab, char);
                             }
                         }
@@ -1088,7 +1191,12 @@ pub const Browser = struct {
                 const should_activate = if (self.focus) |focus_str|
                     std.mem.eql(u8, focus_str, "content")
                 else
-                    tab != null and tab.?.focus != null;
+                    if (tab) |active_tab| blk: {
+                        if (active_tab.root_frame) |frame| {
+                            break :blk frame.focus != null;
+                        }
+                        break :blk false;
+                    } else false;
                 self.lock.unlock();
                 if (should_activate) {
                     if (tab) |active_tab| {
@@ -1129,7 +1237,12 @@ pub const Browser = struct {
                 const should_backspace = if (self.focus) |focus_str|
                     std.mem.eql(u8, focus_str, "content")
                 else
-                    tab != null and tab.?.focus != null;
+                    if (tab) |active_tab| blk: {
+                        if (active_tab.root_frame) |frame| {
+                            break :blk frame.focus != null;
+                        }
+                        break :blk false;
+                    } else false;
                 self.lock.unlock();
                 if (should_backspace) {
                     if (tab) |active_tab| {
@@ -1176,6 +1289,10 @@ pub const Browser = struct {
             self.lock.unlock();
             return;
         };
+        const frame = tab.root_frame orelse {
+            self.lock.unlock();
+            return;
+        };
 
         self.focus = "content";
         self.chrome.blur();
@@ -1187,76 +1304,9 @@ pub const Browser = struct {
         const tab_y = screen_y - chrome_bottom;
         const zoom = self.activeZoom();
         const page_x = if (zoom == 1.0) screen_x else @as(i32, @intFromFloat(@as(f32, @floatFromInt(screen_x)) / zoom));
-        const page_y = (if (zoom == 1.0) tab_y else @as(i32, @intFromFloat(@as(f32, @floatFromInt(tab_y)) / zoom))) + tab.scroll;
+        const page_y = (if (zoom == 1.0) tab_y else @as(i32, @intFromFloat(@as(f32, @floatFromInt(tab_y)) / zoom))) + frame.scroll;
 
         std.debug.print("Page coordinates: ({d}, {d})\n", .{ page_x, page_y });
-
-        if (tab.current_node == null) {
-            std.debug.print("No current_node\n", .{});
-            return;
-        }
-
-        std.debug.print("Current URL: {s}\n", .{if (tab.current_url) |url_ptr| url_ptr.*.path else "none"});
-
-        var handled_link = false;
-        for (self.layout_engine.link_bounds.items) |entry| {
-            const bounds = entry.bounds;
-            if (page_x >= bounds.x and page_x < bounds.x + bounds.width and
-                page_y >= bounds.y and page_y < bounds.y + bounds.height)
-            {
-                const link_node = entry.node;
-                const prevent_default = self.js_engine.dispatchEvent("click", link_node) catch |err| blk: {
-                    std.log.warn("Failed to dispatch click event: {}", .{err});
-                    break :blk false;
-                };
-                if (prevent_default) {
-                    std.debug.print("Click default prevented for link\n", .{});
-                    return;
-                }
-
-                switch (link_node.*) {
-                    .element => |*link_element| {
-                        if (link_element.attributes) |attrs| {
-                            if (attrs.get("href")) |href| {
-                                if (tab.current_url) |current_url_ptr| {
-                                    var resolved_url = try current_url_ptr.*.resolve(self.allocator, href);
-                                    std.debug.print("Loading link: {s}\n", .{href});
-
-                                    const new_url_ptr = self.allocator.create(Url) catch |alloc_err| {
-                                        std.log.err("Failed to allocate URL: {any}", .{alloc_err});
-                                        resolved_url.free(self.allocator);
-                                        return;
-                                    };
-                                    new_url_ptr.* = resolved_url;
-                                    var url_owned = true;
-                                    defer if (url_owned) {
-                                        new_url_ptr.*.free(self.allocator);
-                                        self.allocator.destroy(new_url_ptr);
-                                    };
-
-                                    self.scheduleLoad(tab, new_url_ptr, null) catch |err| {
-                                        std.log.err("Failed to schedule load for {s}: {any}", .{ href, err });
-                                        return;
-                                    };
-                                    url_owned = false;
-
-                                    self.setNeedsCompositeRasterDraw();
-                                    try self.compositeRasterAndDraw();
-                                    handled_link = true;
-                                } else {
-                                    std.debug.print("No current_url to resolve against\n", .{});
-                                }
-                            }
-                        }
-                    },
-                    else => {},
-                }
-
-                if (handled_link) {
-                    return;
-                }
-            }
-        }
 
         self.scheduleTabClickTask(tab, page_x, page_y);
     }
@@ -1270,6 +1320,7 @@ pub const Browser = struct {
 
         if (!screen_reader_on) return;
         const active_tab = tab orelse return;
+        const frame = active_tab.root_frame orelse return;
         if (screen_y < chrome_bottom) {
             active_tab.updateAccessibilityHover(null);
             return;
@@ -1278,7 +1329,7 @@ pub const Browser = struct {
         const tab_y = screen_y - chrome_bottom;
         const zoom = self.activeZoom();
         const page_x = if (zoom == 1.0) screen_x else @as(i32, @intFromFloat(@as(f32, @floatFromInt(screen_x)) / zoom));
-        const page_y = (if (zoom == 1.0) tab_y else @as(i32, @intFromFloat(@as(f32, @floatFromInt(tab_y)) / zoom))) + active_tab.scroll;
+        const page_y = (if (zoom == 1.0) tab_y else @as(i32, @intFromFloat(@as(f32, @floatFromInt(tab_y)) / zoom))) + frame.scroll;
 
         const hit = active_tab.accessibilityHitTest(page_x, page_y);
         active_tab.updateAccessibilityHover(hit);
@@ -1445,118 +1496,157 @@ pub const Browser = struct {
 
         tab.task_runner.clear();
         tab.invalidateJsContext();
-        self.js_engine.setNodes(null);
-        self.js_engine.setRenderCallback(null, null);
-        self.js_engine.setXhrCallback(null, null);
-        self.js_engine.setSetTimeoutCallback(null, null);
-        self.js_engine.setAnimationFrameCallback(null, null);
-
-        tab.scroll = 0;
-        tab.scroll_changed_in_tab = true;
 
         var referrer_value: ?Url = null;
-        if (tab.current_url) |ref_ptr| {
-            referrer_value = ref_ptr.*;
+        if (tab.root_frame) |old_frame| {
+            if (old_frame.current_url) |ref_ptr| {
+                referrer_value = ref_ptr.*;
+            }
         }
+
+        if (tab.root_frame) |old_frame| {
+            old_frame.deinit();
+            tab.allocator.destroy(old_frame);
+            tab.root_frame = null;
+        }
+
+        const frame = try tab.allocator.create(Frame);
+        frame.* = Frame.init(tab.allocator, tab, null, null);
+        tab.root_frame = frame;
+        tab.registerFrame(frame);
+        frame.viewport_height = tab.tab_height;
+        tab.focused_frame = frame;
+
+        frame.scroll = 0;
+        tab.scroll_changed_in_tab = true;
 
         // Do the request, getting back the body of the response.
         const response = try self.fetchBody(url.*, referrer_value, payload);
         defer if (response.csp_header) |hdr| self.allocator.free(hdr);
 
-        tab.clearAllowedOrigins();
+        frame.clearAllowedOrigins();
         if (response.csp_header) |hdr| {
-            tab.applyContentSecurityPolicy(hdr, url.*) catch |err| {
+            frame.applyContentSecurityPolicy(hdr, url.*) catch |err| {
                 std.log.warn("Failed to apply Content-Security-Policy: {}", .{err});
             };
         }
 
-        const body = response.body;
-
-        // Free previous HTML source if it exists
-        if (tab.current_html_source) |old_source| {
-            self.allocator.free(old_source);
-            tab.current_html_source = null;
+        const raw_body = response.body;
+        const body_text = try decodeUtf8Replace(self.allocator, raw_body);
+        const body_owned = !std.mem.eql(u8, url.*.scheme, "about") and !std.mem.eql(u8, url.*.scheme, "data");
+        if (body_owned) {
+            self.allocator.free(raw_body);
         }
 
+        // Free previous HTML source if it exists
+        if (frame.current_html_source) |old_source| {
+            self.allocator.free(old_source);
+            frame.current_html_source = null;
+        }
+
+        var body_text_owned = true;
         if (url.*.view_source) {
             // Use the new layoutSourceCode function for view-source mode
-            defer if (!std.mem.eql(u8, url.*.scheme, "about")) self.allocator.free(body);
+            defer self.allocator.free(body_text);
 
             self.layout_engine.accessibility = tab.accessibility;
 
-            if (tab.display_list) |items| {
+            if (frame.display_list) |items| {
                 DisplayItem.freeList(self.allocator, items);
             }
 
-            if (tab.document_layout) |doc| {
+            if (frame.document_layout) |doc| {
                 doc.deinit();
                 self.allocator.destroy(doc);
-                tab.document_layout = null;
+                frame.document_layout = null;
             }
 
-            if (tab.current_node) |node| {
+            if (frame.current_node) |node| {
                 var n = node;
                 n.deinit(self.allocator);
-                tab.current_node = null;
+                frame.current_node = null;
             }
 
-            tab.display_list = try self.layout_engine.layoutSourceCode(body);
-            tab.content_height = self.layout_engine.content_height;
+            frame.display_list = try self.layout_engine.layoutSourceCode(body_text);
+            frame.content_height = self.layout_engine.content_height;
         } else {
             // Parse HTML into a node tree
-            var html_parser = try HTMLParser.init(self.allocator, body);
+            errdefer if (body_text_owned) self.allocator.free(body_text);
+            var html_parser = try HTMLParser.init(self.allocator, body_text);
             defer html_parser.deinit(self.allocator);
 
             // Clear any previous node tree
-            if (tab.current_node) |node| {
+            if (frame.current_node) |node| {
                 var n = node;
                 n.deinit(self.allocator);
-                tab.current_node = null;
+                frame.current_node = null;
             }
 
             // Parse the HTML and store the root node
-            tab.current_node = try html_parser.parse();
+            frame.current_node = try html_parser.parse();
 
             // IMPORTANT: Fix parent pointers after copying the tree
             // The parse() method returns the tree by value, which copies it,
             // but the parent pointers still point to the old locations
-            parser.fixParentPointers(&tab.current_node.?, null);
+            parser.fixParentPointers(&frame.current_node.?, null);
 
             // Store the HTML source (it contains slices used by the tree)
             // Only store if it's not an about: URL (those return static strings)
-            if (!std.mem.eql(u8, url.*.scheme, "about")) {
-                tab.current_html_source = body;
-            }
+            frame.current_html_source = body_text;
+            body_text_owned = false;
 
             // Update the JS engine with the current nodes for DOM API
-            self.js_engine.setNodes(&tab.current_node.?);
-            tab.js_render_context.setPointers(
-                @as(?*anyopaque, @ptrCast(self)),
-                @as(?*anyopaque, @ptrCast(tab)),
-            );
-            tab.js_render_context.setGeneration(tab.js_generation);
-            tab.js_render_context_initialized = true;
-            self.js_engine.setRenderCallback(
-                jsRenderCallback,
-                @ptrCast(&tab.js_render_context),
-            );
-            self.js_engine.setXhrCallback(
-                jsXhrCallback,
-                @ptrCast(&tab.js_render_context),
-            );
-            self.js_engine.setAnimationFrameCallback(
-                jsRequestAnimationFrameCallback,
-                @ptrCast(&tab.js_render_context),
-            );
-            self.js_engine.setSetTimeoutCallback(
-                jsSetTimeoutCallback,
-                @ptrCast(&tab.js_render_context),
-            );
+            frame.js_context = try tab.get_js(url);
+            if (frame.js_context) |ctx| {
+                ctx.setNodes(frame.window_id, &frame.current_node.?);
+                frame.js_render_context.setPointers(
+                    @as(?*anyopaque, @ptrCast(self)),
+                    @as(?*anyopaque, @ptrCast(tab)),
+                    ctx,
+                    frame.window_id,
+                );
+                frame.js_render_context.setGeneration(tab.js_generation);
+                frame.js_render_context_initialized = true;
+                ctx.setRenderCallback(
+                    frame.window_id,
+                    jsRenderCallback,
+                    @ptrCast(&frame.js_render_context),
+                );
+                ctx.setXhrCallback(
+                    frame.window_id,
+                    jsXhrCallback,
+                    @ptrCast(&frame.js_render_context),
+                );
+                ctx.setAnimationFrameCallback(
+                    frame.window_id,
+                    jsRequestAnimationFrameCallback,
+                    @ptrCast(&frame.js_render_context),
+                );
+                ctx.setSetTimeoutCallback(
+                    frame.window_id,
+                    jsSetTimeoutCallback,
+                    @ptrCast(&frame.js_render_context),
+                );
+                ctx.setPostMessageCallback(
+                    frame.window_id,
+                    jsPostMessageCallback,
+                    @ptrCast(&frame.js_render_context),
+                );
+            }
+            tab.setParentWindow(frame.window_id, null);
+            if (frame.js_context) |ctx| {
+                ctx.setParentWindow(frame.window_id, null);
+            }
 
             // Find all scripts and stylesheets
             var node_list = std.ArrayList(*parser.Node).empty;
             defer node_list.deinit(self.allocator);
-            try parser.treeToList(self.allocator, &tab.current_node.?, &node_list);
+            try parser.treeToList(self.allocator, &frame.current_node.?, &node_list);
+
+            // Download and decode <img> elements before layout/paint.
+            self.loadImages(frame, url, node_list.items) catch |err| {
+                std.log.warn("Failed to load images: {}", .{err});
+            };
 
             // Queue external scripts to run later
             for (node_list.items) |node| {
@@ -1565,16 +1655,28 @@ pub const Browser = struct {
                         if (std.mem.eql(u8, e.tag, "script")) {
                             if (e.attributes) |attrs| {
                                 if (attrs.get("src")) |src| {
-                                    self.scheduleScriptTask(tab, url, src) catch |err| {
+                                    self.scheduleScriptTask(tab, frame, url, src) catch |err| {
                                         std.log.warn("Failed to schedule script {s}: {}", .{ src, err });
                                     };
+                                    continue;
                                 }
+                            }
+                            if (self.collectInlineScriptText(node)) |script_body| {
+                                defer self.allocator.free(script_body);
+                                self.scheduleInlineScriptTask(tab, frame, url, script_body) catch |err| {
+                                    std.log.warn("Failed to schedule inline script: {}", .{err});
+                                };
                             }
                         }
                     },
                     .text => {},
                 }
             }
+
+            // Create and load iframe subdocuments after scheduling parent scripts.
+            self.loadIframes(frame, url, node_list.items) catch |err| {
+                std.log.warn("Failed to load iframes: {}", .{err});
+            };
 
             // Collect stylesheet URLs from <link rel="stylesheet" href="..."> elements
             var stylesheet_urls = std.ArrayList([]const u8).empty;
@@ -1642,7 +1744,7 @@ pub const Browser = struct {
                 };
                 defer stylesheet_url.free(self.allocator);
 
-                if (!tab.allowedRequest(stylesheet_url, url)) {
+                if (!frame.allowedRequest(stylesheet_url, url)) {
                     std.log.warn("Blocked stylesheet {s} due to CSP", .{href});
                     continue;
                 }
@@ -1654,11 +1756,11 @@ pub const Browser = struct {
                 };
                 defer if (css_response.csp_header) |hdr| self.allocator.free(hdr);
 
-                var css_text = css_response.body;
-                if (std.mem.eql(u8, stylesheet_url.scheme, "data") or std.mem.eql(u8, stylesheet_url.scheme, "about")) {
-                    const copy = try self.allocator.alloc(u8, css_text.len);
-                    @memcpy(copy, css_text);
-                    css_text = copy;
+                const css_raw = css_response.body;
+                const raw_owned = !std.mem.eql(u8, stylesheet_url.scheme, "data") and !std.mem.eql(u8, stylesheet_url.scheme, "about");
+                const css_text = try decodeUtf8Replace(self.allocator, css_raw);
+                if (raw_owned) {
+                    self.allocator.free(css_raw);
                 }
 
                 // Parse the stylesheet using self.allocator
@@ -1675,7 +1777,7 @@ pub const Browser = struct {
 
                 // Store css_text so it can be freed when the Tab is destroyed
                 // (CSS rules reference strings within this text)
-                try tab.css_texts.append(self.allocator, css_text);
+                try frame.css_texts.append(self.allocator, css_text);
 
                 // Add the parsed rules to our collection
                 for (parsed_rules) |rule| {
@@ -1695,40 +1797,43 @@ pub const Browser = struct {
             }.lessThan);
 
             // Clean up old CSS rules and texts before replacing them
-            for (tab.rules.items) |*rule| {
+            for (frame.rules.items) |*rule| {
                 if (rule.owned) {
                     rule.deinit(self.allocator);
                 }
             }
 
             // Free old CSS text buffers
-            for (tab.css_texts.items) |old_css_text| {
+            for (frame.css_texts.items) |old_css_text| {
                 self.allocator.free(old_css_text);
             }
-            tab.css_texts.clearRetainingCapacity();
+            frame.css_texts.clearRetainingCapacity();
 
             // Now clear the rules list
-            tab.rules.clearRetainingCapacity();
+            frame.rules.clearRetainingCapacity();
 
             // Track how many default rules we have (these are borrowed, not owned)
-            tab.default_rules_count = default_rules_count;
+            frame.default_rules_count = default_rules_count;
 
             // Copy all rules to tab (ownership is tracked per-rule)
             for (all_rules.items) |rule| {
-                try tab.rules.append(self.allocator, rule);
+                try frame.rules.append(self.allocator, rule);
             }
 
             // Apply all stylesheet rules and inline styles (sorted by cascade order)
-            try parser.style(self.allocator, &tab.current_node.?, tab.rules.items);
+            try parser.style(self.allocator, &frame.current_node.?, frame.rules.items);
 
             // Layout using the HTML node tree
-            try self.layoutTabNodes(tab);
+            try self.layoutTabNodes(frame);
         }
 
         // Record navigation history and update current URL ownership
         try tab.history.append(self.allocator, url);
-        tab.current_url = url;
+        frame.current_url = url;
+        frame.current_url_owned = false;
         tab.setNeedsRender();
+        // Render and commit immediately to ensure first paint even if animation scheduling stalls.
+        tab.runAnimationFrame(frame.scroll);
     }
 
     pub fn scheduleLoad(
@@ -1756,13 +1861,365 @@ pub const Browser = struct {
         };
     }
 
+    fn loadImages(self: *Browser, frame: *Frame, page_url: *Url, nodes: []*Node) !void {
+        for (nodes) |node| {
+            switch (node.*) {
+                .element => |*element| {
+                    if (!std.mem.eql(u8, element.tag, "img")) continue;
+                    const attrs = element.attributes orelse continue;
+                    const src = attrs.get("src") orelse continue;
+                    if (src.len == 0) continue;
+
+                    var image_url = page_url.*.resolve(self.allocator, src) catch |err| {
+                        std.log.warn("Failed to resolve image URL {s}: {}", .{ src, err });
+                        if (element.image_data) |*existing| {
+                            existing.deinit(self.allocator);
+                        }
+                        const broken = try createBrokenImage(self.allocator);
+                        element.image_data = ImageData{
+                            .encoded_bytes = null,
+                            .image = broken,
+                        };
+                        continue;
+                    };
+                    defer image_url.free(self.allocator);
+
+                    if (!frame.allowedRequest(image_url, page_url)) {
+                        std.log.warn("Blocked image {s} due to CSP", .{src});
+                        continue;
+                    }
+
+                    const image_response = self.fetchBody(image_url, page_url.*, null) catch |err| {
+                        std.log.warn("Failed to load image {s}: {}", .{ src, err });
+                        if (element.image_data) |*existing| {
+                            existing.deinit(self.allocator);
+                        }
+                        const broken = try createBrokenImage(self.allocator);
+                        element.image_data = ImageData{
+                            .encoded_bytes = null,
+                            .image = broken,
+                        };
+                        continue;
+                    };
+                    defer if (image_response.csp_header) |hdr| self.allocator.free(hdr);
+
+                    var encoded_bytes = image_response.body;
+                    if (std.mem.eql(u8, image_url.scheme, "data") or std.mem.eql(u8, image_url.scheme, "about")) {
+                        const copy = try self.allocator.alloc(u8, encoded_bytes.len);
+                        @memcpy(copy, encoded_bytes);
+                        encoded_bytes = copy;
+                    }
+
+                    var image = zigimg.Image.fromMemory(self.allocator, encoded_bytes) catch |err| {
+                        std.log.warn("Failed to decode image {s}: {}", .{ src, err });
+                        self.allocator.free(encoded_bytes);
+                        if (element.image_data) |*existing| {
+                            existing.deinit(self.allocator);
+                        }
+                        const broken = try createBrokenImage(self.allocator);
+                        element.image_data = ImageData{
+                            .encoded_bytes = null,
+                            .image = broken,
+                        };
+                        continue;
+                    };
+
+                    image.convert(self.allocator, .rgba32) catch |err| {
+                        std.log.warn("Failed to convert image {s} to RGBA: {}", .{ src, err });
+                        image.deinit(self.allocator);
+                        self.allocator.free(encoded_bytes);
+                        if (element.image_data) |*existing| {
+                            existing.deinit(self.allocator);
+                        }
+                        const broken = try createBrokenImage(self.allocator);
+                        element.image_data = ImageData{
+                            .encoded_bytes = null,
+                            .image = broken,
+                        };
+                        continue;
+                    };
+
+                    if (element.image_data) |*existing| {
+                        existing.deinit(self.allocator);
+                    }
+                    element.image_data = ImageData{
+                        .encoded_bytes = encoded_bytes,
+                        .image = image,
+                    };
+                },
+                .text => {},
+            }
+        }
+    }
+
+    fn loadIframes(self: *Browser, parent: *Frame, page_url: *Url, nodes: []*Node) !void {
+        for (nodes) |node| {
+            switch (node.*) {
+                .element => |*element| {
+                    if (!std.mem.eql(u8, element.tag, "iframe")) continue;
+                    const attrs = element.attributes orelse continue;
+                    const src = attrs.get("src") orelse continue;
+                    if (src.len == 0) continue;
+                    self.loadIframe(parent, node, page_url, src) catch |err| {
+                        std.log.warn("Failed to load iframe {s}: {}", .{ src, err });
+                    };
+                },
+                .text => {},
+            }
+        }
+    }
+
+    fn loadIframe(self: *Browser, parent: *Frame, iframe_node: *Node, page_url: *Url, src: []const u8) !void {
+        var iframe_url = page_url.*.resolve(self.allocator, src) catch |err| {
+            std.log.warn("Failed to resolve iframe URL {s}: {}", .{ src, err });
+            return;
+        };
+        var url_owned = true;
+        defer if (url_owned) iframe_url.free(self.allocator);
+
+        if (!parent.allowedRequest(iframe_url, page_url)) {
+            std.log.warn("Blocked iframe {s} due to CSP", .{src});
+            return;
+        }
+
+        const response = try self.fetchBody(iframe_url, page_url.*, null);
+        defer if (response.csp_header) |hdr| self.allocator.free(hdr);
+
+        const frame = try parent.allocator.create(Frame);
+        frame.* = Frame.init(parent.allocator, parent.tab, parent, iframe_node);
+        errdefer {
+            frame.deinit();
+            parent.allocator.destroy(frame);
+        }
+        parent.tab.registerFrame(frame);
+
+        const frame_url_ptr = try parent.allocator.create(Url);
+        frame_url_ptr.* = iframe_url;
+        frame.current_url = frame_url_ptr;
+        frame.current_url_owned = true;
+        url_owned = false;
+
+        frame.clearAllowedOrigins();
+        if (response.csp_header) |hdr| {
+            frame.applyContentSecurityPolicy(hdr, iframe_url) catch |err| {
+                std.log.warn("Failed to apply iframe CSP: {}", .{err});
+            };
+        }
+
+        const raw_body = response.body;
+        const body_text = try decodeUtf8Replace(self.allocator, raw_body);
+        const body_owned = !std.mem.eql(u8, iframe_url.scheme, "about") and !std.mem.eql(u8, iframe_url.scheme, "data");
+        if (body_owned) {
+            self.allocator.free(raw_body);
+        }
+
+        var body_text_owned = true;
+        errdefer if (body_text_owned) self.allocator.free(body_text);
+
+        var html_parser = try HTMLParser.init(self.allocator, body_text);
+        defer html_parser.deinit(self.allocator);
+
+        frame.current_node = try html_parser.parse();
+        parser.fixParentPointers(&frame.current_node.?, null);
+        frame.current_html_source = body_text;
+        body_text_owned = false;
+
+        frame.js_context = try parent.tab.get_js(frame_url_ptr);
+        if (frame.js_context) |ctx| {
+            ctx.setNodes(frame.window_id, &frame.current_node.?);
+            frame.js_render_context.setPointers(
+                @as(?*anyopaque, @ptrCast(self)),
+                @as(?*anyopaque, @ptrCast(parent.tab)),
+                ctx,
+                frame.window_id,
+            );
+            frame.js_render_context.setGeneration(parent.tab.js_generation);
+            frame.js_render_context_initialized = true;
+            ctx.setRenderCallback(
+                frame.window_id,
+                jsRenderCallback,
+                @ptrCast(&frame.js_render_context),
+            );
+            ctx.setXhrCallback(
+                frame.window_id,
+                jsXhrCallback,
+                @ptrCast(&frame.js_render_context),
+            );
+            ctx.setAnimationFrameCallback(
+                frame.window_id,
+                jsRequestAnimationFrameCallback,
+                @ptrCast(&frame.js_render_context),
+            );
+            ctx.setSetTimeoutCallback(
+                frame.window_id,
+                jsSetTimeoutCallback,
+                @ptrCast(&frame.js_render_context),
+            );
+            ctx.setPostMessageCallback(
+                frame.window_id,
+                jsPostMessageCallback,
+                @ptrCast(&frame.js_render_context),
+            );
+        }
+        var parent_window_id: ?u32 = null;
+        if (frame.current_url) |child_url_ptr| {
+            if (page_url.*.sameOrigin(child_url_ptr.*) or
+                (std.mem.eql(u8, page_url.*.scheme, "file") and std.mem.eql(u8, child_url_ptr.*.scheme, "file")))
+            {
+                parent_window_id = parent.window_id;
+            }
+        }
+        parent.tab.setParentWindow(frame.window_id, parent_window_id);
+        if (frame.js_context) |ctx| {
+            if (parent_window_id != null and parent.js_context != null and parent.js_context == ctx) {
+                ctx.setParentWindow(frame.window_id, parent_window_id);
+            } else {
+                ctx.setParentWindow(frame.window_id, null);
+            }
+        }
+
+        var node_list = std.ArrayList(*parser.Node).empty;
+        defer node_list.deinit(self.allocator);
+        try parser.treeToList(self.allocator, &frame.current_node.?, &node_list);
+
+        self.loadImages(frame, frame_url_ptr, node_list.items) catch |err| {
+            std.log.warn("Failed to load iframe images: {}", .{err});
+        };
+
+        // Queue external scripts to run later
+        for (node_list.items) |node| {
+            switch (node.*) {
+                .element => |e| {
+                    if (std.mem.eql(u8, e.tag, "script")) {
+                        if (e.attributes) |attrs| {
+                            if (attrs.get("src")) |script_src| {
+                                self.scheduleScriptTask(parent.tab, frame, frame_url_ptr, script_src) catch |err| {
+                                    std.log.warn("Failed to schedule iframe script {s}: {}", .{ script_src, err });
+                                };
+                                continue;
+                            }
+                        }
+                        if (self.collectInlineScriptText(node)) |script_body| {
+                            defer self.allocator.free(script_body);
+                            self.scheduleInlineScriptTask(parent.tab, frame, frame_url_ptr, script_body) catch |err| {
+                                std.log.warn("Failed to schedule iframe inline script: {}", .{err});
+                            };
+                        }
+                    }
+                },
+                .text => {},
+            }
+        }
+
+        var stylesheet_urls = std.ArrayList([]const u8).empty;
+        defer {
+            for (stylesheet_urls.items) |href| {
+                self.allocator.free(href);
+            }
+            stylesheet_urls.deinit(self.allocator);
+        }
+
+        for (node_list.items) |node| {
+            switch (node.*) {
+                .element => |e| {
+                    if (std.mem.eql(u8, e.tag, "link")) {
+                        if (e.attributes) |attrs| {
+                            const rel = attrs.get("rel");
+                            const href = attrs.get("href");
+
+                            if (rel != null and href != null and std.mem.eql(u8, rel.?, "stylesheet")) {
+                                const href_copy = try self.allocator.alloc(u8, href.?.len);
+                                @memcpy(href_copy, href.?);
+                                try stylesheet_urls.append(self.allocator, href_copy);
+                            }
+                        }
+                    }
+                },
+                .text => {},
+            }
+        }
+
+        var all_rules = std.ArrayList(CSSParser.CSSRule).empty;
+        const default_rules_count = self.default_style_sheet_rules.len;
+        errdefer {
+            for (all_rules.items) |*rule| {
+                if (rule.owned) {
+                    rule.deinit(self.allocator);
+                }
+            }
+        }
+        defer all_rules.deinit(self.allocator);
+
+        for (self.default_style_sheet_rules) |rule| {
+            try all_rules.append(self.allocator, rule);
+        }
+
+        for (stylesheet_urls.items) |href| {
+            std.log.info("Loading iframe stylesheet: {s}", .{href});
+            const stylesheet_url = iframe_url.resolve(self.allocator, href) catch |err| {
+                std.log.warn("Failed to resolve iframe stylesheet URL {s}: {}", .{ href, err });
+                continue;
+            };
+            defer stylesheet_url.free(self.allocator);
+
+            if (!frame.allowedRequest(stylesheet_url, frame.current_url)) {
+                std.log.warn("Blocked iframe stylesheet {s} due to CSP", .{href});
+                continue;
+            }
+
+            const css_response = self.fetchBody(stylesheet_url, iframe_url, null) catch |err| {
+                std.log.warn("Failed to load iframe stylesheet {s}: {}", .{ href, err });
+                continue;
+            };
+            defer if (css_response.csp_header) |hdr| self.allocator.free(hdr);
+
+            const css_raw = css_response.body;
+            const raw_owned = !std.mem.eql(u8, stylesheet_url.scheme, "data") and !std.mem.eql(u8, stylesheet_url.scheme, "about");
+            const css_text = try decodeUtf8Replace(self.allocator, css_raw);
+            if (raw_owned) {
+                self.allocator.free(css_raw);
+            }
+
+            var css_parser = try CSSParser.init(self.allocator, css_text, parent.tab.accessibility.prefers_dark);
+            defer css_parser.deinit(self.allocator);
+
+            const parsed_rules = css_parser.parse(self.allocator) catch |err| {
+                std.log.warn("Failed to parse iframe stylesheet {s}: {}", .{ href, err });
+                self.allocator.free(css_text);
+                continue;
+            };
+
+            try frame.css_texts.append(self.allocator, css_text);
+            for (parsed_rules) |rule| {
+                try all_rules.append(self.allocator, rule);
+            }
+            self.allocator.free(parsed_rules);
+        }
+
+        std.mem.sort(CSSParser.CSSRule, all_rules.items, {}, struct {
+            fn lessThan(_: void, a: CSSParser.CSSRule, b: CSSParser.CSSRule) bool {
+                return a.cascadePriority() < b.cascadePriority();
+            }
+        }.lessThan);
+
+        frame.default_rules_count = default_rules_count;
+        for (all_rules.items) |rule| {
+            try frame.rules.append(self.allocator, rule);
+        }
+
+        try parser.style(self.allocator, &frame.current_node.?, frame.rules.items);
+        try self.layoutTabNodes(frame);
+        try parent.children.append(parent.allocator, frame);
+    }
+
     fn scheduleScriptTask(
         self: *Browser,
         tab: *Tab,
+        frame: *Frame,
         page_url: *Url,
         src: []const u8,
     ) !void {
-        if (!tab.js_render_context_initialized) return;
+        if (!frame.js_render_context_initialized) return;
         std.log.info("Loading script: {s}", .{src});
 
         const src_copy = try self.allocator.alloc(u8, src.len);
@@ -1774,7 +2231,7 @@ pub const Browser = struct {
         var url_owned = true;
         defer if (url_owned) script_url.free(self.allocator);
 
-        if (!tab.allowedRequest(script_url, page_url)) {
+        if (!frame.allowedRequest(script_url, page_url)) {
             std.log.warn("Blocked script {s} due to CSP", .{src});
             return;
         }
@@ -1785,20 +2242,16 @@ pub const Browser = struct {
         };
         defer if (script_response.csp_header) |hdr| self.allocator.free(hdr);
 
-        var script_body = script_response.body;
-        if (std.mem.eql(u8, script_url.scheme, "data") or std.mem.eql(u8, script_url.scheme, "about")) {
-            const copy = try self.allocator.alloc(u8, script_body.len);
-            @memcpy(copy, script_body);
-            script_body = copy;
+        const script_raw = script_response.body;
+        const raw_owned = !std.mem.eql(u8, script_url.scheme, "data") and !std.mem.eql(u8, script_url.scheme, "about");
+        const body_copy = try decodeUtf8Replace(self.allocator, script_raw);
+        if (raw_owned) {
+            self.allocator.free(script_raw);
         }
-        defer self.allocator.free(script_body);
-
-        const body_copy = try self.allocator.alloc(u8, script_body.len);
-        @memcpy(body_copy, script_body);
         var body_copy_owned = false;
         defer if (!body_copy_owned) self.allocator.free(body_copy);
 
-        const js_context = &tab.js_render_context;
+        const js_context = &frame.js_render_context;
         const generation = js_context.currentGeneration();
 
         const ctx = try ScriptTaskContext.create(
@@ -1807,12 +2260,98 @@ pub const Browser = struct {
             tab,
             js_context,
             generation,
+            js_context.window_id,
             src_copy,
             script_url,
             body_copy,
         );
         src_copy_owned = true;
         body_copy_owned = true;
+        url_owned = false;
+        errdefer ctx.destroy();
+
+        const task_instance = Task.init(
+            ctx.toOpaque(),
+            ScriptTaskContext.runOpaque,
+            ScriptTaskContext.cleanupOpaque,
+        );
+        try tab.task_runner.schedule(task_instance);
+    }
+
+    fn collectInlineScriptText(self: *Browser, node: *Node) ?[]u8 {
+        switch (node.*) {
+            .element => |e| {
+                if (!std.mem.eql(u8, e.tag, "script")) return null;
+                var buffer = std.ArrayList(u8).empty;
+                errdefer buffer.deinit(self.allocator);
+                for (e.children.items) |*child| {
+                    switch (child.*) {
+                        .text => |t| buffer.appendSlice(self.allocator, t.text) catch return null,
+                        .element => {},
+                    }
+                }
+                if (buffer.items.len == 0) {
+                    buffer.deinit(self.allocator);
+                    return null;
+                }
+                return buffer.toOwnedSlice(self.allocator) catch {
+                    buffer.deinit(self.allocator);
+                    return null;
+                };
+            },
+            else => return null,
+        }
+    }
+
+    fn scheduleInlineScriptTask(
+        self: *Browser,
+        tab: *Tab,
+        frame: *Frame,
+        page_url: *Url,
+        script_body: []const u8,
+    ) !void {
+        if (!frame.js_render_context_initialized) return;
+
+        var script_url: Url = undefined;
+        var url_owned = true;
+        const label = if (std.mem.eql(u8, page_url.*.scheme, "data")) blk: {
+            script_url = try Url.init(self.allocator, "about:blank");
+            break :blk try self.allocator.dupe(u8, "inline:data");
+        } else blk: {
+            var url_buf: [2048]u8 = undefined;
+            const url_str = page_url.*.toString(&url_buf) catch |err| {
+                std.log.warn("Failed to format inline script URL: {}", .{err});
+                return;
+            };
+            const url_copy = try self.allocator.dupe(u8, url_str);
+            defer self.allocator.free(url_copy);
+            script_url = try Url.init(self.allocator, url_copy);
+            break :blk try std.fmt.allocPrint(self.allocator, "inline:{s}", .{url_str});
+        };
+        var label_owned = false;
+        defer if (!label_owned) self.allocator.free(label);
+
+        const body_copy = try self.allocator.alloc(u8, script_body.len);
+        @memcpy(body_copy, script_body);
+        var body_owned = false;
+        defer if (!body_owned) self.allocator.free(body_copy);
+
+        const js_context = &frame.js_render_context;
+        const generation = js_context.currentGeneration();
+
+        const ctx = try ScriptTaskContext.create(
+            self.allocator,
+            self,
+            tab,
+            js_context,
+            generation,
+            js_context.window_id,
+            label,
+            script_url,
+            body_copy,
+        );
+        label_owned = true;
+        body_owned = true;
         url_owned = false;
         errdefer ctx.destroy();
 
@@ -1831,7 +2370,7 @@ pub const Browser = struct {
         handle: u32,
         delay_ms: u32,
     ) !void {
-        if (!tab.js_render_context_initialized) return;
+        if (js_context.js_context == null) return;
         const generation = js_context.currentGeneration();
 
         const thread_ctx = try SetTimeoutThreadContext.create(
@@ -1840,6 +2379,7 @@ pub const Browser = struct {
             tab,
             js_context,
             generation,
+            js_context.window_id,
             handle,
             delay_ms,
         );
@@ -1899,12 +2439,14 @@ pub const Browser = struct {
         payload: ?[]const u8,
         handle: u32,
     ) !void {
+        if (js_context.js_context == null) return;
         const ctx = try XhrThreadContext.create(
             self.allocator,
             self,
             tab,
             js_context,
             generation,
+            js_context.window_id,
             resolved_url,
             payload,
             handle,
@@ -1923,21 +2465,22 @@ pub const Browser = struct {
     }
 
     fn rebuildTabStyleRules(self: *Browser, tab: *Tab) !void {
+        const frame = tab.root_frame orelse return;
         const default_rules_count = self.default_style_sheet_rules.len;
 
-        for (tab.rules.items) |*rule| {
+        for (frame.rules.items) |*rule| {
             if (rule.owned) {
                 rule.deinit(self.allocator);
             }
         }
-        tab.rules.clearRetainingCapacity();
-        tab.default_rules_count = default_rules_count;
+        frame.rules.clearRetainingCapacity();
+        frame.default_rules_count = default_rules_count;
 
         for (self.default_style_sheet_rules) |rule| {
-            try tab.rules.append(self.allocator, rule);
+            try frame.rules.append(self.allocator, rule);
         }
 
-        for (tab.css_texts.items) |css_text| {
+        for (frame.css_texts.items) |css_text| {
             var css_parser = try CSSParser.init(self.allocator, css_text, tab.accessibility.prefers_dark);
             defer css_parser.deinit(self.allocator);
 
@@ -1947,12 +2490,12 @@ pub const Browser = struct {
             };
 
             for (parsed_rules) |rule| {
-                try tab.rules.append(self.allocator, rule);
+                try frame.rules.append(self.allocator, rule);
             }
             self.allocator.free(parsed_rules);
         }
 
-        std.mem.sort(CSSParser.CSSRule, tab.rules.items, {}, struct {
+        std.mem.sort(CSSParser.CSSRule, frame.rules.items, {}, struct {
             fn lessThan(_: void, a: CSSParser.CSSRule, b: CSSParser.CSSRule) bool {
                 return a.cascadePriority() < b.cascadePriority();
             }
@@ -1960,35 +2503,36 @@ pub const Browser = struct {
     }
 
     // Layout a tab's HTML nodes with the tree-based layout
-    pub fn layoutTabNodes(self: *Browser, tab: *Tab) !void {
-        if (tab.current_node == null) {
+    pub fn layoutTabNodes(self: *Browser, frame: *Frame) !void {
+        if (frame.current_node == null) {
             return error.NoNodeToLayout;
         }
 
-        self.layout_engine.accessibility = tab.accessibility;
+        self.layout_engine.accessibility = frame.tab.accessibility;
 
         // Clear previous document layout if it exists
-        if (tab.document_layout != null) {
-            tab.document_layout.?.deinit();
-            self.allocator.destroy(tab.document_layout.?);
-            tab.document_layout = null;
+        if (frame.document_layout != null) {
+            frame.document_layout.?.deinit();
+            self.allocator.destroy(frame.document_layout.?);
+            frame.document_layout = null;
         }
 
         // Create and layout the document tree
-        tab.document_layout = try self.layout_engine.buildDocument(tab.current_node.?);
+        frame.document_layout = try self.layout_engine.buildDocument(frame.current_node.?);
 
         // Paint the document to produce draw commands
-        if (tab.display_list) |items| {
+        if (frame.display_list) |items| {
             DisplayItem.freeList(self.allocator, items);
         }
-        tab.display_list = try self.layout_engine.paintDocument(tab.document_layout.?);
+        frame.display_list = try self.layout_engine.paintDocument(frame.document_layout.?);
+        try frame.updateHitTestBounds(self.layout_engine);
 
         var focus_items = std.ArrayList(DisplayItem).empty;
         defer focus_items.deinit(self.allocator);
         const focus_color = Color{ .r = 0x3b, .g = 0x82, .b = 0xf6, .a = 0xff };
         const highlight_color = Color{ .r = 0xf5, .g = 0x9e, .b = 0x0b, .a = 0xff };
 
-        if (tab.focus) |focus_node| {
+        if (frame.focus) |focus_node| {
             for (self.layout_engine.focus_bounds.items) |entry| {
                 if (entry.node == focus_node) {
                     self.appendOutline(&focus_items, focus_color, entry.bounds) catch |err| {
@@ -1998,7 +2542,7 @@ pub const Browser = struct {
             }
         }
 
-        if (tab.accessibility_highlight) |highlight_node| {
+        if (frame.tab.accessibility_highlight) |highlight_node| {
             if (highlight_node.dom_node) |dom| {
                 for (self.layout_engine.focus_bounds.items) |entry| {
                     if (entry.node == dom) {
@@ -2010,16 +2554,16 @@ pub const Browser = struct {
             }
         }
 
-        if (focus_items.items.len > 0 and tab.display_list != null) {
+        if (focus_items.items.len > 0 and frame.display_list != null) {
             var combined = std.ArrayList(DisplayItem).empty;
-            try combined.appendSlice(self.allocator, tab.display_list.?);
+            try combined.appendSlice(self.allocator, frame.display_list.?);
             try combined.appendSlice(self.allocator, focus_items.items);
-            DisplayItem.freeList(self.allocator, tab.display_list.?);
-            tab.display_list = try combined.toOwnedSlice(self.allocator);
+            DisplayItem.freeList(self.allocator, frame.display_list.?);
+            frame.display_list = try combined.toOwnedSlice(self.allocator);
         }
 
         // Debug: print display list tree once when opacity effects are present
-        if (tab.display_list) |list| {
+        if (frame.display_list) |list| {
             const S = struct {
                 var printed: bool = false;
             };
@@ -2030,9 +2574,9 @@ pub const Browser = struct {
         }
 
         // Update content height from the layout engine
-        tab.content_height = self.layout_engine.content_height;
+        frame.content_height = self.layout_engine.content_height;
 
-        tab.buildAccessibilityTree(self) catch |err| {
+        frame.tab.buildAccessibilityTree(self) catch |err| {
             std.log.warn("Failed to build accessibility tree: {}", .{err});
         };
     }
@@ -2087,6 +2631,29 @@ pub const Browser = struct {
                 const needs_layer = blend_item.needs_compositing;
 
                 if (needs_layer) {
+                    const is_dst_in = if (blend_item.blend_mode) |mode|
+                        std.mem.eql(u8, mode, "dst_in")
+                    else
+                        false;
+
+                    if (is_dst_in) {
+                        const cloned = try self.cloneDisplayItem(item);
+                        const layer_items = try self.allocator.alloc(DisplayItem, 1);
+                        layer_items[0] = cloned;
+                        const bounds = self.getDisplayItemBounds(item);
+                        const layer_blend_mode = if (cloned == .blend) cloned.blend.blend_mode else blend_item.blend_mode;
+
+                        const layer = CompositedLayer.init(
+                            layer_items,
+                            bounds,
+                            blend_item.opacity,
+                            layer_blend_mode,
+                            blend_item.node,
+                        );
+                        try self.composited_layers.append(self.allocator, layer);
+                        return;
+                    }
+
                     // Flatten the subtree to collect all non-composited items
                     var flattened = std.ArrayList(DisplayItem).empty;
                     defer flattened.deinit(self.allocator);
@@ -2144,6 +2711,59 @@ pub const Browser = struct {
                 // Primitive items don't need compositing decisions
             },
         }
+    }
+
+    const CloneError = error{OutOfMemory};
+
+    fn cloneDisplayItem(self: *Browser, item: DisplayItem) CloneError!DisplayItem {
+        switch (item) {
+            .blend => |blend_item| {
+                const children = try self.cloneDisplayItemList(blend_item.children);
+                const mode_copy = if (blend_item.blend_mode) |mode| blk: {
+                    const dup = try self.allocator.alloc(u8, mode.len);
+                    @memcpy(dup, mode);
+                    break :blk dup;
+                } else null;
+                return .{
+                    .blend = .{
+                        .opacity = blend_item.opacity,
+                        .blend_mode = mode_copy,
+                        .children = children,
+                        .node = blend_item.node,
+                        .parent = null,
+                        .needs_compositing = blend_item.needs_compositing,
+                    },
+                };
+            },
+            .transform => |transform_item| {
+                const children = try self.cloneDisplayItemList(transform_item.children);
+                return .{
+                    .transform = .{
+                        .translate_x = transform_item.translate_x,
+                        .translate_y = transform_item.translate_y,
+                        .children = children,
+                        .node = transform_item.node,
+                    },
+                };
+            },
+            else => return item,
+        }
+    }
+
+    fn cloneDisplayItemList(self: *Browser, items: []DisplayItem) CloneError![]DisplayItem {
+        const copy = try self.allocator.alloc(DisplayItem, items.len);
+        var filled: usize = 0;
+        errdefer {
+            if (filled > 0) {
+                DisplayItem.freeItems(self.allocator, copy[0..filled]);
+            }
+            self.allocator.free(copy);
+        }
+        for (items, 0..) |item, idx| {
+            copy[idx] = try self.cloneDisplayItem(item);
+            filled = idx + 1;
+        }
+        return copy;
     }
 
     /// Flatten a subtree of display items by recursively expanding non-composited blends.
@@ -2204,6 +2824,18 @@ pub const Browser = struct {
                 .right = self.scalePx(r.x2),
                 .bottom = self.scalePx(r.y2),
             },
+            .image => |img| Rect{
+                .left = self.scalePx(img.x1),
+                .top = self.scalePx(img.y1),
+                .right = self.scalePx(img.x2),
+                .bottom = self.scalePx(img.y2),
+            },
+            .iframe => |iframe_item| Rect{
+                .left = self.scalePx(iframe_item.rect.left),
+                .top = self.scalePx(iframe_item.rect.top),
+                .right = self.scalePx(iframe_item.rect.right),
+                .bottom = self.scalePx(iframe_item.rect.bottom),
+            },
             .rounded_rect => |r| Rect{
                 .left = self.scalePx(r.x1),
                 .top = self.scalePx(r.y1),
@@ -2257,7 +2889,10 @@ pub const Browser = struct {
 
     /// Build a draw list from composited layers
     pub fn paint_draw_list(self: *Browser) !void {
-        self.tab_draw_list.items.len = 0;
+        if (self.tab_draw_list.items.len > 0) {
+            DisplayItem.freeItems(self.allocator, self.tab_draw_list.items);
+            self.tab_draw_list.items.len = 0;
+        }
 
         if (self.active_tab_display_list == null) return;
 
@@ -2394,9 +3029,10 @@ pub const Browser = struct {
         try tab_context.closePath();
         try tab_context.fill();
 
-        // Draw from the composited draw list
+        // Draw from the base display list to avoid compositing regressions.
         const zoom = self.activeZoom();
-        for (self.tab_draw_list.items) |item| {
+        const base_list = self.active_tab_display_list orelse &.{};
+        for (base_list) |item| {
             try self.drawDisplayItemZ2dContext(&tab_context, item, 0, zoom);
         }
     }
@@ -2637,19 +3273,22 @@ pub const Browser = struct {
         self.context.deinit();
         self.context = z2d.Context.init(self.allocator, &self.root_surface);
 
-        // Composite the pre-rastered tab surface and chrome surface.
-        if (self.tab_surface) |*tab_surface| {
+        // Clear root surface to white before drawing.
+        self.context.setSource(.{ .opaque_pattern = .{ .pixel = .{ .rgba = .{ .r = 255, .g = 255, .b = 255, .a = 255 } } } });
+        try self.context.moveTo(0, 0);
+        try self.context.lineTo(@floatFromInt(self.window_width), 0);
+        try self.context.lineTo(@floatFromInt(self.window_width), @floatFromInt(self.window_height));
+        try self.context.lineTo(0, @floatFromInt(self.window_height));
+        try self.context.closePath();
+        try self.context.fill();
+
+        // Draw the active tab directly to the root surface (bypassing tab surface compositing).
+        if (self.active_tab_display_list) |display_list| {
             const zoom = self.activeZoom();
-            const scroll_offset = self.scalePxWithZoom(self.active_tab_scroll, zoom);
-            const tab_y = self.chrome.bottom - scroll_offset;
-            z2d.Surface.composite(
-                &self.root_surface,
-                tab_surface,
-                .src_over,
-                0,
-                tab_y,
-                .{},
-            );
+            const scroll_offset = self.scalePxWithZoom(self.active_tab_scroll, zoom) - self.chrome.bottom;
+            for (display_list) |item| {
+                try self.drawDisplayItemZ2dContext(&self.context, item, scroll_offset, zoom);
+            }
         }
 
         z2d.Surface.composite(
@@ -2720,6 +3359,74 @@ pub const Browser = struct {
     // Draw a display item using the browser's context
     fn drawDisplayItemZ2d(self: *Browser, item: DisplayItem, scroll_offset: i32, zoom: f32) !void {
         try self.drawDisplayItemZ2dContext(&self.context, item, scroll_offset, zoom);
+    }
+
+    fn drawImageNearest(
+        self: *Browser,
+        context: *z2d.Context,
+        image_item: ImageDisplayItem,
+        dest_left: i32,
+        dest_top: i32,
+        dest_right: i32,
+        dest_bottom: i32,
+        surface_width: i32,
+        surface_height: i32,
+    ) !void {
+        _ = self;
+        const dest_width = dest_right - dest_left;
+        const dest_height = dest_bottom - dest_top;
+        if (dest_width <= 0 or dest_height <= 0) return;
+        if (image_item.source_width <= 0 or image_item.source_height <= 0) return;
+
+        var start_x = dest_left;
+        if (start_x < 0) start_x = 0;
+        var end_x = dest_right;
+        if (end_x > surface_width) end_x = surface_width;
+
+        var start_y = dest_top;
+        if (start_y < 0) start_y = 0;
+        var end_y = dest_bottom;
+        if (end_y > surface_height) end_y = surface_height;
+
+        if (end_x <= start_x or end_y <= start_y) return;
+
+        const src_w = image_item.source_width;
+        const src_h = image_item.source_height;
+        const pixels = image_item.pixels;
+
+        var y = start_y;
+        while (y < end_y) : (y += 1) {
+            const src_y = @divTrunc((y - dest_top) * src_h, dest_height);
+            if (src_y < 0 or src_y >= src_h) continue;
+
+            var x = start_x;
+            while (x < end_x) : (x += 1) {
+                const src_x = @divTrunc((x - dest_left) * src_w, dest_width);
+                if (src_x < 0 or src_x >= src_w) continue;
+
+                const src_idx = (@as(usize, @intCast(src_y)) * @as(usize, @intCast(src_w)) + @as(usize, @intCast(src_x))) * 4;
+                const a = pixels[src_idx + 3];
+                if (a == 0) continue;
+
+                const alpha_f = @as(f64, @floatFromInt(a)) * image_item.opacity;
+                const alpha = std.math.clamp(@as(i32, @intFromFloat(alpha_f + 0.5)), 0, 255);
+                if (alpha == 0) continue;
+
+                context.resetPath();
+                context.setSource(.{ .opaque_pattern = .{ .pixel = .{ .rgba = .{
+                    .r = pixels[src_idx + 0],
+                    .g = pixels[src_idx + 1],
+                    .b = pixels[src_idx + 2],
+                    .a = @intCast(alpha),
+                } } } });
+                context.moveTo(@floatFromInt(x), @floatFromInt(y)) catch continue;
+                context.lineTo(@floatFromInt(x + 1), @floatFromInt(y)) catch continue;
+                context.lineTo(@floatFromInt(x + 1), @floatFromInt(y + 1)) catch continue;
+                context.lineTo(@floatFromInt(x), @floatFromInt(y + 1)) catch continue;
+                context.closePath() catch continue;
+                context.fill() catch continue;
+            }
+        }
     }
 
     // Draw a display item using a specific z2d context
@@ -2798,6 +3505,27 @@ pub const Browser = struct {
                     try context.fill();
                     context.resetPath();
                 }
+            },
+            .image => |image_item| {
+                const left = self.scalePxWithZoom(image_item.x1, zoom);
+                const right = self.scalePxWithZoom(image_item.x2, zoom);
+                const top = self.scalePxWithZoom(image_item.y1, zoom) - scroll_offset;
+                const bottom = self.scalePxWithZoom(image_item.y2, zoom) - scroll_offset;
+                const surface_width = context.surface.getWidth();
+                const surface_height = context.surface.getHeight();
+                try self.drawImageNearest(
+                    context,
+                    image_item,
+                    left,
+                    top,
+                    right,
+                    bottom,
+                    surface_width,
+                    surface_height,
+                );
+            },
+            .iframe => {
+                // Iframe placeholders are expanded during display list composition.
             },
             .rounded_rect => |rounded_item| {
                 const left = self.scalePxWithZoom(rounded_item.x1, zoom);
@@ -2902,8 +3630,28 @@ pub const Browser = struct {
             .blend => |blend_item| {
                 // For blend operations, only create a layer if we have opacity < 1 or a blend mode
                 const should_save_layer = blend_item.opacity < 1.0 or blend_item.blend_mode != null;
+                const is_dst_in = if (blend_item.blend_mode) |mode| std.mem.eql(u8, mode, "dst_in") else false;
 
-                if (should_save_layer) {
+                if (should_save_layer and is_dst_in and blend_item.children.len > 0) {
+                    const original_operator = context.getOperator();
+                    const content_end = blend_item.children.len - 1;
+                    for (blend_item.children[0..content_end]) |child_item| {
+                        if (blend_item.opacity < 1.0) {
+                            var modified_item = child_item;
+                            modified_item = self.applyOpacityToDisplayItem(modified_item, blend_item.opacity);
+                            try self.drawDisplayItemZ2dContext(context, modified_item, scroll_offset, zoom);
+                        } else {
+                            try self.drawDisplayItemZ2dContext(context, child_item, scroll_offset, zoom);
+                        }
+                    }
+                    context.setOperator(self.parseBlendMode("dst_in"));
+                    var mask_item = blend_item.children[content_end];
+                    if (blend_item.opacity < 1.0) {
+                        mask_item = self.applyOpacityToDisplayItem(mask_item, blend_item.opacity);
+                    }
+                    try self.drawDisplayItemZ2dContext(context, mask_item, scroll_offset, zoom);
+                    context.setOperator(original_operator);
+                } else if (should_save_layer) {
                     // Save current operator for restoration
                     const original_operator = context.getOperator();
 
@@ -2938,51 +3686,18 @@ pub const Browser = struct {
                 try dcl.layer.raster(self.allocator, self);
 
                 if (dcl.layer.surface) |*layer_surface| {
-                    // Draw the layer surface at its position with opacity
+                    // Draw the layer surface at its position with opacity.
                     const layer_y = dcl.layer.bounds.top - scroll_offset;
+                    const layer_x = dcl.layer.bounds.left;
 
-                    // Get the pixel data from both surfaces
                     const layer_pixels = switch (layer_surface.*) {
                         .image_surface_rgba => |*img_surface| img_surface.buf,
                         else => return error.UnsupportedSurfaceType,
                     };
 
-                    // Get the root surface pixel buffer for direct writing
-                    const root_pixels = switch (self.root_surface) {
-                        .image_surface_rgba => |*img_surface| img_surface.buf,
-                        else => return error.UnsupportedSurfaceType,
-                    };
-                    const root_width: usize = @intCast(self.root_surface.getWidth());
-
-                    // Composite the layer onto the root surface using direct pixel writes
+                    // Composite the layer onto the destination surface using per-pixel draws.
                     const layer_width: usize = @intCast(layer_surface.getWidth());
                     const layer_height: usize = @intCast(layer_surface.getHeight());
-
-                    // DEBUG: Count non-zero alpha pixels and find lightblue pixels
-                    var nonzero_count: usize = 0;
-                    var lightblue_count: usize = 0;
-                    var lightgreen_count: usize = 0;
-                    for (layer_pixels) |pixel| {
-                        if (pixel.a > 0) {
-                            nonzero_count += 1;
-                            // lightblue = (173,216,230), lightgreen = (144,238,144)
-                            if (pixel.r >= 170 and pixel.r <= 176 and pixel.g >= 213 and pixel.g <= 219 and pixel.b >= 227 and pixel.b <= 233) {
-                                lightblue_count += 1;
-                            }
-                            if (pixel.r >= 141 and pixel.r <= 147 and pixel.g >= 235 and pixel.g <= 241 and pixel.b >= 141 and pixel.b <= 147) {
-                                lightgreen_count += 1;
-                            }
-                        }
-                    }
-                    std.debug.print("DEBUG compositing layer: bounds({},{}-{},{}) size {}x{} scroll={} layer_y={} opacity={d:.2} nonzero={} lightblue={} lightgreen={}\n", .{
-                        dcl.layer.bounds.left, dcl.layer.bounds.top, dcl.layer.bounds.right, dcl.layer.bounds.bottom,
-                        layer_width, layer_height, scroll_offset, layer_y, dcl.layer.opacity,
-                        nonzero_count, lightblue_count, lightgreen_count,
-                    });
-
-                    var composited_lightblue: usize = 0;
-                    var composited_lightgreen: usize = 0;
-                    var first_lightblue_printed = false;
 
                     for (0..layer_height) |row| {
                         const y: i32 = @intCast(row);
@@ -2991,7 +3706,7 @@ pub const Browser = struct {
 
                         for (0..layer_width) |col| {
                             const x: i32 = @intCast(col);
-                            const dest_x = dcl.layer.bounds.left + x;
+                            const dest_x = layer_x + x;
                             if (dest_x < 0 or dest_x >= self.window_width) continue;
 
                             const pixel_idx = row * layer_width + col;
@@ -3000,62 +3715,22 @@ pub const Browser = struct {
                             // Apply layer opacity
                             const alpha: f64 = @as(f64, @floatFromInt(pixel.a)) / 255.0 * dcl.layer.opacity;
                             if (alpha > 0.01) {
-                                // Track lightblue and lightgreen pixels being composited
-                                const is_lightblue = pixel.r >= 170 and pixel.r <= 176 and pixel.g >= 213 and pixel.g <= 219 and pixel.b >= 227 and pixel.b <= 233;
-                                if (is_lightblue) {
-                                    composited_lightblue += 1;
-                                    if (!first_lightblue_printed) {
-                                        std.debug.print("DEBUG first lightblue pixel: local({},{}) dest({},{}) color=({},{},{},{}) alpha={d:.2}\n", .{
-                                            col, row, dest_x, dest_y, pixel.r, pixel.g, pixel.b, pixel.a, alpha,
-                                        });
-                                        first_lightblue_printed = true;
-                                    }
-                                }
-                                if (pixel.r >= 141 and pixel.r <= 147 and pixel.g >= 235 and pixel.g <= 241 and pixel.b >= 141 and pixel.b <= 147) {
-                                    composited_lightgreen += 1;
-                                }
-
-                                // Direct pixel write to root surface with alpha blending
-                                const dest_x_usize: usize = @intCast(dest_x);
-                                const dest_y_usize: usize = @intCast(dest_y);
-                                const dest_idx = dest_y_usize * root_width + dest_x_usize;
-
-                                // Get the existing pixel from root surface
-                                const dst = root_pixels[dest_idx];
-
-                                // Source pixel with layer opacity applied
-                                const src_alpha: f64 = alpha;
-                                const src_r: f64 = @floatFromInt(pixel.r);
-                                const src_g: f64 = @floatFromInt(pixel.g);
-                                const src_b: f64 = @floatFromInt(pixel.b);
-
-                                // Destination pixel
-                                const dst_alpha: f64 = @as(f64, @floatFromInt(dst.a)) / 255.0;
-                                const dst_r: f64 = @floatFromInt(dst.r);
-                                const dst_g: f64 = @floatFromInt(dst.g);
-                                const dst_b: f64 = @floatFromInt(dst.b);
-
-                                // Standard "over" compositing: src over dst
-                                // out_alpha = src_alpha + dst_alpha * (1 - src_alpha)
-                                // out_color = (src_color * src_alpha + dst_color * dst_alpha * (1 - src_alpha)) / out_alpha
-                                const out_alpha = src_alpha + dst_alpha * (1.0 - src_alpha);
-                                if (out_alpha > 0.001) {
-                                    const out_r = (src_r * src_alpha + dst_r * dst_alpha * (1.0 - src_alpha)) / out_alpha;
-                                    const out_g = (src_g * src_alpha + dst_g * dst_alpha * (1.0 - src_alpha)) / out_alpha;
-                                    const out_b = (src_b * src_alpha + dst_b * dst_alpha * (1.0 - src_alpha)) / out_alpha;
-
-                                    root_pixels[dest_idx] = .{
-                                        .r = @intFromFloat(@min(255.0, @max(0.0, out_r))),
-                                        .g = @intFromFloat(@min(255.0, @max(0.0, out_g))),
-                                        .b = @intFromFloat(@min(255.0, @max(0.0, out_b))),
-                                        .a = @intFromFloat(@min(255.0, out_alpha * 255.0)),
-                                    };
-                                }
+                                context.resetPath();
+                                context.setSource(.{ .opaque_pattern = .{ .pixel = .{ .rgba = .{
+                                    .r = pixel.r,
+                                    .g = pixel.g,
+                                    .b = pixel.b,
+                                    .a = @intFromFloat(alpha * 255.0),
+                                } } } });
+                                try context.moveTo(@floatFromInt(dest_x), @floatFromInt(dest_y));
+                                try context.lineTo(@floatFromInt(dest_x + 1), @floatFromInt(dest_y));
+                                try context.lineTo(@floatFromInt(dest_x + 1), @floatFromInt(dest_y + 1));
+                                try context.lineTo(@floatFromInt(dest_x), @floatFromInt(dest_y + 1));
+                                try context.closePath();
+                                try context.fill();
                             }
                         }
                     }
-                    std.debug.print("DEBUG composited pixels: lightblue={} lightgreen={}\n", .{ composited_lightblue, composited_lightgreen });
-
                     // Draw debug border if enabled
                     if (self.debug_layer_borders) {
                         const border_y = layer_y;
@@ -3186,10 +3861,87 @@ pub const Browser = struct {
         return true;
     }
 
+    fn drawGlyphFastWithOffset(
+        self: *Browser,
+        context: *z2d.Context,
+        glyph_item: anytype,
+        scroll_offset: i32,
+        x_offset: i32,
+        zoom: f32,
+    ) bool {
+        const pixels = glyph_item.glyph.pixels orelse return false;
+        const img_surface = switch (context.surface.*) {
+            .image_surface_rgba => |*img| img,
+            else => return false,
+        };
+
+        const surface_width = img_surface.width;
+        const surface_height = img_surface.height;
+        const glyph_y = self.scalePxWithZoom(glyph_item.y, zoom) - scroll_offset;
+        const glyph_x = self.scalePxWithZoom(glyph_item.x, zoom) + x_offset;
+        const w: i32 = glyph_item.glyph.w;
+        const h: i32 = glyph_item.glyph.h;
+
+        if (w <= 0 or h <= 0) return true;
+
+        const color = glyph_item.color;
+        const max_x = glyph_x + w;
+        const max_y = glyph_y + h;
+
+        const start_x = if (glyph_x < 0) -glyph_x else 0;
+        const start_y = if (glyph_y < 0) -glyph_y else 0;
+        const end_x = if (max_x > surface_width) w - (max_x - surface_width) else w;
+        const end_y = if (max_y > surface_height) h - (max_y - surface_height) else h;
+
+        if (end_x <= start_x or end_y <= start_y) return true;
+
+        const buf = img_surface.buf;
+        const surface_w_usize: usize = @intCast(surface_width);
+
+        var y: i32 = start_y;
+        while (y < end_y) : (y += 1) {
+            const dest_y = glyph_y + y;
+            const row_start = @as(usize, @intCast(dest_y)) * surface_w_usize;
+            const src_row_start = @as(usize, @intCast(y)) * @as(usize, @intCast(w));
+
+            var x: i32 = start_x;
+            while (x < end_x) : (x += 1) {
+                const dest_x = glyph_x + x;
+                const dst_idx = row_start + @as(usize, @intCast(dest_x));
+                const src_idx = (src_row_start + @as(usize, @intCast(x))) * 4;
+
+                const alpha = pixels[src_idx + 3];
+                if (alpha == 0) continue;
+
+                const final_alpha: u8 = @intCast((@as(u16, alpha) * @as(u16, color.a)) / 255);
+                if (final_alpha == 0) continue;
+
+                const src_a: u16 = final_alpha;
+                const inv_a: u16 = 255 - src_a;
+                const src_r: u16 = (@as(u16, color.r) * src_a) / 255;
+                const src_g: u16 = (@as(u16, color.g) * src_a) / 255;
+                const src_b: u16 = (@as(u16, color.b) * src_a) / 255;
+
+                const dst = buf[dst_idx];
+                const out_r: u8 = @intCast(src_r + (@as(u16, dst.r) * inv_a) / 255);
+                const out_g: u8 = @intCast(src_g + (@as(u16, dst.g) * inv_a) / 255);
+                const out_b: u8 = @intCast(src_b + (@as(u16, dst.b) * inv_a) / 255);
+                const out_a: u8 = @intCast(src_a + (@as(u16, dst.a) * inv_a) / 255);
+
+                buf[dst_idx] = .{ .r = out_r, .g = out_g, .b = out_b, .a = out_a };
+            }
+        }
+
+        return true;
+    }
+
     // Draw a display item with both scroll offset and x translation
     fn drawDisplayItemZ2dContextWithTransform(self: *Browser, context: *z2d.Context, item: DisplayItem, scroll_offset: i32, x_offset: i32, zoom: f32) !void {
         switch (item) {
             .glyph => |glyph_item| {
+                if (self.drawGlyphFastWithOffset(context, glyph_item, scroll_offset, x_offset, zoom)) {
+                    return;
+                }
                 // Render glyph with x offset applied
                 if (glyph_item.glyph.pixels) |pixels| {
                     const glyph_y = self.scalePxWithZoom(glyph_item.y, zoom) - scroll_offset;
@@ -3253,6 +4005,27 @@ pub const Browser = struct {
                     try context.fill();
                 }
             },
+            .image => |image_item| {
+                const top = self.scalePxWithZoom(image_item.y1, zoom) - scroll_offset;
+                const bottom = self.scalePxWithZoom(image_item.y2, zoom) - scroll_offset;
+                const left = self.scalePxWithZoom(image_item.x1, zoom) + x_offset;
+                const right = self.scalePxWithZoom(image_item.x2, zoom) + x_offset;
+                const surface_width = context.surface.getWidth();
+                const surface_height = context.surface.getHeight();
+                try self.drawImageNearest(
+                    context,
+                    image_item,
+                    left,
+                    top,
+                    right,
+                    bottom,
+                    surface_width,
+                    surface_height,
+                );
+            },
+            .iframe => {
+                // Iframe placeholders are expanded during display list composition.
+            },
             .rounded_rect => |rr| {
                 const top = self.scalePxWithZoom(rr.y1, zoom) - scroll_offset;
                 const bottom = self.scalePxWithZoom(rr.y2, zoom) - scroll_offset;
@@ -3315,8 +4088,28 @@ pub const Browser = struct {
             .blend => |blend_item| {
                 // For blends, apply opacity and recurse into children with the transform applied
                 const should_apply_opacity = blend_item.opacity < 1.0 or blend_item.blend_mode != null;
+                const is_dst_in = if (blend_item.blend_mode) |mode| std.mem.eql(u8, mode, "dst_in") else false;
 
-                if (should_apply_opacity) {
+                if (should_apply_opacity and is_dst_in and blend_item.children.len > 0) {
+                    const original_operator = context.getOperator();
+                    const content_end = blend_item.children.len - 1;
+                    for (blend_item.children[0..content_end]) |child| {
+                        if (blend_item.opacity < 1.0) {
+                            var modified_item = child;
+                            modified_item = self.applyOpacityToDisplayItem(modified_item, blend_item.opacity);
+                            try self.drawDisplayItemZ2dContextWithTransform(context, modified_item, scroll_offset, x_offset, zoom);
+                        } else {
+                            try self.drawDisplayItemZ2dContextWithTransform(context, child, scroll_offset, x_offset, zoom);
+                        }
+                    }
+                    context.setOperator(self.parseBlendMode("dst_in"));
+                    var mask_item = blend_item.children[content_end];
+                    if (blend_item.opacity < 1.0) {
+                        mask_item = self.applyOpacityToDisplayItem(mask_item, blend_item.opacity);
+                    }
+                    try self.drawDisplayItemZ2dContextWithTransform(context, mask_item, scroll_offset, x_offset, zoom);
+                    context.setOperator(original_operator);
+                } else if (should_apply_opacity) {
                     const original_operator = context.getOperator();
                     if (blend_item.blend_mode) |mode| {
                         context.setOperator(self.parseBlendMode(mode));
@@ -3458,6 +4251,27 @@ pub const Browser = struct {
                     context.resetPath();
                 }
             },
+            .image => |image_item| {
+                const left = self.scalePxWithZoom(image_item.x1, zoom) - layer_x;
+                const right = self.scalePxWithZoom(image_item.x2, zoom) - layer_x;
+                const top = self.scalePxWithZoom(image_item.y1, zoom) - layer_y;
+                const bottom = self.scalePxWithZoom(image_item.y2, zoom) - layer_y;
+                const surface_width = context.surface.getWidth();
+                const surface_height = context.surface.getHeight();
+                try self.drawImageNearest(
+                    context,
+                    image_item,
+                    left,
+                    top,
+                    right,
+                    bottom,
+                    surface_width,
+                    surface_height,
+                );
+            },
+            .iframe => {
+                // Iframe placeholders are expanded during display list composition.
+            },
             .rounded_rect => |rr| {
                 const left = self.scalePxWithZoom(rr.x1, zoom) - layer_x;
                 const right = self.scalePxWithZoom(rr.x2, zoom) - layer_x;
@@ -3465,14 +4279,6 @@ pub const Browser = struct {
                 const bottom = self.scalePxWithZoom(rr.y2, zoom) - layer_y;
                 const width = right - left;
                 const height = bottom - top;
-
-                std.debug.print("DEBUG rounded_rect: abs({},{}-{},{}) layer_offset({},{}) local({},{}-{},{}) size {}x{} color=({},{},{},{})\n", .{
-                    rr.x1, rr.y1, rr.x2, rr.y2,
-                    layer_x, layer_y,
-                    left, top, right, bottom,
-                    width, height,
-                    rr.color.r, rr.color.g, rr.color.b, rr.color.a,
-                });
 
                 if (width > 1 and height > 1) {
                     context.resetPath();
@@ -3525,25 +4331,28 @@ pub const Browser = struct {
                 else
                     false;
 
-                if (is_dst_in_clip) {
-                    // TEMPORARILY DISABLED: dst_in clipping to debug lightblue rect issue
-                    // For dst_in clipping, don't use the unbounded operator.
-                    // Instead, apply clip mask manually after content is drawn.
-                    // The mask shape is in blend_item.children[0]
-                    std.debug.print("DEBUG dst_in clip: SKIPPED layer_offset({},{}) children={}\n", .{ layer_x, layer_y, blend_item.children.len });
-                    // if (blend_item.children.len > 0) {
-                    //     try self.applyClipMaskForLayer(context, blend_item.children[0], layer_x, layer_y, zoom);
-                    // }
+                if (is_dst_in_clip and blend_item.children.len > 0) {
+                    const original_operator = context.getOperator();
+                    const content_end = blend_item.children.len - 1;
+                    for (blend_item.children[0..content_end]) |child| {
+                        if (blend_item.opacity < 1.0) {
+                            var modified_item = child;
+                            modified_item = self.applyOpacityToDisplayItem(modified_item, blend_item.opacity);
+                            try self.drawDisplayItemZ2dContextForLayer(context, modified_item, layer_x, layer_y, zoom);
+                        } else {
+                            try self.drawDisplayItemZ2dContextForLayer(context, child, layer_x, layer_y, zoom);
+                        }
+                    }
+                    context.setOperator(self.parseBlendMode("dst_in"));
+                    var mask_item = blend_item.children[content_end];
+                    if (blend_item.opacity < 1.0) {
+                        mask_item = self.applyOpacityToDisplayItem(mask_item, blend_item.opacity);
+                    }
+                    try self.drawDisplayItemZ2dContextForLayer(context, mask_item, layer_x, layer_y, zoom);
+                    context.setOperator(original_operator);
                 } else {
                     // Apply opacity and recursively draw children in layer space
                     const should_apply_opacity = blend_item.opacity < 1.0 or blend_item.blend_mode != null;
-
-                    std.debug.print("DEBUG blend: opacity={d:.2} blend_mode={s} should_apply={} children={}\n", .{
-                        blend_item.opacity,
-                        if (blend_item.blend_mode) |m| m else "null",
-                        should_apply_opacity,
-                        blend_item.children.len,
-                    });
 
                     if (should_apply_opacity) {
                         const original_operator = context.getOperator();
@@ -3552,7 +4361,7 @@ pub const Browser = struct {
                         }
 
                         for (blend_item.children, 0..) |child, i| {
-                            std.debug.print("DEBUG blend child[{}]: type={s}\n", .{ i, @tagName(child) });
+                            _ = i;
                             if (blend_item.opacity < 1.0) {
                                 var modified_item = child;
                                 modified_item = self.applyOpacityToDisplayItem(modified_item, blend_item.opacity);
@@ -3576,10 +4385,6 @@ pub const Browser = struct {
             },
             .transform => |t| {
                 // Apply transform offsets to the layer coordinates
-                std.debug.print("DEBUG transform: translate({},{}) layer_offset({},{}) -> ({},{})\n", .{
-                    t.translate_x, t.translate_y, layer_x, layer_y,
-                    layer_x - self.scalePxWithZoom(t.translate_x, zoom), layer_y - self.scalePxWithZoom(t.translate_y, zoom),
-                });
                 for (t.children) |child| {
                     try self.drawDisplayItemZ2dContextForLayer(
                         context,
@@ -3754,6 +4559,12 @@ pub const Browser = struct {
             .rect => |*rect_item| {
                 rect_item.color.a = @as(u8, @intFromFloat(@round(@as(f64, @floatFromInt(rect_item.color.a)) * opacity)));
             },
+            .image => |*image_item| {
+                image_item.opacity *= opacity;
+            },
+            .iframe => {
+                // Iframe placeholders are expanded during display list composition.
+            },
             .rounded_rect => |*rounded_item| {
                 rounded_item.color.a = @as(u8, @intFromFloat(@round(@as(f64, @floatFromInt(rounded_item.color.a)) * opacity)));
             },
@@ -3874,6 +4685,10 @@ pub const Browser = struct {
             layer.deinit(self.allocator);
         }
         self.composited_layers.deinit(self.allocator);
+        if (self.tab_draw_list.items.len > 0) {
+            DisplayItem.freeItems(self.allocator, self.tab_draw_list.items);
+            self.tab_draw_list.items.len = 0;
+        }
         self.tab_draw_list.deinit(self.allocator);
 
         // Clean up default stylesheet rules
@@ -3886,7 +4701,6 @@ pub const Browser = struct {
         self.layout_engine.deinit();
 
         // Clean up JavaScript engine
-        self.js_engine.deinit(self.allocator);
 
         self.measure.finish();
 
@@ -4257,6 +5071,7 @@ const ScriptTaskContext = struct {
     tab: *Tab,
     js_context: *JsRenderContext,
     generation: u64,
+    window_id: u32,
     script_label: []const u8,
     script_url: Url,
     script_body: []const u8,
@@ -4267,6 +5082,7 @@ const ScriptTaskContext = struct {
         tab: *Tab,
         js_context: *JsRenderContext,
         generation: u64,
+        window_id: u32,
         script_label: []const u8,
         script_url: Url,
         script_body: []const u8,
@@ -4278,6 +5094,7 @@ const ScriptTaskContext = struct {
             .tab = tab,
             .js_context = js_context,
             .generation = generation,
+            .window_id = window_id,
             .script_label = script_label,
             .script_url = script_url,
             .script_body = script_body,
@@ -4314,10 +5131,12 @@ const ScriptTaskContext = struct {
             return;
         }
 
+        std.log.info("Executing script for window_id={d}", .{self.window_id});
         std.log.info("========== Executing script ==========", .{});
         const trace_eval = self.browser.measure.begin("evaljs");
         defer if (trace_eval) self.browser.measure.end("evaljs");
-        const result = self.browser.js_engine.evaluate(self.script_body) catch |err| {
+        const js_context = self.js_context.js_context orelse return;
+        const result = js_context.evaluate(self.window_id, self.script_body) catch |err| {
             std.log.err("Script {s} crashed: {}", .{ self.script_label, err });
             return;
         };
@@ -4339,7 +5158,8 @@ const ScriptTaskContext = struct {
     }
 
     fn injectResult(self: *ScriptTaskContext, result_str: []const u8) anyerror!void {
-        if (self.tab.current_node == null) return;
+        const frame = self.tab.frameForWindowId(self.window_id) orelse return;
+        if (frame.current_node == null) return;
 
         const allocator = self.browser.allocator;
         const result_text = try allocator.alloc(u8, result_str.len);
@@ -4348,7 +5168,7 @@ const ScriptTaskContext = struct {
         var node_list = std.ArrayList(*Node).empty;
         defer node_list.deinit(allocator);
 
-        try parser.treeToList(allocator, &self.tab.current_node.?, &node_list);
+        try parser.treeToList(allocator, &frame.current_node.?, &node_list);
 
         var body_node: ?*Node = null;
         for (node_list.items) |node_ptr| {
@@ -4370,7 +5190,7 @@ const ScriptTaskContext = struct {
             } };
             try body_elem.appendChild(allocator, text_node);
             try self.tab.dynamic_texts.append(allocator, result_text);
-            parser.fixParentPointers(&self.tab.current_node.?, null);
+            parser.fixParentPointers(&frame.current_node.?, null);
             try self.tab.render(self.browser);
         } else {
             allocator.free(result_text);
@@ -4384,6 +5204,7 @@ const SetTimeoutThreadContext = struct {
     tab: *Tab,
     js_context: *JsRenderContext,
     generation: u64,
+    window_id: u32,
     handle: u32,
     delay_ms: u32,
 
@@ -4393,6 +5214,7 @@ const SetTimeoutThreadContext = struct {
         tab: *Tab,
         js_context: *JsRenderContext,
         generation: u64,
+        window_id: u32,
         handle: u32,
         delay_ms: u32,
     ) !*SetTimeoutThreadContext {
@@ -4403,6 +5225,7 @@ const SetTimeoutThreadContext = struct {
             .tab = tab,
             .js_context = js_context,
             .generation = generation,
+            .window_id = window_id,
             .handle = handle,
             .delay_ms = delay_ms,
         };
@@ -4436,6 +5259,7 @@ fn runSetTimeoutThread(ctx: *SetTimeoutThreadContext) void {
         ctx.browser,
         ctx.js_context,
         ctx.generation,
+        ctx.window_id,
         ctx.handle,
     ) catch |err| {
         std.log.warn("Failed to allocate setTimeout task: {}", .{err});
@@ -4460,6 +5284,7 @@ const SetTimeoutTaskContext = struct {
     browser: *Browser,
     js_context: *JsRenderContext,
     generation: u64,
+    window_id: u32,
     handle: u32,
 
     fn create(
@@ -4467,6 +5292,7 @@ const SetTimeoutTaskContext = struct {
         browser: *Browser,
         js_context: *JsRenderContext,
         generation: u64,
+        window_id: u32,
         handle: u32,
     ) !*SetTimeoutTaskContext {
         const ctx = try allocator.create(SetTimeoutTaskContext);
@@ -4475,6 +5301,7 @@ const SetTimeoutTaskContext = struct {
             .browser = browser,
             .js_context = js_context,
             .generation = generation,
+            .window_id = window_id,
             .handle = handle,
         };
         return ctx;
@@ -4507,7 +5334,8 @@ const SetTimeoutTaskContext = struct {
         }
         const trace_eval = self.browser.measure.begin("evaljs");
         defer if (trace_eval) self.browser.measure.end("evaljs");
-        self.browser.js_engine.runTimeoutCallback(self.handle) catch |err| {
+        const js_context = self.js_context.js_context orelse return;
+        js_context.runTimeoutCallback(self.window_id, self.handle) catch |err| {
             std.log.warn("setTimeout callback failed: {}", .{err});
         };
     }
@@ -4665,6 +5493,7 @@ const XhrThreadContext = struct {
     tab: *Tab,
     js_context: *JsRenderContext,
     generation: u64,
+    window_id: u32,
     resolved_url: Url,
     payload: ?[]const u8,
     handle: u32,
@@ -4675,6 +5504,7 @@ const XhrThreadContext = struct {
         tab: *Tab,
         js_context: *JsRenderContext,
         generation: u64,
+        window_id: u32,
         resolved_url: Url,
         payload: ?[]const u8,
         handle: u32,
@@ -4686,6 +5516,7 @@ const XhrThreadContext = struct {
             .tab = tab,
             .js_context = js_context,
             .generation = generation,
+            .window_id = window_id,
             .resolved_url = resolved_url,
             .payload = null,
             .handle = handle,
@@ -4718,8 +5549,10 @@ fn runXhrThread(ctx: *XhrThreadContext) void {
     };
 
     var referrer_copy: ?Url = null;
-    if (ctx.tab.current_url) |cur_ptr| {
-        referrer_copy = cur_ptr.*;
+    if (ctx.tab.frameForWindowId(ctx.window_id)) |frame| {
+        if (frame.current_url) |cur_ptr| {
+            referrer_copy = cur_ptr.*;
+        }
     }
 
     const response_result = ctx.browser.fetchBody(
@@ -4749,17 +5582,8 @@ fn runXhrThread(ctx: *XhrThreadContext) void {
         response_allocator = ctx.allocator;
     }
 
-    const task_ctx = XhrOnloadTaskContext.create(
-        ctx.allocator,
-        ctx.browser,
-        ctx.js_context,
-        ctx.generation,
-        ctx.handle,
-        response_body,
-        response_allocator,
-        should_free_response,
-    ) catch |err| {
-        std.log.warn("Failed to enqueue XHR onload task: {}", .{err});
+    const decoded_body = decodeUtf8Replace(ctx.allocator, response_body) catch |err| {
+        std.log.warn("Failed to decode XHR body: {}", .{err});
         if (should_free_response) {
             if (response_allocator) |alloc| {
                 alloc.free(response_body);
@@ -4767,6 +5591,30 @@ fn runXhrThread(ctx: *XhrThreadContext) void {
                 ctx.allocator.free(response_body);
             }
         }
+        return;
+    };
+
+    if (should_free_response) {
+        if (response_allocator) |alloc| {
+            alloc.free(response_body);
+        } else {
+            ctx.allocator.free(response_body);
+        }
+    }
+
+    const task_ctx = XhrOnloadTaskContext.create(
+        ctx.allocator,
+        ctx.browser,
+        ctx.js_context,
+        ctx.generation,
+        ctx.window_id,
+        ctx.handle,
+        decoded_body,
+        ctx.allocator,
+        true,
+    ) catch |err| {
+        std.log.warn("Failed to enqueue XHR onload task: {}", .{err});
+        ctx.allocator.free(decoded_body);
         return;
     };
 
@@ -4787,6 +5635,7 @@ const XhrOnloadTaskContext = struct {
     browser: *Browser,
     js_context: *JsRenderContext,
     generation: u64,
+    window_id: u32,
     handle: u32,
     body: []const u8,
     body_allocator: ?std.mem.Allocator,
@@ -4797,6 +5646,7 @@ const XhrOnloadTaskContext = struct {
         browser: *Browser,
         js_context: *JsRenderContext,
         generation: u64,
+        window_id: u32,
         handle: u32,
         body: []const u8,
         body_allocator: ?std.mem.Allocator,
@@ -4808,6 +5658,7 @@ const XhrOnloadTaskContext = struct {
             .browser = browser,
             .js_context = js_context,
             .generation = generation,
+            .window_id = window_id,
             .handle = handle,
             .body = body,
             .body_allocator = body_allocator,
@@ -4848,7 +5699,8 @@ const XhrOnloadTaskContext = struct {
         if (!self.js_context.matchesGeneration(self.generation)) {
             return;
         }
-        self.browser.js_engine.runXhrOnload(self.handle, self.body) catch |err| {
+        const js_context = self.js_context.js_context orelse return;
+        js_context.runXhrOnload(self.window_id, self.handle, self.body) catch |err| {
             std.log.warn("XHR onload callback failed: {}", .{err});
         };
     }
@@ -4859,12 +5711,18 @@ fn jsRenderCallback(context: ?*anyopaque) anyerror!void {
     const raw_ctx: *align(1) JsRenderContext = @ptrCast(ctx_ptr);
     const ctx: *JsRenderContext = @alignCast(raw_ctx);
 
+    const browser_ptr = ctx.browser_ptr orelse return;
     const tab_ptr = ctx.tab_ptr orelse return;
+
+    const raw_browser: *align(1) Browser = @ptrCast(browser_ptr);
+    const browser: *Browser = @alignCast(raw_browser);
 
     const raw_tab: *align(1) Tab = @ptrCast(tab_ptr);
     const tab: *Tab = @alignCast(raw_tab);
 
+    // Mark render work and run immediately to keep DOM mutations in sync.
     tab.setNeedsRender();
+    tab.runAnimationFrame(browser.active_tab_scroll);
 }
 
 fn jsXhrCallback(
@@ -4887,12 +5745,13 @@ fn jsXhrCallback(
 
     const raw_tab: *align(1) Tab = @ptrCast(tab_ptr);
     const tab: *Tab = @alignCast(raw_tab);
+    const frame = tab.frameForWindowId(ctx.window_id) orelse return error.MissingJsContext;
 
     const allocator = browser.allocator;
     const generation = ctx.currentGeneration();
 
     var resolved_url: Url = undefined;
-    if (tab.current_url) |current_ptr| {
+    if (frame.current_url) |current_ptr| {
         resolved_url = current_ptr.*.resolve(allocator, url_str) catch |err| blk: {
             std.log.warn("Failed to resolve XHR URL {s} relative to page: {}", .{ url_str, err });
             break :blk try Url.init(allocator, url_str);
@@ -4904,7 +5763,7 @@ fn jsXhrCallback(
     var resolved_owned = true;
     defer if (resolved_owned) resolved_url.free(allocator);
 
-    if (tab.current_url) |current_ptr| {
+    if (frame.current_url) |current_ptr| {
         if (!current_ptr.*.sameOrigin(resolved_url)) {
             const current_host = current_ptr.*.host orelse "";
             const target_host = resolved_url.host orelse "";
@@ -4916,7 +5775,7 @@ fn jsXhrCallback(
         }
     }
 
-    if (!tab.allowedRequest(resolved_url, tab.current_url)) {
+    if (!frame.allowedRequest(resolved_url, frame.current_url)) {
         const target_host = resolved_url.host orelse "";
         std.log.warn(
             "Blocked XHR to {s}://{s}:{d} due to CSP",
@@ -4926,7 +5785,7 @@ fn jsXhrCallback(
     }
 
     var current_url_value: ?Url = null;
-    if (tab.current_url) |cur_ptr| {
+    if (frame.current_url) |cur_ptr| {
         current_url_value = cur_ptr.*;
     }
 
@@ -4953,10 +5812,29 @@ fn jsXhrCallback(
         response_allocator = null;
     }
 
+    const decoded_body = decodeUtf8Replace(allocator, response_body) catch |err| {
+        if (should_free_response) {
+            if (response_allocator) |alloc| {
+                alloc.free(response_body);
+            } else {
+                allocator.free(response_body);
+            }
+        }
+        return err;
+    };
+
+    if (should_free_response) {
+        if (response_allocator) |alloc| {
+            alloc.free(response_body);
+        } else {
+            allocator.free(response_body);
+        }
+    }
+
     return .{
-        .data = response_body,
-        .allocator = response_allocator,
-        .should_free = should_free_response,
+        .data = decoded_body,
+        .allocator = allocator,
+        .should_free = true,
     };
 }
 
@@ -4994,4 +5872,85 @@ fn jsRequestAnimationFrameCallback(
     const tab: *Tab = @alignCast(raw_tab);
 
     tab.setNeedsRender();
+}
+
+fn originStringForUrl(allocator: std.mem.Allocator, url: Url) ![]u8 {
+    if (std.mem.eql(u8, url.scheme, "file")) {
+        return allocator.dupe(u8, "file://");
+    }
+    if (std.mem.eql(u8, url.scheme, "about") or std.mem.eql(u8, url.scheme, "data")) {
+        return std.fmt.allocPrint(allocator, "{s}:", .{url.scheme});
+    }
+    const host = url.host orelse "";
+    return std.fmt.allocPrint(allocator, "{s}://{s}:{d}", .{ url.scheme, host, url.port });
+}
+
+fn normalizeOrigin(allocator: std.mem.Allocator, origin: []const u8) ![]const u8 {
+    const trimmed = std.mem.trim(u8, origin, " \t\r\n");
+    const lower = try allocator.alloc(u8, trimmed.len);
+    for (trimmed, 0..) |ch, idx| {
+        lower[idx] = std.ascii.toLower(ch);
+    }
+    return lower;
+}
+
+fn jsPostMessageCallback(
+    context: ?*anyopaque,
+    source_window_id: u32,
+    target_window_id: u32,
+    target_origin: []const u8,
+    message: []const u8,
+) anyerror!void {
+    const ctx_ptr = context orelse return error.MissingJsContext;
+    const raw_ctx: *align(1) JsRenderContext = @ptrCast(ctx_ptr);
+    const ctx: *JsRenderContext = @alignCast(raw_ctx);
+
+    const browser_ptr = ctx.browser_ptr orelse return error.MissingJsContext;
+    const tab_ptr = ctx.tab_ptr orelse return error.MissingJsContext;
+
+    const raw_browser: *align(1) Browser = @ptrCast(browser_ptr);
+    const browser: *Browser = @alignCast(raw_browser);
+
+    const raw_tab: *align(1) Tab = @ptrCast(tab_ptr);
+    const tab: *Tab = @alignCast(raw_tab);
+
+    const source_frame = tab.frameForWindowId(source_window_id) orelse return;
+    const target_frame = tab.frameForWindowId(target_window_id) orelse return;
+    const target_context = target_frame.js_context orelse return;
+
+    const allocator = browser.allocator;
+
+    var source_origin = try allocator.dupe(u8, "null");
+    defer allocator.free(source_origin);
+    if (source_frame.current_url) |url_ptr| {
+        allocator.free(source_origin);
+        source_origin = try originStringForUrl(allocator, url_ptr.*);
+    }
+
+    if (!std.mem.eql(u8, target_origin, "*")) {
+        var target_origin_actual = try allocator.dupe(u8, "null");
+        defer allocator.free(target_origin_actual);
+        if (target_frame.current_url) |url_ptr| {
+            allocator.free(target_origin_actual);
+            target_origin_actual = try originStringForUrl(allocator, url_ptr.*);
+        }
+
+        const target_origin_norm = try normalizeOrigin(allocator, target_origin);
+        defer allocator.free(target_origin_norm);
+        const actual_origin_norm = try normalizeOrigin(allocator, target_origin_actual);
+        defer allocator.free(actual_origin_norm);
+
+        if (!std.mem.eql(u8, target_origin_norm, actual_origin_norm)) {
+            std.log.warn("Blocked postMessage due to target origin mismatch", .{});
+            return;
+        }
+    }
+
+    target_context.dispatchPostMessage(target_window_id, message, source_origin, source_window_id) catch |err| {
+        std.log.warn("Failed to dispatch postMessage: {}", .{err});
+    };
+    // Ensure postMessage-driven DOM updates paint without waiting for input.
+    tab.setNeedsRender();
+    const scroll = if (tab.root_frame) |root| root.scroll else 0;
+    tab.runAnimationFrame(scroll);
 }

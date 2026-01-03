@@ -91,6 +91,48 @@ const SetTimeoutCallback = struct {
     context: ?*anyopaque = null,
 };
 
+const JsLock = struct {
+    mutex: std.Thread.Mutex = .{},
+    owner: ?std.Thread.Id = null,
+    depth: usize = 0,
+
+    fn lock(self: *JsLock) void {
+        const tid = std.Thread.getCurrentId();
+        if (self.owner != null and self.owner.? == tid) {
+            self.depth += 1;
+            return;
+        }
+        self.mutex.lock();
+        self.owner = tid;
+        self.depth = 1;
+    }
+
+    fn unlock(self: *JsLock) void {
+        const tid = std.Thread.getCurrentId();
+        if (self.owner == null or self.owner.? != tid) return;
+        if (self.depth > 1) {
+            self.depth -= 1;
+            return;
+        }
+        self.depth = 0;
+        self.owner = null;
+        self.mutex.unlock();
+    }
+};
+
+pub const PostMessageCallbackFn = *const fn (
+    context: ?*anyopaque,
+    source_window_id: u32,
+    target_window_id: u32,
+    target_origin: []const u8,
+    message: []const u8,
+) anyerror!void;
+
+const PostMessageCallback = struct {
+    function: ?PostMessageCallbackFn = null,
+    context: ?*anyopaque = null,
+};
+
 pub const XhrResult = struct {
     data: []const u8,
     allocator: ?std.mem.Allocator = null,
@@ -111,20 +153,35 @@ const XhrCallback = struct {
     context: ?*anyopaque = null,
 };
 
+const PendingMessage = struct {
+    message: []u8,
+    origin: []u8,
+    source_window_id: u32,
+};
+
+const WindowContext = struct {
+    realm: *Realm,
+    node_to_handle: std.AutoHashMap(*Node, u32),
+    handle_to_node: std.AutoHashMap(u32, *Node),
+    next_handle: u32,
+    current_nodes: ?*Node,
+    pending_messages: std.ArrayList(PendingMessage),
+    render_callback: RenderCallback,
+    set_timeout_callback: SetTimeoutCallback,
+    post_message_callback: PostMessageCallback,
+    xhr_callback: XhrCallback,
+    animation_frame_callback: AnimationFrameCallback,
+};
+
 platform: Agent.Platform,
 agent: Agent,
-realm: *Realm,
 allocator: std.mem.Allocator,
-// Handle management for DOM nodes
-node_to_handle: std.AutoHashMap(*Node, u32),
-handle_to_node: std.AutoHashMap(u32, *Node),
-next_handle: u32,
-// Reference to the current tab's nodes (borrowed, not owned)
-current_nodes: ?*Node,
-render_callback: RenderCallback,
-set_timeout_callback: SetTimeoutCallback,
-xhr_callback: XhrCallback,
-animation_frame_callback: AnimationFrameCallback,
+windows: std.AutoHashMap(u32, WindowContext),
+parent_window_ids: std.AutoHashMap(u32, u32),
+current_window_id: ?u32 = null,
+lock: JsLock = .{},
+realm: ?*Realm = null,
+runtime_initialized: bool = false,
 
 pub fn init(allocator: std.mem.Allocator) !*Js {
     const self = try allocator.create(Js);
@@ -137,34 +194,58 @@ pub fn init(allocator: std.mem.Allocator) !*Js {
     self.agent = try Agent.init(&self.platform, .{});
     errdefer self.agent.deinit();
 
-    // Initialize the realm
-    try Realm.initializeHostDefinedRealm(&self.agent, .{});
-
-    // Get the current realm
-    self.realm = self.agent.currentRealm();
-
-    // Initialize handle management
     self.allocator = allocator;
-    self.node_to_handle = std.AutoHashMap(*Node, u32).init(allocator);
-    self.handle_to_node = std.AutoHashMap(u32, *Node).init(allocator);
-    self.next_handle = 0;
-    self.current_nodes = null;
-    self.render_callback = .{};
-    self.set_timeout_callback = .{};
-    self.xhr_callback = .{};
-    self.animation_frame_callback = .{};
-
-    // Set up console.log
-    try self.setupConsole();
-
-    // Set up document object with DOM API
-    try self.setupDocument();
+    self.windows = std.AutoHashMap(u32, WindowContext).init(allocator);
+    self.parent_window_ids = std.AutoHashMap(u32, u32).init(allocator);
+    self.current_window_id = null;
+    self.lock = .{};
+    self.realm = null;
+    self.runtime_initialized = false;
 
     return self;
 }
 
+fn ensureWindow(self: *Js, window_id: u32) !void {
+    if (self.windows.contains(window_id)) return;
+
+    if (self.realm == null) {
+        try Realm.initializeHostDefinedRealm(&self.agent, .{});
+        self.realm = self.agent.currentRealm();
+        try self.setupConsole(self.realm.?);
+        try self.setupDocument(self.realm.?);
+    }
+
+    const ctx = WindowContext{
+        .realm = self.realm.?,
+        .node_to_handle = std.AutoHashMap(*Node, u32).init(self.allocator),
+        .handle_to_node = std.AutoHashMap(u32, *Node).init(self.allocator),
+        .next_handle = 0,
+        .current_nodes = null,
+        .pending_messages = std.ArrayList(PendingMessage).empty,
+        .render_callback = .{},
+        .set_timeout_callback = .{},
+        .post_message_callback = .{},
+        .xhr_callback = .{},
+        .animation_frame_callback = .{},
+    };
+
+    try self.windows.put(window_id, ctx);
+}
+
+fn getWindowContext(self: *Js, window_id: u32) !*WindowContext {
+    if (!self.windows.contains(window_id)) {
+        try self.ensureWindow(window_id);
+    }
+    return self.windows.getPtr(window_id).?;
+}
+
+fn setCurrentWindow(self: *Js, window_id: u32) !*WindowContext {
+    self.current_window_id = window_id;
+    return self.getWindowContext(window_id);
+}
+
 /// Set up the console object with log function
-fn setupConsole(self: *Js) !void {
+fn setupConsole(self: *Js, realm: *Realm) !void {
     const builtins = kiesel.builtins;
     const PropertyKey = kiesel.types.PropertyKey;
 
@@ -177,11 +258,11 @@ fn setupConsole(self: *Js) !void {
         "log",
         consoleLog,
         1,
-        self.realm,
+        realm,
     );
 
     // Add console to global object
-    try self.realm.global_object.definePropertyDirect(
+    try realm.global_object.definePropertyDirect(
         &self.agent,
         PropertyKey.from("console"),
         .{
@@ -229,14 +310,27 @@ fn consoleLog(agent: *Agent, _: Value, arguments: kiesel.types.Arguments) Agent.
 }
 
 pub fn deinit(self: *Js, allocator: std.mem.Allocator) void {
-    self.node_to_handle.deinit();
-    self.handle_to_node.deinit();
+    var it = self.windows.valueIterator();
+    while (it.next()) |window| {
+        window.node_to_handle.deinit();
+        window.handle_to_node.deinit();
+        for (window.pending_messages.items) |msg| {
+            self.allocator.free(msg.message);
+            self.allocator.free(msg.origin);
+        }
+        window.pending_messages.deinit(self.allocator);
+    }
+    self.windows.deinit();
+    self.parent_window_ids.deinit();
     self.platform.deinit();
     self.agent.deinit();
     allocator.destroy(self);
 }
 
-pub fn evaluate(self: *Js, code: []const u8) !Value {
+pub fn evaluate(self: *Js, window_id: u32, code: []const u8) !Value {
+    self.lock.lock();
+    defer self.lock.unlock();
+    const window = try self.setCurrentWindow(window_id);
     // Inject runtime code to wrap handles in Node objects
     const runtime_code =
         \\// Node constructor that wraps a handle
@@ -332,8 +426,11 @@ pub fn evaluate(self: *Js, code: []const u8) !Value {
         \\globalThis.Event = Event;
         \\globalThis.XMLHttpRequest = XMLHttpRequest;
         \\
-        \\globalThis.__resetEventListeners = function() {
+        \\globalThis.__resetEventListeners = function(windowId) {
         \\  LISTENERS = {};
+        \\  var targetId = (windowId === undefined || windowId === null) ? window.__id : windowId;
+        \\  delete WINDOW_MESSAGE_LISTENERS[targetId];
+        \\  delete WINDOW_ONMESSAGE[targetId];
         \\};
         \\
         \\var SET_TIMEOUT_REQUESTS = {};
@@ -366,6 +463,47 @@ pub fn evaluate(self: *Js, code: []const u8) !Value {
         \\  __native.requestAnimationFrame();
         \\};
         \\
+        \\var WINDOW_MESSAGE_LISTENERS = {};
+        \\var WINDOW_ONMESSAGE = {};
+        \\
+        \\globalThis.window = globalThis;
+        \\window.__id = __native.getWindowId();
+        \\Object.defineProperty(window, "onmessage", {
+        \\  get: function() { return WINDOW_ONMESSAGE[window.__id] || null; },
+        \\  set: function(fn) { WINDOW_ONMESSAGE[window.__id] = fn; }
+        \\});
+        \\window.addEventListener = function(type, listener) {
+        \\  if (type !== "message") return;
+        \\  if (!WINDOW_MESSAGE_LISTENERS[window.__id]) WINDOW_MESSAGE_LISTENERS[window.__id] = [];
+        \\  WINDOW_MESSAGE_LISTENERS[window.__id].push(listener);
+        \\};
+        \\window.postMessage = function(message, targetWindowId, targetOrigin) {
+        \\  var payload = message == null ? "null" : message.toString();
+        \\  var origin = targetOrigin === undefined ? "*" : targetOrigin.toString();
+        \\  __native.postMessage(payload, targetWindowId, origin);
+        \\};
+        \\Object.defineProperty(window, "parent", {
+        \\  get: function() {
+        \\    var parentId = __native.getParentWindowId(window.__id);
+        \\    if (parentId === null || parentId === undefined) return null;
+        \\    return { __id: parentId, postMessage: function(message, targetOrigin) { var payload = message == null ? "null" : message.toString(); var origin = targetOrigin === undefined ? "*" : targetOrigin.toString(); __native.postMessage(payload, parentId, origin); } };
+        \\  }
+        \\});
+        \\globalThis.__setActiveWindow = function(id) {
+        \\  window.__id = id;
+        \\};
+        \\globalThis.__dispatchMessageEvent = function(message, origin, sourceId, targetId) {
+        \\  var evt = { type: 'message', data: message, origin: origin, source: { __id: sourceId } };
+        \\  var list = WINDOW_MESSAGE_LISTENERS[targetId] || [];
+        \\  for (var i = 0; i < list.length; i++) {
+        \\    list[i].call(window, evt);
+        \\  }
+        \\  var handler = WINDOW_ONMESSAGE[targetId];
+        \\  if (handler) {
+        \\    handler(evt);
+        \\  }
+        \\};
+        \\
         \\globalThis.__runXHROnload = function(body, handle) {
         \\  var obj = XHR_REQUESTS[handle];
         \\  if (!obj) return;
@@ -386,30 +524,32 @@ pub fn evaluate(self: *Js, code: []const u8) !Value {
         \\})();
     ;
 
-    // First evaluate the runtime code if this is the first evaluation
-    // We check if Node is already defined to avoid re-injecting
-    const check_script = try Script.parse(
-        "typeof Node !== 'undefined'",
-        self.realm,
-        null,
-        .{},
-    );
-    const is_defined = try check_script.evaluate();
-
-    if (!is_defined.toBoolean()) {
+    if (!self.runtime_initialized) {
         const runtime_script = try Script.parse(
             runtime_code,
-            self.realm,
+            window.realm,
             null,
             .{},
         );
         _ = try runtime_script.evaluate();
+        self.runtime_initialized = true;
+        if (window.pending_messages.items.len > 0) {
+            for (window.pending_messages.items) |msg| {
+                self.dispatchMessageImpl(window, msg.message, msg.origin, msg.source_window_id, window_id) catch |err| {
+                    std.log.warn("Failed to dispatch queued postMessage: {}", .{err});
+                };
+                self.allocator.free(msg.message);
+                self.allocator.free(msg.origin);
+            }
+            window.pending_messages.clearRetainingCapacity();
+        }
     }
+    try self.setActiveWindow(window_id, window);
 
     // Now evaluate the user's code
     const script = try Script.parse(
         code,
-        self.realm,
+        window.realm,
         null,
         .{},
     );
@@ -429,73 +569,102 @@ pub fn formatValue(value: Value, buf: []u8) ![]const u8 {
 }
 
 /// Set the current nodes for DOM operations
-pub fn setNodes(self: *Js, nodes: ?*Node) void {
-    self.current_nodes = nodes;
+pub fn setNodes(self: *Js, window_id: u32, nodes: ?*Node) void {
+    self.lock.lock();
+    defer self.lock.unlock();
+    const window = self.setCurrentWindow(window_id) catch return;
+    window.current_nodes = nodes;
     // Clear handle mappings when nodes change
-    self.node_to_handle.clearRetainingCapacity();
-    self.handle_to_node.clearRetainingCapacity();
-    self.next_handle = 0;
-    // Reset JavaScript-side listener state when the DOM changes
-    self.resetEventListenersImpl();
+    window.node_to_handle.clearRetainingCapacity();
+    window.handle_to_node.clearRetainingCapacity();
+    window.next_handle = 0;
     if (nodes == null) {
-        self.render_callback = .{};
-        self.xhr_callback = .{};
-        self.set_timeout_callback = .{};
-        self.animation_frame_callback = .{};
+        window.render_callback = .{};
+        window.xhr_callback = .{};
+        window.set_timeout_callback = .{};
+        window.post_message_callback = .{};
+        window.animation_frame_callback = .{};
+    } else {
+        // Reset JavaScript-side listener state when the DOM changes.
+        self.resetEventListenersImpl(window, window_id);
     }
 }
 
-pub fn setRenderCallback(self: *Js, callback: ?RenderCallbackFn, context: ?*anyopaque) void {
-    self.render_callback = .{
+pub fn setRenderCallback(self: *Js, window_id: u32, callback: ?RenderCallbackFn, context: ?*anyopaque) void {
+    const window = self.setCurrentWindow(window_id) catch return;
+    window.render_callback = .{
         .function = callback,
         .context = context,
     };
 }
 
-pub fn setXhrCallback(self: *Js, callback: ?XhrCallbackFn, context: ?*anyopaque) void {
-    self.xhr_callback = .{
+pub fn setXhrCallback(self: *Js, window_id: u32, callback: ?XhrCallbackFn, context: ?*anyopaque) void {
+    const window = self.setCurrentWindow(window_id) catch return;
+    window.xhr_callback = .{
         .function = callback,
         .context = context,
     };
 }
 
-pub fn setSetTimeoutCallback(self: *Js, callback: ?SetTimeoutCallbackFn, context: ?*anyopaque) void {
-    self.set_timeout_callback = .{
+pub fn setSetTimeoutCallback(self: *Js, window_id: u32, callback: ?SetTimeoutCallbackFn, context: ?*anyopaque) void {
+    const window = self.setCurrentWindow(window_id) catch return;
+    window.set_timeout_callback = .{
         .function = callback,
         .context = context,
     };
 }
 
-pub fn setAnimationFrameCallback(self: *Js, callback: ?AnimationFrameCallbackFn, context: ?*anyopaque) void {
-    self.animation_frame_callback = .{
+pub fn setAnimationFrameCallback(self: *Js, window_id: u32, callback: ?AnimationFrameCallbackFn, context: ?*anyopaque) void {
+    const window = self.setCurrentWindow(window_id) catch return;
+    window.animation_frame_callback = .{
         .function = callback,
         .context = context,
     };
+}
+
+pub fn setPostMessageCallback(self: *Js, window_id: u32, callback: ?PostMessageCallbackFn, context: ?*anyopaque) void {
+    const window = self.setCurrentWindow(window_id) catch return;
+    window.post_message_callback = .{
+        .function = callback,
+        .context = context,
+    };
+}
+
+pub fn setParentWindow(self: *Js, child_window_id: u32, parent_window_id: ?u32) void {
+    if (parent_window_id) |parent_id| {
+        self.parent_window_ids.put(child_window_id, parent_id) catch {};
+    } else {
+        _ = self.parent_window_ids.fetchRemove(child_window_id);
+    }
 }
 
 /// Get or create a handle for a node
-fn getHandle(self: *Js, node: *Node) !u32 {
-    if (self.node_to_handle.get(node)) |handle| {
+fn getHandle(self: *Js, window: *WindowContext, node: *Node) !u32 {
+    _ = self;
+    if (window.node_to_handle.get(node)) |handle| {
         return handle;
     }
 
-    const handle = self.next_handle;
-    self.next_handle += 1;
+    const handle = window.next_handle;
+    window.next_handle += 1;
 
-    try self.node_to_handle.put(node, handle);
-    try self.handle_to_node.put(handle, node);
+    try window.node_to_handle.put(node, handle);
+    try window.handle_to_node.put(handle, node);
 
     return handle;
 }
 
 /// Get a node from a handle
-fn getNode(self: *Js, handle: u32) ?*Node {
-    return self.handle_to_node.get(handle);
+fn getNode(self: *Js, window: *WindowContext, handle: u32) ?*Node {
+    _ = self;
+    return window.handle_to_node.get(handle);
 }
 
 fn requestRender(self: *Js) void {
-    if (self.render_callback.function) |callback| {
-        const context = self.render_callback.context orelse return;
+    const window_id = self.current_window_id orelse return;
+    const window = self.windows.getPtr(window_id) orelse return;
+    if (window.render_callback.function) |callback| {
+        const context = window.render_callback.context orelse return;
         callback(context) catch |err| {
             std.log.warn("Render callback failed: {}", .{err});
         };
@@ -504,17 +673,21 @@ fn requestRender(self: *Js) void {
 
 /// Dispatch an event to the JavaScript environment for the given node
 /// Returns true if the default action was prevented.
-pub fn dispatchEvent(self: *Js, event_type: []const u8, node: *Node) !bool {
-    if (self.current_nodes == null) return false;
+pub fn dispatchEvent(self: *Js, window_id: u32, event_type: []const u8, node: *Node) !bool {
+    self.lock.lock();
+    defer self.lock.unlock();
+    const window = try self.setCurrentWindow(window_id);
+    try self.setActiveWindow(window_id, window);
+    if (window.current_nodes == null) return false;
 
-    const handle = try self.getHandle(node);
+    const handle = try self.getHandle(window, node);
 
     const type_value = try kiesel.types.String.fromUtf8(&self.agent, event_type);
     const type_js_value = Value.from(type_value);
     const handle_value = Value.from(@as(f64, @floatFromInt(handle)));
 
     const dispatch_key = kiesel.types.PropertyKey.from("__native");
-    const native_value = try self.realm.global_object.get(&self.agent, dispatch_key);
+    const native_value = try window.realm.global_object.get(&self.agent, dispatch_key);
     if (!native_value.isObject()) return false;
     const native_obj = native_value.asObject();
     const dispatch_property = kiesel.types.PropertyKey.from("dispatchEvent");
@@ -532,9 +705,61 @@ pub fn dispatchEvent(self: *Js, event_type: []const u8, node: *Node) !bool {
     return !do_default;
 }
 
-pub fn runTimeoutCallback(self: *Js, handle: u32) !void {
+pub fn dispatchPostMessage(
+    self: *Js,
+    window_id: u32,
+    message: []const u8,
+    origin: []const u8,
+    source_window_id: u32,
+) !void {
+    self.lock.lock();
+    defer self.lock.unlock();
+    const window = try self.setCurrentWindow(window_id);
+    try self.setActiveWindow(window_id, window);
+    if (!self.runtime_initialized) {
+        const message_copy = try self.allocator.dupe(u8, message);
+        errdefer self.allocator.free(message_copy);
+        const origin_copy = try self.allocator.dupe(u8, origin);
+        errdefer self.allocator.free(origin_copy);
+        try window.pending_messages.append(self.allocator, .{
+            .message = message_copy,
+            .origin = origin_copy,
+            .source_window_id = source_window_id,
+        });
+        return;
+    }
+
+    try self.dispatchMessageImpl(window, message, origin, source_window_id, window_id);
+}
+
+fn dispatchMessageImpl(
+    self: *Js,
+    window: *WindowContext,
+    message: []const u8,
+    origin: []const u8,
+    source_window_id: u32,
+    target_window_id: u32,
+) !void {
+    const key = kiesel.types.PropertyKey.from("__dispatchMessageEvent");
+    const fn_value = try window.realm.global_object.get(&self.agent, key);
+    if (!fn_value.isCallable()) return error.MissingMessageHandler;
+
+    const message_value = try self.stringToJsValue(message);
+    const origin_value = try self.stringToJsValue(origin);
+    const source_value = Value.from(@as(f64, @floatFromInt(source_window_id)));
+    const target_value = Value.from(@as(f64, @floatFromInt(target_window_id)));
+
+    _ = try fn_value.call(&self.agent, .undefined, &.{ message_value, origin_value, source_value, target_value });
+    self.requestRender();
+}
+
+pub fn runTimeoutCallback(self: *Js, window_id: u32, handle: u32) !void {
+    self.lock.lock();
+    defer self.lock.unlock();
+    const window = try self.setCurrentWindow(window_id);
+    try self.setActiveWindow(window_id, window);
     const key = kiesel.types.PropertyKey.from("__runSetTimeout");
-    const fn_value = self.realm.global_object.get(&self.agent, key) catch {
+    const fn_value = window.realm.global_object.get(&self.agent, key) catch {
         return error.MissingSetTimeout;
     };
     if (!fn_value.isCallable()) {
@@ -544,20 +769,26 @@ pub fn runTimeoutCallback(self: *Js, handle: u32) !void {
     _ = try fn_value.call(&self.agent, .undefined, &.{ handle_value });
 }
 
-pub fn runAnimationFrameHandlers(self: *Js) void {
+pub fn runAnimationFrameHandlers(self: *Js, window_id: u32) void {
+    self.lock.lock();
+    defer self.lock.unlock();
+    const window = self.setCurrentWindow(window_id) catch return;
+    self.setActiveWindow(window_id, window) catch return;
     const key = kiesel.types.PropertyKey.from("__runRAFHandlers");
-    const fn_value = self.realm.global_object.get(&self.agent, key) catch return;
+    const fn_value = window.realm.global_object.get(&self.agent, key) catch return;
     if (!fn_value.isCallable()) return;
     _ = fn_value.call(&self.agent, .undefined, &.{}) catch |err| {
         std.log.warn("requestAnimationFrame handler failed: {}", .{err});
     };
 }
 
-fn resetEventListenersImpl(self: *Js) void {
+fn resetEventListenersImpl(self: *Js, window: *WindowContext, window_id: u32) void {
+    self.setActiveWindow(window_id, window) catch return;
     const reset_key = kiesel.types.PropertyKey.from("__resetEventListeners");
-    const reset_value = self.realm.global_object.get(&self.agent, reset_key) catch return;
+    const reset_value = window.realm.global_object.get(&self.agent, reset_key) catch return;
     if (!reset_value.isCallable()) return;
-    _ = reset_value.call(&self.agent, .undefined, &.{}) catch return;
+    const window_id_value = Value.from(@as(f64, @floatFromInt(window_id)));
+    _ = reset_value.call(&self.agent, .undefined, &.{window_id_value}) catch return;
 }
 
 fn stringToJsValue(self: *Js, text: []const u8) !Value {
@@ -565,9 +796,22 @@ fn stringToJsValue(self: *Js, text: []const u8) !Value {
     return Value.from(js_string);
 }
 
-pub fn runXhrOnload(self: *Js, handle: u32, body: []const u8) !void {
+fn setActiveWindow(self: *Js, window_id: u32, window: *WindowContext) !void {
+    if (!self.runtime_initialized) return;
+    const key = kiesel.types.PropertyKey.from("__setActiveWindow");
+    const fn_value = try window.realm.global_object.get(&self.agent, key);
+    if (!fn_value.isCallable()) return;
+    const window_value = Value.from(@as(f64, @floatFromInt(window_id)));
+    _ = try fn_value.call(&self.agent, .undefined, &.{ window_value });
+}
+
+pub fn runXhrOnload(self: *Js, window_id: u32, handle: u32, body: []const u8) !void {
+    self.lock.lock();
+    defer self.lock.unlock();
+    const window = try self.setCurrentWindow(window_id);
+    try self.setActiveWindow(window_id, window);
     const key = kiesel.types.PropertyKey.from("__runXHROnload");
-    const fn_value = try self.realm.global_object.get(&self.agent, key);
+    const fn_value = try window.realm.global_object.get(&self.agent, key);
     if (!fn_value.isCallable()) return error.MissingXhrCallback;
 
     const body_value = try self.stringToJsValue(body);
@@ -579,7 +823,7 @@ test "Node.prototype.style setter is defined" {
     var js = try Js.init(std.testing.allocator);
     defer js.deinit(std.testing.allocator);
 
-    const result = try js.evaluate("Object.getOwnPropertyDescriptor(Node.prototype, 'style') !== undefined");
+    const result = try js.evaluate(0, "Object.getOwnPropertyDescriptor(Node.prototype, 'style') !== undefined");
     try std.testing.expect(result.toBoolean());
 }
 
@@ -587,7 +831,7 @@ test "__native.style_set is exposed" {
     var js = try Js.init(std.testing.allocator);
     defer js.deinit(std.testing.allocator);
 
-    const result = try js.evaluate("typeof __native.style_set === 'function'");
+    const result = try js.evaluate(0, "typeof __native.style_set === 'function'");
     try std.testing.expect(result.toBoolean());
 }
 
@@ -599,7 +843,8 @@ test "native style_set updates element style attribute" {
     var node = Node{ .element = element };
     defer node.deinit(std.testing.allocator);
 
-    const handle = try js.getHandle(&node);
+    const window = try js.setCurrentWindow(0);
+    const handle = try js.getHandle(window, &node);
 
     const SafePointer = kiesel.types.SafePointer;
     const builtins = kiesel.builtins;
@@ -610,7 +855,7 @@ test "native style_set updates element style attribute" {
         2,
         "style_set",
         .{
-            .realm = js.realm,
+            .realm = window.realm,
             .additional_fields = self_ptr,
         },
     );
@@ -655,11 +900,12 @@ test "native style_set requests render" {
     var node = Node{ .element = element };
     defer node.deinit(std.testing.allocator);
 
-    const handle = try js.getHandle(&node);
+    const window = try js.setCurrentWindow(0);
+    const handle = try js.getHandle(window, &node);
 
     var called = false;
     var ctx = RenderTestContext{ .called = &called };
-    js.setRenderCallback(renderTestCallback, @ptrCast(&ctx));
+    js.setRenderCallback(0, renderTestCallback, @ptrCast(&ctx));
 
     const SafePointer = kiesel.types.SafePointer;
     const builtins = kiesel.builtins;
@@ -670,7 +916,7 @@ test "native style_set requests render" {
         2,
         "style_set",
         .{
-            .realm = js.realm,
+            .realm = window.realm,
             .additional_fields = self_ptr,
         },
     );
@@ -684,7 +930,7 @@ test "native style_set requests render" {
 }
 
 /// Set up the document object with DOM API
-fn setupDocument(self: *Js) !void {
+fn setupDocument(self: *Js, realm: *Realm) !void {
     const builtins = kiesel.builtins;
     const PropertyKey = kiesel.types.PropertyKey;
     const SafePointer = kiesel.types.SafePointer;
@@ -701,7 +947,7 @@ fn setupDocument(self: *Js) !void {
         1,
         "querySelectorAll",
         .{
-            .realm = self.realm,
+            .realm = realm,
             .additional_fields = self_ptr,
         },
     );
@@ -717,7 +963,7 @@ fn setupDocument(self: *Js) !void {
     );
 
     // Add document to global object
-    try self.realm.global_object.definePropertyDirect(
+    try realm.global_object.definePropertyDirect(
         &self.agent,
         PropertyKey.from("document"),
         .{
@@ -740,7 +986,7 @@ fn setupDocument(self: *Js) !void {
         2,
         "getAttribute",
         .{
-            .realm = self.realm,
+            .realm = realm,
             .additional_fields = self_ptr,
         },
     );
@@ -762,7 +1008,7 @@ fn setupDocument(self: *Js) !void {
         2,
         "innerHTML",
         .{
-            .realm = self.realm,
+            .realm = realm,
             .additional_fields = self_ptr,
         },
     );
@@ -774,7 +1020,7 @@ fn setupDocument(self: *Js) !void {
         2,
         "style_set",
         .{
-            .realm = self.realm,
+            .realm = realm,
             .additional_fields = self_ptr,
         },
     );
@@ -806,7 +1052,7 @@ fn setupDocument(self: *Js) !void {
         5,
         "xhrSend",
         .{
-            .realm = self.realm,
+            .realm = realm,
             .additional_fields = self_ptr,
         },
     );
@@ -826,7 +1072,7 @@ fn setupDocument(self: *Js) !void {
         2,
         "setTimeout",
         .{
-            .realm = self.realm,
+            .realm = realm,
             .additional_fields = self_ptr,
         },
     );
@@ -846,7 +1092,7 @@ fn setupDocument(self: *Js) !void {
         0,
         "requestAnimationFrame",
         .{
-            .realm = self.realm,
+            .realm = realm,
             .additional_fields = self_ptr,
         },
     );
@@ -860,8 +1106,68 @@ fn setupDocument(self: *Js) !void {
         },
     );
 
+    const get_window_id_fn = try kiesel.builtins.createBuiltinFunction(
+        &self.agent,
+        .{ .function = getWindowIdNative },
+        0,
+        "getWindowId",
+        .{
+            .realm = realm,
+            .additional_fields = self_ptr,
+        },
+    );
+
+    try native_obj.definePropertyDirect(
+        &self.agent,
+        PropertyKey.from("getWindowId"),
+        .{
+            .value_or_accessor = .{ .value = Value.from(&get_window_id_fn.object) },
+            .attributes = .builtin_default,
+        },
+    );
+
+    const get_parent_window_id_fn = try kiesel.builtins.createBuiltinFunction(
+        &self.agent,
+        .{ .function = getParentWindowIdNative },
+        1,
+        "getParentWindowId",
+        .{
+            .realm = realm,
+            .additional_fields = self_ptr,
+        },
+    );
+
+    try native_obj.definePropertyDirect(
+        &self.agent,
+        PropertyKey.from("getParentWindowId"),
+        .{
+            .value_or_accessor = .{ .value = Value.from(&get_parent_window_id_fn.object) },
+            .attributes = .builtin_default,
+        },
+    );
+
+    const post_message_fn = try kiesel.builtins.createBuiltinFunction(
+        &self.agent,
+        .{ .function = postMessageNative },
+        3,
+        "postMessage",
+        .{
+            .realm = realm,
+            .additional_fields = self_ptr,
+        },
+    );
+
+    try native_obj.definePropertyDirect(
+        &self.agent,
+        PropertyKey.from("postMessage"),
+        .{
+            .value_or_accessor = .{ .value = Value.from(&post_message_fn.object) },
+            .attributes = .builtin_default,
+        },
+    );
+
     // Add __native to global
-    try self.realm.global_object.definePropertyDirect(
+    try realm.global_object.definePropertyDirect(
         &self.agent,
         PropertyKey.from("__native"),
         .{
@@ -881,6 +1187,16 @@ fn querySelectorAll(agent: *Agent, this_value: Value, arguments: kiesel.types.Ar
     const builtin_fn = function_obj.as(kiesel.builtins.BuiltinFunction);
     const js_instance = builtin_fn.fields.additional_fields.cast(*Js);
     _ = this_value;
+    const window_id = js_instance.current_window_id orelse return agent.throwException(
+        .internal_error,
+        "Missing active window",
+        .{},
+    );
+    const window = js_instance.windows.getPtr(window_id) orelse return agent.throwException(
+        .internal_error,
+        "Missing window context",
+        .{},
+    );
 
     const selector_arg = arguments.get(0);
     if (!selector_arg.isString()) {
@@ -903,14 +1219,14 @@ fn querySelectorAll(agent: *Agent, this_value: Value, arguments: kiesel.types.Ar
         return agent.throwException(.syntax_error, "Invalid selector", .{});
     };
 
-    if (js_instance.current_nodes == null) {
+    if (window.current_nodes == null) {
         const empty_array = try kiesel.builtins.arrayCreate(agent, 0, null);
         return Value.from(&empty_array.object);
     }
 
     var node_list = std.ArrayList(*Node).empty;
     defer node_list.deinit(js_instance.allocator);
-    try parser.treeToList(js_instance.allocator, js_instance.current_nodes.?, &node_list);
+    try parser.treeToList(js_instance.allocator, window.current_nodes.?, &node_list);
 
     var matching_handles = std.ArrayList(u32).empty;
     defer matching_handles.deinit(js_instance.allocator);
@@ -935,7 +1251,7 @@ fn querySelectorAll(agent: *Agent, this_value: Value, arguments: kiesel.types.Ar
         // Check if this node matches the selector
         const matches = selector.matches(node, ancestors.items);
         if (matches) {
-            const handle = try js_instance.getHandle(node);
+            const handle = try js_instance.getHandle(window, node);
             try matching_handles.append(js_instance.allocator, handle);
         }
 
@@ -964,6 +1280,16 @@ fn getAttribute(agent: *Agent, this_value: Value, arguments: kiesel.types.Argume
     const function_obj = agent.activeFunctionObject();
     const builtin_fn = function_obj.as(kiesel.builtins.BuiltinFunction);
     const js_instance = builtin_fn.fields.additional_fields.cast(*Js);
+    const window_id = js_instance.current_window_id orelse return agent.throwException(
+        .internal_error,
+        "Missing active window",
+        .{},
+    );
+    const window = js_instance.windows.getPtr(window_id) orelse return agent.throwException(
+        .internal_error,
+        "Missing window context",
+        .{},
+    );
 
     _ = this_value;
 
@@ -980,7 +1306,7 @@ fn getAttribute(agent: *Agent, this_value: Value, arguments: kiesel.types.Argume
     const handle: u32 = @intFromFloat(handle_arg.asNumber().asFloat());
 
     // Get the node from the handle
-    const node = js_instance.getNode(handle) orelse return agent.throwException(
+    const node = js_instance.getNode(window, handle) orelse return agent.throwException(
         .internal_error,
         "Invalid node handle",
         .{},
@@ -1025,6 +1351,16 @@ fn innerHTML(agent: *Agent, this_value: Value, arguments: kiesel.types.Arguments
     const function_obj = agent.activeFunctionObject();
     const builtin_fn = function_obj.as(kiesel.builtins.BuiltinFunction);
     const js_instance = builtin_fn.fields.additional_fields.cast(*Js);
+    const window_id = js_instance.current_window_id orelse return agent.throwException(
+        .internal_error,
+        "Missing active window",
+        .{},
+    );
+    const window = js_instance.windows.getPtr(window_id) orelse return agent.throwException(
+        .internal_error,
+        "Missing window context",
+        .{},
+    );
 
     _ = this_value;
 
@@ -1041,7 +1377,7 @@ fn innerHTML(agent: *Agent, this_value: Value, arguments: kiesel.types.Arguments
     const handle: u32 = @intFromFloat(handle_arg.asNumber().asFloat());
 
     // Get the node from the handle
-    const node = js_instance.getNode(handle) orelse return agent.throwException(
+    const node = js_instance.getNode(window, handle) orelse return agent.throwException(
         .internal_error,
         "Invalid node handle",
         .{},
@@ -1157,6 +1493,16 @@ fn styleSet(agent: *Agent, this_value: Value, arguments: kiesel.types.Arguments)
     const function_obj = agent.activeFunctionObject();
     const builtin_fn = function_obj.as(kiesel.builtins.BuiltinFunction);
     const js_instance = builtin_fn.fields.additional_fields.cast(*Js);
+    const window_id = js_instance.current_window_id orelse return agent.throwException(
+        .internal_error,
+        "Missing active window",
+        .{},
+    );
+    const window = js_instance.windows.getPtr(window_id) orelse return agent.throwException(
+        .internal_error,
+        "Missing window context",
+        .{},
+    );
 
     _ = this_value;
 
@@ -1171,7 +1517,7 @@ fn styleSet(agent: *Agent, this_value: Value, arguments: kiesel.types.Arguments)
 
     const handle: u32 = @intFromFloat(handle_arg.asNumber().asFloat());
 
-    const node = js_instance.getNode(handle) orelse return agent.throwException(
+    const node = js_instance.getNode(window, handle) orelse return agent.throwException(
         .internal_error,
         "Invalid node handle",
         .{},
@@ -1257,10 +1603,20 @@ fn xhrSend(agent: *Agent, this_value: Value, arguments: kiesel.types.Arguments) 
     const function_obj = agent.activeFunctionObject();
     const builtin_fn = function_obj.as(kiesel.builtins.BuiltinFunction);
     const js_instance = builtin_fn.fields.additional_fields.cast(*Js);
+    const window_id = js_instance.current_window_id orelse return agent.throwException(
+        .internal_error,
+        "Missing active window",
+        .{},
+    );
+    const window = js_instance.windows.getPtr(window_id) orelse return agent.throwException(
+        .internal_error,
+        "Missing window context",
+        .{},
+    );
 
-    const callback = js_instance.xhr_callback.function orelse
+    const callback = window.xhr_callback.function orelse
         return agent.throwException(.type_error, "XMLHttpRequest is not available", .{});
-    const callback_context = js_instance.xhr_callback.context;
+    const callback_context = window.xhr_callback.context;
 
     const method_arg = arguments.get(0);
     if (!method_arg.isString()) {
@@ -1342,6 +1698,16 @@ fn setTimeoutNative(agent: *Agent, this_value: Value, arguments: kiesel.types.Ar
     const function_obj = agent.activeFunctionObject();
     const builtin_fn = function_obj.as(kiesel.builtins.BuiltinFunction);
     const js_instance = builtin_fn.fields.additional_fields.cast(*Js);
+    const window_id = js_instance.current_window_id orelse return agent.throwException(
+        .internal_error,
+        "Missing active window",
+        .{},
+    );
+    const window = js_instance.windows.getPtr(window_id) orelse return agent.throwException(
+        .internal_error,
+        "Missing window context",
+        .{},
+    );
 
     const handle_arg = arguments.get(0);
     if (!handle_arg.isNumber()) {
@@ -1375,8 +1741,8 @@ fn setTimeoutNative(agent: *Agent, this_value: Value, arguments: kiesel.types.Ar
         }
     }
 
-    if (js_instance.set_timeout_callback.function) |callback| {
-        const callback_context = js_instance.set_timeout_callback.context;
+    if (window.set_timeout_callback.function) |callback| {
+        const callback_context = window.set_timeout_callback.context;
         callback(callback_context, handle, delay_ms) catch |err| {
             std.log.warn("Failed to schedule setTimeout callback: {}", .{err});
         };
@@ -1392,11 +1758,109 @@ fn requestAnimationFrameNative(agent: *Agent, this_value: Value, arguments: kies
     const function_obj = agent.activeFunctionObject();
     const builtin_fn = function_obj.as(kiesel.builtins.BuiltinFunction);
     const js_instance = builtin_fn.fields.additional_fields.cast(*Js);
+    const window_id = js_instance.current_window_id orelse return agent.throwException(
+        .internal_error,
+        "Missing active window",
+        .{},
+    );
+    const window = js_instance.windows.getPtr(window_id) orelse return agent.throwException(
+        .internal_error,
+        "Missing window context",
+        .{},
+    );
 
-    if (js_instance.animation_frame_callback.function) |callback| {
-        const callback_context = js_instance.animation_frame_callback.context;
+    if (window.animation_frame_callback.function) |callback| {
+        const callback_context = window.animation_frame_callback.context;
         callback(callback_context) catch |err| {
             std.log.warn("Failed to schedule animation frame: {}", .{err});
+        };
+    }
+
+    return .undefined;
+}
+
+fn getWindowIdNative(agent: *Agent, this_value: Value, _: kiesel.types.Arguments) Agent.Error!Value {
+    const function_obj = agent.activeFunctionObject();
+    const builtin_fn = function_obj.as(kiesel.builtins.BuiltinFunction);
+    const js_instance = builtin_fn.fields.additional_fields.cast(*Js);
+    _ = this_value;
+
+    const window_id = js_instance.current_window_id orelse return agent.throwException(
+        .internal_error,
+        "Missing active window",
+        .{},
+    );
+    return Value.from(@as(f64, @floatFromInt(window_id)));
+}
+
+fn getParentWindowIdNative(agent: *Agent, this_value: Value, arguments: kiesel.types.Arguments) Agent.Error!Value {
+    const function_obj = agent.activeFunctionObject();
+    const builtin_fn = function_obj.as(kiesel.builtins.BuiltinFunction);
+    const js_instance = builtin_fn.fields.additional_fields.cast(*Js);
+    _ = this_value;
+
+    const id_arg = arguments.get(0);
+    if (!id_arg.isNumber()) {
+        return agent.throwException(.type_error, "getParentWindowId requires a numeric window id", .{});
+    }
+
+    const raw_id = id_arg.asNumber().asFloat();
+    if (std.math.isNan(raw_id)) {
+        return agent.throwException(.type_error, "getParentWindowId requires a valid window id", .{});
+    }
+    const window_id = @as(u32, @intFromFloat(raw_id));
+    const parent_id = js_instance.parent_window_ids.get(window_id) orelse return .null;
+    if (!js_instance.windows.contains(parent_id)) {
+        return .null;
+    }
+    return Value.from(@as(f64, @floatFromInt(parent_id)));
+}
+
+fn postMessageNative(agent: *Agent, this_value: Value, arguments: kiesel.types.Arguments) Agent.Error!Value {
+    const function_obj = agent.activeFunctionObject();
+    const builtin_fn = function_obj.as(kiesel.builtins.BuiltinFunction);
+    const js_instance = builtin_fn.fields.additional_fields.cast(*Js);
+    _ = this_value;
+
+    const window_id = js_instance.current_window_id orelse return agent.throwException(
+        .internal_error,
+        "Missing active window",
+        .{},
+    );
+    const window = js_instance.windows.getPtr(window_id) orelse return agent.throwException(
+        .internal_error,
+        "Missing window context",
+        .{},
+    );
+
+    const message_arg = arguments.get(0);
+    const target_id_arg = arguments.get(1);
+    const target_origin_arg = arguments.get(2);
+
+    if (!target_id_arg.isNumber()) {
+        return agent.throwException(.type_error, "postMessage requires a numeric target window id", .{});
+    }
+    if (!target_origin_arg.isString()) {
+        return agent.throwException(.type_error, "postMessage requires a string target origin", .{});
+    }
+
+    const message_str = try message_arg.toString(&js_instance.agent);
+    const message = try message_str.toUtf8(js_instance.allocator);
+    defer js_instance.allocator.free(message);
+
+    const target_origin = try target_origin_arg.asString().toUtf8(js_instance.allocator);
+    defer js_instance.allocator.free(target_origin);
+
+    const raw_target_id = target_id_arg.asNumber().asFloat();
+    if (std.math.isNan(raw_target_id)) {
+        return agent.throwException(.type_error, "postMessage requires a valid target window id", .{});
+    }
+    const target_window_id = @as(u32, @intFromFloat(raw_target_id));
+
+    if (window.post_message_callback.function) |callback| {
+        const ctx = window.post_message_callback.context;
+        callback(ctx, window_id, target_window_id, target_origin, message) catch |err| {
+            return agent.throwException(.internal_error, "postMessage failed: {any}", .{err});
         };
     }
 

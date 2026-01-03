@@ -46,6 +46,12 @@ pub fn build(b: *std.Build) !void {
     });
     source_module.addImport("kiesel", kiesel_dep.module("kiesel"));
 
+    const zigimg_dep = b.dependency("zigimg", .{
+        .target = target,
+        .optimize = optimize,
+    });
+    source_module.addImport("zigimg", zigimg_dep.module("zigimg"));
+
     const run_cmd = b.addRunArtifact(exe);
     run_cmd.step.dependOn(b.getInstallStep());
 

@@ -6,6 +6,7 @@ const Layout = @import("Layout.zig");
 const CSSParser = @import("cssParser.zig");
 const task = @import("task.zig");
 const MeasureTime = @import("measure_time.zig").MeasureTime;
+const js_module = @import("js.zig");
 
 const Url = url_module.Url;
 const Browser = browser_mod.Browser;
@@ -15,6 +16,10 @@ const AccessibilitySettings = browser_mod.AccessibilitySettings;
 const TaskRunner = task.TaskRunner;
 const Node = parser.Node;
 const Bounds = Layout.Bounds;
+const FrameBoundEntry = struct {
+    node: *Node,
+    bounds: Bounds,
+};
 
 /// Represents a composited visual effect update (e.g., opacity change during animation)
 pub const CompositedUpdate = struct {
@@ -45,48 +50,410 @@ pub const LiveSetting = enum {
     assertive,
 };
 
+pub const Frame = struct {
+    allocator: std.mem.Allocator,
+    tab: *Tab,
+    parent: ?*Frame,
+    frame_element: ?*Node,
+    input_bounds: std.AutoHashMap(*Node, Bounds),
+    link_bounds: std.ArrayList(FrameBoundEntry),
+    iframe_bounds: std.ArrayList(FrameBoundEntry),
+    accessibility_bounds: std.ArrayList(FrameBoundEntry),
+    viewport_width: i32 = 0,
+    viewport_height: i32 = 0,
+    window_id: u32 = 0,
+    current_url: ?*Url = null,
+    current_url_owned: bool = false,
+    current_html_source: ?[]const u8 = null,
+    current_node: ?Node = null,
+    document_layout: ?*Layout.DocumentLayout = null,
+    display_list: ?[]DisplayItem = null,
+    content_height: i32 = 0,
+    scroll: i32 = 0,
+    focus: ?*Node = null,
+    js_context: ?*js_module = null,
+    js_render_context: JsRenderContext = .{},
+    js_render_context_initialized: bool = false,
+    rules: std.ArrayList(CSSParser.CSSRule),
+    default_rules_count: usize = 0,
+    css_texts: std.ArrayList([]const u8),
+    allowed_origins: ?std.ArrayList([]const u8) = null,
+    children: std.ArrayList(*Frame),
+
+    pub fn init(
+        allocator: std.mem.Allocator,
+        tab: *Tab,
+        parent: ?*Frame,
+        frame_element: ?*Node,
+    ) Frame {
+        return .{
+            .allocator = allocator,
+            .tab = tab,
+            .parent = parent,
+            .frame_element = frame_element,
+            .rules = std.ArrayList(CSSParser.CSSRule).empty,
+            .css_texts = std.ArrayList([]const u8).empty,
+            .children = std.ArrayList(*Frame).empty,
+            .input_bounds = std.AutoHashMap(*Node, Bounds).init(allocator),
+            .link_bounds = std.ArrayList(FrameBoundEntry).empty,
+            .iframe_bounds = std.ArrayList(FrameBoundEntry).empty,
+            .accessibility_bounds = std.ArrayList(FrameBoundEntry).empty,
+        };
+    }
+
+    pub fn deinit(self: *Frame) void {
+        self.tab.unregisterFrame(self);
+        self.input_bounds.deinit();
+        self.link_bounds.deinit(self.allocator);
+        self.iframe_bounds.deinit(self.allocator);
+        self.accessibility_bounds.deinit(self.allocator);
+        for (self.children.items) |child| {
+            child.deinit();
+            self.allocator.destroy(child);
+        }
+        self.children.deinit(self.allocator);
+
+        if (self.display_list) |items| {
+            DisplayItem.freeList(self.allocator, items);
+            self.display_list = null;
+        }
+
+        if (self.document_layout) |doc| {
+            doc.deinit();
+            self.allocator.destroy(doc);
+            self.document_layout = null;
+        }
+
+        if (self.current_node) |node| {
+            var n = node;
+            n.deinit(self.allocator);
+            self.current_node = null;
+        }
+
+        if (self.current_html_source) |source| {
+            self.allocator.free(source);
+            self.current_html_source = null;
+        }
+
+        for (self.rules.items) |*rule| {
+            if (rule.owned) {
+                rule.deinit(self.allocator);
+            }
+        }
+        self.rules.deinit(self.allocator);
+
+        for (self.css_texts.items) |css_text| {
+            self.allocator.free(css_text);
+        }
+        self.css_texts.deinit(self.allocator);
+
+        self.clearAllowedOrigins();
+
+        if (self.current_url_owned) {
+            if (self.current_url) |url_ptr| {
+                url_ptr.*.free(self.allocator);
+                self.allocator.destroy(url_ptr);
+            }
+        }
+        self.current_url = null;
+        self.current_url_owned = false;
+    }
+
+    pub fn render(self: *Frame, browser: *Browser, needs_style: bool, needs_layout: bool, needs_paint: bool) !void {
+        if (self.current_node == null) return;
+        if (needs_style) {
+            try parser.style(browser.allocator, &self.current_node.?, self.rules.items);
+        }
+        if (needs_layout or needs_paint) {
+            try browser.layoutTabNodes(self);
+        }
+    }
+
+    pub fn updateHitTestBounds(self: *Frame, engine: *Layout) !void {
+        self.input_bounds.clearRetainingCapacity();
+        var input_it = engine.input_bounds.iterator();
+        while (input_it.next()) |entry| {
+            try self.input_bounds.put(entry.key_ptr.*, entry.value_ptr.*);
+        }
+
+        self.link_bounds.clearRetainingCapacity();
+        for (engine.link_bounds.items) |entry| {
+            try self.link_bounds.append(self.allocator, .{
+                .node = entry.node,
+                .bounds = entry.bounds,
+            });
+        }
+
+        self.iframe_bounds.clearRetainingCapacity();
+        for (engine.iframe_bounds.items) |entry| {
+            try self.iframe_bounds.append(self.allocator, .{
+                .node = entry.node,
+                .bounds = entry.bounds,
+            });
+        }
+
+        self.accessibility_bounds.clearRetainingCapacity();
+        for (engine.accessibility_bounds.items) |entry| {
+            try self.accessibility_bounds.append(self.allocator, .{
+                .node = entry.node,
+                .bounds = entry.bounds,
+            });
+        }
+    }
+
+    pub fn dispatchEvent(self: *Frame, event_type: []const u8, node: *Node) bool {
+        const ctx = self.js_context orelse return false;
+        return ctx.dispatchEvent(self.window_id, event_type, node) catch |err| blk: {
+            std.log.warn("Failed to dispatch {s} event: {}", .{ event_type, err });
+            break :blk false;
+        };
+    }
+
+    pub fn click(self: *Frame, b: *Browser, x: i32, y: i32) !bool {
+        for (self.iframe_bounds.items) |entry| {
+            const bounds = entry.bounds;
+            if (x >= bounds.x and x < bounds.x + bounds.width and
+                y >= bounds.y and y < bounds.y + bounds.height)
+            {
+                if (self.findFrameByElement(entry.node)) |child| {
+                    self.tab.focused_frame = child;
+                    const child_x = x - bounds.x;
+                    const child_y = y - bounds.y + child.scroll;
+                    _ = try child.click(b, child_x, child_y);
+                }
+                return true;
+            }
+        }
+
+        for (self.link_bounds.items) |entry| {
+            const bounds = entry.bounds;
+            if (x >= bounds.x and x < bounds.x + bounds.width and
+                y >= bounds.y and y < bounds.y + bounds.height)
+            {
+                const link_node = entry.node;
+                const prevent_default = self.dispatchEvent("click", link_node);
+                if (prevent_default) return true;
+
+                switch (link_node.*) {
+                    .element => |*link_element| {
+                        if (link_element.attributes) |attrs| {
+                            if (attrs.get("href")) |href| {
+                                if (self.current_url) |current_url_ptr| {
+                                    var resolved_url = try current_url_ptr.*.resolve(self.allocator, href);
+                                    const new_url_ptr = self.allocator.create(Url) catch |alloc_err| {
+                                        std.log.err("Failed to allocate URL: {any}", .{alloc_err});
+                                        resolved_url.free(self.allocator);
+                                        return true;
+                                    };
+                                    new_url_ptr.* = resolved_url;
+                                    var url_owned = true;
+                                    defer if (url_owned) {
+                                        new_url_ptr.*.free(self.allocator);
+                                        self.allocator.destroy(new_url_ptr);
+                                    };
+
+                                    b.scheduleLoad(self.tab, new_url_ptr, null) catch |err| {
+                                        std.log.err("Failed to schedule load for {s}: {any}", .{ href, err });
+                                        return true;
+                                    };
+                                    url_owned = false;
+                                }
+                            }
+                        }
+                    },
+                    else => {},
+                }
+                self.tab.focused_frame = self;
+                return true;
+            }
+        }
+
+        var it = self.input_bounds.iterator();
+        while (it.next()) |entry| {
+            const node_ptr = entry.key_ptr.*;
+            const bounds = entry.value_ptr.*;
+            if (x >= bounds.x and x < bounds.x + bounds.width and
+                y >= bounds.y and y < bounds.y + bounds.height)
+            {
+                switch (node_ptr.*) {
+                    .element => |*e| {
+                        if (std.mem.eql(u8, e.tag, "input")) {
+                            const prevent_default = self.dispatchEvent("click", node_ptr);
+                            if (prevent_default) return true;
+                            if (e.attributes) |*attrs| {
+                                try attrs.put("value", "");
+                            }
+                            e.is_focused = true;
+                            self.focus = node_ptr;
+                            self.tab.focused_frame = self;
+                            self.tab.updateAccessibilityFocus(b);
+                            self.tab.setNeedsRender();
+                            return true;
+                        }
+
+                        if (std.mem.eql(u8, e.tag, "button")) {
+                            const prevent_default = self.dispatchEvent("click", node_ptr);
+                            if (prevent_default) return true;
+                            try self.tab.submitForm(b, self, node_ptr);
+                            self.tab.focused_frame = self;
+                            return true;
+                        }
+                    },
+                    else => {},
+                }
+            }
+        }
+
+        return false;
+    }
+
+    pub fn findFrameByElement(self: *Frame, node: *Node) ?*Frame {
+        if (self.frame_element == node) return self;
+        for (self.children.items) |child| {
+            if (child.findFrameByElement(node)) |hit| return hit;
+        }
+        return null;
+    }
+
+    pub fn clearAllowedOrigins(self: *Frame) void {
+        if (self.allowed_origins) |*origins| {
+            for (origins.items) |origin| {
+                self.allocator.free(origin);
+            }
+            origins.deinit(self.allocator);
+            self.allowed_origins = null;
+        }
+    }
+
+    fn allocLowercase(self: *Frame, text: []const u8) ![]const u8 {
+        const copy = try self.allocator.alloc(u8, text.len);
+        for (copy, 0..) |*ch, idx| {
+            ch.* = std.ascii.toLower(text[idx]);
+        }
+        return copy;
+    }
+
+    pub fn allowedRequest(self: *Frame, target_url: Url, base_url: ?*const Url) bool {
+        var page_url: ?Url = null;
+        if (base_url) |base| {
+            page_url = base.*;
+        } else if (self.current_url) |url_ptr| {
+            page_url = url_ptr.*;
+        }
+        if (page_url) |current| {
+            if (current.sameOrigin(target_url)) {
+                return true;
+            }
+        }
+
+        const origins = self.allowed_origins orelse return true;
+
+        var origin_buffer: [256]u8 = undefined;
+        const host = target_url.host orelse return true;
+        const origin_str = std.fmt.bufPrint(&origin_buffer, "{s}://{s}:{d}", .{ target_url.scheme, host, target_url.port }) catch return false;
+
+        var lower_buffer: [256]u8 = undefined;
+        if (origin_str.len > lower_buffer.len) return false;
+        for (origin_str, 0..) |ch, idx| {
+            lower_buffer[idx] = std.ascii.toLower(ch);
+        }
+        const normalized = lower_buffer[0..origin_str.len];
+
+        for (origins.items) |allowed| {
+            if (allowed.len == normalized.len and std.mem.eql(u8, allowed, normalized)) {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    pub fn applyContentSecurityPolicy(self: *Frame, header: []const u8, base_url: Url) !void {
+        const whitespace = " \t\r\n";
+        var directives = std.mem.tokenizeScalar(u8, header, ';');
+        while (directives.next()) |directive_raw| {
+            const trimmed = std.mem.trim(u8, directive_raw, whitespace);
+            if (trimmed.len == 0) continue;
+
+            var tokens = std.mem.tokenizeScalar(u8, trimmed, ' ');
+            const directive_name = tokens.next() orelse continue;
+            if (!std.ascii.eqlIgnoreCase(directive_name, "default-src")) continue;
+
+            var origins_list = std.ArrayList([]const u8).empty;
+            var assigned = false;
+            errdefer {
+                if (!assigned) {
+                    for (origins_list.items) |origin| self.allocator.free(origin);
+                    origins_list.deinit(self.allocator);
+                }
+            }
+
+            while (tokens.next()) |origin_token| {
+                const semicolon_trimmed = std.mem.trimRight(u8, origin_token, ";\r\n \t");
+                const trimmed_origin = std.mem.trim(u8, semicolon_trimmed, whitespace);
+                if (trimmed_origin.len == 0) continue;
+
+                if (std.ascii.eqlIgnoreCase(trimmed_origin, "'self'") or
+                    std.ascii.eqlIgnoreCase(trimmed_origin, "self"))
+                {
+                    if (base_url.host) |host| {
+                        const normalized = try std.fmt.allocPrint(self.allocator, "{s}://{s}:{d}", .{
+                            base_url.scheme,
+                            host,
+                            base_url.port,
+                        });
+                        defer self.allocator.free(normalized);
+
+                        const lowered = try self.allocLowercase(normalized);
+                        try origins_list.append(self.allocator, lowered);
+                    }
+                    continue;
+                }
+
+                const origin_url = url_module.Url.init(self.allocator, trimmed_origin) catch |err| {
+                    std.log.warn("Failed to parse CSP origin {s}: {}", .{ trimmed_origin, err });
+                    continue;
+                };
+                defer origin_url.free(self.allocator);
+
+                const host = origin_url.host orelse continue;
+
+                const normalized = try std.fmt.allocPrint(self.allocator, "{s}://{s}:{d}", .{ origin_url.scheme, host, origin_url.port });
+                defer self.allocator.free(normalized);
+
+                const lowered = try self.allocLowercase(normalized);
+                try origins_list.append(self.allocator, lowered);
+            }
+
+            self.allowed_origins = origins_list;
+            assigned = true;
+            return;
+        }
+    }
+};
+
 // Tab represents a single web page
 pub const Tab = @This();
 // Memory allocator
 allocator: std.mem.Allocator,
 browser: *Browser,
 accessibility: AccessibilitySettings = .{},
-// List of items to be displayed
-display_list: ?[]DisplayItem = null,
-// Current HTML node tree
-current_node: ?Node = null,
-// Current HTML source (must be kept alive while current_node exists)
-current_html_source: ?[]const u8 = null,
-// Layout tree for the document
-document_layout: ?*Layout.DocumentLayout = null,
-// Total height of the content
-content_height: i32 = 0,
-// Current scroll offset
-scroll: i32 = 0,
-// Current URL being displayed
-current_url: ?*Url = null,
 // Available height for tab content (window height minus chrome height)
 tab_height: i32 = 0,
 // History of visited URLs (owns Url pointers)
 history: std.ArrayList(*Url),
-// Currently focused input element (if any)
-focus: ?*Node = null,
-// Cached nodes for re-rendering without reloading
-nodes: ?Node = null,
-// CSS rules for styling
-rules: std.ArrayList(CSSParser.CSSRule),
-// Number of default browser rules (these are borrowed, not owned)
-default_rules_count: usize = 0,
-// CSS text buffers from external stylesheets (need to be freed)
-css_texts: std.ArrayList([]const u8),
 // Dynamically allocated text strings (e.g., from JavaScript results) that need to be freed
 dynamic_texts: std.ArrayList([]const u8),
+// JS contexts keyed by origin string
+js_contexts: std.StringHashMap(*js_module),
 // Context passed to the JS engine for DOM mutation callbacks
-js_render_context: JsRenderContext = .{},
-js_render_context_initialized: bool = false,
 js_generation: u64 = 0,
-// Parsed Content-Security-Policy allowed origins (lowercase origin strings)
-allowed_origins: ?std.ArrayList([]const u8) = null,
+// Root frame for this tab
+root_frame: ?*Frame = null,
+focused_frame: ?*Frame = null,
+frames_by_id: std.AutoHashMap(u32, *Frame),
+parent_window_ids: std.AutoHashMap(u32, u32),
+next_window_id: u32 = 1,
 // Pending asynchronous work for this tab
 task_runner: TaskRunner,
 async_thread_refs: std.atomic.Value(usize) = std.atomic.Value(usize).init(0),
@@ -117,14 +484,8 @@ pub fn init(allocator: std.mem.Allocator, tab_height: i32, measure: *MeasureTime
         .accessibility = .{ .dark_palette = .{} },
         .tab_height = tab_height,
         .history = std.ArrayList(*Url).empty,
-        .focus = null,
-        .nodes = null,
-        .rules = std.ArrayList(CSSParser.CSSRule).empty,
-        .default_rules_count = 0,
-        .css_texts = std.ArrayList([]const u8).empty,
         .dynamic_texts = std.ArrayList([]const u8).empty,
-        .js_render_context = .{},
-        .js_render_context_initialized = false,
+        .js_contexts = std.StringHashMap(*js_module).init(allocator),
         .task_runner = TaskRunner.init(allocator, measure),
         .composited_updates = std.ArrayList(CompositedUpdate).empty,
         .accessibility_root = null,
@@ -133,6 +494,8 @@ pub fn init(allocator: std.mem.Allocator, tab_height: i32, measure: *MeasureTime
         .accessibility_polite_queue = std.ArrayList(*AccessibilityNode).empty,
         .accessibility_highlight = null,
         .accessibility_strings = std.ArrayList([]const u8).empty,
+        .frames_by_id = std.AutoHashMap(u32, *Frame).init(allocator),
+        .parent_window_ids = std.AutoHashMap(u32, u32).init(allocator),
     };
 }
 
@@ -170,65 +533,26 @@ pub fn deinit(self: *Tab) void {
     self.waitForAsyncThreads();
     self.task_runner.shutdown();
 
-    // Clean up any display list
-    if (self.display_list) |list| {
-        DisplayItem.freeList(self.allocator, list);
+    if (self.root_frame) |frame| {
+        frame.deinit();
+        self.allocator.destroy(frame);
+        self.root_frame = null;
     }
+    self.frames_by_id.deinit();
+    self.parent_window_ids.deinit();
 
-    // Clean up document layout tree
-    if (self.document_layout) |doc| {
-        doc.deinit();
-        self.allocator.destroy(doc);
+    var js_it = self.js_contexts.iterator();
+    while (js_it.next()) |entry| {
+        self.allocator.free(entry.key_ptr.*);
+        entry.value_ptr.*.deinit(self.allocator);
     }
-
-    // Clean up the current HTML node tree
-    if (self.current_node) |node_val| {
-        var node = node_val;
-        node.deinit(self.allocator);
-    }
-
-    // Clean up cached nodes if different from current_node
-    if (self.nodes) |node_val| {
-        // Only deinit if it's not the same as current_node
-        if (self.current_node == null or !std.meta.eql(node_val, self.current_node.?)) {
-            var node = node_val;
-            Node.deinit(&node, self.allocator);
-        }
-    }
-
-    // Clean up the current HTML source
-    if (self.current_html_source) |source| {
-        self.allocator.free(source);
-    }
-
-    // Clean up CSS rules (only owned rules should be deinitialized here)
-    for (self.rules.items) |*rule| {
-        if (rule.owned) {
-            rule.deinit(self.allocator);
-        }
-    }
-    self.rules.deinit(self.allocator);
-
-    // Clean up CSS text buffers from external stylesheets
-    for (self.css_texts.items) |css_text| {
-        self.allocator.free(css_text);
-    }
-    self.css_texts.deinit(self.allocator);
+    self.js_contexts.deinit();
 
     // Clean up dynamically allocated text strings
     for (self.dynamic_texts.items) |text| {
         self.allocator.free(text);
     }
     self.dynamic_texts.deinit(self.allocator);
-
-    if (self.allowed_origins) |origins| {
-        for (origins.items) |origin| {
-            self.allocator.free(origin);
-        }
-        var list = origins;
-        list.deinit(self.allocator);
-        self.allowed_origins = null;
-    }
 
     self.clearAccessibilityTree();
     for (self.accessibility_strings.items) |value| {
@@ -248,122 +572,73 @@ pub fn deinit(self: *Tab) void {
 }
 
 pub fn clearAllowedOrigins(self: *Tab) void {
-    if (self.allowed_origins) |origins| {
-        for (origins.items) |origin| {
-            self.allocator.free(origin);
-        }
-        var list = origins;
-        list.deinit(self.allocator);
-        self.allowed_origins = null;
+    if (self.root_frame) |frame| {
+        frame.clearAllowedOrigins();
     }
 }
 
-fn allocLowercase(self: *Tab, text: []const u8) ![]const u8 {
-    const copy = try self.allocator.alloc(u8, text.len);
-    for (copy, 0..) |*ch, idx| {
-        ch.* = std.ascii.toLower(text[idx]);
-    }
-    return copy;
+pub fn registerFrame(self: *Tab, frame: *Frame) void {
+    const id = self.next_window_id;
+    self.next_window_id += 1;
+    frame.window_id = id;
+    self.frames_by_id.put(id, frame) catch {};
 }
 
-pub fn allowedRequest(self: *Tab, target_url: Url, base_url: ?*const Url) bool {
-    const page_url = base_url orelse self.current_url;
-    if (page_url) |current| {
-        if (current.*.sameOrigin(target_url)) {
-            return true;
-        }
+pub fn unregisterFrame(self: *Tab, frame: *Frame) void {
+    if (self.frames_by_id.fetchRemove(frame.window_id)) |_| {}
+    _ = self.parent_window_ids.fetchRemove(frame.window_id);
+    if (frame.js_context) |ctx| {
+        ctx.setParentWindow(frame.window_id, null);
     }
-
-    const origins = self.allowed_origins orelse return true;
-
-    var origin_buffer: [256]u8 = undefined;
-    const host = target_url.host orelse return true;
-    const origin_str = std.fmt.bufPrint(&origin_buffer, "{s}://{s}:{d}", .{ target_url.scheme, host, target_url.port }) catch return false;
-
-    var lower_buffer: [256]u8 = undefined;
-    if (origin_str.len > lower_buffer.len) return false;
-    for (origin_str, 0..) |ch, idx| {
-        lower_buffer[idx] = std.ascii.toLower(ch);
-    }
-    const normalized = lower_buffer[0..origin_str.len];
-
-    for (origins.items) |allowed| {
-        if (allowed.len == normalized.len and std.mem.eql(u8, allowed, normalized)) {
-            return true;
-        }
-    }
-
-    return false;
 }
 
-pub fn applyContentSecurityPolicy(self: *Tab, header: []const u8, base_url: Url) !void {
-    const whitespace = " \t\r\n";
-    var directives = std.mem.tokenizeScalar(u8, header, ';');
-    while (directives.next()) |directive_raw| {
-        const trimmed = std.mem.trim(u8, directive_raw, whitespace);
-        if (trimmed.len == 0) continue;
+fn originKey(self: *Tab, url: *Url) ![]const u8 {
+    if (std.mem.eql(u8, url.*.scheme, "file")) {
+        return try self.allocator.dupe(u8, "file://");
+    }
+    if (std.mem.eql(u8, url.*.scheme, "about") or std.mem.eql(u8, url.*.scheme, "data")) {
+        return try std.fmt.allocPrint(self.allocator, "{s}:", .{url.*.scheme});
+    }
+    const host = url.*.host orelse "";
+    return try std.fmt.allocPrint(self.allocator, "{s}://{s}:{d}", .{ url.*.scheme, host, url.*.port });
+}
 
-        var tokens = std.mem.tokenizeScalar(u8, trimmed, ' ');
-        const directive_name = tokens.next() orelse continue;
-        if (!std.ascii.eqlIgnoreCase(directive_name, "default-src")) continue;
+pub fn get_js(self: *Tab, url: *Url) !*js_module {
+    const key = try self.originKey(url);
+    if (self.js_contexts.get(key)) |ctx| {
+        self.allocator.free(key);
+        return ctx;
+    }
 
-        var origins_list = std.ArrayList([]const u8).empty;
-        var assigned = false;
-        errdefer {
-            if (!assigned) {
-                for (origins_list.items) |origin| self.allocator.free(origin);
-                origins_list.deinit(self.allocator);
-            }
-        }
+    const ctx = try js_module.init(self.allocator);
+    try self.js_contexts.put(key, ctx);
+    return ctx;
+}
 
-        while (tokens.next()) |origin_token| {
-            const semicolon_trimmed = std.mem.trimRight(u8, origin_token, ";\r\n \t");
-            const trimmed_origin = std.mem.trim(u8, semicolon_trimmed, whitespace);
-            if (trimmed_origin.len == 0) continue;
+pub fn frameForWindowId(self: *Tab, window_id: u32) ?*Frame {
+    return self.frames_by_id.get(window_id);
+}
 
-            if (std.ascii.eqlIgnoreCase(trimmed_origin, "'self'") or
-                std.ascii.eqlIgnoreCase(trimmed_origin, "self"))
-            {
-                if (base_url.host) |host| {
-                    const normalized = try std.fmt.allocPrint(self.allocator, "{s}://{s}:{d}", .{
-                        base_url.scheme,
-                        host,
-                        base_url.port,
-                    });
-                    defer self.allocator.free(normalized);
-
-                    const lowered = try self.allocLowercase(normalized);
-                    try origins_list.append(self.allocator, lowered);
-                }
-                continue;
-            }
-
-            const origin_url = url_module.Url.init(self.allocator, trimmed_origin) catch |err| {
-                std.log.warn("Failed to parse CSP origin {s}: {}", .{ trimmed_origin, err });
-                continue;
-            };
-            defer origin_url.free(self.allocator);
-
-            const host = origin_url.host orelse continue;
-
-            const normalized = try std.fmt.allocPrint(self.allocator, "{s}://{s}:{d}", .{ origin_url.scheme, host, origin_url.port });
-            defer self.allocator.free(normalized);
-
-            const lowered = try self.allocLowercase(normalized);
-            try origins_list.append(self.allocator, lowered);
-        }
-
-        self.allowed_origins = origins_list;
-        assigned = true;
-        return;
+pub fn setParentWindow(self: *Tab, child_window_id: u32, parent_window_id: ?u32) void {
+    if (parent_window_id) |parent_id| {
+        self.parent_window_ids.put(child_window_id, parent_id) catch {};
+    } else {
+        _ = self.parent_window_ids.fetchRemove(child_window_id);
     }
 }
 
 pub fn invalidateJsContext(self: *Tab) void {
     self.js_generation +%= 1;
-    self.js_render_context.setGeneration(self.js_generation);
-    self.js_render_context.setPointers(null, null);
-    self.js_render_context_initialized = false;
+    self.parent_window_ids.clearRetainingCapacity();
+    var it = self.frames_by_id.valueIterator();
+    while (it.next()) |frame_ptr| {
+        frame_ptr.*.js_render_context.setGeneration(self.js_generation);
+        frame_ptr.*.js_render_context.setPointers(null, null, null, 0);
+        frame_ptr.*.js_render_context_initialized = false;
+        if (frame_ptr.*.js_context) |ctx| {
+            ctx.setNodes(frame_ptr.*.window_id, null);
+        }
+    }
 }
 
 pub fn retainAsyncThread(self: *Tab) void {
@@ -387,7 +662,10 @@ pub fn goBack(self: *Tab, b: *Browser) !void {
         if (self.history.pop()) |current_ptr| {
             current_ptr.*.free(self.allocator);
             self.allocator.destroy(current_ptr);
-            self.current_url = null;
+            if (self.root_frame) |frame| {
+                frame.current_url = null;
+                frame.current_url_owned = false;
+            }
         }
         // Get previous page and load it (which will add it back to history)
         if (self.history.pop()) |back_ptr| {
@@ -415,45 +693,191 @@ pub fn setNeedsPaint(self: *Tab) void {
 }
 
 fn refreshFocusState(self: *Tab) !void {
-    if (self.focus == null or self.current_node == null) return;
+    const frame = self.focused_frame orelse self.root_frame orelse return;
+    var frames = std.ArrayList(*Frame).empty;
+    defer frames.deinit(self.allocator);
+    try self.collectFramesPostOrder(frame, &frames);
 
-    var node_list = std.ArrayList(*Node).empty;
-    defer node_list.deinit(self.allocator);
+    for (frames.items) |target| {
+        if (target.focus == null or target.current_node == null) continue;
+        var node_list = std.ArrayList(*Node).empty;
+        defer node_list.deinit(self.allocator);
 
-    var root_mut = self.current_node.?;
-    try parser.treeToList(self.allocator, &root_mut, &node_list);
+        var root_mut = target.current_node.?;
+        try parser.treeToList(self.allocator, &root_mut, &node_list);
 
-    var found = false;
-    for (node_list.items) |node_ptr| {
-        if (node_ptr == self.focus.?) {
-            found = true;
-            switch (node_ptr.*) {
-                .element => |*e| e.is_focused = true,
-                else => {},
-            }
-            break;
-        }
-    }
-
-    if (!found) {
-        if (self.focus) |focus_node| {
-            switch (focus_node.*) {
-                .element => |*e| e.is_focused = false,
-                else => {},
+        var found = false;
+        for (node_list.items) |node_ptr| {
+            if (node_ptr == target.focus.?) {
+                found = true;
+                switch (node_ptr.*) {
+                    .element => |*e| e.is_focused = true,
+                    else => {},
+                }
+                break;
             }
         }
-        self.focus = null;
+
+        if (!found) {
+            if (target.focus) |focus_node| {
+                switch (focus_node.*) {
+                    .element => |*e| e.is_focused = false,
+                    else => {},
+                }
+            }
+            target.focus = null;
+        }
     }
 }
 
-fn clampScroll(self: *Tab, scroll: i32) i32 {
+pub fn clampScrollForFrame(self: *Tab, frame: *Frame, scroll: i32) i32 {
     const zoom = if (self.accessibility.zoom > 0) self.accessibility.zoom else 1.0;
-    const visible_height = if (zoom == 1.0) self.tab_height else @as(i32, @intFromFloat(@as(f32, @floatFromInt(self.tab_height)) / zoom));
-    const height_delta = self.content_height - visible_height;
+    const viewport_height = if (frame.viewport_height > 0) frame.viewport_height else self.tab_height;
+    const visible_height = if (zoom == 1.0) viewport_height else @as(i32, @intFromFloat(@as(f32, @floatFromInt(viewport_height)) / zoom));
+    const height_delta = frame.content_height - visible_height;
     const maxscroll = if (height_delta > 0) height_delta else 0;
     if (scroll < 0) return 0;
     if (scroll > maxscroll) return maxscroll;
     return scroll;
+}
+
+fn collectFramesPostOrder(self: *Tab, frame: *Frame, out: *std.ArrayList(*Frame)) !void {
+    for (frame.children.items) |child| {
+        try self.collectFramesPostOrder(child, out);
+    }
+    try out.append(self.allocator, frame);
+}
+
+const IframeComposeError = error{OutOfMemory};
+
+fn composeDisplayList(self: *Tab, root: *Frame) IframeComposeError!void {
+    const root_list = root.display_list orelse return;
+    root.display_list = null;
+
+    var combined = std.ArrayList(DisplayItem).empty;
+    defer combined.deinit(self.allocator);
+
+    try self.replaceIframesInList(root, root_list, &combined);
+    browser_mod.DisplayItem.freeList(self.allocator, root_list);
+    root.display_list = try combined.toOwnedSlice(self.allocator);
+}
+
+fn replaceIframesInList(
+    self: *Tab,
+    root: *Frame,
+    items: []DisplayItem,
+    out: *std.ArrayList(DisplayItem),
+) IframeComposeError!void {
+    for (items) |item| {
+        switch (item) {
+            .iframe => |iframe_item| {
+                try self.appendIframeContent(root, .{ .iframe = iframe_item }, out);
+            },
+            .blend => |blend_item| {
+                var children = std.ArrayList(DisplayItem).empty;
+                defer children.deinit(self.allocator);
+                try self.replaceIframesInList(root, blend_item.children, &children);
+
+                const child_slice = try self.allocator.alloc(DisplayItem, children.items.len);
+                @memcpy(child_slice, children.items);
+
+                const mode_copy = if (blend_item.blend_mode) |mode|
+                    try self.allocator.dupe(u8, mode)
+                else
+                    null;
+
+                try out.append(self.allocator, .{
+                    .blend = .{
+                        .opacity = blend_item.opacity,
+                        .blend_mode = mode_copy,
+                        .children = child_slice,
+                        .node = blend_item.node,
+                        .parent = null,
+                        .needs_compositing = blend_item.needs_compositing,
+                    },
+                });
+            },
+            .transform => |transform_item| {
+                var children = std.ArrayList(DisplayItem).empty;
+                defer children.deinit(self.allocator);
+                try self.replaceIframesInList(root, transform_item.children, &children);
+
+                const child_slice = try self.allocator.alloc(DisplayItem, children.items.len);
+                @memcpy(child_slice, children.items);
+
+                try out.append(self.allocator, .{
+                    .transform = .{
+                        .translate_x = transform_item.translate_x,
+                        .translate_y = transform_item.translate_y,
+                        .children = child_slice,
+                        .node = transform_item.node,
+                    },
+                });
+            },
+            else => try out.append(self.allocator, item),
+        }
+    }
+}
+
+fn appendIframeContent(
+    self: *Tab,
+    root: *Frame,
+    iframe_item: DisplayItem,
+    out: *std.ArrayList(DisplayItem),
+) IframeComposeError!void {
+    const border_color = browser_mod.Color{ .r = 0x33, .g = 0x33, .b = 0x33, .a = 0xff };
+    const bg_color = browser_mod.Color{ .r = 0xf2, .g = 0xf2, .b = 0xf2, .a = 0xff };
+
+    const iframe_data = iframe_item.iframe;
+    try out.append(self.allocator, .{
+        .rect = .{
+            .x1 = iframe_data.rect.left,
+            .y1 = iframe_data.rect.top,
+            .x2 = iframe_data.rect.right,
+            .y2 = iframe_data.rect.bottom,
+            .color = bg_color,
+        },
+    });
+
+    const child_frame = root.findFrameByElement(iframe_data.node);
+    if (child_frame == null or child_frame.?.display_list == null) {
+        try out.append(self.allocator, .{
+            .outline = .{
+                .rect = iframe_data.rect,
+                .color = border_color,
+                .thickness = 1,
+            },
+        });
+        return;
+    }
+
+    child_frame.?.viewport_width = iframe_data.rect.right - iframe_data.rect.left;
+    child_frame.?.viewport_height = iframe_data.rect.bottom - iframe_data.rect.top;
+
+    const child_list = child_frame.?.display_list.?;
+
+    var expanded_children = std.ArrayList(DisplayItem).empty;
+    defer expanded_children.deinit(self.allocator);
+    try self.replaceIframesInList(root, child_list, &expanded_children);
+    const expanded_slice = try expanded_children.toOwnedSlice(self.allocator);
+
+    const transform_item = DisplayItem{
+        .transform = .{
+            .translate_x = iframe_data.rect.left,
+            .translate_y = iframe_data.rect.top - child_frame.?.scroll,
+            .children = expanded_slice,
+            .node = null,
+        },
+    };
+    try out.append(self.allocator, transform_item);
+
+    try out.append(self.allocator, .{
+        .outline = .{
+            .rect = iframe_data.rect,
+            .color = border_color,
+            .thickness = 1,
+        },
+    });
 }
 
 // Re-render the page without reloading (style, layout, paint)
@@ -469,7 +893,13 @@ pub fn render(self: *Tab, b: *Browser) !void {
     const trace_render = b.measure.begin("render");
     defer if (trace_render) b.measure.end("render");
 
-    if (self.current_node == null) {
+    const frame = self.root_frame orelse {
+        self.needs_style = false;
+        self.needs_layout = false;
+        self.needs_paint = false;
+        return;
+    };
+    if (frame.current_node == null) {
         self.needs_style = false;
         self.needs_layout = false;
         self.needs_paint = false;
@@ -484,7 +914,12 @@ pub fn render(self: *Tab, b: *Browser) !void {
         self.needs_style = false;
         errdefer self.needs_style = true;
         const style_start = if (profiling) std.time.nanoTimestamp() else 0;
-        try parser.style(b.allocator, &self.current_node.?, self.rules.items);
+        var frames = std.ArrayList(*Frame).empty;
+        defer frames.deinit(self.allocator);
+        try self.collectFramesPostOrder(frame, &frames);
+        for (frames.items) |child_frame| {
+            try child_frame.render(b, true, false, false);
+        }
         if (profiling) {
             style_ns = @as(u64, @intCast(std.time.nanoTimestamp() - style_start));
         }
@@ -499,14 +934,21 @@ pub fn render(self: *Tab, b: *Browser) !void {
             self.needs_paint = true;
         }
         const layout_start = if (profiling) std.time.nanoTimestamp() else 0;
-        try b.layoutTabNodes(self);
+        var frames = std.ArrayList(*Frame).empty;
+        defer frames.deinit(self.allocator);
+        try self.collectFramesPostOrder(frame, &frames);
+        for (frames.items) |child_frame| {
+            try child_frame.render(b, false, true, true);
+        }
+        try self.composeDisplayList(frame);
         if (profiling) {
             layout_ns = @as(u64, @intCast(std.time.nanoTimestamp() - layout_start));
         }
-        const clamped_scroll = self.clampScroll(self.scroll);
-        if (clamped_scroll != self.scroll) {
+        frame.viewport_height = self.tab_height;
+        const clamped_scroll = self.clampScrollForFrame(frame, frame.scroll);
+        if (clamped_scroll != frame.scroll) {
             self.scroll_changed_in_tab = true;
-            self.scroll = clamped_scroll;
+            frame.scroll = clamped_scroll;
         }
     }
 
@@ -526,12 +968,18 @@ pub fn render(self: *Tab, b: *Browser) !void {
 }
 
 pub fn runAnimationFrame(self: *Tab, scroll: i32) void {
-    if (self.js_render_context_initialized) {
-        self.browser.js_engine.runAnimationFrameHandlers();
+    const frame = self.root_frame orelse return;
+    var frame_it = self.frames_by_id.valueIterator();
+    while (frame_it.next()) |frame_ptr| {
+        if (frame_ptr.*.js_render_context_initialized) {
+            if (frame_ptr.*.js_context) |ctx| {
+                ctx.runAnimationFrameHandlers(frame_ptr.*.window_id);
+            }
+        }
     }
 
     if (!self.scroll_changed_in_tab) {
-        self.scroll = scroll;
+        frame.scroll = scroll;
     }
 
     // Clear previous frame's composited updates
@@ -539,7 +987,7 @@ pub fn runAnimationFrame(self: *Tab, scroll: i32) void {
 
     // Advance CSS transition animations
     var animations_running = false;
-    if (self.current_node) |*root| {
+    if (frame.current_node) |*root| {
         animations_running = self.advanceAnimations(root);
     }
 
@@ -561,21 +1009,21 @@ pub fn runAnimationFrame(self: *Tab, scroll: i32) void {
 
     var commit_scroll: ?i32 = null;
     if (self.scroll_changed_in_tab) {
-        commit_scroll = self.scroll;
+        commit_scroll = frame.scroll;
     }
 
     // Only commit if we have something to send
     if (needs_full_render or has_composited_updates) {
         const commit_data = browser_mod.CommitData{
-            .url = self.current_url orelse null,
-            .display_list = self.display_list,
+            .url = frame.current_url orelse null,
+            .display_list = frame.display_list,
             .scroll = commit_scroll,
-            .height = self.content_height,
+            .height = frame.content_height,
             .zoom = self.accessibility.zoom,
             .prefers_dark = self.accessibility.prefers_dark,
             .composited_updates = self.composited_updates.items,
         };
-        self.display_list = null;
+        frame.display_list = null;
         self.browser.commit(self, commit_data);
     }
     self.scroll_changed_in_tab = false;
@@ -622,106 +1070,35 @@ fn advanceAnimations(self: *Tab, node: *parser.Node) bool {
 
 // Handle click on tab content
 pub fn click(self: *Tab, b: *Browser, x: i32, y: i32) !void {
-    std.log.info("Tab.click at ({}, {})", .{ x, y });
-    if (b.layout_engine.input_bounds.count() == 0) {
-        try self.render(b);
-    }
+    const frame = self.root_frame orelse return;
+    try self.render(b);
 
-    // Clear previous focus
-    if (self.focus) |focus_node| {
-        switch (focus_node.*) {
-            .element => |*e| e.is_focused = false,
-            else => {},
+    if (self.focused_frame) |focused| {
+        if (focused.focus) |focus_node| {
+            switch (focus_node.*) {
+                .element => |*e| e.is_focused = false,
+                else => {},
+            }
+            focused.focus = null;
         }
-        self.focus = null;
+    }
+    self.focused_frame = frame;
+
+    const handled = try frame.click(b, x, y);
+    if (!handled and self.focused_frame != null) {
         self.setNeedsRender();
-    }
-
-    // Hit test using the input bounds map from the layout engine
-    std.log.info("Checking {} input bounds", .{b.layout_engine.input_bounds.count()});
-    var it = b.layout_engine.input_bounds.iterator();
-    var handled = false;
-    while (it.next()) |entry| {
-        const node_ptr = entry.key_ptr.*;
-        const bounds = entry.value_ptr.*;
-
-        // Check if click is within this element's bounds
-        if (x >= bounds.x and x < bounds.x + bounds.width and
-            y >= bounds.y and y < bounds.y + bounds.height)
-        {
-            // Found the clicked element
-            switch (node_ptr.*) {
-                .element => |*e| {
-                    std.log.info("Clicked element: {s}", .{e.tag});
-                    if (std.mem.eql(u8, e.tag, "input")) {
-                        std.log.info("Input clicked", .{});
-                        const prevent_default = b.js_engine.dispatchEvent("click", node_ptr) catch |err| blk: {
-                            std.log.warn("Failed to dispatch click event: {}", .{err});
-                            break :blk false;
-                        };
-                        if (prevent_default) {
-                            std.log.info("Default click prevented for input", .{});
-                            return;
-                        }
-                        // Clear the input value when focusing
-                        if (e.attributes) |*attrs| {
-                            try attrs.put("value", "");
-                        }
-                        e.is_focused = true;
-                        self.focus = node_ptr;
-                        self.updateAccessibilityFocus(b);
-                        self.setNeedsRender();
-                        handled = true;
-                        break;
-                    } else if (std.mem.eql(u8, e.tag, "button")) {
-                        std.log.info("Button clicked - calling submitForm", .{});
-                        const prevent_default = b.js_engine.dispatchEvent("click", node_ptr) catch |err| blk: {
-                            std.log.warn("Failed to dispatch click event: {}", .{err});
-                            break :blk false;
-                        };
-                        if (prevent_default) {
-                            std.log.info("Default click prevented for button", .{});
-                            return;
-                        }
-                        // Button clicked - submit the form
-                        handled = true;
-                        try self.submitForm(b, node_ptr);
-                        return;
-                    }
-                },
-                else => {},
-            }
-        }
-    }
-
-    if (!handled) {
-        std.log.info("No element clicked, re-rendering", .{});
-        var bounds_it = b.layout_engine.input_bounds.iterator();
-        while (bounds_it.next()) |entry| {
-            const node_ptr = entry.key_ptr.*;
-            const bounds = entry.value_ptr.*;
-            switch (node_ptr.*) {
-                .element => |e| {
-                    std.log.info(
-                        "Input bounds {s}: x={} y={} w={} h={} click=({}, {})",
-                        .{ e.tag, bounds.x, bounds.y, bounds.width, bounds.height, x, y },
-                    );
-                },
-                else => {},
-            }
-        }
     }
 }
 
 // Submit a form when a button is clicked
-fn submitForm(self: *Tab, b: *Browser, button_node: *Node) !void {
+fn submitForm(self: *Tab, b: *Browser, frame: *Frame, button_node: *Node) !void {
     // IMPORTANT: We cannot traverse parent pointers here because loadInTab
     // will free the tree, invalidating all pointers. Instead, we search
     // the entire tree from the root to find which form contains this button.
 
     std.log.info("submitForm called", .{});
 
-    if (self.current_node == null) {
+    if (frame.current_node == null) {
         std.log.warn("No current_node", .{});
         return;
     }
@@ -729,7 +1106,7 @@ fn submitForm(self: *Tab, b: *Browser, button_node: *Node) !void {
     // Get all nodes in the tree
     var node_list = std.ArrayList(*Node).empty;
     defer node_list.deinit(self.allocator);
-    try parser.treeToList(self.allocator, &self.current_node.?, &node_list);
+    try parser.treeToList(self.allocator, &frame.current_node.?, &node_list);
 
     std.log.info("Found {} nodes in tree", .{node_list.items.len});
 
@@ -749,10 +1126,7 @@ fn submitForm(self: *Tab, b: *Browser, button_node: *Node) !void {
                     for (form_nodes.items) |form_child| {
                         if (form_child == button_node) {
                             std.log.info("Found button in form!", .{});
-                            const prevent_default = b.js_engine.dispatchEvent("submit", node_ptr) catch |err| blk: {
-                                std.log.warn("Failed to dispatch submit event: {}", .{err});
-                                break :blk false;
-                            };
+                            const prevent_default = frame.dispatchEvent("submit", node_ptr);
                             if (prevent_default) {
                                 std.log.info("Default submit prevented", .{});
                                 return;
@@ -766,7 +1140,7 @@ fn submitForm(self: *Tab, b: *Browser, button_node: *Node) !void {
                                     @memcpy(action_copy, action);
                                     defer self.allocator.free(action_copy);
 
-                                    try self.submitFormData(b, node_ptr, action_copy);
+                                    try self.submitFormData(b, frame, node_ptr, action_copy);
                                     return;
                                 }
                             }
@@ -782,7 +1156,7 @@ fn submitForm(self: *Tab, b: *Browser, button_node: *Node) !void {
 }
 
 // Collect form inputs and submit via POST
-fn submitFormData(self: *Tab, b: *Browser, form_node: *Node, action: []const u8) !void {
+fn submitFormData(self: *Tab, b: *Browser, frame: *Frame, form_node: *Node, action: []const u8) !void {
     // Get all descendents of the form
     var node_list = std.ArrayList(*Node).empty;
     defer node_list.deinit(self.allocator);
@@ -845,7 +1219,7 @@ fn submitFormData(self: *Tab, b: *Browser, form_node: *Node, action: []const u8)
     std.log.info("Form submission to {s}: {s}", .{ action, body_slice });
 
     // For file:// URLs, we can't actually submit forms, so just log it
-    if (self.current_url) |url_ptr| {
+    if (frame.current_url) |url_ptr| {
         if (std.mem.eql(u8, url_ptr.*.scheme, "file")) {
             std.log.info("Skipping form submission for file:// URL", .{});
             return;
@@ -853,7 +1227,7 @@ fn submitFormData(self: *Tab, b: *Browser, form_node: *Node, action: []const u8)
     }
 
     // Resolve the action URL against the current page URL
-    var form_url = self.current_url.?.*.resolve(self.allocator, action) catch |err| {
+    var form_url = frame.current_url.?.*.resolve(self.allocator, action) catch |err| {
         std.log.warn("Failed to resolve form action URL: {}", .{err});
         return;
     };
@@ -904,8 +1278,8 @@ fn isElementFocusable(element: *const parser.Element) bool {
     return isTabIndexFocusable(element);
 }
 
-fn collectFocusableElements(self: *Tab, out: *std.ArrayList(*Node)) !void {
-    const root_node = self.current_node orelse return;
+fn collectFocusableElements(self: *Tab, frame: *Frame, out: *std.ArrayList(*Node)) !void {
+    const root_node = frame.current_node orelse return;
 
     var node_list = std.ArrayList(*Node).empty;
     defer node_list.deinit(self.allocator);
@@ -926,13 +1300,14 @@ fn collectFocusableElements(self: *Tab, out: *std.ArrayList(*Node)) !void {
 }
 
 pub fn cycleFocus(self: *Tab, b: *Browser, reverse: bool) !void {
+    const frame = self.focused_frame orelse self.root_frame orelse return;
     var focusables = std.ArrayList(*Node).empty;
     defer focusables.deinit(self.allocator);
-    try self.collectFocusableElements(&focusables);
+    try self.collectFocusableElements(frame, &focusables);
     if (focusables.items.len == 0) return;
 
     // Clear current focus
-    if (self.focus) |focus_node| {
+    if (frame.focus) |focus_node| {
         switch (focus_node.*) {
             .element => |*e| e.is_focused = false,
             else => {},
@@ -940,7 +1315,7 @@ pub fn cycleFocus(self: *Tab, b: *Browser, reverse: bool) !void {
     }
 
     var found_index: ?usize = null;
-    if (self.focus) |current_focus| {
+    if (frame.focus) |current_focus| {
         for (focusables.items, 0..) |elem, i| {
             if (elem == current_focus) {
                 found_index = i;
@@ -961,7 +1336,8 @@ pub fn cycleFocus(self: *Tab, b: *Browser, reverse: bool) !void {
         .element => |*e| e.is_focused = true,
         else => {},
     }
-    self.focus = to_focus;
+    frame.focus = to_focus;
+    self.focused_frame = frame;
     self.updateAccessibilityFocus(b);
     b.lock.lock();
     b.focus = "content";
@@ -971,8 +1347,9 @@ pub fn cycleFocus(self: *Tab, b: *Browser, reverse: bool) !void {
 }
 
 pub fn activateFocusedElement(self: *Tab, b: *Browser) !void {
-    if (self.focus == null) return;
-    const node_ptr = self.focus.?;
+    const frame = self.focused_frame orelse self.root_frame orelse return;
+    if (frame.focus == null) return;
+    const node_ptr = frame.focus.?;
 
     switch (node_ptr.*) {
         .element => |*e| {
@@ -980,12 +1357,9 @@ pub fn activateFocusedElement(self: *Tab, b: *Browser) !void {
                 if (e.attributes) |attrs| {
                     if (attrs.get("type")) |raw_type| {
                         if (std.mem.eql(u8, raw_type, "submit") or std.mem.eql(u8, raw_type, "button")) {
-                            const prevent_default = b.js_engine.dispatchEvent("click", node_ptr) catch |err| blk: {
-                                std.log.warn("Failed to dispatch click event: {}", .{err});
-                                break :blk false;
-                            };
+                            const prevent_default = frame.dispatchEvent("click", node_ptr);
                             if (prevent_default) return;
-                            try self.submitForm(b, node_ptr);
+                            try self.submitForm(b, frame, node_ptr);
                         }
                     }
                 }
@@ -993,24 +1367,18 @@ pub fn activateFocusedElement(self: *Tab, b: *Browser) !void {
             }
 
             if (std.mem.eql(u8, e.tag, "button")) {
-                const prevent_default = b.js_engine.dispatchEvent("click", node_ptr) catch |err| blk: {
-                    std.log.warn("Failed to dispatch click event: {}", .{err});
-                    break :blk false;
-                };
+                const prevent_default = frame.dispatchEvent("click", node_ptr);
                 if (prevent_default) return;
-                try self.submitForm(b, node_ptr);
+                try self.submitForm(b, frame, node_ptr);
                 return;
             }
 
             if (std.mem.eql(u8, e.tag, "a")) {
-                const prevent_default = b.js_engine.dispatchEvent("click", node_ptr) catch |err| blk: {
-                    std.log.warn("Failed to dispatch click event: {}", .{err});
-                    break :blk false;
-                };
+                const prevent_default = frame.dispatchEvent("click", node_ptr);
                 if (prevent_default) return;
                 if (e.attributes) |attrs| {
                     if (attrs.get("href")) |href| {
-                        if (self.current_url) |current_url_ptr| {
+                        if (frame.current_url) |current_url_ptr| {
                             const resolved_url = try current_url_ptr.*.resolve(self.allocator, href);
                             const url_ptr = try self.allocator.create(Url);
                             url_ptr.* = resolved_url;
@@ -1025,10 +1393,7 @@ pub fn activateFocusedElement(self: *Tab, b: *Browser) !void {
                 }
             }
 
-            const prevent_default = b.js_engine.dispatchEvent("click", node_ptr) catch |err| blk: {
-                std.log.warn("Failed to dispatch click event: {}", .{err});
-                break :blk false;
-            };
+            const prevent_default = frame.dispatchEvent("click", node_ptr);
             _ = prevent_default;
         },
         else => {},
@@ -1037,12 +1402,13 @@ pub fn activateFocusedElement(self: *Tab, b: *Browser) !void {
 
 // Clear focus (for Escape key)
 pub fn clearFocus(self: *Tab, b: *Browser) !void {
-    if (self.focus) |focus_node| {
+    const frame = self.focused_frame orelse self.root_frame orelse return;
+    if (frame.focus) |focus_node| {
         switch (focus_node.*) {
             .element => |*e| e.is_focused = false,
             else => {},
         }
-        self.focus = null;
+        frame.focus = null;
         self.updateAccessibilityFocus(b);
         self.setNeedsRender();
     }
@@ -1050,11 +1416,10 @@ pub fn clearFocus(self: *Tab, b: *Browser) !void {
 
 // Handle keypress in focused input
 pub fn keypress(self: *Tab, b: *Browser, char: u8) !void {
-    if (self.focus) |focus_node| {
-        const prevent_default = b.js_engine.dispatchEvent("keydown", focus_node) catch |err| blk: {
-            std.log.warn("Failed to dispatch keydown event: {}", .{err});
-            break :blk false;
-        };
+    _ = b;
+    const frame = self.focused_frame orelse self.root_frame orelse return;
+    if (frame.focus) |focus_node| {
+        const prevent_default = frame.dispatchEvent("keydown", focus_node);
         if (prevent_default) {
             std.log.info("Default keydown prevented", .{});
             return;
@@ -1086,7 +1451,8 @@ pub fn keypress(self: *Tab, b: *Browser, char: u8) !void {
 // Handle backspace in focused input
 pub fn backspace(self: *Tab, b: *Browser) !void {
     _ = b;
-    if (self.focus) |focus_node| {
+    const frame = self.focused_frame orelse self.root_frame orelse return;
+    if (frame.focus) |focus_node| {
         switch (focus_node.*) {
             .element => |*e| {
                 if (std.mem.eql(u8, e.tag, "input")) {
@@ -1122,21 +1488,34 @@ pub fn buildAccessibilityTree(self: *Tab, b: *Browser) !void {
     }
     self.accessibility_strings.clearRetainingCapacity();
 
-    if (self.current_node == null) return;
+    const frame = self.root_frame orelse return;
+    if (frame.current_node == null) return;
 
     var bounds_map = std.AutoHashMap(*Node, Bounds).init(self.allocator);
     defer bounds_map.deinit();
 
-    for (b.layout_engine.accessibility_bounds.items) |entry| {
-        if (bounds_map.getPtr(entry.node)) |existing| {
-            mergeBounds(existing, entry.bounds);
-        } else {
-            try bounds_map.put(entry.node, entry.bounds);
+    var frames = std.ArrayList(*Frame).empty;
+    defer frames.deinit(self.allocator);
+    try self.collectFramesPostOrder(frame, &frames);
+    for (frames.items) |target_frame| {
+        const offset = self.frameOffsetToRoot(target_frame);
+        for (target_frame.accessibility_bounds.items) |entry| {
+            const adjusted = Bounds{
+                .x = entry.bounds.x + offset.x,
+                .y = entry.bounds.y + offset.y,
+                .width = entry.bounds.width,
+                .height = entry.bounds.height,
+            };
+            if (bounds_map.getPtr(entry.node)) |existing| {
+                mergeBounds(existing, adjusted);
+            } else {
+                try bounds_map.put(entry.node, adjusted);
+            }
         }
     }
 
     var root_children = std.ArrayList(*AccessibilityNode).empty;
-    switch (self.current_node.?) {
+    switch (frame.current_node.?) {
         .text => {},
         .element => |*root_element| {
             for (root_element.children.items) |*child| {
@@ -1149,12 +1528,12 @@ pub fn buildAccessibilityTree(self: *Tab, b: *Browser) !void {
         .x = 0,
         .y = 0,
         .width = b.layout_engine.window_width,
-        .height = self.content_height,
+        .height = frame.content_height,
     };
     const root_name = try self.copyAccessibilityString("document");
     const root = try self.createAccessibilityNode("document", root_name, root_bounds, null, root_children);
     self.accessibility_root = root;
-    self.accessibility_focused = self.findAccessibilityNodeForDom(self.accessibility_root, self.focus);
+    self.accessibility_focused = self.findAccessibilityNodeForDom(self.accessibility_root, frame.focus);
     self.accessibility_hovered = null;
 
     if (previous_root) |old_root| {
@@ -1204,8 +1583,23 @@ fn appendAccessibilityNodes(
             }
 
             var children = std.ArrayList(*AccessibilityNode).empty;
-            for (e.children.items) |*child| {
-                try self.appendAccessibilityNodes(&children, child, bounds_map);
+            if (std.mem.eql(u8, e.tag, "iframe")) {
+                if (self.frameForElement(node_ptr)) |child_frame| {
+                    if (child_frame.current_node) |*child_root| {
+                        switch (child_root.*) {
+                            .text => {},
+                            .element => |*child_element| {
+                                for (child_element.children.items) |*child| {
+                                    try self.appendAccessibilityNodes(&children, child, bounds_map);
+                                }
+                            },
+                        }
+                    }
+                }
+            } else {
+                for (e.children.items) |*child| {
+                    try self.appendAccessibilityNodes(&children, child, bounds_map);
+                }
             }
 
             const role = accessibilityRole(e);
@@ -1256,7 +1650,33 @@ fn accessibilityRole(element: *const parser.Element) []const u8 {
     if (std.mem.eql(u8, element.tag, "ul") or std.mem.eql(u8, element.tag, "ol")) return "list";
     if (std.mem.eql(u8, element.tag, "li")) return "listitem";
     if (std.mem.eql(u8, element.tag, "form")) return "form";
+    if (std.mem.eql(u8, element.tag, "iframe")) return "iframe";
     return "generic";
+}
+
+fn frameForElement(self: *Tab, node: *Node) ?*Frame {
+    const root = self.root_frame orelse return null;
+    return root.findFrameByElement(node);
+}
+
+fn frameOffsetToRoot(self: *Tab, frame: *Frame) struct { x: i32, y: i32 } {
+    _ = self;
+    var x: i32 = 0;
+    var y: i32 = 0;
+    var current: *Frame = frame;
+    while (current.parent) |parent| {
+        if (current.frame_element) |elem| {
+            for (parent.iframe_bounds.items) |entry| {
+                if (entry.node == elem) {
+                    x += entry.bounds.x;
+                    y += entry.bounds.y - current.scroll;
+                    break;
+                }
+            }
+        }
+        current = parent;
+    }
+    return .{ .x = x, .y = y };
 }
 
 fn accessibilityName(self: *Tab, node_ptr: *Node, element: *const parser.Element) ![]const u8 {
@@ -1370,7 +1790,8 @@ pub fn accessibilityHitTest(self: *Tab, x: i32, y: i32) ?*AccessibilityNode {
 
 pub fn updateAccessibilityFocus(self: *Tab, b: *Browser) void {
     _ = b;
-    self.accessibility_focused = self.findAccessibilityNodeForDom(self.accessibility_root, self.focus);
+    const frame = self.focused_frame orelse self.root_frame orelse return;
+    self.accessibility_focused = self.findAccessibilityNodeForDom(self.accessibility_root, frame.focus);
     if (self.accessibility_focused != null and self.accessibility.screen_reader) {
         self.speakAccessibilityNode(self.accessibility_focused.?, "focus");
     }
@@ -1531,11 +1952,12 @@ pub fn handleVoiceCommand(self: *Tab, b: *Browser, command: []const u8) void {
 
 fn commandClick(self: *Tab, query: []const u8) void {
     const root = self.accessibility_root orelse return;
+    const frame = self.root_frame orelse return;
     if (self.findAccessibilityByName(root, query)) |node| {
         self.accessibility_highlight = node;
         if (node.dom_node) |dom| {
-            self.focus = dom;
-            if (self.focus) |focus_node| {
+            frame.focus = dom;
+            if (frame.focus) |focus_node| {
                 switch (focus_node.*) {
                     .element => |*e| e.is_focused = true,
                     else => {},
