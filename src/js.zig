@@ -310,6 +310,8 @@ fn consoleLog(agent: *Agent, _: Value, arguments: kiesel.types.Arguments) Agent.
 }
 
 pub fn deinit(self: *Js, allocator: std.mem.Allocator) void {
+    self.lock.lock();
+    defer self.lock.unlock();
     var it = self.windows.valueIterator();
     while (it.next()) |window| {
         window.node_to_handle.deinit();

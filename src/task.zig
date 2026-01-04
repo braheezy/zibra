@@ -113,9 +113,8 @@ pub const TaskRunner = struct {
         self.condition.broadcast();
         self.mutex.unlock();
 
-        // Detach instead of join to avoid crash on shutdown
         if (self.thread) |thread| {
-            thread.detach();
+            thread.join();
             self.thread = null;
         }
     }

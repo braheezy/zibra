@@ -1861,7 +1861,355 @@ pub const Browser = struct {
         };
     }
 
+    pub fn scheduleFrameLoad(
+        self: *Browser,
+        frame: *Frame,
+        url: *Url,
+        payload: ?[]const u8,
+    ) !void {
+        std.log.info("Scheduling iframe load for window_id={d}: {s}", .{ frame.window_id, url.*.path });
+        const ctx = try FrameLoadTaskContext.create(
+            self.allocator,
+            self,
+            frame,
+            url,
+            payload,
+        );
+        const task_instance = Task.init(
+            ctx.toOpaque(),
+            FrameLoadTaskContext.runOpaque,
+            FrameLoadTaskContext.cleanupOpaque,
+        );
+        frame.tab.task_runner.schedule(task_instance) catch |err| {
+            ctx.destroy();
+            return err;
+        };
+    }
+
+    fn resetFrameForNavigation(self: *Browser, frame: *Frame) void {
+        frame.input_bounds.clearRetainingCapacity();
+        frame.link_bounds.clearRetainingCapacity();
+        frame.iframe_bounds.clearRetainingCapacity();
+        frame.accessibility_bounds.clearRetainingCapacity();
+
+        for (frame.children.items) |child| {
+            child.deinit();
+            frame.allocator.destroy(child);
+        }
+        frame.children.clearRetainingCapacity();
+
+        if (frame.display_list) |items| {
+            DisplayItem.freeList(self.allocator, items);
+            frame.display_list = null;
+        }
+
+        if (frame.document_layout) |doc| {
+            doc.deinit();
+            self.allocator.destroy(doc);
+            frame.document_layout = null;
+        }
+
+        for (frame.rules.items) |*rule| {
+            if (rule.owned) {
+                rule.deinit(self.allocator);
+            }
+        }
+        frame.rules.clearRetainingCapacity();
+        frame.default_rules_count = 0;
+
+        for (frame.css_texts.items) |css_text| {
+            self.allocator.free(css_text);
+        }
+        frame.css_texts.clearRetainingCapacity();
+
+        if (frame.current_html_source) |old_source| {
+            self.allocator.free(old_source);
+            frame.current_html_source = null;
+        }
+
+        if (frame.current_url_owned) {
+            if (frame.current_url) |url_ptr| {
+                url_ptr.*.free(self.allocator);
+                self.allocator.destroy(url_ptr);
+            }
+        }
+        frame.current_url = null;
+        frame.current_url_owned = false;
+        frame.current_node = null;
+        frame.content_height = 0;
+        frame.scroll = 0;
+        frame.focus = null;
+
+        if (frame.js_context) |ctx| {
+            ctx.setNodes(frame.window_id, null);
+        }
+        frame.js_context = null;
+        frame.js_render_context_initialized = false;
+
+        frame.clearAllowedOrigins();
+    }
+
+    pub fn loadInFrame(
+        self: *Browser,
+        frame: *Frame,
+        url: *Url,
+        payload: ?[]const u8,
+    ) !void {
+        std.log.info("Loading iframe: {s}", .{url.*.path});
+
+        var referrer_value: ?Url = null;
+        if (frame.current_url) |ref_ptr| {
+            referrer_value = ref_ptr.*;
+        }
+
+        self.resetFrameForNavigation(frame);
+
+        const response = try self.fetchBody(url.*, referrer_value, payload);
+        defer if (response.csp_header) |hdr| self.allocator.free(hdr);
+
+        frame.clearAllowedOrigins();
+        if (response.csp_header) |hdr| {
+            frame.applyContentSecurityPolicy(hdr, url.*) catch |err| {
+                std.log.warn("Failed to apply Content-Security-Policy: {}", .{err});
+            };
+        }
+
+        const raw_body = response.body;
+        const body_text = try decodeUtf8Replace(self.allocator, raw_body);
+        const body_owned = !std.mem.eql(u8, url.*.scheme, "about") and !std.mem.eql(u8, url.*.scheme, "data");
+        if (body_owned) {
+            self.allocator.free(raw_body);
+        }
+
+        var body_text_owned = true;
+        errdefer if (body_text_owned) self.allocator.free(body_text);
+
+        var html_parser = try HTMLParser.init(self.allocator, body_text);
+        defer html_parser.deinit(self.allocator);
+
+        frame.current_node = try html_parser.parse();
+        parser.fixParentPointers(&frame.current_node.?, null);
+        frame.current_html_source = body_text;
+        body_text_owned = false;
+
+        frame.current_url = url;
+        frame.current_url_owned = true;
+
+        frame.js_context = try frame.tab.get_js(url);
+        if (frame.js_context) |ctx| {
+            ctx.setNodes(frame.window_id, &frame.current_node.?);
+            frame.js_render_context.setPointers(
+                @as(?*anyopaque, @ptrCast(self)),
+                @as(?*anyopaque, @ptrCast(frame.tab)),
+                ctx,
+                frame.window_id,
+            );
+            frame.js_render_context.setGeneration(frame.tab.js_generation);
+            frame.js_render_context_initialized = true;
+            ctx.setRenderCallback(
+                frame.window_id,
+                jsRenderCallback,
+                @ptrCast(&frame.js_render_context),
+            );
+            ctx.setXhrCallback(
+                frame.window_id,
+                jsXhrCallback,
+                @ptrCast(&frame.js_render_context),
+            );
+            ctx.setAnimationFrameCallback(
+                frame.window_id,
+                jsRequestAnimationFrameCallback,
+                @ptrCast(&frame.js_render_context),
+            );
+            ctx.setSetTimeoutCallback(
+                frame.window_id,
+                jsSetTimeoutCallback,
+                @ptrCast(&frame.js_render_context),
+            );
+            ctx.setPostMessageCallback(
+                frame.window_id,
+                jsPostMessageCallback,
+                @ptrCast(&frame.js_render_context),
+            );
+        }
+
+        var parent_window_id: ?u32 = null;
+        if (frame.parent) |parent| {
+            if (parent.current_url != null and frame.current_url != null) {
+                if (parent.current_url.?.*.sameOrigin(frame.current_url.?.*) or
+                    (std.mem.eql(u8, parent.current_url.?.*.scheme, "file") and std.mem.eql(u8, frame.current_url.?.*.scheme, "file")))
+                {
+                    parent_window_id = parent.window_id;
+                }
+            }
+        }
+        frame.tab.setParentWindow(frame.window_id, parent_window_id);
+        if (frame.js_context) |ctx| {
+            if (parent_window_id != null and frame.parent != null and frame.parent.?.js_context != null and frame.parent.?.js_context == ctx) {
+                ctx.setParentWindow(frame.window_id, parent_window_id);
+            } else {
+                ctx.setParentWindow(frame.window_id, null);
+            }
+        }
+
+        var node_list = std.ArrayList(*parser.Node).empty;
+        defer node_list.deinit(self.allocator);
+        try parser.treeToList(self.allocator, &frame.current_node.?, &node_list);
+
+        self.loadImages(frame, url, node_list.items) catch |err| {
+            std.log.warn("Failed to load iframe images: {}", .{err});
+        };
+
+        // Queue external scripts to run later
+        for (node_list.items) |node| {
+            switch (node.*) {
+                .element => |e| {
+                    if (std.mem.eql(u8, e.tag, "script")) {
+                        if (e.attributes) |attrs| {
+                            if (attrs.get("src")) |script_src| {
+                                self.scheduleScriptTask(frame.tab, frame, url, script_src) catch |err| {
+                                    std.log.warn("Failed to schedule iframe script {s}: {}", .{ script_src, err });
+                                };
+                                continue;
+                            }
+                        }
+                        if (self.collectInlineScriptText(node)) |script_body| {
+                            defer self.allocator.free(script_body);
+                            self.scheduleInlineScriptTask(frame.tab, frame, url, script_body) catch |err| {
+                                std.log.warn("Failed to schedule iframe inline script: {}", .{err});
+                            };
+                        }
+                    }
+                },
+                .text => {},
+            }
+        }
+
+        // Load nested iframes in this frame.
+        self.loadIframes(frame, url, node_list.items) catch |err| {
+            std.log.warn("Failed to load iframe subdocuments: {}", .{err});
+        };
+
+        var stylesheet_urls = std.ArrayList([]const u8).empty;
+        defer {
+            for (stylesheet_urls.items) |href| {
+                self.allocator.free(href);
+            }
+            stylesheet_urls.deinit(self.allocator);
+        }
+
+        for (node_list.items) |node| {
+            switch (node.*) {
+                .element => |e| {
+                    if (std.mem.eql(u8, e.tag, "link")) {
+                        if (e.attributes) |attrs| {
+                            const rel = attrs.get("rel");
+                            const href = attrs.get("href");
+
+                            if (rel != null and href != null and std.mem.eql(u8, rel.?, "stylesheet")) {
+                                const href_copy = try self.allocator.alloc(u8, href.?.len);
+                                @memcpy(href_copy, href.?);
+                                try stylesheet_urls.append(self.allocator, href_copy);
+                            }
+                        }
+                    }
+                },
+                .text => {},
+            }
+        }
+
+        var all_rules = std.ArrayList(CSSParser.CSSRule).empty;
+        const default_rules_count = self.default_style_sheet_rules.len;
+        errdefer {
+            for (all_rules.items) |*rule| {
+                if (rule.owned) {
+                    rule.deinit(self.allocator);
+                }
+            }
+        }
+        defer all_rules.deinit(self.allocator);
+
+        for (self.default_style_sheet_rules) |rule| {
+            try all_rules.append(self.allocator, rule);
+        }
+
+        for (stylesheet_urls.items) |href| {
+            std.log.info("Loading iframe stylesheet: {s}", .{href});
+            const stylesheet_url = url.*.resolve(self.allocator, href) catch |err| {
+                std.log.warn("Failed to resolve iframe stylesheet URL {s}: {}", .{ href, err });
+                continue;
+            };
+            defer stylesheet_url.free(self.allocator);
+
+            if (!frame.allowedRequest(stylesheet_url, url)) {
+                std.log.warn("Blocked iframe stylesheet {s} due to CSP", .{href});
+                continue;
+            }
+
+            const css_response = self.fetchBody(stylesheet_url, url.*, null) catch |err| {
+                std.log.warn("Failed to load iframe stylesheet {s}: {}", .{ href, err });
+                continue;
+            };
+            defer if (css_response.csp_header) |hdr| self.allocator.free(hdr);
+
+            const css_raw = css_response.body;
+            const raw_owned = !std.mem.eql(u8, stylesheet_url.scheme, "data") and !std.mem.eql(u8, stylesheet_url.scheme, "about");
+            const css_text = try decodeUtf8Replace(self.allocator, css_raw);
+            if (raw_owned) {
+                self.allocator.free(css_raw);
+            }
+
+            var css_parser = try CSSParser.init(self.allocator, css_text, frame.tab.accessibility.prefers_dark);
+            defer css_parser.deinit(self.allocator);
+
+            const parsed_rules = css_parser.parse(self.allocator) catch |err| {
+                std.log.warn("Failed to parse iframe stylesheet {s}: {}", .{ href, err });
+                self.allocator.free(css_text);
+                continue;
+            };
+
+            try frame.css_texts.append(self.allocator, css_text);
+            for (parsed_rules) |rule| {
+                try all_rules.append(self.allocator, rule);
+            }
+            self.allocator.free(parsed_rules);
+        }
+
+        std.mem.sort(CSSParser.CSSRule, all_rules.items, {}, struct {
+            fn lessThan(_: void, a: CSSParser.CSSRule, b: CSSParser.CSSRule) bool {
+                return a.cascadePriority() < b.cascadePriority();
+            }
+        }.lessThan);
+
+        frame.default_rules_count = default_rules_count;
+        for (all_rules.items) |rule| {
+            try frame.rules.append(self.allocator, rule);
+        }
+
+        try parser.style(self.allocator, &frame.current_node.?, frame.rules.items);
+        try self.layoutTabNodes(frame);
+
+        frame.tab.setNeedsRender();
+        frame.tab.runAnimationFrame(frame.scroll);
+    }
+
     fn loadImages(self: *Browser, frame: *Frame, page_url: *Url, nodes: []*Node) !void {
+        const ImageCacheEntry = struct {
+            width: usize,
+            height: usize,
+            pixels: []const u8,
+        };
+
+        var image_cache = std.StringHashMap(ImageCacheEntry).init(self.allocator);
+        defer {
+            var it = image_cache.iterator();
+            while (it.next()) |entry| {
+                self.allocator.free(entry.key_ptr.*);
+                self.allocator.free(entry.value_ptr.pixels);
+            }
+            image_cache.deinit();
+        }
+
         for (nodes) |node| {
             switch (node.*) {
                 .element => |*element| {
@@ -1889,8 +2237,24 @@ pub const Browser = struct {
                         continue;
                     }
 
+                    const cache_key = try self.allocator.dupe(u8, image_url.path);
+                    if (image_cache.get(cache_key)) |entry| {
+                        self.allocator.free(cache_key);
+                        const pixels_copy = try self.allocator.dupe(u8, entry.pixels);
+                        const image = try zigimg.Image.fromRawPixelsOwned(entry.width, entry.height, pixels_copy, .rgba32);
+                        if (element.image_data) |*existing| {
+                            existing.deinit(self.allocator);
+                        }
+                        element.image_data = ImageData{
+                            .encoded_bytes = null,
+                            .image = image,
+                        };
+                        continue;
+                    }
+
                     const image_response = self.fetchBody(image_url, page_url.*, null) catch |err| {
                         std.log.warn("Failed to load image {s}: {}", .{ src, err });
+                        self.allocator.free(cache_key);
                         if (element.image_data) |*existing| {
                             existing.deinit(self.allocator);
                         }
@@ -1913,6 +2277,7 @@ pub const Browser = struct {
                     var image = zigimg.Image.fromMemory(self.allocator, encoded_bytes) catch |err| {
                         std.log.warn("Failed to decode image {s}: {}", .{ src, err });
                         self.allocator.free(encoded_bytes);
+                        self.allocator.free(cache_key);
                         if (element.image_data) |*existing| {
                             existing.deinit(self.allocator);
                         }
@@ -1928,6 +2293,7 @@ pub const Browser = struct {
                         std.log.warn("Failed to convert image {s} to RGBA: {}", .{ src, err });
                         image.deinit(self.allocator);
                         self.allocator.free(encoded_bytes);
+                        self.allocator.free(cache_key);
                         if (element.image_data) |*existing| {
                             existing.deinit(self.allocator);
                         }
@@ -1938,6 +2304,13 @@ pub const Browser = struct {
                         };
                         continue;
                     };
+
+                    const cached_pixels = try self.allocator.dupe(u8, image.rawBytes());
+                    try image_cache.put(cache_key, .{
+                        .width = image.width,
+                        .height = image.height,
+                        .pixels = cached_pixels,
+                    });
 
                     if (element.image_data) |*existing| {
                         existing.deinit(self.allocator);
@@ -1969,6 +2342,42 @@ pub const Browser = struct {
         }
     }
 
+    fn parseLengthAttribute(value: []const u8) ?i32 {
+        if (value.len == 0) return null;
+        if (std.mem.endsWith(u8, value, "px")) {
+            const num_str = value[0 .. value.len - 2];
+            return std.fmt.parseInt(i32, num_str, 10) catch null;
+        }
+        return std.fmt.parseInt(i32, value, 10) catch null;
+    }
+
+    fn iframeViewportFromNode(node: *Node) ?struct { width: i32, height: i32 } {
+        const element = switch (node.*) {
+            .element => |e| e,
+            else => return null,
+        };
+        if (!std.mem.eql(u8, element.tag, "iframe")) return null;
+
+        var width: i32 = 300;
+        var height: i32 = 150;
+
+        if (element.attributes) |attrs| {
+            if (attrs.get("width")) |width_str| {
+                if (parseLengthAttribute(width_str)) |parsed_width| {
+                    width = parsed_width;
+                }
+            }
+            if (attrs.get("height")) |height_str| {
+                if (parseLengthAttribute(height_str)) |parsed_height| {
+                    height = parsed_height;
+                }
+            }
+        }
+
+        if (width <= 0 or height <= 0) return null;
+        return .{ .width = width, .height = height };
+    }
+
     fn loadIframe(self: *Browser, parent: *Frame, iframe_node: *Node, page_url: *Url, src: []const u8) !void {
         var iframe_url = page_url.*.resolve(self.allocator, src) catch |err| {
             std.log.warn("Failed to resolve iframe URL {s}: {}", .{ src, err });
@@ -1992,6 +2401,10 @@ pub const Browser = struct {
             parent.allocator.destroy(frame);
         }
         parent.tab.registerFrame(frame);
+        if (iframeViewportFromNode(iframe_node)) |viewport| {
+            frame.viewport_width = viewport.width;
+            frame.viewport_height = viewport.height;
+        }
 
         const frame_url_ptr = try parent.allocator.create(Url);
         frame_url_ptr.* = iframe_url;
@@ -2402,16 +2815,19 @@ pub const Browser = struct {
             self.lock.unlock();
             return;
         }
+        const tab = self.activeTab().?;
         self.animation_timer_active = true;
         self.needs_animation_frame = false;
+        tab.retainAsyncThread();
         self.lock.unlock();
 
-        const ctx = AnimationTimerContext.create(self) catch |err| {
+        const ctx = AnimationTimerContext.create(self, tab) catch |err| {
             std.log.warn("Failed to allocate animation timer context: {}", .{err});
             self.lock.lock();
             self.animation_timer_active = false;
             self.needs_animation_frame = true;
             self.lock.unlock();
+            tab.releaseAsyncThread();
             return;
         };
 
@@ -2422,6 +2838,7 @@ pub const Browser = struct {
             self.animation_timer_active = false;
             self.needs_animation_frame = true;
             self.lock.unlock();
+            tab.releaseAsyncThread();
             return;
         };
         _ = thread.setName("Animation timer thread") catch |err| {
@@ -2509,6 +2926,22 @@ pub const Browser = struct {
         }
 
         self.layout_engine.accessibility = frame.tab.accessibility;
+        const saved_window_width = self.layout_engine.window_width;
+        const saved_window_height = self.layout_engine.window_height;
+        defer {
+            self.layout_engine.window_width = saved_window_width;
+            self.layout_engine.window_height = saved_window_height;
+        }
+        if (frame.parent != null and frame.viewport_width > 0) {
+            self.layout_engine.window_width = self.scalePx(frame.viewport_width);
+        } else {
+            self.layout_engine.window_width = self.window_width;
+        }
+        if (frame.parent != null and frame.viewport_height > 0) {
+            self.layout_engine.window_height = self.scalePx(frame.viewport_height);
+        } else {
+            self.layout_engine.window_height = self.window_height;
+        }
 
         // Clear previous document layout if it exists
         if (frame.document_layout != null) {
@@ -2855,6 +3288,12 @@ pub const Browser = struct {
                 .bottom = self.scalePx(o.rect.bottom),
             },
             .blend => |b| blk: {
+                if (b.blend_mode) |mode| {
+                    if (std.mem.eql(u8, mode, "dst_in") and b.children.len > 0) {
+                        const mask_child = b.children[b.children.len - 1];
+                        break :blk self.getDisplayItemBounds(mask_child);
+                    }
+                }
                 var bounds = Rect{ .left = std.math.maxInt(i32), .top = std.math.maxInt(i32), .right = std.math.minInt(i32), .bottom = std.math.minInt(i32) };
                 for (b.children) |child| {
                     const child_bounds = self.getDisplayItemBounds(child);
@@ -3029,10 +3468,12 @@ pub const Browser = struct {
         try tab_context.closePath();
         try tab_context.fill();
 
-        // Draw from the base display list to avoid compositing regressions.
+        // Prefer the composited draw list when available so blend-mode effects
+        // (like dst_in clipping) render correctly.
         const zoom = self.activeZoom();
         const base_list = self.active_tab_display_list orelse &.{};
-        for (base_list) |item| {
+        const draw_list = if (self.tab_draw_list.items.len > 0) self.tab_draw_list.items else base_list;
+        for (draw_list) |item| {
             try self.drawDisplayItemZ2dContext(&tab_context, item, 0, zoom);
         }
     }
@@ -3282,11 +3723,13 @@ pub const Browser = struct {
         try self.context.closePath();
         try self.context.fill();
 
-        // Draw the active tab directly to the root surface (bypassing tab surface compositing).
-        if (self.active_tab_display_list) |display_list| {
+        // Draw the active tab using the composited draw list when available.
+        if (self.active_tab_display_list != null) {
             const zoom = self.activeZoom();
             const scroll_offset = self.scalePxWithZoom(self.active_tab_scroll, zoom) - self.chrome.bottom;
-            for (display_list) |item| {
+            const base_list = self.active_tab_display_list orelse &.{};
+            const draw_list = if (self.tab_draw_list.items.len > 0) self.tab_draw_list.items else base_list;
+            for (draw_list) |item| {
                 try self.drawDisplayItemZ2dContext(&self.context, item, scroll_offset, zoom);
             }
         }
@@ -3393,6 +3836,58 @@ pub const Browser = struct {
         const src_w = image_item.source_width;
         const src_h = image_item.source_height;
         const pixels = image_item.pixels;
+
+        switch (context.surface.*) {
+            .image_surface_rgba => |*img_surface| {
+                const dest_pixels = img_surface.buf;
+                const opacity = std.math.clamp(image_item.opacity, 0.0, 1.0);
+
+                var y = start_y;
+                while (y < end_y) : (y += 1) {
+                    const src_y = @divTrunc((y - dest_top) * src_h, dest_height);
+                    if (src_y < 0 or src_y >= src_h) continue;
+
+                    const row_base = @as(usize, @intCast(y)) * @as(usize, @intCast(surface_width));
+
+                    var x = start_x;
+                    while (x < end_x) : (x += 1) {
+                        const src_x = @divTrunc((x - dest_left) * src_w, dest_width);
+                        if (src_x < 0 or src_x >= src_w) continue;
+
+                        const src_idx = (@as(usize, @intCast(src_y)) * @as(usize, @intCast(src_w)) + @as(usize, @intCast(src_x))) * 4;
+                        const src_a = pixels[src_idx + 3];
+                        if (src_a == 0) continue;
+
+                    const alpha_f = @as(f64, @floatFromInt(src_a)) * opacity;
+                    const alpha = std.math.clamp(@as(i32, @intFromFloat(alpha_f + 0.5)), 0, 255);
+                    if (alpha == 0) continue;
+
+                    const dst_idx = row_base + @as(usize, @intCast(x));
+                    const dst = dest_pixels[dst_idx];
+                    const alpha_u32 = @as(u32, @intCast(alpha));
+                    const inv_alpha = 255 - alpha_u32;
+
+                    if (alpha == 255) {
+                        dest_pixels[dst_idx] = .{
+                            .r = pixels[src_idx + 0],
+                            .g = pixels[src_idx + 1],
+                            .b = pixels[src_idx + 2],
+                            .a = 255,
+                        };
+                    } else {
+                        dest_pixels[dst_idx] = .{
+                            .r = @intCast((@as(u32, pixels[src_idx + 0]) * alpha_u32 + @as(u32, dst.r) * inv_alpha) / 255),
+                            .g = @intCast((@as(u32, pixels[src_idx + 1]) * alpha_u32 + @as(u32, dst.g) * inv_alpha) / 255),
+                            .b = @intCast((@as(u32, pixels[src_idx + 2]) * alpha_u32 + @as(u32, dst.b) * inv_alpha) / 255),
+                            .a = @intCast((alpha_u32 + @as(u32, dst.a) * inv_alpha) / 255),
+                        };
+                    }
+                    }
+                }
+                return;
+            },
+            else => {},
+        }
 
         var y = start_y;
         while (y < end_y) : (y += 1) {
@@ -3686,6 +4181,10 @@ pub const Browser = struct {
                 try dcl.layer.raster(self.allocator, self);
 
                 if (dcl.layer.surface) |*layer_surface| {
+                    const original_operator = context.getOperator();
+                    context.setOperator(.src_over);
+                    defer context.setOperator(original_operator);
+
                     // Draw the layer surface at its position with opacity.
                     const layer_y = dcl.layer.bounds.top - scroll_offset;
                     const layer_x = dcl.layer.bounds.left;
@@ -4136,6 +4635,10 @@ pub const Browser = struct {
                 // For composited layers, draw at transformed position
                 try dcl.layer.raster(self.allocator, self);
                 if (dcl.layer.surface) |*layer_surface| {
+                    const original_operator = context.getOperator();
+                    context.setOperator(.src_over);
+                    defer context.setOperator(original_operator);
+
                     const layer_y = dcl.layer.bounds.top - scroll_offset;
                     const layer_x = dcl.layer.bounds.left + x_offset;
                     const layer_pixels = switch (layer_surface.*) {
@@ -4446,8 +4949,7 @@ pub const Browser = struct {
                 }
             },
             .rect => |_| {
-                // For regular rects, nothing to clip - the content already fills the rect
-                // No corner pixels to clear
+                // Regular rect clip masks are handled by dst_in in the compositing path.
             },
             else => {
                 // Other shapes not supported for clipping yet
@@ -4780,6 +5282,71 @@ const LoadTaskContext = struct {
 
     fn cleanupOpaque(context: *anyopaque) void {
         LoadTaskContext.fromOpaque(context).destroy();
+    }
+};
+
+const FrameLoadTaskContext = struct {
+    allocator: std.mem.Allocator,
+    browser: *Browser,
+    frame: *Frame,
+    url: ?*Url,
+    payload: ?[]const u8,
+
+    pub fn create(
+        allocator: std.mem.Allocator,
+        browser: *Browser,
+        frame: *Frame,
+        url: *Url,
+        payload: ?[]const u8,
+    ) !*FrameLoadTaskContext {
+        const ctx = try allocator.create(FrameLoadTaskContext);
+        ctx.* = .{
+            .allocator = allocator,
+            .browser = browser,
+            .frame = frame,
+            .url = url,
+            .payload = payload,
+        };
+        return ctx;
+    }
+
+    fn destroy(self: *FrameLoadTaskContext) void {
+        self.consumePayload();
+        if (self.url) |url_ptr| {
+            url_ptr.*.free(self.allocator);
+            self.allocator.destroy(url_ptr);
+        }
+        self.allocator.destroy(self);
+    }
+
+    fn consumePayload(self: *FrameLoadTaskContext) void {
+        if (self.payload) |payload| {
+            self.allocator.free(payload);
+            self.payload = null;
+        }
+    }
+
+    fn run(self: *FrameLoadTaskContext) !void {
+        defer self.consumePayload();
+        try self.browser.loadInFrame(self.frame, self.url.?, self.payload);
+        self.url = null;
+    }
+
+    fn toOpaque(self: *FrameLoadTaskContext) *anyopaque {
+        return @ptrCast(self);
+    }
+
+    fn fromOpaque(context: *anyopaque) *FrameLoadTaskContext {
+        const raw: *align(1) FrameLoadTaskContext = @ptrCast(context);
+        return @alignCast(raw);
+    }
+
+    fn runOpaque(context: *anyopaque) anyerror!void {
+        try FrameLoadTaskContext.fromOpaque(context).run();
+    }
+
+    fn cleanupOpaque(context: *anyopaque) void {
+        FrameLoadTaskContext.fromOpaque(context).destroy();
     }
 };
 
@@ -5343,10 +5910,11 @@ const SetTimeoutTaskContext = struct {
 
 const AnimationTimerContext = struct {
     browser: *Browser,
+    tab: *Tab,
 
-    fn create(browser: *Browser) !*AnimationTimerContext {
+    fn create(browser: *Browser, tab: *Tab) !*AnimationTimerContext {
         const ctx = try browser.allocator.create(AnimationTimerContext);
-        ctx.* = .{ .browser = browser };
+        ctx.* = .{ .browser = browser, .tab = tab };
         return ctx;
     }
 
@@ -5357,7 +5925,11 @@ const AnimationTimerContext = struct {
 
 fn runAnimationTimerThread(ctx: *AnimationTimerContext) void {
     const browser = ctx.browser;
-    defer ctx.destroy();
+    const tab = ctx.tab;
+    defer {
+        tab.releaseAsyncThread();
+        ctx.destroy();
+    }
 
     _ = browser.measure.registerThread("Animation timer thread") catch |err| {
         std.log.warn("Failed to register animation timer thread: {}", .{err});
@@ -5372,25 +5944,23 @@ fn runAnimationTimerThread(ctx: *AnimationTimerContext) void {
         browser.lock.unlock();
         return;
     }
-    const tab = browser.activeTab() orelse {
+    const active_tab = browser.activeTab() orelse {
         browser.animation_timer_active = false;
         browser.lock.unlock();
         return;
     };
-    const generation = tab.js_generation;
+    const generation = active_tab.js_generation;
     const scroll = browser.active_tab_scroll;
     browser.lock.unlock();
 
-    tab.retainAsyncThread();
     const render_ctx = AnimationRenderTaskContext.create(
         browser.allocator,
         browser,
-        tab,
+        active_tab,
         generation,
         scroll,
     ) catch |err| {
         std.log.warn("Failed to allocate animation task: {}", .{err});
-        tab.releaseAsyncThread();
         browser.lock.lock();
         browser.animation_timer_active = false;
         browser.lock.unlock();
@@ -5403,16 +5973,14 @@ fn runAnimationTimerThread(ctx: *AnimationTimerContext) void {
         AnimationRenderTaskContext.cleanupOpaque,
     );
 
-    tab.task_runner.schedule(task) catch |err| {
+    active_tab.task_runner.schedule(task) catch |err| {
         std.log.warn("Failed to schedule animation frame: {}", .{err});
         render_ctx.destroy();
-        tab.releaseAsyncThread();
         browser.lock.lock();
         browser.animation_timer_active = false;
         browser.lock.unlock();
         return;
     };
-    tab.releaseAsyncThread();
 }
 
 const AnimationRenderTaskContext = struct {
@@ -5916,7 +6484,6 @@ fn jsPostMessageCallback(
 
     const source_frame = tab.frameForWindowId(source_window_id) orelse return;
     const target_frame = tab.frameForWindowId(target_window_id) orelse return;
-    const target_context = target_frame.js_context orelse return;
 
     const allocator = browser.allocator;
 
@@ -5946,11 +6513,107 @@ fn jsPostMessageCallback(
         }
     }
 
-    target_context.dispatchPostMessage(target_window_id, message, source_origin, source_window_id) catch |err| {
-        std.log.warn("Failed to dispatch postMessage: {}", .{err});
+    const generation = ctx.currentGeneration();
+    const task_ctx = try PostMessageTaskContext.create(
+        allocator,
+        browser,
+        tab,
+        generation,
+        target_window_id,
+        source_window_id,
+        message,
+        source_origin,
+    );
+    const task = Task.init(
+        task_ctx.toOpaque(),
+        PostMessageTaskContext.runOpaque,
+        PostMessageTaskContext.cleanupOpaque,
+    );
+    tab.task_runner.schedule(task) catch |err| {
+        std.log.warn("Failed to schedule postMessage task: {}", .{err});
+        task_ctx.destroy();
     };
-    // Ensure postMessage-driven DOM updates paint without waiting for input.
-    tab.setNeedsRender();
-    const scroll = if (tab.root_frame) |root| root.scroll else 0;
-    tab.runAnimationFrame(scroll);
 }
+
+const PostMessageTaskContext = struct {
+    allocator: std.mem.Allocator,
+    browser: *Browser,
+    tab: *Tab,
+    generation: u64,
+    target_window_id: u32,
+    source_window_id: u32,
+    message: []const u8,
+    origin: []const u8,
+
+    fn create(
+        allocator: std.mem.Allocator,
+        browser: *Browser,
+        tab: *Tab,
+        generation: u64,
+        target_window_id: u32,
+        source_window_id: u32,
+        message: []const u8,
+        origin: []const u8,
+    ) !*PostMessageTaskContext {
+        const ctx = try allocator.create(PostMessageTaskContext);
+        const message_copy = try allocator.dupe(u8, message);
+        errdefer allocator.free(message_copy);
+        const origin_copy = try allocator.dupe(u8, origin);
+        errdefer allocator.free(origin_copy);
+        ctx.* = .{
+            .allocator = allocator,
+            .browser = browser,
+            .tab = tab,
+            .generation = generation,
+            .target_window_id = target_window_id,
+            .source_window_id = source_window_id,
+            .message = message_copy,
+            .origin = origin_copy,
+        };
+        return ctx;
+    }
+
+    fn destroy(self: *PostMessageTaskContext) void {
+        self.allocator.free(self.message);
+        self.allocator.free(self.origin);
+        self.allocator.destroy(self);
+    }
+
+    fn toOpaque(self: *PostMessageTaskContext) *anyopaque {
+        return @ptrCast(self);
+    }
+
+    fn fromOpaque(context: *anyopaque) *PostMessageTaskContext {
+        const raw: *align(1) PostMessageTaskContext = @ptrCast(context);
+        return @alignCast(raw);
+    }
+
+    fn runOpaque(context: *anyopaque) anyerror!void {
+        try PostMessageTaskContext.fromOpaque(context).run();
+    }
+
+    fn cleanupOpaque(context: *anyopaque) void {
+        PostMessageTaskContext.fromOpaque(context).destroy();
+    }
+
+    fn run(self: *PostMessageTaskContext) !void {
+        const target_frame = self.tab.frameForWindowId(self.target_window_id) orelse return;
+        if (!target_frame.js_render_context.matchesGeneration(self.generation)) {
+            return;
+        }
+        const target_context = target_frame.js_context orelse return;
+        target_context.dispatchPostMessage(
+            self.target_window_id,
+            self.message,
+            self.origin,
+            self.source_window_id,
+        ) catch |err| {
+            std.log.warn("Failed to dispatch postMessage: {}", .{err});
+            return;
+        };
+        // Ensure postMessage-driven DOM updates paint without waiting for input.
+        self.tab.setNeedsRender();
+        const scroll = if (self.tab.root_frame) |root| root.scroll else 0;
+        self.tab.runAnimationFrame(scroll);
+    }
+};

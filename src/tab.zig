@@ -202,10 +202,10 @@ pub const Frame = struct {
     }
 
     pub fn dispatchEvent(self: *Frame, event_type: []const u8, node: *Node) bool {
-        const ctx = self.js_context orelse return false;
+        const ctx = self.js_context orelse return true;
         return ctx.dispatchEvent(self.window_id, event_type, node) catch |err| blk: {
             std.log.warn("Failed to dispatch {s} event: {}", .{ event_type, err });
-            break :blk false;
+            break :blk true;
         };
     }
 
@@ -231,13 +231,14 @@ pub const Frame = struct {
                 y >= bounds.y and y < bounds.y + bounds.height)
             {
                 const link_node = entry.node;
-                const prevent_default = self.dispatchEvent("click", link_node);
-                if (prevent_default) return true;
+                const do_default = self.dispatchEvent("click", link_node);
+                if (!do_default) return true;
 
                 switch (link_node.*) {
                     .element => |*link_element| {
                         if (link_element.attributes) |attrs| {
                             if (attrs.get("href")) |href| {
+                                std.log.info("Link click in window_id={d}: {s}", .{ self.window_id, href });
                                 if (self.current_url) |current_url_ptr| {
                                     var resolved_url = try current_url_ptr.*.resolve(self.allocator, href);
                                     const new_url_ptr = self.allocator.create(Url) catch |alloc_err| {
@@ -252,10 +253,17 @@ pub const Frame = struct {
                                         self.allocator.destroy(new_url_ptr);
                                     };
 
-                                    b.scheduleLoad(self.tab, new_url_ptr, null) catch |err| {
-                                        std.log.err("Failed to schedule load for {s}: {any}", .{ href, err });
-                                        return true;
-                                    };
+                                    if (self.parent != null) {
+                                        b.scheduleFrameLoad(self, new_url_ptr, null) catch |err| {
+                                            std.log.err("Failed to schedule iframe load for {s}: {any}", .{ href, err });
+                                            return true;
+                                        };
+                                    } else {
+                                        b.scheduleLoad(self.tab, new_url_ptr, null) catch |err| {
+                                            std.log.err("Failed to schedule load for {s}: {any}", .{ href, err });
+                                            return true;
+                                        };
+                                    }
                                     url_owned = false;
                                 }
                             }
@@ -267,7 +275,6 @@ pub const Frame = struct {
                 return true;
             }
         }
-
         var it = self.input_bounds.iterator();
         while (it.next()) |entry| {
             const node_ptr = entry.key_ptr.*;
@@ -278,8 +285,8 @@ pub const Frame = struct {
                 switch (node_ptr.*) {
                     .element => |*e| {
                         if (std.mem.eql(u8, e.tag, "input")) {
-                            const prevent_default = self.dispatchEvent("click", node_ptr);
-                            if (prevent_default) return true;
+                            const do_default = self.dispatchEvent("click", node_ptr);
+                            if (!do_default) return true;
                             if (e.attributes) |*attrs| {
                                 try attrs.put("value", "");
                             }
@@ -292,8 +299,8 @@ pub const Frame = struct {
                         }
 
                         if (std.mem.eql(u8, e.tag, "button")) {
-                            const prevent_default = self.dispatchEvent("click", node_ptr);
-                            if (prevent_default) return true;
+                            const do_default = self.dispatchEvent("click", node_ptr);
+                            if (!do_default) return true;
                             try self.tab.submitForm(b, self, node_ptr);
                             self.tab.focused_frame = self;
                             return true;
@@ -869,7 +876,29 @@ fn appendIframeContent(
             .node = null,
         },
     };
-    try out.append(self.allocator, transform_item);
+    const mask_item = DisplayItem{
+        .rect = .{
+            .x1 = iframe_data.rect.left,
+            .y1 = iframe_data.rect.top,
+            .x2 = iframe_data.rect.right,
+            .y2 = iframe_data.rect.bottom,
+            .color = browser_mod.Color{ .r = 0xff, .g = 0xff, .b = 0xff, .a = 0xff },
+        },
+    };
+    const clip_children = try self.allocator.alloc(DisplayItem, 2);
+    clip_children[0] = transform_item;
+    clip_children[1] = mask_item;
+    const clip_blend_mode = try self.allocator.alloc(u8, 6);
+    @memcpy(clip_blend_mode, "dst_in");
+    try out.append(self.allocator, .{
+        .blend = .{
+            .opacity = 1.0,
+            .blend_mode = clip_blend_mode,
+            .children = clip_children,
+            .node = null,
+            .needs_compositing = true,
+        },
+    });
 
     try out.append(self.allocator, .{
         .outline = .{
@@ -1126,8 +1155,8 @@ fn submitForm(self: *Tab, b: *Browser, frame: *Frame, button_node: *Node) !void 
                     for (form_nodes.items) |form_child| {
                         if (form_child == button_node) {
                             std.log.info("Found button in form!", .{});
-                            const prevent_default = frame.dispatchEvent("submit", node_ptr);
-                            if (prevent_default) {
+                            const do_default = frame.dispatchEvent("submit", node_ptr);
+                            if (!do_default) {
                                 std.log.info("Default submit prevented", .{});
                                 return;
                             }
@@ -1245,10 +1274,17 @@ fn submitFormData(self: *Tab, b: *Browser, frame: *Frame, form_node: *Node, acti
         b.allocator.destroy(form_url_ptr);
     };
 
-    b.scheduleLoad(self, form_url_ptr, body_slice) catch |err| {
-        std.log.err("Failed to submit form: {any}", .{err});
-        return;
-    };
+    if (frame.parent != null) {
+        b.scheduleFrameLoad(frame, form_url_ptr, body_slice) catch |err| {
+            std.log.err("Failed to submit iframe form: {any}", .{err});
+            return;
+        };
+    } else {
+        b.scheduleLoad(self, form_url_ptr, body_slice) catch |err| {
+            std.log.err("Failed to submit form: {any}", .{err});
+            return;
+        };
+    }
     url_owned = false;
     body_owned = false;
 }
@@ -1357,8 +1393,8 @@ pub fn activateFocusedElement(self: *Tab, b: *Browser) !void {
                 if (e.attributes) |attrs| {
                     if (attrs.get("type")) |raw_type| {
                         if (std.mem.eql(u8, raw_type, "submit") or std.mem.eql(u8, raw_type, "button")) {
-                            const prevent_default = frame.dispatchEvent("click", node_ptr);
-                            if (prevent_default) return;
+                            const do_default = frame.dispatchEvent("click", node_ptr);
+                            if (!do_default) return;
                             try self.submitForm(b, frame, node_ptr);
                         }
                     }
@@ -1367,34 +1403,41 @@ pub fn activateFocusedElement(self: *Tab, b: *Browser) !void {
             }
 
             if (std.mem.eql(u8, e.tag, "button")) {
-                const prevent_default = frame.dispatchEvent("click", node_ptr);
-                if (prevent_default) return;
+                const do_default = frame.dispatchEvent("click", node_ptr);
+                if (!do_default) return;
                 try self.submitForm(b, frame, node_ptr);
                 return;
             }
 
             if (std.mem.eql(u8, e.tag, "a")) {
-                const prevent_default = frame.dispatchEvent("click", node_ptr);
-                if (prevent_default) return;
+                const do_default = frame.dispatchEvent("click", node_ptr);
+                if (!do_default) return;
                 if (e.attributes) |attrs| {
                     if (attrs.get("href")) |href| {
                         if (frame.current_url) |current_url_ptr| {
                             const resolved_url = try current_url_ptr.*.resolve(self.allocator, href);
                             const url_ptr = try self.allocator.create(Url);
                             url_ptr.* = resolved_url;
-                            b.scheduleLoad(self, url_ptr, null) catch |err| {
-                                std.log.err("Failed to schedule load for {s}: {any}", .{ href, err });
-                                url_ptr.*.free(self.allocator);
-                                self.allocator.destroy(url_ptr);
-                            };
+                            if (frame.parent != null) {
+                                b.scheduleFrameLoad(frame, url_ptr, null) catch |err| {
+                                    std.log.err("Failed to schedule iframe load for {s}: {any}", .{ href, err });
+                                    url_ptr.*.free(self.allocator);
+                                    self.allocator.destroy(url_ptr);
+                                };
+                            } else {
+                                b.scheduleLoad(self, url_ptr, null) catch |err| {
+                                    std.log.err("Failed to schedule load for {s}: {any}", .{ href, err });
+                                    url_ptr.*.free(self.allocator);
+                                    self.allocator.destroy(url_ptr);
+                                };
+                            }
                             return;
                         }
                     }
                 }
             }
 
-            const prevent_default = frame.dispatchEvent("click", node_ptr);
-            _ = prevent_default;
+            _ = frame.dispatchEvent("click", node_ptr);
         },
         else => {},
     }
@@ -1419,8 +1462,8 @@ pub fn keypress(self: *Tab, b: *Browser, char: u8) !void {
     _ = b;
     const frame = self.focused_frame orelse self.root_frame orelse return;
     if (frame.focus) |focus_node| {
-        const prevent_default = frame.dispatchEvent("keydown", focus_node);
-        if (prevent_default) {
+        const do_default = frame.dispatchEvent("keydown", focus_node);
+        if (!do_default) {
             std.log.info("Default keydown prevented", .{});
             return;
         }

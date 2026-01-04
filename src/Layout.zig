@@ -121,6 +121,8 @@ const EmbedLayout = struct {
 
         try line_buffer.append(engine.allocator, LineItem{
             .x = engine.cursor_x,
+            .hit_offset_x = engine.transform_offset_x,
+            .hit_offset_y = engine.transform_offset_y,
             .ascent = self.ascent,
             .descent = self.descent,
             .width = self.width,
@@ -232,6 +234,8 @@ const LineItemPayload = union(enum) {
 
 const LineItem = struct {
     x: i32,
+    hit_offset_x: i32,
+    hit_offset_y: i32,
     /// The glyph's ascent or image height (from font metrics)
     ascent: i32,
     /// The glyph's descent as a positive value (–TTF_FontDescent)
@@ -846,6 +850,8 @@ fn flushLine(self: *Layout, line_buffer: *std.ArrayList(LineItem)) !void {
     const line_height = max_ascent + max_descent;
     const extra_leading: i32 = @intFromFloat(@as(f32, @floatFromInt(line_height)) * 0.25);
     const baseline = self.cursor_y + max_ascent;
+    const line_top = self.cursor_y;
+    const line_box_height = line_height + extra_leading;
 
     var focus_map = std.AutoHashMap(*Node, Bounds).init(self.allocator);
     defer focus_map.deinit();
@@ -870,53 +876,57 @@ fn flushLine(self: *Layout, line_buffer: *std.ArrayList(LineItem)) !void {
             final_y = baseline - item.ascent;
         }
 
+        const bounds_x = item.x + item.hit_offset_x;
+        const bounds_y = final_y + item.hit_offset_y;
+        const line_bounds_y = line_top + item.hit_offset_y;
+
         if (item.node_ptr) |ptr| {
             if (item.payload == .input) {
                 try self.input_bounds.put(ptr, .{
-                    .x = item.x,
-                    .y = final_y,
+                    .x = bounds_x,
+                    .y = bounds_y,
                     .width = item.width,
                     .height = item.height,
                 });
             }
-            try self.recordLinkBounds(ptr, item.x, final_y, item.width, item.height);
+            try self.recordLinkBounds(ptr, bounds_x, line_bounds_y, item.width, line_box_height);
             if (findFocusableNode(ptr)) |focus_node| {
-                const right = item.x + item.width;
-                const bottom = final_y + item.height;
+                const right = bounds_x + item.width;
+                const bottom = bounds_y + item.height;
                 if (focus_map.getPtr(focus_node)) |existing| {
                     const existing_right = existing.x + existing.width;
                     const existing_bottom = existing.y + existing.height;
-                    if (item.x < existing.x) existing.x = item.x;
-                    if (final_y < existing.y) existing.y = final_y;
+                    if (bounds_x < existing.x) existing.x = bounds_x;
+                    if (bounds_y < existing.y) existing.y = bounds_y;
                     const new_right = if (right > existing_right) right else existing_right;
                     const new_bottom = if (bottom > existing_bottom) bottom else existing_bottom;
                     existing.width = new_right - existing.x;
                     existing.height = new_bottom - existing.y;
                 } else {
                     try focus_map.put(focus_node, .{
-                        .x = item.x,
-                        .y = final_y,
+                        .x = bounds_x,
+                        .y = bounds_y,
                         .width = item.width,
                         .height = item.height,
                     });
                 }
             }
             if (findAccessibleNode(ptr)) |accessible_node| {
-                const right = item.x + item.width;
-                const bottom = final_y + item.height;
+                const right = bounds_x + item.width;
+                const bottom = bounds_y + item.height;
                 if (accessibility_map.getPtr(accessible_node)) |existing| {
                     const existing_right = existing.x + existing.width;
                     const existing_bottom = existing.y + existing.height;
-                    if (item.x < existing.x) existing.x = item.x;
-                    if (final_y < existing.y) existing.y = final_y;
+                    if (bounds_x < existing.x) existing.x = bounds_x;
+                    if (bounds_y < existing.y) existing.y = bounds_y;
                     const new_right = if (right > existing_right) right else existing_right;
                     const new_bottom = if (bottom > existing_bottom) bottom else existing_bottom;
                     existing.width = new_right - existing.x;
                     existing.height = new_bottom - existing.y;
                 } else {
                     try accessibility_map.put(accessible_node, .{
-                        .x = item.x,
-                        .y = final_y,
+                        .x = bounds_x,
+                        .y = bounds_y,
                         .width = item.width,
                         .height = item.height,
                     });
@@ -957,10 +967,10 @@ fn flushLine(self: *Layout, line_buffer: *std.ArrayList(LineItem)) !void {
                     try self.current_display_target.append(self.allocator, DisplayItem{
                         .iframe = .{
                             .rect = .{
-                                .left = item.x,
-                                .top = final_y,
-                                .right = item.x + item.width,
-                                .bottom = final_y + item.height,
+                                .left = bounds_x,
+                                .top = bounds_y,
+                                .right = bounds_x + item.width,
+                                .bottom = bounds_y + item.height,
                             },
                             .node = ptr,
                         },
@@ -968,8 +978,8 @@ fn flushLine(self: *Layout, line_buffer: *std.ArrayList(LineItem)) !void {
                     try self.iframe_bounds.append(self.allocator, .{
                         .node = ptr,
                         .bounds = .{
-                            .x = item.x,
-                            .y = final_y,
+                            .x = bounds_x,
+                            .y = bounds_y,
                             .width = item.width,
                             .height = item.height,
                         },
@@ -1112,6 +1122,8 @@ fn processGrapheme(
     // Add glyph to line buffer with current text color
     try line_buffer.append(self.allocator, LineItem{
         .x = self.cursor_x,
+        .hit_offset_x = self.transform_offset_x,
+        .hit_offset_y = self.transform_offset_y,
         .ascent = glyph_ascent,
         .descent = glyph_descent,
         .width = glyph_width,

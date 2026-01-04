@@ -5,6 +5,8 @@
 
 This repo holds my Zig code for the browser implemented in [Web Browser Engineering](https://browser.engineering/).
 
+Where possible, this project takes the most difficult route possible to implement features that are implemented quick easily in the book. It benefits from Python and mature third party libraries/bindings. We get no such benefits.
+
 ## Usage
 
 You'll need Zig installed.
