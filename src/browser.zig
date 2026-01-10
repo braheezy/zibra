@@ -2943,15 +2943,16 @@ pub const Browser = struct {
             self.layout_engine.window_height = self.window_height;
         }
 
-        // Clear previous document layout if it exists
-        if (frame.document_layout != null) {
-            frame.document_layout.?.deinit();
-            self.allocator.destroy(frame.document_layout.?);
-            frame.document_layout = null;
-        }
+        const scheme_dark = self.layout_engine.resolveColorScheme("light dark");
+        self.layout_engine.color_scheme_dark = scheme_dark;
+        self.layout_engine.document_color_scheme_dark = scheme_dark;
 
-        // Create and layout the document tree
-        frame.document_layout = try self.layout_engine.buildDocument(frame.current_node.?);
+        if (frame.document_layout == null) {
+            // Create and layout the document tree the first time
+            frame.document_layout = try self.layout_engine.buildDocument(frame.current_node.?);
+        } else {
+            try frame.document_layout.?.layout(self.layout_engine);
+        }
 
         // Paint the document to produce draw commands
         if (frame.display_list) |items| {
@@ -3043,15 +3044,43 @@ pub const Browser = struct {
         const right = bounds.x + bounds.width + padding;
         const bottom = bounds.y + bounds.height + padding;
         try items.append(self.allocator, .{
-            .outline = .{
-                .rect = .{
-                    .left = left,
-                    .top = top,
-                    .right = right,
-                    .bottom = bottom,
-                },
+            .line = .{
+                .x1 = left,
+                .y1 = top,
+                .x2 = right,
+                .y2 = top,
                 .color = color,
-                .thickness = 2,
+                .thickness = 1,
+            },
+        });
+        try items.append(self.allocator, .{
+            .line = .{
+                .x1 = right,
+                .y1 = top,
+                .x2 = right,
+                .y2 = bottom,
+                .color = color,
+                .thickness = 1,
+            },
+        });
+        try items.append(self.allocator, .{
+            .line = .{
+                .x1 = right,
+                .y1 = bottom,
+                .x2 = left,
+                .y2 = bottom,
+                .color = color,
+                .thickness = 1,
+            },
+        });
+        try items.append(self.allocator, .{
+            .line = .{
+                .x1 = left,
+                .y1 = bottom,
+                .x2 = left,
+                .y2 = top,
+                .color = color,
+                .thickness = 1,
             },
         });
     }

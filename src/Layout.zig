@@ -32,6 +32,27 @@ const c = sdl.c;
 // Assume 60 fps for frame calculations
 const FRAMES_PER_SECOND: u32 = 60;
 
+fn drawCursor(
+    commands: *std.ArrayList(DisplayItem),
+    allocator: std.mem.Allocator,
+    x: i32,
+    y: i32,
+    height: i32,
+    color: browser.Color,
+) !void {
+    const cursor_height = if (height > 0) height else 1;
+    try commands.append(allocator, DisplayItem{
+        .line = .{
+            .x1 = x,
+            .y1 = y,
+            .x2 = x,
+            .y2 = y + cursor_height,
+            .color = color,
+            .thickness = 1,
+        },
+    });
+}
+
 /// Parse a transition value like "opacity 2s" into property name and frame count
 /// Returns null if parsing fails
 fn parseTransitionValue(value: []const u8) ?struct { property: []const u8, frames: u32 } {
@@ -446,7 +467,7 @@ fn parseLengthAttribute(value: []const u8) ?i32 {
     return std.fmt.parseInt(i32, value, 10) catch null;
 }
 
-fn resolveColorScheme(self: *const Layout, value: []const u8) bool {
+pub fn resolveColorScheme(self: *const Layout, value: []const u8) bool {
     const support = parseColorSchemeValue(value);
     if (!support.light and !support.dark) return self.accessibility.prefers_dark;
     if (support.light and support.dark) return self.accessibility.prefers_dark;
@@ -1028,7 +1049,7 @@ fn processGrapheme(
 ) !void {
     // Extract first code point to determine character category
     var cp_iter = code_point.Iterator{ .bytes = gme };
-    const first_cp = cp_iter.next() orelse return error.InvalidUtf8;
+    const first_cp = cp_iter.next() orelse return;
 
     // Determine font category based on code point
     const category = getCategory(first_cp.code);
@@ -1061,32 +1082,32 @@ fn processGrapheme(
             // Convert to uppercase and render at smaller size with bold
             var upper_buf: [4]u8 = undefined;
             const upper_len = std.ascii.upperString(&upper_buf, gme);
-            glyph = try self.font_manager.getStyledGlyph(
+            glyph = self.font_manager.getStyledGlyph(
                 upper_buf[0..upper_len.len],
                 .Bold, // Force bold for small caps
                 slant,
                 self.scaledFontSize(@divTrunc(self.size * 4, 5)), // Make it ~80% of normal size
                 use_monospace,
-            );
+            ) catch return;
         } else {
             // Regular rendering for non-lowercase characters
-            glyph = try self.font_manager.getStyledGlyph(
+            glyph = self.font_manager.getStyledGlyph(
                 gme,
                 weight,
                 slant,
                 self.scaledFontSize(self.size),
                 use_monospace,
-            );
+            ) catch return;
         }
     } else {
         // Normal rendering
-        glyph = try self.font_manager.getStyledGlyph(
+        glyph = self.font_manager.getStyledGlyph(
             gme,
             weight,
             slant,
             self.scaledFontSize(if (options.is_superscript) @divTrunc(self.size, 2) else self.size),
             use_monospace,
-        );
+        ) catch return;
     }
 
     glyph.is_superscript = options.is_superscript;
@@ -1207,6 +1228,11 @@ fn isTabIndexFocusable(element: *const parser.Element) bool {
 fn isElementFocusable(element: *const parser.Element) bool {
     if (std.mem.eql(u8, element.tag, "input") or std.mem.eql(u8, element.tag, "button")) {
         return true;
+    }
+    if (element.attributes) |attrs| {
+        if (attrs.get("contenteditable") != null) {
+            return true;
+        }
     }
     if (std.mem.eql(u8, element.tag, "a")) {
         if (element.attributes) |attrs| {
@@ -1602,10 +1628,10 @@ pub const InputLayout = struct {
             });
         }
 
+        var text_x = x + 2;
+        const baseline_y = y + self.embed.ascent;
         if (self.text.len > 0) {
             var g_iter = engine.grapheme_data.iterator(self.text);
-            var text_x = x + 2;
-            const baseline_y = y + self.embed.ascent;
 
             while (g_iter.next()) |gc| {
                 const gme = gc.bytes(self.text);
@@ -1627,19 +1653,17 @@ pub const InputLayout = struct {
                 });
                 text_x += engine.toLayoutPx(glyph.w);
             }
+        }
 
-            if (self.is_focused) {
-                try commands.append(engine.allocator, DisplayItem{
-                    .line = .{
-                        .x1 = text_x,
-                        .y1 = y,
-                        .x2 = text_x,
-                        .y2 = y + self.embed.height,
-                        .color = engine.remapColor(.{ .r = 0, .g = 0, .b = 0, .a = 255 }),
-                        .thickness = 1,
-                    },
-                });
-            }
+        if (self.is_focused) {
+            try drawCursor(
+                commands,
+                engine.allocator,
+                text_x,
+                y,
+                self.embed.height,
+                engine.remapColor(.{ .r = 255, .g = 0, .b = 0, .a = 255 }),
+            );
         }
     }
 };
@@ -1910,16 +1934,16 @@ pub const DocumentLayout = struct {
         engine.focus_bounds.clearRetainingCapacity();
         engine.accessibility_bounds.clearRetainingCapacity();
 
-        for (self.children.items) |child| {
-            child.deinit();
-            self.allocator.destroy(child);
+        var root_block = if (self.children.items.len > 0) self.children.items[0] else null;
+        if (root_block == null) {
+            const child = try BlockLayout.init(self.allocator, self.node, null, self, null, null);
+            try self.children.append(self.allocator, child);
+            root_block = child;
         }
-        self.children.clearRetainingCapacity();
-        const child = try BlockLayout.init(self.allocator, self.node, null, self, null, null);
-        try self.children.append(self.allocator, child);
 
-        try child.layout(engine);
-        self.height = child.height;
+        const block = root_block.?;
+        try block.layout(engine);
+        self.height = block.height;
     }
 
     pub fn shouldPaint(self: *const DocumentLayout) bool {
@@ -2083,13 +2107,15 @@ pub const BlockLayout = struct {
                 is_block = false;
             }
         }
-        if (is_block) {
-            // Clear existing children
-            for (self.children.items) |child| {
-                child.deinit(self.allocator);
-            }
-            self.children.clearRetainingCapacity();
 
+        // Reset any cached inline commands and previous children
+        self.display_list.clearRetainingCapacity();
+        for (self.children.items) |child| {
+            child.deinit(self.allocator);
+        }
+        self.children.clearRetainingCapacity();
+
+        if (is_block) {
             // Create block children
             switch (self.node) {
                 .element => |e| {
@@ -2117,11 +2143,13 @@ pub const BlockLayout = struct {
                     },
                 }
             }
+
+            try recordContentEditableFocusBounds(engine, self);
         } else {
             // Inline layout mode - use the old approach for now
             // TODO: Refactor to populate LineLayout and TextLayout objects
-            self.display_list.clearRetainingCapacity();
             try engine.layoutInlineBlock(self);
+            try recordContentEditableFocusBounds(engine, self);
             // Height is set by layoutInlineBlock
         }
     }
@@ -2137,6 +2165,99 @@ pub const BlockLayout = struct {
         }
     }
 };
+
+fn findLastTextLayout(block: *BlockLayout) ?*TextLayout {
+    var last: ?*TextLayout = null;
+    for (block.children.items) |child| {
+        switch (child) {
+            .block => |b| {
+                if (findLastTextLayout(b)) |found| {
+                    last = found;
+                }
+            },
+            .line => |line| {
+                for (line.children.items) |text| {
+                    last = text;
+                }
+            },
+        }
+    }
+    return last;
+}
+
+fn appendContentEditableCursor(self: *Layout, commands: *std.ArrayList(DisplayItem), block: *BlockLayout) !void {
+    if (block.node != .element) return;
+
+    const element = block.node.element;
+    if (!element.is_focused) return;
+    if (element.attributes == null) return;
+    if (element.attributes.?.get("contenteditable") == null) return;
+
+    const cursor_color = self.remapColor(.{ .r = 255, .g = 0, .b = 0, .a = 255 });
+    if (findLastTextLayout(block)) |text| {
+        const cursor_x = text.x + text.width;
+        try drawCursor(commands, self.allocator, cursor_x, text.y, text.height, cursor_color);
+        return;
+    }
+
+    const glyph = try self.font_manager.getStyledGlyph(
+        "X",
+        .Normal,
+        .Roman,
+        self.default_font_size,
+        false,
+    );
+    const cursor_height = self.toLayoutPx(glyph.ascent + glyph.descent);
+    try drawCursor(commands, self.allocator, block.x, block.y, cursor_height, cursor_color);
+}
+
+fn recordContentEditableFocusBounds(self: *Layout, block: *const BlockLayout) !void {
+    if (block.node != .element) return;
+    const element = block.node.element;
+    if (element.attributes == null) return;
+    if (element.attributes.?.get("contenteditable") == null) return;
+    const node_ptr = block.node_ptr orelse return;
+
+    var height = block.height;
+    if (height <= 0) {
+        const glyph = try self.font_manager.getStyledGlyph(
+            "X",
+            .Normal,
+            .Roman,
+            self.default_font_size,
+            false,
+        );
+        height = self.toLayoutPx(glyph.ascent + glyph.descent);
+    }
+
+    const block_bounds = Bounds{
+        .x = block.x,
+        .y = block.y,
+        .width = block.width,
+        .height = height,
+    };
+
+    for (self.focus_bounds.items) |*entry| {
+        if (entry.node == node_ptr) {
+            const entry_right = entry.bounds.x + entry.bounds.width;
+            const entry_bottom = entry.bounds.y + entry.bounds.height;
+            const block_right = block_bounds.x + block_bounds.width;
+            const block_bottom = block_bounds.y + block_bounds.height;
+            if (block_bounds.x < entry.bounds.x) entry.bounds.x = block_bounds.x;
+            if (block_bounds.y < entry.bounds.y) entry.bounds.y = block_bounds.y;
+            const new_right = if (block_right > entry_right) block_right else entry_right;
+            const new_bottom = if (block_bottom > entry_bottom) block_bottom else entry_bottom;
+            entry.bounds.width = new_right - entry.bounds.x;
+            entry.bounds.height = new_bottom - entry.bounds.y;
+            return;
+        }
+    }
+
+    try self.focus_bounds.append(self.allocator, .{
+        .node = node_ptr,
+        .bounds = block_bounds,
+    });
+}
 
 fn layoutInlineBlock(self: *Layout, block: *BlockLayout) !void {
     const snapshot = snapshotInlineState(self);
@@ -2389,6 +2510,8 @@ fn paintBlockTree(self: *Layout, block: *BlockLayout) !void {
         }
     }
 
+    try appendContentEditableCursor(self, &commands, block);
+
     // Apply visual effects (opacity, etc.) to wrap the entire subtree
     const final_commands = try applyPaintEffects(self, block, commands.items);
 
@@ -2424,6 +2547,8 @@ fn paintBlockTreeRecursive(commands: *std.ArrayList(DisplayItem), self: *Layout,
             .line => |l| try l.paintToList(&block_commands, self),
         }
     }
+
+    try appendContentEditableCursor(self, &block_commands, block);
 
     // Apply visual effects (opacity, transform, etc.) for this block
     const final_commands = try applyPaintEffects(self, block, block_commands.items);

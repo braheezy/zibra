@@ -58,6 +58,7 @@ pub const Frame = struct {
     input_bounds: std.AutoHashMap(*Node, Bounds),
     link_bounds: std.ArrayList(FrameBoundEntry),
     iframe_bounds: std.ArrayList(FrameBoundEntry),
+    focus_bounds: std.ArrayList(FrameBoundEntry),
     accessibility_bounds: std.ArrayList(FrameBoundEntry),
     viewport_width: i32 = 0,
     viewport_height: i32 = 0,
@@ -97,6 +98,7 @@ pub const Frame = struct {
             .input_bounds = std.AutoHashMap(*Node, Bounds).init(allocator),
             .link_bounds = std.ArrayList(FrameBoundEntry).empty,
             .iframe_bounds = std.ArrayList(FrameBoundEntry).empty,
+            .focus_bounds = std.ArrayList(FrameBoundEntry).empty,
             .accessibility_bounds = std.ArrayList(FrameBoundEntry).empty,
         };
     }
@@ -106,6 +108,7 @@ pub const Frame = struct {
         self.input_bounds.deinit();
         self.link_bounds.deinit(self.allocator);
         self.iframe_bounds.deinit(self.allocator);
+        self.focus_bounds.deinit(self.allocator);
         self.accessibility_bounds.deinit(self.allocator);
         for (self.children.items) |child| {
             child.deinit();
@@ -187,6 +190,14 @@ pub const Frame = struct {
         self.iframe_bounds.clearRetainingCapacity();
         for (engine.iframe_bounds.items) |entry| {
             try self.iframe_bounds.append(self.allocator, .{
+                .node = entry.node,
+                .bounds = entry.bounds,
+            });
+        }
+
+        self.focus_bounds.clearRetainingCapacity();
+        for (engine.focus_bounds.items) |entry| {
+            try self.focus_bounds.append(self.allocator, .{
                 .node = entry.node,
                 .bounds = entry.bounds,
             });
@@ -275,39 +286,83 @@ pub const Frame = struct {
                 return true;
             }
         }
-        var it = self.input_bounds.iterator();
-        while (it.next()) |entry| {
-            const node_ptr = entry.key_ptr.*;
-            const bounds = entry.value_ptr.*;
-            if (x >= bounds.x and x < bounds.x + bounds.width and
-                y >= bounds.y and y < bounds.y + bounds.height)
-            {
-                switch (node_ptr.*) {
-                    .element => |*e| {
-                        if (std.mem.eql(u8, e.tag, "input")) {
-                            const do_default = self.dispatchEvent("click", node_ptr);
-                            if (!do_default) return true;
-                            if (e.attributes) |*attrs| {
-                                try attrs.put("value", "");
-                            }
-                            e.is_focused = true;
-                            self.focus = node_ptr;
-                            self.tab.focused_frame = self;
-                            self.tab.updateAccessibilityFocus(b);
-                            self.tab.setNeedsRender();
-                            return true;
-                        }
+        var best_focus: ?struct {
+            node: *Node,
+            bounds: Bounds,
+            priority: u8,
+        } = null;
 
-                        if (std.mem.eql(u8, e.tag, "button")) {
-                            const do_default = self.dispatchEvent("click", node_ptr);
-                            if (!do_default) return true;
-                            try self.tab.submitForm(b, self, node_ptr);
-                            self.tab.focused_frame = self;
-                            return true;
+        for (self.focus_bounds.items) |entry| {
+            const bounds = entry.bounds;
+            if (x < bounds.x or x >= bounds.x + bounds.width or
+                y < bounds.y or y >= bounds.y + bounds.height)
+            {
+                continue;
+            }
+            var priority: u8 = 0;
+            switch (entry.node.*) {
+                .element => |e| {
+                    if (e.attributes) |attrs| {
+                        if (attrs.get("contenteditable") != null) {
+                            priority = 3;
                         }
-                    },
-                    else => {},
+                    }
+                    if (std.mem.eql(u8, e.tag, "input") or std.mem.eql(u8, e.tag, "button")) {
+                        if (priority < 2) priority = 2;
+                    }
+                },
+                else => {},
+            }
+            if (priority == 0) continue;
+
+            if (best_focus == null) {
+                best_focus = .{ .node = entry.node, .bounds = bounds, .priority = priority };
+                continue;
+            }
+            const best = best_focus.?;
+            if (priority > best.priority) {
+                best_focus = .{ .node = entry.node, .bounds = bounds, .priority = priority };
+                continue;
+            }
+            if (priority == best.priority) {
+                const best_area = best.bounds.width * best.bounds.height;
+                const area = bounds.width * bounds.height;
+                if (area < best_area) {
+                    best_focus = .{ .node = entry.node, .bounds = bounds, .priority = priority };
                 }
+            }
+        }
+
+        if (best_focus) |hit| {
+            const node_ptr = hit.node;
+            const do_default = self.dispatchEvent("click", node_ptr);
+            if (!do_default) return true;
+            switch (node_ptr.*) {
+                .element => |*e| {
+                    if (std.mem.eql(u8, e.tag, "input")) {
+                        if (e.attributes) |*attrs| {
+                            try attrs.put("value", "");
+                        }
+                        e.is_focused = true;
+                        self.focus = node_ptr;
+                        self.tab.focused_frame = self;
+                        self.tab.updateAccessibilityFocus(b);
+                        self.tab.setNeedsRender();
+                        return true;
+                    }
+                    if (std.mem.eql(u8, e.tag, "button")) {
+                        try self.tab.submitForm(b, self, node_ptr);
+                        self.tab.focused_frame = self;
+                        return true;
+                    }
+                    e.is_focused = true;
+                    self.focus = node_ptr;
+                    self.tab.focused_frame = self;
+                    self.tab.updateAccessibilityFocus(b);
+                    self.tab.setNeedsRender();
+                    return true;
+                },
+                else => {},
             }
         }
 
@@ -1306,6 +1361,11 @@ fn isElementFocusable(element: *const parser.Element) bool {
     if (std.mem.eql(u8, element.tag, "input") or std.mem.eql(u8, element.tag, "button")) {
         return true;
     }
+    if (element.attributes) |attrs| {
+        if (attrs.get("contenteditable") != null) {
+            return true;
+        }
+    }
     if (std.mem.eql(u8, element.tag, "a")) {
         if (element.attributes) |attrs| {
             return attrs.get("href") != null or isTabIndexFocusable(element);
@@ -1484,6 +1544,59 @@ pub fn keypress(self: *Tab, b: *Browser, char: u8) !void {
                         try e.owned_strings.?.append(self.allocator, new_value);
                     }
                     self.setNeedsRender();
+                } else if (e.attributes) |*attrs| {
+                    if (attrs.get("contenteditable") != null) {
+                        var node_list = std.ArrayList(*Node).empty;
+                        defer node_list.deinit(self.allocator);
+                        try parser.treeToList(self.allocator, focus_node, &node_list);
+
+                        var last_text_node: ?*Node = null;
+                        for (node_list.items) |node_ptr| {
+                            if (node_ptr.* == .text) {
+                                last_text_node = node_ptr;
+                            }
+                        }
+
+                        const new_text = blk: {
+                            if (last_text_node) |text_node| {
+                                switch (text_node.*) {
+                                    .text => |t| {
+                                        const old_text = t.text;
+                                        const buffer = try self.allocator.alloc(u8, old_text.len + 1);
+                                        @memcpy(buffer[0..old_text.len], old_text);
+                                        buffer[old_text.len] = char;
+                                        break :blk buffer;
+                                    },
+                                    else => unreachable,
+                                }
+                            } else {
+                                const buffer = try self.allocator.alloc(u8, 1);
+                                buffer[0] = char;
+                                break :blk buffer;
+                            }
+                        };
+
+                        if (e.owned_strings == null) {
+                            e.owned_strings = std.ArrayList([]const u8).empty;
+                        }
+                        try e.owned_strings.?.append(self.allocator, new_text);
+
+                        if (last_text_node) |text_node| {
+                            switch (text_node.*) {
+                                .text => |*t| t.text = new_text,
+                                else => unreachable,
+                            }
+                        } else {
+                            const text_node = Node{ .text = .{
+                                .text = new_text,
+                                .parent = focus_node,
+                            } };
+                            try e.children.append(self.allocator, text_node);
+                            parser.fixParentPointers(focus_node, e.parent);
+                        }
+
+                        self.setNeedsRender();
+                    }
                 }
             },
             else => {},

@@ -674,13 +674,13 @@ fn requestRender(self: *Js) void {
 }
 
 /// Dispatch an event to the JavaScript environment for the given node
-/// Returns true if the default action was prevented.
+/// Returns true if the default action should proceed.
 pub fn dispatchEvent(self: *Js, window_id: u32, event_type: []const u8, node: *Node) !bool {
     self.lock.lock();
     defer self.lock.unlock();
     const window = try self.setCurrentWindow(window_id);
     try self.setActiveWindow(window_id, window);
-    if (window.current_nodes == null) return false;
+    if (window.current_nodes == null) return true;
 
     const handle = try self.getHandle(window, node);
 
@@ -690,7 +690,7 @@ pub fn dispatchEvent(self: *Js, window_id: u32, event_type: []const u8, node: *N
 
     const dispatch_key = kiesel.types.PropertyKey.from("__native");
     const native_value = try window.realm.global_object.get(&self.agent, dispatch_key);
-    if (!native_value.isObject()) return false;
+    if (!native_value.isObject()) return true;
     const native_obj = native_value.asObject();
     const dispatch_property = kiesel.types.PropertyKey.from("dispatchEvent");
     const dispatch_value = try native_obj.internal_methods.get(
@@ -700,11 +700,11 @@ pub fn dispatchEvent(self: *Js, window_id: u32, event_type: []const u8, node: *N
         native_value,
     );
 
-    if (!dispatch_value.isCallable()) return false;
+    if (!dispatch_value.isCallable()) return true;
 
     const result = try dispatch_value.call(&self.agent, .undefined, &.{ handle_value, type_js_value });
     const do_default = result.toBoolean();
-    return !do_default;
+    return do_default;
 }
 
 pub fn dispatchPostMessage(
