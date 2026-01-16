@@ -578,7 +578,22 @@ pub fn setZoom(self: *Tab, zoom: f32) void {
     const clamped = std.math.clamp(zoom, 0.5, 3.0);
     if (self.accessibility.zoom == clamped) return;
     self.accessibility.zoom = clamped;
+
+    // Mark all frame layouts as dirty for layout recalculation
+    if (self.root_frame) |frame| {
+        markFrameLayoutDirty(frame);
+    }
+
     self.setNeedsRender();
+}
+
+fn markFrameLayoutDirty(frame: *Frame) void {
+    if (frame.document_layout) |doc| {
+        doc.mark();
+    }
+    for (frame.children.items) |child| {
+        markFrameLayoutDirty(child);
+    }
 }
 
 pub fn adjustZoom(self: *Tab, delta: f32) void {
@@ -1592,6 +1607,7 @@ pub fn keypress(self: *Tab, b: *Browser, char: u8) !void {
                                 .parent = focus_node,
                             } };
                             try e.children.append(self.allocator, text_node);
+                            e.children_dirty = true;
                             parser.fixParentPointers(focus_node, e.parent);
                         }
 

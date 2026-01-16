@@ -1539,6 +1539,12 @@ pub const Browser = struct {
         }
 
         // Free previous HTML source if it exists
+        if (frame.current_node) |node| {
+            var n = node;
+            n.deinit(self.allocator);
+            frame.current_node = null;
+        }
+
         if (frame.current_html_source) |old_source| {
             self.allocator.free(old_source);
             frame.current_html_source = null;
@@ -1935,7 +1941,6 @@ pub const Browser = struct {
         }
         frame.current_url = null;
         frame.current_url_owned = false;
-        frame.current_node = null;
         frame.content_height = 0;
         frame.scroll = 0;
         frame.focus = null;
@@ -2949,8 +2954,9 @@ pub const Browser = struct {
 
         if (frame.document_layout == null) {
             // Create and layout the document tree the first time
-            frame.document_layout = try self.layout_engine.buildDocument(frame.current_node.?);
+            frame.document_layout = try self.layout_engine.buildDocument(&frame.current_node.?);
         } else {
+            // Layout on subsequent frames
             try frame.document_layout.?.layout(self.layout_engine);
         }
 
@@ -6317,9 +6323,9 @@ fn jsRenderCallback(context: ?*anyopaque) anyerror!void {
     const raw_tab: *align(1) Tab = @ptrCast(tab_ptr);
     const tab: *Tab = @alignCast(raw_tab);
 
-    // Mark render work and run immediately to keep DOM mutations in sync.
+    // Mark render work; let the main loop drive rendering to avoid re-entrancy.
+    _ = browser;
     tab.setNeedsRender();
-    tab.runAnimationFrame(browser.active_tab_scroll);
 }
 
 fn jsXhrCallback(

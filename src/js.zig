@@ -405,6 +405,12 @@ pub fn evaluate(self: *Js, window_id: u32, code: []const u8) !Value {
         \\  return __native.getAttribute(this.handle, name);
         \\};
         \\
+        \\// Add setAttribute method to Node prototype
+        \\Node.prototype.setAttribute = function(name, value) {
+        \\  var text = value == null ? "" : value.toString();
+        \\  __native.setAttribute(this.handle, name, text);
+        \\};
+        \\
         \\// Add innerHTML setter to Node prototype
         \\Object.defineProperty(Node.prototype, "innerHTML", {
         \\  set: function(value) {
@@ -1003,6 +1009,28 @@ fn setupDocument(self: *Js, realm: *Realm) !void {
         },
     );
 
+    // Create setAttribute function with self pointer
+    const set_attribute_fn = try kiesel.builtins.createBuiltinFunction(
+        &self.agent,
+        .{ .function = setAttribute },
+        3,
+        "setAttribute",
+        .{
+            .realm = realm,
+            .additional_fields = self_ptr,
+        },
+    );
+
+    // Add setAttribute to __native
+    try native_obj.definePropertyDirect(
+        &self.agent,
+        PropertyKey.from("setAttribute"),
+        .{
+            .value_or_accessor = .{ .value = Value.from(&set_attribute_fn.object) },
+            .attributes = .builtin_default,
+        },
+    );
+
     // Create innerHTML function with self pointer
     const inner_html_fn = try kiesel.builtins.createBuiltinFunction(
         &self.agent,
@@ -1347,6 +1375,96 @@ fn getAttribute(agent: *Agent, this_value: Value, arguments: kiesel.types.Argume
     }
 }
 
+/// __native.setAttribute implementation
+fn setAttribute(agent: *Agent, this_value: Value, arguments: kiesel.types.Arguments) Agent.Error!Value {
+    const function_obj = agent.activeFunctionObject();
+    const builtin_fn = function_obj.as(kiesel.builtins.BuiltinFunction);
+    const js_instance = builtin_fn.fields.additional_fields.cast(*Js);
+    const window_id = js_instance.current_window_id orelse return agent.throwException(
+        .internal_error,
+        "Missing active window",
+        .{},
+    );
+    const window = js_instance.windows.getPtr(window_id) orelse return agent.throwException(
+        .internal_error,
+        "Missing window context",
+        .{},
+    );
+
+    _ = this_value;
+
+    const handle_arg = arguments.get(0);
+    if (!handle_arg.isNumber()) {
+        return agent.throwException(
+            .type_error,
+            "setAttribute requires a numeric handle as first argument",
+            .{},
+        );
+    }
+    const handle: u32 = @intFromFloat(handle_arg.asNumber().asFloat());
+
+    const node = js_instance.getNode(window, handle) orelse return agent.throwException(
+        .internal_error,
+        "Invalid node handle",
+        .{},
+    );
+
+    const attr_name_arg = arguments.get(1);
+    if (!attr_name_arg.isString()) {
+        return agent.throwException(
+            .type_error,
+            "setAttribute requires a string name",
+            .{},
+        );
+    }
+    const attr_name = try attr_name_arg.asString().toUtf8(js_instance.allocator);
+    defer js_instance.allocator.free(attr_name);
+
+    const attr_value_arg = arguments.get(2);
+    if (!attr_value_arg.isString()) {
+        return agent.throwException(
+            .type_error,
+            "setAttribute requires a string value",
+            .{},
+        );
+    }
+    const attr_value = try attr_value_arg.asString().toUtf8(js_instance.allocator);
+    defer js_instance.allocator.free(attr_value);
+
+    switch (node.*) {
+        .element => |*e| {
+            if (e.attributes == null) {
+                e.attributes = std.StringHashMap([]const u8).init(js_instance.allocator);
+            }
+            if (e.owned_strings == null) {
+                e.owned_strings = std.ArrayList([]const u8).empty;
+            }
+
+            const owned_name = try js_instance.allocator.dupe(u8, attr_name);
+            const owned_value = try js_instance.allocator.dupe(u8, attr_value);
+            try e.owned_strings.?.append(js_instance.allocator, owned_name);
+            try e.owned_strings.?.append(js_instance.allocator, owned_value);
+            try e.attributes.?.put(owned_name, owned_value);
+
+            if ((std.mem.eql(u8, e.tag, "img") or std.mem.eql(u8, e.tag, "iframe")) and
+                (std.mem.eql(u8, attr_name, "width") or std.mem.eql(u8, attr_name, "height")))
+            {
+                e.children_dirty = true;
+            }
+
+            js_instance.requestRender();
+            return .undefined;
+        },
+        .text => {
+            return agent.throwException(
+                .type_error,
+                "Text nodes do not support setAttribute",
+                .{},
+            );
+        },
+    }
+}
+
 /// __native.innerHTML implementation (setter only)
 fn innerHTML(agent: *Agent, this_value: Value, arguments: kiesel.types.Arguments) Agent.Error!Value {
     // Get the Js instance from the function's additional_fields
@@ -1463,13 +1581,15 @@ fn innerHTML(agent: *Agent, this_value: Value, arguments: kiesel.types.Arguments
             }
             e.children.clearRetainingCapacity();
 
-            for (body_children.items) |child| {
-                try e.children.append(js_instance.allocator, child);
-            }
+                for (body_children.items) |child| {
+                    try e.children.append(js_instance.allocator, child);
+                }
 
-            if (e.owned_strings == null) {
-                e.owned_strings = std.ArrayList([]const u8).empty;
-            }
+                e.children_dirty = true;
+
+                if (e.owned_strings == null) {
+                    e.owned_strings = std.ArrayList([]const u8).empty;
+                }
             try e.owned_strings.?.append(js_instance.allocator, wrapped_html);
             wrapped_cleanup = false;
 
@@ -1545,8 +1665,8 @@ fn styleSet(agent: *Agent, this_value: Value, arguments: kiesel.types.Arguments)
 
             // Get old opacity value for transition detection
             var old_opacity: ?f64 = null;
-            if (e.style) |style| {
-                if (style.get("opacity")) |op_str| {
+            if (e.style) |*style_field| {
+                if (style_field.get().get("opacity")) |op_str| {
                     old_opacity = std.fmt.parseFloat(f64, op_str) catch null;
                 }
             }
@@ -1583,6 +1703,10 @@ fn styleSet(agent: *Agent, this_value: Value, arguments: kiesel.types.Arguments)
                     }
                 }
             } else |_| {}
+
+            if (e.style) |*style_field| {
+                style_field.mark();
+            }
 
             js_instance.requestRender();
 

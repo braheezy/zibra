@@ -1,5 +1,6 @@
 const std = @import("std");
 const zigimg = @import("zigimg");
+const ProtectedField = @import("protected_field.zig").ProtectedField;
 pub const CSSParser = @import("cssParser.zig").CSSParser;
 
 /// Animation state for a numeric CSS property transition
@@ -89,6 +90,7 @@ const Text = struct {
     parent: ?*Node = null,
     children: ?std.ArrayList(Node) = null,
     is_focused: bool = false,
+    style: ?ProtectedField(std.StringHashMap([]const u8)) = null,
 
     pub fn init(text: []const u8, parent: ?*Node) !Text {
         return Text{
@@ -96,6 +98,7 @@ const Text = struct {
             .parent = parent,
             .children = null,
             .is_focused = false,
+            .style = null,
         };
     }
 };
@@ -103,12 +106,13 @@ const Text = struct {
 pub const Element = struct {
     tag: []const u8,
     attributes: ?std.StringHashMap([]const u8) = null,
-    style: ?std.StringHashMap([]const u8) = null,
+    style: ?ProtectedField(std.StringHashMap([]const u8)) = null,
     parent: ?*Node = null,
     children: std.ArrayList(Node),
     // Track strings we've allocated (like resolved percentage font sizes) so we can free them
     owned_strings: ?std.ArrayList([]const u8) = null,
     is_focused: bool = false,
+    children_dirty: bool = true,
     // Animation state for CSS transitions, keyed by property name (e.g., "opacity")
     animations: ?std.StringHashMap(NumericAnimation) = null,
     image_data: ?ImageData = null,
@@ -148,9 +152,9 @@ pub const Element = struct {
             attrs.deinit();
         }
 
-        if (self.style) |styles| {
-            var s = styles;
-            s.deinit();
+        if (self.style) |*styles| {
+            styles.value.deinit();
+            styles.deinit();
         }
 
         // Free any strings we allocated (like resolved percentage font sizes)
@@ -274,7 +278,12 @@ pub const Node = union(enum) {
 
     pub fn deinit(self: *Node, allocator: std.mem.Allocator) void {
         switch (self.*) {
-            .text => {},
+            .text => |*t| {
+                if (t.style) |*styles| {
+                    styles.value.deinit();
+                    styles.deinit();
+                }
+            },
             .element => |*e| e.deinit(allocator),
         }
     }
@@ -293,7 +302,7 @@ pub const Node = union(enum) {
     pub fn children(self: *Node) ?*std.ArrayList(Node) {
         return switch (self.*) {
             .text => unreachable,
-            .element => |e| &e.children,
+            .element => |*e| elementChildren(e),
         };
     }
 
@@ -333,6 +342,16 @@ pub const Node = union(enum) {
         return result.toOwnedSlice(al);
     }
 };
+
+fn elementChildren(e: *Element) *std.ArrayList(Node) {
+    const ChildrenType = @TypeOf(e.children);
+    if (ChildrenType == std.ArrayList(Node)) {
+        return &e.children;
+    } else if (ChildrenType == ProtectedField(std.ArrayList(Node))) {
+        return e.children.get();
+    }
+    @compileError("Unsupported children field type");
+}
 
 // Public function to fix parent pointers after modifying the tree
 pub fn fixParentPointers(node: *Node, parent: ?*Node) void {
@@ -977,31 +996,57 @@ fn getDefaultParentStyle(allocator: std.mem.Allocator) !std.StringHashMap([]cons
 // Parse inline styles from the style attribute and apply CSS rules to the node tree
 // This function recurses through the HTML tree to process all elements
 pub fn style(allocator: std.mem.Allocator, node: *Node, rules: []const CSSParser.CSSRule) !void {
-    var default_parent = try getDefaultParentStyle(allocator);
-    defer default_parent.deinit();
+    const default_parent_map = try getDefaultParentStyle(allocator);
+    var default_parent = ProtectedField(std.StringHashMap([]const u8)).initNamed(allocator, default_parent_map, "Node", "style");
+    default_parent.dirty = false;
+    defer {
+        default_parent.value.deinit();
+        default_parent.deinit();
+    }
     const empty_ancestors = &[_]*Node{};
     try styleWithParent(allocator, node, rules, &default_parent, empty_ancestors);
 }
 
-fn styleWithParent(allocator: std.mem.Allocator, node: *Node, rules: []const CSSParser.CSSRule, parent_style: *const std.StringHashMap([]const u8), ancestor_chain: []const *Node) !void {
+fn styleWithParent(allocator: std.mem.Allocator, node: *Node, rules: []const CSSParser.CSSRule, parent_style: *ProtectedField(std.StringHashMap([]const u8)), ancestor_chain: []const *Node) !void {
     switch (node.*) {
-        .text => {
-            // Text nodes don't have styles
+        .text => |*t| {
+            var style_map = std.StringHashMap([]const u8).init(allocator);
+            var style_field: *ProtectedField(std.StringHashMap([]const u8)) = undefined;
+            if (t.style) |*existing| {
+                existing.value.deinit();
+                style_field = existing;
+            } else {
+                var field = ProtectedField(std.StringHashMap([]const u8)).initNamed(allocator, style_map, "TextNode", "style");
+                field.dirty = false;
+                t.style = field;
+                style_field = &t.style.?;
+            }
+
+            const parent_map = parent_style.read(style_field);
+            for (INHERITED_PROPERTIES) |prop| {
+                const value = parent_map.get(prop.name) orelse prop.default_value;
+                try style_map.put(prop.name, value);
+            }
+            style_field.set(style_map);
             return;
         },
         .element => |*e| {
-            // Deinitialize existing style map if it exists (from previous render)
-            if (e.style) |existing_style| {
-                var style_map = existing_style;
-                style_map.deinit();
+            var style_map = std.StringHashMap([]const u8).init(allocator);
+            var style_field: *ProtectedField(std.StringHashMap([]const u8)) = undefined;
+            if (e.style) |*existing| {
+                existing.value.deinit();
+                style_field = existing;
+            } else {
+                var field = ProtectedField(std.StringHashMap([]const u8)).initNamed(allocator, style_map, "Element", "style");
+                field.dirty = false;
+                e.style = field;
+                style_field = &e.style.?;
             }
-            // Initialize empty style map
-            e.style = std.StringHashMap([]const u8).init(allocator);
 
             // First, inherit properties from parent
             for (INHERITED_PROPERTIES) |prop| {
-                const value = parent_style.get(prop.name) orelse prop.default_value;
-                try e.style.?.put(prop.name, value);
+                const value = parent_style.read(style_field).get(prop.name) orelse prop.default_value;
+                try style_map.put(prop.name, value);
             }
 
             // Second, apply styles from CSS rules (can override inherited values)
@@ -1010,7 +1055,7 @@ fn styleWithParent(allocator: std.mem.Allocator, node: *Node, rules: []const CSS
                     // This rule matches, copy all its properties
                     var it = rule.properties.iterator();
                     while (it.next()) |entry| {
-                        try e.style.?.put(entry.key_ptr.*, entry.value_ptr.*);
+                        try style_map.put(entry.key_ptr.*, entry.value_ptr.*);
                     }
                 }
             }
@@ -1030,16 +1075,16 @@ fn styleWithParent(allocator: std.mem.Allocator, node: *Node, rules: []const CSS
                     // Since style_attr lives in attributes, these slices are safe to store
                     var it = parsed_styles.iterator();
                     while (it.next()) |entry| {
-                        try e.style.?.put(entry.key_ptr.*, entry.value_ptr.*);
+                        try style_map.put(entry.key_ptr.*, entry.value_ptr.*);
                     }
                 }
             }
 
             // Fourth, resolve percentage font sizes to absolute pixels
-            if (e.style.?.get("font-size")) |font_size| {
+            if (style_map.get("font-size")) |font_size| {
                 if (std.mem.endsWith(u8, font_size, "%")) {
                     // Get parent font size from inherited value
-                    const parent_font_size = parent_style.get("font-size") orelse "16px";
+                    const parent_font_size = parent_style.read(style_field).get("font-size") orelse "16px";
 
                     // Parse the percentage (e.g., "150%" -> 150)
                     const pct_str = font_size[0 .. font_size.len - 1];
@@ -1061,9 +1106,11 @@ fn styleWithParent(allocator: std.mem.Allocator, node: *Node, rules: []const CSS
                     }
                     try e.owned_strings.?.append(allocator, resolved_size);
 
-                    try e.style.?.put("font-size", resolved_size);
+                    try style_map.put("font-size", resolved_size);
                 }
             }
+
+            style_field.set(style_map);
 
             // Finally, recursively process all children with this element's computed style
             // Build new ancestor chain by appending current node
@@ -1078,7 +1125,7 @@ fn styleWithParent(allocator: std.mem.Allocator, node: *Node, rules: []const CSS
             new_ancestors[ancestor_chain.len] = node;
 
             for (e.children.items) |*child| {
-                try styleWithParent(allocator, child, rules, &e.style.?, new_ancestors);
+                try styleWithParent(allocator, child, rules, style_field, new_ancestors);
             }
         },
     }
@@ -1092,7 +1139,8 @@ pub fn treeToList(allocator: std.mem.Allocator, node: *Node, list: *std.ArrayLis
     switch (node.*) {
         .text => {},
         .element => |*e| {
-            for (e.children.items) |*child| {
+            const children = elementChildren(e);
+            for (children.items) |*child| {
                 try treeToList(allocator, child, list);
             }
         },

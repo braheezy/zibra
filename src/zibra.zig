@@ -31,7 +31,7 @@ pub fn main() !void {
 fn zibra() !void {
     var debug_allocator: std.heap.DebugAllocator(.{}) = .init;
     // Memory allocation setup
-    const allocator, const is_debug = gpa: {
+    const backing_allocator, const is_debug = gpa: {
         if (builtin.os.tag == .wasi) break :gpa .{ std.heap.wasm_allocator, false };
         break :gpa switch (builtin.mode) {
             .Debug, .ReleaseSafe => .{ debug_allocator.allocator(), true },
@@ -43,6 +43,10 @@ fn zibra() !void {
             std.process.exit(1);
         }
     };
+    var arena = std.heap.ArenaAllocator.init(backing_allocator);
+    defer arena.deinit();
+    var thread_safe = std.heap.ThreadSafeAllocator{ .child_allocator = arena.allocator() };
+    const allocator = thread_safe.allocator();
 
     // Test JS engine (disabled - now integrated into browser)
     // const js_exec = try js.init(allocator);
