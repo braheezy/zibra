@@ -961,16 +961,19 @@ pub const Browser = struct {
         self.scheduleAnimationFrame();
 
         while (!quit) {
+            var handled_event = false;
             // Use waitEventTimeout to be responsive to system events while still
             // limiting frame rate. This prevents the macOS beach ball by waking
             // immediately when events arrive instead of blocking in delay().
             if (sdl2.waitEventTimeout(17)) |event| {
+                handled_event = true;
                 if (try self.handleEvent(event)) {
                     quit = true;
                 }
 
                 // Process any additional pending events without blocking
                 while (sdl2.pollEvent()) |extra_event| {
+                    handled_event = true;
                     if (try self.handleEvent(extra_event)) {
                         quit = true;
                         break;
@@ -981,29 +984,47 @@ pub const Browser = struct {
             if (!quit) {
                 try self.compositeRasterAndDraw();
                 self.scheduleAnimationFrame();
+                if (!handled_event and self.isIdle()) {
+                    // Yield briefly to avoid a busy loop when there's no work.
+                    std.Thread.sleep(2_000_000); // 2ms
+                }
             }
         }
 
         // Signal shutdown to background threads before cleanup
+        std.debug.print("[SHUTDOWN] signaling shutdown\n", .{});
         self.lock.lock();
         self.shutting_down = true;
         self.lock.unlock();
 
         // Give background threads a moment to notice shutdown
+        std.debug.print("[SHUTDOWN] sleeping\n", .{});
         std.Thread.sleep(50_000_000); // 50ms
+        std.debug.print("[SHUTDOWN] run() returning\n", .{});
+    }
+
+    fn isIdle(self: *Browser) bool {
+        self.lock.lock();
+        defer self.lock.unlock();
+        return !self.needs_composite and !self.needs_raster and !self.needs_draw and !self.needs_animation_frame;
     }
 
     // Handle a single SDL event. Returns true if quit was requested.
     fn handleEvent(self: *Browser, event: sdl2.Event) !bool {
         switch (event) {
-            .quit => return true,
+            .quit => {
+                std.debug.print("[EVENT] quit\n", .{});
+                return true;
+            },
             .key_down => |kb_event| {
+                std.debug.print("[EVENT] key_down\n", .{});
                 try self.handleKeyEvent(kb_event.keycode, kb_event.modifiers);
                 if (kb_event.keycode == .escape) {
                     return true;
                 }
             },
             .text_input => |text_event| {
+                std.debug.print("[EVENT] text_input\n", .{});
                 const text = std.mem.sliceTo(&text_event.text, 0);
                 var chrome_changed = false;
                 for (text) |char| {
@@ -1024,6 +1045,7 @@ pub const Browser = struct {
                 }
             },
             .mouse_wheel => |wheel_event| {
+                std.debug.print("[EVENT] mouse_wheel\n", .{});
                 if (wheel_event.delta_y > 0) {
                     self.handleScroll(-scroll_step);
                 } else if (wheel_event.delta_y < 0) {
@@ -1031,17 +1053,22 @@ pub const Browser = struct {
                 }
             },
             .mouse_button_down => |button_event| {
+                std.debug.print("[EVENT] mouse_button_down\n", .{});
                 if (button_event.button == .left) {
                     try self.handleClick(button_event.x, button_event.y);
                 }
             },
             .mouse_motion => |motion_event| {
+                std.debug.print("[EVENT] mouse_motion\n", .{});
                 try self.handleHover(motion_event.x, motion_event.y);
             },
             .window => |window_event| {
+                std.debug.print("[EVENT] window\n", .{});
                 try self.handleWindowEvent(window_event);
             },
-            else => {},
+            else => {
+                std.debug.print("[EVENT] other\n", .{});
+            },
         }
         return false;
     }
@@ -2952,20 +2979,29 @@ pub const Browser = struct {
         self.layout_engine.color_scheme_dark = scheme_dark;
         self.layout_engine.document_color_scheme_dark = scheme_dark;
 
+        var did_layout = false;
         if (frame.document_layout == null) {
             // Create and layout the document tree the first time
             frame.document_layout = try self.layout_engine.buildDocument(&frame.current_node.?);
+            did_layout = true;
         } else {
-            // Layout on subsequent frames
-            try frame.document_layout.?.layout(self.layout_engine);
+            // Layout on subsequent frames - only if needed
+            const doc = frame.document_layout.?;
+            if (doc.layout_needed()) {
+                try doc.layout(self.layout_engine);
+                did_layout = true;
+            }
         }
 
-        // Paint the document to produce draw commands
-        if (frame.display_list) |items| {
-            DisplayItem.freeList(self.allocator, items);
+        // Only repaint if layout actually ran
+        if (did_layout) {
+            // Paint the document to produce draw commands
+            if (frame.display_list) |items| {
+                DisplayItem.freeList(self.allocator, items);
+            }
+            frame.display_list = try self.layout_engine.paintDocument(frame.document_layout.?);
+            try frame.updateHitTestBounds(self.layout_engine);
         }
-        frame.display_list = try self.layout_engine.paintDocument(frame.document_layout.?);
-        try frame.updateHitTestBounds(self.layout_engine);
 
         var focus_items = std.ArrayList(DisplayItem).empty;
         defer focus_items.deinit(self.allocator);
@@ -5172,6 +5208,7 @@ pub const Browser = struct {
 
     // Ensure we clean up the document_layout in deinit
     pub fn deinit(self: *Browser) void {
+        std.debug.print("[DEINIT] Browser.deinit() starting\n", .{});
         // Clean up z2d surfaces and context
         self.context.deinit();
         self.root_surface.deinit(self.allocator);
@@ -5179,6 +5216,7 @@ pub const Browser = struct {
         if (self.tab_surface) |*tab_surface| {
             tab_surface.deinit(self.allocator);
         }
+        std.debug.print("[DEINIT] surfaces done\n", .{});
 
         // Clean up cached SDL texture
         if (self.cached_texture) |tex| {
@@ -5187,6 +5225,7 @@ pub const Browser = struct {
 
         // Close all connections
         self.http_client.deinit();
+        std.debug.print("[DEINIT] http_client done\n", .{});
 
         // Free cache
         var cache = self.cache;
@@ -5194,6 +5233,7 @@ pub const Browser = struct {
 
         // Clean up chrome
         self.chrome.deinit();
+        std.debug.print("[DEINIT] chrome done\n", .{});
 
         // Free cookie jar values and map storage
         var cookie_it = self.cookie_jar.iterator();
@@ -5202,13 +5242,17 @@ pub const Browser = struct {
             self.allocator.free(entry.key_ptr.*);
         }
         self.cookie_jar.deinit();
+        std.debug.print("[DEINIT] cookies done\n", .{});
 
         // Clean up all tabs
+        std.debug.print("[DEINIT] cleaning up tabs\n", .{});
         for (self.tabs.items) |tab| {
+            std.debug.print("[DEINIT] tab.deinit()\n", .{});
             tab.deinit();
             self.allocator.destroy(tab);
         }
         self.tabs.deinit(self.allocator);
+        std.debug.print("[DEINIT] tabs done\n", .{});
 
         if (self.active_tab_display_list) |list| {
             DisplayItem.freeList(self.allocator, list);

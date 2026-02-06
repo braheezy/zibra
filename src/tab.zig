@@ -606,9 +606,13 @@ pub fn start(self: *Tab) !void {
 }
 
 pub fn deinit(self: *Tab) void {
+    std.debug.print("[TAB.DEINIT] invalidateJsContext\n", .{});
     self.invalidateJsContext();
+    std.debug.print("[TAB.DEINIT] waitForAsyncThreads\n", .{});
     self.waitForAsyncThreads();
+    std.debug.print("[TAB.DEINIT] task_runner.shutdown\n", .{});
     self.task_runner.shutdown();
+    std.debug.print("[TAB.DEINIT] task_runner.shutdown done\n", .{});
 
     if (self.root_frame) |frame| {
         frame.deinit();
@@ -981,8 +985,10 @@ fn appendIframeContent(
 
 // Re-render the page without reloading (style, layout, paint)
 pub fn render(self: *Tab, b: *Browser) !void {
+    std.debug.print("[TAB] render: style={} layout={} paint={}\n", .{ self.needs_style, self.needs_layout, self.needs_paint });
     // Check if any render phase is needed
     if (!self.needs_style and !self.needs_layout and !self.needs_paint) return;
+    std.debug.print("[TAB] render RUNNING\n", .{});
 
     const profiling = b.profiling_enabled;
     const render_start = if (profiling) std.time.nanoTimestamp() else 0;
@@ -1039,7 +1045,9 @@ pub fn render(self: *Tab, b: *Browser) !void {
         for (frames.items) |child_frame| {
             try child_frame.render(b, false, true, true);
         }
+        std.debug.print("[TAB] render: composeDisplayList\n", .{});
         try self.composeDisplayList(frame);
+        std.debug.print("[TAB] render: composeDisplayList done\n", .{});
         if (profiling) {
             layout_ns = @as(u64, @intCast(std.time.nanoTimestamp() - layout_start));
         }
@@ -1051,7 +1059,9 @@ pub fn render(self: *Tab, b: *Browser) !void {
         }
     }
 
+    std.debug.print("[TAB] render: setNeedsCompositeRasterDraw\n", .{});
     b.setNeedsCompositeRasterDraw();
+    std.debug.print("[TAB] render: setNeedsCompositeRasterDraw done\n", .{});
 
     if (profiling) {
         const total_ns = @as(u64, @intCast(std.time.nanoTimestamp() - render_start));
@@ -1064,6 +1074,7 @@ pub fn render(self: *Tab, b: *Browser) !void {
             },
         );
     }
+    std.debug.print("[TAB] render END\n", .{});
 }
 
 pub fn runAnimationFrame(self: *Tab, scroll: i32) void {

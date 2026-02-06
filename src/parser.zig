@@ -109,6 +109,8 @@ pub const Element = struct {
     style: ?ProtectedField(std.StringHashMap([]const u8)) = null,
     parent: ?*Node = null,
     children: std.ArrayList(Node),
+    layout_ptr: ?*anyopaque = null,
+    layout_mark: ?*const fn (*anyopaque) void = null,
     // Track strings we've allocated (like resolved percentage font sizes) so we can free them
     owned_strings: ?std.ArrayList([]const u8) = null,
     is_focused: bool = false,
@@ -1010,6 +1012,11 @@ pub fn style(allocator: std.mem.Allocator, node: *Node, rules: []const CSSParser
 fn styleWithParent(allocator: std.mem.Allocator, node: *Node, rules: []const CSSParser.CSSRule, parent_style: *ProtectedField(std.StringHashMap([]const u8)), ancestor_chain: []const *Node) !void {
     switch (node.*) {
         .text => |*t| {
+            if (t.style) |*existing| {
+                if (!existing.dirty) {
+                    return;
+                }
+            }
             var style_map = std.StringHashMap([]const u8).init(allocator);
             var style_field: *ProtectedField(std.StringHashMap([]const u8)) = undefined;
             if (t.style) |*existing| {
@@ -1031,6 +1038,23 @@ fn styleWithParent(allocator: std.mem.Allocator, node: *Node, rules: []const CSS
             return;
         },
         .element => |*e| {
+            if (e.style) |*existing| {
+                if (!existing.dirty) {
+                    // Style is clean; reuse it but still recurse into children.
+                    var new_ancestors = try allocator.alloc(*Node, ancestor_chain.len + 1);
+                    defer allocator.free(new_ancestors);
+
+                    for (ancestor_chain, 0..) |ancestor, i| {
+                        new_ancestors[i] = ancestor;
+                    }
+                    new_ancestors[ancestor_chain.len] = node;
+
+                    for (e.children.items) |*child| {
+                        try styleWithParent(allocator, child, rules, existing, new_ancestors);
+                    }
+                    return;
+                }
+            }
             var style_map = std.StringHashMap([]const u8).init(allocator);
             var style_field: *ProtectedField(std.StringHashMap([]const u8)) = undefined;
             if (e.style) |*existing| {

@@ -45,6 +45,16 @@ pub fn ProtectedField(comptime T: type) type {
         }
 
         pub fn mark(self: *@This()) void {
+            if (self.dirty) return;
+            self.dirty = true;
+            if (self.owner_ptr) |owner| {
+                if (self.owner_mark) |mark_fn| {
+                    mark_fn(owner);
+                }
+            }
+        }
+
+        pub fn markNoOwner(self: *@This()) void {
             self.dirty = true;
         }
 
@@ -54,8 +64,8 @@ pub fn ProtectedField(comptime T: type) type {
         }
 
         pub fn notify(self: *@This()) void {
-            if (DEBUG_PROTECTED_FIELDS and self.obj.len > 0) {
-                std.debug.print("  [INVALIDATE] {s}.{s} notifying {} dependents\n", .{ self.obj, self.name, self.invalidations.count() });
+            if (DEBUG_PROTECTED_FIELDS) {
+                std.debug.print("  [NOTIFY] notifying {} dependents\n", .{self.invalidations.count()});
             }
             var it = self.invalidations.iterator();
             while (it.next()) |entry| {
@@ -65,12 +75,14 @@ pub fn ProtectedField(comptime T: type) type {
         }
 
         fn addInvalidation(self: *@This(), target: anytype) void {
-            const notify_ptr: *anyopaque = @ptrCast(@alignCast(target));
+            const notify_ptr: *anyopaque = @ptrCast(@alignCast(@constCast(target)));
+            const self_ptr: *anyopaque = @ptrCast(@alignCast(self));
+            if (notify_ptr == self_ptr) return;
             if (self.invalidations.contains(notify_ptr)) return;
 
             const MarkFn = struct {
                 fn mark(ptr: *anyopaque) void {
-                    const field: @TypeOf(target) = @ptrCast(@alignCast(ptr));
+                    const field: @TypeOf(@constCast(target)) = @constCast(@ptrCast(@alignCast(ptr)));
                     field.mark();
                 }
             };
@@ -90,6 +102,11 @@ pub fn ProtectedField(comptime T: type) type {
         }
 
         pub fn get(self: *const @This()) *const T {
+            if (self.dirty) {
+                std.debug.print("[PROTECTED_FIELD] get() called on dirty field! Type={s} obj={s} name={s}\n", .{ @typeName(T), self.obj, self.name });
+                // Print stack trace to help identify the caller
+                std.debug.dumpCurrentStackTrace(@returnAddress());
+            }
             std.debug.assert(!self.dirty);
             return &self.value;
         }
@@ -106,30 +123,21 @@ pub fn ProtectedField(comptime T: type) type {
             if (comptime (T == i32 or T == f32 or T == i64 or T == f64 or T == bool or T == u32 or T == u64)) {
                 // Simple types: only notify if value changed
                 if (self.value != value) {
-                    if (DEBUG_PROTECTED_FIELDS and self.obj.len > 0) {
-                        std.debug.print("[SET] {s}.{s} changed, invalidating\n", .{ self.obj, self.name });
+                    if (DEBUG_PROTECTED_FIELDS) {
+                        std.debug.print("[SET] value changed, invalidating\n", .{});
                     }
                     value_changed = true;
                     self.notify();
-                } else if (DEBUG_PROTECTED_FIELDS and self.obj.len > 0) {
-                    std.debug.print("[SET] {s}.{s} unchanged (no-op), skipping invalidation\n", .{ self.obj, self.name });
+                } else if (DEBUG_PROTECTED_FIELDS) {
+                    // Skip logging unchanged values to reduce noise
                 }
             } else {
                 // Complex types: always notify
-                if (DEBUG_PROTECTED_FIELDS and self.obj.len > 0) {
-                    std.debug.print("[SET] {s}.{s} (complex type), invalidating\n", .{ self.obj, self.name });
+                if (DEBUG_PROTECTED_FIELDS) {
+                    std.debug.print("[SET] complex type, invalidating\n", .{});
                 }
                 value_changed = true;
                 self.notify();
-            }
-
-            // Notify owner if value changed
-            if (value_changed) {
-                if (self.owner_ptr) |owner| {
-                    if (self.owner_mark) |mark_fn| {
-                        mark_fn(owner);
-                    }
-                }
             }
 
             self.value = value;

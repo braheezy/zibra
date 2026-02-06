@@ -4,7 +4,7 @@ const browser = @import("browser.zig");
 const code_point = @import("code_point");
 const grapheme = @import("grapheme");
 const parser = @import("parser.zig");
-// const ProtectedField = @import("protected_field.zig").ProtectedField;
+const ProtectedField = @import("protected_field.zig").ProtectedField;
 const DisplayItem = browser.DisplayItem;
 const Node = parser.Node;
 const FontWeight = font.FontWeight;
@@ -761,8 +761,11 @@ fn applyNodeStyles(self: *Layout, element: parser.Element, _: *std.ArrayList(Lin
     };
     try self.style_stack.append(self.allocator, snapshot);
 
-    if (element.style) |style_field| {
-        const style_map = style_field.get();
+    if (element.style) |*style_field| {
+        const style_map = if (self.inline_block) |blk|
+            style_field.read(&blk.height)
+        else
+            style_field.get();
         // Apply font-weight
         if (style_map.get("font-weight")) |weight_str| {
             self.is_bold = std.mem.eql(u8, weight_str, "bold");
@@ -1588,7 +1591,10 @@ pub const InputLayout = struct {
         self.color = engine.text_color;
 
         if (element.style) |*style_field| {
-            const style_map = style_field.get();
+            const style_map = if (engine.inline_block) |blk|
+                style_field.read(&blk.height)
+            else
+                style_field.get();
             if (style_map.get("background-color")) |bg| {
                 if (parseColor(bg)) |col| {
                     self.bgcolor = col;
@@ -1699,23 +1705,28 @@ pub const TextLayout = struct {
     parent: *LineLayout,
     previous: ?*TextLayout,
 
-    // Plain fields
-    zoom: f32 = 1.0,
-    x: i32 = 0,
-    y: i32 = 0,
-    width: i32 = 0,
-    height: i32 = 0,
+    // ProtectedField-wrapped layout properties
+    zoom: ProtectedField(f32),
+    x: ProtectedField(i32),
+    y: ProtectedField(i32),
+    width: ProtectedField(i32),
+    height: ProtectedField(i32),
+    ascent: ProtectedField(i32),
+    descent: ProtectedField(i32),
+
+    // Non-layout style properties (not ProtectedFields)
     font_size: i32 = 16,
     font_weight: FontWeight = .Normal,
     font_slant: FontSlant = .Roman,
     color: browser.Color = .{ .r = 0, .g = 0, .b = 0, .a = 255 },
-    // Store font metrics for baseline calculation
-    ascent: i32 = 0,
-    descent: i32 = 0,
 
-    // Dirty tracking
-    dirty: bool = true,
+    // Dirty tracking for descendants
     has_dirty_descendants: bool = false,
+
+    fn markOpaque(ptr: *anyopaque) void {
+        const self: *TextLayout = @ptrCast(@alignCast(ptr));
+        self.mark();
+    }
 
     pub fn init(
         allocator: std.mem.Allocator,
@@ -1731,28 +1742,67 @@ pub const TextLayout = struct {
             .word = word,
             .parent = parent,
             .previous = previous,
+            .zoom = ProtectedField(f32).init(allocator, 1.0),
+            .x = ProtectedField(i32).init(allocator, 0),
+            .y = ProtectedField(i32).init(allocator, 0),
+            .width = ProtectedField(i32).init(allocator, 0),
+            .height = ProtectedField(i32).init(allocator, 0),
+            .ascent = ProtectedField(i32).init(allocator, 0),
+            .descent = ProtectedField(i32).init(allocator, 0),
         };
+        text.zoom.setOwner(text, markOpaque);
+        text.x.setOwner(text, markOpaque);
+        text.y.setOwner(text, markOpaque);
+        text.width.setOwner(text, markOpaque);
+        text.height.setOwner(text, markOpaque);
+        text.ascent.setOwner(text, markOpaque);
+        text.descent.setOwner(text, markOpaque);
         return text;
     }
 
     pub fn deinit(self: *TextLayout) void {
-        _ = self;
-        // Word and node not owned by this layout
+        self.zoom.deinit();
+        self.x.deinit();
+        self.y.deinit();
+        self.width.deinit();
+        self.height.deinit();
+        self.ascent.deinit();
+        self.descent.deinit();
     }
 
     pub fn mark(self: *TextLayout) void {
-        self.dirty = true;
-        self.parent.mark();
+        // Mark all layout properties as dirty
+        self.x.markNoOwner();
+        self.y.markNoOwner();
+        self.width.markNoOwner();
+        self.height.markNoOwner();
+        self.ascent.markNoOwner();
+        self.descent.markNoOwner();
+        self.zoom.markNoOwner();
+        // Mark immediate parent LineLayout
+        if (self.parent.has_dirty_descendants) return;
+        self.parent.has_dirty_descendants = true;
+        // Get the BlockLayout parent and mark up the tree
+        var block_parent: *BlockLayout = self.parent.parent;
+        if (block_parent.has_dirty_descendants) return;
+        block_parent.has_dirty_descendants = true;
+        // Walk up through BlockLayout chain
+        var current: ?*BlockLayout = block_parent.parent_block;
+        while (current) |bp| {
+            if (bp.has_dirty_descendants) break;
+            bp.has_dirty_descendants = true;
+            current = bp.parent_block;
+        }
+        // Mark document
+        if (block_parent.document.has_dirty_descendants) return;
+        block_parent.document.has_dirty_descendants = true;
     }
 
     pub fn layout(self: *TextLayout, engine: *Layout) !void {
-        // TODO: Skip layout if nothing is dirty
-        // if (!self.layout_needed()) return;
+        // Skip layout if nothing is dirty
+        if (!self.layout_needed()) return;
 
-        // self.zoom.copy(&self.parent.zoom);
         // Get font properties from node style
-        // In a real browser, we'd read from self.node.style
-        // For now, use the engine's current style state
         self.font_weight = if (engine.is_bold) .Bold else .Normal;
         self.font_slant = if (engine.is_italic) .Italic else .Roman;
         self.font_size = engine.scaledFontSize(engine.size);
@@ -1768,31 +1818,12 @@ pub const TextLayout = struct {
         );
 
         const width_value = engine.toLayoutPx(glyph.w);
-        if (self.width != width_value) {
-            self.width = width_value;
-            self.dirty = true;
-        }
-
-        // Store font metrics for baseline calculation
         const ascent_value = engine.toLayoutPx(glyph.ascent);
         const descent_value = engine.toLayoutPx(glyph.descent);
-        if (self.ascent != ascent_value) {
-            self.ascent = ascent_value;
-            self.dirty = true;
-        }
-        if (self.descent != descent_value) {
-            self.descent = descent_value;
-            self.dirty = true;
-        }
-
-        // Height is the line spacing (ascent + descent)
         const height_value = ascent_value + descent_value;
-        if (self.height != height_value) {
-            self.height = height_value;
-            self.dirty = true;
-        }
 
         // Compute x position (horizontal stacking with space between words)
+        // Use .read() to register invalidation dependencies on other objects' fields
         const x_value = if (self.previous) |prev| x: {
             // Measure a space character
             const space_glyph = try engine.font_manager.getStyledGlyph(
@@ -1803,16 +1834,21 @@ pub const TextLayout = struct {
                 false,
             );
             const space = engine.toLayoutPx(space_glyph.w);
-            break :x prev.x + space + prev.width;
+            break :x prev.x.read(&self.x).* + space + prev.width.read(&self.x).*;
         } else x: {
-            break :x self.parent.x;
+            break :x self.parent.x.read(&self.x).*;
         };
-        // Just compute, don't set dirty during layout
-        self.x = x_value;
+
+        // Set all values using ProtectedField.set() (clears dirty flags)
+        self.width.set(width_value);
+        self.height.set(height_value);
+        self.ascent.set(ascent_value);
+        self.descent.set(descent_value);
+        self.x.set(x_value);
+        self.zoom.set(1.0);
         // y position is computed by LineLayout after baseline is determined
 
-        // Clear flags after layout pass
-        self.dirty = false;
+        // Clear descendant flags after layout pass
         self.has_dirty_descendants = false;
     }
 
@@ -1837,8 +1873,8 @@ pub const TextLayout = struct {
 
         try commands.append(self.allocator, DisplayItem{
             .glyph = .{
-                .x = self.x,
-                .y = self.y,
+                .x = self.x.get().*,
+                .y = self.y.get().*,
                 .glyph = glyph,
                 .color = engine.remapColor(self.color),
             },
@@ -1846,7 +1882,15 @@ pub const TextLayout = struct {
     }
 
     pub fn layout_needed(self: *const TextLayout) bool {
-        return self.dirty or self.has_dirty_descendants;
+        if (self.zoom.dirty) return true;
+        if (self.x.dirty) return true;
+        if (self.y.dirty) return true;
+        if (self.width.dirty) return true;
+        if (self.height.dirty) return true;
+        if (self.ascent.dirty) return true;
+        if (self.descent.dirty) return true;
+        if (self.has_dirty_descendants) return true;
+        return false;
     }
 
     pub fn shouldPaint(self: *const TextLayout) bool {
@@ -1862,17 +1906,22 @@ pub const LineLayout = struct {
     parent: *BlockLayout,
     previous: ?*LineLayout,
 
-    zoom: f32 = 1.0,
-    children: std.ArrayList(*TextLayout),
-    x: i32 = 0,
-    y: i32 = 0,
-    width: i32 = 0,
-    height: i32 = 0,
-    ascent: i32 = 0,
-    descent: i32 = 0,
+    // ProtectedField-wrapped layout properties
+    zoom: ProtectedField(f32),
+    x: ProtectedField(i32),
+    y: ProtectedField(i32),
+    width: ProtectedField(i32),
+    height: ProtectedField(i32),
+    ascent: ProtectedField(i32),
+    descent: ProtectedField(i32),
 
-    dirty: bool = true,
+    children: std.ArrayList(*TextLayout),
     has_dirty_descendants: bool = false,
+
+    fn markOpaque(ptr: *anyopaque) void {
+        const self: *LineLayout = @ptrCast(@alignCast(ptr));
+        self.mark();
+    }
 
     pub fn init(
         allocator: std.mem.Allocator,
@@ -1886,8 +1935,22 @@ pub const LineLayout = struct {
             .node = node,
             .parent = parent,
             .previous = previous,
+            .zoom = ProtectedField(f32).init(allocator, 1.0),
+            .x = ProtectedField(i32).init(allocator, 0),
+            .y = ProtectedField(i32).init(allocator, 0),
+            .width = ProtectedField(i32).init(allocator, 0),
+            .height = ProtectedField(i32).init(allocator, 0),
+            .ascent = ProtectedField(i32).init(allocator, 0),
+            .descent = ProtectedField(i32).init(allocator, 0),
             .children = std.ArrayList(*TextLayout).empty,
         };
+        line.zoom.setOwner(line, markOpaque);
+        line.x.setOwner(line, markOpaque);
+        line.y.setOwner(line, markOpaque);
+        line.width.setOwner(line, markOpaque);
+        line.height.setOwner(line, markOpaque);
+        line.ascent.setOwner(line, markOpaque);
+        line.descent.setOwner(line, markOpaque);
         return line;
     }
 
@@ -1897,21 +1960,32 @@ pub const LineLayout = struct {
             self.allocator.destroy(child);
         }
         self.children.deinit(self.allocator);
+        self.zoom.deinit();
+        self.x.deinit();
+        self.y.deinit();
+        self.width.deinit();
+        self.height.deinit();
+        self.ascent.deinit();
+        self.descent.deinit();
     }
 
     pub fn layout(self: *LineLayout, engine: *Layout) !void {
-        // TODO: Skip layout if nothing is dirty
-        // if (!self.layout_needed()) return;
+        // Skip layout if nothing is dirty
+        if (!self.layout_needed()) return;
 
-        // Position the line relative to parent block
-        self.x = self.parent.x;
+        // Compute x position from parent block
+        // Use .read() to register invalidation dependencies on parent's fields
+        const x_value = self.parent.x.read(&self.x).*;
+        const width_value = self.parent.width.read(&self.width).*;
 
         // Position is below previous line, or at parent's y
-        if (self.previous) |prev| {
-            self.y = prev.y + prev.height;
-        } else {
-            self.y = self.parent.y;
-        }
+        // Use .read() to register invalidation dependencies on previous/parent fields
+        const y_value = if (self.previous) |prev| prev.y.read(&self.y).* + prev.height.read(&self.y).* else self.parent.y.read(&self.y).*;
+
+        // Set x and y BEFORE child layout so children can read them
+        self.x.set(x_value);
+        self.y.set(y_value);
+        self.width.set(width_value);
 
         // Layout each word in the line (computes x, width, height, font metrics)
         for (self.children.items) |word| {
@@ -1919,38 +1993,45 @@ pub const LineLayout = struct {
         }
 
         // Compute the line's baseline from maximum ascent
+        // Use .read() to register invalidation dependencies on children's ascent
         var max_ascent: i32 = 0;
         for (self.children.items) |word| {
-            if (word.ascent > max_ascent) {
-                max_ascent = word.ascent;
+            const word_ascent = word.ascent.read(&self.ascent).*;
+            if (word_ascent > max_ascent) {
+                max_ascent = word_ascent;
             }
         }
-        self.ascent = max_ascent;
 
         // Baseline with 1.25 leading factor
-        const baseline = self.y + @as(i32, @intFromFloat(1.25 * @as(f32, @floatFromInt(max_ascent))));
+        const baseline = y_value + @as(i32, @intFromFloat(1.25 * @as(f32, @floatFromInt(max_ascent))));
 
-        // Position each word vertically relative to baseline (just compute, don't set dirty)
+        // Position each word vertically relative to baseline
         for (self.children.items) |word| {
-            const word_ascent = word.ascent;
-            const y_value = baseline - word_ascent;
-            word.y = y_value;
+            const word_ascent = word.ascent.read(&self.ascent).*;
+            const y_word = baseline - word_ascent;
+            word.y.set(y_word);
         }
 
         // Compute maximum descent
+        // Use .read() to register invalidation dependencies on children's descent
         var max_descent: i32 = 0;
         for (self.children.items) |word| {
-            if (word.descent > max_descent) {
-                max_descent = word.descent;
+            const word_descent = word.descent.read(&self.descent).*;
+            if (word_descent > max_descent) {
+                max_descent = word_descent;
             }
         }
 
         // Compute line height with 1.25 leading factor
-        self.descent = max_descent;
-        self.height = @intFromFloat(1.25 * @as(f32, @floatFromInt(max_ascent + max_descent)));
+        const height_value = @as(i32, @intFromFloat(1.25 * @as(f32, @floatFromInt(max_ascent + max_descent))));
 
-        // Clear flags after layout pass
-        self.dirty = false;
+        // Set remaining values (x, y already set before child layout)
+        self.ascent.set(max_ascent);
+        self.descent.set(max_descent);
+        self.height.set(height_value);
+        self.zoom.set(1.0);
+
+        // Clear descendant flags after layout pass
         self.has_dirty_descendants = false;
     }
 
@@ -1971,12 +2052,40 @@ pub const LineLayout = struct {
     }
 
     pub fn layout_needed(self: *const LineLayout) bool {
-        return self.dirty or self.has_dirty_descendants;
+        if (self.zoom.dirty) return true;
+        if (self.x.dirty) return true;
+        if (self.y.dirty) return true;
+        if (self.width.dirty) return true;
+        if (self.height.dirty) return true;
+        if (self.ascent.dirty) return true;
+        if (self.descent.dirty) return true;
+        if (self.has_dirty_descendants) return true;
+        return false;
     }
 
     pub fn mark(self: *LineLayout) void {
-        self.dirty = true;
-        self.parent.mark();
+        // Mark all layout properties as dirty
+        self.x.markNoOwner();
+        self.y.markNoOwner();
+        self.width.markNoOwner();
+        self.height.markNoOwner();
+        self.ascent.markNoOwner();
+        self.descent.markNoOwner();
+        self.zoom.markNoOwner();
+        // Mark immediate parent BlockLayout
+        var block_parent: *BlockLayout = self.parent;
+        if (block_parent.has_dirty_descendants) return;
+        block_parent.has_dirty_descendants = true;
+        // Walk up through BlockLayout chain
+        var current: ?*BlockLayout = block_parent.parent_block;
+        while (current) |bp| {
+            if (bp.has_dirty_descendants) break;
+            bp.has_dirty_descendants = true;
+            current = bp.parent_block;
+        }
+        // Mark document
+        if (block_parent.document.has_dirty_descendants) return;
+        block_parent.document.has_dirty_descendants = true;
     }
 
     pub fn shouldPaint(self: *const LineLayout) bool {
@@ -1990,15 +2099,19 @@ pub const DocumentLayout = struct {
     node: Node,
     node_ptr: *Node,
 
-    zoom: f32 = 1.0,
-    x: i32 = 0,
-    y: i32 = 0,
-    width: i32 = 0,
-    height: i32 = 0,
+    zoom: ProtectedField(f32),
+    x: ProtectedField(i32),
+    y: ProtectedField(i32),
+    width: ProtectedField(i32),
+    height: ProtectedField(i32),
     children: std.ArrayList(*BlockLayout),
 
-    dirty: bool = true,
     has_dirty_descendants: bool = false,
+
+    fn markOpaque(ptr: *anyopaque) void {
+        const self: *DocumentLayout = @ptrCast(@alignCast(ptr));
+        self.mark();
+    }
 
     pub fn init(allocator: std.mem.Allocator, node: *Node) !*DocumentLayout {
         const document = try allocator.create(DocumentLayout);
@@ -2006,13 +2119,18 @@ pub const DocumentLayout = struct {
             .allocator = allocator,
             .node = node.*,
             .node_ptr = node,
-            .zoom = 1.0,
+            .zoom = ProtectedField(f32).init(allocator, 1.0),
             .children = std.ArrayList(*BlockLayout).empty,
-            .x = h_offset,
-            .y = v_offset,
-            .width = 0,
-            .height = 0,
+            .x = ProtectedField(i32).init(allocator, h_offset),
+            .y = ProtectedField(i32).init(allocator, v_offset),
+            .width = ProtectedField(i32).init(allocator, 0),
+            .height = ProtectedField(i32).init(allocator, 0),
         };
+        document.zoom.setOwner(document, markOpaque);
+        document.x.setOwner(document, markOpaque);
+        document.y.setOwner(document, markOpaque);
+        document.width.setOwner(document, markOpaque);
+        document.height.setOwner(document, markOpaque);
 
         return document;
     }
@@ -2023,21 +2141,27 @@ pub const DocumentLayout = struct {
             self.allocator.destroy(child);
         }
         self.children.deinit(self.allocator);
+        self.zoom.deinit();
+        self.x.deinit();
+        self.y.deinit();
+        self.width.deinit();
+        self.height.deinit();
     }
 
     pub fn layout(self: *DocumentLayout, engine: *Layout) !void {
-        // TODO: Skip layout if nothing is dirty
-        // if (!self.layout_needed()) return;
+        if (!self.layout_needed()) return;
 
-        // Update dimensions (just compute, don't set dirty)
-        self.x = h_offset;
-        self.y = v_offset;
-
+        // Compute dimensions
+        const x_value = h_offset;
+        const y_value = v_offset;
         const width_value = engine.layoutWindowWidth() - engine.layoutScrollbarWidth() - (2 * h_offset);
-        self.width = width_value;
-
         const zoom_value = engine.zoom();
-        self.zoom = zoom_value;
+
+        // Set x, y, width, zoom BEFORE child layout so children can read them
+        self.x.set(x_value);
+        self.y.set(y_value);
+        self.width.set(width_value);
+        self.zoom.set(zoom_value);
 
         engine.input_bounds.clearRetainingCapacity();
         engine.link_bounds.clearRetainingCapacity();
@@ -2059,20 +2183,36 @@ pub const DocumentLayout = struct {
         block.node_ptr = self.node_ptr;
         try block.layout(engine);
 
-        // Update height from child block (don't set dirty, just compute)
-        self.height = block.height;
+        // Set height after child layout completes
+        // Use .read() to register invalidation dependency on child's height
+        self.height.set(block.height.read(&self.height).*);
 
-        // Clear flags after layout pass
-        self.dirty = false;
+        // Clear descendant flags after layout pass
         self.has_dirty_descendants = false;
     }
 
     pub fn layout_needed(self: *const DocumentLayout) bool {
-        return self.dirty or self.has_dirty_descendants;
+        if (self.zoom.dirty) return true;
+        if (self.x.dirty) return true;
+        if (self.y.dirty) return true;
+        if (self.width.dirty) return true;
+        if (self.height.dirty) return true;
+        if (self.has_dirty_descendants) return true;
+        return false;
     }
 
     pub fn mark(self: *DocumentLayout) void {
-        self.dirty = true;
+        // Mark all layout properties as dirty
+        self.x.markNoOwner();
+        self.y.markNoOwner();
+        self.width.markNoOwner();
+        self.height.markNoOwner();
+        self.zoom.markNoOwner();
+        self.has_dirty_descendants = true;
+        // Also mark all children so they re-layout
+        for (self.children.items) |child| {
+            child.mark();
+        }
     }
 
     pub fn shouldPaint(self: *const DocumentLayout) bool {
@@ -2107,16 +2247,25 @@ pub const BlockLayout = struct {
     document: *DocumentLayout,
     parent_block: ?*BlockLayout,
     previous: ?*BlockLayout,
-    zoom: f32 = 1.0,
+
+    // ProtectedField-wrapped layout properties
+    zoom: ProtectedField(f32),
+    x: ProtectedField(i32),
+    y: ProtectedField(i32),
+    width: ProtectedField(i32),
+    height: ProtectedField(i32),
+    children_epoch: u64 = 0,
+    children_version: ProtectedField(u64),
+
     children: std.ArrayList(LayoutChild),
     display_list: std.ArrayList(DisplayItem),
-    x: i32 = 0,
-    y: i32 = 0,
-    width: i32 = 0,
-    height: i32 = 0,
     cursor_x: i32 = 0,
-    dirty: bool = true,
     has_dirty_descendants: bool = false,
+
+    fn markOpaque(ptr: *anyopaque) void {
+        const self: *BlockLayout = @ptrCast(@alignCast(ptr));
+        self.mark();
+    }
 
     pub fn init(
         allocator: std.mem.Allocator,
@@ -2134,32 +2283,84 @@ pub const BlockLayout = struct {
             .document = document,
             .parent_block = parent_block,
             .previous = previous,
-            .zoom = 1.0,
+            .zoom = ProtectedField(f32).init(allocator, 1.0),
+            .x = ProtectedField(i32).init(allocator, 0),
+            .y = ProtectedField(i32).init(allocator, 0),
+            .width = ProtectedField(i32).init(allocator, 0),
+            .height = ProtectedField(i32).init(allocator, 0),
             .children = std.ArrayList(LayoutChild).empty,
             .display_list = std.ArrayList(DisplayItem).empty,
-            .x = 0,
-            .y = 0,
-            .width = 0,
-            .height = 0,
+            .children_epoch = 0,
+            .children_version = ProtectedField(u64).init(allocator, 0),
         };
+        block.zoom.setOwner(block, markOpaque);
+        block.x.setOwner(block, markOpaque);
+        block.y.setOwner(block, markOpaque);
+        block.width.setOwner(block, markOpaque);
+        block.height.setOwner(block, markOpaque);
+        block.children_version.setOwner(block, markOpaque);
+
+        if (node_ptr) |ptr| {
+            switch (ptr.*) {
+                .element => |*e| {
+                    e.layout_ptr = block;
+                    e.layout_mark = markOpaque;
+                },
+                else => {},
+            }
+        }
 
         return block;
     }
 
     pub fn deinit(self: *BlockLayout) void {
+        if (self.node_ptr) |ptr| {
+            switch (ptr.*) {
+                .element => |*e| {
+                    const self_ptr: *anyopaque = @ptrCast(@alignCast(self));
+                    if (e.layout_ptr == self_ptr) {
+                        e.layout_ptr = null;
+                        e.layout_mark = null;
+                    }
+                },
+                else => {},
+            }
+        }
         for (self.children.items) |child| {
             child.deinit(self.allocator);
         }
         self.children.deinit(self.allocator);
         self.display_list.deinit(self.allocator);
+        self.zoom.deinit();
+        self.x.deinit();
+        self.y.deinit();
+        self.width.deinit();
+        self.height.deinit();
+        self.children_version.deinit();
     }
 
     pub fn mark(self: *BlockLayout) void {
-        self.dirty = true;
+        // Mark all layout properties as dirty
+        self.x.markNoOwner();
+        self.y.markNoOwner();
+        self.width.markNoOwner();
+        self.height.markNoOwner();
+        self.zoom.markNoOwner();
+        // Mark ancestors' has_dirty_descendants by walking up the parent chain
         if (self.parent_block) |parent| {
-            parent.mark();
+            if (parent.has_dirty_descendants) return;
+            parent.has_dirty_descendants = true;
+            var current: ?*BlockLayout = parent.parent_block;
+            while (current) |bp| {
+                if (bp.has_dirty_descendants) break;
+                bp.has_dirty_descendants = true;
+                current = bp.parent_block;
+            }
+            if (parent.document.has_dirty_descendants) return;
+            parent.document.has_dirty_descendants = true;
         } else {
-            self.document.mark();
+            if (self.document.has_dirty_descendants) return;
+            self.document.has_dirty_descendants = true;
         }
     }
 
@@ -2241,23 +2442,24 @@ pub const BlockLayout = struct {
     }
 
     pub fn layout(self: *BlockLayout, engine: *Layout) !void {
-        // TODO: Skip layout if nothing is dirty
-        // if (!self.layout_needed()) return;
+        // Skip layout if nothing is dirty
+        if (!self.layout_needed()) return;
 
         if (self.node_ptr) |ptr| {
             self.node = ptr.*;
         }
 
-        // Update position and dimensions (just compute, don't set dirty)
-        const parent_x = if (self.parent_block) |pb| pb.x else self.document.x;
-        self.x = parent_x;
+        // Compute position and dimensions
+        // Use .read() to register invalidation dependencies on parent/document/previous fields
+        const parent_x = if (self.parent_block) |pb| pb.x.read(&self.x).* else self.document.x.read(&self.x).*;
+        const parent_y = if (self.parent_block) |pb| pb.y.read(&self.y).* else self.document.y.read(&self.y).*;
+        const prev_y = if (self.previous) |prev| prev.y.read(&self.y).* + prev.height.read(&self.y).* else parent_y;
+        const parent_width = if (self.parent_block) |pb| pb.width.read(&self.width).* else self.document.width.read(&self.width).*;
 
-        const parent_y = if (self.parent_block) |pb| pb.y else self.document.y;
-        const prev_y = if (self.previous) |prev| prev.y + prev.height else parent_y;
-        self.y = prev_y;
-
-        const parent_width = if (self.parent_block) |pb| pb.width else self.document.width;
-        self.width = parent_width;
+        // Set x, y, width early so children can read them
+        self.x.set(parent_x);
+        self.y.set(prev_y);
+        self.width.set(parent_width);
 
         var is_block = self.isBlockContainer();
         if (self.node == .element) {
@@ -2288,7 +2490,7 @@ pub const BlockLayout = struct {
             }
 
             // Rebuild if children are dirty OR if we have no children yet (first layout)
-            if (children_dirty or self.children.items.len == 0) {
+            if (children_dirty or self.children_version.dirty or self.children.items.len == 0) {
                 for (self.children.items) |child| {
                     child.deinit(self.allocator);
                 }
@@ -2305,24 +2507,28 @@ pub const BlockLayout = struct {
                     },
                     else => {},
                 }
+                self.children_epoch += 1;
+                self.children_version.set(self.children_epoch);
             }
 
             // Layout all children and compute height
+            // Use .read() to register invalidation dependencies on children's heights
             var computed_height: i32 = 0;
+            _ = self.children_version.read(&self.height);
             for (self.children.items) |child| {
                 switch (child) {
                     .block => |b| {
                         try b.layout(engine);
-                        computed_height += b.height;
+                        computed_height += b.height.read(&self.height).*;
                     },
                     .line => |l| {
                         try l.layout(engine);
-                        computed_height += l.height;
+                        computed_height += l.height.read(&self.height).*;
                     },
                 }
             }
-            // Just compute, don't set dirty
-            self.height = computed_height;
+            self.height.set(computed_height);
+            self.zoom.set(1.0);
 
             try recordContentEditableFocusBounds(engine, self);
         } else {
@@ -2336,18 +2542,26 @@ pub const BlockLayout = struct {
                 }
                 self.children.clearRetainingCapacity();
             }
+            self.children_epoch += 1;
+            self.children_version.set(self.children_epoch);
 
             try recordContentEditableFocusBounds(engine, self);
-            // Height is set by layoutInlineBlock
+            // Height is set by layoutInlineBlock - need to ensure it uses .set()
         }
 
-        // Clear flags after layout pass
-        self.dirty = false;
+        // Clear descendant flags after layout pass
         self.has_dirty_descendants = false;
     }
 
     pub fn layout_needed(self: *const BlockLayout) bool {
-        return self.dirty or self.has_dirty_descendants;
+        if (self.zoom.dirty) return true;
+        if (self.x.dirty) return true;
+        if (self.y.dirty) return true;
+        if (self.width.dirty) return true;
+        if (self.height.dirty) return true;
+        if (self.children_version.dirty) return true;
+        if (self.has_dirty_descendants) return true;
+        return false;
     }
 
     pub fn shouldPaint(self: *const BlockLayout) bool {
@@ -2391,9 +2605,9 @@ fn appendContentEditableCursor(self: *Layout, commands: *std.ArrayList(DisplayIt
 
     const cursor_color = self.remapColor(.{ .r = 255, .g = 0, .b = 0, .a = 255 });
     if (findLastTextLayout(block)) |text| {
-        const cursor_x = text.x + text.width;
-        const cursor_y = text.y;
-        const cursor_height = text.height;
+        const cursor_x = text.x.get().* + text.width.get().*;
+        const cursor_y = text.y.get().*;
+        const cursor_height = text.height.get().*;
         try drawCursor(commands, self.allocator, cursor_x, cursor_y, cursor_height, cursor_color);
         return;
     }
@@ -2406,7 +2620,7 @@ fn appendContentEditableCursor(self: *Layout, commands: *std.ArrayList(DisplayIt
         false,
     );
     const cursor_height = self.toLayoutPx(glyph.ascent + glyph.descent);
-    try drawCursor(commands, self.allocator, block.x, block.y, cursor_height, cursor_color);
+    try drawCursor(commands, self.allocator, block.x.get().*, block.y.get().*, cursor_height, cursor_color);
 }
 
 fn recordContentEditableFocusBounds(self: *Layout, block: *const BlockLayout) !void {
@@ -2416,7 +2630,7 @@ fn recordContentEditableFocusBounds(self: *Layout, block: *const BlockLayout) !v
     if (element.attributes.?.get("contenteditable") == null) return;
     const node_ptr = block.node_ptr orelse return;
 
-    var height = block.height;
+    var height = block.height.get().*;
     if (height <= 0) {
         const glyph = try self.font_manager.getStyledGlyph(
             "X",
@@ -2429,9 +2643,9 @@ fn recordContentEditableFocusBounds(self: *Layout, block: *const BlockLayout) !v
     }
 
     const block_bounds = Bounds{
-        .x = block.x,
-        .y = block.y,
-        .width = block.width,
+        .x = block.x.get().*,
+        .y = block.y.get().*,
+        .width = block.width.get().*,
         .height = height,
     };
 
@@ -2468,11 +2682,11 @@ fn layoutInlineBlock(self: *Layout, block: *BlockLayout) !void {
     }
     self.inline_block = block;
 
-    self.line_left = block.x;
-    const block_width = block.width;
-    self.line_right = block.x + block_width;
+    self.line_left = block.x.get().*;
+    const block_width = block.width.get().*;
+    self.line_right = block.x.get().* + block_width;
     self.cursor_x = if (self.rtl_text) self.line_right else self.line_left;
-    self.cursor_y = block.y;
+    self.cursor_y = block.y.get().*;
     self.size = self.default_font_size;
     self.is_bold = false;
     self.is_italic = false;
@@ -2519,8 +2733,9 @@ fn layoutInlineBlock(self: *Layout, block: *BlockLayout) !void {
     }
 
     try self.flushLine(&line_buffer);
-    const computed_height = self.cursor_y - block.y;
-    block.height = if (computed_height < 0) 0 else computed_height;
+    const computed_height = self.cursor_y - block.y.get().*;
+    block.height.set(if (computed_height < 0) 0 else computed_height);
+    block.zoom.set(1.0);
 }
 
 fn parseColor(color_str: []const u8) ?browser.Color {
@@ -2583,17 +2798,17 @@ fn addBackgroundIfNeeded(self: *Layout, block: *const BlockLayout) !void {
 
     switch (block.node) {
         .element => |e| {
-            if (block.height <= 0) return;
+            if (block.height.get().* <= 0) return;
 
             // Check for background-color in the style attribute
             const bgcolor_str = if (e.style) |*style_field|
-                style_field.get().get("background-color")
+                style_field.read(&block.height).get("background-color")
             else
                 null;
 
             // Check for border-radius
             const border_radius_str = if (e.style) |*style_field|
-                style_field.get().get("border-radius")
+                style_field.read(&block.height).get("border-radius")
             else
                 null;
 
@@ -2623,10 +2838,10 @@ fn addBackgroundIfNeeded(self: *Layout, block: *const BlockLayout) !void {
                     }
                 }
 
-                const block_width = block.width;
-                const block_x = block.x;
-                const block_y = block.y;
-                const block_height = block.height;
+                const block_width = block.width.get().*;
+                const block_x = block.x.get().*;
+                const block_y = block.y.get().*;
+                const block_height = block.height.get().*;
                 if (radius > 0.0) {
                     // Use rounded rectangle
                     const rounded_rect = DisplayItem{ .rounded_rect = .{
@@ -2667,7 +2882,7 @@ pub fn paintDocument(self: *Layout, document: *DocumentLayout) ![]DisplayItem {
     self.display_list.clearRetainingCapacity();
 
     if (self.document_color_scheme_dark) {
-        const height = document.height + v_offset;
+        const height = document.height.get().* + v_offset;
         const width = self.layoutWindowWidth();
         const bg_color = if (self.accessibility.dark_palette) |palette|
             palette.background
@@ -2687,39 +2902,58 @@ pub fn paintDocument(self: *Layout, document: *DocumentLayout) ![]DisplayItem {
         try paintBlockTree(self, child);
     }
 
-    self.content_height = document.height + v_offset;
+    self.content_height = document.height.get().* + v_offset;
     return try self.display_list.toOwnedSlice(self.allocator);
 }
 
 // Paint a block and its subtree, applying stacking context effects
 fn paintBlockTree(self: *Layout, block: *BlockLayout) !void {
+    std.debug.print("[PAINT_BLOCK] paintBlockTree entry\n", .{});
     // Only paint if the block should be painted
-    if (!block.shouldPaint()) return;
+    if (!block.shouldPaint()) {
+        std.debug.print("[PAINT_BLOCK] shouldPaint=false, returning\n", .{});
+        return;
+    }
+    std.debug.print("[PAINT_BLOCK] shouldPaint=true\n", .{});
 
     // Collect all display commands for this block and its subtree
     var commands = std.ArrayList(DisplayItem).empty;
     defer commands.deinit(self.allocator);
 
     // Add the block's own background/borders
+    std.debug.print("[PAINT_BLOCK] calling addBackgroundIfNeeded\n", .{});
     try addBackgroundIfNeeded(self, block);
+    std.debug.print("[PAINT_BLOCK] addBackgroundIfNeeded done\n", .{});
 
     // Add the block's display items (from children like text, etc.)
+    std.debug.print("[PAINT_BLOCK] adding {} display items\n", .{block.display_list.items.len});
     for (block.display_list.items) |item| {
         try commands.append(self.allocator, item);
     }
+    std.debug.print("[PAINT_BLOCK] display items done\n", .{});
 
     // Recursively paint children
+    std.debug.print("[PAINT_BLOCK] painting {} children\n", .{block.children.items.len});
     for (block.children.items) |child| {
         switch (child) {
-            .block => |b| try paintBlockTreeRecursive(&commands, self, b),
-            .line => |l| try l.paintToList(&commands, self),
+            .block => |b| {
+                std.debug.print("[PAINT_BLOCK] recursive block\n", .{});
+                try paintBlockTreeRecursive(&commands, self, b);
+            },
+            .line => |l| {
+                std.debug.print("[PAINT_BLOCK] line\n", .{});
+                try l.paintToList(&commands, self);
+            },
         }
     }
+    std.debug.print("[PAINT_BLOCK] children painted\n", .{});
 
     try appendContentEditableCursor(self, &commands, block);
+    std.debug.print("[PAINT_BLOCK] cursor done\n", .{});
 
     // Apply visual effects (opacity, etc.) to wrap the entire subtree
     const final_commands = try applyPaintEffects(self, block, commands.items);
+    std.debug.print("[PAINT_BLOCK] effects done\n", .{});
 
     // Add the final commands to the display list
     for (final_commands) |cmd| {
@@ -2782,7 +3016,7 @@ fn applyPaintEffects(self: *Layout, block: *BlockLayout, commands: []DisplayItem
     if (block.node == .element) {
         const elem = block.node.element;
         if (elem.style) |*style_field| {
-            const style = style_field.get();
+            const style = style_field.read(&block.height);
             // Check for active opacity animation first
             if (elem.animations) |animations| {
                 if (animations.get("opacity")) |anim| {
@@ -2834,10 +3068,10 @@ fn applyPaintEffects(self: *Layout, block: *BlockLayout, commands: []DisplayItem
         const clip_blend_mode = try self.allocator.alloc(u8, 6);
         @memcpy(clip_blend_mode, "dst_in");
 
-        const block_width = block.width;
-        const block_x = block.x;
-        const block_y = block.y;
-        const block_height = block.height;
+        const block_width = block.width.get().*;
+        const block_x = block.x.get().*;
+        const block_y = block.y.get().*;
+        const block_height = block.height.get().*;
         const clip_mask_commands = try self.allocator.alloc(DisplayItem, 1);
         clip_mask_commands[0] = DisplayItem{
             .rounded_rect = .{
@@ -2955,17 +3189,17 @@ fn addBackgroundIfNeededToList(self: *Layout, commands: *std.ArrayList(DisplayIt
 
     switch (block.node) {
         .element => |e| {
-            if (block.height <= 0) return;
+            if (block.height.get().* <= 0) return;
 
             // Check for background-color in the style attribute
             const bgcolor_str = if (e.style) |*style_field|
-                style_field.get().get("background-color")
+                style_field.read(&block.height).get("background-color")
             else
                 null;
 
             // Check for border-radius
             const border_radius_str = if (e.style) |*style_field|
-                style_field.get().get("border-radius")
+                style_field.read(&block.height).get("border-radius")
             else
                 null;
 
@@ -2995,10 +3229,10 @@ fn addBackgroundIfNeededToList(self: *Layout, commands: *std.ArrayList(DisplayIt
                     }
                 }
 
-                const block_width = block.width;
-                const block_x = block.x;
-                const block_y = block.y;
-                const block_height = block.height;
+                const block_width = block.width.get().*;
+                const block_x = block.x.get().*;
+                const block_y = block.y.get().*;
+                const block_height = block.height.get().*;
                 if (radius > 0.0) {
                     // Use rounded rectangle
                     const rounded_rect = DisplayItem{ .rounded_rect = .{

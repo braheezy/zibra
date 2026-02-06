@@ -113,8 +113,10 @@ pub const TaskRunner = struct {
         self.condition.broadcast();
         self.mutex.unlock();
 
+        // Don't join the thread - if a task is stuck, joining will hang forever.
+        // The thread will terminate when the process exits.
         if (self.thread) |thread| {
-            thread.join();
+            thread.detach();
             self.thread = null;
         }
     }

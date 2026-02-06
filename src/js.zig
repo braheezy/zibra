@@ -679,6 +679,14 @@ fn requestRender(self: *Js) void {
     }
 }
 
+fn markElementLayoutDirty(e: *parser.Element) void {
+    if (e.layout_ptr) |ptr| {
+        if (e.layout_mark) |mark_fn| {
+            mark_fn(ptr);
+        }
+    }
+}
+
 /// Dispatch an event to the JavaScript environment for the given node
 /// Returns true if the default action should proceed.
 pub fn dispatchEvent(self: *Js, window_id: u32, event_type: []const u8, node: *Node) !bool {
@@ -1450,6 +1458,7 @@ fn setAttribute(agent: *Agent, this_value: Value, arguments: kiesel.types.Argume
                 (std.mem.eql(u8, attr_name, "width") or std.mem.eql(u8, attr_name, "height")))
             {
                 e.children_dirty = true;
+                markElementLayoutDirty(e);
             }
 
             js_instance.requestRender();
@@ -1581,15 +1590,16 @@ fn innerHTML(agent: *Agent, this_value: Value, arguments: kiesel.types.Arguments
             }
             e.children.clearRetainingCapacity();
 
-                for (body_children.items) |child| {
-                    try e.children.append(js_instance.allocator, child);
-                }
+            for (body_children.items) |child| {
+                try e.children.append(js_instance.allocator, child);
+            }
 
-                e.children_dirty = true;
+            e.children_dirty = true;
+            markElementLayoutDirty(e);
 
-                if (e.owned_strings == null) {
-                    e.owned_strings = std.ArrayList([]const u8).empty;
-                }
+            if (e.owned_strings == null) {
+                e.owned_strings = std.ArrayList([]const u8).empty;
+            }
             try e.owned_strings.?.append(js_instance.allocator, wrapped_html);
             wrapped_cleanup = false;
 
@@ -1706,6 +1716,7 @@ fn styleSet(agent: *Agent, this_value: Value, arguments: kiesel.types.Arguments)
 
             if (e.style) |*style_field| {
                 style_field.mark();
+                markElementLayoutDirty(e);
             }
 
             js_instance.requestRender();
