@@ -168,7 +168,7 @@ pub const Frame = struct {
             try parser.style(browser.allocator, &self.current_node.?, self.rules.items);
         }
         if (needs_layout or needs_paint) {
-            try browser.layoutTabNodes(self);
+            try browser.layoutTabNodes(self, needs_paint);
         }
     }
 
@@ -344,6 +344,7 @@ pub const Frame = struct {
                             try attrs.put("value", "");
                         }
                         e.is_focused = true;
+                        parser.dirtyStyleForElement(e);
                         self.focus = node_ptr;
                         self.tab.focused_frame = self;
                         self.tab.updateAccessibilityFocus(b);
@@ -356,6 +357,7 @@ pub const Frame = struct {
                         return true;
                     }
                     e.is_focused = true;
+                    parser.dirtyStyleForElement(e);
                     self.focus = node_ptr;
                     self.tab.focused_frame = self;
                     self.tab.updateAccessibilityFocus(b);
@@ -789,20 +791,26 @@ fn refreshFocusState(self: *Tab) !void {
 
         var found = false;
         for (node_list.items) |node_ptr| {
-            if (node_ptr == target.focus.?) {
-                found = true;
-                switch (node_ptr.*) {
-                    .element => |*e| e.is_focused = true,
-                    else => {},
+                if (node_ptr == target.focus.?) {
+                    found = true;
+                    switch (node_ptr.*) {
+                        .element => |*e| {
+                            e.is_focused = true;
+                            parser.dirtyStyleForElement(e);
+                        },
+                        else => {},
+                    }
+                    break;
                 }
-                break;
-            }
         }
 
         if (!found) {
             if (target.focus) |focus_node| {
                 switch (focus_node.*) {
-                    .element => |*e| e.is_focused = false,
+                    .element => |*e| {
+                        e.is_focused = false;
+                        parser.dirtyStyleForElement(e);
+                    },
                     else => {},
                 }
             }
@@ -1156,6 +1164,14 @@ fn advanceAnimations(self: *Tab, node: *parser.Node) bool {
 
                         // Record composited update for opacity animations
                         if (std.mem.eql(u8, entry.key_ptr.*, "opacity")) {
+                            if (elem.style) |*style_map| {
+                                if (style_map.getPtr("opacity")) |field| {
+                                    const buf = std.fmt.bufPrint(&elem.opacity_anim_value, "{d:.3}", .{anim.getValue()}) catch null;
+                                    if (buf) |value| {
+                                        field.set(value);
+                                    }
+                                }
+                            }
                             self.composited_updates.append(self.allocator, .{
                                 .node = @ptrCast(elem),
                                 .opacity = anim.getValue(),
@@ -1186,7 +1202,10 @@ pub fn click(self: *Tab, b: *Browser, x: i32, y: i32) !void {
     if (self.focused_frame) |focused| {
         if (focused.focus) |focus_node| {
             switch (focus_node.*) {
-                .element => |*e| e.is_focused = false,
+                .element => |*e| {
+                    e.is_focused = false;
+                    parser.dirtyStyleForElement(e);
+                },
                 else => {},
             }
             focused.focus = null;
@@ -1431,7 +1450,10 @@ pub fn cycleFocus(self: *Tab, b: *Browser, reverse: bool) !void {
     // Clear current focus
     if (frame.focus) |focus_node| {
         switch (focus_node.*) {
-            .element => |*e| e.is_focused = false,
+            .element => |*e| {
+                e.is_focused = false;
+                parser.dirtyStyleForElement(e);
+            },
             else => {},
         }
     }
@@ -1455,7 +1477,10 @@ pub fn cycleFocus(self: *Tab, b: *Browser, reverse: bool) !void {
 
     const to_focus = focusables.items[next_index];
     switch (to_focus.*) {
-        .element => |*e| e.is_focused = true,
+        .element => |*e| {
+            e.is_focused = true;
+            parser.dirtyStyleForElement(e);
+        },
         else => {},
     }
     frame.focus = to_focus;
@@ -1534,7 +1559,10 @@ pub fn clearFocus(self: *Tab, b: *Browser) !void {
     const frame = self.focused_frame orelse self.root_frame orelse return;
     if (frame.focus) |focus_node| {
         switch (focus_node.*) {
-            .element => |*e| e.is_focused = false,
+            .element => |*e| {
+                e.is_focused = false;
+                parser.dirtyStyleForElement(e);
+            },
             else => {},
         }
         frame.focus = null;
@@ -2142,7 +2170,10 @@ fn commandClick(self: *Tab, query: []const u8) void {
             frame.focus = dom;
             if (frame.focus) |focus_node| {
                 switch (focus_node.*) {
-                    .element => |*e| e.is_focused = true,
+                    .element => |*e| {
+                        e.is_focused = true;
+                        parser.dirtyStyleForElement(e);
+                    },
                     else => {},
                 }
             }

@@ -1675,9 +1675,9 @@ fn styleSet(agent: *Agent, this_value: Value, arguments: kiesel.types.Arguments)
 
             // Get old opacity value for transition detection
             var old_opacity: ?f64 = null;
-            if (e.style) |*style_field| {
-                if (style_field.get().get("opacity")) |op_str| {
-                    old_opacity = std.fmt.parseFloat(f64, op_str) catch null;
+            if (e.style) |*style_map| {
+                if (style_map.getPtr("opacity")) |field| {
+                    old_opacity = std.fmt.parseFloat(f64, field.get().*) catch null;
                 }
             }
 
@@ -1714,10 +1714,8 @@ fn styleSet(agent: *Agent, this_value: Value, arguments: kiesel.types.Arguments)
                 }
             } else |_| {}
 
-            if (e.style) |*style_field| {
-                style_field.mark();
-                markElementLayoutDirty(e);
-            }
+            parser.dirtyStyleForElement(e);
+            markElementLayoutDirty(e);
 
             js_instance.requestRender();
 

@@ -175,10 +175,12 @@ pub const Rect = struct {
     }
 
     pub fn width(self: Rect) i32 {
+        if (self.right <= self.left) return 0;
         return self.right - self.left;
     }
 
     pub fn height(self: Rect) i32 {
+        if (self.bottom <= self.top) return 0;
         return self.bottom - self.top;
     }
 
@@ -1041,7 +1043,8 @@ pub const Browser = struct {
                     }
                 }
                 if (chrome_changed) {
-                    self.setNeedsCompositeRasterDraw();
+                    // Chrome-only update; avoid recomposite if the display list is unchanged.
+                    self.setNeedsRasterDraw();
                 }
             },
             .mouse_wheel => |wheel_event| {
@@ -1253,7 +1256,8 @@ pub const Browser = struct {
                         self.scheduleTabClearFocusTask(active_tab);
                     }
                 }
-                self.setNeedsCompositeRasterDraw();
+                // Chrome-only update (clear focus UI); avoid recomposite if the display list is unchanged.
+                self.setNeedsRasterDraw();
                 try self.compositeRasterAndDraw();
                 return;
             },
@@ -1277,7 +1281,8 @@ pub const Browser = struct {
                     }
                 }
                 if (chrome_changed) {
-                    self.setNeedsCompositeRasterDraw();
+                    // Chrome-only update (address bar text); avoid recomposite if the display list is unchanged.
+                    self.setNeedsRasterDraw();
                     try self.compositeRasterAndDraw();
                 }
                 return;
@@ -1305,8 +1310,19 @@ pub const Browser = struct {
         if (screen_y < chrome_bottom) {
             self.focus = null;
             self.lock.unlock();
-            if (try self.chrome.click(self, screen_x, screen_y)) {
-                self.setNeedsCompositeRasterDraw();
+            var chrome_changed = try self.chrome.click(self, screen_x, screen_y);
+            if (!chrome_changed) {
+                // Fallback: focus address bar if click lands in the URL bar region.
+                if (screen_y >= self.chrome.urlbar_top and screen_y < self.chrome.urlbar_bottom and
+                    screen_x >= self.chrome.address_rect.left and screen_x < self.chrome.address_rect.right)
+                {
+                    self.chrome.focusAddressBar();
+                    chrome_changed = true;
+                }
+            }
+            if (chrome_changed) {
+                // Chrome-only update; avoid recomposite if the display list is unchanged.
+                self.setNeedsRasterDraw();
                 try self.compositeRasterAndDraw();
             }
             return;
@@ -1857,7 +1873,7 @@ pub const Browser = struct {
             try parser.style(self.allocator, &frame.current_node.?, frame.rules.items);
 
             // Layout using the HTML node tree
-            try self.layoutTabNodes(frame);
+            try self.layoutTabNodes(frame, true);
         }
 
         // Record navigation history and update current URL ownership
@@ -2219,7 +2235,7 @@ pub const Browser = struct {
         }
 
         try parser.style(self.allocator, &frame.current_node.?, frame.rules.items);
-        try self.layoutTabNodes(frame);
+        try self.layoutTabNodes(frame, true);
 
         frame.tab.setNeedsRender();
         frame.tab.runAnimationFrame(frame.scroll);
@@ -2653,7 +2669,7 @@ pub const Browser = struct {
         }
 
         try parser.style(self.allocator, &frame.current_node.?, frame.rules.items);
-        try self.layoutTabNodes(frame);
+        try self.layoutTabNodes(frame, true);
         try parent.children.append(parent.allocator, frame);
     }
 
@@ -2952,7 +2968,7 @@ pub const Browser = struct {
     }
 
     // Layout a tab's HTML nodes with the tree-based layout
-    pub fn layoutTabNodes(self: *Browser, frame: *Frame) !void {
+    pub fn layoutTabNodes(self: *Browser, frame: *Frame, force_paint: bool) !void {
         if (frame.current_node == null) {
             return error.NoNodeToLayout;
         }
@@ -2993,8 +3009,8 @@ pub const Browser = struct {
             }
         }
 
-        // Only repaint if layout actually ran
-        if (did_layout) {
+        // Repaint if layout ran or paint was requested
+        if (did_layout or force_paint) {
             // Paint the document to produce draw commands
             if (frame.display_list) |items| {
                 DisplayItem.freeList(self.allocator, items);
@@ -3031,11 +3047,13 @@ pub const Browser = struct {
         }
 
         if (focus_items.items.len > 0 and frame.display_list != null) {
+            const old_list = frame.display_list.?;
             var combined = std.ArrayList(DisplayItem).empty;
-            try combined.appendSlice(self.allocator, frame.display_list.?);
+            try combined.appendSlice(self.allocator, old_list);
             try combined.appendSlice(self.allocator, focus_items.items);
-            DisplayItem.freeList(self.allocator, frame.display_list.?);
             frame.display_list = try combined.toOwnedSlice(self.allocator);
+            // Only free the old container; the items (and their children) are now owned by the new list.
+            self.allocator.free(old_list);
         }
 
         // Debug: print display list tree once when opacity effects are present
@@ -3163,9 +3181,8 @@ pub const Browser = struct {
                     defer flattened.deinit(self.allocator);
                     try self.flattenSubtree(blend_item.children, &flattened);
 
-                    // Convert to owned slice for the layer
-                    const flattened_items = try self.allocator.alloc(DisplayItem, flattened.items.len);
-                    @memcpy(flattened_items, flattened.items);
+                    // Convert to owned slice for the layer (deep-clone to avoid aliasing display list storage)
+                    const flattened_items = try self.cloneDisplayItemList(flattened.items);
 
                     // Calculate bounds from flattened children
                     var bounds = Rect{ .left = std.math.maxInt(i32), .top = std.math.maxInt(i32), .right = std.math.minInt(i32), .bottom = std.math.minInt(i32) };
@@ -3631,6 +3648,13 @@ pub const Browser = struct {
         self.needs_draw = true;
     }
 
+    pub fn setNeedsRasterDraw(self: *Browser) void {
+        self.lock.lock();
+        defer self.lock.unlock();
+        self.needs_raster = true;
+        self.needs_draw = true;
+    }
+
     pub fn setNeedsAnimationFrame(self: *Browser, tab: *Tab) void {
         self.lock.lock();
         defer self.lock.unlock();
@@ -3654,19 +3678,30 @@ pub const Browser = struct {
 
         var has_display_list_change = false;
         if (data.display_list) |list| {
+            var incoming_list = list;
+            // Clone to avoid any accidental aliasing with the tab thread's list.
+            const cloned_list = self.cloneDisplayItemList(list) catch |err| blk: {
+                std.log.warn("Failed to clone display list for commit: {}", .{err});
+                break :blk null;
+            };
+            if (cloned_list) |cloned| {
+                DisplayItem.freeList(self.allocator, list);
+                incoming_list = cloned;
+            }
+
             if (self.active_tab_display_list) |old_list| {
                 DisplayItem.freeList(self.allocator, old_list);
             }
-            self.active_tab_display_list = list;
+            self.active_tab_display_list = incoming_list;
             // Set parent pointers for tree traversal
-            DisplayItem.setParentPointers(list, null);
+            DisplayItem.setParentPointers(incoming_list, null);
 
             // Debug: print display list tree once when opacity effects are present
             const S = struct {
                 var printed_opacity_debug: bool = false;
             };
-            if (!S.printed_opacity_debug and DisplayItem.hasOpacityEffects(list)) {
-                DisplayItem.debugPrintIfHasOpacity(list);
+            if (!S.printed_opacity_debug and DisplayItem.hasOpacityEffects(incoming_list)) {
+                DisplayItem.debugPrintIfHasOpacity(incoming_list);
                 S.printed_opacity_debug = true;
             }
             has_display_list_change = true;
@@ -4257,8 +4292,10 @@ pub const Browser = struct {
                     defer context.setOperator(original_operator);
 
                     // Draw the layer surface at its position with opacity.
-                    const layer_y = dcl.layer.bounds.top - scroll_offset;
-                    const layer_x = dcl.layer.bounds.left;
+                    const layer_y_i64 = @as(i64, dcl.layer.bounds.top) - @as(i64, scroll_offset);
+                    const layer_x_i64 = @as(i64, dcl.layer.bounds.left);
+                    const layer_y: i32 = @intCast(std.math.clamp(layer_y_i64, @as(i64, std.math.minInt(i32)), @as(i64, std.math.maxInt(i32))));
+                    const layer_x: i32 = @intCast(std.math.clamp(layer_x_i64, @as(i64, std.math.minInt(i32)), @as(i64, std.math.maxInt(i32))));
 
                     const layer_pixels = switch (layer_surface.*) {
                         .image_surface_rgba => |*img_surface| img_surface.buf,

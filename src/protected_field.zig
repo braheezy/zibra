@@ -13,6 +13,7 @@ pub fn ProtectedField(comptime T: type) type {
         name: []const u8 = "",
         owner_mark: ?*const fn (*anyopaque) void = null,
         owner_ptr: ?*anyopaque = null,
+        frozen_dependencies: bool = false,
 
         pub fn init(allocator: std.mem.Allocator, value: T) @This() {
             return .{
@@ -24,6 +25,7 @@ pub fn ProtectedField(comptime T: type) type {
                 .name = "",
                 .owner_mark = null,
                 .owner_ptr = null,
+                .frozen_dependencies = false,
             };
         }
 
@@ -37,8 +39,10 @@ pub fn ProtectedField(comptime T: type) type {
                 .name = name,
                 .owner_mark = null,
                 .owner_ptr = null,
+                .frozen_dependencies = false,
             };
         }
+
 
         pub fn deinit(self: *@This()) void {
             self.invalidations.deinit();
@@ -61,6 +65,14 @@ pub fn ProtectedField(comptime T: type) type {
         pub fn setOwner(self: *@This(), owner: anytype, mark_fn: *const fn (*anyopaque) void) void {
             self.owner_ptr = @ptrCast(@alignCast(owner));
             self.owner_mark = mark_fn;
+        }
+
+        pub fn addDependency(self: *@This(), dependency: anytype) void {
+            dependency.addInvalidation(self);
+        }
+
+        pub fn freezeDependencies(self: *@This()) void {
+            self.frozen_dependencies = true;
         }
 
         pub fn notify(self: *@This()) void {
@@ -92,7 +104,12 @@ pub fn ProtectedField(comptime T: type) type {
 
         pub fn read(self: *const @This(), target: anytype) *const T {
             const self_mut: *@This() = @constCast(self);
-            self_mut.addInvalidation(target);
+            const notify_ptr: *anyopaque = @ptrCast(@alignCast(@constCast(target)));
+            if (@hasField(@TypeOf(target.*), "frozen_dependencies") and target.frozen_dependencies) {
+                std.debug.assert(self.invalidations.contains(notify_ptr));
+            } else {
+                self_mut.addInvalidation(target);
+            }
             return self.get();
         }
 

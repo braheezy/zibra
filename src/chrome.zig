@@ -360,8 +360,7 @@ pub fn click(self: *Chrome, b: *Browser, x: i32, y: i32) !bool {
 
     // Check if clicked on address bar
     if (self.address_rect.containsPoint(x, y)) {
-        self.focus = "address bar";
-        self.address_bar.clearRetainingCapacity();
+        self.focusAddressBar();
         return true;
     }
 
@@ -377,6 +376,11 @@ pub fn click(self: *Chrome, b: *Browser, x: i32, y: i32) !bool {
     }
 
     return false;
+}
+
+pub fn focusAddressBar(self: *Chrome) void {
+    self.focus = "address bar";
+    self.address_bar.clearRetainingCapacity();
 }
 
 pub fn keypress(self: *Chrome, char: u8) !bool {

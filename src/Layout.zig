@@ -123,10 +123,77 @@ fn parseTranslate(value: []const u8) ?struct { x: i32, y: i32 } {
 }
 
 const EmbedLayout = struct {
-    width: i32 = 0,
-    height: i32 = 0,
-    ascent: i32 = 0,
-    descent: i32 = 0,
+    allocator: std.mem.Allocator,
+    deps_initialized: bool = false,
+    zoom: ProtectedField(f32),
+    font_stub: ProtectedField(i32),
+    width: ProtectedField(i32),
+    height: ProtectedField(i32),
+    ascent: ProtectedField(i32),
+    descent: ProtectedField(i32),
+
+    pub fn init(allocator: std.mem.Allocator) EmbedLayout {
+        return .{
+            .allocator = allocator,
+            .deps_initialized = false,
+            .zoom = ProtectedField(f32).init(allocator, 1.0),
+            .font_stub = ProtectedField(i32).init(allocator, 0),
+            .width = ProtectedField(i32).init(allocator, 0),
+            .height = ProtectedField(i32).init(allocator, 0),
+            .ascent = ProtectedField(i32).init(allocator, 0),
+            .descent = ProtectedField(i32).init(allocator, 0),
+        };
+    }
+
+    pub fn deinit(self: *EmbedLayout) void {
+        self.zoom.deinit();
+        self.font_stub.deinit();
+        self.width.deinit();
+        self.height.deinit();
+        self.ascent.deinit();
+        self.descent.deinit();
+    }
+
+    pub fn setupDependencies(self: *EmbedLayout, parent_block: ?*BlockLayout, style_map: ?*const parser.StyleMap) void {
+        if (self.deps_initialized) return;
+        self.deps_initialized = true;
+
+        if (parent_block) |parent| {
+            self.zoom.addDependency(&parent.zoom);
+        }
+        self.zoom.freezeDependencies();
+
+        self.font_stub.addDependency(&self.zoom);
+        if (style_map) |map| {
+            const map_mut = @constCast(map);
+            if (map_mut.getPtr("font-weight")) |field| self.font_stub.addDependency(field);
+            if (map_mut.getPtr("font-style")) |field| self.font_stub.addDependency(field);
+            if (map_mut.getPtr("font-size")) |field| self.font_stub.addDependency(field);
+        }
+        self.font_stub.freezeDependencies();
+
+        self.width.addDependency(&self.zoom);
+        self.width.freezeDependencies();
+
+        self.height.addDependency(&self.zoom);
+        self.height.addDependency(&self.font_stub);
+        self.height.addDependency(&self.width);
+        self.height.freezeDependencies();
+
+        self.ascent.addDependency(&self.height);
+        self.ascent.freezeDependencies();
+
+        self.descent.freezeDependencies();
+    }
+
+    pub fn setMetrics(self: *EmbedLayout, width_value: i32, height_value: i32, ascent_value: i32, descent_value: i32, zoom_value: f32, font_value: i32) void {
+        self.zoom.set(zoom_value);
+        self.font_stub.set(font_value);
+        self.width.set(width_value);
+        self.height.set(height_value);
+        self.ascent.set(ascent_value);
+        self.descent.set(descent_value);
+    }
 
     pub fn appendInline(
         self: *const EmbedLayout,
@@ -135,9 +202,11 @@ const EmbedLayout = struct {
         node_ptr: ?*Node,
         payload: LineItemPayload,
     ) !void {
-        if (self.width <= 0 or self.height <= 0) return;
+        const width_value = self.width.get().*;
+        const height_value = self.height.get().*;
+        if (width_value <= 0 or height_value <= 0) return;
 
-        if (engine.cursor_x + self.width > engine.line_right) {
+        if (engine.cursor_x + width_value > engine.line_right) {
             try engine.flushLine(line_buffer);
             engine.cursor_x = if (engine.rtl_text) engine.line_right else engine.line_left;
         }
@@ -146,65 +215,80 @@ const EmbedLayout = struct {
             .x = engine.cursor_x,
             .hit_offset_x = engine.transform_offset_x,
             .hit_offset_y = engine.transform_offset_y,
-            .ascent = self.ascent,
-            .descent = self.descent,
-            .width = self.width,
-            .height = self.height,
+            .ascent = self.ascent.get().*,
+            .descent = self.descent.get().*,
+            .width = width_value,
+            .height = height_value,
             .node_ptr = node_ptr,
             .payload = payload,
         });
-        engine.cursor_x += self.width;
+        engine.cursor_x += width_value;
     }
 };
 
 pub const ImageLayout = struct {
-    embed: EmbedLayout = .{},
+    embed: EmbedLayout,
     pixels: []const u8,
     source_width: i32,
     source_height: i32,
     opacity: f64 = 1.0,
 
     pub fn init(
+        allocator: std.mem.Allocator,
         layout_width: i32,
         layout_height: i32,
         image_data: ?parser.ImageData,
+        parent_block: ?*BlockLayout,
+        style_map: ?*const parser.StyleMap,
+        zoom_value: f32,
     ) ImageLayout {
         const empty_pixels = &[_]u8{};
         const src_width: i32 = if (image_data) |data| @intCast(data.image.width) else 0;
         const src_height: i32 = if (image_data) |data| @intCast(data.image.height) else 0;
-        return .{
-            .embed = .{
-                .width = layout_width,
-                .height = layout_height,
-                .ascent = layout_height,
-                .descent = 0,
-            },
+        var layout = ImageLayout{
+            .embed = EmbedLayout.init(allocator),
             .pixels = if (image_data) |data| data.image.rawBytes() else empty_pixels,
             .source_width = src_width,
             .source_height = src_height,
             .opacity = 1.0,
         };
+        layout.embed.setupDependencies(parent_block, style_map);
+        layout.embed.setMetrics(layout_width, layout_height, layout_height, 0, zoom_value, 0);
+        return layout;
+    }
+
+    pub fn deinit(self: *ImageLayout) void {
+        self.embed.deinit();
     }
 };
 
 pub const IframeLayout = struct {
-    embed: EmbedLayout = .{},
+    embed: EmbedLayout,
     bgcolor: browser.Color,
     border_color: browser.Color,
     border_thickness: i32 = 1,
 
-    pub fn init(layout_width: i32, layout_height: i32) IframeLayout {
-        return .{
-            .embed = .{
-                .width = layout_width,
-                .height = layout_height,
-                .ascent = layout_height,
-                .descent = 0,
-            },
+    pub fn init(
+        allocator: std.mem.Allocator,
+        layout_width: i32,
+        layout_height: i32,
+        parent_block: ?*BlockLayout,
+        style_map: ?*const parser.StyleMap,
+        zoom_value: f32,
+    ) IframeLayout {
+        var layout = IframeLayout{
+            .embed = EmbedLayout.init(allocator),
             .bgcolor = .{ .r = 0xf2, .g = 0xf2, .b = 0xf2, .a = 0xff },
             .border_color = .{ .r = 0x33, .g = 0x33, .b = 0x33, .a = 0xff },
             .border_thickness = 1,
         };
+        layout.embed.setupDependencies(parent_block, style_map);
+        layout.embed.setMetrics(layout_width, layout_height, layout_height, 0, zoom_value, 0);
+        return layout;
+    }
+
+    pub fn deinit(self: *IframeLayout) void {
+        self.embed.deinit();
     }
 
     pub fn paintAt(
@@ -214,8 +298,8 @@ pub const IframeLayout = struct {
         x: i32,
         y: i32,
     ) !void {
-        const width_value = self.embed.width;
-        const height_value = self.embed.height;
+        const width_value = self.embed.width.get().*;
+        const height_value = self.embed.height.get().*;
         const bg = engine.remapColor(self.bgcolor);
         if (bg.a > 0) {
             try commands.append(engine.allocator, DisplayItem{
@@ -255,6 +339,15 @@ const LineItemPayload = union(enum) {
     input: InputLayout,
     image: ImageLayout,
     iframe: IframeLayout,
+
+    pub fn deinit(self: *LineItemPayload) void {
+        switch (self.*) {
+            .glyph => {},
+            .input => |*input_payload| input_payload.deinit(),
+            .image => |*image_payload| image_payload.deinit(),
+            .iframe => |*iframe_payload| iframe_payload.deinit(),
+        }
+    }
 };
 
 const LineItem = struct {
@@ -698,7 +791,11 @@ fn handleImageElement(self: *Layout, node: Node, node_ptr: ?*Node, line_buffer: 
 
     if (layout_width <= 0 or layout_height <= 0) return;
 
-    var image_layout = ImageLayout.init(layout_width, layout_height, image_data);
+    const style_map = if (node == .element) blk: {
+        if (node.element.style) |*map| break :blk map;
+        break :blk null;
+    } else null;
+    var image_layout = ImageLayout.init(self.allocator, layout_width, layout_height, image_data, self.inline_block, style_map, self.zoom());
     try image_layout.embed.appendInline(self, line_buffer, node_ptr, .{
         .image = image_layout,
     });
@@ -732,7 +829,11 @@ fn handleIframeElement(self: *Layout, node: Node, node_ptr: ?*Node, line_buffer:
 
     if (layout_width <= 0 or layout_height <= 0) return;
 
-    var iframe_layout = IframeLayout.init(layout_width, layout_height);
+    const style_map = if (node == .element) blk: {
+        if (node.element.style) |*map| break :blk map;
+        break :blk null;
+    } else null;
+    var iframe_layout = IframeLayout.init(self.allocator, layout_width, layout_height, self.inline_block, style_map, self.zoom());
     try iframe_layout.embed.appendInline(self, line_buffer, node_ptr, .{
         .iframe = iframe_layout,
     });
@@ -748,6 +849,20 @@ const StyleSnapshot = struct {
     color_scheme_dark: bool,
 };
 
+fn styleValue(style_map: *const parser.StyleMap, property: []const u8) ?[]const u8 {
+    if (@constCast(style_map).getPtr(property)) |field| {
+        return field.get().*;
+    }
+    return null;
+}
+
+fn styleValueRead(style_map: *const parser.StyleMap, property: []const u8, notify: anytype) ?[]const u8 {
+    if (@constCast(style_map).getPtr(property)) |field| {
+        return field.read(notify).*;
+    }
+    return null;
+}
+
 fn applyNodeStyles(self: *Layout, element: parser.Element, _: *std.ArrayList(LineItem)) !void {
     // Save current style state including transform offsets
     const snapshot = StyleSnapshot{
@@ -761,23 +876,32 @@ fn applyNodeStyles(self: *Layout, element: parser.Element, _: *std.ArrayList(Lin
     };
     try self.style_stack.append(self.allocator, snapshot);
 
-    if (element.style) |*style_field| {
-        const style_map = if (self.inline_block) |blk|
-            style_field.read(&blk.height)
-        else
-            style_field.get();
+    if (element.style) |*style_map| {
+        const notify_target = if (self.inline_block) |blk| &blk.height else null;
         // Apply font-weight
-        if (style_map.get("font-weight")) |weight_str| {
+        if (notify_target) |target| {
+            if (styleValueRead(style_map, "font-weight", target)) |weight_str| {
+                self.is_bold = std.mem.eql(u8, weight_str, "bold");
+            }
+        } else if (styleValue(style_map, "font-weight")) |weight_str| {
             self.is_bold = std.mem.eql(u8, weight_str, "bold");
         }
 
         // Apply font-style
-        if (style_map.get("font-style")) |style_str| {
+        if (notify_target) |target| {
+            if (styleValueRead(style_map, "font-style", target)) |style_str| {
+                self.is_italic = std.mem.eql(u8, style_str, "italic");
+            }
+        } else if (styleValue(style_map, "font-style")) |style_str| {
             self.is_italic = std.mem.eql(u8, style_str, "italic");
         }
 
         // Apply font-size
-        if (style_map.get("font-size")) |size_str| {
+        const size_value = if (notify_target) |target|
+            styleValueRead(style_map, "font-size", target)
+        else
+            styleValue(style_map, "font-size");
+        if (size_value) |size_str| {
             if (std.mem.endsWith(u8, size_str, "px")) {
                 const size_num_str = size_str[0 .. size_str.len - 2];
                 if (std.fmt.parseFloat(f64, size_num_str)) |size_float| {
@@ -788,21 +912,21 @@ fn applyNodeStyles(self: *Layout, element: parser.Element, _: *std.ArrayList(Lin
         }
 
         // Apply color
-        if (style_map.get("color")) |color_str| {
+        if (styleValue(style_map, "color")) |color_str| {
             if (parseColor(color_str)) |color| {
                 self.text_color = color;
             }
         }
 
         // Apply transform to cumulative offset for hit testing
-        if (style_map.get("transform")) |transform_str| {
+        if (styleValue(style_map, "transform")) |transform_str| {
             if (parseTranslate(transform_str)) |translate| {
                 self.transform_offset_x += translate.x;
                 self.transform_offset_y += translate.y;
             }
         }
 
-        if (style_map.get("color-scheme")) |scheme| {
+        if (styleValue(style_map, "color-scheme")) |scheme| {
             self.color_scheme_dark = self.resolveColorScheme(scheme);
             if (std.mem.eql(u8, element.tag, "html") or std.mem.eql(u8, element.tag, "body")) {
                 self.document_color_scheme_dark = self.color_scheme_dark;
@@ -1035,6 +1159,11 @@ fn flushLine(self: *Layout, line_buffer: *std.ArrayList(LineItem)) !void {
             .node = entry.key_ptr.*,
             .bounds = entry.value_ptr.*,
         });
+    }
+
+    // Clean up embedded payload state now that the line is flushed.
+    for (line_buffer.items) |*item| {
+        item.payload.deinit();
     }
 
     // Advance cursor_y and reset cursor_x
@@ -1578,10 +1707,13 @@ pub const InputLayout = struct {
     is_focused: bool = false,
 
     pub fn init(allocator: std.mem.Allocator) InputLayout {
-        _ = allocator;
         return .{
-            .embed = .{},
+            .embed = EmbedLayout.init(allocator),
         };
+    }
+
+    pub fn deinit(self: *InputLayout) void {
+        self.embed.deinit();
     }
 
     pub fn measure(self: *InputLayout, engine: *Layout, element: parser.Element) !void {
@@ -1590,12 +1722,8 @@ pub const InputLayout = struct {
         self.font_size = engine.scaledFontSize(engine.size);
         self.color = engine.text_color;
 
-        if (element.style) |*style_field| {
-            const style_map = if (engine.inline_block) |blk|
-                style_field.read(&blk.height)
-            else
-                style_field.get();
-            if (style_map.get("background-color")) |bg| {
+        if (element.style) |*style_map| {
+            if (styleValue(style_map, "background-color")) |bg| {
                 if (parseColor(bg)) |col| {
                     self.bgcolor = col;
                 }
@@ -1627,19 +1755,18 @@ pub const InputLayout = struct {
             false,
         );
 
-        self.embed.width = INPUT_WIDTH_PX;
         const ascent_value = engine.toLayoutPx(glyph.ascent);
         const descent_value = engine.toLayoutPx(glyph.descent);
-        self.embed.ascent = ascent_value;
-        self.embed.descent = descent_value;
-        self.embed.height = ascent_value + descent_value;
+        const height_value = ascent_value + descent_value;
+        self.embed.setupDependencies(engine.inline_block, if (element.style) |*map| map else null);
+        self.embed.setMetrics(INPUT_WIDTH_PX, height_value, ascent_value, descent_value, engine.zoom(), self.font_size);
         self.is_focused = element.is_focused;
     }
 
     pub fn paintAt(self: *const InputLayout, commands: *std.ArrayList(DisplayItem), engine: *Layout, x: i32, y: i32) !void {
-        const width_value = self.embed.width;
-        const height_value = self.embed.height;
-        const ascent_value = self.embed.ascent;
+        const width_value = self.embed.width.get().*;
+        const height_value = self.embed.height.get().*;
+        const ascent_value = self.embed.ascent.get().*;
         const remapped_bg = engine.remapColor(self.bgcolor);
         if (remapped_bg.a > 0) {
             try commands.append(engine.allocator, DisplayItem{
@@ -1757,6 +1884,79 @@ pub const TextLayout = struct {
         text.height.setOwner(text, markOpaque);
         text.ascent.setOwner(text, markOpaque);
         text.descent.setOwner(text, markOpaque);
+
+        // Freeze dependencies for layout fields.
+        text.zoom.addDependency(&parent.zoom);
+        text.zoom.freezeDependencies();
+
+        if (previous) |prev| {
+            text.x.addDependency(&prev.x);
+            text.x.addDependency(&prev.width);
+        } else {
+            text.x.addDependency(&parent.x);
+        }
+        text.x.freezeDependencies();
+
+        text.y.addDependency(&text.ascent);
+        text.y.addDependency(&parent.y);
+        text.y.addDependency(&parent.ascent);
+        text.y.freezeDependencies();
+
+        text.width.addDependency(&text.zoom);
+        text.height.addDependency(&text.zoom);
+        text.ascent.addDependency(&text.zoom);
+        text.descent.addDependency(&text.zoom);
+
+        switch (text.node) {
+            .text => |*t| {
+                if (t.style) |*style_map| {
+                    if (style_map.getPtr("font-weight")) |field| {
+                        text.width.addDependency(field);
+                        text.height.addDependency(field);
+                        text.ascent.addDependency(field);
+                        text.descent.addDependency(field);
+                    }
+                    if (style_map.getPtr("font-style")) |field| {
+                        text.width.addDependency(field);
+                        text.height.addDependency(field);
+                        text.ascent.addDependency(field);
+                        text.descent.addDependency(field);
+                    }
+                    if (style_map.getPtr("font-size")) |field| {
+                        text.width.addDependency(field);
+                        text.height.addDependency(field);
+                        text.ascent.addDependency(field);
+                        text.descent.addDependency(field);
+                    }
+                }
+            },
+            .element => |*e| {
+                if (e.style) |*style_map| {
+                    if (style_map.getPtr("font-weight")) |field| {
+                        text.width.addDependency(field);
+                        text.height.addDependency(field);
+                        text.ascent.addDependency(field);
+                        text.descent.addDependency(field);
+                    }
+                    if (style_map.getPtr("font-style")) |field| {
+                        text.width.addDependency(field);
+                        text.height.addDependency(field);
+                        text.ascent.addDependency(field);
+                        text.descent.addDependency(field);
+                    }
+                    if (style_map.getPtr("font-size")) |field| {
+                        text.width.addDependency(field);
+                        text.height.addDependency(field);
+                        text.ascent.addDependency(field);
+                        text.descent.addDependency(field);
+                    }
+                }
+            },
+        }
+        text.width.freezeDependencies();
+        text.height.freezeDependencies();
+        text.ascent.freezeDependencies();
+        text.descent.freezeDependencies();
         return text;
     }
 
@@ -1917,6 +2117,7 @@ pub const LineLayout = struct {
 
     children: std.ArrayList(*TextLayout),
     has_dirty_descendants: bool = false,
+    initialized_fields: bool = false,
 
     fn markOpaque(ptr: *anyopaque) void {
         const self: *LineLayout = @ptrCast(@alignCast(ptr));
@@ -1943,6 +2144,7 @@ pub const LineLayout = struct {
             .ascent = ProtectedField(i32).init(allocator, 0),
             .descent = ProtectedField(i32).init(allocator, 0),
             .children = std.ArrayList(*TextLayout).empty,
+            .initialized_fields = false,
         };
         line.zoom.setOwner(line, markOpaque);
         line.x.setOwner(line, markOpaque);
@@ -1951,6 +2153,23 @@ pub const LineLayout = struct {
         line.height.setOwner(line, markOpaque);
         line.ascent.setOwner(line, markOpaque);
         line.descent.setOwner(line, markOpaque);
+
+        line.zoom.addDependency(&parent.zoom);
+        line.zoom.freezeDependencies();
+        line.x.addDependency(&parent.x);
+        line.x.freezeDependencies();
+        line.width.addDependency(&parent.width);
+        line.width.freezeDependencies();
+        if (previous) |prev| {
+            line.y.addDependency(&prev.y);
+            line.y.addDependency(&prev.height);
+        } else {
+            line.y.addDependency(&parent.y);
+        }
+        line.y.freezeDependencies();
+        line.height.addDependency(&line.ascent);
+        line.height.addDependency(&line.descent);
+        line.height.freezeDependencies();
         return line;
     }
 
@@ -1972,6 +2191,26 @@ pub const LineLayout = struct {
     pub fn layout(self: *LineLayout, engine: *Layout) !void {
         // Skip layout if nothing is dirty
         if (!self.layout_needed()) return;
+
+        if (!self.initialized_fields) {
+            var ascent_deps = std.ArrayList(*ProtectedField(i32)).empty;
+            var descent_deps = std.ArrayList(*ProtectedField(i32)).empty;
+            defer ascent_deps.deinit(self.allocator);
+            defer descent_deps.deinit(self.allocator);
+            for (self.children.items) |child| {
+                try ascent_deps.append(self.allocator, &child.ascent);
+                try descent_deps.append(self.allocator, &child.descent);
+            }
+            for (ascent_deps.items) |dep| {
+                self.ascent.addDependency(dep);
+            }
+            for (descent_deps.items) |dep| {
+                self.descent.addDependency(dep);
+            }
+            self.ascent.freezeDependencies();
+            self.descent.freezeDependencies();
+            self.initialized_fields = true;
+        }
 
         // Compute x position from parent block
         // Use .read() to register invalidation dependencies on parent's fields
@@ -2132,6 +2371,11 @@ pub const DocumentLayout = struct {
         document.width.setOwner(document, markOpaque);
         document.height.setOwner(document, markOpaque);
 
+        document.zoom.freezeDependencies();
+        document.x.freezeDependencies();
+        document.y.freezeDependencies();
+        document.width.freezeDependencies();
+
         return document;
     }
 
@@ -2179,6 +2423,12 @@ pub const DocumentLayout = struct {
         }
 
         const block = root_block.?;
+        if (!self.height.frozen_dependencies) {
+            self.height.addDependency(&block.height);
+            self.height.freezeDependencies();
+        } else {
+            self.height.addDependency(&block.height);
+        }
         block.node = self.node;
         block.node_ptr = self.node_ptr;
         try block.layout(engine);
@@ -2299,6 +2549,33 @@ pub const BlockLayout = struct {
         block.width.setOwner(block, markOpaque);
         block.height.setOwner(block, markOpaque);
         block.children_version.setOwner(block, markOpaque);
+
+        if (parent_block) |parent| {
+            block.zoom.addDependency(&parent.zoom);
+            block.x.addDependency(&parent.x);
+            block.width.addDependency(&parent.width);
+            if (previous) |prev| {
+                block.y.addDependency(&prev.y);
+                block.y.addDependency(&prev.height);
+            } else {
+                block.y.addDependency(&parent.y);
+            }
+        } else {
+            block.zoom.addDependency(&document.zoom);
+            block.x.addDependency(&document.x);
+            block.width.addDependency(&document.width);
+            if (previous) |prev| {
+                block.y.addDependency(&prev.y);
+                block.y.addDependency(&prev.height);
+            } else {
+                block.y.addDependency(&document.y);
+            }
+        }
+        block.zoom.freezeDependencies();
+        block.x.freezeDependencies();
+        block.y.freezeDependencies();
+        block.width.freezeDependencies();
+        block.children_version.freezeDependencies();
 
         if (node_ptr) |ptr| {
             switch (ptr.*) {
@@ -2452,9 +2729,11 @@ pub const BlockLayout = struct {
         // Compute position and dimensions
         // Use .read() to register invalidation dependencies on parent/document/previous fields
         const parent_x = if (self.parent_block) |pb| pb.x.read(&self.x).* else self.document.x.read(&self.x).*;
-        const parent_y = if (self.parent_block) |pb| pb.y.read(&self.y).* else self.document.y.read(&self.y).*;
-        const prev_y = if (self.previous) |prev| prev.y.read(&self.y).* + prev.height.read(&self.y).* else parent_y;
         const parent_width = if (self.parent_block) |pb| pb.width.read(&self.width).* else self.document.width.read(&self.width).*;
+        const prev_y = if (self.previous) |prev|
+            prev.y.read(&self.y).* + prev.height.read(&self.y).*
+        else
+            if (self.parent_block) |pb| pb.y.read(&self.y).* else self.document.y.read(&self.y).*;
 
         // Set x, y, width early so children can read them
         self.x.set(parent_x);
@@ -2511,6 +2790,22 @@ pub const BlockLayout = struct {
                 self.children_version.set(self.children_epoch);
             }
 
+            {
+                var height_deps = std.ArrayList(*ProtectedField(i32)).empty;
+                defer height_deps.deinit(self.allocator);
+                for (self.children.items) |child| {
+                    switch (child) {
+                        .block => |b| try height_deps.append(self.allocator, &b.height),
+                        .line => |l| try height_deps.append(self.allocator, &l.height),
+                    }
+                }
+                for (height_deps.items) |dep| {
+                    self.height.addDependency(dep);
+                }
+                self.height.addDependency(&self.children_version);
+                self.height.frozen_dependencies = true;
+            }
+
             // Layout all children and compute height
             // Use .read() to register invalidation dependencies on children's heights
             var computed_height: i32 = 0;
@@ -2534,6 +2829,7 @@ pub const BlockLayout = struct {
         } else {
             // Inline layout mode - use the old approach for now
             // TODO: Refactor to populate LineLayout and TextLayout objects
+            self.height.frozen_dependencies = false;
             try engine.layoutInlineBlock(self);
 
             if (self.children.items.len > 0) {
@@ -2801,14 +3097,14 @@ fn addBackgroundIfNeeded(self: *Layout, block: *const BlockLayout) !void {
             if (block.height.get().* <= 0) return;
 
             // Check for background-color in the style attribute
-            const bgcolor_str = if (e.style) |*style_field|
-                style_field.read(&block.height).get("background-color")
+            const bgcolor_str = if (e.style) |*style_map|
+                styleValue(style_map, "background-color")
             else
                 null;
 
             // Check for border-radius
-            const border_radius_str = if (e.style) |*style_field|
-                style_field.read(&block.height).get("border-radius")
+            const border_radius_str = if (e.style) |*style_map|
+                styleValue(style_map, "border-radius")
             else
                 null;
 
@@ -3015,8 +3311,7 @@ fn applyPaintEffects(self: *Layout, block: *BlockLayout, commands: []DisplayItem
 
     if (block.node == .element) {
         const elem = block.node.element;
-        if (elem.style) |*style_field| {
-            const style = style_field.read(&block.height);
+        if (elem.style) |*style_map| {
             // Check for active opacity animation first
             if (elem.animations) |animations| {
                 if (animations.get("opacity")) |anim| {
@@ -3026,17 +3321,17 @@ fn applyPaintEffects(self: *Layout, block: *BlockLayout, commands: []DisplayItem
             }
             // Fall back to style value if no animation
             if (opacity == 1.0) {
-                if (style.get("opacity")) |op_str| {
+                if (styleValue(style_map, "opacity")) |op_str| {
                     opacity = std.fmt.parseFloat(f64, op_str) catch 1.0;
                     opacity = @max(0.0, @min(1.0, opacity)); // Clamp to valid range
                 }
             }
-            if (style.get("mix-blend-mode")) |blend_str| {
+            if (styleValue(style_map, "mix-blend-mode")) |blend_str| {
                 blend_mode = blend_str;
             }
-            if (std.mem.eql(u8, style.get("overflow") orelse "visible", "clip")) {
+            if (std.mem.eql(u8, styleValue(style_map, "overflow") orelse "visible", "clip")) {
                 should_clip = true;
-                if (style.get("border-radius")) |radius_str| {
+                if (styleValue(style_map, "border-radius")) |radius_str| {
                     // Parse border-radius (e.g., "30px" -> 30.0)
                     if (std.mem.endsWith(u8, radius_str, "px")) {
                         const radius_value = radius_str[0 .. radius_str.len - 2];
@@ -3045,7 +3340,7 @@ fn applyPaintEffects(self: *Layout, block: *BlockLayout, commands: []DisplayItem
                 }
             }
             // Parse transform: translate(xpx, ypx)
-            if (style.get("transform")) |transform_str| {
+            if (styleValue(style_map, "transform")) |transform_str| {
                 if (parseTranslate(transform_str)) |translate| {
                     transform_x = translate.x;
                     transform_y = translate.y;
@@ -3192,14 +3487,14 @@ fn addBackgroundIfNeededToList(self: *Layout, commands: *std.ArrayList(DisplayIt
             if (block.height.get().* <= 0) return;
 
             // Check for background-color in the style attribute
-            const bgcolor_str = if (e.style) |*style_field|
-                style_field.read(&block.height).get("background-color")
+            const bgcolor_str = if (e.style) |*style_map|
+                styleValue(style_map, "background-color")
             else
                 null;
 
             // Check for border-radius
-            const border_radius_str = if (e.style) |*style_field|
-                style_field.read(&block.height).get("border-radius")
+            const border_radius_str = if (e.style) |*style_map|
+                styleValue(style_map, "border-radius")
             else
                 null;
 
@@ -3294,8 +3589,7 @@ pub fn layoutTreeToList(document: *DocumentLayout, list: *std.ArrayList(LayoutOb
 fn blockToList(block: *BlockLayout, list: *std.ArrayList(LayoutObject)) !void {
     try list.append(block.allocator, .{ .block = block });
 
-    const children = block.children.get();
-    for (children.items) |child| {
+    for (block.children.items) |child| {
         switch (child) {
             .block => |b| try blockToList(b, list),
             .line => |l| {
