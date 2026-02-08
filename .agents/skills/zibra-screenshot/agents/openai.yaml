@@ -1,0 +1,4 @@
+interface:
+  display_name: "Zibra Screenshot"
+  short_description: "Capture Zibra screenshots (Docker headless or macOS GUI)."
+  default_prompt: "Capture a screenshot of Zibra rendering a page and return the image path."

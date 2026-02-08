@@ -1,5 +1,5 @@
 zibra
-.zig-cache
+.zig-cache*
 zig-out
 autorun
 tests
