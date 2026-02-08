@@ -32,40 +32,6 @@ zibra https://example.org
 
 Run without a URL for a default HTML.
 
-## Supported Features
-
-`zibra` is small but supports the basics:
-
-- HTTP/1.1
-- HTTPS
-- `file://` URIs
-- `data:` URIs
-- Entity support:
-  - `&amp;` → `&` (ampersand)
-  - `&lt;` → `<` (less than)
-  - `&gt;` → `>` (greater than)
-  - `&quot;` → `"` (quotation mark)
-  - `&apos;` → `'` (apostrophe)
-  - `&shy;` → `­` (soft hyphen)
-- Connections that live beyond single request for `Connection: keep-alive` header
-- Redirects
-- `Cache-Control` header
-- `Content-Encoding: gzip` and `Transfer-Encoding: chunked` headers
-- Emojis and CJK text
-- Various tags for styling:
-  - `<b>Bold</b>`
-  - `<i>Italic</i>`
-  - `<big>Larger text</big>`
-  - `<small>Smaller text</small>`
-  - `<sup>Superscript</sup>`
-  - `<h1 class="title">Centered title</h1>`: An `h1` with `class` set to `title` will be centered
-  - `<abbr>Abbreviations</abbr>`
-  - `<pre>Preformatted text</pre>`: Including bold and italic variants
-- HTML parsing features:
-  - Automatic insertion of implicit `<html>`, `<head>`, and `<body>` tags
-  - Proper handling of self-closing tags like `<img />`, `<br />`, and `<input />`
-  - Support for quoted, unquoted, and boolean HTML attributes
-
 ## Development
 
 There's more Zig commands:
