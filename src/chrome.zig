@@ -438,6 +438,9 @@ pub fn enter(self: *Chrome, b: *Browser) !bool {
                     std.log.err("Failed to load URL: {any}", .{err});
                     return false;
                 };
+                // Update the displayed URL immediately so we don't flash the old one
+                // while the new page loads.
+                b.setActiveTabUrl(url_ptr);
                 url_owned = false;
             }
 

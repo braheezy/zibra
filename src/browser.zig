@@ -1215,7 +1215,37 @@ pub const Browser = struct {
                 }
                 return;
             },
-            .@"return", .space => {
+            .@"return" => {
+                const chrome_changed = try self.chrome.enter(self);
+                if (chrome_changed) {
+                    // Chrome-only update (clear address bar text); avoid recomposite if the display list is unchanged.
+                    self.setNeedsRasterDraw();
+                    try self.compositeRasterAndDraw();
+                    return;
+                }
+
+                self.lock.lock();
+                const tab = self.activeTab();
+                const should_activate = if (self.focus) |focus_str|
+                    std.mem.eql(u8, focus_str, "content")
+                else
+                    if (tab) |active_tab| blk: {
+                        if (active_tab.root_frame) |frame| {
+                            break :blk frame.focus != null;
+                        }
+                        break :blk false;
+                    } else false;
+                self.lock.unlock();
+                if (should_activate) {
+                    if (tab) |active_tab| {
+                        active_tab.activateFocusedElement(self) catch |err| {
+                            std.log.warn("Failed to activate focused element: {}", .{err});
+                        };
+                    }
+                }
+                return;
+            },
+            .space => {
                 self.lock.lock();
                 const tab = self.activeTab();
                 const should_activate = if (self.focus) |focus_str|
@@ -3777,6 +3807,10 @@ pub const Browser = struct {
                 return;
             }
         }
+    }
+
+    pub fn setActiveTabUrl(self: *Browser, url: *Url) void {
+        self.updateActiveTabUrl(url);
     }
 
     fn updateActiveTabUrl(self: *Browser, url: *Url) void {
