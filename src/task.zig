@@ -1,5 +1,6 @@
 const std = @import("std");
 const MeasureTime = @import("measure_time.zig").MeasureTime;
+const sync = @import("sync.zig");
 
 pub const Task = struct {
     context: *anyopaque,
@@ -32,8 +33,8 @@ pub const Task = struct {
 pub const TaskRunner = struct {
     allocator: std.mem.Allocator,
     tasks: std.ArrayList(Task),
-    mutex: std.Thread.Mutex = .{},
-    condition: std.Thread.Condition = .{},
+    mutex: sync.Mutex,
+    condition: sync.Condition,
     needs_quit: bool = false,
     shutting_down: bool = false,
     thread: ?std.Thread = null,
@@ -43,6 +44,8 @@ pub const TaskRunner = struct {
         return .{
             .allocator = allocator,
             .tasks = std.ArrayList(Task).empty,
+            .mutex = .init(measure.io),
+            .condition = .init(measure.io),
             .measure = measure,
         };
     }
@@ -54,7 +57,7 @@ pub const TaskRunner = struct {
 
     pub fn start(self: *TaskRunner) !void {
         const thread = try std.Thread.spawn(.{}, runThread, .{self});
-        _ = thread.setName("Tab main thread") catch |err| {
+        _ = thread.setName(self.measure.io, "Tab main thread") catch |err| {
             std.log.warn("Failed to name tab thread: {}", .{err});
         };
         self.thread = thread;

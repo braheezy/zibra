@@ -1,4 +1,5 @@
 const std = @import("std");
+const Mutex = @import("sync.zig").Mutex;
 
 pub const MeasureTime = struct {
     const ThreadInfo = struct {
@@ -6,39 +7,47 @@ pub const MeasureTime = struct {
         name: []u8,
     };
 
-    file: ?std.fs.File,
+    file: ?std.Io.File,
+    io: std.Io,
+    environ: *const std.process.Environ.Map,
     allocator: std.mem.Allocator,
     needs_comma: bool,
-    lock: std.Thread.Mutex = .{},
+    lock: Mutex,
     thread_infos: std.ArrayList(ThreadInfo),
     enabled: bool,
 
-    pub fn init(allocator: std.mem.Allocator) !MeasureTime {
-        const enabled = isTracingEnabled(allocator);
-        var file: ?std.fs.File = null;
+    pub fn init(
+        allocator: std.mem.Allocator,
+        io: std.Io,
+        environ: *const std.process.Environ.Map,
+    ) !MeasureTime {
+        const enabled = isTracingEnabled(environ);
+        var file: ?std.Io.File = null;
         if (enabled) {
-            const cwd = std.fs.cwd();
+            const cwd = std.Io.Dir.cwd();
             const trace_file = try cwd.createFile(
+                io,
                 "browser.trace",
                 .{
                     .truncate = true,
-                    .mode = 0o644,
                 },
             );
-            try trace_file.writeAll("{\"traceEvents\": [");
-            const ts = @divFloor(std.time.nanoTimestamp(), 1000);
+            try trace_file.writeStreamingAll(io, "{\"traceEvents\": [");
+            const ts = std.Io.Clock.real.now(io).toMicroseconds();
             const metadata = try std.fmt.allocPrint(allocator, "{{ \"name\": \"process_name\", \"ph\": \"M\", \"ts\": {d}, \"pid\": 1, \"cat\": \"__metadata\", \"args\": {{\"name\": \"Browser\"}}}}", .{ts});
             defer allocator.free(metadata);
-            try trace_file.writeAll(metadata);
+            try trace_file.writeStreamingAll(io, metadata);
             file = trace_file;
         }
 
         const thread_infos = std.ArrayList(ThreadInfo).empty;
         return MeasureTime{
             .file = file,
+            .io = io,
+            .environ = environ,
             .allocator = allocator,
             .needs_comma = true,
-            .lock = .{},
+            .lock = .init(io),
             .thread_infos = thread_infos,
             .enabled = enabled,
         };
@@ -91,14 +100,14 @@ pub const MeasureTime = struct {
         defer self.lock.unlock();
 
         if (self.needs_comma) {
-            try file.writeAll(", ");
+            try file.writeStreamingAll(self.io, ", ");
         }
-        const ts = @divFloor(std.time.nanoTimestamp(), 1000);
+        const ts = std.Io.Clock.real.now(self.io).toMicroseconds();
         const tid = std.Thread.getCurrentId();
         const tid_num = @as(usize, tid);
         const event = try std.fmt.allocPrint(self.allocator, "{{ \"ph\": \"{s}\", \"cat\": \"_\", \"name\": \"{s}\", \"ts\": {d}, \"pid\": 1, \"tid\": {d} }}", .{ ph, name, ts, tid_num });
         defer self.allocator.free(event);
-        try file.writeAll(event);
+        try file.writeStreamingAll(self.io, event);
         self.needs_comma = true;
     }
 
@@ -151,11 +160,11 @@ pub const MeasureTime = struct {
             std.mem.copyForwards(u8, metadata[write_index .. write_index + metadata_suffix.len], metadata_suffix);
 
             if (self.needs_comma) {
-                _ = file.writeAll(", ") catch |err| {
+                _ = file.writeStreamingAll(self.io, ", ") catch |err| {
                     std.log.warn("Failed to write trace comma: {}", .{err});
                 };
             }
-            _ = file.writeAll(metadata) catch |err| {
+            _ = file.writeStreamingAll(self.io, metadata) catch |err| {
                 std.log.warn("Failed to write thread metadata: {}", .{err});
             };
             self.needs_comma = true;
@@ -163,18 +172,17 @@ pub const MeasureTime = struct {
         }
         self.thread_infos.deinit(self.allocator);
 
-        _ = file.writeAll("]}") catch |err| {
+        _ = file.writeStreamingAll(self.io, "]}") catch |err| {
             std.log.warn("Failed to finish trace file: {}", .{err});
         };
-        _ = file.sync() catch |err| {
+        _ = file.sync(self.io) catch |err| {
             std.log.warn("Failed to sync trace file: {}", .{err});
         };
-        file.close();
+        file.close(self.io);
     }
 
-    fn isTracingEnabled(allocator: std.mem.Allocator) bool {
-        const env = std.process.getEnvVarOwned(allocator, "ZIBRA_TRACE") catch return false;
-        defer allocator.free(env);
+    fn isTracingEnabled(environ: *const std.process.Environ.Map) bool {
+        const env = environ.get("ZIBRA_TRACE") orelse return false;
         if (env.len == 0) return false;
         return !std.mem.eql(u8, env, "0");
     }

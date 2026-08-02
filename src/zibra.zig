@@ -1,5 +1,4 @@
 const std = @import("std");
-const builtin = @import("builtin");
 
 const js = @import("js.zig");
 const browser = @import("browser.zig");
@@ -19,34 +18,17 @@ fn dbgln(comptime fmt: []const u8) void {
 
 const default_html = @embedFile("default.html");
 
-pub fn main() !void {
+pub fn main(init: std.process.Init) !void {
     // Catch and print errors to prevent ugly stack traces.
-    zibra() catch |err| {
+    zibra(init) catch |err| {
         std.log.err("Error: {any}", .{err});
         std.process.exit(1);
     };
 }
 
 // Dead code eliminates this if not used.
-fn zibra() !void {
-    var debug_allocator: std.heap.DebugAllocator(.{}) = .init;
-    // Memory allocation setup
-    const backing_allocator, const is_debug = gpa: {
-        if (builtin.os.tag == .wasi) break :gpa .{ std.heap.wasm_allocator, false };
-        break :gpa switch (builtin.mode) {
-            .Debug, .ReleaseSafe => .{ debug_allocator.allocator(), true },
-            .ReleaseFast, .ReleaseSmall => .{ std.heap.smp_allocator, false },
-        };
-    };
-    defer if (is_debug) {
-        if (debug_allocator.deinit() == .leak) {
-            std.process.exit(1);
-        }
-    };
-    var arena = std.heap.ArenaAllocator.init(backing_allocator);
-    defer arena.deinit();
-    var thread_safe = std.heap.ThreadSafeAllocator{ .child_allocator = arena.allocator() };
-    const allocator = thread_safe.allocator();
+fn zibra(init: std.process.Init) !void {
+    const allocator = init.arena.allocator();
 
     // Test JS engine (disabled - now integrated into browser)
     // const js_exec = try js.init(allocator);
@@ -58,8 +40,7 @@ fn zibra() !void {
     // std.debug.print("Result: {f}\n", .{result.fmtPretty()});
 
     // Read arguments
-    const args = try std.process.argsAlloc(allocator);
-    defer std.process.argsFree(allocator, args);
+    const args = try init.minimal.args.toSlice(allocator);
 
     // Hold values, if provided
     var rtl_flag = false;
@@ -82,19 +63,18 @@ fn zibra() !void {
         url = Url.init(allocator, arg) catch |err| blk: {
             if (err == error.InvalidUrl) {
                 // Attempt to treat the URL as a local file path
-                const cwd = try std.fs.cwd().realpathAlloc(allocator, ".");
+                const cwd = try std.process.currentPathAlloc(init.io, allocator);
                 defer allocator.free(cwd);
 
                 const absolute_path = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ cwd, arg });
                 defer allocator.free(absolute_path);
 
                 // Check if the file exists before creating a file URL
-                const file_exists = std.fs.cwd().access(arg, .{}) catch |access_err| {
+                std.Io.Dir.cwd().access(init.io, arg, .{}) catch |access_err| {
                     std.log.warn("File '{s}' does not exist or is not accessible: {any}", .{ arg, access_err });
                     // Fallback to about:blank if the file doesn't exist
                     break :blk try Url.init(allocator, "about:blank");
                 };
-                _ = file_exists;
 
                 const file_url = try std.fmt.allocPrint(allocator, "file://{s}", .{absolute_path});
                 defer allocator.free(file_url);
@@ -116,7 +96,7 @@ fn zibra() !void {
     defer if (url) |u| u.free(allocator);
 
     // Initialize browser
-    var b = try Browser.init(allocator, rtl_flag);
+    var b = try Browser.init(allocator, init.io, init.environ_map, rtl_flag);
     defer b.deinit();
 
     if (url) |u| {

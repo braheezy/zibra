@@ -1,4 +1,5 @@
 const std = @import("std");
+const Mutex = @import("sync.zig").Mutex;
 
 const kiesel = @import("kiesel");
 const Agent = kiesel.execution.Agent;
@@ -92,9 +93,13 @@ const SetTimeoutCallback = struct {
 };
 
 const JsLock = struct {
-    mutex: std.Thread.Mutex = .{},
+    mutex: Mutex,
     owner: ?std.Thread.Id = null,
     depth: usize = 0,
+
+    fn init(io: std.Io) JsLock {
+        return .{ .mutex = .init(io) };
+    }
 
     fn lock(self: *JsLock) void {
         const tid = std.Thread.getCurrentId();
@@ -179,26 +184,30 @@ allocator: std.mem.Allocator,
 windows: std.AutoHashMap(u32, WindowContext),
 parent_window_ids: std.AutoHashMap(u32, u32),
 current_window_id: ?u32 = null,
-lock: JsLock = .{},
+lock: JsLock,
 realm: ?*Realm = null,
 runtime_initialized: bool = false,
 
-pub fn init(allocator: std.mem.Allocator) !*Js {
+pub fn init(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    environ: *const std.process.Environ.Map,
+) !*Js {
     const self = try allocator.create(Js);
     errdefer allocator.destroy(self);
 
     // Initialize platform first
-    self.platform = Agent.Platform.default();
+    self.platform = Agent.Platform.default(io, environ);
 
     // Then initialize agent with a pointer to the platform that's now in the struct
-    self.agent = try Agent.init(&self.platform, .{});
+    self.agent = try Agent.init(allocator, io, &self.platform, .{});
     errdefer self.agent.deinit();
 
     self.allocator = allocator;
     self.windows = std.AutoHashMap(u32, WindowContext).init(allocator);
     self.parent_window_ids = std.AutoHashMap(u32, u32).init(allocator);
     self.current_window_id = null;
-    self.lock = .{};
+    self.lock = .init(io);
     self.realm = null;
     self.runtime_initialized = false;
 
@@ -539,7 +548,7 @@ pub fn evaluate(self: *Js, window_id: u32, code: []const u8) !Value {
             null,
             .{},
         );
-        _ = try runtime_script.evaluate();
+        _ = try runtime_script.evaluate("zibra-runtime");
         self.runtime_initialized = true;
         if (window.pending_messages.items.len > 0) {
             for (window.pending_messages.items) |msg| {
@@ -561,7 +570,7 @@ pub fn evaluate(self: *Js, window_id: u32, code: []const u8) !Value {
         null,
         .{},
     );
-    const result = try script.evaluate();
+    const result = try script.evaluate("zibra-script");
     return result;
 }
 
@@ -707,12 +716,7 @@ pub fn dispatchEvent(self: *Js, window_id: u32, event_type: []const u8, node: *N
     if (!native_value.isObject()) return true;
     const native_obj = native_value.asObject();
     const dispatch_property = kiesel.types.PropertyKey.from("dispatchEvent");
-    const dispatch_value = try native_obj.internal_methods.get(
-        &self.agent,
-        native_obj,
-        dispatch_property,
-        native_value,
-    );
+    const dispatch_value = try native_obj.get(&self.agent, dispatch_property);
 
     if (!dispatch_value.isCallable()) return true;
 
@@ -782,7 +786,7 @@ pub fn runTimeoutCallback(self: *Js, window_id: u32, handle: u32) !void {
         return error.MissingSetTimeout;
     }
     const handle_value = Value.from(@as(f64, @floatFromInt(handle)));
-    _ = try fn_value.call(&self.agent, .undefined, &.{ handle_value });
+    _ = try fn_value.call(&self.agent, .undefined, &.{handle_value});
 }
 
 pub fn runAnimationFrameHandlers(self: *Js, window_id: u32) void {
@@ -818,7 +822,7 @@ fn setActiveWindow(self: *Js, window_id: u32, window: *WindowContext) !void {
     const fn_value = try window.realm.global_object.get(&self.agent, key);
     if (!fn_value.isCallable()) return;
     const window_value = Value.from(@as(f64, @floatFromInt(window_id)));
-    _ = try fn_value.call(&self.agent, .undefined, &.{ window_value });
+    _ = try fn_value.call(&self.agent, .undefined, &.{window_value});
 }
 
 pub fn runXhrOnload(self: *Js, window_id: u32, handle: u32, body: []const u8) !void {
@@ -836,7 +840,9 @@ pub fn runXhrOnload(self: *Js, window_id: u32, handle: u32, body: []const u8) !v
 }
 
 test "Node.prototype.style setter is defined" {
-    var js = try Js.init(std.testing.allocator);
+    var environ = std.process.Environ.Map.init(std.testing.allocator);
+    defer environ.deinit();
+    var js = try Js.init(std.testing.allocator, std.testing.io, &environ);
     defer js.deinit(std.testing.allocator);
 
     const result = try js.evaluate(0, "Object.getOwnPropertyDescriptor(Node.prototype, 'style') !== undefined");
@@ -844,7 +850,9 @@ test "Node.prototype.style setter is defined" {
 }
 
 test "__native.style_set is exposed" {
-    var js = try Js.init(std.testing.allocator);
+    var environ = std.process.Environ.Map.init(std.testing.allocator);
+    defer environ.deinit();
+    var js = try Js.init(std.testing.allocator, std.testing.io, &environ);
     defer js.deinit(std.testing.allocator);
 
     const result = try js.evaluate(0, "typeof __native.style_set === 'function'");
@@ -852,7 +860,9 @@ test "__native.style_set is exposed" {
 }
 
 test "native style_set updates element style attribute" {
-    var js = try Js.init(std.testing.allocator);
+    var environ = std.process.Environ.Map.init(std.testing.allocator);
+    defer environ.deinit();
+    var js = try Js.init(std.testing.allocator, std.testing.io, &environ);
     defer js.deinit(std.testing.allocator);
 
     const element = try parser.Element.init(std.testing.allocator, "div", null);
@@ -862,9 +872,8 @@ test "native style_set updates element style attribute" {
     const window = try js.setCurrentWindow(0);
     const handle = try js.getHandle(window, &node);
 
-    const SafePointer = kiesel.types.SafePointer;
     const builtins = kiesel.builtins;
-    const self_ptr = SafePointer.make(*Js, js);
+    const self_ptr: *anyopaque = js;
     const style_fn = try builtins.createBuiltinFunction(
         &js.agent,
         .{ .function = styleSet },
@@ -909,7 +918,9 @@ fn renderTestCallback(context: ?*anyopaque) anyerror!void {
 }
 
 test "native style_set requests render" {
-    var js = try Js.init(std.testing.allocator);
+    var environ = std.process.Environ.Map.init(std.testing.allocator);
+    defer environ.deinit();
+    var js = try Js.init(std.testing.allocator, std.testing.io, &environ);
     defer js.deinit(std.testing.allocator);
 
     const element = try parser.Element.init(std.testing.allocator, "div", null);
@@ -923,9 +934,8 @@ test "native style_set requests render" {
     var ctx = RenderTestContext{ .called = &called };
     js.setRenderCallback(0, renderTestCallback, @ptrCast(&ctx));
 
-    const SafePointer = kiesel.types.SafePointer;
     const builtins = kiesel.builtins;
-    const self_ptr = SafePointer.make(*Js, js);
+    const self_ptr: *anyopaque = js;
     const style_fn = try builtins.createBuiltinFunction(
         &js.agent,
         .{ .function = styleSet },
@@ -949,9 +959,7 @@ test "native style_set requests render" {
 fn setupDocument(self: *Js, realm: *Realm) !void {
     const builtins = kiesel.builtins;
     const PropertyKey = kiesel.types.PropertyKey;
-    const SafePointer = kiesel.types.SafePointer;
-    // Store self pointer in a SafePointer for passing to builtin functions
-    const self_ptr = SafePointer.make(*Js, self);
+    const self_ptr: *anyopaque = self;
 
     // Create document object
     const document_obj = try builtins.ordinaryObjectCreate(&self.agent, null);
@@ -1223,7 +1231,7 @@ fn setupDocument(self: *Js, realm: *Realm) !void {
 fn querySelectorAll(agent: *Agent, this_value: Value, arguments: kiesel.types.Arguments) Agent.Error!Value {
     const function_obj = agent.activeFunctionObject();
     const builtin_fn = function_obj.as(kiesel.builtins.BuiltinFunction);
-    const js_instance = builtin_fn.fields.additional_fields.cast(*Js);
+    const js_instance = builtin_fn.fields.additionalFieldsAs(Js);
     _ = this_value;
     const window_id = js_instance.current_window_id orelse return agent.throwException(
         .internal_error,
@@ -1317,7 +1325,7 @@ fn getAttribute(agent: *Agent, this_value: Value, arguments: kiesel.types.Argume
     // Get the Js instance from the function's additional_fields
     const function_obj = agent.activeFunctionObject();
     const builtin_fn = function_obj.as(kiesel.builtins.BuiltinFunction);
-    const js_instance = builtin_fn.fields.additional_fields.cast(*Js);
+    const js_instance = builtin_fn.fields.additionalFieldsAs(Js);
     const window_id = js_instance.current_window_id orelse return agent.throwException(
         .internal_error,
         "Missing active window",
@@ -1387,7 +1395,7 @@ fn getAttribute(agent: *Agent, this_value: Value, arguments: kiesel.types.Argume
 fn setAttribute(agent: *Agent, this_value: Value, arguments: kiesel.types.Arguments) Agent.Error!Value {
     const function_obj = agent.activeFunctionObject();
     const builtin_fn = function_obj.as(kiesel.builtins.BuiltinFunction);
-    const js_instance = builtin_fn.fields.additional_fields.cast(*Js);
+    const js_instance = builtin_fn.fields.additionalFieldsAs(Js);
     const window_id = js_instance.current_window_id orelse return agent.throwException(
         .internal_error,
         "Missing active window",
@@ -1479,7 +1487,7 @@ fn innerHTML(agent: *Agent, this_value: Value, arguments: kiesel.types.Arguments
     // Get the Js instance from the function's additional_fields
     const function_obj = agent.activeFunctionObject();
     const builtin_fn = function_obj.as(kiesel.builtins.BuiltinFunction);
-    const js_instance = builtin_fn.fields.additional_fields.cast(*Js);
+    const js_instance = builtin_fn.fields.additionalFieldsAs(Js);
     const window_id = js_instance.current_window_id orelse return agent.throwException(
         .internal_error,
         "Missing active window",
@@ -1624,7 +1632,7 @@ fn innerHTML(agent: *Agent, this_value: Value, arguments: kiesel.types.Arguments
 fn styleSet(agent: *Agent, this_value: Value, arguments: kiesel.types.Arguments) Agent.Error!Value {
     const function_obj = agent.activeFunctionObject();
     const builtin_fn = function_obj.as(kiesel.builtins.BuiltinFunction);
-    const js_instance = builtin_fn.fields.additional_fields.cast(*Js);
+    const js_instance = builtin_fn.fields.additionalFieldsAs(Js);
     const window_id = js_instance.current_window_id orelse return agent.throwException(
         .internal_error,
         "Missing active window",
@@ -1737,7 +1745,7 @@ fn xhrSend(agent: *Agent, this_value: Value, arguments: kiesel.types.Arguments) 
 
     const function_obj = agent.activeFunctionObject();
     const builtin_fn = function_obj.as(kiesel.builtins.BuiltinFunction);
-    const js_instance = builtin_fn.fields.additional_fields.cast(*Js);
+    const js_instance = builtin_fn.fields.additionalFieldsAs(Js);
     const window_id = js_instance.current_window_id orelse return agent.throwException(
         .internal_error,
         "Missing active window",
@@ -1832,7 +1840,7 @@ fn setTimeoutNative(agent: *Agent, this_value: Value, arguments: kiesel.types.Ar
 
     const function_obj = agent.activeFunctionObject();
     const builtin_fn = function_obj.as(kiesel.builtins.BuiltinFunction);
-    const js_instance = builtin_fn.fields.additional_fields.cast(*Js);
+    const js_instance = builtin_fn.fields.additionalFieldsAs(Js);
     const window_id = js_instance.current_window_id orelse return agent.throwException(
         .internal_error,
         "Missing active window",
@@ -1892,7 +1900,7 @@ fn requestAnimationFrameNative(agent: *Agent, this_value: Value, arguments: kies
 
     const function_obj = agent.activeFunctionObject();
     const builtin_fn = function_obj.as(kiesel.builtins.BuiltinFunction);
-    const js_instance = builtin_fn.fields.additional_fields.cast(*Js);
+    const js_instance = builtin_fn.fields.additionalFieldsAs(Js);
     const window_id = js_instance.current_window_id orelse return agent.throwException(
         .internal_error,
         "Missing active window",
@@ -1917,7 +1925,7 @@ fn requestAnimationFrameNative(agent: *Agent, this_value: Value, arguments: kies
 fn getWindowIdNative(agent: *Agent, this_value: Value, _: kiesel.types.Arguments) Agent.Error!Value {
     const function_obj = agent.activeFunctionObject();
     const builtin_fn = function_obj.as(kiesel.builtins.BuiltinFunction);
-    const js_instance = builtin_fn.fields.additional_fields.cast(*Js);
+    const js_instance = builtin_fn.fields.additionalFieldsAs(Js);
     _ = this_value;
 
     const window_id = js_instance.current_window_id orelse return agent.throwException(
@@ -1931,7 +1939,7 @@ fn getWindowIdNative(agent: *Agent, this_value: Value, _: kiesel.types.Arguments
 fn getParentWindowIdNative(agent: *Agent, this_value: Value, arguments: kiesel.types.Arguments) Agent.Error!Value {
     const function_obj = agent.activeFunctionObject();
     const builtin_fn = function_obj.as(kiesel.builtins.BuiltinFunction);
-    const js_instance = builtin_fn.fields.additional_fields.cast(*Js);
+    const js_instance = builtin_fn.fields.additionalFieldsAs(Js);
     _ = this_value;
 
     const id_arg = arguments.get(0);
@@ -1954,7 +1962,7 @@ fn getParentWindowIdNative(agent: *Agent, this_value: Value, arguments: kiesel.t
 fn postMessageNative(agent: *Agent, this_value: Value, arguments: kiesel.types.Arguments) Agent.Error!Value {
     const function_obj = agent.activeFunctionObject();
     const builtin_fn = function_obj.as(kiesel.builtins.BuiltinFunction);
-    const js_instance = builtin_fn.fields.additional_fields.cast(*Js);
+    const js_instance = builtin_fn.fields.additionalFieldsAs(Js);
     _ = this_value;
 
     const window_id = js_instance.current_window_id orelse return agent.throwException(

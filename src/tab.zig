@@ -453,7 +453,7 @@ pub const Frame = struct {
             }
 
             while (tokens.next()) |origin_token| {
-                const semicolon_trimmed = std.mem.trimRight(u8, origin_token, ";\r\n \t");
+                const semicolon_trimmed = std.mem.trimEnd(u8, origin_token, ";\r\n \t");
                 const trimmed_origin = std.mem.trim(u8, semicolon_trimmed, whitespace);
                 if (trimmed_origin.len == 0) continue;
 
@@ -693,7 +693,11 @@ pub fn get_js(self: *Tab, url: *Url) !*js_module {
         return ctx;
     }
 
-    const ctx = try js_module.init(self.allocator);
+    const ctx = try js_module.init(
+        self.allocator,
+        self.task_runner.measure.io,
+        self.task_runner.measure.environ,
+    );
     try self.js_contexts.put(key, ctx);
     return ctx;
 }
@@ -791,17 +795,17 @@ fn refreshFocusState(self: *Tab) !void {
 
         var found = false;
         for (node_list.items) |node_ptr| {
-                if (node_ptr == target.focus.?) {
-                    found = true;
-                    switch (node_ptr.*) {
-                        .element => |*e| {
-                            e.is_focused = true;
-                            parser.dirtyStyleForElement(e);
-                        },
-                        else => {},
-                    }
-                    break;
+            if (node_ptr == target.focus.?) {
+                found = true;
+                switch (node_ptr.*) {
+                    .element => |*e| {
+                        e.is_focused = true;
+                        parser.dirtyStyleForElement(e);
+                    },
+                    else => {},
                 }
+                break;
+            }
         }
 
         if (!found) {
@@ -999,7 +1003,7 @@ pub fn render(self: *Tab, b: *Browser) !void {
     std.debug.print("[TAB] render RUNNING\n", .{});
 
     const profiling = b.profiling_enabled;
-    const render_start = if (profiling) std.time.nanoTimestamp() else 0;
+    const render_start = if (profiling) std.Io.Clock.awake.now(b.io).nanoseconds else 0;
     var style_ns: u64 = 0;
     var layout_ns: u64 = 0;
 
@@ -1026,7 +1030,7 @@ pub fn render(self: *Tab, b: *Browser) !void {
     if (self.needs_style) {
         self.needs_style = false;
         errdefer self.needs_style = true;
-        const style_start = if (profiling) std.time.nanoTimestamp() else 0;
+        const style_start = if (profiling) std.Io.Clock.awake.now(b.io).nanoseconds else 0;
         var frames = std.ArrayList(*Frame).empty;
         defer frames.deinit(self.allocator);
         try self.collectFramesPostOrder(frame, &frames);
@@ -1034,7 +1038,7 @@ pub fn render(self: *Tab, b: *Browser) !void {
             try child_frame.render(b, true, false, false);
         }
         if (profiling) {
-            style_ns = @as(u64, @intCast(std.time.nanoTimestamp() - style_start));
+            style_ns = @intCast(std.Io.Clock.awake.now(b.io).nanoseconds - style_start);
         }
     }
 
@@ -1046,7 +1050,7 @@ pub fn render(self: *Tab, b: *Browser) !void {
             self.needs_layout = true;
             self.needs_paint = true;
         }
-        const layout_start = if (profiling) std.time.nanoTimestamp() else 0;
+        const layout_start = if (profiling) std.Io.Clock.awake.now(b.io).nanoseconds else 0;
         var frames = std.ArrayList(*Frame).empty;
         defer frames.deinit(self.allocator);
         try self.collectFramesPostOrder(frame, &frames);
@@ -1057,7 +1061,7 @@ pub fn render(self: *Tab, b: *Browser) !void {
         try self.composeDisplayList(frame);
         std.debug.print("[TAB] render: composeDisplayList done\n", .{});
         if (profiling) {
-            layout_ns = @as(u64, @intCast(std.time.nanoTimestamp() - layout_start));
+            layout_ns = @intCast(std.Io.Clock.awake.now(b.io).nanoseconds - layout_start);
         }
         frame.viewport_height = self.tab_height;
         const clamped_scroll = self.clampScrollForFrame(frame, frame.scroll);
@@ -1072,7 +1076,7 @@ pub fn render(self: *Tab, b: *Browser) !void {
     std.debug.print("[TAB] render: setNeedsCompositeRasterDraw done\n", .{});
 
     if (profiling) {
-        const total_ns = @as(u64, @intCast(std.time.nanoTimestamp() - render_start));
+        const total_ns: u64 = @intCast(std.Io.Clock.awake.now(b.io).nanoseconds - render_start);
         std.log.info(
             "profile: render total={}ms style={}ms layout={}ms",
             .{

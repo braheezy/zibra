@@ -332,7 +332,7 @@ pub const Url = struct {
         // Check the cache (only for GET requests)
         if (payload == null) {
             if (cache.get(self.path)) |entry| {
-                const now: u64 = @intCast(std.time.milliTimestamp());
+                const now: u64 = @intCast(std.Io.Clock.real.now(http_client.io).toMilliseconds());
                 if (entry.max_age) |max_age| {
                     if ((now - entry.timestampe) / 1000 <= max_age) {
                         std.log.info("Cache hit for {s}", .{self.path});
@@ -587,12 +587,14 @@ pub const Url = struct {
         unreachable;
     }
 
-    pub fn fileRequest(self: Url, al: std.mem.Allocator) ![]const u8 {
-        const html_file = try std.fs.cwd().openFile(self.path, .{});
+    pub fn fileRequest(self: Url, al: std.mem.Allocator, io: std.Io) ![]const u8 {
+        const html_file = try std.Io.Dir.cwd().openFile(io, self.path, .{});
 
-        defer html_file.close();
+        defer html_file.close(io);
 
-        const html_content = try html_file.readToEndAlloc(al, std.math.maxInt(usize));
+        var buffer: [8192]u8 = undefined;
+        var reader = html_file.reader(io, &buffer);
+        const html_content = try reader.interface.allocRemaining(al, .unlimited);
         return html_content;
     }
 
@@ -616,10 +618,8 @@ pub const Url = struct {
         const host_str = self.host orelse return error.NoHost;
         const has_explicit_port = hostHasExplicitPort(host_str);
 
-        const show_port = !has_explicit_port and (
-            (std.mem.eql(u8, self.scheme, "https") and self.port != 443) or
-            (std.mem.eql(u8, self.scheme, "http") and self.port != 80)
-        );
+        const show_port = !has_explicit_port and ((std.mem.eql(u8, self.scheme, "https") and self.port != 443) or
+            (std.mem.eql(u8, self.scheme, "http") and self.port != 80));
 
         if (show_port) {
             return std.fmt.bufPrint(buffer, "{s}://{s}:{d}{s}", .{

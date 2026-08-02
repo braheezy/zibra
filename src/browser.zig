@@ -1,4 +1,5 @@
 const std = @import("std");
+const Mutex = @import("sync.zig").Mutex;
 const builtin = @import("builtin");
 
 const grapheme = @import("grapheme");
@@ -154,6 +155,10 @@ pub const Color = struct {
         return .{ .r = self.r, .g = self.g, .b = self.b, .a = self.a };
     }
 };
+
+fn premultiplyChannel(channel: u8, alpha: u8) u8 {
+    return @intCast((@as(u16, channel) * @as(u16, alpha) + 127) / 255);
+}
 
 pub const DarkPalette = struct {
     background: Color = .{ .r = 18, .g = 18, .b = 18, .a = 255 },
@@ -311,7 +316,7 @@ pub const CompositedLayer = struct {
             self.surface = try z2d.Surface.init(.image_surface_rgba, allocator, layer_width, layer_height);
         }
 
-        var ctx = z2d.Context.init(allocator, &self.surface.?);
+        var ctx = z2d.Context.init(browser.io, allocator, &self.surface.?);
         defer ctx.deinit();
 
         // Clear to transparent
@@ -612,6 +617,7 @@ pub const JsRenderContext = struct {
 pub const Browser = struct {
     // Memory allocator for the browser
     allocator: std.mem.Allocator,
+    io: std.Io,
     // SDL window handle
     window: sdl2.Window,
     // SDL renderer handle
@@ -626,7 +632,7 @@ pub const Browser = struct {
     tab_surface: ?z2d.Surface,
     // HTTP client for making requests (handles both HTTP and HTTPS)
     http_client: std.http.Client,
-    http_client_mutex: std.Thread.Mutex = .{},
+    http_client_mutex: Mutex,
     // Cache for storing fetched resources
     cache: Cache,
     // Shared cookie storage across tabs
@@ -652,7 +658,7 @@ pub const Browser = struct {
     needs_animation_frame: bool = false,
     shutting_down: bool = false,
     measure: MeasureTime,
-    lock: std.Thread.Mutex = .{},
+    lock: Mutex,
     active_tab_url: ?[]u8 = null,
     active_tab_scroll: i32 = 0,
     active_tab_height: i32 = 0,
@@ -670,7 +676,12 @@ pub const Browser = struct {
     profiling_enabled: bool = false,
 
     // Create a new Browser instance
-    pub fn init(al: std.mem.Allocator, rtl_flag: bool) !Browser {
+    pub fn init(
+        al: std.mem.Allocator,
+        io: std.Io,
+        environ: *const std.process.Environ.Map,
+        rtl_flag: bool,
+    ) !Browser {
         // Initialize SDL
         try sdl2.init(.{
             .video = true,
@@ -731,6 +742,8 @@ pub const Browser = struct {
 
         const layout_engine = try Layout.init(
             al,
+            io,
+            environ,
             renderer,
             initial_window_width,
             initial_window_height,
@@ -742,21 +755,23 @@ pub const Browser = struct {
         errdefer root_surface.deinit(al);
 
         // Create z2d context for drawing operations
-        var context = z2d.Context.init(al, &root_surface);
+        var context = z2d.Context.init(io, al, &root_surface);
         errdefer context.deinit();
 
-        const measure = try MeasureTime.init(al);
-        const profiling_enabled = isProfilingEnabled(al);
+        const measure = try MeasureTime.init(al, io, environ);
+        const profiling_enabled = isProfilingEnabled(environ);
 
         var browser = Browser{
             .allocator = al,
+            .io = io,
             .window = screen,
             .canvas = renderer,
             .root_surface = root_surface,
             .context = context,
             .chrome_surface = undefined, // Will be set below
             .tab_surface = null,
-            .http_client = .{ .allocator = al },
+            .http_client = .{ .allocator = al, .io = io },
+            .http_client_mutex = .init(io),
             .cache = try Cache.init(al),
             .cookie_jar = std.StringHashMap(url_module.CookieEntry).init(al),
             .layout_engine = layout_engine,
@@ -764,6 +779,7 @@ pub const Browser = struct {
             .tabs = std.ArrayList(*Tab).empty,
             .chrome = try Chrome.init(&layout_engine.font_manager, initial_window_width, al),
             .measure = measure,
+            .lock = .init(io),
             .cached_texture = cached_texture,
             .composited_layers = std.ArrayList(CompositedLayer).empty,
             .tab_draw_list = std.ArrayList(DisplayItem).empty,
@@ -781,9 +797,8 @@ pub const Browser = struct {
         return browser;
     }
 
-    fn isProfilingEnabled(allocator: std.mem.Allocator) bool {
-        const env = std.process.getEnvVarOwned(allocator, "ZIBRA_PROFILE") catch return false;
-        defer allocator.free(env);
+    fn isProfilingEnabled(environ: *const std.process.Environ.Map) bool {
+        const env = environ.get("ZIBRA_PROFILE") orelse return false;
         if (env.len == 0) return false;
         return !std.mem.eql(u8, env, "0");
     }
@@ -988,7 +1003,7 @@ pub const Browser = struct {
                 self.scheduleAnimationFrame();
                 if (!handled_event and self.isIdle()) {
                     // Yield briefly to avoid a busy loop when there's no work.
-                    std.Thread.sleep(2_000_000); // 2ms
+                    try self.io.sleep(.fromNanoseconds(2_000_000), .awake); // 2ms
                 }
             }
         }
@@ -1001,7 +1016,7 @@ pub const Browser = struct {
 
         // Give background threads a moment to notice shutdown
         std.debug.print("[SHUTDOWN] sleeping\n", .{});
-        std.Thread.sleep(50_000_000); // 50ms
+        try self.io.sleep(.fromNanoseconds(50_000_000), .awake); // 50ms
         std.debug.print("[SHUTDOWN] run() returning\n", .{});
     }
 
@@ -1093,7 +1108,7 @@ pub const Browser = struct {
                 self.context.deinit();
                 self.root_surface.deinit(self.allocator);
                 self.root_surface = try z2d.Surface.init(.image_surface_rgba, self.allocator, size.width, size.height);
-                self.context = z2d.Context.init(self.allocator, &self.root_surface);
+                self.context = z2d.Context.init(self.io, self.allocator, &self.root_surface);
 
                 // Recreate chrome surface with new width
                 self.chrome_surface.deinit(self.allocator);
@@ -1228,13 +1243,12 @@ pub const Browser = struct {
                 const tab = self.activeTab();
                 const should_activate = if (self.focus) |focus_str|
                     std.mem.eql(u8, focus_str, "content")
-                else
-                    if (tab) |active_tab| blk: {
-                        if (active_tab.root_frame) |frame| {
-                            break :blk frame.focus != null;
-                        }
-                        break :blk false;
-                    } else false;
+                else if (tab) |active_tab| blk: {
+                    if (active_tab.root_frame) |frame| {
+                        break :blk frame.focus != null;
+                    }
+                    break :blk false;
+                } else false;
                 self.lock.unlock();
                 if (should_activate) {
                     if (tab) |active_tab| {
@@ -1250,13 +1264,12 @@ pub const Browser = struct {
                 const tab = self.activeTab();
                 const should_activate = if (self.focus) |focus_str|
                     std.mem.eql(u8, focus_str, "content")
-                else
-                    if (tab) |active_tab| blk: {
-                        if (active_tab.root_frame) |frame| {
-                            break :blk frame.focus != null;
-                        }
-                        break :blk false;
-                    } else false;
+                else if (tab) |active_tab| blk: {
+                    if (active_tab.root_frame) |frame| {
+                        break :blk frame.focus != null;
+                    }
+                    break :blk false;
+                } else false;
                 self.lock.unlock();
                 if (should_activate) {
                     if (tab) |active_tab| {
@@ -1297,13 +1310,12 @@ pub const Browser = struct {
                 const tab = self.activeTab();
                 const should_backspace = if (self.focus) |focus_str|
                     std.mem.eql(u8, focus_str, "content")
-                else
-                    if (tab) |active_tab| blk: {
-                        if (active_tab.root_frame) |frame| {
-                            break :blk frame.focus != null;
-                        }
-                        break :blk false;
-                    } else false;
+                else if (tab) |active_tab| blk: {
+                    if (active_tab.root_frame) |frame| {
+                        break :blk frame.focus != null;
+                    }
+                    break :blk false;
+                } else false;
                 self.lock.unlock();
                 if (should_backspace) {
                     if (tab) |active_tab| {
@@ -1410,10 +1422,10 @@ pub const Browser = struct {
 
     fn handleVoiceCommand(self: *Browser) void {
         var buf: [256]u8 = undefined;
-        const stdin = std.fs.File.stdin();
-        var reader = std.fs.File.deprecatedReader(stdin);
+        const stdin = std.Io.File.stdin();
+        var reader = stdin.reader(self.io, &buf);
         std.log.info("voice command> ", .{});
-        const line = reader.readUntilDelimiterOrEof(&buf, '\n') catch |err| {
+        const line = reader.interface.takeDelimiter('\n') catch |err| {
             std.log.warn("Failed to read command: {}", .{err});
             return;
         };
@@ -1531,7 +1543,7 @@ pub const Browser = struct {
     // Update the scroll offset
     pub fn fetchBody(self: *Browser, url: Url, referrer: ?Url, payload: ?[]const u8) !url_module.HttpResponse {
         if (std.mem.eql(u8, url.scheme, "file")) {
-            const content = try url.fileRequest(self.allocator);
+            const content = try url.fileRequest(self.allocator, self.io);
             return .{ .body = content, .csp_header = null };
         } else if (std.mem.eql(u8, url.scheme, "data")) {
             return .{ .body = url.path, .csp_header = null };
@@ -2881,7 +2893,7 @@ pub const Browser = struct {
             thread_ctx.destroy();
             return err;
         };
-        _ = thread.setName("SetTimeout thread") catch |err| {
+        _ = thread.setName(self.io, "SetTimeout thread") catch |err| {
             std.log.warn("Failed to name setTimeout thread: {}", .{err});
         };
         thread.detach();
@@ -2919,7 +2931,7 @@ pub const Browser = struct {
             tab.releaseAsyncThread();
             return;
         };
-        _ = thread.setName("Animation timer thread") catch |err| {
+        _ = thread.setName(self.io, "Animation timer thread") catch |err| {
             std.log.warn("Failed to name animation timer thread: {}", .{err});
         };
         thread.detach();
@@ -2953,7 +2965,7 @@ pub const Browser = struct {
             ctx.destroy();
             return err;
         };
-        _ = thread.setName("XHR thread") catch |err| {
+        _ = thread.setName(self.io, "XHR thread") catch |err| {
             std.log.warn("Failed to name XHR thread: {}", .{err});
         };
         thread.detach();
@@ -3526,7 +3538,7 @@ pub const Browser = struct {
     // Raster the browser chrome to the chrome surface
     pub fn rasterChrome(self: *Browser) !void {
         // Create a temporary context for the chrome surface
-        var chrome_context = z2d.Context.init(self.allocator, &self.chrome_surface);
+        var chrome_context = z2d.Context.init(self.io, self.allocator, &self.chrome_surface);
         defer chrome_context.deinit();
 
         // Clear chrome surface (white background)
@@ -3575,7 +3587,7 @@ pub const Browser = struct {
             self.tab_surface = try z2d.Surface.init(.image_surface_rgba, self.allocator, self.window_width, tab_height);
         }
 
-        var tab_context = z2d.Context.init(self.allocator, &self.tab_surface.?);
+        var tab_context = z2d.Context.init(self.io, self.allocator, &self.tab_surface.?);
         defer tab_context.deinit();
 
         tab_context.setSource(.{ .opaque_pattern = .{ .pixel = .{ .rgba = .{ .r = 255, .g = 255, .b = 255, .a = 255 } } } });
@@ -3604,7 +3616,7 @@ pub const Browser = struct {
         if (!self.needs_composite and !self.needs_raster and !self.needs_draw) return;
 
         const profiling = self.profiling_enabled;
-        const start_ns = if (profiling) std.time.nanoTimestamp() else 0;
+        const start_ns = if (profiling) std.Io.Clock.awake.now(self.io).nanoseconds else 0;
         var composite_ns: u64 = 0;
         var raster_ns: u64 = 0;
         var draw_ns: u64 = 0;
@@ -3621,43 +3633,43 @@ pub const Browser = struct {
 
         // Composite phase: rebuild composited layers from display list
         if (self.needs_composite) {
-            const phase_start = if (profiling) std.time.nanoTimestamp() else 0;
+            const phase_start = if (profiling) std.Io.Clock.awake.now(self.io).nanoseconds else 0;
             _ = try self.composite();
             try self.paint_draw_list();
             self.needs_composite = false;
             // Compositing implies we need to raster the new layers
             self.needs_raster = true;
             if (profiling) {
-                composite_ns = @as(u64, @intCast(std.time.nanoTimestamp() - phase_start));
+                composite_ns = @intCast(std.Io.Clock.awake.now(self.io).nanoseconds - phase_start);
             }
         }
 
         // Raster phase: render layers to surfaces
         if (self.needs_raster) {
-            const phase_start = if (profiling) std.time.nanoTimestamp() else 0;
+            const phase_start = if (profiling) std.Io.Clock.awake.now(self.io).nanoseconds else 0;
             try self.rasterChrome();
             try self.rasterTabSurfaces();
             self.needs_raster = false;
             // Rastering implies we need to draw
             self.needs_draw = true;
             if (profiling) {
-                raster_ns = @as(u64, @intCast(std.time.nanoTimestamp() - phase_start));
+                raster_ns = @intCast(std.Io.Clock.awake.now(self.io).nanoseconds - phase_start);
             }
         }
 
         // Draw phase: composite surfaces to screen
         if (self.needs_draw) {
-            const phase_start = if (profiling) std.time.nanoTimestamp() else 0;
+            const phase_start = if (profiling) std.Io.Clock.awake.now(self.io).nanoseconds else 0;
             try self.draw();
             self.canvas.present();
             self.needs_draw = false;
             if (profiling) {
-                draw_ns = @as(u64, @intCast(std.time.nanoTimestamp() - phase_start));
+                draw_ns = @intCast(std.Io.Clock.awake.now(self.io).nanoseconds - phase_start);
             }
         }
 
         if (profiling) {
-            const total_ns = @as(u64, @intCast(std.time.nanoTimestamp() - start_ns));
+            const total_ns: u64 = @intCast(std.Io.Clock.awake.now(self.io).nanoseconds - start_ns);
             std.log.info(
                 "profile: composite total={}ms comp={}ms raster={}ms draw={}ms",
                 .{
@@ -3725,7 +3737,6 @@ pub const Browser = struct {
             self.active_tab_display_list = incoming_list;
             // Set parent pointers for tree traversal
             DisplayItem.setParentPointers(incoming_list, null);
-
             // Debug: print display list tree once when opacity effects are present
             const S = struct {
                 var printed_opacity_debug: bool = false;
@@ -3852,7 +3863,7 @@ pub const Browser = struct {
 
         // Recreate the context to avoid corruption issues
         self.context.deinit();
-        self.context = z2d.Context.init(self.allocator, &self.root_surface);
+        self.context = z2d.Context.init(self.io, self.allocator, &self.root_surface);
 
         // Clear root surface to white before drawing.
         self.context.setSource(.{ .opaque_pattern = .{ .pixel = .{ .rgba = .{ .r = 255, .g = 255, .b = 255, .a = 255 } } } });
@@ -3998,30 +4009,30 @@ pub const Browser = struct {
                         const src_a = pixels[src_idx + 3];
                         if (src_a == 0) continue;
 
-                    const alpha_f = @as(f64, @floatFromInt(src_a)) * opacity;
-                    const alpha = std.math.clamp(@as(i32, @intFromFloat(alpha_f + 0.5)), 0, 255);
-                    if (alpha == 0) continue;
+                        const alpha_f = @as(f64, @floatFromInt(src_a)) * opacity;
+                        const alpha = std.math.clamp(@as(i32, @intFromFloat(alpha_f + 0.5)), 0, 255);
+                        if (alpha == 0) continue;
 
-                    const dst_idx = row_base + @as(usize, @intCast(x));
-                    const dst = dest_pixels[dst_idx];
-                    const alpha_u32 = @as(u32, @intCast(alpha));
-                    const inv_alpha = 255 - alpha_u32;
+                        const dst_idx = row_base + @as(usize, @intCast(x));
+                        const dst = dest_pixels[dst_idx];
+                        const alpha_u32 = @as(u32, @intCast(alpha));
+                        const inv_alpha = 255 - alpha_u32;
 
-                    if (alpha == 255) {
-                        dest_pixels[dst_idx] = .{
-                            .r = pixels[src_idx + 0],
-                            .g = pixels[src_idx + 1],
-                            .b = pixels[src_idx + 2],
-                            .a = 255,
-                        };
-                    } else {
-                        dest_pixels[dst_idx] = .{
-                            .r = @intCast((@as(u32, pixels[src_idx + 0]) * alpha_u32 + @as(u32, dst.r) * inv_alpha) / 255),
-                            .g = @intCast((@as(u32, pixels[src_idx + 1]) * alpha_u32 + @as(u32, dst.g) * inv_alpha) / 255),
-                            .b = @intCast((@as(u32, pixels[src_idx + 2]) * alpha_u32 + @as(u32, dst.b) * inv_alpha) / 255),
-                            .a = @intCast((alpha_u32 + @as(u32, dst.a) * inv_alpha) / 255),
-                        };
-                    }
+                        if (alpha == 255) {
+                            dest_pixels[dst_idx] = .{
+                                .r = pixels[src_idx + 0],
+                                .g = pixels[src_idx + 1],
+                                .b = pixels[src_idx + 2],
+                                .a = 255,
+                            };
+                        } else {
+                            dest_pixels[dst_idx] = .{
+                                .r = @intCast((@as(u32, pixels[src_idx + 0]) * alpha_u32 + @as(u32, dst.r) * inv_alpha) / 255),
+                                .g = @intCast((@as(u32, pixels[src_idx + 1]) * alpha_u32 + @as(u32, dst.g) * inv_alpha) / 255),
+                                .b = @intCast((@as(u32, pixels[src_idx + 2]) * alpha_u32 + @as(u32, dst.b) * inv_alpha) / 255),
+                                .a = @intCast((alpha_u32 + @as(u32, dst.a) * inv_alpha) / 255),
+                            };
+                        }
                     }
                 }
                 return;
@@ -4096,9 +4107,9 @@ pub const Browser = struct {
                                 if (final_alpha > 0) {
                                     context.resetPath();
                                     context.setSource(.{ .opaque_pattern = .{ .pixel = .{ .rgba = .{
-                                        .r = glyph_item.color.r,
-                                        .g = glyph_item.color.g,
-                                        .b = glyph_item.color.b,
+                                        .r = premultiplyChannel(glyph_item.color.r, final_alpha),
+                                        .g = premultiplyChannel(glyph_item.color.g, final_alpha),
+                                        .b = premultiplyChannel(glyph_item.color.b, final_alpha),
                                         .a = final_alpha,
                                     } } } });
                                     context.moveTo(@floatFromInt(dest_x), @floatFromInt(dest_y)) catch continue;
@@ -4605,9 +4616,9 @@ pub const Browser = struct {
                                 if (final_alpha > 0) {
                                     context.resetPath();
                                     context.setSource(.{ .opaque_pattern = .{ .pixel = .{ .rgba = .{
-                                        .r = glyph_item.color.r,
-                                        .g = glyph_item.color.g,
-                                        .b = glyph_item.color.b,
+                                        .r = premultiplyChannel(glyph_item.color.r, final_alpha),
+                                        .g = premultiplyChannel(glyph_item.color.g, final_alpha),
+                                        .b = premultiplyChannel(glyph_item.color.b, final_alpha),
                                         .a = final_alpha,
                                     } } } });
                                     context.moveTo(@floatFromInt(dest_x), @floatFromInt(dest_y)) catch continue;
@@ -4858,9 +4869,9 @@ pub const Browser = struct {
                                 if (final_alpha > 0) {
                                     context.resetPath();
                                     context.setSource(.{ .opaque_pattern = .{ .pixel = .{ .rgba = .{
-                                        .r = glyph_item.color.r,
-                                        .g = glyph_item.color.g,
-                                        .b = glyph_item.color.b,
+                                        .r = premultiplyChannel(glyph_item.color.r, final_alpha),
+                                        .g = premultiplyChannel(glyph_item.color.g, final_alpha),
+                                        .b = premultiplyChannel(glyph_item.color.b, final_alpha),
                                         .a = final_alpha,
                                     } } } });
                                     context.moveTo(@floatFromInt(dest_x), @floatFromInt(dest_y)) catch continue;
@@ -5090,7 +5101,7 @@ pub const Browser = struct {
                     }
                 }
             },
-            .rect => |_| {
+            .rect => {
                 // Regular rect clip masks are handled by dst_in in the compositing path.
             },
             else => {
@@ -5964,7 +5975,7 @@ fn runSetTimeoutThread(ctx: *SetTimeoutThreadContext) void {
 
     if (ctx.delay_ms > 0) {
         const delay_ns = @as(u64, ctx.delay_ms) * std.time.ns_per_ms;
-        std.Thread.sleep(delay_ns);
+        ctx.browser.io.sleep(.fromNanoseconds(@intCast(delay_ns)), .awake) catch return;
     }
 
     if (!ctx.js_context.matchesGeneration(ctx.generation)) {
@@ -6085,7 +6096,7 @@ fn runAnimationTimerThread(ctx: *AnimationTimerContext) void {
         std.log.warn("Failed to register animation timer thread: {}", .{err});
     };
 
-    std.Thread.sleep(refresh_rate_ns);
+    browser.io.sleep(.fromNanoseconds(refresh_rate_ns), .awake) catch return;
 
     browser.lock.lock();
     // Check if browser is shutting down before accessing any resources

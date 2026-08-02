@@ -43,7 +43,6 @@ pub fn ProtectedField(comptime T: type) type {
             };
         }
 
-
         pub fn deinit(self: *@This()) void {
             self.invalidations.deinit();
         }
@@ -94,7 +93,7 @@ pub fn ProtectedField(comptime T: type) type {
 
             const MarkFn = struct {
                 fn mark(ptr: *anyopaque) void {
-                    const field: @TypeOf(@constCast(target)) = @constCast(@ptrCast(@alignCast(ptr)));
+                    const field: @TypeOf(@constCast(target)) = @ptrCast(@alignCast(@constCast(ptr)));
                     field.mark();
                 }
             };
@@ -122,7 +121,7 @@ pub fn ProtectedField(comptime T: type) type {
             if (self.dirty) {
                 std.debug.print("[PROTECTED_FIELD] get() called on dirty field! Type={s} obj={s} name={s}\n", .{ @typeName(T), self.obj, self.name });
                 // Print stack trace to help identify the caller
-                std.debug.dumpCurrentStackTrace(@returnAddress());
+                std.debug.dumpCurrentStackTrace(.{ .first_address = @returnAddress() });
             }
             std.debug.assert(!self.dirty);
             return &self.value;

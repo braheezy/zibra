@@ -13,7 +13,6 @@ const FontCategory = font.FontCategory;
 const scrollbar_width = browser.scrollbar_width;
 const h_offset = browser.h_offset;
 const v_offset = browser.v_offset;
-const GraphemeData = @TypeOf(grapheme.init(std.heap.page_allocator) catch unreachable);
 
 const sdl2 = @import("sdl");
 
@@ -29,7 +28,6 @@ fn isBlockElement(tag: []const u8) bool {
 
 const sdl = @import("sdl.zig");
 const c = sdl.c;
-
 
 // Assume 60 fps for frame calculations
 const FRAMES_PER_SECOND: u32 = 60;
@@ -406,16 +404,15 @@ pub const Layout = @This();
 // Layout state
 allocator: std.mem.Allocator,
 // Font manager for handling fonts and glyphs
-    font_manager: font.FontManager,
-    grapheme_data: GraphemeData,
-    window_width: i32,
-    window_height: i32,
-    rtl_text: bool = false,
-    accessibility: browser.AccessibilitySettings = .{},
-    color_scheme_dark: bool = false,
-    document_color_scheme_dark: bool = false,
-    default_font_size: i32 = 16,
-    size: i32 = 16,
+font_manager: font.FontManager,
+window_width: i32,
+window_height: i32,
+rtl_text: bool = false,
+accessibility: browser.AccessibilitySettings = .{},
+color_scheme_dark: bool = false,
+document_color_scheme_dark: bool = false,
+default_font_size: i32 = 16,
+size: i32 = 16,
 cursor_x: i32,
 cursor_y: i32,
 line_left: i32,
@@ -430,8 +427,8 @@ style_stack: std.ArrayList(StyleSnapshot) = undefined,
 // Final content height after layout
 content_height: i32 = 0,
 display_list: std.ArrayList(DisplayItem),
-    current_display_target: *std.ArrayList(DisplayItem),
-    inline_block: ?*BlockLayout = null,
+current_display_target: *std.ArrayList(DisplayItem),
+inline_block: ?*BlockLayout = null,
 
 // Add cache as field
 word_cache: std.AutoHashMap(u64, WordCache),
@@ -607,12 +604,14 @@ fn remapColor(self: *const Layout, color: browser.Color) browser.Color {
 
 pub fn init(
     allocator: std.mem.Allocator,
+    io: std.Io,
+    environ: *const std.process.Environ.Map,
     renderer: sdl2.Renderer,
     window_width: i32,
     window_height: i32,
     rtl_text: bool,
 ) !*Layout {
-    const font_manager = try font.FontManager.init(allocator, renderer);
+    const font_manager = try font.FontManager.init(allocator, io, environ, renderer);
     const layout = try allocator.create(Layout);
 
     const layout_width = window_width;
@@ -621,7 +620,6 @@ pub fn init(
     layout.* = Layout{
         .allocator = allocator,
         .font_manager = font_manager,
-        .grapheme_data = undefined,
         .window_width = window_width,
         .window_height = window_height,
         .rtl_text = rtl_text,
@@ -645,7 +643,6 @@ pub fn init(
     layout.current_display_target = &layout.display_list;
 
     try layout.font_manager.loadSystemFont(layout.scaledFontSize(layout.size));
-    layout.grapheme_data = try grapheme.init(allocator);
 
     layout.style_stack = std.ArrayList(StyleSnapshot).empty;
     return layout;
@@ -653,7 +650,6 @@ pub fn init(
 
 pub fn deinit(self: *Layout) void {
     // clean up hash map for fonts
-    self.grapheme_data.deinit(self.allocator);
     self.font_manager.deinit();
 
     var it = self.word_cache.iterator();
@@ -1445,7 +1441,7 @@ fn handlePreformattedText(
         self.current_font_category = .monospace;
     }
 
-    var g_iter = self.grapheme_data.iterator(content);
+    var g_iter = grapheme.iterator(content);
     while (g_iter.next()) |gc| {
         const gme = gc.bytes(content);
         try self.processGrapheme(gme, line_buffer, node_ptr, .{
@@ -1606,7 +1602,7 @@ pub fn layoutSourceCode(self: *Layout, source: []const u8) ![]DisplayItem {
             self.current_font_category = .latin; // Use regular document font for tags
 
             // Process the '<' character
-            var g_iter = self.grapheme_data.iterator(source[i .. i + 1]);
+            var g_iter = grapheme.iterator(source[i .. i + 1]);
             if (g_iter.next()) |gc| {
                 const gme = gc.bytes(source[i..]);
                 try self.processGrapheme(gme, &line_buffer, null, .{
@@ -1632,7 +1628,7 @@ pub fn layoutSourceCode(self: *Layout, source: []const u8) ![]DisplayItem {
             in_string = false;
 
             // Process the '>' character
-            var g_iter = self.grapheme_data.iterator(source[i .. i + 1]);
+            var g_iter = grapheme.iterator(source[i .. i + 1]);
             if (g_iter.next()) |gc| {
                 const gme = gc.bytes(source[i..]);
                 try self.processGrapheme(gme, &line_buffer, null, .{
@@ -1668,7 +1664,7 @@ pub fn layoutSourceCode(self: *Layout, source: []const u8) ![]DisplayItem {
         }
 
         // Process current character
-        var g_iter = self.grapheme_data.iterator(source[i..]);
+        var g_iter = grapheme.iterator(source[i..]);
         if (g_iter.next()) |gc| {
             const gme = gc.bytes(source[i..]);
             try self.processGrapheme(gme, &line_buffer, null, .{
@@ -1783,7 +1779,7 @@ pub const InputLayout = struct {
         var text_x = x + 2;
         const baseline_y = y + ascent_value;
         if (self.text.len > 0) {
-            var g_iter = engine.grapheme_data.iterator(self.text);
+            var g_iter = grapheme.iterator(self.text);
 
             while (g_iter.next()) |gc| {
                 const gme = gc.bytes(self.text);
@@ -2732,8 +2728,7 @@ pub const BlockLayout = struct {
         const parent_width = if (self.parent_block) |pb| pb.width.read(&self.width).* else self.document.width.read(&self.width).*;
         const prev_y = if (self.previous) |prev|
             prev.y.read(&self.y).* + prev.height.read(&self.y).*
-        else
-            if (self.parent_block) |pb| pb.y.read(&self.y).* else self.document.y.read(&self.y).*;
+        else if (self.parent_block) |pb| pb.y.read(&self.y).* else self.document.y.read(&self.y).*;
 
         // Set x, y, width early so children can read them
         self.x.set(parent_x);

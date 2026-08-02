@@ -5,6 +5,7 @@ const sdl = @import("sdl");
 pub fn build(b: *std.Build) !void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
+    const io = b.graph.io;
 
     const sdk = sdl.init(b, .{});
     const sdl_mod = sdk.getWrapperModule();
@@ -21,8 +22,10 @@ pub fn build(b: *std.Build) !void {
         .root_module = source_module,
     });
 
-    // This will link SDL2 and SDL2_TTF
-    sdk.link(exe, .static, sdl.Library.SDL2_ttf);
+    // SDL2_ttf uses SDL2, but does not make SDL2's symbols available to this
+    // executable on every linker/platform. Link both libraries explicitly.
+    sdk.link(io, exe, .static, sdl.Library.SDL2);
+    sdk.link(io, exe, .static, sdl.Library.SDL2_ttf);
     b.installArtifact(exe);
 
     const known_folders = b.dependency("known_folders", .{}).module("known-folders");

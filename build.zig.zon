@@ -5,36 +5,39 @@
     .dependencies = .{
         // For Unicode text processing
         .zg = .{
-            .url = "git+https://codeberg.org/loftafi/zg#2f02c3b16c073d0bd3d9368a66ce272a574f75a3",
-            .hash = "zg-0.15.1-oGqU3J1DtAJhPKw_pU5s8kHGVYDk1leZm4TtO1cvMihq",
+            .url = "git+https://codeberg.org/atman/zg#b5ebb3e50684613f20d745ac6b6b21c6d33e61ff",
+            .hash = "zg-0.16.2-oGqU3OaMtgJLe_KwUwfcmRwJrE4Ihy2LpDEQm_rANL9J",
         },
         // For URL parsing
         .adazig = .{
-            .url = "git+https://github.com/braheezy/ada-zig?ref=3.3.0#be92d04eeca6401f0d4ff41a493d5b8658ba7a5b",
-            .hash = "adazig-3.3.0-t4eT-oRlAACE_weWUFiOuG8aAfK-gMa1t6PbBW0p_Zcr",
+            .url = "git+https://github.com/braheezy/ada-zig?ref=3.4.4#7477fe23c17cac0b7583b6c5a64e6500ee5b42a6",
+            .hash = "adazig-3.4.4-t4eT-vxtAACBiPcng_L6x-AGLtoYhQ9MP0xYb8d73JyW",
         },
         // The locations of folders
         .known_folders = .{
-            .url = "git+https://github.com/ziglibs/known-folders#ab5cf5feb936fa3b72c95d3ad0c0c67791937ba1",
-            .hash = "known_folders-0.0.0-Fy-PJtTTAADUOhGKM0sxzG4eMkNQxRvx9e5dfHVyaeA3",
+            .url = "git+https://github.com/ziglibs/known-folders#6da0d0c41b78b9ed2d34fa364fcb81b5ebece6c4",
+            .hash = "known_folders-0.0.0-Fy-PJiDLAAB98m3uYUzatrTb2mO2fpvwx2zpSroEtfbO",
         },
         // Javascript runtime
         .kiesel = .{
-            .path = "kiesel",
+            .url = "git+https://codeberg.org/kiesel-js/kiesel#589108a6098cdd137bb2bc8404efef685e641643",
+            .hash = "kiesel-0.4.0-Q1t3SpMfkAB5aKM9mWsoGig4_zQ3sD-4BeSqzLXG9zz2",
         },
         // For 2d graphics
         .z2d = .{
-            .path = "z2d",
+            .url = "git+https://github.com/vancluever/z2d#47fc1030c1636dcfb75ea1cc238f706dd1feb379",
+            .hash = "z2d-0.12.2-pre-j5P_HtA8EQDpzu5RUtQhr_Sn9MeQF3_q7rWMw3ouesd0",
         },
         // Graphics + input handling
         // update with --save=sdl
         .sdl = .{
-            .url = "git+https://github.com/ikskuh/SDL.zig#827ad6a03ef1ad390b1ae8d96521b7cd3aaa19ff",
-            .hash = "SDL2-0.0.0-yMCQioGqBABWVG7BzbU3WEU6dyYDF0EojBS8CZRlFw-7",
+            .path = "SDL.zig",
+            // .url = "git+https://github.com/braheezy/SDL.zig#a1c36303a95c37ba36c69b19f79683f2eb5050b4",
+            // .hash = "SDL2-0.0.0-yMCQipWnBABMAdfue6YmerIoyHg-6r3f3zapmQoy9teu",
         },
         .zigimg = .{
-            .url = "git+https://github.com/zigimg/zigimg.git#eab2522c023b9259db8b13f2f90d609b7437e5f6",
-            .hash = "zigimg-0.1.0-8_eo2vUZFgAAtN1c6dAO5DdqL0d4cEWHtn6iR5ucZJti",
+            .url = "git+https://github.com/zigimg/zigimg.git#096115a3eeae1a4c477496d575f1f1f74865387c",
+            .hash = "zigimg-0.1.0-8_eo2mHBFwDLhWjXriR17_b7VF6qML1f98Xokp7ZZbop",
         },
     },
     .fingerprint = 0x5f81e20e918f49dc,

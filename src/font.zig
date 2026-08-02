@@ -238,6 +238,8 @@ pub const FontKey = struct {
 
 pub const FontManager = struct {
     allocator: std.mem.Allocator,
+    io: std.Io,
+    environ: *const std.process.Environ.Map,
     renderer: sdl2.Renderer,
     fonts: std.StringHashMap(*Font),
     styled_fonts: std.AutoHashMap(FontKey, *Font),
@@ -246,11 +248,18 @@ pub const FontManager = struct {
     min_line_height: i32 = std.math.maxInt(i32),
     loaded_sizes: std.AutoHashMap(i32, void),
 
-    pub fn init(allocator: std.mem.Allocator, renderer: sdl2.Renderer) !FontManager {
+    pub fn init(
+        allocator: std.mem.Allocator,
+        io: std.Io,
+        environ: *const std.process.Environ.Map,
+        renderer: sdl2.Renderer,
+    ) !FontManager {
         try sdl2.ttf.init();
 
         return FontManager{
             .allocator = allocator,
+            .io = io,
+            .environ = environ,
             .renderer = renderer,
             .fonts = std.StringHashMap(*Font).init(allocator),
             .styled_fonts = std.AutoHashMap(FontKey, *Font).init(allocator),
@@ -314,11 +323,11 @@ pub const FontManager = struct {
         var paths = std.ArrayList([]const u8).empty;
 
         // Add user font directory first to prefer them.
-        const home_dir = try known_folders.getPath(self.allocator, .home) orelse return error.NoHomeDir;
+        const home_dir = try known_folders.getPath(self.io, self.allocator, self.environ, .home) orelse return error.NoHomeDir;
         defer self.allocator.free(home_dir);
 
         const user_suffixes = switch (builtin.target.os.tag) {
-            .macos => &[_][]const u8{ "/Library/Fonts" },
+            .macos => &[_][]const u8{"/Library/Fonts"},
             .linux => &[_][]const u8{ "/.local/share/fonts", "/.fonts" },
             else => &[_][]const u8{},
         };
@@ -340,11 +349,11 @@ pub const FontManager = struct {
         const extensions = [_][]const u8{ ".ttf", ".otf", ".ttc" };
 
         for (paths) |dir| {
-            var dir_path = std.fs.cwd().openDir(dir, .{ .iterate = true }) catch continue;
-            defer dir_path.close();
+            var dir_path = std.Io.Dir.cwd().openDir(self.io, dir, .{ .iterate = true }) catch continue;
+            defer dir_path.close(self.io);
 
             var dir_entries = dir_path.iterate();
-            while (try dir_entries.next()) |file_entry| {
+            while (try dir_entries.next(self.io)) |file_entry| {
                 if (file_entry.kind != .file) continue;
 
                 const filename = file_entry.name;
