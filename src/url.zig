@@ -745,14 +745,14 @@ fn printHeaders(al: std.mem.Allocator, headers: std.StringHashMap([]const u8)) !
 const expect = std.testing.expect;
 
 test "file request" {
-    const url = try Url.init(std.testing.allocator, "file:///test/path.html", false);
+    const url = try Url.init(std.testing.allocator, "file:///test/path.html");
     defer url.free(std.testing.allocator);
     try expect(std.mem.eql(u8, url.scheme, "file"));
     try expect(std.mem.eql(u8, url.path, "/test/path.html"));
 }
 
 test "data request" {
-    const url = try Url.init(std.testing.allocator, "data:text/html,Hello%20World!", false);
+    const url = try Url.init(std.testing.allocator, "data:text/html,Hello%20World!");
     defer url.free(std.testing.allocator);
     try expect(std.mem.eql(u8, url.scheme, "data"));
     try expect(std.mem.eql(u8, url.path, "Hello%20World!"));
@@ -760,10 +760,10 @@ test "data request" {
 }
 
 test "data request with attributes" {
-    const url = try Url.init(std.testing.allocator, "data:text/html;charset=utf-8;base64,SGVsbG8gV29ybGQh", false);
+    const url = try Url.init(std.testing.allocator, "data:text/html;charset=utf-8;base64,SGVsbG8gV29ybGQh");
     defer url.free(std.testing.allocator);
     try expect(std.mem.eql(u8, url.scheme, "data"));
-    try expect(std.mem.eql(u8, url.path, "SGVsbG8gV29ybGQh"));
+    try expect(std.mem.eql(u8, url.path, "Hello World!"));
     try expect(std.mem.eql(u8, url.mime_type.?, "text/html"));
     try expect(url.attributes.?.items.len == 2);
     try expect(std.mem.eql(u8, url.attributes.?.items[0], "charset=utf-8"));
@@ -771,7 +771,7 @@ test "data request with attributes" {
 }
 
 test "http request" {
-    const url = try Url.init(std.testing.allocator, "http://example.com", false);
+    const url = try Url.init(std.testing.allocator, "http://example.com");
     defer url.free(std.testing.allocator);
     try expect(std.mem.eql(u8, url.scheme, "http"));
     try expect(std.mem.eql(u8, url.host.?, "example.com"));

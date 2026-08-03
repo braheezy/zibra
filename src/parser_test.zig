@@ -9,7 +9,7 @@ test "Parse basic HTML" {
     parser.use_implicit_tags = false;
     defer parser.deinit(allocator);
 
-    const root = try parser.parse();
+    var root = try parser.parse();
     defer root.deinit(allocator);
 
     try std.testing.expectEqualStrings("html", root.element.tag);
@@ -35,7 +35,7 @@ test "Parse quoted attributes" {
     parser.use_implicit_tags = false;
     defer parser.deinit(allocator);
 
-    const root = try parser.parse();
+    var root = try parser.parse();
     defer root.deinit(allocator);
 
     try std.testing.expectEqualStrings("div", root.element.tag);
@@ -56,7 +56,7 @@ test "Parse boolean attributes" {
     parser.use_implicit_tags = false;
     defer parser.deinit(allocator);
 
-    const root = try parser.parse();
+    var root = try parser.parse();
     defer root.deinit(allocator);
     try std.testing.expectEqualStrings("input", root.element.tag);
     try std.testing.expect(root.element.attributes != null);
@@ -76,7 +76,7 @@ test "Parse unquoted attributes" {
     parser.use_implicit_tags = false;
     defer parser.deinit(allocator);
 
-    const root = try parser.parse();
+    var root = try parser.parse();
     defer root.deinit(allocator);
     try std.testing.expectEqualStrings("input", root.element.tag);
     try std.testing.expect(root.element.attributes != null);
@@ -96,7 +96,7 @@ test "Parse mixed attribute types" {
     parser.use_implicit_tags = false;
     defer parser.deinit(allocator);
 
-    const root = try parser.parse();
+    var root = try parser.parse();
     defer root.deinit(allocator);
     try std.testing.expectEqualStrings("form", root.element.tag);
     try std.testing.expect(root.element.attributes != null);
@@ -117,7 +117,7 @@ test "Parse self-closing tags with attributes" {
     parser.use_implicit_tags = false;
     defer parser.deinit(allocator);
 
-    const root = try parser.parse();
+    var root = try parser.parse();
     defer root.deinit(allocator);
 
     try std.testing.expectEqualStrings("img", root.element.tag);
@@ -147,7 +147,7 @@ test "Parse HTML with implicit tags" {
     var parser = try HTMLParser.init(allocator, html);
     defer parser.deinit(allocator);
 
-    const root = try parser.parse();
+    var root = try parser.parse();
     defer root.deinit(allocator);
 
     // Verify implicit html tag was added
@@ -181,7 +181,7 @@ test "Parse HTML with head elements but no explicit head tag" {
     var parser = try HTMLParser.init(allocator, html);
     defer parser.deinit(allocator);
 
-    const root = try parser.parse();
+    var root = try parser.parse();
     defer root.deinit(allocator);
 
     // Verify implicit html tag was added
@@ -216,7 +216,7 @@ test "Parse HTML with unclosed paragraph tags" {
     var parser = try HTMLParser.init(allocator, html);
     defer parser.deinit(allocator);
 
-    const root = try parser.parse();
+    var root = try parser.parse();
     defer root.deinit(allocator);
 
     // Verify implicit html tag was added
@@ -255,7 +255,7 @@ test "Parse HTML with nested paragraphs" {
     var parser = try HTMLParser.init(allocator, html);
     defer parser.deinit(allocator);
 
-    const root = try parser.parse();
+    var root = try parser.parse();
     defer root.deinit(allocator);
 
     // Get the body element
@@ -286,7 +286,7 @@ test "Parse HTML with list items" {
     var parser = try HTMLParser.init(allocator, html);
     defer parser.deinit(allocator);
 
-    const root = try parser.parse();
+    var root = try parser.parse();
     defer root.deinit(allocator);
 
     // Get the body element
@@ -324,7 +324,7 @@ test "Parse HTML with nested lists" {
     var parser = try HTMLParser.init(allocator, html);
     defer parser.deinit(allocator);
 
-    const root = try parser.parse();
+    var root = try parser.parse();
     defer root.deinit(allocator);
 
     // Get the body element
@@ -372,7 +372,7 @@ test "Parse overlapping formatting elements" {
     var parser = try HTMLParser.init(allocator, html);
     defer parser.deinit(allocator);
 
-    const root = try parser.parse();
+    var root = try parser.parse();
     defer root.deinit(allocator);
 
     // Get the body element
@@ -412,7 +412,7 @@ test "Parse quoted attributes with spaces and angle brackets" {
     parser.use_implicit_tags = false;
     defer parser.deinit(allocator);
 
-    const root = try parser.parse();
+    var root = try parser.parse();
     defer root.deinit(allocator);
 
     try std.testing.expectEqualStrings("div", root.element.tag);
@@ -432,7 +432,7 @@ test "Parse nested formatting elements" {
     var parser = try HTMLParser.init(allocator, html);
     defer parser.deinit(allocator);
 
-    const root = try parser.parse();
+    var root = try parser.parse();
     defer root.deinit(allocator);
 
     // Get the body element
@@ -496,7 +496,7 @@ test "Parse script tag content" {
     parser.use_implicit_tags = false;
     defer parser.deinit(allocator);
 
-    const root = try parser.parse();
+    var root = try parser.parse();
     defer root.deinit(allocator);
 
     try std.testing.expectEqualStrings("html", root.element.tag);
@@ -526,7 +526,7 @@ test "Parse script tag with implicit tags" {
     var parser = try HTMLParser.init(allocator, html);
     defer parser.deinit(allocator);
 
-    const root = try parser.parse();
+    var root = try parser.parse();
     defer root.deinit(allocator);
 
     // Verify implicit html tag was added

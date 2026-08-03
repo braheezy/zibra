@@ -87,6 +87,8 @@ pub fn build(b: *std.Build) !void {
     const run_step = b.step("run", "Run the app");
     run_step.dependOn(&run_cmd.step);
 
+    const test_step = b.step("test", "Run unit tests");
+
     const js_test_module = b.createModule(.{
         .root_source_file = b.path("src/js.zig"),
         .target = target,
@@ -97,6 +99,60 @@ pub fn build(b: *std.Build) !void {
     js_test_module.addImport("zigimg", zigimg_dep.module("zigimg"));
     const js_tests = b.addTest(.{ .root_module = js_test_module });
     const js_tests_run = b.addRunArtifact(js_tests);
-    const test_step = b.step("test", "Run tests");
     test_step.dependOn(&js_tests_run.step);
+
+    const parser_test_module = b.createModule(.{
+        .root_source_file = b.path("src/parser_test.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    parser_test_module.addImport("zigimg", zigimg_dep.module("zigimg"));
+    const parser_tests = b.addTest(.{ .root_module = parser_test_module });
+    const parser_tests_run = b.addRunArtifact(parser_tests);
+    test_step.dependOn(&parser_tests_run.step);
+
+    const url_test_module = b.createModule(.{
+        .root_source_file = b.path("src/url.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    url_test_module.addImport("ada", ada_dep.module("ada"));
+    const url_tests = b.addTest(.{ .root_module = url_test_module });
+    const url_tests_run = b.addRunArtifact(url_tests);
+    test_step.dependOn(&url_tests_run.step);
+
+    const screenshot_test_step = b.step(
+        "test-screenshot",
+        "Capture and compare the native macOS screenshot fixture",
+    );
+    if (builtin.os.tag == .macos and
+        target.result.os.tag == .macos and
+        target.result.cpu.arch == builtin.cpu.arch)
+    {
+        const screenshot_compare_module = b.createModule(.{
+            .root_source_file = b.path("tests/screenshot_compare.zig"),
+            .target = target,
+            .optimize = optimize,
+        });
+        screenshot_compare_module.addImport("zigimg", zigimg_dep.module("zigimg"));
+        const screenshot_compare = b.addExecutable(.{
+            .name = "screenshot-compare",
+            .root_module = screenshot_compare_module,
+        });
+
+        const capture = b.addRunArtifact(exe);
+        capture.addArg("--screenshot");
+        const actual_screenshot = capture.addOutputFileArg("native-screenshot.png");
+        capture.addPrefixedFileArg("file://", b.path("tests/manual/native-screenshot.html"));
+
+        const compare = b.addRunArtifact(screenshot_compare);
+        compare.addFileArg(b.path("tests/golden/native-screenshot.macos.png"));
+        compare.addFileArg(actual_screenshot);
+        screenshot_test_step.dependOn(&compare.step);
+    } else {
+        const unsupported = b.addFail(
+            "test-screenshot currently requires a native macOS target",
+        );
+        screenshot_test_step.dependOn(&unsupported.step);
+    }
 }
