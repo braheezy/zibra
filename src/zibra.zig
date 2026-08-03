@@ -46,14 +46,34 @@ fn zibra(init: std.process.Init) !void {
     var rtl_flag = false;
     var url: ?Url = null;
     var print_tree = false;
+    var screenshot_path: ?[]const u8 = null;
 
-    for (args[1..]) |arg| {
+    var arg_index: usize = 1;
+    while (arg_index < args.len) : (arg_index += 1) {
+        const arg = args[arg_index];
         if (std.mem.eql(u8, arg, "-rtl")) {
             rtl_flag = true;
             continue;
         }
         if (std.mem.eql(u8, arg, "-t")) {
             print_tree = true;
+            continue;
+        }
+        if (std.mem.eql(u8, arg, "--screenshot")) {
+            if (screenshot_path != null or arg_index + 1 >= args.len) {
+                std.log.err("--screenshot requires exactly one output path.", .{});
+                return error.BadArguments;
+            }
+            arg_index += 1;
+            screenshot_path = args[arg_index];
+            continue;
+        }
+        if (std.mem.startsWith(u8, arg, "--screenshot=")) {
+            if (screenshot_path != null or arg.len == "--screenshot=".len) {
+                std.log.err("--screenshot requires exactly one output path.", .{});
+                return error.BadArguments;
+            }
+            screenshot_path = arg["--screenshot=".len..];
             continue;
         }
         if (url) |_| {
@@ -95,8 +115,12 @@ fn zibra(init: std.process.Init) !void {
 
     defer if (url) |u| u.free(allocator);
 
+    if (print_tree and screenshot_path != null) {
+        std.log.err("-t and --screenshot cannot be used together.", .{});
+        return error.BadArguments;
+    }
     // Initialize browser
-    var b = try Browser.init(allocator, init.io, init.environ_map, rtl_flag);
+    var b = try Browser.init(allocator, init.io, init.environ_map, rtl_flag, screenshot_path != null);
     defer b.deinit();
 
     if (url) |u| {
@@ -139,7 +163,11 @@ fn zibra(init: std.process.Init) !void {
     }
 
     // Start main exec loop
-    try b.run();
+    if (screenshot_path) |path| {
+        try b.runToScreenshot(path);
+    } else {
+        try b.run();
+    }
 }
 
 test {

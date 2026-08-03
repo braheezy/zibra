@@ -1,6 +1,7 @@
 const std = @import("std");
 const Mutex = @import("sync.zig").Mutex;
 
+const bdwgc = @import("bdwgc");
 const kiesel = @import("kiesel");
 const Agent = kiesel.execution.Agent;
 const Script = kiesel.language.Script;
@@ -181,6 +182,7 @@ const WindowContext = struct {
 platform: Agent.Platform,
 agent: Agent,
 allocator: std.mem.Allocator,
+storage_allocator: std.mem.Allocator,
 windows: std.AutoHashMap(u32, WindowContext),
 parent_window_ids: std.AutoHashMap(u32, u32),
 current_window_id: ?u32 = null,
@@ -193,8 +195,16 @@ pub fn init(
     io: std.Io,
     environ: *const std.process.Environ.Map,
 ) !*Js {
-    const self = try allocator.create(Js);
-    errdefer allocator.destroy(self);
+    // Agent is embedded in Js, so Js must live in memory scanned by Kiesel's
+    // collector. The caller's arena is not a GC root and previously allowed
+    // Agent-owned realms and string-cache storage to be reclaimed.
+    if (kiesel.build_options.enable_libgc) kiesel.gc.init();
+    const storage_allocator = if (kiesel.build_options.enable_libgc)
+        bdwgc.allocator_uncollectable
+    else
+        allocator;
+    const self = try storage_allocator.create(Js);
+    errdefer storage_allocator.destroy(self);
 
     // Initialize platform first
     self.platform = Agent.Platform.default(io, environ);
@@ -204,6 +214,7 @@ pub fn init(
     errdefer self.agent.deinit();
 
     self.allocator = allocator;
+    self.storage_allocator = storage_allocator;
     self.windows = std.AutoHashMap(u32, WindowContext).init(allocator);
     self.parent_window_ids = std.AutoHashMap(u32, u32).init(allocator);
     self.current_window_id = null;
@@ -319,8 +330,8 @@ fn consoleLog(agent: *Agent, _: Value, arguments: kiesel.types.Arguments) Agent.
 }
 
 pub fn deinit(self: *Js, allocator: std.mem.Allocator) void {
+    _ = allocator;
     self.lock.lock();
-    defer self.lock.unlock();
     var it = self.windows.valueIterator();
     while (it.next()) |window| {
         window.node_to_handle.deinit();
@@ -335,7 +346,9 @@ pub fn deinit(self: *Js, allocator: std.mem.Allocator) void {
     self.parent_window_ids.deinit();
     self.platform.deinit();
     self.agent.deinit();
-    allocator.destroy(self);
+    const storage_allocator = self.storage_allocator;
+    self.lock.unlock();
+    storage_allocator.destroy(self);
 }
 
 pub fn evaluate(self: *Js, window_id: u32, code: []const u8) !Value {
@@ -856,6 +869,23 @@ test "__native.style_set is exposed" {
     defer js.deinit(std.testing.allocator);
 
     const result = try js.evaluate(0, "typeof __native.style_set === 'function'");
+    try std.testing.expect(result.toBoolean());
+}
+
+test "Js roots Kiesel Agent state across garbage collections" {
+    var environ = std.process.Environ.Map.init(std.testing.allocator);
+    defer environ.deinit();
+    var js = try Js.init(std.testing.allocator, std.testing.io, &environ);
+    defer js.deinit(std.testing.allocator);
+
+    _ = try js.evaluate(0, "typeof Node === 'function'");
+    kiesel.gc.collect();
+    kiesel.gc.collect();
+
+    const result = try js.evaluate(
+        0,
+        "typeof Node === 'function' && typeof __native === 'object'",
+    );
     try std.testing.expect(result.toBoolean());
 }
 

@@ -37,6 +37,7 @@ pub const TaskRunner = struct {
     condition: sync.Condition,
     needs_quit: bool = false,
     shutting_down: bool = false,
+    active_tasks: usize = 0,
     thread: ?std.Thread = null,
     measure: *MeasureTime,
 
@@ -88,12 +89,16 @@ pub const TaskRunner = struct {
         }
     }
 
-    pub fn isEmpty(self: *const TaskRunner) bool {
-        return self.tasks.items.len == 0;
+    pub fn isIdle(self: *TaskRunner) bool {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        return self.tasks.items.len == 0 and self.active_tasks == 0;
     }
 
-    pub fn pendingCount(self: *const TaskRunner) usize {
-        return self.tasks.items.len;
+    pub fn pendingCount(self: *TaskRunner) usize {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        return self.tasks.items.len + self.active_tasks;
     }
 
     pub fn setNeedsQuit(self: *TaskRunner) void {
@@ -141,13 +146,20 @@ fn runThread(runner: *TaskRunner) void {
         }
 
         task_to_run = runner.tasks.orderedRemove(0);
+        runner.active_tasks += 1;
         runner.mutex.unlock();
 
         if (task_to_run) |task| {
-            defer task.cleanup();
             task.run() catch |err| {
                 std.log.err("Task failed: {}", .{err});
             };
+            task.cleanup();
+
+            runner.mutex.lock();
+            std.debug.assert(runner.active_tasks > 0);
+            runner.active_tasks -= 1;
+            runner.condition.broadcast();
+            runner.mutex.unlock();
         }
     }
 }

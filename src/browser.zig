@@ -615,6 +615,10 @@ pub const JsRenderContext = struct {
 
 // Browser manages the window and tabs
 pub const Browser = struct {
+    const ScreenshotRequest = struct {
+        path: []const u8,
+    };
+
     // Memory allocator for the browser
     allocator: std.mem.Allocator,
     io: std.Io,
@@ -681,16 +685,17 @@ pub const Browser = struct {
         io: std.Io,
         environ: *const std.process.Environ.Map,
         rtl_flag: bool,
+        hidden: bool,
     ) !Browser {
         // Initialize SDL
         try sdl2.init(.{
             .video = true,
         });
 
-        const preferred_position = windowPositionForFocusedDisplay();
+        const preferred_position = if (hidden) null else windowPositionForFocusedDisplay();
         const window_x: sdl2.WindowPosition = if (preferred_position) |pos| .{ .absolute = pos.x } else .default;
         const window_y: sdl2.WindowPosition = if (preferred_position) |pos| .{ .absolute = pos.y } else .default;
-        const window_visibility: sdl2.WindowFlags.Visibility = if (preferred_position != null) .hidden else .default;
+        const window_visibility: sdl2.WindowFlags.Visibility = if (hidden or preferred_position != null) .hidden else .default;
 
         // Create a window with correct OS graphics
         const screen = try sdl2.createWindow(
@@ -701,9 +706,11 @@ pub const Browser = struct {
             initial_window_height,
             .{ .vis = window_visibility }, // Not resizable
         );
-        if (preferred_position) |pos| {
-            try screen.setPosition(.{ .x = pos.x, .y = pos.y });
-            screen.setVisible(true);
+        if (!hidden) {
+            if (preferred_position) |pos| {
+                try screen.setPosition(.{ .x = pos.x, .y = pos.y });
+                screen.setVisible(true);
+            }
         }
 
         // Create a renderer, which will be used to draw to the window
@@ -972,9 +979,25 @@ pub const Browser = struct {
         url_owned = false;
     }
 
+    const screenshot_timeout_ns: i64 = 30 * std.time.ns_per_s;
+
     // Run the browser event loop
     pub fn run(self: *Browser) !void {
+        try self.runLoop(null);
+    }
+
+    /// Run the normal browser pipeline in a hidden window, write the resulting
+    /// quiescent frame to `path`, and exit.
+    pub fn runToScreenshot(self: *Browser, path: []const u8) !void {
+        try self.runLoop(.{ .path = path });
+    }
+
+    fn runLoop(self: *Browser, screenshot: ?ScreenshotRequest) !void {
+        defer self.finishRunLoop();
+
         var quit = false;
+        var screenshot_ready_checks: u8 = 0;
+        const screenshot_started_ns = std.Io.Clock.awake.now(self.io).nanoseconds;
         self.scheduleAnimationFrame();
 
         while (!quit) {
@@ -998,16 +1021,47 @@ pub const Browser = struct {
                 }
             }
 
+            if (quit and screenshot != null) {
+                std.log.err("Screenshot run aborted before capture.", .{});
+                // A tab task may be stuck in foreign/JS code. Normal teardown
+                // cannot safely free the tab underneath that detached worker.
+                std.process.exit(130);
+            }
+
             if (!quit) {
                 try self.compositeRasterAndDraw();
                 self.scheduleAnimationFrame();
+
+                if (screenshot) |request| {
+                    if (self.isScreenshotReady()) {
+                        screenshot_ready_checks += 1;
+                        if (screenshot_ready_checks >= 2) {
+                            try self.writeScreenshot(request.path);
+                            std.log.info("Screenshot written to {s}", .{request.path});
+                            quit = true;
+                        }
+                    } else {
+                        screenshot_ready_checks = 0;
+                    }
+
+                    const elapsed_ns = std.Io.Clock.awake.now(self.io).nanoseconds - screenshot_started_ns;
+                    if (!quit and elapsed_ns >= screenshot_timeout_ns) {
+                        std.log.err("Screenshot timed out after 30 seconds.", .{});
+                        // Screenshot mode is a process-isolated automation path.
+                        // Exit directly so a stuck tab worker cannot hang deinit.
+                        std.process.exit(124);
+                    }
+                }
+
                 if (!handled_event and self.isIdle()) {
                     // Yield briefly to avoid a busy loop when there's no work.
                     try self.io.sleep(.fromNanoseconds(2_000_000), .awake); // 2ms
                 }
             }
         }
+    }
 
+    fn finishRunLoop(self: *Browser) void {
         // Signal shutdown to background threads before cleanup
         std.debug.print("[SHUTDOWN] signaling shutdown\n", .{});
         self.lock.lock();
@@ -1016,8 +1070,30 @@ pub const Browser = struct {
 
         // Give background threads a moment to notice shutdown
         std.debug.print("[SHUTDOWN] sleeping\n", .{});
-        try self.io.sleep(.fromNanoseconds(50_000_000), .awake); // 50ms
+        self.io.sleep(.fromNanoseconds(50_000_000), .awake) catch |err| {
+            std.log.warn("Failed to wait for browser threads during shutdown: {}", .{err});
+        }; // 50ms
         std.debug.print("[SHUTDOWN] run() returning\n", .{});
+    }
+
+    fn isScreenshotReady(self: *Browser) bool {
+        self.lock.lock();
+        const tab = self.activeTab();
+        const render_ready = tab != null and
+            self.active_tab_display_list != null and
+            !self.needs_composite and
+            !self.needs_raster and
+            !self.needs_draw and
+            !self.needs_animation_frame and
+            !self.animation_timer_active;
+        self.lock.unlock();
+
+        if (!render_ready) return false;
+        return tab.?.task_runner.isIdle();
+    }
+
+    fn writeScreenshot(self: *Browser, path: []const u8) !void {
+        try z2d.png_exporter.writeToPNGFile(self.io, self.root_surface, path, .{});
     }
 
     fn isIdle(self: *Browser) bool {

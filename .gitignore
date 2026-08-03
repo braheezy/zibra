@@ -2,4 +2,3 @@ zibra
 .zig-cache*
 zig-out
 autorun
-tests

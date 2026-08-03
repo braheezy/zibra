@@ -23,6 +23,13 @@
             .url = "git+https://codeberg.org/kiesel-js/kiesel#589108a6098cdd137bb2bc8404efef685e641643",
             .hash = "kiesel-0.4.0-Q1t3SpMfkAB5aKM9mWsoGig4_zQ3sD-4BeSqzLXG9zz2",
         },
+        // Zibra embeds Kiesel's Agent in a long-lived host object. Access the
+        // collector's scanned, uncollectable allocator so that object can be
+        // kept as a GC root for its full lifetime.
+        .bdwgc_zig = .{
+            .url = "git+https://github.com/bdwgc/bdwgc-zig#81e92063debddd226f3a660cee43665a04c926f3",
+            .hash = "bdwgc_zig-0.1.0-ffcEgYd6AAA_rlVpPv9GN2Olt2DCBle_4Ageca2NDNUy",
+        },
         // For 2d graphics
         .z2d = .{
             .url = "git+https://github.com/vancluever/z2d#47fc1030c1636dcfb75ea1cc238f706dd1feb379",

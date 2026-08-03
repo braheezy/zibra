@@ -49,6 +49,29 @@ pub fn build(b: *std.Build) !void {
     });
     source_module.addImport("kiesel", kiesel_dep.module("kiesel"));
 
+    // Match Kiesel's bdwgc dependency options exactly. Zig then reuses the
+    // same dependency instance instead of linking a second collector.
+    const bdwgc_cflags = if (optimize == .Debug)
+        "-DNO_MSGBOX_ON_ERROR"
+    else
+        "-DNO_MSGBOX_ON_ERROR -DNO_GETENV";
+    const enable_nan_boxing = switch (target.result.cpu.arch) {
+        .x86_64, .aarch64 => true,
+        else => false,
+    };
+    const bdwgc_dep = b.dependency("bdwgc_zig", .{
+        .target = target,
+        .optimize = optimize,
+        .linkage = .static,
+        .CFLAGS_EXTRA = bdwgc_cflags,
+        .enable_gcj_support = false,
+        .enable_java_finalization = false,
+        .enable_large_config = true,
+        .enable_gc_dump = false,
+        .enable_dynamic_pointer_mask = enable_nan_boxing,
+    });
+    source_module.addImport("bdwgc", bdwgc_dep.module("bdwgc"));
+
     const zigimg_dep = b.dependency("zigimg", .{
         .target = target,
         .optimize = optimize,
@@ -70,6 +93,8 @@ pub fn build(b: *std.Build) !void {
         .optimize = optimize,
     });
     js_test_module.addImport("kiesel", kiesel_dep.module("kiesel"));
+    js_test_module.addImport("bdwgc", bdwgc_dep.module("bdwgc"));
+    js_test_module.addImport("zigimg", zigimg_dep.module("zigimg"));
     const js_tests = b.addTest(.{ .root_module = js_test_module });
     const js_tests_run = b.addRunArtifact(js_tests);
     const test_step = b.step("test", "Run tests");
