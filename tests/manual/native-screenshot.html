@@ -1,0 +1,25 @@
+<!--
+How to verify:
+  zig build run -- --screenshot /tmp/zibra-native-screenshot.png tests/manual/native-screenshot.html
+
+Expected behavior:
+  The command captures this page to the requested path, stays hidden, and exits.
+-->
+<!doctype html>
+<html>
+  <head>
+    <title>Native screenshot fixture</title>
+    <style>
+      body { background-color: white; color: black; }
+      .panel { background-color: #d8f3dc; }
+      a { color: #2457e6; }
+    </style>
+  </head>
+  <body>
+    <h1>Native screenshot</h1>
+    <div class="panel">
+      <p>This frame came directly from Zibra's z2d surface.</p>
+      <a href="https://example.com/">A blue test link</a>
+    </div>
+  </body>
+</html>
