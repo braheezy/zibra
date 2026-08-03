@@ -1,3 +1,11 @@
+//! Per-tab serialized background task execution.
+//!
+//! A `Task` borrows its opaque context until its cleanup callback runs. The
+//! runner executes and cleans each accepted task exactly once, or cleans it
+//! without running when pending work is cleared. `shutdown` signals and
+//! detaches the worker rather than waiting for an active task to finish, so it
+//! does not by itself establish that the runner's storage is no longer in use.
+
 const std = @import("std");
 const MeasureTime = @import("measure_time.zig").MeasureTime;
 const sync = @import("sync.zig");
@@ -19,11 +27,11 @@ pub const Task = struct {
         };
     }
 
-    pub fn run(self: Task) anyerror!void {
+    fn run(self: Task) anyerror!void {
         try self.run_fn(self.context);
     }
 
-    pub fn cleanup(self: Task) void {
+    fn cleanup(self: Task) void {
         if (self.cleanup_fn) |cleanup_fn| {
             cleanup_fn(self.context);
         }
@@ -93,19 +101,6 @@ pub const TaskRunner = struct {
         self.mutex.lock();
         defer self.mutex.unlock();
         return self.tasks.items.len == 0 and self.active_tasks == 0;
-    }
-
-    pub fn pendingCount(self: *TaskRunner) usize {
-        self.mutex.lock();
-        defer self.mutex.unlock();
-        return self.tasks.items.len + self.active_tasks;
-    }
-
-    pub fn setNeedsQuit(self: *TaskRunner) void {
-        self.mutex.lock();
-        defer self.mutex.unlock();
-        self.needs_quit = true;
-        self.condition.broadcast();
     }
 
     pub fn shutdown(self: *TaskRunner) void {

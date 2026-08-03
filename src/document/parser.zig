@@ -1,7 +1,14 @@
+//! DOM representation, tutorial HTML parser, and computed-style application.
+//!
+//! Parsed node strings borrow the parser input buffer. The caller must keep
+//! that buffer alive until the complete `Node` tree has been deinitialized.
+//! Child nodes are stored by value, so callers must repair parent pointers
+//! after structural mutation and must not retain pointers across relocation.
+
 const std = @import("std");
 const zigimg = @import("zigimg");
-const ProtectedField = @import("protected_field.zig").ProtectedField;
-pub const CSSParser = @import("cssParser.zig").CSSParser;
+const ProtectedField = @import("../core/protected_field.zig").ProtectedField;
+const CSSParser = @import("css_parser.zig").CSSParser;
 
 /// Animation state for a numeric CSS property transition
 pub const NumericAnimation = struct {
@@ -90,16 +97,12 @@ pub const StyleMap = std.StringHashMap(ProtectedField([]const u8));
 const Text = struct {
     text: []const u8,
     parent: ?*Node = null,
-    children: ?std.ArrayList(Node) = null,
-    is_focused: bool = false,
     style: ?StyleMap = null,
 
-    pub fn init(text: []const u8, parent: ?*Node) !Text {
-        return Text{
+    fn init(text: []const u8, parent: ?*Node) Text {
+        return .{
             .text = text,
             .parent = parent,
-            .children = null,
-            .is_focused = false,
             .style = null,
         };
     }
@@ -134,6 +137,7 @@ pub const Element = struct {
             .animations = null,
             .image_data = null,
         };
+        errdefer e.deinit(allocator);
 
         // Only parse attributes if there's a space in the tag
         if (std.mem.indexOf(u8, tag, " ") != null) {
@@ -302,16 +306,9 @@ pub const Node = union(enum) {
         }
     }
 
-    pub fn children(self: *Node) ?*std.ArrayList(Node) {
-        return switch (self.*) {
-            .text => unreachable,
-            .element => |*e| elementChildren(e),
-        };
-    }
-
-    // allocate a string from node (because we may need to build up attribtues)
+    // Allocate a string from a node because attributes may need assembling.
     // caller must free the string
-    pub fn asString(self: *const Node, al: std.mem.Allocator) ![]const u8 {
+    fn asString(self: *const Node, al: std.mem.Allocator) ![]const u8 {
         var result = std.ArrayList(u8).empty;
         errdefer result.deinit(al);
 
@@ -345,16 +342,6 @@ pub const Node = union(enum) {
         return result.toOwnedSlice(al);
     }
 };
-
-fn elementChildren(e: *Element) *std.ArrayList(Node) {
-    const ChildrenType = @TypeOf(e.children);
-    if (ChildrenType == std.ArrayList(Node)) {
-        return &e.children;
-    } else if (ChildrenType == ProtectedField(std.ArrayList(Node))) {
-        return e.children.get();
-    }
-    @compileError("Unsupported children field type");
-}
 
 // Public function to fix parent pointers after modifying the tree
 pub fn fixParentPointers(node: *Node, parent: ?*Node) void {
@@ -395,6 +382,9 @@ pub const HTMLParser = struct {
     }
 
     pub fn deinit(self: *HTMLParser, allocator: std.mem.Allocator) void {
+        for (self.unfinished.items) |*node| {
+            node.deinit(self.allocator);
+        }
         self.unfinished.deinit(self.allocator);
         allocator.destroy(self);
     }
@@ -501,9 +491,8 @@ pub const HTMLParser = struct {
 
         const parent = &self.unfinished.items[self.unfinished.items.len - 1];
 
-        // Create text node and append directly
-        // Don't pass parent pointer - let appendChild set it
-        const text_node = try Text.init(
+        // Parent pointers are repaired after the tree reaches stable storage.
+        const text_node = Text.init(
             text_slice,
             null,
         );
@@ -670,8 +659,7 @@ pub const HTMLParser = struct {
 
         const parent = &self.unfinished.items[self.unfinished.items.len - 1];
 
-        // Create element directly
-        // Don't pass parent pointer - let appendChild set it
+        // Parent pointers are repaired after the tree reaches stable storage.
         const element = try Element.init(
             self.allocator,
             tag_slice,
@@ -684,8 +672,7 @@ pub const HTMLParser = struct {
 
     // Handle an opening tag by creating it and adding it to the unfinished stack
     fn handleOpeningTag(self: *HTMLParser, tag_slice: []const u8, tag_name: []const u8) !void {
-        // Create element directly
-        // Don't pass parent pointer - it will be set when added to parent
+        // Parent pointers are repaired after the tree reaches stable storage.
         const element = try Element.init(
             self.allocator,
             tag_slice,
@@ -1013,10 +1000,14 @@ fn isInheritedProperty(property: []const u8) bool {
 
 fn initStyleMap(allocator: std.mem.Allocator, obj_name: []const u8, parent_style: ?*StyleMap) !StyleMap {
     var map = StyleMap.init(allocator);
+    errdefer deinitStyleMap(&map);
     for (CSS_PROPERTIES) |prop| {
         var field = ProtectedField([]const u8).initNamed(allocator, prop.default_value, obj_name, prop.name);
         field.dirty = true;
-        try map.put(prop.name, field);
+        map.put(prop.name, field) catch |err| {
+            field.deinit();
+            return err;
+        };
     }
     for (CSS_PROPERTIES) |prop| {
         if (map.getPtr(prop.name)) |child_field| {
@@ -1053,20 +1044,6 @@ pub fn dirtyStyleForElement(e: *Element) void {
         while (it.next()) |entry| {
             entry.value_ptr.mark();
         }
-    }
-}
-
-pub fn dirtyStyleForNode(node: *Node) void {
-    switch (node.*) {
-        .element => |*e| dirtyStyleForElement(e),
-        .text => |*t| {
-            if (t.style) |*style_map| {
-                var it = style_map.iterator();
-                while (it.next()) |entry| {
-                    entry.value_ptr.mark();
-                }
-            }
-        },
     }
 }
 
@@ -1209,11 +1186,14 @@ fn styleWithParent(allocator: std.mem.Allocator, node: *Node, rules: []const CSS
 
                         const absolute_px = (node_pct / 100.0) * parent_px;
                         const resolved_size = try std.fmt.allocPrint(allocator, "{d:.1}px", .{absolute_px});
+                        var resolved_size_owned = true;
+                        defer if (resolved_size_owned) allocator.free(resolved_size);
 
                         if (e.owned_strings == null) {
                             e.owned_strings = std.ArrayList([]const u8).empty;
                         }
                         try e.owned_strings.?.append(allocator, resolved_size);
+                        resolved_size_owned = false;
 
                         try new_style.put("font-size", resolved_size);
                     }
@@ -1246,16 +1226,14 @@ fn styleWithParent(allocator: std.mem.Allocator, node: *Node, rules: []const CSS
     }
 }
 
-/// Convert a tree structure into a flat list of nodes
-/// Works on both HTML and layout trees
+/// Convert a DOM tree into a flat list of node pointers.
 pub fn treeToList(allocator: std.mem.Allocator, node: *Node, list: *std.ArrayList(*Node)) !void {
     try list.append(allocator, node);
 
     switch (node.*) {
         .text => {},
         .element => |*e| {
-            const children = elementChildren(e);
-            for (children.items) |*child| {
+            for (e.children.items) |*child| {
                 try treeToList(allocator, child, list);
             }
         },

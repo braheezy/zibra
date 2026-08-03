@@ -5,7 +5,7 @@
 
 This repo holds my Zig code for the browser implemented in [Web Browser Engineering](https://browser.engineering/).
 
-Where possible, this project takes the most difficult route possible to implement features that are implemented quick easily in the book. It benefits from Python and mature third party libraries/bindings. We get no such benefits.
+Where possible, this project takes the most difficult route possible to implement features that are implemented quite easily in the book. It benefits from Python and mature third-party libraries and bindings. We get no such benefits.
 
 ## Usage
 
@@ -41,9 +41,13 @@ There's more Zig commands:
 zig build run -- https://example.com
 # Run tests
 zig build test
+# Capture and compare the native macOS screenshot fixture
+zig build test-screenshot
 ```
 
 To test chunked gzip responses, run `gzipServer.py` locally.
+
+See [Architecture and lifetimes](docs/architecture-and-lifetimes.md) for the source map, ownership contracts, threading model, and known lifetime risks.
 
 ## Known Issues
 

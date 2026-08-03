@@ -1,10 +1,15 @@
+//! Browser-owned chrome UI for tabs, navigation, and address entry.
+//!
+//! Chrome borrows the browser's font manager while it is alive and owns its
+//! address-entry buffer. Input methods run on the browser thread.
+
 const std = @import("std");
-const browser = @import("browser.zig");
+const browser = @import("root.zig");
 const Rect = browser.Rect;
 const DisplayItem = browser.DisplayItem;
-const font = @import("font.zig");
+const font = @import("render/font.zig");
 const Browser = browser.Browser;
-const Url = @import("url.zig").Url;
+const Url = @import("../network/url.zig").Url;
 
 // Chrome represents the browser UI (tab bar, buttons, etc.)
 pub const Chrome = @This();
@@ -23,8 +28,6 @@ bottom: i32 = 0,
 focus: ?[]const u8 = null,
 address_bar: std.ArrayList(u8) = undefined,
 allocator: std.mem.Allocator = undefined,
-// Cached display list (owned, must be freed)
-cached_display_list: ?[]DisplayItem = null,
 
 pub fn init(font_manager: *font.FontManager, window_width: i32, allocator: std.mem.Allocator) !Chrome {
     var chrome = Chrome{
@@ -96,12 +99,9 @@ pub fn init(font_manager: *font.FontManager, window_width: i32, allocator: std.m
 
 pub fn deinit(self: *Chrome) void {
     self.address_bar.deinit(self.allocator);
-    if (self.cached_display_list) |list| {
-        self.allocator.free(list);
-    }
 }
 
-pub fn tabRect(self: *const Chrome, i: usize) Rect {
+fn tabRect(self: *const Chrome, i: usize) Rect {
     const tabs_start = self.newtab_rect.right + self.padding;
     const tab_width = 100; // Approximate width for "Tab X"
     const idx: i32 = @intCast(i);
@@ -114,14 +114,6 @@ pub fn tabRect(self: *const Chrome, i: usize) Rect {
 }
 
 pub fn paint(self: *Chrome, allocator: std.mem.Allocator, b: *const Browser) !std.ArrayList(DisplayItem) {
-    // Free the old display list if it exists
-    if (self.cached_display_list) |old_list| {
-        allocator.free(old_list);
-        self.cached_display_list = null;
-    }
-
-    // and only freed/reallocated when the URL actually changes
-
     var cmds = std.ArrayList(DisplayItem).empty;
 
     // Draw white background for chrome
@@ -166,7 +158,7 @@ pub fn paint(self: *Chrome, allocator: std.mem.Allocator, b: *const Browser) !st
     } });
 
     // Draw tabs
-    for (b.tabs.items, 0..) |tab, i| {
+    for (b.tabs.items, 0..) |_, i| {
         const bounds = self.tabRect(i);
 
         // Draw left border
@@ -230,8 +222,6 @@ pub fn paint(self: *Chrome, allocator: std.mem.Allocator, b: *const Browser) !st
             .glyph = tab_glyph,
             .color = .{ .r = 0, .g = 0, .b = 0, .a = 255 },
         } });
-
-        _ = tab; // Silence unused variable warning
     }
 
     // Draw back button
@@ -416,11 +406,13 @@ pub fn enter(self: *Chrome, b: *Browser) !bool {
         if (std.mem.eql(u8, focus_str, "address bar")) {
             if (self.address_bar.items.len == 0) return false;
 
-            const url = Url.init(b.allocator, self.address_bar.items) catch |err| {
+            var url = Url.init(b.allocator, self.address_bar.items) catch |err| {
                 std.log.err("Invalid URL: {any}", .{err});
                 self.focus = null;
                 return false;
             };
+            var url_owned = true;
+            defer if (url_owned) url.free(b.allocator);
 
             if (b.activeTab()) |tab| {
                 const url_ptr = b.allocator.create(Url) catch |alloc_err| {
@@ -428,8 +420,10 @@ pub fn enter(self: *Chrome, b: *Browser) !bool {
                     return false;
                 };
                 url_ptr.* = url;
-                var url_owned = true;
-                defer if (url_owned) {
+                url_owned = false;
+
+                var url_ptr_owned = true;
+                defer if (url_ptr_owned) {
                     url_ptr.*.free(b.allocator);
                     b.allocator.destroy(url_ptr);
                 };
@@ -441,7 +435,7 @@ pub fn enter(self: *Chrome, b: *Browser) !bool {
                 // Update the displayed URL immediately so we don't flash the old one
                 // while the new page loads.
                 b.setActiveTabUrl(url_ptr);
-                url_owned = false;
+                url_ptr_owned = false;
             }
 
             self.focus = null;

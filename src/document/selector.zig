@@ -1,3 +1,8 @@
+//! CSS selector representation, specificity, and DOM matching.
+//!
+//! Selectors own their normalized tag storage and borrow DOM nodes only for
+//! the duration of matching.
+
 const std = @import("std");
 const parser = @import("parser.zig");
 const Node = parser.Node;
@@ -43,7 +48,7 @@ pub const TagSelector = struct {
     }
 
     /// Returns true if the node is an Element with matching tag
-    pub fn matches(self: TagSelector, node: *Node) bool {
+    fn matches(self: TagSelector, node: *Node) bool {
         return switch (node.*) {
             .element => |e| std.mem.eql(u8, self.tag, e.tag),
             .text => false,
@@ -51,12 +56,12 @@ pub const TagSelector = struct {
     }
 
     /// Free the allocated tag string
-    pub fn deinit(self: TagSelector, allocator: std.mem.Allocator) void {
+    fn deinit(self: TagSelector, allocator: std.mem.Allocator) void {
         allocator.free(self.tag);
     }
 
     /// Tag selectors have a priority of 1
-    pub fn priority(self: TagSelector) u32 {
+    fn priority(self: TagSelector) u32 {
         _ = self;
         return 1;
     }
@@ -71,9 +76,10 @@ pub const DescendantSelector = struct {
 
     pub fn init(allocator: std.mem.Allocator, ancestor: Selector, descendant: Selector) !DescendantSelector {
         const ancestor_ptr = try allocator.create(Selector);
-        ancestor_ptr.* = ancestor;
+        errdefer allocator.destroy(ancestor_ptr);
 
         const descendant_ptr = try allocator.create(Selector);
+        ancestor_ptr.* = ancestor;
         descendant_ptr.* = descendant;
 
         return DescendantSelector{
@@ -82,7 +88,7 @@ pub const DescendantSelector = struct {
         };
     }
 
-    pub fn deinit(self: DescendantSelector, allocator: std.mem.Allocator) void {
+    fn deinit(self: DescendantSelector, allocator: std.mem.Allocator) void {
         // Recursively free the child selectors
         self.ancestor.deinit(allocator);
         self.descendant.deinit(allocator);
@@ -93,14 +99,14 @@ pub const DescendantSelector = struct {
 
     /// Descendant selectors have a priority equal to the sum of their parts
     /// This makes more specific selectors (like "article div p") have higher priority
-    pub fn priority(self: DescendantSelector) u32 {
+    fn priority(self: DescendantSelector) u32 {
         return self.ancestor.priority() + self.descendant.priority();
     }
 
     /// Returns true if:
     /// 1. The node matches the descendant selector, AND
     /// 2. The node has an ancestor that matches the ancestor selector
-    pub fn matches(self: DescendantSelector, node: *Node, ancestor_chain: []const *Node) bool {
+    fn matches(self: DescendantSelector, node: *Node, ancestor_chain: []const *Node) bool {
         // First check if this node matches the descendant part
         if (!self.descendant.matches(node, ancestor_chain)) {
             return false;

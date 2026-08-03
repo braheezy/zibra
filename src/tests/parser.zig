@@ -1,5 +1,7 @@
+//! Regression tests for the tutorial HTML parser and DOM construction rules.
+
 const std = @import("std");
-const HTMLParser = @import("parser.zig").HTMLParser;
+const HTMLParser = @import("../document/parser.zig").HTMLParser;
 
 test "Parse basic HTML" {
     const allocator = std.testing.allocator;

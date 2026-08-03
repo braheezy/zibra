@@ -1,10 +1,16 @@
+//! Builds layout trees and paint commands from Zibra's styled DOM nodes.
+//!
+//! This module owns block and inline layout, text and replaced-element
+//! measurement, hit-test bounds, incremental invalidation, and generation of
+//! the display items consumed by the browser compositor.
+
 const std = @import("std");
 const font = @import("font.zig");
-const browser = @import("browser.zig");
+const browser = @import("../root.zig");
 const code_point = @import("code_point");
 const grapheme = @import("grapheme");
-const parser = @import("parser.zig");
-const ProtectedField = @import("protected_field.zig").ProtectedField;
+const parser = @import("../../document/parser.zig");
+const ProtectedField = @import("../../core/protected_field.zig").ProtectedField;
 const DisplayItem = browser.DisplayItem;
 const Node = parser.Node;
 const FontWeight = font.FontWeight;
@@ -26,12 +32,6 @@ fn isBlockElement(tag: []const u8) bool {
     return false;
 }
 
-const sdl = @import("sdl.zig");
-const c = sdl.c;
-
-// Assume 60 fps for frame calculations
-const FRAMES_PER_SECOND: u32 = 60;
-
 fn drawCursor(
     commands: *std.ArrayList(DisplayItem),
     allocator: std.mem.Allocator,
@@ -51,33 +51,6 @@ fn drawCursor(
             .thickness = 1,
         },
     });
-}
-
-/// Parse a transition value like "opacity 2s" into property name and frame count
-/// Returns null if parsing fails
-fn parseTransitionValue(value: []const u8) ?struct { property: []const u8, frames: u32 } {
-    // Split on whitespace
-    var parts = std.mem.tokenizeAny(u8, value, " \t");
-    const property = parts.next() orelse return null;
-    const duration_str = parts.next() orelse return null;
-
-    // Parse duration (e.g., "2s" or "500ms")
-    var frames: u32 = 0;
-    if (std.mem.endsWith(u8, duration_str, "ms")) {
-        // Milliseconds
-        const ms_str = duration_str[0 .. duration_str.len - 2];
-        const ms = std.fmt.parseFloat(f64, ms_str) catch return null;
-        frames = @intFromFloat(ms / 1000.0 * @as(f64, FRAMES_PER_SECOND));
-    } else if (std.mem.endsWith(u8, duration_str, "s")) {
-        // Seconds
-        const s_str = duration_str[0 .. duration_str.len - 1];
-        const s = std.fmt.parseFloat(f64, s_str) catch return null;
-        frames = @intFromFloat(s * @as(f64, FRAMES_PER_SECOND));
-    } else {
-        return null;
-    }
-
-    return .{ .property = property, .frames = @max(1, frames) };
 }
 
 /// Parse a translate transform value like "translate(10px, 20px)" into x and y offsets
@@ -130,7 +103,7 @@ const EmbedLayout = struct {
     ascent: ProtectedField(i32),
     descent: ProtectedField(i32),
 
-    pub fn init(allocator: std.mem.Allocator) EmbedLayout {
+    fn init(allocator: std.mem.Allocator) EmbedLayout {
         return .{
             .allocator = allocator,
             .deps_initialized = false,
@@ -143,7 +116,7 @@ const EmbedLayout = struct {
         };
     }
 
-    pub fn deinit(self: *EmbedLayout) void {
+    fn deinit(self: *EmbedLayout) void {
         self.zoom.deinit();
         self.font_stub.deinit();
         self.width.deinit();
@@ -152,7 +125,7 @@ const EmbedLayout = struct {
         self.descent.deinit();
     }
 
-    pub fn setupDependencies(self: *EmbedLayout, parent_block: ?*BlockLayout, style_map: ?*const parser.StyleMap) void {
+    fn setupDependencies(self: *EmbedLayout, parent_block: ?*BlockLayout, style_map: ?*const parser.StyleMap) void {
         if (self.deps_initialized) return;
         self.deps_initialized = true;
 
@@ -184,7 +157,7 @@ const EmbedLayout = struct {
         self.descent.freezeDependencies();
     }
 
-    pub fn setMetrics(self: *EmbedLayout, width_value: i32, height_value: i32, ascent_value: i32, descent_value: i32, zoom_value: f32, font_value: i32) void {
+    fn setMetrics(self: *EmbedLayout, width_value: i32, height_value: i32, ascent_value: i32, descent_value: i32, zoom_value: f32, font_value: i32) void {
         self.zoom.set(zoom_value);
         self.font_stub.set(font_value);
         self.width.set(width_value);
@@ -193,7 +166,7 @@ const EmbedLayout = struct {
         self.descent.set(descent_value);
     }
 
-    pub fn appendInline(
+    fn appendInline(
         self: *const EmbedLayout,
         engine: *Layout,
         line_buffer: *std.ArrayList(LineItem),
@@ -224,14 +197,14 @@ const EmbedLayout = struct {
     }
 };
 
-pub const ImageLayout = struct {
+const ImageLayout = struct {
     embed: EmbedLayout,
     pixels: []const u8,
     source_width: i32,
     source_height: i32,
     opacity: f64 = 1.0,
 
-    pub fn init(
+    fn init(
         allocator: std.mem.Allocator,
         layout_width: i32,
         layout_height: i32,
@@ -255,18 +228,18 @@ pub const ImageLayout = struct {
         return layout;
     }
 
-    pub fn deinit(self: *ImageLayout) void {
+    fn deinit(self: *ImageLayout) void {
         self.embed.deinit();
     }
 };
 
-pub const IframeLayout = struct {
+const IframeLayout = struct {
     embed: EmbedLayout,
     bgcolor: browser.Color,
     border_color: browser.Color,
     border_thickness: i32 = 1,
 
-    pub fn init(
+    fn init(
         allocator: std.mem.Allocator,
         layout_width: i32,
         layout_height: i32,
@@ -285,11 +258,11 @@ pub const IframeLayout = struct {
         return layout;
     }
 
-    pub fn deinit(self: *IframeLayout) void {
+    fn deinit(self: *IframeLayout) void {
         self.embed.deinit();
     }
 
-    pub fn paintAt(
+    fn paintAt(
         self: *const IframeLayout,
         commands: *std.ArrayList(DisplayItem),
         engine: *Layout,
@@ -338,7 +311,7 @@ const LineItemPayload = union(enum) {
     image: ImageLayout,
     iframe: IframeLayout,
 
-    pub fn deinit(self: *LineItemPayload) void {
+    fn deinit(self: *LineItemPayload) void {
         switch (self.*) {
             .glyph => {},
             .input => |*input_payload| input_payload.deinit(),
@@ -505,7 +478,7 @@ fn restoreInlineState(self: *Layout, snapshot: InlineSnapshot) void {
     self.text_color = snapshot.text_color;
 }
 
-pub fn zoom(self: *const Layout) f32 {
+fn zoom(self: *const Layout) f32 {
     return if (self.accessibility.zoom > 0) self.accessibility.zoom else 1.0;
 }
 
@@ -530,7 +503,7 @@ fn layoutWindowWidth(self: *const Layout) i32 {
     return self.toLayoutPx(self.window_width);
 }
 
-pub fn layoutScrollbarWidth(self: *const Layout) i32 {
+fn layoutScrollbarWidth(self: *const Layout) i32 {
     return self.toLayoutPx(scrollbar_width);
 }
 
@@ -1562,7 +1535,6 @@ fn lexEntityAt(text: []const u8, pos: usize) ?struct { replacement: []const u8, 
 
 // Update layoutSourceCode to format HTML source with tags in normal font and content in bold
 pub fn layoutSourceCode(self: *Layout, source: []const u8) ![]DisplayItem {
-    std.debug.print("layoutSourceCode: {d} bytes\n", .{source.len});
     self.current_display_target = &self.display_list;
     self.cursor_x = if (self.rtl_text) self.line_right else self.line_left;
     self.cursor_y = v_offset;
@@ -1692,7 +1664,7 @@ pub fn layoutSourceCode(self: *Layout, source: []const u8) ![]DisplayItem {
 const INPUT_WIDTH_PX: i32 = 200;
 
 // Input layout for form widgets (input and button elements)
-pub const InputLayout = struct {
+const InputLayout = struct {
     embed: EmbedLayout,
     font_size: i32 = 16,
     font_weight: FontWeight = .Normal,
@@ -1702,17 +1674,17 @@ pub const InputLayout = struct {
     text: []const u8 = "",
     is_focused: bool = false,
 
-    pub fn init(allocator: std.mem.Allocator) InputLayout {
+    fn init(allocator: std.mem.Allocator) InputLayout {
         return .{
             .embed = EmbedLayout.init(allocator),
         };
     }
 
-    pub fn deinit(self: *InputLayout) void {
+    fn deinit(self: *InputLayout) void {
         self.embed.deinit();
     }
 
-    pub fn measure(self: *InputLayout, engine: *Layout, element: parser.Element) !void {
+    fn measure(self: *InputLayout, engine: *Layout, element: parser.Element) !void {
         self.font_weight = if (engine.is_bold) .Bold else .Normal;
         self.font_slant = if (engine.is_italic) .Italic else .Roman;
         self.font_size = engine.scaledFontSize(engine.size);
@@ -1736,9 +1708,7 @@ pub const InputLayout = struct {
                     .text => |t| {
                         self.text = t.text;
                     },
-                    else => {
-                        std.debug.print("Ignoring HTML contents inside button\n", .{});
-                    },
+                    else => {},
                 }
             }
         }
@@ -1759,7 +1729,7 @@ pub const InputLayout = struct {
         self.is_focused = element.is_focused;
     }
 
-    pub fn paintAt(self: *const InputLayout, commands: *std.ArrayList(DisplayItem), engine: *Layout, x: i32, y: i32) !void {
+    fn paintAt(self: *const InputLayout, commands: *std.ArrayList(DisplayItem), engine: *Layout, x: i32, y: i32) !void {
         const width_value = self.embed.width.get().*;
         const height_value = self.embed.height.get().*;
         const ascent_value = self.embed.ascent.get().*;
@@ -1821,7 +1791,7 @@ pub const InputLayout = struct {
 };
 
 // Text layout for individual words
-pub const TextLayout = struct {
+const TextLayout = struct {
     allocator: std.mem.Allocator,
     node: Node,
     word: []const u8,
@@ -1851,7 +1821,7 @@ pub const TextLayout = struct {
         self.mark();
     }
 
-    pub fn init(
+    fn init(
         allocator: std.mem.Allocator,
         node: Node,
         word: []const u8,
@@ -1956,7 +1926,7 @@ pub const TextLayout = struct {
         return text;
     }
 
-    pub fn deinit(self: *TextLayout) void {
+    fn deinit(self: *TextLayout) void {
         self.zoom.deinit();
         self.x.deinit();
         self.y.deinit();
@@ -1966,7 +1936,7 @@ pub const TextLayout = struct {
         self.descent.deinit();
     }
 
-    pub fn mark(self: *TextLayout) void {
+    fn mark(self: *TextLayout) void {
         // Mark all layout properties as dirty
         self.x.markNoOwner();
         self.y.markNoOwner();
@@ -1994,9 +1964,9 @@ pub const TextLayout = struct {
         block_parent.document.has_dirty_descendants = true;
     }
 
-    pub fn layout(self: *TextLayout, engine: *Layout) !void {
+    fn layout(self: *TextLayout, engine: *Layout) !void {
         // Skip layout if nothing is dirty
-        if (!self.layout_needed()) return;
+        if (!self.layoutNeeded()) return;
 
         // Get font properties from node style
         self.font_weight = if (engine.is_bold) .Bold else .Normal;
@@ -2048,7 +2018,7 @@ pub const TextLayout = struct {
         self.has_dirty_descendants = false;
     }
 
-    pub fn paint(self: *TextLayout, engine: *Layout) !void {
+    fn paint(self: *TextLayout, engine: *Layout) !void {
         var commands = std.ArrayList(DisplayItem).empty;
         defer commands.deinit(engine.allocator);
         try self.paintToList(&commands, engine);
@@ -2057,7 +2027,7 @@ pub const TextLayout = struct {
         }
     }
 
-    pub fn paintToList(self: *TextLayout, commands: *std.ArrayList(DisplayItem), engine: *Layout) !void {
+    fn paintToList(self: *TextLayout, commands: *std.ArrayList(DisplayItem), engine: *Layout) !void {
         // Paint the word using the stored font properties
         const glyph = try engine.font_manager.getStyledGlyph(
             self.word,
@@ -2077,7 +2047,7 @@ pub const TextLayout = struct {
         });
     }
 
-    pub fn layout_needed(self: *const TextLayout) bool {
+    fn layoutNeeded(self: *const TextLayout) bool {
         if (self.zoom.dirty) return true;
         if (self.x.dirty) return true;
         if (self.y.dirty) return true;
@@ -2089,14 +2059,14 @@ pub const TextLayout = struct {
         return false;
     }
 
-    pub fn shouldPaint(self: *const TextLayout) bool {
+    fn shouldPaint(self: *const TextLayout) bool {
         _ = self;
         return true;
     }
 };
 
 // Line layout for each line of text
-pub const LineLayout = struct {
+const LineLayout = struct {
     allocator: std.mem.Allocator,
     node: Node,
     parent: *BlockLayout,
@@ -2120,7 +2090,7 @@ pub const LineLayout = struct {
         self.mark();
     }
 
-    pub fn init(
+    fn init(
         allocator: std.mem.Allocator,
         node: Node,
         parent: *BlockLayout,
@@ -2169,7 +2139,7 @@ pub const LineLayout = struct {
         return line;
     }
 
-    pub fn deinit(self: *LineLayout) void {
+    fn deinit(self: *LineLayout) void {
         for (self.children.items) |child| {
             child.deinit();
             self.allocator.destroy(child);
@@ -2184,9 +2154,9 @@ pub const LineLayout = struct {
         self.descent.deinit();
     }
 
-    pub fn layout(self: *LineLayout, engine: *Layout) !void {
+    fn layout(self: *LineLayout, engine: *Layout) !void {
         // Skip layout if nothing is dirty
-        if (!self.layout_needed()) return;
+        if (!self.layoutNeeded()) return;
 
         if (!self.initialized_fields) {
             var ascent_deps = std.ArrayList(*ProtectedField(i32)).empty;
@@ -2270,7 +2240,7 @@ pub const LineLayout = struct {
         self.has_dirty_descendants = false;
     }
 
-    pub fn paint(self: *LineLayout, engine: *Layout) !void {
+    fn paint(self: *LineLayout, engine: *Layout) !void {
         var commands = std.ArrayList(DisplayItem).empty;
         defer commands.deinit(engine.allocator);
         try self.paintToList(&commands, engine);
@@ -2279,14 +2249,14 @@ pub const LineLayout = struct {
         }
     }
 
-    pub fn paintToList(self: *LineLayout, commands: *std.ArrayList(DisplayItem), engine: *Layout) !void {
+    fn paintToList(self: *LineLayout, commands: *std.ArrayList(DisplayItem), engine: *Layout) !void {
         // Paint each word in the line
         for (self.children.items) |text| {
             try text.paintToList(commands, engine);
         }
     }
 
-    pub fn layout_needed(self: *const LineLayout) bool {
+    fn layoutNeeded(self: *const LineLayout) bool {
         if (self.zoom.dirty) return true;
         if (self.x.dirty) return true;
         if (self.y.dirty) return true;
@@ -2298,7 +2268,7 @@ pub const LineLayout = struct {
         return false;
     }
 
-    pub fn mark(self: *LineLayout) void {
+    fn mark(self: *LineLayout) void {
         // Mark all layout properties as dirty
         self.x.markNoOwner();
         self.y.markNoOwner();
@@ -2323,7 +2293,7 @@ pub const LineLayout = struct {
         block_parent.document.has_dirty_descendants = true;
     }
 
-    pub fn shouldPaint(self: *const LineLayout) bool {
+    fn shouldPaint(self: *const LineLayout) bool {
         _ = self;
         return true;
     }
@@ -2348,7 +2318,7 @@ pub const DocumentLayout = struct {
         self.mark();
     }
 
-    pub fn init(allocator: std.mem.Allocator, node: *Node) !*DocumentLayout {
+    fn init(allocator: std.mem.Allocator, node: *Node) !*DocumentLayout {
         const document = try allocator.create(DocumentLayout);
         document.* = DocumentLayout{
             .allocator = allocator,
@@ -2389,7 +2359,7 @@ pub const DocumentLayout = struct {
     }
 
     pub fn layout(self: *DocumentLayout, engine: *Layout) !void {
-        if (!self.layout_needed()) return;
+        if (!self.layoutNeeded()) return;
 
         // Compute dimensions
         const x_value = h_offset;
@@ -2437,7 +2407,7 @@ pub const DocumentLayout = struct {
         self.has_dirty_descendants = false;
     }
 
-    pub fn layout_needed(self: *const DocumentLayout) bool {
+    pub fn layoutNeeded(self: *const DocumentLayout) bool {
         if (self.zoom.dirty) return true;
         if (self.x.dirty) return true;
         if (self.y.dirty) return true;
@@ -2461,18 +2431,18 @@ pub const DocumentLayout = struct {
         }
     }
 
-    pub fn shouldPaint(self: *const DocumentLayout) bool {
+    fn shouldPaint(self: *const DocumentLayout) bool {
         _ = self;
         return true;
     }
 };
 
 // Union type to handle both block and line children
-pub const LayoutChild = union(enum) {
+const LayoutChild = union(enum) {
     block: *BlockLayout,
     line: *LineLayout,
 
-    pub fn deinit(self: LayoutChild, allocator: std.mem.Allocator) void {
+    fn deinit(self: LayoutChild, allocator: std.mem.Allocator) void {
         switch (self) {
             .block => |b| {
                 b.deinit();
@@ -2486,7 +2456,7 @@ pub const LayoutChild = union(enum) {
     }
 };
 
-pub const BlockLayout = struct {
+const BlockLayout = struct {
     allocator: std.mem.Allocator,
     node: Node,
     node_ptr: ?*Node,
@@ -2513,7 +2483,7 @@ pub const BlockLayout = struct {
         self.mark();
     }
 
-    pub fn init(
+    fn init(
         allocator: std.mem.Allocator,
         node: Node,
         node_ptr: ?*Node,
@@ -2586,7 +2556,7 @@ pub const BlockLayout = struct {
         return block;
     }
 
-    pub fn deinit(self: *BlockLayout) void {
+    fn deinit(self: *BlockLayout) void {
         if (self.node_ptr) |ptr| {
             switch (ptr.*) {
                 .element => |*e| {
@@ -2612,7 +2582,7 @@ pub const BlockLayout = struct {
         self.children_version.deinit();
     }
 
-    pub fn mark(self: *BlockLayout) void {
+    fn mark(self: *BlockLayout) void {
         // Mark all layout properties as dirty
         self.x.markNoOwner();
         self.y.markNoOwner();
@@ -2714,9 +2684,9 @@ pub const BlockLayout = struct {
         _ = font_mgr; // Will use this later for measuring
     }
 
-    pub fn layout(self: *BlockLayout, engine: *Layout) !void {
+    fn layout(self: *BlockLayout, engine: *Layout) !void {
         // Skip layout if nothing is dirty
-        if (!self.layout_needed()) return;
+        if (!self.layoutNeeded()) return;
 
         if (self.node_ptr) |ptr| {
             self.node = ptr.*;
@@ -2844,7 +2814,7 @@ pub const BlockLayout = struct {
         self.has_dirty_descendants = false;
     }
 
-    pub fn layout_needed(self: *const BlockLayout) bool {
+    fn layoutNeeded(self: *const BlockLayout) bool {
         if (self.zoom.dirty) return true;
         if (self.x.dirty) return true;
         if (self.y.dirty) return true;
@@ -2855,7 +2825,7 @@ pub const BlockLayout = struct {
         return false;
     }
 
-    pub fn shouldPaint(self: *const BlockLayout) bool {
+    fn shouldPaint(self: *const BlockLayout) bool {
         switch (self.node) {
             .text => return true,
             .element => |e| {
@@ -3199,52 +3169,33 @@ pub fn paintDocument(self: *Layout, document: *DocumentLayout) ![]DisplayItem {
 
 // Paint a block and its subtree, applying stacking context effects
 fn paintBlockTree(self: *Layout, block: *BlockLayout) !void {
-    std.debug.print("[PAINT_BLOCK] paintBlockTree entry\n", .{});
     // Only paint if the block should be painted
-    if (!block.shouldPaint()) {
-        std.debug.print("[PAINT_BLOCK] shouldPaint=false, returning\n", .{});
-        return;
-    }
-    std.debug.print("[PAINT_BLOCK] shouldPaint=true\n", .{});
+    if (!block.shouldPaint()) return;
 
     // Collect all display commands for this block and its subtree
     var commands = std.ArrayList(DisplayItem).empty;
     defer commands.deinit(self.allocator);
 
     // Add the block's own background/borders
-    std.debug.print("[PAINT_BLOCK] calling addBackgroundIfNeeded\n", .{});
     try addBackgroundIfNeeded(self, block);
-    std.debug.print("[PAINT_BLOCK] addBackgroundIfNeeded done\n", .{});
 
     // Add the block's display items (from children like text, etc.)
-    std.debug.print("[PAINT_BLOCK] adding {} display items\n", .{block.display_list.items.len});
     for (block.display_list.items) |item| {
         try commands.append(self.allocator, item);
     }
-    std.debug.print("[PAINT_BLOCK] display items done\n", .{});
 
     // Recursively paint children
-    std.debug.print("[PAINT_BLOCK] painting {} children\n", .{block.children.items.len});
     for (block.children.items) |child| {
         switch (child) {
-            .block => |b| {
-                std.debug.print("[PAINT_BLOCK] recursive block\n", .{});
-                try paintBlockTreeRecursive(&commands, self, b);
-            },
-            .line => |l| {
-                std.debug.print("[PAINT_BLOCK] line\n", .{});
-                try l.paintToList(&commands, self);
-            },
+            .block => |b| try paintBlockTreeRecursive(&commands, self, b),
+            .line => |l| try l.paintToList(&commands, self),
         }
     }
-    std.debug.print("[PAINT_BLOCK] children painted\n", .{});
 
     try appendContentEditableCursor(self, &commands, block);
-    std.debug.print("[PAINT_BLOCK] cursor done\n", .{});
 
     // Apply visual effects (opacity, etc.) to wrap the entire subtree
     const final_commands = try applyPaintEffects(self, block, commands.items);
-    std.debug.print("[PAINT_BLOCK] effects done\n", .{});
 
     // Add the final commands to the display list
     for (final_commands) |cmd| {
@@ -3548,51 +3499,5 @@ fn addBackgroundIfNeededToList(self: *Layout, commands: *std.ArrayList(DisplayIt
             }
         },
         else => {},
-    }
-}
-
-// Layout object that can be clicked
-pub const LayoutObject = union(enum) {
-    text: *TextLayout,
-    line: *LineLayout,
-    block: *BlockLayout,
-
-    pub fn getNode(self: LayoutObject) Node {
-        return switch (self) {
-            .text => |t| t.node,
-            .line => |l| l.node,
-            .block => |b| b.node,
-        };
-    }
-
-    pub fn getBounds(self: LayoutObject) struct { x: i32, y: i32, width: i32, height: i32 } {
-        return switch (self) {
-            .text => |t| .{ .x = t.x, .y = t.y, .width = t.width, .height = t.height },
-            .line => |l| .{ .x = l.x, .y = l.y, .width = l.width, .height = l.height },
-            .block => |b| .{ .x = b.x, .y = b.y, .width = b.width, .height = b.height },
-        };
-    }
-};
-
-// Flatten the layout tree into a list
-pub fn layoutTreeToList(document: *DocumentLayout, list: *std.ArrayList(LayoutObject)) !void {
-    for (document.children.items) |child| {
-        try blockToList(child, list);
-    }
-}
-
-fn blockToList(block: *BlockLayout, list: *std.ArrayList(LayoutObject)) !void {
-    try list.append(block.allocator, .{ .block = block });
-
-    for (block.children.items) |child| {
-        switch (child) {
-            .block => |b| try blockToList(b, list),
-            .line => |l| {
-                try list.append(block.allocator, .{ .line = l });
-                for (l.children.items) |text| {
-                    try list.append(block.allocator, .{ .text = text });
-                }
-            },
-        }
     }
 }

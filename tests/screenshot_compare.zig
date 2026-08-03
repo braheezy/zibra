@@ -1,3 +1,5 @@
+//! Pixel comparator for the deterministic native macOS screenshot fixture.
+
 const std = @import("std");
 const zigimg = @import("zigimg");
 

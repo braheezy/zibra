@@ -1,3 +1,10 @@
+//! Chrome trace-event recording for browser work and worker threads.
+//!
+//! Tracing is enabled by a nonempty `ZIBRA_TRACE` value other than `0` and is
+//! written to `browser.trace`. The environment and I/O objects are borrowed for
+//! the recorder's lifetime. `finish` finalizes the file and must be called at
+//! most once when tracing is enabled.
+
 const std = @import("std");
 const Mutex = @import("sync.zig").Mutex;
 
@@ -53,12 +60,12 @@ pub const MeasureTime = struct {
         };
     }
 
-    pub fn time(self: *MeasureTime, name: []const u8) !void {
+    fn time(self: *MeasureTime, name: []const u8) !void {
         if (!self.enabled) return;
         try self.writeEvent("B", name);
     }
 
-    pub fn stop(self: *MeasureTime, name: []const u8) !void {
+    fn stop(self: *MeasureTime, name: []const u8) !void {
         if (!self.enabled) return;
         try self.writeEvent("E", name);
     }

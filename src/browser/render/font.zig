@@ -1,3 +1,8 @@
+//! Discovers fonts and supplies measured, rasterized glyphs to layout and paint.
+//!
+//! The font manager wraps SDL_ttf, selects system-font fallbacks by character
+//! category and style, and caches loaded font sizes and glyph pixel data.
+
 const std = @import("std");
 const builtin = @import("builtin");
 
@@ -6,9 +11,7 @@ const grapheme = @import("grapheme");
 const code_point = @import("code_point");
 const sdl2 = @import("sdl");
 
-const browser = @import("browser.zig");
-
-pub const hyphen_codepoint = 0x00AD;
+const hyphen_codepoint = 0x00AD;
 
 pub const FontWeight = enum {
     Normal,
@@ -27,12 +30,12 @@ pub const FontCategory = enum {
     monospace,
 };
 
-pub const UnicodeRange = struct {
+const UnicodeRange = struct {
     start: u21,
     end: u21,
 };
 
-pub const FontCategoryRanges = struct {
+const FontCategoryRanges = struct {
     latin: []const UnicodeRange,
     cjk: []const UnicodeRange,
     emoji: []const UnicodeRange,
@@ -209,7 +212,6 @@ const system_fonts = switch (builtin.target.os.tag) {
 };
 
 pub const Glyph = struct {
-    grapheme: []const u8,
     texture: ?sdl2.Texture,
     w: i32,
     h: i32,
@@ -222,7 +224,7 @@ pub const Glyph = struct {
     pixels: ?[]u8 = null,
 };
 
-pub const Font = struct {
+const Font = struct {
     name: []const u8,
     font_handle: sdl2.ttf.Font,
     // Glyph cache or atlas.
@@ -230,7 +232,7 @@ pub const Font = struct {
     line_height: i32,
 };
 
-pub const FontKey = struct {
+const FontKey = struct {
     category: FontCategory,
     weight: FontWeight,
     slant: FontSlant,
@@ -297,26 +299,6 @@ pub const FontManager = struct {
         self.loaded_sizes.deinit();
 
         sdl2.ttf.quit();
-    }
-
-    pub fn loadFontFromEmbed(self: *FontManager, size: i32) !void {
-        const embed_file = @embedFile("ocraext.ttf");
-        const name = "ocraext";
-
-        var font: *Font = try self.allocator.create(Font);
-        font.font_handle = sdl2.ttf.openFontMem(embed_file, false, size) orelse return error.LoadFailed;
-        font.glyphs = std.AutoHashMap(u64, Glyph).init(self.allocator);
-        font.line_height = font.font_handle.lineSkip();
-
-        try self.fonts.put(name, font);
-
-        if (font.line_height < self.min_line_height) {
-            self.min_line_height = font.line_height;
-        }
-
-        if (self.current_font == null) {
-            self.current_font = self.fonts.get(name);
-        }
     }
 
     fn collectFontPaths(self: *FontManager) !std.ArrayList([]const u8) {
@@ -475,7 +457,6 @@ pub const FontManager = struct {
 
         if (codepoint.code == hyphen_codepoint) {
             return Glyph{
-                .grapheme = gme,
                 .texture = null,
                 .w = 0,
                 .h = 0,
@@ -615,7 +596,6 @@ pub const FontManager = struct {
         };
 
         const new_glyph = if (!is_emoji) Glyph{
-            .grapheme = gme,
             .texture = glyph_tex,
             .w = surf.w,
             .h = surf.h,
@@ -632,7 +612,6 @@ pub const FontManager = struct {
             const emoji_width: i32 = @intFromFloat(tmp1 * emoji_scale_factor);
             const emoji_height: i32 = @intFromFloat(tmp2 * emoji_scale_factor);
             break :blk Glyph{
-                .grapheme = gme,
                 .texture = glyph_tex,
                 .w = emoji_width,
                 .h = emoji_height,
@@ -660,7 +639,7 @@ pub const FontManager = struct {
         try self.loaded_sizes.put(size, {});
     }
 
-    pub fn pickFontForCharacter(self: *FontManager, codepoint: u21) ?*Font {
+    fn pickFontForCharacter(self: *FontManager, codepoint: u21) ?*Font {
         const categories = [_]FontCategory{ .latin, .cjk, .emoji, .monospace };
 
         for (categories) |category| {
@@ -693,7 +672,7 @@ pub const FontManager = struct {
         return null; // No matching font found
     }
 
-    pub fn pickFontForCharacterStyle(
+    fn pickFontForCharacterStyle(
         self: *FontManager,
         codepoint: u21,
         weight: FontWeight,
@@ -752,12 +731,12 @@ pub fn getCategory(codepoint: u21) ?FontCategory {
     return null;
 }
 
-fn hash_combine(seed: u64, value: u64) u64 {
+fn hashCombine(seed: u64, value: u64) u64 {
     // A common hash combine (borrowed from boost::hash_combine)
     return seed ^ (value +% 0x9e3779b97f4a7c15 +% (seed << 6) +% (seed >> 2));
 }
 
-pub fn newGlyphCacheKey(gme: []const u8, weight: FontWeight, slant: FontSlant, size: i32) u64 {
+fn newGlyphCacheKey(gme: []const u8, weight: FontWeight, slant: FontSlant, size: i32) u64 {
     // Prepare style bits: bit 0 for Bold, bit 1 for Italic.
     var bits: u8 = 0;
     if (weight == .Bold) bits |= 1;
@@ -766,7 +745,7 @@ pub fn newGlyphCacheKey(gme: []const u8, weight: FontWeight, slant: FontSlant, s
     const grapheme_hash = std.hash.Fnv1a_64.hash(gme);
 
     // Combine the hashed grapheme, the size, and the style bits.
-    var key = hash_combine(grapheme_hash, @as(u64, @intCast(size)));
-    key = hash_combine(key, @as(u64, bits));
+    var key = hashCombine(grapheme_hash, @as(u64, @intCast(size)));
+    key = hashCombine(key, @as(u64, bits));
     return key;
 }

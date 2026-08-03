@@ -1,3 +1,9 @@
+//! Uncancelable synchronization wrappers bound to a `std.Io` instance.
+//!
+//! These types provide the blocking semantics used by Zibra's browser and tab
+//! workers. `Condition.wait` atomically releases the supplied mutex while
+//! waiting and reacquires it before returning.
+
 const std = @import("std");
 
 pub const Mutex = struct {

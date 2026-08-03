@@ -1,39 +1,34 @@
-const std = @import("std");
-const Mutex = @import("sync.zig").Mutex;
-const builtin = @import("builtin");
+//! Process-wide browser controller, event loop, and rendering coordinator.
+//!
+//! `Browser` owns SDL and z2d resources, tabs, shared networking state, and
+//! the committed render snapshot. Tab workers send commits back to this
+//! controller; SDL rendering remains coordinated by the browser thread.
 
-const grapheme = @import("grapheme");
-const code_point = @import("code_point");
+const std = @import("std");
+const Mutex = @import("../runtime/sync.zig").Mutex;
 const sdl2 = @import("sdl");
 const z2d = @import("z2d");
 const compositor = z2d.compositor;
 const zigimg = @import("zigimg");
 
-const token = @import("token.zig");
-const font = @import("font.zig");
-const Token = token.Token;
-const FontManager = font.FontManager;
+const font = @import("render/font.zig");
 const Glyph = font.Glyph;
-const FontWeight = font.FontWeight;
-const FontSlant = font.FontSlant;
-const url_module = @import("url.zig");
+const url_module = @import("../network/url.zig");
 const Url = url_module.Url;
-const Cache = @import("cache.zig").Cache;
-const ArrayList = std.ArrayList;
-const Layout = @import("Layout.zig");
-const parser = @import("parser.zig");
+const Layout = @import("render/layout.zig");
+const parser = @import("../document/parser.zig");
 const HTMLParser = parser.HTMLParser;
 const Node = parser.Node;
 const ImageData = parser.ImageData;
-const CSSParser = @import("cssParser.zig").CSSParser;
-const js_module = @import("js.zig");
+const CSSParser = @import("../document/css_parser.zig").CSSParser;
+const js_module = @import("../script/js.zig");
 const tab_module = @import("tab.zig");
 const Tab = tab_module.Tab;
 const Frame = tab_module.Frame;
 const Chrome = @import("chrome.zig");
-const task_module = @import("task.zig");
+const task_module = @import("../runtime/task.zig");
 const Task = task_module.Task;
-const MeasureTime = @import("measure_time.zig").MeasureTime;
+const MeasureTime = @import("../runtime/measure_time.zig").MeasureTime;
 
 // Default browser stylesheet - defines default styling for HTML elements
 const DEFAULT_STYLE_SHEET = @embedFile("browser.css");
@@ -252,7 +247,7 @@ pub const CompositedLayer = struct {
 
     /// Check if another layer can be merged into this one.
     /// Layers can merge if they have identical visual-effect ancestry (same opacity and blend_mode).
-    pub fn can_merge(self: *const CompositedLayer, other_opacity: f64, other_blend_mode: ?[]const u8) bool {
+    pub fn canMerge(self: *const CompositedLayer, other_opacity: f64, other_blend_mode: ?[]const u8) bool {
         // Must have same opacity
         if (self.opacity != other_opacity) return false;
 
@@ -410,94 +405,6 @@ pub const DisplayItem = union(enum) {
         node: ?*anyopaque = null,
     },
 
-    // Debug print a display item with indentation
-    pub fn debugPrint(self: DisplayItem, indent: usize) void {
-        const indent_str = "  ";
-        var i: usize = 0;
-        while (i < indent) : (i += 1) {
-            std.debug.print("{s}", .{indent_str});
-        }
-
-        switch (self) {
-            .glyph => |g| {
-                std.debug.print("Glyph({d},{d}) color=({d},{d},{d},{d})\n", .{
-                    g.x, g.y, g.color.r, g.color.g, g.color.b, g.color.a,
-                });
-            },
-            .rect => |r| {
-                std.debug.print("Rect({d},{d})-({d},{d}) color=({d},{d},{d},{d})\n", .{
-                    r.x1, r.y1, r.x2, r.y2, r.color.r, r.color.g, r.color.b, r.color.a,
-                });
-            },
-            .image => |img| {
-                std.debug.print("Image({d},{d})-({d},{d}) src=({d}x{d})\n", .{
-                    img.x1, img.y1, img.x2, img.y2, img.source_width, img.source_height,
-                });
-            },
-            .iframe => |iframe_item| {
-                std.debug.print("Iframe({d},{d})-({d},{d})\n", .{
-                    iframe_item.rect.left,
-                    iframe_item.rect.top,
-                    iframe_item.rect.right,
-                    iframe_item.rect.bottom,
-                });
-            },
-            .rounded_rect => |r| {
-                std.debug.print("RoundedRect({d},{d})-({d},{d}) r={d:.1} color=({d},{d},{d},{d})\n", .{
-                    r.x1, r.y1, r.x2, r.y2, r.radius, r.color.r, r.color.g, r.color.b, r.color.a,
-                });
-            },
-            .line => |l| {
-                std.debug.print("Line({d},{d})-({d},{d}) t={d}\n", .{
-                    l.x1, l.y1, l.x2, l.y2, l.thickness,
-                });
-            },
-            .outline => |o| {
-                std.debug.print("Outline({d},{d})-({d},{d}) t={d}\n", .{
-                    o.rect.left, o.rect.top, o.rect.right, o.rect.bottom, o.thickness,
-                });
-            },
-            .blend => |b| {
-                std.debug.print("Blend(opacity={d:.2}, mode={s}, children={d})\n", .{
-                    b.opacity,
-                    if (b.blend_mode) |mode| mode else "normal",
-                    b.children.len,
-                });
-                for (b.children) |child| {
-                    child.debugPrint(indent + 1);
-                }
-            },
-            .draw_composited_layer => |dcl| {
-                std.debug.print("DrawCompositedLayer(bounds=({d},{d})-({d},{d}), opacity={d:.2})\n", .{
-                    dcl.layer.bounds.left,
-                    dcl.layer.bounds.top,
-                    dcl.layer.bounds.right,
-                    dcl.layer.bounds.bottom,
-                    dcl.layer.opacity,
-                });
-            },
-            .transform => |t| {
-                std.debug.print("Transform(translate=({d},{d}), {d} children)\n", .{
-                    t.translate_x,
-                    t.translate_y,
-                    t.children.len,
-                });
-                for (t.children) |child| {
-                    child.debugPrint(indent + 1);
-                }
-            },
-        }
-    }
-
-    // Debug print an entire display list as a tree
-    pub fn debugPrintList(items: []const DisplayItem) void {
-        std.debug.print("=== Display List ({d} items) ===\n", .{items.len});
-        for (items) |item| {
-            item.debugPrint(0);
-        }
-        std.debug.print("=== End Display List ===\n", .{});
-    }
-
     // Set parent pointers recursively on a display list
     // This should be called after the display list is constructed
     pub fn setParentPointers(items: []DisplayItem, parent: ?*const DisplayItem) void {
@@ -510,44 +417,6 @@ pub const DisplayItem = union(enum) {
                 },
                 else => {}, // Leaf nodes don't have parent pointers
             }
-        }
-    }
-
-    // Walk up the parent chain from this item (only works for blend items)
-    pub fn getAncestorChain(self: *const DisplayItem, allocator: std.mem.Allocator) ![]const *const DisplayItem {
-        var ancestors = std.ArrayList(*const DisplayItem).init(allocator);
-        var current: ?*const DisplayItem = self;
-        while (current) |item| {
-            switch (item.*) {
-                .blend => |b| {
-                    try ancestors.append(item);
-                    current = b.parent;
-                },
-                else => break,
-            }
-        }
-        return ancestors.toOwnedSlice();
-    }
-
-    // Check if display list contains any opacity effects (opacity < 1.0)
-    pub fn hasOpacityEffects(items: []const DisplayItem) bool {
-        for (items) |item| {
-            switch (item) {
-                .blend => |b| {
-                    if (b.opacity < 1.0) return true;
-                    if (hasOpacityEffects(b.children)) return true;
-                },
-                else => {},
-            }
-        }
-        return false;
-    }
-
-    // Debug print the display list if it contains opacity effects
-    pub fn debugPrintIfHasOpacity(items: []const DisplayItem) void {
-        if (hasOpacityEffects(items)) {
-            std.debug.print("\n=== Opacity Frame Detected ===\n", .{});
-            debugPrintList(items);
         }
     }
 
@@ -637,8 +506,6 @@ pub const Browser = struct {
     // HTTP client for making requests (handles both HTTP and HTTPS)
     http_client: std.http.Client,
     http_client_mutex: Mutex,
-    // Cache for storing fetched resources
-    cache: Cache,
     // Shared cookie storage across tabs
     cookie_jar: std.StringHashMap(url_module.CookieEntry),
     // Window dimensions
@@ -779,7 +646,6 @@ pub const Browser = struct {
             .tab_surface = null,
             .http_client = .{ .allocator = al, .io = io },
             .http_client_mutex = .init(io),
-            .cache = try Cache.init(al),
             .cookie_jar = std.StringHashMap(url_module.CookieEntry).init(al),
             .layout_engine = layout_engine,
             .default_style_sheet_rules = default_rules,
@@ -830,12 +696,6 @@ pub const Browser = struct {
         return @intFromFloat(@as(f32, @floatFromInt(value)) * zoom);
     }
 
-    fn scalePxF(self: *const Browser, value: f64) f64 {
-        const zoom = self.activeZoom();
-        if (zoom == 1.0) return value;
-        return value * @as(f64, zoom);
-    }
-
     fn scalePxWithZoom(self: *const Browser, value: i32, zoom: f32) i32 {
         _ = self;
         if (zoom == 1.0) return value;
@@ -852,15 +712,6 @@ pub const Browser = struct {
         const zoom = self.activeZoom();
         if (zoom == 1.0) return self.window_height - self.chrome.bottom;
         return @intFromFloat(@as(f32, @floatFromInt(self.window_height - self.chrome.bottom)) / zoom);
-    }
-
-    fn clampScroll(self: *Browser, scroll: i32) i32 {
-        const visible = self.visibleTabHeightCss();
-        const max_height = @max(self.active_tab_height, visible);
-        const maxscroll = @max(max_height - visible, 0);
-        if (scroll < 0) return 0;
-        if (scroll > maxscroll) return maxscroll;
-        return scroll;
     }
 
     pub fn handleScroll(self: *Browser, delta: i32) void {
@@ -941,12 +792,6 @@ pub const Browser = struct {
         if (should_schedule) {
             self.scheduleAnimationFrame();
         }
-    }
-
-    // Free the resources used by the browser
-    // Deprecated: use deinit() instead
-    pub fn free(self: *Browser) void {
-        self.deinit();
     }
 
     // Create a new tab and load a URL into it
@@ -1063,17 +908,14 @@ pub const Browser = struct {
 
     fn finishRunLoop(self: *Browser) void {
         // Signal shutdown to background threads before cleanup
-        std.debug.print("[SHUTDOWN] signaling shutdown\n", .{});
         self.lock.lock();
         self.shutting_down = true;
         self.lock.unlock();
 
         // Give background threads a moment to notice shutdown
-        std.debug.print("[SHUTDOWN] sleeping\n", .{});
         self.io.sleep(.fromNanoseconds(50_000_000), .awake) catch |err| {
             std.log.warn("Failed to wait for browser threads during shutdown: {}", .{err});
         }; // 50ms
-        std.debug.print("[SHUTDOWN] run() returning\n", .{});
     }
 
     fn isScreenshotReady(self: *Browser) bool {
@@ -1105,19 +947,14 @@ pub const Browser = struct {
     // Handle a single SDL event. Returns true if quit was requested.
     fn handleEvent(self: *Browser, event: sdl2.Event) !bool {
         switch (event) {
-            .quit => {
-                std.debug.print("[EVENT] quit\n", .{});
-                return true;
-            },
+            .quit => return true,
             .key_down => |kb_event| {
-                std.debug.print("[EVENT] key_down\n", .{});
                 try self.handleKeyEvent(kb_event.keycode, kb_event.modifiers);
                 if (kb_event.keycode == .escape) {
                     return true;
                 }
             },
             .text_input => |text_event| {
-                std.debug.print("[EVENT] text_input\n", .{});
                 const text = std.mem.sliceTo(&text_event.text, 0);
                 var chrome_changed = false;
                 for (text) |char| {
@@ -1139,7 +976,6 @@ pub const Browser = struct {
                 }
             },
             .mouse_wheel => |wheel_event| {
-                std.debug.print("[EVENT] mouse_wheel\n", .{});
                 if (wheel_event.delta_y > 0) {
                     self.handleScroll(-scroll_step);
                 } else if (wheel_event.delta_y < 0) {
@@ -1147,22 +983,17 @@ pub const Browser = struct {
                 }
             },
             .mouse_button_down => |button_event| {
-                std.debug.print("[EVENT] mouse_button_down\n", .{});
                 if (button_event.button == .left) {
                     try self.handleClick(button_event.x, button_event.y);
                 }
             },
             .mouse_motion => |motion_event| {
-                std.debug.print("[EVENT] mouse_motion\n", .{});
                 try self.handleHover(motion_event.x, motion_event.y);
             },
             .window => |window_event| {
-                std.debug.print("[EVENT] window\n", .{});
                 try self.handleWindowEvent(window_event);
             },
-            else => {
-                std.debug.print("[EVENT] other\n", .{});
-            },
+            else => {},
         }
         return false;
     }
@@ -1421,8 +1252,6 @@ pub const Browser = struct {
 
     // Handle mouse clicks to navigate links
     fn handleClick(self: *Browser, screen_x: i32, screen_y: i32) !void {
-        std.debug.print("Click detected at screen ({d}, {d})\n", .{ screen_x, screen_y });
-
         self.lock.lock();
         const chrome_bottom = self.chrome.bottom;
         if (screen_y < chrome_bottom) {
@@ -1466,8 +1295,6 @@ pub const Browser = struct {
         const zoom = self.activeZoom();
         const page_x = if (zoom == 1.0) screen_x else @as(i32, @intFromFloat(@as(f32, @floatFromInt(screen_x)) / zoom));
         const page_y = (if (zoom == 1.0) tab_y else @as(i32, @intFromFloat(@as(f32, @floatFromInt(tab_y)) / zoom))) + frame.scroll;
-
-        std.debug.print("Page coordinates: ({d}, {d})\n", .{ page_x, page_y });
 
         self.scheduleTabClickTask(tab, page_x, page_y);
     }
@@ -1565,40 +1392,6 @@ pub const Browser = struct {
         };
     }
 
-    fn scheduleTabCycleFocusTask(self: *Browser, tab: *Tab, reverse: bool) void {
-        const ctx = TabCycleFocusTaskContext.create(self.allocator, self, tab, reverse) catch |err| {
-            std.log.err("Failed to allocate cycle focus task: {}", .{err});
-            return;
-        };
-        const task_instance = Task.init(
-            ctx.toOpaque(),
-            TabCycleFocusTaskContext.runOpaque,
-            TabCycleFocusTaskContext.cleanupOpaque,
-        );
-        tab.task_runner.schedule(task_instance) catch |err| {
-            std.log.err("Failed to schedule cycle focus: {}", .{err});
-            ctx.destroy();
-            return;
-        };
-    }
-
-    fn scheduleTabActivateTask(self: *Browser, tab: *Tab) void {
-        const ctx = TabActivateTaskContext.create(self.allocator, self, tab) catch |err| {
-            std.log.err("Failed to allocate activate task: {}", .{err});
-            return;
-        };
-        const task_instance = Task.init(
-            ctx.toOpaque(),
-            TabActivateTaskContext.runOpaque,
-            TabActivateTaskContext.cleanupOpaque,
-        );
-        tab.task_runner.schedule(task_instance) catch |err| {
-            std.log.err("Failed to schedule activate: {}", .{err});
-            ctx.destroy();
-            return;
-        };
-    }
-
     fn scheduleTabClearFocusTask(self: *Browser, tab: *Tab) void {
         const ctx = TabClearFocusTaskContext.create(self.allocator, self, tab) catch |err| {
             std.log.err("Failed to allocate clear focus task: {}", .{err});
@@ -1633,7 +1426,6 @@ pub const Browser = struct {
         const response = url.httpRequest(
             self.allocator,
             &self.http_client,
-            &self.cache,
             &self.cookie_jar,
             referrer,
             payload,
@@ -1763,7 +1555,7 @@ pub const Browser = struct {
             body_text_owned = false;
 
             // Update the JS engine with the current nodes for DOM API
-            frame.js_context = try tab.get_js(url);
+            frame.js_context = try tab.getJs(url);
             if (frame.js_context) |ctx| {
                 ctx.setNodes(frame.window_id, &frame.current_node.?);
                 frame.js_render_context.setPointers(
@@ -1880,20 +1672,30 @@ pub const Browser = struct {
             // Note: We use self.allocator directly for CSS parsing instead of an arena
             // because the CSS rules need to live as long as the Tab (for re-rendering)
 
-            // Load and parse external stylesheets
+            // Load and parse external stylesheets. Rules borrow their property
+            // strings from these buffers, so stage both collections and commit
+            // them to the frame together.
+            var new_css_texts = std.ArrayList([]const u8).empty;
+            defer {
+                for (new_css_texts.items) |css_text| {
+                    self.allocator.free(css_text);
+                }
+                new_css_texts.deinit(self.allocator);
+            }
+
             var all_rules = std.ArrayList(CSSParser.CSSRule).empty;
 
             // Track how many default rules we have so we don't double-free them
             const default_rules_count = self.default_style_sheet_rules.len;
 
-            errdefer {
+            defer {
                 for (all_rules.items) |*rule| {
                     if (rule.owned) {
                         rule.deinit(self.allocator);
                     }
                 }
+                all_rules.deinit(self.allocator);
             }
-            defer all_rules.deinit(self.allocator);
 
             // Start with default browser stylesheet rules (shallow copy, browser still owns them)
             for (self.default_style_sheet_rules) |rule| {
@@ -1942,17 +1744,24 @@ pub const Browser = struct {
                     continue;
                 };
 
-                // Store css_text so it can be freed when the Tab is destroyed
-                // (CSS rules reference strings within this text)
-                try frame.css_texts.append(self.allocator, css_text);
+                // Store css_text so it can be freed with the rules that borrow it.
+                var css_text_owned = true;
+                defer if (css_text_owned) self.allocator.free(css_text);
+                try new_css_texts.append(self.allocator, css_text);
+                css_text_owned = false;
 
                 // Add the parsed rules to our collection
+                var transferred_rules: usize = 0;
+                defer {
+                    for (parsed_rules[transferred_rules..]) |*rule| {
+                        rule.deinit(self.allocator);
+                    }
+                    self.allocator.free(parsed_rules);
+                }
                 for (parsed_rules) |rule| {
                     try all_rules.append(self.allocator, rule);
+                    transferred_rules += 1;
                 }
-
-                // Free the parsed_rules slice (the rules themselves are now in all_rules)
-                self.allocator.free(parsed_rules);
             }
 
             // Sort rules by cascade priority (more specific selectors override less specific)
@@ -1963,29 +1772,24 @@ pub const Browser = struct {
                 }
             }.lessThan);
 
-            // Clean up old CSS rules and texts before replacing them
+            // Clean up the old generation before transferring the staged one.
             for (frame.rules.items) |*rule| {
                 if (rule.owned) {
                     rule.deinit(self.allocator);
                 }
             }
+            frame.rules.deinit(self.allocator);
 
-            // Free old CSS text buffers
             for (frame.css_texts.items) |old_css_text| {
                 self.allocator.free(old_css_text);
             }
-            frame.css_texts.clearRetainingCapacity();
+            frame.css_texts.deinit(self.allocator);
 
-            // Now clear the rules list
-            frame.rules.clearRetainingCapacity();
-
-            // Track how many default rules we have (these are borrowed, not owned)
             frame.default_rules_count = default_rules_count;
-
-            // Copy all rules to tab (ownership is tracked per-rule)
-            for (all_rules.items) |rule| {
-                try frame.rules.append(self.allocator, rule);
-            }
+            frame.rules = all_rules;
+            all_rules = .empty;
+            frame.css_texts = new_css_texts;
+            new_css_texts = .empty;
 
             // Apply all stylesheet rules and inline styles (sorted by cascade order)
             try parser.style(self.allocator, &frame.current_node.?, frame.rules.items);
@@ -2054,6 +1858,13 @@ pub const Browser = struct {
     }
 
     fn resetFrameForNavigation(self: *Browser, frame: *Frame) void {
+        if (frame.js_context) |ctx| {
+            ctx.setNodes(frame.window_id, null);
+        }
+        frame.js_render_context.setPointers(null, null, null, 0);
+        frame.js_context = null;
+        frame.js_render_context_initialized = false;
+
         frame.input_bounds.clearRetainingCapacity();
         frame.link_bounds.clearRetainingCapacity();
         frame.iframe_bounds.clearRetainingCapacity();
@@ -2089,6 +1900,11 @@ pub const Browser = struct {
         }
         frame.css_texts.clearRetainingCapacity();
 
+        if (frame.current_node) |*node| {
+            node.deinit(self.allocator);
+            frame.current_node = null;
+        }
+
         if (frame.current_html_source) |old_source| {
             self.allocator.free(old_source);
             frame.current_html_source = null;
@@ -2105,12 +1921,6 @@ pub const Browser = struct {
         frame.content_height = 0;
         frame.scroll = 0;
         frame.focus = null;
-
-        if (frame.js_context) |ctx| {
-            ctx.setNodes(frame.window_id, null);
-        }
-        frame.js_context = null;
-        frame.js_render_context_initialized = false;
 
         frame.clearAllowedOrigins();
     }
@@ -2161,7 +1971,7 @@ pub const Browser = struct {
         frame.current_url = url;
         frame.current_url_owned = true;
 
-        frame.js_context = try frame.tab.get_js(url);
+        frame.js_context = try frame.tab.getJs(url);
         if (frame.js_context) |ctx| {
             ctx.setNodes(frame.window_id, &frame.current_node.?);
             frame.js_render_context.setPointers(
@@ -2286,6 +2096,7 @@ pub const Browser = struct {
 
         var all_rules = std.ArrayList(CSSParser.CSSRule).empty;
         const default_rules_count = self.default_style_sheet_rules.len;
+        defer all_rules.deinit(self.allocator);
         errdefer {
             for (all_rules.items) |*rule| {
                 if (rule.owned) {
@@ -2293,7 +2104,6 @@ pub const Browser = struct {
                 }
             }
         }
-        defer all_rules.deinit(self.allocator);
 
         for (self.default_style_sheet_rules) |rule| {
             try all_rules.append(self.allocator, rule);
@@ -2603,7 +2413,7 @@ pub const Browser = struct {
         frame.current_html_source = body_text;
         body_text_owned = false;
 
-        frame.js_context = try parent.tab.get_js(frame_url_ptr);
+        frame.js_context = try parent.tab.getJs(frame_url_ptr);
         if (frame.js_context) |ctx| {
             ctx.setNodes(frame.window_id, &frame.current_node.?);
             frame.js_render_context.setPointers(
@@ -2720,6 +2530,7 @@ pub const Browser = struct {
 
         var all_rules = std.ArrayList(CSSParser.CSSRule).empty;
         const default_rules_count = self.default_style_sheet_rules.len;
+        defer all_rules.deinit(self.allocator);
         errdefer {
             for (all_rules.items) |*rule| {
                 if (rule.owned) {
@@ -2727,7 +2538,6 @@ pub const Browser = struct {
                 }
             }
         }
-        defer all_rules.deinit(self.allocator);
 
         for (self.default_style_sheet_rules) |rule| {
             try all_rules.append(self.allocator, rule);
@@ -3121,7 +2931,7 @@ pub const Browser = struct {
         } else {
             // Layout on subsequent frames - only if needed
             const doc = frame.document_layout.?;
-            if (doc.layout_needed()) {
+            if (doc.layoutNeeded()) {
                 try doc.layout(self.layout_engine);
                 did_layout = true;
             }
@@ -3172,17 +2982,6 @@ pub const Browser = struct {
             frame.display_list = try combined.toOwnedSlice(self.allocator);
             // Only free the old container; the items (and their children) are now owned by the new list.
             self.allocator.free(old_list);
-        }
-
-        // Debug: print display list tree once when opacity effects are present
-        if (frame.display_list) |list| {
-            const S = struct {
-                var printed: bool = false;
-            };
-            if (!S.printed and DisplayItem.hasOpacityEffects(list)) {
-                DisplayItem.debugPrintIfHasOpacity(list);
-                S.printed = true;
-            }
         }
 
         // Update content height from the layout engine
@@ -3315,7 +3114,7 @@ pub const Browser = struct {
                     // Try to merge with the last layer if compatible
                     const can_merge = if (self.composited_layers.items.len > 0) blk: {
                         const last_layer = &self.composited_layers.items[self.composited_layers.items.len - 1];
-                        break :blk last_layer.can_merge(blend_item.opacity, blend_item.blend_mode);
+                        break :blk last_layer.canMerge(blend_item.opacity, blend_item.blend_mode);
                     } else false;
 
                     if (can_merge) {
@@ -3533,7 +3332,7 @@ pub const Browser = struct {
     }
 
     /// Build a draw list from composited layers
-    pub fn paint_draw_list(self: *Browser) !void {
+    pub fn paintDrawList(self: *Browser) !void {
         if (self.tab_draw_list.items.len > 0) {
             DisplayItem.freeItems(self.allocator, self.tab_draw_list.items);
             self.tab_draw_list.items.len = 0;
@@ -3634,18 +3433,6 @@ pub const Browser = struct {
         }
     }
 
-    // Raster the current tab to the tab surface using composited layers
-    pub fn rasterTab(self: *Browser) !void {
-        if (self.active_tab_display_list == null) return;
-
-        // Build composited layers and draw list
-        _ = try self.composite();
-        try self.paint_draw_list();
-
-        // Raster to surfaces
-        try self.rasterTabSurfaces();
-    }
-
     // Raster tab content to surfaces (without rebuilding composite/draw lists)
     fn rasterTabSurfaces(self: *Browser) !void {
         if (self.active_tab_display_list == null) return;
@@ -3711,7 +3498,7 @@ pub const Browser = struct {
         if (self.needs_composite) {
             const phase_start = if (profiling) std.Io.Clock.awake.now(self.io).nanoseconds else 0;
             _ = try self.composite();
-            try self.paint_draw_list();
+            try self.paintDrawList();
             self.needs_composite = false;
             // Compositing implies we need to raster the new layers
             self.needs_raster = true;
@@ -3813,14 +3600,6 @@ pub const Browser = struct {
             self.active_tab_display_list = incoming_list;
             // Set parent pointers for tree traversal
             DisplayItem.setParentPointers(incoming_list, null);
-            // Debug: print display list tree once when opacity effects are present
-            const S = struct {
-                var printed_opacity_debug: bool = false;
-            };
-            if (!S.printed_opacity_debug and DisplayItem.hasOpacityEffects(incoming_list)) {
-                DisplayItem.debugPrintIfHasOpacity(incoming_list);
-                S.printed_opacity_debug = true;
-            }
             has_display_list_change = true;
         }
         if (data.scroll) |scroll| {
@@ -4024,11 +3803,6 @@ pub const Browser = struct {
 
         // Copy texture to renderer (texture persists for next frame)
         try self.canvas.copy(texture, null, null);
-    }
-
-    // Draw a display item using the browser's context
-    fn drawDisplayItemZ2d(self: *Browser, item: DisplayItem, scroll_offset: i32, zoom: f32) !void {
-        try self.drawDisplayItemZ2dContext(&self.context, item, scroll_offset, zoom);
     }
 
     fn drawImageNearest(
@@ -5130,121 +4904,6 @@ pub const Browser = struct {
         }
     }
 
-    /// Apply a clip mask by clearing pixels outside the mask shape
-    /// This implements dst_in clipping by manually setting outside pixels to transparent
-    /// IMPORTANT: Only clears pixels WITHIN the mask's bounding box that are outside the shape
-    /// (e.g., corner pixels for rounded rects). Does NOT clear pixels outside the bounding box
-    /// to avoid affecting other content in the same layer.
-    fn applyClipMaskForLayer(self: *Browser, context: *z2d.Context, mask_item: DisplayItem, layer_x: i32, layer_y: i32, zoom: f32) !void {
-        switch (mask_item) {
-            .rounded_rect => |rr| {
-                // Get surface from context - we need direct pixel access
-                const surface = context.surface;
-                const surface_width = surface.getWidth();
-                const surface_height = surface.getHeight();
-
-                // Map mask coordinates to layer-local space
-                const mask_left = self.scalePxWithZoom(rr.x1, zoom) - layer_x;
-                const mask_right = self.scalePxWithZoom(rr.x2, zoom) - layer_x;
-                const mask_top = self.scalePxWithZoom(rr.y1, zoom) - layer_y;
-                const mask_bottom = self.scalePxWithZoom(rr.y2, zoom) - layer_y;
-                const radius = self.scalePxFWithZoom(rr.radius, zoom);
-
-                // Get pixel buffer
-                const pixel_buf = switch (surface.*) {
-                    .image_surface_rgba => |*img| img.buf,
-                    else => return,
-                };
-
-                // Only iterate over pixels WITHIN the mask's bounding box
-                // Clear corner pixels that are outside the rounded shape
-                const start_y: usize = @intCast(@max(0, mask_top));
-                const end_y: usize = @intCast(@min(surface_height, @max(0, mask_bottom)));
-                const start_x: usize = @intCast(@max(0, mask_left));
-                const end_x: usize = @intCast(@min(surface_width, @max(0, mask_right)));
-
-                for (start_y..end_y) |y_idx| {
-                    const y: i32 = @intCast(y_idx);
-                    for (start_x..end_x) |x_idx| {
-                        const x: i32 = @intCast(x_idx);
-
-                        // Check if point is outside the rounded rect (in the corners)
-                        if (!isPointInRoundedRect(x, y, mask_left, mask_top, mask_right, mask_bottom, radius)) {
-                            // Clear this corner pixel to transparent
-                            const idx = y_idx * @as(usize, @intCast(surface_width)) + x_idx;
-                            pixel_buf[idx] = .{ .r = 0, .g = 0, .b = 0, .a = 0 };
-                        }
-                    }
-                }
-            },
-            .rect => {
-                // Regular rect clip masks are handled by dst_in in the compositing path.
-            },
-            else => {
-                // Other shapes not supported for clipping yet
-            },
-        }
-    }
-
-    /// Check if a point is inside a rounded rectangle
-    fn isPointInRoundedRect(x: i32, y: i32, left: i32, top: i32, right: i32, bottom: i32, radius: f64) bool {
-        // First check if outside the bounding rect
-        if (x < left or x >= right or y < top or y >= bottom) {
-            return false;
-        }
-
-        // Check corners
-        const r: i32 = @intFromFloat(radius);
-        const width = right - left;
-        const height = bottom - top;
-
-        // If radius is larger than half the width/height, clamp it
-        const effective_r = @min(r, @min(@divTrunc(width, 2), @divTrunc(height, 2)));
-
-        // Check if in corner regions
-        const in_left_region = x < left + effective_r;
-        const in_right_region = x >= right - effective_r;
-        const in_top_region = y < top + effective_r;
-        const in_bottom_region = y >= bottom - effective_r;
-
-        // Check each corner
-        if (in_left_region and in_top_region) {
-            // Top-left corner
-            const cx = left + effective_r;
-            const cy = top + effective_r;
-            const dx = x - cx;
-            const dy = y - cy;
-            return dx * dx + dy * dy <= effective_r * effective_r;
-        }
-        if (in_right_region and in_top_region) {
-            // Top-right corner
-            const cx = right - effective_r;
-            const cy = top + effective_r;
-            const dx = x - cx;
-            const dy = y - cy;
-            return dx * dx + dy * dy <= effective_r * effective_r;
-        }
-        if (in_left_region and in_bottom_region) {
-            // Bottom-left corner
-            const cx = left + effective_r;
-            const cy = bottom - effective_r;
-            const dx = x - cx;
-            const dy = y - cy;
-            return dx * dx + dy * dy <= effective_r * effective_r;
-        }
-        if (in_right_region and in_bottom_region) {
-            // Bottom-right corner
-            const cx = right - effective_r;
-            const cy = bottom - effective_r;
-            const dx = x - cx;
-            const dy = y - cy;
-            return dx * dx + dy * dy <= effective_r * effective_r;
-        }
-
-        // Not in a corner region, so inside the rounded rect
-        return true;
-    }
-
     // Parse CSS blend mode string to z2d compositing operator
     fn parseBlendMode(self: *Browser, blend_mode_str: []const u8) compositor.Operator {
         _ = self;
@@ -5366,7 +5025,6 @@ pub const Browser = struct {
 
     // Ensure we clean up the document_layout in deinit
     pub fn deinit(self: *Browser) void {
-        std.debug.print("[DEINIT] Browser.deinit() starting\n", .{});
         // Clean up z2d surfaces and context
         self.context.deinit();
         self.root_surface.deinit(self.allocator);
@@ -5374,8 +5032,6 @@ pub const Browser = struct {
         if (self.tab_surface) |*tab_surface| {
             tab_surface.deinit(self.allocator);
         }
-        std.debug.print("[DEINIT] surfaces done\n", .{});
-
         // Clean up cached SDL texture
         if (self.cached_texture) |tex| {
             tex.destroy();
@@ -5383,15 +5039,9 @@ pub const Browser = struct {
 
         // Close all connections
         self.http_client.deinit();
-        std.debug.print("[DEINIT] http_client done\n", .{});
-
-        // Free cache
-        var cache = self.cache;
-        cache.free();
 
         // Clean up chrome
         self.chrome.deinit();
-        std.debug.print("[DEINIT] chrome done\n", .{});
 
         // Free cookie jar values and map storage
         var cookie_it = self.cookie_jar.iterator();
@@ -5400,17 +5050,13 @@ pub const Browser = struct {
             self.allocator.free(entry.key_ptr.*);
         }
         self.cookie_jar.deinit();
-        std.debug.print("[DEINIT] cookies done\n", .{});
 
         // Clean up all tabs
-        std.debug.print("[DEINIT] cleaning up tabs\n", .{});
         for (self.tabs.items) |tab| {
-            std.debug.print("[DEINIT] tab.deinit()\n", .{});
             tab.deinit();
             self.allocator.destroy(tab);
         }
         self.tabs.deinit(self.allocator);
-        std.debug.print("[DEINIT] tabs done\n", .{});
 
         if (self.active_tab_display_list) |list| {
             DisplayItem.freeList(self.allocator, list);
@@ -5464,7 +5110,7 @@ const LoadTaskContext = struct {
     url: ?*Url,
     payload: ?[]const u8,
 
-    pub fn create(
+    fn create(
         allocator: std.mem.Allocator,
         browser: *Browser,
         tab: *Tab,
@@ -5529,7 +5175,7 @@ const FrameLoadTaskContext = struct {
     url: ?*Url,
     payload: ?[]const u8,
 
-    pub fn create(
+    fn create(
         allocator: std.mem.Allocator,
         browser: *Browser,
         frame: *Frame,
@@ -5594,7 +5240,7 @@ const TabClickTaskContext = struct {
     x: i32,
     y: i32,
 
-    pub fn create(
+    fn create(
         allocator: std.mem.Allocator,
         browser: *Browser,
         tab: *Tab,
@@ -5644,7 +5290,7 @@ const TabKeypressTaskContext = struct {
     tab: *Tab,
     char: u8,
 
-    pub fn create(
+    fn create(
         allocator: std.mem.Allocator,
         browser: *Browser,
         tab: *Tab,
@@ -5691,7 +5337,7 @@ const TabBackspaceTaskContext = struct {
     browser: *Browser,
     tab: *Tab,
 
-    pub fn create(
+    fn create(
         allocator: std.mem.Allocator,
         browser: *Browser,
         tab: *Tab,
@@ -5731,105 +5377,12 @@ const TabBackspaceTaskContext = struct {
     }
 };
 
-const TabCycleFocusTaskContext = struct {
-    allocator: std.mem.Allocator,
-    browser: *Browser,
-    tab: *Tab,
-    reverse: bool,
-
-    pub fn create(
-        allocator: std.mem.Allocator,
-        browser: *Browser,
-        tab: *Tab,
-        reverse: bool,
-    ) !*TabCycleFocusTaskContext {
-        const ctx = try allocator.create(TabCycleFocusTaskContext);
-        ctx.* = .{
-            .allocator = allocator,
-            .browser = browser,
-            .tab = tab,
-            .reverse = reverse,
-        };
-        return ctx;
-    }
-
-    fn destroy(self: *TabCycleFocusTaskContext) void {
-        self.allocator.destroy(self);
-    }
-
-    fn run(self: *TabCycleFocusTaskContext) !void {
-        try self.tab.cycleFocus(self.browser, self.reverse);
-    }
-
-    fn toOpaque(self: *TabCycleFocusTaskContext) *anyopaque {
-        return @ptrCast(self);
-    }
-
-    fn fromOpaque(context: *anyopaque) *TabCycleFocusTaskContext {
-        const raw: *align(1) TabCycleFocusTaskContext = @ptrCast(context);
-        return @alignCast(raw);
-    }
-
-    fn runOpaque(context: *anyopaque) anyerror!void {
-        try TabCycleFocusTaskContext.fromOpaque(context).run();
-    }
-
-    fn cleanupOpaque(context: *anyopaque) void {
-        TabCycleFocusTaskContext.fromOpaque(context).destroy();
-    }
-};
-
-const TabActivateTaskContext = struct {
-    allocator: std.mem.Allocator,
-    browser: *Browser,
-    tab: *Tab,
-
-    pub fn create(
-        allocator: std.mem.Allocator,
-        browser: *Browser,
-        tab: *Tab,
-    ) !*TabActivateTaskContext {
-        const ctx = try allocator.create(TabActivateTaskContext);
-        ctx.* = .{
-            .allocator = allocator,
-            .browser = browser,
-            .tab = tab,
-        };
-        return ctx;
-    }
-
-    fn destroy(self: *TabActivateTaskContext) void {
-        self.allocator.destroy(self);
-    }
-
-    fn run(self: *TabActivateTaskContext) !void {
-        try self.tab.activateFocusedElement(self.browser);
-    }
-
-    fn toOpaque(self: *TabActivateTaskContext) *anyopaque {
-        return @ptrCast(self);
-    }
-
-    fn fromOpaque(context: *anyopaque) *TabActivateTaskContext {
-        const raw: *align(1) TabActivateTaskContext = @ptrCast(context);
-        return @alignCast(raw);
-    }
-
-    fn runOpaque(context: *anyopaque) anyerror!void {
-        try TabActivateTaskContext.fromOpaque(context).run();
-    }
-
-    fn cleanupOpaque(context: *anyopaque) void {
-        TabActivateTaskContext.fromOpaque(context).destroy();
-    }
-};
-
 const TabClearFocusTaskContext = struct {
     allocator: std.mem.Allocator,
     browser: *Browser,
     tab: *Tab,
 
-    pub fn create(
+    fn create(
         allocator: std.mem.Allocator,
         browser: *Browser,
         tab: *Tab,

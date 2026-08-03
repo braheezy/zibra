@@ -1,3 +1,9 @@
+//! Dependency-tracked fields that propagate style and layout invalidation.
+//!
+//! Owners and dependents must remain at stable addresses after registration.
+//! The current implementation has no unsubscribe operation and is not thread
+//! safe; callers must destroy an entire dependency graph in a compatible order.
+
 const std = @import("std");
 
 // Debug flag: set to true to enable invalidation logging
@@ -5,7 +11,6 @@ const DEBUG_PROTECTED_FIELDS = false;
 
 pub fn ProtectedField(comptime T: type) type {
     return struct {
-        allocator: std.mem.Allocator,
         value: T,
         dirty: bool,
         invalidations: std.AutoHashMap(*anyopaque, *const fn (*anyopaque) void),
@@ -17,7 +22,6 @@ pub fn ProtectedField(comptime T: type) type {
 
         pub fn init(allocator: std.mem.Allocator, value: T) @This() {
             return .{
-                .allocator = allocator,
                 .value = value,
                 .dirty = true,
                 .invalidations = std.AutoHashMap(*anyopaque, *const fn (*anyopaque) void).init(allocator),
@@ -31,7 +35,6 @@ pub fn ProtectedField(comptime T: type) type {
 
         pub fn initNamed(allocator: std.mem.Allocator, value: T, obj: []const u8, name: []const u8) @This() {
             return .{
-                .allocator = allocator,
                 .value = value,
                 .dirty = true,
                 .invalidations = std.AutoHashMap(*anyopaque, *const fn (*anyopaque) void).init(allocator),
@@ -74,7 +77,7 @@ pub fn ProtectedField(comptime T: type) type {
             self.frozen_dependencies = true;
         }
 
-        pub fn notify(self: *@This()) void {
+        fn notify(self: *@This()) void {
             if (DEBUG_PROTECTED_FIELDS) {
                 std.debug.print("  [NOTIFY] notifying {} dependents\n", .{self.invalidations.count()});
             }
@@ -112,11 +115,6 @@ pub fn ProtectedField(comptime T: type) type {
             return self.get();
         }
 
-        pub fn copy(self: *@This(), src: anytype) void {
-            const value = src.read(self);
-            self.set(value.*);
-        }
-
         pub fn get(self: *const @This()) *const T {
             if (self.dirty) {
                 std.debug.print("[PROTECTED_FIELD] get() called on dirty field! Type={s} obj={s} name={s}\n", .{ @typeName(T), self.obj, self.name });
@@ -127,22 +125,15 @@ pub fn ProtectedField(comptime T: type) type {
             return &self.value;
         }
 
-        pub fn getMut(self: *@This()) *T {
-            std.debug.assert(!self.dirty);
-            return &self.value;
-        }
-
         pub fn set(self: *@This(), value: T) void {
             // Only notify dependents if the value actually changed (for comparable types)
             // Check type at comptime and decide whether to compare
-            var value_changed = false;
             if (comptime (T == i32 or T == f32 or T == i64 or T == f64 or T == bool or T == u32 or T == u64)) {
                 // Simple types: only notify if value changed
                 if (self.value != value) {
                     if (DEBUG_PROTECTED_FIELDS) {
                         std.debug.print("[SET] value changed, invalidating\n", .{});
                     }
-                    value_changed = true;
                     self.notify();
                 } else if (DEBUG_PROTECTED_FIELDS) {
                     // Skip logging unchanged values to reduce noise
@@ -152,7 +143,6 @@ pub fn ProtectedField(comptime T: type) type {
                 if (DEBUG_PROTECTED_FIELDS) {
                     std.debug.print("[SET] complex type, invalidating\n", .{});
                 }
-                value_changed = true;
                 self.notify();
             }
 

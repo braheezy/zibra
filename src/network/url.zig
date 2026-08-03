@@ -1,11 +1,13 @@
+//! Owning URL representation, relative resolution, and resource loading.
+//!
+//! `Url` is an owning value even though Zig permits copying it: exactly one
+//! logical copy must be passed to `free`. Its component slices are backed by
+//! the owned Ada URL, except for data-URL storage allocated by `init`; callers
+//! must pass the same allocator to `free` for those allocations.
+
 const std = @import("std");
 
 const ada = @import("ada");
-
-const ArrayList = std.ArrayList;
-const StringHashMap = std.StringHashMap;
-const Cache = @import("cache.zig").Cache;
-const CacheEntry = @import("cache.zig").CacheEntry;
 
 pub const SameSiteMode = enum { none, lax };
 
@@ -17,35 +19,6 @@ pub const CookieEntry = struct {
 pub const HttpResponse = struct {
     body: []const u8,
     csp_header: ?[]u8 = null,
-};
-
-const dbg = std.debug.print;
-
-fn dbgln(comptime fmt: []const u8) void {
-    dbg("{s}\n", .{fmt});
-}
-
-pub const Response = struct {
-    status: u16,
-    headers: StringHashMap([]const u8),
-    body: ?[]const u8,
-
-    pub fn free(self: *Response, al: std.mem.Allocator) void {
-        // Free all keys and values
-        var iter = self.headers.iterator();
-        while (iter.next()) |entry| {
-            al.free(entry.key_ptr.*);
-            al.free(entry.value_ptr.*);
-        }
-
-        self.headers.deinit();
-
-        // Free body if it exists
-        if (self.body) |_| al.free(self.body.?);
-
-        // Destroy the Response struct itself
-        al.destroy(self);
-    }
 };
 
 // Note: Connection handling is now done by std.http.Client
@@ -63,7 +36,6 @@ pub const Url = struct {
     view_source: bool = false,
 
     pub fn init(allocator: std.mem.Allocator, url: []const u8) !Url {
-        std.debug.print("checking url: {s}\n", .{url});
         const ada_url = try ada.Url.init(url);
 
         var u = Url{ .ada_url = ada_url };
@@ -88,31 +60,33 @@ pub const Url = struct {
         } else {
             u.port = if (u.is_https) 443 else 80;
         }
-        std.debug.print("scheme: {s}\n", .{u.scheme});
-
         if (std.mem.eql(u8, u.scheme, "view-source")) {
             u.view_source = true;
 
             // Extract the actual URL after view-source:
             const actual_url = url[std.mem.indexOf(u8, url, ":").? + 1 ..];
 
-            // Create a new URL object for the actual URL
-            const actual_ada_url = try ada.Url.init(actual_url);
+            // Replace the wrapper URL with the URL whose component slices we
+            // expose. Keeping the original owner here left all component
+            // slices dangling and caused `free` to release it a second time.
+            const actual_ada_url = ada.Url.init(actual_url) catch |err| {
+                u.ada_url.free();
+                return err;
+            };
+            u.ada_url.free();
+            u.ada_url = actual_ada_url;
 
             // Update the URL properties with the actual URL's properties (strip colon)
-            const actual_protocol = actual_ada_url.getProtocol();
+            const actual_protocol = u.ada_url.getProtocol();
             u.scheme = if (std.mem.endsWith(u8, actual_protocol, ":"))
                 actual_protocol[0 .. actual_protocol.len - 1]
             else
                 actual_protocol;
 
-            u.host = actual_ada_url.getHost();
-            u.path = actual_ada_url.getPathname();
+            u.host = u.ada_url.getHost();
+            u.path = u.ada_url.getPathname();
             u.is_https = std.mem.eql(u8, u.scheme, "https");
             u.port = if (u.is_https) 443 else 80;
-
-            // Free the temporary ada_url
-            ada_url.free();
         }
 
         if (std.mem.eql(u8, u.scheme, "data")) {
@@ -324,24 +298,10 @@ pub const Url = struct {
         self: Url,
         al: std.mem.Allocator,
         http_client: *std.http.Client,
-        cache: *Cache,
         cookie_jar: *std.StringHashMap(CookieEntry),
         referrer: ?Url,
         payload: ?[]const u8,
     ) !HttpResponse {
-        // Check the cache (only for GET requests)
-        if (payload == null) {
-            if (cache.get(self.path)) |entry| {
-                const now: u64 = @intCast(std.Io.Clock.real.now(http_client.io).toMilliseconds());
-                if (entry.max_age) |max_age| {
-                    if ((now - entry.timestampe) / 1000 <= max_age) {
-                        std.log.info("Cache hit for {s}", .{self.path});
-                        return HttpResponse{ .body = entry.body, .csp_header = null };
-                    }
-                }
-            }
-        }
-
         // Build full URL for std.http.Client
         var url_builder = std.ArrayList(u8).empty;
         defer url_builder.deinit(al);
@@ -637,110 +597,6 @@ pub const Url = struct {
         }
     }
 };
-
-pub fn isRedirectStatusCode(status: u16) bool {
-    return status == 301 or status == 302 or status == 303 or status == 307 or status == 308;
-}
-
-pub fn isCacheableStatusCode(status: u16) bool {
-    return status == 200 or status == 203 or status == 204 or status == 206 or status == 300 or status == 301 or status == 404 or status == 405 or status == 410 or status == 414 or status == 501;
-}
-
-// Parse the status line
-// Returns a tuple of version, status, and explanation
-fn parseStatus(line: []const u8) !struct {
-    []const u8,
-    []const u8,
-    []const u8,
-} {
-    var line_iter = std.mem.splitScalar(u8, line, ' ');
-    const version = line_iter.next();
-    const status = line_iter.next();
-    const explanation = line_iter.rest();
-
-    if (version == null or status == null) {
-        return error.InvalidStatusLine;
-    }
-
-    return .{ version.?, status.?, explanation };
-}
-
-// Old HTTP parsing functions removed - std.http.Client handles headers now
-
-fn oldParseHeaders(data: []const u8, al: std.mem.Allocator) !StringHashMap([]const u8) {
-    // Define a hashmap to store the headers
-    var headers = StringHashMap([]const u8).init(al);
-
-    var lines = std.mem.splitSequence(
-        u8,
-        data,
-        "\r\n",
-    );
-
-    // Parse the headers
-    while (lines.next()) |header_line| {
-        // Empty line indicates end of headers
-        if (std.mem.eql(u8, header_line, "")) {
-            break;
-        }
-
-        // Split the header line by ':' for the key and value
-        var line_iter = std.mem.splitScalar(u8, header_line, ':');
-
-        const header_key = line_iter.next();
-        if (header_key == null) {
-            return error.NoHeaderNameFound;
-        }
-        // normalize the key to lowercase
-        const lowercase_header_name = try std.ascii.allocLowerString(al, header_key.?);
-        const result = try headers.getOrPut(lowercase_header_name);
-
-        // Remove whitespace because it's insignificant
-        const header_value = std.mem.trim(u8, line_iter.rest(), " ");
-
-        // If duplicate headers are sent, we need to free the duplicated header name
-        // ! If duplicate headers are sent, only the first one will be stored.
-        if (result.found_existing) {
-            al.free(lowercase_header_name);
-        }
-        const value_copy = try al.alloc(u8, header_value.len);
-        @memcpy(value_copy, header_value);
-        result.value_ptr.* = value_copy;
-    }
-    return headers;
-}
-
-fn parseStatusLine(headers_data: []const u8) !u16 {
-    var lines = std.mem.splitSequence(u8, headers_data, "\r\n");
-    const status_line = lines.next() orelse return error.NoStatusLineFound;
-
-    std.log.info("{s}", .{status_line});
-
-    // Parse "HTTP/1.1 200 OK"
-    var parts = std.mem.splitScalar(u8, status_line, ' ');
-    // Skip "HTTP/1.1"
-    _ = parts.next();
-    const status_str = parts.next() orelse return error.NoStatusCodeFound;
-
-    return std.fmt.parseInt(u16, status_str, 10) catch return error.InvalidStatusCode;
-}
-
-// Print the headers
-fn printHeaders(al: std.mem.Allocator, headers: std.StringHashMap([]const u8)) !void {
-    var headers_list = std.ArrayList(u8).empty;
-    defer headers_list.deinit(al);
-
-    try headers_list.appendSlice(al, "Headers:\n");
-
-    var iter = headers.iterator();
-    while (iter.next()) |entry| {
-        const header_line = try std.fmt.allocPrint(al, "{s}: {s}\n", .{ entry.key_ptr.*, entry.value_ptr.* });
-        defer al.free(header_line);
-        try headers_list.appendSlice(al, header_line);
-    }
-
-    std.log.info("{s}", .{headers_list.items});
-}
 
 const expect = std.testing.expect;
 

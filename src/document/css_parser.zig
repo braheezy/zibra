@@ -1,3 +1,9 @@
+//! Parser for Zibra's intentionally small CSS subset.
+//!
+//! Property names and values in returned rules borrow the input stylesheet;
+//! selectors allocate their normalized tag names. The stylesheet therefore
+//! must outlive its rules, and each owned rule must be deinitialized.
+
 const std = @import("std");
 const selector_mod = @import("selector.zig");
 const Selector = selector_mod.Selector;
@@ -24,13 +30,13 @@ pub fn deinit(self: *CSSParser, allocator: std.mem.Allocator) void {
     allocator.destroy(self);
 }
 
-pub fn whitespace(self: *CSSParser) void {
+fn whitespace(self: *CSSParser) void {
     while (self.pos < self.string.len and std.ascii.isWhitespace(self.string[self.pos])) {
         self.pos += 1;
     }
 }
 
-pub fn word(self: *CSSParser) ![]const u8 {
+fn word(self: *CSSParser) ![]const u8 {
     const start = self.pos;
     while (self.pos < self.string.len) {
         const c = self.string[self.pos];
@@ -46,7 +52,7 @@ pub fn word(self: *CSSParser) ![]const u8 {
     return self.string[start..self.pos];
 }
 
-pub fn literal(self: *CSSParser, lit: u8) !void {
+fn literal(self: *CSSParser, lit: u8) !void {
     if (self.pos >= self.string.len or self.string[self.pos] != lit) {
         return error.InvalidLiteral;
     }
@@ -54,7 +60,7 @@ pub fn literal(self: *CSSParser, lit: u8) !void {
 }
 
 /// Read a CSS value until `;` or `}`, trimming trailing whitespace
-pub fn value(self: *CSSParser) ![]const u8 {
+fn value(self: *CSSParser) ![]const u8 {
     const start = self.pos;
     while (self.pos < self.string.len) {
         const c = self.string[self.pos];
@@ -74,7 +80,7 @@ pub fn value(self: *CSSParser) ![]const u8 {
     return self.string[start..end];
 }
 
-pub fn pair(self: *CSSParser) !struct { property: []const u8, value: []const u8 } {
+fn pair(self: *CSSParser) !struct { property: []const u8, value: []const u8 } {
     const property = try self.word();
     self.whitespace();
     try self.literal(':');
@@ -85,6 +91,7 @@ pub fn pair(self: *CSSParser) !struct { property: []const u8, value: []const u8 
 
 pub fn body(self: *CSSParser, allocator: std.mem.Allocator) !std.StringHashMap([]const u8) {
     var map = std.StringHashMap([]const u8).init(allocator);
+    errdefer map.deinit();
     // Stop at closing brace
     while (self.pos < self.string.len and self.string[self.pos] != '}') {
         // Try to parse a property-value pair, but catch any errors
@@ -115,7 +122,7 @@ pub fn body(self: *CSSParser, allocator: std.mem.Allocator) !std.StringHashMap([
     return map;
 }
 
-pub fn ignoreUntil(self: *CSSParser, chars: []const u8) ?u8 {
+fn ignoreUntil(self: *CSSParser, chars: []const u8) ?u8 {
     while (self.pos < self.string.len) {
         const current_char = self.string[self.pos];
         for (chars) |c| {
@@ -159,10 +166,8 @@ fn prefersColorSchemeMatch(self: *CSSParser, allocator: std.mem.Allocator, prelu
     return null;
 }
 
-/// Parse a CSS selector (tag selector or descendant selector)
-/// Note: Using word() for tag names means .class and #id selectors
-/// are mis-parsed as tag selectors, but this won't cause harm since
-/// there are no elements with those tags
+/// Parse a tag selector or a whitespace-separated descendant selector.
+/// Class, ID, attribute, and combinator selectors are not yet supported.
 pub fn selector(self: *CSSParser, allocator: std.mem.Allocator) !Selector {
     // Start with a tag selector
     const first_tag = try self.word();
@@ -176,6 +181,7 @@ pub fn selector(self: *CSSParser, allocator: std.mem.Allocator) !Selector {
     @memcpy(tag_copy, lower_tag);
 
     var out = Selector{ .tag = TagSelector.init(tag_copy) };
+    errdefer out.deinit(allocator);
     self.whitespace();
 
     // Continue parsing descendant selectors until we hit '{'
@@ -190,10 +196,13 @@ pub fn selector(self: *CSSParser, allocator: std.mem.Allocator) !Selector {
         const descendant_tag_copy = try allocator.alloc(u8, lower_descendant.len);
         @memcpy(descendant_tag_copy, lower_descendant);
 
-        const descendant = Selector{ .tag = TagSelector.init(descendant_tag_copy) };
+        var descendant = Selector{ .tag = TagSelector.init(descendant_tag_copy) };
+        var descendant_owned = true;
+        defer if (descendant_owned) descendant.deinit(allocator);
 
         // Create a descendant selector: out is the ancestor, descendant is the child
         const desc_selector = try DescendantSelector.init(allocator, out, descendant);
+        descendant_owned = false;
         out = Selector{ .descendant = desc_selector };
 
         self.whitespace();
@@ -212,7 +221,7 @@ pub const CSSRule = struct {
         // Free the selector's allocated memory (pass pointer since deinit expects *Selector)
         Selector.deinit(&self.selector, allocator);
 
-        // Free the properties hashmap structure (keys/values managed by arena)
+        // The map owns its table; property/value slices borrow the stylesheet.
         self.properties.deinit();
     }
 
@@ -228,8 +237,7 @@ pub fn parse(self: *CSSParser, allocator: std.mem.Allocator) ![]CSSRule {
     var rules = std.ArrayList(CSSRule).empty;
     errdefer {
         for (rules.items) |*rule| {
-            var mutable_rule = rule;
-            mutable_rule.deinit(allocator);
+            rule.deinit(allocator);
         }
         rules.deinit(allocator);
     }
@@ -255,11 +263,21 @@ pub fn parse(self: *CSSParser, allocator: std.mem.Allocator) ![]CSSRule {
                         defer media_parser.deinit(allocator);
 
                         const media_rules = try media_parser.parse(allocator);
-                        defer allocator.free(media_rules);
-
-                        for (media_rules) |rule| {
-                            try rules.append(allocator, rule);
+                        var media_rules_transferred = false;
+                        defer {
+                            if (!media_rules_transferred) {
+                                for (media_rules) |*rule| {
+                                    rule.deinit(allocator);
+                                }
+                            }
+                            allocator.free(media_rules);
                         }
+
+                        try rules.ensureUnusedCapacity(allocator, media_rules.len);
+                        for (media_rules) |rule| {
+                            rules.appendAssumeCapacity(rule);
+                        }
+                        media_rules_transferred = true;
                     }
                 }
 
@@ -357,7 +375,11 @@ pub fn parse(self: *CSSParser, allocator: std.mem.Allocator) ![]CSSRule {
         };
 
         // Add rule if we successfully parsed one
-        try rules.append(allocator, rule_result);
+        rules.append(allocator, rule_result) catch |err| {
+            var owned_rule = rule_result;
+            owned_rule.deinit(allocator);
+            return err;
+        };
     }
 
     return rules.toOwnedSlice(allocator);

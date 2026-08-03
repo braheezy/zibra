@@ -1,3 +1,5 @@
+//! Build, run, unit-test, and native screenshot-test steps for Zibra.
+
 const std = @import("std");
 const builtin = @import("builtin");
 const sdl = @import("sdl");
@@ -11,7 +13,7 @@ pub fn build(b: *std.Build) !void {
     const sdl_mod = sdk.getWrapperModule();
 
     const source_module = b.createModule(.{
-        .root_source_file = b.path("src/zibra.zig"),
+        .root_source_file = b.path("src/main.zig"),
         .target = target,
         .optimize = optimize,
     });
@@ -35,7 +37,10 @@ pub fn build(b: *std.Build) !void {
     source_module.addImport("grapheme", zg.module("Graphemes"));
     source_module.addImport("code_point", zg.module("code_point"));
 
-    const ada_dep = b.dependency("adazig", .{});
+    const ada_dep = b.dependency("adazig", .{
+        .target = target,
+        .optimize = optimize,
+    });
     source_module.addImport("ada", ada_dep.module("ada"));
 
     const z2d_dep = b.dependency("z2d", .{});
@@ -89,37 +94,18 @@ pub fn build(b: *std.Build) !void {
 
     const test_step = b.step("test", "Run unit tests");
 
-    const js_test_module = b.createModule(.{
-        .root_source_file = b.path("src/js.zig"),
+    const test_module = b.createModule(.{
+        .root_source_file = b.path("src/test_root.zig"),
         .target = target,
         .optimize = optimize,
     });
-    js_test_module.addImport("kiesel", kiesel_dep.module("kiesel"));
-    js_test_module.addImport("bdwgc", bdwgc_dep.module("bdwgc"));
-    js_test_module.addImport("zigimg", zigimg_dep.module("zigimg"));
-    const js_tests = b.addTest(.{ .root_module = js_test_module });
-    const js_tests_run = b.addRunArtifact(js_tests);
-    test_step.dependOn(&js_tests_run.step);
-
-    const parser_test_module = b.createModule(.{
-        .root_source_file = b.path("src/parser_test.zig"),
-        .target = target,
-        .optimize = optimize,
-    });
-    parser_test_module.addImport("zigimg", zigimg_dep.module("zigimg"));
-    const parser_tests = b.addTest(.{ .root_module = parser_test_module });
-    const parser_tests_run = b.addRunArtifact(parser_tests);
-    test_step.dependOn(&parser_tests_run.step);
-
-    const url_test_module = b.createModule(.{
-        .root_source_file = b.path("src/url.zig"),
-        .target = target,
-        .optimize = optimize,
-    });
-    url_test_module.addImport("ada", ada_dep.module("ada"));
-    const url_tests = b.addTest(.{ .root_module = url_test_module });
-    const url_tests_run = b.addRunArtifact(url_tests);
-    test_step.dependOn(&url_tests_run.step);
+    test_module.addImport("kiesel", kiesel_dep.module("kiesel"));
+    test_module.addImport("bdwgc", bdwgc_dep.module("bdwgc"));
+    test_module.addImport("zigimg", zigimg_dep.module("zigimg"));
+    test_module.addImport("ada", ada_dep.module("ada"));
+    const unit_tests = b.addTest(.{ .root_module = test_module });
+    const unit_tests_run = b.addRunArtifact(unit_tests);
+    test_step.dependOn(&unit_tests_run.step);
 
     const screenshot_test_step = b.step(
         "test-screenshot",

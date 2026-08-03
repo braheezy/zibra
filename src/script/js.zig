@@ -1,5 +1,11 @@
+//! Kiesel JavaScript host integration and the minimal DOM-facing Web APIs.
+//!
+//! A `Js` instance owns Kiesel agent state and per-window handle maps. Kiesel
+//! execution is serialized by `JsLock`; DOM pointers and callback contexts are
+//! borrowed and must be invalidated before their owning frame is destroyed.
+
 const std = @import("std");
-const Mutex = @import("sync.zig").Mutex;
+const Mutex = @import("../runtime/sync.zig").Mutex;
 
 const bdwgc = @import("bdwgc");
 const kiesel = @import("kiesel");
@@ -7,10 +13,9 @@ const Agent = kiesel.execution.Agent;
 const Script = kiesel.language.Script;
 const Realm = kiesel.execution.Realm;
 const Value = kiesel.types.Value;
-const parser = @import("parser.zig");
+const parser = @import("../document/parser.zig");
 const Node = parser.Node;
-const CSSParser = @import("cssParser.zig").CSSParser;
-const Selector = @import("selector.zig").Selector;
+const CSSParser = @import("../document/css_parser.zig").CSSParser;
 const NumericAnimation = parser.NumericAnimation;
 
 const Js = @This();
@@ -688,6 +693,22 @@ fn getHandle(self: *Js, window: *WindowContext, node: *Node) !u32 {
 fn getNode(self: *Js, window: *WindowContext, handle: u32) ?*Node {
     _ = self;
     return window.handle_to_node.get(handle);
+}
+
+fn removeHandlesForSubtree(self: *Js, window: *WindowContext, node: *Node) void {
+    switch (node.*) {
+        .element => |*element| {
+            for (element.children.items) |*child| {
+                self.removeHandlesForSubtree(window, child);
+            }
+        },
+        .text => {},
+    }
+
+    if (window.node_to_handle.get(node)) |handle| {
+        _ = window.node_to_handle.remove(node);
+        _ = window.handle_to_node.remove(handle);
+    }
 }
 
 fn requestRender(self: *Js) void {
@@ -1624,6 +1645,7 @@ fn innerHTML(agent: *Agent, this_value: Value, arguments: kiesel.types.Arguments
         .element => |*e| {
             // Clear existing children
             for (e.children.items) |*child| {
+                js_instance.removeHandlesForSubtree(window, child);
                 child.deinit(js_instance.allocator);
             }
             e.children.clearRetainingCapacity();
@@ -2038,35 +2060,4 @@ fn postMessageNative(agent: *Agent, this_value: Value, arguments: kiesel.types.A
     }
 
     return .undefined;
-}
-
-/// Escape a string for safe embedding in JavaScript source
-fn quoteJsString(allocator: std.mem.Allocator, input: []const u8) ![]u8 {
-    var builder = std.ArrayList(u8).empty;
-    errdefer builder.deinit(allocator);
-
-    try builder.append(allocator, '"');
-    for (input) |ch| {
-        switch (ch) {
-            '\\' => {
-                try builder.appendSlice(allocator, "\\\\");
-            },
-            '"' => {
-                try builder.appendSlice(allocator, "\\\"");
-            },
-            '\n' => {
-                try builder.appendSlice(allocator, "\\n");
-            },
-            '\r' => {
-                try builder.appendSlice(allocator, "\\r");
-            },
-            '\t' => {
-                try builder.appendSlice(allocator, "\\t");
-            },
-            else => try builder.append(allocator, ch),
-        }
-    }
-    try builder.append(allocator, '"');
-
-    return builder.toOwnedSlice();
 }

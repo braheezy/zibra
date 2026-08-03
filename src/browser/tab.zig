@@ -1,12 +1,18 @@
+//! Per-tab navigation, frame ownership, and serialized page work.
+//!
+//! `Browser` owns each heap-allocated `Tab`. A tab must reach its final address
+//! before `start`, because its task runner retains a pointer to the tab-owned
+//! state. Frames own DOM, stylesheet, layout, and display-list generations.
+
 const std = @import("std");
-const browser_mod = @import("browser.zig");
-const url_module = @import("url.zig");
-const parser = @import("parser.zig");
-const Layout = @import("Layout.zig");
-const CSSParser = @import("cssParser.zig");
-const task = @import("task.zig");
-const MeasureTime = @import("measure_time.zig").MeasureTime;
-const js_module = @import("js.zig");
+const browser_mod = @import("root.zig");
+const url_module = @import("../network/url.zig");
+const parser = @import("../document/parser.zig");
+const Layout = @import("render/layout.zig");
+const CSSParser = @import("../document/css_parser.zig");
+const task = @import("../runtime/task.zig");
+const MeasureTime = @import("../runtime/measure_time.zig").MeasureTime;
+const js_module = @import("../script/js.zig");
 
 const Url = url_module.Url;
 const Browser = browser_mod.Browser;
@@ -104,7 +110,14 @@ pub const Frame = struct {
     }
 
     pub fn deinit(self: *Frame) void {
+        if (self.js_context) |ctx| {
+            ctx.setNodes(self.window_id, null);
+        }
+        self.js_render_context.setPointers(null, null, null, 0);
         self.tab.unregisterFrame(self);
+        self.js_context = null;
+        self.js_render_context_initialized = false;
+
         self.input_bounds.deinit();
         self.link_bounds.deinit(self.allocator);
         self.iframe_bounds.deinit(self.allocator);
@@ -127,9 +140,8 @@ pub const Frame = struct {
             self.document_layout = null;
         }
 
-        if (self.current_node) |node| {
-            var n = node;
-            n.deinit(self.allocator);
+        if (self.current_node) |*node| {
+            node.deinit(self.allocator);
             self.current_node = null;
         }
 
@@ -608,13 +620,9 @@ pub fn start(self: *Tab) !void {
 }
 
 pub fn deinit(self: *Tab) void {
-    std.debug.print("[TAB.DEINIT] invalidateJsContext\n", .{});
     self.invalidateJsContext();
-    std.debug.print("[TAB.DEINIT] waitForAsyncThreads\n", .{});
     self.waitForAsyncThreads();
-    std.debug.print("[TAB.DEINIT] task_runner.shutdown\n", .{});
     self.task_runner.shutdown();
-    std.debug.print("[TAB.DEINIT] task_runner.shutdown done\n", .{});
 
     if (self.root_frame) |frame| {
         frame.deinit();
@@ -686,7 +694,7 @@ fn originKey(self: *Tab, url: *Url) ![]const u8 {
     return try std.fmt.allocPrint(self.allocator, "{s}://{s}:{d}", .{ url.*.scheme, host, url.*.port });
 }
 
-pub fn get_js(self: *Tab, url: *Url) !*js_module {
+pub fn getJs(self: *Tab, url: *Url) !*js_module {
     const key = try self.originKey(url);
     if (self.js_contexts.get(key)) |ctx| {
         self.allocator.free(key);
@@ -997,10 +1005,8 @@ fn appendIframeContent(
 
 // Re-render the page without reloading (style, layout, paint)
 pub fn render(self: *Tab, b: *Browser) !void {
-    std.debug.print("[TAB] render: style={} layout={} paint={}\n", .{ self.needs_style, self.needs_layout, self.needs_paint });
     // Check if any render phase is needed
     if (!self.needs_style and !self.needs_layout and !self.needs_paint) return;
-    std.debug.print("[TAB] render RUNNING\n", .{});
 
     const profiling = b.profiling_enabled;
     const render_start = if (profiling) std.Io.Clock.awake.now(b.io).nanoseconds else 0;
@@ -1057,9 +1063,7 @@ pub fn render(self: *Tab, b: *Browser) !void {
         for (frames.items) |child_frame| {
             try child_frame.render(b, false, true, true);
         }
-        std.debug.print("[TAB] render: composeDisplayList\n", .{});
         try self.composeDisplayList(frame);
-        std.debug.print("[TAB] render: composeDisplayList done\n", .{});
         if (profiling) {
             layout_ns = @intCast(std.Io.Clock.awake.now(b.io).nanoseconds - layout_start);
         }
@@ -1071,9 +1075,7 @@ pub fn render(self: *Tab, b: *Browser) !void {
         }
     }
 
-    std.debug.print("[TAB] render: setNeedsCompositeRasterDraw\n", .{});
     b.setNeedsCompositeRasterDraw();
-    std.debug.print("[TAB] render: setNeedsCompositeRasterDraw done\n", .{});
 
     if (profiling) {
         const total_ns: u64 = @intCast(std.Io.Clock.awake.now(b.io).nanoseconds - render_start);
@@ -1086,7 +1088,6 @@ pub fn render(self: *Tab, b: *Browser) !void {
             },
         );
     }
-    std.debug.print("[TAB] render END\n", .{});
 }
 
 pub fn runAnimationFrame(self: *Tab, scroll: i32) void {
@@ -1697,11 +1698,20 @@ pub fn buildAccessibilityTree(self: *Tab, b: *Browser) !void {
     const previous_root = self.accessibility_root;
     self.accessibility_root = null;
 
-    self.clearAccessibilityTree();
-    for (self.accessibility_strings.items) |value| {
-        self.allocator.free(value);
+    var previous_strings = self.accessibility_strings;
+    self.accessibility_strings = .empty;
+    defer {
+        if (previous_root) |old_root| {
+            old_root.deinit(self.allocator);
+            self.allocator.destroy(old_root);
+        }
+        for (previous_strings.items) |value| {
+            self.allocator.free(value);
+        }
+        previous_strings.deinit(self.allocator);
     }
-    self.accessibility_strings.clearRetainingCapacity();
+
+    self.clearAccessibilityTree();
 
     const frame = self.root_frame orelse return;
     if (frame.current_node == null) return;
@@ -1753,8 +1763,6 @@ pub fn buildAccessibilityTree(self: *Tab, b: *Browser) !void {
 
     if (previous_root) |old_root| {
         self.handleLiveRegionUpdates(old_root, root);
-        old_root.deinit(self.allocator);
-        self.allocator.destroy(old_root);
     }
     if (self.accessibility_focused != null and self.accessibility.screen_reader) {
         self.speakAccessibilityNode(self.accessibility_focused.?, "focus");
