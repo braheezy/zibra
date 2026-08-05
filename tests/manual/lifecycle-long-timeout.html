@@ -1,0 +1,16 @@
+<!--
+How to verify:
+  zig build run -- --screenshot /tmp/zibra-timeout.png \
+    file:///absolute/path/to/tests/manual/lifecycle-long-timeout.html
+
+Expected: Zibra captures the page and exits promptly. Shutdown must cancel the
+pending one-hour timer instead of waiting for its detached helper to finish.
+-->
+<!doctype html>
+<title>Long timeout shutdown</title>
+<p id="status">ready</p>
+<script>
+  setTimeout(function () {
+    document.getElementById("status").innerHTML = "unexpected timer fire";
+  }, 3600000);
+</script>

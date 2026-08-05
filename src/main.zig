@@ -106,19 +106,20 @@ fn zibra(init: std.process.Init) !void {
         return error.BadArguments;
     }
     // Initialize browser
-    var b = try Browser.init(allocator, init.io, init.environ_map, rtl_flag, screenshot_path != null);
-    defer b.deinit();
+    const b = try Browser.init(allocator, init.io, init.environ_map, rtl_flag, screenshot_path != null);
+    defer {
+        b.deinit();
+        allocator.destroy(b);
+    }
 
     if (url) |u| {
         if (print_tree) {
             const response = try b.fetchBody(u, null, null);
             defer if (response.csp_header) |hdr| allocator.free(hdr);
             const raw_body = response.body;
-            const body = try browser.decodeUtf8Replace(allocator, raw_body);
             const body_owned = !std.mem.eql(u8, u.scheme, "data") and !std.mem.eql(u8, u.scheme, "about");
-            if (body_owned) {
-                allocator.free(raw_body);
-            }
+            defer if (body_owned) allocator.free(raw_body);
+            const body = try browser.decodeUtf8Replace(allocator, raw_body);
             defer allocator.free(body);
 
             var html_parser = try HTMLParser.init(allocator, body);

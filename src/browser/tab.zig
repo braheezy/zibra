@@ -11,6 +11,7 @@ const parser = @import("../document/parser.zig");
 const Layout = @import("render/layout.zig");
 const CSSParser = @import("../document/css_parser.zig");
 const task = @import("../runtime/task.zig");
+const sync = @import("../runtime/sync.zig");
 const MeasureTime = @import("../runtime/measure_time.zig").MeasureTime;
 const js_module = @import("../script/js.zig");
 
@@ -81,6 +82,7 @@ pub const Frame = struct {
     js_context: ?*js_module = null,
     js_render_context: JsRenderContext = .{},
     js_render_context_initialized: bool = false,
+    document_generation: u64 = 0,
     rules: std.ArrayList(CSSParser.CSSRule),
     default_rules_count: usize = 0,
     css_texts: std.ArrayList([]const u8),
@@ -113,6 +115,8 @@ pub const Frame = struct {
         if (self.js_context) |ctx| {
             ctx.setNodes(self.window_id, null);
         }
+        self.document_generation = 0;
+        self.js_render_context.setGeneration(0);
         self.js_render_context.setPointers(null, null, null, 0);
         self.tab.unregisterFrame(self);
         self.js_context = null;
@@ -522,7 +526,9 @@ history: std.ArrayList(*Url),
 dynamic_texts: std.ArrayList([]const u8),
 // JS contexts keyed by origin string
 js_contexts: std.StringHashMap(*js_module),
-// Context passed to the JS engine for DOM mutation callbacks
+// Monotonic identity assigned to every installed root/child document.
+next_document_generation: u64 = 1,
+// Generation for tab-wide animation/render work.
 js_generation: u64 = 0,
 // Root frame for this tab
 root_frame: ?*Frame = null,
@@ -532,7 +538,10 @@ parent_window_ids: std.AutoHashMap(u32, u32),
 next_window_id: u32 = 1,
 // Pending asynchronous work for this tab
 task_runner: TaskRunner,
-async_thread_refs: std.atomic.Value(usize) = std.atomic.Value(usize).init(0),
+async_thread_refs: usize = 0,
+async_thread_mutex: sync.Mutex,
+async_thread_condition: sync.Condition,
+shutting_down: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
 // Separate dirty flags for render phases
 needs_style: bool = true,
 needs_layout: bool = true,
@@ -563,6 +572,8 @@ pub fn init(allocator: std.mem.Allocator, tab_height: i32, measure: *MeasureTime
         .dynamic_texts = std.ArrayList([]const u8).empty,
         .js_contexts = std.StringHashMap(*js_module).init(allocator),
         .task_runner = TaskRunner.init(allocator, measure),
+        .async_thread_mutex = .init(measure.io),
+        .async_thread_condition = .init(measure.io),
         .composited_updates = std.ArrayList(CompositedUpdate).empty,
         .accessibility_root = null,
         .accessibility_focused = null,
@@ -619,10 +630,21 @@ pub fn start(self: *Tab) !void {
     try self.task_runner.start();
 }
 
-pub fn deinit(self: *Tab) void {
-    self.invalidateJsContext();
-    self.waitForAsyncThreads();
+/// Stop every producer of tab work and wait until no worker/helper can borrow
+/// tab, frame, JavaScript, or Browser storage. Document destruction must happen
+/// only after this boundary.
+pub fn shutdown(self: *Tab) void {
+    self.shutting_down.store(true, .seq_cst);
+
+    // Joining the serialized worker first prevents an active task from
+    // launching a new helper after the helper count has reached zero.
     self.task_runner.shutdown();
+    self.waitForAsyncThreads();
+    self.invalidateJsContext();
+}
+
+pub fn deinit(self: *Tab) void {
+    self.shutdown();
 
     if (self.root_frame) |frame| {
         frame.deinit();
@@ -696,8 +718,10 @@ fn originKey(self: *Tab, url: *Url) ![]const u8 {
 
 pub fn getJs(self: *Tab, url: *Url) !*js_module {
     const key = try self.originKey(url);
+    var key_owned = true;
+    defer if (key_owned) self.allocator.free(key);
+
     if (self.js_contexts.get(key)) |ctx| {
-        self.allocator.free(key);
         return ctx;
     }
 
@@ -706,8 +730,19 @@ pub fn getJs(self: *Tab, url: *Url) !*js_module {
         self.task_runner.measure.io,
         self.task_runner.measure.environ,
     );
+    errdefer ctx.deinit(self.allocator);
     try self.js_contexts.put(key, ctx);
+    key_owned = false;
     return ctx;
+}
+
+pub fn activateDocumentGeneration(self: *Tab, frame: *Frame) u64 {
+    const generation = self.next_document_generation;
+    self.next_document_generation +%= 1;
+    if (self.next_document_generation == 0) self.next_document_generation = 1;
+    frame.document_generation = generation;
+    frame.js_render_context.setGeneration(generation);
+    return generation;
 }
 
 pub fn frameForWindowId(self: *Tab, window_id: u32) ?*Frame {
@@ -727,7 +762,8 @@ pub fn invalidateJsContext(self: *Tab) void {
     self.parent_window_ids.clearRetainingCapacity();
     var it = self.frames_by_id.valueIterator();
     while (it.next()) |frame_ptr| {
-        frame_ptr.*.js_render_context.setGeneration(self.js_generation);
+        frame_ptr.*.document_generation = 0;
+        frame_ptr.*.js_render_context.setGeneration(0);
         frame_ptr.*.js_render_context.setPointers(null, null, null, 0);
         frame_ptr.*.js_render_context_initialized = false;
         if (frame_ptr.*.js_context) |ctx| {
@@ -737,17 +773,29 @@ pub fn invalidateJsContext(self: *Tab) void {
 }
 
 pub fn retainAsyncThread(self: *Tab) void {
-    _ = self.async_thread_refs.fetchAdd(1, .seq_cst);
+    self.async_thread_mutex.lock();
+    self.async_thread_refs += 1;
+    self.async_thread_mutex.unlock();
 }
 
 pub fn releaseAsyncThread(self: *Tab) void {
-    _ = self.async_thread_refs.fetchSub(1, .seq_cst);
+    self.async_thread_mutex.lock();
+    std.debug.assert(self.async_thread_refs > 0);
+    self.async_thread_refs -= 1;
+    if (self.async_thread_refs == 0) self.async_thread_condition.broadcast();
+    self.async_thread_mutex.unlock();
 }
 
 fn waitForAsyncThreads(self: *Tab) void {
-    while (self.async_thread_refs.load(.seq_cst) != 0) {
-        std.Thread.yield() catch {};
+    self.async_thread_mutex.lock();
+    while (self.async_thread_refs != 0) {
+        self.async_thread_condition.wait(&self.async_thread_mutex);
     }
+    self.async_thread_mutex.unlock();
+}
+
+pub fn isShuttingDown(self: *const Tab) bool {
+    return self.shutting_down.load(.seq_cst);
 }
 
 // Go back in history

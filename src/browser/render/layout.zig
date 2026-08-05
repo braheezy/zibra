@@ -584,8 +584,11 @@ pub fn init(
     window_height: i32,
     rtl_text: bool,
 ) !*Layout {
-    const font_manager = try font.FontManager.init(allocator, io, environ, renderer);
-    const layout = try allocator.create(Layout);
+    var font_manager = try font.FontManager.init(allocator, io, environ, renderer);
+    const layout = allocator.create(Layout) catch |err| {
+        font_manager.deinit();
+        return err;
+    };
 
     const layout_width = window_width;
     const scrollbar_width_css = scrollbar_width;
@@ -611,13 +614,13 @@ pub fn init(
         .iframe_bounds = std.ArrayList(IframeBoundEntry).empty,
         .focus_bounds = std.ArrayList(FocusBoundEntry).empty,
         .accessibility_bounds = std.ArrayList(AccessibilityBoundEntry).empty,
+        .style_stack = std.ArrayList(StyleSnapshot).empty,
     };
+    errdefer layout.deinit();
 
     layout.current_display_target = &layout.display_list;
 
     try layout.font_manager.loadSystemFont(layout.scaledFontSize(layout.size));
-
-    layout.style_stack = std.ArrayList(StyleSnapshot).empty;
     return layout;
 }
 

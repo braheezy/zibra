@@ -39,6 +39,7 @@ pub const Url = struct {
         const ada_url = try ada.Url.init(url);
 
         var u = Url{ .ada_url = ada_url };
+        errdefer u.ada_url.free();
 
         // Get the protocol (e.g., "https:") and strip the trailing colon
         const protocol = ada_url.getProtocol();
@@ -70,7 +71,6 @@ pub const Url = struct {
             // expose. Keeping the original owner here left all component
             // slices dangling and caused `free` to release it a second time.
             const actual_ada_url = ada.Url.init(actual_url) catch |err| {
-                u.ada_url.free();
                 return err;
             };
             u.ada_url.free();
@@ -107,15 +107,24 @@ pub const Url = struct {
             var split_iter = std.mem.splitSequence(u8, rest, ";");
             const mime_type = split_iter.first();
             var attributes = std.ArrayList([]const u8).empty;
+            errdefer {
+                for (attributes.items) |attribute| allocator.free(attribute);
+                attributes.deinit(allocator);
+            }
             var is_base64 = false;
             while (split_iter.next()) |attr| {
                 if (std.ascii.eqlIgnoreCase(attr, "base64")) {
                     is_base64 = true;
                 }
-                try attributes.append(allocator, attr);
+                {
+                    const attribute = try allocator.dupe(u8, attr);
+                    errdefer allocator.free(attribute);
+                    try attributes.append(allocator, attribute);
+                }
             }
             // Allocate memory for strings.
             const mime_type_alloc = try allocator.alloc(u8, mime_type.len);
+            errdefer allocator.free(mime_type_alloc);
             @memcpy(mime_type_alloc, mime_type);
 
             const data_alloc = if (is_base64) blk: {
@@ -130,6 +139,7 @@ pub const Url = struct {
                 @memcpy(copy, data);
                 break :blk copy;
             };
+            errdefer allocator.free(data_alloc);
 
             u.path = data_alloc;
             u.mime_type = mime_type_alloc;
@@ -149,9 +159,20 @@ pub const Url = struct {
         }
         if (self.attributes) |attrs| {
             var a = attrs;
+            for (a.items) |attribute| allocator.free(attribute);
             a.deinit(allocator);
         }
         self.ada_url.free();
+    }
+
+    /// Return an independently owned copy of this URL.
+    ///
+    /// A plain Zig assignment only copies the Ada handle and therefore must
+    /// never be used when both values can outlive the same owner.
+    pub fn clone(self: Url, allocator: std.mem.Allocator) !Url {
+        var result = try Url.init(allocator, self.ada_url.getHref());
+        result.view_source = self.view_source;
+        return result;
     }
 
     /// Resolve a relative URL against this URL
@@ -624,6 +645,36 @@ test "data request with attributes" {
     try expect(url.attributes.?.items.len == 2);
     try expect(std.mem.eql(u8, url.attributes.?.items[0], "charset=utf-8"));
     try expect(std.mem.eql(u8, url.attributes.?.items[1], "base64"));
+}
+
+test "URL clone owns independent Ada and data URL storage" {
+    var original = try Url.init(
+        std.testing.allocator,
+        "data:text/html;charset=utf-8;base64,SGVsbG8gV29ybGQh",
+    );
+    const cloned = try original.clone(std.testing.allocator);
+    original.free(std.testing.allocator);
+    original = undefined;
+    defer cloned.free(std.testing.allocator);
+
+    try expect(std.mem.eql(u8, cloned.scheme, "data"));
+    try expect(std.mem.eql(u8, cloned.path, "Hello World!"));
+    try expect(std.mem.eql(u8, cloned.mime_type.?, "text/html"));
+    try expect(std.mem.eql(u8, cloned.attributes.?.items[0], "charset=utf-8"));
+    try expect(std.mem.eql(u8, cloned.attributes.?.items[1], "base64"));
+}
+
+test "URL clone preserves view-source metadata" {
+    var original = try Url.init(std.testing.allocator, "view-source:https://example.com/path");
+    const cloned = try original.clone(std.testing.allocator);
+    original.free(std.testing.allocator);
+    original = undefined;
+    defer cloned.free(std.testing.allocator);
+
+    try expect(cloned.view_source);
+    try expect(std.mem.eql(u8, cloned.scheme, "https"));
+    try expect(std.mem.eql(u8, cloned.host.?, "example.com"));
+    try expect(std.mem.eql(u8, cloned.path, "/path"));
 }
 
 test "http request" {

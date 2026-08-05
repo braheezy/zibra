@@ -7,4 +7,5 @@ comptime {
     _ = @import("script/js.zig");
     _ = @import("tests/parser.zig");
     _ = @import("network/url.zig");
+    _ = @import("runtime/task.zig");
 }

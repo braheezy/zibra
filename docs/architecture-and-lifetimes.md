@@ -66,7 +66,7 @@ process main thread
   one TaskRunner worker per Tab
     navigation, parsing, DOM, style, layout, paint, JavaScript host work
           |
-          | spawns detached helpers
+          | spawns accounted helper threads
           v
     setTimeout thread(s), animation timer thread, async XHR thread(s)
           |
@@ -74,11 +74,12 @@ process main thread
 ```
 
 The entry point uses `init.arena.allocator()` and constructs one process-wide
-`Browser`; see `zibra` in [`src/main.zig`](../src/main.zig). `Browser` owns the
-platform and cross-tab state. Each `Tab` owns one `TaskRunner`. `Tab.start` must
-run only after the `Tab` reaches its final address because the worker retains a
-pointer to the tab-owned runner; see `Tab.start` in
-[`src/browser/tab.zig`](../src/browser/tab.zig).
+heap-stable `Browser`; see `zibra` in [`src/main.zig`](../src/main.zig).
+Heap stability is required because z2d `Context` stores a pointer to
+`Browser.root_surface`. `Browser` owns the platform and cross-tab state. Each
+`Tab` owns one `TaskRunner`. `Tab.start` must run only after the `Tab` reaches
+its final address because the worker retains a pointer to the tab-owned runner;
+see `Tab.start` in [`src/browser/tab.zig`](../src/browser/tab.zig).
 
 This is not currently a strict actor model. Main-thread input handlers read or
 mutate some `Tab`, `Frame`, accessibility, scroll, `Layout`, and `FontManager`
@@ -111,9 +112,9 @@ but no lock or owner-thread rule covers the complete mutable graph.
   list;
 - browser chrome, measurement/profiling state, and browser render flags.
 
-`Tab.browser` is a borrowed back-pointer. Task contexts and detached helper
-contexts also borrow `Browser`; therefore `Browser` cannot be destroyed until
-all of them have finished and can no longer enqueue work.
+`Tab.browser` is a borrowed back-pointer. Task and helper contexts also borrow
+`Browser`; `Browser.deinit` therefore publishes shutdown, joins every tab
+worker, waits for every accounted helper, and only then destroys shared state.
 
 ### Tab
 
@@ -122,7 +123,7 @@ all of them have finished and can no longer enqueue work.
 - URL history entries;
 - one root `Frame`, which recursively owns child frames;
 - one Kiesel `Js` context per origin key;
-- frame-ID maps and the JavaScript generation counter;
+- frame-ID maps plus tab-wide and per-document generation counters;
 - the `TaskRunner` and accounting for detached helper threads;
 - dynamic text allocations;
 - the accessibility tree and its backing strings;
@@ -231,13 +232,11 @@ for `about:`. Callers currently infer ownership again from the URL scheme.
 `Url` wraps an owning `ada.Url` and has an explicit `free` method. Its component
 slices borrow that owner, except for separately allocated data-URL storage.
 Ordinary Zig value copies of `Url` are shallow. Treat `Url` as move-only unless
-a function is explicitly documented to borrow it.
-
-That convention is currently violated by child-frame navigation:
-`Browser.loadInFrame` shallow-copies `frame.current_url` into a referrer value,
-then `resetFrameForNavigation` can free the owned child-frame URL before
-`fetchBody` reads the referrer. The repaired DOM teardown does not resolve this
-independent URL lifetime.
+a function is explicitly documented to borrow it, and use `Url.clone` when an
+independent owner is required. `clone` rebuilds independent Ada and data-URL
+storage. Root and child navigation keep the prior URL owner alive through the
+synchronous fetch; async XHR clones its target and referrer before leaving the
+tab worker.
 
 `view-source:` now replaces the wrapper Ada URL with the parsed inner Ada URL
 before exposing the inner component slices. That inner URL is the one released
@@ -261,17 +260,22 @@ owns its opaque context through one of these paths:
 - if discarded before execution, call `cleanup_fn` while clearing the queue.
 
 Scheduling after shutdown immediately invokes cleanup. This is a useful local
-contract, but it does not make an already-running task or its borrowed objects
-safe to destroy.
+contract. `TaskRunner.shutdown` publishes quit, cleans queued work, and joins
+the active worker; after it returns, neither the runner nor an active task
+context is borrowed by that worker.
 
 ### Detached helpers
 
 `Browser.scheduleSetTimeoutTask`, `scheduleAnimationFrame`, and
 `scheduleAsyncXhr` in [`src/browser/root.zig`](../src/browser/root.zig) spawn
-detached threads. A Tab-level atomic reference count tracks their completion,
-and `Tab.deinit` busy-yields until the count reaches zero. The count is not a
-cancellation mechanism and does not independently retain embedded frame
-objects.
+detached OS threads. A Tab-level mutex, condition, and reference count provide a
+logical join point: helper teardown releases the reference as its final owner
+access, and `Tab.shutdown` waits for zero before document destruction. Helpers
+carry copied `DocumentHandle` values rather than `Frame` or `JsRenderContext`
+pointers.
+Long timers poll the tab shutdown flag and exit promptly. Async HTTP still has
+no request cancellation, so shutdown can safely wait but may wait for network
+I/O to finish.
 
 ### Current locks
 
@@ -293,50 +297,52 @@ lock across parsing, layout, JavaScript, and rendering.
 
 `Browser.loadInTab` in [`src/browser/root.zig`](../src/browser/root.zig):
 
-1. clears queued tab tasks;
-2. invalidates the old JavaScript generation, clears host pointers, and clears
-   JS node roots/handles;
-3. destroys the old root `Frame`, including layout, DOM, and source backing;
-4. allocates and registers a new root `Frame`;
-5. fetches and decodes the response;
+1. borrows the prior URL as referrer and fetches/decodes while its owner and old
+   document remain alive, so a fetch/decode failure preserves the old page;
+2. clears queued old-generation tasks and invalidates JavaScript roots and host
+   callbacks;
+3. retires browser-side draw/layer/display snapshots under `Browser.lock`;
+4. destroys the old root `Frame`, including layout, DOM, and source backing;
+5. allocates and registers a new root `Frame`;
 6. transfers the decoded body to the frame as backing storage for the DOM;
 7. stages stylesheet source buffers and parsed rules together;
-8. parses scripts, builds layout/paint state, and commits browser-visible data;
+8. assigns a unique document generation, parses scripts, builds layout/paint
+   state, and commits browser-visible data;
 9. adds the URL to history.
 
 `Tab.invalidateJsContext` in [`src/browser/tab.zig`](../src/browser/tab.zig)
-updates every current frame's embedded `JsRenderContext`, clears its raw
-pointers, and calls `Js.setNodes(..., null)`. The old frame is deinitialized
-only after this invalidation.
+zeros every current frame's document generation, clears its embedded
+`JsRenderContext`, and calls `Js.setNodes(..., null)`. The old frame is
+deinitialized only after this invalidation.
 
 ### Current child-frame sequence
 
 Child-frame navigation reuses a `Frame` allocation.
 `Browser.resetFrameForNavigation` first clears JS node roots and render-context
-pointers, then destroys children, display state, layout, rules, the old DOM, and
-finally the decoded HTML backing source. This now preserves the DOM/source
-teardown order. It does not yet retire every kind of backing in ideal order:
-stylesheet text is currently freed before the DOM style fields that can still
-contain slices into it.
+pointers, then destroys children, display state, layout, the old DOM, owned
+rules, stylesheet text, and finally decoded HTML and URL backing. The fetch
+happens before reset so the referrer remains valid, and browser-side render
+state is retired under `Browser.lock` before reset frees document resources.
+Installing the replacement assigns a fresh per-document generation.
 
 ### Stylesheet generation transfer
 
-Root navigation builds `new_css_texts` and `all_rules` as one staged generation.
-Error cleanup owns both staging collections until success. Only after parsing
-and sorting succeed does the code destroy the old frame generation and move
-both staged collections into `frame.css_texts` and `frame.rules`. Rules and the
-source slices they borrow therefore cross the ownership boundary together; see
-the stylesheet block in `Browser.loadInTab`.
+Root and child navigation build `new_css_texts` and `all_rules` as one staged
+generation. Error cleanup owns both staging collections until success. Only
+after parsing and sorting succeed does the code replace `frame.css_texts` and
+`frame.rules`. Rules and the source slices they borrow therefore cross the
+ownership boundary together. Accessibility-driven stylesheet rebuilding also
+constructs a complete replacement rule generation before retiring the old one;
+see `loadInTab`, `loadInFrame`, `loadIframe`, and `rebuildTabStyleRules`.
 
 ### Required navigation invariant
 
-The repaired teardown order does not by itself make navigation fully quiescent.
 Before old document state is reclaimed, a complete navigation transaction must
 guarantee:
 
 1. no new task can be scheduled against the old document generation;
-2. sleeping/network helpers are cancelled or retain only a stable token whose
-   owner outlives them;
+2. sleeping/network helpers are cancelled or retain only a copied stable
+   document identity and owned request inputs;
 3. queued tasks for the old generation are cleaned up;
 4. an active tab task has reached a quiescent point;
 5. JavaScript handles and host callbacks no longer expose old DOM pointers;
@@ -347,9 +353,10 @@ guarantee:
 9. DOM is destroyed before its source buffers, and URLs are released exactly
    once.
 
-The current code establishes parts of this sequence, but not all nine as one
-atomic contract. Generation checks are useful only when the generation token
-itself has stable storage.
+The current code enforces task cleanup, copied document handles, callback/root
+invalidation, render-snapshot retirement, and source/URL teardown order. Main
+thread readers, address-stable DOM identity, and invalidation unsubscription
+still prevent this from being a complete atomic transaction.
 
 ## Render and commit contract
 
@@ -393,20 +400,23 @@ Current enforced behavior includes:
   destroying it, so descendant JavaScript handles are removed with the old
   subtree;
 - `JsRenderContext` connects a frame window to Browser/Tab/Js host pointers and
-  carries a generation number.
+  carries a generation number while it is synchronously registered with
+  Kiesel;
+- pending scripts, child-frame navigations, timers, XHR completions, and
+  `postMessage` tasks carry a copied `(window_id, document_generation)` handle
+  and resolve it only on the serialized tab worker.
 
 Unresolved parts of the contract are:
 
 - DOM identity is still based on raw addresses of nodes stored in resizable
   arrays outside the repaired `innerHTML` path;
-- `JsRenderContext` is embedded in `Frame`, while detached timeout/XHR contexts
-  retain its address;
 - callback setter methods and `setParentWindow` mutate window/map state without
   acquiring `JsLock`;
 - no enforced owner-thread rule explains when those unlocked methods are safe.
 
-Host callbacks should receive stable IDs or stable cancellation objects, not a
-raw pointer into a destructible `Frame`. DOM handles need a generation or a
+The raw `JsRenderContext` callback pointer remains a synchronous borrow cleared
+by `Js.setNodes(..., null)` before frame destruction. Asynchronous paths must
+continue to use `DocumentHandle`. DOM handles still need a generation or a
 stable-node representation so reuse of an array address cannot silently
 retarget an old JavaScript wrapper.
 
@@ -438,12 +448,12 @@ or assertion establishing which thread may access the font glyph map or
 renderer. The concurrency is confirmed; whether a particular SDL backend
 tolerates it is platform-dependent and must not be assumed.
 
-`Browser.deinit` currently destroys z2d state and the renderer texture, then the
-HTTP client, chrome, cookies, tabs, display lists, layout/fonts, measurement
-state, and finally calls `sdl2.quit`. It does not explicitly destroy the
-renderer/window or stop text input in that method, and early failures in
-`Browser.init` do not have symmetric rollback for every previously created
-native resource.
+Normal `Browser.deinit` now quiesces tabs first, retires display snapshots,
+destroys document/network state, destroys glyph and cached textures while the
+renderer is alive, tears down z2d state, stops text input, explicitly destroys
+the renderer and window, and finally calls `sdl2.quit`. `Browser.init` uses
+reverse-order `errdefer` rollback for SDL, window, renderer, text input,
+textures, styles, Layout/FontManager, measurement, chrome, and z2d resources.
 
 The intended SDL contract should be:
 
@@ -458,81 +468,86 @@ The intended SDL contract should be:
 
 ## Shutdown contract
 
-`Browser.finishRunLoop` sets `shutting_down`, sleeps briefly, and returns.
-`Browser.deinit` then begins destroying surfaces and network state before it
-deinitializes tabs. Both functions are in
-[`src/browser/root.zig`](../src/browser/root.zig).
-
-`Tab.deinit` invalidates JS contexts, waits for detached helper reference
-counts, then asks the `TaskRunner` to shut down before destroying frame and JS
-state. `TaskRunner.shutdown` clears queued tasks but detaches its worker instead
-of joining it. An active task continues using the runner after its callback
-returns; see `shutdown` and `runThread` in
-[`src/runtime/task.zig`](../src/runtime/task.zig).
-
-A safe shutdown needs explicit phases:
+`Browser.finishRunLoop` publishes shutdown without relying on a delay.
+`Browser.deinit` and `Tab.shutdown` enforce these phases:
 
 1. publish shutdown and reject new browser/tab/JS work;
-2. cancel or wake sleeping/network helpers;
-3. join helper threads and tab workers;
-4. destroy tabs, frames, DOM, JS contexts, and all render snapshots;
-5. destroy HTTP/cookie, layout, font, and graphics resources;
-6. destroy renderer/window and quit SDL/SDL_ttf;
-7. finish measurement state only after no thread can record into it.
+2. wake long timer helpers and stop/join each tab worker;
+3. wait for accounted helpers, whose completion tasks are rejected and cleaned
+   by the stopped runner;
+4. retire browser render snapshots, then destroy tabs, frames, DOM, and JS;
+5. destroy HTTP/cookie, layout, font, and z2d resources;
+6. finish measurement state after no thread can record into it;
+7. destroy renderer/window and quit SDL/SDL_ttf.
 
-Timeout-based sleeps and detached threads are not substitutes for joining or a
-process-isolated hard-exit path.
+Async HTTP requests are not cancellable yet, so phase 3 can block on network
+I/O; it remains memory-safe because HTTP, Tab, Browser, and measurement owners
+stay alive through the wait.
 
 ## Resolved lifetime repairs
 
 These former risks are now resolved in the current code and should not be
 reintroduced:
 
-1. **Navigation DOM/HTML-source order:** root navigation invalidates JS pointers
-   before old-frame destruction, and child-frame reset deinitializes the old DOM
-   before freeing its HTML backing. This item is intentionally narrower than
-   the remaining child-frame CSS-backing risk below. See `loadInTab`,
-   `resetFrameForNavigation`, and `Tab.invalidateJsContext`.
-2. **Stylesheet generation ownership:** root stylesheet source buffers and
-   parsed rules are staged, cleaned up on error, and moved into `Frame`
-   together. See the `new_css_texts`/`all_rules` transaction in `loadInTab`.
-3. **Accessibility diff backing:** the previous accessibility strings stay
+1. **Worker quiescence:** `TaskRunner.shutdown` rejects new tasks, cleans queued
+   contexts exactly once, and joins the active worker before runner storage can
+   be destroyed. A focused test holds an active task while shutdown begins and
+   verifies the join and cleanup boundary. See
+   [`src/runtime/task.zig`](../src/runtime/task.zig).
+2. **Queued and async document identity:** detached timeout/XHR helpers,
+   child-frame navigation, and queued completions no longer retain a Frame
+   pointer across a scheduling boundary. They carry a copied `DocumentHandle`,
+   and work resolves only if the same window and document generation still
+   exist on the tab worker. `postMessage` captures the target document
+   generation. See
+   [`src/browser/root.zig`](../src/browser/root.zig).
+3. **Navigation backing order:** root navigation and child reset invalidate JS
+   callbacks, destroy layout before DOM, destroy DOM before CSS/HTML backing,
+   and keep the old URL owner alive through referrer use. See `loadInTab`,
+   `loadInFrame`, `resetFrameForNavigation`, and `Tab.invalidateJsContext`.
+4. **Committed render retirement:** draw-list layer pointers, composited layers,
+   and the active display list retire in dependency order under `Browser.lock`
+   before document navigation, tab destruction, or display-list replacement.
+   See `retireActiveRenderStateLocked` and `retireRenderStateForTab`.
+5. **URL snapshots:** `Url.clone` creates independent Ada and data-URL storage;
+   async XHR clones target/referrer inputs before spawning. Clone behavior is
+   covered with normal, data, and `view-source:` URLs.
+6. **Shutdown owner order:** Browser publishes shutdown, joins tab workers,
+   waits helpers, retires render snapshots, then destroys tabs, network, fonts,
+   z2d, renderer, and window. Long timers poll cancellation and no longer delay
+   close until their nominal deadline. See
+   [`tests/manual/lifecycle-long-timeout.html`](../tests/manual/lifecycle-long-timeout.html).
+7. **Stylesheet generation ownership:** root and child stylesheet source
+   buffers and parsed rules are staged, cleaned up on error, and moved into
+   `Frame` together. Rule rebuilding also preserves the prior generation until
+   its replacement is complete. See the `new_css_texts`/`all_rules`
+   transactions and `rebuildTabStyleRules`.
+8. **Accessibility diff backing:** the previous accessibility strings stay
    alive through the old/new tree diff. See `previous_strings` in
    `Tab.buildAccessibilityTree`.
-4. **Subtree JS handles:** `innerHTML` recursively removes handles for
+9. **Subtree JS handles:** `innerHTML` recursively removes handles for
    descendants before destroying the old subtree. See
    `removeHandlesForSubtree` in [`src/script/js.zig`](../src/script/js.zig).
-5. **`view-source:` Ada ownership:** `Url.init` replaces the wrapper Ada URL
+10. **`view-source:` Ada ownership:** `Url.init` replaces the wrapper Ada URL
    with the inner URL and `Url.free` releases that same owner. See
    [`src/network/url.zig`](../src/network/url.zig).
-6. **Glyph metadata:** cached `Glyph` values no longer retain a borrowed
+11. **Glyph metadata:** cached `Glyph` values no longer retain a borrowed
    grapheme slice. See [`src/browser/render/font.zig`](../src/browser/render/font.zig).
+12. **Native initialization rollback:** `Browser.init` and `Layout.init` unwind
+   previously created native/allocator resources in reverse dependency order;
+   font discovery and font insertion also clean partial allocations. `Browser`
+   is allocated at its final address before binding z2d `Context` to its root
+   surface, avoiding a self-pointer into an init-local copy.
+13. **JS context construction rollback:** origin keys and newly constructed
+   Kiesel host contexts remain locally owned until insertion into the tab map,
+   so allocation or map-insertion failure cannot strand either owner.
 
 ## Confirmed unresolved lifetime risks
 
 A confirmed issue means the structural ownership gap is visible in code. It
 does not mean every run will manifest a crash.
 
-### 1. TaskRunner can outlive its storage
-
-`TaskRunner.shutdown` detaches the worker. `Tab.deinit` later deinitializes the
-runner's queue and destroys objects an active task can still borrow. After an
-active task returns, `runThread` locks the runner and updates `active_tasks`.
-This creates a direct use-after-destroy window. See
-[`src/runtime/task.zig`](../src/runtime/task.zig) and
-[`src/browser/tab.zig`](../src/browser/tab.zig).
-
-### 2. Async generation checks borrow destructible Frame storage
-
-Root navigation invalidates then destroys the old frame. Timeout and XHR helper
-and completion contexts retain `*JsRenderContext`, which is embedded in that
-frame, and later dereference it to check the generation or invoke callbacks.
-The check cannot protect the read of the token when the token itself has been
-destroyed. See `JsRenderContext`, `SetTimeoutThreadContext`,
-`SetTimeoutTaskContext`, `XhrThreadContext`, and `XhrOnloadTaskContext` in
-[`src/browser/root.zig`](../src/browser/root.zig).
-
-### 3. DOM identity remains address-unstable
+### 1. DOM identity remains address-unstable
 
 Children live by value in resizable arrays while layout, hit-test, focus,
 frame-element, accessibility, display, and JS structures store `*Node`.
@@ -542,7 +557,7 @@ does not create stable identity for every other mutation or borrower. See
 [`src/script/js.zig`](../src/script/js.zig), and
 [`src/browser/tab.zig`](../src/browser/tab.zig).
 
-### 4. ProtectedField dependencies cannot unsubscribe
+### 2. ProtectedField dependencies cannot unsubscribe
 
 Dependency sources retain raw pointers to dependent fields. Dependent teardown
 does not remove those entries from the source, while style/layout rebuilding
@@ -550,64 +565,51 @@ can destroy dependents before their sources. The missing reverse edge or
 subscription token is visible in
 [`src/core/protected_field.zig`](../src/core/protected_field.zig).
 
-### 5. Display-list cloning does not make leaf resources independent
+### 3. Display-list cloning does not make leaf resources independent
 
 The browser clone recursively owns only container slices and blend-mode text;
 primitive variants are copied by value. Those primitives contain borrowed
 image, glyph, DOM, and layer resources. See `cloneDisplayItem` in
 [`src/browser/root.zig`](../src/browser/root.zig).
 
-### 6. Shutdown does not quiesce owners before dependents
+Snapshot retirement now closes navigation, replacement, and shutdown paths,
+but in-place DOM mutation can still retire a leaf before the replacement commit
+reaches the browser. The clone is not independently safe by type.
 
-Browser graphics and network resources are destroyed before tabs. Tab helper
-waits cannot cancel a long sleep or network request, and the tab worker is
-detached rather than joined. The current order cannot guarantee that every
-borrower is gone before its owner.
-
-### 7. Shared Layout, FontManager, and renderer access has no global contract
+### 4. Shared Layout, FontManager, and renderer access has no global contract
 
 The browser owns one mutable layout/font stack. Resize and chrome/render paths
 use it from the main thread, while tab tasks use it for document layout and
 glyph creation. No common owner-thread assertion or lock covers these paths.
 The concurrency gap is confirmed; backend-specific failure is a hypothesis.
 
-### 8. Response and URL ownership is encoded in call-site convention
+### 5. Response and URL ownership is encoded in call-site convention
 
-Response-body ownership is inferred from schemes, while `Url` is an owning
-value that can be shallow-copied. The `view-source:` owner is now correct, but
-the broader API still cannot mechanically prevent a leak, double free, or
-borrowed-body free when a caller or scheme is added.
+Response-body ownership is inferred from schemes, while `Url` remains an owning
+value whose plain assignment is shallow. `Url.clone` provides the required
+operation, but the type system still cannot prevent accidental copy, leak,
+double free, or a wrongly freed borrowed response when a caller/scheme is added.
 
-### 9. Child-frame referrer can borrow a freed URL
-
-`Browser.loadInFrame` copies the current owning `Url` by value, calls
-`resetFrameForNavigation`, and only then passes the copy to `fetchBody`. When
-the child frame owns the old URL, reset releases the Ada URL backing the copied
-component slices. This leaves the referrer structurally dangling during the
-request. See `loadInFrame` and `resetFrameForNavigation` in
-[`src/browser/root.zig`](../src/browser/root.zig).
-
-### 10. Child-frame reset retires CSS backing before DOM style fields
-
-`resetFrameForNavigation` destroys rules and frees `css_texts` before
-deinitializing `current_node`. DOM computed-style fields can still contain
-slices derived from those stylesheet buffers. The current DOM destructor does
-not intentionally read the values, so an immediate crash is not asserted, but
-the owner-before-borrower retirement order remains structurally wrong.
-
-### 11. JavaScript host mutation has a partial lock contract
+### 6. JavaScript host mutation has a partial lock contract
 
 Evaluation and many callback entry points use `JsLock`, but callback setter
 methods and `setParentWindow` do not. This may be valid under an owner-thread
 rule, but no such rule is asserted or documented in the API. See
 [`src/script/js.zig`](../src/script/js.zig).
 
-### 12. Native initialization and teardown are not fully symmetric
+### 7. Async HTTP has no cancellation path
 
-`Browser.init` creates SDL/window/renderer/text-input/texture/layout resources
-before all fallible initialization is complete. Not every earlier resource has
-an `errdefer`, and normal teardown relies on `sdl2.quit` rather than explicitly
-destroying every renderer/window/text-input resource.
+The XHR helper owns its request inputs and stays accounted until it destroys
+them, so Browser/Tab/HTTP storage remains valid. A blocked network operation can
+still delay shutdown indefinitely because there is no cancellation token or
+request deadline.
+
+### 8. Main-thread readers lack a complete document snapshot contract
+
+Input, accessibility, and some render/chrome paths can read tab/frame state
+while the worker mutates it. `Browser.lock` protects committed render state but
+does not cover the DOM/accessibility/layout graph. This remains a race and
+ownership gap independent of the repaired navigation teardown.
 
 ## Hypotheses requiring focused tests
 
@@ -615,10 +617,8 @@ These consequences are plausible from the confirmed structure, but should not
 be presented as root causes without a reproducer, sanitizer evidence, or a
 targeted stress test:
 
-- navigation dereferencing an old timeout/XHR's destroyed frame-embedded
-  `JsRenderContext`;
 - a browser display list reading image bytes or DOM identity after the tab
-  worker destroys the old document during navigation;
+  worker mutates a subtree before publishing the replacement commit;
 - `ProtectedField.notify` reaching a destroyed child style/layout field after a
   subtree mutation or layout rebuild;
 - main-thread accessibility hit testing racing a worker rebuild and observing
@@ -627,20 +627,19 @@ targeted stress test:
   backend's thread-affinity requirements;
 - an arena-backed build appearing stable while a reclaiming test allocator
   reuses freed storage and exposes a latent UAF;
-- `MeasureTime.finish` racing a detached thread that can still record a
-  measurement.
 
-Focused tests should force timing rather than rely only on random site loading:
-navigate while long timers and XHR are outstanding, mutate subtrees after
-exporting JS handles, repeatedly rebuild layouts, force Kiesel GC, render
-image-heavy pages while navigating, and close the browser during each phase.
+Focused tests should force timing rather than rely only on random site loading.
+The long-timeout shutdown fixture now covers timer cancellation. Still needed:
+navigate while XHR is outstanding, mutate subtrees after exporting JS handles,
+repeatedly rebuild layouts, force Kiesel GC, render image-heavy pages during
+mutation, and close the browser during each phase.
 
 ## Contracts to establish during cleanup
 
 1. **Thread owner:** name the sole mutation thread for Browser render state,
    each Tab/DOM, Layout/FontManager, and SDL renderer objects.
-2. **Join and cancellation:** every spawned thread has an owner, cancellation
-   path, and join point. Cancellation storage outlives the thread.
+2. **Join and cancellation:** extend the established TaskRunner/helper
+   quiescence boundary with async HTTP cancellation/deadlines.
 3. **DOM identity:** choose stable individual node allocations or stable
    `(document_generation, node_id)` handles; do not expose array element
    addresses as persistent identity.
@@ -663,8 +662,8 @@ image-heavy pages while navigating, and close the browser during each phase.
 
 Until stronger types enforce these contracts, new code should not:
 
-- detach a thread that retains a raw pointer to Browser, Tab, Frame, DOM,
-  TaskRunner, measurement, allocator state, or a native handle;
+- detach a thread that retains owner pointers without an accounting reference,
+  cancellation path, and shutdown wait that outlive it;
 - use a generation field embedded in an object that asynchronous work can
   outlive;
 - free or replace a source buffer while DOM, CSS, layout, or display data still
@@ -675,6 +674,8 @@ Until stronger types enforce these contracts, new code should not:
   accessibility pointers, layout back-pointers, and render snapshots;
 - shallow-copy an owning `Url`, response, texture, image, surface, or display
   container and let both copies appear owning;
+- return or move a value after storing pointers to its own fields unless the
+  pointees have an independently stable allocation;
 - represent ownership only with a boolean at distant call sites when a tagged
   owner/borrower type or RAII wrapper can express it;
 - register a raw callback dependency without a corresponding unregister path;
@@ -719,15 +720,18 @@ Until stronger types enforce these contracts, new code should not:
 
 ## Recommended cleanup order
 
-This ordering avoids building later refactors on unsafe foundations:
+The worker join, document handles, navigation snapshot retirement, timer
+cancellation, and normal shutdown order are now foundations rather than open
+steps. Continue in this order:
 
-1. make the tab worker joinable and helpers cancellable/joinable;
-2. define owner threads and a safe shutdown/navigation transaction;
-3. introduce stable DOM identity and centralized mutation invalidation;
-4. make render snapshots self-contained or generation-retained;
-5. add invalidation unsubscribe semantics;
-6. encode URL/response ownership and complete SDL RAII/error rollback;
-7. add stress tests and debug assertions for each contract.
+1. define and assert owner threads for DOM, Layout/FontManager, and SDL work;
+2. introduce stable DOM identity and centralized mutation invalidation;
+3. make render snapshots self-contained or generation-retained across in-place
+   DOM mutation;
+4. add invalidation unsubscribe semantics;
+5. tag response ownership, add XHR cancellation/deadlines, and audit
+   dependency-local initialization rollback;
+6. add stress tests and debug assertions for each contract.
 
 Update this document whenever an unresolved contract is decided. Once a
 contract is enforced by types, ownership wrappers, joins, or assertions, move

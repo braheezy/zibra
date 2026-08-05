@@ -303,6 +303,10 @@ pub const FontManager = struct {
 
     fn collectFontPaths(self: *FontManager) !std.ArrayList([]const u8) {
         var paths = std.ArrayList([]const u8).empty;
+        errdefer {
+            for (paths.items) |path| self.allocator.free(path);
+            paths.deinit(self.allocator);
+        }
 
         // Add user font directory first to prefer them.
         const home_dir = try known_folders.getPath(self.io, self.allocator, self.environ, .home) orelse return error.NoHomeDir;
@@ -315,13 +319,19 @@ pub const FontManager = struct {
         };
         for (user_suffixes) |suffix| {
             const user_path = try std.fmt.allocPrint(self.allocator, "{s}{s}", .{ home_dir, suffix });
-            try paths.append(self.allocator, user_path);
+            paths.append(self.allocator, user_path) catch |err| {
+                self.allocator.free(user_path);
+                return err;
+            };
         }
 
         // Add system font directories
         for (system_fonts.paths) |dir| {
             const copy = try self.allocator.dupe(u8, dir);
-            try paths.append(self.allocator, copy);
+            paths.append(self.allocator, copy) catch |err| {
+                self.allocator.free(copy);
+                return err;
+            };
         }
 
         return paths;
@@ -364,7 +374,16 @@ pub const FontManager = struct {
 
         var fh = sdl2.ttf.openFontIndex(path_z, size, 0) catch return false;
 
-        const font = try self.allocator.create(Font);
+        const font = self.allocator.create(Font) catch |err| {
+            fh.close();
+            return err;
+        };
+        var font_owned = true;
+        errdefer if (font_owned) {
+            font.glyphs.deinit();
+            fh.close();
+            self.allocator.destroy(font);
+        };
         font.* = Font{
             .name = name,
             .font_handle = fh,
@@ -373,6 +392,7 @@ pub const FontManager = struct {
         };
 
         try self.fonts.put(name, font);
+        font_owned = false;
 
         if (font.line_height < self.min_line_height) {
             self.min_line_height = font.line_height;

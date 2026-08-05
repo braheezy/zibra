@@ -482,6 +482,27 @@ pub const JsRenderContext = struct {
     }
 };
 
+/// Copyable identity for one installed document. Detached helpers carry this
+/// value instead of borrowing a Frame or its synchronous JS callback context.
+const DocumentHandle = struct {
+    window_id: u32,
+    generation: u64,
+
+    fn fromFrame(frame: *const Frame) DocumentHandle {
+        return .{
+            .window_id = frame.window_id,
+            .generation = frame.document_generation,
+        };
+    }
+
+    /// Resolve only on the serialized tab worker.
+    fn resolve(self: DocumentHandle, tab: *Tab) ?*Frame {
+        const frame = tab.frameForWindowId(self.window_id) orelse return null;
+        if (frame.document_generation != self.generation) return null;
+        return frame;
+    }
+};
+
 // Browser manages the window and tabs
 pub const Browser = struct {
     const ScreenshotRequest = struct {
@@ -553,11 +574,15 @@ pub const Browser = struct {
         environ: *const std.process.Environ.Map,
         rtl_flag: bool,
         hidden: bool,
-    ) !Browser {
+    ) !*Browser {
+        const browser = try al.create(Browser);
+        errdefer al.destroy(browser);
+
         // Initialize SDL
         try sdl2.init(.{
             .video = true,
         });
+        errdefer sdl2.quit();
 
         const preferred_position = if (hidden) null else windowPositionForFocusedDisplay();
         const window_x: sdl2.WindowPosition = if (preferred_position) |pos| .{ .absolute = pos.x } else .default;
@@ -573,6 +598,7 @@ pub const Browser = struct {
             initial_window_height,
             .{ .vis = window_visibility }, // Not resizable
         );
+        errdefer screen.destroy();
         if (!hidden) {
             if (preferred_position) |pos| {
                 try screen.setPosition(.{ .x = pos.x, .y = pos.y });
@@ -586,9 +612,11 @@ pub const Browser = struct {
             null,
             .{ .accelerated = true },
         );
+        errdefer renderer.destroy();
 
         // Enable SDL text input so TextInput events fire for typing.
         sdl2.startTextInput();
+        errdefer sdl2.stopTextInput();
 
         // Log the SDL renderer backend to confirm hardware acceleration
         const renderer_info = try renderer.getInfo();
@@ -604,12 +632,17 @@ pub const Browser = struct {
             initial_window_width,
             initial_window_height,
         );
+        errdefer cached_texture.destroy();
         try cached_texture.setBlendMode(.blend);
 
         // Parse the default browser stylesheet
         var css_parser = try CSSParser.init(al, DEFAULT_STYLE_SHEET, false);
         defer css_parser.deinit(al);
         const default_rules = try css_parser.parse(al);
+        errdefer {
+            for (default_rules) |*rule| rule.deinit(al);
+            al.free(default_rules);
+        }
         for (default_rules) |*rule| {
             rule.owned = false;
         }
@@ -623,25 +656,26 @@ pub const Browser = struct {
             initial_window_height,
             rtl_flag,
         );
+        errdefer layout_engine.deinit();
 
         // Create z2d surface for drawing (RGBA format like the tutorial)
         var root_surface = try z2d.Surface.init(.image_surface_rgba, al, initial_window_width, initial_window_height);
         errdefer root_surface.deinit(al);
 
-        // Create z2d context for drawing operations
-        var context = z2d.Context.init(io, al, &root_surface);
-        errdefer context.deinit();
-
-        const measure = try MeasureTime.init(al, io, environ);
+        var measure = try MeasureTime.init(al, io, environ);
+        errdefer measure.finish();
         const profiling_enabled = isProfilingEnabled(environ);
 
-        var browser = Browser{
+        var chrome = try Chrome.init(&layout_engine.font_manager, initial_window_width, al);
+        errdefer chrome.deinit();
+
+        browser.* = Browser{
             .allocator = al,
             .io = io,
             .window = screen,
             .canvas = renderer,
             .root_surface = root_surface,
-            .context = context,
+            .context = undefined,
             .chrome_surface = undefined, // Will be set below
             .tab_surface = null,
             .http_client = .{ .allocator = al, .io = io },
@@ -650,7 +684,7 @@ pub const Browser = struct {
             .layout_engine = layout_engine,
             .default_style_sheet_rules = default_rules,
             .tabs = std.ArrayList(*Tab).empty,
-            .chrome = try Chrome.init(&layout_engine.font_manager, initial_window_width, al),
+            .chrome = chrome,
             .measure = measure,
             .lock = .init(io),
             .cached_texture = cached_texture,
@@ -658,6 +692,11 @@ pub const Browser = struct {
             .tab_draw_list = std.ArrayList(DisplayItem).empty,
             .profiling_enabled = profiling_enabled,
         };
+
+        // z2d.Context stores the Surface pointer. Browser is heap-stable so
+        // this points at the final field address rather than an init-local copy.
+        browser.context = z2d.Context.init(io, al, &browser.root_surface);
+        errdefer browser.context.deinit();
 
         // Create chrome surface (fixed height based on chrome.bottom)
         browser.chrome_surface = try z2d.Surface.init(.image_surface_rgba, al, initial_window_width, @intCast(browser.chrome.bottom));
@@ -766,19 +805,7 @@ pub const Browser = struct {
             }
             self.active_tab_url = null;
 
-            // Clear compositing state when switching tabs
-            for (self.composited_layers.items) |*layer| {
-                layer.deinit(self.allocator);
-            }
-            self.composited_layers.items.len = 0;
-            if (self.tab_draw_list.items.len > 0) {
-                DisplayItem.freeItems(self.allocator, self.tab_draw_list.items);
-                self.tab_draw_list.items.len = 0;
-            }
-            if (self.active_tab_display_list) |old_list| {
-                DisplayItem.freeList(self.allocator, old_list);
-            }
-            self.active_tab_display_list = null;
+            self.retireActiveRenderStateLocked();
 
             // Reset all dirty flags to force full rebuild
             self.needs_composite = true;
@@ -794,22 +821,52 @@ pub const Browser = struct {
         }
     }
 
+    /// Retire derived draw state before the committed display list it borrows.
+    /// Caller must hold `self.lock`.
+    fn retireActiveRenderStateLocked(self: *Browser) void {
+        if (self.tab_draw_list.items.len > 0) {
+            DisplayItem.freeItems(self.allocator, self.tab_draw_list.items);
+            self.tab_draw_list.items.len = 0;
+        }
+        for (self.composited_layers.items) |*layer| {
+            layer.deinit(self.allocator);
+        }
+        self.composited_layers.items.len = 0;
+        if (self.active_tab_display_list) |display_list| {
+            DisplayItem.freeList(self.allocator, display_list);
+            self.active_tab_display_list = null;
+        }
+    }
+
+    /// Wait for any in-progress raster/draw and release browser-side borrows of
+    /// a tab before that tab retires a document generation.
+    fn retireRenderStateForTab(self: *Browser, tab: *Tab) void {
+        self.lock.lock();
+        defer self.lock.unlock();
+        if (self.activeTab() != tab) return;
+        self.retireActiveRenderStateLocked();
+        self.needs_composite = true;
+        self.needs_raster = true;
+        self.needs_draw = true;
+    }
+
     // Create a new tab and load a URL into it
     pub fn newTab(self: *Browser, url: Url) !void {
         const tab_height = self.window_height - self.chrome.bottom;
         const tab = try self.allocator.create(Tab);
-        var tab_inited = false;
-        defer if (!tab_inited) {
+        tab.* = Tab.init(self.allocator, tab_height, &self.measure);
+        var tab_adopted = false;
+        errdefer if (!tab_adopted) {
+            tab.deinit();
             self.allocator.destroy(tab);
         };
-        tab.* = Tab.init(self.allocator, tab_height, &self.measure);
         tab.browser = self;
         tab.logAccessibilitySettings("init");
         // Start the task runner thread now that the Tab is in its final memory location
         try tab.start();
-        tab_inited = true;
 
         try self.tabs.append(self.allocator, tab);
+        tab_adopted = true;
         self.setActiveTab(tab);
 
         const url_ptr = try self.allocator.create(Url);
@@ -907,15 +964,10 @@ pub const Browser = struct {
     }
 
     fn finishRunLoop(self: *Browser) void {
-        // Signal shutdown to background threads before cleanup
         self.lock.lock();
         self.shutting_down = true;
+        self.needs_animation_frame = false;
         self.lock.unlock();
-
-        // Give background threads a moment to notice shutdown
-        self.io.sleep(.fromNanoseconds(50_000_000), .awake) catch |err| {
-            std.log.warn("Failed to wait for browser threads during shutdown: {}", .{err});
-        }; // 50ms
     }
 
     fn isScreenshotReady(self: *Browser) bool {
@@ -1438,6 +1490,42 @@ pub const Browser = struct {
         return response;
     }
 
+    fn attachJsCallbacks(
+        self: *Browser,
+        tab: *Tab,
+        frame: *Frame,
+        js_context: *js_module,
+    ) void {
+        _ = tab.activateDocumentGeneration(frame);
+        const render_context = &frame.js_render_context;
+        render_context.setPointers(
+            @as(?*anyopaque, @ptrCast(self)),
+            @as(?*anyopaque, @ptrCast(tab)),
+            js_context,
+            frame.window_id,
+        );
+
+        frame.js_render_context_initialized = true;
+        js_context.setNodes(frame.window_id, &frame.current_node.?);
+        js_context.setRenderCallback(frame.window_id, jsRenderCallback, @ptrCast(render_context));
+        js_context.setXhrCallback(frame.window_id, jsXhrCallback, @ptrCast(render_context));
+        js_context.setAnimationFrameCallback(
+            frame.window_id,
+            jsRequestAnimationFrameCallback,
+            @ptrCast(render_context),
+        );
+        js_context.setSetTimeoutCallback(
+            frame.window_id,
+            jsSetTimeoutCallback,
+            @ptrCast(render_context),
+        );
+        js_context.setPostMessageCallback(
+            frame.window_id,
+            jsPostMessageCallback,
+            @ptrCast(render_context),
+        );
+    }
+
     // Send request to a URL, load response into a tab
     pub fn loadInTab(
         self: *Browser,
@@ -1447,9 +1535,6 @@ pub const Browser = struct {
     ) !void {
         std.log.info("Loading: {s}", .{url.*.path});
 
-        tab.task_runner.clear();
-        tab.invalidateJsContext();
-
         var referrer_value: ?Url = null;
         if (tab.root_frame) |old_frame| {
             if (old_frame.current_url) |ref_ptr| {
@@ -1457,6 +1542,18 @@ pub const Browser = struct {
             }
         }
 
+        // Fetch and decode while the old document still owns the referrer and
+        // remains usable if navigation fails before commit.
+        const response = try self.fetchBody(url.*, referrer_value, payload);
+        defer if (response.csp_header) |hdr| self.allocator.free(hdr);
+        const raw_body = response.body;
+        const body_owned = !std.mem.eql(u8, url.*.scheme, "about") and !std.mem.eql(u8, url.*.scheme, "data");
+        defer if (body_owned) self.allocator.free(raw_body);
+        const body_text = try decodeUtf8Replace(self.allocator, raw_body);
+
+        tab.task_runner.clear();
+        tab.invalidateJsContext();
+        self.retireRenderStateForTab(tab);
         if (tab.root_frame) |old_frame| {
             old_frame.deinit();
             tab.allocator.destroy(old_frame);
@@ -1473,22 +1570,11 @@ pub const Browser = struct {
         frame.scroll = 0;
         tab.scroll_changed_in_tab = true;
 
-        // Do the request, getting back the body of the response.
-        const response = try self.fetchBody(url.*, referrer_value, payload);
-        defer if (response.csp_header) |hdr| self.allocator.free(hdr);
-
         frame.clearAllowedOrigins();
         if (response.csp_header) |hdr| {
             frame.applyContentSecurityPolicy(hdr, url.*) catch |err| {
                 std.log.warn("Failed to apply Content-Security-Policy: {}", .{err});
             };
-        }
-
-        const raw_body = response.body;
-        const body_text = try decodeUtf8Replace(self.allocator, raw_body);
-        const body_owned = !std.mem.eql(u8, url.*.scheme, "about") and !std.mem.eql(u8, url.*.scheme, "data");
-        if (body_owned) {
-            self.allocator.free(raw_body);
         }
 
         // Free previous HTML source if it exists
@@ -1557,40 +1643,7 @@ pub const Browser = struct {
             // Update the JS engine with the current nodes for DOM API
             frame.js_context = try tab.getJs(url);
             if (frame.js_context) |ctx| {
-                ctx.setNodes(frame.window_id, &frame.current_node.?);
-                frame.js_render_context.setPointers(
-                    @as(?*anyopaque, @ptrCast(self)),
-                    @as(?*anyopaque, @ptrCast(tab)),
-                    ctx,
-                    frame.window_id,
-                );
-                frame.js_render_context.setGeneration(tab.js_generation);
-                frame.js_render_context_initialized = true;
-                ctx.setRenderCallback(
-                    frame.window_id,
-                    jsRenderCallback,
-                    @ptrCast(&frame.js_render_context),
-                );
-                ctx.setXhrCallback(
-                    frame.window_id,
-                    jsXhrCallback,
-                    @ptrCast(&frame.js_render_context),
-                );
-                ctx.setAnimationFrameCallback(
-                    frame.window_id,
-                    jsRequestAnimationFrameCallback,
-                    @ptrCast(&frame.js_render_context),
-                );
-                ctx.setSetTimeoutCallback(
-                    frame.window_id,
-                    jsSetTimeoutCallback,
-                    @ptrCast(&frame.js_render_context),
-                );
-                ctx.setPostMessageCallback(
-                    frame.window_id,
-                    jsPostMessageCallback,
-                    @ptrCast(&frame.js_render_context),
-                );
+                self.attachJsCallbacks(tab, frame, ctx);
             }
             tab.setParentWindow(frame.window_id, null);
             if (frame.js_context) |ctx| {
@@ -1660,7 +1713,10 @@ pub const Browser = struct {
                                     // Copy the href string for later use
                                     const href_copy = try self.allocator.alloc(u8, href.?.len);
                                     @memcpy(href_copy, href.?);
-                                    try stylesheet_urls.append(self.allocator, href_copy);
+                                    stylesheet_urls.append(self.allocator, href_copy) catch |err| {
+                                        self.allocator.free(href_copy);
+                                        return err;
+                                    };
                                 }
                             }
                         }
@@ -1727,10 +1783,10 @@ pub const Browser = struct {
 
                 const css_raw = css_response.body;
                 const raw_owned = !std.mem.eql(u8, stylesheet_url.scheme, "data") and !std.mem.eql(u8, stylesheet_url.scheme, "about");
+                defer if (raw_owned) self.allocator.free(css_raw);
                 const css_text = try decodeUtf8Replace(self.allocator, css_raw);
-                if (raw_owned) {
-                    self.allocator.free(css_raw);
-                }
+                var css_text_owned = true;
+                defer if (css_text_owned) self.allocator.free(css_text);
 
                 // Parse the stylesheet using self.allocator
                 // (CSS rules need to live as long as the Tab)
@@ -1739,29 +1795,27 @@ pub const Browser = struct {
 
                 const parsed_rules = css_parser.parse(self.allocator) catch |err| {
                     std.log.warn("Failed to parse stylesheet {s}: {}", .{ href, err });
-                    // Free css_text before continuing
-                    self.allocator.free(css_text);
                     continue;
                 };
-
-                // Store css_text so it can be freed with the rules that borrow it.
-                var css_text_owned = true;
-                defer if (css_text_owned) self.allocator.free(css_text);
-                try new_css_texts.append(self.allocator, css_text);
-                css_text_owned = false;
-
-                // Add the parsed rules to our collection
-                var transferred_rules: usize = 0;
+                var parsed_rules_owned = true;
                 defer {
-                    for (parsed_rules[transferred_rules..]) |*rule| {
-                        rule.deinit(self.allocator);
+                    if (parsed_rules_owned) {
+                        for (parsed_rules) |*rule| rule.deinit(self.allocator);
                     }
                     self.allocator.free(parsed_rules);
                 }
+
+                // Reserve both destinations before transferring either half of
+                // the stylesheet generation. Rules borrow from css_text, so
+                // the text and every parsed rule must move together.
+                try new_css_texts.ensureUnusedCapacity(self.allocator, 1);
+                try all_rules.ensureUnusedCapacity(self.allocator, parsed_rules.len);
+                new_css_texts.appendAssumeCapacity(css_text);
+                css_text_owned = false;
                 for (parsed_rules) |rule| {
-                    try all_rules.append(self.allocator, rule);
-                    transferred_rules += 1;
+                    all_rules.appendAssumeCapacity(rule);
                 }
+                parsed_rules_owned = false;
             }
 
             // Sort rules by cascade priority (more specific selectors override less specific)
@@ -1861,6 +1915,8 @@ pub const Browser = struct {
         if (frame.js_context) |ctx| {
             ctx.setNodes(frame.window_id, null);
         }
+        frame.document_generation = 0;
+        frame.js_render_context.setGeneration(0);
         frame.js_render_context.setPointers(null, null, null, 0);
         frame.js_context = null;
         frame.js_render_context_initialized = false;
@@ -1868,6 +1924,7 @@ pub const Browser = struct {
         frame.input_bounds.clearRetainingCapacity();
         frame.link_bounds.clearRetainingCapacity();
         frame.iframe_bounds.clearRetainingCapacity();
+        frame.focus_bounds.clearRetainingCapacity();
         frame.accessibility_bounds.clearRetainingCapacity();
 
         for (frame.children.items) |child| {
@@ -1887,6 +1944,11 @@ pub const Browser = struct {
             frame.document_layout = null;
         }
 
+        if (frame.current_node) |*node| {
+            node.deinit(self.allocator);
+            frame.current_node = null;
+        }
+
         for (frame.rules.items) |*rule| {
             if (rule.owned) {
                 rule.deinit(self.allocator);
@@ -1899,11 +1961,6 @@ pub const Browser = struct {
             self.allocator.free(css_text);
         }
         frame.css_texts.clearRetainingCapacity();
-
-        if (frame.current_node) |*node| {
-            node.deinit(self.allocator);
-            frame.current_node = null;
-        }
 
         if (frame.current_html_source) |old_source| {
             self.allocator.free(old_source);
@@ -1938,10 +1995,30 @@ pub const Browser = struct {
             referrer_value = ref_ptr.*;
         }
 
-        self.resetFrameForNavigation(frame);
-
         const response = try self.fetchBody(url.*, referrer_value, payload);
         defer if (response.csp_header) |hdr| self.allocator.free(hdr);
+        const raw_body = response.body;
+        const body_owned = !std.mem.eql(u8, url.*.scheme, "about") and !std.mem.eql(u8, url.*.scheme, "data");
+        defer if (body_owned) self.allocator.free(raw_body);
+        const body_text = try decodeUtf8Replace(self.allocator, raw_body);
+        var body_text_owned = true;
+        errdefer if (body_text_owned) self.allocator.free(body_text);
+
+        const frame_url = try self.allocator.create(Url);
+        var frame_url_owned = true;
+        defer if (frame_url_owned) self.allocator.destroy(frame_url);
+        frame_url.* = url.*.clone(self.allocator) catch |err| {
+            self.allocator.destroy(frame_url);
+            frame_url_owned = false;
+            return err;
+        };
+        defer if (frame_url_owned) frame_url.*.free(self.allocator);
+
+        // The old child-frame URL owns the storage borrowed by referrer_value.
+        // Keep the old document generation alive through fetch/decode, then
+        // retire it before installing the response as the new generation.
+        self.retireRenderStateForTab(frame.tab);
+        self.resetFrameForNavigation(frame);
 
         frame.clearAllowedOrigins();
         if (response.csp_header) |hdr| {
@@ -1949,16 +2026,6 @@ pub const Browser = struct {
                 std.log.warn("Failed to apply Content-Security-Policy: {}", .{err});
             };
         }
-
-        const raw_body = response.body;
-        const body_text = try decodeUtf8Replace(self.allocator, raw_body);
-        const body_owned = !std.mem.eql(u8, url.*.scheme, "about") and !std.mem.eql(u8, url.*.scheme, "data");
-        if (body_owned) {
-            self.allocator.free(raw_body);
-        }
-
-        var body_text_owned = true;
-        errdefer if (body_text_owned) self.allocator.free(body_text);
 
         var html_parser = try HTMLParser.init(self.allocator, body_text);
         defer html_parser.deinit(self.allocator);
@@ -1968,45 +2035,13 @@ pub const Browser = struct {
         frame.current_html_source = body_text;
         body_text_owned = false;
 
-        frame.current_url = url;
+        frame.current_url = frame_url;
         frame.current_url_owned = true;
+        frame_url_owned = false;
 
         frame.js_context = try frame.tab.getJs(url);
         if (frame.js_context) |ctx| {
-            ctx.setNodes(frame.window_id, &frame.current_node.?);
-            frame.js_render_context.setPointers(
-                @as(?*anyopaque, @ptrCast(self)),
-                @as(?*anyopaque, @ptrCast(frame.tab)),
-                ctx,
-                frame.window_id,
-            );
-            frame.js_render_context.setGeneration(frame.tab.js_generation);
-            frame.js_render_context_initialized = true;
-            ctx.setRenderCallback(
-                frame.window_id,
-                jsRenderCallback,
-                @ptrCast(&frame.js_render_context),
-            );
-            ctx.setXhrCallback(
-                frame.window_id,
-                jsXhrCallback,
-                @ptrCast(&frame.js_render_context),
-            );
-            ctx.setAnimationFrameCallback(
-                frame.window_id,
-                jsRequestAnimationFrameCallback,
-                @ptrCast(&frame.js_render_context),
-            );
-            ctx.setSetTimeoutCallback(
-                frame.window_id,
-                jsSetTimeoutCallback,
-                @ptrCast(&frame.js_render_context),
-            );
-            ctx.setPostMessageCallback(
-                frame.window_id,
-                jsPostMessageCallback,
-                @ptrCast(&frame.js_render_context),
-            );
+            self.attachJsCallbacks(frame.tab, frame, ctx);
         }
 
         var parent_window_id: ?u32 = null;
@@ -2085,7 +2120,10 @@ pub const Browser = struct {
                             if (rel != null and href != null and std.mem.eql(u8, rel.?, "stylesheet")) {
                                 const href_copy = try self.allocator.alloc(u8, href.?.len);
                                 @memcpy(href_copy, href.?);
-                                try stylesheet_urls.append(self.allocator, href_copy);
+                                stylesheet_urls.append(self.allocator, href_copy) catch |err| {
+                                    self.allocator.free(href_copy);
+                                    return err;
+                                };
                             }
                         }
                     }
@@ -2094,15 +2132,21 @@ pub const Browser = struct {
             }
         }
 
+        var new_css_texts = std.ArrayList([]const u8).empty;
+        defer {
+            for (new_css_texts.items) |css_text| self.allocator.free(css_text);
+            new_css_texts.deinit(self.allocator);
+        }
+
         var all_rules = std.ArrayList(CSSParser.CSSRule).empty;
         const default_rules_count = self.default_style_sheet_rules.len;
-        defer all_rules.deinit(self.allocator);
-        errdefer {
+        defer {
             for (all_rules.items) |*rule| {
                 if (rule.owned) {
                     rule.deinit(self.allocator);
                 }
             }
+            all_rules.deinit(self.allocator);
         }
 
         for (self.default_style_sheet_rules) |rule| {
@@ -2130,25 +2174,34 @@ pub const Browser = struct {
 
             const css_raw = css_response.body;
             const raw_owned = !std.mem.eql(u8, stylesheet_url.scheme, "data") and !std.mem.eql(u8, stylesheet_url.scheme, "about");
+            defer if (raw_owned) self.allocator.free(css_raw);
             const css_text = try decodeUtf8Replace(self.allocator, css_raw);
-            if (raw_owned) {
-                self.allocator.free(css_raw);
-            }
+            var css_text_owned = true;
+            defer if (css_text_owned) self.allocator.free(css_text);
 
             var css_parser = try CSSParser.init(self.allocator, css_text, frame.tab.accessibility.prefers_dark);
             defer css_parser.deinit(self.allocator);
 
             const parsed_rules = css_parser.parse(self.allocator) catch |err| {
                 std.log.warn("Failed to parse iframe stylesheet {s}: {}", .{ href, err });
-                self.allocator.free(css_text);
                 continue;
             };
-
-            try frame.css_texts.append(self.allocator, css_text);
-            for (parsed_rules) |rule| {
-                try all_rules.append(self.allocator, rule);
+            var parsed_rules_owned = true;
+            defer {
+                if (parsed_rules_owned) {
+                    for (parsed_rules) |*rule| rule.deinit(self.allocator);
+                }
+                self.allocator.free(parsed_rules);
             }
-            self.allocator.free(parsed_rules);
+
+            try new_css_texts.ensureUnusedCapacity(self.allocator, 1);
+            try all_rules.ensureUnusedCapacity(self.allocator, parsed_rules.len);
+            new_css_texts.appendAssumeCapacity(css_text);
+            css_text_owned = false;
+            for (parsed_rules) |rule| {
+                all_rules.appendAssumeCapacity(rule);
+            }
+            parsed_rules_owned = false;
         }
 
         std.mem.sort(CSSParser.CSSRule, all_rules.items, {}, struct {
@@ -2157,10 +2210,16 @@ pub const Browser = struct {
             }
         }.lessThan);
 
+        // resetFrameForNavigation left these lists empty but retained their
+        // buffers. Replace both generations together so rules never outlive
+        // the stylesheet text they borrow.
+        frame.rules.deinit(self.allocator);
+        frame.css_texts.deinit(self.allocator);
         frame.default_rules_count = default_rules_count;
-        for (all_rules.items) |rule| {
-            try frame.rules.append(self.allocator, rule);
-        }
+        frame.rules = all_rules;
+        all_rules = .empty;
+        frame.css_texts = new_css_texts;
+        new_css_texts = .empty;
 
         try parser.style(self.allocator, &frame.current_node.?, frame.rules.items);
         try self.layoutTabNodes(frame, true);
@@ -2396,11 +2455,9 @@ pub const Browser = struct {
         }
 
         const raw_body = response.body;
-        const body_text = try decodeUtf8Replace(self.allocator, raw_body);
         const body_owned = !std.mem.eql(u8, iframe_url.scheme, "about") and !std.mem.eql(u8, iframe_url.scheme, "data");
-        if (body_owned) {
-            self.allocator.free(raw_body);
-        }
+        defer if (body_owned) self.allocator.free(raw_body);
+        const body_text = try decodeUtf8Replace(self.allocator, raw_body);
 
         var body_text_owned = true;
         errdefer if (body_text_owned) self.allocator.free(body_text);
@@ -2415,40 +2472,7 @@ pub const Browser = struct {
 
         frame.js_context = try parent.tab.getJs(frame_url_ptr);
         if (frame.js_context) |ctx| {
-            ctx.setNodes(frame.window_id, &frame.current_node.?);
-            frame.js_render_context.setPointers(
-                @as(?*anyopaque, @ptrCast(self)),
-                @as(?*anyopaque, @ptrCast(parent.tab)),
-                ctx,
-                frame.window_id,
-            );
-            frame.js_render_context.setGeneration(parent.tab.js_generation);
-            frame.js_render_context_initialized = true;
-            ctx.setRenderCallback(
-                frame.window_id,
-                jsRenderCallback,
-                @ptrCast(&frame.js_render_context),
-            );
-            ctx.setXhrCallback(
-                frame.window_id,
-                jsXhrCallback,
-                @ptrCast(&frame.js_render_context),
-            );
-            ctx.setAnimationFrameCallback(
-                frame.window_id,
-                jsRequestAnimationFrameCallback,
-                @ptrCast(&frame.js_render_context),
-            );
-            ctx.setSetTimeoutCallback(
-                frame.window_id,
-                jsSetTimeoutCallback,
-                @ptrCast(&frame.js_render_context),
-            );
-            ctx.setPostMessageCallback(
-                frame.window_id,
-                jsPostMessageCallback,
-                @ptrCast(&frame.js_render_context),
-            );
+            self.attachJsCallbacks(parent.tab, frame, ctx);
         }
         var parent_window_id: ?u32 = null;
         if (frame.current_url) |child_url_ptr| {
@@ -2519,7 +2543,10 @@ pub const Browser = struct {
                             if (rel != null and href != null and std.mem.eql(u8, rel.?, "stylesheet")) {
                                 const href_copy = try self.allocator.alloc(u8, href.?.len);
                                 @memcpy(href_copy, href.?);
-                                try stylesheet_urls.append(self.allocator, href_copy);
+                                stylesheet_urls.append(self.allocator, href_copy) catch |err| {
+                                    self.allocator.free(href_copy);
+                                    return err;
+                                };
                             }
                         }
                     }
@@ -2528,15 +2555,21 @@ pub const Browser = struct {
             }
         }
 
+        var new_css_texts = std.ArrayList([]const u8).empty;
+        defer {
+            for (new_css_texts.items) |css_text| self.allocator.free(css_text);
+            new_css_texts.deinit(self.allocator);
+        }
+
         var all_rules = std.ArrayList(CSSParser.CSSRule).empty;
         const default_rules_count = self.default_style_sheet_rules.len;
-        defer all_rules.deinit(self.allocator);
-        errdefer {
+        defer {
             for (all_rules.items) |*rule| {
                 if (rule.owned) {
                     rule.deinit(self.allocator);
                 }
             }
+            all_rules.deinit(self.allocator);
         }
 
         for (self.default_style_sheet_rules) |rule| {
@@ -2564,25 +2597,34 @@ pub const Browser = struct {
 
             const css_raw = css_response.body;
             const raw_owned = !std.mem.eql(u8, stylesheet_url.scheme, "data") and !std.mem.eql(u8, stylesheet_url.scheme, "about");
+            defer if (raw_owned) self.allocator.free(css_raw);
             const css_text = try decodeUtf8Replace(self.allocator, css_raw);
-            if (raw_owned) {
-                self.allocator.free(css_raw);
-            }
+            var css_text_owned = true;
+            defer if (css_text_owned) self.allocator.free(css_text);
 
             var css_parser = try CSSParser.init(self.allocator, css_text, parent.tab.accessibility.prefers_dark);
             defer css_parser.deinit(self.allocator);
 
             const parsed_rules = css_parser.parse(self.allocator) catch |err| {
                 std.log.warn("Failed to parse iframe stylesheet {s}: {}", .{ href, err });
-                self.allocator.free(css_text);
                 continue;
             };
-
-            try frame.css_texts.append(self.allocator, css_text);
-            for (parsed_rules) |rule| {
-                try all_rules.append(self.allocator, rule);
+            var parsed_rules_owned = true;
+            defer {
+                if (parsed_rules_owned) {
+                    for (parsed_rules) |*rule| rule.deinit(self.allocator);
+                }
+                self.allocator.free(parsed_rules);
             }
-            self.allocator.free(parsed_rules);
+
+            try new_css_texts.ensureUnusedCapacity(self.allocator, 1);
+            try all_rules.ensureUnusedCapacity(self.allocator, parsed_rules.len);
+            new_css_texts.appendAssumeCapacity(css_text);
+            css_text_owned = false;
+            for (parsed_rules) |rule| {
+                all_rules.appendAssumeCapacity(rule);
+            }
+            parsed_rules_owned = false;
         }
 
         std.mem.sort(CSSParser.CSSRule, all_rules.items, {}, struct {
@@ -2591,10 +2633,13 @@ pub const Browser = struct {
             }
         }.lessThan);
 
+        frame.rules.deinit(self.allocator);
+        frame.css_texts.deinit(self.allocator);
         frame.default_rules_count = default_rules_count;
-        for (all_rules.items) |rule| {
-            try frame.rules.append(self.allocator, rule);
-        }
+        frame.rules = all_rules;
+        all_rules = .empty;
+        frame.css_texts = new_css_texts;
+        new_css_texts = .empty;
 
         try parser.style(self.allocator, &frame.current_node.?, frame.rules.items);
         try self.layoutTabNodes(frame, true);
@@ -2633,23 +2678,16 @@ pub const Browser = struct {
 
         const script_raw = script_response.body;
         const raw_owned = !std.mem.eql(u8, script_url.scheme, "data") and !std.mem.eql(u8, script_url.scheme, "about");
+        defer if (raw_owned) self.allocator.free(script_raw);
         const body_copy = try decodeUtf8Replace(self.allocator, script_raw);
-        if (raw_owned) {
-            self.allocator.free(script_raw);
-        }
         var body_copy_owned = false;
         defer if (!body_copy_owned) self.allocator.free(body_copy);
-
-        const js_context = &frame.js_render_context;
-        const generation = js_context.currentGeneration();
 
         const ctx = try ScriptTaskContext.create(
             self.allocator,
             self,
             tab,
-            js_context,
-            generation,
-            js_context.window_id,
+            DocumentHandle.fromFrame(frame),
             src_copy,
             script_url,
             body_copy,
@@ -2725,16 +2763,11 @@ pub const Browser = struct {
         var body_owned = false;
         defer if (!body_owned) self.allocator.free(body_copy);
 
-        const js_context = &frame.js_render_context;
-        const generation = js_context.currentGeneration();
-
         const ctx = try ScriptTaskContext.create(
             self.allocator,
             self,
             tab,
-            js_context,
-            generation,
-            js_context.window_id,
+            DocumentHandle.fromFrame(frame),
             label,
             script_url,
             body_copy,
@@ -2759,24 +2792,25 @@ pub const Browser = struct {
         handle: u32,
         delay_ms: u32,
     ) !void {
-        if (js_context.js_context == null) return;
-        const generation = js_context.currentGeneration();
+        if (tab.isShuttingDown() or js_context.js_context == null) return;
+        const document = DocumentHandle{
+            .window_id = js_context.window_id,
+            .generation = js_context.currentGeneration(),
+        };
 
         const thread_ctx = try SetTimeoutThreadContext.create(
             self.allocator,
             self,
             tab,
-            js_context,
-            generation,
-            js_context.window_id,
+            document,
             handle,
             delay_ms,
         );
 
         tab.retainAsyncThread();
         const thread = std.Thread.spawn(.{}, runSetTimeoutThread, .{thread_ctx}) catch |err| {
-            tab.releaseAsyncThread();
             thread_ctx.destroy();
+            tab.releaseAsyncThread();
             return err;
         };
         _ = thread.setName(self.io, "SetTimeout thread") catch |err| {
@@ -2827,28 +2861,45 @@ pub const Browser = struct {
         self: *Browser,
         tab: *Tab,
         js_context: *JsRenderContext,
-        generation: u64,
         resolved_url: Url,
+        referrer: ?Url,
         payload: ?[]const u8,
         handle: u32,
     ) !void {
-        if (js_context.js_context == null) return;
+        if (tab.isShuttingDown() or js_context.js_context == null) return;
+
+        var resolved_copy = try resolved_url.clone(self.allocator);
+        var resolved_copy_owned = true;
+        defer if (resolved_copy_owned) resolved_copy.free(self.allocator);
+
+        var referrer_copy: ?Url = null;
+        var referrer_copy_owned = false;
+        if (referrer) |source| {
+            referrer_copy = try source.clone(self.allocator);
+            referrer_copy_owned = true;
+        }
+        defer if (referrer_copy_owned) referrer_copy.?.free(self.allocator);
+
         const ctx = try XhrThreadContext.create(
             self.allocator,
             self,
             tab,
-            js_context,
-            generation,
-            js_context.window_id,
-            resolved_url,
+            .{
+                .window_id = js_context.window_id,
+                .generation = js_context.currentGeneration(),
+            },
+            resolved_copy,
+            referrer_copy,
             payload,
             handle,
         );
+        resolved_copy_owned = false;
+        referrer_copy_owned = false;
 
         tab.retainAsyncThread();
         const thread = std.Thread.spawn(.{}, runXhrThread, .{ctx}) catch |err| {
-            tab.releaseAsyncThread();
             ctx.destroy();
+            tab.releaseAsyncThread();
             return err;
         };
         _ = thread.setName(self.io, "XHR thread") catch |err| {
@@ -2861,16 +2912,16 @@ pub const Browser = struct {
         const frame = tab.root_frame orelse return;
         const default_rules_count = self.default_style_sheet_rules.len;
 
-        for (frame.rules.items) |*rule| {
-            if (rule.owned) {
-                rule.deinit(self.allocator);
+        var new_rules = std.ArrayList(CSSParser.CSSRule).empty;
+        defer {
+            for (new_rules.items) |*rule| {
+                if (rule.owned) rule.deinit(self.allocator);
             }
+            new_rules.deinit(self.allocator);
         }
-        frame.rules.clearRetainingCapacity();
-        frame.default_rules_count = default_rules_count;
 
         for (self.default_style_sheet_rules) |rule| {
-            try frame.rules.append(self.allocator, rule);
+            try new_rules.append(self.allocator, rule);
         }
 
         for (frame.css_texts.items) |css_text| {
@@ -2881,18 +2932,34 @@ pub const Browser = struct {
                 std.log.warn("Failed to parse stylesheet on rebuild: {}", .{err});
                 continue;
             };
-
-            for (parsed_rules) |rule| {
-                try frame.rules.append(self.allocator, rule);
+            var parsed_rules_owned = true;
+            defer {
+                if (parsed_rules_owned) {
+                    for (parsed_rules) |*rule| rule.deinit(self.allocator);
+                }
+                self.allocator.free(parsed_rules);
             }
-            self.allocator.free(parsed_rules);
+
+            try new_rules.ensureUnusedCapacity(self.allocator, parsed_rules.len);
+            for (parsed_rules) |rule| {
+                new_rules.appendAssumeCapacity(rule);
+            }
+            parsed_rules_owned = false;
         }
 
-        std.mem.sort(CSSParser.CSSRule, frame.rules.items, {}, struct {
+        std.mem.sort(CSSParser.CSSRule, new_rules.items, {}, struct {
             fn lessThan(_: void, a: CSSParser.CSSRule, b: CSSParser.CSSRule) bool {
                 return a.cascadePriority() < b.cascadePriority();
             }
         }.lessThan);
+
+        for (frame.rules.items) |*rule| {
+            if (rule.owned) rule.deinit(self.allocator);
+        }
+        frame.rules.deinit(self.allocator);
+        frame.rules = new_rules;
+        new_rules = .empty;
+        frame.default_rules_count = default_rules_count;
     }
 
     // Layout a tab's HTML nodes with the tree-based layout
@@ -3594,9 +3661,9 @@ pub const Browser = struct {
                 incoming_list = cloned;
             }
 
-            if (self.active_tab_display_list) |old_list| {
-                DisplayItem.freeList(self.allocator, old_list);
-            }
+            // Draw lists and composited layers contain pointers into the old
+            // committed list, so retire them before replacing that owner.
+            self.retireActiveRenderStateLocked();
             self.active_tab_display_list = incoming_list;
             // Set parent pointers for tree traversal
             DisplayItem.setParentPointers(incoming_list, null);
@@ -5023,27 +5090,36 @@ pub const Browser = struct {
         try self.context.fill();
     }
 
-    // Ensure we clean up the document_layout in deinit
     pub fn deinit(self: *Browser) void {
-        // Clean up z2d surfaces and context
-        self.context.deinit();
-        self.root_surface.deinit(self.allocator);
-        self.chrome_surface.deinit(self.allocator);
-        if (self.tab_surface) |*tab_surface| {
-            tab_surface.deinit(self.allocator);
+        // First stop every producer while all Browser-owned services remain
+        // alive. Never hold the browser lock while joining or waiting.
+        self.lock.lock();
+        self.shutting_down = true;
+        self.needs_animation_frame = false;
+        self.lock.unlock();
+        for (self.tabs.items) |tab| tab.shutdown();
+
+        // No tab can publish another commit now. Retire browser-side display
+        // snapshots before destroying the document/font/image data they borrow.
+        self.lock.lock();
+        self.retireActiveRenderStateLocked();
+        self.lock.unlock();
+
+        for (self.tabs.items) |tab| {
+            tab.deinit();
+            self.allocator.destroy(tab);
         }
-        // Clean up cached SDL texture
-        if (self.cached_texture) |tex| {
-            tex.destroy();
+        self.tabs.deinit(self.allocator);
+
+        if (self.active_tab_url) |url| {
+            self.allocator.free(url);
         }
 
-        // Close all connections
+        self.composited_layers.deinit(self.allocator);
+        self.tab_draw_list.deinit(self.allocator);
+
+        // No remaining task can use networking or shared browser state.
         self.http_client.deinit();
-
-        // Clean up chrome
-        self.chrome.deinit();
-
-        // Free cookie jar values and map storage
         var cookie_it = self.cookie_jar.iterator();
         while (cookie_it.next()) |entry| {
             self.allocator.free(entry.value_ptr.value);
@@ -5051,44 +5127,30 @@ pub const Browser = struct {
         }
         self.cookie_jar.deinit();
 
-        // Clean up all tabs
-        for (self.tabs.items) |tab| {
-            tab.deinit();
-            self.allocator.destroy(tab);
-        }
-        self.tabs.deinit(self.allocator);
+        self.chrome.deinit();
 
-        if (self.active_tab_display_list) |list| {
-            DisplayItem.freeList(self.allocator, list);
-        }
-        if (self.active_tab_url) |url| {
-            self.allocator.free(url);
-        }
-
-        // Clean up composited layers
-        for (self.composited_layers.items) |*layer| {
-            layer.deinit(self.allocator);
-        }
-        self.composited_layers.deinit(self.allocator);
-        if (self.tab_draw_list.items.len > 0) {
-            DisplayItem.freeItems(self.allocator, self.tab_draw_list.items);
-            self.tab_draw_list.items.len = 0;
-        }
-        self.tab_draw_list.deinit(self.allocator);
-
-        // Clean up default stylesheet rules
         for (self.default_style_sheet_rules) |*rule| {
             rule.deinit(self.allocator);
         }
         self.allocator.free(self.default_style_sheet_rules);
 
-        // clean up layout
+        // FontManager owns SDL textures, so it must be retired while the
+        // renderer is still alive.
+        if (self.cached_texture) |texture| texture.destroy();
         self.layout_engine.deinit();
 
-        // Clean up JavaScript engine
+        self.context.deinit();
+        self.root_surface.deinit(self.allocator);
+        self.chrome_surface.deinit(self.allocator);
+        if (self.tab_surface) |*tab_surface| {
+            tab_surface.deinit(self.allocator);
+        }
 
         self.measure.finish();
 
+        sdl2.stopTextInput();
+        self.canvas.destroy();
+        self.window.destroy();
         sdl2.quit();
     }
 };
@@ -5171,7 +5233,8 @@ const LoadTaskContext = struct {
 const FrameLoadTaskContext = struct {
     allocator: std.mem.Allocator,
     browser: *Browser,
-    frame: *Frame,
+    tab: *Tab,
+    document: DocumentHandle,
     url: ?*Url,
     payload: ?[]const u8,
 
@@ -5186,7 +5249,8 @@ const FrameLoadTaskContext = struct {
         ctx.* = .{
             .allocator = allocator,
             .browser = browser,
-            .frame = frame,
+            .tab = frame.tab,
+            .document = DocumentHandle.fromFrame(frame),
             .url = url,
             .payload = payload,
         };
@@ -5211,8 +5275,8 @@ const FrameLoadTaskContext = struct {
 
     fn run(self: *FrameLoadTaskContext) !void {
         defer self.consumePayload();
-        try self.browser.loadInFrame(self.frame, self.url.?, self.payload);
-        self.url = null;
+        const frame = self.document.resolve(self.tab) orelse return;
+        try self.browser.loadInFrame(frame, self.url.?, self.payload);
     }
 
     fn toOpaque(self: *FrameLoadTaskContext) *anyopaque {
@@ -5426,9 +5490,7 @@ const ScriptTaskContext = struct {
     allocator: std.mem.Allocator,
     browser: *Browser,
     tab: *Tab,
-    js_context: *JsRenderContext,
-    generation: u64,
-    window_id: u32,
+    document: DocumentHandle,
     script_label: []const u8,
     script_url: Url,
     script_body: []const u8,
@@ -5437,9 +5499,7 @@ const ScriptTaskContext = struct {
         allocator: std.mem.Allocator,
         browser: *Browser,
         tab: *Tab,
-        js_context: *JsRenderContext,
-        generation: u64,
-        window_id: u32,
+        document: DocumentHandle,
         script_label: []const u8,
         script_url: Url,
         script_body: []const u8,
@@ -5449,9 +5509,7 @@ const ScriptTaskContext = struct {
             .allocator = allocator,
             .browser = browser,
             .tab = tab,
-            .js_context = js_context,
-            .generation = generation,
-            .window_id = window_id,
+            .document = document,
             .script_label = script_label,
             .script_url = script_url,
             .script_body = script_body,
@@ -5484,16 +5542,14 @@ const ScriptTaskContext = struct {
     }
 
     fn run(self: *ScriptTaskContext) !void {
-        if (!self.js_context.matchesGeneration(self.generation)) {
-            return;
-        }
+        const frame = self.document.resolve(self.tab) orelse return;
+        const js_context = frame.js_context orelse return;
 
-        std.log.info("Executing script for window_id={d}", .{self.window_id});
+        std.log.info("Executing script for window_id={d}", .{self.document.window_id});
         std.log.info("========== Executing script ==========", .{});
         const trace_eval = self.browser.measure.begin("evaljs");
         defer if (trace_eval) self.browser.measure.end("evaljs");
-        const js_context = self.js_context.js_context orelse return;
-        const result = js_context.evaluate(self.window_id, self.script_body) catch |err| {
+        const result = js_context.evaluate(self.document.window_id, self.script_body) catch |err| {
             std.log.err("Script {s} crashed: {}", .{ self.script_label, err });
             return;
         };
@@ -5515,7 +5571,7 @@ const ScriptTaskContext = struct {
     }
 
     fn injectResult(self: *ScriptTaskContext, result_str: []const u8) anyerror!void {
-        const frame = self.tab.frameForWindowId(self.window_id) orelse return;
+        const frame = self.document.resolve(self.tab) orelse return;
         if (frame.current_node == null) return;
 
         const allocator = self.browser.allocator;
@@ -5559,9 +5615,7 @@ const SetTimeoutThreadContext = struct {
     allocator: std.mem.Allocator,
     browser: *Browser,
     tab: *Tab,
-    js_context: *JsRenderContext,
-    generation: u64,
-    window_id: u32,
+    document: DocumentHandle,
     handle: u32,
     delay_ms: u32,
 
@@ -5569,9 +5623,7 @@ const SetTimeoutThreadContext = struct {
         allocator: std.mem.Allocator,
         browser: *Browser,
         tab: *Tab,
-        js_context: *JsRenderContext,
-        generation: u64,
-        window_id: u32,
+        document: DocumentHandle,
         handle: u32,
         delay_ms: u32,
     ) !*SetTimeoutThreadContext {
@@ -5580,9 +5632,7 @@ const SetTimeoutThreadContext = struct {
             .allocator = allocator,
             .browser = browser,
             .tab = tab,
-            .js_context = js_context,
-            .generation = generation,
-            .window_id = window_id,
+            .document = document,
             .handle = handle,
             .delay_ms = delay_ms,
         };
@@ -5595,28 +5645,30 @@ const SetTimeoutThreadContext = struct {
 };
 
 fn runSetTimeoutThread(ctx: *SetTimeoutThreadContext) void {
-    defer ctx.destroy();
-    defer ctx.tab.releaseAsyncThread();
+    const tab = ctx.tab;
+    defer {
+        ctx.destroy();
+        tab.releaseAsyncThread();
+    }
 
     _ = ctx.browser.measure.registerThread("SetTimeout thread") catch |err| {
         std.log.warn("Failed to register setTimeout thread: {}", .{err});
     };
 
-    if (ctx.delay_ms > 0) {
-        const delay_ns = @as(u64, ctx.delay_ms) * std.time.ns_per_ms;
-        ctx.browser.io.sleep(.fromNanoseconds(@intCast(delay_ns)), .awake) catch return;
+    var remaining_ns = @as(u64, ctx.delay_ms) * std.time.ns_per_ms;
+    while (remaining_ns > 0) {
+        if (tab.isShuttingDown()) return;
+        const sleep_ns = @min(remaining_ns, 10 * std.time.ns_per_ms);
+        ctx.browser.io.sleep(.fromNanoseconds(@intCast(sleep_ns)), .awake) catch return;
+        remaining_ns -= sleep_ns;
     }
-
-    if (!ctx.js_context.matchesGeneration(ctx.generation)) {
-        return;
-    }
+    if (tab.isShuttingDown()) return;
 
     const task_ctx = SetTimeoutTaskContext.create(
         ctx.browser.allocator,
         ctx.browser,
-        ctx.js_context,
-        ctx.generation,
-        ctx.window_id,
+        tab,
+        ctx.document,
         ctx.handle,
     ) catch |err| {
         std.log.warn("Failed to allocate setTimeout task: {}", .{err});
@@ -5630,7 +5682,7 @@ fn runSetTimeoutThread(ctx: *SetTimeoutThreadContext) void {
         SetTimeoutTaskContext.cleanupOpaque,
     );
 
-    ctx.tab.task_runner.schedule(task) catch |err| {
+    tab.task_runner.schedule(task) catch |err| {
         std.log.warn("Failed to enqueue setTimeout task: {}", .{err});
         task_ctx.destroy();
     };
@@ -5639,26 +5691,23 @@ fn runSetTimeoutThread(ctx: *SetTimeoutThreadContext) void {
 const SetTimeoutTaskContext = struct {
     allocator: std.mem.Allocator,
     browser: *Browser,
-    js_context: *JsRenderContext,
-    generation: u64,
-    window_id: u32,
+    tab: *Tab,
+    document: DocumentHandle,
     handle: u32,
 
     fn create(
         allocator: std.mem.Allocator,
         browser: *Browser,
-        js_context: *JsRenderContext,
-        generation: u64,
-        window_id: u32,
+        tab: *Tab,
+        document: DocumentHandle,
         handle: u32,
     ) !*SetTimeoutTaskContext {
         const ctx = try allocator.create(SetTimeoutTaskContext);
         ctx.* = .{
             .allocator = allocator,
             .browser = browser,
-            .js_context = js_context,
-            .generation = generation,
-            .window_id = window_id,
+            .tab = tab,
+            .document = document,
             .handle = handle,
         };
         return ctx;
@@ -5686,13 +5735,11 @@ const SetTimeoutTaskContext = struct {
     }
 
     fn run(self: *SetTimeoutTaskContext) !void {
-        if (!self.js_context.matchesGeneration(self.generation)) {
-            return;
-        }
+        const frame = self.document.resolve(self.tab) orelse return;
         const trace_eval = self.browser.measure.begin("evaljs");
         defer if (trace_eval) self.browser.measure.end("evaljs");
-        const js_context = self.js_context.js_context orelse return;
-        js_context.runTimeoutCallback(self.window_id, self.handle) catch |err| {
+        const js_context = frame.js_context orelse return;
+        js_context.runTimeoutCallback(self.document.window_id, self.handle) catch |err| {
             std.log.warn("setTimeout callback failed: {}", .{err});
         };
     }
@@ -5717,8 +5764,8 @@ fn runAnimationTimerThread(ctx: *AnimationTimerContext) void {
     const browser = ctx.browser;
     const tab = ctx.tab;
     defer {
-        tab.releaseAsyncThread();
         ctx.destroy();
+        tab.releaseAsyncThread();
     }
 
     _ = browser.measure.registerThread("Animation timer thread") catch |err| {
@@ -5739,15 +5786,18 @@ fn runAnimationTimerThread(ctx: *AnimationTimerContext) void {
         browser.lock.unlock();
         return;
     };
-    const generation = active_tab.js_generation;
+    if (active_tab != tab or tab.isShuttingDown()) {
+        browser.animation_timer_active = false;
+        browser.lock.unlock();
+        return;
+    }
     const scroll = browser.active_tab_scroll;
     browser.lock.unlock();
 
     const render_ctx = AnimationRenderTaskContext.create(
         browser.allocator,
         browser,
-        active_tab,
-        generation,
+        tab,
         scroll,
     ) catch |err| {
         std.log.warn("Failed to allocate animation task: {}", .{err});
@@ -5763,7 +5813,7 @@ fn runAnimationTimerThread(ctx: *AnimationTimerContext) void {
         AnimationRenderTaskContext.cleanupOpaque,
     );
 
-    active_tab.task_runner.schedule(task) catch |err| {
+    tab.task_runner.schedule(task) catch |err| {
         std.log.warn("Failed to schedule animation frame: {}", .{err});
         render_ctx.destroy();
         browser.lock.lock();
@@ -5777,14 +5827,12 @@ const AnimationRenderTaskContext = struct {
     allocator: std.mem.Allocator,
     browser: *Browser,
     tab: *Tab,
-    generation: u64,
     scroll: i32,
 
     fn create(
         allocator: std.mem.Allocator,
         browser: *Browser,
         tab: *Tab,
-        generation: u64,
         scroll: i32,
     ) !*AnimationRenderTaskContext {
         const ctx = try allocator.create(AnimationRenderTaskContext);
@@ -5792,7 +5840,6 @@ const AnimationRenderTaskContext = struct {
             .allocator = allocator,
             .browser = browser,
             .tab = tab,
-            .generation = generation,
             .scroll = scroll,
         };
         return ctx;
@@ -5820,16 +5867,7 @@ const AnimationRenderTaskContext = struct {
     }
 
     fn run(self: *AnimationRenderTaskContext) !void {
-        if (self.tab.js_generation != self.generation) {
-            self.browser.lock.lock();
-            self.browser.animation_timer_active = false;
-            const should_reschedule = self.browser.needs_animation_frame;
-            self.browser.lock.unlock();
-            if (should_reschedule) {
-                self.browser.scheduleAnimationFrame();
-            }
-            return;
-        }
+        if (self.tab.isShuttingDown()) return;
         self.tab.runAnimationFrame(self.scroll);
 
         self.browser.lock.lock();
@@ -5849,10 +5887,9 @@ const XhrThreadContext = struct {
     allocator: std.mem.Allocator,
     browser: *Browser,
     tab: *Tab,
-    js_context: *JsRenderContext,
-    generation: u64,
-    window_id: u32,
+    document: DocumentHandle,
     resolved_url: Url,
+    referrer: ?Url,
     payload: ?[]const u8,
     handle: u32,
 
@@ -5860,31 +5897,30 @@ const XhrThreadContext = struct {
         allocator: std.mem.Allocator,
         browser: *Browser,
         tab: *Tab,
-        js_context: *JsRenderContext,
-        generation: u64,
-        window_id: u32,
+        document: DocumentHandle,
         resolved_url: Url,
+        referrer: ?Url,
         payload: ?[]const u8,
         handle: u32,
     ) !*XhrThreadContext {
         const ctx = try allocator.create(XhrThreadContext);
+        errdefer allocator.destroy(ctx);
+
+        const payload_copy = if (payload) |body| blk: {
+            const copy = try allocator.alloc(u8, body.len);
+            @memcpy(copy, body);
+            break :blk copy;
+        } else null;
         ctx.* = .{
             .allocator = allocator,
             .browser = browser,
             .tab = tab,
-            .js_context = js_context,
-            .generation = generation,
-            .window_id = window_id,
+            .document = document,
             .resolved_url = resolved_url,
-            .payload = null,
+            .referrer = referrer,
+            .payload = payload_copy,
             .handle = handle,
         };
-
-        if (payload) |body| {
-            const copy = try allocator.alloc(u8, body.len);
-            @memcpy(copy, body);
-            ctx.payload = copy;
-        }
 
         return ctx;
     }
@@ -5894,28 +5930,25 @@ const XhrThreadContext = struct {
             self.allocator.free(body);
         }
         self.resolved_url.free(self.allocator);
+        if (self.referrer) |referrer| referrer.free(self.allocator);
         self.allocator.destroy(self);
     }
 };
 
 fn runXhrThread(ctx: *XhrThreadContext) void {
-    defer ctx.tab.releaseAsyncThread();
-    defer ctx.destroy();
+    const tab = ctx.tab;
+    defer {
+        ctx.destroy();
+        tab.releaseAsyncThread();
+    }
 
     _ = ctx.browser.measure.registerThread("XHR thread") catch |err| {
         std.log.warn("Failed to register XHR thread: {}", .{err});
     };
 
-    var referrer_copy: ?Url = null;
-    if (ctx.tab.frameForWindowId(ctx.window_id)) |frame| {
-        if (frame.current_url) |cur_ptr| {
-            referrer_copy = cur_ptr.*;
-        }
-    }
-
     const response_result = ctx.browser.fetchBody(
         ctx.resolved_url,
-        referrer_copy,
+        ctx.referrer,
         ctx.payload,
     ) catch |err| {
         std.log.warn("Async XHR failed: {}", .{err});
@@ -5963,9 +5996,8 @@ fn runXhrThread(ctx: *XhrThreadContext) void {
     const task_ctx = XhrOnloadTaskContext.create(
         ctx.allocator,
         ctx.browser,
-        ctx.js_context,
-        ctx.generation,
-        ctx.window_id,
+        tab,
+        ctx.document,
         ctx.handle,
         decoded_body,
         ctx.allocator,
@@ -5982,7 +6014,7 @@ fn runXhrThread(ctx: *XhrThreadContext) void {
         XhrOnloadTaskContext.cleanupOpaque,
     );
 
-    ctx.tab.task_runner.schedule(task) catch |err| {
+    tab.task_runner.schedule(task) catch |err| {
         std.log.warn("Failed to schedule XHR onload task: {}", .{err});
         task_ctx.destroy();
     };
@@ -5991,9 +6023,8 @@ fn runXhrThread(ctx: *XhrThreadContext) void {
 const XhrOnloadTaskContext = struct {
     allocator: std.mem.Allocator,
     browser: *Browser,
-    js_context: *JsRenderContext,
-    generation: u64,
-    window_id: u32,
+    tab: *Tab,
+    document: DocumentHandle,
     handle: u32,
     body: []const u8,
     body_allocator: ?std.mem.Allocator,
@@ -6002,9 +6033,8 @@ const XhrOnloadTaskContext = struct {
     fn create(
         allocator: std.mem.Allocator,
         browser: *Browser,
-        js_context: *JsRenderContext,
-        generation: u64,
-        window_id: u32,
+        tab: *Tab,
+        document: DocumentHandle,
         handle: u32,
         body: []const u8,
         body_allocator: ?std.mem.Allocator,
@@ -6014,9 +6044,8 @@ const XhrOnloadTaskContext = struct {
         ctx.* = .{
             .allocator = allocator,
             .browser = browser,
-            .js_context = js_context,
-            .generation = generation,
-            .window_id = window_id,
+            .tab = tab,
+            .document = document,
             .handle = handle,
             .body = body,
             .body_allocator = body_allocator,
@@ -6054,11 +6083,9 @@ const XhrOnloadTaskContext = struct {
     }
 
     fn run(self: *XhrOnloadTaskContext) !void {
-        if (!self.js_context.matchesGeneration(self.generation)) {
-            return;
-        }
-        const js_context = self.js_context.js_context orelse return;
-        js_context.runXhrOnload(self.window_id, self.handle, self.body) catch |err| {
+        const frame = self.document.resolve(self.tab) orelse return;
+        const js_context = frame.js_context orelse return;
+        js_context.runXhrOnload(self.document.window_id, self.handle, self.body) catch |err| {
             std.log.warn("XHR onload callback failed: {}", .{err});
         };
     }
@@ -6106,8 +6133,6 @@ fn jsXhrCallback(
     const frame = tab.frameForWindowId(ctx.window_id) orelse return error.MissingJsContext;
 
     const allocator = browser.allocator;
-    const generation = ctx.currentGeneration();
-
     var resolved_url: Url = undefined;
     if (frame.current_url) |current_ptr| {
         resolved_url = current_ptr.*.resolve(allocator, url_str) catch |err| blk: {
@@ -6118,8 +6143,7 @@ fn jsXhrCallback(
         resolved_url = try Url.init(allocator, url_str);
     }
 
-    var resolved_owned = true;
-    defer if (resolved_owned) resolved_url.free(allocator);
+    defer resolved_url.free(allocator);
 
     if (frame.current_url) |current_ptr| {
         if (!current_ptr.*.sameOrigin(resolved_url)) {
@@ -6148,8 +6172,7 @@ fn jsXhrCallback(
     }
 
     if (is_async) {
-        try browser.scheduleAsyncXhr(tab, ctx, generation, resolved_url, body, handle);
-        resolved_owned = false;
+        try browser.scheduleAsyncXhr(tab, ctx, resolved_url, current_url_value, body, handle);
         return .{ .data = "", .allocator = null, .should_free = false };
     }
 
@@ -6303,13 +6326,11 @@ fn jsPostMessageCallback(
         }
     }
 
-    const generation = ctx.currentGeneration();
     const task_ctx = try PostMessageTaskContext.create(
         allocator,
         browser,
         tab,
-        generation,
-        target_window_id,
+        DocumentHandle.fromFrame(target_frame),
         source_window_id,
         message,
         source_origin,
@@ -6329,8 +6350,7 @@ const PostMessageTaskContext = struct {
     allocator: std.mem.Allocator,
     browser: *Browser,
     tab: *Tab,
-    generation: u64,
-    target_window_id: u32,
+    target_document: DocumentHandle,
     source_window_id: u32,
     message: []const u8,
     origin: []const u8,
@@ -6339,8 +6359,7 @@ const PostMessageTaskContext = struct {
         allocator: std.mem.Allocator,
         browser: *Browser,
         tab: *Tab,
-        generation: u64,
-        target_window_id: u32,
+        target_document: DocumentHandle,
         source_window_id: u32,
         message: []const u8,
         origin: []const u8,
@@ -6354,8 +6373,7 @@ const PostMessageTaskContext = struct {
             .allocator = allocator,
             .browser = browser,
             .tab = tab,
-            .generation = generation,
-            .target_window_id = target_window_id,
+            .target_document = target_document,
             .source_window_id = source_window_id,
             .message = message_copy,
             .origin = origin_copy,
@@ -6387,13 +6405,10 @@ const PostMessageTaskContext = struct {
     }
 
     fn run(self: *PostMessageTaskContext) !void {
-        const target_frame = self.tab.frameForWindowId(self.target_window_id) orelse return;
-        if (!target_frame.js_render_context.matchesGeneration(self.generation)) {
-            return;
-        }
+        const target_frame = self.target_document.resolve(self.tab) orelse return;
         const target_context = target_frame.js_context orelse return;
         target_context.dispatchPostMessage(
-            self.target_window_id,
+            self.target_document.window_id,
             self.message,
             self.origin,
             self.source_window_id,
