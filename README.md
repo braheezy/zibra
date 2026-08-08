@@ -39,8 +39,11 @@ There's more Zig commands:
 ```sh
 # build and run
 zig build run -- https://example.com
-# Inspect a document without starting SDL, layout, JavaScript, or rendering
+# Inspect individual document-pipeline stages without an interactive browser
 zig build run -- --dump-dom https://example.com
+zig build run -- --dump-style https://example.com
+zig build run -- --dump-layout https://example.com
+zig build run -- --dump-display-list https://example.com
 # Run tests
 zig build test
 # Capture and compare the native macOS screenshot fixture

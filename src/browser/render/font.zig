@@ -242,7 +242,9 @@ pub const FontManager = struct {
     allocator: std.mem.Allocator,
     io: std.Io,
     environ: *const std.process.Environ.Map,
-    renderer: sdl2.Renderer,
+    /// Rendering is optional for inspection-only layout passes. SDL_ttf still
+    /// provides metrics and software glyph pixels in that mode.
+    renderer: ?sdl2.Renderer,
     fonts: std.StringHashMap(*Font),
     styled_fonts: std.AutoHashMap(FontKey, *Font),
     category_fonts: std.AutoHashMap(FontCategory, *Font),
@@ -254,7 +256,7 @@ pub const FontManager = struct {
         allocator: std.mem.Allocator,
         io: std.Io,
         environ: *const std.process.Environ.Map,
-        renderer: sdl2.Renderer,
+        renderer: ?sdl2.Renderer,
     ) !FontManager {
         try sdl2.ttf.init();
 
@@ -572,8 +574,11 @@ pub const FontManager = struct {
             glyph_surface = bold_surface;
         }
 
-        const glyph_tex = try sdl2.createTextureFromSurface(self.renderer, glyph_surface);
-        try glyph_tex.setScaleMode(.linear);
+        const glyph_tex = if (self.renderer) |renderer| blk: {
+            const texture = try sdl2.createTextureFromSurface(renderer, glyph_surface);
+            try texture.setScaleMode(.linear);
+            break :blk texture;
+        } else null;
 
         const surf = glyph_surface.ptr;
         const is_emoji = isCodepointEmoji(codepoint.code);

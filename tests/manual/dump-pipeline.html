@@ -1,0 +1,14 @@
+<!--
+How to verify:
+  zig build run -- --dump-style tests/manual/dump-pipeline.html
+  zig build run -- --dump-layout tests/manual/dump-pipeline.html
+  zig build run -- --dump-display-list tests/manual/dump-pipeline.html
+Expected: all commands exit without opening a window. The style dump shows the
+external stylesheet and inline color; later stages emit geometry and paint data.
+-->
+<!doctype html>
+<link rel="stylesheet" href="dump-pipeline.css">
+<main>
+  <h1 style="color: red">Inspection fixture</h1>
+  <p>One <strong>styled</strong> line.</p>
+</main>

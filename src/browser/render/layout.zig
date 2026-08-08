@@ -416,6 +416,9 @@ iframe_bounds: std.ArrayList(IframeBoundEntry),
 focus_bounds: std.ArrayList(FocusBoundEntry),
 // Per-line bounds for accessible elements
 accessibility_bounds: std.ArrayList(AccessibilityBoundEntry),
+// Inspection commands serialize geometry only; they do not need interactive
+// hit-test state or DOM-parent walks.
+collect_hit_test_bounds: bool = true,
 
 // Cumulative transform offset for hit testing (tracks nested transforms)
 transform_offset_x: i32 = 0,
@@ -579,7 +582,7 @@ pub fn init(
     allocator: std.mem.Allocator,
     io: std.Io,
     environ: *const std.process.Environ.Map,
-    renderer: sdl2.Renderer,
+    renderer: ?sdl2.Renderer,
     window_width: i32,
     window_height: i32,
     rtl_text: bool,
@@ -1007,55 +1010,57 @@ fn flushLine(self: *Layout, line_buffer: *std.ArrayList(LineItem)) !void {
         const line_bounds_y = line_top + item.hit_offset_y;
 
         if (item.node_ptr) |ptr| {
-            if (item.payload == .input) {
-                try self.input_bounds.put(ptr, .{
-                    .x = bounds_x,
-                    .y = bounds_y,
-                    .width = item.width,
-                    .height = item.height,
-                });
-            }
-            try self.recordLinkBounds(ptr, bounds_x, line_bounds_y, item.width, line_box_height);
-            if (findFocusableNode(ptr)) |focus_node| {
-                const right = bounds_x + item.width;
-                const bottom = bounds_y + item.height;
-                if (focus_map.getPtr(focus_node)) |existing| {
-                    const existing_right = existing.x + existing.width;
-                    const existing_bottom = existing.y + existing.height;
-                    if (bounds_x < existing.x) existing.x = bounds_x;
-                    if (bounds_y < existing.y) existing.y = bounds_y;
-                    const new_right = if (right > existing_right) right else existing_right;
-                    const new_bottom = if (bottom > existing_bottom) bottom else existing_bottom;
-                    existing.width = new_right - existing.x;
-                    existing.height = new_bottom - existing.y;
-                } else {
-                    try focus_map.put(focus_node, .{
+            if (self.collect_hit_test_bounds) {
+                if (item.payload == .input) {
+                    try self.input_bounds.put(ptr, .{
                         .x = bounds_x,
                         .y = bounds_y,
                         .width = item.width,
                         .height = item.height,
                     });
                 }
-            }
-            if (findAccessibleNode(ptr)) |accessible_node| {
-                const right = bounds_x + item.width;
-                const bottom = bounds_y + item.height;
-                if (accessibility_map.getPtr(accessible_node)) |existing| {
-                    const existing_right = existing.x + existing.width;
-                    const existing_bottom = existing.y + existing.height;
-                    if (bounds_x < existing.x) existing.x = bounds_x;
-                    if (bounds_y < existing.y) existing.y = bounds_y;
-                    const new_right = if (right > existing_right) right else existing_right;
-                    const new_bottom = if (bottom > existing_bottom) bottom else existing_bottom;
-                    existing.width = new_right - existing.x;
-                    existing.height = new_bottom - existing.y;
-                } else {
-                    try accessibility_map.put(accessible_node, .{
-                        .x = bounds_x,
-                        .y = bounds_y,
-                        .width = item.width,
-                        .height = item.height,
-                    });
+                try self.recordLinkBounds(ptr, bounds_x, line_bounds_y, item.width, line_box_height);
+                if (findFocusableNode(ptr)) |focus_node| {
+                    const right = bounds_x + item.width;
+                    const bottom = bounds_y + item.height;
+                    if (focus_map.getPtr(focus_node)) |existing| {
+                        const existing_right = existing.x + existing.width;
+                        const existing_bottom = existing.y + existing.height;
+                        if (bounds_x < existing.x) existing.x = bounds_x;
+                        if (bounds_y < existing.y) existing.y = bounds_y;
+                        const new_right = if (right > existing_right) right else existing_right;
+                        const new_bottom = if (bottom > existing_bottom) bottom else existing_bottom;
+                        existing.width = new_right - existing.x;
+                        existing.height = new_bottom - existing.y;
+                    } else {
+                        try focus_map.put(focus_node, .{
+                            .x = bounds_x,
+                            .y = bounds_y,
+                            .width = item.width,
+                            .height = item.height,
+                        });
+                    }
+                }
+                if (findAccessibleNode(ptr)) |accessible_node| {
+                    const right = bounds_x + item.width;
+                    const bottom = bounds_y + item.height;
+                    if (accessibility_map.getPtr(accessible_node)) |existing| {
+                        const existing_right = existing.x + existing.width;
+                        const existing_bottom = existing.y + existing.height;
+                        if (bounds_x < existing.x) existing.x = bounds_x;
+                        if (bounds_y < existing.y) existing.y = bounds_y;
+                        const new_right = if (right > existing_right) right else existing_right;
+                        const new_bottom = if (bottom > existing_bottom) bottom else existing_bottom;
+                        existing.width = new_right - existing.x;
+                        existing.height = new_bottom - existing.y;
+                    } else {
+                        try accessibility_map.put(accessible_node, .{
+                            .x = bounds_x,
+                            .y = bounds_y,
+                            .width = item.width,
+                            .height = item.height,
+                        });
+                    }
                 }
             }
         }
@@ -2361,6 +2366,16 @@ pub const DocumentLayout = struct {
         self.height.deinit();
     }
 
+    /// Serialize geometry only. This is for deterministic inspection before
+    /// painting; it does not invoke the compositor, rasterizer, or window.
+    pub fn writeDebug(self: *const DocumentLayout, writer: *std.Io.Writer) !void {
+        try writer.print(
+            "document x={d} y={d} width={d} height={d}\n",
+            .{ self.x.get().*, self.y.get().*, self.width.get().*, self.height.get().* },
+        );
+        for (self.children.items) |child| try writeBlockDebug(writer, child, 2);
+    }
+
     pub fn layout(self: *DocumentLayout, engine: *Layout) !void {
         if (!self.layoutNeeded()) return;
 
@@ -3206,6 +3221,68 @@ fn paintBlockTree(self: *Layout, block: *BlockLayout) !void {
     }
     if (final_commands.len > 0) {
         self.allocator.free(final_commands);
+    }
+}
+
+fn writeBlockDebug(writer: *std.Io.Writer, block: *const BlockLayout, indent: usize) !void {
+    try writeIndent(writer, indent);
+    try writer.print(
+        "block x={d} y={d} width={d} height={d}\n",
+        .{ block.x.get().*, block.y.get().*, block.width.get().*, block.height.get().* },
+    );
+    for (block.children.items) |child| switch (child) {
+        .block => |nested| try writeBlockDebug(writer, nested, indent + 2),
+        .line => |line| try writeLineDebug(writer, line, indent + 2),
+    };
+}
+
+fn writeLineDebug(writer: *std.Io.Writer, line: *const LineLayout, indent: usize) !void {
+    try writeIndent(writer, indent);
+    try writer.print(
+        "line x={d} y={d} width={d} height={d}\n",
+        .{ line.x.get().*, line.y.get().*, line.width.get().*, line.height.get().* },
+    );
+    for (line.children.items) |text| {
+        try writeIndent(writer, indent + 2);
+        try writer.print(
+            "text {s} x={d} y={d} width={d} height={d}\n",
+            .{ text.word, text.x.get().*, text.y.get().*, text.width.get().*, text.height.get().* },
+        );
+    }
+}
+
+fn writeIndent(writer: *std.Io.Writer, indent: usize) !void {
+    var remaining = indent;
+    while (remaining > 0) : (remaining -= 1) try writer.writeByte(' ');
+}
+
+/// Serialize paint commands without compositing or rasterizing them. Pointer
+/// fields and pixel buffers are intentionally omitted so output is stable.
+pub fn writeDisplayListDebug(writer: *std.Io.Writer, items: []const DisplayItem) !void {
+    try writeDisplayItemsDebug(writer, items, 0);
+}
+
+fn writeDisplayItemsDebug(writer: *std.Io.Writer, items: []const DisplayItem, indent: usize) !void {
+    for (items) |item| {
+        try writeIndent(writer, indent);
+        switch (item) {
+            .glyph => |glyph| try writer.print("glyph x={d} y={d} width={d} height={d} color=#{x:0>2}{x:0>2}{x:0>2}{x:0>2}\n", .{ glyph.x, glyph.y, glyph.glyph.w, glyph.glyph.h, glyph.color.r, glyph.color.g, glyph.color.b, glyph.color.a }),
+            .rect => |rect| try writer.print("rect x1={d} y1={d} x2={d} y2={d} color=#{x:0>2}{x:0>2}{x:0>2}{x:0>2}\n", .{ rect.x1, rect.y1, rect.x2, rect.y2, rect.color.r, rect.color.g, rect.color.b, rect.color.a }),
+            .image => |image| try writer.print("image x1={d} y1={d} x2={d} y2={d} source_width={d} source_height={d} opacity={d}\n", .{ image.x1, image.y1, image.x2, image.y2, image.source_width, image.source_height, image.opacity }),
+            .iframe => |iframe| try writer.print("iframe left={d} top={d} right={d} bottom={d}\n", .{ iframe.rect.left, iframe.rect.top, iframe.rect.right, iframe.rect.bottom }),
+            .rounded_rect => |rect| try writer.print("rounded-rect x1={d} y1={d} x2={d} y2={d} radius={d} color=#{x:0>2}{x:0>2}{x:0>2}{x:0>2}\n", .{ rect.x1, rect.y1, rect.x2, rect.y2, rect.radius, rect.color.r, rect.color.g, rect.color.b, rect.color.a }),
+            .line => |line| try writer.print("line x1={d} y1={d} x2={d} y2={d} thickness={d} color=#{x:0>2}{x:0>2}{x:0>2}{x:0>2}\n", .{ line.x1, line.y1, line.x2, line.y2, line.thickness, line.color.r, line.color.g, line.color.b, line.color.a }),
+            .outline => |outline| try writer.print("outline left={d} top={d} right={d} bottom={d} thickness={d} color=#{x:0>2}{x:0>2}{x:0>2}{x:0>2}\n", .{ outline.rect.left, outline.rect.top, outline.rect.right, outline.rect.bottom, outline.thickness, outline.color.r, outline.color.g, outline.color.b, outline.color.a }),
+            .blend => |blend| {
+                try writer.print("blend opacity={d} mode={s}\n", .{ blend.opacity, blend.blend_mode orelse "normal" });
+                try writeDisplayItemsDebug(writer, blend.children, indent + 2);
+            },
+            .transform => |transform| {
+                try writer.print("transform x={d} y={d}\n", .{ transform.translate_x, transform.translate_y });
+                try writeDisplayItemsDebug(writer, transform.children, indent + 2);
+            },
+            .draw_composited_layer => try writer.writeAll("composited-layer\n"),
+        }
     }
 }
 

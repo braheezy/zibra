@@ -32,13 +32,14 @@ The source tree is organized by responsibility:
 
 | Area | Responsibility |
 | --- | --- |
-| [`src/main.zig`](../src/main.zig) | Executable entry point, CLI parsing, process arena, isolated DOM-dump mode, Browser construction, and screenshot mode. |
+| [`src/main.zig`](../src/main.zig) | Executable entry point, CLI parsing, process arena, isolated DOM/style/layout/display-list dumps, Browser construction, and screenshot mode. |
 | [`src/browser/root.zig`](../src/browser/root.zig) | Process-wide `Browser`, SDL event loop, navigation orchestration, fetch coordination, async host helpers, render commit, composition, raster, and draw. |
 | [`src/browser/tab.zig`](../src/browser/tab.zig) | `Tab` and `Frame` ownership, task serialization, history, frame lookup, accessibility, focus, and per-document state. |
 | [`src/browser/chrome.zig`](../src/browser/chrome.zig) | Browser chrome UI and its display data. |
 | [`src/browser/render/layout.zig`](../src/browser/render/layout.zig) | Layout tree, invalidation dependencies, hit-test collection, paint, and image layout. |
 | [`src/browser/render/font.zig`](../src/browser/render/font.zig) | Font discovery, SDL_ttf handles, glyph textures, and software glyph pixels. |
 | [`src/document/parser.zig`](../src/document/parser.zig) | HTML parser, DOM representation, style maps, images, and DOM tree utilities. |
+| [`src/document/inspection.zig`](../src/document/inspection.zig) | Browser-free fetch/decode/parse/style pipeline for document inspection commands. |
 | [`src/document/css_parser.zig`](../src/document/css_parser.zig) | CSS parsing and `CSSRule` ownership. |
 | [`src/document/selector.zig`](../src/document/selector.zig) | Selector representation and matching. |
 | [`src/network/url.zig`](../src/network/url.zig) | Owning `Url`, URL resolution, schemes, HTTP requests, redirects, cookies, and response bodies. |
@@ -737,3 +738,14 @@ Update this document whenever an unresolved contract is decided. Once a
 contract is enforced by types, ownership wrappers, joins, or assertions, move
 it from the risk registry to the resolved section and record the enforcement
 point.
+
+## Inspection pipeline boundaries
+
+The command-line inspection modes are deliberately narrower than an
+interactive browser run. `--dump-dom` fetches, decodes, and parses only.
+`--dump-style` additionally collects linked stylesheets and applies the
+cascade. `--dump-layout` initializes SDL_ttf font measurement without a
+window or renderer, then builds geometry while skipping interactive hit-test
+state. `--dump-display-list` extends that path through paint-command creation,
+but never enters compositing or rasterization. Keep these boundaries intact so
+each mode can isolate a failure to one stage of the browser pipeline.

@@ -1241,3 +1241,48 @@ pub fn treeToList(allocator: std.mem.Allocator, node: *Node, list: *std.ArrayLis
         },
     }
 }
+
+/// Write the DOM with its computed style values in a stable property order.
+/// This is intentionally separate from `writePretty`: callers can inspect the
+/// cascade without constructing layout, a renderer, or a JavaScript context.
+pub fn writeStyledPretty(
+    allocator: std.mem.Allocator,
+    writer: *std.Io.Writer,
+    node: Node,
+    indent: usize,
+) !void {
+    const spaces = try allocator.alloc(u8, indent);
+    defer allocator.free(spaces);
+    @memset(spaces, ' ');
+
+    const node_str = try node.asString(allocator);
+    defer allocator.free(node_str);
+    try writer.print("{s}{s}", .{ spaces, node_str });
+
+    const style_map: ?*const StyleMap = switch (node) {
+        .text => |text| if (text.style) |*styles| styles else null,
+        .element => |element| if (element.style) |*styles| styles else null,
+    };
+    if (style_map) |styles| {
+        try writer.writeAll(" [");
+        for (CSS_PROPERTIES, 0..) |prop, index| {
+            if (index != 0) try writer.writeAll("; ");
+            const value = if (styles.getPtr(prop.name)) |field|
+                field.get().*
+            else
+                prop.default_value;
+            try writer.print("{s}: {s}", .{ prop.name, value });
+        }
+        try writer.writeAll("]");
+    }
+    try writer.writeByte('\n');
+
+    switch (node) {
+        .text => {},
+        .element => |element| {
+            for (element.children.items) |child| {
+                try writeStyledPretty(allocator, writer, child, indent + 2);
+            }
+        },
+    }
+}

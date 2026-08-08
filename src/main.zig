@@ -12,6 +12,10 @@ const url_module = @import("network/url.zig");
 const Url = url_module.Url;
 const parser = @import("document/parser.zig");
 const HTMLParser = parser.HTMLParser;
+const inspection = @import("document/inspection.zig");
+const Layout = @import("browser/render/layout.zig").Layout;
+const DisplayItem = browser.DisplayItem;
+const sdl2 = @import("sdl");
 
 const default_html = @embedFile("assets/default.html");
 
@@ -81,6 +85,53 @@ fn dumpDom(init: std.process.Init, allocator: std.mem.Allocator, url: ?Url) !voi
     try stdout.flush();
 }
 
+const DumpMode = enum { dom, style, layout, display_list };
+
+fn dumpPipeline(
+    init: std.process.Init,
+    allocator: std.mem.Allocator,
+    url: ?Url,
+    mode: DumpMode,
+    rtl_text: bool,
+) !void {
+    var page = try inspection.Page.load(init, allocator, url);
+    defer page.deinit();
+
+    var stdout_buffer: [4096]u8 = undefined;
+    var stdout_writer = std.Io.File.stdout().writer(init.io, &stdout_buffer);
+    const stdout = &stdout_writer.interface;
+
+    if (mode == .style) {
+        try parser.writeStyledPretty(allocator, stdout, page.root, 0);
+        try stdout.flush();
+        return;
+    }
+
+    // SDL_ttf needs SDL's video subsystem for glyph surfaces on macOS, but the
+    // inspection path deliberately creates neither a window nor a renderer.
+    try sdl2.init(.{ .video = true });
+    defer sdl2.quit();
+    const layout = try Layout.init(allocator, init.io, init.environ_map, null, 800, 600, rtl_text);
+    defer layout.deinit();
+    layout.collect_hit_test_bounds = false;
+    const document = try layout.buildDocument(&page.root);
+    defer {
+        document.deinit();
+        allocator.destroy(document);
+    }
+
+    if (mode == .layout) {
+        try document.writeDebug(stdout);
+        try stdout.flush();
+        return;
+    }
+
+    const display_list = try layout.paintDocument(document);
+    defer DisplayItem.freeList(allocator, display_list);
+    try Layout.writeDisplayListDebug(stdout, display_list);
+    try stdout.flush();
+}
+
 fn zibra(init: std.process.Init) !void {
     const allocator = init.arena.allocator();
 
@@ -90,7 +141,7 @@ fn zibra(init: std.process.Init) !void {
     // Hold values, if provided
     var rtl_flag = false;
     var url: ?Url = null;
-    var dump_dom = false;
+    var dump_mode: ?DumpMode = null;
     var screenshot_path: ?[]const u8 = null;
 
     var arg_index: usize = 1;
@@ -101,7 +152,19 @@ fn zibra(init: std.process.Init) !void {
             continue;
         }
         if (std.mem.eql(u8, arg, "-t") or std.mem.eql(u8, arg, "--dump-dom")) {
-            dump_dom = true;
+            dump_mode = .dom;
+            continue;
+        }
+        if (std.mem.eql(u8, arg, "--dump-style")) {
+            dump_mode = .style;
+            continue;
+        }
+        if (std.mem.eql(u8, arg, "--dump-layout")) {
+            dump_mode = .layout;
+            continue;
+        }
+        if (std.mem.eql(u8, arg, "--dump-display-list")) {
+            dump_mode = .display_list;
             continue;
         }
         if (std.mem.eql(u8, arg, "--screenshot")) {
@@ -160,13 +223,17 @@ fn zibra(init: std.process.Init) !void {
 
     defer if (url) |u| u.free(allocator);
 
-    if (dump_dom and screenshot_path != null) {
-        std.log.err("--dump-dom and --screenshot cannot be used together.", .{});
+    if (dump_mode != null and screenshot_path != null) {
+        std.log.err("Dump commands and --screenshot cannot be used together.", .{});
         return error.BadArguments;
     }
 
-    if (dump_dom) {
-        try dumpDom(init, allocator, url);
+    if (dump_mode) |mode| {
+        if (mode == .dom) {
+            try dumpDom(init, allocator, url);
+        } else {
+            try dumpPipeline(init, allocator, url, mode, rtl_flag);
+        }
         return;
     }
 
