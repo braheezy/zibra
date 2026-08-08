@@ -9,6 +9,23 @@ const std = @import("std");
 
 const ada = @import("ada");
 
+const user_agent = "Zibra/0.0.0";
+
+fn requestOptions(
+    redirect_behavior: std.http.Client.Request.RedirectBehavior,
+    extra_headers: []const std.http.Header,
+) std.http.Client.RequestOptions {
+    return .{
+        .version = .@"HTTP/1.1",
+        .keep_alive = false,
+        .redirect_behavior = redirect_behavior,
+        .headers = .{
+            .user_agent = .{ .override = user_agent },
+        },
+        .extra_headers = extra_headers,
+    };
+}
+
 pub const SameSiteMode = enum { none, lax };
 
 pub const CookieEntry = struct {
@@ -402,9 +419,10 @@ pub const Url = struct {
         const method_str = if (payload != null) "POST" else "GET";
         std.log.info("{s} {s}", .{ method_str, url_str });
 
-        // Build the outgoing header list (Content-Type + Cookie when available)
-        var header_storage: [2]std.http.Header = undefined;
-        var header_count: usize = 0;
+        // Keep optional headers in a growable list so adding another request
+        // header does not require resizing and manually indexing fixed storage.
+        var extra_headers: std.ArrayList(std.http.Header) = .empty;
+        defer extra_headers.deinit(al);
         const method: std.http.Method = if (payload != null) .POST else .GET;
 
         if (self.host) |host_slice| {
@@ -421,27 +439,20 @@ pub const Url = struct {
                 }
 
                 if (allow_cookie) {
-                    header_storage[header_count] = .{
+                    try extra_headers.append(al, .{
                         .name = "Cookie",
                         .value = entry.value,
-                    };
-                    header_count += 1;
+                    });
                 }
             }
         }
 
         if (payload != null) {
-            header_storage[header_count] = .{
+            try extra_headers.append(al, .{
                 .name = "Content-Type",
                 .value = "application/x-www-form-urlencoded",
-            };
-            header_count += 1;
+            });
         }
-
-        const extra_headers = if (header_count == 0)
-            &[_]std.http.Header{}
-        else
-            header_storage[0..header_count];
 
         const RedirectBehavior = std.http.Client.Request.RedirectBehavior;
         const redirect_behavior: RedirectBehavior = if (payload == null)
@@ -458,10 +469,11 @@ pub const Url = struct {
         var redirect_buffer: [8 * 1024]u8 = undefined;
 
         request_loop: while (attempt < max_attempts) : (attempt += 1) {
-            var req = try http_client.request(method, uri, .{
-                .redirect_behavior = redirect_behavior,
-                .extra_headers = extra_headers,
-            });
+            var req = try http_client.request(
+                method,
+                uri,
+                requestOptions(redirect_behavior, extra_headers.items),
+            );
             defer req.deinit();
 
             if (payload) |body_payload| {
@@ -764,4 +776,21 @@ test "http request" {
     try expect(std.mem.eql(u8, url.path, "/"));
     try expect(url.port == 80);
     try expect(!url.is_https);
+}
+
+test "HTTP requests identify Zibra and close HTTP/1.1 connections" {
+    const headers = [_]std.http.Header{
+        .{ .name = "X-Zibra-Test", .value = "present" },
+    };
+    const options = requestOptions(.unhandled, &headers);
+
+    try std.testing.expectEqual(std.http.Version.@"HTTP/1.1", options.version);
+    try expect(!options.keep_alive);
+    try std.testing.expectEqualStrings(
+        user_agent,
+        options.headers.user_agent.override,
+    );
+    try std.testing.expectEqual(@as(usize, 1), options.extra_headers.len);
+    try std.testing.expectEqualStrings("X-Zibra-Test", options.extra_headers[0].name);
+    try std.testing.expectEqualStrings("present", options.extra_headers[0].value);
 }
