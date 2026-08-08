@@ -267,6 +267,14 @@ The process main thread owns the SDL event loop and browser composition,
 raster, and draw phases. It also handles chrome, window events, screenshot
 output, and some direct reads or updates of active `Tab`/`Frame` state.
 
+Window resizing preserves that ownership boundary. The main thread allocates a
+complete replacement generation of the root/chrome/tab z2d surfaces and SDL
+texture before retiring the live generation, updates chrome geometry, and then
+queues viewport snapshots to each tab. Obsolete drag-resize snapshots are
+discarded by generation. A tab worker updates its root-frame viewport, marks
+every frame layout dirty, re-clamps scroll, and requests the active tab's next
+animation frame; it does not mutate native render targets.
+
 ### Tab worker
 
 Each `TaskRunner` in [`src/runtime/task.zig`](../src/runtime/task.zig) owns a

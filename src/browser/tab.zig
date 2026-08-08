@@ -519,6 +519,7 @@ allocator: std.mem.Allocator,
 browser: *Browser,
 accessibility: AccessibilitySettings = .{},
 // Available height for tab content (window height minus chrome height)
+tab_width: i32 = 0,
 tab_height: i32 = 0,
 // History of visited URLs (owns Url pointers)
 history: std.ArrayList(*Url),
@@ -562,11 +563,12 @@ accessibility_highlight: ?*AccessibilityNode = null,
 // Owned strings for accessibility names/labels
 accessibility_strings: std.ArrayList([]const u8),
 
-pub fn init(allocator: std.mem.Allocator, tab_height: i32, measure: *MeasureTime) Tab {
+pub fn init(allocator: std.mem.Allocator, tab_width: i32, tab_height: i32, measure: *MeasureTime) Tab {
     return Tab{
         .allocator = allocator,
         .browser = undefined,
         .accessibility = .{ .dark_palette = .{} },
+        .tab_width = tab_width,
         .tab_height = tab_height,
         .history = std.ArrayList(*Url).empty,
         .dynamic_texts = std.ArrayList([]const u8).empty,
@@ -619,6 +621,37 @@ fn markFrameLayoutDirty(frame: *Frame) void {
     for (frame.children.items) |child| {
         markFrameLayoutDirty(child);
     }
+}
+
+fn invalidateFrameTreeForViewportResize(frame: *Frame) void {
+    if (frame.document_layout) |doc| {
+        doc.mark();
+    }
+    for (frame.children.items) |child| {
+        invalidateFrameTreeForViewportResize(child);
+    }
+}
+
+/// Apply a native viewport change on the tab worker. The next animation frame
+/// performs layout and paint using the new root-frame dimensions.
+pub fn resizeViewport(self: *Tab, width: i32, height: i32) void {
+    self.tab_width = @max(width, 1);
+    self.tab_height = @max(height, 0);
+
+    if (self.root_frame) |frame| {
+        frame.viewport_width = self.tab_width;
+        frame.viewport_height = self.tab_height;
+        invalidateFrameTreeForViewportResize(frame);
+
+        const clamped_scroll = self.clampScrollForFrame(frame, frame.scroll);
+        if (clamped_scroll != frame.scroll) {
+            frame.scroll = clamped_scroll;
+            self.scroll_changed_in_tab = true;
+        }
+    }
+
+    self.needs_layout = true;
+    self.needs_paint = true;
 }
 
 pub fn adjustZoom(self: *Tab, delta: f32) void {
@@ -890,9 +923,20 @@ fn refreshFocusState(self: *Tab) !void {
 pub fn clampScrollForFrame(self: *Tab, frame: *Frame, scroll: i32) i32 {
     const zoom = if (self.accessibility.zoom > 0) self.accessibility.zoom else 1.0;
     const viewport_height = if (frame.viewport_height > 0) frame.viewport_height else self.tab_height;
-    const visible_height = if (zoom == 1.0) viewport_height else @as(i32, @intFromFloat(@as(f32, @floatFromInt(viewport_height)) / zoom));
-    const height_delta = frame.content_height - visible_height;
-    const maxscroll = if (height_delta > 0) height_delta else 0;
+    return clampScrollOffset(scroll, frame.content_height, viewport_height, zoom);
+}
+
+/// Clamp a CSS-pixel scroll offset to the document range visible at `zoom`.
+pub fn clampScrollOffset(scroll: i32, content_height: i32, viewport_height: i32, zoom: f32) i32 {
+    const effective_zoom = if (zoom > 0) zoom else 1.0;
+    const safe_viewport_height = @max(viewport_height, 0);
+    const visible_height_float = @as(f64, @floatFromInt(safe_viewport_height)) / @as(f64, effective_zoom);
+    const visible_height: i32 = if (!(visible_height_float < @as(f64, @floatFromInt(std.math.maxInt(i32)))))
+        std.math.maxInt(i32)
+    else
+        @intFromFloat(visible_height_float);
+    const height_delta = @as(i64, content_height) - @as(i64, visible_height);
+    const maxscroll: i32 = @intCast(std.math.clamp(height_delta, 0, std.math.maxInt(i32)));
     if (scroll < 0) return 0;
     if (scroll > maxscroll) return maxscroll;
     return scroll;
@@ -1750,7 +1794,7 @@ pub fn backspace(self: *Tab, b: *Browser) !void {
     }
 }
 
-pub fn buildAccessibilityTree(self: *Tab, b: *Browser) !void {
+pub fn buildAccessibilityTree(self: *Tab) !void {
     const previous_root = self.accessibility_root;
     self.accessibility_root = null;
 
@@ -1808,7 +1852,7 @@ pub fn buildAccessibilityTree(self: *Tab, b: *Browser) !void {
     const root_bounds = Bounds{
         .x = 0,
         .y = 0,
-        .width = b.layout_engine.window_width,
+        .width = self.tab_width,
         .height = frame.content_height,
     };
     const root_name = try self.copyAccessibilityString("document");

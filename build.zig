@@ -99,6 +99,11 @@ pub fn build(b: *std.Build) !void {
         .target = target,
         .optimize = optimize,
     });
+    test_module.addImport("sdl", sdl_mod);
+    test_module.addImport("known-folders", known_folders);
+    test_module.addImport("grapheme", zg.module("Graphemes"));
+    test_module.addImport("code_point", zg.module("code_point"));
+    test_module.addImport("z2d", z2d_dep.module("z2d"));
     test_module.addImport("kiesel", kiesel_dep.module("kiesel"));
     test_module.addImport("bdwgc", bdwgc_dep.module("bdwgc"));
     test_module.addImport("zigimg", zigimg_dep.module("zigimg"));

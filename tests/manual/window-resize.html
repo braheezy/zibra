@@ -1,0 +1,25 @@
+<!--
+How to verify: open this page, scroll to the bottom, then repeatedly make the
+window narrower and wider. The sentence must rewrap, the green marker must
+move vertically with it, the address bar must keep spanning the window, and
+the scrollbar must remain within its valid range without stale pixels.
+-->
+<!doctype html>
+<html>
+  <head>
+    <title>Window resize regression</title>
+    <style>
+      body { margin: 16px; font-size: 20px; }
+      .copy { background-color: #e8f0ff; }
+      .marker { background-color: #78d89a; height: 48px; }
+      .spacer { height: 900px; }
+    </style>
+  </head>
+  <body>
+    <h1>Resize regression</h1>
+    <p class="copy">This deliberately long sentence must occupy more lines as the window becomes narrow and fewer lines as the window becomes wide, proving that layout uses the current viewport width.</p>
+    <div class="marker">This marker moves when the paragraph reflows.</div>
+    <div class="spacer">Scroll near the bottom before resizing vertically.</div>
+    <p>Bottom of the document</p>
+  </body>
+</html>

@@ -84,6 +84,57 @@ pub fn wheelScrollDelta(delta_y: i32, is_flipped: bool) i32 {
     ));
 }
 
+/// Native and content-surface dimensions derived from an SDL resize event.
+pub const ResizeGeometry = struct {
+    window_width: i32,
+    window_height: i32,
+    tab_viewport_height: i32,
+    tab_surface_height: ?i32,
+};
+
+const ResizeTargets = struct {
+    root_surface: z2d.Surface,
+    chrome_surface: z2d.Surface,
+    tab_surface: ?z2d.Surface,
+    cached_texture: sdl2.Texture,
+};
+
+/// Validate a native window size and derive the dependent tab target sizes.
+pub fn resizeGeometry(
+    window_width: i32,
+    window_height: i32,
+    chrome_height: i32,
+    content_height: i32,
+    zoom: f32,
+    has_tab_surface: bool,
+) ?ResizeGeometry {
+    if (window_width <= 0 or window_height <= 0) return null;
+
+    const viewport_delta = @as(i64, window_height) - @as(i64, chrome_height);
+    const viewport_height: i32 = @intCast(std.math.clamp(
+        viewport_delta,
+        0,
+        std.math.maxInt(i32),
+    ));
+    const effective_zoom = if (zoom > 0) zoom else 1.0;
+    const safe_content_height = @max(content_height, 0);
+    const scaled_height = @as(f64, @floatFromInt(safe_content_height)) * @as(f64, effective_zoom);
+    const scaled_content_height: i32 = if (!(scaled_height < @as(f64, @floatFromInt(std.math.maxInt(i32)))))
+        std.math.maxInt(i32)
+    else
+        @intFromFloat(scaled_height);
+
+    return .{
+        .window_width = window_width,
+        .window_height = window_height,
+        .tab_viewport_height = viewport_height,
+        .tab_surface_height = if (has_tab_surface)
+            @max(@max(scaled_content_height, viewport_height), 1)
+        else
+            null,
+    };
+}
+
 const WindowPos = struct {
     x: c_int,
     y: c_int,
@@ -534,6 +585,7 @@ pub const Browser = struct {
     needs_draw: bool = true,
     needs_animation_frame: bool = false,
     shutting_down: bool = false,
+    resize_generation: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
     measure: MeasureTime,
     lock: Mutex,
     active_tab_url: ?[]u8 = null,
@@ -581,7 +633,7 @@ pub const Browser = struct {
             window_y,
             initial_window_width,
             initial_window_height,
-            .{ .vis = window_visibility }, // Not resizable
+            .{ .vis = window_visibility, .resizable = true },
         );
         errdefer screen.destroy();
         if (!hidden) {
@@ -653,6 +705,10 @@ pub const Browser = struct {
 
         var chrome = try Chrome.init(&layout_engine.font_manager, initial_window_width, al);
         errdefer chrome.deinit();
+        screen.setMinimumSize(
+            chrome.address_rect.left + chrome.padding + 1,
+            chrome.bottom + 1,
+        );
 
         browser.* = Browser{
             .allocator = al,
@@ -838,9 +894,9 @@ pub const Browser = struct {
 
     // Create a new tab and load a URL into it
     pub fn newTab(self: *Browser, url: Url) !void {
-        const tab_height = self.window_height - self.chrome.bottom;
+        const tab_height = @max(self.window_height - self.chrome.bottom, 0);
         const tab = try self.allocator.create(Tab);
-        tab.* = Tab.init(self.allocator, tab_height, &self.measure);
+        tab.* = Tab.init(self.allocator, self.window_width, tab_height, &self.measure);
         var tab_adopted = false;
         errdefer if (!tab_adopted) {
             tab.deinit();
@@ -1036,55 +1092,118 @@ pub const Browser = struct {
     pub fn handleWindowEvent(self: *Browser, window_event: sdl2.WindowEvent) !void {
         switch (window_event.type) {
             .resized, .size_changed => |size| {
-                // Adjust renderer viewport to match new window size
+                self.lock.lock();
+                const active_tab_height = self.active_tab_height;
+                const active_tab_zoom = self.activeZoom();
+                self.lock.unlock();
+                const geometry = resizeGeometry(
+                    size.width,
+                    size.height,
+                    self.chrome.bottom,
+                    active_tab_height,
+                    active_tab_zoom,
+                    self.tab_surface != null,
+                ) orelse return;
+                if (geometry.window_width == self.window_width and
+                    geometry.window_height == self.window_height)
+                {
+                    return;
+                }
+
                 try self.canvas.setViewport(null);
+                const targets = try self.createResizeTargets(geometry);
+                self.installResizeTargets(targets);
 
-                self.window_width = size.width;
-                self.window_height = size.height;
+                self.lock.lock();
+                self.window_width = geometry.window_width;
+                self.window_height = geometry.window_height;
+                self.needs_composite = true;
+                self.needs_raster = true;
+                self.needs_draw = true;
+                self.lock.unlock();
+                self.chrome.resize(geometry.window_width);
 
-                // Update layout engine's window dimensions
-                self.layout_engine.window_width = size.width;
-                self.layout_engine.window_height = size.height;
-
-                // Recreate z2d surfaces with new dimensions
-                self.context.deinit();
-                self.root_surface.deinit(self.allocator);
-                self.root_surface = try z2d.Surface.init(.image_surface_rgba, self.allocator, size.width, size.height);
-                self.context = z2d.Context.init(self.io, self.allocator, &self.root_surface);
-
-                // Recreate chrome surface with new width
-                self.chrome_surface.deinit(self.allocator);
-                self.chrome_surface = try z2d.Surface.init(.image_surface_rgba, self.allocator, size.width, @intCast(self.chrome.bottom));
-
-                // Recreate tab surface if it exists
-                if (self.tab_surface) |*tab_surface| {
-                    const tab_height = tab_surface.getHeight();
-                    tab_surface.deinit(self.allocator);
-                    self.tab_surface = try z2d.Surface.init(.image_surface_rgba, self.allocator, size.width, tab_height);
+                const generation = self.resize_generation.fetchAdd(1, .seq_cst) +% 1;
+                for (self.tabs.items) |tab| {
+                    self.scheduleTabResizeTask(
+                        tab,
+                        geometry.window_width,
+                        geometry.tab_viewport_height,
+                        generation,
+                    );
                 }
 
-                // Recreate cached SDL texture with new dimensions
-                if (self.cached_texture) |tex| {
-                    tex.destroy();
-                }
-                // Use ABGR8888 to match z2d's RGBA memory layout
-                self.cached_texture = try sdl2.createTexture(
-                    self.canvas,
-                    .abgr8888,
-                    .streaming,
-                    @intCast(size.width),
-                    @intCast(size.height),
-                );
-                try self.cached_texture.?.setBlendMode(.blend);
-
-                // Force re-raster and redraw
-                try self.canvas.setColor(.{ .r = 255, .g = 255, .b = 255, .a = 255 });
-                try self.canvas.clear();
+                // Draw the previous display list at the new native size while
+                // the tab worker prepares the reflowed replacement.
                 self.setNeedsCompositeRasterDraw();
-                try self.compositeRasterAndDraw();
             },
             else => {},
         }
+    }
+
+    /// Allocate a complete replacement generation before retiring any live
+    /// SDL or z2d target. An allocation failure therefore leaves the current
+    /// render generation usable.
+    fn createResizeTargets(self: *Browser, geometry: ResizeGeometry) !ResizeTargets {
+        var root_surface = try z2d.Surface.init(
+            .image_surface_rgba,
+            self.allocator,
+            geometry.window_width,
+            geometry.window_height,
+        );
+        errdefer root_surface.deinit(self.allocator);
+
+        var chrome_surface = try z2d.Surface.init(
+            .image_surface_rgba,
+            self.allocator,
+            geometry.window_width,
+            @max(self.chrome.bottom, 1),
+        );
+        errdefer chrome_surface.deinit(self.allocator);
+
+        var tab_surface: ?z2d.Surface = null;
+        errdefer if (tab_surface) |*surface| surface.deinit(self.allocator);
+        if (geometry.tab_surface_height) |height| {
+            tab_surface = try z2d.Surface.init(
+                .image_surface_rgba,
+                self.allocator,
+                geometry.window_width,
+                height,
+            );
+        }
+
+        const cached_texture = try sdl2.createTexture(
+            self.canvas,
+            .abgr8888,
+            .streaming,
+            @intCast(geometry.window_width),
+            @intCast(geometry.window_height),
+        );
+        errdefer cached_texture.destroy();
+        try cached_texture.setBlendMode(.blend);
+
+        return .{
+            .root_surface = root_surface,
+            .chrome_surface = chrome_surface,
+            .tab_surface = tab_surface,
+            .cached_texture = cached_texture,
+        };
+    }
+
+    fn installResizeTargets(self: *Browser, targets: ResizeTargets) void {
+        self.context.deinit();
+        self.root_surface.deinit(self.allocator);
+        self.root_surface = targets.root_surface;
+        self.context = z2d.Context.init(self.io, self.allocator, &self.root_surface);
+
+        self.chrome_surface.deinit(self.allocator);
+        self.chrome_surface = targets.chrome_surface;
+
+        if (self.tab_surface) |*surface| surface.deinit(self.allocator);
+        self.tab_surface = targets.tab_surface;
+
+        if (self.cached_texture) |texture| texture.destroy();
+        self.cached_texture = targets.cached_texture;
     }
 
     fn handleKeyEvent(self: *Browser, key: sdl2.Keycode, modifiers: sdl2.KeyModifierSet) !void {
@@ -1444,6 +1563,36 @@ pub const Browser = struct {
         };
     }
 
+    fn scheduleTabResizeTask(
+        self: *Browser,
+        tab: *Tab,
+        width: i32,
+        height: i32,
+        generation: u64,
+    ) void {
+        const ctx = TabResizeTaskContext.create(
+            self.allocator,
+            self,
+            tab,
+            width,
+            height,
+            generation,
+        ) catch |err| {
+            std.log.err("Failed to allocate tab resize task: {}", .{err});
+            return;
+        };
+        const task_instance = Task.init(
+            ctx.toOpaque(),
+            TabResizeTaskContext.runOpaque,
+            TabResizeTaskContext.cleanupOpaque,
+        );
+        tab.task_runner.schedule(task_instance) catch |err| {
+            std.log.err("Failed to schedule tab resize: {}", .{err});
+            ctx.destroy();
+            return;
+        };
+    }
+
     // Update the scroll offset
     pub fn fetchBody(self: *Browser, url: Url, referrer: ?Url, payload: ?[]const u8) !url_module.HttpResponse {
         self.http_client_mutex.lock();
@@ -1565,6 +1714,7 @@ pub const Browser = struct {
         frame.* = Frame.init(tab.allocator, tab, null, null);
         tab.root_frame = frame;
         tab.registerFrame(frame);
+        frame.viewport_width = tab.tab_width;
         frame.viewport_height = tab.tab_height;
         tab.focused_frame = frame;
 
@@ -2977,14 +3127,14 @@ pub const Browser = struct {
             self.layout_engine.window_height = saved_window_height;
         }
         if (frame.parent != null and frame.viewport_width > 0) {
-            self.layout_engine.window_width = self.scalePx(frame.viewport_width);
+            self.layout_engine.window_width = self.scalePxWithZoom(frame.viewport_width, frame.tab.accessibility.zoom);
         } else {
-            self.layout_engine.window_width = self.window_width;
+            self.layout_engine.window_width = frame.tab.tab_width;
         }
         if (frame.parent != null and frame.viewport_height > 0) {
-            self.layout_engine.window_height = self.scalePx(frame.viewport_height);
+            self.layout_engine.window_height = self.scalePxWithZoom(frame.viewport_height, frame.tab.accessibility.zoom);
         } else {
-            self.layout_engine.window_height = self.window_height;
+            self.layout_engine.window_height = frame.tab.tab_height;
         }
 
         const scheme_dark = self.layout_engine.resolveColorScheme("light dark");
@@ -3004,7 +3154,6 @@ pub const Browser = struct {
                 did_layout = true;
             }
         }
-
         // Repaint if layout ran or paint was requested
         if (did_layout or force_paint) {
             // Paint the document to produce draw commands
@@ -3055,7 +3204,7 @@ pub const Browser = struct {
         // Update content height from the layout engine
         frame.content_height = self.layout_engine.content_height;
 
-        frame.tab.buildAccessibilityTree(self) catch |err| {
+        frame.tab.buildAccessibilityTree() catch |err| {
             std.log.warn("Failed to build accessibility tree: {}", .{err});
         };
     }
@@ -3506,13 +3655,20 @@ pub const Browser = struct {
         if (self.active_tab_display_list == null) return;
 
         const scaled_height = self.scalePx(self.active_tab_height);
-        const tab_height = @max(scaled_height, self.window_height - self.chrome.bottom);
+        const tab_height = @max(@max(scaled_height, self.window_height - self.chrome.bottom), 1);
 
         if (self.tab_surface) |*existing_surface| {
+            const current_width = existing_surface.getWidth();
             const current_height = existing_surface.getHeight();
-            if (current_height != tab_height) {
+            if (current_width != self.window_width or current_height != tab_height) {
+                const replacement = try z2d.Surface.init(
+                    .image_surface_rgba,
+                    self.allocator,
+                    self.window_width,
+                    tab_height,
+                );
                 existing_surface.deinit(self.allocator);
-                self.tab_surface = try z2d.Surface.init(.image_surface_rgba, self.allocator, self.window_width, tab_height);
+                self.tab_surface = replacement;
             }
         } else {
             self.tab_surface = try z2d.Surface.init(.image_surface_rgba, self.allocator, self.window_width, tab_height);
@@ -5485,6 +5641,65 @@ const TabClearFocusTaskContext = struct {
 
     fn cleanupOpaque(context: *anyopaque) void {
         TabClearFocusTaskContext.fromOpaque(context).destroy();
+    }
+};
+
+const TabResizeTaskContext = struct {
+    allocator: std.mem.Allocator,
+    browser: *Browser,
+    tab: *Tab,
+    width: i32,
+    height: i32,
+    generation: u64,
+
+    fn create(
+        allocator: std.mem.Allocator,
+        browser: *Browser,
+        tab: *Tab,
+        width: i32,
+        height: i32,
+        generation: u64,
+    ) !*TabResizeTaskContext {
+        const ctx = try allocator.create(TabResizeTaskContext);
+        ctx.* = .{
+            .allocator = allocator,
+            .browser = browser,
+            .tab = tab,
+            .width = width,
+            .height = height,
+            .generation = generation,
+        };
+        return ctx;
+    }
+
+    fn destroy(self: *TabResizeTaskContext) void {
+        self.allocator.destroy(self);
+    }
+
+    fn run(self: *TabResizeTaskContext) void {
+        if (self.tab.isShuttingDown()) return;
+        if (self.generation != self.browser.resize_generation.load(.seq_cst)) return;
+
+        self.tab.resizeViewport(self.width, self.height);
+        self.browser.setNeedsAnimationFrame(self.tab);
+        self.browser.scheduleAnimationFrame();
+    }
+
+    fn toOpaque(self: *TabResizeTaskContext) *anyopaque {
+        return @ptrCast(self);
+    }
+
+    fn fromOpaque(context: *anyopaque) *TabResizeTaskContext {
+        const raw: *align(1) TabResizeTaskContext = @ptrCast(context);
+        return @alignCast(raw);
+    }
+
+    fn runOpaque(context: *anyopaque) anyerror!void {
+        TabResizeTaskContext.fromOpaque(context).run();
+    }
+
+    fn cleanupOpaque(context: *anyopaque) void {
+        TabResizeTaskContext.fromOpaque(context).destroy();
     }
 };
 

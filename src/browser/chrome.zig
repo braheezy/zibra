@@ -101,6 +101,14 @@ pub fn deinit(self: *Chrome) void {
     self.address_bar.deinit(self.allocator);
 }
 
+/// Update chrome geometry that depends on the native window width.
+pub fn resize(self: *Chrome, window_width: i32) void {
+    self.address_rect.right = @max(
+        self.address_rect.left,
+        window_width - self.padding,
+    );
+}
+
 fn tabRect(self: *const Chrome, i: usize) Rect {
     const tabs_start = self.newtab_rect.right + self.padding;
     const tab_width = 100; // Approximate width for "Tab X"
