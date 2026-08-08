@@ -1,0 +1,59 @@
+# Worktree workflow for parallel, named Zibra changes.
+#
+# Bootstrap once on macOS:
+#   brew install worktrunk
+#   wt config shell install
+#
+# Task cannot change the invoking terminal's directory, so commands that need
+# to operate inside a worktree use `wt switch --execute` instead.
+version: '3'
+
+tasks:
+  worktree:new:
+    desc: Create a named branch and Worktrunk-managed worktree
+    requires:
+      vars: [BRANCH]
+    cmds:
+      - wt switch --create --no-cd "{{.BRANCH}}"
+
+  worktree:status:
+    desc: Show the named worktree's branch and working-tree state
+    requires:
+      vars: [BRANCH]
+    cmds:
+      - wt switch --no-cd --execute git "{{.BRANCH}}" -- status --short --branch
+
+  worktree:commit:
+    desc: Stage all worktree changes and commit them with MSG
+    requires:
+      vars: [BRANCH, MSG]
+    cmds:
+      - wt switch --no-cd --execute git "{{.BRANCH}}" -- add --all
+      - wt switch --no-cd --execute git "{{.BRANCH}}" -- commit -m "{{.MSG}}"
+
+  worktree:push:
+    desc: Push a named branch and configure origin as its upstream
+    requires:
+      vars: [BRANCH]
+    cmds:
+      - wt switch --no-cd --execute git "{{.BRANCH}}" -- push --set-upstream origin "{{.BRANCH}}"
+
+  worktree:remove:
+    desc: Remove an integrated named worktree and delete its merged branch
+    requires:
+      vars: [BRANCH]
+    cmds:
+      - wt remove --foreground --reap "{{.BRANCH}}"
+
+  worktree:discard:
+    desc: Irreversibly remove a dirty/unmerged named worktree and branch
+    requires:
+      vars: [BRANCH]
+    prompt: This discards uncommitted work and unmerged commits for {{.BRANCH}}. Continue?
+    cmds:
+      - wt remove --foreground --reap --force --force-delete "{{.BRANCH}}"
+
+  worktree:list:
+    desc: List Worktrunk-managed worktrees and their status
+    cmds:
+      - wt list
