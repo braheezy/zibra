@@ -71,6 +71,47 @@ pub fn decodeUtf8Replace(allocator: std.mem.Allocator, input: []const u8) ![]u8 
     return output.toOwnedSlice(allocator);
 }
 
+fn percentByte(input: []const u8) ?u8 {
+    return std.fmt.parseInt(u8, input, 16) catch null;
+}
+
+/// Decode valid percent escapes while preserving malformed escapes verbatim.
+/// The returned buffer is owned by `allocator`.
+fn percentDecodeAlloc(allocator: std.mem.Allocator, input: []const u8) ![]u8 {
+    var decoded_len: usize = 0;
+    var input_index: usize = 0;
+    while (input_index < input.len) {
+        if (input_index + 2 < input.len and input[input_index] == '%' and
+            percentByte(input[input_index + 1 .. input_index + 3]) != null)
+        {
+            input_index += 3;
+        } else {
+            input_index += 1;
+        }
+        decoded_len += 1;
+    }
+
+    const decoded = try allocator.alloc(u8, decoded_len);
+    errdefer allocator.free(decoded);
+
+    input_index = 0;
+    var output_index: usize = 0;
+    while (input_index < input.len) : (output_index += 1) {
+        if (input_index + 2 < input.len and input[input_index] == '%') {
+            if (percentByte(input[input_index + 1 .. input_index + 3])) |byte| {
+                decoded[output_index] = byte;
+                input_index += 3;
+                continue;
+            }
+        }
+
+        decoded[output_index] = input[input_index];
+        input_index += 1;
+    }
+
+    return decoded;
+}
+
 // Note: Connection handling is now done by std.http.Client
 // which handles both HTTP and HTTPS automatically with TLS support
 
@@ -177,17 +218,19 @@ pub const Url = struct {
             errdefer allocator.free(mime_type_alloc);
             @memcpy(mime_type_alloc, mime_type);
 
+            const percent_decoded = try percentDecodeAlloc(allocator, data);
+            errdefer allocator.free(percent_decoded);
+
             const data_alloc = if (is_base64) blk: {
                 const decoder = &std.base64.standard.Decoder;
-                const decoded_len = try decoder.calcSizeForSlice(data);
+                const decoded_len = try decoder.calcSizeForSlice(percent_decoded);
                 const decoded = try allocator.alloc(u8, decoded_len);
                 errdefer allocator.free(decoded);
-                try decoder.decode(decoded, data);
+                try decoder.decode(decoded, percent_decoded);
+                allocator.free(percent_decoded);
                 break :blk decoded;
             } else blk: {
-                const copy = try allocator.alloc(u8, data.len);
-                @memcpy(copy, data);
-                break :blk copy;
+                break :blk percent_decoded;
             };
             errdefer allocator.free(data_alloc);
 
@@ -701,8 +744,17 @@ test "data request" {
     const url = try Url.init(std.testing.allocator, "data:text/html,Hello%20World!");
     defer url.free(std.testing.allocator);
     try expect(std.mem.eql(u8, url.scheme, "data"));
-    try expect(std.mem.eql(u8, url.path, "Hello%20World!"));
+    try expect(std.mem.eql(u8, url.path, "Hello World!"));
     try expect(std.mem.eql(u8, url.mime_type.?, "text/html"));
+}
+
+test "data request supports the literal browser engineering exercise" {
+    const url = try Url.init(std.testing.allocator, "data:text/html,Hello world!");
+    defer url.free(std.testing.allocator);
+
+    try expect(std.mem.eql(u8, url.scheme, "data"));
+    try expect(std.mem.eql(u8, url.mime_type.?, "text/html"));
+    try expect(std.mem.eql(u8, url.path, "Hello world!"));
 }
 
 test "data request with attributes" {
@@ -714,6 +766,13 @@ test "data request with attributes" {
     try expect(url.attributes.?.items.len == 2);
     try expect(std.mem.eql(u8, url.attributes.?.items[0], "charset=utf-8"));
     try expect(std.mem.eql(u8, url.attributes.?.items[1], "base64"));
+}
+
+test "data request percent-decodes before base64 decoding" {
+    const url = try Url.init(std.testing.allocator, "data:text/plain;base64,SGVsbG8%3D");
+    defer url.free(std.testing.allocator);
+
+    try expect(std.mem.eql(u8, url.path, "Hello"));
 }
 
 test "fetchBody handles data URLs without Browser state" {
@@ -734,7 +793,7 @@ test "fetchBody handles data URLs without Browser state" {
         null,
         null,
     );
-    try expect(std.mem.eql(u8, response.body, "isolated%20document"));
+    try expect(std.mem.eql(u8, response.body, "isolated document"));
     try expect(response.csp_header == null);
 }
 
