@@ -1447,6 +1447,28 @@ pub const Browser = struct {
         );
     }
 
+    fn fetchBodyForNavigation(
+        self: *Browser,
+        url: Url,
+        referrer: ?Url,
+        payload: ?[]const u8,
+        final_url: *?Url,
+    ) !url_module.HttpResponse {
+        self.http_client_mutex.lock();
+        defer self.http_client_mutex.unlock();
+
+        return url_module.Url.fetchBodyWithFinalUrl(
+            self.allocator,
+            self.io,
+            &self.http_client,
+            &self.cookie_jar,
+            url,
+            referrer,
+            payload,
+            final_url,
+        );
+    }
+
     fn attachJsCallbacks(
         self: *Browser,
         tab: *Tab,
@@ -1501,7 +1523,14 @@ pub const Browser = struct {
 
         // Fetch and decode while the old document still owns the referrer and
         // remains usable if navigation fails before commit.
-        const response = try self.fetchBody(url.*, referrer_value, payload);
+        var final_url: ?Url = null;
+        errdefer if (final_url) |resolved| resolved.free(self.allocator);
+        const response = try self.fetchBodyForNavigation(url.*, referrer_value, payload, &final_url);
+        if (final_url) |resolved| {
+            url.*.free(self.allocator);
+            url.* = resolved;
+            final_url = null;
+        }
         defer if (response.csp_header) |hdr| self.allocator.free(hdr);
         const raw_body = response.body;
         const body_owned = !std.mem.eql(u8, url.*.scheme, "about") and !std.mem.eql(u8, url.*.scheme, "data");

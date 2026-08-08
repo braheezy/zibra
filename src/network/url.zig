@@ -10,6 +10,7 @@ const std = @import("std");
 const ada = @import("ada");
 
 const user_agent = "Zibra/0.0.0";
+const redirect_limit: u16 = 3;
 
 fn requestOptions(
     redirect_behavior: std.http.Client.Request.RedirectBehavior,
@@ -422,6 +423,35 @@ pub const Url = struct {
         referrer: ?Url,
         payload: ?[]const u8,
     ) !HttpResponse {
+        return fetchBodyInternal(allocator, io, http_client, cookie_jar, url, referrer, payload, null);
+    }
+
+    /// Fetch a URL and, for HTTP(S), return the final URL after redirects.
+    /// The caller owns a non-null `final_url` and must free or move it.
+    pub fn fetchBodyWithFinalUrl(
+        allocator: std.mem.Allocator,
+        io: std.Io,
+        http_client: *std.http.Client,
+        cookie_jar: *std.StringHashMap(CookieEntry),
+        url: Url,
+        referrer: ?Url,
+        payload: ?[]const u8,
+        final_url: *?Url,
+    ) !HttpResponse {
+        final_url.* = null;
+        return fetchBodyInternal(allocator, io, http_client, cookie_jar, url, referrer, payload, final_url);
+    }
+
+    fn fetchBodyInternal(
+        allocator: std.mem.Allocator,
+        io: std.Io,
+        http_client: *std.http.Client,
+        cookie_jar: *std.StringHashMap(CookieEntry),
+        url: Url,
+        referrer: ?Url,
+        payload: ?[]const u8,
+        final_url: ?*?Url,
+    ) !HttpResponse {
         if (std.mem.eql(u8, url.scheme, "file")) {
             return .{ .body = try url.fileRequest(allocator, io) };
         }
@@ -431,7 +461,7 @@ pub const Url = struct {
         if (std.mem.eql(u8, url.scheme, "about")) {
             return .{ .body = url.aboutRequest() };
         }
-        return url.httpRequest(allocator, http_client, cookie_jar, referrer, payload);
+        return url.httpRequest(allocator, http_client, cookie_jar, referrer, payload, final_url);
     }
 
     pub fn httpRequest(
@@ -441,6 +471,7 @@ pub const Url = struct {
         cookie_jar: *std.StringHashMap(CookieEntry),
         referrer: ?Url,
         payload: ?[]const u8,
+        final_url: ?*?Url,
     ) !HttpResponse {
         // Build full URL for std.http.Client
         var url_builder = std.ArrayList(u8).empty;
@@ -501,7 +532,7 @@ pub const Url = struct {
 
         const RedirectBehavior = std.http.Client.Request.RedirectBehavior;
         const redirect_behavior: RedirectBehavior = if (payload == null)
-            @enumFromInt(3)
+            RedirectBehavior.init(redirect_limit)
         else
             .unhandled;
 
@@ -666,10 +697,23 @@ pub const Url = struct {
             };
 
             const body = try allocating_writer.toOwnedSlice();
+            errdefer al.free(body);
             std.log.info("Received {d} bytes, status: {d}", .{
                 body.len,
                 @intFromEnum(response.head.status),
             });
+
+            if (final_url) |output| {
+                var final_url_writer = std.Io.Writer.Allocating.init(al);
+                defer final_url_writer.deinit();
+                try req.uri.writeToStream(&final_url_writer.writer, .all);
+                const final_url_text = try final_url_writer.toOwnedSlice();
+                defer al.free(final_url_text);
+
+                var resolved = try Url.init(al, final_url_text);
+                resolved.view_source = self.view_source;
+                output.* = resolved;
+            }
 
             const result = HttpResponse{
                 .body = body,
@@ -1007,4 +1051,114 @@ test "HTTP requests reuse a keep-alive connection" {
     try std.testing.expectEqual(@as(usize, 1), context.accepted_connections);
     try std.testing.expectEqual(@as(usize, 2), context.handled_requests);
     try expect(context.saw_keep_alive);
+}
+
+test "HTTP redirects follow relative and absolute locations and report the final URL" {
+    const RedirectServer = struct {
+        server: std.Io.net.Server,
+        io: std.Io,
+        port: u16,
+        handled_requests: usize = 0,
+        err: ?anyerror = null,
+
+        fn run(self: *@This()) void {
+            self.serve() catch |err| {
+                self.err = err;
+            };
+        }
+
+        fn serve(self: *@This()) !void {
+            var stream = try self.server.accept(self.io);
+            defer stream.socket.close(self.io);
+
+            var read_buffer: [4096]u8 = undefined;
+            var reader = stream.reader(self.io, &read_buffer);
+            var write_buffer: [1024]u8 = undefined;
+            var writer = stream.writer(self.io, &write_buffer);
+            const expected_paths = [_][]const u8{ "/start", "/middle", "/final" };
+
+            for (expected_paths, 0..) |expected_path, index| {
+                const request_line = try reader.interface.takeDelimiterExclusive('\n');
+                var request_parts = std.mem.splitScalar(u8, std.mem.trimEnd(u8, request_line, "\r"), ' ');
+                if (!std.mem.eql(u8, request_parts.first(), "GET")) return error.InvalidRequest;
+                const request_path = request_parts.next() orelse return error.InvalidRequest;
+                if (!std.mem.eql(u8, request_path, expected_path)) return error.UnexpectedRedirectTarget;
+
+                while (true) {
+                    const header = try reader.interface.takeDelimiterExclusive('\n');
+                    if (std.mem.eql(u8, header, "\r")) break;
+                }
+
+                switch (index) {
+                    0 => try writer.interface.writeAll(
+                        "HTTP/1.1 302 Found\r\nContent-Length: 0\r\nLocation: /middle\r\nConnection: keep-alive\r\n\r\n",
+                    ),
+                    1 => try writer.interface.print(
+                        "HTTP/1.1 301 Moved Permanently\r\nContent-Length: 0\r\nLocation: http://127.0.0.1:{d}/final\r\nConnection: keep-alive\r\n\r\n",
+                        .{self.port},
+                    ),
+                    2 => try writer.interface.writeAll(
+                        "HTTP/1.1 200 OK\r\nContent-Length: 5\r\nConnection: keep-alive\r\n\r\nfinal",
+                    ),
+                    else => unreachable,
+                }
+                try writer.interface.flush();
+                self.handled_requests += 1;
+            }
+        }
+    };
+
+    const address = try std.Io.net.IpAddress.parse("127.0.0.1", 0);
+    var server = try address.listen(std.testing.io, .{});
+    defer server.deinit(std.testing.io);
+    const port = server.socket.address.getPort();
+    var context = RedirectServer{
+        .server = server,
+        .io = std.testing.io,
+        .port = port,
+    };
+    const thread = try std.Thread.spawn(.{}, RedirectServer.run, .{&context});
+
+    var http_client: std.http.Client = .{ .allocator = std.testing.allocator, .io = std.testing.io };
+    defer http_client.deinit();
+    var cookie_jar = std.StringHashMap(CookieEntry).init(std.testing.allocator);
+    defer cookie_jar.deinit();
+
+    const initial_url_text = try std.fmt.allocPrint(
+        std.testing.allocator,
+        "http://127.0.0.1:{d}/start",
+        .{port},
+    );
+    defer std.testing.allocator.free(initial_url_text);
+    const initial_url = try Url.init(std.testing.allocator, initial_url_text);
+    defer initial_url.free(std.testing.allocator);
+
+    var final_url: ?Url = null;
+    defer if (final_url) |resolved| resolved.free(std.testing.allocator);
+    const response = try Url.fetchBodyWithFinalUrl(
+        std.testing.allocator,
+        std.testing.io,
+        &http_client,
+        &cookie_jar,
+        initial_url,
+        null,
+        null,
+        &final_url,
+    );
+    defer std.testing.allocator.free(response.body);
+
+    thread.join();
+    if (context.err) |err| return err;
+    try std.testing.expectEqual(@as(usize, 3), context.handled_requests);
+    try expect(std.mem.eql(u8, response.body, "final"));
+    try expect(final_url != null);
+
+    const expected_final_url = try std.fmt.allocPrint(
+        std.testing.allocator,
+        "http://127.0.0.1:{d}/final",
+        .{port},
+    );
+    defer std.testing.allocator.free(expected_final_url);
+    var final_url_buffer: [256]u8 = undefined;
+    try expect(std.mem.eql(u8, try final_url.?.toString(&final_url_buffer), expected_final_url));
 }

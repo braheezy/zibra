@@ -239,6 +239,12 @@ storage. Root and child navigation keep the prior URL owner alive through the
 synchronous fetch; async XHR clones its target and referrer before leaving the
 tab worker.
 
+Top-level HTTP navigation uses `fetchBodyWithFinalUrl` to receive an owned URL
+for the final redirect destination. `loadInTab` moves that value into the
+existing navigation URL pointer before parsing subresources or committing
+history, so the frame, relative URLs, history, and chrome all use the final
+destination without adding URL ownership to ordinary subresource responses.
+
 `view-source:` now replaces the wrapper Ada URL with the parsed inner Ada URL
 before exposing the inner component slices. That inner URL is the one released
 by `Url.free`; see `Url.init` in [`src/network/url.zig`](../src/network/url.zig).
