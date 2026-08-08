@@ -356,6 +356,23 @@ pub fn deinit(self: *Js, allocator: std.mem.Allocator) void {
     storage_allocator.destroy(self);
 }
 
+/// Install a host callback that can stop long-running JavaScript at Kiesel VM
+/// safe points. The callback runs on the JavaScript execution thread.
+pub fn setInterruptHandler(
+    self: *Js,
+    context: ?*anyopaque,
+    handler: Agent.InterruptHandler,
+) void {
+    self.agent.setInterruptHandler(context, handler);
+}
+
+fn translateExecutionError(self: *Js, err: Agent.Error) anyerror {
+    if (err == error.ExceptionThrown and self.agent.takeExecutionInterrupt()) {
+        return error.ExecutionInterrupted;
+    }
+    return err;
+}
+
 pub fn evaluate(self: *Js, window_id: u32, code: []const u8) !Value {
     self.lock.lock();
     defer self.lock.unlock();
@@ -566,7 +583,9 @@ pub fn evaluate(self: *Js, window_id: u32, code: []const u8) !Value {
             null,
             .{},
         );
-        _ = try runtime_script.evaluate("zibra-runtime");
+        _ = runtime_script.evaluate("zibra-runtime") catch |err| {
+            return self.translateExecutionError(err);
+        };
         self.runtime_initialized = true;
         if (window.pending_messages.items.len > 0) {
             for (window.pending_messages.items) |msg| {
@@ -588,7 +607,9 @@ pub fn evaluate(self: *Js, window_id: u32, code: []const u8) !Value {
         null,
         .{},
     );
-    const result = try script.evaluate("zibra-script");
+    const result = script.evaluate("zibra-script") catch |err| {
+        return self.translateExecutionError(err);
+    };
     return result;
 }
 
@@ -891,6 +912,37 @@ test "__native.style_set is exposed" {
 
     const result = try js.evaluate(0, "typeof __native.style_set === 'function'");
     try std.testing.expect(result.toBoolean());
+}
+
+test "host interrupt stops an infinite script" {
+    const InterruptAfterPolls = struct {
+        remaining: usize,
+
+        fn check(context: ?*anyopaque) bool {
+            const raw_context = context orelse return false;
+            const unaligned: *align(1) @This() = @ptrCast(raw_context);
+            const self: *@This() = @alignCast(unaligned);
+            if (self.remaining == 0) return true;
+            self.remaining -= 1;
+            return false;
+        }
+    };
+
+    var environ = std.process.Environ.Map.init(std.testing.allocator);
+    defer environ.deinit();
+    var js = try Js.init(std.testing.allocator, std.testing.io, &environ);
+    defer js.deinit(std.testing.allocator);
+
+    // Initialize Zibra's runtime before enabling the deliberately finite
+    // execution budget so the test measures the page script itself.
+    _ = try js.evaluate(0, "undefined");
+    var interrupt = InterruptAfterPolls{ .remaining = 1024 };
+    js.setInterruptHandler(&interrupt, InterruptAfterPolls.check);
+
+    try std.testing.expectError(
+        error.ExecutionInterrupted,
+        js.evaluate(0, "try { while (true) {} } catch (error) {}"),
+    );
 }
 
 test "Js roots Kiesel Agent state across garbage collections" {

@@ -42,7 +42,8 @@ The source tree is organized by responsibility:
 | [`src/document/inspection.zig`](../src/document/inspection.zig) | Browser-free fetch/decode/parse/style pipeline for document inspection commands. |
 | [`src/document/css_parser.zig`](../src/document/css_parser.zig) | CSS parsing and `CSSRule` ownership. |
 | [`src/document/selector.zig`](../src/document/selector.zig) | Selector representation and matching. |
-| [`src/network/url.zig`](../src/network/url.zig) | Owning `Url`, URL resolution, schemes, HTTP requests, redirects, cookies, and response bodies. |
+| [`src/network/url.zig`](../src/network/url.zig) | Owning `Url`, URL resolution, schemes, HTTP requests, redirects, cookies, response bodies, and cache integration. |
+| [`src/network/cache.zig`](../src/network/cache.zig) | Browser-session HTTP response entries, expiry, and strict `Cache-Control` policy parsing. |
 | [`src/script/js.zig`](../src/script/js.zig) | Kiesel host integration, realms/windows, DOM handles, JavaScript evaluation, events, timers, XHR, and host callbacks. |
 | [`src/runtime/task.zig`](../src/runtime/task.zig) | Per-tab serialized task worker and opaque task-context cleanup. |
 | [`src/runtime/sync.zig`](../src/runtime/sync.zig) | Runtime synchronization wrappers. |
@@ -105,7 +106,7 @@ but no lock or owner-thread rule covers the complete mutable graph.
 
 - the SDL window, renderer, cached output texture, and text-input lifecycle;
 - root, chrome, and optional tab z2d surfaces plus the root z2d context;
-- the shared `std.http.Client` and cookie jar;
+- the shared `std.http.Client`, cookie jar, and decoded HTTP response cache;
 - the shared `Layout`, including its `FontManager`;
 - default user-agent CSS rules;
 - all `Tab` allocations;
@@ -230,6 +231,15 @@ untagged slice with no destructor. `Browser.fetchBody` returns allocated bodies
 for file and HTTP paths, a slice into `Url.path` for `data:`, and borrowed data
 for `about:`. Callers currently infer ownership again from the URL scheme.
 
+The Browser-owned `HttpCache` in [`src/network/cache.zig`](../src/network/cache.zig)
+stores owned copies of decoded GET/200 response bodies, CSP headers, and final
+redirect URLs. Cache hits duplicate body and header data before returning, so
+they preserve the existing caller-owned HTTP response contract. Entries with
+`max-age` use the monotonic awake clock; `no-store`, malformed directives, and
+unknown directives bypass storage. Responses without `Cache-Control` remain
+cached for the current browser session, matching the exercise's simplified
+model. The Browser HTTP mutex serializes both the shared client and cache.
+
 `Url` wraps an owning `ada.Url` and has an explicit `free` method. Its component
 slices borrow that owner, except for separately allocated data-URL storage.
 Ordinary Zig value copies of `Url` are shallow. Treat `Url` as move-only unless
@@ -289,8 +299,8 @@ I/O to finish.
 - `Browser.lock` protects a subset of active-tab render state, dirty flags, and
   shutdown/animation flags.
 - `TaskRunner.mutex` and its condition protect the task queue and worker flags.
-- `http_client_mutex` serializes the shared HTTP client and cookie jar around
-  HTTP requests.
+- `http_client_mutex` serializes the shared HTTP client, cookie jar, and HTTP
+  response cache around fetches.
 - `JsLock` is a recursive-by-thread-ID wrapper used around evaluation and many
   callback operations in [`src/script/js.zig`](../src/script/js.zig).
 
@@ -401,6 +411,9 @@ Current enforced behavior includes:
 
 - the scanned, uncollectable `Js` allocation roots the embedded Kiesel `Agent`;
 - entry into evaluation and callback execution is serialized by `JsLock`;
+- every tab-owned `Js` installs a Kiesel host-interrupt callback that reads the
+  tab's atomic shutdown flag; the VM polls it at bytecode safe points and turns
+  it into an uncatchable host error at the `Js.evaluate` boundary;
 - `Js.setNodes` changes the root, clears both handle maps, and resets callbacks
   when the root becomes null;
 - `innerHTML` calls `removeHandlesForSubtree` for every removed child before
@@ -479,7 +492,8 @@ The intended SDL contract should be:
 `Browser.deinit` and `Tab.shutdown` enforce these phases:
 
 1. publish shutdown and reject new browser/tab/JS work;
-2. wake long timer helpers and stop/join each tab worker;
+2. wake long timer helpers, interrupt JavaScript running on each tab worker,
+   and stop/join the workers;
 3. wait for accounted helpers, whose completion tasks are rejected and cleaned
    by the stopped runner;
 4. retire browser render snapshots, then destroy tabs, frames, DOM, and JS;
@@ -521,8 +535,9 @@ reintroduced:
    covered with normal, data, and `view-source:` URLs.
 6. **Shutdown owner order:** Browser publishes shutdown, joins tab workers,
    waits helpers, retires render snapshots, then destroys tabs, network, fonts,
-   z2d, renderer, and window. Long timers poll cancellation and no longer delay
-   close until their nominal deadline. See
+   z2d, renderer, and window. Long timers poll cancellation and Kiesel polls a
+   host interrupt at VM safe points, so neither a distant timeout nor an
+   infinite page script can indefinitely prevent the worker join. See
    [`tests/manual/lifecycle-long-timeout.html`](../tests/manual/lifecycle-long-timeout.html).
 7. **Stylesheet generation ownership:** root and child stylesheet source
    buffers and parsed rules are staged, cleaned up on error, and moved into

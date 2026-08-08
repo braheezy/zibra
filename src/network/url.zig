@@ -8,6 +8,10 @@
 const std = @import("std");
 
 const ada = @import("ada");
+const cache_module = @import("cache.zig");
+
+pub const CacheControl = cache_module.CacheControl;
+pub const HttpCache = cache_module.HttpCache;
 
 const user_agent = "Zibra/0.0.0";
 const redirect_limit: u16 = 3;
@@ -43,6 +47,8 @@ pub const CookieEntry = struct {
 pub const HttpResponse = struct {
     body: []const u8,
     csp_header: ?[]u8 = null,
+    status: ?std.http.Status = null,
+    cache_control: CacheControl = .default,
 };
 
 /// Decode bytes as UTF-8, replacing each malformed sequence with U+FFFD.
@@ -423,11 +429,12 @@ pub const Url = struct {
         io: std.Io,
         http_client: *std.http.Client,
         cookie_jar: *std.StringHashMap(CookieEntry),
+        cache: ?*HttpCache,
         url: Url,
         referrer: ?Url,
         payload: ?[]const u8,
     ) !HttpResponse {
-        return fetchBodyInternal(allocator, io, http_client, cookie_jar, url, referrer, payload, null);
+        return fetchBodyInternal(allocator, io, http_client, cookie_jar, cache, url, referrer, payload, null);
     }
 
     /// Fetch a URL and, for HTTP(S), return the final URL after redirects.
@@ -437,13 +444,14 @@ pub const Url = struct {
         io: std.Io,
         http_client: *std.http.Client,
         cookie_jar: *std.StringHashMap(CookieEntry),
+        cache: ?*HttpCache,
         url: Url,
         referrer: ?Url,
         payload: ?[]const u8,
         final_url: *?Url,
     ) !HttpResponse {
         final_url.* = null;
-        return fetchBodyInternal(allocator, io, http_client, cookie_jar, url, referrer, payload, final_url);
+        return fetchBodyInternal(allocator, io, http_client, cookie_jar, cache, url, referrer, payload, final_url);
     }
 
     fn fetchBodyInternal(
@@ -451,6 +459,7 @@ pub const Url = struct {
         io: std.Io,
         http_client: *std.http.Client,
         cookie_jar: *std.StringHashMap(CookieEntry),
+        cache: ?*HttpCache,
         url: Url,
         referrer: ?Url,
         payload: ?[]const u8,
@@ -465,7 +474,73 @@ pub const Url = struct {
         if (std.mem.eql(u8, url.scheme, "about")) {
             return .{ .body = url.aboutRequest() };
         }
-        return url.httpRequest(allocator, http_client, cookie_jar, referrer, payload, final_url);
+
+        const is_http = std.mem.eql(u8, url.scheme, "http") or std.mem.eql(u8, url.scheme, "https");
+        const use_cache = is_http and payload == null and cache != null;
+        const href = url.ada_url.getHref();
+        const cache_key = if (std.mem.indexOfScalar(u8, href, '#')) |fragment| href[0..fragment] else href;
+
+        if (use_cache) {
+            const lookup_time_ns = std.Io.Clock.awake.now(io).nanoseconds;
+            if (cache.?.lookup(cache_key, lookup_time_ns)) |entry| {
+                var cached_final_url: ?Url = null;
+                errdefer if (cached_final_url) |resolved| resolved.free(allocator);
+                if (final_url != null) {
+                    if (entry.final_url) |final_url_text| {
+                        cached_final_url = try Url.init(allocator, final_url_text);
+                        cached_final_url.?.view_source = url.view_source;
+                    }
+                }
+
+                const body = try allocator.dupe(u8, entry.body);
+                errdefer allocator.free(body);
+                const csp_header = if (entry.csp_header) |header| try allocator.dupe(u8, header) else null;
+                errdefer if (csp_header) |header| allocator.free(header);
+
+                if (final_url) |output| {
+                    output.* = cached_final_url;
+                    cached_final_url = null;
+                }
+                return .{
+                    .body = body,
+                    .csp_header = csp_header,
+                    .status = .ok,
+                    .cache_control = entry.policy,
+                };
+            }
+        }
+
+        var fetched_final_url: ?Url = null;
+        defer if (fetched_final_url) |resolved| resolved.free(allocator);
+        const final_url_output = if (use_cache or final_url != null) &fetched_final_url else null;
+        const response = try url.httpRequest(
+            allocator,
+            http_client,
+            cookie_jar,
+            referrer,
+            payload,
+            final_url_output,
+        );
+
+        if (use_cache and response.status == .ok and response.cache_control.isCacheable()) {
+            const final_url_text = if (fetched_final_url) |resolved| resolved.ada_url.getHref() else null;
+            cache.?.store(
+                cache_key,
+                response.body,
+                response.csp_header,
+                final_url_text,
+                response.cache_control,
+                std.Io.Clock.awake.now(io).nanoseconds,
+            ) catch |err| {
+                std.log.warn("Failed to cache {s}: {}", .{ cache_key, err });
+            };
+        }
+
+        if (final_url) |output| {
+            output.* = fetched_final_url;
+            fetched_final_url = null;
+        }
+        return response;
     }
 
     pub fn httpRequest(
@@ -543,6 +618,7 @@ pub const Url = struct {
         var csp_header: ?[]u8 = null;
         var csp_header_cleanup = true;
         defer if (csp_header_cleanup) if (csp_header) |hdr| al.free(hdr);
+        var cache_control: CacheControl = .default;
 
         const max_attempts: usize = 2;
         var attempt: usize = 0;
@@ -657,6 +733,8 @@ pub const Url = struct {
                         const copy = try al.alloc(u8, trimmed.len);
                         @memcpy(copy, trimmed);
                         csp_header = copy;
+                    } else if (std.ascii.eqlIgnoreCase(header.name, "cache-control")) {
+                        cache_control.apply(header.value);
                     }
                 }
             }
@@ -722,6 +800,8 @@ pub const Url = struct {
             const result = HttpResponse{
                 .body = body,
                 .csp_header = csp_header,
+                .status = response.head.status,
+                .cache_control = cache_control,
             };
             csp_header_cleanup = false;
             return result;
@@ -793,6 +873,11 @@ pub const Url = struct {
 };
 
 const expect = std.testing.expect;
+
+fn readTestHttpLine(reader: *std.Io.Reader) ![]const u8 {
+    const line = try reader.takeDelimiterInclusive('\n');
+    return std.mem.trimEnd(u8, line, "\r\n");
+}
 
 test "file URLs load local file contents" {
     var temp_dir = std.testing.tmpDir(.{});
@@ -888,6 +973,7 @@ test "fetchBody handles data URLs without Browser state" {
         std.testing.io,
         &http_client,
         &cookie_jar,
+        null,
         url,
         null,
         null,
@@ -994,15 +1080,15 @@ test "HTTP requests negotiate and decode chunked gzip responses" {
             var write_buffer: [1024]u8 = undefined;
             var writer = stream.writer(self.io, &write_buffer);
 
-            const request_line = try reader.interface.takeDelimiterExclusive('\n');
+            const request_line = try readTestHttpLine(&reader.interface);
             if (!std.mem.startsWith(u8, request_line, "GET ")) return error.InvalidRequest;
 
             while (true) {
-                const header = try reader.interface.takeDelimiterExclusive('\n');
-                if (std.mem.eql(u8, header, "\r")) break;
+                const header = try readTestHttpLine(&reader.interface);
+                if (header.len == 0) break;
                 const colon = std.mem.indexOfScalar(u8, header, ':') orelse continue;
                 const name = header[0..colon];
-                const value = std.mem.trim(u8, header[colon + 1 ..], " \t\r");
+                const value = std.mem.trim(u8, header[colon + 1 ..], " \t");
                 if (std.ascii.eqlIgnoreCase(name, "accept-encoding")) {
                     self.saw_gzip = std.ascii.eqlIgnoreCase(value, "gzip");
                 }
@@ -1056,6 +1142,7 @@ test "HTTP requests negotiate and decode chunked gzip responses" {
         std.testing.io,
         &http_client,
         &cookie_jar,
+        null,
         url,
         null,
         null,
@@ -1095,7 +1182,7 @@ test "HTTP requests reuse a keep-alive connection" {
                 var writer = stream.writer(self.io, &write_buffer);
 
                 while (self.handled_requests < 2) {
-                    const request_line = reader.interface.takeDelimiterExclusive('\n') catch |err| switch (err) {
+                    const request_line = readTestHttpLine(&reader.interface) catch |err| switch (err) {
                         error.EndOfStream => break,
                         else => return err,
                     };
@@ -1103,11 +1190,11 @@ test "HTTP requests reuse a keep-alive connection" {
 
                     var connection_is_keep_alive = false;
                     while (true) {
-                        const header = try reader.interface.takeDelimiterExclusive('\n');
-                        if (std.mem.eql(u8, header, "\r")) break;
+                        const header = try readTestHttpLine(&reader.interface);
+                        if (header.len == 0) break;
                         if (std.mem.indexOfScalar(u8, header, ':')) |colon| {
                             const name = header[0..colon];
-                            const value = std.mem.trim(u8, header[colon + 1 ..], " \t\r");
+                            const value = std.mem.trim(u8, header[colon + 1 ..], " \t");
                             if (std.ascii.eqlIgnoreCase(name, "connection")) {
                                 connection_is_keep_alive = std.ascii.eqlIgnoreCase(value, "keep-alive");
                             }
@@ -1151,6 +1238,7 @@ test "HTTP requests reuse a keep-alive connection" {
             std.testing.io,
             &http_client,
             &cookie_jar,
+            null,
             url,
             null,
             null,
@@ -1164,6 +1252,165 @@ test "HTTP requests reuse a keep-alive connection" {
     try std.testing.expectEqual(@as(usize, 1), context.accepted_connections);
     try std.testing.expectEqual(@as(usize, 2), context.handled_requests);
     try expect(context.saw_keep_alive);
+}
+
+test "HTTP cache reuses only cacheable GET 200 responses" {
+    const CacheServer = struct {
+        server: std.Io.net.Server,
+        io: std.Io,
+        handled_requests: usize = 0,
+        default_requests: usize = 0,
+        max_age_requests: usize = 0,
+        no_store_requests: usize = 0,
+        unknown_requests: usize = 0,
+        not_found_requests: usize = 0,
+        err: ?anyerror = null,
+
+        const Route = enum { default, max_age, no_store, unknown, not_found };
+
+        fn run(self: *@This()) void {
+            self.serve() catch |err| {
+                self.err = err;
+            };
+        }
+
+        fn serve(self: *@This()) !void {
+            var stream = try self.server.accept(self.io);
+            defer stream.socket.close(self.io);
+
+            var read_buffer: [4096]u8 = undefined;
+            var reader = stream.reader(self.io, &read_buffer);
+            var write_buffer: [1024]u8 = undefined;
+            var writer = stream.writer(self.io, &write_buffer);
+
+            while (true) {
+                const request_line = readTestHttpLine(&reader.interface) catch |err| switch (err) {
+                    error.EndOfStream => return,
+                    else => return err,
+                };
+                var request_parts = std.mem.splitScalar(u8, request_line, ' ');
+                if (!std.mem.eql(u8, request_parts.first(), "GET")) return error.InvalidRequest;
+                const request_path = request_parts.next() orelse return error.InvalidRequest;
+
+                const route: Route = if (std.mem.eql(u8, request_path, "/default"))
+                    .default
+                else if (std.mem.eql(u8, request_path, "/max-age"))
+                    .max_age
+                else if (std.mem.eql(u8, request_path, "/no-store"))
+                    .no_store
+                else if (std.mem.eql(u8, request_path, "/unknown"))
+                    .unknown
+                else if (std.mem.eql(u8, request_path, "/not-found"))
+                    .not_found
+                else
+                    return error.UnexpectedRequestTarget;
+                switch (route) {
+                    .default => self.default_requests += 1,
+                    .max_age => self.max_age_requests += 1,
+                    .no_store => self.no_store_requests += 1,
+                    .unknown => self.unknown_requests += 1,
+                    .not_found => self.not_found_requests += 1,
+                }
+
+                while (true) {
+                    const header = try readTestHttpLine(&reader.interface);
+                    if (header.len == 0) break;
+                }
+
+                if (route == .not_found) {
+                    try writer.interface.writeAll(
+                        "HTTP/1.1 404 Not Found\r\n" ++
+                            "Content-Length: 9\r\n" ++
+                            "Cache-Control: max-age=60\r\n" ++
+                            "Connection: keep-alive\r\n\r\n" ++
+                            "not-found",
+                    );
+                } else {
+                    const response_path, const cache_control = switch (route) {
+                        .default => .{ "/default", "" },
+                        .max_age => .{ "/max-age", "Cache-Control: max-age=60\r\n" },
+                        .no_store => .{ "/no-store", "Cache-Control: no-store\r\n" },
+                        .unknown => .{ "/unknown", "Cache-Control: max-age=60, public\r\n" },
+                        .not_found => unreachable,
+                    };
+                    try writer.interface.print(
+                        "HTTP/1.1 200 OK\r\n" ++
+                            "Content-Length: {d}\r\n" ++
+                            "{s}" ++
+                            "Connection: keep-alive\r\n\r\n" ++
+                            "{s}",
+                        .{ response_path.len, cache_control, response_path },
+                    );
+                }
+                try writer.interface.flush();
+                self.handled_requests += 1;
+            }
+        }
+    };
+
+    const address = try std.Io.net.IpAddress.parse("127.0.0.1", 0);
+    var server = try address.listen(std.testing.io, .{});
+    defer server.deinit(std.testing.io);
+    var context = CacheServer{ .server = server, .io = std.testing.io };
+    const thread = try std.Thread.spawn(.{}, CacheServer.run, .{&context});
+    var thread_joined = false;
+    defer if (!thread_joined) thread.join();
+
+    var http_client: std.http.Client = .{ .allocator = std.testing.allocator, .io = std.testing.io };
+    var http_client_live = true;
+    defer if (http_client_live) http_client.deinit();
+    var cookie_jar = std.StringHashMap(CookieEntry).init(std.testing.allocator);
+    defer cookie_jar.deinit();
+    var cache = HttpCache.init(std.testing.allocator);
+    defer cache.deinit();
+
+    const paths = [_][]const u8{ "/default", "/max-age", "/no-store", "/unknown", "/not-found" };
+    var responses_valid = true;
+    for (paths) |path| {
+        const url_text = try std.fmt.allocPrint(
+            std.testing.allocator,
+            "http://127.0.0.1:{d}{s}",
+            .{ server.socket.address.getPort(), path },
+        );
+        defer std.testing.allocator.free(url_text);
+        const url = try Url.init(std.testing.allocator, url_text);
+        defer url.free(std.testing.allocator);
+
+        for (0..2) |_| {
+            const response = try Url.fetchBody(
+                std.testing.allocator,
+                std.testing.io,
+                &http_client,
+                &cookie_jar,
+                &cache,
+                url,
+                null,
+                null,
+            );
+            defer if (response.csp_header) |header| std.testing.allocator.free(header);
+            if (std.mem.eql(u8, path, "/not-found")) {
+                responses_valid = responses_valid and response.status == .not_found;
+                responses_valid = responses_valid and std.mem.eql(u8, "not-found", response.body);
+            } else {
+                responses_valid = responses_valid and response.status == .ok;
+                responses_valid = responses_valid and std.mem.eql(u8, path, response.body);
+            }
+            std.testing.allocator.free(response.body);
+        }
+    }
+
+    http_client.deinit();
+    http_client_live = false;
+    thread.join();
+    thread_joined = true;
+    if (context.err) |err| return err;
+    try expect(responses_valid);
+    try std.testing.expectEqual(@as(usize, 8), context.handled_requests);
+    try std.testing.expectEqual(@as(usize, 1), context.default_requests);
+    try std.testing.expectEqual(@as(usize, 1), context.max_age_requests);
+    try std.testing.expectEqual(@as(usize, 2), context.no_store_requests);
+    try std.testing.expectEqual(@as(usize, 2), context.unknown_requests);
+    try std.testing.expectEqual(@as(usize, 2), context.not_found_requests);
 }
 
 test "HTTP redirects follow relative and absolute locations and report the final URL" {
@@ -1191,15 +1438,15 @@ test "HTTP redirects follow relative and absolute locations and report the final
             const expected_paths = [_][]const u8{ "/start", "/middle", "/final" };
 
             for (expected_paths, 0..) |expected_path, index| {
-                const request_line = try reader.interface.takeDelimiterExclusive('\n');
-                var request_parts = std.mem.splitScalar(u8, std.mem.trimEnd(u8, request_line, "\r"), ' ');
+                const request_line = try readTestHttpLine(&reader.interface);
+                var request_parts = std.mem.splitScalar(u8, request_line, ' ');
                 if (!std.mem.eql(u8, request_parts.first(), "GET")) return error.InvalidRequest;
                 const request_path = request_parts.next() orelse return error.InvalidRequest;
                 if (!std.mem.eql(u8, request_path, expected_path)) return error.UnexpectedRedirectTarget;
 
                 while (true) {
-                    const header = try reader.interface.takeDelimiterExclusive('\n');
-                    if (std.mem.eql(u8, header, "\r")) break;
+                    const header = try readTestHttpLine(&reader.interface);
+                    if (header.len == 0) break;
                 }
 
                 switch (index) {
@@ -1253,6 +1500,7 @@ test "HTTP redirects follow relative and absolute locations and report the final
         std.testing.io,
         &http_client,
         &cookie_jar,
+        null,
         initial_url,
         null,
         null,

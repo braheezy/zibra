@@ -142,7 +142,7 @@ fn fetchDecoded(
     defer if (client == null) local_client.deinit();
     defer if (cookie_jar == null) deinitCookieJar(allocator, &local_jar);
 
-    const response = try Url.fetchBody(allocator, init.io, actual_client, actual_jar, url, null, null);
+    const response = try Url.fetchBody(allocator, init.io, actual_client, actual_jar, null, url, null, null);
     defer if (response.csp_header) |header| allocator.free(header);
     defer if (!std.mem.eql(u8, url.scheme, "data") and !std.mem.eql(u8, url.scheme, "about")) allocator.free(response.body);
     return url_module.decodeUtf8Replace(allocator, response.body);

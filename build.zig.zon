@@ -20,8 +20,7 @@
         },
         // Javascript runtime
         .kiesel = .{
-            .url = "git+https://codeberg.org/kiesel-js/kiesel#589108a6098cdd137bb2bc8404efef685e641643",
-            .hash = "kiesel-0.4.0-Q1t3SpMfkAB5aKM9mWsoGig4_zQ3sD-4BeSqzLXG9zz2",
+            .path = "../kiesel",
         },
         // Zibra embeds Kiesel's Agent in a long-lived host object. Access the
         // collector's scanned, uncollectable allocator so that object can be
