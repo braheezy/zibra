@@ -59,6 +59,7 @@ architecture document.
   comment. Use the `zibra-screenshot` skill for Linux/Xvfb captures when a
   screenshot is required.
 
+
 ## Doing an Issue
 
 There are many GitHub issues tracking extra Exercises from the book. They are related by chapter and exercise number. Each contains a link to the browser engineering book chapter on the content, with the full context of the exercises near the bottom
