@@ -1,14 +1,15 @@
 //! Zibra executable entry point and command-line interface.
 //!
 //! The process arena owns application allocations. This module parses the
-//! command line, creates the process-wide `Browser`, and tears it down after
-//! the interactive or screenshot run completes.
+//! command line, runs isolated document-inspection modes, or creates the
+//! process-wide `Browser` for interactive and screenshot runs.
 
 const std = @import("std");
 
 const browser = @import("browser/root.zig");
 const Browser = browser.Browser;
-const Url = @import("network/url.zig").Url;
+const url_module = @import("network/url.zig");
+const Url = url_module.Url;
 const parser = @import("document/parser.zig");
 const HTMLParser = parser.HTMLParser;
 
@@ -22,6 +23,64 @@ pub fn main(init: std.process.Init) !void {
     };
 }
 
+fn deinitCookieJar(allocator: std.mem.Allocator, cookie_jar: *std.StringHashMap(url_module.CookieEntry)) void {
+    var it = cookie_jar.iterator();
+    while (it.next()) |entry| {
+        allocator.free(entry.value_ptr.value);
+        allocator.free(entry.key_ptr.*);
+    }
+    cookie_jar.deinit();
+}
+
+fn fetchDecodedDocument(
+    init: std.process.Init,
+    allocator: std.mem.Allocator,
+    url: Url,
+) ![]u8 {
+    var http_client: std.http.Client = .{ .allocator = allocator, .io = init.io };
+    defer http_client.deinit();
+
+    var cookie_jar = std.StringHashMap(url_module.CookieEntry).init(allocator);
+    defer deinitCookieJar(allocator, &cookie_jar);
+
+    const response = try Url.fetchBody(
+        allocator,
+        init.io,
+        &http_client,
+        &cookie_jar,
+        url,
+        null,
+        null,
+    );
+    defer if (response.csp_header) |header| allocator.free(header);
+
+    const raw_body = response.body;
+    const body_owned = !std.mem.eql(u8, url.scheme, "data") and !std.mem.eql(u8, url.scheme, "about");
+    defer if (body_owned) allocator.free(raw_body);
+    return url_module.decodeUtf8Replace(allocator, raw_body);
+}
+
+/// Parse and print a DOM without constructing Browser, SDL, layout, or JS.
+fn dumpDom(init: std.process.Init, allocator: std.mem.Allocator, url: ?Url) !void {
+    const body = if (url) |source_url|
+        try fetchDecodedDocument(init, allocator, source_url)
+    else
+        try allocator.dupe(u8, default_html);
+    defer allocator.free(body);
+
+    var html_parser = try HTMLParser.init(allocator, body);
+    defer html_parser.deinit(allocator);
+
+    var root = try html_parser.parse();
+    defer root.deinit(allocator);
+
+    var stdout_buffer: [4096]u8 = undefined;
+    var stdout_writer = std.Io.File.stdout().writer(init.io, &stdout_buffer);
+    const stdout = &stdout_writer.interface;
+    try html_parser.writePretty(stdout, root, 0);
+    try stdout.flush();
+}
+
 fn zibra(init: std.process.Init) !void {
     const allocator = init.arena.allocator();
 
@@ -31,7 +90,7 @@ fn zibra(init: std.process.Init) !void {
     // Hold values, if provided
     var rtl_flag = false;
     var url: ?Url = null;
-    var print_tree = false;
+    var dump_dom = false;
     var screenshot_path: ?[]const u8 = null;
 
     var arg_index: usize = 1;
@@ -41,8 +100,8 @@ fn zibra(init: std.process.Init) !void {
             rtl_flag = true;
             continue;
         }
-        if (std.mem.eql(u8, arg, "-t")) {
-            print_tree = true;
+        if (std.mem.eql(u8, arg, "-t") or std.mem.eql(u8, arg, "--dump-dom")) {
+            dump_dom = true;
             continue;
         }
         if (std.mem.eql(u8, arg, "--screenshot")) {
@@ -101,10 +160,16 @@ fn zibra(init: std.process.Init) !void {
 
     defer if (url) |u| u.free(allocator);
 
-    if (print_tree and screenshot_path != null) {
-        std.log.err("-t and --screenshot cannot be used together.", .{});
+    if (dump_dom and screenshot_path != null) {
+        std.log.err("--dump-dom and --screenshot cannot be used together.", .{});
         return error.BadArguments;
     }
+
+    if (dump_dom) {
+        try dumpDom(init, allocator, url);
+        return;
+    }
+
     // Initialize browser
     const b = try Browser.init(allocator, init.io, init.environ_map, rtl_flag, screenshot_path != null);
     defer {
@@ -113,37 +178,10 @@ fn zibra(init: std.process.Init) !void {
     }
 
     if (url) |u| {
-        if (print_tree) {
-            const response = try b.fetchBody(u, null, null);
-            defer if (response.csp_header) |hdr| allocator.free(hdr);
-            const raw_body = response.body;
-            const body_owned = !std.mem.eql(u8, u.scheme, "data") and !std.mem.eql(u8, u.scheme, "about");
-            defer if (body_owned) allocator.free(raw_body);
-            const body = try browser.decodeUtf8Replace(allocator, raw_body);
-            defer allocator.free(body);
-
-            var html_parser = try HTMLParser.init(allocator, body);
-            defer html_parser.deinit(allocator);
-
-            var root = try html_parser.parse();
-            defer root.deinit(allocator);
-
-            try html_parser.prettyPrint(root, 0);
-            return;
-        }
         // Create a new tab and load the URL
         try b.newTab(u);
         url = null;
     } else {
-        if (print_tree) {
-            var html_parser = try HTMLParser.init(allocator, default_html);
-            defer html_parser.deinit(allocator);
-            var root = try html_parser.parse();
-            defer root.deinit(allocator);
-            try html_parser.prettyPrint(root, 0);
-            return;
-        }
-
         // Create a new tab with the default HTML
         const about_url = try Url.init(allocator, "about:blank");
         try b.newTab(about_url);

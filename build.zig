@@ -107,6 +107,29 @@ pub fn build(b: *std.Build) !void {
     const unit_tests_run = b.addRunArtifact(unit_tests);
     test_step.dependOn(&unit_tests_run.step);
 
+    const dump_dom_test_step = b.step(
+        "test-dump-dom",
+        "Capture and compare the isolated DOM-dump fixture",
+    );
+    const dump_dom_compare_module = b.createModule(.{
+        .root_source_file = b.path("tests/dump_dom_compare.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    const dump_dom_compare = b.addExecutable(.{
+        .name = "dump-dom-compare",
+        .root_module = dump_dom_compare_module,
+    });
+    const dump_dom = b.addRunArtifact(exe);
+    dump_dom.addArg("--dump-dom");
+    dump_dom.addPrefixedFileArg("file://", b.path("tests/manual/dump-dom.html"));
+    const actual_dom_dump = dump_dom.captureStdOut(.{ .basename = "dump-dom.txt" });
+
+    const compare_dom_dump = b.addRunArtifact(dump_dom_compare);
+    compare_dom_dump.addFileArg(b.path("tests/golden/dump-dom.txt"));
+    compare_dom_dump.addFileArg(actual_dom_dump);
+    dump_dom_test_step.dependOn(&compare_dom_dump.step);
+
     const screenshot_test_step = b.step(
         "test-screenshot",
         "Capture and compare the native macOS screenshot fixture",

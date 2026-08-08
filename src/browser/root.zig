@@ -38,37 +38,7 @@ const DEFAULT_STYLE_SHEET = @embedFile("browser.css");
 // *********************************************************
 const initial_window_width = 800;
 const initial_window_height = 600;
-
-pub fn decodeUtf8Replace(allocator: std.mem.Allocator, input: []const u8) ![]u8 {
-    var output = std.ArrayList(u8).empty;
-    errdefer output.deinit(allocator);
-
-    const replacement = "\xEF\xBF\xBD";
-    var i: usize = 0;
-    while (i < input.len) {
-        const seq_len = std.unicode.utf8ByteSequenceLength(input[i]) catch {
-            try output.appendSlice(allocator, replacement);
-            i += 1;
-            continue;
-        };
-
-        if (i + seq_len > input.len) {
-            try output.appendSlice(allocator, replacement);
-            break;
-        }
-
-        const slice = input[i .. i + seq_len];
-        if (std.unicode.utf8ValidateSlice(slice)) {
-            try output.appendSlice(allocator, slice);
-            i += seq_len;
-        } else {
-            try output.appendSlice(allocator, replacement);
-            i += 1;
-        }
-    }
-
-    return output.toOwnedSlice(allocator);
-}
+pub const decodeUtf8Replace = url_module.decodeUtf8Replace;
 
 fn createBrokenImage(allocator: std.mem.Allocator) !zigimg.Image {
     const width: usize = 16;
@@ -1463,31 +1433,18 @@ pub const Browser = struct {
 
     // Update the scroll offset
     pub fn fetchBody(self: *Browser, url: Url, referrer: ?Url, payload: ?[]const u8) !url_module.HttpResponse {
-        if (std.mem.eql(u8, url.scheme, "file")) {
-            const content = try url.fileRequest(self.allocator, self.io);
-            return .{ .body = content, .csp_header = null };
-        } else if (std.mem.eql(u8, url.scheme, "data")) {
-            return .{ .body = url.path, .csp_header = null };
-        } else if (std.mem.eql(u8, url.scheme, "about")) {
-            return .{ .body = url.aboutRequest(), .csp_header = null };
-        }
-
         self.http_client_mutex.lock();
         defer self.http_client_mutex.unlock();
 
-        const response = url.httpRequest(
+        return url_module.Url.fetchBody(
             self.allocator,
+            self.io,
             &self.http_client,
             &self.cookie_jar,
+            url,
             referrer,
             payload,
-        ) catch |err| {
-            if (err == error.UnexpectedCharacter) {
-                std.log.warn("httpRequest parser error for {s}", .{url.path});
-            }
-            return err;
-        };
-        return response;
+        );
     }
 
     fn attachJsCallbacks(

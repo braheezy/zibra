@@ -21,6 +21,39 @@ pub const HttpResponse = struct {
     csp_header: ?[]u8 = null,
 };
 
+/// Decode bytes as UTF-8, replacing each malformed sequence with U+FFFD.
+/// The returned buffer is owned by `allocator`.
+pub fn decodeUtf8Replace(allocator: std.mem.Allocator, input: []const u8) ![]u8 {
+    var output = std.ArrayList(u8).empty;
+    errdefer output.deinit(allocator);
+
+    const replacement = "\xEF\xBF\xBD";
+    var i: usize = 0;
+    while (i < input.len) {
+        const seq_len = std.unicode.utf8ByteSequenceLength(input[i]) catch {
+            try output.appendSlice(allocator, replacement);
+            i += 1;
+            continue;
+        };
+
+        if (i + seq_len > input.len) {
+            try output.appendSlice(allocator, replacement);
+            break;
+        }
+
+        const slice = input[i .. i + seq_len];
+        if (std.unicode.utf8ValidateSlice(slice)) {
+            try output.appendSlice(allocator, slice);
+            i += seq_len;
+        } else {
+            try output.appendSlice(allocator, replacement);
+            i += 1;
+        }
+    }
+
+    return output.toOwnedSlice(allocator);
+}
+
 // Note: Connection handling is now done by std.http.Client
 // which handles both HTTP and HTTPS automatically with TLS support
 
@@ -313,6 +346,30 @@ pub const Url = struct {
         // We might support more about pages eventually
         _ = self;
         return "<html><body></body></html>";
+    }
+
+    /// Fetch a URL without imposing browser/window ownership. Callers own the
+    /// returned response according to its scheme: file and HTTP bodies are
+    /// allocated, while data and about bodies borrow the URL/static storage.
+    pub fn fetchBody(
+        allocator: std.mem.Allocator,
+        io: std.Io,
+        http_client: *std.http.Client,
+        cookie_jar: *std.StringHashMap(CookieEntry),
+        url: Url,
+        referrer: ?Url,
+        payload: ?[]const u8,
+    ) !HttpResponse {
+        if (std.mem.eql(u8, url.scheme, "file")) {
+            return .{ .body = try url.fileRequest(allocator, io) };
+        }
+        if (std.mem.eql(u8, url.scheme, "data")) {
+            return .{ .body = url.path };
+        }
+        if (std.mem.eql(u8, url.scheme, "about")) {
+            return .{ .body = url.aboutRequest() };
+        }
+        return url.httpRequest(allocator, http_client, cookie_jar, referrer, payload);
     }
 
     pub fn httpRequest(
@@ -645,6 +702,28 @@ test "data request with attributes" {
     try expect(url.attributes.?.items.len == 2);
     try expect(std.mem.eql(u8, url.attributes.?.items[0], "charset=utf-8"));
     try expect(std.mem.eql(u8, url.attributes.?.items[1], "base64"));
+}
+
+test "fetchBody handles data URLs without Browser state" {
+    const url = try Url.init(std.testing.allocator, "data:text/html,isolated%20document");
+    defer url.free(std.testing.allocator);
+
+    var http_client: std.http.Client = .{ .allocator = std.testing.allocator, .io = std.testing.io };
+    defer http_client.deinit();
+    var cookie_jar = std.StringHashMap(CookieEntry).init(std.testing.allocator);
+    defer cookie_jar.deinit();
+
+    const response = try Url.fetchBody(
+        std.testing.allocator,
+        std.testing.io,
+        &http_client,
+        &cookie_jar,
+        url,
+        null,
+        null,
+    );
+    try expect(std.mem.eql(u8, response.body, "isolated%20document"));
+    try expect(response.csp_header == null);
 }
 
 test "URL clone owns independent Ada and data URL storage" {

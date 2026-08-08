@@ -32,7 +32,7 @@ The source tree is organized by responsibility:
 
 | Area | Responsibility |
 | --- | --- |
-| [`src/main.zig`](../src/main.zig) | Executable entry point, CLI parsing, process arena, Browser construction, tree-print and screenshot modes. |
+| [`src/main.zig`](../src/main.zig) | Executable entry point, CLI parsing, process arena, isolated DOM-dump mode, Browser construction, and screenshot mode. |
 | [`src/browser/root.zig`](../src/browser/root.zig) | Process-wide `Browser`, SDL event loop, navigation orchestration, fetch coordination, async host helpers, render commit, composition, raster, and draw. |
 | [`src/browser/tab.zig`](../src/browser/tab.zig) | `Tab` and `Frame` ownership, task serialization, history, frame lookup, accessibility, focus, and per-document state. |
 | [`src/browser/chrome.zig`](../src/browser/chrome.zig) | Browser chrome UI and its display data. |

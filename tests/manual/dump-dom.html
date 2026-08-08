@@ -1,0 +1,14 @@
+<!--
+How to verify:
+  zig build run -- --dump-dom /absolute/path/to/tests/manual/dump-dom.html
+
+Expected: stdout contains the document tree below. Zibra must exit without
+initializing SDL, layout, JavaScript, or rendering.
+-->
+<!doctype html>
+<html>
+  <head><title>DOM dump fixture</title></head>
+  <body>
+    <main id="content"><p>Hello<strong>Zibra</strong>.</p></main>
+  </body>
+</html>

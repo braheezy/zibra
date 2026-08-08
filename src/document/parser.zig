@@ -911,7 +911,9 @@ pub const HTMLParser = struct {
         return root;
     }
 
-    pub fn prettyPrint(self: *HTMLParser, node: Node, indent: usize) !void {
+    /// Write a deterministic, indented DOM tree without invoking layout or
+    /// rendering. The caller owns the output destination.
+    pub fn writePretty(self: *HTMLParser, writer: *std.Io.Writer, node: Node, indent: usize) !void {
         // Create a temporary buffer filled with spaces
         const spaces = try self.allocator.alloc(u8, indent);
         defer self.allocator.free(spaces);
@@ -923,13 +925,13 @@ pub const HTMLParser = struct {
         const node_str = try node.asString(self.allocator);
         defer self.allocator.free(node_str);
 
-        std.debug.print("{s}{s}\n", .{ spaces, node_str });
+        try writer.print("{s}{s}\n", .{ spaces, node_str });
 
         switch (node) {
             .text => {},
             .element => |e| {
                 for (e.children.items, 0..) |_, i| {
-                    try self.prettyPrint(e.children.items[i], indent + 2);
+                    try self.writePretty(writer, e.children.items[i], indent + 2);
                 }
             },
         }

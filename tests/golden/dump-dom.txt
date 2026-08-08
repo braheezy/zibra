@@ -1,0 +1,14 @@
+<html>
+  <head>
+  <body>
+    <html>
+      <head>
+        <title>
+          DOM dump fixture
+      <body>
+        <main id="content">
+          <p>
+            Hello
+            <strong>
+              Zibra
+            .
