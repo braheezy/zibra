@@ -15,6 +15,8 @@ before changing `root.zig`, `tab.zig`, `render/`, or browser task scheduling.
 - `render/layout.zig` and `render/font.zig` borrow DOM/image state and own
   layout/font resources. Layout must retire before DOM; fonts/textures must
   retire before the renderer.
+- `scroll.zig` is the single source of truth for CSS scroll ranges and native
+  scrollbar-thumb geometry. Clamping and drawing must use the same metrics.
 - Keep browser rendering work and isolated inspection modes separate. A DOM
   dump must not construct `Browser` merely to reuse a convenience method.
 

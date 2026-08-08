@@ -22,6 +22,16 @@ const v_offset = browser.v_offset;
 
 const sdl2 = @import("sdl");
 
+fn addPageBottomPadding(content_bottom_css: i32) i32 {
+    const padded = @as(i64, @max(content_bottom_css, 0)) + v_offset;
+    return @intCast(@min(padded, std.math.maxInt(i32)));
+}
+
+/// Return the full scrollable height, including top and bottom page padding.
+pub fn documentScrollHeight(document_height_css: i32) i32 {
+    return addPageBottomPadding(addPageBottomPadding(document_height_css));
+}
+
 // Define the list of HTML block elements
 const BLOCK_ELEMENTS = [_][]const u8{ "html", "body", "article", "section", "nav", "aside", "h1", "h2", "h3", "h4", "h5", "h6", "hgroup", "header", "footer", "address", "p", "hr", "pre", "blockquote", "ol", "ul", "menu", "li", "dl", "dt", "dd", "figure", "figcaption", "main", "div", "table", "form", "fieldset", "legend", "details", "summary" };
 
@@ -1739,7 +1749,9 @@ pub fn layoutSourceCode(self: *Layout, source: []const u8) ![]DisplayItem {
     self.current_font_category = original_font_category;
     self.is_bold = original_is_bold;
 
-    self.content_height = self.cursor_y;
+    // `cursor_y` already includes the top page padding. Keep matching bottom
+    // whitespace so source documents use the same scroll contract as HTML.
+    self.content_height = addPageBottomPadding(self.cursor_y);
     return try self.display_list.toOwnedSlice(self.allocator);
 }
 
@@ -3233,9 +3245,9 @@ pub fn buildDocument(self: *Layout, root: *Node) !*DocumentLayout {
 
 pub fn paintDocument(self: *Layout, document: *DocumentLayout) ![]DisplayItem {
     self.display_list.clearRetainingCapacity();
+    const content_height = documentScrollHeight(document.height.get().*);
 
     if (self.document_color_scheme_dark) {
-        const height = document.height.get().* + v_offset;
         const width = self.layoutWindowWidth();
         const bg_color = if (self.accessibility.dark_palette) |palette|
             palette.background
@@ -3245,7 +3257,7 @@ pub fn paintDocument(self: *Layout, document: *DocumentLayout) ![]DisplayItem {
             .x1 = 0,
             .y1 = 0,
             .x2 = width,
-            .y2 = height,
+            .y2 = content_height,
             .color = bg_color,
         } };
         try self.display_list.append(self.allocator, bg);
@@ -3255,8 +3267,15 @@ pub fn paintDocument(self: *Layout, document: *DocumentLayout) ![]DisplayItem {
         try paintBlockTree(self, child);
     }
 
-    self.content_height = document.height.get().* + v_offset;
+    self.content_height = content_height;
     return try self.display_list.toOwnedSlice(self.allocator);
+}
+
+test "document scroll height includes Chapter 5 page padding" {
+    try std.testing.expectEqual(@as(i32, 136), documentScrollHeight(100));
+    try std.testing.expectEqual(@as(i32, 36), documentScrollHeight(0));
+    try std.testing.expectEqual(@as(i32, 36), documentScrollHeight(-100));
+    try std.testing.expectEqual(std.math.maxInt(i32), documentScrollHeight(std.math.maxInt(i32)));
 }
 
 // Paint a block and its subtree, applying stacking context effects

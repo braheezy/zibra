@@ -26,6 +26,7 @@ const js_module = @import("../script/js.zig");
 const tab_module = @import("tab.zig");
 const Tab = tab_module.Tab;
 const Frame = tab_module.Frame;
+const scroll_model = @import("scroll.zig");
 const Chrome = @import("chrome.zig");
 const task_module = @import("../runtime/task.zig");
 const Task = task_module.Task;
@@ -787,12 +788,6 @@ pub const Browser = struct {
         _ = self;
         if (zoom == 1.0) return value;
         return value * @as(f64, zoom);
-    }
-
-    fn visibleTabHeightCss(self: *const Browser) i32 {
-        const zoom = self.activeZoom();
-        if (zoom == 1.0) return self.window_height - self.chrome.bottom;
-        return @intFromFloat(@as(f32, @floatFromInt(self.window_height - self.chrome.bottom)) / zoom);
     }
 
     pub fn handleScroll(self: *Browser, delta: i32) void {
@@ -5208,21 +5203,13 @@ pub const Browser = struct {
     }
 
     fn drawScrollbarZ2d(self: *Browser) !void {
-        const tab_height = self.window_height - self.chrome.bottom;
-        const zoom = self.activeZoom();
-        const visible_css = if (zoom == 1.0) tab_height else @as(i32, @intFromFloat(@as(f32, @floatFromInt(tab_height)) / zoom));
-        if (self.active_tab_height <= visible_css) {
-            return;
-        }
-
-        const track_height = tab_height;
-        const thumb_height: i32 = @intFromFloat(@as(f32, @floatFromInt(tab_height)) * (@as(f32, @floatFromInt(visible_css)) / @as(f32, @floatFromInt(self.active_tab_height))));
-        const max_scroll = self.active_tab_height - visible_css;
-        const thumb_y_offset: i32 = @intFromFloat(
-            @as(f32, @floatFromInt(self.active_tab_scroll)) /
-                @as(f32, @floatFromInt(max_scroll)) *
-                (@as(f32, @floatFromInt(tab_height)) - @as(f32, @floatFromInt(thumb_height))),
+        const metrics = scroll_model.calculate(
+            self.active_tab_height,
+            self.window_height - self.chrome.bottom,
+            self.active_tab_scroll,
+            self.activeZoom(),
         );
+        if (!metrics.visible) return;
 
         // Draw scrollbar track (background) - start below chrome
         self.context.setSource(.{ .opaque_pattern = .{ .pixel = .{ .rgba = .{ .r = 200, .g = 200, .b = 200, .a = 255 } } } }); // Light gray
@@ -5230,19 +5217,19 @@ pub const Browser = struct {
         const track_y = self.chrome.bottom;
         try self.context.moveTo(@floatFromInt(track_x), @floatFromInt(track_y));
         try self.context.lineTo(@floatFromInt(track_x + scrollbar_width), @floatFromInt(track_y));
-        try self.context.lineTo(@floatFromInt(track_x + scrollbar_width), @floatFromInt(track_y + track_height));
-        try self.context.lineTo(@floatFromInt(track_x), @floatFromInt(track_y + track_height));
+        try self.context.lineTo(@floatFromInt(track_x + scrollbar_width), @floatFromInt(track_y + metrics.track_height_px));
+        try self.context.lineTo(@floatFromInt(track_x), @floatFromInt(track_y + metrics.track_height_px));
         try self.context.closePath();
         try self.context.fill();
 
         // Draw scrollbar thumb (movable part) - offset by chrome height
         self.context.setSource(.{ .opaque_pattern = .{ .pixel = .{ .rgba = .{ .r = 0, .g = 102, .b = 204, .a = 255 } } } }); // Blue
         const thumb_x = self.window_width - scrollbar_width;
-        const thumb_y = self.chrome.bottom + thumb_y_offset;
+        const thumb_y = self.chrome.bottom + metrics.thumb_offset_px;
         try self.context.moveTo(@floatFromInt(thumb_x), @floatFromInt(thumb_y));
         try self.context.lineTo(@floatFromInt(thumb_x + scrollbar_width), @floatFromInt(thumb_y));
-        try self.context.lineTo(@floatFromInt(thumb_x + scrollbar_width), @floatFromInt(thumb_y + thumb_height));
-        try self.context.lineTo(@floatFromInt(thumb_x), @floatFromInt(thumb_y + thumb_height));
+        try self.context.lineTo(@floatFromInt(thumb_x + scrollbar_width), @floatFromInt(thumb_y + metrics.thumb_height_px));
+        try self.context.lineTo(@floatFromInt(thumb_x), @floatFromInt(thumb_y + metrics.thumb_height_px));
         try self.context.closePath();
         try self.context.fill();
     }

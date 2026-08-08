@@ -12,6 +12,7 @@ const Layout = @import("render/layout.zig");
 const CSSParser = @import("../document/css_parser.zig");
 const task = @import("../runtime/task.zig");
 const sync = @import("../runtime/sync.zig");
+const scroll_model = @import("scroll.zig");
 const MeasureTime = @import("../runtime/measure_time.zig").MeasureTime;
 const js_module = @import("../script/js.zig");
 
@@ -928,18 +929,7 @@ pub fn clampScrollForFrame(self: *Tab, frame: *Frame, scroll: i32) i32 {
 
 /// Clamp a CSS-pixel scroll offset to the document range visible at `zoom`.
 pub fn clampScrollOffset(scroll: i32, content_height: i32, viewport_height: i32, zoom: f32) i32 {
-    const effective_zoom = if (zoom > 0) zoom else 1.0;
-    const safe_viewport_height = @max(viewport_height, 0);
-    const visible_height_float = @as(f64, @floatFromInt(safe_viewport_height)) / @as(f64, effective_zoom);
-    const visible_height: i32 = if (!(visible_height_float < @as(f64, @floatFromInt(std.math.maxInt(i32)))))
-        std.math.maxInt(i32)
-    else
-        @intFromFloat(visible_height_float);
-    const height_delta = @as(i64, content_height) - @as(i64, visible_height);
-    const maxscroll: i32 = @intCast(std.math.clamp(height_delta, 0, std.math.maxInt(i32)));
-    if (scroll < 0) return 0;
-    if (scroll > maxscroll) return maxscroll;
-    return scroll;
+    return scroll_model.clampOffset(content_height, viewport_height, scroll, zoom);
 }
 
 fn collectFramesPostOrder(self: *Tab, frame: *Frame, out: *std.ArrayList(*Frame)) !void {

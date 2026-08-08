@@ -8,6 +8,7 @@ comptime {
     _ = @import("script/js.zig");
     _ = @import("tests/browser_input.zig");
     _ = @import("tests/browser_resize.zig");
+    _ = @import("tests/browser_scroll.zig");
     _ = @import("tests/parser.zig");
     _ = @import("network/url.zig");
     _ = @import("runtime/task.zig");
