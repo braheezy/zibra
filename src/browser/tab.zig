@@ -731,9 +731,17 @@ pub fn getJs(self: *Tab, url: *Url) !*js_module {
         self.task_runner.measure.environ,
     );
     errdefer ctx.deinit(self.allocator);
+    ctx.setInterruptHandler(self, interruptJavaScriptOnShutdown);
     try self.js_contexts.put(key, ctx);
     key_owned = false;
     return ctx;
+}
+
+fn interruptJavaScriptOnShutdown(context: ?*anyopaque) bool {
+    const raw_context = context orelse return false;
+    const unaligned: *align(1) Tab = @ptrCast(raw_context);
+    const tab: *Tab = @alignCast(unaligned);
+    return tab.isShuttingDown();
 }
 
 pub fn activateDocumentGeneration(self: *Tab, frame: *Frame) u64 {

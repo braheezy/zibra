@@ -411,6 +411,9 @@ Current enforced behavior includes:
 
 - the scanned, uncollectable `Js` allocation roots the embedded Kiesel `Agent`;
 - entry into evaluation and callback execution is serialized by `JsLock`;
+- every tab-owned `Js` installs a Kiesel host-interrupt callback that reads the
+  tab's atomic shutdown flag; the VM polls it at bytecode safe points and turns
+  it into an uncatchable host error at the `Js.evaluate` boundary;
 - `Js.setNodes` changes the root, clears both handle maps, and resets callbacks
   when the root becomes null;
 - `innerHTML` calls `removeHandlesForSubtree` for every removed child before
@@ -489,7 +492,8 @@ The intended SDL contract should be:
 `Browser.deinit` and `Tab.shutdown` enforce these phases:
 
 1. publish shutdown and reject new browser/tab/JS work;
-2. wake long timer helpers and stop/join each tab worker;
+2. wake long timer helpers, interrupt JavaScript running on each tab worker,
+   and stop/join the workers;
 3. wait for accounted helpers, whose completion tasks are rejected and cleaned
    by the stopped runner;
 4. retire browser render snapshots, then destroy tabs, frames, DOM, and JS;
@@ -531,8 +535,9 @@ reintroduced:
    covered with normal, data, and `view-source:` URLs.
 6. **Shutdown owner order:** Browser publishes shutdown, joins tab workers,
    waits helpers, retires render snapshots, then destroys tabs, network, fonts,
-   z2d, renderer, and window. Long timers poll cancellation and no longer delay
-   close until their nominal deadline. See
+   z2d, renderer, and window. Long timers poll cancellation and Kiesel polls a
+   host interrupt at VM safe points, so neither a distant timeout nor an
+   infinite page script can indefinitely prevent the worker join. See
    [`tests/manual/lifecycle-long-timeout.html`](../tests/manual/lifecycle-long-timeout.html).
 7. **Stylesheet generation ownership:** root and child stylesheet source
    buffers and parsed rules are staged, cleaned up on error, and moved into
