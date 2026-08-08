@@ -1,59 +1,56 @@
-This project is a Zig implementation of https://browser.engineering (the original is in Python). We built a browser from scratch, chapter by chapter, following the book’s core algorithms while adapting to the Zig codebase and supporting libraries.
+# Zibra agent guide
 
-Status
+Zibra is a Zig browser built by following
+[Web Browser Engineering](https://browser.engineering). The tutorial is
+complete; current work is bug fixes and the book's optional exercises.
 
-- The full tutorial book is implemented.
-- From here on, we focus on bug fixes and implementing the book’s extra exercise features.
+## Read in this order
 
-Build and Run
+1. This file for repository-wide rules.
+2. The nearest `AGENTS.md` to the files being changed. Nested guides add the
+   most specific rules for their subsystem.
+3. [`docs/architecture-and-lifetimes.md`](docs/architecture-and-lifetimes.md)
+   before changing navigation, rendering, JavaScript callbacks, URL ownership,
+   or task shutdown.
 
-- Always run `zig build` after code changes.
-- `zig build run` starts the browser with the blank default page.
-- `zig build run -- <url>` starts the browser at a specific URL.
+Keep the nearest `AGENTS.md` and its linked documentation current whenever a
+change alters commands, source layout, ownership, thread boundaries, testing,
+or subsystem contracts. Add a focused nested `AGENTS.md` when a directory
+becomes a distinct subsystem; do not turn this root guide into a second
+architecture document.
 
-Third-Party Libraries (Special)
+## Map
 
-- z2d: 2D raster/compositor used for drawing display lists to surfaces and compositing effects like opacity. Core rendering paths flow through `src/browser/root.zig` and `src/browser/render/layout.zig`.
-- kiesel: JavaScript engine/runtime used by `src/script/js.zig` to implement a minimal DOM/JS host environment.
-- sdl2: Windowing/input/event loop and the primary platform integration for rendering.
-- zigimg: Image decoding/handling for `<img>` and other image resources.
+| Area | Entry point |
+| --- | --- |
+| CLI and isolated inspection modes | `src/main.zig` |
+| Browser, tabs, compositor, chrome | `src/browser/` |
+| DOM, HTML, CSS, selectors | `src/document/` |
+| Kiesel host integration | `src/script/` |
+| URLs, HTTP, cookies, response decoding | `src/network/` |
+| Tasking and synchronization | `src/runtime/` |
+| Shared low-level primitives | `src/core/` |
+| Fixtures and regression tests | `tests/` |
 
-Architecture Map (High Level)
+## Working rules
 
-- Entry point: `src/main.zig` parses args and initializes `Browser`.
-- Browser core: `src/browser/root.zig` owns window setup, event loop, tabs, rendering, and compositor integration.
-- Tabs/Frames: `src/browser/tab.zig` manages navigation, DOM trees, CSS rules, layout, paint, hit-testing, and JS context per frame.
-- HTML parser & DOM: `src/document/parser.zig` builds the DOM tree and applies computed styles.
-- CSS parsing: `src/document/css_parser.zig` parses CSS rules; `src/document/selector.zig` matches tag/descendant selectors.
-- Layout & paint: `src/browser/render/layout.zig` builds display lists, handles text/layout, and emits draw commands; `src/browser/render/font.zig` owns font and glyph resources.
-- JS runtime/host bindings: `src/script/js.zig` implements `document`, events, `XMLHttpRequest`, timers, and `querySelectorAll`.
-- Networking & URLs: `src/network/url.zig` handles URL parsing, request schemes, redirects, cookies, and response decoding.
-- Chrome UI: `src/browser/chrome.zig` handles the address bar and browser controls.
-- Runtime support: `src/runtime/` contains the task runner, synchronization wrapper, and timing utility.
-- Shared primitives: `src/core/` contains low-level reusable state helpers.
+- Keep ownership explicit. Do not shallow-copy an owning `Url`, response,
+  display-list container, native handle, or resource-backed slice.
+- Treat raw `*Node`, `*Frame`, and JavaScript callback pointers as synchronous
+  borrows unless the lifecycle documentation explicitly gives them a stable
+  identity or lifetime.
+- Prefer isolated CLI diagnostics when debugging a pipeline stage:
+  `--dump-dom` stops after HTML parsing; screenshot mode exercises the full
+  rendering pipeline.
+- Do not edit `SDL.zig/` unless the task explicitly targets the local SDL
+  binding dependency.
 
-Subsystem Guide (Where To Work)
+## Verification
 
-- HTML parsing / DOM: `src/document/parser.zig`
-- CSS parsing / selectors / cascade: `src/document/css_parser.zig`, `src/document/selector.zig`, `src/document/parser.zig` (style application)
-- Layout, paint, display list: `src/browser/render/layout.zig`
-- Font and glyph resources: `src/browser/render/font.zig`
-- Rendering & compositor: `src/browser/root.zig`, `src/browser/render/layout.zig`
-- JavaScript features: `src/script/js.zig`
-- Requests, redirects, gzip, cookies, and file/data/about URLs: `src/network/url.zig`
-- Tabs/frames/navigation: `src/browser/tab.zig`
-- UI/chrome: `src/browser/chrome.zig`
-- Tasking and synchronization: `src/runtime/task.zig`, `src/runtime/sync.zig`
-
-For ownership and lifetime contracts, read `docs/architecture-and-lifetimes.md` before changing navigation, rendering, JavaScript callbacks, or task shutdown.
-
-Verification Guidance (For Issues)
-
-- Provide a minimal HTML test file that demonstrates the change. Put it under a clear path like `tests/manual/<issue-id>.html`.
-- Include a short “how to verify” section at the top of the HTML file (as comments) describing the exact expected behavior and what to click/observe.
-- Prefer deterministic, visible outcomes (text changes, color changes, layout changes) that can be confirmed by a human.
-- If the feature is interactive (events, JS), include a simple on-page status area that updates on success.
-- Run and verify with `zig build run -- /absolute/path/to/test.html`.
-- Run `zig build test` for the unified unit-test suite.
-- On macOS, run `zig build test-screenshot` for the native deterministic screenshot fixture.
-- For screenshots, use the `zibra-screenshot` skill in `.agents/skills/zibra-screenshot`. Run setup once, then run capture to produce `out/screenshot/zibra.png`.
+- Run `zig build` after Zig or build-script changes.
+- Run `zig build test` for unit coverage.
+- Run `zig build test-dump-dom` for the isolated DOM CLI contract.
+- On macOS, run `zig build test-screenshot` for the native rendering fixture.
+- Put human-facing regressions in `tests/manual/` with a short verification
+  comment. Use the `zibra-screenshot` skill for Linux/Xvfb captures when a
+  screenshot is required.
