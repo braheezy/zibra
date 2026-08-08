@@ -24,6 +24,10 @@ fn requestOptions(
         .redirect_behavior = redirect_behavior,
         .headers = .{
             .user_agent = .{ .override = user_agent },
+            // Compression support is part of Zibra's HTTP contract rather
+            // than an incidental std.http default. Keep negotiation aligned
+            // with the encoding handled by the browser-engineering exercise.
+            .accept_encoding = .{ .override = "gzip" },
         },
         .extra_headers = extra_headers,
     };
@@ -950,9 +954,118 @@ test "HTTP requests identify Zibra and keep HTTP/1.1 connections alive" {
         user_agent,
         options.headers.user_agent.override,
     );
+    try std.testing.expectEqualStrings(
+        "gzip",
+        options.headers.accept_encoding.override,
+    );
     try std.testing.expectEqual(@as(usize, 1), options.extra_headers.len);
     try std.testing.expectEqualStrings("X-Zibra-Test", options.extra_headers[0].name);
     try std.testing.expectEqualStrings("present", options.extra_headers[0].value);
+}
+
+test "HTTP requests negotiate and decode chunked gzip responses" {
+    const CompressionServer = struct {
+        server: std.Io.net.Server,
+        io: std.Io,
+        saw_gzip: bool = false,
+        err: ?anyerror = null,
+
+        const compressed_body = [_]u8{
+            0x1f, 0x8b, 0x08, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x02, 0xff, 0x4b, 0xce, 0xcf, 0x2d, 0x28, 0x4a,
+            0x2d, 0x2e, 0x4e, 0x4d, 0x51, 0x00, 0x52, 0x05,
+            0xf9, 0x79, 0xc5, 0xa9, 0x0a, 0x49, 0xf9, 0x29,
+            0x95, 0x00, 0x74, 0x6d, 0x27, 0xcb, 0x18, 0x00,
+            0x00, 0x00,
+        };
+
+        fn run(self: *@This()) void {
+            self.serve() catch |err| {
+                self.err = err;
+            };
+        }
+
+        fn serve(self: *@This()) !void {
+            var stream = try self.server.accept(self.io);
+            defer stream.socket.close(self.io);
+
+            var read_buffer: [4096]u8 = undefined;
+            var reader = stream.reader(self.io, &read_buffer);
+            var write_buffer: [1024]u8 = undefined;
+            var writer = stream.writer(self.io, &write_buffer);
+
+            const request_line = try reader.interface.takeDelimiterExclusive('\n');
+            if (!std.mem.startsWith(u8, request_line, "GET ")) return error.InvalidRequest;
+
+            while (true) {
+                const header = try reader.interface.takeDelimiterExclusive('\n');
+                if (std.mem.eql(u8, header, "\r")) break;
+                const colon = std.mem.indexOfScalar(u8, header, ':') orelse continue;
+                const name = header[0..colon];
+                const value = std.mem.trim(u8, header[colon + 1 ..], " \t\r");
+                if (std.ascii.eqlIgnoreCase(name, "accept-encoding")) {
+                    self.saw_gzip = std.ascii.eqlIgnoreCase(value, "gzip");
+                }
+            }
+
+            try writer.interface.writeAll(
+                "HTTP/1.1 200 OK\r\n" ++
+                    "Content-Type: text/plain\r\n" ++
+                    "Content-Encoding: gzip\r\n" ++
+                    "Transfer-Encoding: chunked\r\n" ++
+                    "Connection: close\r\n\r\n",
+            );
+
+            const chunk_size: usize = 7;
+            var offset: usize = 0;
+            while (offset < compressed_body.len) {
+                const end = @min(offset + chunk_size, compressed_body.len);
+                const chunk = compressed_body[offset..end];
+                try writer.interface.print("{x}\r\n", .{chunk.len});
+                try writer.interface.writeAll(chunk);
+                try writer.interface.writeAll("\r\n");
+                offset = end;
+            }
+            try writer.interface.writeAll("0\r\n\r\n");
+            try writer.interface.flush();
+        }
+    };
+
+    const address = try std.Io.net.IpAddress.parse("127.0.0.1", 0);
+    var server = try address.listen(std.testing.io, .{});
+    defer server.deinit(std.testing.io);
+    var context = CompressionServer{ .server = server, .io = std.testing.io };
+    const thread = try std.Thread.spawn(.{}, CompressionServer.run, .{&context});
+
+    var http_client: std.http.Client = .{ .allocator = std.testing.allocator, .io = std.testing.io };
+    defer http_client.deinit();
+    var cookie_jar = std.StringHashMap(CookieEntry).init(std.testing.allocator);
+    defer cookie_jar.deinit();
+
+    const url_string = try std.fmt.allocPrint(
+        std.testing.allocator,
+        "http://127.0.0.1:{d}/compressed",
+        .{server.socket.address.getPort()},
+    );
+    defer std.testing.allocator.free(url_string);
+    const url = try Url.init(std.testing.allocator, url_string);
+    defer url.free(std.testing.allocator);
+
+    const response = try Url.fetchBody(
+        std.testing.allocator,
+        std.testing.io,
+        &http_client,
+        &cookie_jar,
+        url,
+        null,
+        null,
+    );
+    defer std.testing.allocator.free(response.body);
+
+    thread.join();
+    if (context.err) |err| return err;
+    try expect(context.saw_gzip);
+    try std.testing.expectEqualStrings("compressed response body", response.body);
 }
 
 test "HTTP requests reuse a keep-alive connection" {
