@@ -4,6 +4,7 @@
 //! directories without escaping their Zig module path.
 
 comptime {
+    _ = @import("browser/render/layout.zig");
     _ = @import("script/js.zig");
     _ = @import("tests/parser.zig");
     _ = @import("network/url.zig");

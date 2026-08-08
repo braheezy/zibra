@@ -1409,7 +1409,8 @@ fn findAccessibleNode(node_ptr: *Node) ?*Node {
     return null;
 }
 
-// Update handlePreformattedText to use the common processGrapheme function
+// Preserve preformatted whitespace while decoding the same text entities used
+// by ordinary text nodes.
 fn handlePreformattedText(
     self: *Layout,
     content: []const u8,
@@ -1422,13 +1423,36 @@ fn handlePreformattedText(
         self.current_font_category = .monospace;
     }
 
-    var g_iter = grapheme.iterator(content);
-    while (g_iter.next()) |gc| {
-        const gme = gc.bytes(content);
-        try self.processGrapheme(gme, line_buffer, node_ptr, .{
-            .is_superscript = self.is_superscript,
-            .is_small_caps = self.is_small_caps,
-        });
+    var position: usize = 0;
+    while (position < content.len) {
+        if (lexEntityAt(content, position)) |entity| {
+            // A soft hyphen is a discretionary line-break marker. Preformatted
+            // text does not wrap, so it remains invisible here as well.
+            if (std.mem.eql(u8, entity.replacement, "\u{00AD}")) {
+                position += entity.len;
+                continue;
+            }
+            try self.processGrapheme(entity.replacement, line_buffer, node_ptr, .{
+                .is_superscript = self.is_superscript,
+                .is_small_caps = self.is_small_caps,
+            });
+            position += entity.len;
+            continue;
+        }
+
+        // Keep grapheme segmentation for source text, but stop before the
+        // next potential entity so it can be decoded on the next iteration.
+        const search_start = if (content[position] == '&') position + 1 else position;
+        const entity_start = std.mem.indexOfScalarPos(u8, content, search_start, '&') orelse content.len;
+        var g_iter = grapheme.iterator(content[position..entity_start]);
+        while (g_iter.next()) |gc| {
+            const gme = gc.bytes(content[position..entity_start]);
+            try self.processGrapheme(gme, line_buffer, node_ptr, .{
+                .is_superscript = self.is_superscript,
+                .is_small_caps = self.is_small_caps,
+            });
+        }
+        position = entity_start;
     }
 }
 
@@ -1539,6 +1563,22 @@ fn lexEntityAt(text: []const u8, pos: usize) ?struct { replacement: []const u8, 
         return .{ .replacement = "\u{00AD}", .len = 5 }; // Unicode soft hyphen
 
     return null;
+}
+
+test "lexEntityAt recognizes the entities rendered as text" {
+    const input = "&lt;div&gt; &amp; &quot;quote&quot; &apos;apostrophe&apos;";
+
+    const less_than = lexEntityAt(input, 0).?;
+    try std.testing.expectEqualStrings("<", less_than.replacement);
+    try std.testing.expectEqual(@as(usize, 4), less_than.len);
+
+    const greater_than_start = std.mem.indexOf(u8, input, "&gt;").?;
+    const greater_than = lexEntityAt(input, greater_than_start).?;
+    try std.testing.expectEqualStrings(">", greater_than.replacement);
+    try std.testing.expectEqual(@as(usize, 4), greater_than.len);
+
+    try std.testing.expect(lexEntityAt("&unknown;", 0) == null);
+    try std.testing.expect(lexEntityAt("&lt", 0) == null);
 }
 
 // Update layoutSourceCode to format HTML source with tags in normal font and content in bold
