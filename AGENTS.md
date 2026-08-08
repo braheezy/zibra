@@ -59,12 +59,6 @@ architecture document.
   comment. Use the `zibra-screenshot` skill for Linux/Xvfb captures when a
   screenshot is required.
 
-## Worktrees
-
-Use the named Worktrunk workflow in `Taskfile.yml` for parallel changes; see
-[`docs/worktrees.md`](docs/worktrees.md). Do not create detached worktrees for
-feature work. The safe cleanup task removes only integrated branches; reserve
-the explicit discard task for abandoned work.
 
 ## Doing an Issue
 
