@@ -733,11 +733,49 @@ pub const Url = struct {
 
 const expect = std.testing.expect;
 
-test "file request" {
+test "file URLs load local file contents" {
+    var temp_dir = std.testing.tmpDir(.{});
+    defer temp_dir.cleanup();
+
+    try temp_dir.dir.writeFile(std.testing.io, .{
+        .sub_path = "page.html",
+        .data = "<p>local fixture</p>",
+    });
+
+    var directory_path_buffer: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const directory_path_len = try temp_dir.dir.realPath(std.testing.io, &directory_path_buffer);
+    const file_url = try std.fmt.allocPrint(
+        std.testing.allocator,
+        "file://{s}/page.html",
+        .{directory_path_buffer[0..directory_path_len]},
+    );
+    defer std.testing.allocator.free(file_url);
+
+    const url = try Url.init(std.testing.allocator, file_url);
+    defer url.free(std.testing.allocator);
+    const body = try url.fileRequest(std.testing.allocator, std.testing.io);
+    defer std.testing.allocator.free(body);
+
+    try expect(std.mem.eql(u8, body, "<p>local fixture</p>"));
+}
+
+test "file URLs resolve relative and root-relative resources" {
     const url = try Url.init(std.testing.allocator, "file:///test/path.html");
     defer url.free(std.testing.allocator);
     try expect(std.mem.eql(u8, url.scheme, "file"));
     try expect(std.mem.eql(u8, url.path, "/test/path.html"));
+
+    const relative = try url.resolve(std.testing.allocator, "assets/site.css");
+    defer relative.free(std.testing.allocator);
+    try expect(std.mem.eql(u8, relative.path, "/test/assets/site.css"));
+
+    const parent_relative = try url.resolve(std.testing.allocator, "../shared/site.css");
+    defer parent_relative.free(std.testing.allocator);
+    try expect(std.mem.eql(u8, parent_relative.path, "/shared/site.css"));
+
+    const root_relative = try url.resolve(std.testing.allocator, "/images/logo.png");
+    defer root_relative.free(std.testing.allocator);
+    try expect(std.mem.eql(u8, root_relative.path, "/images/logo.png"));
 }
 
 test "data request" {

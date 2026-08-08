@@ -191,10 +191,13 @@ fn zibra(init: std.process.Init) !void {
         url = Url.init(allocator, arg) catch |err| blk: {
             if (err == error.InvalidUrl) {
                 // Attempt to treat the URL as a local file path
-                const cwd = try std.process.currentPathAlloc(init.io, allocator);
-                defer allocator.free(cwd);
-
-                const absolute_path = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ cwd, arg });
+                const absolute_path = if (std.Io.Dir.path.isAbsolute(arg))
+                    try allocator.dupe(u8, arg)
+                else absolute_path: {
+                    const cwd = try std.process.currentPathAlloc(init.io, allocator);
+                    defer allocator.free(cwd);
+                    break :absolute_path try std.fmt.allocPrint(allocator, "{s}/{s}", .{ cwd, arg });
+                };
                 defer allocator.free(absolute_path);
 
                 // Check if the file exists before creating a file URL
