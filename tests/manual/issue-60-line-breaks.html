@@ -1,0 +1,12 @@
+<!--
+How to verify:
+  zig build run -- --dump-display-list tests/manual/issue-60-line-breaks.html
+
+Expected behavior:
+  "First line", "Second line", and "Third line" start on separate lines.
+  Their vertical separation is visibly larger than an automatically wrapped
+  line, giving each source newline the appearance of a paragraph break.
+-->
+<html><body><div>First line
+Second line
+Third line</div></body></html>

@@ -1456,7 +1456,34 @@ fn handlePreformattedText(
     }
 }
 
-// Update handleTextToken to use the common processGrapheme function
+fn lineBreakLengthAt(text: []const u8, position: usize) usize {
+    if (position >= text.len) return 0;
+    return switch (text[position]) {
+        '\n' => 1,
+        '\r' => if (position + 1 < text.len and text[position + 1] == '\n') 2 else 1,
+        else => 0,
+    };
+}
+
+fn paragraphGap(font_size: i32) i32 {
+    const line_step = @max(font_size, 1);
+    return @max(@divTrunc(line_step, 2), 1);
+}
+
+fn breakParagraph(self: *Layout, line_buffer: *std.ArrayList(LineItem)) !void {
+    const initial_y = self.cursor_y;
+    try self.flushLine(line_buffer);
+
+    const gap = paragraphGap(self.size);
+    if (self.cursor_y == initial_y) {
+        // Preserve an empty source line even though flushLine has no glyph
+        // metrics from which to derive its normal advance.
+        self.cursor_y += @max(self.size, 1);
+    }
+    self.cursor_y += gap;
+    self.cursor_x = if (self.rtl_text) self.line_right else self.line_left;
+}
+
 fn handleTextToken(
     self: *Layout,
     content: []const u8,
@@ -1468,28 +1495,22 @@ fn handleTextToken(
         return;
     }
 
-    // Replace newline characters with spaces in a stack buffer.
-    var buf: [4096]u8 = undefined;
-    const text = if (content.len < buf.len) blk: {
-        @memcpy(buf[0..content.len], content);
-        for (buf[0..content.len]) |*byte| {
-            if (byte.* == '\n') byte.* = ' ';
-        }
-        break :blk buf[0..content.len];
-    } else content;
-
-    // Track the last soft hyphen position in the current line
-    var last_hyphen_idx: ?usize = null;
-
     // Process entities before grapheme iteration
     var i: usize = 0;
-    while (i < text.len) {
-        if (text[i] == '&') {
+    while (i < content.len) {
+        const line_break_len = lineBreakLengthAt(content, i);
+        if (line_break_len != 0) {
+            try self.breakParagraph(line_buffer);
+            i += line_break_len;
+            continue;
+        }
+
+        if (content[i] == '&') {
             // Check if this is an entity
-            if (lexEntityAt(text, i)) |entity| {
+            if (lexEntityAt(content, i)) |entity| {
                 if (std.mem.eql(u8, entity.replacement, "\u{00AD}")) {
-                    // Soft hyphen - remember position but don't render
-                    last_hyphen_idx = line_buffer.items.len;
+                    // Soft hyphens are discretionary break markers. They stay
+                    // invisible until soft-hyphen wrapping is implemented.
                     i += entity.len;
                     continue;
                 }
@@ -1508,12 +1529,12 @@ fn handleTextToken(
 
         // Find next grapheme boundary
         var g_end = i;
-        while (g_end < text.len) {
-            if (text[g_end] == '&') break; // Stop at potential entity
+        while (g_end < content.len) {
+            if (content[g_end] == '&' or lineBreakLengthAt(content, g_end) != 0) break;
 
             g_end += 1;
-            if (g_end < text.len) {
-                if ((text[g_end] & 0xC0) != 0x80) break; // Not a continuation byte
+            if (g_end < content.len) {
+                if ((content[g_end] & 0xC0) != 0x80) break; // Not a continuation byte
             }
         }
 
@@ -1522,7 +1543,7 @@ fn handleTextToken(
             g_end = i + 1;
         }
 
-        const gme = text[i..g_end];
+        const gme = content[i..g_end];
 
         // Process the grapheme using our common function
         try self.processGrapheme(gme, line_buffer, node_ptr, .{
@@ -1532,6 +1553,19 @@ fn handleTextToken(
 
         i = g_end;
     }
+}
+
+test "lineBreakLengthAt recognizes platform newline encodings" {
+    try std.testing.expectEqual(@as(usize, 1), lineBreakLengthAt("a\nb", 1));
+    try std.testing.expectEqual(@as(usize, 2), lineBreakLengthAt("a\r\nb", 1));
+    try std.testing.expectEqual(@as(usize, 1), lineBreakLengthAt("a\rb", 1));
+    try std.testing.expectEqual(@as(usize, 0), lineBreakLengthAt("abc", 1));
+}
+
+test "paragraph gap adds visible leading beyond a normal line step" {
+    try std.testing.expectEqual(@as(i32, 8), paragraphGap(16));
+    try std.testing.expect(paragraphGap(16) > 0);
+    try std.testing.expectEqual(@as(i32, 1), paragraphGap(1));
 }
 
 // Entity handling function that takes a position in text
