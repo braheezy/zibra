@@ -27,7 +27,7 @@ architecture document.
 | Browser, tabs, compositor, chrome      | `src/browser/`  |
 | DOM, HTML, CSS, selectors              | `src/document/` |
 | Kiesel host integration                | `src/script/`   |
-| URLs, HTTP, cookies, response decoding | `src/network/`  |
+| URLs, HTTP, cookies, caching, decoding | `src/network/`  |
 | Tasking and synchronization            | `src/runtime/`  |
 | Shared low-level primitives            | `src/core/`     |
 | Fixtures and regression tests          | `tests/`        |

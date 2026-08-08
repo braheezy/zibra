@@ -52,6 +52,7 @@ fn fetchDecodedDocument(
         init.io,
         &http_client,
         &cookie_jar,
+        null,
         url,
         null,
         null,

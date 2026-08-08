@@ -15,6 +15,7 @@ const font = @import("render/font.zig");
 const Glyph = font.Glyph;
 const url_module = @import("../network/url.zig");
 const Url = url_module.Url;
+const HttpCache = url_module.HttpCache;
 const Layout = @import("render/layout.zig");
 const parser = @import("../document/parser.zig");
 const HTMLParser = parser.HTMLParser;
@@ -499,6 +500,8 @@ pub const Browser = struct {
     http_client_mutex: Mutex,
     // Shared cookie storage across tabs
     cookie_jar: std.StringHashMap(url_module.CookieEntry),
+    // Shared decoded HTTP responses across tabs and document generations.
+    http_cache: HttpCache,
     // Window dimensions
     window_width: i32 = initial_window_width,
     window_height: i32 = initial_window_height,
@@ -651,6 +654,7 @@ pub const Browser = struct {
             .http_client = .{ .allocator = al, .io = io },
             .http_client_mutex = .init(io),
             .cookie_jar = std.StringHashMap(url_module.CookieEntry).init(al),
+            .http_cache = HttpCache.init(al),
             .layout_engine = layout_engine,
             .default_style_sheet_rules = default_rules,
             .tabs = std.ArrayList(*Tab).empty,
@@ -1441,6 +1445,7 @@ pub const Browser = struct {
             self.io,
             &self.http_client,
             &self.cookie_jar,
+            &self.http_cache,
             url,
             referrer,
             payload,
@@ -1462,6 +1467,7 @@ pub const Browser = struct {
             self.io,
             &self.http_client,
             &self.cookie_jar,
+            &self.http_cache,
             url,
             referrer,
             payload,
@@ -5106,6 +5112,7 @@ pub const Browser = struct {
 
         // No remaining task can use networking or shared browser state.
         self.http_client.deinit();
+        self.http_cache.deinit();
         var cookie_it = self.cookie_jar.iterator();
         while (cookie_it.next()) |entry| {
             self.allocator.free(entry.value_ptr.value);

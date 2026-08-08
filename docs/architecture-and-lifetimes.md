@@ -42,7 +42,8 @@ The source tree is organized by responsibility:
 | [`src/document/inspection.zig`](../src/document/inspection.zig) | Browser-free fetch/decode/parse/style pipeline for document inspection commands. |
 | [`src/document/css_parser.zig`](../src/document/css_parser.zig) | CSS parsing and `CSSRule` ownership. |
 | [`src/document/selector.zig`](../src/document/selector.zig) | Selector representation and matching. |
-| [`src/network/url.zig`](../src/network/url.zig) | Owning `Url`, URL resolution, schemes, HTTP requests, redirects, cookies, and response bodies. |
+| [`src/network/url.zig`](../src/network/url.zig) | Owning `Url`, URL resolution, schemes, HTTP requests, redirects, cookies, response bodies, and cache integration. |
+| [`src/network/cache.zig`](../src/network/cache.zig) | Browser-session HTTP response entries, expiry, and strict `Cache-Control` policy parsing. |
 | [`src/script/js.zig`](../src/script/js.zig) | Kiesel host integration, realms/windows, DOM handles, JavaScript evaluation, events, timers, XHR, and host callbacks. |
 | [`src/runtime/task.zig`](../src/runtime/task.zig) | Per-tab serialized task worker and opaque task-context cleanup. |
 | [`src/runtime/sync.zig`](../src/runtime/sync.zig) | Runtime synchronization wrappers. |
@@ -105,7 +106,7 @@ but no lock or owner-thread rule covers the complete mutable graph.
 
 - the SDL window, renderer, cached output texture, and text-input lifecycle;
 - root, chrome, and optional tab z2d surfaces plus the root z2d context;
-- the shared `std.http.Client` and cookie jar;
+- the shared `std.http.Client`, cookie jar, and decoded HTTP response cache;
 - the shared `Layout`, including its `FontManager`;
 - default user-agent CSS rules;
 - all `Tab` allocations;
@@ -230,6 +231,15 @@ untagged slice with no destructor. `Browser.fetchBody` returns allocated bodies
 for file and HTTP paths, a slice into `Url.path` for `data:`, and borrowed data
 for `about:`. Callers currently infer ownership again from the URL scheme.
 
+The Browser-owned `HttpCache` in [`src/network/cache.zig`](../src/network/cache.zig)
+stores owned copies of decoded GET/200 response bodies, CSP headers, and final
+redirect URLs. Cache hits duplicate body and header data before returning, so
+they preserve the existing caller-owned HTTP response contract. Entries with
+`max-age` use the monotonic awake clock; `no-store`, malformed directives, and
+unknown directives bypass storage. Responses without `Cache-Control` remain
+cached for the current browser session, matching the exercise's simplified
+model. The Browser HTTP mutex serializes both the shared client and cache.
+
 `Url` wraps an owning `ada.Url` and has an explicit `free` method. Its component
 slices borrow that owner, except for separately allocated data-URL storage.
 Ordinary Zig value copies of `Url` are shallow. Treat `Url` as move-only unless
@@ -289,8 +299,8 @@ I/O to finish.
 - `Browser.lock` protects a subset of active-tab render state, dirty flags, and
   shutdown/animation flags.
 - `TaskRunner.mutex` and its condition protect the task queue and worker flags.
-- `http_client_mutex` serializes the shared HTTP client and cookie jar around
-  HTTP requests.
+- `http_client_mutex` serializes the shared HTTP client, cookie jar, and HTTP
+  response cache around fetches.
 - `JsLock` is a recursive-by-thread-ID wrapper used around evaluation and many
   callback operations in [`src/script/js.zig`](../src/script/js.zig).
 
