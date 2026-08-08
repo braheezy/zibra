@@ -17,7 +17,9 @@ fn requestOptions(
 ) std.http.Client.RequestOptions {
     return .{
         .version = .@"HTTP/1.1",
-        .keep_alive = false,
+        // A long-lived Browser owns this client, so fully consumed responses
+        // can return their connections to Zig's per-origin pool.
+        .keep_alive = true,
         .redirect_behavior = redirect_behavior,
         .headers = .{
             .user_agent = .{ .override = user_agent },
@@ -892,14 +894,14 @@ test "http request" {
     try expect(!url.is_https);
 }
 
-test "HTTP requests identify Zibra and close HTTP/1.1 connections" {
+test "HTTP requests identify Zibra and keep HTTP/1.1 connections alive" {
     const headers = [_]std.http.Header{
         .{ .name = "X-Zibra-Test", .value = "present" },
     };
     const options = requestOptions(.unhandled, &headers);
 
     try std.testing.expectEqual(std.http.Version.@"HTTP/1.1", options.version);
-    try expect(!options.keep_alive);
+    try expect(options.keep_alive);
     try std.testing.expectEqualStrings(
         user_agent,
         options.headers.user_agent.override,
@@ -907,4 +909,102 @@ test "HTTP requests identify Zibra and close HTTP/1.1 connections" {
     try std.testing.expectEqual(@as(usize, 1), options.extra_headers.len);
     try std.testing.expectEqualStrings("X-Zibra-Test", options.extra_headers[0].name);
     try std.testing.expectEqualStrings("present", options.extra_headers[0].value);
+}
+
+test "HTTP requests reuse a keep-alive connection" {
+    const KeepAliveServer = struct {
+        server: std.Io.net.Server,
+        io: std.Io,
+        accepted_connections: usize = 0,
+        handled_requests: usize = 0,
+        saw_keep_alive: bool = false,
+        err: ?anyerror = null,
+
+        fn run(self: *@This()) void {
+            self.serve() catch |err| {
+                self.err = err;
+            };
+        }
+
+        fn serve(self: *@This()) !void {
+            while (self.handled_requests < 2) {
+                var stream = try self.server.accept(self.io);
+                defer stream.socket.close(self.io);
+                self.accepted_connections += 1;
+
+                var read_buffer: [4096]u8 = undefined;
+                var reader = stream.reader(self.io, &read_buffer);
+                var write_buffer: [1024]u8 = undefined;
+                var writer = stream.writer(self.io, &write_buffer);
+
+                while (self.handled_requests < 2) {
+                    const request_line = reader.interface.takeDelimiterExclusive('\n') catch |err| switch (err) {
+                        error.EndOfStream => break,
+                        else => return err,
+                    };
+                    if (!std.mem.startsWith(u8, request_line, "GET ")) return error.InvalidRequest;
+
+                    var connection_is_keep_alive = false;
+                    while (true) {
+                        const header = try reader.interface.takeDelimiterExclusive('\n');
+                        if (std.mem.eql(u8, header, "\r")) break;
+                        if (std.mem.indexOfScalar(u8, header, ':')) |colon| {
+                            const name = header[0..colon];
+                            const value = std.mem.trim(u8, header[colon + 1 ..], " \t\r");
+                            if (std.ascii.eqlIgnoreCase(name, "connection")) {
+                                connection_is_keep_alive = std.ascii.eqlIgnoreCase(value, "keep-alive");
+                            }
+                        }
+                    }
+                    self.saw_keep_alive = self.saw_keep_alive or connection_is_keep_alive;
+
+                    try writer.interface.writeAll(
+                        "HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: keep-alive\r\n\r\nok",
+                    );
+                    try writer.interface.flush();
+                    self.handled_requests += 1;
+                }
+            }
+        }
+    };
+
+    const address = try std.Io.net.IpAddress.parse("127.0.0.1", 0);
+    var server = try address.listen(std.testing.io, .{});
+    defer server.deinit(std.testing.io);
+    var context = KeepAliveServer{ .server = server, .io = std.testing.io };
+    const thread = try std.Thread.spawn(.{}, KeepAliveServer.run, .{&context});
+
+    var http_client: std.http.Client = .{ .allocator = std.testing.allocator, .io = std.testing.io };
+    defer http_client.deinit();
+    var cookie_jar = std.StringHashMap(CookieEntry).init(std.testing.allocator);
+    defer cookie_jar.deinit();
+
+    const url_string = try std.fmt.allocPrint(
+        std.testing.allocator,
+        "http://127.0.0.1:{d}/resource",
+        .{server.socket.address.getPort()},
+    );
+    defer std.testing.allocator.free(url_string);
+    const url = try Url.init(std.testing.allocator, url_string);
+    defer url.free(std.testing.allocator);
+
+    for (0..2) |_| {
+        const response = try Url.fetchBody(
+            std.testing.allocator,
+            std.testing.io,
+            &http_client,
+            &cookie_jar,
+            url,
+            null,
+            null,
+        );
+        defer std.testing.allocator.free(response.body);
+        try expect(std.mem.eql(u8, response.body, "ok"));
+    }
+
+    thread.join();
+    if (context.err) |err| return err;
+    try std.testing.expectEqual(@as(usize, 1), context.accepted_connections);
+    try std.testing.expectEqual(@as(usize, 2), context.handled_requests);
+    try expect(context.saw_keep_alive);
 }
