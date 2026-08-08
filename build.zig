@@ -158,6 +158,19 @@ pub fn build(b: *std.Build) !void {
         compare.addFileArg(b.path("tests/golden/native-screenshot.macos.png"));
         compare.addFileArg(actual_screenshot);
         screenshot_test_step.dependOn(&compare.step);
+
+        const view_source_capture = b.addRunArtifact(exe);
+        // The native hidden-window path is process-global on macOS. Serialize
+        // the captures so the two screenshot fixtures cannot race SDL setup.
+        view_source_capture.step.dependOn(&compare.step);
+        view_source_capture.addArg("--screenshot");
+        const actual_view_source_screenshot = view_source_capture.addOutputFileArg("view-source-screenshot.png");
+        view_source_capture.addPrefixedFileArg("view-source:file://", b.path("tests/manual/view-source.html"));
+
+        const compare_view_source = b.addRunArtifact(screenshot_compare);
+        compare_view_source.addFileArg(b.path("tests/golden/view-source.macos.png"));
+        compare_view_source.addFileArg(actual_view_source_screenshot);
+        screenshot_test_step.dependOn(&compare_view_source.step);
     } else {
         const unsupported = b.addFail(
             "test-screenshot currently requires a native macOS target",

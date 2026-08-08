@@ -694,6 +694,17 @@ pub const Url = struct {
     /// Convert URL to string representation
     /// Returns a formatted URL string, hiding default ports
     pub fn toString(self: Url, buffer: []u8) ![]const u8 {
+        if (self.view_source) {
+            const prefix = "view-source:";
+            if (buffer.len < prefix.len) return error.NoSpaceLeft;
+            @memcpy(buffer[0..prefix.len], prefix);
+            const inner_url = try self.toStringInner(buffer[prefix.len..]);
+            return buffer[0 .. prefix.len + inner_url.len];
+        }
+        return self.toStringInner(buffer);
+    }
+
+    fn toStringInner(self: Url, buffer: []u8) ![]const u8 {
         // Handle special schemes
         if (std.mem.eql(u8, self.scheme, "data")) {
             return std.fmt.bufPrint(buffer, "data:{s}", .{self.path});
@@ -852,8 +863,11 @@ test "URL clone owns independent Ada and data URL storage" {
     try expect(std.mem.eql(u8, cloned.attributes.?.items[1], "base64"));
 }
 
-test "URL clone preserves view-source metadata" {
+test "view-source URLs preserve their wrapper when serialized and cloned" {
     var original = try Url.init(std.testing.allocator, "view-source:https://example.com/path");
+    var original_buffer: [128]u8 = undefined;
+    try expect(std.mem.eql(u8, try original.toString(&original_buffer), "view-source:https://example.com/path"));
+
     const cloned = try original.clone(std.testing.allocator);
     original.free(std.testing.allocator);
     original = undefined;
@@ -863,6 +877,9 @@ test "URL clone preserves view-source metadata" {
     try expect(std.mem.eql(u8, cloned.scheme, "https"));
     try expect(std.mem.eql(u8, cloned.host.?, "example.com"));
     try expect(std.mem.eql(u8, cloned.path, "/path"));
+
+    var cloned_buffer: [128]u8 = undefined;
+    try expect(std.mem.eql(u8, try cloned.toString(&cloned_buffer), "view-source:https://example.com/path"));
 }
 
 test "http request" {

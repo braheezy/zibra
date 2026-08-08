@@ -1,0 +1,20 @@
+<!--
+How to verify:
+  zig build test-screenshot
+
+Expected behavior:
+  The view-source screenshot fixture renders this file's literal markup rather
+  than rendering this heading or running its script. The source text includes
+  the literal entity spelling "&amp;lt;literal&amp;gt;".
+-->
+<!doctype html>
+<html>
+  <head>
+    <title>View-source fixture</title>
+    <script>document.body.innerHTML = "this must not run";</script>
+  </head>
+  <body>
+    <h1>This is source, not a heading</h1>
+    <p>&lt;literal&gt;</p>
+  </body>
+</html>
