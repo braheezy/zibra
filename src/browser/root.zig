@@ -72,6 +72,18 @@ const scroll_step: i32 = 100;
 const refresh_rate_ns: u64 = 33_000_000; // ~30 FPS
 // *********************************************************
 
+/// Convert SDL wheel units into Zibra's signed CSS-pixel scroll delta.
+/// SDL reports natural scrolling separately, so normalize that direction here.
+pub fn wheelScrollDelta(delta_y: i32, is_flipped: bool) i32 {
+    const normalized_delta: i64 = if (is_flipped) -@as(i64, delta_y) else delta_y;
+    const requested_scroll = -normalized_delta * @as(i64, scroll_step);
+    return @intCast(std.math.clamp(
+        requested_scroll,
+        @as(i64, std.math.minInt(i32)),
+        @as(i64, std.math.maxInt(i32)),
+    ));
+}
+
 const WindowPos = struct {
     x: c_int,
     y: c_int,
@@ -734,7 +746,7 @@ pub const Browser = struct {
         if (tab) |active| {
             const target_frame = active.focused_frame orelse active.root_frame;
             if (target_frame) |frame| {
-                const new_scroll = active.clampScrollForFrame(frame, frame.scroll + delta);
+                const new_scroll = active.clampScrollForFrame(frame, frame.scroll +| delta);
                 if (new_scroll != frame.scroll) {
                     frame.scroll = new_scroll;
                     if (frame == active.root_frame) {
@@ -1002,11 +1014,8 @@ pub const Browser = struct {
                 }
             },
             .mouse_wheel => |wheel_event| {
-                if (wheel_event.delta_y > 0) {
-                    self.handleScroll(-scroll_step);
-                } else if (wheel_event.delta_y < 0) {
-                    self.handleScroll(scroll_step);
-                }
+                const delta = wheelScrollDelta(wheel_event.delta_y, wheel_event.direction == .flipped);
+                if (delta != 0) self.handleScroll(delta);
             },
             .mouse_button_down => |button_event| {
                 if (button_event.button == .left) {
