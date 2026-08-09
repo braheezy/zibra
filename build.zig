@@ -247,6 +247,17 @@ pub fn build(b: *std.Build) !void {
         compare_text_direction.addFileArg(b.path("tests/golden/alternate-text-direction.macos.png"));
         compare_text_direction.addFileArg(actual_text_direction_screenshot);
         screenshot_test_step.dependOn(&compare_text_direction.step);
+
+        const centered_title_capture = b.addRunArtifact(exe);
+        centered_title_capture.step.dependOn(&compare_text_direction.step);
+        centered_title_capture.addArg("--screenshot");
+        const actual_centered_title_screenshot = centered_title_capture.addOutputFileArg("centered-title-screenshot.png");
+        centered_title_capture.addPrefixedFileArg("file://", b.path("tests/manual/centered-title.html"));
+
+        const compare_centered_title = b.addRunArtifact(screenshot_compare);
+        compare_centered_title.addFileArg(b.path("tests/golden/centered-title.macos.png"));
+        compare_centered_title.addFileArg(actual_centered_title_screenshot);
+        screenshot_test_step.dependOn(&compare_centered_title.step);
     } else {
         const unsupported = b.addFail(
             "test-screenshot currently requires a native macOS target",

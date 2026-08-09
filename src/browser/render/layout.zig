@@ -419,6 +419,34 @@ fn explicitTextDirection(element: *const parser.Element) ?TextDirection {
     return null;
 }
 
+fn elementHasClass(element: *const parser.Element, expected: []const u8) bool {
+    const attributes = element.attributes orelse return false;
+    const class_value = attributes.get("class") orelse return false;
+    var classes = std.mem.tokenizeAny(u8, class_value, " \t\r\n\x0c");
+    while (classes.next()) |class_name| {
+        if (std.mem.eql(u8, class_name, expected)) return true;
+    }
+    return false;
+}
+
+fn isCenteredTitleElement(element: *const parser.Element) bool {
+    return std.ascii.eqlIgnoreCase(element.tag, "h1") and
+        elementHasClass(element, "title");
+}
+
+fn isCenteredTitleBlock(block: *const BlockLayout) bool {
+    var current: ?*const BlockLayout = block;
+    while (current) |candidate| : (current = candidate.parent_block) {
+        switch (candidate.node) {
+            .element => |*element| {
+                if (isCenteredTitleElement(element)) return true;
+            },
+            .text => {},
+        }
+    }
+    return false;
+}
+
 /// Resolve the nearest inherited HTML `dir` value through the acyclic layout
 /// tree. `auto` and invalid values inherit because Zibra does not yet
 /// implement Unicode bidi detection.
@@ -473,6 +501,34 @@ test "HTML dir values override or inherit the CLI fallback" {
 
     try std.testing.expectEqual(TextDirection.left_to_right, textDirectionFromFlag(false));
     try std.testing.expectEqual(TextDirection.right_to_left, textDirectionFromFlag(true));
+}
+
+test "centered title recognizes title as an HTML class token" {
+    const allocator = std.testing.allocator;
+
+    var title = Node{ .element = try parser.Element.init(
+        allocator,
+        "h1 class='chapter title featured'",
+        null,
+    ) };
+    defer title.deinit(allocator);
+    try std.testing.expect(isCenteredTitleElement(&title.element));
+
+    var partial_match = Node{ .element = try parser.Element.init(
+        allocator,
+        "h1 class=subtitle",
+        null,
+    ) };
+    defer partial_match.deinit(allocator);
+    try std.testing.expect(!isCenteredTitleElement(&partial_match.element));
+
+    var wrong_element = Node{ .element = try parser.Element.init(
+        allocator,
+        "h2 class=title",
+        null,
+    ) };
+    defer wrong_element.deinit(allocator);
+    try std.testing.expect(!isCenteredTitleElement(&wrong_element.element));
 }
 
 // Layout state
@@ -1057,7 +1113,6 @@ fn flushLine(self: *Layout, line_buffer: *std.ArrayList(LineItem)) !void {
     if (shift != 0) {
         for (line_buffer.items) |*item| item.x += shift;
     }
-    self.is_title = false;
 
     // === PASS 1: Collect line metrics ===
     var max_ascent: i32 = 0;
@@ -3160,7 +3215,10 @@ fn layoutInlineBlock(self: *Layout, block: *BlockLayout) !void {
     self.size = self.default_font_size;
     self.is_bold = false;
     self.is_italic = false;
-    self.is_title = false;
+    // Centering belongs to the complete title block, not one buffered line.
+    // Keeping this state stable lets explicit and automatic line breaks center
+    // each completed line independently in flushLine().
+    self.is_title = isCenteredTitleBlock(block);
     self.is_superscript = false;
     self.is_small_caps = false;
     self.text_color = .{ .r = 0, .g = 0, .b = 0, .a = 255 }; // Reset to black

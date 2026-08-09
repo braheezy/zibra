@@ -233,6 +233,10 @@ wrapped in source order, then the completed line is shifted to its selected
 edge, so English remains left-to-right while an RTL-directed line grows from
 the right. This is intentionally not a Unicode bidi or contextual-script
 shaping implementation; `dir=auto` currently inherits the fallback.
+The same completed-line alignment step centers every line beneath an `h1`
+whose class-token list contains `title`. Title alignment is resolved from the
+layout parent chain and remains active across explicit and automatic line
+breaks.
 
 ### Network responses and URLs
 

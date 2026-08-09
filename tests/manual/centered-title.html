@@ -1,0 +1,22 @@
+<!--
+How to verify:
+  zig build run -- --screenshot tests/golden/centered-title.macos.png tests/manual/centered-title.html
+
+Expected: both blue title lines are centered independently. The long purple
+title wraps and its shorter final line is centered too. The ordinary red h1
+starts at the left content edge.
+-->
+<!doctype html>
+<html>
+  <head>
+    <title>Centered title fixture</title>
+    <style>
+      body { background-color: white; color: black; }
+    </style>
+  </head>
+  <body>
+    <h1 class="chapter title featured" style="color: #2457e6">Centered title line<br>Short</h1>
+    <h1 class="title" style="color: #6f2c91">This deliberately long centered title keeps going across the available width until it wraps, leaving a noticeably shorter final line that must also be centered independently.</h1>
+    <h1 class="subtitle" style="color: #b42318">Ordinary heading starts at the left edge</h1>
+  </body>
+</html>

@@ -23,6 +23,9 @@ before changing `root.zig`, `tab.zig`, `render/`, or browser task scheduling.
   `-rtl` supplies the document fallback, while the nearest block ancestor's
   `dir=rtl` or `dir=ltr` overrides it. Unicode bidi reordering, `dir=auto`, and
   contextual script shaping are not implemented.
+- An `h1` whose whitespace-separated class list contains `title` centers each
+  completed line independently. Keep this alignment stable for the whole
+  inline block; line flushing must not consume it.
 - Keep browser rendering work and isolated inspection modes separate. A DOM
   dump must not construct `Browser` merely to reuse a convenience method.
 
