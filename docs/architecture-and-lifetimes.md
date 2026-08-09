@@ -37,7 +37,7 @@ The source tree is organized by responsibility:
 | [`src/browser/tab.zig`](../src/browser/tab.zig) | `Tab` and `Frame` ownership, task serialization, history, frame lookup, accessibility, focus, and per-document state. |
 | [`src/browser/chrome.zig`](../src/browser/chrome.zig) | Browser chrome UI and its display data. |
 | [`src/browser/render/layout.zig`](../src/browser/render/layout.zig) | Layout tree, invalidation dependencies, hit-test collection, paint, and image layout. |
-| [`src/browser/render/font.zig`](../src/browser/render/font.zig) | Font discovery, SDL_ttf handles, glyph textures, and software glyph pixels. |
+| [`src/browser/render/font.zig`](../src/browser/render/font.zig) | Font discovery, SDL_ttf handles, Unicode fallback selection, and owned RGBA glyph bitmaps. |
 | [`src/document/parser.zig`](../src/document/parser.zig) | HTML parser, DOM representation, style maps, images, and DOM tree utilities. |
 | [`src/document/inspection.zig`](../src/document/inspection.zig) | Browser-free fetch/decode/parse/style pipeline for document inspection commands. |
 | [`src/document/css_parser.zig`](../src/document/css_parser.zig) | CSS parsing and `CSSRule` ownership. |
@@ -61,7 +61,8 @@ process main thread
     SDL event loop
     chrome, composite, raster, draw
     committed Browser render snapshot
-    shared Layout / FontManager / SDL renderer
+    shared Layout / FontManager
+    main-thread SDL renderer
           |
           | schedules Task values
           v
@@ -95,7 +96,7 @@ but no lock or owner-thread rule covers the complete mutable graph.
 | Process arena | Normal application allocations use the process arena in [`src/main.zig`](../src/main.zig). Individual `free` and `destroy` calls still express logical ownership even when the arena does not promptly reclaim most allocations. | Arena behavior can hide leaks and delay visible corruption. Ownership-sensitive code should also be exercised with `std.testing.allocator` or a GPA. |
 | Kiesel host object | With libgc enabled, `Js.init` allocates `Js` from BDWGC's scanned, uncollectable allocator so its embedded `Agent` remains a collector root. `Js.deinit` releases the agent/platform and destroys the host object through its storage allocator; see [`src/script/js.zig`](../src/script/js.zig). | Any Kiesel pointer reachable only from unscanned Zig memory must be rooted deliberately. The process arena is not a GC root. |
 | Zibra collections | `Browser`, `Tab`, `Frame`, DOM, layout, rules, tasks, and snapshots generally retain the caller allocator and provide explicit teardown paths. | The explicit lifetime remains authoritative even when production allocation behavior masks a bad free order. |
-| SDL and SDL_ttf | Window, renderer, textures, surfaces, fonts, and SDL_ttf handles are native resources. `FontManager.deinit` destroys glyph textures, frees pixel masks, closes fonts, and quits SDL_ttf; see [`src/browser/render/font.zig`](../src/browser/render/font.zig). | Native handles require deterministic release and an explicit thread-affinity rule. |
+| SDL and SDL_ttf | Window, renderer, textures, surfaces, fonts, and SDL_ttf handles are native resources. `FontManager.deinit` frees cached RGBA glyph bitmaps, closes fonts, and quits SDL_ttf; see [`src/browser/render/font.zig`](../src/browser/render/font.zig). | Native handles require deterministic release and an explicit thread-affinity rule. |
 | z2d and zigimg | `Browser` owns long-lived z2d surfaces/contexts. `ImageData` owns a `zigimg.Image` and, when present, its encoded byte buffer; see [`src/document/parser.zig`](../src/document/parser.zig). | Layout and display items borrow pixel slices from these owners. The source image must outlive every borrower. |
 
 ## Ownership topology
@@ -206,10 +207,11 @@ Individual block layouts also retain node pointers and install
 therefore borrows the DOM and must be destroyed before it.
 
 `ImageLayout.pixels` borrows `ImageData.image.rawBytes()`. `FontManager` owns
-font handles, glyph textures, and software-rendering pixel masks. A copied
-`Glyph` borrows those resources; it does not transfer ownership. The cached
-`Glyph` no longer stores the source grapheme slice, so transient input text is
-not retained as glyph metadata.
+font handles and dimensionally exact RGBA glyph bitmaps. A copied `Glyph`
+borrows its cached pixel slice; it does not transfer ownership. Its
+`pixel_mode` distinguishes a tintable alpha mask from a native-color bitmap.
+The cached `Glyph` does not store the source grapheme slice, so transient input
+text is not retained as glyph metadata.
 
 Display-list container ownership is recursive: `.blend` and `.transform` own
 their child slices, and `.blend` owns its copied blend-mode string. See
@@ -217,7 +219,7 @@ their child slices, and `.blend` owns its copied blend-mode string. See
 Primitive entries are not self-contained:
 
 - `.image.pixels` borrows decoded image memory;
-- `.glyph.glyph` borrows `FontManager` texture/pixel resources;
+- `.glyph.glyph` borrows a `FontManager` pixel resource;
 - `.iframe.node`, `.blend.node`, and `.transform.node` borrow DOM identity;
 - composited-layer entries borrow layer allocations.
 
@@ -466,20 +468,22 @@ thread-ownership contract remains unresolved.
 `Browser.init` initializes SDL, creates a window and renderer, starts text
 input, creates a renderer texture, initializes `Layout`/`FontManager`, and
 creates z2d surfaces; see [`src/browser/root.zig`](../src/browser/root.zig).
-`FontManager` retains the renderer, and `getStyledGlyph` can mutate font state,
-render an SDL_ttf surface, and create an SDL texture; see
+`FontManager` does not retain the renderer. `getStyledGlyph` mutates SDL_ttf
+font state, renders a temporary SDL surface, converts it to canonical RGBA,
+and stores only allocator-owned bytes; see
 [`src/browser/render/font.zig`](../src/browser/render/font.zig).
 
 The same browser-global `Layout` and `FontManager` are reachable from tab
-layout/paint work and main-thread chrome/render paths. There is no shared lock
-or assertion establishing which thread may access the font glyph map or
-renderer. The concurrency is confirmed; whether a particular SDL backend
-tolerates it is platform-dependent and must not be assumed.
+layout/paint work and main-thread chrome paths. There is no shared lock or
+assertion establishing which thread may access the font glyph map or SDL_ttf
+font handles. The renderer no longer participates in glyph-cache mutation, but
+the remaining font concurrency is confirmed and must not be assumed safe.
 
 Normal `Browser.deinit` now quiesces tabs first, retires display snapshots,
-destroys document/network state, destroys glyph and cached textures while the
-renderer is alive, tears down z2d state, stops text input, explicitly destroys
-the renderer and window, and finally calls `sdl2.quit`. `Browser.init` uses
+destroys document/network state, frees cached glyph bitmaps and closes fonts,
+destroys cached textures while the renderer is alive, tears down z2d state,
+stops text input, explicitly destroys the renderer and window, and finally
+calls `sdl2.quit`. `Browser.init` uses
 reverse-order `errdefer` rollback for SDL, window, renderer, text input,
 textures, styles, Layout/FontManager, measurement, chrome, and z2d resources.
 
@@ -487,10 +491,9 @@ The intended SDL contract should be:
 
 1. designate one thread as the owner of the SDL renderer and all renderer-bound
    textures;
-2. marshal renderer operations to that thread, or document and enforce the
-   narrower set of operations allowed elsewhere;
-3. stop workers before destroying glyph textures, surfaces, renderer, or
-   window;
+2. separately serialize mutable SDL_ttf font and glyph-cache access;
+3. stop workers before freeing glyph bitmaps or destroying fonts, surfaces,
+   renderer, or window;
 4. destroy resources in reverse dependency order;
 5. make every partial initialization path use the same ownership order.
 
@@ -606,12 +609,14 @@ Snapshot retirement now closes navigation, replacement, and shutdown paths,
 but in-place DOM mutation can still retire a leaf before the replacement commit
 reaches the browser. The clone is not independently safe by type.
 
-### 4. Shared Layout, FontManager, and renderer access has no global contract
+### 4. Shared Layout and FontManager access has no global contract
 
-The browser owns one mutable layout/font stack. Resize and chrome/render paths
-use it from the main thread, while tab tasks use it for document layout and
-glyph creation. No common owner-thread assertion or lock covers these paths.
-The concurrency gap is confirmed; backend-specific failure is a hypothesis.
+The browser owns one mutable layout/font stack. Resize and chrome paths use it
+from the main thread, while tab tasks use it for document layout and glyph
+creation. No common owner-thread assertion or lock covers these paths. Glyph
+rasterization no longer touches the SDL renderer, but font handles and caches
+remain shared. The concurrency gap is confirmed; backend-specific failure is a
+hypothesis.
 
 ### 5. Response and URL ownership is encoded in call-site convention
 
@@ -653,8 +658,8 @@ targeted stress test:
   subtree mutation or layout rebuild;
 - main-thread accessibility hit testing racing a worker rebuild and observing
   a retired tree, despite the repaired string-generation ownership;
-- simultaneous main-thread and tab-thread font/SDL renderer access violating a
-  backend's thread-affinity requirements;
+- simultaneous main-thread and tab-thread font/cache mutation corrupting
+  SDL_ttf or hash-map state;
 - an arena-backed build appearing stable while a reclaiming test allocator
   reuses freed storage and exposes a latent UAF;
 

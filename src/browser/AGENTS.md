@@ -13,8 +13,10 @@ before changing `root.zig`, `tab.zig`, `render/`, or browser task scheduling.
   quiescence. Queued or detached work must carry a stable document identity,
   not a borrowed frame pointer.
 - `render/layout.zig` and `render/font.zig` borrow DOM/image state and own
-  layout/font resources. Layout must retire before DOM; fonts/textures must
-  retire before the renderer.
+  layout/font resources. `FontManager` owns canonical RGBA glyph bitmaps;
+  display-list `Glyph` values borrow those bytes, and `pixel_mode` tells paint
+  whether to tint an alpha mask or preserve native color. Layout must retire
+  before DOM, and display snapshots must retire before `FontManager`.
 - `scroll.zig` is the single source of truth for CSS scroll ranges and native
   scrollbar-thumb geometry. Clamping and drawing must use the same metrics.
 - Keep browser rendering work and isolated inspection modes separate. A DOM

@@ -112,7 +112,7 @@ fn dumpPipeline(
     // inspection path deliberately creates neither a window nor a renderer.
     try sdl2.init(.{ .video = true });
     defer sdl2.quit();
-    const layout = try Layout.init(allocator, init.io, init.environ_map, null, 800, 600, rtl_text);
+    const layout = try Layout.init(allocator, init.io, init.environ_map, 800, 600, rtl_text);
     defer layout.deinit();
     layout.collect_hit_test_bounds = false;
     const document = try layout.buildDocument(&page.root);

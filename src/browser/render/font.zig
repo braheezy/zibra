@@ -1,17 +1,21 @@
 //! Discovers fonts and supplies measured, rasterized glyphs to layout and paint.
 //!
 //! The font manager wraps SDL_ttf, selects system-font fallbacks by character
-//! category and style, and caches loaded font sizes and glyph pixel data.
+//! category and style, and caches owned RGBA glyph bitmaps.
 
 const std = @import("std");
 const builtin = @import("builtin");
 
 const known_folders = @import("known-folders");
-const grapheme = @import("grapheme");
 const code_point = @import("code_point");
+const unicode_emoji = @import("emoji");
 const sdl2 = @import("sdl");
 
 const hyphen_codepoint = 0x00AD;
+const rgba_surface_format = if (builtin.target.cpu.arch.endian() == .big)
+    sdl2.c.SDL_PIXELFORMAT_RGBA8888
+else
+    sdl2.c.SDL_PIXELFORMAT_ABGR8888;
 
 pub const FontWeight = enum {
     Normal,
@@ -26,6 +30,7 @@ pub const FontSlant = enum {
 pub const FontCategory = enum {
     latin,
     cjk,
+    symbols,
     emoji,
     monospace,
 };
@@ -38,7 +43,6 @@ const UnicodeRange = struct {
 const FontCategoryRanges = struct {
     latin: []const UnicodeRange,
     cjk: []const UnicodeRange,
-    emoji: []const UnicodeRange,
 };
 
 const unicode_ranges = FontCategoryRanges{
@@ -55,11 +59,6 @@ const unicode_ranges = FontCategoryRanges{
         .{ .start = 0x3040, .end = 0x309F }, // Hiragana
         .{ .start = 0x30A0, .end = 0x30FF }, // Katakana
         .{ .start = 0xAC00, .end = 0xD7A3 }, // Hangul Syllables
-    },
-    .emoji = &[_]UnicodeRange{
-        .{ .start = 0x1F300, .end = 0x1F5FF }, // Miscellaneous Symbols and Pictographs
-        .{ .start = 0x1F600, .end = 0x1F64F }, // Emoticons
-        .{ .start = 0x1F900, .end = 0x1F9FF }, // Supplemental Symbols and Pictographs
     },
 };
 
@@ -90,6 +89,12 @@ const system_fonts = switch (builtin.target.os.tag) {
             .{
                 .name = "Arial Unicode",
                 .category = .cjk,
+                .weight = .Normal,
+                .slant = .Roman,
+            },
+            .{
+                .name = "Apple Symbols",
+                .category = .symbols,
                 .weight = .Normal,
                 .slant = .Roman,
             },
@@ -141,7 +146,9 @@ const system_fonts = switch (builtin.target.os.tag) {
             "/usr/share/fonts/google-noto",
             "/usr/share/fonts/google-noto-sans-cjk-vf-fonts",
             "/usr/share/fonts/google-noto-color-emoji-fonts",
-            "/home/braheezy/zibra",
+            "/usr/share/fonts/truetype/noto",
+            "/usr/share/fonts/opentype/noto",
+            "/usr/share/fonts/noto",
             "/usr/share/fonts/twemoji",
         },
         .fonts = &[_]FontEntry{
@@ -173,6 +180,12 @@ const system_fonts = switch (builtin.target.os.tag) {
             .{
                 .name = "NotoSansCJK-VF",
                 .category = .cjk,
+                .weight = .Normal,
+                .slant = .Roman,
+            },
+            .{
+                .name = "NotoSansSymbols2-Regular",
+                .category = .symbols,
                 .weight = .Normal,
                 .slant = .Roman,
             },
@@ -211,25 +224,103 @@ const system_fonts = switch (builtin.target.os.tag) {
     else => @compileError("Unsupported operating system"),
 };
 
+fn configuredFontCategory(name: []const u8) FontCategory {
+    for (system_fonts.fonts) |font| {
+        if (std.mem.eql(u8, font.name, name)) return font.category;
+    }
+    return .latin;
+}
+
+pub const GlyphPixelMode = enum {
+    alpha_mask,
+    color,
+};
+
 pub const Glyph = struct {
-    texture: ?sdl2.Texture,
     w: i32,
     h: i32,
     ascent: i32,
     descent: i32,
     is_superscript: bool = false,
     is_soft_hyphen: bool = false,
-    preserve_texture_color: bool = false,
-    /// Pixel data for z2d software rendering (RGBA format, alpha mask from font)
+    pixel_mode: GlyphPixelMode = .alpha_mask,
+    /// Owned by the FontManager cache and borrowed by display-list snapshots.
+    /// The dimensions always match `w` and `h` exactly.
     pixels: ?[]u8 = null,
 };
 
+fn emojiWidthForHeight(source_width: i32, source_height: i32, target_height: i32) i32 {
+    if (source_width <= 0 or source_height <= 0 or target_height <= 0) return 0;
+    const numerator = @as(i64, source_width) * target_height + @divTrunc(source_height, 2);
+    const scaled = @divTrunc(numerator, source_height);
+    return @intCast(@min(@max(scaled, 1), @as(i64, std.math.maxInt(i32))));
+}
+
+fn emojiHeightForFontSize(font_size: i32) i32 {
+    if (font_size <= 0) return 0;
+    const scaled = @divTrunc(@as(i64, font_size) * 4 + 2, 3);
+    return @intCast(@min(scaled, @as(i64, std.math.maxInt(i32))));
+}
+
+fn copySurfaceRgba(
+    allocator: std.mem.Allocator,
+    surface: sdl2.Surface,
+    target_width: i32,
+    target_height: i32,
+) ![]u8 {
+    if (target_width <= 0 or target_height <= 0) return error.InvalidGlyphDimensions;
+
+    const converted_ptr = sdl2.c.SDL_ConvertSurfaceFormat(
+        surface.ptr,
+        rgba_surface_format,
+        0,
+    ) orelse return sdl2.makeError();
+    const converted = sdl2.Surface{ .ptr = converted_ptr };
+    defer converted.destroy();
+
+    var resized: ?sdl2.Surface = null;
+    defer if (resized) |value| value.destroy();
+
+    const output_ptr = if (converted.ptr.w == target_width and converted.ptr.h == target_height)
+        converted.ptr
+    else blk: {
+        const resized_ptr = sdl2.c.SDL_CreateRGBSurfaceWithFormat(
+            0,
+            target_width,
+            target_height,
+            32,
+            rgba_surface_format,
+        ) orelse return sdl2.makeError();
+        resized = .{ .ptr = resized_ptr };
+        if (sdl2.c.SDL_SoftStretchLinear(converted.ptr, null, resized_ptr, null) < 0) {
+            return sdl2.makeError();
+        }
+        break :blk resized_ptr;
+    };
+
+    const pixels_ptr = output_ptr.pixels orelse return error.MissingGlyphPixels;
+    const width: usize = @intCast(target_width);
+    const height: usize = @intCast(target_height);
+    const row_bytes = width * 4;
+    const pitch: usize = @intCast(output_ptr.pitch);
+    if (pitch < row_bytes) return error.InvalidGlyphPitch;
+
+    const pixels = try allocator.alloc(u8, row_bytes * height);
+    errdefer allocator.free(pixels);
+    const source: [*]const u8 = @ptrCast(pixels_ptr);
+    for (0..height) |y| {
+        @memcpy(
+            pixels[y * row_bytes ..][0..row_bytes],
+            source[y * pitch ..][0..row_bytes],
+        );
+    }
+    return pixels;
+}
+
 const Font = struct {
-    name: []const u8,
+    category: FontCategory,
     font_handle: sdl2.ttf.Font,
-    // Glyph cache or atlas.
     glyphs: std.AutoHashMap(u64, Glyph),
-    line_height: i32,
 };
 
 const FontKey = struct {
@@ -242,21 +333,16 @@ pub const FontManager = struct {
     allocator: std.mem.Allocator,
     io: std.Io,
     environ: *const std.process.Environ.Map,
-    /// Rendering is optional for inspection-only layout passes. SDL_ttf still
-    /// provides metrics and software glyph pixels in that mode.
-    renderer: ?sdl2.Renderer,
     fonts: std.StringHashMap(*Font),
     styled_fonts: std.AutoHashMap(FontKey, *Font),
     category_fonts: std.AutoHashMap(FontCategory, *Font),
     current_font: ?*Font = null,
-    min_line_height: i32 = std.math.maxInt(i32),
     loaded_sizes: std.AutoHashMap(i32, void),
 
     pub fn init(
         allocator: std.mem.Allocator,
         io: std.Io,
         environ: *const std.process.Environ.Map,
-        renderer: ?sdl2.Renderer,
     ) !FontManager {
         try sdl2.ttf.init();
 
@@ -264,7 +350,6 @@ pub const FontManager = struct {
             .allocator = allocator,
             .io = io,
             .environ = environ,
-            .renderer = renderer,
             .fonts = std.StringHashMap(*Font).init(allocator),
             .styled_fonts = std.AutoHashMap(FontKey, *Font).init(allocator),
             .category_fonts = std.AutoHashMap(FontCategory, *Font).init(allocator),
@@ -279,12 +364,7 @@ pub const FontManager = struct {
 
             var outer_it = f.glyphs.iterator();
             while (outer_it.next()) |outer_entry| {
-                // For each style => destroy the texture and free pixel data
                 const cache_entry = outer_entry.value_ptr.*;
-                if (cache_entry.texture) |texture| {
-                    texture.destroy();
-                }
-                // Free the pixel data used for z2d software rendering
                 if (cache_entry.pixels) |pixels| {
                     self.allocator.free(pixels);
                 }
@@ -387,18 +467,13 @@ pub const FontManager = struct {
             self.allocator.destroy(font);
         };
         font.* = Font{
-            .name = name,
+            .category = configuredFontCategory(name),
             .font_handle = fh,
             .glyphs = std.AutoHashMap(u64, Glyph).init(self.allocator),
-            .line_height = fh.lineSkip(),
         };
 
         try self.fonts.put(name, font);
         font_owned = false;
-
-        if (font.line_height < self.min_line_height) {
-            self.min_line_height = font.line_height;
-        }
 
         if (self.current_font == null) {
             self.current_font = self.fonts.get(name);
@@ -439,7 +514,7 @@ pub const FontManager = struct {
         }
 
         // Iterate through font categories in order of priority
-        const categories = [_]FontCategory{ .latin, .cjk, .emoji, .monospace };
+        const categories = [_]FontCategory{ .latin, .cjk, .symbols, .emoji, .monospace };
         for (categories) |category| {
             for (system_fonts.fonts) |font| {
                 if (font.category != category) continue; // Skip fonts not matching the current category
@@ -479,7 +554,6 @@ pub const FontManager = struct {
 
         if (codepoint.code == hyphen_codepoint) {
             return Glyph{
-                .texture = null,
                 .w = 0,
                 .h = 0,
                 .ascent = 0,
@@ -488,53 +562,50 @@ pub const FontManager = struct {
             };
         }
 
-        var styled_font = self.pickFontForCharacterStyle(
-            codepoint.code,
-            weight,
-            slant,
-            use_monospace,
-        );
+        const category: FontCategory = if (use_monospace)
+            .monospace
+        else
+            getGraphemeCategory(gme);
+        var styled_font = self.pickFontForCharacterStyle(category, weight, slant);
         var style_set = false;
         var synthetic_bold = false;
 
         if (styled_font == null) {
-            // Try again with normal weight for monospace
             if (use_monospace and weight == .Bold) {
-                styled_font = self.pickFontForCharacterStyle(
-                    codepoint.code,
-                    .Normal,
-                    slant,
-                    use_monospace,
-                );
+                styled_font = self.pickFontForCharacterStyle(category, .Normal, slant);
                 if (styled_font != null) {
-                    synthetic_bold = true; // Mark for synthetic bold rendering
+                    synthetic_bold = true;
                 }
             }
 
             if (styled_font == null) {
-                styled_font = self.pickFontForCharacter(codepoint.code);
+                styled_font = self.pickCategoryFallback(category);
+                if (styled_font == null) styled_font = self.current_font;
                 if (styled_font == null) return error.NoFontForGlyph;
-                const new_style: sdl2.ttf.Font.Style = .{
-                    .bold = weight == .Bold,
-                    .italic = slant == .Italic,
-                };
-                styled_font.?.font_handle.setStyle(new_style);
-                style_set = true;
+
+                // Color emoji fonts supply their own faces. Applying a
+                // synthetic bold or italic style can disable color strikes.
+                if (styled_font.?.category != .emoji and
+                    (weight != .Normal or slant != .Roman))
+                {
+                    styled_font.?.font_handle.setStyle(.{
+                        .bold = weight == .Bold,
+                        .italic = slant == .Italic,
+                    });
+                    style_set = true;
+                }
             }
         }
         const font = styled_font.?;
+        defer if (style_set) font.font_handle.setStyle(.{});
 
-        // Use a single cache key that combines grapheme, weight, slant, and size.
         const key = newGlyphCacheKey(gme, weight, slant, size);
         if (font.glyphs.get(key)) |cached_glyph| {
-            if (style_set) font.font_handle.setStyle(.{});
             return cached_glyph;
         }
 
-        // Set the font size before rendering.
         font.font_handle.setSize(size);
 
-        // Convert the grapheme to a null-terminated string.
         const sentinel_gme = try sliceToSentinelArray(self.allocator, gme);
         defer self.allocator.free(sentinel_gme);
 
@@ -544,23 +615,14 @@ pub const FontManager = struct {
         );
         defer glyph_surface.destroy();
 
-        // Apply synthetic bold effect before creating texture
         if (synthetic_bold) {
             const bold_offset = @max(1, @divTrunc(size, 24));
-
-            // Create a new surface for the bold effect
             const bold_surface = try sdl2.createRgbSurfaceWithFormat(
                 @intCast(glyph_surface.ptr.w + bold_offset),
                 @intCast(glyph_surface.ptr.h),
                 .abgr8888,
             );
-            // Copy original glyph multiple times with offset
-            try sdl2.blit(
-                glyph_surface,
-                null,
-                bold_surface,
-                null,
-            );
+            try sdl2.blit(glyph_surface, null, bold_surface, null);
             var rect = sdl2.Rectangle{
                 .x = bold_offset,
                 .y = 0,
@@ -568,88 +630,47 @@ pub const FontManager = struct {
                 .height = glyph_surface.ptr.h,
             };
             try sdl2.blit(glyph_surface, null, bold_surface, &rect);
-
-            // Replace original surface with bold version
             glyph_surface.destroy();
             glyph_surface = bold_surface;
         }
 
-        const glyph_tex = if (self.renderer) |renderer| blk: {
-            const texture = try sdl2.createTextureFromSurface(renderer, glyph_surface);
-            try texture.setScaleMode(.linear);
-            break :blk texture;
-        } else null;
-
         const surf = glyph_surface.ptr;
-        const is_emoji = isCodepointEmoji(codepoint.code);
+        if (surf.w <= 0 or surf.h <= 0) return error.InvalidGlyphDimensions;
+        const is_color_emoji = category == .emoji and font.category == .emoji;
         const ascent = font.font_handle.ascent();
-        const descent = -font.font_handle.descent(); // Make positive
+        const descent = -font.font_handle.descent();
+        const glyph_height = if (is_color_emoji) emojiHeightForFontSize(size) else surf.h;
+        const glyph_width = if (is_color_emoji)
+            emojiWidthForHeight(surf.w, surf.h, glyph_height)
+        else
+            surf.w;
+        const pixel_data = try copySurfaceRgba(
+            self.allocator,
+            glyph_surface,
+            glyph_width,
+            glyph_height,
+        );
+        errdefer self.allocator.free(pixel_data);
 
-        // Extract pixel data from surface for z2d software rendering
-        // The surface pixels contain alpha values from the font rendering
-        const pixel_data: ?[]u8 = blk: {
-            if (surf.pixels) |pixels_ptr| {
-                const w: usize = @intCast(surf.w);
-                const h: usize = @intCast(surf.h);
-                const pitch: usize = @intCast(surf.pitch);
-
-                // Allocate space for RGBA data (4 bytes per pixel)
-                const data = self.allocator.alloc(u8, w * h * 4) catch break :blk null;
-
-                // Copy pixel data row by row (respecting pitch)
-                // SDL_TTF renderUtf8Blended returns ARGB8888 format
-                // On little-endian: byte 0=B, byte 1=G, byte 2=R, byte 3=A
-                const src_bytes: [*]const u8 = @ptrCast(pixels_ptr);
-                for (0..h) |y| {
-                    for (0..w) |x| {
-                        const src_idx = y * pitch + x * 4;
-                        const dst_idx = (y * w + x) * 4;
-                        // Convert from ARGB8888 (BGRA in memory) to RGBA
-                        const b = src_bytes[src_idx + 0];
-                        const g = src_bytes[src_idx + 1];
-                        const r = src_bytes[src_idx + 2];
-                        const a = src_bytes[src_idx + 3];
-                        data[dst_idx + 0] = r;
-                        data[dst_idx + 1] = g;
-                        data[dst_idx + 2] = b;
-                        data[dst_idx + 3] = a;
-                    }
-                }
-                break :blk data;
-            }
-            break :blk null;
-        };
-
-        const new_glyph = if (!is_emoji) Glyph{
-            .texture = glyph_tex,
-            .w = surf.w,
-            .h = surf.h,
+        const new_glyph = if (!is_color_emoji) Glyph{
+            .w = glyph_width,
+            .h = glyph_height,
             .ascent = ascent,
             .descent = descent,
             .pixels = pixel_data,
         } else blk: {
-            const text_height: i32 = self.min_line_height;
-            var tmp1: f32 = @floatFromInt(text_height);
-            const tmp2: f32 = @floatFromInt(surf.h);
-            // Multiply by 1.2 to make the emoji 20% larger than before.
-            const emoji_scale_factor = (tmp1 / tmp2) * 1.2;
-            tmp1 = @floatFromInt(surf.w);
-            const emoji_width: i32 = @intFromFloat(tmp1 * emoji_scale_factor);
-            const emoji_height: i32 = @intFromFloat(tmp2 * emoji_scale_factor);
+            const emoji_ascent = @max(@divTrunc(glyph_height * 3, 4), 1);
             break :blk Glyph{
-                .texture = glyph_tex,
-                .w = emoji_width,
-                .h = emoji_height,
-                .ascent = @divTrunc(3 * self.min_line_height, 4),
-                .descent = @divTrunc(self.min_line_height, 4),
-                .preserve_texture_color = true,
+                .w = glyph_width,
+                .h = glyph_height,
+                .ascent = emoji_ascent,
+                .descent = glyph_height - emoji_ascent,
+                .pixel_mode = .color,
                 .pixels = pixel_data,
             };
         };
 
         try font.glyphs.put(key, new_glyph);
-        if (style_set) font.font_handle.setStyle(.{});
-
         return new_glyph;
     }
 
@@ -664,50 +685,12 @@ pub const FontManager = struct {
         try self.loaded_sizes.put(size, {});
     }
 
-    fn pickFontForCharacter(self: *FontManager, codepoint: u21) ?*Font {
-        const categories = [_]FontCategory{ .latin, .cjk, .emoji, .monospace };
-
-        for (categories) |category| {
-            const ranges = switch (category) {
-                .latin => unicode_ranges.latin,
-                .cjk => unicode_ranges.cjk,
-                .emoji => unicode_ranges.emoji,
-                .monospace => unicode_ranges.latin, // Monospace uses Latin ranges
-            };
-
-            for (ranges) |range| {
-                if (codepoint >= range.start and codepoint <= range.end) {
-                    // Search fonts matching the category
-                    var it = self.fonts.iterator();
-                    while (it.next()) |entry| {
-                        const font_name = entry.key_ptr.*;
-                        const font = entry.value_ptr.*;
-
-                        // Check the font's category by matching against system_fonts.fonts
-                        for (system_fonts.fonts) |sf| {
-                            if (std.mem.eql(u8, sf.name, font_name) and sf.category == category) {
-                                return font;
-                            }
-                        }
-                    }
-                }
-            }
-        }
-
-        return null; // No matching font found
-    }
-
     fn pickFontForCharacterStyle(
         self: *FontManager,
-        codepoint: u21,
+        category: FontCategory,
         weight: FontWeight,
         slant: FontSlant,
-        use_monospace: bool,
     ) ?*Font {
-        // 1) Get category
-        const category = if (use_monospace) .monospace else getCategory(codepoint) orelse return null;
-
-        // 2) Try exact style match
         const key = FontKey{
             .category = category,
             .weight = weight,
@@ -716,8 +699,22 @@ pub const FontManager = struct {
         if (self.styled_fonts.get(key)) |font| {
             return font;
         }
+        return null;
+    }
 
-        // 3) Fallback to normal style for this category
+    fn pickCategoryFallback(self: *FontManager, category: FontCategory) ?*Font {
+        const fallbacks: []const FontCategory = switch (category) {
+            .emoji => &.{ .emoji, .symbols, .cjk, .latin },
+            .symbols => &.{ .symbols, .cjk, .latin },
+            .cjk => &.{ .cjk, .latin },
+            .monospace => &.{ .monospace, .latin },
+            .latin => &.{.latin},
+        };
+        for (fallbacks) |fallback| {
+            if (self.category_fonts.get(fallback)) |fallback_font| {
+                return fallback_font;
+            }
+        }
         return null;
     }
 };
@@ -729,31 +726,60 @@ fn sliceToSentinelArray(allocator: std.mem.Allocator, slice: []const u8) ![:0]co
     return arr;
 }
 
-fn isCodepointEmoji(codepoint: u21) bool {
-    for (unicode_ranges.emoji) |range| {
-        if (codepoint >= range.start and codepoint <= range.end) {
-            return true;
-        }
-    }
-    return false;
-}
-
 pub fn getCategory(codepoint: u21) ?FontCategory {
-    const categories = [_]FontCategory{ .latin, .cjk, .emoji, .monospace };
-    for (categories) |category| {
-        const ranges = switch (category) {
-            .latin => unicode_ranges.latin,
-            .cjk => unicode_ranges.cjk,
-            .emoji => unicode_ranges.emoji,
-            .monospace => unicode_ranges.latin, // Monospace uses Latin ranges
-        };
-        for (ranges) |range| {
-            if (codepoint >= range.start and codepoint <= range.end) {
-                return category;
-            }
-        }
+    if (unicode_emoji.isEmojiPresentation(codepoint)) return .emoji;
+    if (codepoint > 0x7F and unicode_emoji.isEmoji(codepoint)) return .symbols;
+    for (unicode_ranges.cjk) |range| {
+        if (codepoint >= range.start and codepoint <= range.end) return .cjk;
+    }
+    for (unicode_ranges.latin) |range| {
+        if (codepoint >= range.start and codepoint <= range.end) return .latin;
     }
     return null;
+}
+
+/// Return whether a complete grapheme cluster requests emoji presentation.
+pub fn isEmojiGrapheme(gme: []const u8) bool {
+    var iter = code_point.Iterator{ .bytes = gme };
+    const first = iter.next() orelse return false;
+    var has_text_selector = false;
+    var has_emoji_selector = false;
+    var has_keycap = false;
+    var has_joiner = false;
+    var has_modifier = false;
+
+    while (iter.next()) |current| {
+        switch (current.code) {
+            0xFE0E => has_text_selector = true,
+            0xFE0F => has_emoji_selector = true,
+            0x20E3 => has_keycap = true,
+            0x200D => has_joiner = true,
+            else => if (unicode_emoji.isEmojiModifier(current.code)) {
+                has_modifier = true;
+            },
+        }
+    }
+
+    if (has_text_selector and !has_emoji_selector) return false;
+    if (has_emoji_selector and unicode_emoji.isEmoji(first.code)) return true;
+    if (has_keycap and unicode_emoji.isEmoji(first.code)) return true;
+    if (has_modifier and unicode_emoji.isEmojiModifierBase(first.code)) return true;
+    if (has_joiner and unicode_emoji.isExtendedPictographic(first.code)) return true;
+    return unicode_emoji.isEmojiPresentation(first.code);
+}
+
+/// Choose one font for an entire grapheme cluster. Unknown scripts fall back
+/// to the Latin face so SDL_ttf can render its normal missing-glyph marker.
+pub fn getGraphemeCategory(gme: []const u8) FontCategory {
+    if (isEmojiGrapheme(gme)) return .emoji;
+    var iter = code_point.Iterator{ .bytes = gme };
+    const first = iter.next() orelse return .latin;
+    while (iter.next()) |current| {
+        if (current.code == 0xFE0E and unicode_emoji.isEmoji(first.code)) {
+            return .symbols;
+        }
+    }
+    return getCategory(first.code) orelse .latin;
 }
 
 fn hashCombine(seed: u64, value: u64) u64 {
@@ -773,4 +799,39 @@ fn newGlyphCacheKey(gme: []const u8, weight: FontWeight, slant: FontSlant, size:
     var key = hashCombine(grapheme_hash, @as(u64, @intCast(size)));
     key = hashCombine(key, @as(u64, bits));
     return key;
+}
+
+test "emoji grapheme classification covers presentation sequences" {
+    const emoji_graphemes = [_][]const u8{
+        "😀",
+        "🚀",
+        "🇺🇸",
+        "👍🏽",
+        "👨‍👩‍👧‍👦",
+        "❤️",
+        "☀️",
+    };
+    for (emoji_graphemes) |gme| {
+        try std.testing.expect(isEmojiGrapheme(gme));
+        try std.testing.expectEqual(FontCategory.emoji, getGraphemeCategory(gme));
+    }
+
+    try std.testing.expect(!isEmojiGrapheme("A"));
+    try std.testing.expect(!isEmojiGrapheme("☀"));
+}
+
+test "grapheme font category preserves text and CJK fallbacks" {
+    try std.testing.expectEqual(FontCategory.latin, getGraphemeCategory("A"));
+    try std.testing.expectEqual(FontCategory.cjk, getGraphemeCategory("中"));
+    try std.testing.expectEqual(FontCategory.symbols, getGraphemeCategory("☀"));
+    try std.testing.expectEqual(FontCategory.symbols, getGraphemeCategory("😀︎"));
+}
+
+test "emoji bitmap scaling preserves aspect ratio and validates dimensions" {
+    try std.testing.expectEqual(@as(i32, 16), emojiHeightForFontSize(12));
+    try std.testing.expectEqual(@as(i32, 0), emojiHeightForFontSize(0));
+    try std.testing.expectEqual(@as(i32, 16), emojiWidthForHeight(128, 128, 16));
+    try std.testing.expectEqual(@as(i32, 32), emojiWidthForHeight(256, 128, 16));
+    try std.testing.expectEqual(@as(i32, 8), emojiWidthForHeight(64, 128, 16));
+    try std.testing.expectEqual(@as(i32, 0), emojiWidthForHeight(0, 128, 16));
 }

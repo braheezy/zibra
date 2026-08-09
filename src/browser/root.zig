@@ -186,8 +186,55 @@ pub const Color = struct {
     }
 };
 
-fn premultiplyChannel(channel: u8, alpha: u8) u8 {
-    return @intCast((@as(u16, channel) * @as(u16, alpha) + 127) / 255);
+fn glyphSourcePixel(
+    pixel_mode: font.GlyphPixelMode,
+    bitmap_pixel: []const u8,
+    text_color: Color,
+) ?z2d.pixel.RGBA {
+    std.debug.assert(bitmap_pixel.len == 4);
+    const bitmap_alpha = bitmap_pixel[3];
+    const final_alpha: u8 = @intCast(
+        (@as(u16, bitmap_alpha) * @as(u16, text_color.a) + 127) / 255,
+    );
+    if (final_alpha == 0) return null;
+
+    const source_rgb = switch (pixel_mode) {
+        .alpha_mask => .{ text_color.r, text_color.g, text_color.b },
+        .color => .{ bitmap_pixel[0], bitmap_pixel[1], bitmap_pixel[2] },
+    };
+    return (z2d.pixel.RGBA{
+        .r = source_rgb[0],
+        .g = source_rgb[1],
+        .b = source_rgb[2],
+        .a = final_alpha,
+    }).multiply();
+}
+
+test "glyph source pixels tint masks but preserve color bitmaps" {
+    const bitmap = [_]u8{ 210, 120, 30, 255 };
+    const text_color = Color{ .r = 12, .g = 34, .b = 56, .a = 255 };
+
+    try std.testing.expectEqual(
+        z2d.pixel.RGBA{ .r = 12, .g = 34, .b = 56, .a = 255 },
+        glyphSourcePixel(.alpha_mask, &bitmap, text_color).?,
+    );
+    try std.testing.expectEqual(
+        z2d.pixel.RGBA{ .r = 210, .g = 120, .b = 30, .a = 255 },
+        glyphSourcePixel(.color, &bitmap, text_color).?,
+    );
+}
+
+test "glyph source pixels combine bitmap and CSS alpha" {
+    const bitmap = [_]u8{ 255, 128, 64, 128 };
+    const source = glyphSourcePixel(
+        .color,
+        &bitmap,
+        .{ .r = 1, .g = 2, .b = 3, .a = 128 },
+    ).?;
+    try std.testing.expectEqual(@as(u8, 64), source.a);
+    try std.testing.expect(source.r <= source.a);
+    try std.testing.expect(source.g <= source.a);
+    try std.testing.expect(source.b <= source.a);
 }
 
 pub const DarkPalette = struct {
@@ -689,7 +736,6 @@ pub const Browser = struct {
             al,
             io,
             environ,
-            renderer,
             initial_window_width,
             initial_window_height,
             rtl_flag,
@@ -4148,50 +4194,9 @@ pub const Browser = struct {
     fn drawDisplayItemZ2dContext(self: *Browser, context: *z2d.Context, item: DisplayItem, scroll_offset: i32, zoom: f32) !void {
         switch (item) {
             .glyph => |glyph_item| {
-                if (self.drawGlyphFast(context, glyph_item, scroll_offset, zoom)) {
-                    return;
-                }
-                // Render glyph using pixel data stored in the Glyph struct
-                if (glyph_item.glyph.pixels) |pixels| {
-                    const glyph_y = self.scalePxWithZoom(glyph_item.y, zoom) - scroll_offset;
-                    const glyph_x = self.scalePxWithZoom(glyph_item.x, zoom);
-                    const w: usize = @intCast(glyph_item.glyph.w);
-                    const h: usize = @intCast(glyph_item.glyph.h);
-
-                    // Draw each pixel of the glyph
-                    for (0..h) |py| {
-                        const dest_y = glyph_y + @as(i32, @intCast(py));
-                        if (dest_y < 0 or dest_y >= self.window_height) continue;
-
-                        for (0..w) |px| {
-                            const dest_x = glyph_x + @as(i32, @intCast(px));
-                            if (dest_x < 0 or dest_x >= self.window_width) continue;
-
-                            const idx = (py * w + px) * 4;
-                            // Glyph pixels are white with alpha - blend with the glyph color
-                            const alpha = pixels[idx + 3];
-                            if (alpha > 0) {
-                                // Blend glyph alpha with the requested color
-                                const final_alpha = @as(u8, @intFromFloat(@as(f64, @floatFromInt(alpha)) * @as(f64, @floatFromInt(glyph_item.color.a)) / 255.0));
-                                if (final_alpha > 0) {
-                                    context.resetPath();
-                                    context.setSource(.{ .opaque_pattern = .{ .pixel = .{ .rgba = .{
-                                        .r = premultiplyChannel(glyph_item.color.r, final_alpha),
-                                        .g = premultiplyChannel(glyph_item.color.g, final_alpha),
-                                        .b = premultiplyChannel(glyph_item.color.b, final_alpha),
-                                        .a = final_alpha,
-                                    } } } });
-                                    context.moveTo(@floatFromInt(dest_x), @floatFromInt(dest_y)) catch continue;
-                                    context.lineTo(@floatFromInt(dest_x + 1), @floatFromInt(dest_y)) catch continue;
-                                    context.lineTo(@floatFromInt(dest_x + 1), @floatFromInt(dest_y + 1)) catch continue;
-                                    context.lineTo(@floatFromInt(dest_x), @floatFromInt(dest_y + 1)) catch continue;
-                                    context.closePath() catch continue;
-                                    context.fill() catch continue;
-                                }
-                            }
-                        }
-                    }
-                }
+                const glyph_x = self.scalePxWithZoom(glyph_item.x, zoom);
+                const glyph_y = self.scalePxWithZoom(glyph_item.y, zoom) - scroll_offset;
+                try drawGlyphBitmap(context, glyph_item, glyph_x, glyph_y);
             },
             .rect => |rect_item| {
                 const left = self.scalePxWithZoom(rect_item.x1, zoom);
@@ -4515,106 +4520,43 @@ pub const Browser = struct {
         }
     }
 
-    fn drawGlyphFast(self: *Browser, context: *z2d.Context, glyph_item: anytype, scroll_offset: i32, zoom: f32) bool {
-        const pixels = glyph_item.glyph.pixels orelse return false;
-        const img_surface = switch (context.surface.*) {
-            .image_surface_rgba => |*img| img,
-            else => return false,
-        };
-
-        const surface_width = img_surface.width;
-        const surface_height = img_surface.height;
-        const glyph_y = self.scalePxWithZoom(glyph_item.y, zoom) - scroll_offset;
-        const glyph_x = self.scalePxWithZoom(glyph_item.x, zoom);
-        const w: i32 = glyph_item.glyph.w;
-        const h: i32 = glyph_item.glyph.h;
-
-        if (w <= 0 or h <= 0) return true;
-
-        const color = glyph_item.color;
-        const max_x = glyph_x + w;
-        const max_y = glyph_y + h;
-
-        const start_x = if (glyph_x < 0) -glyph_x else 0;
-        const start_y = if (glyph_y < 0) -glyph_y else 0;
-        const end_x = if (max_x > surface_width) w - (max_x - surface_width) else w;
-        const end_y = if (max_y > surface_height) h - (max_y - surface_height) else h;
-
-        if (end_x <= start_x or end_y <= start_y) return true;
-
-        const buf = img_surface.buf;
-        const surface_w_usize: usize = @intCast(surface_width);
-
-        var y: i32 = start_y;
-        while (y < end_y) : (y += 1) {
-            const dest_y = glyph_y + y;
-            const row_start = @as(usize, @intCast(dest_y)) * surface_w_usize;
-            const src_row_start = @as(usize, @intCast(y)) * @as(usize, @intCast(w));
-
-            var x: i32 = start_x;
-            while (x < end_x) : (x += 1) {
-                const dest_x = glyph_x + x;
-                const dst_idx = row_start + @as(usize, @intCast(dest_x));
-                const src_idx = (src_row_start + @as(usize, @intCast(x))) * 4;
-
-                const alpha = pixels[src_idx + 3];
-                if (alpha == 0) continue;
-
-                const final_alpha: u8 = @intCast((@as(u16, alpha) * @as(u16, color.a)) / 255);
-                if (final_alpha == 0) continue;
-
-                const src_a: u16 = final_alpha;
-                const inv_a: u16 = 255 - src_a;
-                const src_r: u16 = (@as(u16, color.r) * src_a) / 255;
-                const src_g: u16 = (@as(u16, color.g) * src_a) / 255;
-                const src_b: u16 = (@as(u16, color.b) * src_a) / 255;
-
-                const dst = buf[dst_idx];
-                const out_r: u8 = @intCast(src_r + (@as(u16, dst.r) * inv_a) / 255);
-                const out_g: u8 = @intCast(src_g + (@as(u16, dst.g) * inv_a) / 255);
-                const out_b: u8 = @intCast(src_b + (@as(u16, dst.b) * inv_a) / 255);
-                const out_a: u8 = @intCast(src_a + (@as(u16, dst.a) * inv_a) / 255);
-
-                buf[dst_idx] = .{ .r = out_r, .g = out_g, .b = out_b, .a = out_a };
-            }
-        }
-
-        return true;
-    }
-
-    fn drawGlyphFastWithOffset(
-        self: *Browser,
+    fn drawGlyphBitmap(
         context: *z2d.Context,
         glyph_item: anytype,
-        scroll_offset: i32,
-        x_offset: i32,
-        zoom: f32,
-    ) bool {
-        const pixels = glyph_item.glyph.pixels orelse return false;
+        glyph_x: i32,
+        glyph_y: i32,
+    ) !void {
+        const pixels = glyph_item.glyph.pixels orelse return;
         const img_surface = switch (context.surface.*) {
             .image_surface_rgba => |*img| img,
-            else => return false,
+            else => return error.UnsupportedGlyphSurface,
         };
 
         const surface_width = img_surface.width;
         const surface_height = img_surface.height;
-        const glyph_y = self.scalePxWithZoom(glyph_item.y, zoom) - scroll_offset;
-        const glyph_x = self.scalePxWithZoom(glyph_item.x, zoom) + x_offset;
         const w: i32 = glyph_item.glyph.w;
         const h: i32 = glyph_item.glyph.h;
 
-        if (w <= 0 or h <= 0) return true;
+        if (w <= 0 or h <= 0) return;
 
-        const color = glyph_item.color;
-        const max_x = glyph_x + w;
-        const max_y = glyph_y + h;
+        const w_usize: usize = @intCast(w);
+        const h_usize: usize = @intCast(h);
+        const pixel_count = std.math.mul(usize, w_usize, h_usize) catch
+            return error.InvalidGlyphBitmap;
+        const byte_count = std.math.mul(usize, pixel_count, 4) catch
+            return error.InvalidGlyphBitmap;
+        if (pixels.len != byte_count) return error.InvalidGlyphBitmap;
 
-        const start_x = if (glyph_x < 0) -glyph_x else 0;
-        const start_y = if (glyph_y < 0) -glyph_y else 0;
-        const end_x = if (max_x > surface_width) w - (max_x - surface_width) else w;
-        const end_y = if (max_y > surface_height) h - (max_y - surface_height) else h;
+        const start_x_i64 = @max(@as(i64, 0), -@as(i64, glyph_x));
+        const start_y_i64 = @max(@as(i64, 0), -@as(i64, glyph_y));
+        const end_x_i64 = @min(@as(i64, w), @as(i64, surface_width) - glyph_x);
+        const end_y_i64 = @min(@as(i64, h), @as(i64, surface_height) - glyph_y);
+        if (end_x_i64 <= start_x_i64 or end_y_i64 <= start_y_i64) return;
 
-        if (end_x <= start_x or end_y <= start_y) return true;
+        const start_x: i32 = @intCast(start_x_i64);
+        const start_y: i32 = @intCast(start_y_i64);
+        const end_x: i32 = @intCast(end_x_i64);
+        const end_y: i32 = @intCast(end_y_i64);
 
         const buf = img_surface.buf;
         const surface_w_usize: usize = @intCast(surface_width);
@@ -4630,77 +4572,29 @@ pub const Browser = struct {
                 const dest_x = glyph_x + x;
                 const dst_idx = row_start + @as(usize, @intCast(dest_x));
                 const src_idx = (src_row_start + @as(usize, @intCast(x))) * 4;
-
-                const alpha = pixels[src_idx + 3];
-                if (alpha == 0) continue;
-
-                const final_alpha: u8 = @intCast((@as(u16, alpha) * @as(u16, color.a)) / 255);
-                if (final_alpha == 0) continue;
-
-                const src_a: u16 = final_alpha;
-                const inv_a: u16 = 255 - src_a;
-                const src_r: u16 = (@as(u16, color.r) * src_a) / 255;
-                const src_g: u16 = (@as(u16, color.g) * src_a) / 255;
-                const src_b: u16 = (@as(u16, color.b) * src_a) / 255;
-
-                const dst = buf[dst_idx];
-                const out_r: u8 = @intCast(src_r + (@as(u16, dst.r) * inv_a) / 255);
-                const out_g: u8 = @intCast(src_g + (@as(u16, dst.g) * inv_a) / 255);
-                const out_b: u8 = @intCast(src_b + (@as(u16, dst.b) * inv_a) / 255);
-                const out_a: u8 = @intCast(src_a + (@as(u16, dst.a) * inv_a) / 255);
-
-                buf[dst_idx] = .{ .r = out_r, .g = out_g, .b = out_b, .a = out_a };
+                const source = glyphSourcePixel(
+                    glyph_item.glyph.pixel_mode,
+                    pixels[src_idx..][0..4],
+                    glyph_item.color,
+                ) orelse continue;
+                buf[dst_idx] = compositor.runPixelT(
+                    z2d.pixel.RGBA,
+                    buf[dst_idx],
+                    z2d.pixel.RGBA,
+                    source,
+                    .src_over,
+                );
             }
         }
-
-        return true;
     }
 
     // Draw a display item with both scroll offset and x translation
     fn drawDisplayItemZ2dContextWithTransform(self: *Browser, context: *z2d.Context, item: DisplayItem, scroll_offset: i32, x_offset: i32, zoom: f32) !void {
         switch (item) {
             .glyph => |glyph_item| {
-                if (self.drawGlyphFastWithOffset(context, glyph_item, scroll_offset, x_offset, zoom)) {
-                    return;
-                }
-                // Render glyph with x offset applied
-                if (glyph_item.glyph.pixels) |pixels| {
-                    const glyph_y = self.scalePxWithZoom(glyph_item.y, zoom) - scroll_offset;
-                    const glyph_x = self.scalePxWithZoom(glyph_item.x, zoom) + x_offset;
-                    const w: usize = @intCast(glyph_item.glyph.w);
-                    const h: usize = @intCast(glyph_item.glyph.h);
-
-                    for (0..h) |py| {
-                        const dest_y = glyph_y + @as(i32, @intCast(py));
-                        if (dest_y < 0 or dest_y >= self.window_height) continue;
-
-                        for (0..w) |px| {
-                            const dest_x = glyph_x + @as(i32, @intCast(px));
-                            if (dest_x < 0 or dest_x >= self.window_width) continue;
-
-                            const idx = (py * w + px) * 4;
-                            const alpha = pixels[idx + 3];
-                            if (alpha > 0) {
-                                const final_alpha = @as(u8, @intFromFloat(@as(f64, @floatFromInt(alpha)) * @as(f64, @floatFromInt(glyph_item.color.a)) / 255.0));
-                                if (final_alpha > 0) {
-                                    context.resetPath();
-                                    context.setSource(.{ .opaque_pattern = .{ .pixel = .{ .rgba = .{
-                                        .r = premultiplyChannel(glyph_item.color.r, final_alpha),
-                                        .g = premultiplyChannel(glyph_item.color.g, final_alpha),
-                                        .b = premultiplyChannel(glyph_item.color.b, final_alpha),
-                                        .a = final_alpha,
-                                    } } } });
-                                    context.moveTo(@floatFromInt(dest_x), @floatFromInt(dest_y)) catch continue;
-                                    context.lineTo(@floatFromInt(dest_x + 1), @floatFromInt(dest_y)) catch continue;
-                                    context.lineTo(@floatFromInt(dest_x + 1), @floatFromInt(dest_y + 1)) catch continue;
-                                    context.lineTo(@floatFromInt(dest_x), @floatFromInt(dest_y + 1)) catch continue;
-                                    context.closePath() catch continue;
-                                    context.fill() catch continue;
-                                }
-                            }
-                        }
-                    }
-                }
+                const glyph_x = self.scalePxWithZoom(glyph_item.x, zoom) + x_offset;
+                const glyph_y = self.scalePxWithZoom(glyph_item.y, zoom) - scroll_offset;
+                try drawGlyphBitmap(context, glyph_item, glyph_x, glyph_y);
             },
             .rect => |rect_item| {
                 const top = self.scalePxWithZoom(rect_item.y1, zoom) - scroll_offset;
@@ -4918,42 +4812,9 @@ pub const Browser = struct {
     fn drawDisplayItemZ2dContextForLayer(self: *Browser, context: *z2d.Context, item: DisplayItem, layer_x: i32, layer_y: i32, zoom: f32) !void {
         switch (item) {
             .glyph => |glyph_item| {
-                // Render glyph in layer-local coordinates
-                if (glyph_item.glyph.pixels) |pixels| {
-                    const glyph_x = self.scalePxWithZoom(glyph_item.x, zoom) - layer_x;
-                    const glyph_y = self.scalePxWithZoom(glyph_item.y, zoom) - layer_y;
-                    const w: usize = @intCast(glyph_item.glyph.w);
-                    const h: usize = @intCast(glyph_item.glyph.h);
-
-                    for (0..h) |py| {
-                        const dest_y = glyph_y + @as(i32, @intCast(py));
-
-                        for (0..w) |px| {
-                            const dest_x = glyph_x + @as(i32, @intCast(px));
-
-                            const idx = (py * w + px) * 4;
-                            const alpha = pixels[idx + 3];
-                            if (alpha > 0) {
-                                const final_alpha = @as(u8, @intFromFloat(@as(f64, @floatFromInt(alpha)) * @as(f64, @floatFromInt(glyph_item.color.a)) / 255.0));
-                                if (final_alpha > 0) {
-                                    context.resetPath();
-                                    context.setSource(.{ .opaque_pattern = .{ .pixel = .{ .rgba = .{
-                                        .r = premultiplyChannel(glyph_item.color.r, final_alpha),
-                                        .g = premultiplyChannel(glyph_item.color.g, final_alpha),
-                                        .b = premultiplyChannel(glyph_item.color.b, final_alpha),
-                                        .a = final_alpha,
-                                    } } } });
-                                    context.moveTo(@floatFromInt(dest_x), @floatFromInt(dest_y)) catch continue;
-                                    context.lineTo(@floatFromInt(dest_x + 1), @floatFromInt(dest_y)) catch continue;
-                                    context.lineTo(@floatFromInt(dest_x + 1), @floatFromInt(dest_y + 1)) catch continue;
-                                    context.lineTo(@floatFromInt(dest_x), @floatFromInt(dest_y + 1)) catch continue;
-                                    context.closePath() catch continue;
-                                    context.fill() catch continue;
-                                }
-                            }
-                        }
-                    }
-                }
+                const glyph_x = self.scalePxWithZoom(glyph_item.x, zoom) - layer_x;
+                const glyph_y = self.scalePxWithZoom(glyph_item.y, zoom) - layer_y;
+                try drawGlyphBitmap(context, glyph_item, glyph_x, glyph_y);
             },
             .rect => |rect_item| {
                 // Map absolute coordinates to layer-local space

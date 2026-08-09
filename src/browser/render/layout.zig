@@ -7,7 +7,6 @@
 const std = @import("std");
 const font = @import("font.zig");
 const browser = @import("../root.zig");
-const code_point = @import("code_point");
 const grapheme = @import("grapheme");
 const parser = @import("../../document/parser.zig");
 const ProtectedField = @import("../../core/protected_field.zig").ProtectedField;
@@ -19,8 +18,6 @@ const FontCategory = font.FontCategory;
 const scrollbar_width = browser.scrollbar_width;
 const h_offset = browser.h_offset;
 const v_offset = browser.v_offset;
-
-const sdl2 = @import("sdl");
 
 fn addPageBottomPadding(content_bottom_css: i32) i32 {
     const padded = @as(i64, @max(content_bottom_css, 0)) + v_offset;
@@ -352,8 +349,6 @@ const WordCache = struct {
     graphemes: []const []const u8,
 };
 
-const getCategory = @import("font.zig").getCategory;
-
 // Bounding box for hit testing
 pub const Bounds = struct {
     x: i32,
@@ -592,12 +587,11 @@ pub fn init(
     allocator: std.mem.Allocator,
     io: std.Io,
     environ: *const std.process.Environ.Map,
-    renderer: ?sdl2.Renderer,
     window_width: i32,
     window_height: i32,
     rtl_text: bool,
 ) !*Layout {
-    var font_manager = try font.FontManager.init(allocator, io, environ, renderer);
+    var font_manager = try font.FontManager.init(allocator, io, environ);
     const layout = allocator.create(Layout) catch |err| {
         font_manager.deinit();
         return err;
@@ -1172,10 +1166,6 @@ fn processGrapheme(
         is_small_caps: bool = false,
     },
 ) !void {
-    // Extract first code point to determine character category
-    var cp_iter = code_point.Iterator{ .bytes = gme };
-    const first_cp = cp_iter.next() orelse return;
-
     // Handle newlines explicitly before font shaping.
     if (std.mem.eql(u8, gme, "\n") or std.mem.eql(u8, gme, "\r") or options.force_newline) {
         try self.flushLine(line_buffer);
@@ -1183,19 +1173,20 @@ fn processGrapheme(
         return;
     }
 
-    // Determine font category based on code point
-    const category = getCategory(first_cp.code);
+    // Choose one font for the complete Unicode grapheme. Emoji sequences must
+    // not be split across fallback fonts or rendered as separate code points.
+    const category = font.getGraphemeCategory(gme);
 
     // Determine if we should use monospace font
     // Only use monospace for ASCII and Latin characters in preformatted mode
     // For emoji and CJK, use their specialized fonts even in preformatted mode
     const use_monospace = self.is_preformatted and
-        (category == null or category.? == .latin or category.? == .monospace);
+        (category == .latin or category == .monospace);
 
     // Update current font category if needed
-    if (category != null and category.? != self.current_font_category) {
+    if (category != self.current_font_category) {
         self.prev_font_category = self.current_font_category;
-        self.current_font_category = category.?;
+        self.current_font_category = category;
     }
 
     // Use the current style settings
@@ -1205,41 +1196,40 @@ fn processGrapheme(
     // Handle small caps rendering
     var glyph: font.Glyph = undefined;
     if (options.is_small_caps) {
-        // Check if the grapheme is a lowercase letter
-        const is_lowercase = for (gme) |byte| {
-            if (byte >= 'a' and byte <= 'z') break true;
-        } else false;
+        const is_lowercase = gme.len > 0 and std.ascii.isLower(gme[0]);
 
         if (is_lowercase) {
-            // Convert to uppercase and render at smaller size with bold
-            var upper_buf: [4]u8 = undefined;
-            const upper_len = std.ascii.upperString(&upper_buf, gme);
-            glyph = self.font_manager.getStyledGlyph(
-                upper_buf[0..upper_len.len],
+            // Preserve combining marks in the grapheme while uppercasing its
+            // ASCII base. The allocation avoids imposing a cluster-size cap.
+            const upper_gme = try self.allocator.dupe(u8, gme);
+            defer self.allocator.free(upper_gme);
+            upper_gme[0] = std.ascii.toUpper(upper_gme[0]);
+            glyph = try self.font_manager.getStyledGlyph(
+                upper_gme,
                 .Bold, // Force bold for small caps
                 slant,
                 self.scaledFontSize(@divTrunc(self.size * 4, 5)), // Make it ~80% of normal size
                 use_monospace,
-            ) catch return;
+            );
         } else {
             // Regular rendering for non-lowercase characters
-            glyph = self.font_manager.getStyledGlyph(
+            glyph = try self.font_manager.getStyledGlyph(
                 gme,
                 weight,
                 slant,
                 self.scaledFontSize(self.size),
                 use_monospace,
-            ) catch return;
+            );
         }
     } else {
         // Normal rendering
-        glyph = self.font_manager.getStyledGlyph(
+        glyph = try self.font_manager.getStyledGlyph(
             gme,
             weight,
             slant,
             self.scaledFontSize(if (options.is_superscript) @divTrunc(self.size, 2) else self.size),
             use_monospace,
-        ) catch return;
+        );
     }
 
     glyph.is_superscript = options.is_superscript;
@@ -1505,7 +1495,9 @@ fn handleTextToken(
         return;
     }
 
-    // Process entities before grapheme iteration
+    // Keep source text in Unicode grapheme clusters while stopping at syntax
+    // that needs special handling. This keeps emoji modifiers, flags, and ZWJ
+    // sequences together for font fallback and rasterization.
     var i: usize = 0;
     while (i < content.len) {
         const line_break_len = lineBreakLengthAt(content, i);
@@ -1516,7 +1508,6 @@ fn handleTextToken(
         }
 
         if (content[i] == '&') {
-            // Check if this is an entity
             if (lexEntityAt(content, i)) |entity| {
                 if (std.mem.eql(u8, entity.replacement, "\u{00AD}")) {
                     // Soft hyphens are discretionary break markers. They stay
@@ -1525,44 +1516,55 @@ fn handleTextToken(
                     continue;
                 }
 
-                // Process the entity using our common function
                 try self.processGrapheme(entity.replacement, line_buffer, node_ptr, .{
                     .is_superscript = self.is_superscript,
                     .is_small_caps = self.is_small_caps,
                 });
 
-                // Skip past the entity
                 i += entity.len;
                 continue;
             }
+
+            // An ampersand that does not begin a recognized entity is text.
+            try self.processGrapheme("&", line_buffer, node_ptr, .{
+                .is_superscript = self.is_superscript,
+                .is_small_caps = self.is_small_caps,
+            });
+            i += 1;
+            continue;
         }
 
-        // Find next grapheme boundary
-        var g_end = i;
-        while (g_end < content.len) {
-            if (content[g_end] == '&' or lineBreakLengthAt(content, g_end) != 0) break;
-
-            g_end += 1;
-            if (g_end < content.len) {
-                if ((content[g_end] & 0xC0) != 0x80) break; // Not a continuation byte
-            }
+        var run_end = i;
+        while (run_end < content.len and
+            content[run_end] != '&' and
+            lineBreakLengthAt(content, run_end) == 0)
+        {
+            run_end += 1;
         }
 
-        if (g_end == i) {
-            // Process single character (not part of any grapheme cluster)
-            g_end = i + 1;
+        const run = content[i..run_end];
+        var g_iter = grapheme.iterator(run);
+        while (g_iter.next()) |gc| {
+            try self.processGrapheme(gc.bytes(run), line_buffer, node_ptr, .{
+                .is_superscript = self.is_superscript,
+                .is_small_caps = self.is_small_caps,
+            });
         }
-
-        const gme = content[i..g_end];
-
-        // Process the grapheme using our common function
-        try self.processGrapheme(gme, line_buffer, node_ptr, .{
-            .is_superscript = self.is_superscript,
-            .is_small_caps = self.is_small_caps,
-        });
-
-        i = g_end;
+        i = run_end;
     }
+}
+
+fn graphemeCount(text: []const u8) usize {
+    var count: usize = 0;
+    var iter = grapheme.iterator(text);
+    while (iter.next()) |_| count += 1;
+    return count;
+}
+
+test "emoji sequences stay in one grapheme cluster" {
+    try std.testing.expectEqual(@as(usize, 1), graphemeCount("👍🏽"));
+    try std.testing.expectEqual(@as(usize, 1), graphemeCount("👨‍👩‍👧‍👦"));
+    try std.testing.expectEqual(@as(usize, 1), graphemeCount("🇺🇸"));
 }
 
 test "lineBreakLengthAt recognizes platform newline encodings" {

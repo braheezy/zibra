@@ -35,6 +35,7 @@ pub fn build(b: *std.Build) !void {
 
     const zg = b.dependency("zg", .{});
     source_module.addImport("grapheme", zg.module("Graphemes"));
+    source_module.addImport("emoji", zg.module("Emoji"));
     source_module.addImport("code_point", zg.module("code_point"));
 
     const ada_dep = b.dependency("adazig", .{
@@ -102,6 +103,7 @@ pub fn build(b: *std.Build) !void {
     test_module.addImport("sdl", sdl_mod);
     test_module.addImport("known-folders", known_folders);
     test_module.addImport("grapheme", zg.module("Graphemes"));
+    test_module.addImport("emoji", zg.module("Emoji"));
     test_module.addImport("code_point", zg.module("code_point"));
     test_module.addImport("z2d", z2d_dep.module("z2d"));
     test_module.addImport("kiesel", kiesel_dep.module("kiesel"));
@@ -187,6 +189,17 @@ pub fn build(b: *std.Build) !void {
         compare_scrollbar.addFileArg(b.path("tests/golden/scrollbar.macos.png"));
         compare_scrollbar.addFileArg(actual_scrollbar_screenshot);
         screenshot_test_step.dependOn(&compare_scrollbar.step);
+
+        const emoji_capture = b.addRunArtifact(exe);
+        emoji_capture.step.dependOn(&compare_scrollbar.step);
+        emoji_capture.addArg("--screenshot");
+        const actual_emoji_screenshot = emoji_capture.addOutputFileArg("emoji-screenshot.png");
+        emoji_capture.addPrefixedFileArg("file://", b.path("tests/manual/emoji.html"));
+
+        const compare_emoji = b.addRunArtifact(screenshot_compare);
+        compare_emoji.addFileArg(b.path("tests/golden/emoji.macos.png"));
+        compare_emoji.addFileArg(actual_emoji_screenshot);
+        screenshot_test_step.dependOn(&compare_emoji.step);
     } else {
         const unsupported = b.addFail(
             "test-screenshot currently requires a native macOS target",
