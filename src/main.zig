@@ -189,39 +189,37 @@ fn zibra(init: std.process.Init) !void {
             std.log.err("Only one URL is supported at a time.", .{});
             return error.BadArguments;
         }
+        if (Url.hasExplicitScheme(arg)) {
+            url = try Url.initForNavigation(allocator, arg);
+            continue;
+        }
+
         url = Url.init(allocator, arg) catch |err| blk: {
-            if (err == error.InvalidUrl) {
-                // Attempt to treat the URL as a local file path
-                const absolute_path = if (std.Io.Dir.path.isAbsolute(arg))
-                    try allocator.dupe(u8, arg)
-                else absolute_path: {
-                    const cwd = try std.process.currentPathAlloc(init.io, allocator);
-                    defer allocator.free(cwd);
-                    break :absolute_path try std.fmt.allocPrint(allocator, "{s}/{s}", .{ cwd, arg });
-                };
-                defer allocator.free(absolute_path);
+            if (err == error.OutOfMemory) return err;
 
-                // Check if the file exists before creating a file URL
-                std.Io.Dir.cwd().access(init.io, arg, .{}) catch |access_err| {
-                    std.log.warn("File '{s}' does not exist or is not accessible: {any}", .{ arg, access_err });
-                    // Fallback to about:blank if the file doesn't exist
-                    break :blk try Url.init(allocator, "about:blank");
-                };
+            // Preserve the CLI convenience of accepting an ordinary path.
+            const absolute_path = if (std.Io.Dir.path.isAbsolute(arg))
+                try allocator.dupe(u8, arg)
+            else absolute_path: {
+                const cwd = try std.process.currentPathAlloc(init.io, allocator);
+                defer allocator.free(cwd);
+                break :absolute_path try std.fmt.allocPrint(allocator, "{s}/{s}", .{ cwd, arg });
+            };
+            defer allocator.free(absolute_path);
 
-                const file_url = try std.fmt.allocPrint(allocator, "file://{s}", .{absolute_path});
-                defer allocator.free(file_url);
+            std.Io.Dir.cwd().access(init.io, arg, .{}) catch |access_err| {
+                std.log.warn("File '{s}' does not exist or is not accessible: {any}", .{ arg, access_err });
+                break :blk try Url.blank(allocator);
+            };
 
-                // Try to initialize the URL with the file path
-                // This should always succeed since file:// URLs are valid,
-                // but we'll handle errors just in case
-                break :blk Url.init(allocator, file_url) catch |file_err| {
-                    std.log.warn("Failed to create URL from file path: {any}", .{file_err});
-                    // Fallback to "about:blank" if there's any issue
-                    break :blk try Url.init(allocator, "about:blank");
-                };
-            } else {
-                return err;
-            }
+            const file_url = try std.fmt.allocPrint(allocator, "file://{s}", .{absolute_path});
+            defer allocator.free(file_url);
+
+            break :blk Url.init(allocator, file_url) catch |file_err| {
+                if (file_err == error.OutOfMemory) return file_err;
+                std.log.warn("Failed to create URL from file path: {any}", .{file_err});
+                break :blk try Url.blank(allocator);
+            };
         };
     }
 
@@ -254,7 +252,7 @@ fn zibra(init: std.process.Init) !void {
         url = null;
     } else {
         // Create a new tab with the default HTML
-        const about_url = try Url.init(allocator, "about:blank");
+        const about_url = try Url.blank(allocator);
         try b.newTab(about_url);
     }
 

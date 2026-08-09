@@ -10,6 +10,11 @@ before changing URL or response ownership.
 
 - `Url` is logically move-only despite Zig value-copy syntax. Use `Url.clone`
   whenever two independently live owners are needed.
+- Use `Url.initForNavigation` and `Url.resolveForNavigation` for targets that
+  replace a document. They preserve allocation failures but normalize URL
+  syntax/payload errors and unsupported schemes to `about:blank`.
+  Subresources should continue using strict `init`/`resolve` and handle errors
+  without replacing the containing document.
 - `HttpResponse.body` ownership depends on scheme: HTTP/file are allocated;
   data/about borrow URL/static storage. Preserve or improve this boundary—do
   not free by guesswork at a distant caller.

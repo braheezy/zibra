@@ -251,6 +251,15 @@ storage. Root and child navigation keep the prior URL owner alive through the
 synchronous fetch; async XHR clones its target and referrer before leaving the
 tab worker.
 
+Document-replacing inputs use `Url.initForNavigation` or
+`Url.resolveForNavigation`. These preserve `OutOfMemory`, but turn URL syntax,
+data-payload, and unsupported-scheme failures into an independently owned
+`about:blank`. Strict `init`/`resolve` remain the subresource contract so a bad
+stylesheet, image, or script URL does not replace its containing document;
+attempting to fetch an unsupported scheme through that strict path returns
+`UnsupportedScheme`. The borrowed `about:blank` response body is empty; HTML
+parsing supplies the normal empty document structure.
+
 Top-level HTTP navigation uses `fetchBodyWithFinalUrl` to receive an owned URL
 for the final redirect destination. `loadInTab` moves that value into the
 existing navigation URL pointer before parsing subresources or committing

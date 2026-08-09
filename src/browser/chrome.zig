@@ -414,11 +414,7 @@ pub fn enter(self: *Chrome, b: *Browser) !bool {
         if (std.mem.eql(u8, focus_str, "address bar")) {
             if (self.address_bar.items.len == 0) return false;
 
-            var url = Url.init(b.allocator, self.address_bar.items) catch |err| {
-                std.log.err("Invalid URL: {any}", .{err});
-                self.focus = null;
-                return false;
-            };
+            var url = try Url.initForNavigation(b.allocator, self.address_bar.items);
             var url_owned = true;
             defer if (url_owned) url.free(b.allocator);
 

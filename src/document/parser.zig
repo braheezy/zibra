@@ -946,6 +946,15 @@ pub const HTMLParser = struct {
 
     // Ensure a BODY element exists before finishing parsing
     fn ensureBodyElementBeforeFinish(self: *HTMLParser) !void {
+        // An empty (or whitespace-only) response still represents an HTML
+        // document. Build the same implicit structure that a non-head tag
+        // would have caused during tokenization.
+        if (self.unfinished.items.len == 0) {
+            try self.createHtmlElement();
+            try self.ensureHeadAndBodyElements();
+            return;
+        }
+
         // If we have an HTML element and a HEAD element but no BODY element
         if (self.unfinished.items.len == 2 and
             std.mem.eql(u8, self.unfinished.items[0].element.tag, "html") and

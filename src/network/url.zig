@@ -258,6 +258,56 @@ pub const Url = struct {
         return u;
     }
 
+    /// Construct the canonical empty document URL.
+    pub fn blank(allocator: std.mem.Allocator) !Url {
+        return init(allocator, "about:blank");
+    }
+
+    pub fn isAboutBlank(self: Url) bool {
+        return std.mem.eql(u8, self.scheme, "about") and
+            std.mem.eql(u8, self.path, "blank");
+    }
+
+    /// Return whether `input` begins with an RFC-style URL scheme.
+    pub fn hasExplicitScheme(input: []const u8) bool {
+        const colon = std.mem.indexOfScalar(u8, input, ':') orelse return false;
+        if (colon == 0 or !std.ascii.isAlphabetic(input[0])) return false;
+        for (input[1..colon]) |ch| {
+            if (!std.ascii.isAlphanumeric(ch) and ch != '+' and ch != '-' and ch != '.') {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    /// Parse a user- or document-initiated navigation target. URL syntax and
+    /// payload-format failures recover to `about:blank`; resource exhaustion
+    /// remains visible to the caller.
+    pub fn initForNavigation(allocator: std.mem.Allocator, input: []const u8) !Url {
+        const parsed = init(allocator, input) catch |err| {
+            return recoverNavigationError(allocator, err);
+        };
+        return normalizeNavigation(allocator, parsed);
+    }
+
+    fn recoverNavigationError(allocator: std.mem.Allocator, err: anyerror) !Url {
+        if (err == error.OutOfMemory) return error.OutOfMemory;
+        return blank(allocator);
+    }
+
+    fn normalizeNavigation(allocator: std.mem.Allocator, parsed: Url) !Url {
+        const supported = std.mem.eql(u8, parsed.scheme, "http") or
+            std.mem.eql(u8, parsed.scheme, "https") or
+            std.mem.eql(u8, parsed.scheme, "file") or
+            std.mem.eql(u8, parsed.scheme, "data") or
+            parsed.isAboutBlank();
+        if (!supported) {
+            parsed.free(allocator);
+            return blank(allocator);
+        }
+        return parsed;
+    }
+
     pub fn free(self: Url, allocator: std.mem.Allocator) void {
         if (self.mime_type) |_| allocator.free(self.mime_type.?);
         if (std.mem.eql(u8, self.scheme, "data")) {
@@ -283,21 +333,16 @@ pub const Url = struct {
 
     /// Resolve a relative URL against this URL
     /// Handles:
-    /// - Normal URLs with "://" (returned as-is)
+    /// - Absolute URLs with a scheme (returned as-is)
     /// - Host-relative URLs starting with "/" (reuse scheme and host)
     /// - Path-relative URLs (resolve relative to current path)
     /// - Scheme-relative URLs starting with "//" (reuse scheme)
     /// - Parent directory navigation with "../"
     pub fn resolve(self: Url, allocator: std.mem.Allocator, relative_url: []const u8) !Url {
-        // If it's already a full URL, just parse and return it
-        if (std.mem.indexOf(u8, relative_url, "://") != null) {
-            return try Url.init(allocator, relative_url);
-        }
-
-        if (std.mem.startsWith(u8, relative_url, "data:") or
-            std.mem.startsWith(u8, relative_url, "about:") or
-            std.mem.startsWith(u8, relative_url, "file:"))
-        {
+        // If it is already an absolute URL, parse it without combining it
+        // with the current path. This includes schemes without `//`, such as
+        // data, about, and mailto.
+        if (hasExplicitScheme(relative_url)) {
             return try Url.init(allocator, relative_url);
         }
 
@@ -390,6 +435,15 @@ pub const Url = struct {
         return try Url.init(allocator, resolved_url.items);
     }
 
+    /// Resolve a navigation target, recovering malformed results to the
+    /// canonical blank document while preserving allocation failures.
+    pub fn resolveForNavigation(self: Url, allocator: std.mem.Allocator, relative_url: []const u8) !Url {
+        const resolved = self.resolve(allocator, relative_url) catch |err| {
+            return recoverNavigationError(allocator, err);
+        };
+        return normalizeNavigation(allocator, resolved);
+    }
+
     /// Determine if two URLs share the same origin (scheme, host, and port)
     pub fn sameOrigin(self: Url, other: Url) bool {
         if (!std.mem.eql(u8, self.scheme, other.scheme)) return false;
@@ -415,10 +469,8 @@ pub const Url = struct {
     // Old HTTP helper functions removed - std.http.Client handles this now
 
     pub fn aboutRequest(self: Url) []const u8 {
-        // This is a special case for about:blank
-        // We might support more about pages eventually
         _ = self;
-        return "<html><body></body></html>";
+        return "";
     }
 
     /// Fetch a URL without imposing browser/window ownership. Callers own the
@@ -476,6 +528,7 @@ pub const Url = struct {
         }
 
         const is_http = std.mem.eql(u8, url.scheme, "http") or std.mem.eql(u8, url.scheme, "https");
+        if (!is_http) return error.UnsupportedScheme;
         const use_cache = is_http and payload == null and cache != null;
         const href = url.ada_url.getHref();
         const cache_key = if (std.mem.indexOfScalar(u8, href, '#')) |fragment| href[0..fragment] else href;
@@ -877,6 +930,112 @@ const expect = std.testing.expect;
 fn readTestHttpLine(reader: *std.Io.Reader) ![]const u8 {
     const line = try reader.takeDelimiterInclusive('\n');
     return std.mem.trimEnd(u8, line, "\r\n");
+}
+
+test "about blank is canonical and fetches an empty document" {
+    const url = try Url.blank(std.testing.allocator);
+    defer url.free(std.testing.allocator);
+
+    try expect(url.isAboutBlank());
+    var url_buffer: [32]u8 = undefined;
+    try std.testing.expectEqualStrings("about:blank", try url.toString(&url_buffer));
+
+    var http_client: std.http.Client = .{
+        .allocator = std.testing.allocator,
+        .io = std.testing.io,
+    };
+    defer http_client.deinit();
+    var cookie_jar = std.StringHashMap(CookieEntry).init(std.testing.allocator);
+    defer cookie_jar.deinit();
+
+    const response = try Url.fetchBody(
+        std.testing.allocator,
+        std.testing.io,
+        &http_client,
+        &cookie_jar,
+        null,
+        url,
+        null,
+        null,
+    );
+    try std.testing.expectEqualStrings("", response.body);
+}
+
+test "navigation parsing recovers malformed URLs to about blank" {
+    const malformed_inputs = [_][]const u8{
+        "http://[",
+        "data:text/html",
+        "view-source:http://[",
+        "mailto:test@example.com",
+    };
+    for (malformed_inputs) |input| {
+        const recovered = try Url.initForNavigation(std.testing.allocator, input);
+        defer recovered.free(std.testing.allocator);
+        try expect(recovered.isAboutBlank());
+    }
+
+    const unsupported_about = try Url.initForNavigation(std.testing.allocator, "about:not-implemented");
+    defer unsupported_about.free(std.testing.allocator);
+    try expect(unsupported_about.isAboutBlank());
+
+    const valid = try Url.initForNavigation(std.testing.allocator, "https://example.com/path");
+    defer valid.free(std.testing.allocator);
+    try std.testing.expectEqualStrings("https", valid.scheme);
+    try std.testing.expectEqualStrings("example.com", valid.host.?);
+    try std.testing.expectEqualStrings("/path", valid.path);
+}
+
+test "navigation resolution recovers malformed links to about blank" {
+    const base = try Url.init(std.testing.allocator, "https://example.com/path/page.html");
+    defer base.free(std.testing.allocator);
+
+    const recovered = try base.resolveForNavigation(std.testing.allocator, "data:text/html");
+    defer recovered.free(std.testing.allocator);
+    try expect(recovered.isAboutBlank());
+
+    const unsupported = try base.resolveForNavigation(std.testing.allocator, "mailto:test@example.com");
+    defer unsupported.free(std.testing.allocator);
+    try expect(unsupported.isAboutBlank());
+
+    const relative = try base.resolveForNavigation(std.testing.allocator, "next.html");
+    defer relative.free(std.testing.allocator);
+    try std.testing.expectEqualStrings("/path/next.html", relative.path);
+}
+
+test "explicit URL scheme detection leaves file-like inputs alone" {
+    try expect(Url.hasExplicitScheme("https://example.com"));
+    try expect(Url.hasExplicitScheme("about:blank"));
+    try expect(Url.hasExplicitScheme("data:text/plain,hello"));
+    try expect(!Url.hasExplicitScheme("example.com"));
+    try expect(!Url.hasExplicitScheme("/tmp/page.html"));
+    try expect(!Url.hasExplicitScheme("1invalid:value"));
+}
+
+test "strict fetch rejects unsupported schemes without panicking" {
+    const url = try Url.init(std.testing.allocator, "mailto:test@example.com");
+    defer url.free(std.testing.allocator);
+
+    var http_client: std.http.Client = .{
+        .allocator = std.testing.allocator,
+        .io = std.testing.io,
+    };
+    defer http_client.deinit();
+    var cookie_jar = std.StringHashMap(CookieEntry).init(std.testing.allocator);
+    defer cookie_jar.deinit();
+
+    try std.testing.expectError(
+        error.UnsupportedScheme,
+        Url.fetchBody(
+            std.testing.allocator,
+            std.testing.io,
+            &http_client,
+            &cookie_jar,
+            null,
+            url,
+            null,
+            null,
+        ),
+    );
 }
 
 test "file URLs load local file contents" {

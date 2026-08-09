@@ -268,7 +268,7 @@ pub const Frame = struct {
                             if (attrs.get("href")) |href| {
                                 std.log.info("Link click in window_id={d}: {s}", .{ self.window_id, href });
                                 if (self.current_url) |current_url_ptr| {
-                                    var resolved_url = try current_url_ptr.*.resolve(self.allocator, href);
+                                    var resolved_url = try current_url_ptr.*.resolveForNavigation(self.allocator, href);
                                     const new_url_ptr = self.allocator.create(Url) catch |alloc_err| {
                                         std.log.err("Failed to allocate URL: {any}", .{alloc_err});
                                         resolved_url.free(self.allocator);
@@ -1451,10 +1451,7 @@ fn submitFormData(self: *Tab, b: *Browser, frame: *Frame, form_node: *Node, acti
     }
 
     // Resolve the action URL against the current page URL
-    var form_url = frame.current_url.?.*.resolve(self.allocator, action) catch |err| {
-        std.log.warn("Failed to resolve form action URL: {}", .{err});
-        return;
-    };
+    var form_url = try frame.current_url.?.*.resolveForNavigation(self.allocator, action);
 
     // Load the URL with the POST body
     const form_url_ptr = b.allocator.create(Url) catch |alloc_err| {
@@ -1621,7 +1618,7 @@ pub fn activateFocusedElement(self: *Tab, b: *Browser) !void {
                 if (e.attributes) |attrs| {
                     if (attrs.get("href")) |href| {
                         if (frame.current_url) |current_url_ptr| {
-                            const resolved_url = try current_url_ptr.*.resolve(self.allocator, href);
+                            const resolved_url = try current_url_ptr.*.resolveForNavigation(self.allocator, href);
                             const url_ptr = try self.allocator.create(Url);
                             url_ptr.* = resolved_url;
                             if (frame.parent != null) {

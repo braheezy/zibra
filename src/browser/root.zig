@@ -2606,10 +2606,7 @@ pub const Browser = struct {
     }
 
     fn loadIframe(self: *Browser, parent: *Frame, iframe_node: *Node, page_url: *Url, src: []const u8) !void {
-        var iframe_url = page_url.*.resolve(self.allocator, src) catch |err| {
-            std.log.warn("Failed to resolve iframe URL {s}: {}", .{ src, err });
-            return;
-        };
+        var iframe_url = try page_url.*.resolveForNavigation(self.allocator, src);
         var url_owned = true;
         defer if (url_owned) iframe_url.free(self.allocator);
 
@@ -2934,7 +2931,7 @@ pub const Browser = struct {
         var script_url: Url = undefined;
         var url_owned = true;
         const label = if (std.mem.eql(u8, page_url.*.scheme, "data")) blk: {
-            script_url = try Url.init(self.allocator, "about:blank");
+            script_url = try Url.blank(self.allocator);
             break :blk try self.allocator.dupe(u8, "inline:data");
         } else blk: {
             var url_buf: [2048]u8 = undefined;

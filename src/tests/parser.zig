@@ -175,6 +175,27 @@ test "Parse HTML with implicit tags" {
     try std.testing.expectEqualStrings("Hello, world!", text.text);
 }
 
+test "Parse empty HTML as an implicit blank document" {
+    const allocator = std.testing.allocator;
+
+    var parser = try HTMLParser.init(allocator, "");
+    defer parser.deinit(allocator);
+
+    var root = try parser.parse();
+    defer root.deinit(allocator);
+
+    try std.testing.expectEqualStrings("html", root.element.tag);
+    try std.testing.expectEqual(@as(usize, 2), root.element.children.items.len);
+
+    const head = root.element.children.items[0].element;
+    try std.testing.expectEqualStrings("head", head.tag);
+    try std.testing.expectEqual(@as(usize, 0), head.children.items.len);
+
+    const body = root.element.children.items[1].element;
+    try std.testing.expectEqualStrings("body", body.tag);
+    try std.testing.expectEqual(@as(usize, 0), body.children.items.len);
+}
+
 test "Parse HTML with head elements but no explicit head tag" {
     const allocator = std.testing.allocator;
     // HTML with a title but no explicit head or body tags

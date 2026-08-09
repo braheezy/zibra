@@ -116,7 +116,7 @@ pub fn build(b: *std.Build) !void {
 
     const dump_dom_test_step = b.step(
         "test-dump-dom",
-        "Capture and compare the isolated DOM-dump fixture",
+        "Capture and compare isolated DOM-dump regressions",
     );
     const dump_dom_compare_module = b.createModule(.{
         .root_source_file = b.path("tests/dump_dom_compare.zig"),
@@ -135,7 +135,43 @@ pub fn build(b: *std.Build) !void {
     const compare_dom_dump = b.addRunArtifact(dump_dom_compare);
     compare_dom_dump.addFileArg(b.path("tests/golden/dump-dom.txt"));
     compare_dom_dump.addFileArg(actual_dom_dump);
-    dump_dom_test_step.dependOn(&compare_dom_dump.step);
+
+    const dump_about_blank = b.addRunArtifact(exe);
+    dump_about_blank.step.dependOn(&compare_dom_dump.step);
+    dump_about_blank.addArg("--dump-dom");
+    dump_about_blank.addArg("about:blank");
+    const actual_about_blank_dump = dump_about_blank.captureStdOut(.{
+        .basename = "about-blank-dom.txt",
+    });
+
+    const compare_about_blank_dump = b.addRunArtifact(dump_dom_compare);
+    compare_about_blank_dump.addFileArg(b.path("tests/golden/about-blank-dom.txt"));
+    compare_about_blank_dump.addFileArg(actual_about_blank_dump);
+
+    const dump_malformed_url = b.addRunArtifact(exe);
+    dump_malformed_url.step.dependOn(&compare_about_blank_dump.step);
+    dump_malformed_url.addArg("--dump-dom");
+    dump_malformed_url.addArg("http://[");
+    const actual_malformed_url_dump = dump_malformed_url.captureStdOut(.{
+        .basename = "malformed-url-dom.txt",
+    });
+
+    const compare_malformed_url_dump = b.addRunArtifact(dump_dom_compare);
+    compare_malformed_url_dump.addFileArg(b.path("tests/golden/about-blank-dom.txt"));
+    compare_malformed_url_dump.addFileArg(actual_malformed_url_dump);
+
+    const dump_unsupported_scheme = b.addRunArtifact(exe);
+    dump_unsupported_scheme.step.dependOn(&compare_malformed_url_dump.step);
+    dump_unsupported_scheme.addArg("--dump-dom");
+    dump_unsupported_scheme.addArg("mailto:test@example.com");
+    const actual_unsupported_scheme_dump = dump_unsupported_scheme.captureStdOut(.{
+        .basename = "unsupported-scheme-dom.txt",
+    });
+
+    const compare_unsupported_scheme_dump = b.addRunArtifact(dump_dom_compare);
+    compare_unsupported_scheme_dump.addFileArg(b.path("tests/golden/about-blank-dom.txt"));
+    compare_unsupported_scheme_dump.addFileArg(actual_unsupported_scheme_dump);
+    dump_dom_test_step.dependOn(&compare_unsupported_scheme_dump.step);
 
     const screenshot_test_step = b.step(
         "test-screenshot",

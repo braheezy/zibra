@@ -11,7 +11,9 @@ update to hide a regression.
 Current checks:
 
 - `zig build test` — unified Zig unit suite.
-- `zig build test-dump-dom` — isolated HTML parse/DOM-dump output.
+- `zig build test-dump-dom` — isolated HTML parse/DOM-dump output, including
+  literal `about:blank`, malformed-navigation recovery, and unsupported-scheme
+  recovery.
 - `zig build test-screenshot` — native macOS rendering output.
 
 Choose the narrowest check that covers the pipeline stage under change. A DOM
