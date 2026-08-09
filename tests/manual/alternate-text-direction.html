@@ -1,0 +1,29 @@
+<!--
+How to verify:
+  zig build test-screenshot
+
+How to update the macOS golden after an intentional rendering change:
+  zig build run -- --screenshot tests/golden/alternate-text-direction.macos.png tests/manual/alternate-text-direction.html
+
+Expected behavior:
+  The first two English paragraphs preserve left-to-right glyph order while
+  ending at the right page edge. The final dir=ltr paragraph starts at the
+  left page edge. The longer RTL paragraph wraps and right-aligns each line.
+-->
+<!doctype html>
+<html>
+  <head>
+    <title>Alternate text direction fixture</title>
+    <style>
+      body { background-color: white; color: black; }
+      .rtl-short { color: #2457e6; }
+      .rtl-wrap { color: #5f2580; }
+      .ltr-override { color: #b42318; }
+    </style>
+  </head>
+  <body dir="rtl">
+    <p class="rtl-short">RTL body: this English sentence stays in source order and ends at the right edge.</p>
+    <p class="rtl-wrap">Wrapped RTL line: every completed line grows inward from the right edge while the English words and letters remain left-to-right for predictable basic rendering across the page.</p>
+    <p class="ltr-override" dir="ltr">Nested dir=ltr override: this sentence starts at the left edge.</p>
+  </body>
+</html>

@@ -226,6 +226,14 @@ Primitive entries are not self-contained:
 These leaf resources must outlive every frame-side and browser-side display
 list that references them.
 
+Basic text direction is resolved per inline block through the acyclic layout
+parent chain. The CLI `-rtl` flag supplies the fallback direction; the nearest
+block ancestor with `dir=rtl` or `dir=ltr` overrides it. Glyphs are measured and
+wrapped in source order, then the completed line is shifted to its selected
+edge, so English remains left-to-right while an RTL-directed line grows from
+the right. This is intentionally not a Unicode bidi or contextual-script
+shaping implementation; `dir=auto` currently inherits the fallback.
+
 ### Network responses and URLs
 
 `HttpResponse.body` in [`src/network/url.zig`](../src/network/url.zig) is an

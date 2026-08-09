@@ -186,7 +186,7 @@ const EmbedLayout = struct {
 
         if (engine.cursor_x + width_value > engine.line_right) {
             try engine.flushLine(line_buffer);
-            engine.cursor_x = if (engine.rtl_text) engine.line_right else engine.line_left;
+            engine.cursor_x = engine.line_left;
         }
 
         try line_buffer.append(engine.allocator, LineItem{
@@ -379,13 +379,110 @@ const AccessibilityBoundEntry = struct {
 
 pub const Layout = @This();
 
+const TextDirection = enum {
+    left_to_right,
+    right_to_left,
+};
+
+const LineAlignment = enum {
+    start,
+    center,
+    end,
+};
+
+fn textDirectionFromFlag(rtl_text: bool) TextDirection {
+    return if (rtl_text) .right_to_left else .left_to_right;
+}
+
+fn lineAlignmentShift(
+    alignment: LineAlignment,
+    line_left: i32,
+    line_right: i32,
+    content_left: i32,
+    content_right: i32,
+) i32 {
+    const content_width = @max(content_right - content_left, 0);
+    const target_left = switch (alignment) {
+        .start => line_left,
+        .center => line_left + @divTrunc((line_right - line_left) - content_width, 2),
+        .end => line_right - content_width,
+    };
+    return target_left - content_left;
+}
+
+fn explicitTextDirection(element: *const parser.Element) ?TextDirection {
+    const attributes = element.attributes orelse return null;
+    const raw_direction = attributes.get("dir") orelse return null;
+    const direction = std.mem.trim(u8, raw_direction, " \t\r\n");
+    if (std.ascii.eqlIgnoreCase(direction, "rtl")) return .right_to_left;
+    if (std.ascii.eqlIgnoreCase(direction, "ltr")) return .left_to_right;
+    return null;
+}
+
+/// Resolve the nearest inherited HTML `dir` value through the acyclic layout
+/// tree. `auto` and invalid values inherit because Zibra does not yet
+/// implement Unicode bidi detection.
+fn textDirectionForBlock(block: *const BlockLayout, fallback: TextDirection) TextDirection {
+    var current: ?*const BlockLayout = block;
+    while (current) |candidate| : (current = candidate.parent_block) {
+        switch (candidate.node) {
+            .element => |*element| {
+                if (explicitTextDirection(element)) |direction| return direction;
+            },
+            .text => {},
+        }
+    }
+    return fallback;
+}
+
+test "line alignment preserves source order and selects the requested edge" {
+    try std.testing.expectEqual(
+        @as(i32, 0),
+        lineAlignmentShift(.start, 13, 777, 13, 76),
+    );
+    try std.testing.expectEqual(
+        @as(i32, 701),
+        lineAlignmentShift(.end, 13, 777, 13, 76),
+    );
+    try std.testing.expectEqual(
+        @as(i32, 350),
+        lineAlignmentShift(.center, 13, 777, 13, 76),
+    );
+}
+
+test "HTML dir values override or inherit the CLI fallback" {
+    const allocator = std.testing.allocator;
+
+    var body = Node{ .element = try parser.Element.init(allocator, "body dir=rtl", null) };
+    defer body.deinit(allocator);
+    try std.testing.expectEqual(
+        TextDirection.right_to_left,
+        explicitTextDirection(&body.element).?,
+    );
+
+    var overridden = Node{ .element = try parser.Element.init(allocator, "p dir='LTR'", null) };
+    defer overridden.deinit(allocator);
+    try std.testing.expectEqual(
+        TextDirection.left_to_right,
+        explicitTextDirection(&overridden.element).?,
+    );
+
+    var automatic = Node{ .element = try parser.Element.init(allocator, "p dir=auto", null) };
+    defer automatic.deinit(allocator);
+    try std.testing.expectEqual(@as(?TextDirection, null), explicitTextDirection(&automatic.element));
+
+    try std.testing.expectEqual(TextDirection.left_to_right, textDirectionFromFlag(false));
+    try std.testing.expectEqual(TextDirection.right_to_left, textDirectionFromFlag(true));
+}
+
 // Layout state
 allocator: std.mem.Allocator,
 // Font manager for handling fonts and glyphs
 font_manager: font.FontManager,
 window_width: i32,
 window_height: i32,
-rtl_text: bool = false,
+default_direction: TextDirection = .left_to_right,
+line_direction: TextDirection = .left_to_right,
 accessibility: browser.AccessibilitySettings = .{},
 color_scheme_dark: bool = false,
 document_color_scheme_dark: bool = false,
@@ -448,6 +545,7 @@ const InlineSnapshot = struct {
     prev_font_category: ?FontCategory,
     current_font_category: FontCategory,
     text_color: browser.Color,
+    line_direction: TextDirection,
 };
 
 fn snapshotInlineState(self: *const Layout) InlineSnapshot {
@@ -466,6 +564,7 @@ fn snapshotInlineState(self: *const Layout) InlineSnapshot {
         .prev_font_category = self.prev_font_category,
         .current_font_category = self.current_font_category,
         .text_color = self.text_color,
+        .line_direction = self.line_direction,
     };
 }
 
@@ -484,6 +583,7 @@ fn restoreInlineState(self: *Layout, snapshot: InlineSnapshot) void {
     self.prev_font_category = snapshot.prev_font_category;
     self.current_font_category = snapshot.current_font_category;
     self.text_color = snapshot.text_color;
+    self.line_direction = snapshot.line_direction;
 }
 
 fn zoom(self: *const Layout) f32 {
@@ -597,19 +697,19 @@ pub fn init(
         return err;
     };
 
-    const layout_width = window_width;
-    const scrollbar_width_css = scrollbar_width;
+    const default_direction = textDirectionFromFlag(rtl_text);
 
     layout.* = Layout{
         .allocator = allocator,
         .font_manager = font_manager,
         .window_width = window_width,
         .window_height = window_height,
-        .rtl_text = rtl_text,
-        .cursor_x = if (rtl_text) layout_width - scrollbar_width_css - h_offset else h_offset,
+        .default_direction = default_direction,
+        .line_direction = default_direction,
+        .cursor_x = h_offset,
         .cursor_y = v_offset,
         .line_left = h_offset,
-        .line_right = layout_width - scrollbar_width_css - h_offset,
+        .line_right = window_width - scrollbar_width - h_offset,
         .is_bold = false,
         .is_italic = false,
         .content_height = 0,
@@ -932,31 +1032,32 @@ fn flushLine(self: *Layout, line_buffer: *std.ArrayList(LineItem)) !void {
     // Nothing to flush? Return.
     if (line_buffer.items.len == 0) return;
 
-    // === Handle title centering if needed ===
-    if (self.is_title) {
-        // Determine the bounding x-coordinates from the line items.
-        var min_x: i32 = line_buffer.items[0].x;
-        var max_x: i32 = line_buffer.items[0].x + line_buffer.items[0].width;
-        for (line_buffer.items) |item| {
-            if (item.x < min_x) {
-                min_x = item.x;
-            }
-            const item_right = item.x + item.width;
-            if (item_right > max_x) {
-                max_x = item_right;
-            }
-        }
-        const line_width: i32 = max_x - min_x;
-        const available_width: i32 = self.line_right - self.line_left;
-        const new_x_offset: i32 = self.line_left + @divTrunc(available_width - line_width, 2);
-        const shift: i32 = new_x_offset - min_x;
-        // Adjust all glyph positions for centering.
-        for (line_buffer.items) |*item| {
-            item.x += shift;
-        }
-        // Reset the is_title state since the title line has been centered.
-        self.is_title = false;
+    // Build every line in logical source order from the left, then align the
+    // completed run. This preserves English LTR glyph order under `dir=rtl`
+    // while making the line grow inward from the right edge.
+    var content_left: i32 = line_buffer.items[0].x;
+    var content_right: i32 = line_buffer.items[0].x + line_buffer.items[0].width;
+    for (line_buffer.items[1..]) |item| {
+        content_left = @min(content_left, item.x);
+        content_right = @max(content_right, item.x + item.width);
     }
+    const alignment: LineAlignment = if (self.is_title)
+        .center
+    else if (self.line_direction == .right_to_left)
+        .end
+    else
+        .start;
+    const shift = lineAlignmentShift(
+        alignment,
+        self.line_left,
+        self.line_right,
+        content_left,
+        content_right,
+    );
+    if (shift != 0) {
+        for (line_buffer.items) |*item| item.x += shift;
+    }
+    self.is_title = false;
 
     // === PASS 1: Collect line metrics ===
     var max_ascent: i32 = 0;
@@ -1149,7 +1250,7 @@ fn flushLine(self: *Layout, line_buffer: *std.ArrayList(LineItem)) !void {
 
     // Advance cursor_y and reset cursor_x
     self.cursor_y = baseline + max_descent + extra_leading;
-    self.cursor_x = if (self.rtl_text) self.line_right else self.line_left;
+    self.cursor_x = self.line_left;
 
     line_buffer.clearRetainingCapacity();
 }
@@ -1169,7 +1270,7 @@ fn processGrapheme(
     // Handle newlines explicitly before font shaping.
     if (std.mem.eql(u8, gme, "\n") or std.mem.eql(u8, gme, "\r") or options.force_newline) {
         try self.flushLine(line_buffer);
-        self.cursor_x = if (self.rtl_text) self.line_right else self.line_left;
+        self.cursor_x = self.line_left;
         return;
     }
 
@@ -1252,7 +1353,7 @@ fn processGrapheme(
     // Check if we need to wrap (only at window edge)
     if (self.cursor_x + glyph_width > self.line_right) {
         try self.flushLine(line_buffer);
-        self.cursor_x = if (self.rtl_text) self.line_right else self.line_left;
+        self.cursor_x = self.line_left;
     }
 
     // Add glyph to line buffer with current text color
@@ -1481,7 +1582,7 @@ fn breakParagraph(self: *Layout, line_buffer: *std.ArrayList(LineItem)) !void {
         self.cursor_y += @max(self.size, 1);
     }
     self.cursor_y += gap;
-    self.cursor_x = if (self.rtl_text) self.line_right else self.line_left;
+    self.cursor_x = self.line_left;
 }
 
 fn handleTextToken(
@@ -1630,10 +1731,11 @@ test "lexEntityAt recognizes the entities rendered as text" {
 // Update layoutSourceCode to format HTML source with tags in normal font and content in bold
 pub fn layoutSourceCode(self: *Layout, source: []const u8) ![]DisplayItem {
     self.current_display_target = &self.display_list;
-    self.cursor_x = if (self.rtl_text) self.line_right else self.line_left;
-    self.cursor_y = v_offset;
     self.line_left = h_offset;
     self.line_right = self.layoutWindowWidth() - self.layoutScrollbarWidth() - h_offset;
+    self.cursor_x = self.line_left;
+    self.cursor_y = v_offset;
+    self.line_direction = self.default_direction;
     self.size = self.default_font_size;
 
     // Save current state
@@ -3052,8 +3154,9 @@ fn layoutInlineBlock(self: *Layout, block: *BlockLayout) !void {
     self.line_left = block.x.get().*;
     const block_width = block.width.get().*;
     self.line_right = block.x.get().* + block_width;
-    self.cursor_x = if (self.rtl_text) self.line_right else self.line_left;
+    self.cursor_x = self.line_left;
     self.cursor_y = block.y.get().*;
+    self.line_direction = textDirectionForBlock(block, self.default_direction);
     self.size = self.default_font_size;
     self.is_bold = false;
     self.is_italic = false;

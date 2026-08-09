@@ -19,6 +19,10 @@ before changing `root.zig`, `tab.zig`, `render/`, or browser task scheduling.
   before DOM, and display snapshots must retire before `FontManager`.
 - `scroll.zig` is the single source of truth for CSS scroll ranges and native
   scrollbar-thumb geometry. Clamping and drawing must use the same metrics.
+- Basic text direction keeps glyphs in source order and aligns completed lines:
+  `-rtl` supplies the document fallback, while the nearest block ancestor's
+  `dir=rtl` or `dir=ltr` overrides it. Unicode bidi reordering, `dir=auto`, and
+  contextual script shaping are not implemented.
 - Keep browser rendering work and isolated inspection modes separate. A DOM
   dump must not construct `Browser` merely to reuse a convenience method.
 

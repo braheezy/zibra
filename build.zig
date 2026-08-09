@@ -236,6 +236,17 @@ pub fn build(b: *std.Build) !void {
         compare_emoji.addFileArg(b.path("tests/golden/emoji.macos.png"));
         compare_emoji.addFileArg(actual_emoji_screenshot);
         screenshot_test_step.dependOn(&compare_emoji.step);
+
+        const text_direction_capture = b.addRunArtifact(exe);
+        text_direction_capture.step.dependOn(&compare_emoji.step);
+        text_direction_capture.addArg("--screenshot");
+        const actual_text_direction_screenshot = text_direction_capture.addOutputFileArg("alternate-text-direction-screenshot.png");
+        text_direction_capture.addPrefixedFileArg("file://", b.path("tests/manual/alternate-text-direction.html"));
+
+        const compare_text_direction = b.addRunArtifact(screenshot_compare);
+        compare_text_direction.addFileArg(b.path("tests/golden/alternate-text-direction.macos.png"));
+        compare_text_direction.addFileArg(actual_text_direction_screenshot);
+        screenshot_test_step.dependOn(&compare_text_direction.step);
     } else {
         const unsupported = b.addFail(
             "test-screenshot currently requires a native macOS target",
