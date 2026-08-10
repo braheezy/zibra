@@ -269,6 +269,17 @@ pub fn build(b: *std.Build) !void {
         compare_superscript.addFileArg(b.path("tests/golden/superscript.macos.png"));
         compare_superscript.addFileArg(actual_superscript_screenshot);
         screenshot_test_step.dependOn(&compare_superscript.step);
+
+        const soft_hyphen_capture = b.addRunArtifact(exe);
+        soft_hyphen_capture.step.dependOn(&compare_superscript.step);
+        soft_hyphen_capture.addArg("--screenshot");
+        const actual_soft_hyphen_screenshot = soft_hyphen_capture.addOutputFileArg("soft-hyphens-screenshot.png");
+        soft_hyphen_capture.addPrefixedFileArg("file://", b.path("tests/manual/soft-hyphens.html"));
+
+        const compare_soft_hyphens = b.addRunArtifact(screenshot_compare);
+        compare_soft_hyphens.addFileArg(b.path("tests/golden/soft-hyphens.macos.png"));
+        compare_soft_hyphens.addFileArg(actual_soft_hyphen_screenshot);
+        screenshot_test_step.dependOn(&compare_soft_hyphens.step);
     } else {
         const unsupported = b.addFail(
             "test-screenshot currently requires a native macOS target",

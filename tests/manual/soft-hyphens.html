@@ -1,0 +1,23 @@
+<!--
+How to verify:
+  zig build run -- --screenshot tests/golden/soft-hyphens.macos.png tests/manual/soft-hyphens.html
+
+Expected: unused markers in the first line remain invisible. The second sample
+ends its first line with a red hyphen and moves the bold suffix intact. The
+large purple word contains literal U+00AD characters, wraps at its latest
+fitting marker, draws a hyphen, and continues on the next line.
+-->
+<!doctype html>
+<html>
+  <head>
+    <title>Soft hyphen fixture</title>
+    <style>
+      body { background-color: white; color: black; }
+    </style>
+  </head>
+  <body>
+    <p>Unused markers stay invisible: alpha&shy;beta and gamma­delta.</p>
+    <p style="font-size: 40px">This prefix uses most of the available line: super<span style="color: #b42318">&shy;</span><b>califragilistic</b></p>
+    <p style="font-size: 96px; color: #6f2c91">super­cali­fragi­listic­expi­ali­docious</p>
+  </body>
+</html>

@@ -241,6 +241,11 @@ Superscript state likewise follows DOM recursion and layout ancestry rather
 than borrowed DOM-parent pointers. Superscript glyphs carry their placement
 marker into line flushing, which aligns their tops without moving the normal
 text baseline.
+Soft-hyphen wrapping temporarily transfers the post-break `LineItem` suffix
+out of the active line before flushing its prefix. Glyph entries only borrow
+font data, but embedded input, image, and iframe payloads retain single
+ownership throughout the transfer. The suffix is then rebased and transferred
+back to the next line; it must never be shallow-copied and independently freed.
 
 ### Network responses and URLs
 

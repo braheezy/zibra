@@ -343,6 +343,18 @@ const LineItem = struct {
     payload: LineItemPayload,
 };
 
+const SoftHyphenBreak = struct {
+    item_index: usize,
+    break_x: i32,
+    hyphen_item: LineItem,
+};
+
+const GraphemeOptions = struct {
+    force_newline: bool = false,
+    is_superscript: bool = false,
+    is_small_caps: bool = false,
+};
+
 // Add this struct to cache word measurements
 const WordCache = struct {
     width: i32,
@@ -602,6 +614,11 @@ inline_block: ?*BlockLayout = null,
 // Add cache as field
 word_cache: std.AutoHashMap(u64, WordCache),
 
+// Discretionary break opportunities for the current visible word and line.
+// Each candidate owns no resources: its hyphen glyph borrows FontManager data.
+soft_hyphen_breaks: std.ArrayList(SoftHyphenBreak),
+soft_hyphen_word_has_content: bool = false,
+
 // Map of input element nodes to their bounding boxes for hit testing
 input_bounds: std.AutoHashMap(*Node, Bounds),
 // Collected bounds for anchor elements
@@ -810,6 +827,7 @@ pub fn init(
         .display_list = std.ArrayList(DisplayItem).empty,
         .current_display_target = undefined,
         .word_cache = std.AutoHashMap(u64, WordCache).init(allocator),
+        .soft_hyphen_breaks = std.ArrayList(SoftHyphenBreak).empty,
         .input_bounds = std.AutoHashMap(*Node, Bounds).init(allocator),
         .link_bounds = std.ArrayList(LinkBoundEntry).empty,
         .iframe_bounds = std.ArrayList(IframeBoundEntry).empty,
@@ -834,6 +852,7 @@ pub fn deinit(self: *Layout) void {
         self.allocator.free(entry.value_ptr.graphemes);
     }
     self.word_cache.deinit();
+    self.soft_hyphen_breaks.deinit(self.allocator);
 
     self.input_bounds.deinit();
     self.link_bounds.deinit(self.allocator);
@@ -908,6 +927,7 @@ fn handleInputElement(self: *Layout, node: Node, node_ptr: ?*Node, line_buffer: 
         .element => |e| e,
         else => return,
     };
+    self.resetSoftHyphenWord();
 
     var input_layout = InputLayout.init(self.allocator);
     try input_layout.measure(self, element);
@@ -922,6 +942,7 @@ fn handleImageElement(self: *Layout, node: Node, node_ptr: ?*Node, line_buffer: 
         .element => |e| e,
         else => return,
     };
+    self.resetSoftHyphenWord();
 
     var width_attr: ?i32 = null;
     var height_attr: ?i32 = null;
@@ -986,6 +1007,7 @@ fn handleIframeElement(self: *Layout, node: Node, node_ptr: ?*Node, line_buffer:
         .element => |e| e,
         else => return,
     };
+    self.resetSoftHyphenWord();
 
     var width_attr: ?i32 = null;
     var height_attr: ?i32 = null;
@@ -1129,9 +1151,136 @@ fn restoreNodeStyles(self: *Layout, _: *std.ArrayList(LineItem)) !void {
     }
 }
 
+fn isSoftHyphenGrapheme(gme: []const u8) bool {
+    return std.mem.eql(u8, gme, "\u{00AD}");
+}
+
+fn isWordSeparatorGrapheme(gme: []const u8) bool {
+    return gme.len == 1 and std.ascii.isWhitespace(gme[0]);
+}
+
+test "soft hyphen recognition is distinct from word separation" {
+    try std.testing.expect(isSoftHyphenGrapheme("\u{00AD}"));
+    try std.testing.expect(!isSoftHyphenGrapheme("-"));
+    try std.testing.expect(isWordSeparatorGrapheme(" "));
+    try std.testing.expect(isWordSeparatorGrapheme("\t"));
+    try std.testing.expect(!isWordSeparatorGrapheme("a"));
+}
+
+fn resetSoftHyphenWord(self: *Layout) void {
+    self.soft_hyphen_breaks.clearRetainingCapacity();
+    self.soft_hyphen_word_has_content = false;
+}
+
+fn recordSoftHyphenBreak(
+    self: *Layout,
+    line_buffer: *const std.ArrayList(LineItem),
+    node_ptr: ?*Node,
+    options: GraphemeOptions,
+) !void {
+    // Soft hyphens at the start of a visual line have no prefix to break, and
+    // preformatted text deliberately does not wrap.
+    if (self.is_preformatted or !self.soft_hyphen_word_has_content) return;
+
+    const weight: font.FontWeight = if (self.is_bold) .Bold else .Normal;
+    const slant: font.FontSlant = if (self.is_italic) .Italic else .Roman;
+    const text_size = textSizeForSuperscript(self.size, options.is_superscript);
+    var hyphen = try self.font_manager.getStyledGlyph(
+        "-",
+        weight,
+        slant,
+        self.scaledFontSize(text_size),
+        false,
+    );
+    hyphen.is_superscript = options.is_superscript;
+    hyphen.is_soft_hyphen = false;
+
+    const hyphen_width = self.toLayoutPx(hyphen.w);
+    if (hyphen_width <= 0) return;
+
+    try self.soft_hyphen_breaks.append(self.allocator, .{
+        .item_index = line_buffer.items.len,
+        .break_x = self.cursor_x,
+        .hyphen_item = .{
+            .x = self.cursor_x,
+            .hit_offset_x = self.transform_offset_x,
+            .hit_offset_y = self.transform_offset_y,
+            .ascent = self.toLayoutPx(hyphen.ascent),
+            .descent = self.toLayoutPx(hyphen.descent),
+            .width = hyphen_width,
+            .height = self.toLayoutPx(hyphen.h),
+            .node_ptr = node_ptr,
+            .payload = .{ .glyph = .{
+                .glyph = hyphen,
+                .color = self.remapColor(self.text_color),
+            } },
+        },
+    });
+}
+
+/// Break at the latest recorded soft hyphen whose visible hyphen fits. The
+/// suffix is transferred out of the current line before flushing its prefix,
+/// then rebased onto the next line without duplicating payload ownership.
+fn trySoftHyphenBreak(self: *Layout, line_buffer: *std.ArrayList(LineItem)) !bool {
+    var chosen_index = self.soft_hyphen_breaks.items.len;
+    while (chosen_index > 0) {
+        chosen_index -= 1;
+        const candidate = self.soft_hyphen_breaks.items[chosen_index];
+        if (candidate.item_index == 0 or candidate.item_index > line_buffer.items.len) continue;
+        if (candidate.break_x + candidate.hyphen_item.width <= self.line_right) break;
+    } else return false;
+
+    const chosen = self.soft_hyphen_breaks.items[chosen_index];
+
+    var suffix = std.ArrayList(LineItem).empty;
+    defer {
+        // Until ownership is transferred back to line_buffer, suffix is
+        // responsible for embedded payload cleanup.
+        for (suffix.items) |*item| item.payload.deinit();
+        suffix.deinit(self.allocator);
+    }
+    try suffix.appendSlice(self.allocator, line_buffer.items[chosen.item_index..]);
+    line_buffer.shrinkRetainingCapacity(chosen.item_index);
+
+    var carried_breaks = std.ArrayList(SoftHyphenBreak).empty;
+    defer carried_breaks.deinit(self.allocator);
+    for (self.soft_hyphen_breaks.items[chosen_index + 1 ..]) |candidate| {
+        // Consecutive markers at the chosen boundary would become an invalid
+        // break at the start of the new visual line.
+        if (candidate.item_index <= chosen.item_index) continue;
+        var carried = candidate;
+        carried.item_index -= chosen.item_index;
+        carried.break_x = self.line_left + (candidate.break_x - chosen.break_x);
+        carried.hyphen_item.x = carried.break_x;
+        try carried_breaks.append(self.allocator, carried);
+    }
+
+    try line_buffer.append(self.allocator, chosen.hyphen_item);
+    self.cursor_x = chosen.break_x + chosen.hyphen_item.width;
+    try self.flushLine(line_buffer);
+
+    for (suffix.items) |*item| {
+        item.x = self.line_left + (item.x - chosen.break_x);
+    }
+    try line_buffer.appendSlice(self.allocator, suffix.items);
+    suffix.clearRetainingCapacity(); // Ownership transferred to line_buffer.
+
+    try self.soft_hyphen_breaks.appendSlice(self.allocator, carried_breaks.items);
+    self.soft_hyphen_word_has_content = line_buffer.items.len > 0;
+    self.cursor_x = if (line_buffer.items.len > 0) blk: {
+        const last = line_buffer.items[line_buffer.items.len - 1];
+        break :blk last.x + last.width;
+    } else self.line_left;
+    return true;
+}
+
 fn flushLine(self: *Layout, line_buffer: *std.ArrayList(LineItem)) !void {
     // Nothing to flush? Return.
-    if (line_buffer.items.len == 0) return;
+    if (line_buffer.items.len == 0) {
+        self.resetSoftHyphenWord();
+        return;
+    }
+    defer self.resetSoftHyphenWord();
 
     // Build every line in logical source order from the left, then align the
     // completed run. This preserves English LTR glyph order under `dir=rtl`
@@ -1369,11 +1518,7 @@ fn processGrapheme(
     gme: []const u8,
     line_buffer: *std.ArrayList(LineItem),
     node_ptr: ?*Node,
-    options: struct {
-        force_newline: bool = false,
-        is_superscript: bool = false,
-        is_small_caps: bool = false,
-    },
+    options: GraphemeOptions,
 ) !void {
     // Handle newlines explicitly before font shaping.
     if (std.mem.eql(u8, gme, "\n") or std.mem.eql(u8, gme, "\r") or options.force_newline) {
@@ -1381,6 +1526,14 @@ fn processGrapheme(
         self.cursor_x = self.line_left;
         return;
     }
+
+    if (isSoftHyphenGrapheme(gme)) {
+        try self.recordSoftHyphenBreak(line_buffer, node_ptr, options);
+        return;
+    }
+
+    const separates_word = isWordSeparatorGrapheme(gme);
+    if (separates_word) self.resetSoftHyphenWord();
 
     // Choose one font for the complete Unicode grapheme. Emoji sequences must
     // not be split across fallback fonts or rendered as separate code points.
@@ -1445,25 +1598,15 @@ fn processGrapheme(
 
     glyph.is_superscript = options.is_superscript;
 
-    // Check for soft hyphen character (U+00AD)
-    const is_soft_hyphen = (gme.len == 2 and gme[0] == 0xC2 and gme[1] == 0xAD) or
-        std.mem.eql(u8, gme, "\u{00AD}");
-    glyph.is_soft_hyphen = is_soft_hyphen;
-
-    // Skip rendering soft hyphens
-    if (glyph.is_soft_hyphen) {
-        return;
-    }
-
     const glyph_width = self.toLayoutPx(glyph.w);
     const glyph_height = self.toLayoutPx(glyph.h);
     const glyph_ascent = self.toLayoutPx(glyph.ascent);
     const glyph_descent = self.toLayoutPx(glyph.descent);
 
     // Check if we need to wrap (only at window edge)
-    if (self.cursor_x + glyph_width > self.line_right) {
+    while (self.cursor_x + glyph_width > self.line_right and line_buffer.items.len > 0) {
+        if (try self.trySoftHyphenBreak(line_buffer)) continue;
         try self.flushLine(line_buffer);
-        self.cursor_x = self.line_left;
     }
 
     // Add glyph to line buffer with current text color
@@ -1484,6 +1627,7 @@ fn processGrapheme(
         },
     });
     self.cursor_x += glyph_width;
+    if (!separates_word) self.soft_hyphen_word_has_content = true;
 }
 
 fn recordLinkBounds(self: *Layout, node_ptr: *Node, x: i32, y: i32, width: i32, height: i32) !void {
@@ -1637,12 +1781,6 @@ fn handlePreformattedText(
     var position: usize = 0;
     while (position < content.len) {
         if (lexEntityAt(content, position)) |entity| {
-            // A soft hyphen is a discretionary line-break marker. Preformatted
-            // text does not wrap, so it remains invisible here as well.
-            if (std.mem.eql(u8, entity.replacement, "\u{00AD}")) {
-                position += entity.len;
-                continue;
-            }
             try self.processGrapheme(entity.replacement, line_buffer, node_ptr, .{
                 .is_superscript = self.is_superscript,
                 .is_small_caps = self.is_small_caps,
@@ -1720,13 +1858,6 @@ fn handleTextToken(
 
         if (content[i] == '&') {
             if (lexEntityAt(content, i)) |entity| {
-                if (std.mem.eql(u8, entity.replacement, "\u{00AD}")) {
-                    // Soft hyphens are discretionary break markers. They stay
-                    // invisible until soft-hyphen wrapping is implemented.
-                    i += entity.len;
-                    continue;
-                }
-
                 try self.processGrapheme(entity.replacement, line_buffer, node_ptr, .{
                     .is_superscript = self.is_superscript,
                     .is_small_caps = self.is_small_caps,
@@ -1834,6 +1965,10 @@ test "lexEntityAt recognizes the entities rendered as text" {
     try std.testing.expectEqualStrings(">", greater_than.replacement);
     try std.testing.expectEqual(@as(usize, 4), greater_than.len);
 
+    const soft_hyphen = lexEntityAt("&shy;", 0).?;
+    try std.testing.expectEqualStrings("\u{00AD}", soft_hyphen.replacement);
+    try std.testing.expectEqual(@as(usize, 5), soft_hyphen.len);
+
     try std.testing.expect(lexEntityAt("&unknown;", 0) == null);
     try std.testing.expect(lexEntityAt("&lt", 0) == null);
 }
@@ -1847,6 +1982,7 @@ pub fn layoutSourceCode(self: *Layout, source: []const u8) ![]DisplayItem {
     self.cursor_y = v_offset;
     self.line_direction = self.default_direction;
     self.size = self.default_font_size;
+    self.resetSoftHyphenWord();
 
     // Save current state
     const original_preformatted = self.is_preformatted;
@@ -3260,6 +3396,7 @@ fn layoutInlineBlock(self: *Layout, block: *BlockLayout) !void {
         self.inline_block = previous_inline_block;
     }
     self.inline_block = block;
+    self.resetSoftHyphenWord();
 
     self.line_left = block.x.get().*;
     const block_width = block.width.get().*;
