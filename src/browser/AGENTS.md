@@ -26,6 +26,9 @@ before changing `root.zig`, `tab.zig`, `render/`, or browser task scheduling.
 - An `h1` whose whitespace-separated class list contains `title` centers each
   completed line independently. Keep this alignment stable for the whole
   inline block; line flushing must not consume it.
+- Superscript state is scoped to the DOM/layout subtree beneath `sup`. Its
+  glyphs use half the inherited text size and align their top with the tallest
+  normal glyph without changing that line's normal baseline.
 - Keep browser rendering work and isolated inspection modes separate. A DOM
   dump must not construct `Browser` merely to reuse a convenience method.
 

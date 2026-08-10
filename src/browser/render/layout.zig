@@ -447,6 +447,28 @@ fn isCenteredTitleBlock(block: *const BlockLayout) bool {
     return false;
 }
 
+fn isSuperscriptElement(element: *const parser.Element) bool {
+    return std.ascii.eqlIgnoreCase(element.tag, "sup");
+}
+
+fn isWithinSuperscriptBlock(block: *const BlockLayout) bool {
+    var current: ?*const BlockLayout = block;
+    while (current) |candidate| : (current = candidate.parent_block) {
+        switch (candidate.node) {
+            .element => |*element| {
+                if (isSuperscriptElement(element)) return true;
+            },
+            .text => {},
+        }
+    }
+    return false;
+}
+
+fn textSizeForSuperscript(size: i32, is_superscript: bool) i32 {
+    if (!is_superscript) return size;
+    return @max(@divTrunc(size, 2), 1);
+}
+
 /// Resolve the nearest inherited HTML `dir` value through the acyclic layout
 /// tree. `auto` and invalid values inherit because Zibra does not yet
 /// implement Unicode bidi detection.
@@ -529,6 +551,22 @@ test "centered title recognizes title as an HTML class token" {
     ) };
     defer wrong_element.deinit(allocator);
     try std.testing.expect(!isCenteredTitleElement(&wrong_element.element));
+}
+
+test "superscript elements use a bounded half-size font" {
+    const allocator = std.testing.allocator;
+
+    var superscript = Node{ .element = try parser.Element.init(allocator, "SUP", null) };
+    defer superscript.deinit(allocator);
+    try std.testing.expect(isSuperscriptElement(&superscript.element));
+
+    var subscript = Node{ .element = try parser.Element.init(allocator, "sub", null) };
+    defer subscript.deinit(allocator);
+    try std.testing.expect(!isSuperscriptElement(&subscript.element));
+
+    try std.testing.expectEqual(@as(i32, 8), textSizeForSuperscript(16, true));
+    try std.testing.expectEqual(@as(i32, 1), textSizeForSuperscript(1, true));
+    try std.testing.expectEqual(@as(i32, 16), textSizeForSuperscript(16, false));
 }
 
 // Layout state
@@ -827,6 +865,13 @@ fn recurseNode(self: *Layout, node: Node, node_ptr: ?*Node, line_buffer: *std.Ar
             // Apply CSS styles before processing this element
             try self.applyNodeStyles(e, line_buffer);
 
+            // DOM recursion replaces the old opening/closing-tag token stream.
+            // Scope superscript state to this subtree so nested styles retain
+            // it and following siblings return to their previous state.
+            const previous_superscript = self.is_superscript;
+            if (isSuperscriptElement(&e)) self.is_superscript = true;
+            defer self.is_superscript = previous_superscript;
+
             // Handle br tag for line breaks
             if (std.mem.eql(u8, e.tag, "br")) {
                 try self.flushLine(line_buffer);
@@ -1115,9 +1160,11 @@ fn flushLine(self: *Layout, line_buffer: *std.ArrayList(LineItem)) !void {
     }
 
     // === PASS 1: Collect line metrics ===
-    var max_ascent: i32 = 0;
-    var max_normal_ascent: i32 = 0; // Track max ascent of normal (non-superscript) text
-    var max_descent: i32 = 0;
+    var has_normal_item = false;
+    var max_normal_ascent: i32 = 0;
+    var max_normal_descent: i32 = 0;
+    var max_superscript_ascent: i32 = 0;
+    var max_superscript_descent: i32 = 0;
 
     for (line_buffer.items) |item| {
         const is_superscript = switch (item.payload) {
@@ -1127,18 +1174,24 @@ fn flushLine(self: *Layout, line_buffer: *std.ArrayList(LineItem)) !void {
             .iframe => false,
         };
         if (is_superscript) {
-            if (item.ascent > max_ascent) max_ascent = item.ascent;
-            if (item.descent > max_descent) max_descent = item.descent;
+            max_superscript_ascent = @max(max_superscript_ascent, item.ascent);
+            max_superscript_descent = @max(max_superscript_descent, item.descent);
         } else {
-            if (item.ascent > max_ascent) max_ascent = item.ascent;
-            if (item.ascent > max_normal_ascent) max_normal_ascent = item.ascent;
-            if (item.descent > max_descent) max_descent = item.descent;
+            has_normal_item = true;
+            max_normal_ascent = @max(max_normal_ascent, item.ascent);
+            max_normal_descent = @max(max_normal_descent, item.descent);
         }
     }
 
-    const line_height = max_ascent + max_descent;
+    // Normal glyphs share a baseline. Superscripts instead share the top of
+    // the tallest normal glyph, so their metrics must not move that baseline.
+    // A line containing only superscripts uses its own ascent as a fallback.
+    const baseline_ascent = if (has_normal_item) max_normal_ascent else max_superscript_ascent;
+    const normal_height = max_normal_ascent + max_normal_descent;
+    const superscript_height = max_superscript_ascent + max_superscript_descent;
+    const line_height = @max(normal_height, superscript_height);
     const extra_leading: i32 = @intFromFloat(@as(f32, @floatFromInt(line_height)) * 0.25);
-    const baseline = self.cursor_y + max_ascent;
+    const baseline = self.cursor_y + baseline_ascent;
     const line_top = self.cursor_y;
     const line_box_height = line_height + extra_leading;
 
@@ -1158,8 +1211,8 @@ fn flushLine(self: *Layout, line_buffer: *std.ArrayList(LineItem)) !void {
             .iframe => false,
         };
         if (is_superscript) {
-            // Position superscript so its top aligns with normal text top
-            final_y = self.cursor_y; // Start at line top
+            // Position superscript so its top aligns with normal text top.
+            final_y = baseline - baseline_ascent;
         } else {
             // Normal baseline alignment
             final_y = baseline - item.ascent;
@@ -1304,7 +1357,7 @@ fn flushLine(self: *Layout, line_buffer: *std.ArrayList(LineItem)) !void {
     }
 
     // Advance cursor_y and reset cursor_x
-    self.cursor_y = baseline + max_descent + extra_leading;
+    self.cursor_y = line_top + line_height + extra_leading;
     self.cursor_x = self.line_left;
 
     line_buffer.clearRetainingCapacity();
@@ -1349,6 +1402,8 @@ fn processGrapheme(
     const weight: font.FontWeight = if (self.is_bold) .Bold else .Normal;
     const slant: font.FontSlant = if (self.is_italic) .Italic else .Roman;
 
+    const text_size = textSizeForSuperscript(self.size, options.is_superscript);
+
     // Handle small caps rendering
     var glyph: font.Glyph = undefined;
     if (options.is_small_caps) {
@@ -1364,7 +1419,7 @@ fn processGrapheme(
                 upper_gme,
                 .Bold, // Force bold for small caps
                 slant,
-                self.scaledFontSize(@divTrunc(self.size * 4, 5)), // Make it ~80% of normal size
+                self.scaledFontSize(@divTrunc(text_size * 4, 5)), // Make it ~80% of normal size
                 use_monospace,
             );
         } else {
@@ -1373,7 +1428,7 @@ fn processGrapheme(
                 gme,
                 weight,
                 slant,
-                self.scaledFontSize(self.size),
+                self.scaledFontSize(text_size),
                 use_monospace,
             );
         }
@@ -1383,7 +1438,7 @@ fn processGrapheme(
             gme,
             weight,
             slant,
-            self.scaledFontSize(if (options.is_superscript) @divTrunc(self.size, 2) else self.size),
+            self.scaledFontSize(text_size),
             use_monospace,
         );
     }
@@ -3219,7 +3274,7 @@ fn layoutInlineBlock(self: *Layout, block: *BlockLayout) !void {
     // Keeping this state stable lets explicit and automatic line breaks center
     // each completed line independently in flushLine().
     self.is_title = isCenteredTitleBlock(block);
-    self.is_superscript = false;
+    self.is_superscript = isWithinSuperscriptBlock(block);
     self.is_small_caps = false;
     self.text_color = .{ .r = 0, .g = 0, .b = 0, .a = 255 }; // Reset to black
     self.is_preformatted = false;

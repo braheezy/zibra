@@ -237,6 +237,10 @@ The same completed-line alignment step centers every line beneath an `h1`
 whose class-token list contains `title`. Title alignment is resolved from the
 layout parent chain and remains active across explicit and automatic line
 breaks.
+Superscript state likewise follows DOM recursion and layout ancestry rather
+than borrowed DOM-parent pointers. Superscript glyphs carry their placement
+marker into line flushing, which aligns their tops without moving the normal
+text baseline.
 
 ### Network responses and URLs
 

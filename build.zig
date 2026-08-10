@@ -258,6 +258,17 @@ pub fn build(b: *std.Build) !void {
         compare_centered_title.addFileArg(b.path("tests/golden/centered-title.macos.png"));
         compare_centered_title.addFileArg(actual_centered_title_screenshot);
         screenshot_test_step.dependOn(&compare_centered_title.step);
+
+        const superscript_capture = b.addRunArtifact(exe);
+        superscript_capture.step.dependOn(&compare_centered_title.step);
+        superscript_capture.addArg("--screenshot");
+        const actual_superscript_screenshot = superscript_capture.addOutputFileArg("superscript-screenshot.png");
+        superscript_capture.addPrefixedFileArg("file://", b.path("tests/manual/superscript.html"));
+
+        const compare_superscript = b.addRunArtifact(screenshot_compare);
+        compare_superscript.addFileArg(b.path("tests/golden/superscript.macos.png"));
+        compare_superscript.addFileArg(actual_superscript_screenshot);
+        screenshot_test_step.dependOn(&compare_superscript.step);
     } else {
         const unsupported = b.addFail(
             "test-screenshot currently requires a native macOS target",

@@ -1,0 +1,22 @@
+<!--
+How to verify:
+  zig build run -- --screenshot tests/golden/superscript.macos.png tests/manual/superscript.html
+
+Expected: blue and purple superscripts are half-sized and their tops align with
+the adjacent normal capitals. Bold nested text remains superscript, text after
+each closing tag returns to normal size, and the superscript-only line renders.
+-->
+<!doctype html>
+<html>
+  <head>
+    <title>Superscript fixture</title>
+    <style>
+      body { background-color: white; color: black; }
+    </style>
+  </head>
+  <body>
+    <p style="font-size: 32px">X<sup style="color: #2457e6">2</sup> + Y<sup style="color: #2457e6">3</sup> then normal 2</p>
+    <p style="font-size: 24px">E = mc<sup style="color: #6f2c91"><b>2</b></sup>; following text is normal</p>
+    <p><sup style="color: #b42318">Superscript-only line</sup></p>
+  </body>
+</html>
