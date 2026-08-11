@@ -1,0 +1,29 @@
+<!--
+How to verify:
+  zig build run -- --screenshot tests/golden/preformatted.macos.png tests/manual/preformatted.html
+
+Expected: spaces and the empty line are preserved, every preformatted Latin
+glyph uses a fixed-width face, nested red text is bold, and the long final line
+continues beyond the viewport instead of wrapping. Text after pre is ordinary.
+-->
+<!doctype html>
+<html>
+  <head>
+    <title>Preformatted text fixture</title>
+    <style>
+      body { background-color: white; color: #161616; }
+    </style>
+  </head>
+  <body>
+    <p>Ordinary proportional text: iiiiii WWWWWW</p>
+    <pre style="font-size: 20px">|iiiiii|
+|WWWWWW|
+    four leading spaces
+one  two    four
+
+empty line above
+plain <b style="color: #b42318">bold text</b> plain again
+long line: 0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ-0123456789-ABCDEFGHIJKLMNOPQRSTUVWXYZ-0123456789-END</pre>
+    <p>Ordinary text after pre.</p>
+  </body>
+</html>

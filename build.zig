@@ -291,6 +291,17 @@ pub fn build(b: *std.Build) !void {
         compare_small_caps.addFileArg(b.path("tests/golden/small-caps.macos.png"));
         compare_small_caps.addFileArg(actual_small_caps_screenshot);
         screenshot_test_step.dependOn(&compare_small_caps.step);
+
+        const preformatted_capture = b.addRunArtifact(exe);
+        preformatted_capture.step.dependOn(&compare_small_caps.step);
+        preformatted_capture.addArg("--screenshot");
+        const actual_preformatted_screenshot = preformatted_capture.addOutputFileArg("preformatted-screenshot.png");
+        preformatted_capture.addPrefixedFileArg("file://", b.path("tests/manual/preformatted.html"));
+
+        const compare_preformatted = b.addRunArtifact(screenshot_compare);
+        compare_preformatted.addFileArg(b.path("tests/golden/preformatted.macos.png"));
+        compare_preformatted.addFileArg(actual_preformatted_screenshot);
+        screenshot_test_step.dependOn(&compare_preformatted.step);
     } else {
         const unsupported = b.addFail(
             "test-screenshot currently requires a native macOS target",

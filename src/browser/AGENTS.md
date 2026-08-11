@@ -33,6 +33,10 @@ before changing `root.zig`, `tab.zig`, `render/`, or browser task scheduling.
   Lowercase ASCII graphemes use an uppercase bold glyph at four-fifths of the
   inherited size; uppercase letters, numbers, punctuation, and following
   siblings retain their inherited font.
+- Preformatted state is scoped to the DOM/layout subtree beneath `pre`.
+  Preserve spaces and explicit CR, LF, and CRLF line breaks, advance empty
+  lines, suppress automatic wrapping, and use the monospace face without
+  suppressing nested inline styles.
 - Soft hyphens are invisible discretionary breaks. Track every candidate in
   the current word, use the latest one whose visible hyphen fits, and transfer
   the suffix to the next line without duplicating owning inline payloads.

@@ -493,6 +493,23 @@ fn isWithinSmallCapsBlock(block: *const BlockLayout) bool {
     return false;
 }
 
+fn isPreformattedElement(element: *const parser.Element) bool {
+    return std.ascii.eqlIgnoreCase(element.tag, "pre");
+}
+
+fn isWithinPreformattedBlock(block: *const BlockLayout) bool {
+    var current: ?*const BlockLayout = block;
+    while (current) |candidate| : (current = candidate.parent_block) {
+        switch (candidate.node) {
+            .element => |*element| {
+                if (isPreformattedElement(element)) return true;
+            },
+            .text => {},
+        }
+    }
+    return false;
+}
+
 fn textSizeForSuperscript(size: i32, is_superscript: bool) i32 {
     if (!is_superscript) return size;
     return @max(@divTrunc(size, 2), 1);
@@ -504,6 +521,18 @@ fn isSmallCapsLowercaseGrapheme(grapheme_bytes: []const u8) bool {
 
 fn textSizeForSmallCaps(size: i32) i32 {
     return @max(@divTrunc(size * 4, 5), 1);
+}
+
+fn shouldAutomaticallyWrap(
+    is_preformatted: bool,
+    cursor_x: i32,
+    glyph_width: i32,
+    line_right: i32,
+    line_has_content: bool,
+) bool {
+    return !is_preformatted and
+        line_has_content and
+        cursor_x + glyph_width > line_right;
 }
 
 /// Resolve the nearest inherited HTML `dir` value through the acyclic layout
@@ -625,6 +654,22 @@ test "abbr elements render lowercase ASCII as bounded small caps" {
 
     try std.testing.expectEqual(@as(i32, 12), textSizeForSmallCaps(16));
     try std.testing.expectEqual(@as(i32, 1), textSizeForSmallCaps(1));
+}
+
+test "pre elements preserve text without automatic wrapping" {
+    const allocator = std.testing.allocator;
+
+    var pre = Node{ .element = try parser.Element.init(allocator, "PRE", null) };
+    defer pre.deinit(allocator);
+    try std.testing.expect(isPreformattedElement(&pre.element));
+
+    var code = Node{ .element = try parser.Element.init(allocator, "code", null) };
+    defer code.deinit(allocator);
+    try std.testing.expect(!isPreformattedElement(&code.element));
+
+    try std.testing.expect(!shouldAutomaticallyWrap(true, 95, 10, 100, true));
+    try std.testing.expect(shouldAutomaticallyWrap(false, 95, 10, 100, true));
+    try std.testing.expect(!shouldAutomaticallyWrap(false, 95, 10, 100, false));
 }
 
 // Layout state
@@ -941,9 +986,13 @@ fn recurseNode(self: *Layout, node: Node, node_ptr: ?*Node, line_buffer: *std.Ar
             if (isSmallCapsElement(&e)) self.is_small_caps = true;
             defer self.is_small_caps = previous_small_caps;
 
+            const previous_preformatted = self.is_preformatted;
+            if (isPreformattedElement(&e)) self.is_preformatted = true;
+            defer self.is_preformatted = previous_preformatted;
+
             // Handle br tag for line breaks
             if (std.mem.eql(u8, e.tag, "br")) {
-                try self.flushLine(line_buffer);
+                try self.breakExplicitLine(line_buffer);
             } else if (std.mem.eql(u8, e.tag, "input") or std.mem.eql(u8, e.tag, "button")) {
                 // Handle input and button elements - render as inline widgets
                 try self.handleInputElement(node, node_ptr, line_buffer);
@@ -1562,6 +1611,44 @@ fn flushLine(self: *Layout, line_buffer: *std.ArrayList(LineItem)) !void {
     line_buffer.clearRetainingCapacity();
 }
 
+fn breakPreformattedLine(self: *Layout, line_buffer: *std.ArrayList(LineItem)) !void {
+    if (line_buffer.items.len != 0) {
+        try self.flushLine(line_buffer);
+        return;
+    }
+
+    // An empty visual line has no glyph metrics for flushLine() to use. Measure
+    // a representative monospace glyph so consecutive newlines advance by the
+    // same line box as surrounding preformatted text without painting data.
+    const weight: font.FontWeight = if (self.is_bold) .Bold else .Normal;
+    const slant: font.FontSlant = if (self.is_italic) .Italic else .Roman;
+    const text_size = textSizeForSuperscript(self.size, self.is_superscript);
+    const reference = try self.font_manager.getStyledGlyph(
+        "M",
+        weight,
+        slant,
+        self.scaledFontSize(text_size),
+        true,
+    );
+    const ascent = self.toLayoutPx(reference.ascent);
+    const descent = self.toLayoutPx(reference.descent);
+    const line_height = @max(ascent + descent, 1);
+    const extra_leading: i32 = @intFromFloat(@as(f32, @floatFromInt(line_height)) * 0.25);
+
+    self.cursor_y += line_height + extra_leading;
+    self.cursor_x = self.line_left;
+    self.resetSoftHyphenWord();
+}
+
+fn breakExplicitLine(self: *Layout, line_buffer: *std.ArrayList(LineItem)) !void {
+    if (self.is_preformatted) {
+        try self.breakPreformattedLine(line_buffer);
+    } else {
+        try self.flushLine(line_buffer);
+    }
+    self.cursor_x = self.line_left;
+}
+
 // Add a common function for handling individual graphemes
 fn processGrapheme(
     self: *Layout,
@@ -1572,8 +1659,7 @@ fn processGrapheme(
 ) !void {
     // Handle newlines explicitly before font shaping.
     if (std.mem.eql(u8, gme, "\n") or std.mem.eql(u8, gme, "\r") or options.force_newline) {
-        try self.flushLine(line_buffer);
-        self.cursor_x = self.line_left;
+        try self.breakExplicitLine(line_buffer);
         return;
     }
 
@@ -1654,7 +1740,13 @@ fn processGrapheme(
     const glyph_descent = self.toLayoutPx(glyph.descent);
 
     // Check if we need to wrap (only at window edge)
-    while (self.cursor_x + glyph_width > self.line_right and line_buffer.items.len > 0) {
+    while (shouldAutomaticallyWrap(
+        self.is_preformatted,
+        self.cursor_x,
+        glyph_width,
+        self.line_right,
+        line_buffer.items.len > 0,
+    )) {
         if (try self.trySoftHyphenBreak(line_buffer)) continue;
         try self.flushLine(line_buffer);
     }
@@ -1822,14 +1914,15 @@ fn handlePreformattedText(
     line_buffer: *std.ArrayList(LineItem),
     node_ptr: ?*Node,
 ) !void {
-    // Save current font category and switch to monospace
-    if (!self.is_preformatted) {
-        self.prev_font_category = self.current_font_category;
-        self.current_font_category = .monospace;
-    }
-
     var position: usize = 0;
     while (position < content.len) {
+        const line_break_len = lineBreakLengthAt(content, position);
+        if (line_break_len != 0) {
+            try self.breakPreformattedLine(line_buffer);
+            position += line_break_len;
+            continue;
+        }
+
         if (lexEntityAt(content, position)) |entity| {
             try self.processGrapheme(entity.replacement, line_buffer, node_ptr, .{
                 .is_superscript = self.is_superscript,
@@ -1839,19 +1932,34 @@ fn handlePreformattedText(
             continue;
         }
 
-        // Keep grapheme segmentation for source text, but stop before the
-        // next potential entity so it can be decoded on the next iteration.
-        const search_start = if (content[position] == '&') position + 1 else position;
-        const entity_start = std.mem.indexOfScalarPos(u8, content, search_start, '&') orelse content.len;
-        var g_iter = grapheme.iterator(content[position..entity_start]);
+        if (content[position] == '&') {
+            // An ampersand that does not begin a recognized entity is text.
+            try self.processGrapheme("&", line_buffer, node_ptr, .{
+                .is_superscript = self.is_superscript,
+                .is_small_caps = self.is_small_caps,
+            });
+            position += 1;
+            continue;
+        }
+
+        // Preserve the run byte-for-byte while still keeping Unicode grapheme
+        // clusters together for font fallback.
+        var run_end = position;
+        while (run_end < content.len and
+            content[run_end] != '&' and
+            lineBreakLengthAt(content, run_end) == 0)
+        {
+            run_end += 1;
+        }
+        const run = content[position..run_end];
+        var g_iter = grapheme.iterator(run);
         while (g_iter.next()) |gc| {
-            const gme = gc.bytes(content[position..entity_start]);
-            try self.processGrapheme(gme, line_buffer, node_ptr, .{
+            try self.processGrapheme(gc.bytes(run), line_buffer, node_ptr, .{
                 .is_superscript = self.is_superscript,
                 .is_small_caps = self.is_small_caps,
             });
         }
-        position = entity_start;
+        position = run_end;
     }
 }
 
@@ -3464,7 +3572,7 @@ fn layoutInlineBlock(self: *Layout, block: *BlockLayout) !void {
     self.is_superscript = isWithinSuperscriptBlock(block);
     self.is_small_caps = isWithinSmallCapsBlock(block);
     self.text_color = .{ .r = 0, .g = 0, .b = 0, .a = 255 }; // Reset to black
-    self.is_preformatted = false;
+    self.is_preformatted = isWithinPreformattedBlock(block);
     self.prev_font_category = null;
     self.current_font_category = .latin;
 
@@ -3483,7 +3591,7 @@ fn layoutInlineBlock(self: *Layout, block: *BlockLayout) !void {
 
             // Handle br tag for line breaks
             if (std.mem.eql(u8, e.tag, "br")) {
-                try self.flushLine(&line_buffer);
+                try self.breakExplicitLine(&line_buffer);
             }
 
             if (std.ascii.eqlIgnoreCase(e.tag, "input") or std.ascii.eqlIgnoreCase(e.tag, "button")) {
