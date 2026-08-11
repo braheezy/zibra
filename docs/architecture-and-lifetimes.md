@@ -241,6 +241,10 @@ Superscript state likewise follows DOM recursion and layout ancestry rather
 than borrowed DOM-parent pointers. Superscript glyphs carry their placement
 marker into line flushing, which aligns their tops without moving the normal
 text baseline.
+Small-caps state follows the same scoped DOM-recursion and layout-ancestry
+model for `abbr`. Lowercase ASCII graphemes select an uppercase bold glyph at
+four-fifths of the inherited size, while other graphemes and following
+siblings retain their inherited text styling.
 Soft-hyphen wrapping temporarily transfers the post-break `LineItem` suffix
 out of the active line before flushing its prefix. Glyph entries only borrow
 font data, but embedded input, image, and iframe payloads retain single

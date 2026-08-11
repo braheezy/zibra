@@ -476,9 +476,34 @@ fn isWithinSuperscriptBlock(block: *const BlockLayout) bool {
     return false;
 }
 
+fn isSmallCapsElement(element: *const parser.Element) bool {
+    return std.ascii.eqlIgnoreCase(element.tag, "abbr");
+}
+
+fn isWithinSmallCapsBlock(block: *const BlockLayout) bool {
+    var current: ?*const BlockLayout = block;
+    while (current) |candidate| : (current = candidate.parent_block) {
+        switch (candidate.node) {
+            .element => |*element| {
+                if (isSmallCapsElement(element)) return true;
+            },
+            .text => {},
+        }
+    }
+    return false;
+}
+
 fn textSizeForSuperscript(size: i32, is_superscript: bool) i32 {
     if (!is_superscript) return size;
     return @max(@divTrunc(size, 2), 1);
+}
+
+fn isSmallCapsLowercaseGrapheme(grapheme_bytes: []const u8) bool {
+    return grapheme_bytes.len > 0 and std.ascii.isLower(grapheme_bytes[0]);
+}
+
+fn textSizeForSmallCaps(size: i32) i32 {
+    return @max(@divTrunc(size * 4, 5), 1);
 }
 
 /// Resolve the nearest inherited HTML `dir` value through the acyclic layout
@@ -579,6 +604,27 @@ test "superscript elements use a bounded half-size font" {
     try std.testing.expectEqual(@as(i32, 8), textSizeForSuperscript(16, true));
     try std.testing.expectEqual(@as(i32, 1), textSizeForSuperscript(1, true));
     try std.testing.expectEqual(@as(i32, 16), textSizeForSuperscript(16, false));
+}
+
+test "abbr elements render lowercase ASCII as bounded small caps" {
+    const allocator = std.testing.allocator;
+
+    var abbreviation = Node{ .element = try parser.Element.init(allocator, "ABBR", null) };
+    defer abbreviation.deinit(allocator);
+    try std.testing.expect(isSmallCapsElement(&abbreviation.element));
+
+    var span = Node{ .element = try parser.Element.init(allocator, "span", null) };
+    defer span.deinit(allocator);
+    try std.testing.expect(!isSmallCapsElement(&span.element));
+
+    try std.testing.expect(isSmallCapsLowercaseGrapheme("a"));
+    try std.testing.expect(isSmallCapsLowercaseGrapheme("a\u{0301}"));
+    try std.testing.expect(!isSmallCapsLowercaseGrapheme("A"));
+    try std.testing.expect(!isSmallCapsLowercaseGrapheme("7"));
+    try std.testing.expect(!isSmallCapsLowercaseGrapheme("😀"));
+
+    try std.testing.expectEqual(@as(i32, 12), textSizeForSmallCaps(16));
+    try std.testing.expectEqual(@as(i32, 1), textSizeForSmallCaps(1));
 }
 
 // Layout state
@@ -885,11 +931,15 @@ fn recurseNode(self: *Layout, node: Node, node_ptr: ?*Node, line_buffer: *std.Ar
             try self.applyNodeStyles(e, line_buffer);
 
             // DOM recursion replaces the old opening/closing-tag token stream.
-            // Scope superscript state to this subtree so nested styles retain
+            // Scope semantic text state to this subtree so nested styles retain
             // it and following siblings return to their previous state.
             const previous_superscript = self.is_superscript;
             if (isSuperscriptElement(&e)) self.is_superscript = true;
             defer self.is_superscript = previous_superscript;
+
+            const previous_small_caps = self.is_small_caps;
+            if (isSmallCapsElement(&e)) self.is_small_caps = true;
+            defer self.is_small_caps = previous_small_caps;
 
             // Handle br tag for line breaks
             if (std.mem.eql(u8, e.tag, "br")) {
@@ -1560,7 +1610,7 @@ fn processGrapheme(
     // Handle small caps rendering
     var glyph: font.Glyph = undefined;
     if (options.is_small_caps) {
-        const is_lowercase = gme.len > 0 and std.ascii.isLower(gme[0]);
+        const is_lowercase = isSmallCapsLowercaseGrapheme(gme);
 
         if (is_lowercase) {
             // Preserve combining marks in the grapheme while uppercasing its
@@ -1572,7 +1622,7 @@ fn processGrapheme(
                 upper_gme,
                 .Bold, // Force bold for small caps
                 slant,
-                self.scaledFontSize(@divTrunc(text_size * 4, 5)), // Make it ~80% of normal size
+                self.scaledFontSize(textSizeForSmallCaps(text_size)),
                 use_monospace,
             );
         } else {
@@ -3412,7 +3462,7 @@ fn layoutInlineBlock(self: *Layout, block: *BlockLayout) !void {
     // each completed line independently in flushLine().
     self.is_title = isCenteredTitleBlock(block);
     self.is_superscript = isWithinSuperscriptBlock(block);
-    self.is_small_caps = false;
+    self.is_small_caps = isWithinSmallCapsBlock(block);
     self.text_color = .{ .r = 0, .g = 0, .b = 0, .a = 255 }; // Reset to black
     self.is_preformatted = false;
     self.prev_font_category = null;

@@ -1,0 +1,26 @@
+<!--
+How to verify:
+  zig build run -- --screenshot tests/golden/small-caps.macos.png tests/manual/small-caps.html
+
+Expected: lowercase letters inside each abbr are uppercase, bold, and smaller.
+The literal ABC and 123 retain the surrounding font, italic text stays italic,
+lowercase text after each closing abbr returns to normal rendering, and the
+block-level abbr retains small caps through block layout.
+-->
+<!doctype html>
+<html>
+  <head>
+    <title>Small caps fixture</title>
+    <style>
+      body { background-color: white; color: #161616; font-size: 28px; }
+      .blue { color: #2457e6; }
+      .purple { color: #7030a0; }
+    </style>
+  </head>
+  <body>
+    <p>Plain lowercase ABC 123</p>
+    <p class="blue"><abbr>lowercase ABC 123</abbr> normal tail</p>
+    <p class="purple"><abbr>mixed <i>italic</i> ABC 123</abbr> restored text</p>
+    <abbr style="display: block; color: #b42318">block lowercase ABC 123</abbr>
+  </body>
+</html>

@@ -29,6 +29,10 @@ before changing `root.zig`, `tab.zig`, `render/`, or browser task scheduling.
 - Superscript state is scoped to the DOM/layout subtree beneath `sup`. Its
   glyphs use half the inherited text size and align their top with the tallest
   normal glyph without changing that line's normal baseline.
+- Small-caps state is scoped to the DOM/layout subtree beneath `abbr`.
+  Lowercase ASCII graphemes use an uppercase bold glyph at four-fifths of the
+  inherited size; uppercase letters, numbers, punctuation, and following
+  siblings retain their inherited font.
 - Soft hyphens are invisible discretionary breaks. Track every candidate in
   the current word, use the latest one whose visible hyphen fits, and transfer
   the suffix to the next line without duplicating owning inline payloads.

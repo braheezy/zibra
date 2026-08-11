@@ -16,7 +16,7 @@ Current checks:
   recovery.
 - `zig build test-screenshot` — native macOS rendering output, including the
   inherited alternate-text-direction, multiline centered-title, and scoped
-  superscript fixtures, plus discretionary soft-hyphen wrapping.
+  superscript and small-caps fixtures, plus discretionary soft-hyphen wrapping.
 
 Choose the narrowest check that covers the pipeline stage under change. A DOM
 or parser regression should normally add a DOM dump or unit fixture before a

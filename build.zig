@@ -280,6 +280,17 @@ pub fn build(b: *std.Build) !void {
         compare_soft_hyphens.addFileArg(b.path("tests/golden/soft-hyphens.macos.png"));
         compare_soft_hyphens.addFileArg(actual_soft_hyphen_screenshot);
         screenshot_test_step.dependOn(&compare_soft_hyphens.step);
+
+        const small_caps_capture = b.addRunArtifact(exe);
+        small_caps_capture.step.dependOn(&compare_soft_hyphens.step);
+        small_caps_capture.addArg("--screenshot");
+        const actual_small_caps_screenshot = small_caps_capture.addOutputFileArg("small-caps-screenshot.png");
+        small_caps_capture.addPrefixedFileArg("file://", b.path("tests/manual/small-caps.html"));
+
+        const compare_small_caps = b.addRunArtifact(screenshot_compare);
+        compare_small_caps.addFileArg(b.path("tests/golden/small-caps.macos.png"));
+        compare_small_caps.addFileArg(actual_small_caps_screenshot);
+        screenshot_test_step.dependOn(&compare_small_caps.step);
     } else {
         const unsupported = b.addFail(
             "test-screenshot currently requires a native macOS target",
