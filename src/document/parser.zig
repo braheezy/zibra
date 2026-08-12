@@ -394,6 +394,7 @@ pub const HTMLParser = struct {
         var pos: usize = 0;
         var start_idx: usize = 0;
         var in_tag = false;
+        var attribute_quote: ?u8 = null;
         var script_content_start: ?usize = null;
 
         while (pos < self.body.len) {
@@ -424,7 +425,7 @@ pub const HTMLParser = struct {
                     // Continue to next character if we're still in script tag
                     pos += 1;
                 }
-            } else if (std.mem.startsWith(u8, self.body[pos..], "<!--")) {
+            } else if (!in_tag and std.mem.startsWith(u8, self.body[pos..], "<!--")) {
                 // Comments are not tags: their contents may contain either
                 // angle bracket. Discard the whole comment before returning to
                 // normal text/tag scanning. HTML also treats <!--> as an
@@ -443,32 +444,39 @@ pub const HTMLParser = struct {
                     pos = self.body.len;
                 }
                 start_idx = pos;
-            } else if (c == '<') {
+            } else if (c == '<' and !in_tag) {
                 // End of text, start of tag
-                if (!in_tag and pos > start_idx) {
+                if (pos > start_idx) {
                     // Process text content using direct slice
                     try self.addText(self.body[start_idx..pos]);
                 }
                 // Skip the '<'
                 start_idx = pos + 1;
                 in_tag = true;
+                attribute_quote = null;
                 pos += 1;
-            } else if (c == '>') {
+            } else if (in_tag and (c == '"' or c == '\'')) {
+                if (attribute_quote) |quote| {
+                    if (c == quote) attribute_quote = null;
+                } else {
+                    attribute_quote = c;
+                }
+                pos += 1;
+            } else if (c == '>' and in_tag and attribute_quote == null) {
                 // End of tag
-                if (in_tag) {
-                    const tag_slice = self.body[start_idx..pos];
-                    try self.addTag(tag_slice);
+                const tag_slice = self.body[start_idx..pos];
+                try self.addTag(tag_slice);
 
-                    // Check if we just entered a script tag
-                    const tag_info = parseTagInfo(tag_slice);
-                    if (!tag_info.is_closing and isRawTextElement(tag_info.name)) {
-                        self.in_script_tag = true;
-                        script_content_start = pos + 1; // Start capturing script content
-                    }
+                // Check if we just entered a script tag
+                const tag_info = parseTagInfo(tag_slice);
+                if (!tag_info.is_closing and isRawTextElement(tag_info.name)) {
+                    self.in_script_tag = true;
+                    script_content_start = pos + 1; // Start capturing script content
                 }
                 // Skip the '>'
                 start_idx = pos + 1;
                 in_tag = false;
+                attribute_quote = null;
                 pos += 1;
             } else {
                 // Just a regular character
