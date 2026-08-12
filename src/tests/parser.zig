@@ -425,7 +425,7 @@ test "Parse overlapping formatting elements" {
 
 test "Parse quoted attributes with spaces and angle brackets" {
     const allocator = std.testing.allocator;
-    const html = "<div title=\"Simple title\">Content</div>";
+    const html = "<div title=\"A > B with spaces\" data-note='left > right'>Content</div>";
 
     var parser = try HTMLParser.init(allocator, html);
     parser.use_implicit_tags = false;
@@ -438,10 +438,11 @@ test "Parse quoted attributes with spaces and angle brackets" {
     try std.testing.expect(root.element.attributes != null);
 
     const attrs = root.element.attributes.?;
-    try std.testing.expectEqual(@as(usize, 1), attrs.count());
+    try std.testing.expectEqual(@as(usize, 2), attrs.count());
 
     const title_attr = attrs.get("title") orelse "";
-    try std.testing.expectEqualStrings("Simple title", title_attr);
+    try std.testing.expectEqualStrings("A > B with spaces", title_attr);
+    try std.testing.expectEqualStrings("left > right", attrs.get("data-note").?);
 }
 
 test "Parse nested formatting elements" {
