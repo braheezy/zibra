@@ -10,8 +10,8 @@
         },
         // For URL parsing
         .adazig = .{
-            .url = "git+https://github.com/braheezy/ada-zig?ref=3.4.4#7477fe23c17cac0b7583b6c5a64e6500ee5b42a6",
-            .hash = "adazig-3.4.4-t4eT-vxtAACBiPcng_L6x-AGLtoYhQ9MP0xYb8d73JyW",
+            .url = "git+https://github.com/braheezy/ada-zig#18afbfbf56b86d511be356335f7f52f715963b1d",
+            .hash = "adazig-4.0.0-t4eT-vJtAAAU96x1U7UJI7fmixUJiJsMfpuZurw9ETaK",
         },
         // The locations of folders
         .known_folders = .{
