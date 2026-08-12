@@ -424,6 +424,25 @@ pub const HTMLParser = struct {
                     // Continue to next character if we're still in script tag
                     pos += 1;
                 }
+            } else if (std.mem.startsWith(u8, self.body[pos..], "<!--")) {
+                // Comments are not tags: their contents may contain either
+                // angle bracket. Discard the whole comment before returning to
+                // normal text/tag scanning. HTML also treats <!--> as an
+                // abruptly closed empty comment.
+                if (pos > start_idx) {
+                    try self.addText(self.body[start_idx..pos]);
+                }
+
+                const comment_start = pos + "<!--".len;
+                if (comment_start < self.body.len and self.body[comment_start] == '>') {
+                    pos = comment_start + 1;
+                } else if (std.mem.indexOfPos(u8, self.body, comment_start, "-->")) |end| {
+                    pos = end + "-->".len;
+                } else {
+                    // An unterminated comment consumes the rest of the input.
+                    pos = self.body.len;
+                }
+                start_idx = pos;
             } else if (c == '<') {
                 // End of text, start of tag
                 if (!in_tag and pos > start_idx) {

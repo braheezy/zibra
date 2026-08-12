@@ -569,3 +569,38 @@ test "Parse script tag with implicit tags" {
     try std.testing.expectEqual(@as(usize, 1), script.children.items.len);
     try std.testing.expectEqualStrings("var x = 10; if (x < 20) { console.log('x < 20'); }", script.children.items[0].text.text);
 }
+
+test "Parse HTML comments without emitting nodes" {
+    const allocator = std.testing.allocator;
+    const html = "<div>before<!-- <fake> and </fake> > -->after<span>child</span><!-- unfinished";
+
+    var parser = try HTMLParser.init(allocator, html);
+    parser.use_implicit_tags = false;
+    defer parser.deinit(allocator);
+
+    var root = try parser.parse();
+    defer root.deinit(allocator);
+
+    try std.testing.expectEqualStrings("div", root.element.tag);
+    try std.testing.expectEqual(@as(usize, 3), root.element.children.items.len);
+    try std.testing.expectEqualStrings("before", root.element.children.items[0].text.text);
+    try std.testing.expectEqualStrings("after", root.element.children.items[1].text.text);
+    try std.testing.expectEqualStrings("span", root.element.children.items[2].element.tag);
+    try std.testing.expectEqualStrings("child", root.element.children.items[2].element.children.items[0].text.text);
+}
+
+test "Parse abruptly closed empty HTML comment" {
+    const allocator = std.testing.allocator;
+    const html = "<div><!-->visible</div>";
+
+    var parser = try HTMLParser.init(allocator, html);
+    parser.use_implicit_tags = false;
+    defer parser.deinit(allocator);
+
+    var root = try parser.parse();
+    defer root.deinit(allocator);
+
+    try std.testing.expectEqualStrings("div", root.element.tag);
+    try std.testing.expectEqual(@as(usize, 1), root.element.children.items.len);
+    try std.testing.expectEqualStrings("visible", root.element.children.items[0].text.text);
+}
