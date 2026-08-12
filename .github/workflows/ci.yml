@@ -45,7 +45,7 @@ jobs:
         run: sudo apt-get update && sudo apt-get install --no-install-recommends --yes libsdl2-dev libsdl2-ttf-dev
 
       - name: Build
-        run: zig build
+        run: zig build -j1
 
       - name: Test
-        run: zig build test
+        run: zig build test -j1
