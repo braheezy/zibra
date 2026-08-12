@@ -354,14 +354,13 @@ test "Parse HTML with nested lists" {
     const body = root.element.children.items[1].element;
     try std.testing.expectEqualStrings("body", body.tag);
 
-    // Body has two children: the main ul and the second li that got moved out
-    try std.testing.expectEqual(@as(usize, 2), body.children.items.len);
+    try std.testing.expectEqual(@as(usize, 1), body.children.items.len);
 
     // Check the ul element
     const ul = body.children.items[0].element;
     try std.testing.expectEqualStrings("ul", ul.tag);
 
-    // The ul has two children: the first li and the second li
+    // The outer ul has two sibling list items.
     try std.testing.expectEqual(@as(usize, 2), ul.children.items.len);
 
     // Check first li
@@ -370,22 +369,19 @@ test "Parse HTML with nested lists" {
     try std.testing.expectEqual(@as(usize, 2), li1.children.items.len);
     try std.testing.expectEqualStrings("First", li1.children.items[0].text.text);
 
-    // The nested ul is empty because the nested li got moved out
+    // The nested ul retains its list item.
     const nested_ul = li1.children.items[1].element;
     try std.testing.expectEqualStrings("ul", nested_ul.tag);
-    try std.testing.expectEqual(@as(usize, 0), nested_ul.children.items.len);
+    try std.testing.expectEqual(@as(usize, 1), nested_ul.children.items.len);
+    const nested_li = nested_ul.children.items[0].element;
+    try std.testing.expectEqualStrings("li", nested_li.tag);
+    try std.testing.expectEqualStrings("Nested item", nested_li.children.items[0].text.text);
 
     // The second li is a child of the main ul
     const li2 = ul.children.items[1].element;
     try std.testing.expectEqualStrings("li", li2.tag);
     try std.testing.expectEqual(@as(usize, 1), li2.children.items.len);
-    try std.testing.expectEqualStrings("Nested item", li2.children.items[0].text.text);
-
-    // The third li (originally the second) got moved to be a sibling of the main ul
-    const li3 = body.children.items[1].element;
-    try std.testing.expectEqualStrings("li", li3.tag);
-    try std.testing.expectEqual(@as(usize, 1), li3.children.items.len);
-    try std.testing.expectEqualStrings("Second", li3.children.items[0].text.text);
+    try std.testing.expectEqualStrings("Second", li2.children.items[0].text.text);
 }
 
 test "Parse overlapping formatting elements" {

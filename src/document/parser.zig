@@ -835,14 +835,10 @@ pub const HTMLParser = struct {
         try self.unfinished.append(self.allocator, body_node);
     }
 
-    // Handle elements that can't contain themselves (p, li)
-    // This implements browser behavior where certain elements can't be nested
+    // Handle elements that can't contain themselves (p, li).
     fn handleSelfClosingElements(self: *HTMLParser, tag_name: []const u8) !void {
         // Tags that can't contain themselves directly
         const self_closing_elements = [_][]const u8{ "p", "li" };
-
-        // List container elements (can contain li elements)
-        const list_containers = [_][]const u8{ "ul", "ol", "menu" };
 
         // Check if this is a tag that can't contain itself
         const is_self_closing_element = for (self_closing_elements) |elem| {
@@ -850,28 +846,29 @@ pub const HTMLParser = struct {
         } else false;
 
         if (is_self_closing_element) {
-            try self.handleSelfClosingElement(tag_name, list_containers);
+            try self.handleSelfClosingElement(tag_name);
         }
     }
 
-    // Handle a specific self-closing element (p or li)
-    // Browsers treat certain elements specially - they can't contain themselves
-    fn handleSelfClosingElement(self: *HTMLParser, tag_name: []const u8, list_containers: [3][]const u8) !void {
+    // Handle a specific implied-closing element (p or li).
+    fn handleSelfClosingElement(self: *HTMLParser, tag_name: []const u8) !void {
         // For each element in the stack from top to bottom
         var i: usize = self.unfinished.items.len;
         while (i > 0) {
             i -= 1;
             const current = &self.unfinished.items[i];
 
+            // A nested list is valid content of an outer list item. When
+            // opening an li inside it, do not close the outer item.
+            if (std.mem.eql(u8, tag_name, "li") and
+                current.* == .element and isListContainer(current.element.tag))
+            {
+                break;
+            }
+
             // If we find the same tag type
             if (current.* == .element and std.mem.eql(u8, current.element.tag, tag_name)) {
-                if (std.mem.eql(u8, tag_name, "li")) {
-                    // Special case for list items
-                    try self.handleListItem(i, list_containers);
-                } else {
-                    // For paragraphs and other self-closing elements, always close
-                    try self.closeNodesUpTo(i);
-                }
+                try self.closeNodesUpTo(i);
                 break;
             }
 
@@ -885,27 +882,11 @@ pub const HTMLParser = struct {
         }
     }
 
-    // Handle special case for list items
-    // Browsers don't allow list items to directly contain other list items
-    fn handleListItem(self: *HTMLParser, index: usize, list_containers: [3][]const u8) !void {
-        // Check if the parent of this li is a list container
-        var is_in_list_container = false;
-        if (index > 0) {
-            const potential_list = &self.unfinished.items[index - 1];
-            if (potential_list.* == .element) {
-                const list_tag = potential_list.element.tag;
-                is_in_list_container = for (list_containers) |list_container| {
-                    if (std.mem.eql(u8, list_tag, list_container)) break true;
-                } else false;
-            }
-        }
-
-        // If we're in a list container, close the current li
-        // This behavior ensures list items are siblings rather than nested,
-        // matching browser behavior where list items can't directly contain other list items
-        if (is_in_list_container) {
-            try self.closeNodesUpTo(index);
-        }
+    fn isListContainer(tag_name: []const u8) bool {
+        const list_containers = [_][]const u8{ "ul", "ol", "menu" };
+        return for (list_containers) |list_container| {
+            if (std.mem.eql(u8, tag_name, list_container)) break true;
+        } else false;
     }
 
     // Finalize the parsing process and return the root node
