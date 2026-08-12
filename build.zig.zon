@@ -20,7 +20,8 @@
         },
         // Javascript runtime
         .kiesel = .{
-            .path = "../kiesel",
+            .url = "git+https://github.com/braheezy/kiesel-fork#26a59948cfa4eae714e73f3dd68fca9fb6806836",
+            .hash = "kiesel-0.4.0-Q1t3Sm4XkAAlcUKaplfUjQCHgWGdKnalREDos2vZsvVi",
         },
         // Zibra embeds Kiesel's Agent in a long-lived host object. Access the
         // collector's scanned, uncollectable allocator so that object can be
@@ -37,9 +38,8 @@
         // Graphics + input handling
         // update with --save=sdl
         .sdl = .{
-            .path = "SDL.zig",
-            // .url = "git+https://github.com/braheezy/SDL.zig#a1c36303a95c37ba36c69b19f79683f2eb5050b4",
-            // .hash = "SDL2-0.0.0-yMCQipWnBABMAdfue6YmerIoyHg-6r3f3zapmQoy9teu",
+            .url = "git+https://github.com/braheezy/SDL.zig#b2226e206877bd643be1340ec9497b1a7cd06d03",
+            .hash = "SDL2-0.0.0-yMCQiveoBACTGOzL4uzZcbiVwkP2Xp2AjB1bkE2TKslj",
         },
         .zigimg = .{
             .url = "git+https://github.com/zigimg/zigimg.git#096115a3eeae1a4c477496d575f1f1f74865387c",
