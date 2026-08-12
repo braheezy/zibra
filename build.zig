@@ -8,6 +8,9 @@ pub fn build(b: *std.Build) !void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
     const io = b.graph.io;
+    // Zig 0.16's default backend can crash while compiling Zibra on Linux.
+    // Prefer the LLVM backend there until the compiler issue is resolved.
+    const use_llvm = builtin.os.tag == .linux;
 
     const sdk = sdl.init(b, .{});
     const sdl_mod = sdk.getWrapperModule();
@@ -22,6 +25,7 @@ pub fn build(b: *std.Build) !void {
     const exe = b.addExecutable(.{
         .name = "zibra",
         .root_module = source_module,
+        .use_llvm = use_llvm,
     });
 
     // SDL2_ttf uses SDL2, but does not make SDL2's symbols available to this
@@ -110,7 +114,10 @@ pub fn build(b: *std.Build) !void {
     test_module.addImport("bdwgc", bdwgc_dep.module("bdwgc"));
     test_module.addImport("zigimg", zigimg_dep.module("zigimg"));
     test_module.addImport("ada", ada_dep.module("ada"));
-    const unit_tests = b.addTest(.{ .root_module = test_module });
+    const unit_tests = b.addTest(.{
+        .root_module = test_module,
+        .use_llvm = use_llvm,
+    });
     const unit_tests_run = b.addRunArtifact(unit_tests);
     test_step.dependOn(&unit_tests_run.step);
 
