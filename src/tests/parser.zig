@@ -509,7 +509,7 @@ test "Parse nested formatting elements" {
 
 test "Parse script tag content" {
     const allocator = std.testing.allocator;
-    const html = "<html><body><script>if (x < y) { alert('Hello!'); }</script></body></html>";
+    const html = "<html><body><script>if (x < y) { alert('<em>not markup</em>'); }</script></body></html>";
 
     var parser = try HTMLParser.init(allocator, html);
     parser.use_implicit_tags = false;
@@ -534,7 +534,7 @@ test "Parse script tag content" {
 
     // The script element should have one text child with the JavaScript code
     try std.testing.expectEqual(@as(usize, 1), script.children.items.len);
-    try std.testing.expectEqualStrings("if (x < y) { alert('Hello!'); }", script.children.items[0].text.text);
+    try std.testing.expectEqualStrings("if (x < y) { alert('<em>not markup</em>'); }", script.children.items[0].text.text);
 }
 
 test "Parse script tag with implicit tags" {
