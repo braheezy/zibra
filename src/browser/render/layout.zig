@@ -23,6 +23,11 @@ const list_marker_size = 6;
 const list_marker_top_offset = 7;
 const toc_header_height = 24;
 
+const ContentBounds = struct {
+    x: i32,
+    width: i32,
+};
+
 fn addPageBottomPadding(content_bottom_css: i32) i32 {
     const padded = @as(i64, @max(content_bottom_css, 0)) + v_offset;
     return @intCast(@min(padded, std.math.maxInt(i32)));
@@ -60,11 +65,21 @@ fn tableOfContentsHeaderHeight(node: Node) i32 {
     };
 }
 
-fn listItemContentBounds(parent_x: i32, parent_width: i32) struct { x: i32, width: i32 } {
+fn listItemContentBounds(parent_x: i32, parent_width: i32) ContentBounds {
     return .{
         .x = parent_x + list_item_indent,
         .width = @max(parent_width - list_item_indent, 0),
     };
+}
+
+fn contentBoundsForNode(node: Node, parent_x: i32, parent_width: i32) ContentBounds {
+    switch (node) {
+        .element => |element| {
+            if (isListItemElement(&element)) return listItemContentBounds(parent_x, parent_width);
+        },
+        .text => {},
+    }
+    return .{ .x = parent_x, .width = parent_width };
 }
 
 fn drawCursor(
@@ -3367,10 +3382,7 @@ const BlockLayout = struct {
             self.document.y.read(&self.y).*;
 
         // Set x, y, width early so children can read them
-        const content_bounds = if (self.node == .element and isListItemElement(&self.node.element))
-            listItemContentBounds(parent_x, parent_width)
-        else
-            .{ .x = parent_x, .width = parent_width };
+        const content_bounds = contentBoundsForNode(self.node, parent_x, parent_width);
         self.x.set(content_bounds.x);
         self.y.set(prev_y);
         self.width.set(content_bounds.width);
