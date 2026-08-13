@@ -1,0 +1,21 @@
+<!--
+How to verify:
+  zig build run -- tests/manual/list-bullets.html
+
+Expected: every item has a small square marker to its left, its text begins to
+the right of that marker, and the nested list receives a further indentation.
+-->
+<!doctype html>
+<html>
+  <body>
+    <ul>
+      <li>First item</li>
+      <li>Second item
+        <ul>
+          <li>Nested item</li>
+        </ul>
+      </li>
+      <li>Third item</li>
+    </ul>
+  </body>
+</html>

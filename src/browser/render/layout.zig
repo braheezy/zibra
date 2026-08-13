@@ -18,6 +18,9 @@ const FontCategory = font.FontCategory;
 const scrollbar_width = browser.scrollbar_width;
 const h_offset = browser.h_offset;
 const v_offset = browser.v_offset;
+const list_item_indent = 24;
+const list_marker_size = 6;
+const list_marker_top_offset = 7;
 
 fn addPageBottomPadding(content_bottom_css: i32) i32 {
     const padded = @as(i64, @max(content_bottom_css, 0)) + v_offset;
@@ -37,6 +40,17 @@ fn isBlockElement(tag: []const u8) bool {
         if (std.mem.eql(u8, tag, candidate)) return true;
     }
     return false;
+}
+
+fn isListItemElement(element: *const parser.Element) bool {
+    return std.ascii.eqlIgnoreCase(element.tag, "li");
+}
+
+fn listItemContentBounds(parent_x: i32, parent_width: i32) struct { x: i32, width: i32 } {
+    return .{
+        .x = parent_x + list_item_indent,
+        .width = @max(parent_width - list_item_indent, 0),
+    };
 }
 
 fn drawCursor(
@@ -670,6 +684,17 @@ test "pre elements preserve text without automatic wrapping" {
     try std.testing.expect(!shouldAutomaticallyWrap(true, 95, 10, 100, true));
     try std.testing.expect(shouldAutomaticallyWrap(false, 95, 10, 100, true));
     try std.testing.expect(!shouldAutomaticallyWrap(false, 95, 10, 100, false));
+}
+
+test "list items reserve room for square markers" {
+    const allocator = std.testing.allocator;
+    var item = Node{ .element = try parser.Element.init(allocator, "LI", null) };
+    defer item.deinit(allocator);
+    try std.testing.expect(isListItemElement(&item.element));
+
+    const bounds = listItemContentBounds(13, 100);
+    try std.testing.expectEqual(@as(i32, 37), bounds.x);
+    try std.testing.expectEqual(@as(i32, 76), bounds.width);
 }
 
 // Layout state
@@ -3313,9 +3338,13 @@ const BlockLayout = struct {
         else if (self.parent_block) |pb| pb.y.read(&self.y).* else self.document.y.read(&self.y).*;
 
         // Set x, y, width early so children can read them
-        self.x.set(parent_x);
+        const content_bounds = if (self.node == .element and isListItemElement(&self.node.element))
+            listItemContentBounds(parent_x, parent_width)
+        else
+            .{ .x = parent_x, .width = parent_width };
+        self.x.set(content_bounds.x);
         self.y.set(prev_y);
-        self.width.set(parent_width);
+        self.width.set(content_bounds.width);
 
         var is_block = self.isBlockContainer();
         if (self.node == .element) {
@@ -3494,6 +3523,29 @@ fn appendContentEditableCursor(self: *Layout, commands: *std.ArrayList(DisplayIt
     );
     const cursor_height = self.toLayoutPx(glyph.ascent + glyph.descent);
     try drawCursor(commands, self.allocator, block.x.get().*, block.y.get().*, cursor_height, cursor_color);
+}
+
+fn appendListMarker(self: *Layout, commands: *std.ArrayList(DisplayItem), block: *const BlockLayout) !void {
+    const element = switch (block.node) {
+        .element => |*value| value,
+        .text => return,
+    };
+    if (!isListItemElement(element) or block.height.get().* <= 0) return;
+
+    const marker_x = block.x.get().* - list_item_indent + (list_item_indent - list_marker_size) / 2;
+    const marker_y = block.y.get().* + @min(list_marker_top_offset, @max(block.height.get().* - list_marker_size, 0));
+    const color = if (element.style) |*style_map|
+        if (styleValue(style_map, "color")) |value| parseColor(value) orelse browser.Color{ .r = 0, .g = 0, .b = 0, .a = 255 } else browser.Color{ .r = 0, .g = 0, .b = 0, .a = 255 }
+    else
+        browser.Color{ .r = 0, .g = 0, .b = 0, .a = 255 };
+
+    try commands.append(self.allocator, .{ .rect = .{
+        .x1 = marker_x,
+        .y1 = marker_y,
+        .x2 = marker_x + list_marker_size,
+        .y2 = marker_y + list_marker_size,
+        .color = self.remapColor(color),
+    } });
 }
 
 fn recordContentEditableFocusBounds(self: *Layout, block: *const BlockLayout) !void {
@@ -3807,6 +3859,7 @@ fn paintBlockTree(self: *Layout, block: *BlockLayout) !void {
     for (block.display_list.items) |item| {
         try commands.append(self.allocator, item);
     }
+    try appendListMarker(self, &commands, block);
 
     // Recursively paint children
     for (block.children.items) |child| {
@@ -3907,6 +3960,7 @@ fn paintBlockTreeRecursive(commands: *std.ArrayList(DisplayItem), self: *Layout,
     for (block.display_list.items) |item| {
         try block_commands.append(self.allocator, item);
     }
+    try appendListMarker(self, &block_commands, block);
 
     // Recursively paint children - collect their commands
     for (block.children.items) |child| {
