@@ -8,6 +8,7 @@ const std = @import("std");
 const selector_mod = @import("selector.zig");
 const Selector = selector_mod.Selector;
 const TagSelector = selector_mod.TagSelector;
+const TagClassSelector = selector_mod.TagClassSelector;
 const DescendantSelector = selector_mod.DescendantSelector;
 
 pub const CSSParser = @This();
@@ -166,37 +167,16 @@ fn prefersColorSchemeMatch(self: *CSSParser, allocator: std.mem.Allocator, prelu
     return null;
 }
 
-/// Parse a tag selector or a whitespace-separated descendant selector.
-/// Class, ID, attribute, and combinator selectors are not yet supported.
+/// Parse a tag/class selector or a whitespace-separated descendant selector.
+/// ID, attribute, and combinator selectors are not yet supported.
 pub fn selector(self: *CSSParser, allocator: std.mem.Allocator) !Selector {
-    // Start with a tag selector
-    const first_tag = try self.word();
-
-    // Convert to lowercase (casefold in Python)
-    const lower_tag = try std.ascii.allocLowerString(allocator, first_tag);
-    defer allocator.free(lower_tag);
-
-    // Allocate permanent storage for the tag
-    const tag_copy = try allocator.alloc(u8, lower_tag.len);
-    @memcpy(tag_copy, lower_tag);
-
-    var out = Selector{ .tag = TagSelector.init(tag_copy) };
+    var out = try self.simpleSelector(allocator);
     errdefer out.deinit(allocator);
     self.whitespace();
 
     // Continue parsing descendant selectors until we hit '{'
     while (self.pos < self.string.len and self.string[self.pos] != '{') {
-        const tag = try self.word();
-
-        // Convert to lowercase
-        const lower_descendant = try std.ascii.allocLowerString(allocator, tag);
-        defer allocator.free(lower_descendant);
-
-        // Allocate permanent storage
-        const descendant_tag_copy = try allocator.alloc(u8, lower_descendant.len);
-        @memcpy(descendant_tag_copy, lower_descendant);
-
-        var descendant = Selector{ .tag = TagSelector.init(descendant_tag_copy) };
+        var descendant = try self.simpleSelector(allocator);
         var descendant_owned = true;
         defer if (descendant_owned) descendant.deinit(allocator);
 
@@ -209,6 +189,30 @@ pub fn selector(self: *CSSParser, allocator: std.mem.Allocator) !Selector {
     }
 
     return out;
+}
+
+fn simpleSelector(self: *CSSParser, allocator: std.mem.Allocator) !Selector {
+    const raw = try self.word();
+    const dot_index = std.mem.indexOfScalar(u8, raw, '.');
+    if (dot_index) |dot| {
+        const raw_tag = raw[0..dot];
+        const class_name = raw[dot + 1 ..];
+        if (class_name.len == 0 or std.mem.indexOfScalar(u8, class_name, '.') != null) {
+            return error.InvalidSelector;
+        }
+        const tag_copy = if (raw_tag.len == 0) null else blk: {
+            const lower_tag = try std.ascii.allocLowerString(allocator, raw_tag);
+            defer allocator.free(lower_tag);
+            break :blk try allocator.dupe(u8, lower_tag);
+        };
+        errdefer if (tag_copy) |tag| allocator.free(tag);
+        const class_copy = try allocator.dupe(u8, class_name);
+        return .{ .tag_class = TagClassSelector.init(tag_copy, class_copy) };
+    }
+
+    const lower_tag = try std.ascii.allocLowerString(allocator, raw);
+    defer allocator.free(lower_tag);
+    return .{ .tag = TagSelector.init(try allocator.dupe(u8, lower_tag)) };
 }
 
 /// CSS Rule - a selector and its associated property-value pairs

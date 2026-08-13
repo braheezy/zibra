@@ -10,6 +10,7 @@ const Node = parser.Node;
 /// CSS Selector types
 pub const Selector = union(enum) {
     tag: TagSelector,
+    tag_class: TagClassSelector,
     descendant: DescendantSelector,
 
     /// Check if this selector matches the given node
@@ -17,6 +18,7 @@ pub const Selector = union(enum) {
     pub fn matches(self: Selector, node: *Node, ancestor_chain: []const *Node) bool {
         return switch (self) {
             .tag => |t| t.matches(node),
+            .tag_class => |t| t.matches(node),
             .descendant => |d| d.matches(node, ancestor_chain),
         };
     }
@@ -25,6 +27,7 @@ pub const Selector = union(enum) {
     pub fn deinit(self: *Selector, allocator: std.mem.Allocator) void {
         switch (self.*) {
             .tag => |*t| t.deinit(allocator),
+            .tag_class => |*t| t.deinit(allocator),
             .descendant => |*d| d.deinit(allocator),
         }
     }
@@ -34,8 +37,46 @@ pub const Selector = union(enum) {
     pub fn priority(self: Selector) u32 {
         return switch (self) {
             .tag => |t| t.priority(),
+            .tag_class => |t| t.priority(),
             .descendant => |d| d.priority(),
         };
+    }
+};
+
+/// A class selector, optionally constrained to an element tag (for example,
+/// `.links` or `nav.links`).
+pub const TagClassSelector = struct {
+    tag: ?[]const u8,
+    class: []const u8,
+
+    pub fn init(tag: ?[]const u8, class: []const u8) TagClassSelector {
+        return .{ .tag = tag, .class = class };
+    }
+
+    fn matches(self: TagClassSelector, node: *Node) bool {
+        const element = switch (node.*) {
+            .element => |*value| value,
+            .text => return false,
+        };
+        if (self.tag) |tag| {
+            if (!std.mem.eql(u8, tag, element.tag)) return false;
+        }
+        const attributes = element.attributes orelse return false;
+        const class_value = attributes.get("class") orelse return false;
+        var classes = std.mem.tokenizeAny(u8, class_value, " \t\r\n\x0c");
+        while (classes.next()) |class_name| {
+            if (std.mem.eql(u8, self.class, class_name)) return true;
+        }
+        return false;
+    }
+
+    fn deinit(self: TagClassSelector, allocator: std.mem.Allocator) void {
+        if (self.tag) |tag| allocator.free(tag);
+        allocator.free(self.class);
+    }
+
+    fn priority(self: TagClassSelector) u32 {
+        return if (self.tag == null) 10 else 11;
     }
 };
 
