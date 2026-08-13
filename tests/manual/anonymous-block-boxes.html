@@ -1,0 +1,13 @@
+<!--
+How to verify:
+  zig build run -- tests/manual/anonymous-block-boxes.html
+
+Expected: “Hello, world!” appears as one inline paragraph, with Hello italic
+and world bold. “So it began...” begins on the next line as a separate block.
+-->
+<!doctype html>
+<html>
+  <body>
+    <div><i>Hello, </i><b>world!</b><p>So it began...</p></div>
+  </body>
+</html>

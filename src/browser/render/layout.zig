@@ -48,6 +48,20 @@ fn isBlockElement(tag: []const u8) bool {
     return false;
 }
 
+fn isContainerNode(node: Node) bool {
+    return switch (node) {
+        .element => |element| isBlockElement(element.tag),
+        .text => false,
+    };
+}
+
+fn isRunInHeadingNode(node: Node) bool {
+    return switch (node) {
+        .element => |element| std.ascii.eqlIgnoreCase(element.tag, "h6"),
+        .text => false,
+    };
+}
+
 fn isListItemElement(element: *const parser.Element) bool {
     return std.ascii.eqlIgnoreCase(element.tag, "li");
 }
@@ -736,6 +750,30 @@ test "table of contents navigation reserves a header row" {
     var ordinary_nav = Node{ .element = try parser.Element.init(allocator, "nav id=links", null) };
     defer ordinary_nav.deinit(allocator);
     try std.testing.expectEqual(@as(i32, 0), tableOfContentsHeaderHeight(ordinary_nav));
+}
+
+test "anonymous blocks group only consecutive inline siblings" {
+    const allocator = std.testing.allocator;
+    var inline_node = Node{ .element = try parser.Element.init(allocator, "i", null) };
+    defer inline_node.deinit(allocator);
+    var paragraph = Node{ .element = try parser.Element.init(allocator, "p", null) };
+    defer paragraph.deinit(allocator);
+    const text = Node{ .text = .{ .text = "text" } };
+
+    try std.testing.expect(!isContainerNode(inline_node));
+    try std.testing.expect(isContainerNode(paragraph));
+    try std.testing.expect(!isContainerNode(text));
+}
+
+test "h6 headings run into a following block" {
+    const allocator = std.testing.allocator;
+    var heading = Node{ .element = try parser.Element.init(allocator, "h6", null) };
+    defer heading.deinit(allocator);
+    var paragraph = Node{ .element = try parser.Element.init(allocator, "p", null) };
+    defer paragraph.deinit(allocator);
+
+    try std.testing.expect(isRunInHeadingNode(heading));
+    try std.testing.expect(isContainerNode(paragraph));
 }
 
 // Layout state
@@ -3141,6 +3179,9 @@ const BlockLayout = struct {
     document: *DocumentLayout,
     parent_block: ?*BlockLayout,
     previous: ?*BlockLayout,
+    // An anonymous block owns this pointer slice and lays out each sibling as
+    // one inline run. Normal blocks retain their single DOM node instead.
+    inline_nodes: ?[]*Node = null,
 
     // ProtectedField-wrapped layout properties
     zoom: ProtectedField(f32),
@@ -3234,6 +3275,26 @@ const BlockLayout = struct {
         return block;
     }
 
+    fn initAnonymous(
+        allocator: std.mem.Allocator,
+        inline_nodes: []*Node,
+        document: *DocumentLayout,
+        parent_block: *BlockLayout,
+        previous: ?*BlockLayout,
+    ) !*BlockLayout {
+        std.debug.assert(inline_nodes.len > 0);
+        const block = try BlockLayout.init(
+            allocator,
+            inline_nodes[0].*,
+            null,
+            document,
+            parent_block,
+            previous,
+        );
+        block.inline_nodes = inline_nodes;
+        return block;
+    }
+
     fn deinit(self: *BlockLayout) void {
         if (self.node_ptr) |ptr| {
             switch (ptr.*) {
@@ -3251,6 +3312,7 @@ const BlockLayout = struct {
             child.deinit(self.allocator);
         }
         self.children.deinit(self.allocator);
+        if (self.inline_nodes) |nodes| self.allocator.free(nodes);
         self.display_list.deinit(self.allocator);
         self.zoom.deinit();
         self.x.deinit();
@@ -3286,6 +3348,7 @@ const BlockLayout = struct {
     }
 
     fn isBlockContainer(self: *const BlockLayout) bool {
+        if (self.inline_nodes != null) return false;
         switch (self.node) {
             .text => return false,
             .element => |e| {
@@ -3423,14 +3486,7 @@ const BlockLayout = struct {
                 self.children.clearRetainingCapacity();
 
                 switch (self.node) {
-                    .element => |e| {
-                        var previous: ?*BlockLayout = null;
-                        for (e.children.items) |*child_node| {
-                            const child = try BlockLayout.init(self.allocator, child_node.*, child_node, self.document, self, previous);
-                            try self.children.append(self.allocator, .{ .block = child });
-                            previous = child;
-                        }
-                    },
+                    .element => |e| try self.appendBlockChildren(e.children.items),
                     else => {},
                 }
                 self.children_epoch += 1;
@@ -3494,6 +3550,50 @@ const BlockLayout = struct {
 
         // Clear descendant flags after layout pass
         self.has_dirty_descendants = false;
+    }
+
+    fn appendBlockChildren(self: *BlockLayout, nodes: []Node) !void {
+        var previous: ?*BlockLayout = null;
+        var index: usize = 0;
+        while (index < nodes.len) {
+            // A run-in heading is laid out with the following paragraph rather
+            // than as its own block. Once both DOM nodes are in the same
+            // anonymous block, normal inline recursion preserves the h6's
+            // style while continuing straight into the paragraph text.
+            if (isRunInHeadingNode(nodes[index]) and
+                index + 1 < nodes.len and isContainerNode(nodes[index + 1]))
+            {
+                const run_in_nodes = try self.allocator.alloc(*Node, 2);
+                errdefer self.allocator.free(run_in_nodes);
+                run_in_nodes[0] = &nodes[index];
+                run_in_nodes[1] = &nodes[index + 1];
+                const child = try BlockLayout.initAnonymous(self.allocator, run_in_nodes, self.document, self, previous);
+                try self.children.append(self.allocator, .{ .block = child });
+                previous = child;
+                index += 2;
+                continue;
+            }
+
+            if (isContainerNode(nodes[index])) {
+                const child_node = &nodes[index];
+                const child = try BlockLayout.init(self.allocator, child_node.*, child_node, self.document, self, previous);
+                try self.children.append(self.allocator, .{ .block = child });
+                previous = child;
+                index += 1;
+                continue;
+            }
+
+            const start = index;
+            while (index < nodes.len and !isContainerNode(nodes[index])) : (index += 1) {}
+            const inline_nodes = try self.allocator.alloc(*Node, index - start);
+            errdefer self.allocator.free(inline_nodes);
+            for (nodes[start..index], 0..) |*node, output_index| {
+                inline_nodes[output_index] = node;
+            }
+            const child = try BlockLayout.initAnonymous(self.allocator, inline_nodes, self.document, self, previous);
+            try self.children.append(self.allocator, .{ .block = child });
+            previous = child;
+        }
     }
 
     fn layoutNeeded(self: *const BlockLayout) bool {
@@ -3708,7 +3808,11 @@ fn layoutInlineBlock(self: *Layout, block: *BlockLayout) !void {
     var line_buffer = std.ArrayList(LineItem).empty;
     defer line_buffer.deinit(self.allocator);
 
-    switch (block.node) {
+    if (block.inline_nodes) |nodes| {
+        for (nodes) |node| {
+            try self.recurseNode(node.*, node, &line_buffer);
+        }
+    } else switch (block.node) {
         .text => |t| {
             try self.handleTextToken(t.text, &line_buffer, null);
         },

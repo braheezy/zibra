@@ -1,0 +1,16 @@
+<!--
+How to verify:
+  zig build run -- tests/manual/run-in-headings.html
+
+Expected: each h6 heading shares its line with the paragraph that follows it;
+the second pair begins on a new line below the first pair.
+-->
+<!doctype html>
+<html>
+  <body>
+    <div>
+      <h6>First heading.</h6><p>Its paragraph begins immediately after the heading.</p>
+      <h6>Second heading.</h6><p>Its paragraph begins immediately after the heading too.</p>
+    </div>
+  </body>
+</html>
