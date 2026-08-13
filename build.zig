@@ -10,7 +10,7 @@ pub fn build(b: *std.Build) !void {
     const io = b.graph.io;
     // Zig 0.16's default backend can crash while compiling Zibra on Linux.
     // Prefer the LLVM backend there until the compiler issue is resolved.
-    const use_llvm = builtin.os.tag == .linux;
+    const use_llvm = builtin.os.tag == .linux or builtin.os.tag == .macos;
 
     const sdk = sdl.init(b, .{});
     const sdl_mod = sdk.getWrapperModule();
