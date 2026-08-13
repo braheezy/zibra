@@ -1,7 +1,9 @@
 //! Regression tests for the tutorial HTML parser and DOM construction rules.
 
 const std = @import("std");
-const HTMLParser = @import("../document/parser.zig").HTMLParser;
+const document_parser = @import("../document/parser.zig");
+const HTMLParser = document_parser.HTMLParser;
+const CSSParser = @import("../document/css_parser.zig").CSSParser;
 
 test "Parse basic HTML" {
     const allocator = std.testing.allocator;
@@ -600,4 +602,29 @@ test "Parse abruptly closed empty HTML comment" {
     try std.testing.expectEqualStrings("div", root.element.tag);
     try std.testing.expectEqual(@as(usize, 1), root.element.children.items.len);
     try std.testing.expectEqualStrings("visible", root.element.children.items[0].text.text);
+}
+
+test "Apply tag and class CSS selectors" {
+    const allocator = std.testing.allocator;
+    const html = "<nav class=\"chapter links\">Previous | Next</nav>";
+    const css = "nav.links { background-color: lightgray; } .chapter { color: blue; }";
+
+    var html_parser = try HTMLParser.init(allocator, html);
+    html_parser.use_implicit_tags = false;
+    defer html_parser.deinit(allocator);
+    var root = try html_parser.parse();
+    defer root.deinit(allocator);
+
+    var css_parser = try CSSParser.init(allocator, css, false);
+    defer css_parser.deinit(allocator);
+    const rules = try css_parser.parse(allocator);
+    defer {
+        for (rules) |*rule| rule.deinit(allocator);
+        allocator.free(rules);
+    }
+
+    try document_parser.style(allocator, &root, rules);
+    const styles = root.element.style.?;
+    try std.testing.expectEqualStrings("lightgray", styles.getPtr("background-color").?.get().*);
+    try std.testing.expectEqualStrings("blue", styles.getPtr("color").?.get().*);
 }

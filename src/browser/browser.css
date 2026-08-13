@@ -1,6 +1,7 @@
 pre {
     background-color: gray;
 }
+nav.links { background-color: lightgray; }
 a { color: blue; }
 i { font-style: italic; }
 b { font-weight: bold; }

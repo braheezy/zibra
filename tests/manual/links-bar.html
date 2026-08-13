@@ -1,0 +1,15 @@
+<!--
+How to verify:
+  zig build run -- tests/manual/links-bar.html
+
+Expected: each navigation bar has a light-gray background spanning the page
+width; the paragraphs between them retain the normal transparent background.
+-->
+<!doctype html>
+<html>
+  <body>
+    <nav class="links">Chapter 5: <a href="#previous">Previous</a> | <a href="#next">Next</a></nav>
+    <p>Chapter content appears between the navigation bars.</p>
+    <nav class="links secondary">Chapter 5: <a href="#previous">Previous</a> | <a href="#next">Next</a></nav>
+  </body>
+</html>
