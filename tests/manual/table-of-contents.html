@@ -1,0 +1,19 @@
+<!--
+How to verify:
+  zig build run -- tests/manual/table-of-contents.html
+
+Expected: the navigation list is preceded by a full-width light-gray bar labeled
+"Table of Contents". A neighboring nav without id="toc" has no inserted bar.
+-->
+<!doctype html>
+<html>
+  <body>
+    <nav id="toc">
+      <ul>
+        <li><a href="#one">One</a></li>
+        <li><a href="#two">Two</a></li>
+      </ul>
+    </nav>
+    <nav id="ordinary"><a href="#three">Ordinary navigation</a></nav>
+  </body>
+</html>

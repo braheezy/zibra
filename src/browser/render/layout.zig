@@ -21,6 +21,7 @@ const v_offset = browser.v_offset;
 const list_item_indent = 24;
 const list_marker_size = 6;
 const list_marker_top_offset = 7;
+const toc_header_height = 24;
 
 fn addPageBottomPadding(content_bottom_css: i32) i32 {
     const padded = @as(i64, @max(content_bottom_css, 0)) + v_offset;
@@ -44,6 +45,19 @@ fn isBlockElement(tag: []const u8) bool {
 
 fn isListItemElement(element: *const parser.Element) bool {
     return std.ascii.eqlIgnoreCase(element.tag, "li");
+}
+
+fn isTableOfContentsElement(element: *const parser.Element) bool {
+    if (!std.ascii.eqlIgnoreCase(element.tag, "nav")) return false;
+    const attributes = element.attributes orelse return false;
+    return std.mem.eql(u8, attributes.get("id") orelse return false, "toc");
+}
+
+fn tableOfContentsHeaderHeight(node: Node) i32 {
+    return switch (node) {
+        .element => |element| if (isTableOfContentsElement(&element)) toc_header_height else 0,
+        .text => 0,
+    };
 }
 
 fn listItemContentBounds(parent_x: i32, parent_width: i32) struct { x: i32, width: i32 } {
@@ -695,6 +709,18 @@ test "list items reserve room for square markers" {
     const bounds = listItemContentBounds(13, 100);
     try std.testing.expectEqual(@as(i32, 37), bounds.x);
     try std.testing.expectEqual(@as(i32, 76), bounds.width);
+}
+
+test "table of contents navigation reserves a header row" {
+    const allocator = std.testing.allocator;
+    var toc = Node{ .element = try parser.Element.init(allocator, "nav id=toc", null) };
+    defer toc.deinit(allocator);
+    try std.testing.expect(isTableOfContentsElement(&toc.element));
+    try std.testing.expectEqual(toc_header_height, tableOfContentsHeaderHeight(toc));
+
+    var ordinary_nav = Node{ .element = try parser.Element.init(allocator, "nav id=links", null) };
+    defer ordinary_nav.deinit(allocator);
+    try std.testing.expectEqual(@as(i32, 0), tableOfContentsHeaderHeight(ordinary_nav));
 }
 
 // Layout state
@@ -3335,7 +3361,10 @@ const BlockLayout = struct {
         const parent_width = if (self.parent_block) |pb| pb.width.read(&self.width).* else self.document.width.read(&self.width).*;
         const prev_y = if (self.previous) |prev|
             prev.y.read(&self.y).* + prev.height.read(&self.y).*
-        else if (self.parent_block) |pb| pb.y.read(&self.y).* else self.document.y.read(&self.y).*;
+        else if (self.parent_block) |pb|
+            pb.y.read(&self.y).* + tableOfContentsHeaderHeight(pb.node)
+        else
+            self.document.y.read(&self.y).*;
 
         // Set x, y, width early so children can read them
         const content_bounds = if (self.node == .element and isListItemElement(&self.node.element))
@@ -3428,7 +3457,7 @@ const BlockLayout = struct {
                     },
                 }
             }
-            self.height.set(computed_height);
+            self.height.set(computed_height + tableOfContentsHeaderHeight(self.node));
             self.zoom.set(1.0);
 
             try recordContentEditableFocusBounds(engine, self);
@@ -3545,6 +3574,40 @@ fn appendListMarker(self: *Layout, commands: *std.ArrayList(DisplayItem), block:
         .x2 = marker_x + list_marker_size,
         .y2 = marker_y + list_marker_size,
         .color = self.remapColor(color),
+    } });
+}
+
+fn appendTableOfContentsHeader(self: *Layout, commands: *std.ArrayList(DisplayItem), block: *const BlockLayout) !void {
+    const element = switch (block.node) {
+        .element => |*value| value,
+        .text => return,
+    };
+    if (!isTableOfContentsElement(element)) return;
+
+    const x = block.x.get().*;
+    const y = block.y.get().*;
+    const width = block.width.get().*;
+    const background = self.remapColor(.{ .r = 211, .g = 211, .b = 211, .a = 255 });
+    try commands.append(self.allocator, .{ .rect = .{
+        .x1 = x,
+        .y1 = y,
+        .x2 = x + width,
+        .y2 = y + toc_header_height,
+        .color = background,
+    } });
+
+    const glyph = try self.font_manager.getStyledGlyph(
+        "Table of Contents",
+        .Normal,
+        .Roman,
+        self.scaledFontSize(self.default_font_size),
+        false,
+    );
+    try commands.append(self.allocator, .{ .glyph = .{
+        .x = x + 4,
+        .y = y + 3,
+        .glyph = glyph,
+        .color = self.remapColor(.{ .r = 0, .g = 0, .b = 0, .a = 255 }),
     } });
 }
 
@@ -3854,6 +3917,7 @@ fn paintBlockTree(self: *Layout, block: *BlockLayout) !void {
 
     // Add the block's own background/borders
     try addBackgroundIfNeeded(self, block);
+    try appendTableOfContentsHeader(self, &commands, block);
 
     // Add the block's display items (from children like text, etc.)
     for (block.display_list.items) |item| {
@@ -3955,6 +4019,7 @@ fn paintBlockTreeRecursive(commands: *std.ArrayList(DisplayItem), self: *Layout,
 
     // Add background/borders for this block
     try addBackgroundIfNeededToList(self, &block_commands, block);
+    try appendTableOfContentsHeader(self, &block_commands, block);
 
     // Add display items (from text, etc.)
     for (block.display_list.items) |item| {
