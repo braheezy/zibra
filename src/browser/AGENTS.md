@@ -37,6 +37,11 @@ before changing `root.zig`, `tab.zig`, `render/`, or browser task scheduling.
   Preserve spaces and explicit CR, LF, and CRLF line breaks, advance empty
   lines, suppress automatic wrapping, and use the monospace face without
   suppressing nested inline styles.
+- `font-family` is inherited. The supported CSS family list resolves normal
+  proportional faces and common Courier/monospace aliases to platform fonts;
+  CJK, symbol, and emoji graphemes retain their specialized fallback faces.
+  Glyph caches belong to the selected font face, so never reuse a glyph across
+  family selections. The user-agent stylesheet makes `code` monospace.
 - Soft hyphens are invisible discretionary breaks. Track every candidate in
   the current word, use the latest one whose visible hyphen fits, and transfer
   the suffix to the next line without duplicating owning inline payloads.

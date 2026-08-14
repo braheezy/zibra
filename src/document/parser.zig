@@ -986,6 +986,7 @@ const InheritedProperty = struct {
 };
 
 const INHERITED_PROPERTIES = [_]InheritedProperty{
+    .{ .name = "font-family", .default_value = "sans-serif" },
     .{ .name = "font-size", .default_value = "16px" },
     .{ .name = "font-style", .default_value = "normal" },
     .{ .name = "font-weight", .default_value = "normal" },
@@ -994,6 +995,7 @@ const INHERITED_PROPERTIES = [_]InheritedProperty{
 };
 
 const CSS_PROPERTIES = [_]struct { name: []const u8, default_value: []const u8 }{
+    .{ .name = "font-family", .default_value = "inherit" },
     .{ .name = "font-size", .default_value = "inherit" },
     .{ .name = "font-weight", .default_value = "inherit" },
     .{ .name = "font-style", .default_value = "inherit" },
@@ -1073,6 +1075,17 @@ fn cssDefaultFor(property: []const u8) []const u8 {
         }
     }
     return "";
+}
+
+fn resolveFontFamilyKeyword(value: []const u8, inherited_value: []const u8) []const u8 {
+    const keyword = std.mem.trim(u8, value, " \t\r\n");
+    if (std.ascii.eqlIgnoreCase(keyword, "inherit") or
+        std.ascii.eqlIgnoreCase(keyword, "unset"))
+    {
+        return inherited_value;
+    }
+    if (std.ascii.eqlIgnoreCase(keyword, "initial")) return "sans-serif";
+    return value;
 }
 
 // Helper to get a default parent style map with inherited defaults
@@ -1186,6 +1199,21 @@ fn styleWithParent(allocator: std.mem.Allocator, node: *Node, rules: []const CSS
                             try new_style.put(entry.key_ptr.*, entry.value_ptr.*);
                         }
                     }
+                }
+
+                // Resolve CSS-wide keywords before storing the computed
+                // font-family value. Since font-family is inherited, `unset`
+                // has the same effect as `inherit`.
+                if (new_style.get("font-family")) |font_family| {
+                    const child_field = style_map.getPtr("font-family").?;
+                    const inherited_family = if (parent_style.getPtr("font-family")) |parent_field|
+                        parent_field.read(child_field).*
+                    else
+                        "sans-serif";
+                    try new_style.put(
+                        "font-family",
+                        resolveFontFamilyKeyword(font_family, inherited_family),
+                    );
                 }
 
                 // Fourth, resolve percentage font sizes to absolute pixels

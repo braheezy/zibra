@@ -35,6 +35,15 @@ pub const FontCategory = enum {
     monospace,
 };
 
+/// The CSS family choices supported by Zibra's bundled system-font set.
+/// Named monospace faces such as Courier resolve to the platform's available
+/// monospace face; the proportional choice continues to use Unicode-specific
+/// fallback faces for CJK, symbols, and emoji.
+pub const FontFamily = enum {
+    proportional,
+    monospace,
+};
+
 const UnicodeRange = struct {
     start: u21,
     end: u21,
@@ -545,7 +554,7 @@ pub const FontManager = struct {
         weight: FontWeight,
         slant: FontSlant,
         size: i32,
-        use_monospace: bool,
+        family: FontFamily,
     ) !Glyph {
         try self.ensureFontSize(size);
 
@@ -562,16 +571,13 @@ pub const FontManager = struct {
             };
         }
 
-        const category: FontCategory = if (use_monospace)
-            .monospace
-        else
-            getGraphemeCategory(gme);
+        const category = categoryForFamily(gme, family);
         var styled_font = self.pickFontForCharacterStyle(category, weight, slant);
         var style_set = false;
         var synthetic_bold = false;
 
         if (styled_font == null) {
-            if (use_monospace and weight == .Bold) {
+            if (family == .monospace and weight == .Bold) {
                 styled_font = self.pickFontForCharacterStyle(category, .Normal, slant);
                 if (styled_font != null) {
                     synthetic_bold = true;
@@ -599,6 +605,8 @@ pub const FontManager = struct {
         const font = styled_font.?;
         defer if (style_set) font.font_handle.setStyle(.{});
 
+        // Each loaded Font owns its own glyph map, so selecting another CSS
+        // family selects another cache before this per-face key is consulted.
         const key = newGlyphCacheKey(gme, weight, slant, size);
         if (font.glyphs.get(key)) |cached_glyph| {
             return cached_glyph;
@@ -782,6 +790,73 @@ pub fn getGraphemeCategory(gme: []const u8) FontCategory {
     return getCategory(first.code) orelse .latin;
 }
 
+/// Apply a CSS family preference without sacrificing the specialized fallback
+/// faces required for CJK, symbols, and emoji.
+pub fn categoryForFamily(gme: []const u8, family: FontFamily) FontCategory {
+    const category = getGraphemeCategory(gme);
+    return if (family == .monospace and category == .latin) .monospace else category;
+}
+
+fn unquoteCssFamily(value: []const u8) []const u8 {
+    const trimmed = std.mem.trim(u8, value, " \t\r\n");
+    if (trimmed.len >= 2 and
+        ((trimmed[0] == '\'' and trimmed[trimmed.len - 1] == '\'') or
+            (trimmed[0] == '"' and trimmed[trimmed.len - 1] == '"')))
+    {
+        return std.mem.trim(u8, trimmed[1 .. trimmed.len - 1], " \t\r\n");
+    }
+    return trimmed;
+}
+
+fn isMonospaceFamily(name: []const u8) bool {
+    const aliases = [_][]const u8{
+        "monospace",
+        "ui-monospace",
+        "courier",
+        "courier new",
+        "andale mono",
+        "dejavu sans mono",
+        "dejavusansmono",
+    };
+    for (aliases) |alias| {
+        if (std.ascii.eqlIgnoreCase(name, alias)) return true;
+    }
+    return false;
+}
+
+fn isProportionalFamily(name: []const u8) bool {
+    const aliases = [_][]const u8{
+        "sans-serif",
+        "serif",
+        "system-ui",
+        "ui-sans-serif",
+        "ui-serif",
+        "cursive",
+        "fantasy",
+        "arial",
+        "helvetica",
+        "noto sans",
+        "notosans-regular",
+    };
+    for (aliases) |alias| {
+        if (std.ascii.eqlIgnoreCase(name, alias)) return true;
+    }
+    return false;
+}
+
+/// Resolve the first supported entry in a CSS font-family fallback list.
+/// Unsupported named fonts are skipped; an entirely unsupported list falls
+/// back to Zibra's normal proportional system face.
+pub fn familyFromCss(value: []const u8) FontFamily {
+    var families = std.mem.splitScalar(u8, value, ',');
+    while (families.next()) |raw_family| {
+        const family = unquoteCssFamily(raw_family);
+        if (isMonospaceFamily(family)) return .monospace;
+        if (isProportionalFamily(family)) return .proportional;
+    }
+    return .proportional;
+}
+
 fn hashCombine(seed: u64, value: u64) u64 {
     // A common hash combine (borrowed from boost::hash_combine)
     return seed ^ (value +% 0x9e3779b97f4a7c15 +% (seed << 6) +% (seed >> 2));
@@ -825,6 +900,19 @@ test "grapheme font category preserves text and CJK fallbacks" {
     try std.testing.expectEqual(FontCategory.cjk, getGraphemeCategory("中"));
     try std.testing.expectEqual(FontCategory.symbols, getGraphemeCategory("☀"));
     try std.testing.expectEqual(FontCategory.symbols, getGraphemeCategory("😀︎"));
+}
+
+test "CSS font families select monospace without replacing Unicode fallbacks" {
+    try std.testing.expectEqual(FontFamily.monospace, familyFromCss("Courier"));
+    try std.testing.expectEqual(FontFamily.monospace, familyFromCss("'Courier New', serif"));
+    try std.testing.expectEqual(FontFamily.monospace, familyFromCss("Missing Face, monospace"));
+    try std.testing.expectEqual(FontFamily.proportional, familyFromCss("Arial, monospace"));
+    try std.testing.expectEqual(FontFamily.proportional, familyFromCss("Missing Face"));
+
+    try std.testing.expectEqual(FontCategory.monospace, categoryForFamily("A", .monospace));
+    try std.testing.expectEqual(FontCategory.latin, categoryForFamily("A", .proportional));
+    try std.testing.expectEqual(FontCategory.cjk, categoryForFamily("中", .monospace));
+    try std.testing.expectEqual(FontCategory.emoji, categoryForFamily("😀", .monospace));
 }
 
 test "emoji bitmap scaling preserves aspect ratio and validates dimensions" {

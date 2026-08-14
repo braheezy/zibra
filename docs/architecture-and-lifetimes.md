@@ -249,6 +249,12 @@ Preformatted state follows that scoped model for `pre`. Its text retains source
 spaces and explicit CR, LF, and CRLF line breaks, advances consecutive empty
 lines, suppresses viewport wrapping, and selects the monospace font while
 allowing nested elements to change weight, slant, color, and size normally.
+The inherited `font-family` computed value selects either the proportional or
+platform monospace face for Latin text. Common Courier and monospace aliases
+map to that platform face, while CJK, symbol, and emoji graphemes continue to
+use their specialized fallback categories. Each loaded font owns its glyph
+cache, so identical grapheme/style/size keys remain isolated between selected
+families.
 Soft-hyphen wrapping temporarily transfers the post-break `LineItem` suffix
 out of the active line before flushing its prefix. Glyph entries only borrow
 font data, but embedded input, image, and iframe payloads retain single

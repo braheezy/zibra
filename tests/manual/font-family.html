@@ -1,0 +1,20 @@
+<!doctype html>
+<!--
+How to verify: run `zig build run -- tests/manual/font-family.html`.
+The code samples and the explicitly monospace paragraph should use equal-width
+Latin glyphs; the ordinary and overridden text should remain proportional.
+CJK and emoji should stay visible through their specialized fallback fonts.
+-->
+<html>
+  <head>
+    <title>Font family regression</title>
+  </head>
+  <body style="background-color: white; color: black; font-size: 24px">
+    <p>Proportional reference: |iiiiii| |WWWWWW|</p>
+    <p><code>Default code: |iiiiii| |WWWWWW|</code></p>
+    <p style='font-family: "Courier New", monospace'>Inherited named family: |iiiiii| <b>|WWWWWW|</b> 中 😀</p>
+    <p style='font-family: "Definitely Missing", monospace'>Fallback list: |iiiiii| |WWWWWW|</p>
+    <p style="font-family: monospace">Monospace parent; <span style="font-family: sans-serif">proportional child</span>; monospace again.</p>
+    <div style="font-family: monospace">Anonymous inline inheritance: |iiiiii| <b>|WWWWWW|</b></div>
+  </body>
+</html>

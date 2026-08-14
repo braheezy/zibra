@@ -15,6 +15,10 @@ or selector/rule lifetime.
   stable identity scheme is in place.
 - CSS rules own selector/map allocations while their property slices borrow the
   stylesheet. Move and retire rules with their source text as one generation.
+- Keep the computed-style property table and inherited-property defaults in
+  sync. A computed `font-family` borrows either its declaration or inherited
+  parent slice; rendering resolves the supported family/fallback list without
+  retaining a new borrowed value.
 - Keep parser output deterministic: the `--dump-dom` golden test is the first
   inspection contract for this pipeline stage.
 
