@@ -628,3 +628,57 @@ test "Apply tag and class CSS selectors" {
     try std.testing.expectEqualStrings("lightgray", styles.getPtr("background-color").?.get().*);
     try std.testing.expectEqualStrings("blue", styles.getPtr("color").?.get().*);
 }
+
+test "font-family is inherited and code uses the user-agent monospace family" {
+    const allocator = std.testing.allocator;
+    const html =
+        "<p>prose <code>inline <span style=\"font-family: inherit\">code</span></code> " ++
+        "<em style=\"font-family: sans-serif\">override</em></p>";
+    const browser_css = @embedFile("../browser/browser.css");
+
+    var html_parser = try HTMLParser.init(allocator, html);
+    html_parser.use_implicit_tags = false;
+    defer html_parser.deinit(allocator);
+    var root = try html_parser.parse();
+    defer root.deinit(allocator);
+
+    var css_parser = try CSSParser.init(allocator, browser_css, false);
+    defer css_parser.deinit(allocator);
+    const rules = try css_parser.parse(allocator);
+    defer {
+        for (rules) |*rule| rule.deinit(allocator);
+        allocator.free(rules);
+    }
+
+    try document_parser.style(allocator, &root, rules);
+
+    const paragraph = &root.element;
+    try std.testing.expectEqualStrings(
+        "sans-serif",
+        paragraph.style.?.getPtr("font-family").?.get().*,
+    );
+    try std.testing.expectEqualStrings(
+        "sans-serif",
+        paragraph.children.items[0].text.style.?.getPtr("font-family").?.get().*,
+    );
+
+    const code = &paragraph.children.items[1].element;
+    try std.testing.expectEqualStrings(
+        "monospace",
+        code.style.?.getPtr("font-family").?.get().*,
+    );
+    try std.testing.expectEqualStrings(
+        "monospace",
+        code.children.items[0].text.style.?.getPtr("font-family").?.get().*,
+    );
+    try std.testing.expectEqualStrings(
+        "monospace",
+        code.children.items[1].element.style.?.getPtr("font-family").?.get().*,
+    );
+
+    const override = &paragraph.children.items[paragraph.children.items.len - 1].element;
+    try std.testing.expectEqualStrings(
+        "sans-serif",
+        override.style.?.getPtr("font-family").?.get().*,
+    );
+}

@@ -15,6 +15,7 @@ const Node = parser.Node;
 const FontWeight = font.FontWeight;
 const FontSlant = font.FontSlant;
 const FontCategory = font.FontCategory;
+const FontFamily = font.FontFamily;
 const scrollbar_width = browser.scrollbar_width;
 const h_offset = browser.h_offset;
 const v_offset = browser.v_offset;
@@ -204,6 +205,7 @@ const EmbedLayout = struct {
             if (map_mut.getPtr("font-weight")) |field| self.font_stub.addDependency(field);
             if (map_mut.getPtr("font-style")) |field| self.font_stub.addDependency(field);
             if (map_mut.getPtr("font-size")) |field| self.font_stub.addDependency(field);
+            if (map_mut.getPtr("font-family")) |field| self.font_stub.addDependency(field);
         }
         self.font_stub.freezeDependencies();
 
@@ -795,6 +797,7 @@ line_left: i32,
 line_right: i32,
 is_bold: bool = false,
 is_italic: bool = false,
+font_family: FontFamily = .proportional,
 is_title: bool = false,
 is_superscript: bool = false,
 is_small_caps: bool = false,
@@ -844,6 +847,7 @@ const InlineSnapshot = struct {
     size: i32,
     is_bold: bool,
     is_italic: bool,
+    font_family: FontFamily,
     is_title: bool,
     is_superscript: bool,
     is_small_caps: bool,
@@ -863,6 +867,7 @@ fn snapshotInlineState(self: *const Layout) InlineSnapshot {
         .size = self.size,
         .is_bold = self.is_bold,
         .is_italic = self.is_italic,
+        .font_family = self.font_family,
         .is_title = self.is_title,
         .is_superscript = self.is_superscript,
         .is_small_caps = self.is_small_caps,
@@ -882,6 +887,7 @@ fn restoreInlineState(self: *Layout, snapshot: InlineSnapshot) void {
     self.size = snapshot.size;
     self.is_bold = snapshot.is_bold;
     self.is_italic = snapshot.is_italic;
+    self.font_family = snapshot.font_family;
     self.is_title = snapshot.is_title;
     self.is_superscript = snapshot.is_superscript;
     self.is_small_caps = snapshot.is_small_caps;
@@ -911,6 +917,13 @@ fn toDevicePx(self: *const Layout, layout_px: i32) i32 {
 fn scaledFontSize(self: *const Layout, css_size: i32) i32 {
     const scaled = self.toDevicePx(css_size);
     return if (scaled < 1) 1 else scaled;
+}
+
+fn activeFontFamily(self: *const Layout) FontFamily {
+    // Preformatted layout already promises a monospace face independently of
+    // the user-agent stylesheet. Nested CSS family rules still work normally
+    // outside that whitespace-preservation mode.
+    return if (self.is_preformatted) .monospace else self.font_family;
 }
 
 fn layoutWindowWidth(self: *const Layout) i32 {
@@ -1247,6 +1260,7 @@ fn handleIframeElement(self: *Layout, node: Node, node_ptr: ?*Node, line_buffer:
 const StyleSnapshot = struct {
     is_bold: bool,
     is_italic: bool,
+    font_family: FontFamily,
     size: i32,
     text_color: browser.Color,
     transform_offset_x: i32,
@@ -1273,6 +1287,7 @@ fn applyNodeStyles(self: *Layout, element: parser.Element, _: *std.ArrayList(Lin
     const snapshot = StyleSnapshot{
         .is_bold = self.is_bold,
         .is_italic = self.is_italic,
+        .font_family = self.font_family,
         .size = self.size,
         .text_color = self.text_color,
         .transform_offset_x = self.transform_offset_x,
@@ -1283,6 +1298,17 @@ fn applyNodeStyles(self: *Layout, element: parser.Element, _: *std.ArrayList(Lin
 
     if (element.style) |*style_map| {
         const notify_target = if (self.inline_block) |blk| &blk.height else null;
+        // Apply the inherited font family before measuring any descendant
+        // glyphs. Unsupported named faces resolve through the CSS fallback
+        // list to Zibra's proportional system face.
+        const family_value = if (notify_target) |target|
+            styleValueRead(style_map, "font-family", target)
+        else
+            styleValue(style_map, "font-family");
+        if (family_value) |family_str| {
+            self.font_family = font.familyFromCss(family_str);
+        }
+
         // Apply font-weight
         if (notify_target) |target| {
             if (styleValueRead(style_map, "font-weight", target)) |weight_str| {
@@ -1346,6 +1372,7 @@ fn restoreNodeStyles(self: *Layout, _: *std.ArrayList(LineItem)) !void {
         const snapshot = self.style_stack.pop() orelse return;
         self.is_bold = snapshot.is_bold;
         self.is_italic = snapshot.is_italic;
+        self.font_family = snapshot.font_family;
         self.size = snapshot.size;
         self.text_color = snapshot.text_color;
         self.transform_offset_x = snapshot.transform_offset_x;
@@ -1393,7 +1420,7 @@ fn recordSoftHyphenBreak(
         weight,
         slant,
         self.scaledFontSize(text_size),
-        false,
+        self.activeFontFamily(),
     );
     hyphen.is_superscript = options.is_superscript;
     hyphen.is_soft_hyphen = false;
@@ -1732,7 +1759,7 @@ fn breakPreformattedLine(self: *Layout, line_buffer: *std.ArrayList(LineItem)) !
         weight,
         slant,
         self.scaledFontSize(text_size),
-        true,
+        .monospace,
     );
     const ascent = self.toLayoutPx(reference.ascent);
     const descent = self.toLayoutPx(reference.descent);
@@ -1779,11 +1806,7 @@ fn processGrapheme(
     // not be split across fallback fonts or rendered as separate code points.
     const category = font.getGraphemeCategory(gme);
 
-    // Determine if we should use monospace font
-    // Only use monospace for ASCII and Latin characters in preformatted mode
-    // For emoji and CJK, use their specialized fonts even in preformatted mode
-    const use_monospace = self.is_preformatted and
-        (category == .latin or category == .monospace);
+    const active_family = self.activeFontFamily();
 
     // Update current font category if needed
     if (category != self.current_font_category) {
@@ -1813,7 +1836,7 @@ fn processGrapheme(
                 .Bold, // Force bold for small caps
                 slant,
                 self.scaledFontSize(textSizeForSmallCaps(text_size)),
-                use_monospace,
+                active_family,
             );
         } else {
             // Regular rendering for non-lowercase characters
@@ -1822,7 +1845,7 @@ fn processGrapheme(
                 weight,
                 slant,
                 self.scaledFontSize(text_size),
-                use_monospace,
+                active_family,
             );
         }
     } else {
@@ -1832,7 +1855,7 @@ fn processGrapheme(
             weight,
             slant,
             self.scaledFontSize(text_size),
-            use_monospace,
+            active_family,
         );
     }
 
@@ -2250,10 +2273,12 @@ pub fn layoutSourceCode(self: *Layout, source: []const u8) ![]DisplayItem {
     const original_preformatted = self.is_preformatted;
     const original_font_category = self.current_font_category;
     const original_is_bold = self.is_bold;
+    const original_font_family = self.font_family;
 
     // Start with preformatted mode on for whitespace preservation
     // but use normal font for initial state
     self.is_preformatted = true; // Keep preformatted for all content to preserve whitespace
+    self.font_family = .proportional;
     self.current_font_category = .latin; // Start with normal font
     self.is_bold = false; // Start with normal weight
 
@@ -2360,6 +2385,7 @@ pub fn layoutSourceCode(self: *Layout, source: []const u8) ![]DisplayItem {
     self.is_preformatted = original_preformatted;
     self.current_font_category = original_font_category;
     self.is_bold = original_is_bold;
+    self.font_family = original_font_family;
 
     // `cursor_y` already includes the top page padding. Keep matching bottom
     // whitespace so source documents use the same scroll contract as HTML.
@@ -2375,6 +2401,7 @@ const InputLayout = struct {
     font_size: i32 = 16,
     font_weight: FontWeight = .Normal,
     font_slant: FontSlant = .Roman,
+    font_family: FontFamily = .proportional,
     color: browser.Color = .{ .r = 0, .g = 0, .b = 0, .a = 255 },
     bgcolor: browser.Color = .{ .r = 173, .g = 216, .b = 230, .a = 255 }, // lightblue
     text: []const u8 = "",
@@ -2393,6 +2420,7 @@ const InputLayout = struct {
     fn measure(self: *InputLayout, engine: *Layout, element: parser.Element) !void {
         self.font_weight = if (engine.is_bold) .Bold else .Normal;
         self.font_slant = if (engine.is_italic) .Italic else .Roman;
+        self.font_family = engine.activeFontFamily();
         self.font_size = engine.scaledFontSize(engine.size);
         self.color = engine.text_color;
 
@@ -2424,7 +2452,7 @@ const InputLayout = struct {
             self.font_weight,
             self.font_slant,
             self.font_size,
-            false,
+            self.font_family,
         );
 
         const ascent_value = engine.toLayoutPx(glyph.ascent);
@@ -2468,7 +2496,7 @@ const InputLayout = struct {
                     self.font_weight,
                     self.font_slant,
                     self.font_size,
-                    false,
+                    self.font_family,
                 );
 
                 try commands.append(engine.allocator, DisplayItem{
@@ -2517,6 +2545,7 @@ const TextLayout = struct {
     font_size: i32 = 16,
     font_weight: FontWeight = .Normal,
     font_slant: FontSlant = .Roman,
+    font_family: FontFamily = .proportional,
     color: browser.Color = .{ .r = 0, .g = 0, .b = 0, .a = 255 },
 
     // Dirty tracking for descendants
@@ -2600,6 +2629,12 @@ const TextLayout = struct {
                         text.ascent.addDependency(field);
                         text.descent.addDependency(field);
                     }
+                    if (style_map.getPtr("font-family")) |field| {
+                        text.width.addDependency(field);
+                        text.height.addDependency(field);
+                        text.ascent.addDependency(field);
+                        text.descent.addDependency(field);
+                    }
                 }
             },
             .element => |*e| {
@@ -2617,6 +2652,12 @@ const TextLayout = struct {
                         text.descent.addDependency(field);
                     }
                     if (style_map.getPtr("font-size")) |field| {
+                        text.width.addDependency(field);
+                        text.height.addDependency(field);
+                        text.ascent.addDependency(field);
+                        text.descent.addDependency(field);
+                    }
+                    if (style_map.getPtr("font-family")) |field| {
                         text.width.addDependency(field);
                         text.height.addDependency(field);
                         text.ascent.addDependency(field);
@@ -2677,6 +2718,7 @@ const TextLayout = struct {
         // Get font properties from node style
         self.font_weight = if (engine.is_bold) .Bold else .Normal;
         self.font_slant = if (engine.is_italic) .Italic else .Roman;
+        self.font_family = engine.activeFontFamily();
         self.font_size = engine.scaledFontSize(engine.size);
         self.color = engine.text_color;
 
@@ -2686,7 +2728,7 @@ const TextLayout = struct {
             self.font_weight,
             self.font_slant,
             self.font_size,
-            false,
+            self.font_family,
         );
 
         const width_value = engine.toLayoutPx(glyph.w);
@@ -2703,7 +2745,7 @@ const TextLayout = struct {
                 prev.font_weight,
                 prev.font_slant,
                 prev.font_size,
-                false,
+                prev.font_family,
             );
             const space = engine.toLayoutPx(space_glyph.w);
             break :x prev.x.read(&self.x).* + space + prev.width.read(&self.x).*;
@@ -2740,7 +2782,7 @@ const TextLayout = struct {
             self.font_weight,
             self.font_slant,
             self.font_size,
-            false,
+            self.font_family,
         );
 
         try commands.append(self.allocator, DisplayItem{
@@ -3660,7 +3702,7 @@ fn appendContentEditableCursor(self: *Layout, commands: *std.ArrayList(DisplayIt
         .Normal,
         .Roman,
         self.default_font_size,
-        false,
+        .proportional,
     );
     const cursor_height = self.toLayoutPx(glyph.ascent + glyph.descent);
     try drawCursor(commands, self.allocator, block.x.get().*, block.y.get().*, cursor_height, cursor_color);
@@ -3713,7 +3755,7 @@ fn appendTableOfContentsHeader(self: *Layout, commands: *std.ArrayList(DisplayIt
         .Normal,
         .Roman,
         self.scaledFontSize(self.default_font_size),
-        false,
+        .proportional,
     );
     try commands.append(self.allocator, .{ .glyph = .{
         .x = x + 4,
@@ -3737,7 +3779,7 @@ fn recordContentEditableFocusBounds(self: *Layout, block: *const BlockLayout) !v
             .Normal,
             .Roman,
             self.default_font_size,
-            false,
+            .proportional,
         );
         height = self.toLayoutPx(glyph.ascent + glyph.descent);
     }
@@ -3792,6 +3834,7 @@ fn layoutInlineBlock(self: *Layout, block: *BlockLayout) !void {
     self.size = self.default_font_size;
     self.is_bold = false;
     self.is_italic = false;
+    self.font_family = .proportional;
     // Centering belongs to the complete title block, not one buffered line.
     // Keeping this state stable lets explicit and automatic line breaks center
     // each completed line independently in flushLine().
@@ -3802,6 +3845,25 @@ fn layoutInlineBlock(self: *Layout, block: *BlockLayout) !void {
     self.is_preformatted = isWithinPreformattedBlock(block);
     self.prev_font_category = null;
     self.current_font_category = .latin;
+
+    // Anonymous blocks represent an inline run beneath a container but do not
+    // carry that container as their own node. Seed the inherited family from
+    // the parent so bare text siblings receive the same computed face as
+    // nested inline elements.
+    if (block.inline_nodes != null) {
+        if (block.parent_block) |parent| {
+            switch (parent.node) {
+                .element => |element| {
+                    if (element.style) |*style_map| {
+                        if (styleValueRead(style_map, "font-family", &block.height)) |family_value| {
+                            self.font_family = font.familyFromCss(family_value);
+                        }
+                    }
+                },
+                .text => {},
+            }
+        }
+    }
 
     self.current_display_target = &block.display_list;
 

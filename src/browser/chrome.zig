@@ -41,7 +41,7 @@ pub fn init(font_manager: *font.FontManager, window_width: i32, allocator: std.m
         .Normal,
         .Roman,
         chrome.font_size,
-        false,
+        .proportional,
     );
     chrome.font_height = test_glyph.ascent + test_glyph.descent;
 
@@ -60,7 +60,7 @@ pub fn init(font_manager: *font.FontManager, window_width: i32, allocator: std.m
         .Normal,
         .Roman,
         chrome.font_size,
-        false,
+        .proportional,
     );
     const plus_width = plus_glyph.w + 2 * chrome.padding;
     chrome.newtab_rect = Rect{
@@ -76,7 +76,7 @@ pub fn init(font_manager: *font.FontManager, window_width: i32, allocator: std.m
         .Normal,
         .Roman,
         chrome.font_size,
-        false,
+        .proportional,
     );
     const back_width = back_glyph.w + 2 * chrome.padding;
     chrome.back_rect = Rect{
@@ -156,7 +156,7 @@ pub fn paint(self: *Chrome, allocator: std.mem.Allocator, b: *const Browser) !st
         .Normal,
         .Roman,
         self.font_size,
-        false,
+        .proportional,
     );
     try cmds.append(allocator, .{ .glyph = .{
         .x = self.newtab_rect.left + self.padding,
@@ -222,7 +222,7 @@ pub fn paint(self: *Chrome, allocator: std.mem.Allocator, b: *const Browser) !st
             .Normal,
             .Roman,
             self.font_size,
-            false,
+            .proportional,
         );
         try cmds.append(allocator, .{ .glyph = .{
             .x = bounds.left + self.padding,
@@ -244,7 +244,7 @@ pub fn paint(self: *Chrome, allocator: std.mem.Allocator, b: *const Browser) !st
         .Normal,
         .Roman,
         self.font_size,
-        false,
+        .proportional,
     );
     try cmds.append(allocator, .{ .glyph = .{
         .x = self.back_rect.left + self.padding,
@@ -278,7 +278,7 @@ pub fn paint(self: *Chrome, allocator: std.mem.Allocator, b: *const Browser) !st
                         .Normal,
                         .Roman,
                         self.font_size,
-                        false,
+                        .proportional,
                     );
                     try cmds.append(allocator, .{ .glyph = .{
                         .x = text_x,
@@ -316,7 +316,7 @@ pub fn paint(self: *Chrome, allocator: std.mem.Allocator, b: *const Browser) !st
                     .Normal,
                     .Roman,
                     self.font_size,
-                    false,
+                    .proportional,
                 );
                 try cmds.append(allocator, .{ .glyph = .{
                     .x = text_x,
