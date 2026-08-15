@@ -86,6 +86,8 @@ pub const Frame = struct {
     document_generation: u64 = 0,
     rules: std.ArrayList(CSSParser.CSSRule),
     default_rules_count: usize = 0,
+    // Owned linked and inline author stylesheet buffers in DOM order. Owned
+    // rules borrow their property strings from these allocations.
     css_texts: std.ArrayList([]const u8),
     allowed_origins: ?std.ArrayList([]const u8) = null,
     children: std.ArrayList(*Frame),

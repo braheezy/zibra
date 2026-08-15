@@ -143,7 +143,8 @@ worker, waits for every accounted helper, and only then destroys shared state.
 - the document's decoded HTML source;
 - the root DOM `Node` value;
 - document layout and the frame-side display list;
-- owned CSS rules and the stylesheet source buffers borrowed by those rules;
+- owned CSS rules and their source buffers, including decoded linked sheets
+  and copied `<style>` text retained in DOM order;
 - hit-test collections and allowed-origin strings;
 - a frame-owned URL only when `current_url_owned` is true.
 
@@ -177,9 +178,10 @@ parent pointers; it does not repair every other retained `*Node`.
 
 ### CSS rules and invalidation fields
 
-`CSSRule` owns selector allocations and property-map storage, while property
-keys and values are slices into the parser's source string. See `CSSParser.word`,
-`CSSParser.value`, `CSSParser.body`, and `CSSRule.deinit` in
+`CSSRule` owns selector allocations and property-map storage. Declared property
+keys and values borrow the parser's source string; shorthand expansions can
+also use static keys and defaults. See `CSSParser.word`, `CSSParser.value`,
+`CSSParser.body`, and `CSSRule.deinit` in
 [`src/document/css_parser.zig`](../src/document/css_parser.zig). Frame rules
 borrow the browser's default rules and own document rules, distinguished by
 `CSSRule.owned`.
@@ -268,6 +270,13 @@ children into anonymous inline runs; the browser stylesheet, rather than Zig
 tag tables, supplies HTML's block defaults. Each block layout registers direct
 child display fields against its tree-version field so a later style change
 rebuilds grouping without retaining an additional DOM or string borrow.
+Inline `<style>` text is copied out of the DOM into the same frame-owned source
+generation as decoded linked stylesheets. Both forms are parsed in DOM order,
+and the stable specificity sort preserves that order among equally specific
+rules. Inspection pages and interactive root/iframe loads use the same source
+ordering. This copy lets accessibility-driven rule rebuilds reparse every
+retained author sheet for that frame without making CSS rule lifetime depend
+on DOM text slices.
 CSS shorthands expand while declaration bodies are parsed, before cascade and
 computed-style resolution. Expanded property names and defaults are static;
 other values borrow sub-slices of the stylesheet or inline-style buffer.

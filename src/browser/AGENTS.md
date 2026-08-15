@@ -12,6 +12,9 @@ before changing `root.zig`, `tab.zig`, `render/`, or browser task scheduling.
 - `tab.zig` owns frames, document generations, task serialization, and helper
   quiescence. Queued or detached work must carry a stable document identity,
   not a borrowed frame pointer.
+- A frame's `css_texts` owns decoded linked stylesheets and copied `<style>`
+  text in DOM order. Its author rules borrow those buffers; rebuild and retire
+  the text and rules as one generation for root documents and iframes.
 - `render/layout.zig` and `render/font.zig` borrow DOM/image state and own
   layout/font resources. `FontManager` owns canonical RGBA glyph bitmaps;
   display-list `Glyph` values borrow those bytes, and `pixel_mode` tells paint

@@ -15,6 +15,9 @@ or selector/rule lifetime.
   stable identity scheme is in place.
 - CSS rules own selector/map allocations while their property slices borrow the
   stylesheet. Move and retire rules with their source text as one generation.
+- `<style>` element text is copied into the same owned stylesheet generation as
+  decoded external CSS. Keep inline and linked sheets in DOM order, and make
+  isolated inspection and interactive frame loading follow the same cascade.
 - When adding a supported CSS property that has a shorthand, add its expansion
   to `CSSParser.putDeclaration`. Expand in source order for both stylesheet and
   inline declarations, preserve borrowed slices or static defaults, and test

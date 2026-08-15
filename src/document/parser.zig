@@ -1290,6 +1290,34 @@ pub fn treeToList(allocator: std.mem.Allocator, node: *Node, list: *std.ArrayLis
     }
 }
 
+/// Return an owned copy of the direct text content of a `style` element.
+///
+/// HTML text nodes borrow the document source, while parsed CSS rules must stay
+/// paired with a stylesheet buffer that can be rebuilt and retired as a unit.
+/// Callers therefore own the returned allocation and should retain it for at
+/// least as long as any rules parsed from it.
+pub fn collectInlineStyleText(allocator: std.mem.Allocator, node: *const Node) !?[]u8 {
+    const element = switch (node.*) {
+        .element => |*value| value,
+        .text => return null,
+    };
+    if (!std.mem.eql(u8, element.tag, "style")) return null;
+
+    var text = std.ArrayList(u8).empty;
+    errdefer text.deinit(allocator);
+    for (element.children.items) |child| {
+        switch (child) {
+            .text => |value| try text.appendSlice(allocator, value.text),
+            .element => {},
+        }
+    }
+    if (text.items.len == 0) {
+        text.deinit(allocator);
+        return null;
+    }
+    return try text.toOwnedSlice(allocator);
+}
+
 /// Write the DOM with its computed style values in a stable property order.
 /// This is intentionally separate from `writePretty`: callers can inspect the
 /// cascade without constructing layout, a renderer, or a JavaScript context.

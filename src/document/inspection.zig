@@ -41,7 +41,7 @@ pub const Page = struct {
         errdefer page.deinit();
 
         try page.appendRules(default_style_sheet, false);
-        if (source_url) |url| try page.loadLinkedStylesheets(init, url);
+        try page.loadDocumentStylesheets(init, source_url);
 
         std.mem.sort(CSSParser.CSSRule, page.rules.items, {}, struct {
             fn lessThan(_: void, a: CSSParser.CSSRule, b: CSSParser.CSSRule) bool {
@@ -71,17 +71,21 @@ pub const Page = struct {
             self.allocator.free(rules);
         };
 
+        // Reserve both destinations before transferring either the rules or
+        // their backing text. After these calls there are no fallible steps in
+        // the ownership transfer.
+        if (keep_text) try self.css_texts.ensureUnusedCapacity(self.allocator, 1);
+        try self.rules.ensureUnusedCapacity(self.allocator, rules.len);
         if (keep_text) {
             // `stylesheet` is an owned allocation supplied by the caller.
-            try self.css_texts.append(self.allocator, @constCast(stylesheet));
+            self.css_texts.appendAssumeCapacity(@constCast(stylesheet));
         }
-        try self.rules.ensureUnusedCapacity(self.allocator, rules.len);
         for (rules) |rule| self.rules.appendAssumeCapacity(rule);
         rules_owned = false;
         self.allocator.free(rules);
     }
 
-    fn loadLinkedStylesheets(self: *Page, init: std.process.Init, page_url: Url) !void {
+    fn loadDocumentStylesheets(self: *Page, init: std.process.Init, page_url: ?Url) !void {
         var nodes = std.ArrayList(*parser.Node).empty;
         defer nodes.deinit(self.allocator);
         try parser.treeToList(self.allocator, &self.root, &nodes);
@@ -96,13 +100,24 @@ pub const Page = struct {
                 .element => |*value| value,
                 .text => continue,
             };
+
+            if (std.mem.eql(u8, element.tag, "style")) {
+                const css_text = (try parser.collectInlineStyleText(self.allocator, node)) orelse continue;
+                var text_owned = true;
+                errdefer if (text_owned) self.allocator.free(css_text);
+                try self.appendRules(css_text, true);
+                text_owned = false;
+                continue;
+            }
+
             if (!std.mem.eql(u8, element.tag, "link")) continue;
+            const base_url = page_url orelse continue;
             const attrs = element.attributes orelse continue;
             const rel = attrs.get("rel") orelse continue;
             const href = attrs.get("href") orelse continue;
             if (!std.mem.eql(u8, rel, "stylesheet")) continue;
 
-            const stylesheet_url = page_url.resolve(self.allocator, href) catch |err| {
+            const stylesheet_url = base_url.resolve(self.allocator, href) catch |err| {
                 std.log.warn("Ignoring stylesheet {s}: {}", .{ href, err });
                 continue;
             };

@@ -31,6 +31,67 @@ test "Parse basic HTML" {
     try std.testing.expectEqualStrings("Hello, world!", text.text);
 }
 
+test "style element text can be collected and parsed as CSS" {
+    const allocator = std.testing.allocator;
+    const html =
+        "<html><head><style>p { color: red; }\n.note { font-weight: bold; }</style></head>" ++
+        "<body><p class=note>styled</p></body></html>";
+
+    var html_parser = try HTMLParser.init(allocator, html);
+    html_parser.use_implicit_tags = false;
+    defer html_parser.deinit(allocator);
+    var root = try html_parser.parse();
+    defer root.deinit(allocator);
+
+    var nodes = std.ArrayList(*document_parser.Node).empty;
+    defer nodes.deinit(allocator);
+    try document_parser.treeToList(allocator, &root, &nodes);
+
+    var style_text: ?[]u8 = null;
+    var paragraph: ?*document_parser.Node = null;
+    for (nodes.items) |node| {
+        switch (node.*) {
+            .element => |element| {
+                if (std.mem.eql(u8, element.tag, "style")) {
+                    style_text = try document_parser.collectInlineStyleText(allocator, node);
+                } else if (std.mem.eql(u8, element.tag, "p")) {
+                    paragraph = node;
+                }
+            },
+            .text => {},
+        }
+    }
+    defer if (style_text) |text| allocator.free(text);
+
+    try std.testing.expectEqualStrings(
+        "p { color: red; }\n.note { font-weight: bold; }",
+        style_text.?,
+    );
+
+    var css_parser = try CSSParser.init(allocator, style_text.?, false);
+    defer css_parser.deinit(allocator);
+    const rules = try css_parser.parse(allocator);
+    defer {
+        for (rules) |*rule| rule.deinit(allocator);
+        allocator.free(rules);
+    }
+
+    std.mem.sort(CSSParser.CSSRule, rules, {}, struct {
+        fn lessThan(_: void, a: CSSParser.CSSRule, b: CSSParser.CSSRule) bool {
+            return a.cascadePriority() < b.cascadePriority();
+        }
+    }.lessThan);
+    try document_parser.style(allocator, &root, rules);
+    try std.testing.expectEqualStrings(
+        "red",
+        paragraph.?.element.style.?.getPtr("color").?.get().*,
+    );
+    try std.testing.expectEqualStrings(
+        "bold",
+        paragraph.?.element.style.?.getPtr("font-weight").?.get().*,
+    );
+}
+
 test "Parse quoted attributes" {
     const allocator = std.testing.allocator;
     const html = "<div class=\"container\" id=\"main\"><span>Text</span></div>";

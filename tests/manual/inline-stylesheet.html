@@ -1,0 +1,32 @@
+<!doctype html>
+<!--
+How to verify:
+  zig build run -- --dump-style tests/manual/inline-stylesheet.html
+  zig build run -- --dump-layout tests/manual/inline-stylesheet.html
+  zig build run -- --dump-display-list tests/manual/inline-stylesheet.html
+  zig build run -- --screenshot /tmp/zibra-inline-stylesheet.png tests/manual/inline-stylesheet.html
+Expected: the card has a 360x90 light-gray box with a light-blue paragraph.
+Its text is bold italic, monospaced, 24px, and green; the final style element
+wins over the linked blue rule and initial red rule because equally specific
+author rules keep DOM order.
+Neither style element or its CSS text appears in layout or paint output.
+-->
+<html>
+  <head>
+    <title>Inline stylesheet regression</title>
+    <style>
+      body { background-color: white; color: black; }
+      .card { display: block; width: 360px; height: 90px; background-color: lightgray; }
+      .message { color: red; font: italic bold 24px monospace; }
+    </style>
+    <link rel="stylesheet" href="inline-stylesheet.css">
+    <style>
+      .message { color: green; }
+    </style>
+  </head>
+  <body>
+    <div class="card">
+      <p class="message">Inline styles are active.</p>
+    </div>
+  </body>
+</html>

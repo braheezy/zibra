@@ -1882,45 +1882,10 @@ pub const Browser = struct {
                 std.log.warn("Failed to load iframes: {}", .{err});
             };
 
-            // Collect stylesheet URLs from <link rel="stylesheet" href="..."> elements
-            var stylesheet_urls = std.ArrayList([]const u8).empty;
-            defer {
-                for (stylesheet_urls.items) |href| {
-                    self.allocator.free(href);
-                }
-                stylesheet_urls.deinit(self.allocator);
-            }
-
-            for (node_list.items) |node| {
-                switch (node.*) {
-                    .element => |e| {
-                        if (std.mem.eql(u8, e.tag, "link")) {
-                            if (e.attributes) |attrs| {
-                                const rel = attrs.get("rel");
-                                const href = attrs.get("href");
-
-                                if (rel != null and href != null and
-                                    std.mem.eql(u8, rel.?, "stylesheet"))
-                                {
-                                    // Copy the href string for later use
-                                    const href_copy = try self.allocator.alloc(u8, href.?.len);
-                                    @memcpy(href_copy, href.?);
-                                    stylesheet_urls.append(self.allocator, href_copy) catch |err| {
-                                        self.allocator.free(href_copy);
-                                        return err;
-                                    };
-                                }
-                            }
-                        }
-                    },
-                    .text => {},
-                }
-            }
-
             // Note: We use self.allocator directly for CSS parsing instead of an arena
             // because the CSS rules need to live as long as the Tab (for re-rendering)
 
-            // Load and parse external stylesheets. Rules borrow their property
+            // Load and parse author stylesheets. Rules borrow their property
             // strings from these buffers, so stage both collections and commit
             // them to the frame together.
             var new_css_texts = std.ArrayList([]const u8).empty;
@@ -1950,65 +1915,13 @@ pub const Browser = struct {
                 try all_rules.append(self.allocator, rule);
             }
 
-            // Download and parse each linked stylesheet
-            for (stylesheet_urls.items) |href| {
-                std.log.info("Loading stylesheet: {s}", .{href});
-
-                // Resolve relative URL against the current page URL
-                const stylesheet_url = url.*.resolve(self.allocator, href) catch |err| {
-                    std.log.warn("Failed to resolve stylesheet URL {s}: {}", .{ href, err });
-                    continue;
-                };
-                defer stylesheet_url.free(self.allocator);
-
-                if (!frame.allowedRequest(stylesheet_url, url)) {
-                    std.log.warn("Blocked stylesheet {s} due to CSP", .{href});
-                    continue;
-                }
-
-                // Fetch the stylesheet
-                const css_response = self.fetchBody(stylesheet_url, url.*, null) catch |err| {
-                    std.log.warn("Failed to load stylesheet {s}: {}", .{ href, err });
-                    continue;
-                };
-                defer if (css_response.csp_header) |hdr| self.allocator.free(hdr);
-
-                const css_raw = css_response.body;
-                const raw_owned = !std.mem.eql(u8, stylesheet_url.scheme, "data") and !std.mem.eql(u8, stylesheet_url.scheme, "about");
-                defer if (raw_owned) self.allocator.free(css_raw);
-                const css_text = try decodeUtf8Replace(self.allocator, css_raw);
-                var css_text_owned = true;
-                defer if (css_text_owned) self.allocator.free(css_text);
-
-                // Parse the stylesheet using self.allocator
-                // (CSS rules need to live as long as the Tab)
-                var css_parser = try CSSParser.init(self.allocator, css_text, tab.accessibility.prefers_dark);
-                defer css_parser.deinit(self.allocator);
-
-                const parsed_rules = css_parser.parse(self.allocator) catch |err| {
-                    std.log.warn("Failed to parse stylesheet {s}: {}", .{ href, err });
-                    continue;
-                };
-                var parsed_rules_owned = true;
-                defer {
-                    if (parsed_rules_owned) {
-                        for (parsed_rules) |*rule| rule.deinit(self.allocator);
-                    }
-                    self.allocator.free(parsed_rules);
-                }
-
-                // Reserve both destinations before transferring either half of
-                // the stylesheet generation. Rules borrow from css_text, so
-                // the text and every parsed rule must move together.
-                try new_css_texts.ensureUnusedCapacity(self.allocator, 1);
-                try all_rules.ensureUnusedCapacity(self.allocator, parsed_rules.len);
-                new_css_texts.appendAssumeCapacity(css_text);
-                css_text_owned = false;
-                for (parsed_rules) |rule| {
-                    all_rules.appendAssumeCapacity(rule);
-                }
-                parsed_rules_owned = false;
-            }
+            try self.appendDocumentStylesheets(
+                frame,
+                url,
+                node_list.items,
+                &new_css_texts,
+                &all_rules,
+            );
 
             // Sort rules by cascade priority (more specific selectors override less specific)
             // Stable sort preserves file order for rules with equal priority
@@ -2293,37 +2206,6 @@ pub const Browser = struct {
             std.log.warn("Failed to load iframe subdocuments: {}", .{err});
         };
 
-        var stylesheet_urls = std.ArrayList([]const u8).empty;
-        defer {
-            for (stylesheet_urls.items) |href| {
-                self.allocator.free(href);
-            }
-            stylesheet_urls.deinit(self.allocator);
-        }
-
-        for (node_list.items) |node| {
-            switch (node.*) {
-                .element => |e| {
-                    if (std.mem.eql(u8, e.tag, "link")) {
-                        if (e.attributes) |attrs| {
-                            const rel = attrs.get("rel");
-                            const href = attrs.get("href");
-
-                            if (rel != null and href != null and std.mem.eql(u8, rel.?, "stylesheet")) {
-                                const href_copy = try self.allocator.alloc(u8, href.?.len);
-                                @memcpy(href_copy, href.?);
-                                stylesheet_urls.append(self.allocator, href_copy) catch |err| {
-                                    self.allocator.free(href_copy);
-                                    return err;
-                                };
-                            }
-                        }
-                    }
-                },
-                .text => {},
-            }
-        }
-
         var new_css_texts = std.ArrayList([]const u8).empty;
         defer {
             for (new_css_texts.items) |css_text| self.allocator.free(css_text);
@@ -2345,56 +2227,13 @@ pub const Browser = struct {
             try all_rules.append(self.allocator, rule);
         }
 
-        for (stylesheet_urls.items) |href| {
-            std.log.info("Loading iframe stylesheet: {s}", .{href});
-            const stylesheet_url = url.*.resolve(self.allocator, href) catch |err| {
-                std.log.warn("Failed to resolve iframe stylesheet URL {s}: {}", .{ href, err });
-                continue;
-            };
-            defer stylesheet_url.free(self.allocator);
-
-            if (!frame.allowedRequest(stylesheet_url, url)) {
-                std.log.warn("Blocked iframe stylesheet {s} due to CSP", .{href});
-                continue;
-            }
-
-            const css_response = self.fetchBody(stylesheet_url, url.*, null) catch |err| {
-                std.log.warn("Failed to load iframe stylesheet {s}: {}", .{ href, err });
-                continue;
-            };
-            defer if (css_response.csp_header) |hdr| self.allocator.free(hdr);
-
-            const css_raw = css_response.body;
-            const raw_owned = !std.mem.eql(u8, stylesheet_url.scheme, "data") and !std.mem.eql(u8, stylesheet_url.scheme, "about");
-            defer if (raw_owned) self.allocator.free(css_raw);
-            const css_text = try decodeUtf8Replace(self.allocator, css_raw);
-            var css_text_owned = true;
-            defer if (css_text_owned) self.allocator.free(css_text);
-
-            var css_parser = try CSSParser.init(self.allocator, css_text, frame.tab.accessibility.prefers_dark);
-            defer css_parser.deinit(self.allocator);
-
-            const parsed_rules = css_parser.parse(self.allocator) catch |err| {
-                std.log.warn("Failed to parse iframe stylesheet {s}: {}", .{ href, err });
-                continue;
-            };
-            var parsed_rules_owned = true;
-            defer {
-                if (parsed_rules_owned) {
-                    for (parsed_rules) |*rule| rule.deinit(self.allocator);
-                }
-                self.allocator.free(parsed_rules);
-            }
-
-            try new_css_texts.ensureUnusedCapacity(self.allocator, 1);
-            try all_rules.ensureUnusedCapacity(self.allocator, parsed_rules.len);
-            new_css_texts.appendAssumeCapacity(css_text);
-            css_text_owned = false;
-            for (parsed_rules) |rule| {
-                all_rules.appendAssumeCapacity(rule);
-            }
-            parsed_rules_owned = false;
-        }
+        try self.appendDocumentStylesheets(
+            frame,
+            url,
+            node_list.items,
+            &new_css_texts,
+            &all_rules,
+        );
 
         std.mem.sort(CSSParser.CSSRule, all_rules.items, {}, struct {
             fn lessThan(_: void, a: CSSParser.CSSRule, b: CSSParser.CSSRule) bool {
@@ -2713,37 +2552,6 @@ pub const Browser = struct {
             }
         }
 
-        var stylesheet_urls = std.ArrayList([]const u8).empty;
-        defer {
-            for (stylesheet_urls.items) |href| {
-                self.allocator.free(href);
-            }
-            stylesheet_urls.deinit(self.allocator);
-        }
-
-        for (node_list.items) |node| {
-            switch (node.*) {
-                .element => |e| {
-                    if (std.mem.eql(u8, e.tag, "link")) {
-                        if (e.attributes) |attrs| {
-                            const rel = attrs.get("rel");
-                            const href = attrs.get("href");
-
-                            if (rel != null and href != null and std.mem.eql(u8, rel.?, "stylesheet")) {
-                                const href_copy = try self.allocator.alloc(u8, href.?.len);
-                                @memcpy(href_copy, href.?);
-                                stylesheet_urls.append(self.allocator, href_copy) catch |err| {
-                                    self.allocator.free(href_copy);
-                                    return err;
-                                };
-                            }
-                        }
-                    }
-                },
-                .text => {},
-            }
-        }
-
         var new_css_texts = std.ArrayList([]const u8).empty;
         defer {
             for (new_css_texts.items) |css_text| self.allocator.free(css_text);
@@ -2765,56 +2573,13 @@ pub const Browser = struct {
             try all_rules.append(self.allocator, rule);
         }
 
-        for (stylesheet_urls.items) |href| {
-            std.log.info("Loading iframe stylesheet: {s}", .{href});
-            const stylesheet_url = iframe_url.resolve(self.allocator, href) catch |err| {
-                std.log.warn("Failed to resolve iframe stylesheet URL {s}: {}", .{ href, err });
-                continue;
-            };
-            defer stylesheet_url.free(self.allocator);
-
-            if (!frame.allowedRequest(stylesheet_url, frame.current_url)) {
-                std.log.warn("Blocked iframe stylesheet {s} due to CSP", .{href});
-                continue;
-            }
-
-            const css_response = self.fetchBody(stylesheet_url, iframe_url, null) catch |err| {
-                std.log.warn("Failed to load iframe stylesheet {s}: {}", .{ href, err });
-                continue;
-            };
-            defer if (css_response.csp_header) |hdr| self.allocator.free(hdr);
-
-            const css_raw = css_response.body;
-            const raw_owned = !std.mem.eql(u8, stylesheet_url.scheme, "data") and !std.mem.eql(u8, stylesheet_url.scheme, "about");
-            defer if (raw_owned) self.allocator.free(css_raw);
-            const css_text = try decodeUtf8Replace(self.allocator, css_raw);
-            var css_text_owned = true;
-            defer if (css_text_owned) self.allocator.free(css_text);
-
-            var css_parser = try CSSParser.init(self.allocator, css_text, parent.tab.accessibility.prefers_dark);
-            defer css_parser.deinit(self.allocator);
-
-            const parsed_rules = css_parser.parse(self.allocator) catch |err| {
-                std.log.warn("Failed to parse iframe stylesheet {s}: {}", .{ href, err });
-                continue;
-            };
-            var parsed_rules_owned = true;
-            defer {
-                if (parsed_rules_owned) {
-                    for (parsed_rules) |*rule| rule.deinit(self.allocator);
-                }
-                self.allocator.free(parsed_rules);
-            }
-
-            try new_css_texts.ensureUnusedCapacity(self.allocator, 1);
-            try all_rules.ensureUnusedCapacity(self.allocator, parsed_rules.len);
-            new_css_texts.appendAssumeCapacity(css_text);
-            css_text_owned = false;
-            for (parsed_rules) |rule| {
-                all_rules.appendAssumeCapacity(rule);
-            }
-            parsed_rules_owned = false;
-        }
+        try self.appendDocumentStylesheets(
+            frame,
+            frame_url_ptr,
+            node_list.items,
+            &new_css_texts,
+            &all_rules,
+        );
 
         std.mem.sort(CSSParser.CSSRule, all_rules.items, {}, struct {
             fn lessThan(_: void, a: CSSParser.CSSRule, b: CSSParser.CSSRule) bool {
@@ -2916,6 +2681,118 @@ pub const Browser = struct {
                 };
             },
             else => return null,
+        }
+    }
+
+    /// Parse one owned document stylesheet into staged frame storage. The
+    /// caller retains ownership of `css_text` on error and transfers it to
+    /// `css_texts` only after this function succeeds.
+    fn appendDocumentStylesheetRules(
+        self: *Browser,
+        css_text: []const u8,
+        prefers_dark: bool,
+        css_texts: *std.ArrayList([]const u8),
+        rules: *std.ArrayList(CSSParser.CSSRule),
+    ) !void {
+        var css_parser = try CSSParser.init(self.allocator, css_text, prefers_dark);
+        defer css_parser.deinit(self.allocator);
+
+        const parsed_rules = try css_parser.parse(self.allocator);
+        var parsed_rules_owned = true;
+        defer {
+            if (parsed_rules_owned) {
+                for (parsed_rules) |*rule| rule.deinit(self.allocator);
+            }
+            self.allocator.free(parsed_rules);
+        }
+
+        // Reserve both destinations before transferring either half of the
+        // generation. Every parsed rule borrows from css_text.
+        try css_texts.ensureUnusedCapacity(self.allocator, 1);
+        try rules.ensureUnusedCapacity(self.allocator, parsed_rules.len);
+        css_texts.appendAssumeCapacity(css_text);
+        for (parsed_rules) |rule| rules.appendAssumeCapacity(rule);
+        parsed_rules_owned = false;
+    }
+
+    /// Load author stylesheets in DOM order. Inline `<style>` text is copied
+    /// into the same frame-owned backing store as decoded external CSS so rule
+    /// rebuilding and retirement do not depend on DOM string lifetimes.
+    fn appendDocumentStylesheets(
+        self: *Browser,
+        frame: *Frame,
+        page_url: *Url,
+        nodes: []*Node,
+        css_texts: *std.ArrayList([]const u8),
+        rules: *std.ArrayList(CSSParser.CSSRule),
+    ) !void {
+        for (nodes) |node| {
+            const element = switch (node.*) {
+                .element => |*value| value,
+                .text => continue,
+            };
+
+            if (std.mem.eql(u8, element.tag, "style")) {
+                const css_text = (try parser.collectInlineStyleText(self.allocator, node)) orelse continue;
+                var css_text_owned = true;
+                defer if (css_text_owned) self.allocator.free(css_text);
+
+                self.appendDocumentStylesheetRules(
+                    css_text,
+                    frame.tab.accessibility.prefers_dark,
+                    css_texts,
+                    rules,
+                ) catch |err| {
+                    std.log.warn("Failed to parse inline stylesheet: {}", .{err});
+                    continue;
+                };
+                css_text_owned = false;
+                continue;
+            }
+
+            if (!std.mem.eql(u8, element.tag, "link")) continue;
+            const attrs = element.attributes orelse continue;
+            const rel = attrs.get("rel") orelse continue;
+            const href = attrs.get("href") orelse continue;
+            if (!std.mem.eql(u8, rel, "stylesheet")) continue;
+
+            std.log.info("Loading stylesheet: {s}", .{href});
+            const stylesheet_url = page_url.*.resolve(self.allocator, href) catch |err| {
+                std.log.warn("Failed to resolve stylesheet URL {s}: {}", .{ href, err });
+                continue;
+            };
+            defer stylesheet_url.free(self.allocator);
+
+            if (!frame.allowedRequest(stylesheet_url, page_url)) {
+                std.log.warn("Blocked stylesheet {s} due to CSP", .{href});
+                continue;
+            }
+
+            const css_response = self.fetchBody(stylesheet_url, page_url.*, null) catch |err| {
+                std.log.warn("Failed to load stylesheet {s}: {}", .{ href, err });
+                continue;
+            };
+            defer if (css_response.csp_header) |header| self.allocator.free(header);
+
+            const css_raw = css_response.body;
+            const raw_owned = !std.mem.eql(u8, stylesheet_url.scheme, "data") and
+                !std.mem.eql(u8, stylesheet_url.scheme, "about");
+            defer if (raw_owned) self.allocator.free(css_raw);
+
+            const css_text = try decodeUtf8Replace(self.allocator, css_raw);
+            var css_text_owned = true;
+            defer if (css_text_owned) self.allocator.free(css_text);
+
+            self.appendDocumentStylesheetRules(
+                css_text,
+                frame.tab.accessibility.prefers_dark,
+                css_texts,
+                rules,
+            ) catch |err| {
+                std.log.warn("Failed to parse stylesheet {s}: {}", .{ href, err });
+                continue;
+            };
+            css_text_owned = false;
         }
     }
 
