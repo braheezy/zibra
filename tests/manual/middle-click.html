@@ -1,0 +1,24 @@
+<!--
+How to verify:
+  zig build run -- file://$PWD/tests/manual/middle-click.html
+
+Middle-click either link with a mouse. Zibra should open the resolved target in
+a new active tab. Middle-clicking the surrounding text must not open a tab or
+change focus. A normal left-click must continue navigating the current tab.
+-->
+<!doctype html>
+<html>
+  <head>
+    <title>Middle-click links</title>
+    <style>
+      body { font-size: 24px; }
+      p { margin-bottom: 24px; }
+    </style>
+  </head>
+  <body>
+    <h1>Middle-click link test</h1>
+    <p><a href="middle-click-target.html">Relative target</a></p>
+    <p><a href="https://browser.engineering/">Absolute target</a></p>
+    <p>This text is not a link.</p>
+  </body>
+</html>

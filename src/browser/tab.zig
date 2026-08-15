@@ -29,6 +29,11 @@ const FrameBoundEntry = struct {
     bounds: Bounds,
 };
 
+pub const ClickButton = enum {
+    primary,
+    middle,
+};
+
 /// Represents a composited visual effect update (e.g., opacity change during animation)
 pub const CompositedUpdate = struct {
     node: *anyopaque, // Pointer to the element that owns this effect
@@ -239,17 +244,17 @@ pub const Frame = struct {
         };
     }
 
-    pub fn click(self: *Frame, b: *Browser, x: i32, y: i32) !bool {
+    pub fn click(self: *Frame, b: *Browser, x: i32, y: i32, button: ClickButton) !bool {
         for (self.iframe_bounds.items) |entry| {
             const bounds = entry.bounds;
             if (x >= bounds.x and x < bounds.x + bounds.width and
                 y >= bounds.y and y < bounds.y + bounds.height)
             {
                 if (self.findFrameByElement(entry.node)) |child| {
-                    self.tab.focused_frame = child;
+                    if (button == .primary) self.tab.focused_frame = child;
                     const child_x = x - bounds.x;
                     const child_y = y - bounds.y + child.scroll;
-                    _ = try child.click(b, child_x, child_y);
+                    _ = try child.click(b, child_x, child_y, button);
                 }
                 return true;
             }
@@ -261,8 +266,10 @@ pub const Frame = struct {
                 y >= bounds.y and y < bounds.y + bounds.height)
             {
                 const link_node = entry.node;
-                const do_default = self.dispatchEvent("click", link_node);
-                if (!do_default) return true;
+                if (button == .primary) {
+                    const do_default = self.dispatchEvent("click", link_node);
+                    if (!do_default) return true;
+                }
 
                 switch (link_node.*) {
                     .element => |*link_element| {
@@ -271,6 +278,14 @@ pub const Frame = struct {
                                 std.log.info("Link click in window_id={d}: {s}", .{ self.window_id, href });
                                 if (self.current_url) |current_url_ptr| {
                                     var resolved_url = try current_url_ptr.*.resolveForNavigation(self.allocator, href);
+                                    if (button == .middle) {
+                                        b.queueNewTab(resolved_url) catch |err| {
+                                            resolved_url.free(self.allocator);
+                                            std.log.err("Failed to queue new tab for {s}: {any}", .{ href, err });
+                                        };
+                                        return true;
+                                    }
+
                                     const new_url_ptr = self.allocator.create(Url) catch |alloc_err| {
                                         std.log.err("Failed to allocate URL: {any}", .{alloc_err});
                                         resolved_url.free(self.allocator);
@@ -301,10 +316,12 @@ pub const Frame = struct {
                     },
                     else => {},
                 }
-                self.tab.focused_frame = self;
+                if (button == .primary) self.tab.focused_frame = self;
                 return true;
             }
         }
+        if (button == .middle) return false;
+
         var best_focus: ?struct {
             node: *Node,
             bounds: Bounds,
@@ -1301,26 +1318,28 @@ fn advanceAnimations(self: *Tab, node: *parser.Node) bool {
 }
 
 // Handle click on tab content
-pub fn click(self: *Tab, b: *Browser, x: i32, y: i32) !void {
+pub fn click(self: *Tab, b: *Browser, x: i32, y: i32, button: ClickButton) !void {
     const frame = self.root_frame orelse return;
     try self.render(b);
 
-    if (self.focused_frame) |focused| {
-        if (focused.focus) |focus_node| {
-            switch (focus_node.*) {
-                .element => |*e| {
-                    e.is_focused = false;
-                    parser.dirtyStyleForElement(e);
-                },
-                else => {},
+    if (button == .primary) {
+        if (self.focused_frame) |focused| {
+            if (focused.focus) |focus_node| {
+                switch (focus_node.*) {
+                    .element => |*e| {
+                        e.is_focused = false;
+                        parser.dirtyStyleForElement(e);
+                    },
+                    else => {},
+                }
+                focused.focus = null;
             }
-            focused.focus = null;
         }
+        self.focused_frame = frame;
     }
-    self.focused_frame = frame;
 
-    const handled = try frame.click(b, x, y);
-    if (!handled and self.focused_frame != null) {
+    const handled = try frame.click(b, x, y, button);
+    if (button == .primary and !handled and self.focused_frame != null) {
         self.setNeedsRender();
     }
 }

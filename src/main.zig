@@ -247,9 +247,10 @@ fn zibra(init: std.process.Init) !void {
     }
 
     if (url) |u| {
-        // Create a new tab and load the URL
-        try b.newTab(u);
+        // Transfer URL ownership before creating the tab; Browser.newTab
+        // consumes the URL even if tab construction or scheduling fails.
         url = null;
+        try b.newTab(u);
     } else {
         // Create a new tab with the default HTML
         const about_url = try Url.blank(allocator);

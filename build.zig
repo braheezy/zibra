@@ -118,6 +118,10 @@ pub fn build(b: *std.Build) !void {
         .root_module = test_module,
         .use_llvm = use_llvm,
     });
+    // Browser input tests exercise real frame activation paths, whose lazy
+    // code generation reaches the renderer and font modules.
+    sdk.link(io, unit_tests, .static, sdl.Library.SDL2);
+    sdk.link(io, unit_tests, .static, sdl.Library.SDL2_ttf);
     const unit_tests_run = b.addRunArtifact(unit_tests);
     test_step.dependOn(&unit_tests_run.step);
 

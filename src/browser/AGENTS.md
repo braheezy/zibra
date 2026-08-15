@@ -12,6 +12,11 @@ before changing `root.zig`, `tab.zig`, `render/`, or browser task scheduling.
 - `tab.zig` owns frames, document generations, task serialization, and helper
   quiescence. Queued or detached work must carry a stable document identity,
   not a borrowed frame pointer.
+- Tab workers must not create tabs or mutate browser chrome collections.
+  Cross-thread new-tab requests transfer an owning `Url` through
+  `Browser.pending_new_tabs`; the browser thread drains that queue.
+  `queueNewTab` takes ownership only on success, while `newTab` consumes its
+  URL on entry, including failure paths.
 - A frame's `css_texts` owns decoded linked stylesheets and copied `<style>`
   text in DOM order. Its author rules borrow those buffers; rebuild and retire
   the text and rules as one generation for root documents and iframes.

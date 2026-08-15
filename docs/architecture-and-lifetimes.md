@@ -114,6 +114,7 @@ but no lock or owner-thread rule covers the complete mutable graph.
 - the shared `Layout`, including its `FontManager`;
 - default user-agent CSS rules;
 - all `Tab` allocations;
+- owning URLs queued by tab workers for browser-thread tab creation;
 - the active browser-side display-list snapshot, composited layers, and tab draw
   list;
 - browser chrome, measurement/profiling state, and browser render flags.
@@ -376,7 +377,12 @@ The process main thread owns browser composition, raster, and draw phases. In
 interactive mode it also owns the SDL event loop, renderer, chrome/window
 events, and some direct reads or updates of active `Tab`/`Frame` state. In
 screenshot mode it runs a windowless quiescence loop and exports the software
-root surface directly.
+root surface directly. Page workers never mutate the tab collection: a
+middle-click resolves its link target on the serialized tab worker, transfers
+the owning URL into `Browser.pending_new_tabs` under `Browser.lock`, and the
+interactive main loop drains that queue before creating and activating tabs.
+`queueNewTab` transfers ownership only when append succeeds; `newTab` consumes
+the URL on entry so every creation and scheduling failure has one clear owner.
 
 Window resizing preserves that ownership boundary. The main thread allocates a
 complete replacement generation of the root/chrome/tab z2d surfaces and SDL

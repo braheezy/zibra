@@ -27,6 +27,7 @@ const js_module = @import("../script/js.zig");
 const tab_module = @import("tab.zig");
 const Tab = tab_module.Tab;
 const Frame = tab_module.Frame;
+const ClickButton = tab_module.ClickButton;
 const scroll_model = @import("scroll.zig");
 const Chrome = @import("chrome.zig");
 const task_module = @import("../runtime/task.zig");
@@ -618,6 +619,9 @@ pub const Browser = struct {
     default_style_sheet_rules: []CSSParser.CSSRule,
     // List of tabs
     tabs: std.ArrayList(*Tab),
+    // Owned link targets requested by tab workers. The browser thread drains
+    // this queue because it exclusively creates tabs and updates chrome.
+    pending_new_tabs: std.ArrayList(Url),
     // Index of the active tab
     active_tab_index: ?usize = null,
     // Browser chrome (UI)
@@ -779,6 +783,7 @@ pub const Browser = struct {
             .layout_engine = layout_engine,
             .default_style_sheet_rules = default_rules,
             .tabs = std.ArrayList(*Tab).empty,
+            .pending_new_tabs = std.ArrayList(Url).empty,
             .chrome = chrome,
             .measure = measure,
             .lock = .init(io),
@@ -940,7 +945,12 @@ pub const Browser = struct {
     }
 
     // Create a new tab and load a URL into it
+    /// Takes ownership of `url`, including on failure.
     pub fn newTab(self: *Browser, url: Url) !void {
+        var owned_url = url;
+        var owns_url = true;
+        defer if (owns_url) owned_url.free(self.allocator);
+
         const tab_height = @max(self.window_height - self.chrome.bottom, 0);
         const tab = try self.allocator.create(Tab);
         tab.* = Tab.init(self.allocator, self.window_width, tab_height, &self.measure);
@@ -959,7 +969,8 @@ pub const Browser = struct {
         self.setActiveTab(tab);
 
         const url_ptr = try self.allocator.create(Url);
-        url_ptr.* = url;
+        url_ptr.* = owned_url;
+        owns_url = false;
         var url_owned = true;
         defer if (url_owned) {
             url_ptr.*.free(self.allocator);
@@ -968,6 +979,31 @@ pub const Browser = struct {
 
         try self.scheduleLoad(tab, url_ptr, null);
         url_owned = false;
+    }
+
+    /// Transfer an owned URL from a tab worker to the browser thread.
+    /// Ownership moves into the queue only when this function succeeds.
+    pub fn queueNewTab(self: *Browser, url: Url) !void {
+        self.lock.lock();
+        defer self.lock.unlock();
+        if (self.shutting_down) return error.BrowserShuttingDown;
+        try self.pending_new_tabs.append(self.allocator, url);
+    }
+
+    fn openPendingTabs(self: *Browser) void {
+        while (true) {
+            self.lock.lock();
+            if (self.pending_new_tabs.items.len == 0) {
+                self.lock.unlock();
+                return;
+            }
+            const url = self.pending_new_tabs.orderedRemove(0);
+            self.lock.unlock();
+
+            self.newTab(url) catch |err| {
+                std.log.err("Failed to open queued tab: {any}", .{err});
+            };
+        }
     }
 
     const screenshot_timeout_ns: i64 = 30 * std.time.ns_per_s;
@@ -1028,6 +1064,8 @@ pub const Browser = struct {
         self.scheduleAnimationFrame();
 
         while (!quit) {
+            self.openPendingTabs();
+
             var handled_event = false;
             // Use waitEventTimeout to be responsive to system events while still
             // limiting frame rate. This prevents the macOS beach ball by waking
@@ -1138,8 +1176,10 @@ pub const Browser = struct {
                 if (delta != 0) self.handleScroll(delta);
             },
             .mouse_button_down => |button_event| {
-                if (button_event.button == .left) {
-                    try self.handleClick(button_event.x, button_event.y);
+                switch (button_event.button) {
+                    .left => try self.handleClick(button_event.x, button_event.y),
+                    .middle => self.handleMiddleClick(button_event.x, button_event.y),
+                    else => {},
                 }
             },
             .mouse_motion => |motion_event| {
@@ -1516,7 +1556,27 @@ pub const Browser = struct {
         const page_x = if (zoom == 1.0) screen_x else @as(i32, @intFromFloat(@as(f32, @floatFromInt(screen_x)) / zoom));
         const page_y = (if (zoom == 1.0) tab_y else @as(i32, @intFromFloat(@as(f32, @floatFromInt(tab_y)) / zoom))) + frame.scroll;
 
-        self.scheduleTabClickTask(tab, page_x, page_y);
+        self.scheduleTabClickTask(tab, page_x, page_y, .primary);
+    }
+
+    // Middle-click only activates links in page content. Chrome and non-link
+    // targets are intentionally left unchanged.
+    fn handleMiddleClick(self: *Browser, screen_x: i32, screen_y: i32) void {
+        self.lock.lock();
+        const tab = self.activeTab();
+        const chrome_bottom = self.chrome.bottom;
+        const zoom = self.activeZoom();
+        const frame = if (tab) |active_tab| active_tab.root_frame else null;
+        self.lock.unlock();
+
+        if (screen_y < chrome_bottom) return;
+        const active_tab = tab orelse return;
+        const root_frame = frame orelse return;
+        const tab_y = screen_y - chrome_bottom;
+        const page_x = if (zoom == 1.0) screen_x else @as(i32, @intFromFloat(@as(f32, @floatFromInt(screen_x)) / zoom));
+        const page_y = (if (zoom == 1.0) tab_y else @as(i32, @intFromFloat(@as(f32, @floatFromInt(tab_y)) / zoom))) + root_frame.scroll;
+
+        self.scheduleTabClickTask(active_tab, page_x, page_y, .middle);
     }
 
     fn handleHover(self: *Browser, screen_x: i32, screen_y: i32) !void {
@@ -1561,8 +1621,8 @@ pub const Browser = struct {
         }
     }
 
-    fn scheduleTabClickTask(self: *Browser, tab: *Tab, x: i32, y: i32) void {
-        const ctx = TabClickTaskContext.create(self.allocator, self, tab, x, y) catch |err| {
+    fn scheduleTabClickTask(self: *Browser, tab: *Tab, x: i32, y: i32, button: ClickButton) void {
+        const ctx = TabClickTaskContext.create(self.allocator, self, tab, x, y, button) catch |err| {
             std.log.err("Failed to allocate tab click task: {}", .{err});
             return;
         };
@@ -5016,6 +5076,9 @@ pub const Browser = struct {
         }
         self.tabs.deinit(self.allocator);
 
+        for (self.pending_new_tabs.items) |*url| url.free(self.allocator);
+        self.pending_new_tabs.deinit(self.allocator);
+
         if (self.active_tab_url) |url| {
             self.allocator.free(url);
         }
@@ -5212,6 +5275,7 @@ const TabClickTaskContext = struct {
     tab: *Tab,
     x: i32,
     y: i32,
+    button: ClickButton,
 
     fn create(
         allocator: std.mem.Allocator,
@@ -5219,6 +5283,7 @@ const TabClickTaskContext = struct {
         tab: *Tab,
         x: i32,
         y: i32,
+        button: ClickButton,
     ) !*TabClickTaskContext {
         const ctx = try allocator.create(TabClickTaskContext);
         ctx.* = .{
@@ -5227,6 +5292,7 @@ const TabClickTaskContext = struct {
             .tab = tab,
             .x = x,
             .y = y,
+            .button = button,
         };
         return ctx;
     }
@@ -5236,7 +5302,7 @@ const TabClickTaskContext = struct {
     }
 
     fn run(self: *TabClickTaskContext) !void {
-        try self.tab.click(self.browser, self.x, self.y);
+        try self.tab.click(self.browser, self.x, self.y, self.button);
     }
 
     fn toOpaque(self: *TabClickTaskContext) *anyopaque {

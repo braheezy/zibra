@@ -10,7 +10,8 @@ update to hide a regression.
 
 Current checks:
 
-- `zig build test` — unified Zig unit suite.
+- `zig build test` — unified Zig unit suite. The test artifact links SDL and
+  SDL_ttf so browser-input tests can exercise real frame activation paths.
 - `zig build test-dump-dom` — isolated HTML parse/DOM-dump output, including
   literal `about:blank`, malformed-navigation recovery, and unsupported-scheme
   recovery.
