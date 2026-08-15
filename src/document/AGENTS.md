@@ -28,6 +28,10 @@ or selector/rule lifetime.
   to `CSSParser.putDeclaration`. Expand in source order for both stylesheet and
   inline declarations, preserve borrowed slices or static defaults, and test
   shorthand/longhand precedence in both directions.
+- CSS declaration maps store borrowed values together with declaration-local
+  `!important` metadata. Preserve importance through shorthand expansion and
+  compare cascade priority per property: selector priority plus 10,000 for
+  important declarations, with later declarations winning exact ties.
 - Keep the computed-style property table and inherited-property defaults in
   sync. A computed `font-family` borrows either its declaration or inherited
   parent slice; rendering resolves the supported family/fallback list without

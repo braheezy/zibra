@@ -294,6 +294,12 @@ computed-style resolution. Expanded property names and defaults are static;
 other values borrow sub-slices of the stylesheet or inline-style buffer.
 Declaration order is preserved so shorthand and longhand overrides have normal
 last-write behavior without introducing a second owned value representation.
+Each expanded longhand also retains declaration-local `!important` metadata.
+The cascade compares each matching property independently using selector
+priority plus 10,000 for important declarations; exact ties retain source order.
+Inline declarations use a base specificity of 1,000, so an author-important
+declaration beats a normal inline value while an inline-important declaration
+normally wins among author declarations.
 Soft-hyphen wrapping temporarily transfers the post-break `LineItem` suffix
 out of the active line before flushing its prefix. Glyph entries only borrow
 font data, but embedded input, image, and iframe payloads retain single

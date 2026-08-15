@@ -1116,6 +1116,23 @@ pub fn style(allocator: std.mem.Allocator, node: *Node, rules: []const CSSParser
     try styleWithParent(allocator, node, rules, &default_parent, empty_ancestors);
 }
 
+fn applyCascadedDeclaration(
+    values: *std.StringHashMap([]const u8),
+    priorities: *std.StringHashMap(u32),
+    property: []const u8,
+    declaration: CSSParser.Declaration,
+    base_priority: u32,
+) !void {
+    const priority = declaration.priority(base_priority);
+    if (priorities.get(property)) |existing_priority| {
+        // Later declarations win ties; callers preserve stylesheet source
+        // order among equal-specificity rules.
+        if (priority < existing_priority) return;
+    }
+    try values.put(property, declaration.value);
+    try priorities.put(property, priority);
+}
+
 fn styleWithParent(allocator: std.mem.Allocator, node: *Node, rules: []const CSSParser.CSSRule, parent_style: *StyleMap, ancestor_chain: []const *Node) !void {
     switch (node.*) {
         .text => |*t| {
@@ -1161,6 +1178,8 @@ fn styleWithParent(allocator: std.mem.Allocator, node: *Node, rules: []const CSS
             if (needs_style) {
                 var new_style = std.StringHashMap([]const u8).init(allocator);
                 defer new_style.deinit();
+                var cascade_priorities = std.StringHashMap(u32).init(allocator);
+                defer cascade_priorities.deinit();
 
                 for (CSS_PROPERTIES) |prop| {
                     try new_style.put(prop.name, prop.default_value);
@@ -1183,12 +1202,19 @@ fn styleWithParent(allocator: std.mem.Allocator, node: *Node, rules: []const CSS
                     if (rule.selector.matches(node, ancestor_chain)) {
                         var it = rule.properties.iterator();
                         while (it.next()) |entry| {
-                            try new_style.put(entry.key_ptr.*, entry.value_ptr.*);
+                            try applyCascadedDeclaration(
+                                &new_style,
+                                &cascade_priorities,
+                                entry.key_ptr.*,
+                                entry.value_ptr.*,
+                                rule.cascadePriority(),
+                            );
                         }
                     }
                 }
 
-                // Third, apply inline styles from the style attribute (overrides everything)
+                // Third, apply style-attribute declarations with inline
+                // specificity. Author !important still beats normal inline.
                 if (e.attributes) |attrs| {
                     if (attrs.get("style")) |style_attr| {
                         var css_parser = try CSSParser.init(allocator, style_attr, false);
@@ -1199,7 +1225,13 @@ fn styleWithParent(allocator: std.mem.Allocator, node: *Node, rules: []const CSS
 
                         var it = parsed_styles.iterator();
                         while (it.next()) |entry| {
-                            try new_style.put(entry.key_ptr.*, entry.value_ptr.*);
+                            try applyCascadedDeclaration(
+                                &new_style,
+                                &cascade_priorities,
+                                entry.key_ptr.*,
+                                entry.value_ptr.*,
+                                CSSParser.INLINE_STYLE_PRIORITY,
+                            );
                         }
                     }
                 }

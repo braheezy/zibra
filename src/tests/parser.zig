@@ -804,6 +804,76 @@ test "descendant selectors are flat and match ordered ancestor chains" {
     );
 }
 
+test "important declarations retain values, priority, and shorthand metadata" {
+    const allocator = std.testing.allocator;
+    var css_parser = try CSSParser.init(
+        allocator,
+        "color: red !IMPORTANT; color: blue; background-color: white; " ++
+            "font: italic bold 125% monospace ! important; font-style: normal",
+        false,
+    );
+    defer css_parser.deinit(allocator);
+    var declarations = try css_parser.body(allocator);
+    defer declarations.deinit();
+
+    const color = declarations.get("color").?;
+    try std.testing.expectEqualStrings("red", color.value);
+    try std.testing.expect(color.important);
+    try std.testing.expectEqual(@as(u32, 10_007), color.priority(7));
+
+    const background = declarations.get("background-color").?;
+    try std.testing.expectEqualStrings("white", background.value);
+    try std.testing.expect(!background.important);
+    try std.testing.expectEqual(@as(u32, 7), background.priority(7));
+
+    try std.testing.expectEqualStrings("italic", declarations.get("font-style").?.value);
+    try std.testing.expectEqualStrings("bold", declarations.get("font-weight").?.value);
+    try std.testing.expectEqualStrings("125%", declarations.get("font-size").?.value);
+    try std.testing.expectEqualStrings("monospace", declarations.get("font-family").?.value);
+    try std.testing.expect(declarations.get("font-style").?.important);
+    try std.testing.expect(declarations.get("font-weight").?.important);
+    try std.testing.expect(declarations.get("font-size").?.important);
+    try std.testing.expect(declarations.get("font-family").?.important);
+}
+
+test "important declarations cascade per property" {
+    const allocator = std.testing.allocator;
+    const html =
+        "<p class=notice style=\"color: purple; background-color: orange !important\">" ++
+        "Important cascade</p>";
+    const css =
+        ".notice { color: red !important; font-style: normal !important; " ++
+        "font-weight: bold; background-color: blue !important; outline: red !important; }" ++
+        "p { color: black !important; font-style: italic !important; " ++
+        "font-weight: normal; background-color: white; }" ++
+        ".notice { outline: blue !important; }";
+
+    var html_parser = try HTMLParser.init(allocator, html);
+    html_parser.use_implicit_tags = false;
+    defer html_parser.deinit(allocator);
+    var root = try html_parser.parse();
+    defer root.deinit(allocator);
+
+    var css_parser = try CSSParser.init(allocator, css, false);
+    defer css_parser.deinit(allocator);
+    const rules = try css_parser.parse(allocator);
+    defer {
+        for (rules) |*rule| rule.deinit(allocator);
+        allocator.free(rules);
+    }
+
+    try document_parser.style(allocator, &root, rules);
+    const styles = root.element.style.?;
+    // Important class declarations beat later important tag declarations and
+    // normal inline styles. Important inline declarations retain inline
+    // specificity, while unrelated normal properties cascade normally.
+    try std.testing.expectEqualStrings("red", styles.getPtr("color").?.get().*);
+    try std.testing.expectEqualStrings("normal", styles.getPtr("font-style").?.get().*);
+    try std.testing.expectEqualStrings("bold", styles.getPtr("font-weight").?.get().*);
+    try std.testing.expectEqualStrings("orange", styles.getPtr("background-color").?.get().*);
+    try std.testing.expectEqualStrings("blue", styles.getPtr("outline").?.get().*);
+}
+
 test "font-family is inherited and code uses the user-agent monospace family" {
     const allocator = std.testing.allocator;
     const html =
@@ -871,10 +941,10 @@ test "font shorthand expands in declaration order" {
     defer properties.deinit();
 
     try std.testing.expect(properties.get("font") == null);
-    try std.testing.expectEqualStrings("normal", properties.get("font-style").?);
-    try std.testing.expectEqualStrings("bold", properties.get("font-weight").?);
-    try std.testing.expectEqualStrings("125%", properties.get("font-size").?);
-    try std.testing.expectEqualStrings("\"Courier New\", monospace", properties.get("font-family").?);
+    try std.testing.expectEqualStrings("normal", properties.get("font-style").?.value);
+    try std.testing.expectEqualStrings("bold", properties.get("font-weight").?.value);
+    try std.testing.expectEqualStrings("125%", properties.get("font-size").?.value);
+    try std.testing.expectEqualStrings("\"Courier New\", monospace", properties.get("font-family").?.value);
 
     var reset_parser = try CSSParser.init(
         allocator,
@@ -884,10 +954,10 @@ test "font shorthand expands in declaration order" {
     defer reset_parser.deinit(allocator);
     var reset_properties = try reset_parser.body(allocator);
     defer reset_properties.deinit();
-    try std.testing.expectEqualStrings("normal", reset_properties.get("font-style").?);
-    try std.testing.expectEqualStrings("normal", reset_properties.get("font-weight").?);
-    try std.testing.expectEqualStrings("18px", reset_properties.get("font-size").?);
-    try std.testing.expectEqualStrings("sans-serif", reset_properties.get("font-family").?);
+    try std.testing.expectEqualStrings("normal", reset_properties.get("font-style").?.value);
+    try std.testing.expectEqualStrings("normal", reset_properties.get("font-weight").?.value);
+    try std.testing.expectEqualStrings("18px", reset_properties.get("font-size").?.value);
+    try std.testing.expectEqualStrings("sans-serif", reset_properties.get("font-family").?.value);
 
     var invalid_parser = try CSSParser.init(
         allocator,
@@ -901,7 +971,7 @@ test "font shorthand expands in declaration order" {
     try std.testing.expect(invalid_properties.get("font-weight") == null);
     try std.testing.expect(invalid_properties.get("font-size") == null);
     try std.testing.expect(invalid_properties.get("font-family") == null);
-    try std.testing.expectEqualStrings("red", invalid_properties.get("color").?);
+    try std.testing.expectEqualStrings("red", invalid_properties.get("color").?.value);
 }
 
 test "font shorthand produces inherited computed longhands" {

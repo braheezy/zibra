@@ -18,6 +18,22 @@ const DescendantSelector = selector_mod.DescendantSelector;
 
 pub const CSSParser = @This();
 
+pub const IMPORTANT_PRIORITY: u32 = 10_000;
+pub const INLINE_STYLE_PRIORITY: u32 = 1_000;
+
+/// One parsed property value. The value borrows the stylesheet or inline-style
+/// buffer; `important` is declaration-local cascade metadata.
+pub const Declaration = struct {
+    value: []const u8,
+    important: bool = false,
+
+    pub fn priority(self: Declaration, base_priority: u32) u32 {
+        return base_priority + if (self.important) IMPORTANT_PRIORITY else 0;
+    }
+};
+
+pub const DeclarationMap = std.StringHashMap(Declaration);
+
 string: []const u8,
 pos: usize,
 prefers_dark: bool,
@@ -155,26 +171,51 @@ fn parseFontShorthand(declaration_value: []const u8) ?FontShorthand {
     return null;
 }
 
-/// Apply one declaration in source order. Shorthands expand here so inline
-/// attributes and stylesheet rules share identical precedence behavior.
-fn putDeclaration(
-    map: *std.StringHashMap([]const u8),
-    property: []const u8,
-    declaration_value: []const u8,
-) !void {
-    if (std.mem.eql(u8, property, "font")) {
-        const font = parseFontShorthand(declaration_value) orelse return;
-        try map.put("font-style", font.style);
-        try map.put("font-weight", font.weight);
-        try map.put("font-size", font.size);
-        try map.put("font-family", font.family);
-        return;
+fn parseDeclarationValue(raw_value: []const u8) ?Declaration {
+    const bang = std.mem.lastIndexOfScalar(u8, raw_value, '!') orelse {
+        return .{ .value = raw_value };
+    };
+    const suffix = std.mem.trim(u8, raw_value[bang + 1 ..], " \t\r\n");
+    if (!std.ascii.eqlIgnoreCase(suffix, "important")) {
+        return .{ .value = raw_value };
     }
-    try map.put(property, declaration_value);
+
+    const value_without_priority = std.mem.trimEnd(u8, raw_value[0..bang], " \t\r\n");
+    if (value_without_priority.len == 0) return null;
+    return .{ .value = value_without_priority, .important = true };
 }
 
-pub fn body(self: *CSSParser, allocator: std.mem.Allocator) !std.StringHashMap([]const u8) {
-    var map = std.StringHashMap([]const u8).init(allocator);
+fn putLonghand(map: *DeclarationMap, property: []const u8, declaration: Declaration) !void {
+    if (map.get(property)) |existing| {
+        // Within one declaration block, an earlier important longhand cannot
+        // be reset by a later normal longhand or shorthand expansion.
+        if (existing.important and !declaration.important) return;
+    }
+    try map.put(property, declaration);
+}
+
+/// Apply one declaration in source order. Shorthands expand here so inline
+/// attributes and stylesheet rules share identical precedence behavior and
+/// every generated longhand retains the shorthand's importance.
+fn putDeclaration(
+    map: *DeclarationMap,
+    property: []const u8,
+    raw_value: []const u8,
+) !void {
+    const declaration = parseDeclarationValue(raw_value) orelse return;
+    if (std.mem.eql(u8, property, "font")) {
+        const font = parseFontShorthand(declaration.value) orelse return;
+        try putLonghand(map, "font-style", .{ .value = font.style, .important = declaration.important });
+        try putLonghand(map, "font-weight", .{ .value = font.weight, .important = declaration.important });
+        try putLonghand(map, "font-size", .{ .value = font.size, .important = declaration.important });
+        try putLonghand(map, "font-family", .{ .value = font.family, .important = declaration.important });
+        return;
+    }
+    try putLonghand(map, property, declaration);
+}
+
+pub fn body(self: *CSSParser, allocator: std.mem.Allocator) !DeclarationMap {
+    var map = DeclarationMap.init(allocator);
     errdefer map.deinit();
     // Stop at closing brace
     while (self.pos < self.string.len and self.string[self.pos] != '}') {
@@ -348,15 +389,15 @@ fn appendSequenceSelector(
 /// CSS Rule - a selector and its associated property-value pairs
 pub const CSSRule = struct {
     selector: Selector,
-    properties: std.StringHashMap([]const u8),
+    properties: DeclarationMap,
     owned: bool = true,
 
     pub fn deinit(self: *CSSRule, allocator: std.mem.Allocator) void {
         // Free the selector's allocated memory (pass pointer since deinit expects *Selector)
         Selector.deinit(&self.selector, allocator);
 
-        // The map owns its table; property/value slices borrow the stylesheet
-        // or are static shorthand expansion strings.
+        // The map owns its table; declaration values borrow the stylesheet or
+        // are static shorthand expansion strings.
         self.properties.deinit();
     }
 

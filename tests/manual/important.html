@@ -1,0 +1,39 @@
+<!doctype html>
+<!--
+How to verify:
+  zig build run -- --dump-style tests/manual/important.html
+  zig build run -- tests/manual/important.html
+Expected: the paragraph has red, bold, upright text on an orange background.
+The important class color beats the normal inline purple and important tag
+black; important class font style beats important tag italics; normal class
+weight beats normal tag weight; and important inline orange beats important
+class blue. The outline is blue because a later equally important declaration
+wins without changing the other properties.
+-->
+<html>
+  <head>
+    <title>Important declaration regression</title>
+    <style>
+      body { background-color: white; color: black; font-size: 20px; }
+      .notice {
+        color: red !important;
+        font-style: normal !important;
+        font-weight: bold;
+        background-color: blue !important;
+        outline: red !important;
+      }
+      p {
+        color: black !important;
+        font-style: italic !important;
+        font-weight: normal;
+        background-color: white;
+      }
+      .notice { outline: blue !important; }
+    </style>
+  </head>
+  <body>
+    <p class="notice" style="color: purple; background-color: orange !important">
+      Important declarations cascade per property.
+    </p>
+  </body>
+</html>
