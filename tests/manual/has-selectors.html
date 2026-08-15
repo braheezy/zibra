@@ -1,0 +1,40 @@
+<!doctype html>
+<!--
+How to verify:
+  zig build run -- --dump-style tests/manual/has-selectors.html
+  zig build run -- tests/manual/has-selectors.html
+Expected: the first card has green text and a light gray background because it
+contains a span.badge at any depth. The second card remains blue on white because
+its badge is an em. The JavaScript status line reports PASS, confirming that
+querySelectorAll uses the same strict-descendant :has semantics.
+-->
+<html>
+  <head>
+    <title>:has selector regression</title>
+    <style>
+      body { background-color: white; color: black; font-size: 20px; }
+      .card { display: block; color: blue; background-color: white; }
+      main div.card:has(span.badge) {
+        color: green;
+        background-color: lightgray;
+      }
+      .has-status { color: green; }
+    </style>
+  </head>
+  <body>
+    <main>
+      <div class="card"><section><span class="badge">Matching card</span></section></div>
+      <div class="card"><section><em class="badge">Non-matching card</em></section></div>
+    </main>
+    <p class="has-status">PASS: JavaScript :has selectors</p>
+    <script>
+      var matches = document.querySelectorAll('main div.card:has(span.badge)').length;
+      var selfMatches = document.querySelectorAll('span.badge:has(span.badge)').length;
+      var hasSelectorsPass = matches === 1 && selfMatches === 0;
+      if (!hasSelectorsPass) {
+        document.querySelectorAll('.has-status')[0].innerHTML = 'FAIL: JavaScript :has selectors';
+      }
+      hasSelectorsPass ? 'PASS: JavaScript :has selectors' : 'FAIL: JavaScript :has selectors';
+    </script>
+  </body>
+</html>

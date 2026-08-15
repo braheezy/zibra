@@ -991,6 +991,36 @@ test "querySelectorAll matches ordered descendant selector chains" {
     try std.testing.expect(result.toBoolean());
 }
 
+test "querySelectorAll matches :has selectors through strict descendants" {
+    const allocator = std.testing.allocator;
+    const html =
+        "<main>" ++
+        "<div class=card><section><span class=badge>Matched</span></section></div>" ++
+        "<div class=card><section><em class=badge>Also matched</em></section></div>" ++
+        "</main>";
+
+    var html_parser = try parser.HTMLParser.init(allocator, html);
+    html_parser.use_implicit_tags = false;
+    defer html_parser.deinit(allocator);
+    var root = try html_parser.parse();
+    defer root.deinit(allocator);
+    parser.fixParentPointers(&root, null);
+
+    var environ = std.process.Environ.Map.init(allocator);
+    defer environ.deinit();
+    var js = try Js.init(allocator, std.testing.io, &environ);
+    defer js.deinit(allocator);
+    js.setNodes(0, &root);
+    defer js.setNodes(0, null);
+
+    const result = try js.evaluate(0,
+        \\document.querySelectorAll('main div.card:has(span.badge)').length === 1 &&
+        \\document.querySelectorAll('main div.card:has(.badge)').length === 2 &&
+        \\document.querySelectorAll('span.badge:has(.badge)').length === 0
+    );
+    try std.testing.expect(result.toBoolean());
+}
+
 test "native style_set updates element style attribute" {
     var environ = std.process.Environ.Map.init(std.testing.allocator);
     defer environ.deinit();
@@ -1403,6 +1433,13 @@ fn querySelectorAll(agent: *Agent, this_value: Value, arguments: kiesel.types.Ar
         return Value.from(&empty_array.object);
     }
 
+    var has_cache = CSSParser.HasMatchCache.init(js_instance.allocator);
+    defer has_cache.deinit();
+    selector.populateHasMatches(&has_cache, window.current_nodes.?) catch {
+        return agent.throwException(.internal_error, "Could not match selector", .{});
+    };
+    const match_context = CSSParser.MatchContext{ .has_cache = &has_cache };
+
     var node_list = std.ArrayList(*Node).empty;
     defer node_list.deinit(js_instance.allocator);
     try parser.treeToList(js_instance.allocator, window.current_nodes.?, &node_list);
@@ -1433,7 +1470,7 @@ fn querySelectorAll(agent: *Agent, this_value: Value, arguments: kiesel.types.Ar
         std.mem.reverse(*Node, ancestors.items);
 
         // Check if this node matches the selector
-        const matches = selector.matches(node, ancestors.items);
+        const matches = selector.matchesWithContext(node, ancestors.items, match_context);
         if (matches) {
             const handle = try js_instance.getHandle(window, node);
             try matching_handles.append(js_instance.allocator, handle);
@@ -1595,6 +1632,7 @@ fn setAttribute(agent: *Agent, this_value: Value, arguments: kiesel.types.Argume
             try e.owned_strings.?.append(js_instance.allocator, owned_name);
             try e.owned_strings.?.append(js_instance.allocator, owned_value);
             try e.attributes.?.put(owned_name, owned_value);
+            parser.dirtyStyleForElement(e);
 
             if ((std.mem.eql(u8, e.tag, "img") or std.mem.eql(u8, e.tag, "iframe")) and
                 (std.mem.eql(u8, attr_name, "width") or std.mem.eql(u8, attr_name, "height")))

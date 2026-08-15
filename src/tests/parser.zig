@@ -804,6 +804,78 @@ test "descendant selectors are flat and match ordered ancestor chains" {
     );
 }
 
+test ":has selectors match strict descendants, cascade, and recompute" {
+    const allocator = std.testing.allocator;
+    const html =
+        "<main>" ++
+        "<div class=card><section><span class=badge>Matched</span></section></div>" ++
+        "<div class=card><section><em class=badge>Wrong tag</em></section></div>" ++
+        "</main>";
+    const css =
+        "main div.card:HAS(span.badge) { color: green; background-color: lightgray; }" ++
+        "div.card { color: blue; }" ++
+        "span.badge:has(span.badge) { font-weight: bold; }";
+
+    var html_parser = try HTMLParser.init(allocator, html);
+    html_parser.use_implicit_tags = false;
+    defer html_parser.deinit(allocator);
+    var root = try html_parser.parse();
+    defer root.deinit(allocator);
+
+    var css_parser = try CSSParser.init(allocator, css, false);
+    defer css_parser.deinit(allocator);
+    const rules = try css_parser.parse(allocator);
+    defer {
+        for (rules) |*rule| rule.deinit(allocator);
+        allocator.free(rules);
+    }
+
+    try std.testing.expectEqual(@as(usize, 3), rules.len);
+    switch (rules[0].selector) {
+        .descendant => |descendant| {
+            try std.testing.expectEqual(@as(usize, 2), descendant.selectors.items.len);
+            try std.testing.expect(descendant.selectors.items[1] == .has);
+        },
+        else => return error.TestExpectedDescendantSelector,
+    }
+    // main (1) + div.card (11) + span.badge (11)
+    try std.testing.expectEqual(@as(u32, 23), rules[0].cascadePriority());
+
+    try document_parser.style(allocator, &root, rules);
+    const matching_card = &root.element.children.items[0].element;
+    const other_card = &root.element.children.items[1].element;
+    const badge = &matching_card.children.items[0].element.children.items[0];
+
+    try std.testing.expectEqualStrings("green", matching_card.style.?.getPtr("color").?.get().*);
+    try std.testing.expectEqualStrings("lightgray", matching_card.style.?.getPtr("background-color").?.get().*);
+    try std.testing.expectEqualStrings("blue", other_card.style.?.getPtr("color").?.get().*);
+    try std.testing.expectEqualStrings("transparent", other_card.style.?.getPtr("background-color").?.get().*);
+    // :has examines strict descendants; the selected node cannot satisfy its
+    // own relational argument.
+    try std.testing.expectEqualStrings("normal", badge.element.style.?.getPtr("font-weight").?.get().*);
+
+    // A descendant-only mutation must invalidate the ancestor's relational
+    // match even when the ancestor itself was not explicitly dirtied.
+    try badge.element.attributes.?.put("class", "removed");
+    document_parser.dirtyStyleForElement(&badge.element);
+    try document_parser.style(allocator, &root, rules);
+    try std.testing.expectEqualStrings("blue", matching_card.style.?.getPtr("color").?.get().*);
+    try std.testing.expectEqualStrings("transparent", matching_card.style.?.getPtr("background-color").?.get().*);
+
+    try badge.element.attributes.?.put("class", "badge");
+    document_parser.dirtyStyleForElement(&badge.element);
+    try document_parser.style(allocator, &root, rules);
+    try std.testing.expectEqualStrings("green", matching_card.style.?.getPtr("color").?.get().*);
+
+    var unclosed_parser = try CSSParser.init(allocator, "div:has(span", false);
+    defer unclosed_parser.deinit(allocator);
+    try std.testing.expectError(error.InvalidLiteral, unclosed_parser.selector(allocator));
+
+    var unsupported_chain_parser = try CSSParser.init(allocator, "div:has(section span)", false);
+    defer unsupported_chain_parser.deinit(allocator);
+    try std.testing.expectError(error.InvalidLiteral, unsupported_chain_parser.selector(allocator));
+}
+
 test "important declarations retain values, priority, and shorthand metadata" {
     const allocator = std.testing.allocator;
     var css_parser = try CSSParser.init(

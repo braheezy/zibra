@@ -12,17 +12,41 @@ pub const Selector = union(enum) {
     tag: TagSelector,
     class: ClassSelector,
     sequence: SelectorSequence,
+    has: HasSelector,
     descendant: DescendantSelector,
 
     /// Check if this selector matches the given node. `ancestor_chain` must be
     /// ordered from the root element to the node's immediate parent.
     pub fn matches(self: Selector, node: *Node, ancestor_chain: []const *Node) bool {
+        return self.matchesWithContext(node, ancestor_chain, .{});
+    }
+
+    pub fn matchesWithContext(
+        self: Selector,
+        node: *Node,
+        ancestor_chain: []const *Node,
+        context: MatchContext,
+    ) bool {
         return switch (self) {
             .tag => |t| t.matches(node),
             .class => |c| c.matches(node),
             .sequence => |s| s.matches(node),
-            .descendant => |d| d.matches(node, ancestor_chain),
+            .has => |h| h.matches(node, context),
+            .descendant => |d| d.matches(node, ancestor_chain, context),
         };
+    }
+
+    /// Populate all relational-selector matches needed by this selector.
+    pub fn populateHasMatches(
+        self: Selector,
+        cache: *HasMatchCache,
+        root: *Node,
+    ) std.mem.Allocator.Error!void {
+        switch (self) {
+            .has => |has| try has.populateMatches(cache, root),
+            .descendant => |descendant| try descendant.populateHasMatches(cache, root),
+            else => {},
+        }
     }
 
     /// Free allocated memory for this selector
@@ -31,6 +55,7 @@ pub const Selector = union(enum) {
             .tag => |*t| t.deinit(allocator),
             .class => |*c| c.deinit(allocator),
             .sequence => |*s| s.deinit(allocator),
+            .has => |*h| h.deinit(allocator),
             .descendant => |*d| d.deinit(allocator),
         }
     }
@@ -42,6 +67,7 @@ pub const Selector = union(enum) {
             .tag => |t| t.priority(),
             .class => |c| c.priority(),
             .sequence => |s| s.priority(),
+            .has => |h| h.priority(),
             .descendant => |d| d.priority(),
         };
     }
@@ -53,21 +79,35 @@ pub const SimpleSelector = union(enum) {
     tag: TagSelector,
     class: ClassSelector,
     sequence: SelectorSequence,
+    has: HasSelector,
 
     pub fn intoSelector(self: SimpleSelector) Selector {
         return switch (self) {
             .tag => |tag| .{ .tag = tag },
             .class => |class| .{ .class = class },
             .sequence => |sequence| .{ .sequence = sequence },
+            .has => |has| .{ .has = has },
         };
     }
 
-    fn matches(self: SimpleSelector, node: *Node) bool {
+    fn matches(self: SimpleSelector, node: *Node, context: MatchContext) bool {
         return switch (self) {
             .tag => |tag| tag.matches(node),
             .class => |class| class.matches(node),
             .sequence => |sequence| sequence.matches(node),
+            .has => |has| has.matches(node, context),
         };
+    }
+
+    fn populateHasMatches(
+        self: SimpleSelector,
+        cache: *HasMatchCache,
+        root: *Node,
+    ) std.mem.Allocator.Error!void {
+        switch (self) {
+            .has => |has| try has.populateMatches(cache, root),
+            else => {},
+        }
     }
 
     pub fn deinit(self: *SimpleSelector, allocator: std.mem.Allocator) void {
@@ -75,6 +115,7 @@ pub const SimpleSelector = union(enum) {
             .tag => |*tag| tag.deinit(allocator),
             .class => |*class| class.deinit(allocator),
             .sequence => |*sequence| sequence.deinit(allocator),
+            .has => |*has| has.deinit(allocator),
         }
     }
 
@@ -83,6 +124,7 @@ pub const SimpleSelector = union(enum) {
             .tag => |tag| tag.priority(),
             .class => |class| class.priority(),
             .sequence => |sequence| sequence.priority(),
+            .has => |has| has.priority(),
         };
     }
 };
@@ -216,6 +258,145 @@ pub const SelectorSequence = struct {
     }
 };
 
+pub const MatchContext = struct {
+    has_cache: ?*const HasMatchCache = null,
+};
+
+const HasMatchKey = struct {
+    selector: *const SimpleSelector,
+    node: *const Node,
+};
+
+/// Ephemeral matches for relational selectors. A post-order pass records each
+/// ancestor whose strict subtree contains the requested selector, allowing
+/// subsequent `:has` checks to use an average-O(1) hash lookup.
+pub const HasMatchCache = struct {
+    matches: std.AutoHashMap(HasMatchKey, void),
+    prepared: std.AutoHashMap(*const SimpleSelector, void),
+
+    pub fn init(allocator: std.mem.Allocator) HasMatchCache {
+        return .{
+            .matches = std.AutoHashMap(HasMatchKey, void).init(allocator),
+            .prepared = std.AutoHashMap(*const SimpleSelector, void).init(allocator),
+        };
+    }
+
+    pub fn deinit(self: *HasMatchCache) void {
+        self.matches.deinit();
+        self.prepared.deinit();
+    }
+
+    fn isPrepared(self: *const HasMatchCache, selector: *const SimpleSelector) bool {
+        return self.prepared.contains(selector);
+    }
+
+    fn contains(self: *const HasMatchCache, selector: *const SimpleSelector, node: *const Node) bool {
+        return self.matches.contains(.{ .selector = selector, .node = node });
+    }
+
+    fn populate(
+        self: *HasMatchCache,
+        root: *Node,
+        has: HasSelector,
+    ) std.mem.Allocator.Error!void {
+        if (self.isPrepared(has.descendant)) return;
+        _ = try self.visit(root, has);
+        try self.prepared.put(has.descendant, {});
+    }
+
+    /// Return whether `node` or any of its descendants matches the relational
+    /// selector's descendant component. Only child results qualify `node`
+    /// itself, preserving the strict-descendant semantics of `:has`.
+    fn visit(
+        self: *HasMatchCache,
+        node: *Node,
+        has: HasSelector,
+    ) std.mem.Allocator.Error!bool {
+        const context = MatchContext{ .has_cache = self };
+        var child_contains_match = false;
+        switch (node.*) {
+            .text => {},
+            .element => |*element| {
+                for (element.children.items) |*child| {
+                    if (try self.visit(child, has)) child_contains_match = true;
+                }
+            },
+        }
+
+        if (child_contains_match and has.ancestor.matches(node, context)) {
+            try self.matches.put(.{ .selector = has.descendant, .node = node }, {});
+        }
+        return child_contains_match or has.descendant.matches(node, context);
+    }
+};
+
+/// An ancestor selector constrained by the presence of a matching strict
+/// descendant, such as `div.card:has(span.badge)`.
+pub const HasSelector = struct {
+    ancestor: *SimpleSelector,
+    descendant: *SimpleSelector,
+
+    pub fn init(
+        allocator: std.mem.Allocator,
+        ancestor: SimpleSelector,
+        descendant: SimpleSelector,
+    ) !HasSelector {
+        const ancestor_ptr = try allocator.create(SimpleSelector);
+        errdefer allocator.destroy(ancestor_ptr);
+        const descendant_ptr = try allocator.create(SimpleSelector);
+
+        ancestor_ptr.* = ancestor;
+        descendant_ptr.* = descendant;
+        return .{ .ancestor = ancestor_ptr, .descendant = descendant_ptr };
+    }
+
+    fn deinit(self: *HasSelector, allocator: std.mem.Allocator) void {
+        self.ancestor.deinit(allocator);
+        self.descendant.deinit(allocator);
+        allocator.destroy(self.ancestor);
+        allocator.destroy(self.descendant);
+    }
+
+    fn priority(self: HasSelector) u32 {
+        return self.ancestor.priority() + self.descendant.priority();
+    }
+
+    fn matches(self: HasSelector, node: *Node, context: MatchContext) bool {
+        if (!self.ancestor.matches(node, context)) return false;
+        if (context.has_cache) |cache| {
+            if (cache.isPrepared(self.descendant)) {
+                return cache.contains(self.descendant, node);
+            }
+        }
+        return self.hasMatchingDescendant(node, context);
+    }
+
+    fn hasMatchingDescendant(self: HasSelector, node: *Node, context: MatchContext) bool {
+        const element = switch (node.*) {
+            .text => return false,
+            .element => |*value| value,
+        };
+        for (element.children.items) |*child| {
+            if (self.descendant.matches(child, context) or
+                self.hasMatchingDescendant(child, context))
+            {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    fn populateMatches(
+        self: HasSelector,
+        cache: *HasMatchCache,
+        root: *Node,
+    ) std.mem.Allocator.Error!void {
+        try self.ancestor.populateHasMatches(cache, root);
+        try self.descendant.populateHasMatches(cache, root);
+        try cache.populate(root, self);
+    }
+};
+
 /// A whitespace-separated chain of simple selectors. For example,
 /// `article div p` matches a `p` with a `div` ancestor that in turn has an
 /// `article` ancestor. The flat representation permits a single ancestor walk.
@@ -244,20 +425,35 @@ pub const DescendantSelector = struct {
         return total;
     }
 
+    fn populateHasMatches(
+        self: DescendantSelector,
+        cache: *HasMatchCache,
+        root: *Node,
+    ) std.mem.Allocator.Error!void {
+        for (self.selectors.items) |selector| {
+            try selector.populateHasMatches(cache, root);
+        }
+    }
+
     /// Match the rightmost selector against `node`, then walk both the
     /// selector chain and the root-to-parent ancestor chain backward. Each
     /// selector and ancestor is advanced at most once, making this O(n + d).
-    fn matches(self: DescendantSelector, node: *Node, ancestor_chain: []const *Node) bool {
+    fn matches(
+        self: DescendantSelector,
+        node: *Node,
+        ancestor_chain: []const *Node,
+        context: MatchContext,
+    ) bool {
         const selectors = self.selectors.items;
         if (selectors.len < 2) return false;
 
         var selector_index = selectors.len - 1;
-        if (!selectors[selector_index].matches(node)) return false;
+        if (!selectors[selector_index].matches(node, context)) return false;
 
         var ancestor_index = ancestor_chain.len;
         while (selector_index > 0 and ancestor_index > 0) {
             ancestor_index -= 1;
-            if (selectors[selector_index - 1].matches(ancestor_chain[ancestor_index])) {
+            if (selectors[selector_index - 1].matches(ancestor_chain[ancestor_index], context)) {
                 selector_index -= 1;
             }
         }

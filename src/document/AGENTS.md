@@ -21,6 +21,12 @@ or selector/rule lifetime.
 - Descendant selectors own a flat, source-ordered list of simple selectors.
   Matching callers must pass ancestors from the document root through the
   immediate parent so matching remains one O(n + d) backward walk.
+- `:has(...)` owns its anchor and strict-descendant selector components. Style
+  and script queries must prepare an ephemeral post-order `HasMatchCache` before
+  matching: preprocessing is O(HN), then each fixed relational selector is an
+  average-O(1) lookup per element. Because descendant changes affect ancestors,
+  selector-relevant mutation hooks must dirty the changed element and its
+  ancestor chain before the next style pass.
 - `<style>` element text is copied into the same owned stylesheet generation as
   decoded external CSS. Keep inline and linked sheets in DOM order, and make
   isolated inspection and interactive frame loading follow the same cascade.

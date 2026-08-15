@@ -198,6 +198,18 @@ parent, then walks that slice and the selector list backward once. Both style
 traversal and JavaScript selector queries must preserve this order so matching
 remains O(n + d).
 
+Relational selectors such as `div.card:has(span.badge)` own separate anchor and
+strict-descendant simple selectors. Before style matching or a JavaScript
+selector query, a post-order traversal propagates each descendant match upward
+and stores qualifying ancestors in an ephemeral `HasMatchCache`. For H distinct
+relational selectors and N DOM nodes, preprocessing costs O(HN) time and up to
+O(HN) cache space; subsequent matching costs average O(H) per element, or
+average O(1) per element for each fixed selector. Style passes with relational
+rules rebuild the cache, while selector-relevant mutation hooks conservatively
+dirty the changed element and its ancestor chain in O(depth) time. The cache
+borrows DOM and selector pointers only for the synchronous traversal and must
+not survive either tree or rule mutation.
+
 Style and layout values use `ProtectedField`. A dependency registers a raw
 target pointer and callback in the dependency's `invalidations` map.
 `ProtectedField.deinit` only destroys the field's own map; it does not remove
@@ -209,6 +221,9 @@ Inherited style fields establish these edges between parent and child DOM
 styles in [`src/document/parser.zig`](../src/document/parser.zig). Layout fields
 establish similar edges between document, parent, previous sibling, and child
 layout objects in [`src/browser/render/layout.zig`](../src/browser/render/layout.zig).
+The synthetic default-parent style used at the root is ephemeral to one style
+pass: root fields read its defaults directly and never register dependency edges
+to it.
 The unresolved contract is how an invalidation subscriber unregisters before
 its address becomes invalid.
 

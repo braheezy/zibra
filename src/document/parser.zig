@@ -1063,12 +1063,26 @@ fn styleNeedsUpdate(map: *StyleMap) bool {
 }
 
 pub fn dirtyStyleForElement(e: *Element) void {
-    if (e.style) |*style_map| {
-        var it = style_map.iterator();
-        while (it.next()) |entry| {
-            entry.value_ptr.mark();
+    if (e.style) |*style_map| dirtyStyleMap(style_map);
+
+    // Relational selectors make an element's attributes/style relevant to
+    // every ancestor. Conservatively dirty that chain; this remains O(depth)
+    // and avoids rescanning or restyling unrelated subtrees.
+    var ancestor = e.parent;
+    while (ancestor) |node| {
+        switch (node.*) {
+            .text => break,
+            .element => |*element| {
+                if (element.style) |*style_map| dirtyStyleMap(style_map);
+                ancestor = element.parent;
+            },
         }
     }
+}
+
+fn dirtyStyleMap(style_map: *StyleMap) void {
+    var it = style_map.iterator();
+    while (it.next()) |entry| entry.value_ptr.mark();
 }
 
 fn cssDefaultFor(property: []const u8) []const u8 {
@@ -1110,10 +1124,22 @@ fn getDefaultParentStyle(allocator: std.mem.Allocator) !StyleMap {
 // Parse inline styles from the style attribute and apply CSS rules to the node tree
 // This function recurses through the HTML tree to process all elements
 pub fn style(allocator: std.mem.Allocator, node: *Node, rules: []const CSSParser.CSSRule) !void {
+    var has_cache = CSSParser.HasMatchCache.init(allocator);
+    defer has_cache.deinit();
+    for (rules) |rule| try rule.selector.populateHasMatches(&has_cache, node);
+
     var default_parent = try getDefaultParentStyle(allocator);
     defer deinitStyleMap(&default_parent);
     const empty_ancestors = &[_]*Node{};
-    try styleWithParent(allocator, node, rules, &default_parent, empty_ancestors);
+    try styleWithParent(
+        allocator,
+        node,
+        rules,
+        &default_parent,
+        empty_ancestors,
+        .{ .has_cache = &has_cache },
+        true,
+    );
 }
 
 fn applyCascadedDeclaration(
@@ -1133,11 +1159,36 @@ fn applyCascadedDeclaration(
     try priorities.put(property, priority);
 }
 
-fn styleWithParent(allocator: std.mem.Allocator, node: *Node, rules: []const CSSParser.CSSRule, parent_style: *StyleMap, ancestor_chain: []const *Node) !void {
+fn inheritedValue(
+    parent_field: *ProtectedField([]const u8),
+    child_field: *ProtectedField([]const u8),
+    parent_is_ephemeral_default: bool,
+) []const u8 {
+    // The synthetic root parent is destroyed at the end of every style pass,
+    // so root fields may read it but must never register a dependency on it.
+    return if (parent_is_ephemeral_default)
+        parent_field.get().*
+    else
+        parent_field.read(child_field).*;
+}
+
+fn styleWithParent(
+    allocator: std.mem.Allocator,
+    node: *Node,
+    rules: []const CSSParser.CSSRule,
+    parent_style: *StyleMap,
+    ancestor_chain: []const *Node,
+    match_context: CSSParser.MatchContext,
+    parent_is_ephemeral_default: bool,
+) !void {
     switch (node.*) {
         .text => |*t| {
             if (t.style == null) {
-                t.style = try initStyleMap(allocator, "TextNode", parent_style);
+                t.style = try initStyleMap(
+                    allocator,
+                    "TextNode",
+                    if (parent_is_ephemeral_default) null else parent_style,
+                );
             }
             var style_map = &t.style.?;
             if (!styleNeedsUpdate(style_map)) return;
@@ -1152,7 +1203,11 @@ fn styleWithParent(allocator: std.mem.Allocator, node: *Node, rules: []const CSS
             for (INHERITED_PROPERTIES) |prop| {
                 if (style_map.getPtr(prop.name)) |child_field| {
                     if (parent_style.getPtr(prop.name)) |parent_field| {
-                        const parent_value = parent_field.read(child_field).*;
+                        const parent_value = inheritedValue(
+                            parent_field,
+                            child_field,
+                            parent_is_ephemeral_default,
+                        );
                         try new_style.put(prop.name, parent_value);
                     } else {
                         try new_style.put(prop.name, prop.default_value);
@@ -1170,7 +1225,11 @@ fn styleWithParent(allocator: std.mem.Allocator, node: *Node, rules: []const CSS
         },
         .element => |*e| {
             if (e.style == null) {
-                e.style = try initStyleMap(allocator, "Element", parent_style);
+                e.style = try initStyleMap(
+                    allocator,
+                    "Element",
+                    if (parent_is_ephemeral_default) null else parent_style,
+                );
             }
             var style_map = &e.style.?;
             const needs_style = styleNeedsUpdate(style_map);
@@ -1189,7 +1248,11 @@ fn styleWithParent(allocator: std.mem.Allocator, node: *Node, rules: []const CSS
                 for (INHERITED_PROPERTIES) |prop| {
                     if (style_map.getPtr(prop.name)) |child_field| {
                         if (parent_style.getPtr(prop.name)) |parent_field| {
-                            const parent_value = parent_field.read(child_field).*;
+                            const parent_value = inheritedValue(
+                                parent_field,
+                                child_field,
+                                parent_is_ephemeral_default,
+                            );
                             try new_style.put(prop.name, parent_value);
                         } else {
                             try new_style.put(prop.name, prop.default_value);
@@ -1199,7 +1262,7 @@ fn styleWithParent(allocator: std.mem.Allocator, node: *Node, rules: []const CSS
 
                 // Second, apply styles from CSS rules (can override inherited values)
                 for (rules) |rule| {
-                    if (rule.selector.matches(node, ancestor_chain)) {
+                    if (rule.selector.matchesWithContext(node, ancestor_chain, match_context)) {
                         var it = rule.properties.iterator();
                         while (it.next()) |entry| {
                             try applyCascadedDeclaration(
@@ -1242,7 +1305,7 @@ fn styleWithParent(allocator: std.mem.Allocator, node: *Node, rules: []const CSS
                 if (new_style.get("font-family")) |font_family| {
                     const child_field = style_map.getPtr("font-family").?;
                     const inherited_family = if (parent_style.getPtr("font-family")) |parent_field|
-                        parent_field.read(child_field).*
+                        inheritedValue(parent_field, child_field, parent_is_ephemeral_default)
                     else
                         "sans-serif";
                     try new_style.put(
@@ -1256,7 +1319,7 @@ fn styleWithParent(allocator: std.mem.Allocator, node: *Node, rules: []const CSS
                     if (std.mem.endsWith(u8, font_size, "%")) {
                         const child_field = style_map.getPtr("font-size").?;
                         const parent_font_size = if (parent_style.getPtr("font-size")) |parent_field|
-                            parent_field.read(child_field).*
+                            inheritedValue(parent_field, child_field, parent_is_ephemeral_default)
                         else
                             "16px";
 
@@ -1302,7 +1365,15 @@ fn styleWithParent(allocator: std.mem.Allocator, node: *Node, rules: []const CSS
             new_ancestors[ancestor_chain.len] = node;
 
             for (e.children.items) |*child| {
-                try styleWithParent(allocator, child, rules, style_map, new_ancestors);
+                try styleWithParent(
+                    allocator,
+                    child,
+                    rules,
+                    style_map,
+                    new_ancestors,
+                    match_context,
+                    false,
+                );
             }
         },
     }

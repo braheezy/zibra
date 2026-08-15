@@ -14,5 +14,7 @@ or Kiesel allocation/locking.
   pointer.
 - Preserve Kiesel's GC-root and `JsLock` assumptions. Do not add unlocked
   cross-thread host mutation without documenting and enforcing its owner.
+- Attribute and inline-style mutation can affect `:has` matches. Dirty the
+  changed element's style and its ancestor chain before requesting a render.
 - Exercise interactive behavior with a deterministic `tests/manual/` page that
   reports success in-page.

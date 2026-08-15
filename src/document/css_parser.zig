@@ -3,8 +3,8 @@
 //! Property names and declared values in returned rules normally borrow the
 //! input stylesheet; shorthand-generated property names and defaults are
 //! static slices. Selectors own their normalized names, selector-sequence lists,
-//! and descendant-chain lists. The stylesheet therefore must outlive its rules,
-//! and each owned rule must be deinitialized.
+//! descendant-chain lists, and relational-selector components. The stylesheet
+//! therefore must outlive its rules, and each owned rule must be deinitialized.
 
 const std = @import("std");
 const selector_mod = @import("selector.zig");
@@ -14,12 +14,15 @@ const TagSelector = selector_mod.TagSelector;
 const ClassSelector = selector_mod.ClassSelector;
 const SequenceSelector = selector_mod.SequenceSelector;
 const SelectorSequence = selector_mod.SelectorSequence;
+const HasSelector = selector_mod.HasSelector;
 const DescendantSelector = selector_mod.DescendantSelector;
 
 pub const CSSParser = @This();
 
 pub const IMPORTANT_PRIORITY: u32 = 10_000;
 pub const INLINE_STYLE_PRIORITY: u32 = 1_000;
+pub const MatchContext = selector_mod.MatchContext;
+pub const HasMatchCache = selector_mod.HasMatchCache;
 
 /// One parsed property value. The value borrows the stylesheet or inline-style
 /// buffer; `important` is declaration-local cascade metadata.
@@ -291,8 +294,9 @@ fn prefersColorSchemeMatch(self: *CSSParser, allocator: std.mem.Allocator, prelu
     return null;
 }
 
-/// Parse a tag/class selector or a whitespace-separated descendant selector.
-/// ID, attribute, and combinator selectors are not yet supported.
+/// Parse a tag/class selector, `:has(...)` relational selector, or a
+/// whitespace-separated descendant selector. ID, attribute, and other
+/// combinator selectors are not yet supported.
 pub fn selector(self: *CSSParser, allocator: std.mem.Allocator) !Selector {
     var selectors = std.ArrayList(SimpleSelector).empty;
     errdefer {
@@ -300,22 +304,24 @@ pub fn selector(self: *CSSParser, allocator: std.mem.Allocator) !Selector {
         selectors.deinit(allocator);
     }
 
-    var first = try self.simpleSelector(allocator);
+    var first = try self.relationalSelector(allocator);
     selectors.append(allocator, first) catch |err| {
         first.deinit(allocator);
         return err;
     };
-    self.whitespace();
 
-    // Continue parsing descendant selectors until we hit '{'
-    while (self.pos < self.string.len and self.string[self.pos] != '{') {
-        var descendant = try self.simpleSelector(allocator);
+    // Descendant combinators require whitespace between selector components.
+    while (self.pos < self.string.len) {
+        const before_whitespace = self.pos;
+        self.whitespace();
+        if (self.pos >= self.string.len or self.string[self.pos] == '{') break;
+        if (self.pos == before_whitespace) return error.InvalidSelector;
+
+        var descendant = try self.relationalSelector(allocator);
         selectors.append(allocator, descendant) catch |err| {
             descendant.deinit(allocator);
             return err;
         };
-
-        self.whitespace();
     }
 
     if (selectors.items.len == 1) {
@@ -325,6 +331,29 @@ pub fn selector(self: *CSSParser, allocator: std.mem.Allocator) !Selector {
     }
 
     return .{ .descendant = DescendantSelector.take(&selectors) };
+}
+
+/// Parse a selector anchored to the current element and optionally constrained
+/// by a matching strict descendant. Zibra's current selector subset accepts a
+/// tag/class sequence on each side of `:has`.
+fn relationalSelector(self: *CSSParser, allocator: std.mem.Allocator) !SimpleSelector {
+    var ancestor = try self.simpleSelector(allocator);
+    errdefer ancestor.deinit(allocator);
+
+    if (self.pos >= self.string.len or self.string[self.pos] != ':') return ancestor;
+
+    try self.literal(':');
+    const pseudo_class = try self.word();
+    if (!std.ascii.eqlIgnoreCase(pseudo_class, "has")) return error.InvalidSelector;
+    try self.literal('(');
+    self.whitespace();
+
+    var descendant = try self.simpleSelector(allocator);
+    errdefer descendant.deinit(allocator);
+    self.whitespace();
+    try self.literal(')');
+
+    return .{ .has = try HasSelector.init(allocator, ancestor, descendant) };
 }
 
 fn simpleSelector(self: *CSSParser, allocator: std.mem.Allocator) !SimpleSelector {
