@@ -1,0 +1,27 @@
+<!doctype html>
+<!--
+How to verify:
+  zig build run -- --dump-style tests/manual/selector-sequences.html
+  zig build run -- tests/manual/selector-sequences.html
+Expected: both spans are green. Only the first span is bold and has a gray
+background because it has both announce and urgent classes. The div is blue,
+normal-weight, and gray: the class-only sequence matches it, but the span-tag
+sequences do not.
+-->
+<html>
+  <head>
+    <title>Selector sequence regression</title>
+    <style>
+      body { background-color: white; color: black; font-size: 20px; }
+      .announce { color: blue; }
+      span.announce { color: green; }
+      span.announce.urgent { font-weight: bold; }
+      .announce.urgent { background-color: lightgray; }
+    </style>
+  </head>
+  <body>
+    <p><span class="announce urgent">Both classes.</span></p>
+    <p><span class="announce">Only announce.</span></p>
+    <div class="announce urgent">Both classes, wrong tag.</div>
+  </body>
+</html>

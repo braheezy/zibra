@@ -966,7 +966,7 @@ test "querySelectorAll matches ordered descendant selector chains" {
     const allocator = std.testing.allocator;
     const html =
         "<main><aside><section><article>" ++
-        "<span class=target>Matched</span>" ++
+        "<span class=\"target urgent\">Matched</span>" ++
         "</article></section></aside></main>";
 
     var html_parser = try parser.HTMLParser.init(allocator, html);
@@ -984,8 +984,9 @@ test "querySelectorAll matches ordered descendant selector chains" {
     defer js.setNodes(0, null);
 
     const result = try js.evaluate(0,
-        \\document.querySelectorAll('main section article .target').length === 1 &&
-        \\document.querySelectorAll('section main article .target').length === 0
+        \\document.querySelectorAll('main section article span.target.urgent').length === 1 &&
+        \\document.querySelectorAll('section main article span.target.urgent').length === 0 &&
+        \\document.querySelectorAll('main section article span.target.missing').length === 0
     );
     try std.testing.expect(result.toBoolean());
 }

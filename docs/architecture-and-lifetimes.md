@@ -186,6 +186,11 @@ also use static keys and defaults. See `CSSParser.word`, `CSSParser.value`,
 borrow the browser's default rules and own document rules, distinguished by
 `CSSRule.owned`.
 
+Concatenated tag/class selectors, such as `span.announce.urgent`, own a flat
+`SelectorSequence` of atomic selectors. All members match against the same DOM
+node, and their specificity priorities are summed. A single tag or class keeps
+its direct representation without allocating a sequence list.
+
 Whitespace-separated descendant selectors own a flat, source-ordered list of
 simple selectors instead of a recursive selector tree. Matching receives a
 borrowed ancestor slice ordered from the document root through the immediate

@@ -10,7 +10,8 @@ const Node = parser.Node;
 /// CSS selector types.
 pub const Selector = union(enum) {
     tag: TagSelector,
-    tag_class: TagClassSelector,
+    class: ClassSelector,
+    sequence: SelectorSequence,
     descendant: DescendantSelector,
 
     /// Check if this selector matches the given node. `ancestor_chain` must be
@@ -18,7 +19,8 @@ pub const Selector = union(enum) {
     pub fn matches(self: Selector, node: *Node, ancestor_chain: []const *Node) bool {
         return switch (self) {
             .tag => |t| t.matches(node),
-            .tag_class => |t| t.matches(node),
+            .class => |c| c.matches(node),
+            .sequence => |s| s.matches(node),
             .descendant => |d| d.matches(node, ancestor_chain),
         };
     }
@@ -27,7 +29,8 @@ pub const Selector = union(enum) {
     pub fn deinit(self: *Selector, allocator: std.mem.Allocator) void {
         switch (self.*) {
             .tag => |*t| t.deinit(allocator),
-            .tag_class => |*t| t.deinit(allocator),
+            .class => |*c| c.deinit(allocator),
+            .sequence => |*s| s.deinit(allocator),
             .descendant => |*d| d.deinit(allocator),
         }
     }
@@ -37,7 +40,8 @@ pub const Selector = union(enum) {
     pub fn priority(self: Selector) u32 {
         return switch (self) {
             .tag => |t| t.priority(),
-            .tag_class => |t| t.priority(),
+            .class => |c| c.priority(),
+            .sequence => |s| s.priority(),
             .descendant => |d| d.priority(),
         };
     }
@@ -47,55 +51,55 @@ pub const Selector = union(enum) {
 /// selector chain is flat rather than a recursively nested binary tree.
 pub const SimpleSelector = union(enum) {
     tag: TagSelector,
-    tag_class: TagClassSelector,
+    class: ClassSelector,
+    sequence: SelectorSequence,
 
     pub fn intoSelector(self: SimpleSelector) Selector {
         return switch (self) {
             .tag => |tag| .{ .tag = tag },
-            .tag_class => |tag_class| .{ .tag_class = tag_class },
+            .class => |class| .{ .class = class },
+            .sequence => |sequence| .{ .sequence = sequence },
         };
     }
 
     fn matches(self: SimpleSelector, node: *Node) bool {
         return switch (self) {
             .tag => |tag| tag.matches(node),
-            .tag_class => |tag_class| tag_class.matches(node),
+            .class => |class| class.matches(node),
+            .sequence => |sequence| sequence.matches(node),
         };
     }
 
     pub fn deinit(self: *SimpleSelector, allocator: std.mem.Allocator) void {
         switch (self.*) {
-            .tag => |tag| tag.deinit(allocator),
-            .tag_class => |tag_class| tag_class.deinit(allocator),
+            .tag => |*tag| tag.deinit(allocator),
+            .class => |*class| class.deinit(allocator),
+            .sequence => |*sequence| sequence.deinit(allocator),
         }
     }
 
     fn priority(self: SimpleSelector) u32 {
         return switch (self) {
             .tag => |tag| tag.priority(),
-            .tag_class => |tag_class| tag_class.priority(),
+            .class => |class| class.priority(),
+            .sequence => |sequence| sequence.priority(),
         };
     }
 };
 
-/// A class selector, optionally constrained to an element tag (for example,
-/// `.links` or `nav.links`).
-pub const TagClassSelector = struct {
-    tag: ?[]const u8,
+/// A class selector such as `.links`.
+pub const ClassSelector = struct {
     class: []const u8,
 
-    pub fn init(tag: ?[]const u8, class: []const u8) TagClassSelector {
-        return .{ .tag = tag, .class = class };
+    pub fn init(class: []const u8) ClassSelector {
+        return .{ .class = class };
     }
 
-    fn matches(self: TagClassSelector, node: *Node) bool {
+    fn matches(self: ClassSelector, node: *Node) bool {
         const element = switch (node.*) {
             .element => |*value| value,
             .text => return false,
         };
-        if (self.tag) |tag| {
-            if (!std.mem.eql(u8, tag, element.tag)) return false;
-        }
         const attributes = element.attributes orelse return false;
         const class_value = attributes.get("class") orelse return false;
         var classes = std.mem.tokenizeAny(u8, class_value, " \t\r\n\x0c");
@@ -105,13 +109,13 @@ pub const TagClassSelector = struct {
         return false;
     }
 
-    fn deinit(self: TagClassSelector, allocator: std.mem.Allocator) void {
-        if (self.tag) |tag| allocator.free(tag);
+    fn deinit(self: ClassSelector, allocator: std.mem.Allocator) void {
         allocator.free(self.class);
     }
 
-    fn priority(self: TagClassSelector) u32 {
-        return if (self.tag == null) 10 else 11;
+    fn priority(self: ClassSelector) u32 {
+        _ = self;
+        return 10;
     }
 };
 
@@ -140,6 +144,75 @@ pub const TagSelector = struct {
     fn priority(self: TagSelector) u32 {
         _ = self;
         return 1;
+    }
+};
+
+/// One atomic member of a selector sequence. A sequence matches only when all
+/// of its tag and class members match the same element.
+pub const SequenceSelector = union(enum) {
+    tag: TagSelector,
+    class: ClassSelector,
+
+    pub fn intoSimpleSelector(self: SequenceSelector) SimpleSelector {
+        return switch (self) {
+            .tag => |tag| .{ .tag = tag },
+            .class => |class| .{ .class = class },
+        };
+    }
+
+    fn matches(self: SequenceSelector, node: *Node) bool {
+        return switch (self) {
+            .tag => |tag| tag.matches(node),
+            .class => |class| class.matches(node),
+        };
+    }
+
+    pub fn deinit(self: *SequenceSelector, allocator: std.mem.Allocator) void {
+        switch (self.*) {
+            .tag => |*tag| tag.deinit(allocator),
+            .class => |*class| class.deinit(allocator),
+        }
+    }
+
+    fn priority(self: SequenceSelector) u32 {
+        return switch (self) {
+            .tag => |tag| tag.priority(),
+            .class => |class| class.priority(),
+        };
+    }
+};
+
+/// Concatenated tag/class selectors, such as `span.announce.urgent`.
+pub const SelectorSequence = struct {
+    selectors: std.ArrayList(SequenceSelector),
+
+    /// Take ownership of a parser-built sequence containing at least two
+    /// atomic selectors. Single selectors retain their direct representation.
+    pub fn take(selectors: *std.ArrayList(SequenceSelector)) SelectorSequence {
+        std.debug.assert(selectors.items.len >= 2);
+        const owned_selectors = selectors.*;
+        selectors.* = .empty;
+        return .{ .selectors = owned_selectors };
+    }
+
+    fn deinit(self: *SelectorSequence, allocator: std.mem.Allocator) void {
+        for (self.selectors.items) |*selector| selector.deinit(allocator);
+        self.selectors.deinit(allocator);
+        self.selectors = .empty;
+    }
+
+    fn matches(self: SelectorSequence, node: *Node) bool {
+        for (self.selectors.items) |selector| {
+            if (!selector.matches(node)) return false;
+        }
+        return true;
+    }
+
+    /// Sequence specificity is the sum of the member specificities.
+    fn priority(self: SelectorSequence) u32 {
+        var total: u32 = 0;
+        for (self.selectors.items) |selector| total += selector.priority();
+        return total;
     }
 };
 

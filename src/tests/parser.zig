@@ -690,6 +690,74 @@ test "Apply tag and class CSS selectors" {
     try std.testing.expectEqualStrings("blue", styles.getPtr("color").?.get().*);
 }
 
+test "selector sequences require every member and sum priorities" {
+    const allocator = std.testing.allocator;
+    const html =
+        "<div>" ++
+        "<span class=\"announce urgent\">Both classes</span>" ++
+        "<span class=announce>One class</span>" ++
+        "<div class=\"announce urgent\">Wrong tag</div>" ++
+        "</div>";
+    const css =
+        ".announce { color: blue; }" ++
+        "SPAN.announce { color: green; }" ++
+        "span.announce.urgent { font-weight: bold; }" ++
+        ".announce.urgent { background-color: lightgray; }";
+
+    var html_parser = try HTMLParser.init(allocator, html);
+    html_parser.use_implicit_tags = false;
+    defer html_parser.deinit(allocator);
+    var root = try html_parser.parse();
+    defer root.deinit(allocator);
+
+    var css_parser = try CSSParser.init(allocator, css, false);
+    defer css_parser.deinit(allocator);
+    const rules = try css_parser.parse(allocator);
+    defer {
+        for (rules) |*rule| rule.deinit(allocator);
+        allocator.free(rules);
+    }
+
+    try std.testing.expectEqual(@as(usize, 4), rules.len);
+    switch (rules[1].selector) {
+        .sequence => |sequence| {
+            try std.testing.expectEqual(@as(usize, 2), sequence.selectors.items.len);
+        },
+        else => return error.TestExpectedSelectorSequence,
+    }
+    switch (rules[2].selector) {
+        .sequence => |sequence| {
+            try std.testing.expectEqual(@as(usize, 3), sequence.selectors.items.len);
+        },
+        else => return error.TestExpectedSelectorSequence,
+    }
+    try std.testing.expectEqual(@as(u32, 10), rules[0].cascadePriority());
+    try std.testing.expectEqual(@as(u32, 11), rules[1].cascadePriority());
+    try std.testing.expectEqual(@as(u32, 21), rules[2].cascadePriority());
+    try std.testing.expectEqual(@as(u32, 20), rules[3].cascadePriority());
+
+    try document_parser.style(allocator, &root, rules);
+    const both = &root.element.children.items[0].element;
+    const one = &root.element.children.items[1].element;
+    const wrong_tag = &root.element.children.items[2].element;
+
+    try std.testing.expectEqualStrings("green", both.style.?.getPtr("color").?.get().*);
+    try std.testing.expectEqualStrings("bold", both.style.?.getPtr("font-weight").?.get().*);
+    try std.testing.expectEqualStrings("lightgray", both.style.?.getPtr("background-color").?.get().*);
+
+    try std.testing.expectEqualStrings("green", one.style.?.getPtr("color").?.get().*);
+    try std.testing.expectEqualStrings("normal", one.style.?.getPtr("font-weight").?.get().*);
+    try std.testing.expectEqualStrings("transparent", one.style.?.getPtr("background-color").?.get().*);
+
+    try std.testing.expectEqualStrings("blue", wrong_tag.style.?.getPtr("color").?.get().*);
+    try std.testing.expectEqualStrings("normal", wrong_tag.style.?.getPtr("font-weight").?.get().*);
+    try std.testing.expectEqualStrings("lightgray", wrong_tag.style.?.getPtr("background-color").?.get().*);
+
+    var invalid_parser = try CSSParser.init(allocator, "span..urgent", false);
+    defer invalid_parser.deinit(allocator);
+    try std.testing.expectError(error.InvalidSelector, invalid_parser.selector(allocator));
+}
+
 test "descendant selectors are flat and match ordered ancestor chains" {
     const allocator = std.testing.allocator;
     const html =

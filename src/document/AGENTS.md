@@ -15,6 +15,9 @@ or selector/rule lifetime.
   stable identity scheme is in place.
 - CSS rules own selector/map allocations while their property slices borrow the
   stylesheet. Move and retire rules with their source text as one generation.
+- Concatenated tag/class selectors own a source-ordered `SelectorSequence` of
+  atomic selectors, all of which must match the same element. Sequence
+  specificity is the sum of its members.
 - Descendant selectors own a flat, source-ordered list of simple selectors.
   Matching callers must pass ancestors from the document root through the
   immediate parent so matching remains one O(n + d) backward walk.

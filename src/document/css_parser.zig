@@ -2,16 +2,18 @@
 //!
 //! Property names and declared values in returned rules normally borrow the
 //! input stylesheet; shorthand-generated property names and defaults are
-//! static slices. Selectors own their normalized tag names and descendant-chain
-//! lists. The stylesheet therefore must outlive its rules, and each owned rule
-//! must be deinitialized.
+//! static slices. Selectors own their normalized names, selector-sequence lists,
+//! and descendant-chain lists. The stylesheet therefore must outlive its rules,
+//! and each owned rule must be deinitialized.
 
 const std = @import("std");
 const selector_mod = @import("selector.zig");
 const Selector = selector_mod.Selector;
 const SimpleSelector = selector_mod.SimpleSelector;
 const TagSelector = selector_mod.TagSelector;
-const TagClassSelector = selector_mod.TagClassSelector;
+const ClassSelector = selector_mod.ClassSelector;
+const SequenceSelector = selector_mod.SequenceSelector;
+const SelectorSequence = selector_mod.SelectorSequence;
 const DescendantSelector = selector_mod.DescendantSelector;
 
 pub const CSSParser = @This();
@@ -286,26 +288,61 @@ pub fn selector(self: *CSSParser, allocator: std.mem.Allocator) !Selector {
 
 fn simpleSelector(self: *CSSParser, allocator: std.mem.Allocator) !SimpleSelector {
     const raw = try self.word();
-    const dot_index = std.mem.indexOfScalar(u8, raw, '.');
-    if (dot_index) |dot| {
-        const raw_tag = raw[0..dot];
-        const class_name = raw[dot + 1 ..];
-        if (class_name.len == 0 or std.mem.indexOfScalar(u8, class_name, '.') != null) {
-            return error.InvalidSelector;
-        }
-        const tag_copy = if (raw_tag.len == 0) null else blk: {
-            const lower_tag = try std.ascii.allocLowerString(allocator, raw_tag);
-            defer allocator.free(lower_tag);
-            break :blk try allocator.dupe(u8, lower_tag);
-        };
-        errdefer if (tag_copy) |tag| allocator.free(tag);
-        const class_copy = try allocator.dupe(u8, class_name);
-        return .{ .tag_class = TagClassSelector.init(tag_copy, class_copy) };
+    if (std.mem.indexOfAny(u8, raw, "#%") != null) return error.InvalidSelector;
+
+    var selectors = std.ArrayList(SequenceSelector).empty;
+    errdefer {
+        for (selectors.items) |*part| part.deinit(allocator);
+        selectors.deinit(allocator);
     }
 
-    const lower_tag = try std.ascii.allocLowerString(allocator, raw);
-    defer allocator.free(lower_tag);
-    return .{ .tag = TagSelector.init(try allocator.dupe(u8, lower_tag)) };
+    var cursor: usize = 0;
+    if (raw[0] != '.') {
+        const tag_end = std.mem.indexOfScalar(u8, raw, '.') orelse raw.len;
+        const lower_tag = try std.ascii.allocLowerString(allocator, raw[0..tag_end]);
+        try appendSequenceSelector(
+            allocator,
+            &selectors,
+            .{ .tag = TagSelector.init(lower_tag) },
+        );
+        cursor = tag_end;
+    }
+
+    while (cursor < raw.len) {
+        if (raw[cursor] != '.') return error.InvalidSelector;
+        const class_start = cursor + 1;
+        if (class_start >= raw.len) return error.InvalidSelector;
+
+        const remaining = raw[class_start..];
+        const class_len = std.mem.indexOfScalar(u8, remaining, '.') orelse remaining.len;
+        if (class_len == 0) return error.InvalidSelector;
+
+        try appendSequenceSelector(
+            allocator,
+            &selectors,
+            .{ .class = ClassSelector.init(try allocator.dupe(u8, remaining[0..class_len])) },
+        );
+        cursor = class_start + class_len;
+    }
+
+    if (selectors.items.len == 1) {
+        const part = selectors.items[0];
+        selectors.deinit(allocator);
+        return part.intoSimpleSelector();
+    }
+    return .{ .sequence = SelectorSequence.take(&selectors) };
+}
+
+fn appendSequenceSelector(
+    allocator: std.mem.Allocator,
+    selectors: *std.ArrayList(SequenceSelector),
+    part: SequenceSelector,
+) !void {
+    var owned_part = part;
+    selectors.append(allocator, owned_part) catch |err| {
+        owned_part.deinit(allocator);
+        return err;
+    };
 }
 
 /// CSS Rule - a selector and its associated property-value pairs
