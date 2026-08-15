@@ -682,3 +682,38 @@ test "font-family is inherited and code uses the user-agent monospace family" {
         override.style.?.getPtr("font-family").?.get().*,
     );
 }
+
+test "width and height are computed without inheriting" {
+    const allocator = std.testing.allocator;
+    const html = "<div style=\"width: 320px; height: 90px\"><p>child</p></div>";
+
+    var html_parser = try HTMLParser.init(allocator, html);
+    html_parser.use_implicit_tags = false;
+    defer html_parser.deinit(allocator);
+    var root = try html_parser.parse();
+    defer root.deinit(allocator);
+
+    const rules = &[_]CSSParser.CSSRule{};
+    try document_parser.style(allocator, &root, rules);
+
+    try std.testing.expectEqualStrings(
+        "320px",
+        root.element.style.?.getPtr("width").?.get().*,
+    );
+    try std.testing.expectEqualStrings(
+        "90px",
+        root.element.style.?.getPtr("height").?.get().*,
+    );
+
+    const child = &root.element.children.items[0].element;
+    try std.testing.expectEqualStrings("auto", child.style.?.getPtr("width").?.get().*);
+    try std.testing.expectEqualStrings("auto", child.style.?.getPtr("height").?.get().*);
+    try std.testing.expectEqualStrings(
+        "auto",
+        child.children.items[0].text.style.?.getPtr("width").?.get().*,
+    );
+    try std.testing.expectEqualStrings(
+        "auto",
+        child.children.items[0].text.style.?.getPtr("height").?.get().*,
+    );
+}

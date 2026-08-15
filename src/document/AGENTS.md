@@ -19,6 +19,9 @@ or selector/rule lifetime.
   sync. A computed `font-family` borrows either its declaration or inherited
   parent slice; rendering resolves the supported family/fallback list without
   retaining a new borrowed value.
+- `width` and `height` are non-inherited computed properties. Their default is
+  `auto`; layout currently resolves only non-negative pixel lengths and keeps
+  the borrowed computed-value slice in the style map.
 - Keep parser output deterministic: the `--dump-dom` golden test is the first
   inspection contract for this pipeline stage.
 

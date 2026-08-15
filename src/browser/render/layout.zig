@@ -97,6 +97,21 @@ fn contentBoundsForNode(node: Node, parent_x: i32, parent_width: i32) ContentBou
     return .{ .x = parent_x, .width = parent_width };
 }
 
+/// Parse the subset of CSS lengths supported by block dimensions. `auto`,
+/// unsupported units, negative lengths, and invalid values use auto layout.
+fn parseCssPixelLength(value: []const u8) ?i32 {
+    const trimmed = std.mem.trim(u8, value, " \t\r\n");
+    if (std.ascii.eqlIgnoreCase(trimmed, "auto")) return null;
+    if (trimmed.len < 2 or !std.ascii.eqlIgnoreCase(trimmed[trimmed.len - 2 ..], "px")) return null;
+
+    const number = std.mem.trim(u8, trimmed[0 .. trimmed.len - 2], " \t\r\n");
+    if (number.len == 0) return null;
+    const pixels = std.fmt.parseFloat(f64, number) catch return null;
+    const max_i32_float: f64 = @floatFromInt(std.math.maxInt(i32));
+    if (!std.math.isFinite(pixels) or pixels < 0 or pixels > max_i32_float) return null;
+    return @intFromFloat(pixels);
+}
+
 fn drawCursor(
     commands: *std.ArrayList(DisplayItem),
     allocator: std.mem.Allocator,
@@ -740,6 +755,19 @@ test "list items reserve room for square markers" {
     const bounds = listItemContentBounds(13, 100);
     try std.testing.expectEqual(@as(i32, 37), bounds.x);
     try std.testing.expectEqual(@as(i32, 76), bounds.width);
+}
+
+test "block dimensions accept non-negative pixel lengths" {
+    try std.testing.expectEqual(@as(?i32, 240), parseCssPixelLength("240px"));
+    try std.testing.expectEqual(@as(?i32, 12), parseCssPixelLength(" 12.75PX "));
+    try std.testing.expectEqual(@as(?i32, 0), parseCssPixelLength("0px"));
+
+    try std.testing.expectEqual(@as(?i32, null), parseCssPixelLength("auto"));
+    try std.testing.expectEqual(@as(?i32, null), parseCssPixelLength("AUTO"));
+    try std.testing.expectEqual(@as(?i32, null), parseCssPixelLength("100%"));
+    try std.testing.expectEqual(@as(?i32, null), parseCssPixelLength("-1px"));
+    try std.testing.expectEqual(@as(?i32, null), parseCssPixelLength("NaNpx"));
+    try std.testing.expectEqual(@as(?i32, null), parseCssPixelLength("999999999999px"));
 }
 
 test "table of contents navigation reserves a header row" {
@@ -3298,6 +3326,20 @@ const BlockLayout = struct {
                 block.y.addDependency(&document.y);
             }
         }
+
+        // Real DOM-backed blocks react to changes in their specified
+        // dimensions. Anonymous blocks intentionally keep their auto size.
+        if (node_ptr) |ptr| {
+            switch (ptr.*) {
+                .element => |*element| {
+                    if (element.style) |*style_map| {
+                        if (style_map.getPtr("width")) |field| block.width.addDependency(field);
+                        if (style_map.getPtr("height")) |field| block.height.addDependency(field);
+                    }
+                },
+                .text => {},
+            }
+        }
         block.zoom.freezeDependencies();
         block.x.freezeDependencies();
         block.y.freezeDependencies();
@@ -3315,6 +3357,25 @@ const BlockLayout = struct {
         }
 
         return block;
+    }
+
+    fn specifiedPixelDimension(
+        self: *BlockLayout,
+        property: []const u8,
+        target: *ProtectedField(i32),
+    ) ?i32 {
+        if (self.inline_nodes != null) return null;
+        const node_ptr = self.node_ptr orelse return null;
+        return switch (node_ptr.*) {
+            .element => |*element| if (element.style) |*style_map|
+                if (styleValueRead(style_map, property, target)) |value|
+                    parseCssPixelLength(value)
+                else
+                    null
+            else
+                null,
+            .text => null,
+        };
     }
 
     fn initAnonymous(
@@ -3488,9 +3549,11 @@ const BlockLayout = struct {
 
         // Set x, y, width early so children can read them
         const content_bounds = contentBoundsForNode(self.node, parent_x, parent_width);
+        const specified_width = self.specifiedPixelDimension("width", &self.width);
+        const specified_height = self.specifiedPixelDimension("height", &self.height);
         self.x.set(content_bounds.x);
         self.y.set(prev_y);
-        self.width.set(content_bounds.width);
+        self.width.set(specified_width orelse content_bounds.width);
 
         var is_block = self.isBlockContainer();
         if (self.node == .element) {
@@ -3567,7 +3630,8 @@ const BlockLayout = struct {
                     },
                 }
             }
-            self.height.set(computed_height + tableOfContentsHeaderHeight(self.node));
+            const auto_height = computed_height + tableOfContentsHeaderHeight(self.node);
+            self.height.set(specified_height orelse auto_height);
             self.zoom.set(1.0);
 
             try recordContentEditableFocusBounds(engine, self);
@@ -3585,6 +3649,8 @@ const BlockLayout = struct {
             }
             self.children_epoch += 1;
             self.children_version.set(self.children_epoch);
+
+            if (specified_height) |height| self.height.set(height);
 
             try recordContentEditableFocusBounds(engine, self);
             // Height is set by layoutInlineBlock - need to ensure it uses .set()
