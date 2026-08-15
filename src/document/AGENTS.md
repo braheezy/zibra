@@ -15,6 +15,10 @@ or selector/rule lifetime.
   stable identity scheme is in place.
 - CSS rules own selector/map allocations while their property slices borrow the
   stylesheet. Move and retire rules with their source text as one generation.
+- When adding a supported CSS property that has a shorthand, add its expansion
+  to `CSSParser.putDeclaration`. Expand in source order for both stylesheet and
+  inline declarations, preserve borrowed slices or static defaults, and test
+  shorthand/longhand precedence in both directions.
 - Keep the computed-style property table and inherited-property defaults in
   sync. A computed `font-family` borrows either its declaration or inherited
   parent slice; rendering resolves the supported family/fallback list without

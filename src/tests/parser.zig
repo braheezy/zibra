@@ -683,6 +683,91 @@ test "font-family is inherited and code uses the user-agent monospace family" {
     );
 }
 
+test "font shorthand expands in declaration order" {
+    const allocator = std.testing.allocator;
+
+    var parser = try CSSParser.init(
+        allocator,
+        "font-weight: normal; font: Italic Bold 125% \"Courier New\", monospace; font-style: normal",
+        false,
+    );
+    defer parser.deinit(allocator);
+    var properties = try parser.body(allocator);
+    defer properties.deinit();
+
+    try std.testing.expect(properties.get("font") == null);
+    try std.testing.expectEqualStrings("normal", properties.get("font-style").?);
+    try std.testing.expectEqualStrings("bold", properties.get("font-weight").?);
+    try std.testing.expectEqualStrings("125%", properties.get("font-size").?);
+    try std.testing.expectEqualStrings("\"Courier New\", monospace", properties.get("font-family").?);
+
+    var reset_parser = try CSSParser.init(
+        allocator,
+        "font-style: italic; font-weight: bold; font: 18px sans-serif",
+        false,
+    );
+    defer reset_parser.deinit(allocator);
+    var reset_properties = try reset_parser.body(allocator);
+    defer reset_properties.deinit();
+    try std.testing.expectEqualStrings("normal", reset_properties.get("font-style").?);
+    try std.testing.expectEqualStrings("normal", reset_properties.get("font-weight").?);
+    try std.testing.expectEqualStrings("18px", reset_properties.get("font-size").?);
+    try std.testing.expectEqualStrings("sans-serif", reset_properties.get("font-family").?);
+
+    var invalid_parser = try CSSParser.init(
+        allocator,
+        "font: italic bold MissingSize; color: red",
+        false,
+    );
+    defer invalid_parser.deinit(allocator);
+    var invalid_properties = try invalid_parser.body(allocator);
+    defer invalid_properties.deinit();
+    try std.testing.expect(invalid_properties.get("font-style") == null);
+    try std.testing.expect(invalid_properties.get("font-weight") == null);
+    try std.testing.expect(invalid_properties.get("font-size") == null);
+    try std.testing.expect(invalid_properties.get("font-family") == null);
+    try std.testing.expectEqualStrings("red", invalid_properties.get("color").?);
+}
+
+test "font shorthand produces inherited computed longhands" {
+    const allocator = std.testing.allocator;
+    const html = "<p class=sample>parent <span>child</span></p>";
+    const css = ".sample { font: italic bold 150% \"Courier New\", monospace; }";
+
+    var html_parser = try HTMLParser.init(allocator, html);
+    html_parser.use_implicit_tags = false;
+    defer html_parser.deinit(allocator);
+    var root = try html_parser.parse();
+    defer root.deinit(allocator);
+
+    var css_parser = try CSSParser.init(allocator, css, false);
+    defer css_parser.deinit(allocator);
+    const rules = try css_parser.parse(allocator);
+    defer {
+        for (rules) |*rule| rule.deinit(allocator);
+        allocator.free(rules);
+    }
+
+    try document_parser.style(allocator, &root, rules);
+    const styles = root.element.style.?;
+    try std.testing.expectEqualStrings("italic", styles.getPtr("font-style").?.get().*);
+    try std.testing.expectEqualStrings("bold", styles.getPtr("font-weight").?.get().*);
+    try std.testing.expectEqualStrings("24.0px", styles.getPtr("font-size").?.get().*);
+    try std.testing.expectEqualStrings(
+        "\"Courier New\", monospace",
+        styles.getPtr("font-family").?.get().*,
+    );
+
+    const child = &root.element.children.items[1].element;
+    try std.testing.expectEqualStrings("italic", child.style.?.getPtr("font-style").?.get().*);
+    try std.testing.expectEqualStrings("bold", child.style.?.getPtr("font-weight").?.get().*);
+    try std.testing.expectEqualStrings("24.0px", child.style.?.getPtr("font-size").?.get().*);
+    try std.testing.expectEqualStrings(
+        "\"Courier New\", monospace",
+        child.style.?.getPtr("font-family").?.get().*,
+    );
+}
+
 test "width and height are computed without inheriting" {
     const allocator = std.testing.allocator;
     const html = "<div style=\"width: 320px; height: 90px\"><p>child</p></div>";

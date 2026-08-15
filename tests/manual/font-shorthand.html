@@ -1,0 +1,20 @@
+<!doctype html>
+<!--
+How to verify:
+  zig build run -- --dump-style tests/manual/font-shorthand.html
+  zig build run -- tests/manual/font-shorthand.html
+Expected: the first line is italic, bold, 28px, and monospace; the second line
+is normal proportional 24px text because the shorthand resets earlier
+longhands; and the third line is italic, normal-weight, 30px monospace text
+because its trailing longhand overrides the shorthand weight.
+-->
+<html>
+  <head>
+    <title>Font shorthand regression</title>
+  </head>
+  <body style="background-color: white; color: black; font-size: 20px">
+    <p style='font: italic bold 28px "Courier New", monospace'>Italic bold monospace shorthand.</p>
+    <p style="font-style: italic; font-weight: bold; font: 24px sans-serif">Shorthand resets style and weight.</p>
+    <p style="font: italic bold 150% monospace; font-weight: normal">Trailing longhand overrides bold.</p>
+  </body>
+</html>

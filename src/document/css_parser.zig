@@ -1,8 +1,9 @@
 //! Parser for Zibra's intentionally small CSS subset.
 //!
-//! Property names and values in returned rules borrow the input stylesheet;
-//! selectors allocate their normalized tag names. The stylesheet therefore
-//! must outlive its rules, and each owned rule must be deinitialized.
+//! Property names and declared values in returned rules normally borrow the
+//! input stylesheet; shorthand-generated property names and defaults are
+//! static slices. Selectors allocate their normalized tag names. The stylesheet
+//! therefore must outlive its rules, and each owned rule must be deinitialized.
 
 const std = @import("std");
 const selector_mod = @import("selector.zig");
@@ -90,6 +91,84 @@ fn pair(self: *CSSParser) !struct { property: []const u8, value: []const u8 } {
     return .{ .property = property, .value = val };
 }
 
+const FontShorthand = struct {
+    style: []const u8 = "normal",
+    weight: []const u8 = "normal",
+    size: []const u8,
+    family: []const u8,
+};
+
+fn isSupportedFontSize(font_size: []const u8) bool {
+    const number = if (std.mem.endsWith(u8, font_size, "px"))
+        font_size[0 .. font_size.len - 2]
+    else if (std.mem.endsWith(u8, font_size, "%"))
+        font_size[0 .. font_size.len - 1]
+    else
+        return false;
+    if (number.len == 0) return false;
+    const parsed = std.fmt.parseFloat(f64, number) catch return false;
+    return std.math.isFinite(parsed) and parsed >= 0;
+}
+
+/// Parse the subset of the `font` shorthand represented by Zibra's computed
+/// style: optional `italic` and `bold`, followed by a required px/percentage
+/// size and a required family or fallback list. Unsupported syntax invalidates
+/// the declaration instead of applying only part of it.
+fn parseFontShorthand(declaration_value: []const u8) ?FontShorthand {
+    var result = FontShorthand{ .size = undefined, .family = undefined };
+    var saw_style = false;
+    var saw_weight = false;
+    var pos: usize = 0;
+
+    while (pos < declaration_value.len) {
+        while (pos < declaration_value.len and std.ascii.isWhitespace(declaration_value[pos])) : (pos += 1) {}
+        if (pos == declaration_value.len) return null;
+
+        const token_start = pos;
+        while (pos < declaration_value.len and !std.ascii.isWhitespace(declaration_value[pos])) : (pos += 1) {}
+        const token = declaration_value[token_start..pos];
+
+        if (isSupportedFontSize(token)) {
+            const family = std.mem.trim(u8, declaration_value[pos..], " \t\r\n");
+            if (family.len == 0) return null;
+            result.size = token;
+            result.family = family;
+            return result;
+        }
+
+        if (std.ascii.eqlIgnoreCase(token, "italic")) {
+            if (saw_style) return null;
+            result.style = "italic";
+            saw_style = true;
+        } else if (std.ascii.eqlIgnoreCase(token, "bold")) {
+            if (saw_weight) return null;
+            result.weight = "bold";
+            saw_weight = true;
+        } else if (!std.ascii.eqlIgnoreCase(token, "normal")) {
+            return null;
+        }
+    }
+    return null;
+}
+
+/// Apply one declaration in source order. Shorthands expand here so inline
+/// attributes and stylesheet rules share identical precedence behavior.
+fn putDeclaration(
+    map: *std.StringHashMap([]const u8),
+    property: []const u8,
+    declaration_value: []const u8,
+) !void {
+    if (std.mem.eql(u8, property, "font")) {
+        const font = parseFontShorthand(declaration_value) orelse return;
+        try map.put("font-style", font.style);
+        try map.put("font-weight", font.weight);
+        try map.put("font-size", font.size);
+        try map.put("font-family", font.family);
+        return;
+    }
+    try map.put(property, declaration_value);
+}
+
 pub fn body(self: *CSSParser, allocator: std.mem.Allocator) !std.StringHashMap([]const u8) {
     var map = std.StringHashMap([]const u8).init(allocator);
     errdefer map.deinit();
@@ -114,8 +193,8 @@ pub fn body(self: *CSSParser, allocator: std.mem.Allocator) !std.StringHashMap([
             continue;
         };
 
-        // Just store the slices directly - caller is responsible for memory management
-        try map.put(result.property, result.value);
+        // Values borrow the parser input; shorthand defaults are static slices.
+        try putDeclaration(&map, result.property, result.value);
         self.whitespace();
         _ = self.literal(';') catch {};
         self.whitespace();
@@ -225,7 +304,8 @@ pub const CSSRule = struct {
         // Free the selector's allocated memory (pass pointer since deinit expects *Selector)
         Selector.deinit(&self.selector, allocator);
 
-        // The map owns its table; property/value slices borrow the stylesheet.
+        // The map owns its table; property/value slices borrow the stylesheet
+        // or are static shorthand expansion strings.
         self.properties.deinit();
     }
 

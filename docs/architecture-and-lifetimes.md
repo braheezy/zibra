@@ -268,6 +268,11 @@ children into anonymous inline runs; the browser stylesheet, rather than Zig
 tag tables, supplies HTML's block defaults. Each block layout registers direct
 child display fields against its tree-version field so a later style change
 rebuilds grouping without retaining an additional DOM or string borrow.
+CSS shorthands expand while declaration bodies are parsed, before cascade and
+computed-style resolution. Expanded property names and defaults are static;
+other values borrow sub-slices of the stylesheet or inline-style buffer.
+Declaration order is preserved so shorthand and longhand overrides have normal
+last-write behavior without introducing a second owned value representation.
 Soft-hyphen wrapping temporarily transfers the post-break `LineItem` suffix
 out of the active line before flushing its prefix. Glyph entries only borrow
 font data, but embedded input, image, and iframe payloads retain single
