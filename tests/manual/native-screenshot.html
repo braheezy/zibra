@@ -6,8 +6,8 @@ How to update the macOS golden after an intentional rendering change:
   zig build run -- --screenshot tests/golden/native-screenshot.macos.png tests/manual/native-screenshot.html
 
 Expected behavior:
-  Zibra captures this page through its native hidden-window path, and the page
-  pixels match tests/golden/native-screenshot.macos.png exactly.
+  Zibra captures this page through its windowless software-rendering path, and
+  the page pixels match tests/golden/native-screenshot.macos.png exactly.
 -->
 <!doctype html>
 <html>

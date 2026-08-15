@@ -54,7 +54,7 @@ architecture document.
 - Run `zig build test-dump-dom` for the isolated DOM CLI contract.
 - Exercise `tests/manual/dump-pipeline.html` with the style, layout, and
   display-list commands when changing document-pipeline diagnostics.
-- On macOS, run `zig build test-screenshot` for the native rendering fixture.
+- On macOS, run `zig build test-screenshot` for the windowless software-rendering fixtures.
 - Put human-facing regressions in `tests/manual/` with a short verification
   comment. Use the `zibra-screenshot` skill for Linux/Xvfb captures when a
   screenshot is required.

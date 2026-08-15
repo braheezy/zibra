@@ -58,11 +58,12 @@ The runtime currently has three kinds of execution context:
 ```text
 process main thread
   Browser
-    SDL event loop
+    interactive: SDL event loop and renderer
+    screenshot: windowless software loop
     chrome, composite, raster, draw
     committed Browser render snapshot
     shared Layout / FontManager
-    main-thread SDL renderer
+    optional main-thread SDL renderer
           |
           | schedules Task values
           v
@@ -79,7 +80,8 @@ process main thread
 The entry point uses `init.arena.allocator()` and constructs one process-wide
 heap-stable `Browser`; see `zibra` in [`src/main.zig`](../src/main.zig).
 Heap stability is required because z2d `Context` stores a pointer to
-`Browser.root_surface`. `Browser` owns the platform and cross-tab state. Each
+`Browser.root_surface`. `Browser` owns the optional interactive platform and
+cross-tab state. Each
 `Tab` owns one `TaskRunner`. `Tab.start` must run only after the `Tab` reaches
 its final address because the worker retains a pointer to the tab-owned runner;
 see `Tab.start` in [`src/browser/tab.zig`](../src/browser/tab.zig).
@@ -105,7 +107,8 @@ but no lock or owner-thread rule covers the complete mutable graph.
 
 `Browser` in [`src/browser/root.zig`](../src/browser/root.zig) owns:
 
-- the SDL window, renderer, cached output texture, and text-input lifecycle;
+- in interactive mode, the SDL window, renderer, cached output texture, and
+  text-input lifecycle; screenshot mode leaves all four absent;
 - root, chrome, and optional tab z2d surfaces plus the root z2d context;
 - the shared `std.http.Client`, cookie jar, and decoded HTTP response cache;
 - the shared `Layout`, including its `FontManager`;
@@ -369,9 +372,11 @@ by `Url.free`; see `Url.init` in [`src/network/url.zig`](../src/network/url.zig)
 
 ### Main/UI/render thread
 
-The process main thread owns the SDL event loop and browser composition,
-raster, and draw phases. It also handles chrome, window events, screenshot
-output, and some direct reads or updates of active `Tab`/`Frame` state.
+The process main thread owns browser composition, raster, and draw phases. In
+interactive mode it also owns the SDL event loop, renderer, chrome/window
+events, and some direct reads or updates of active `Tab`/`Frame` state. In
+screenshot mode it runs a windowless quiescence loop and exports the software
+root surface directly.
 
 Window resizing preserves that ownership boundary. The main thread allocates a
 complete replacement generation of the root/chrome/tab z2d surfaces and SDL
@@ -569,27 +574,31 @@ thread-ownership contract remains unresolved.
 
 ## SDL and graphics contract
 
-`Browser.init` initializes SDL, creates a window and renderer, starts text
-input, creates a renderer texture, initializes `Layout`/`FontManager`, and
-creates z2d surfaces; see [`src/browser/root.zig`](../src/browser/root.zig).
+`Browser.init` always initializes SDL video because SDL_ttf requires it on
+macOS, then initializes `Layout`/`FontManager` and the z2d surfaces. Interactive
+mode additionally creates a window, accelerated renderer, presentation texture,
+and text-input lifecycle. Screenshot mode creates none of those presentation
+resources; it waits until the tab worker and all accounted helpers are
+quiescent, renders to z2d, and exports `root_surface` directly. See
+[`src/browser/root.zig`](../src/browser/root.zig).
 `FontManager` does not retain the renderer. `getStyledGlyph` mutates SDL_ttf
 font state, renders a temporary SDL surface, converts it to canonical RGBA,
 and stores only allocator-owned bytes; see
 [`src/browser/render/font.zig`](../src/browser/render/font.zig).
 
 The same browser-global `Layout` and `FontManager` are reachable from tab
-layout/paint work and main-thread chrome paths. There is no shared lock or
-assertion establishing which thread may access the font glyph map or SDL_ttf
-font handles. The renderer no longer participates in glyph-cache mutation, but
-the remaining font concurrency is confirmed and must not be assumed safe.
+layout/paint work and main-thread chrome paths. Interactive mode still lacks a
+shared lock or assertion establishing which thread may access the font glyph
+map or SDL_ttf handles. Screenshot mode closes that race by refusing to raster
+until the serialized tab worker and all accounted helpers are quiescent. The
+renderer no longer participates in glyph-cache mutation.
 
 Normal `Browser.deinit` now quiesces tabs first, retires display snapshots,
 destroys document/network state, frees cached glyph bitmaps and closes fonts,
-destroys cached textures while the renderer is alive, tears down z2d state,
-stops text input, explicitly destroys the renderer and window, and finally
-calls `sdl2.quit`. `Browser.init` uses
-reverse-order `errdefer` rollback for SDL, window, renderer, text input,
-textures, styles, Layout/FontManager, measurement, chrome, and z2d resources.
+tears down z2d state, then conditionally destroys interactive textures, text
+input, renderer, and window before calling `sdl2.quit`. `Browser.init` uses
+reverse-order `errdefer` rollback for both the interactive and windowless
+resource sets.
 
 The intended SDL contract should be:
 
@@ -614,7 +623,7 @@ The intended SDL contract should be:
 4. retire browser render snapshots, then destroy tabs, frames, DOM, and JS;
 5. destroy HTTP/cookie, layout, font, and z2d resources;
 6. finish measurement state after no thread can record into it;
-7. destroy renderer/window and quit SDL/SDL_ttf.
+7. destroy the optional renderer/window and quit SDL/SDL_ttf.
 
 Async HTTP requests are not cancellable yet, so phase 3 can block on network
 I/O; it remains memory-safe because HTTP, Tab, Browser, and measurement owners
@@ -670,8 +679,8 @@ reintroduced:
    [`src/network/url.zig`](../src/network/url.zig).
 11. **Glyph metadata:** cached `Glyph` values no longer retain a borrowed
    grapheme slice. See [`src/browser/render/font.zig`](../src/browser/render/font.zig).
-12. **Native initialization rollback:** `Browser.init` and `Layout.init` unwind
-   previously created native/allocator resources in reverse dependency order;
+12. **Platform initialization rollback:** `Browser.init` and `Layout.init`
+   unwind previously created native/allocator resources in reverse dependency order;
    font discovery and font insertion also clean partial allocations. `Browser`
    is allocated at its final address before binding z2d `Context` to its root
    surface, avoiding a self-pointer into an init-local copy.
@@ -713,14 +722,13 @@ Snapshot retirement now closes navigation, replacement, and shutdown paths,
 but in-place DOM mutation can still retire a leaf before the replacement commit
 reaches the browser. The clone is not independently safe by type.
 
-### 4. Shared Layout and FontManager access has no global contract
+### 4. Interactive Layout and FontManager access has no global contract
 
-The browser owns one mutable layout/font stack. Resize and chrome paths use it
-from the main thread, while tab tasks use it for document layout and glyph
-creation. No common owner-thread assertion or lock covers these paths. Glyph
-rasterization no longer touches the SDL renderer, but font handles and caches
-remain shared. The concurrency gap is confirmed; backend-specific failure is a
-hypothesis.
+The browser owns one mutable layout/font stack. Interactive resize and chrome
+paths use it from the main thread, while tab tasks use it for document layout
+and glyph creation. No common owner-thread assertion or lock covers those
+interactive paths. Windowless screenshot capture is excluded from this gap by
+its tab/helper quiescence gate, but the interactive concurrency gap remains.
 
 ### 5. Response and URL ownership is encoded in call-site convention
 
@@ -885,5 +893,8 @@ interactive browser run. `--dump-dom` fetches, decodes, and parses only.
 cascade. `--dump-layout` initializes SDL_ttf font measurement without a
 window or renderer, then builds geometry while skipping interactive hit-test
 state. `--dump-display-list` extends that path through paint-command creation,
-but never enters compositing or rasterization. Keep these boundaries intact so
-each mode can isolate a failure to one stage of the browser pipeline.
+but never enters compositing or rasterization. `--screenshot` continues through
+software composition and rasterization without an SDL window, renderer,
+presentation texture, or event polling, then writes the z2d root surface as a
+PNG. Keep these boundaries intact so each mode can isolate a failure to one
+stage of the browser pipeline.

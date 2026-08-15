@@ -2,7 +2,7 @@
 //!
 //! The process arena owns application allocations. This module parses the
 //! command line, runs isolated document-inspection modes, or creates the
-//! process-wide `Browser` for interactive and screenshot runs.
+//! process-wide `Browser` for interactive or windowless screenshot runs.
 
 const std = @import("std");
 

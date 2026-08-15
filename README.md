@@ -46,7 +46,7 @@ zig build run -- --dump-layout https://example.com
 zig build run -- --dump-display-list https://example.com
 # Run tests
 zig build test
-# Capture and compare the native macOS screenshot fixture
+# Capture and compare the windowless macOS screenshot fixtures
 zig build test-screenshot
 ```
 

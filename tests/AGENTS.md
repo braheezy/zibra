@@ -14,10 +14,10 @@ Current checks:
 - `zig build test-dump-dom` — isolated HTML parse/DOM-dump output, including
   literal `about:blank`, malformed-navigation recovery, and unsupported-scheme
   recovery.
-- `zig build test-screenshot` — native macOS rendering output, including the
-  inherited alternate-text-direction, multiline centered-title, and scoped
-  superscript, small-caps, and preformatted-text fixtures, plus discretionary
-  soft-hyphen wrapping.
+- `zig build test-screenshot` — windowless macOS software-rendering output,
+  including the inherited alternate-text-direction, multiline centered-title,
+  and scoped superscript, small-caps, and preformatted-text fixtures, plus
+  discretionary soft-hyphen wrapping.
 
 Choose the narrowest check that covers the pipeline stage under change. A DOM
 or parser regression should normally add a DOM dump or unit fixture before a

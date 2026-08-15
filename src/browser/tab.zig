@@ -830,6 +830,15 @@ pub fn releaseAsyncThread(self: *Tab) void {
     self.async_thread_mutex.unlock();
 }
 
+/// Return whether the serialized worker and all detached helpers are idle.
+/// Screenshot mode uses this to keep shared SDL_ttf state single-threaded.
+pub fn isQuiescent(self: *Tab) bool {
+    if (!self.task_runner.isIdle()) return false;
+    self.async_thread_mutex.lock();
+    defer self.async_thread_mutex.unlock();
+    return self.async_thread_refs == 0;
+}
+
 fn waitForAsyncThreads(self: *Tab) void {
     self.async_thread_mutex.lock();
     while (self.async_thread_refs != 0) {

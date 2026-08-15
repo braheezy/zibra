@@ -1,4 +1,4 @@
-//! Build, run, unit-test, and native screenshot-test steps for Zibra.
+//! Build, run, unit-test, and windowless screenshot-test steps for Zibra.
 
 const std = @import("std");
 const builtin = @import("builtin");
@@ -182,7 +182,7 @@ pub fn build(b: *std.Build) !void {
 
     const screenshot_test_step = b.step(
         "test-screenshot",
-        "Capture and compare the native macOS screenshot fixture",
+        "Capture and compare the windowless macOS screenshot fixtures",
     );
     if (builtin.os.tag == .macos and
         target.result.os.tag == .macos and
@@ -210,8 +210,8 @@ pub fn build(b: *std.Build) !void {
         screenshot_test_step.dependOn(&compare.step);
 
         const view_source_capture = b.addRunArtifact(exe);
-        // The native hidden-window path is process-global on macOS. Serialize
-        // the captures so the native screenshot fixtures cannot race SDL setup.
+        // SDL/SDL_ttf initialization is process-global. Serialize captures even
+        // though screenshot mode creates no window or renderer.
         view_source_capture.step.dependOn(&compare.step);
         view_source_capture.addArg("--screenshot");
         const actual_view_source_screenshot = view_source_capture.addOutputFileArg("view-source-screenshot.png");

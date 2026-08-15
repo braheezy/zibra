@@ -2,7 +2,8 @@
 //!
 //! `Browser` owns SDL and z2d resources, tabs, shared networking state, and
 //! the committed render snapshot. Tab workers send commits back to this
-//! controller; SDL rendering remains coordinated by the browser thread.
+//! controller; interactive SDL rendering remains coordinated by the browser
+//! thread, while screenshot mode renders only to software z2d surfaces.
 
 const std = @import("std");
 const Mutex = @import("../runtime/sync.zig").Mutex;
@@ -587,17 +588,13 @@ const DocumentHandle = struct {
 
 // Browser manages the window and tabs
 pub const Browser = struct {
-    const ScreenshotRequest = struct {
-        path: []const u8,
-    };
-
     // Memory allocator for the browser
     allocator: std.mem.Allocator,
     io: std.Io,
-    // SDL window handle
-    window: sdl2.Window,
-    // SDL renderer handle
-    canvas: sdl2.Renderer,
+    // Interactive presentation resources. Screenshot mode leaves these null
+    // and exports the software root surface directly.
+    window: ?sdl2.Window,
+    canvas: ?sdl2.Renderer,
     // z2d surface for drawing (RGBA format like the tutorial)
     root_surface: z2d.Surface,
     // z2d context for drawing operations
@@ -658,7 +655,7 @@ pub const Browser = struct {
         io: std.Io,
         environ: *const std.process.Environ.Map,
         rtl_flag: bool,
-        hidden: bool,
+        headless: bool,
     ) !*Browser {
         const browser = try al.create(Browser);
         errdefer al.destroy(browser);
@@ -669,56 +666,63 @@ pub const Browser = struct {
         });
         errdefer sdl2.quit();
 
-        const preferred_position = if (hidden) null else windowPositionForFocusedDisplay();
-        const window_x: sdl2.WindowPosition = if (preferred_position) |pos| .{ .absolute = pos.x } else .default;
-        const window_y: sdl2.WindowPosition = if (preferred_position) |pos| .{ .absolute = pos.y } else .default;
-        const window_visibility: sdl2.WindowFlags.Visibility = if (hidden or preferred_position != null) .hidden else .default;
+        var screen: ?sdl2.Window = null;
+        errdefer if (screen) |window| window.destroy();
+        var renderer: ?sdl2.Renderer = null;
+        errdefer if (renderer) |canvas| canvas.destroy();
+        var cached_texture: ?sdl2.Texture = null;
+        errdefer if (cached_texture) |texture| texture.destroy();
+        var text_input_started = false;
+        errdefer if (text_input_started) sdl2.stopTextInput();
 
-        // Create a window with correct OS graphics
-        const screen = try sdl2.createWindow(
-            "zibra",
-            window_x,
-            window_y,
-            initial_window_width,
-            initial_window_height,
-            .{ .vis = window_visibility, .resizable = true },
-        );
-        errdefer screen.destroy();
-        if (!hidden) {
+        if (!headless) {
+            const preferred_position = windowPositionForFocusedDisplay();
+            const window_x: sdl2.WindowPosition = if (preferred_position) |pos| .{ .absolute = pos.x } else .default;
+            const window_y: sdl2.WindowPosition = if (preferred_position) |pos| .{ .absolute = pos.y } else .default;
+            const window_visibility: sdl2.WindowFlags.Visibility = if (preferred_position != null) .hidden else .default;
+
+            // Interactive mode creates the native presentation resources.
+            screen = try sdl2.createWindow(
+                "zibra",
+                window_x,
+                window_y,
+                initial_window_width,
+                initial_window_height,
+                .{ .vis = window_visibility, .resizable = true },
+            );
             if (preferred_position) |pos| {
-                try screen.setPosition(.{ .x = pos.x, .y = pos.y });
-                screen.setVisible(true);
+                try screen.?.setPosition(.{ .x = pos.x, .y = pos.y });
+                screen.?.setVisible(true);
             }
+
+            renderer = try sdl2.createRenderer(
+                screen.?,
+                null,
+                .{ .accelerated = true },
+            );
+
+            // Enable SDL text input so TextInput events fire for typing.
+            sdl2.startTextInput();
+            text_input_started = true;
+
+            const renderer_info = try renderer.?.getInfo();
+            const renderer_name = std.mem.span(renderer_info.name);
+            std.log.info("SDL renderer backend: {s}", .{renderer_name});
+
+            // Use ABGR8888 to match z2d's RGBA memory layout.
+            cached_texture = try sdl2.createTexture(
+                renderer.?,
+                .abgr8888,
+                .streaming,
+                initial_window_width,
+                initial_window_height,
+            );
+            try cached_texture.?.setBlendMode(.blend);
+        } else {
+            // SDL's video subsystem remains initialized because SDL_ttf needs
+            // it on macOS, but no OS window, renderer, or texture is created.
+            std.log.info("Screenshot renderer: software z2d (no SDL window)", .{});
         }
-
-        // Create a renderer, which will be used to draw to the window
-        const renderer = try sdl2.createRenderer(
-            screen,
-            null,
-            .{ .accelerated = true },
-        );
-        errdefer renderer.destroy();
-
-        // Enable SDL text input so TextInput events fire for typing.
-        sdl2.startTextInput();
-        errdefer sdl2.stopTextInput();
-
-        // Log the SDL renderer backend to confirm hardware acceleration
-        const renderer_info = try renderer.getInfo();
-        const renderer_name = std.mem.span(renderer_info.name);
-        std.log.info("SDL renderer backend: {s}", .{renderer_name});
-
-        // Create persistent streaming texture for GPU-accelerated rendering
-        // Use ABGR8888 to match z2d's RGBA memory layout (r at lowest address)
-        const cached_texture = try sdl2.createTexture(
-            renderer,
-            .abgr8888,
-            .streaming,
-            initial_window_width,
-            initial_window_height,
-        );
-        errdefer cached_texture.destroy();
-        try cached_texture.setBlendMode(.blend);
 
         // Parse the default browser stylesheet
         var css_parser = try CSSParser.init(al, DEFAULT_STYLE_SHEET, false);
@@ -752,10 +756,12 @@ pub const Browser = struct {
 
         var chrome = try Chrome.init(&layout_engine.font_manager, initial_window_width, al);
         errdefer chrome.deinit();
-        screen.setMinimumSize(
-            chrome.address_rect.left + chrome.padding + 1,
-            chrome.bottom + 1,
-        );
+        if (screen) |window| {
+            window.setMinimumSize(
+                chrome.address_rect.left + chrome.padding + 1,
+                chrome.bottom + 1,
+            );
+        }
 
         browser.* = Browser{
             .allocator = al,
@@ -968,21 +974,57 @@ pub const Browser = struct {
 
     // Run the browser event loop
     pub fn run(self: *Browser) !void {
-        try self.runLoop(null);
+        if (self.canvas == null or self.window == null) {
+            return error.InteractiveBrowserRequiresWindow;
+        }
+        try self.runLoop();
     }
 
-    /// Run the normal browser pipeline in a hidden window, write the resulting
-    /// quiescent frame to `path`, and exit.
+    /// Run the normal browser pipeline against software surfaces, write the
+    /// quiescent frame to `path`, and exit without an SDL window or renderer.
     pub fn runToScreenshot(self: *Browser, path: []const u8) !void {
-        try self.runLoop(.{ .path = path });
+        if (self.canvas != null or self.window != null) {
+            return error.ScreenshotRequiresHeadlessBrowser;
+        }
+        defer self.finishRunLoop();
+
+        var ready_checks: u8 = 0;
+        const started_ns = std.Io.Clock.awake.now(self.io).nanoseconds;
+        while (true) {
+            self.scheduleAnimationFrame();
+
+            // FontManager/SDL_ttf is shared with the tab worker. Render only
+            // after all tab and detached work is quiescent so glyph state is
+            // never mutated concurrently during a deterministic capture.
+            if (self.isScreenshotRenderSafe()) {
+                try self.compositeRasterAndDraw();
+            }
+
+            if (self.isScreenshotReady()) {
+                ready_checks += 1;
+                if (ready_checks >= 2) {
+                    try self.writeScreenshot(path);
+                    std.log.info("Screenshot written to {s}", .{path});
+                    return;
+                }
+            } else {
+                ready_checks = 0;
+            }
+
+            const elapsed_ns = std.Io.Clock.awake.now(self.io).nanoseconds - started_ns;
+            if (elapsed_ns >= screenshot_timeout_ns) {
+                std.log.err("Screenshot timed out after 30 seconds.", .{});
+                // A detached page task may be stuck and prevent safe teardown.
+                std.process.exit(124);
+            }
+            try self.io.sleep(.fromNanoseconds(2_000_000), .awake);
+        }
     }
 
-    fn runLoop(self: *Browser, screenshot: ?ScreenshotRequest) !void {
+    fn runLoop(self: *Browser) !void {
         defer self.finishRunLoop();
 
         var quit = false;
-        var screenshot_ready_checks: u8 = 0;
-        const screenshot_started_ns = std.Io.Clock.awake.now(self.io).nanoseconds;
         self.scheduleAnimationFrame();
 
         while (!quit) {
@@ -1006,37 +1048,9 @@ pub const Browser = struct {
                 }
             }
 
-            if (quit and screenshot != null) {
-                std.log.err("Screenshot run aborted before capture.", .{});
-                // A tab task may be stuck in foreign/JS code. Normal teardown
-                // cannot safely free the tab underneath that detached worker.
-                std.process.exit(130);
-            }
-
             if (!quit) {
                 try self.compositeRasterAndDraw();
                 self.scheduleAnimationFrame();
-
-                if (screenshot) |request| {
-                    if (self.isScreenshotReady()) {
-                        screenshot_ready_checks += 1;
-                        if (screenshot_ready_checks >= 2) {
-                            try self.writeScreenshot(request.path);
-                            std.log.info("Screenshot written to {s}", .{request.path});
-                            quit = true;
-                        }
-                    } else {
-                        screenshot_ready_checks = 0;
-                    }
-
-                    const elapsed_ns = std.Io.Clock.awake.now(self.io).nanoseconds - screenshot_started_ns;
-                    if (!quit and elapsed_ns >= screenshot_timeout_ns) {
-                        std.log.err("Screenshot timed out after 30 seconds.", .{});
-                        // Screenshot mode is a process-isolated automation path.
-                        // Exit directly so a stuck tab worker cannot hang deinit.
-                        std.process.exit(124);
-                    }
-                }
 
                 if (!handled_event and self.isIdle()) {
                     // Yield briefly to avoid a busy loop when there's no work.
@@ -1066,7 +1080,16 @@ pub const Browser = struct {
         self.lock.unlock();
 
         if (!render_ready) return false;
-        return tab.?.task_runner.isIdle();
+        return tab.?.isQuiescent();
+    }
+
+    fn isScreenshotRenderSafe(self: *Browser) bool {
+        self.lock.lock();
+        const tab = self.activeTab();
+        const animation_quiet = !self.needs_animation_frame and !self.animation_timer_active;
+        self.lock.unlock();
+        if (tab == null or !animation_quiet) return false;
+        return tab.?.isQuiescent();
     }
 
     fn writeScreenshot(self: *Browser, path: []const u8) !void {
@@ -1131,6 +1154,7 @@ pub const Browser = struct {
     }
 
     pub fn handleWindowEvent(self: *Browser, window_event: sdl2.WindowEvent) !void {
+        const canvas = self.canvas orelse return;
         switch (window_event.type) {
             .resized, .size_changed => |size| {
                 self.lock.lock();
@@ -1151,7 +1175,7 @@ pub const Browser = struct {
                     return;
                 }
 
-                try self.canvas.setViewport(null);
+                try canvas.setViewport(null);
                 const targets = try self.createResizeTargets(geometry);
                 self.installResizeTargets(targets);
 
@@ -1186,6 +1210,7 @@ pub const Browser = struct {
     /// SDL or z2d target. An allocation failure therefore leaves the current
     /// render generation usable.
     fn createResizeTargets(self: *Browser, geometry: ResizeGeometry) !ResizeTargets {
+        const canvas = self.canvas orelse return error.HeadlessBrowserCannotResize;
         var root_surface = try z2d.Surface.init(
             .image_surface_rgba,
             self.allocator,
@@ -1214,7 +1239,7 @@ pub const Browser = struct {
         }
 
         const cached_texture = try sdl2.createTexture(
-            self.canvas,
+            canvas,
             .abgr8888,
             .streaming,
             @intCast(geometry.window_width),
@@ -3663,7 +3688,7 @@ pub const Browser = struct {
         if (self.needs_draw) {
             const phase_start = if (profiling) std.Io.Clock.awake.now(self.io).nanoseconds else 0;
             try self.draw();
-            self.canvas.present();
+            if (self.canvas) |canvas| canvas.present();
             self.needs_draw = false;
             if (profiling) {
                 draw_ns = @intCast(std.Io.Clock.awake.now(self.io).nanoseconds - phase_start);
@@ -3897,6 +3922,7 @@ pub const Browser = struct {
     // Copy z2d surface to SDL for display (surface handoff)
     // Uses persistent cached texture to avoid per-frame texture churn
     fn copyZ2dToSDL(self: *Browser) !void {
+        const canvas = self.canvas orelse return;
         const texture = self.cached_texture orelse return error.NoCachedTexture;
 
         // Get the pixel data from the z2d surface
@@ -3941,7 +3967,7 @@ pub const Browser = struct {
         pixel_data_result.release();
 
         // Copy texture to renderer (texture persists for next frame)
-        try self.canvas.copy(texture, null, null);
+        try canvas.copy(texture, null, null);
     }
 
     fn drawImageNearest(
@@ -5014,8 +5040,9 @@ pub const Browser = struct {
         }
         self.allocator.free(self.default_style_sheet_rules);
 
-        // FontManager owns SDL textures, so it must be retired while the
-        // renderer is still alive.
+        // Retire presentation resources, then SDL_ttf/font state, while SDL is
+        // still initialized. Headless screenshot mode owns no presentation
+        // resources here.
         if (self.cached_texture) |texture| texture.destroy();
         self.layout_engine.deinit();
 
@@ -5028,9 +5055,11 @@ pub const Browser = struct {
 
         self.measure.finish();
 
-        sdl2.stopTextInput();
-        self.canvas.destroy();
-        self.window.destroy();
+        if (self.canvas) |canvas| {
+            sdl2.stopTextInput();
+            canvas.destroy();
+        }
+        if (self.window) |window| window.destroy();
         sdl2.quit();
     }
 };

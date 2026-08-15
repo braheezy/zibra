@@ -57,6 +57,9 @@ before changing `root.zig`, `tab.zig`, `render/`, or browser task scheduling.
   the suffix to the next line without duplicating owning inline payloads.
 - Keep browser rendering work and isolated inspection modes separate. A DOM
   dump must not construct `Browser` merely to reuse a convenience method.
+- Screenshot mode is windowless: initialize SDL video only for SDL_ttf's macOS
+  requirement, create no SDL window/renderer/texture, wait for tab and detached
+  work to become quiescent, raster to z2d surfaces, and export the root surface.
 
 For changed browser behavior, add a deterministic manual fixture and run the
 relevant unit, DOM-dump, and macOS screenshot checks from the root guide.
