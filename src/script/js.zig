@@ -962,6 +962,34 @@ test "Js roots Kiesel Agent state across garbage collections" {
     try std.testing.expect(result.toBoolean());
 }
 
+test "querySelectorAll matches ordered descendant selector chains" {
+    const allocator = std.testing.allocator;
+    const html =
+        "<main><aside><section><article>" ++
+        "<span class=target>Matched</span>" ++
+        "</article></section></aside></main>";
+
+    var html_parser = try parser.HTMLParser.init(allocator, html);
+    html_parser.use_implicit_tags = false;
+    defer html_parser.deinit(allocator);
+    var root = try html_parser.parse();
+    defer root.deinit(allocator);
+    parser.fixParentPointers(&root, null);
+
+    var environ = std.process.Environ.Map.init(allocator);
+    defer environ.deinit();
+    var js = try Js.init(allocator, std.testing.io, &environ);
+    defer js.deinit(allocator);
+    js.setNodes(0, &root);
+    defer js.setNodes(0, null);
+
+    const result = try js.evaluate(0,
+        \\document.querySelectorAll('main section article .target').length === 1 &&
+        \\document.querySelectorAll('section main article .target').length === 0
+    );
+    try std.testing.expect(result.toBoolean());
+}
+
 test "native style_set updates element style attribute" {
     var environ = std.process.Environ.Map.init(std.testing.allocator);
     defer environ.deinit();
@@ -1367,6 +1395,7 @@ fn querySelectorAll(agent: *Agent, this_value: Value, arguments: kiesel.types.Ar
     var selector = css_parser.selector(js_instance.allocator) catch {
         return agent.throwException(.syntax_error, "Invalid selector", .{});
     };
+    defer selector.deinit(js_instance.allocator);
 
     if (window.current_nodes == null) {
         const empty_array = try kiesel.builtins.arrayCreate(agent, 0, null);
@@ -1382,6 +1411,7 @@ fn querySelectorAll(agent: *Agent, this_value: Value, arguments: kiesel.types.Ar
 
     for (node_list.items) |node| {
         var ancestors = std.ArrayList(*Node).empty;
+        defer ancestors.deinit(js_instance.allocator);
 
         var current = node;
         while (true) {
@@ -1397,17 +1427,17 @@ fn querySelectorAll(agent: *Agent, this_value: Value, arguments: kiesel.types.Ar
             }
         }
 
+        // Selector matching uses the same root-to-parent order as the style
+        // traversal. Parent pointers naturally produced the reverse order.
+        std.mem.reverse(*Node, ancestors.items);
+
         // Check if this node matches the selector
         const matches = selector.matches(node, ancestors.items);
         if (matches) {
             const handle = try js_instance.getHandle(window, node);
             try matching_handles.append(js_instance.allocator, handle);
         }
-
-        ancestors.deinit(js_instance.allocator);
     }
-
-    selector.deinit(js_instance.allocator);
 
     const result_array = try kiesel.builtins.arrayCreate(agent, @intCast(matching_handles.items.len), null);
 

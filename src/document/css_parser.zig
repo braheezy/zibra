@@ -2,12 +2,14 @@
 //!
 //! Property names and declared values in returned rules normally borrow the
 //! input stylesheet; shorthand-generated property names and defaults are
-//! static slices. Selectors allocate their normalized tag names. The stylesheet
-//! therefore must outlive its rules, and each owned rule must be deinitialized.
+//! static slices. Selectors own their normalized tag names and descendant-chain
+//! lists. The stylesheet therefore must outlive its rules, and each owned rule
+//! must be deinitialized.
 
 const std = @import("std");
 const selector_mod = @import("selector.zig");
 const Selector = selector_mod.Selector;
+const SimpleSelector = selector_mod.SimpleSelector;
 const TagSelector = selector_mod.TagSelector;
 const TagClassSelector = selector_mod.TagClassSelector;
 const DescendantSelector = selector_mod.DescendantSelector;
@@ -249,28 +251,40 @@ fn prefersColorSchemeMatch(self: *CSSParser, allocator: std.mem.Allocator, prelu
 /// Parse a tag/class selector or a whitespace-separated descendant selector.
 /// ID, attribute, and combinator selectors are not yet supported.
 pub fn selector(self: *CSSParser, allocator: std.mem.Allocator) !Selector {
-    var out = try self.simpleSelector(allocator);
-    errdefer out.deinit(allocator);
+    var selectors = std.ArrayList(SimpleSelector).empty;
+    errdefer {
+        for (selectors.items) |*simple| simple.deinit(allocator);
+        selectors.deinit(allocator);
+    }
+
+    var first = try self.simpleSelector(allocator);
+    selectors.append(allocator, first) catch |err| {
+        first.deinit(allocator);
+        return err;
+    };
     self.whitespace();
 
     // Continue parsing descendant selectors until we hit '{'
     while (self.pos < self.string.len and self.string[self.pos] != '{') {
         var descendant = try self.simpleSelector(allocator);
-        var descendant_owned = true;
-        defer if (descendant_owned) descendant.deinit(allocator);
-
-        // Create a descendant selector: out is the ancestor, descendant is the child
-        const desc_selector = try DescendantSelector.init(allocator, out, descendant);
-        descendant_owned = false;
-        out = Selector{ .descendant = desc_selector };
+        selectors.append(allocator, descendant) catch |err| {
+            descendant.deinit(allocator);
+            return err;
+        };
 
         self.whitespace();
     }
 
-    return out;
+    if (selectors.items.len == 1) {
+        const simple = selectors.items[0];
+        selectors.deinit(allocator);
+        return simple.intoSelector();
+    }
+
+    return .{ .descendant = DescendantSelector.take(&selectors) };
 }
 
-fn simpleSelector(self: *CSSParser, allocator: std.mem.Allocator) !Selector {
+fn simpleSelector(self: *CSSParser, allocator: std.mem.Allocator) !SimpleSelector {
     const raw = try self.word();
     const dot_index = std.mem.indexOfScalar(u8, raw, '.');
     if (dot_index) |dot| {

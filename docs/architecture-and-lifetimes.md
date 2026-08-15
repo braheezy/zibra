@@ -186,6 +186,13 @@ also use static keys and defaults. See `CSSParser.word`, `CSSParser.value`,
 borrow the browser's default rules and own document rules, distinguished by
 `CSSRule.owned`.
 
+Whitespace-separated descendant selectors own a flat, source-ordered list of
+simple selectors instead of a recursive selector tree. Matching receives a
+borrowed ancestor slice ordered from the document root through the immediate
+parent, then walks that slice and the selector list backward once. Both style
+traversal and JavaScript selector queries must preserve this order so matching
+remains O(n + d).
+
 Style and layout values use `ProtectedField`. A dependency registers a raw
 target pointer and callback in the dependency's `invalidations` map.
 `ProtectedField.deinit` only destroys the field's own map; it does not remove

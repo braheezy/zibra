@@ -7,14 +7,14 @@ const std = @import("std");
 const parser = @import("parser.zig");
 const Node = parser.Node;
 
-/// CSS Selector types
+/// CSS selector types.
 pub const Selector = union(enum) {
     tag: TagSelector,
     tag_class: TagClassSelector,
     descendant: DescendantSelector,
 
-    /// Check if this selector matches the given node
-    /// ancestor_chain is a list of ancestor nodes to check for descendant selectors
+    /// Check if this selector matches the given node. `ancestor_chain` must be
+    /// ordered from the root element to the node's immediate parent.
     pub fn matches(self: Selector, node: *Node, ancestor_chain: []const *Node) bool {
         return switch (self) {
             .tag => |t| t.matches(node),
@@ -39,6 +39,41 @@ pub const Selector = union(enum) {
             .tag => |t| t.priority(),
             .tag_class => |t| t.priority(),
             .descendant => |d| d.priority(),
+        };
+    }
+};
+
+/// A non-combinator selector. Descendant selectors store these directly so a
+/// selector chain is flat rather than a recursively nested binary tree.
+pub const SimpleSelector = union(enum) {
+    tag: TagSelector,
+    tag_class: TagClassSelector,
+
+    pub fn intoSelector(self: SimpleSelector) Selector {
+        return switch (self) {
+            .tag => |tag| .{ .tag = tag },
+            .tag_class => |tag_class| .{ .tag_class = tag_class },
+        };
+    }
+
+    fn matches(self: SimpleSelector, node: *Node) bool {
+        return switch (self) {
+            .tag => |tag| tag.matches(node),
+            .tag_class => |tag_class| tag_class.matches(node),
+        };
+    }
+
+    pub fn deinit(self: *SimpleSelector, allocator: std.mem.Allocator) void {
+        switch (self.*) {
+            .tag => |tag| tag.deinit(allocator),
+            .tag_class => |tag_class| tag_class.deinit(allocator),
+        }
+    }
+
+    fn priority(self: SimpleSelector) u32 {
+        return switch (self) {
+            .tag => |tag| tag.priority(),
+            .tag_class => |tag_class| tag_class.priority(),
         };
     }
 };
@@ -108,58 +143,51 @@ pub const TagSelector = struct {
     }
 };
 
-/// Descendant selector - matches elements with a specific ancestor
-/// (e.g., "article div" matches div elements inside article elements)
-/// Associates to the left: "a b c" means (a b) c
+/// A whitespace-separated chain of simple selectors. For example,
+/// `article div p` matches a `p` with a `div` ancestor that in turn has an
+/// `article` ancestor. The flat representation permits a single ancestor walk.
 pub const DescendantSelector = struct {
-    ancestor: *Selector,
-    descendant: *Selector,
+    selectors: std.ArrayList(SimpleSelector),
 
-    pub fn init(allocator: std.mem.Allocator, ancestor: Selector, descendant: Selector) !DescendantSelector {
-        const ancestor_ptr = try allocator.create(Selector);
-        errdefer allocator.destroy(ancestor_ptr);
-
-        const descendant_ptr = try allocator.create(Selector);
-        ancestor_ptr.* = ancestor;
-        descendant_ptr.* = descendant;
-
-        return DescendantSelector{
-            .ancestor = ancestor_ptr,
-            .descendant = descendant_ptr,
-        };
+    /// Take ownership of a parser-built chain containing at least two simple
+    /// selectors. The caller's list is reset so it cannot free the moved data.
+    pub fn take(selectors: *std.ArrayList(SimpleSelector)) DescendantSelector {
+        std.debug.assert(selectors.items.len >= 2);
+        const owned_selectors = selectors.*;
+        selectors.* = .empty;
+        return .{ .selectors = owned_selectors };
     }
 
-    fn deinit(self: DescendantSelector, allocator: std.mem.Allocator) void {
-        // Recursively free the child selectors
-        self.ancestor.deinit(allocator);
-        self.descendant.deinit(allocator);
-        // Free the pointers themselves
-        allocator.destroy(self.ancestor);
-        allocator.destroy(self.descendant);
+    fn deinit(self: *DescendantSelector, allocator: std.mem.Allocator) void {
+        for (self.selectors.items) |*selector| selector.deinit(allocator);
+        self.selectors.deinit(allocator);
+        self.selectors = .empty;
     }
 
-    /// Descendant selectors have a priority equal to the sum of their parts
-    /// This makes more specific selectors (like "article div p") have higher priority
+    /// Descendant selectors have a priority equal to the sum of their parts.
     fn priority(self: DescendantSelector) u32 {
-        return self.ancestor.priority() + self.descendant.priority();
+        var total: u32 = 0;
+        for (self.selectors.items) |selector| total += selector.priority();
+        return total;
     }
 
-    /// Returns true if:
-    /// 1. The node matches the descendant selector, AND
-    /// 2. The node has an ancestor that matches the ancestor selector
+    /// Match the rightmost selector against `node`, then walk both the
+    /// selector chain and the root-to-parent ancestor chain backward. Each
+    /// selector and ancestor is advanced at most once, making this O(n + d).
     fn matches(self: DescendantSelector, node: *Node, ancestor_chain: []const *Node) bool {
-        // First check if this node matches the descendant part
-        if (!self.descendant.matches(node, ancestor_chain)) {
-            return false;
-        }
+        const selectors = self.selectors.items;
+        if (selectors.len < 2) return false;
 
-        // Then check if any ancestor in the chain matches the ancestor selector
-        for (ancestor_chain) |ancestor| {
-            if (self.ancestor.matches(ancestor, &[_]*Node{})) {
-                return true;
+        var selector_index = selectors.len - 1;
+        if (!selectors[selector_index].matches(node)) return false;
+
+        var ancestor_index = ancestor_chain.len;
+        while (selector_index > 0 and ancestor_index > 0) {
+            ancestor_index -= 1;
+            if (selectors[selector_index - 1].matches(ancestor_chain[ancestor_index])) {
+                selector_index -= 1;
             }
         }
-
-        return false;
+        return selector_index == 0;
     }
 };

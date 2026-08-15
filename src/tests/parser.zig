@@ -690,6 +690,52 @@ test "Apply tag and class CSS selectors" {
     try std.testing.expectEqualStrings("blue", styles.getPtr("color").?.get().*);
 }
 
+test "descendant selectors are flat and match ordered ancestor chains" {
+    const allocator = std.testing.allocator;
+    const html =
+        "<main><aside><section class=chapter><div><article>" ++
+        "<span class=target>Matched</span>" ++
+        "</article></div></section></aside></main>";
+    const css =
+        "main section.chapter article .target { color: green; }" ++
+        "section main article .target { color: red; }";
+
+    var html_parser = try HTMLParser.init(allocator, html);
+    html_parser.use_implicit_tags = false;
+    defer html_parser.deinit(allocator);
+    var root = try html_parser.parse();
+    defer root.deinit(allocator);
+
+    var css_parser = try CSSParser.init(allocator, css, false);
+    defer css_parser.deinit(allocator);
+    const rules = try css_parser.parse(allocator);
+    defer {
+        for (rules) |*rule| rule.deinit(allocator);
+        allocator.free(rules);
+    }
+
+    try std.testing.expectEqual(@as(usize, 2), rules.len);
+    switch (rules[0].selector) {
+        .descendant => |descendant| {
+            try std.testing.expectEqual(@as(usize, 4), descendant.selectors.items.len);
+        },
+        else => return error.TestExpectedDescendantSelector,
+    }
+    // main (1) + section.chapter (11) + article (1) + .target (10)
+    try std.testing.expectEqual(@as(u32, 23), rules[0].cascadePriority());
+
+    try document_parser.style(allocator, &root, rules);
+    const target = &root.element.children.items[0]
+        .element.children.items[0]
+        .element.children.items[0]
+        .element.children.items[0]
+        .element.children.items[0].element;
+    try std.testing.expectEqualStrings(
+        "green",
+        target.style.?.getPtr("color").?.get().*,
+    );
+}
+
 test "font-family is inherited and code uses the user-agent monospace family" {
     const allocator = std.testing.allocator;
     const html =
