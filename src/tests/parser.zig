@@ -717,3 +717,44 @@ test "width and height are computed without inheriting" {
         child.children.items[0].text.style.?.getPtr("height").?.get().*,
     );
 }
+
+test "display defaults to inline and browser rules define block elements" {
+    const allocator = std.testing.allocator;
+    const html =
+        "<div><span style=\"display: block\">promoted</span>" ++
+        "<p style=\"display: inline\">demoted</p><custom>default</custom></div>";
+    const browser_css = @embedFile("../browser/browser.css");
+
+    var html_parser = try HTMLParser.init(allocator, html);
+    html_parser.use_implicit_tags = false;
+    defer html_parser.deinit(allocator);
+    var root = try html_parser.parse();
+    defer root.deinit(allocator);
+
+    var css_parser = try CSSParser.init(allocator, browser_css, false);
+    defer css_parser.deinit(allocator);
+    const rules = try css_parser.parse(allocator);
+    defer {
+        for (rules) |*rule| rule.deinit(allocator);
+        allocator.free(rules);
+    }
+
+    try document_parser.style(allocator, &root, rules);
+    try std.testing.expectEqualStrings("block", root.element.style.?.getPtr("display").?.get().*);
+    try std.testing.expectEqualStrings(
+        "block",
+        root.element.children.items[0].element.style.?.getPtr("display").?.get().*,
+    );
+    try std.testing.expectEqualStrings(
+        "inline",
+        root.element.children.items[1].element.style.?.getPtr("display").?.get().*,
+    );
+    try std.testing.expectEqualStrings(
+        "inline",
+        root.element.children.items[2].element.style.?.getPtr("display").?.get().*,
+    );
+    try std.testing.expectEqualStrings(
+        "inline",
+        root.element.children.items[0].element.children.items[0].text.style.?.getPtr("display").?.get().*,
+    );
+}

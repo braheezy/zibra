@@ -1010,6 +1010,7 @@ const CSS_PROPERTIES = [_]struct { name: []const u8, default_value: []const u8 }
     .{ .name = "background-color", .default_value = "transparent" },
     .{ .name = "image-rendering", .default_value = "auto" },
     .{ .name = "color-scheme", .default_value = "light dark" },
+    .{ .name = "display", .default_value = "inline" },
     .{ .name = "width", .default_value = "auto" },
     .{ .name = "height", .default_value = "auto" },
 };

@@ -46,6 +46,9 @@ before changing `root.zig`, `tab.zig`, `render/`, or browser task scheduling.
   Resolve a fixed width before laying out descendants so it controls wrapping;
   replace the content-derived height afterward, allowing visible overflow.
   Synthesized anonymous blocks always retain their automatic dimensions.
+- Block participation is driven by computed `display`, not a tag list in
+  layout. The user-agent stylesheet owns HTML's block defaults; direct child
+  display fields invalidate their parent's anonymous/block box grouping.
 - Soft hyphens are invisible discretionary breaks. Track every candidate in
   the current word, use the latest one whose visible hyphen fits, and transfer
   the suffix to the next line without duplicating owning inline payloads.

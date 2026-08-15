@@ -1,3 +1,41 @@
+html { display: block; }
+body { display: block; }
+article { display: block; }
+section { display: block; }
+nav { display: block; }
+aside { display: block; }
+h1 { display: block; }
+h2 { display: block; }
+h3 { display: block; }
+h4 { display: block; }
+h5 { display: block; }
+h6 { display: block; }
+hgroup { display: block; }
+header { display: block; }
+footer { display: block; }
+address { display: block; }
+p { display: block; }
+hr { display: block; }
+pre { display: block; }
+blockquote { display: block; }
+ol { display: block; }
+ul { display: block; }
+menu { display: block; }
+li { display: block; }
+dl { display: block; }
+dt { display: block; }
+dd { display: block; }
+figure { display: block; }
+figcaption { display: block; }
+main { display: block; }
+div { display: block; }
+table { display: block; }
+form { display: block; }
+fieldset { display: block; }
+legend { display: block; }
+details { display: block; }
+summary { display: block; }
+
 pre {
     background-color: gray;
 }

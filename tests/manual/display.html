@@ -1,0 +1,23 @@
+<!doctype html>
+<!--
+How to verify:
+  zig build run -- --dump-style tests/manual/display.html
+  zig build run -- --dump-layout tests/manual/display.html
+  zig build run -- tests/manual/display.html
+Expected: the first three phrases share one line despite using div and p tags;
+the promoted span occupies its own blue block; and the final ordinary div and
+paragraph remain separate gray and green blocks via the browser stylesheet.
+-->
+<html>
+  <head>
+    <title>Display property regression</title>
+  </head>
+  <body style="background-color: white; color: black; font-size: 20px">
+    <div style="display: inline">Inline div.</div>
+    <p style="display: inline">Inline paragraph.</p>
+    <span>Inline span.</span>
+    <span style="display: block; background-color: lightblue">Promoted block span.</span>
+    <div style="background-color: lightgray">User-agent block div.</div>
+    <p style="background-color: lightgreen">User-agent block paragraph.</p>
+  </body>
+</html>

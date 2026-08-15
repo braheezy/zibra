@@ -262,6 +262,12 @@ pixel height replaces the content-derived height after descendant layout.
 `auto`, invalid values, and synthesized anonymous blocks retain the existing
 automatic algorithm. Content is not clipped by a fixed height unless the
 separate overflow behavior requests clipping.
+The non-inherited `display` computed value likewise remains a borrowed style
+slice. Layout treats `block` children as separate block boxes and groups other
+children into anonymous inline runs; the browser stylesheet, rather than Zig
+tag tables, supplies HTML's block defaults. Each block layout registers direct
+child display fields against its tree-version field so a later style change
+rebuilds grouping without retaining an additional DOM or string borrow.
 Soft-hyphen wrapping temporarily transfers the post-break `LineItem` suffix
 out of the active line before flushing its prefix. Glyph entries only borrow
 font data, but embedded input, image, and iframe payloads retain single

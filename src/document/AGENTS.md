@@ -22,6 +22,8 @@ or selector/rule lifetime.
 - `width` and `height` are non-inherited computed properties. Their default is
   `auto`; layout currently resolves only non-negative pixel lengths and keeps
   the borrowed computed-value slice in the style map.
+- `display` is non-inherited and defaults to `inline`. HTML block defaults live
+  in the user-agent stylesheet; layout reads the borrowed computed value.
 - Keep parser output deterministic: the `--dump-dom` golden test is the first
   inspection contract for this pipeline stage.
 

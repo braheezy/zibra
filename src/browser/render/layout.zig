@@ -39,19 +39,23 @@ pub fn documentScrollHeight(document_height_css: i32) i32 {
     return addPageBottomPadding(addPageBottomPadding(document_height_css));
 }
 
-// Define the list of HTML block elements
-const BLOCK_ELEMENTS = [_][]const u8{ "html", "body", "article", "section", "nav", "aside", "h1", "h2", "h3", "h4", "h5", "h6", "hgroup", "header", "footer", "address", "p", "hr", "pre", "blockquote", "ol", "ul", "menu", "li", "dl", "dt", "dd", "figure", "figcaption", "main", "div", "table", "form", "fieldset", "legend", "details", "summary" };
-
-fn isBlockElement(tag: []const u8) bool {
-    for (BLOCK_ELEMENTS) |candidate| {
-        if (std.mem.eql(u8, tag, candidate)) return true;
-    }
-    return false;
+fn isBlockDisplay(value: []const u8) bool {
+    return std.ascii.eqlIgnoreCase(std.mem.trim(u8, value, " \t\r\n"), "block");
 }
 
-fn isContainerNode(node: Node) bool {
+/// Return whether a node participates as a block child. When supplied, the
+/// parent's tree-version field is invalidated by later display-style changes.
+fn isContainerNode(node: Node, dependency_target: ?*ProtectedField(u64)) bool {
     return switch (node) {
-        .element => |element| isBlockElement(element.tag),
+        .element => |element| blk: {
+            const style_map = if (element.style) |*styles| styles else break :blk false;
+            const field = @constCast(style_map).getPtr("display") orelse break :blk false;
+            const value = if (dependency_target) |target| value: {
+                target.addDependency(field);
+                break :value field.read(target).*;
+            } else field.get().*;
+            break :blk isBlockDisplay(value);
+        },
         .text => false,
     };
 }
@@ -746,6 +750,45 @@ test "pre elements preserve text without automatic wrapping" {
     try std.testing.expect(!shouldAutomaticallyWrap(false, 95, 10, 100, false));
 }
 
+fn setTestDisplay(allocator: std.mem.Allocator, node: *Node, value: []const u8) !void {
+    std.debug.assert(node.* == .element);
+    var styles = parser.StyleMap.init(allocator);
+    errdefer styles.deinit();
+    var field = ProtectedField([]const u8).init(allocator, "inline");
+    field.set(value);
+    styles.put("display", field) catch |err| {
+        field.deinit();
+        return err;
+    };
+    node.element.style = styles;
+}
+
+test "computed display classifies block children" {
+    const allocator = std.testing.allocator;
+    var legacy_div = Node{ .element = try parser.Element.init(allocator, "div", null) };
+    defer legacy_div.deinit(allocator);
+    try std.testing.expect(!isContainerNode(legacy_div, null));
+
+    var promoted_span = Node{ .element = try parser.Element.init(allocator, "span", null) };
+    defer promoted_span.deinit(allocator);
+    try setTestDisplay(allocator, &promoted_span, " BLOCK ");
+    try std.testing.expect(isContainerNode(promoted_span, null));
+
+    var tree_version = ProtectedField(u64).init(allocator, 0);
+    defer tree_version.deinit();
+    tree_version.set(0);
+    tree_version.freezeDependencies();
+    try std.testing.expect(isContainerNode(promoted_span, &tree_version));
+    const display_field = promoted_span.element.style.?.getPtr("display").?;
+    display_field.mark();
+    display_field.set("inline");
+    try std.testing.expect(tree_version.dirty);
+
+    try std.testing.expect(isBlockDisplay("block"));
+    try std.testing.expect(!isBlockDisplay("inline"));
+    try std.testing.expect(!isBlockDisplay("unsupported"));
+}
+
 test "list items reserve room for square markers" {
     const allocator = std.testing.allocator;
     var item = Node{ .element = try parser.Element.init(allocator, "LI", null) };
@@ -788,11 +831,12 @@ test "anonymous blocks group only consecutive inline siblings" {
     defer inline_node.deinit(allocator);
     var paragraph = Node{ .element = try parser.Element.init(allocator, "p", null) };
     defer paragraph.deinit(allocator);
+    try setTestDisplay(allocator, &paragraph, "block");
     const text = Node{ .text = .{ .text = "text" } };
 
-    try std.testing.expect(!isContainerNode(inline_node));
-    try std.testing.expect(isContainerNode(paragraph));
-    try std.testing.expect(!isContainerNode(text));
+    try std.testing.expect(!isContainerNode(inline_node, null));
+    try std.testing.expect(isContainerNode(paragraph, null));
+    try std.testing.expect(!isContainerNode(text, null));
 }
 
 test "h6 headings run into a following block" {
@@ -801,9 +845,10 @@ test "h6 headings run into a following block" {
     defer heading.deinit(allocator);
     var paragraph = Node{ .element = try parser.Element.init(allocator, "p", null) };
     defer paragraph.deinit(allocator);
+    try setTestDisplay(allocator, &paragraph, "block");
 
     try std.testing.expect(isRunInHeadingNode(heading));
-    try std.testing.expect(isContainerNode(paragraph));
+    try std.testing.expect(isContainerNode(paragraph, null));
 }
 
 // Layout state
@@ -3450,7 +3495,7 @@ const BlockLayout = struct {
         }
     }
 
-    fn isBlockContainer(self: *const BlockLayout) bool {
+    fn isBlockContainer(self: *BlockLayout) bool {
         if (self.inline_nodes != null) return false;
         switch (self.node) {
             .text => return false,
@@ -3462,18 +3507,11 @@ const BlockLayout = struct {
                     return false;
                 }
 
-                // Follow the chapter-5 heuristic: if any child is a known block
-                // element we treat this layout box as block-level. Otherwise,
-                // mixed inline content stays inline unless the element is empty,
-                // in which case it acts like an empty block box (matching the
-                // Python reference implementation).
+                // A block-displayed child creates a block formatting context.
+                // Otherwise, mixed content stays inline unless the element is
+                // empty, matching the book's simplified layout algorithm.
                 for (e.children.items) |child| {
-                    switch (child) {
-                        .element => |child_e| {
-                            if (isBlockElement(child_e.tag)) return true;
-                        },
-                        else => {},
-                    }
+                    if (isContainerNode(child, &self.children_version)) return true;
                 }
                 return e.children.items.len == 0;
             },
@@ -3669,7 +3707,7 @@ const BlockLayout = struct {
             // anonymous block, normal inline recursion preserves the h6's
             // style while continuing straight into the paragraph text.
             if (isRunInHeadingNode(nodes[index]) and
-                index + 1 < nodes.len and isContainerNode(nodes[index + 1]))
+                index + 1 < nodes.len and isContainerNode(nodes[index + 1], &self.children_version))
             {
                 const run_in_nodes = try self.allocator.alloc(*Node, 2);
                 errdefer self.allocator.free(run_in_nodes);
@@ -3682,7 +3720,7 @@ const BlockLayout = struct {
                 continue;
             }
 
-            if (isContainerNode(nodes[index])) {
+            if (isContainerNode(nodes[index], &self.children_version)) {
                 const child_node = &nodes[index];
                 const child = try BlockLayout.init(self.allocator, child_node.*, child_node, self.document, self, previous);
                 try self.children.append(self.allocator, .{ .block = child });
@@ -3692,7 +3730,7 @@ const BlockLayout = struct {
             }
 
             const start = index;
-            while (index < nodes.len and !isContainerNode(nodes[index])) : (index += 1) {}
+            while (index < nodes.len and !isContainerNode(nodes[index], &self.children_version)) : (index += 1) {}
             const inline_nodes = try self.allocator.alloc(*Node, index - start);
             errdefer self.allocator.free(inline_nodes);
             for (nodes[start..index], 0..) |*node, output_index| {
