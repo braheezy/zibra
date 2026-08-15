@@ -255,6 +255,13 @@ map to that platform face, while CJK, symbol, and emoji graphemes continue to
 use their specialized fallback categories. Each loaded font owns its glyph
 cache, so identical grapheme/style/size keys remain isolated between selected
 families.
+Block `width` and `height` computed values remain borrowed style slices and are
+registered as dependencies of their DOM-backed layout box. A non-negative
+pixel width replaces the available content width before descendant layout; a
+pixel height replaces the content-derived height after descendant layout.
+`auto`, invalid values, and synthesized anonymous blocks retain the existing
+automatic algorithm. Content is not clipped by a fixed height unless the
+separate overflow behavior requests clipping.
 Soft-hyphen wrapping temporarily transfers the post-break `LineItem` suffix
 out of the active line before flushing its prefix. Glyph entries only borrow
 font data, but embedded input, image, and iframe payloads retain single

@@ -42,6 +42,10 @@ before changing `root.zig`, `tab.zig`, `render/`, or browser task scheduling.
   CJK, symbol, and emoji graphemes retain their specialized fallback faces.
   Glyph caches belong to the selected font face, so never reuse a glyph across
   family selections. The user-agent stylesheet makes `code` monospace.
+- Block `width` and `height` support `auto` and non-negative pixel lengths.
+  Resolve a fixed width before laying out descendants so it controls wrapping;
+  replace the content-derived height afterward, allowing visible overflow.
+  Synthesized anonymous blocks always retain their automatic dimensions.
 - Soft hyphens are invisible discretionary breaks. Track every candidate in
   the current word, use the latest one whose visible hyphen fits, and transfer
   the suffix to the next line without duplicating owning inline payloads.
