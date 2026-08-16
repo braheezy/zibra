@@ -15,6 +15,13 @@ before changing `root.zig`, `tab.zig`, `render/`, or browser task scheduling.
 - Each tab owns a sentinel-terminated copy of its root document title. Tab
   workers replace it under `Browser.lock`; only the interactive browser thread
   may pass it to the native window, including after tab switches.
+- Each tab owns an indexed root-navigation history. Successful ordinary
+  navigation truncates entries after the current index before appending; Back
+  and Forward retain the list and move the index only after the replacement
+  document loads. History entries and the index are tab-worker state. Chrome
+  reads only the atomic back/forward availability flags and schedules traversal
+  back onto that worker. A traversal clones its target URL for the load so the
+  canonical entry remains owned until navigation succeeds.
 - Tab workers must not create tabs or mutate browser chrome collections.
   Cross-thread new-tab requests transfer an owning `Url` through
   `Browser.pending_new_tabs`; the browser thread drains that queue.

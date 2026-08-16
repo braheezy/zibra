@@ -7,6 +7,7 @@ comptime {
     _ = @import("browser/render/layout.zig");
     _ = @import("script/js.zig");
     _ = @import("tests/browser_input.zig");
+    _ = @import("tests/browser_history.zig");
     _ = @import("tests/browser_resize.zig");
     _ = @import("tests/browser_scroll.zig");
     _ = @import("tests/parser.zig");

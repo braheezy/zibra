@@ -127,7 +127,7 @@ worker, waits for every accounted helper, and only then destroys shared state.
 
 `Tab` in [`src/browser/tab.zig`](../src/browser/tab.zig) owns:
 
-- URL history entries;
+- indexed URL history entries and the current-entry index;
 - a sentinel-terminated copy of the current root document's title;
 - one root `Frame`, which recursively owns child frames;
 - one Kiesel `Js` context per origin key;
@@ -156,6 +156,16 @@ worker, waits for every accounted helper, and only then destroys shared state.
 The root frame normally borrows its URL from `Tab.history`; child frames may
 own their URL. `parent`, `tab`, `frame_element`, focus pointers, hit-test node
 pointers, `js_context`, and layout-related node pointers are borrowed.
+
+History is mutated only by the serialized tab worker. Ordinary successful
+navigation removes and releases entries after the current index before
+appending the new URL. Back and Forward retain the list, clone the target URL
+for loading, and update the index only after the replacement document is
+ready; a failed traversal therefore leaves both the prior document's history
+position and every canonical history URL owned. Chrome does not read the
+history collection concurrently. It reads acquire/release atomic availability
+flags and schedules a traversal task, which revalidates the requested move on
+the worker.
 
 `Frame.deinit` destroys display/layout state before DOM and destroys DOM before
 the decoded HTML source. That order is required because layout borrows DOM and
@@ -365,6 +375,9 @@ for the final redirect destination. `loadInTab` moves that value into the
 existing navigation URL pointer before parsing subresources or committing
 history, so the frame, relative URLs, history, and chrome all use the final
 destination without adding URL ownership to ordinary subresource responses.
+For a Back or Forward traversal, that final URL replaces the canonical entry at
+the destination index; this keeps redirected traversal and subsequent history
+moves consistent.
 
 `view-source:` now replaces the wrapper Ada URL with the parsed inner Ada URL
 before exposing the inner component slices. That inner URL is the one released
@@ -387,6 +400,9 @@ the URL on entry so every creation and scheduling failure has one clear owner.
 Root navigation also copies the first DOM `title` into tab-owned sentinel
 storage under `Browser.lock`. The interactive main loop applies a dirty active
 title to SDL; switching tabs uses the same activation path and marks it dirty.
+Chrome's Back and Forward handlers read only atomic availability snapshots and
+enqueue a history task. The worker computes the target again before loading,
+so a click based on a stale disabled/enabled snapshot is harmless.
 
 Window resizing preserves that ownership boundary. The main thread allocates a
 complete replacement generation of the root/chrome/tab z2d surfaces and SDL
@@ -454,7 +470,8 @@ lock across parsing, layout, JavaScript, and rendering.
 7. stages stylesheet source buffers and parsed rules together;
 8. assigns a unique document generation, parses scripts, builds layout/paint
    state, and commits browser-visible data;
-9. adds the URL to history.
+9. commits the final URL by appending it to indexed history, or by replacing a
+   successfully traversed entry and moving the current index.
 
 `Tab.invalidateJsContext` in [`src/browser/tab.zig`](../src/browser/tab.zig)
 zeros every current frame's document generation, clears its embedded

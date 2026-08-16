@@ -6,6 +6,7 @@
 const std = @import("std");
 const browser = @import("root.zig");
 const Rect = browser.Rect;
+const Color = browser.Color;
 const DisplayItem = browser.DisplayItem;
 const font = @import("render/font.zig");
 const Browser = browser.Browser;
@@ -22,6 +23,7 @@ urlbar_top: i32 = 0,
 urlbar_bottom: i32 = 0,
 newtab_rect: Rect = undefined,
 back_rect: Rect = undefined,
+forward_rect: Rect = undefined,
 address_rect: Rect = undefined,
 bottom: i32 = 0,
 // Address bar editing state
@@ -86,15 +88,38 @@ pub fn init(font_manager: *font.FontManager, window_width: i32, allocator: std.m
         .bottom = chrome.urlbar_bottom - chrome.padding,
     };
 
+    // Calculate forward button bounds
+    const forward_glyph = try font_manager.getStyledGlyph(
+        ">",
+        .Normal,
+        .Roman,
+        chrome.font_size,
+        .proportional,
+    );
+    const forward_width = forward_glyph.w + 2 * chrome.padding;
+    chrome.forward_rect = Rect{
+        .left = chrome.back_rect.right + chrome.padding,
+        .top = chrome.urlbar_top + chrome.padding,
+        .right = chrome.back_rect.right + chrome.padding + forward_width,
+        .bottom = chrome.urlbar_bottom - chrome.padding,
+    };
+
     // Calculate address bar bounds
     chrome.address_rect = Rect{
-        .left = chrome.back_rect.right + chrome.padding,
+        .left = chrome.forward_rect.right + chrome.padding,
         .top = chrome.urlbar_top + chrome.padding,
         .right = window_width - chrome.padding,
         .bottom = chrome.urlbar_bottom - chrome.padding,
     };
 
     return chrome;
+}
+
+pub fn navigationButtonColor(enabled: bool) Color {
+    return if (enabled)
+        .{ .r = 0, .g = 0, .b = 0, .a = 255 }
+    else
+        .{ .r = 160, .g = 160, .b = 160, .a = 255 };
 }
 
 pub fn deinit(self: *Chrome) void {
@@ -232,10 +257,14 @@ pub fn paint(self: *Chrome, allocator: std.mem.Allocator, b: *const Browser) !st
         } });
     }
 
+    const active_tab = b.activeTab();
+    const back_color = navigationButtonColor(if (active_tab) |tab| tab.canGoBack() else false);
+    const forward_color = navigationButtonColor(if (active_tab) |tab| tab.canGoForward() else false);
+
     // Draw back button
     try cmds.append(allocator, .{ .outline = .{
         .rect = self.back_rect,
-        .color = .{ .r = 0, .g = 0, .b = 0, .a = 255 },
+        .color = back_color,
         .thickness = 1,
     } });
 
@@ -250,7 +279,28 @@ pub fn paint(self: *Chrome, allocator: std.mem.Allocator, b: *const Browser) !st
         .x = self.back_rect.left + self.padding,
         .y = self.back_rect.top,
         .glyph = back_glyph,
-        .color = .{ .r = 0, .g = 0, .b = 0, .a = 255 },
+        .color = back_color,
+    } });
+
+    // Draw forward button
+    try cmds.append(allocator, .{ .outline = .{
+        .rect = self.forward_rect,
+        .color = forward_color,
+        .thickness = 1,
+    } });
+
+    const forward_glyph = try b.layout_engine.font_manager.getStyledGlyph(
+        ">",
+        .Normal,
+        .Roman,
+        self.font_size,
+        .proportional,
+    );
+    try cmds.append(allocator, .{ .glyph = .{
+        .x = self.forward_rect.left + self.padding,
+        .y = self.forward_rect.top,
+        .glyph = forward_glyph,
+        .color = forward_color,
     } });
 
     // Draw address bar
@@ -349,9 +399,15 @@ pub fn click(self: *Chrome, b: *Browser, x: i32, y: i32) !bool {
     // Check if clicked on back button
     if (self.back_rect.containsPoint(x, y)) {
         if (b.activeTab()) |tab| {
-            tab.goBack(b) catch |err| {
-                std.log.err("Failed to go back: {any}", .{err});
-            };
+            if (tab.canGoBack()) tab.requestHistoryTraversal(b, .back);
+        }
+        return true;
+    }
+
+    // Check if clicked on forward button
+    if (self.forward_rect.containsPoint(x, y)) {
+        if (b.activeTab()) |tab| {
+            if (tab.canGoForward()) tab.requestHistoryTraversal(b, .forward);
         }
         return true;
     }

@@ -34,6 +34,16 @@ pub const ClickButton = enum {
     middle,
 };
 
+pub const HistoryDirection = enum {
+    back,
+    forward,
+};
+
+pub const HistoryNavigation = union(enum) {
+    push,
+    traverse: usize,
+};
+
 /// Represents a composited visual effect update (e.g., opacity change during animation)
 pub const CompositedUpdate = struct {
     node: *anyopaque, // Pointer to the element that owns this effect
@@ -543,6 +553,11 @@ tab_width: i32 = 0,
 tab_height: i32 = 0,
 // History of visited URLs (owns Url pointers)
 history: std.ArrayList(*Url),
+// Index of the currently displayed history entry. Forward entries remain
+// owned until a successful ordinary navigation replaces that branch.
+history_index: ?usize = null,
+history_can_go_back: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+history_can_go_forward: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
 // Owned, sentinel-terminated title from the current root document.
 title: ?[:0]u8 = null,
 // Dynamically allocated text strings (e.g., from JavaScript results) that need to be freed
@@ -593,6 +608,9 @@ pub fn init(allocator: std.mem.Allocator, tab_width: i32, tab_height: i32, measu
         .tab_width = tab_width,
         .tab_height = tab_height,
         .history = std.ArrayList(*Url).empty,
+        .history_index = null,
+        .history_can_go_back = std.atomic.Value(bool).init(false),
+        .history_can_go_forward = std.atomic.Value(bool).init(false),
         .title = null,
         .dynamic_texts = std.ArrayList([]const u8).empty,
         .js_contexts = std.StringHashMap(*js_module).init(allocator),
@@ -876,27 +894,83 @@ pub fn isShuttingDown(self: *const Tab) bool {
     return self.shutting_down.load(.seq_cst);
 }
 
-// Go back in history
-pub fn goBack(self: *Tab, b: *Browser) !void {
-    if (self.history.items.len > 1) {
-        // Remove current page (we already checked length > 1)
-        if (self.history.pop()) |current_ptr| {
-            current_ptr.*.free(self.allocator);
-            self.allocator.destroy(current_ptr);
-            if (self.root_frame) |frame| {
-                frame.current_url = null;
-                frame.current_url_owned = false;
+pub fn canGoBack(self: *const Tab) bool {
+    return self.history_can_go_back.load(.acquire);
+}
+
+pub fn canGoForward(self: *const Tab) bool {
+    return self.history_can_go_forward.load(.acquire);
+}
+
+fn updateHistoryAvailability(self: *Tab) void {
+    const current = self.history_index;
+    self.history_can_go_back.store(current != null and current.? > 0, .release);
+    self.history_can_go_forward.store(
+        current != null and current.? + 1 < self.history.items.len,
+        .release,
+    );
+}
+
+/// Commit `url` as the canonical owner for a successful root navigation.
+/// Ownership transfers only on success.
+pub fn commitHistoryNavigation(
+    self: *Tab,
+    url: *Url,
+    navigation: HistoryNavigation,
+) !void {
+    switch (navigation) {
+        .push => {
+            try self.history.ensureUnusedCapacity(self.allocator, 1);
+            const retained_len = if (self.history_index) |index| index + 1 else 0;
+            while (self.history.items.len > retained_len) {
+                const stale = self.history.pop().?;
+                stale.*.free(self.allocator);
+                self.allocator.destroy(stale);
             }
-        }
-        // Get previous page and load it (which will add it back to history)
-        if (self.history.pop()) |back_ptr| {
-            b.scheduleLoad(self, back_ptr, null) catch |err| {
-                try self.history.append(self.allocator, back_ptr);
-                return err;
-            };
-        }
-        try b.draw();
+            self.history.appendAssumeCapacity(url);
+            self.history_index = self.history.items.len - 1;
+        },
+        .traverse => |target| {
+            if (target >= self.history.items.len) return error.InvalidHistoryTarget;
+            const replaced = self.history.items[target];
+            self.history.items[target] = url;
+            replaced.*.free(self.allocator);
+            self.allocator.destroy(replaced);
+            self.history_index = target;
+        },
     }
+    self.updateHistoryAvailability();
+}
+
+fn historyTarget(self: *const Tab, direction: HistoryDirection) ?usize {
+    const current = self.history_index orelse return null;
+    return switch (direction) {
+        .back => if (current > 0) current - 1 else null,
+        .forward => if (current + 1 < self.history.items.len) current + 1 else null,
+    };
+}
+
+pub fn requestHistoryTraversal(self: *Tab, b: *Browser, direction: HistoryDirection) void {
+    b.scheduleTabHistoryTraversal(self, direction);
+}
+
+/// Runs on the serialized tab worker.
+pub fn traverseHistory(self: *Tab, b: *Browser, direction: HistoryDirection) !void {
+    const target = self.historyTarget(direction) orelse return;
+    const cloned_url = try self.history.items[target].*.clone(self.allocator);
+    const url_ptr = self.allocator.create(Url) catch |err| {
+        cloned_url.free(self.allocator);
+        return err;
+    };
+    url_ptr.* = cloned_url;
+    var url_owned = true;
+    defer if (url_owned) {
+        url_ptr.*.free(self.allocator);
+        self.allocator.destroy(url_ptr);
+    };
+
+    try b.loadInTab(self, url_ptr, null, .{ .traverse = target });
+    url_owned = false;
 }
 
 pub fn setNeedsRender(self: *Tab) void {

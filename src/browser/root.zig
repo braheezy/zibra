@@ -28,6 +28,8 @@ const tab_module = @import("tab.zig");
 const Tab = tab_module.Tab;
 const Frame = tab_module.Frame;
 const ClickButton = tab_module.ClickButton;
+const HistoryDirection = tab_module.HistoryDirection;
+const HistoryNavigation = tab_module.HistoryNavigation;
 const scroll_model = @import("scroll.zig");
 const Chrome = @import("chrome.zig");
 const task_module = @import("../runtime/task.zig");
@@ -1702,6 +1704,32 @@ pub const Browser = struct {
         };
     }
 
+    pub fn scheduleTabHistoryTraversal(
+        self: *Browser,
+        tab: *Tab,
+        direction: HistoryDirection,
+    ) void {
+        const ctx = TabHistoryTaskContext.create(
+            self.allocator,
+            self,
+            tab,
+            direction,
+        ) catch |err| {
+            std.log.err("Failed to allocate history traversal task: {}", .{err});
+            return;
+        };
+        const task_instance = Task.init(
+            ctx.toOpaque(),
+            TabHistoryTaskContext.runOpaque,
+            TabHistoryTaskContext.cleanupOpaque,
+        );
+        tab.task_runner.schedule(task_instance) catch |err| {
+            std.log.err("Failed to schedule history traversal: {}", .{err});
+            ctx.destroy();
+            return;
+        };
+    }
+
     fn scheduleTabClearFocusTask(self: *Browser, tab: *Tab) void {
         const ctx = TabClearFocusTaskContext.create(self.allocator, self, tab) catch |err| {
             std.log.err("Failed to allocate clear focus task: {}", .{err});
@@ -1831,6 +1859,7 @@ pub const Browser = struct {
         tab: *Tab,
         url: *Url,
         payload: ?[]const u8,
+        history_navigation: HistoryNavigation,
     ) !void {
         std.log.info("Loading: {s}", .{url.*.path});
 
@@ -2078,8 +2107,10 @@ pub const Browser = struct {
             try self.layoutTabNodes(frame, true);
         }
 
-        // Record navigation history and update current URL ownership
-        try tab.history.append(self.allocator, url);
+        // Commit history only after the new document is ready. Ordinary
+        // navigation truncates a forward branch; traversal replaces the
+        // canonical target with the final URL after redirects.
+        try tab.commitHistoryNavigation(url, history_navigation);
         frame.current_url = url;
         frame.current_url_owned = false;
         self.updateTabTitle(tab, document_title);
@@ -5218,7 +5249,7 @@ const LoadTaskContext = struct {
 
     fn run(self: *LoadTaskContext) !void {
         defer self.consumePayload();
-        try self.browser.loadInTab(self.tab, self.url.?, self.payload);
+        try self.browser.loadInTab(self.tab, self.url.?, self.payload, .push);
         self.url = null;
     }
 
@@ -5406,6 +5437,54 @@ const TabKeypressTaskContext = struct {
 
     fn cleanupOpaque(context: *anyopaque) void {
         TabKeypressTaskContext.fromOpaque(context).destroy();
+    }
+};
+
+const TabHistoryTaskContext = struct {
+    allocator: std.mem.Allocator,
+    browser: *Browser,
+    tab: *Tab,
+    direction: HistoryDirection,
+
+    fn create(
+        allocator: std.mem.Allocator,
+        browser: *Browser,
+        tab: *Tab,
+        direction: HistoryDirection,
+    ) !*TabHistoryTaskContext {
+        const ctx = try allocator.create(TabHistoryTaskContext);
+        ctx.* = .{
+            .allocator = allocator,
+            .browser = browser,
+            .tab = tab,
+            .direction = direction,
+        };
+        return ctx;
+    }
+
+    fn destroy(self: *TabHistoryTaskContext) void {
+        self.allocator.destroy(self);
+    }
+
+    fn run(self: *TabHistoryTaskContext) !void {
+        try self.tab.traverseHistory(self.browser, self.direction);
+    }
+
+    fn toOpaque(self: *TabHistoryTaskContext) *anyopaque {
+        return @ptrCast(self);
+    }
+
+    fn fromOpaque(context: *anyopaque) *TabHistoryTaskContext {
+        const raw: *align(1) TabHistoryTaskContext = @ptrCast(context);
+        return @alignCast(raw);
+    }
+
+    fn runOpaque(context: *anyopaque) anyerror!void {
+        try TabHistoryTaskContext.fromOpaque(context).run();
+    }
+
+    fn cleanupOpaque(context: *anyopaque) void {
+        TabHistoryTaskContext.fromOpaque(context).destroy();
     }
 };
 
