@@ -81,3 +81,43 @@ test "middle-clicking a link queues its resolved URL for a new tab" {
     try std.testing.expect(!try frame.click(&test_browser, 200, 200, .middle));
     try std.testing.expectEqual(@as(usize, 1), test_browser.pending_new_tabs.items.len);
 }
+
+test "tab title updates own their text and dirty only the active window title" {
+    const allocator = std.testing.allocator;
+
+    var test_browser: browser.Browser = undefined;
+    test_browser.allocator = allocator;
+    test_browser.lock = .init(std.testing.io);
+    test_browser.tabs = .empty;
+    defer test_browser.tabs.deinit(allocator);
+    test_browser.active_tab_index = 0;
+    test_browser.window_title_dirty = false;
+
+    var active_tab: tab_module.Tab = undefined;
+    active_tab.title = null;
+    defer if (active_tab.title) |title| allocator.free(title);
+    var inactive_tab: tab_module.Tab = undefined;
+    inactive_tab.title = null;
+    defer if (inactive_tab.title) |title| allocator.free(title);
+    try test_browser.tabs.append(allocator, &active_tab);
+    try test_browser.tabs.append(allocator, &inactive_tab);
+
+    test_browser.updateTabTitle(
+        &inactive_tab,
+        try allocator.dupeZ(u8, "Background title"),
+    );
+    try std.testing.expect(!test_browser.window_title_dirty);
+    try std.testing.expectEqualStrings("Background title", inactive_tab.title.?);
+
+    test_browser.updateTabTitle(
+        &active_tab,
+        try allocator.dupeZ(u8, "Active title"),
+    );
+    try std.testing.expect(test_browser.window_title_dirty);
+    try std.testing.expectEqualStrings("Active title", active_tab.title.?);
+
+    test_browser.window_title_dirty = false;
+    test_browser.updateTabTitle(&active_tab, try allocator.dupeZ(u8, "Replacement"));
+    try std.testing.expect(test_browser.window_title_dirty);
+    try std.testing.expectEqualStrings("Replacement", active_tab.title.?);
+}

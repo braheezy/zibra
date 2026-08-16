@@ -36,6 +36,7 @@ const MeasureTime = @import("../runtime/measure_time.zig").MeasureTime;
 
 // Default browser stylesheet - defines default styling for HTML elements
 const DEFAULT_STYLE_SHEET = @embedFile("browser.css");
+const default_window_title: [:0]const u8 = "zibra";
 
 // *********************************************************
 // * App Settings
@@ -624,6 +625,8 @@ pub const Browser = struct {
     pending_new_tabs: std.ArrayList(Url),
     // Index of the active tab
     active_tab_index: ?usize = null,
+    // Set by tab workers under `lock`; consumed by the interactive main loop.
+    window_title_dirty: bool = true,
     // Browser chrome (UI)
     chrome: Chrome = undefined,
     // Focus tracking: null means nothing focused, "content" means page content
@@ -891,6 +894,7 @@ pub const Browser = struct {
         }
         if (found_idx) |idx| {
             self.active_tab_index = idx;
+            self.window_title_dirty = true;
             self.active_tab_scroll = 0;
             self.active_tab_zoom = tab.accessibility.zoom;
             self.active_tab_prefers_dark = tab.accessibility.prefers_dark;
@@ -913,6 +917,31 @@ pub const Browser = struct {
         if (should_schedule) {
             self.scheduleAnimationFrame();
         }
+    }
+
+    /// Replace a tab's owned root-document title. Native window mutation
+    /// remains on the interactive main loop.
+    pub fn updateTabTitle(self: *Browser, tab: *Tab, title: ?[:0]u8) void {
+        self.lock.lock();
+        defer self.lock.unlock();
+
+        if (tab.title) |old_title| self.allocator.free(old_title);
+        tab.title = title;
+        if (self.activeTab() == tab) self.window_title_dirty = true;
+    }
+
+    fn applyWindowTitle(self: *Browser) void {
+        const window = self.window orelse return;
+        self.lock.lock();
+        defer self.lock.unlock();
+        if (!self.window_title_dirty) return;
+
+        const title = if (self.activeTab()) |tab|
+            tab.title orelse default_window_title
+        else
+            default_window_title;
+        window.setTitle(title);
+        self.window_title_dirty = false;
     }
 
     /// Retire derived draw state before the committed display list it borrows.
@@ -1065,6 +1094,7 @@ pub const Browser = struct {
 
         while (!quit) {
             self.openPendingTabs();
+            self.applyWindowTitle();
 
             var handled_event = false;
             // Use waitEventTimeout to be responsive to system events while still
@@ -1826,6 +1856,8 @@ pub const Browser = struct {
         const body_owned = !std.mem.eql(u8, url.*.scheme, "about") and !std.mem.eql(u8, url.*.scheme, "data");
         defer if (body_owned) self.allocator.free(raw_body);
         const body_text = try decodeUtf8Replace(self.allocator, raw_body);
+        var document_title: ?[:0]u8 = null;
+        defer if (document_title) |title| self.allocator.free(title);
 
         tab.task_runner.clear();
         tab.invalidateJsContext();
@@ -1906,6 +1938,10 @@ pub const Browser = struct {
 
             // Parse the HTML and store the root node
             frame.current_node = try html_parser.parse();
+            document_title = try parser.collectDocumentTitle(
+                self.allocator,
+                &frame.current_node.?,
+            );
 
             // IMPORTANT: Fix parent pointers after copying the tree
             // The parse() method returns the tree by value, which copies it,
@@ -2046,6 +2082,8 @@ pub const Browser = struct {
         try tab.history.append(self.allocator, url);
         frame.current_url = url;
         frame.current_url_owned = false;
+        self.updateTabTitle(tab, document_title);
+        document_title = null;
         tab.setNeedsRender();
         // Render and commit immediately to ensure first paint even if animation scheduling stalls.
         tab.runAnimationFrame(frame.scroll);

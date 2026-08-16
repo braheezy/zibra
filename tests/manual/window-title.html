@@ -1,0 +1,16 @@
+<!--
+How to verify:
+  zig build run -- file://$PWD/tests/manual/window-title.html
+
+The native window title must read "First Zibra title". Follow the link and it
+must change to "Second Zibra title"; using Back must restore the first title.
+Open both pages in separate tabs and switching tabs must switch the title too.
+-->
+<!doctype html>
+<html>
+  <head><title>First Zibra title</title></head>
+  <body>
+    <h1>First title page</h1>
+    <p><a href="window-title-target.html">Navigate to the second title</a></p>
+  </body>
+</html>

@@ -12,6 +12,9 @@ before changing `root.zig`, `tab.zig`, `render/`, or browser task scheduling.
 - `tab.zig` owns frames, document generations, task serialization, and helper
   quiescence. Queued or detached work must carry a stable document identity,
   not a borrowed frame pointer.
+- Each tab owns a sentinel-terminated copy of its root document title. Tab
+  workers replace it under `Browser.lock`; only the interactive browser thread
+  may pass it to the native window, including after tab switches.
 - Tab workers must not create tabs or mutate browser chrome collections.
   Cross-thread new-tab requests transfer an owning `Url` through
   `Browser.pending_new_tabs`; the browser thread drains that queue.

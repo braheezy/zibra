@@ -543,6 +543,8 @@ tab_width: i32 = 0,
 tab_height: i32 = 0,
 // History of visited URLs (owns Url pointers)
 history: std.ArrayList(*Url),
+// Owned, sentinel-terminated title from the current root document.
+title: ?[:0]u8 = null,
 // Dynamically allocated text strings (e.g., from JavaScript results) that need to be freed
 dynamic_texts: std.ArrayList([]const u8),
 // JS contexts keyed by origin string
@@ -591,6 +593,7 @@ pub fn init(allocator: std.mem.Allocator, tab_width: i32, tab_height: i32, measu
         .tab_width = tab_width,
         .tab_height = tab_height,
         .history = std.ArrayList(*Url).empty,
+        .title = null,
         .dynamic_texts = std.ArrayList([]const u8).empty,
         .js_contexts = std.StringHashMap(*js_module).init(allocator),
         .task_runner = TaskRunner.init(allocator, measure),
@@ -719,6 +722,11 @@ pub fn deinit(self: *Tab) void {
         self.allocator.free(text);
     }
     self.dynamic_texts.deinit(self.allocator);
+
+    if (self.title) |title| {
+        self.allocator.free(title);
+        self.title = null;
+    }
 
     self.clearAccessibilityTree();
     for (self.accessibility_strings.items) |value| {

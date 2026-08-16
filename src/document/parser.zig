@@ -1421,6 +1421,50 @@ pub fn collectInlineStyleText(allocator: std.mem.Allocator, node: *const Node) !
     return try text.toOwnedSlice(allocator);
 }
 
+fn findFirstTitleElement(node: *const Node) ?*const Element {
+    return switch (node.*) {
+        .text => null,
+        .element => |*element| blk: {
+            if (std.ascii.eqlIgnoreCase(element.tag, "title")) break :blk element;
+            for (element.children.items) |*child| {
+                if (findFirstTitleElement(child)) |title| break :blk title;
+            }
+            break :blk null;
+        },
+    };
+}
+
+fn appendNodeText(
+    allocator: std.mem.Allocator,
+    node: *const Node,
+    output: *std.ArrayList(u8),
+) !void {
+    switch (node.*) {
+        .text => |text| try output.appendSlice(allocator, text.text),
+        .element => |element| {
+            for (element.children.items) |*child| {
+                try appendNodeText(allocator, child, output);
+            }
+        },
+    }
+}
+
+/// Return an owned, sentinel-terminated copy of the first `title` element's
+/// text content. The DOM continues to borrow the document source; this copy is
+/// safe to retain independently for native window APIs.
+pub fn collectDocumentTitle(
+    allocator: std.mem.Allocator,
+    root: *const Node,
+) !?[:0]u8 {
+    const title = findFirstTitleElement(root) orelse return null;
+    var text = std.ArrayList(u8).empty;
+    errdefer text.deinit(allocator);
+    for (title.children.items) |*child| {
+        try appendNodeText(allocator, child, &text);
+    }
+    return try text.toOwnedSliceSentinel(allocator, 0);
+}
+
 /// Write the DOM with its computed style values in a stable property order.
 /// This is intentionally separate from `writePretty`: callers can inspect the
 /// cascade without constructing layout, a renderer, or a JavaScript context.

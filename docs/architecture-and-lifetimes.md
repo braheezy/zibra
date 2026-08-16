@@ -128,6 +128,7 @@ worker, waits for every accounted helper, and only then destroys shared state.
 `Tab` in [`src/browser/tab.zig`](../src/browser/tab.zig) owns:
 
 - URL history entries;
+- a sentinel-terminated copy of the current root document's title;
 - one root `Frame`, which recursively owns child frames;
 - one Kiesel `Js` context per origin key;
 - frame-ID maps plus tab-wide and per-document generation counters;
@@ -383,6 +384,9 @@ the owning URL into `Browser.pending_new_tabs` under `Browser.lock`, and the
 interactive main loop drains that queue before creating and activating tabs.
 `queueNewTab` transfers ownership only when append succeeds; `newTab` consumes
 the URL on entry so every creation and scheduling failure has one clear owner.
+Root navigation also copies the first DOM `title` into tab-owned sentinel
+storage under `Browser.lock`. The interactive main loop applies a dirty active
+title to SDL; switching tabs uses the same activation path and marks it dirty.
 
 Window resizing preserves that ownership boundary. The main thread allocates a
 complete replacement generation of the root/chrome/tab z2d surfaces and SDL

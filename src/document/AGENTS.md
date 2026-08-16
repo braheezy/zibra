@@ -30,6 +30,9 @@ or selector/rule lifetime.
 - `<style>` element text is copied into the same owned stylesheet generation as
   decoded external CSS. Keep inline and linked sheets in DOM order, and make
   isolated inspection and interactive frame loading follow the same cascade.
+- `collectDocumentTitle` copies the first `title` element's descendant text
+  into an owned sentinel-terminated slice; native window state must never
+  retain the DOM's source-backed text slices.
 - When adding a supported CSS property that has a shorthand, add its expansion
   to `CSSParser.putDeclaration`. Expand in source order for both stylesheet and
   inline declarations, preserve borrowed slices or static defaults, and test

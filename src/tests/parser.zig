@@ -294,6 +294,40 @@ test "Parse HTML with head elements but no explicit head tag" {
     try std.testing.expectEqual(@as(usize, 1), p.children.items.len);
 }
 
+test "document title copies the first title element text" {
+    const allocator = std.testing.allocator;
+    const html =
+        "<html><head><title>First title</title><title>Ignored</title></head>" ++
+        "<body><p>Content</p></body></html>";
+
+    var html_parser = try HTMLParser.init(allocator, html);
+    defer html_parser.deinit(allocator);
+    var root = try html_parser.parse();
+    defer root.deinit(allocator);
+
+    const title = (try document_parser.collectDocumentTitle(allocator, &root)).?;
+    defer allocator.free(title);
+    try std.testing.expectEqualStrings("First title", title);
+}
+
+test "document title distinguishes an empty title from a missing title" {
+    const allocator = std.testing.allocator;
+
+    var empty_parser = try HTMLParser.init(allocator, "<title></title><p>Content</p>");
+    defer empty_parser.deinit(allocator);
+    var empty_root = try empty_parser.parse();
+    defer empty_root.deinit(allocator);
+    const empty_title = (try document_parser.collectDocumentTitle(allocator, &empty_root)).?;
+    defer allocator.free(empty_title);
+    try std.testing.expectEqual(@as(usize, 0), empty_title.len);
+
+    var missing_parser = try HTMLParser.init(allocator, "<p>Content</p>");
+    defer missing_parser.deinit(allocator);
+    var missing_root = try missing_parser.parse();
+    defer missing_root.deinit(allocator);
+    try std.testing.expect((try document_parser.collectDocumentTitle(allocator, &missing_root)) == null);
+}
+
 test "Parse HTML with unclosed paragraph tags" {
     const allocator = std.testing.allocator;
     // HTML with an unclosed paragraph tag

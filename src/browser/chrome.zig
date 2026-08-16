@@ -366,7 +366,7 @@ pub fn click(self: *Chrome, b: *Browser, x: i32, y: i32) !bool {
     for (0..b.tabs.items.len) |i| {
         if (self.tabRect(i).containsPoint(x, y)) {
             if (b.active_tab_index == null or b.active_tab_index.? != i) {
-                b.active_tab_index = i;
+                b.setActiveTab(b.tabs.items[i]);
                 return true;
             }
             return false;
