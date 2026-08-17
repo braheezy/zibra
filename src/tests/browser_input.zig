@@ -244,6 +244,62 @@ test "Enter does not submit from a text entry outside a form or a non-text input
     ));
 }
 
+test "form method defaults to GET and recognizes POST case-insensitively" {
+    try std.testing.expectEqual(tab_module.FormMethod.get, tab_module.parseFormMethod(null));
+    try std.testing.expectEqual(tab_module.FormMethod.get, tab_module.parseFormMethod(""));
+    try std.testing.expectEqual(tab_module.FormMethod.get, tab_module.parseFormMethod(" GET "));
+    try std.testing.expectEqual(tab_module.FormMethod.get, tab_module.parseFormMethod("invalid"));
+    try std.testing.expectEqual(tab_module.FormMethod.post, tab_module.parseFormMethod("post"));
+    try std.testing.expectEqual(tab_module.FormMethod.post, tab_module.parseFormMethod("\tPoSt\r\n"));
+}
+
+test "GET form plans put encoded data in the action and have no body" {
+    const allocator = std.testing.allocator;
+    const cases = [_]struct {
+        action: []const u8,
+        expected: []const u8,
+    }{
+        .{ .action = "/search", .expected = "/search?q=hi" },
+        .{ .action = "", .expected = "?q=hi" },
+        .{ .action = "/search?old=value", .expected = "/search?q=hi" },
+        .{ .action = "/search?old=value#results", .expected = "/search?q=hi#results" },
+    };
+
+    for (cases) |case| {
+        var plan = try tab_module.planFormSubmission(allocator, .get, case.action, "q=hi");
+        defer plan.deinit(allocator);
+        try std.testing.expectEqualStrings(case.expected, plan.action);
+        try std.testing.expect(plan.payload == null);
+        try std.testing.expect(plan.owned_action != null);
+    }
+
+    var base = try Url.init(allocator, "https://example.test/docs/page?old=1#section");
+    defer base.free(allocator);
+    var plan = try tab_module.planFormSubmission(allocator, .get, "", "q=hi");
+    defer plan.deinit(allocator);
+    const resolved = try base.resolveForNavigation(allocator, plan.action);
+    defer resolved.free(allocator);
+    var url_buffer: [256]u8 = undefined;
+    try std.testing.expectEqualStrings(
+        "https://example.test/docs/page?q=hi",
+        try resolved.toString(&url_buffer),
+    );
+}
+
+test "POST form plans preserve the action and carry the encoded body" {
+    var plan = try tab_module.planFormSubmission(
+        std.testing.allocator,
+        .post,
+        "/submit?existing=yes",
+        "q=hi%20there",
+    );
+    defer plan.deinit(std.testing.allocator);
+
+    try std.testing.expectEqualStrings("/submit?existing=yes", plan.action);
+    try std.testing.expectEqualStrings("q=hi%20there", plan.payload.?);
+    try std.testing.expect(plan.owned_action == null);
+}
+
 test "mouse wheel delta preserves magnitude and normalizes direction" {
     try std.testing.expectEqual(@as(i32, -100), browser.wheelScrollDelta(1, false));
     try std.testing.expectEqual(@as(i32, 300), browser.wheelScrollDelta(-3, false));

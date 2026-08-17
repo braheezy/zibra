@@ -1650,6 +1650,79 @@ pub fn clickDevice(
     }
 }
 
+pub const FormMethod = enum {
+    get,
+    post,
+};
+
+/// Parse the HTML form method. GET is the missing, empty, invalid, and
+/// unsupported-value default; only an explicit ASCII-case-insensitive POST
+/// selects a request body.
+pub fn parseFormMethod(raw_method: ?[]const u8) FormMethod {
+    const raw = raw_method orelse return .get;
+    const trimmed = std.mem.trim(u8, raw, " \t\r\n");
+    return if (std.ascii.eqlIgnoreCase(trimmed, "post")) .post else .get;
+}
+
+/// A synchronous form-navigation plan. `action` and a non-null `payload`
+/// borrow the caller's buffers; `owned_action` is present only for GET and is
+/// released by `deinit`.
+pub const FormSubmissionPlan = struct {
+    action: []const u8,
+    payload: ?[]const u8,
+    owned_action: ?[]u8,
+
+    pub fn deinit(self: *FormSubmissionPlan, allocator: std.mem.Allocator) void {
+        if (self.owned_action) |action| allocator.free(action);
+        self.* = undefined;
+    }
+};
+
+fn buildGetFormAction(
+    allocator: std.mem.Allocator,
+    action: []const u8,
+    encoded_data: []const u8,
+) ![]u8 {
+    // GET form data replaces the action's query. Keep a fragment after the
+    // new query so relative, absolute, and empty actions all retain normal URL
+    // resolution semantics.
+    const fragment_index = std.mem.indexOfScalar(u8, action, '#') orelse action.len;
+    const query_index = std.mem.indexOfScalar(u8, action[0..fragment_index], '?') orelse fragment_index;
+
+    var result = std.ArrayList(u8).empty;
+    errdefer result.deinit(allocator);
+    try result.appendSlice(allocator, action[0..query_index]);
+    try result.append(allocator, '?');
+    try result.appendSlice(allocator, encoded_data);
+    if (fragment_index < action.len) {
+        try result.appendSlice(allocator, action[fragment_index..]);
+    }
+    return result.toOwnedSlice(allocator);
+}
+
+pub fn planFormSubmission(
+    allocator: std.mem.Allocator,
+    method: FormMethod,
+    action: []const u8,
+    encoded_data: []const u8,
+) !FormSubmissionPlan {
+    return switch (method) {
+        .get => blk: {
+            const get_action = try buildGetFormAction(allocator, action, encoded_data);
+            break :blk .{
+                .action = get_action,
+                .payload = null,
+                .owned_action = get_action,
+            };
+        },
+        .post => .{
+            .action = action,
+            .payload = encoded_data,
+            .owned_action = null,
+        },
+    };
+}
+
 // Submit the form containing an activated button or text entry.
 fn submitForm(self: *Tab, b: *Browser, frame: *Frame, control_node: *Node) !bool {
     // IMPORTANT: We cannot traverse parent pointers here because loadInTab
@@ -1699,11 +1772,15 @@ fn submitForm(self: *Tab, b: *Browser, frame: *Frame, control_node: *Node) !bool
                                 attrs.get("action") orelse ""
                             else
                                 "";
+                            const method = parseFormMethod(if (e.attributes) |attrs|
+                                attrs.get("method")
+                            else
+                                null);
                             std.log.info("Form action: {s}", .{action});
                             const action_copy = try self.allocator.dupe(u8, action);
                             defer self.allocator.free(action_copy);
 
-                            try self.submitFormData(b, frame, node_ptr, action_copy);
+                            try self.submitFormData(b, frame, node_ptr, action_copy, method);
                             return true;
                         }
                     }
@@ -1717,8 +1794,15 @@ fn submitForm(self: *Tab, b: *Browser, frame: *Frame, control_node: *Node) !bool
     return false;
 }
 
-// Collect form inputs and submit via POST
-fn submitFormData(self: *Tab, b: *Browser, frame: *Frame, form_node: *Node, action: []const u8) !void {
+// Collect form inputs and submit according to the form's GET/POST method.
+fn submitFormData(
+    self: *Tab,
+    b: *Browser,
+    frame: *Frame,
+    form_node: *Node,
+    action: []const u8,
+    method: FormMethod,
+) !void {
     // Get all descendents of the form
     var node_list = std.ArrayList(*Node).empty;
     defer node_list.deinit(self.allocator);
@@ -1777,9 +1861,6 @@ fn submitFormData(self: *Tab, b: *Browser, frame: *Frame, form_node: *Node, acti
         self.allocator.free(body_slice);
     };
 
-    // Log the form submission
-    std.log.info("Form submission to {s}: {s}", .{ action, body_slice });
-
     // For file:// URLs, we can't actually submit forms, so just log it
     if (frame.current_url) |url_ptr| {
         if (std.mem.eql(u8, url_ptr.*.scheme, "file")) {
@@ -1788,10 +1869,19 @@ fn submitFormData(self: *Tab, b: *Browser, frame: *Frame, form_node: *Node, acti
         }
     }
 
-    // Resolve the action URL against the current page URL
-    var form_url = try frame.current_url.?.*.resolveForNavigation(self.allocator, action);
+    var submission = try planFormSubmission(self.allocator, method, action, body_slice);
+    defer submission.deinit(self.allocator);
 
-    // Load the URL with the POST body
+    std.log.info(
+        "Form {s} submission to {s}: {s}",
+        .{ @tagName(method), submission.action, body_slice },
+    );
+
+    // Resolve the action URL against the current page URL
+    var form_url = try frame.current_url.?.*.resolveForNavigation(self.allocator, submission.action);
+
+    // A non-null payload is the network layer's POST discriminator. GET data
+    // lives only in the resolved URL and its encoded buffer stays local.
     const form_url_ptr = b.allocator.create(Url) catch |alloc_err| {
         std.log.err("Failed to allocate form URL: {any}", .{alloc_err});
         form_url.free(self.allocator);
@@ -1805,18 +1895,18 @@ fn submitFormData(self: *Tab, b: *Browser, frame: *Frame, form_node: *Node, acti
     };
 
     if (frame.parent != null) {
-        b.scheduleFrameLoad(frame, form_url_ptr, body_slice) catch |err| {
+        b.scheduleFrameLoad(frame, form_url_ptr, submission.payload) catch |err| {
             std.log.err("Failed to submit iframe form: {any}", .{err});
             return;
         };
     } else {
-        b.scheduleLoad(self, form_url_ptr, body_slice) catch |err| {
+        b.scheduleLoad(self, form_url_ptr, submission.payload) catch |err| {
             std.log.err("Failed to submit form: {any}", .{err});
             return;
         };
     }
     url_owned = false;
-    body_owned = false;
+    if (submission.payload != null) body_owned = false;
 }
 
 // Cycle focus to the next input element (for Tab key)

@@ -1,0 +1,28 @@
+<!--
+How to verify:
+1. From the repository root, run:
+   python3 -m http.server 8000 --directory tests/manual
+2. Open http://127.0.0.1:8000/form-get.html in Zibra.
+3. Type "hi there" in the input and press Enter/Return (or click Submit).
+4. The target page must load and the address bar must end in
+   /form-get-target.html?q=hi%20there with no POST error from the server.
+-->
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <title>GET form submission</title>
+    <style>
+      body { font: 18px sans-serif; margin: 32px; max-width: 720px; }
+      form { background-color: #e8f2ff; border-radius: 10px; padding: 18px; }
+      input, button { font-size: 18px; padding: 6px; }
+    </style>
+  </head>
+  <body>
+    <h1>GET form submission</h1>
+    <form action="form-get-target.html" method="get">
+      <label>Query: <input name="q" value=""></label>
+      <button>Submit</button>
+    </form>
+  </body>
+</html>

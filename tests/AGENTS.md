@@ -35,6 +35,10 @@ insertion at the address cursor, and Backspace deletion before it.
 dispatches the containing form's submit event, while an input outside a form
 does not submit.
 
+`tests/manual/form-get.html` and its target fixture verify over a localhost
+server that GET submission puts encoded controls in the URL query and sends no
+POST body.
+
 `tests/manual/display-list-hit-testing.html` exercises painted-fragment,
 translation, rounded-clip, overlap, and iframe click routing. Only the visible
 topmost painted target should activate; its child and destination pages are

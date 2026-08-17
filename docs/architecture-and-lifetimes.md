@@ -561,8 +561,12 @@ Once Return is routed to page content, `Tab.enter` distinguishes text entry
 from generic activation: a focused text input dispatches `keydown`, finds its
 containing form, dispatches the cancelable `submit` event, collects the current
 named input values, and schedules the existing form-navigation path. A missing
-form action resolves against the current document. Space continues to use only
-focused-element activation, and a text input outside a form does nothing.
+form action resolves against the current document. The missing/invalid method
+default is GET: its encoded data replaces the action query and the scheduled
+network request has a null payload. An explicit case-insensitive POST instead
+transfers the owned encoded buffer to the load task after successful scheduling.
+Space continues to use only focused-element activation, and a text input outside
+a form does nothing.
 Primary same-document fragment links stay on the tab worker: they resolve the
 new URL, append it to indexed root history (or replace an iframe-owned URL),
 apply the clamped layout target, and request a paint commit. The existing DOM,

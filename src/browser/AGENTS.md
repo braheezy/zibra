@@ -46,8 +46,11 @@ before changing `root.zig`, `tab.zig`, `render/`, or browser task scheduling.
   generic focused-element activation. A focused text-entry input dispatches
   `keydown`, then submits its containing form through the same submit-event and
   navigation path used by buttons; `preventDefault` cancels the default and a
-  missing `action` resolves to the current document. Inputs outside forms and
-  known non-text input types do not implicitly submit.
+  missing `action` resolves to the current document. Form methods default to
+  GET; GET replaces the action query with the encoded named inputs and carries
+  no payload, while an explicit case-insensitive POST keeps that encoding in
+  the owned request body. Inputs outside forms and known non-text input types
+  do not implicitly submit.
 - Each tab owns an indexed root-navigation history. Successful ordinary
   navigation truncates entries after the current index before appending; Back
   and Forward retain the list and move the index only after the replacement
