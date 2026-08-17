@@ -15,6 +15,10 @@ before changing `root.zig`, `tab.zig`, `render/`, or browser task scheduling.
 - Each tab owns a sentinel-terminated copy of its root document title. Tab
   workers replace it under `Browser.lock`; only the interactive browser thread
   may pass it to the native window, including after tab switches.
+- Address-bar interpretation belongs to `chrome.zig`, not general URL or link
+  resolution. Explicit schemes and obvious bare hosts navigate directly;
+  ordinary text becomes a form-encoded Google query. Keep document-authored
+  links strict so a malformed link never silently becomes a search.
 - Each tab owns an indexed root-navigation history. Successful ordinary
   navigation truncates entries after the current index before appending; Back
   and Forward retain the list and move the index only after the replacement

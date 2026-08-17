@@ -12,6 +12,8 @@ const font = @import("render/font.zig");
 const Browser = browser.Browser;
 const Url = @import("../network/url.zig").Url;
 
+const search_url_prefix = "https://google.com/search?q=";
+
 // Chrome represents the browser UI (tab bar, buttons, etc.)
 pub const Chrome = @This();
 font_size: i32 = 20,
@@ -120,6 +122,92 @@ pub fn navigationButtonColor(enabled: bool) Color {
         .{ .r = 0, .g = 0, .b = 0, .a = 255 }
     else
         .{ .r = 160, .g = 160, .b = 160, .a = 255 };
+}
+
+/// Interpret address-bar text as an explicit URL, an obvious bare host, or a
+/// search query. This policy intentionally belongs to chrome rather than the
+/// general URL parser: document links must never become searches.
+pub fn addressInputToUrl(allocator: std.mem.Allocator, input: []const u8) !Url {
+    const trimmed = std.mem.trim(u8, input, " \t\r\n");
+    if (trimmed.len == 0) return error.EmptyAddressInput;
+
+    if (std.mem.startsWith(u8, trimmed, "//")) {
+        const absolute = try std.fmt.allocPrint(allocator, "https:{s}", .{trimmed});
+        defer allocator.free(absolute);
+        return Url.initForNavigation(allocator, absolute);
+    }
+
+    // Check bare hosts before generic schemes because `localhost:8000` and
+    // `example.com:443` are syntactically scheme-like to a URL parser.
+    if (looksLikeBareHost(trimmed)) {
+        const absolute = try std.fmt.allocPrint(allocator, "https://{s}", .{trimmed});
+        defer allocator.free(absolute);
+        return Url.initForNavigation(allocator, absolute);
+    }
+
+    if (Url.hasExplicitScheme(trimmed)) {
+        return Url.initForNavigation(allocator, trimmed);
+    }
+
+    var search_url = std.ArrayList(u8).empty;
+    defer search_url.deinit(allocator);
+    try search_url.appendSlice(allocator, search_url_prefix);
+    try appendSearchQuery(allocator, &search_url, trimmed);
+    return Url.initForNavigation(allocator, search_url.items);
+}
+
+fn looksLikeBareHost(input: []const u8) bool {
+    if (std.mem.indexOfAny(u8, input, " \t\r\n@") != null) return false;
+
+    const authority_end = std.mem.indexOfAny(u8, input, "/?#") orelse input.len;
+    const authority = input[0..authority_end];
+    if (authority.len == 0) return false;
+
+    if (authority[0] == '[') {
+        const close = std.mem.indexOfScalar(u8, authority, ']') orelse return false;
+        if (close + 1 == authority.len) return true;
+        if (authority[close + 1] != ':') return false;
+        return allAsciiDigits(authority[close + 2 ..]);
+    }
+
+    const colon = std.mem.lastIndexOfScalar(u8, authority, ':');
+    const host = if (colon) |index| authority[0..index] else authority;
+    if (host.len == 0) return false;
+    if (colon) |index| {
+        if (!allAsciiDigits(authority[index + 1 ..])) return false;
+    }
+
+    return std.ascii.eqlIgnoreCase(host, "localhost") or
+        std.mem.indexOfScalar(u8, host, '.') != null;
+}
+
+fn allAsciiDigits(input: []const u8) bool {
+    if (input.len == 0) return false;
+    for (input) |byte| {
+        if (!std.ascii.isDigit(byte)) return false;
+    }
+    return true;
+}
+
+fn appendSearchQuery(
+    allocator: std.mem.Allocator,
+    output: *std.ArrayList(u8),
+    query: []const u8,
+) !void {
+    const hex = "0123456789ABCDEF";
+    for (query) |byte| {
+        if (std.ascii.isWhitespace(byte)) {
+            try output.append(allocator, '+');
+        } else if (std.ascii.isAlphanumeric(byte) or
+            byte == '-' or byte == '_' or byte == '.' or byte == '~')
+        {
+            try output.append(allocator, byte);
+        } else {
+            try output.append(allocator, '%');
+            try output.append(allocator, hex[byte >> 4]);
+            try output.append(allocator, hex[byte & 0x0f]);
+        }
+    }
 }
 
 pub fn deinit(self: *Chrome) void {
@@ -470,7 +558,7 @@ pub fn enter(self: *Chrome, b: *Browser) !bool {
         if (std.mem.eql(u8, focus_str, "address bar")) {
             if (self.address_bar.items.len == 0) return false;
 
-            var url = try Url.initForNavigation(b.allocator, self.address_bar.items);
+            var url = try addressInputToUrl(b.allocator, self.address_bar.items);
             var url_owned = true;
             defer if (url_owned) url.free(b.allocator);
 

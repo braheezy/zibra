@@ -416,6 +416,11 @@ title to SDL; switching tabs uses the same activation path and marks it dirty.
 Chrome's Back and Forward handlers read only atomic availability snapshots and
 enqueue a history task. The worker computes the target again before loading,
 so a click based on a stale disabled/enabled snapshot is harmless.
+Address-bar submission is the sole URL-or-search policy boundary. Chrome trims
+the input, preserves explicit schemes and obvious bare hosts, and otherwise
+constructs a Google query using `+` for whitespace and percent escapes for
+unsafe bytes. The result then enters the normal navigation path; document links
+continue to use strict relative URL resolution and can never become searches.
 Primary same-document fragment links stay on the tab worker: they resolve the
 new URL, append it to indexed root history (or replace an iframe-owned URL),
 apply the clamped layout target, and request a paint commit. The existing DOM,

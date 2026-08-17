@@ -2,9 +2,50 @@
 
 const std = @import("std");
 const browser = @import("../browser/root.zig");
+const Chrome = @import("../browser/chrome.zig");
 const tab_module = @import("../browser/tab.zig");
 const parser_module = @import("../document/parser.zig");
 const Url = @import("../network/url.zig").Url;
+
+test "address bar preserves URLs and turns ordinary text into a search" {
+    const allocator = std.testing.allocator;
+    const cases = [_]struct {
+        input: []const u8,
+        expected: []const u8,
+    }{
+        .{
+            .input = "https://example.com/docs?q=one#two",
+            .expected = "https://example.com/docs?q=one#two",
+        },
+        .{
+            .input = "example.com/docs",
+            .expected = "https://example.com/docs",
+        },
+        .{
+            .input = "localhost:8080/status",
+            .expected = "https://localhost:8080/status",
+        },
+        .{
+            .input = "browser engineering",
+            .expected = "https://google.com/search?q=browser+engineering",
+        },
+        .{
+            .input = "  zig + browser & fun  ",
+            .expected = "https://google.com/search?q=zig+%2B+browser+%26+fun",
+        },
+        .{
+            .input = "hello@example.com",
+            .expected = "https://google.com/search?q=hello%40example.com",
+        },
+    };
+
+    for (cases) |case| {
+        const url = try Chrome.addressInputToUrl(allocator, case.input);
+        defer url.free(allocator);
+        var buffer: [256]u8 = undefined;
+        try std.testing.expectEqualStrings(case.expected, try url.toString(&buffer));
+    }
+}
 
 test "mouse wheel delta preserves magnitude and normalizes direction" {
     try std.testing.expectEqual(@as(i32, -100), browser.wheelScrollDelta(1, false));
