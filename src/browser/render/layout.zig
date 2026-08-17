@@ -123,6 +123,7 @@ fn drawCursor(
     y: i32,
     height: i32,
     color: browser.Color,
+    source: ?browser.DisplayItemSource,
 ) !void {
     const cursor_height = if (height > 0) height else 1;
     try commands.append(allocator, DisplayItem{
@@ -133,8 +134,72 @@ fn drawCursor(
             .y2 = y + cursor_height,
             .color = color,
             .thickness = 1,
+            .source = source,
         },
     });
+}
+
+fn isNodeWithin(candidate: *Node, root: *Node) bool {
+    var current: ?*Node = candidate;
+    while (current) |node| {
+        if (node == root) return true;
+        current = switch (node.*) {
+            .text => |text| text.parent,
+            .element => |element| element.parent,
+        };
+    }
+    return false;
+}
+
+fn LayoutNodeResolver(comptime LayoutObject: type) type {
+    return struct {
+        fn resolve(raw_layout: *const anyopaque, fragment: ?*Node) ?*Node {
+            const layout_object: *const LayoutObject = @ptrCast(@alignCast(raw_layout));
+            const root: ?*Node = layout_object.node_ptr;
+            if (fragment) |candidate| {
+                const source_root = root orelse return null;
+                return if (isNodeWithin(candidate, source_root)) candidate else null;
+            }
+            return root;
+        }
+    };
+}
+
+fn resolveBlockLayoutNode(raw_layout: *const anyopaque, fragment: ?*Node) ?*Node {
+    const block: *const BlockLayout = @ptrCast(@alignCast(raw_layout));
+    if (fragment) |candidate| {
+        if (block.node_ptr) |root| {
+            return if (isNodeWithin(candidate, root)) candidate else null;
+        }
+        if (block.inline_nodes) |roots| {
+            for (roots) |root| {
+                if (isNodeWithin(candidate, root)) return candidate;
+            }
+        }
+        return null;
+    }
+    return block.node_ptr;
+}
+
+fn displaySource(layout_object: anytype, node: ?*Node) browser.DisplayItemSource {
+    const LayoutObject = @TypeOf(layout_object.*);
+    const Resolver = LayoutNodeResolver(LayoutObject);
+    return .{
+        .layout = @ptrCast(layout_object),
+        .node = node,
+        .layout_node_resolver = if (LayoutObject == BlockLayout)
+            &resolveBlockLayoutNode
+        else
+            &Resolver.resolve,
+    };
+}
+
+fn opaqueElementForNode(node_ptr: ?*Node) ?*anyopaque {
+    const node = node_ptr orelse return null;
+    return switch (node.*) {
+        .element => |*element| @ptrCast(element),
+        else => null,
+    };
 }
 
 /// Parse a translate transform value like "translate(10px, 20px)" into x and y offsets
@@ -353,6 +418,7 @@ const IframeLayout = struct {
         engine: *Layout,
         x: i32,
         y: i32,
+        source: ?browser.DisplayItemSource,
     ) !void {
         const width_value = self.embed.width.get().*;
         const height_value = self.embed.height.get().*;
@@ -365,6 +431,7 @@ const IframeLayout = struct {
                     .x2 = x + width_value,
                     .y2 = y + height_value,
                     .color = bg,
+                    .source = source,
                 },
             });
         }
@@ -381,6 +448,7 @@ const IframeLayout = struct {
                     },
                     .color = border,
                     .thickness = self.border_thickness,
+                    .source = source,
                 },
             });
         }
@@ -420,6 +488,31 @@ const LineItem = struct {
     node_ptr: ?*Node,
     payload: LineItemPayload,
 };
+
+const visited_link_color = browser.Color{ .r = 128, .g = 0, .b = 128, .a = 255 };
+
+/// Return the default visited-link override for text produced anywhere below
+/// an annotated anchor. The walk is synchronous and borrows the current DOM
+/// generation only for the duration of paint.
+pub fn nodeIsInVisitedLink(node_ptr: ?*const Node) bool {
+    var current = node_ptr;
+    while (current) |node| {
+        switch (node.*) {
+            .element => |*element| {
+                if (std.mem.eql(u8, element.tag, "a") and element.is_visited) {
+                    return true;
+                }
+                current = element.parent;
+            },
+            .text => |*text| current = text.parent,
+        }
+    }
+    return false;
+}
+
+pub fn textColorForNode(node_ptr: ?*const Node, normal_color: browser.Color) browser.Color {
+    return if (nodeIsInVisitedLink(node_ptr)) visited_link_color else normal_color;
+}
 
 const SoftHyphenBreak = struct {
     item_index: usize,
@@ -1745,6 +1838,11 @@ fn flushLine(self: *Layout, line_buffer: *std.ArrayList(LineItem)) !void {
             }
         }
 
+        const source = if (self.inline_block) |block|
+            displaySource(block, item.node_ptr)
+        else
+            null;
+
         switch (item.payload) {
             .glyph => |glyph_payload| {
                 try self.current_display_target.append(self.allocator, DisplayItem{
@@ -1752,12 +1850,16 @@ fn flushLine(self: *Layout, line_buffer: *std.ArrayList(LineItem)) !void {
                         .x = item.x,
                         .y = final_y,
                         .glyph = glyph_payload.glyph,
-                        .color = glyph_payload.color, // Use the color captured when item was added to line buffer
+                        .color = if (nodeIsInVisitedLink(item.node_ptr))
+                            self.remapColor(visited_link_color)
+                        else
+                            glyph_payload.color,
+                        .source = source,
                     },
                 });
             },
             .input => |input_payload| {
-                try input_payload.paintAt(self.current_display_target, self, item.x, final_y);
+                try input_payload.paintAt(self.current_display_target, self, item.x, final_y, source);
             },
             .image => |image_payload| {
                 try self.current_display_target.append(self.allocator, DisplayItem{
@@ -1770,6 +1872,7 @@ fn flushLine(self: *Layout, line_buffer: *std.ArrayList(LineItem)) !void {
                         .source_height = image_payload.source_height,
                         .pixels = image_payload.pixels,
                         .opacity = image_payload.opacity,
+                        .source = source,
                     },
                 });
             },
@@ -1784,6 +1887,7 @@ fn flushLine(self: *Layout, line_buffer: *std.ArrayList(LineItem)) !void {
                                 .bottom = bounds_y + item.height,
                             },
                             .node = ptr,
+                            .source = source,
                         },
                     });
                     try self.iframe_bounds.append(self.allocator, .{
@@ -1796,7 +1900,7 @@ fn flushLine(self: *Layout, line_buffer: *std.ArrayList(LineItem)) !void {
                         },
                     });
                 } else {
-                    try iframe_payload.paintAt(self.current_display_target, self, item.x, final_y);
+                    try iframe_payload.paintAt(self.current_display_target, self, item.x, final_y, source);
                 }
             },
         }
@@ -2170,7 +2274,8 @@ fn handlePreformattedText(
             continue;
         }
 
-        if (lexEntityAt(content, position)) |entity| {
+        var entity_buffer: [4]u8 = undefined;
+        if (lexEntityAt(content, position, &entity_buffer)) |entity| {
             try self.processGrapheme(entity.replacement, line_buffer, node_ptr, .{
                 .is_superscript = self.is_superscript,
                 .is_small_caps = self.is_small_caps,
@@ -2262,7 +2367,8 @@ fn handleTextToken(
         }
 
         if (content[i] == '&') {
-            if (lexEntityAt(content, i)) |entity| {
+            var entity_buffer: [4]u8 = undefined;
+            if (lexEntityAt(content, i, &entity_buffer)) |entity| {
                 try self.processGrapheme(entity.replacement, line_buffer, node_ptr, .{
                     .is_superscript = self.is_superscript,
                     .is_small_caps = self.is_small_caps,
@@ -2327,55 +2433,61 @@ test "paragraph gap adds visible leading beyond a normal line step" {
     try std.testing.expectEqual(@as(i32, 1), paragraphGap(1));
 }
 
-// Entity handling function that takes a position in text
-fn lexEntityAt(text: []const u8, pos: usize) ?struct { replacement: []const u8, len: usize } {
-    if (pos >= text.len or text[pos] != '&') return null;
+// Text stays source-backed in the DOM; decode references only while laying it
+// out. Attribute values use the same lexer but copy decoded bytes in parser.zig.
+fn lexEntityAt(
+    text: []const u8,
+    pos: usize,
+    buffer: *[4]u8,
+) ?struct { replacement: []const u8, len: usize } {
+    const reference = parser.characterReferenceAt(text, pos) orelse return null;
+    const encoded_len = std.unicode.utf8Encode(reference.codepoint, buffer) catch return null;
+    return .{ .replacement = buffer[0..encoded_len], .len = reference.len };
+}
 
-    // Find the entity end (semicolon)
-    var end_idx: usize = pos + 1;
-    while (end_idx < text.len and end_idx < pos + 8) : (end_idx += 1) {
-        if (text[end_idx] == ';') break;
+/// Decode text exactly as the layout text walkers do. DOM text intentionally
+/// remains source-backed and escaped; this owned helper also provides focused
+/// coverage for generated browser-page labels.
+pub fn decodeTextForDisplay(allocator: std.mem.Allocator, text: []const u8) ![]u8 {
+    var output = std.ArrayList(u8).empty;
+    errdefer output.deinit(allocator);
+
+    var pos: usize = 0;
+    while (pos < text.len) {
+        var buffer: [4]u8 = undefined;
+        if (lexEntityAt(text, pos, &buffer)) |entity| {
+            try output.appendSlice(allocator, entity.replacement);
+            pos += entity.len;
+        } else {
+            try output.append(allocator, text[pos]);
+            pos += 1;
+        }
     }
-
-    // If no semicolon found or it's the last character, not an entity
-    if (end_idx >= text.len or text[end_idx] != ';') return null;
-
-    const entity = text[pos .. end_idx + 1];
-
-    if (std.mem.eql(u8, entity, "&amp;"))
-        return .{ .replacement = "&", .len = 5 };
-    if (std.mem.eql(u8, entity, "&lt;"))
-        return .{ .replacement = "<", .len = 4 };
-    if (std.mem.eql(u8, entity, "&gt;"))
-        return .{ .replacement = ">", .len = 4 };
-    if (std.mem.eql(u8, entity, "&quot;"))
-        return .{ .replacement = "\"", .len = 6 };
-    if (std.mem.eql(u8, entity, "&apos;"))
-        return .{ .replacement = "'", .len = 6 };
-    if (std.mem.eql(u8, entity, "&shy;"))
-        return .{ .replacement = "\u{00AD}", .len = 5 }; // Unicode soft hyphen
-
-    return null;
+    return output.toOwnedSlice(allocator);
 }
 
 test "lexEntityAt recognizes the entities rendered as text" {
     const input = "&lt;div&gt; &amp; &quot;quote&quot; &apos;apostrophe&apos;";
 
-    const less_than = lexEntityAt(input, 0).?;
+    var buffer: [4]u8 = undefined;
+    const less_than = lexEntityAt(input, 0, &buffer).?;
     try std.testing.expectEqualStrings("<", less_than.replacement);
     try std.testing.expectEqual(@as(usize, 4), less_than.len);
 
     const greater_than_start = std.mem.indexOf(u8, input, "&gt;").?;
-    const greater_than = lexEntityAt(input, greater_than_start).?;
+    const greater_than = lexEntityAt(input, greater_than_start, &buffer).?;
     try std.testing.expectEqualStrings(">", greater_than.replacement);
     try std.testing.expectEqual(@as(usize, 4), greater_than.len);
 
-    const soft_hyphen = lexEntityAt("&shy;", 0).?;
+    const soft_hyphen = lexEntityAt("&shy;", 0, &buffer).?;
     try std.testing.expectEqualStrings("\u{00AD}", soft_hyphen.replacement);
     try std.testing.expectEqual(@as(usize, 5), soft_hyphen.len);
 
-    try std.testing.expect(lexEntityAt("&unknown;", 0) == null);
-    try std.testing.expect(lexEntityAt("&lt", 0) == null);
+    const numeric = lexEntityAt("&#x1F642;", 0, &buffer).?;
+    try std.testing.expectEqualStrings("🙂", numeric.replacement);
+
+    try std.testing.expect(lexEntityAt("&unknown;", 0, &buffer) == null);
+    try std.testing.expect(lexEntityAt("&lt", 0, &buffer) == null);
 }
 
 // Update layoutSourceCode to format HTML source with tags in normal font and content in bold
@@ -2583,7 +2695,14 @@ const InputLayout = struct {
         self.is_focused = element.is_focused;
     }
 
-    fn paintAt(self: *const InputLayout, commands: *std.ArrayList(DisplayItem), engine: *Layout, x: i32, y: i32) !void {
+    fn paintAt(
+        self: *const InputLayout,
+        commands: *std.ArrayList(DisplayItem),
+        engine: *Layout,
+        x: i32,
+        y: i32,
+        source: ?browser.DisplayItemSource,
+    ) !void {
         const width_value = self.embed.width.get().*;
         const height_value = self.embed.height.get().*;
         const ascent_value = self.embed.ascent.get().*;
@@ -2596,6 +2715,7 @@ const InputLayout = struct {
                     .x2 = x + width_value,
                     .y2 = y + height_value,
                     .color = remapped_bg,
+                    .source = source,
                 },
             });
         }
@@ -2625,6 +2745,7 @@ const InputLayout = struct {
                         .y = baseline_y - engine.toLayoutPx(glyph.ascent),
                         .glyph = glyph,
                         .color = engine.remapColor(self.color),
+                        .source = source,
                     },
                 });
                 text_x += engine.toLayoutPx(glyph.w);
@@ -2639,6 +2760,7 @@ const InputLayout = struct {
                 y,
                 height_value,
                 engine.remapColor(.{ .r = 255, .g = 0, .b = 0, .a = 255 }),
+                source,
             );
         }
     }
@@ -2648,6 +2770,7 @@ const InputLayout = struct {
 const TextLayout = struct {
     allocator: std.mem.Allocator,
     node: Node,
+    node_ptr: ?*Node,
     word: []const u8,
     parent: *LineLayout,
     previous: ?*TextLayout,
@@ -2679,6 +2802,7 @@ const TextLayout = struct {
     fn init(
         allocator: std.mem.Allocator,
         node: Node,
+        node_ptr: ?*Node,
         word: []const u8,
         parent: *LineLayout,
         previous: ?*TextLayout,
@@ -2687,6 +2811,7 @@ const TextLayout = struct {
         text.* = TextLayout{
             .allocator = allocator,
             .node = node,
+            .node_ptr = node_ptr,
             .word = word,
             .parent = parent,
             .previous = previous,
@@ -2910,7 +3035,8 @@ const TextLayout = struct {
                 .x = self.x.get().*,
                 .y = self.y.get().*,
                 .glyph = glyph,
-                .color = engine.remapColor(self.color),
+                .color = engine.remapColor(textColorForNode(&self.node, self.color)),
+                .source = displaySource(self, self.node_ptr),
             },
         });
     }
@@ -3583,7 +3709,14 @@ const BlockLayout = struct {
     }
 
     // Add a word to the current line
-    fn word(self: *BlockLayout, node: Node, word_text: []const u8, font_mgr: *font.FontManager, width: i32) !void {
+    fn word(
+        self: *BlockLayout,
+        node: Node,
+        node_ptr: ?*Node,
+        word_text: []const u8,
+        font_mgr: *font.FontManager,
+        width: i32,
+    ) !void {
         // Get the current line (should be the last child)
         if (self.children.items.len == 0) {
             try self.newLine();
@@ -3607,7 +3740,7 @@ const BlockLayout = struct {
         else
             null;
 
-        const text = try TextLayout.init(self.allocator, node, word_text, line, previous_word);
+        const text = try TextLayout.init(self.allocator, node, node_ptr, word_text, line, previous_word);
         try line.children.append(self.allocator, text);
         self.cursor_x += width;
 
@@ -3816,6 +3949,45 @@ const BlockLayout = struct {
     }
 };
 
+test "block display provenance rejects fragments outside its DOM origin" {
+    const allocator = std.testing.allocator;
+    var html_parser = try parser.HTMLParser.init(
+        allocator,
+        "<html><body><div><a>inside</a></div><p>outside</p></body></html>",
+    );
+    defer html_parser.deinit(allocator);
+    var root = try html_parser.parse();
+    defer root.deinit(allocator);
+    parser.fixParentPointers(&root, null);
+
+    var nodes = std.ArrayList(*Node).empty;
+    defer nodes.deinit(allocator);
+    try parser.treeToList(allocator, &root, &nodes);
+
+    var anchor: ?*Node = null;
+    var inside_text: ?*Node = null;
+    var paragraph: ?*Node = null;
+    for (nodes.items) |node| {
+        switch (node.*) {
+            .element => |element| {
+                if (std.ascii.eqlIgnoreCase(element.tag, "a")) anchor = node;
+                if (std.ascii.eqlIgnoreCase(element.tag, "p")) paragraph = node;
+            },
+            .text => |text| {
+                if (text.parent == anchor) inside_text = node;
+            },
+        }
+    }
+
+    var block: BlockLayout = undefined;
+    block.node_ptr = anchor.?;
+    block.inline_nodes = null;
+
+    try std.testing.expect(displaySource(&block, inside_text.?).originatingNode() == inside_text.?);
+    try std.testing.expect(displaySource(&block, null).originatingNode() == anchor.?);
+    try std.testing.expect(displaySource(&block, paragraph.?).originatingNode() == null);
+}
+
 fn findLastTextLayout(block: *BlockLayout) ?*TextLayout {
     var last: ?*TextLayout = null;
     for (block.children.items) |child| {
@@ -3844,11 +4016,12 @@ fn appendContentEditableCursor(self: *Layout, commands: *std.ArrayList(DisplayIt
     if (element.attributes.?.get("contenteditable") == null) return;
 
     const cursor_color = self.remapColor(.{ .r = 255, .g = 0, .b = 0, .a = 255 });
+    const source = displaySource(block, block.node_ptr);
     if (findLastTextLayout(block)) |text| {
         const cursor_x = text.x.get().* + text.width.get().*;
         const cursor_y = text.y.get().*;
         const cursor_height = text.height.get().*;
-        try drawCursor(commands, self.allocator, cursor_x, cursor_y, cursor_height, cursor_color);
+        try drawCursor(commands, self.allocator, cursor_x, cursor_y, cursor_height, cursor_color, source);
         return;
     }
 
@@ -3860,7 +4033,7 @@ fn appendContentEditableCursor(self: *Layout, commands: *std.ArrayList(DisplayIt
         .proportional,
     );
     const cursor_height = self.toLayoutPx(glyph.ascent + glyph.descent);
-    try drawCursor(commands, self.allocator, block.x.get().*, block.y.get().*, cursor_height, cursor_color);
+    try drawCursor(commands, self.allocator, block.x.get().*, block.y.get().*, cursor_height, cursor_color, source);
 }
 
 fn appendListMarker(self: *Layout, commands: *std.ArrayList(DisplayItem), block: *const BlockLayout) !void {
@@ -3883,6 +4056,7 @@ fn appendListMarker(self: *Layout, commands: *std.ArrayList(DisplayItem), block:
         .x2 = marker_x + list_marker_size,
         .y2 = marker_y + list_marker_size,
         .color = self.remapColor(color),
+        .source = displaySource(block, block.node_ptr),
     } });
 }
 
@@ -3903,6 +4077,7 @@ fn appendTableOfContentsHeader(self: *Layout, commands: *std.ArrayList(DisplayIt
         .x2 = x + width,
         .y2 = y + toc_header_height,
         .color = background,
+        .source = displaySource(block, block.node_ptr),
     } });
 
     const glyph = try self.font_manager.getStyledGlyph(
@@ -3917,6 +4092,7 @@ fn appendTableOfContentsHeader(self: *Layout, commands: *std.ArrayList(DisplayIt
         .y = y + 3,
         .glyph = glyph,
         .color = self.remapColor(.{ .r = 0, .g = 0, .b = 0, .a = 255 }),
+        .source = displaySource(block, block.node_ptr),
     } });
 }
 
@@ -4177,6 +4353,7 @@ fn addBackgroundIfNeeded(self: *Layout, block: *const BlockLayout) !void {
                         .y2 = block_y + block_height,
                         .radius = radius,
                         .color = remapped,
+                        .source = displaySource(block, block.node_ptr),
                     } };
                     try self.display_list.append(self.allocator, rounded_rect);
                 } else {
@@ -4187,6 +4364,7 @@ fn addBackgroundIfNeeded(self: *Layout, block: *const BlockLayout) !void {
                         .x2 = block_x + block_width,
                         .y2 = block_y + block_height,
                         .color = remapped,
+                        .source = displaySource(block, block.node_ptr),
                     } };
                     try self.display_list.append(self.allocator, rect);
                 }
@@ -4220,6 +4398,7 @@ pub fn paintDocument(self: *Layout, document: *DocumentLayout) ![]DisplayItem {
             .x2 = width,
             .y2 = content_height,
             .color = bg_color,
+            .source = displaySource(document, document.node_ptr),
         } };
         try self.display_list.append(self.allocator, bg);
     }
@@ -4460,6 +4639,7 @@ fn applyPaintEffects(self: *Layout, block: *BlockLayout, commands: []DisplayItem
                 .y2 = block_y + block_height,
                 .radius = border_radius,
                 .color = browser.Color{ .r = 255, .g = 255, .b = 255, .a = 255 },
+                .source = displaySource(block, block.node_ptr),
             },
         };
 
@@ -4469,6 +4649,7 @@ fn applyPaintEffects(self: *Layout, block: *BlockLayout, commands: []DisplayItem
                 .blend_mode = clip_blend_mode,
                 .children = clip_mask_commands,
                 .needs_compositing = true, // Has blend mode, needs compositing
+                .source = displaySource(block, block.node_ptr),
             },
         };
 
@@ -4494,10 +4675,7 @@ fn applyPaintEffects(self: *Layout, block: *BlockLayout, commands: []DisplayItem
         @memcpy(wrapped_commands, current_commands);
 
         // Get pointer to the element for identifying this blend across frames
-        const node_ptr: ?*anyopaque = if (block.node == .element)
-            @ptrCast(&block.node.element)
-        else
-            null;
+        const node_ptr = opaqueElementForNode(block.node_ptr);
 
         // Determine if this blend needs compositing (does actual work)
         const needs_compositing = opacity < 1.0 or final_blend_mode != null;
@@ -4509,6 +4687,7 @@ fn applyPaintEffects(self: *Layout, block: *BlockLayout, commands: []DisplayItem
                 .children = wrapped_commands,
                 .node = node_ptr,
                 .needs_compositing = needs_compositing,
+                .source = displaySource(block, block.node_ptr),
             },
         };
 
@@ -4523,6 +4702,7 @@ fn applyPaintEffects(self: *Layout, block: *BlockLayout, commands: []DisplayItem
                     .translate_y = transform_y,
                     .children = result,
                     .node = node_ptr,
+                    .source = displaySource(block, block.node_ptr),
                 },
             };
             const transform_result = try self.allocator.alloc(DisplayItem, 1);
@@ -4536,10 +4716,7 @@ fn applyPaintEffects(self: *Layout, block: *BlockLayout, commands: []DisplayItem
             const wrapped_for_transform = try self.allocator.alloc(DisplayItem, current_commands.len);
             @memcpy(wrapped_for_transform, current_commands);
 
-            const node_ptr: ?*anyopaque = if (block.node == .element)
-                @ptrCast(&block.node.element)
-            else
-                null;
+            const node_ptr = opaqueElementForNode(block.node_ptr);
 
             const transform_item = DisplayItem{
                 .transform = .{
@@ -4547,6 +4724,7 @@ fn applyPaintEffects(self: *Layout, block: *BlockLayout, commands: []DisplayItem
                     .translate_y = transform_y,
                     .children = wrapped_for_transform,
                     .node = node_ptr,
+                    .source = displaySource(block, block.node_ptr),
                 },
             };
             const result = try self.allocator.alloc(DisplayItem, 1);
@@ -4621,6 +4799,7 @@ fn addBackgroundIfNeededToList(self: *Layout, commands: *std.ArrayList(DisplayIt
                         .y2 = block_y + block_height,
                         .radius = radius,
                         .color = remapped,
+                        .source = displaySource(block, block.node_ptr),
                     } };
                     try commands.append(self.allocator, rounded_rect);
                 } else {
@@ -4631,6 +4810,7 @@ fn addBackgroundIfNeededToList(self: *Layout, commands: *std.ArrayList(DisplayIt
                         .x2 = block_x + block_width,
                         .y2 = block_y + block_height,
                         .color = remapped,
+                        .source = displaySource(block, block.node_ptr),
                     } };
                     try commands.append(self.allocator, rect);
                 }

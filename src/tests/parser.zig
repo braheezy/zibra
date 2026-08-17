@@ -113,6 +113,57 @@ test "Parse quoted attributes" {
     try std.testing.expectEqualStrings("main", attrs.get("id").?);
 }
 
+test "attribute character references decode into element-owned strings" {
+    const allocator = std.testing.allocator;
+    const html =
+        "<a href=\"https://example.com/?a=1&amp;b=&quot;two&quot;&apos;&#x1F642;\" " ++
+        "data-unknown=\"&unknown;\">label &amp; text</a>";
+
+    var html_parser = try HTMLParser.init(allocator, html);
+    html_parser.use_implicit_tags = false;
+    defer html_parser.deinit(allocator);
+    var root = try html_parser.parse();
+    defer root.deinit(allocator);
+
+    try std.testing.expectEqualStrings(
+        "https://example.com/?a=1&b=\"two\"'🙂",
+        root.element.attributes.?.get("href").?,
+    );
+    try std.testing.expectEqualStrings(
+        "&unknown;",
+        root.element.attributes.?.get("data-unknown").?,
+    );
+    try std.testing.expect(root.element.owned_strings != null);
+    try std.testing.expectEqual(@as(usize, 1), root.element.owned_strings.?.items.len);
+
+    // Text stays escaped in the DOM and is decoded once by layout.
+    try std.testing.expectEqualStrings("label &amp; text", root.element.children.items[0].text.text);
+}
+
+test "DOM dump re-escapes decoded attribute values" {
+    const allocator = std.testing.allocator;
+    const html = "<div title=\"&quot;&amp;&lt;&gt;&apos;\">x</div>";
+
+    var html_parser = try HTMLParser.init(allocator, html);
+    html_parser.use_implicit_tags = false;
+    defer html_parser.deinit(allocator);
+    var root = try html_parser.parse();
+    defer root.deinit(allocator);
+
+    try std.testing.expectEqualStrings(
+        "\"&<>'",
+        root.element.attributes.?.get("title").?,
+    );
+
+    var output = std.Io.Writer.Allocating.init(allocator);
+    defer output.deinit();
+    try html_parser.writePretty(&output.writer, root, 0);
+    try std.testing.expectEqualStrings(
+        "<div title=\"&quot;&amp;&lt;&gt;&apos;\">\n  x\n",
+        output.written(),
+    );
+}
+
 test "Parse boolean attributes" {
     const allocator = std.testing.allocator;
     const html = "<input disabled required><label>Check me</label>";

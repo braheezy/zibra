@@ -1,9 +1,11 @@
 //! DOM representation, tutorial HTML parser, and computed-style application.
 //!
-//! Parsed node strings borrow the parser input buffer. The caller must keep
-//! that buffer alive until the complete `Node` tree has been deinitialized.
-//! Child nodes are stored by value, so callers must repair parent pointers
-//! after structural mutation and must not retain pointers across relocation.
+//! Parsed node strings normally borrow the parser input buffer. Decoded
+//! attribute character references are explicit Element-owned strings. The
+//! caller must keep the input buffer alive until the complete `Node` tree has
+//! been deinitialized. Child nodes are stored by value, so callers must repair
+//! parent pointers after structural mutation and must not retain pointers
+//! across relocation.
 
 const std = @import("std");
 const zigimg = @import("zigimg");
@@ -94,6 +96,114 @@ const raw_text_elements = [_][]const u8{
 
 pub const StyleMap = std.StringHashMap(ProtectedField([]const u8));
 
+pub const CharacterReference = struct {
+    codepoint: u21,
+    len: usize,
+};
+
+/// Decode the semicolon-terminated character references supported by Zibra's
+/// text and attribute pipelines. Unknown or malformed references remain
+/// literal. Numeric references follow HTML's invalid-codepoint replacement
+/// behavior and Windows-1252 compatibility mapping.
+pub fn characterReferenceAt(text: []const u8, pos: usize) ?CharacterReference {
+    if (pos >= text.len or text[pos] != '&') return null;
+    const semicolon = std.mem.indexOfScalarPos(u8, text, pos + 1, ';') orelse return null;
+    if (semicolon - pos > 64) return null;
+    const name = text[pos + 1 .. semicolon];
+    const codepoint: u21 = if (std.mem.eql(u8, name, "amp"))
+        '&'
+    else if (std.mem.eql(u8, name, "lt"))
+        '<'
+    else if (std.mem.eql(u8, name, "gt"))
+        '>'
+    else if (std.mem.eql(u8, name, "quot"))
+        '"'
+    else if (std.mem.eql(u8, name, "apos"))
+        '\''
+    else if (std.mem.eql(u8, name, "shy"))
+        0x00ad
+    else if (parseNumericCharacterReference(name)) |numeric|
+        numeric
+    else
+        return null;
+    return .{ .codepoint = codepoint, .len = semicolon - pos + 1 };
+}
+
+fn parseNumericCharacterReference(name: []const u8) ?u21 {
+    if (name.len < 2 or name[0] != '#') return null;
+    const hexadecimal = name.len >= 3 and (name[1] == 'x' or name[1] == 'X');
+    const digits = if (hexadecimal) name[2..] else name[1..];
+    if (digits.len == 0) return null;
+    const radix: u32 = if (hexadecimal) 16 else 10;
+
+    var value: u32 = 0;
+    for (digits) |byte| {
+        const digit: u32 = if (byte >= '0' and byte <= '9')
+            byte - '0'
+        else if (hexadecimal and byte >= 'a' and byte <= 'f')
+            byte - 'a' + 10
+        else if (hexadecimal and byte >= 'A' and byte <= 'F')
+            byte - 'A' + 10
+        else
+            return null;
+        if (value > (0x110000 - digit) / radix) {
+            value = 0x110000;
+        } else {
+            value = value * radix + digit;
+        }
+    }
+
+    if (value >= 0x80 and value <= 0x9f) {
+        const windows_1252 = [_]u21{
+            0x20ac, 0x0081, 0x201a, 0x0192, 0x201e, 0x2026, 0x2020, 0x2021,
+            0x02c6, 0x2030, 0x0160, 0x2039, 0x0152, 0x008d, 0x017d, 0x008f,
+            0x0090, 0x2018, 0x2019, 0x201c, 0x201d, 0x2022, 0x2013, 0x2014,
+            0x02dc, 0x2122, 0x0161, 0x203a, 0x0153, 0x009d, 0x017e, 0x0178,
+        };
+        return windows_1252[@intCast(value - 0x80)];
+    }
+    if (value == 0 or value > 0x10ffff or (value >= 0xd800 and value <= 0xdfff)) {
+        return 0xfffd;
+    }
+    return @intCast(value);
+}
+
+fn decodeAttributeCharacterReferences(
+    allocator: std.mem.Allocator,
+    input: []const u8,
+) !?[]u8 {
+    if (std.mem.indexOfScalar(u8, input, '&') == null) return null;
+
+    var output = std.ArrayList(u8).empty;
+    errdefer output.deinit(allocator);
+    var changed = false;
+    var cursor: usize = 0;
+    while (cursor < input.len) {
+        const amp = std.mem.indexOfScalarPos(u8, input, cursor, '&') orelse {
+            try output.appendSlice(allocator, input[cursor..]);
+            break;
+        };
+        try output.appendSlice(allocator, input[cursor..amp]);
+        if (characterReferenceAt(input, amp)) |reference| {
+            var encoded: [4]u8 = undefined;
+            const encoded_len = try std.unicode.utf8Encode(reference.codepoint, &encoded);
+            try output.appendSlice(allocator, encoded[0..encoded_len]);
+            cursor = amp + reference.len;
+            changed = true;
+        } else {
+            try output.append(allocator, '&');
+            cursor = amp + 1;
+        }
+    }
+
+    if (!changed) {
+        output.deinit(allocator);
+        return null;
+    }
+    const owned = try output.toOwnedSlice(allocator);
+    return owned;
+}
+
 const Text = struct {
     text: []const u8,
     parent: ?*Node = null,
@@ -119,6 +229,9 @@ pub const Element = struct {
     // Track strings we've allocated (like resolved percentage font sizes) so we can free them
     owned_strings: ?std.ArrayList([]const u8) = null,
     is_focused: bool = false,
+    // Browser-session annotation used only while painting link descendants.
+    // It owns no URL or session storage.
+    is_visited: bool = false,
     children_dirty: bool = true,
     // Animation state for CSS transitions, keyed by property name (e.g., "opacity")
     animations: ?std.StringHashMap(NumericAnimation) = null,
@@ -134,6 +247,7 @@ pub const Element = struct {
             .children = std.ArrayList(Node).empty,
             .owned_strings = null,
             .is_focused = false,
+            .is_visited = false,
             .animations = null,
             .image_data = null,
         };
@@ -263,7 +377,19 @@ pub const Element = struct {
                 value_slice = raw[value_start..idx];
             }
 
-            try self.attributes.?.put(attr_name_slice, value_slice);
+            var attribute_value = value_slice;
+            if (try decodeAttributeCharacterReferences(al, value_slice)) |decoded| {
+                if (self.owned_strings == null) {
+                    self.owned_strings = std.ArrayList([]const u8).empty;
+                }
+                self.owned_strings.?.append(al, decoded) catch |err| {
+                    al.free(decoded);
+                    return err;
+                };
+                attribute_value = decoded;
+            }
+
+            try self.attributes.?.put(attr_name_slice, attribute_value);
         }
     }
 };
@@ -279,6 +405,28 @@ pub const ImageData = struct {
         }
     }
 };
+
+fn appendEscapedAttributeValue(
+    allocator: std.mem.Allocator,
+    output: *std.ArrayList(u8),
+    value: []const u8,
+) !void {
+    for (value) |byte| {
+        const escaped = switch (byte) {
+            '&' => "&amp;",
+            '<' => "&lt;",
+            '>' => "&gt;",
+            '"' => "&quot;",
+            '\'' => "&apos;",
+            else => null,
+        };
+        if (escaped) |text| {
+            try output.appendSlice(allocator, text);
+        } else {
+            try output.append(allocator, byte);
+        }
+    }
+}
 
 pub const Node = union(enum) {
     text: Text,
@@ -329,7 +477,7 @@ pub const Node = union(enum) {
                         // Only add ="value" if the attribute has a value
                         if (entry.value_ptr.*.len > 0) {
                             try result.appendSlice(al, "=\"");
-                            try result.appendSlice(al, entry.value_ptr.*);
+                            try appendEscapedAttributeValue(al, &result, entry.value_ptr.*);
                             try result.append(al, '"');
                         }
                     }

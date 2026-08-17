@@ -80,6 +80,16 @@ const RenderCallback = struct {
     context: ?*anyopaque = null,
 };
 
+/// Runs synchronously before JavaScript changes DOM child storage. Browser
+/// embedders use this boundary to retire every snapshot that borrows the
+/// current DOM generation before any node can move or be destroyed.
+pub const DomMutationCallbackFn = *const fn (context: ?*anyopaque, mutation_root: *Node) void;
+
+const DomMutationCallback = struct {
+    function: ?DomMutationCallbackFn = null,
+    context: ?*anyopaque = null,
+};
+
 pub const AnimationFrameCallbackFn = *const fn (context: ?*anyopaque) anyerror!void;
 
 const AnimationFrameCallback = struct {
@@ -178,6 +188,7 @@ const WindowContext = struct {
     current_nodes: ?*Node,
     pending_messages: std.ArrayList(PendingMessage),
     render_callback: RenderCallback,
+    dom_mutation_callback: DomMutationCallback,
     set_timeout_callback: SetTimeoutCallback,
     post_message_callback: PostMessageCallback,
     xhr_callback: XhrCallback,
@@ -248,6 +259,7 @@ fn ensureWindow(self: *Js, window_id: u32) !void {
         .current_nodes = null,
         .pending_messages = std.ArrayList(PendingMessage).empty,
         .render_callback = .{},
+        .dom_mutation_callback = .{},
         .set_timeout_callback = .{},
         .post_message_callback = .{},
         .xhr_callback = .{},
@@ -636,6 +648,7 @@ pub fn setNodes(self: *Js, window_id: u32, nodes: ?*Node) void {
     window.next_handle = 0;
     if (nodes == null) {
         window.render_callback = .{};
+        window.dom_mutation_callback = .{};
         window.xhr_callback = .{};
         window.set_timeout_callback = .{};
         window.post_message_callback = .{};
@@ -649,6 +662,14 @@ pub fn setNodes(self: *Js, window_id: u32, nodes: ?*Node) void {
 pub fn setRenderCallback(self: *Js, window_id: u32, callback: ?RenderCallbackFn, context: ?*anyopaque) void {
     const window = self.setCurrentWindow(window_id) catch return;
     window.render_callback = .{
+        .function = callback,
+        .context = context,
+    };
+}
+
+pub fn setDomMutationCallback(self: *Js, window_id: u32, callback: ?DomMutationCallbackFn, context: ?*anyopaque) void {
+    const window = self.setCurrentWindow(window_id) catch return;
+    window.dom_mutation_callback = .{
         .function = callback,
         .context = context,
     };
@@ -740,6 +761,14 @@ fn requestRender(self: *Js) void {
         callback(context) catch |err| {
             std.log.warn("Render callback failed: {}", .{err});
         };
+    }
+}
+
+fn prepareDomMutation(self: *Js, mutation_root: *Node) void {
+    const window_id = self.current_window_id orelse return;
+    const window = self.windows.getPtr(window_id) orelse return;
+    if (window.dom_mutation_callback.function) |callback| {
+        callback(window.dom_mutation_callback.context, mutation_root);
     }
 }
 
@@ -1764,24 +1793,30 @@ fn innerHTML(agent: *Agent, this_value: Value, arguments: kiesel.types.Arguments
     // Parse the HTML and replace the node's children
     switch (node.*) {
         .element => |*e| {
-            // Clear existing children
+            // Stage the only allocation needed by the installed replacement
+            // before exposing any of its source-backed nodes through the DOM.
+            if (e.owned_strings == null) {
+                e.owned_strings = std.ArrayList([]const u8).empty;
+            }
+            try e.owned_strings.?.ensureUnusedCapacity(js_instance.allocator, 1);
+
+            // Child arrays store Nodes by value. Retire every browser-side
+            // borrower before destroying the old nodes or replacing their
+            // backing array. Dirty state and repaint scheduling are published
+            // before this point, so any later failure remains recoverable.
+            e.children_dirty = true;
+            markElementLayoutDirty(e);
+            js_instance.prepareDomMutation(node);
+
             for (e.children.items) |*child| {
                 js_instance.removeHandlesForSubtree(window, child);
                 child.deinit(js_instance.allocator);
             }
-            e.children.clearRetainingCapacity();
+            e.children.deinit(js_instance.allocator);
+            e.children = body_children;
+            body_children = std.ArrayList(Node).empty;
 
-            for (body_children.items) |child| {
-                try e.children.append(js_instance.allocator, child);
-            }
-
-            e.children_dirty = true;
-            markElementLayoutDirty(e);
-
-            if (e.owned_strings == null) {
-                e.owned_strings = std.ArrayList([]const u8).empty;
-            }
-            try e.owned_strings.?.append(js_instance.allocator, wrapped_html);
+            e.owned_strings.?.appendAssumeCapacity(wrapped_html);
             wrapped_cleanup = false;
 
             parser.fixParentPointers(node, e.parent);

@@ -10,6 +10,13 @@ before changing URL or response ownership.
 
 - `Url` is logically move-only despite Zig value-copy syntax. Use `Url.clone`
   whenever two independently live owners are needed.
+- Use `Url.toOwnedString` for canonical URL keys that must outlive a borrowed
+  `Url` or exceed a fixed formatting buffer. The caller owns that serialization;
+  `view-source:` identity remains part of it.
+- Navigation normalization accepts the browser-owned `about:bookmarks` page in
+  addition to `about:blank`. Network-level `aboutRequest` remains static;
+  `Browser.fetchNavigationDocument` generates the session-specific page and
+  returns its body with explicit ownership.
 - Relative references are resolved by Ada against the complete base href so
   query and fragment components follow URL semantics. `Url.fragment` and
   `Url.sameDocument` return borrowed views/comparisons; do not retain their
@@ -28,7 +35,8 @@ before changing URL or response ownership.
   renderer concerns so inspection commands can reuse it. Caching is an
   explicitly supplied dependency; inspection callers may opt out.
 - Cache hits must preserve the normal fetch ownership contract by returning
-  caller-owned body and header copies. Cache entries remain Browser-owned and
-  are protected by the Browser HTTP mutex.
+  caller-owned body and header copies. Interactive cache, cookie, and HTTP
+  client state belongs to the shared `BrowserSession` and is protected by its
+  dedicated network mutex; standalone screenshot browsers own their session.
 - Add data/file tests for ownership changes; use a local fixture/server for
   HTTP, redirects, cookies, compression, or CSP behavior.

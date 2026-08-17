@@ -1,13 +1,15 @@
 //! Zibra executable entry point and command-line interface.
 //!
 //! The process arena owns application allocations. This module parses the
-//! command line, runs isolated document-inspection modes, or creates the
-//! process-wide `Browser` for interactive or windowless screenshot runs.
+//! command line, runs isolated document-inspection modes, creates a
+//! process-wide `BrowserApp` for interactive windows, or owns one standalone
+//! windowless `Browser` for screenshots.
 
 const std = @import("std");
 
 const browser = @import("browser/root.zig");
 const Browser = browser.Browser;
+const BrowserApp = @import("browser/app.zig").BrowserApp;
 const url_module = @import("network/url.zig");
 const Url = url_module.Url;
 const parser = @import("document/parser.zig");
@@ -97,6 +99,10 @@ fn dumpPipeline(
 ) !void {
     var page = try inspection.Page.load(init, allocator, url);
     defer page.deinit();
+    // Page.load returns the DOM by value. Repair parent pointers after the
+    // returned page reaches its stable inspection-stack address before paint
+    // provenance or visited-link ancestry walks borrow them.
+    page.repairParentPointers();
 
     var stdout_buffer: [4096]u8 = undefined;
     var stdout_writer = std.Io.File.stdout().writer(init.io, &stdout_buffer);
@@ -239,28 +245,38 @@ fn zibra(init: std.process.Init) !void {
         return;
     }
 
-    // Initialize browser
-    const b = try Browser.init(allocator, init.io, init.environ_map, rtl_flag, screenshot_path != null);
-    defer {
-        b.deinit();
-        allocator.destroy(b);
-    }
-
-    if (url) |u| {
-        // Transfer URL ownership before creating the tab; Browser.newTab
-        // consumes the URL even if tab construction or scheduling fails.
-        url = null;
-        try b.newTab(u);
-    } else {
-        // Create a new tab with the default HTML
-        const about_url = try Url.blank(allocator);
-        try b.newTab(about_url);
-    }
-
-    // Start main exec loop
     if (screenshot_path) |path| {
+        // Screenshot mode remains a direct, standalone Browser so it creates
+        // no native window and retains its deterministic quiescence loop.
+        const b = try Browser.init(allocator, init.io, init.environ_map, rtl_flag, true);
+        defer {
+            b.deinit();
+            allocator.destroy(b);
+        }
+
+        if (url) |u| {
+            // Browser.newTab consumes the URL even on failure.
+            url = null;
+            try b.newTab(u);
+        } else {
+            try b.newTab(try Url.blank(allocator));
+        }
         try b.runToScreenshot(path);
-    } else {
-        try b.run();
+        return;
     }
+
+    // Interactive mode has one process owner for SDL input and shared session
+    // services. BrowserApp.newWindow consumes the initial URL on entry.
+    const app = try BrowserApp.init(allocator, init.io, init.environ_map, rtl_flag);
+    defer {
+        app.deinit();
+        allocator.destroy(app);
+    }
+    if (url) |u| {
+        url = null;
+        _ = try app.newWindow(u);
+    } else {
+        _ = try app.newBlankWindow();
+    }
+    try app.run();
 }

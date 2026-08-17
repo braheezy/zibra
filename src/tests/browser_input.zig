@@ -3,9 +3,17 @@
 const std = @import("std");
 const browser = @import("../browser/root.zig");
 const Chrome = @import("../browser/chrome.zig");
+const BrowserSession = @import("../browser/session_state.zig").BrowserSession;
 const tab_module = @import("../browser/tab.zig");
 const parser_module = @import("../document/parser.zig");
 const Url = @import("../network/url.zig").Url;
+
+fn initTestChrome(allocator: std.mem.Allocator) Chrome {
+    return .{
+        .address_bar = std.ArrayList(u8).empty,
+        .allocator = allocator,
+    };
+}
 
 test "address bar preserves URLs and turns ordinary text into a search" {
     const allocator = std.testing.allocator;
@@ -45,6 +53,130 @@ test "address bar preserves URLs and turns ordinary text into a search" {
         var buffer: [256]u8 = undefined;
         try std.testing.expectEqualStrings(case.expected, try url.toString(&buffer));
     }
+}
+
+test "address cursor movement is focused and clamped to the input boundaries" {
+    var chrome = initTestChrome(std.testing.allocator);
+    defer chrome.deinit();
+
+    try std.testing.expect(!chrome.isAddressBarFocused());
+    try std.testing.expect(!chrome.moveCursorLeft());
+    try std.testing.expect(!chrome.moveCursorRight());
+
+    chrome.focusAddressBar();
+    try std.testing.expect(chrome.isAddressBarFocused());
+    try std.testing.expect(!chrome.moveCursorLeft());
+    try std.testing.expect(!chrome.moveCursorRight());
+
+    try std.testing.expect(try chrome.keypress('a'));
+    try std.testing.expect(try chrome.keypress('b'));
+    try std.testing.expect(try chrome.keypress('c'));
+    try std.testing.expectEqual(@as(usize, 3), chrome.address_cursor);
+    try std.testing.expect(!chrome.moveCursorRight());
+
+    try std.testing.expect(chrome.moveCursorLeft());
+    try std.testing.expect(chrome.moveCursorLeft());
+    try std.testing.expect(chrome.moveCursorLeft());
+    try std.testing.expectEqual(@as(usize, 0), chrome.address_cursor);
+    try std.testing.expect(!chrome.moveCursorLeft());
+
+    try std.testing.expect(chrome.moveCursorRight());
+    try std.testing.expect(chrome.moveCursorRight());
+    try std.testing.expect(chrome.moveCursorRight());
+    try std.testing.expectEqual(chrome.address_bar.items.len, chrome.address_cursor);
+    try std.testing.expect(!chrome.moveCursorRight());
+
+    chrome.blur();
+    try std.testing.expect(!chrome.isAddressBarFocused());
+    try std.testing.expect(!chrome.moveCursorLeft());
+    try std.testing.expect(!chrome.moveCursorRight());
+}
+
+test "address focus consumes editing keys despite stale document focus" {
+    // A DOM input may remain focused after chrome receives focus. Address-bar
+    // editing must win even for boundary no-ops such as Backspace at zero.
+    try std.testing.expect(!browser.shouldRouteContentEditing(true, null, true));
+    try std.testing.expect(!browser.shouldRouteContentEditing(true, "content", true));
+
+    try std.testing.expect(browser.shouldRouteContentEditing(false, "content", false));
+    try std.testing.expect(browser.shouldRouteContentEditing(false, null, true));
+    try std.testing.expect(!browser.shouldRouteContentEditing(false, null, false));
+    try std.testing.expect(!browser.shouldRouteContentEditing(false, "chrome", true));
+
+    var chrome = initTestChrome(std.testing.allocator);
+    defer chrome.deinit();
+    chrome.focusAddressBar();
+    try std.testing.expect(!chrome.backspace());
+    try std.testing.expect(!browser.shouldRouteContentEditing(
+        chrome.isAddressBarFocused(),
+        null,
+        true,
+    ));
+}
+
+test "address input inserts at the cursor and backspace deletes before it" {
+    var chrome = initTestChrome(std.testing.allocator);
+    defer chrome.deinit();
+    chrome.focusAddressBar();
+
+    try std.testing.expect(try chrome.keypress('a'));
+    try std.testing.expect(try chrome.keypress('c'));
+    try std.testing.expect(chrome.moveCursorLeft());
+    try std.testing.expect(try chrome.keypress('b'));
+    try std.testing.expectEqualStrings("abc", chrome.address_bar.items);
+    try std.testing.expectEqual(@as(usize, 2), chrome.address_cursor);
+
+    try std.testing.expect(chrome.backspace());
+    try std.testing.expectEqualStrings("ac", chrome.address_bar.items);
+    try std.testing.expectEqual(@as(usize, 1), chrome.address_cursor);
+
+    try std.testing.expect(chrome.moveCursorLeft());
+    try std.testing.expect(!chrome.backspace());
+    try std.testing.expect(try chrome.keypress('z'));
+    try std.testing.expectEqualStrings("zac", chrome.address_bar.items);
+    try std.testing.expectEqual(@as(usize, 1), chrome.address_cursor);
+
+    while (chrome.moveCursorRight()) {}
+    try std.testing.expect(try chrome.keypress('!'));
+    try std.testing.expectEqualStrings("zac!", chrome.address_bar.items);
+    try std.testing.expectEqual(chrome.address_bar.items.len, chrome.address_cursor);
+}
+
+test "address cursor resets on focus blur and successful enter" {
+    const allocator = std.testing.allocator;
+    var chrome = initTestChrome(allocator);
+    defer chrome.deinit();
+
+    chrome.focusAddressBar();
+    try std.testing.expect(try chrome.keypress('a'));
+    try std.testing.expect(try chrome.keypress('b'));
+    try std.testing.expect(chrome.moveCursorLeft());
+    chrome.focusAddressBar();
+    try std.testing.expectEqual(@as(usize, 0), chrome.address_cursor);
+    try std.testing.expectEqual(@as(usize, 0), chrome.address_bar.items.len);
+
+    try std.testing.expect(try chrome.keypress('x'));
+    chrome.blur();
+    try std.testing.expectEqual(@as(usize, 0), chrome.address_cursor);
+    try std.testing.expectEqual(@as(usize, 0), chrome.address_bar.items.len);
+    try std.testing.expect(chrome.focus == null);
+
+    chrome.focusAddressBar();
+    for ("example.com") |char| {
+        try std.testing.expect(try chrome.keypress(char));
+    }
+    try std.testing.expect(chrome.moveCursorLeft());
+
+    var test_browser: browser.Browser = undefined;
+    test_browser.allocator = allocator;
+    test_browser.tabs = std.ArrayList(*tab_module.Tab).empty;
+    defer test_browser.tabs.deinit(allocator);
+    test_browser.active_tab_index = null;
+
+    try std.testing.expect(try chrome.enter(&test_browser));
+    try std.testing.expectEqual(@as(usize, 0), chrome.address_cursor);
+    try std.testing.expectEqual(@as(usize, 0), chrome.address_bar.items.len);
+    try std.testing.expect(chrome.focus == null);
 }
 
 test "mouse wheel delta preserves magnitude and normalizes direction" {
@@ -87,9 +219,18 @@ test "middle-clicking a link queues its resolved URL for a new tab" {
     try std.testing.expect(link_node != null);
 
     var test_browser: browser.Browser = undefined;
+    var session = BrowserSession.init(allocator, std.testing.io);
+    defer session.deinit();
     test_browser.allocator = allocator;
+    test_browser.io = std.testing.io;
+    test_browser.session_state = &session;
     test_browser.lock = .init(std.testing.io);
+    test_browser.tabs = .empty;
+    defer test_browser.tabs.deinit(allocator);
+    test_browser.active_tab_index = null;
     test_browser.shutting_down = false;
+    test_browser.animation_timer_active = false;
+    test_browser.needs_animation_frame = false;
     test_browser.pending_new_tabs = .empty;
     defer {
         for (test_browser.pending_new_tabs.items) |*url| url.free(allocator);
@@ -111,6 +252,20 @@ test "middle-clicking a link queues its resolved URL for a new tab" {
         .node = link_node.?,
         .bounds = .{ .x = 10, .y = 20, .width = 100, .height = 30 },
     });
+    var generating_layout: u8 = 0;
+    const display_list = try allocator.alloc(browser.DisplayItem, 1);
+    display_list[0] = .{ .rect = .{
+        .x1 = 10,
+        .y1 = 20,
+        .x2 = 110,
+        .y2 = 50,
+        .color = .{ .r = 0, .g = 0, .b = 0, .a = 255 },
+        .source = .{
+            .layout = @ptrCast(&generating_layout),
+            .node = link_node.?,
+        },
+    } };
+    frame.display_list = display_list;
 
     try std.testing.expect(try frame.click(&test_browser, 25, 25, .middle));
     try std.testing.expectEqual(@as(usize, 1), test_browser.pending_new_tabs.items.len);
@@ -118,8 +273,22 @@ test "middle-clicking a link queues its resolved URL for a new tab" {
         "/docs/next.html",
         test_browser.pending_new_tabs.items[0].path,
     );
+    try std.testing.expect(try session.isVisited(&test_browser.pending_new_tabs.items[0]));
+    try std.testing.expect(test_browser.needs_animation_frame);
+    try test_browser.annotateVisitedLinks(&root, &current_url);
+    try std.testing.expect(link_node.?.element.is_visited);
 
     try std.testing.expect(!try frame.click(&test_browser, 200, 200, .middle));
+    try std.testing.expectEqual(@as(usize, 1), test_browser.pending_new_tabs.items.len);
+
+    var rejected = try Url.init(allocator, "https://example.com/rejected.html");
+    defer rejected.free(allocator);
+    test_browser.shutting_down = true;
+    try std.testing.expectError(
+        error.BrowserShuttingDown,
+        test_browser.queueNewTab(rejected),
+    );
+    try std.testing.expect(!try session.isVisited(&rejected));
     try std.testing.expectEqual(@as(usize, 1), test_browser.pending_new_tabs.items.len);
 }
 

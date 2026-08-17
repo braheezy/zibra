@@ -1,9 +1,9 @@
 //! Process-wide browser controller, event loop, and rendering coordinator.
 //!
-//! `Browser` owns SDL and z2d resources, tabs, shared networking state, and
-//! the committed render snapshot. Tab workers send commits back to this
-//! controller; interactive SDL rendering remains coordinated by the browser
-//! thread, while screenshot mode renders only to software z2d surfaces.
+//! `Browser` owns one native window's tabs, chrome, z2d resources, and
+//! committed render snapshot. Session/network state may be shared by a
+//! process-level `BrowserApp`; screenshot mode can still own a standalone
+//! session and render only to software surfaces.
 
 const std = @import("std");
 const Mutex = @import("../runtime/sync.zig").Mutex;
@@ -16,7 +16,6 @@ const font = @import("render/font.zig");
 const Glyph = font.Glyph;
 const url_module = @import("../network/url.zig");
 const Url = url_module.Url;
-const HttpCache = url_module.HttpCache;
 const Layout = @import("render/layout.zig");
 const parser = @import("../document/parser.zig");
 const HTMLParser = parser.HTMLParser;
@@ -30,6 +29,7 @@ const Frame = tab_module.Frame;
 const ClickButton = tab_module.ClickButton;
 const HistoryDirection = tab_module.HistoryDirection;
 const HistoryNavigation = tab_module.HistoryNavigation;
+const BrowserSession = @import("session_state.zig").BrowserSession;
 const scroll_model = @import("scroll.zig");
 const Chrome = @import("chrome.zig");
 const task_module = @import("../runtime/task.zig");
@@ -46,6 +46,20 @@ const default_window_title: [:0]const u8 = "zibra";
 const initial_window_width = 800;
 const initial_window_height = 600;
 pub const decodeUtf8Replace = url_module.decodeUtf8Replace;
+
+/// A document-navigation response plus explicit ownership for its body and
+/// CSP header. Generated browser pages and fetched resources share this
+/// contract, so callers never infer ownership from the URL scheme.
+pub const NavigationDocument = struct {
+    response: url_module.HttpResponse,
+    owned_body: ?[]const u8,
+
+    pub fn deinit(self: *NavigationDocument, allocator: std.mem.Allocator) void {
+        if (self.response.csp_header) |header| allocator.free(header);
+        if (self.owned_body) |body| allocator.free(body);
+        self.* = undefined;
+    }
+};
 
 fn createBrokenImage(allocator: std.mem.Allocator) !zigimg.Image {
     const width: usize = 16;
@@ -88,6 +102,19 @@ pub fn wheelScrollDelta(delta_y: i32, is_flipped: bool) i32 {
         @as(i64, std.math.minInt(i32)),
         @as(i64, std.math.maxInt(i32)),
     ));
+}
+
+/// Chrome address editing takes precedence over a stale document focus. The
+/// address bar consumes editing keys even when an operation is a boundary
+/// no-op, such as Backspace at cursor zero.
+pub fn shouldRouteContentEditing(
+    address_bar_focused: bool,
+    browser_focus: ?[]const u8,
+    frame_has_focus: bool,
+) bool {
+    if (address_bar_focused) return false;
+    if (browser_focus) |focus| return std.mem.eql(u8, focus, "content");
+    return frame_has_focus;
 }
 
 /// Native and content-surface dimensions derived from an SDL resize event.
@@ -332,6 +359,21 @@ pub const CompositedLayer = struct {
         }
     }
 
+    /// Apply an opacity animation to this layer. A layer whose own node is the
+    /// target can change its composite alpha without rerasterizing; a target
+    /// nested in flattened/iframe-owned display items requires new pixels.
+    pub fn applyCompositedOpacity(self: *CompositedLayer, node: *anyopaque, opacity: f64) bool {
+        if (self.node == node) {
+            self.opacity = opacity;
+            return false;
+        }
+        if (DisplayItem.applyCompositedOpacity(self.display_items, node, opacity)) {
+            self.needs_raster = true;
+            return true;
+        }
+        return false;
+    }
+
     /// Check if another layer can be merged into this one.
     /// Layers can merge if they have identical visual-effect ancestry (same opacity and blend_mode).
     pub fn canMerge(self: *const CompositedLayer, other_opacity: f64, other_blend_mode: ?[]const u8) bool {
@@ -360,14 +402,18 @@ pub const CompositedLayer = struct {
             .right = @max(inner_bounds.right, item_bounds.right),
             .bottom = @max(inner_bounds.bottom, item_bounds.bottom),
         };
-        self.bounds = new_bounds.outset(1);
 
         // Combine display items
         const old_items = self.display_items;
         const new_items = try allocator.alloc(DisplayItem, old_items.len + items.len);
         @memcpy(new_items[0..old_items.len], old_items);
         @memcpy(new_items[old_items.len..], items);
+
+        // Publish the expanded layer only after the fallible allocation. On
+        // failure, both the layer and the caller-owned incoming list remain
+        // unchanged.
         self.display_items = new_items;
+        self.bounds = new_bounds.outset(1);
         if (old_items.len > 0) {
             allocator.free(old_items);
         }
@@ -430,6 +476,27 @@ pub const ImageDisplayItem = struct {
     source_height: i32,
     pixels: []const u8,
     opacity: f64 = 1.0,
+    source: ?DisplayItemSource = null,
+};
+
+/// Synchronous-only provenance for an uncomposed frame display item. Both
+/// pointers borrow the frame's current layout/DOM generation and must be
+/// cleared before the item crosses the tab-to-browser commit boundary.
+pub const DisplayItemSource = struct {
+    layout: *const anyopaque,
+    node: ?*Node,
+    /// Typed by the layout emitter. This keeps the erased layout pointer
+    /// useful without making DisplayItem depend on every concrete layout type.
+    layout_node_resolver: ?*const fn (*const anyopaque, ?*Node) ?*Node = null,
+
+    /// Ask the generating layout object to validate the precise fragment node
+    /// (needed for anonymous inline blocks), or to provide its own DOM node.
+    pub fn originatingNode(self: DisplayItemSource) ?*Node {
+        return if (self.layout_node_resolver) |resolve|
+            resolve(self.layout, self.node)
+        else
+            self.node;
+    }
 };
 
 pub const DisplayItem = union(enum) {
@@ -438,6 +505,7 @@ pub const DisplayItem = union(enum) {
         y: i32,
         glyph: Glyph,
         color: Color,
+        source: ?DisplayItemSource = null,
     },
     rect: struct {
         x1: i32,
@@ -445,11 +513,13 @@ pub const DisplayItem = union(enum) {
         x2: i32,
         y2: i32,
         color: Color,
+        source: ?DisplayItemSource = null,
     },
     image: ImageDisplayItem,
     iframe: struct {
         rect: Rect,
         node: *Node,
+        source: ?DisplayItemSource = null,
     },
     rounded_rect: struct {
         x1: i32,
@@ -458,6 +528,7 @@ pub const DisplayItem = union(enum) {
         y2: i32,
         radius: f64,
         color: Color,
+        source: ?DisplayItemSource = null,
     },
     line: struct {
         x1: i32,
@@ -466,11 +537,13 @@ pub const DisplayItem = union(enum) {
         y2: i32,
         color: Color,
         thickness: i32,
+        source: ?DisplayItemSource = null,
     },
     outline: struct {
         rect: Rect,
         color: Color,
         thickness: i32,
+        source: ?DisplayItemSource = null,
     },
     blend: struct {
         opacity: f64,
@@ -479,10 +552,12 @@ pub const DisplayItem = union(enum) {
         node: ?*anyopaque = null, // Reference back to the DOM node that created this effect
         parent: ?*const DisplayItem = null, // Parent blend for walking up the tree
         needs_compositing: bool = false, // True if this blend or descendants require composited layers
+        source: ?DisplayItemSource = null,
     },
     /// Draw a pre-rasterized composited layer
     draw_composited_layer: struct {
         layer: *CompositedLayer,
+        source: ?DisplayItemSource = null,
     },
     /// Apply a 2D translation transform to children
     transform: struct {
@@ -490,7 +565,304 @@ pub const DisplayItem = union(enum) {
         translate_y: i32,
         children: []DisplayItem,
         node: ?*anyopaque = null,
+        source: ?DisplayItemSource = null,
     },
+
+    pub const HitResult = struct {
+        item: *const DisplayItem,
+        source: DisplayItemSource,
+        /// Point in the hit primitive's local, unzoomed layout coordinates.
+        x: i32,
+        y: i32,
+        /// Exact point in the primitive's local device coordinates.
+        device_x: i32,
+        device_y: i32,
+    };
+
+    pub fn source(self: *const DisplayItem) ?DisplayItemSource {
+        return switch (self.*) {
+            inline else => |payload| payload.source,
+        };
+    }
+
+    /// Strip borrowed layout/DOM provenance before transferring a list to a
+    /// longer-lived browser render snapshot.
+    pub fn clearSources(items: []DisplayItem) void {
+        for (items) |*item| {
+            switch (item.*) {
+                .blend => |*blend_item| {
+                    blend_item.source = null;
+                    clearSources(blend_item.children);
+                },
+                .transform => |*transform_item| {
+                    transform_item.source = null;
+                    clearSources(transform_item.children);
+                },
+                inline else => |*payload| payload.source = null,
+            }
+        }
+    }
+
+    /// Keep the frame's authoritative hit list synchronized with compositor-
+    /// only opacity animation updates. The node identity is the live DOM
+    /// element pointer stored by the layout effect wrapper.
+    pub fn applyCompositedOpacity(items: []DisplayItem, node: *anyopaque, opacity: f64) bool {
+        var updated = false;
+        for (items) |*item| {
+            switch (item.*) {
+                .blend => |*blend_item| {
+                    if (blend_item.node == node) {
+                        blend_item.opacity = opacity;
+                        updated = true;
+                    }
+                    if (applyCompositedOpacity(blend_item.children, node, opacity)) updated = true;
+                },
+                .transform => |*transform_item| {
+                    if (applyCompositedOpacity(transform_item.children, node, opacity)) updated = true;
+                },
+                else => {},
+            }
+        }
+        return updated;
+    }
+
+    pub fn scaleLayoutPx(value: i32, zoom_value: f32) i32 {
+        const zoom = if (zoom_value > 0) zoom_value else 1.0;
+        if (zoom == 1.0) return value;
+        return @intFromFloat(@as(f32, @floatFromInt(value)) * zoom);
+    }
+
+    fn deviceToLayoutPx(value: i32, zoom_value: f32) i32 {
+        const zoom = if (zoom_value > 0) zoom_value else 1.0;
+        if (zoom == 1.0) return value;
+        return @intFromFloat(@as(f32, @floatFromInt(value)) / zoom);
+    }
+
+    /// Convenience entry point for tests and synchronous layout-coordinate
+    /// callers. Native input should retain its exact device coordinate and use
+    /// hitTestDevice so fractional zoom never loses an edge pixel.
+    pub fn hitTest(items: []const DisplayItem, x: i32, y: i32, zoom_value: f32) ?HitResult {
+        return hitTestDevice(
+            items,
+            scaleLayoutPx(x, zoom_value),
+            scaleLayoutPx(y, zoom_value),
+            zoom_value,
+        );
+    }
+
+    /// Return the topmost painted item carrying synchronous frame provenance.
+    /// CSS coordinates and translations use the same truncating scale rule as
+    /// raster; glyph w/h are already exact device bitmap dimensions.
+    pub fn hitTestDevice(items: []const DisplayItem, x: i32, y: i32, zoom_value: f32) ?HitResult {
+        const zoom = if (zoom_value > 0) zoom_value else 1.0;
+        return hitTestDeviceList(items, x, y, zoom);
+    }
+
+    fn hitTestDeviceList(items: []const DisplayItem, x: i32, y: i32, zoom: f32) ?HitResult {
+        var index = items.len;
+        while (index > 0) {
+            index -= 1;
+            const item = &items[index];
+            switch (item.*) {
+                .blend => |blend_item| {
+                    if (blend_item.opacity <= 0) continue;
+                    const is_dst_in = if (blend_item.blend_mode) |mode|
+                        std.mem.eql(u8, mode, "dst_in")
+                    else
+                        false;
+                    if (is_dst_in) {
+                        if (blend_item.children.len == 1) {
+                            // Layout clipping is encoded as a one-child
+                            // dst_in mask following the sibling content it
+                            // clips. The mask is an operator, not a target.
+                            if (!containsPaintedPoint(&blend_item.children[0], x, y, zoom)) return null;
+                            continue;
+                        }
+                        if (blend_item.children.len < 2) continue;
+                        const mask = &blend_item.children[blend_item.children.len - 1];
+                        if (!containsPaintedPoint(mask, x, y, zoom)) continue;
+                        if (hitTestDeviceList(blend_item.children[0 .. blend_item.children.len - 1], x, y, zoom)) |hit| {
+                            return hit;
+                        }
+                        continue;
+                    }
+                    if (hitTestDeviceList(blend_item.children, x, y, zoom)) |hit| return hit;
+                },
+                .transform => |transform_item| {
+                    const local_x = x - scaleLayoutPx(transform_item.translate_x, zoom);
+                    const local_y = y - scaleLayoutPx(transform_item.translate_y, zoom);
+                    if (hitTestDeviceList(transform_item.children, local_x, local_y, zoom)) |hit| return hit;
+                },
+                else => {
+                    const item_source = item.source() orelse continue;
+                    if (containsPrimitivePoint(item, x, y, zoom)) {
+                        return .{
+                            .item = item,
+                            .source = item_source,
+                            .x = deviceToLayoutPx(x, zoom),
+                            .y = deviceToLayoutPx(y, zoom),
+                            .device_x = x,
+                            .device_y = y,
+                        };
+                    }
+                },
+            }
+        }
+        return null;
+    }
+
+    fn containsPaintedPoint(item: *const DisplayItem, x: i32, y: i32, zoom: f32) bool {
+        return switch (item.*) {
+            .blend => |blend_item| blk: {
+                if (blend_item.opacity <= 0) break :blk false;
+                const is_dst_in = if (blend_item.blend_mode) |mode|
+                    std.mem.eql(u8, mode, "dst_in")
+                else
+                    false;
+                if (is_dst_in) {
+                    if (blend_item.children.len == 1) {
+                        break :blk containsPaintedPoint(&blend_item.children[0], x, y, zoom);
+                    }
+                    if (blend_item.children.len < 2) break :blk false;
+                    const mask = &blend_item.children[blend_item.children.len - 1];
+                    if (!containsPaintedPoint(mask, x, y, zoom)) break :blk false;
+                    break :blk listContainsPaintedPoint(blend_item.children[0 .. blend_item.children.len - 1], x, y, zoom);
+                }
+                break :blk listContainsPaintedPoint(blend_item.children, x, y, zoom);
+            },
+            .transform => |transform_item| blk: {
+                const local_x = x - scaleLayoutPx(transform_item.translate_x, zoom);
+                const local_y = y - scaleLayoutPx(transform_item.translate_y, zoom);
+                break :blk listContainsPaintedPoint(transform_item.children, local_x, local_y, zoom);
+            },
+            else => containsPrimitivePoint(item, x, y, zoom),
+        };
+    }
+
+    fn listContainsPaintedPoint(items: []const DisplayItem, x: i32, y: i32, zoom: f32) bool {
+        var index = items.len;
+        while (index > 0) {
+            index -= 1;
+            const item = &items[index];
+            if (item.* == .blend) {
+                const blend_item = item.blend;
+                const is_dst_in = if (blend_item.blend_mode) |mode|
+                    std.mem.eql(u8, mode, "dst_in")
+                else
+                    false;
+                if (is_dst_in and blend_item.children.len == 1) {
+                    if (!containsPaintedPoint(&blend_item.children[0], x, y, zoom)) return false;
+                    continue;
+                }
+            }
+            if (containsPaintedPoint(item, x, y, zoom)) return true;
+        }
+        return false;
+    }
+
+    fn containsPrimitivePoint(item: *const DisplayItem, x: i32, y: i32, zoom: f32) bool {
+        return switch (item.*) {
+            .glyph => |glyph_item| glyph_item.color.a > 0 and pointInRect(
+                x,
+                y,
+                scaleLayoutPx(glyph_item.x, zoom),
+                scaleLayoutPx(glyph_item.y, zoom),
+                scaleLayoutPx(glyph_item.x, zoom) + glyph_item.glyph.w,
+                scaleLayoutPx(glyph_item.y, zoom) + glyph_item.glyph.h,
+            ),
+            .rect => |rect_item| rect_item.color.a > 0 and pointInScaledRect(x, y, rect_item.x1, rect_item.y1, rect_item.x2, rect_item.y2, zoom),
+            .image => |image_item| image_item.opacity > 0 and pointInScaledRect(x, y, image_item.x1, image_item.y1, image_item.x2, image_item.y2, zoom),
+            .iframe => |iframe_item| pointInScaledRect(x, y, iframe_item.rect.left, iframe_item.rect.top, iframe_item.rect.right, iframe_item.rect.bottom, zoom),
+            .rounded_rect => |rounded_item| rounded_item.color.a > 0 and pointInRoundedRect(x, y, rounded_item, zoom),
+            .line => |line_item| line_item.color.a > 0 and pointOnLine(x, y, line_item, zoom),
+            .outline => |outline_item| outline_item.color.a > 0 and pointOnOutline(x, y, outline_item, zoom),
+            .draw_composited_layer => |layer_item| pointInRect(
+                x,
+                y,
+                layer_item.layer.bounds.left,
+                layer_item.layer.bounds.top,
+                layer_item.layer.bounds.right,
+                layer_item.layer.bounds.bottom,
+            ),
+            .blend, .transform => false,
+        };
+    }
+
+    fn pointInScaledRect(x: i32, y: i32, x1: i32, y1: i32, x2: i32, y2: i32, zoom: f32) bool {
+        return pointInRect(
+            x,
+            y,
+            scaleLayoutPx(x1, zoom),
+            scaleLayoutPx(y1, zoom),
+            scaleLayoutPx(x2, zoom),
+            scaleLayoutPx(y2, zoom),
+        );
+    }
+
+    fn pointInRect(x: i32, y: i32, x1: i32, y1: i32, x2: i32, y2: i32) bool {
+        const left = @min(x1, x2);
+        const right = @max(x1, x2);
+        const top = @min(y1, y2);
+        const bottom = @max(y1, y2);
+        return x >= left and x < right and y >= top and y < bottom;
+    }
+
+    fn pointInRoundedRect(x: i32, y: i32, item: anytype, zoom: f32) bool {
+        const left = scaleLayoutPx(@min(item.x1, item.x2), zoom);
+        const right = scaleLayoutPx(@max(item.x1, item.x2), zoom);
+        const top = scaleLayoutPx(@min(item.y1, item.y2), zoom);
+        const bottom = scaleLayoutPx(@max(item.y1, item.y2), zoom);
+        if (!pointInRect(x, y, left, top, right, bottom)) return false;
+        const width: f64 = @floatFromInt(right - left);
+        const height: f64 = @floatFromInt(bottom - top);
+        const radius = @min(item.radius * @as(f64, zoom), @min(width / 2.0, height / 2.0));
+        if (radius <= 0.5) return true;
+        const x_float: f64 = @floatFromInt(x);
+        const y_float: f64 = @floatFromInt(y);
+        const left_float: f64 = @floatFromInt(left);
+        const right_float: f64 = @floatFromInt(right);
+        const top_float: f64 = @floatFromInt(top);
+        const bottom_float: f64 = @floatFromInt(bottom);
+        const center_x = if (x_float < left_float + radius) left_float + radius else if (x_float >= right_float - radius) right_float - radius else x_float;
+        const center_y = if (y_float < top_float + radius) top_float + radius else if (y_float >= bottom_float - radius) bottom_float - radius else y_float;
+        const dx = x_float - center_x;
+        const dy = y_float - center_y;
+        return dx * dx + dy * dy <= radius * radius;
+    }
+
+    fn pointOnLine(x: i32, y: i32, item: anytype, zoom: f32) bool {
+        const x1: f64 = @floatFromInt(scaleLayoutPx(item.x1, zoom));
+        const y1: f64 = @floatFromInt(scaleLayoutPx(item.y1, zoom));
+        const x2: f64 = @floatFromInt(scaleLayoutPx(item.x2, zoom));
+        const y2: f64 = @floatFromInt(scaleLayoutPx(item.y2, zoom));
+        const dx = x2 - x1;
+        const dy = y2 - y1;
+        const length_squared = dx * dx + dy * dy;
+        const x_float: f64 = @floatFromInt(x);
+        const y_float: f64 = @floatFromInt(y);
+        const t = if (length_squared == 0) 0.0 else std.math.clamp(((x_float - x1) * dx + (y_float - y1) * dy) / length_squared, 0.0, 1.0);
+        const nearest_x = x1 + t * dx;
+        const nearest_y = y1 + t * dy;
+        const half_width = @as(f64, @floatFromInt(@max(1, scaleLayoutPx(item.thickness, zoom)))) / 2.0;
+        const distance_x = x_float - nearest_x;
+        const distance_y = y_float - nearest_y;
+        return distance_x * distance_x + distance_y * distance_y <= half_width * half_width;
+    }
+
+    fn pointOnOutline(x: i32, y: i32, item: anytype, zoom: f32) bool {
+        const left = scaleLayoutPx(@min(item.rect.left, item.rect.right), zoom);
+        const right = scaleLayoutPx(@max(item.rect.left, item.rect.right), zoom);
+        const top = scaleLayoutPx(@min(item.rect.top, item.rect.bottom), zoom);
+        const bottom = scaleLayoutPx(@max(item.rect.top, item.rect.bottom), zoom);
+        const thickness = @max(1, scaleLayoutPx(item.thickness, zoom));
+        if (!pointInRect(x, y, left - thickness, top - thickness, right + thickness, bottom + thickness)) return false;
+        const inner_left = left + thickness;
+        const inner_right = right - thickness;
+        const inner_top = top + thickness;
+        const inner_bottom = bottom - thickness;
+        return inner_left >= inner_right or inner_top >= inner_bottom or
+            !pointInRect(x, y, inner_left, inner_top, inner_right, inner_bottom);
+    }
 
     // Set parent pointers recursively on a display list
     // This should be called after the display list is constructed
@@ -595,6 +967,13 @@ pub const Browser = struct {
     // Memory allocator for the browser
     allocator: std.mem.Allocator,
     io: std.Io,
+    // Process/session navigation state has its own lock so BrowserApp can share
+    // this pointer without borrowing one window's render lock.
+    session_state: *BrowserSession,
+    owns_sdl: bool,
+    owns_text_input: bool,
+    owns_session: bool,
+    owns_measure: bool,
     // Interactive presentation resources. Screenshot mode leaves these null
     // and exports the software root surface directly.
     window: ?sdl2.Window,
@@ -607,13 +986,6 @@ pub const Browser = struct {
     chrome_surface: z2d.Surface,
     // Separate surface for current tab content (can be taller than window)
     tab_surface: ?z2d.Surface,
-    // HTTP client for making requests (handles both HTTP and HTTPS)
-    http_client: std.http.Client,
-    http_client_mutex: Mutex,
-    // Shared cookie storage across tabs
-    cookie_jar: std.StringHashMap(url_module.CookieEntry),
-    // Shared decoded HTTP responses across tabs and document generations.
-    http_cache: HttpCache,
     // Window dimensions
     window_width: i32 = initial_window_width,
     window_height: i32 = initial_window_height,
@@ -640,9 +1012,13 @@ pub const Browser = struct {
     needs_animation_frame: bool = false,
     shutting_down: bool = false,
     resize_generation: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
-    measure: MeasureTime,
+    // Heap-stable because every tab worker and every App window shares it.
+    measure: *MeasureTime,
     lock: Mutex,
+    // Optimistic address-bar text may lead a pending load. Bookmark state uses
+    // the separately owned URL from the latest committed document.
     active_tab_url: ?[]u8 = null,
+    active_tab_committed_url: ?[]u8 = null,
     active_tab_scroll: i32 = 0,
     active_tab_height: i32 = 0,
     active_tab_zoom: f32 = 1.0,
@@ -658,7 +1034,9 @@ pub const Browser = struct {
     debug_layer_borders: bool = false,
     profiling_enabled: bool = false,
 
-    // Create a new Browser instance
+    /// Create a standalone Browser. It owns SDL and its session/measurement
+    /// services; the interactive executable instead uses `initAppWindow` so
+    /// one BrowserApp owns those process-level resources exactly once.
     pub fn init(
         al: std.mem.Allocator,
         io: std.Io,
@@ -666,14 +1044,87 @@ pub const Browser = struct {
         rtl_flag: bool,
         headless: bool,
     ) !*Browser {
-        const browser = try al.create(Browser);
-        errdefer al.destroy(browser);
+        const session_state = try al.create(BrowserSession);
+        errdefer al.destroy(session_state);
+        session_state.* = BrowserSession.init(al, io);
+        errdefer session_state.deinit();
 
-        // Initialize SDL
+        const measure = try al.create(MeasureTime);
+        errdefer al.destroy(measure);
+        measure.* = try MeasureTime.init(al, io, environ);
+        errdefer measure.finish();
+
         try sdl2.init(.{
             .video = true,
         });
         errdefer sdl2.quit();
+
+        if (!headless) sdl2.startTextInput();
+        errdefer if (!headless) sdl2.stopTextInput();
+
+        return initWithSharedState(
+            al,
+            io,
+            environ,
+            rtl_flag,
+            headless,
+            session_state,
+            measure,
+            .{
+                .owns_sdl = true,
+                .owns_text_input = !headless,
+                .owns_session = true,
+                .owns_measure = true,
+            },
+        );
+    }
+
+    /// Create one interactive Browser window borrowing process-level services
+    /// from BrowserApp. SDL video and text input must already be initialized.
+    pub fn initAppWindow(
+        al: std.mem.Allocator,
+        io: std.Io,
+        environ: *const std.process.Environ.Map,
+        rtl_flag: bool,
+        session_state: *BrowserSession,
+        measure: *MeasureTime,
+    ) !*Browser {
+        return initWithSharedState(
+            al,
+            io,
+            environ,
+            rtl_flag,
+            false,
+            session_state,
+            measure,
+            .{
+                .owns_sdl = false,
+                .owns_text_input = false,
+                .owns_session = false,
+                .owns_measure = false,
+            },
+        );
+    }
+
+    const Ownership = struct {
+        owns_sdl: bool,
+        owns_text_input: bool,
+        owns_session: bool,
+        owns_measure: bool,
+    };
+
+    fn initWithSharedState(
+        al: std.mem.Allocator,
+        io: std.Io,
+        environ: *const std.process.Environ.Map,
+        rtl_flag: bool,
+        headless: bool,
+        session_state: *BrowserSession,
+        measure: *MeasureTime,
+        ownership: Ownership,
+    ) !*Browser {
+        const browser = try al.create(Browser);
+        errdefer al.destroy(browser);
 
         var screen: ?sdl2.Window = null;
         errdefer if (screen) |window| window.destroy();
@@ -681,8 +1132,6 @@ pub const Browser = struct {
         errdefer if (renderer) |canvas| canvas.destroy();
         var cached_texture: ?sdl2.Texture = null;
         errdefer if (cached_texture) |texture| texture.destroy();
-        var text_input_started = false;
-        errdefer if (text_input_started) sdl2.stopTextInput();
 
         if (!headless) {
             const preferred_position = windowPositionForFocusedDisplay();
@@ -709,10 +1158,6 @@ pub const Browser = struct {
                 null,
                 .{ .accelerated = true },
             );
-
-            // Enable SDL text input so TextInput events fire for typing.
-            sdl2.startTextInput();
-            text_input_started = true;
 
             const renderer_info = try renderer.?.getInfo();
             const renderer_name = std.mem.span(renderer_info.name);
@@ -759,8 +1204,6 @@ pub const Browser = struct {
         var root_surface = try z2d.Surface.init(.image_surface_rgba, al, initial_window_width, initial_window_height);
         errdefer root_surface.deinit(al);
 
-        var measure = try MeasureTime.init(al, io, environ);
-        errdefer measure.finish();
         const profiling_enabled = isProfilingEnabled(environ);
 
         var chrome = try Chrome.init(&layout_engine.font_manager, initial_window_width, al);
@@ -775,16 +1218,17 @@ pub const Browser = struct {
         browser.* = Browser{
             .allocator = al,
             .io = io,
+            .session_state = session_state,
+            .owns_sdl = ownership.owns_sdl,
+            .owns_text_input = ownership.owns_text_input,
+            .owns_session = ownership.owns_session,
+            .owns_measure = ownership.owns_measure,
             .window = screen,
             .canvas = renderer,
             .root_surface = root_surface,
             .context = undefined,
             .chrome_surface = undefined, // Will be set below
             .tab_surface = null,
-            .http_client = .{ .allocator = al, .io = io },
-            .http_client_mutex = .init(io),
-            .cookie_jar = std.StringHashMap(url_module.CookieEntry).init(al),
-            .http_cache = HttpCache.init(al),
             .layout_engine = layout_engine,
             .default_style_sheet_rules = default_rules,
             .tabs = std.ArrayList(*Tab).empty,
@@ -828,6 +1272,106 @@ pub const Browser = struct {
             }
         }
         return null;
+    }
+
+    pub fn windowId(self: *const Browser) !u32 {
+        const window = self.window orelse return error.BrowserHasNoNativeWindow;
+        return window.getID();
+    }
+
+    /// Publish a shared-session visit to this window without holding the
+    /// session lock. The active tab observes the generation on its worker.
+    pub fn requestVisitedGenerationRefresh(self: *Browser) void {
+        self.lock.lock();
+        self.needs_animation_frame = true;
+        self.lock.unlock();
+        self.scheduleAnimationFrame();
+    }
+
+    /// Bookmark selection is chrome-only; rerastering is sufficient and does
+    /// not require taking BrowserSession.lock while Browser.lock is held.
+    pub fn requestBookmarkGenerationRefresh(self: *Browser) void {
+        self.setNeedsRasterDraw();
+    }
+
+    /// Record a navigation in browser-session state. The session owns a
+    /// canonical string, never this owning Url.
+    pub fn markVisited(self: *Browser, url: *const Url) !bool {
+        const inserted = try self.session_state.markVisited(url);
+        if (!inserted) return false;
+
+        // Existing documents may already contain a link to this URL. Publish
+        // an animation request so the active tab observes the new session
+        // generation; background tabs do the same when activated.
+        self.lock.lock();
+        self.needs_animation_frame = true;
+        self.lock.unlock();
+        self.scheduleAnimationFrame();
+        return true;
+    }
+
+    /// Publish both sides of a successful redirected navigation, then move
+    /// the final destination into the caller's owning URL slot. A navigation
+    /// without a redirect naturally deduplicates its second insertion.
+    pub fn recordSuccessfulNavigation(
+        self: *Browser,
+        requested_url: *Url,
+        final_url: *?Url,
+    ) !void {
+        _ = try self.markVisited(requested_url);
+        if (final_url.*) |resolved| {
+            requested_url.*.free(self.allocator);
+            requested_url.* = resolved;
+            final_url.* = null;
+        }
+        _ = try self.markVisited(requested_url);
+    }
+
+    /// Annotate every anchor against the browser-session visited set. Each
+    /// element stores only a boolean; resolved Url values remain local owners.
+    pub fn annotateVisitedLinks(self: *Browser, root: *Node, base_url: *const Url) !void {
+        switch (root.*) {
+            .text => {},
+            .element => |*element| {
+                if (std.ascii.eqlIgnoreCase(element.tag, "a")) {
+                    element.is_visited = false;
+                    if (element.attributes) |attrs| {
+                        if (attrs.get("href")) |href| {
+                            const resolved = try base_url.*.resolveForNavigation(self.allocator, href);
+                            defer resolved.free(self.allocator);
+                            element.is_visited = try self.session_state.isVisited(&resolved);
+                        }
+                    }
+                }
+                for (element.children.items) |*child| {
+                    try self.annotateVisitedLinks(child, base_url);
+                }
+            },
+        }
+    }
+
+    /// Toggle the latest committed document URL, never an optimistic pending
+    /// address. The copied canonical text keeps Browser.lock and
+    /// BrowserSession.lock disjoint and prevents a concurrent commit from
+    /// invalidating the session operation's input.
+    pub fn toggleActiveBookmark(self: *Browser) !bool {
+        const canonical = blk: {
+            self.lock.lock();
+            defer self.lock.unlock();
+            const active_url = self.active_tab_committed_url orelse return false;
+            break :blk try self.allocator.dupe(u8, active_url);
+        };
+        defer self.allocator.free(canonical);
+
+        _ = try self.session_state.toggleBookmarkCanonical(canonical);
+        return true;
+    }
+
+    /// Called while Browser.lock stabilizes the committed chrome URL during
+    /// raster. Bookmark storage itself is synchronized by BrowserSession.
+    pub fn activePageIsBookmarked(self: *const Browser) bool {
+        const active_url = self.active_tab_committed_url orelse return false;
+        return self.session_state.isBookmarkedCanonical(active_url);
     }
 
     fn activeZoom(self: *const Browser) f32 {
@@ -896,6 +1440,7 @@ pub const Browser = struct {
         }
         if (found_idx) |idx| {
             self.active_tab_index = idx;
+            tab.requestActivationCommit();
             self.window_title_dirty = true;
             self.active_tab_scroll = 0;
             self.active_tab_zoom = tab.accessibility.zoom;
@@ -904,6 +1449,10 @@ pub const Browser = struct {
                 self.allocator.free(url);
             }
             self.active_tab_url = null;
+            if (self.active_tab_committed_url) |url| {
+                self.allocator.free(url);
+            }
+            self.active_tab_committed_url = null;
 
             self.retireActiveRenderStateLocked();
 
@@ -965,7 +1514,7 @@ pub const Browser = struct {
 
     /// Wait for any in-progress raster/draw and release browser-side borrows of
     /// a tab before that tab retires a document generation.
-    fn retireRenderStateForTab(self: *Browser, tab: *Tab) void {
+    pub fn retireRenderStateForTab(self: *Browser, tab: *Tab) void {
         self.lock.lock();
         defer self.lock.unlock();
         if (self.activeTab() != tab) return;
@@ -984,7 +1533,7 @@ pub const Browser = struct {
 
         const tab_height = @max(self.window_height - self.chrome.bottom, 0);
         const tab = try self.allocator.create(Tab);
-        tab.* = Tab.init(self.allocator, self.window_width, tab_height, &self.measure);
+        tab.* = Tab.init(self.allocator, self.window_width, tab_height, self.measure);
         var tab_adopted = false;
         errdefer if (!tab_adopted) {
             tab.deinit();
@@ -1016,9 +1565,27 @@ pub const Browser = struct {
     /// Ownership moves into the queue only when this function succeeds.
     pub fn queueNewTab(self: *Browser, url: Url) !void {
         self.lock.lock();
-        defer self.lock.unlock();
-        if (self.shutting_down) return error.BrowserShuttingDown;
-        try self.pending_new_tabs.append(self.allocator, url);
+        if (self.shutting_down) {
+            self.lock.unlock();
+            return error.BrowserShuttingDown;
+        }
+        self.pending_new_tabs.ensureUnusedCapacity(self.allocator, 1) catch |err| {
+            self.lock.unlock();
+            return err;
+        };
+
+        // Every fallible queue step has succeeded before the visit is
+        // published. Browser.lock keeps the owned Url local until it is
+        // appended, while BrowserSession copies its canonical string.
+        const inserted = self.session_state.markVisited(&url) catch |err| {
+            self.lock.unlock();
+            return err;
+        };
+        self.pending_new_tabs.appendAssumeCapacity(url);
+        if (inserted) self.needs_animation_frame = true;
+        self.lock.unlock();
+
+        if (inserted) self.scheduleAnimationFrame();
     }
 
     fn openPendingTabs(self: *Browser) void {
@@ -1130,6 +1697,16 @@ pub const Browser = struct {
         }
     }
 
+    /// Perform one nonblocking iteration of one native window. BrowserApp is
+    /// responsible for SDL polling and calls this for every registered window.
+    pub fn tick(self: *Browser) !bool {
+        self.openPendingTabs();
+        self.applyWindowTitle();
+        try self.compositeRasterAndDraw();
+        self.scheduleAnimationFrame();
+        return self.isIdle();
+    }
+
     fn finishRunLoop(self: *Browser) void {
         self.lock.lock();
         self.shutting_down = true;
@@ -1166,14 +1743,14 @@ pub const Browser = struct {
         try z2d.png_exporter.writeToPNGFile(self.io, self.root_surface, path, .{});
     }
 
-    fn isIdle(self: *Browser) bool {
+    pub fn isIdle(self: *Browser) bool {
         self.lock.lock();
         defer self.lock.unlock();
         return !self.needs_composite and !self.needs_raster and !self.needs_draw and !self.needs_animation_frame;
     }
 
     // Handle a single SDL event. Returns true if quit was requested.
-    fn handleEvent(self: *Browser, event: sdl2.Event) !bool {
+    pub fn handleEvent(self: *Browser, event: sdl2.Event) !bool {
         switch (event) {
             .quit => return true,
             .key_down => |kb_event| {
@@ -1187,12 +1764,17 @@ pub const Browser = struct {
                 var chrome_changed = false;
                 for (text) |char| {
                     if (char >= 0x20 and char < 0x7f) {
+                        const address_bar_focused = self.chrome.isAddressBarFocused();
                         if (try self.chrome.keypress(char)) {
                             chrome_changed = true;
                         }
                         if (self.activeTab()) |tab| {
                             const frame_focus = if (tab.root_frame) |frame| frame.focus != null else false;
-                            if ((self.focus != null and std.mem.eql(u8, self.focus.?, "content")) or frame_focus) {
+                            if (shouldRouteContentEditing(
+                                address_bar_focused,
+                                self.focus,
+                                frame_focus,
+                            )) {
                                 self.scheduleTabKeypressTask(tab, char);
                             }
                         }
@@ -1430,6 +2012,7 @@ pub const Browser = struct {
                 return;
             },
             .@"return" => {
+                const address_bar_focused = self.chrome.isAddressBarFocused();
                 const chrome_changed = try self.chrome.enter(self);
                 if (chrome_changed) {
                     // Chrome-only update (clear address bar text); avoid recomposite if the display list is unchanged.
@@ -1440,14 +2023,17 @@ pub const Browser = struct {
 
                 self.lock.lock();
                 const tab = self.activeTab();
-                const should_activate = if (self.focus) |focus_str|
-                    std.mem.eql(u8, focus_str, "content")
-                else if (tab) |active_tab| blk: {
+                const frame_has_focus = if (tab) |active_tab| blk: {
                     if (active_tab.root_frame) |frame| {
                         break :blk frame.focus != null;
                     }
                     break :blk false;
                 } else false;
+                const should_activate = shouldRouteContentEditing(
+                    address_bar_focused,
+                    self.focus,
+                    frame_has_focus,
+                );
                 self.lock.unlock();
                 if (should_activate) {
                     if (tab) |active_tab| {
@@ -1459,16 +2045,20 @@ pub const Browser = struct {
                 return;
             },
             .space => {
+                const address_bar_focused = self.chrome.isAddressBarFocused();
                 self.lock.lock();
                 const tab = self.activeTab();
-                const should_activate = if (self.focus) |focus_str|
-                    std.mem.eql(u8, focus_str, "content")
-                else if (tab) |active_tab| blk: {
+                const frame_has_focus = if (tab) |active_tab| blk: {
                     if (active_tab.root_frame) |frame| {
                         break :blk frame.focus != null;
                     }
                     break :blk false;
                 } else false;
+                const should_activate = shouldRouteContentEditing(
+                    address_bar_focused,
+                    self.focus,
+                    frame_has_focus,
+                );
                 self.lock.unlock();
                 if (should_activate) {
                     if (tab) |active_tab| {
@@ -1504,17 +2094,21 @@ pub const Browser = struct {
                 return;
             },
             .backspace => {
+                const address_bar_focused = self.chrome.isAddressBarFocused();
                 const chrome_changed = self.chrome.backspace();
                 self.lock.lock();
                 const tab = self.activeTab();
-                const should_backspace = if (self.focus) |focus_str|
-                    std.mem.eql(u8, focus_str, "content")
-                else if (tab) |active_tab| blk: {
+                const frame_has_focus = if (tab) |active_tab| blk: {
                     if (active_tab.root_frame) |frame| {
                         break :blk frame.focus != null;
                     }
                     break :blk false;
                 } else false;
+                const should_backspace = shouldRouteContentEditing(
+                    address_bar_focused,
+                    self.focus,
+                    frame_has_focus,
+                );
                 self.lock.unlock();
                 if (should_backspace) {
                     if (tab) |active_tab| {
@@ -1523,6 +2117,22 @@ pub const Browser = struct {
                 }
                 if (chrome_changed) {
                     // Chrome-only update (address bar text); avoid recomposite if the display list is unchanged.
+                    self.setNeedsRasterDraw();
+                    try self.compositeRasterAndDraw();
+                }
+                return;
+            },
+            .left => {
+                if (self.chrome.moveCursorLeft()) {
+                    // Chrome-only update (address cursor); avoid recomposite if the display list is unchanged.
+                    self.setNeedsRasterDraw();
+                    try self.compositeRasterAndDraw();
+                }
+                return;
+            },
+            .right => {
+                if (self.chrome.moveCursorRight()) {
+                    // Chrome-only update (address cursor); avoid recomposite if the display list is unchanged.
                     self.setNeedsRasterDraw();
                     try self.compositeRasterAndDraw();
                 }
@@ -1575,6 +2185,9 @@ pub const Browser = struct {
             self.lock.unlock();
             return;
         };
+        _ = frame;
+        const zoom = self.activeZoom();
+        const scroll_device = DisplayItem.scaleLayoutPx(self.active_tab_scroll, zoom);
 
         self.focus = "content";
         self.chrome.blur();
@@ -1584,11 +2197,9 @@ pub const Browser = struct {
         try self.compositeRasterAndDraw();
 
         const tab_y = screen_y - chrome_bottom;
-        const zoom = self.activeZoom();
-        const page_x = if (zoom == 1.0) screen_x else @as(i32, @intFromFloat(@as(f32, @floatFromInt(screen_x)) / zoom));
-        const page_y = (if (zoom == 1.0) tab_y else @as(i32, @intFromFloat(@as(f32, @floatFromInt(tab_y)) / zoom))) + frame.scroll;
+        const page_y = tab_y +| scroll_device;
 
-        self.scheduleTabClickTask(tab, page_x, page_y, .primary);
+        self.scheduleTabClickTask(tab, screen_x, page_y, .primary, zoom);
     }
 
     // Middle-click only activates links in page content. Chrome and non-link
@@ -1599,16 +2210,16 @@ pub const Browser = struct {
         const chrome_bottom = self.chrome.bottom;
         const zoom = self.activeZoom();
         const frame = if (tab) |active_tab| active_tab.root_frame else null;
+        const scroll_device = DisplayItem.scaleLayoutPx(self.active_tab_scroll, zoom);
         self.lock.unlock();
 
         if (screen_y < chrome_bottom) return;
         const active_tab = tab orelse return;
-        const root_frame = frame orelse return;
+        _ = frame orelse return;
         const tab_y = screen_y - chrome_bottom;
-        const page_x = if (zoom == 1.0) screen_x else @as(i32, @intFromFloat(@as(f32, @floatFromInt(screen_x)) / zoom));
-        const page_y = (if (zoom == 1.0) tab_y else @as(i32, @intFromFloat(@as(f32, @floatFromInt(tab_y)) / zoom))) + root_frame.scroll;
+        const page_y = tab_y +| scroll_device;
 
-        self.scheduleTabClickTask(active_tab, page_x, page_y, .middle);
+        self.scheduleTabClickTask(active_tab, screen_x, page_y, .middle, zoom);
     }
 
     fn handleHover(self: *Browser, screen_x: i32, screen_y: i32) !void {
@@ -1653,8 +2264,8 @@ pub const Browser = struct {
         }
     }
 
-    fn scheduleTabClickTask(self: *Browser, tab: *Tab, x: i32, y: i32, button: ClickButton) void {
-        const ctx = TabClickTaskContext.create(self.allocator, self, tab, x, y, button) catch |err| {
+    fn scheduleTabClickTask(self: *Browser, tab: *Tab, x: i32, y: i32, button: ClickButton, zoom: f32) void {
+        const ctx = TabClickTaskContext.create(self.allocator, self, tab, x, y, button, zoom) catch |err| {
             std.log.err("Failed to allocate tab click task: {}", .{err});
             return;
         };
@@ -1779,15 +2390,15 @@ pub const Browser = struct {
 
     // Update the scroll offset
     pub fn fetchBody(self: *Browser, url: Url, referrer: ?Url, payload: ?[]const u8) !url_module.HttpResponse {
-        self.http_client_mutex.lock();
-        defer self.http_client_mutex.unlock();
+        self.session_state.network_lock.lock();
+        defer self.session_state.network_lock.unlock();
 
         return url_module.Url.fetchBody(
             self.allocator,
             self.io,
-            &self.http_client,
-            &self.cookie_jar,
-            &self.http_cache,
+            &self.session_state.http_client,
+            &self.session_state.cookie_jar,
+            &self.session_state.http_cache,
             url,
             referrer,
             payload,
@@ -1801,20 +2412,51 @@ pub const Browser = struct {
         payload: ?[]const u8,
         final_url: *?Url,
     ) !url_module.HttpResponse {
-        self.http_client_mutex.lock();
-        defer self.http_client_mutex.unlock();
+        self.session_state.network_lock.lock();
+        defer self.session_state.network_lock.unlock();
 
         return url_module.Url.fetchBodyWithFinalUrl(
             self.allocator,
             self.io,
-            &self.http_client,
-            &self.cookie_jar,
-            &self.http_cache,
+            &self.session_state.http_client,
+            &self.session_state.cookie_jar,
+            &self.session_state.http_cache,
             url,
             referrer,
             payload,
             final_url,
         );
+    }
+
+    /// Fetch or generate a navigated document with explicit response-body
+    /// ownership. Passing final_url enables HTTP redirect destination output.
+    pub fn fetchNavigationDocument(
+        self: *Browser,
+        url: Url,
+        referrer: ?Url,
+        payload: ?[]const u8,
+        final_url: ?*?Url,
+    ) !NavigationDocument {
+        if (final_url) |output| output.* = null;
+
+        if (url.isAboutBookmarks()) {
+            const body = try self.session_state.bookmarksPageHtml(self.allocator);
+            return .{
+                .response = .{ .body = body },
+                .owned_body = body,
+            };
+        }
+
+        const response = if (final_url) |output|
+            try self.fetchBodyForNavigation(url, referrer, payload, output)
+        else
+            try self.fetchBody(url, referrer, payload);
+        const body_is_owned = !std.mem.eql(u8, url.scheme, "about") and
+            !std.mem.eql(u8, url.scheme, "data");
+        return .{
+            .response = response,
+            .owned_body = if (body_is_owned) response.body else null,
+        };
     }
 
     fn attachJsCallbacks(
@@ -1835,6 +2477,11 @@ pub const Browser = struct {
         frame.js_render_context_initialized = true;
         js_context.setNodes(frame.window_id, &frame.current_node.?);
         js_context.setRenderCallback(frame.window_id, jsRenderCallback, @ptrCast(render_context));
+        js_context.setDomMutationCallback(
+            frame.window_id,
+            jsDomMutationCallback,
+            @ptrCast(render_context),
+        );
         js_context.setXhrCallback(frame.window_id, jsXhrCallback, @ptrCast(render_context));
         js_context.setAnimationFrameCallback(
             frame.window_id,
@@ -1874,16 +2521,19 @@ pub const Browser = struct {
         // remains usable if navigation fails before commit.
         var final_url: ?Url = null;
         errdefer if (final_url) |resolved| resolved.free(self.allocator);
-        const response = try self.fetchBodyForNavigation(url.*, referrer_value, payload, &final_url);
-        if (final_url) |resolved| {
-            url.*.free(self.allocator);
-            url.* = resolved;
-            final_url = null;
-        }
-        defer if (response.csp_header) |hdr| self.allocator.free(hdr);
+        var document = try self.fetchNavigationDocument(
+            url.*,
+            referrer_value,
+            payload,
+            &final_url,
+        );
+        defer document.deinit(self.allocator);
+        const response = document.response;
+
+        // The requested link and its final redirect destination are distinct
+        // visits. Record them only after the fetch/generation succeeds.
+        try self.recordSuccessfulNavigation(url, &final_url);
         const raw_body = response.body;
-        const body_owned = !std.mem.eql(u8, url.*.scheme, "about") and !std.mem.eql(u8, url.*.scheme, "data");
-        defer if (body_owned) self.allocator.free(raw_body);
         const body_text = try decodeUtf8Replace(self.allocator, raw_body);
         var document_title: ?[:0]u8 = null;
         defer if (document_title) |title| self.allocator.free(title);
@@ -1976,6 +2626,7 @@ pub const Browser = struct {
             // The parse() method returns the tree by value, which copies it,
             // but the parent pointers still point to the old locations
             parser.fixParentPointers(&frame.current_node.?, null);
+            try self.annotateVisitedLinks(&frame.current_node.?, url);
 
             // Store the HTML source (it contains slices used by the tree)
             // Only store if it's not an about: URL (those return static strings)
@@ -2184,6 +2835,10 @@ pub const Browser = struct {
         frame.js_context = null;
         frame.js_render_context_initialized = false;
 
+        // Source metadata in the retained list borrows this layout/DOM
+        // generation, so it must be gone before either tree is rebuilt.
+        frame.retireDisplayList();
+
         frame.input_bounds.clearRetainingCapacity();
         frame.link_bounds.clearRetainingCapacity();
         frame.iframe_bounds.clearRetainingCapacity();
@@ -2196,11 +2851,6 @@ pub const Browser = struct {
             frame.allocator.destroy(child);
         }
         frame.children.clearRetainingCapacity();
-
-        if (frame.display_list) |items| {
-            DisplayItem.freeList(self.allocator, items);
-            frame.display_list = null;
-        }
 
         if (frame.document_layout) |doc| {
             doc.deinit();
@@ -2254,16 +2904,44 @@ pub const Browser = struct {
     ) !void {
         std.log.info("Loading iframe: {s}", .{url.*.path});
 
+        if (frame.parent) |parent| {
+            if (parent.current_url) |page_url| {
+                if (!iframeNavigationAllowed(parent, page_url, url, null)) {
+                    std.log.warn("Blocked iframe navigation to {s} due to CSP", .{url.*.path});
+                    return error.IframeNavigationBlockedByCsp;
+                }
+            }
+        }
+
         var referrer_value: ?Url = null;
         if (frame.current_url) |ref_ptr| {
             referrer_value = ref_ptr.*;
         }
 
-        const response = try self.fetchBody(url.*, referrer_value, payload);
-        defer if (response.csp_header) |hdr| self.allocator.free(hdr);
+        var final_url: ?Url = null;
+        errdefer if (final_url) |resolved| resolved.free(self.allocator);
+        var document = try self.fetchNavigationDocument(
+            url.*,
+            referrer_value,
+            payload,
+            &final_url,
+        );
+        defer document.deinit(self.allocator);
+        const response = document.response;
+
+        const final_destination: ?*const Url = if (final_url) |*resolved| resolved else null;
+        if (frame.parent) |parent| {
+            if (parent.current_url) |page_url| {
+                if (!iframeNavigationAllowed(parent, page_url, url, final_destination)) {
+                    std.log.warn("Blocked redirected iframe navigation to {s} due to CSP", .{url.*.path});
+                    return error.IframeRedirectBlockedByCsp;
+                }
+            }
+        }
+
+        try self.recordSuccessfulNavigation(url, &final_url);
+
         const raw_body = response.body;
-        const body_owned = !std.mem.eql(u8, url.*.scheme, "about") and !std.mem.eql(u8, url.*.scheme, "data");
-        defer if (body_owned) self.allocator.free(raw_body);
         const body_text = try decodeUtf8Replace(self.allocator, raw_body);
         var body_text_owned = true;
         errdefer if (body_text_owned) self.allocator.free(body_text);
@@ -2296,6 +2974,7 @@ pub const Browser = struct {
 
         frame.current_node = try html_parser.parse();
         parser.fixParentPointers(&frame.current_node.?, null);
+        try self.annotateVisitedLinks(&frame.current_node.?, url);
         frame.current_html_source = body_text;
         body_text_owned = false;
 
@@ -2606,18 +3285,59 @@ pub const Browser = struct {
         return .{ .width = width, .height = height };
     }
 
+    /// A parent document's CSP applies to the response's final destination,
+    /// not only the URL named by the iframe element. The optional URL is a
+    /// synchronous borrow owned by the navigation fetch result.
+    pub fn iframeRedirectAllowed(
+        parent: *Frame,
+        page_url: *const Url,
+        final_destination: ?*const Url,
+    ) bool {
+        const destination = final_destination orelse return true;
+        return parent.allowedRequest(destination.*, page_url);
+    }
+
+    /// Check both the authored target and any final redirect before an iframe
+    /// document is recorded or installed. This is shared by initial iframe
+    /// creation and later navigation within an existing child frame.
+    pub fn iframeNavigationAllowed(
+        parent: *Frame,
+        page_url: *const Url,
+        requested_destination: *const Url,
+        final_destination: ?*const Url,
+    ) bool {
+        return parent.allowedRequest(requested_destination.*, page_url) and
+            iframeRedirectAllowed(parent, page_url, final_destination);
+    }
+
     fn loadIframe(self: *Browser, parent: *Frame, iframe_node: *Node, page_url: *Url, src: []const u8) !void {
         var iframe_url = try page_url.*.resolveForNavigation(self.allocator, src);
         var url_owned = true;
         defer if (url_owned) iframe_url.free(self.allocator);
 
-        if (!parent.allowedRequest(iframe_url, page_url)) {
+        if (!iframeNavigationAllowed(parent, page_url, &iframe_url, null)) {
             std.log.warn("Blocked iframe {s} due to CSP", .{src});
             return;
         }
 
-        const response = try self.fetchBody(iframe_url, page_url.*, null);
-        defer if (response.csp_header) |hdr| self.allocator.free(hdr);
+        var final_url: ?Url = null;
+        errdefer if (final_url) |resolved| resolved.free(self.allocator);
+        var document = try self.fetchNavigationDocument(
+            iframe_url,
+            page_url.*,
+            null,
+            &final_url,
+        );
+        defer document.deinit(self.allocator);
+        const response = document.response;
+
+        const final_destination: ?*const Url = if (final_url) |*resolved| resolved else null;
+        if (!iframeNavigationAllowed(parent, page_url, &iframe_url, final_destination)) {
+            std.log.warn("Blocked redirected iframe {s} due to CSP", .{src});
+            return error.IframeRedirectBlockedByCsp;
+        }
+
+        try self.recordSuccessfulNavigation(&iframe_url, &final_url);
 
         const frame = try parent.allocator.create(Frame);
         frame.* = Frame.init(parent.allocator, parent.tab, parent, iframe_node);
@@ -2645,8 +3365,6 @@ pub const Browser = struct {
         }
 
         const raw_body = response.body;
-        const body_owned = !std.mem.eql(u8, iframe_url.scheme, "about") and !std.mem.eql(u8, iframe_url.scheme, "data");
-        defer if (body_owned) self.allocator.free(raw_body);
         const body_text = try decodeUtf8Replace(self.allocator, raw_body);
 
         var body_text_owned = true;
@@ -2657,6 +3375,7 @@ pub const Browser = struct {
 
         frame.current_node = try html_parser.parse();
         parser.fixParentPointers(&frame.current_node.?, null);
+        try self.annotateVisitedLinks(&frame.current_node.?, frame_url_ptr);
         frame.current_html_source = body_text;
         body_text_owned = false;
 
@@ -3227,6 +3946,9 @@ pub const Browser = struct {
             // Layout on subsequent frames - only if needed
             const doc = frame.document_layout.?;
             if (doc.layoutNeeded()) {
+                // doc.layout can destroy/rebuild BlockLayout descendants.
+                // Retire their borrowed provenance before entering it.
+                frame.retireDisplayList();
                 try doc.layout(self.layout_engine);
                 did_layout = true;
             }
@@ -3234,9 +3956,7 @@ pub const Browser = struct {
         // Repaint if layout ran or paint was requested
         if (did_layout or force_paint) {
             // Paint the document to produce draw commands
-            if (frame.display_list) |items| {
-                DisplayItem.freeList(self.allocator, items);
-            }
+            frame.retireDisplayList();
             frame.display_list = try self.layout_engine.paintDocument(frame.document_layout.?);
             try frame.updateHitTestBounds(self.layout_engine);
         }
@@ -3271,6 +3991,7 @@ pub const Browser = struct {
         if (focus_items.items.len > 0 and frame.display_list != null) {
             const old_list = frame.display_list.?;
             var combined = std.ArrayList(DisplayItem).empty;
+            defer combined.deinit(self.allocator);
             try combined.appendSlice(self.allocator, old_list);
             try combined.appendSlice(self.allocator, focus_items.items);
             frame.display_list = try combined.toOwnedSlice(self.allocator);
@@ -3371,29 +4092,44 @@ pub const Browser = struct {
 
                     if (is_dst_in) {
                         const cloned = try self.cloneDisplayItem(item);
+                        var cloned_owned = true;
+                        errdefer if (cloned_owned) {
+                            var cloned_items = [_]DisplayItem{cloned};
+                            DisplayItem.freeItems(self.allocator, &cloned_items);
+                        };
+
                         const layer_items = try self.allocator.alloc(DisplayItem, 1);
                         layer_items[0] = cloned;
+                        cloned_owned = false;
+
                         const bounds = self.getDisplayItemBounds(item);
                         const layer_blend_mode = if (cloned == .blend) cloned.blend.blend_mode else blend_item.blend_mode;
 
-                        const layer = CompositedLayer.init(
+                        var layer = CompositedLayer.init(
                             layer_items,
                             bounds,
                             blend_item.opacity,
                             layer_blend_mode,
                             blend_item.node,
                         );
+                        var layer_owned = true;
+                        errdefer if (layer_owned) layer.deinit(self.allocator);
                         try self.composited_layers.append(self.allocator, layer);
+                        layer_owned = false;
                         return;
                     }
 
                     // Flatten the subtree to collect all non-composited items
                     var flattened = std.ArrayList(DisplayItem).empty;
                     defer flattened.deinit(self.allocator);
+                    errdefer DisplayItem.freeItems(self.allocator, flattened.items);
                     try self.flattenSubtree(blend_item.children, &flattened);
 
-                    // Convert to owned slice for the layer (deep-clone to avoid aliasing display list storage)
-                    const flattened_items = try self.cloneDisplayItemList(flattened.items);
+                    // flattenSubtree deep-copies every owning command, so the
+                    // resulting slice can move directly into the layer.
+                    const flattened_items = try flattened.toOwnedSlice(self.allocator);
+                    var flattened_items_owned = true;
+                    errdefer if (flattened_items_owned) DisplayItem.freeList(self.allocator, flattened_items);
 
                     // Calculate bounds from flattened children
                     var bounds = Rect{ .left = std.math.maxInt(i32), .top = std.math.maxInt(i32), .right = std.math.minInt(i32), .bottom = std.math.minInt(i32) };
@@ -3415,16 +4151,21 @@ pub const Browser = struct {
                         // Merge into existing layer
                         const last_layer = &self.composited_layers.items[self.composited_layers.items.len - 1];
                         try last_layer.add(self.allocator, flattened_items, bounds);
+                        flattened_items_owned = false;
                     } else {
                         // Create a new composited layer for this blend
-                        const layer = CompositedLayer.init(
+                        var layer = CompositedLayer.init(
                             flattened_items,
                             bounds,
                             blend_item.opacity,
                             blend_item.blend_mode,
                             blend_item.node,
                         );
+                        flattened_items_owned = false;
+                        var layer_owned = true;
+                        errdefer if (layer_owned) layer.deinit(self.allocator);
                         try self.composited_layers.append(self.allocator, layer);
+                        layer_owned = false;
                     }
                 } else {
                     // No layer needed, recurse into children
@@ -3451,6 +4192,7 @@ pub const Browser = struct {
         switch (item) {
             .blend => |blend_item| {
                 const children = try self.cloneDisplayItemList(blend_item.children);
+                errdefer DisplayItem.freeList(self.allocator, children);
                 const mode_copy = if (blend_item.blend_mode) |mode| blk: {
                     const dup = try self.allocator.alloc(u8, mode.len);
                     @memcpy(dup, mode);
@@ -3464,6 +4206,7 @@ pub const Browser = struct {
                         .node = blend_item.node,
                         .parent = null,
                         .needs_compositing = blend_item.needs_compositing,
+                        .source = blend_item.source,
                     },
                 };
             },
@@ -3475,6 +4218,7 @@ pub const Browser = struct {
                         .translate_y = transform_item.translate_y,
                         .children = children,
                         .node = transform_item.node,
+                        .source = transform_item.source,
                     },
                 };
             },
@@ -3499,14 +4243,23 @@ pub const Browser = struct {
     }
 
     /// Flatten a subtree of display items by recursively expanding non-composited blends.
-    /// This collects all primitive items from a subtree into a flat list for efficient rasterization.
+    /// This collects primitives into an independently owned list for efficient
+    /// rasterization. Owning commands are cloned so failure cleanup never
+    /// aliases the browser's committed display list.
     fn flattenSubtree(self: *Browser, items: []DisplayItem, result: *std.ArrayList(DisplayItem)) !void {
         for (items) |item| {
             switch (item) {
                 .blend => |blend_item| {
                     if (blend_item.needs_compositing) {
                         // Composited blends stay as-is (they'll create their own layer)
-                        try result.append(self.allocator, item);
+                        const cloned = try self.cloneDisplayItem(item);
+                        var cloned_owned = true;
+                        errdefer if (cloned_owned) {
+                            var cloned_items = [_]DisplayItem{cloned};
+                            DisplayItem.freeItems(self.allocator, &cloned_items);
+                        };
+                        try result.append(self.allocator, cloned);
+                        cloned_owned = false;
                     } else {
                         // Non-composited blends are flattened - recurse into children
                         try self.flattenSubtree(blend_item.children, result);
@@ -3517,20 +4270,25 @@ pub const Browser = struct {
                     // Recursively flatten children but wrap them in the transform
                     var flattened_children = std.ArrayList(DisplayItem).empty;
                     defer flattened_children.deinit(self.allocator);
+                    errdefer DisplayItem.freeItems(self.allocator, flattened_children.items);
                     try self.flattenSubtree(transform_item.children, &flattened_children);
 
                     if (flattened_children.items.len > 0) {
-                        // Create a new transform with the flattened children
-                        const children_copy = try self.allocator.alloc(DisplayItem, flattened_children.items.len);
-                        @memcpy(children_copy, flattened_children.items);
+                        // Move the independently owned children into the new
+                        // transform and guard that move until append succeeds.
+                        const children_copy = try flattened_children.toOwnedSlice(self.allocator);
+                        var children_owned = true;
+                        errdefer if (children_owned) DisplayItem.freeList(self.allocator, children_copy);
                         try result.append(self.allocator, .{
                             .transform = .{
                                 .translate_x = transform_item.translate_x,
                                 .translate_y = transform_item.translate_y,
                                 .children = children_copy,
                                 .node = transform_item.node,
+                                .source = transform_item.source,
                             },
                         });
+                        children_owned = false;
                     }
                 },
                 else => {
@@ -3666,9 +4424,6 @@ pub const Browser = struct {
             .transform => |transform_item| {
                 // Transforms preserve their structure but recurse for composited content
                 // We need to collect children and emit a transform wrapping them
-                var transformed_children = std.ArrayList(DisplayItem).empty;
-                defer transformed_children.deinit(self.allocator);
-
                 // Save original draw list length
                 const original_len = self.tab_draw_list.items.len;
 
@@ -3685,6 +4440,8 @@ pub const Browser = struct {
 
                     // Remove the newly added items
                     self.tab_draw_list.items.len = original_len;
+                    var children_owned = true;
+                    errdefer if (children_owned) DisplayItem.freeList(self.allocator, children_copy);
 
                     // Emit transform wrapping those items
                     try self.tab_draw_list.append(self.allocator, .{
@@ -3693,8 +4450,10 @@ pub const Browser = struct {
                             .translate_y = transform_item.translate_y,
                             .children = children_copy,
                             .node = transform_item.node,
+                            .source = transform_item.source,
                         },
                     });
+                    children_owned = false;
                 }
             },
             else => {
@@ -3911,9 +4670,9 @@ pub const Browser = struct {
         self.active_tab_prefers_dark = data.prefers_dark;
 
         if (data.url) |url| {
-            self.updateActiveTabUrl(url);
+            self.updateCommittedActiveTabUrlLocked(url);
         } else {
-            self.clearActiveTabUrl();
+            self.clearActiveTabUrlLocked();
         }
 
         self.animation_timer_active = false;
@@ -3942,72 +4701,88 @@ pub const Browser = struct {
 
     /// Apply a composited update to the matching layer
     fn applyCompositedUpdate(self: *Browser, update: Tab.CompositedUpdate) void {
-        // Find the blend item in the display list with matching node pointer
+        // Keep the committed source tree current even when the effect is below
+        // a transform; a later recomposite must see the animated value.
         if (self.active_tab_display_list) |display_list| {
-            self.applyCompositedUpdateToList(display_list, update);
+            _ = DisplayItem.applyCompositedOpacity(display_list, update.node, update.opacity);
         }
-    }
 
-    /// Recursively search display list and update matching blend items
-    fn applyCompositedUpdateToList(self: *Browser, items: []DisplayItem, update: Tab.CompositedUpdate) void {
-        for (items) |*item| {
-            switch (item.*) {
-                .blend => |*blend| {
-                    if (blend.node == update.node) {
-                        blend.opacity = update.opacity;
-                        // Also update the corresponding composited layer
-                        self.updateLayerOpacity(update.node, update.opacity);
-                    }
-                    // Recurse into children
-                    self.applyCompositedUpdateToList(blend.children, update);
-                },
-                else => {},
-            }
-        }
-    }
-
-    /// Update opacity on composited layer matching the node
-    fn updateLayerOpacity(self: *Browser, node: *anyopaque, opacity: f64) void {
+        var needs_layer_raster = false;
         for (self.composited_layers.items) |*layer| {
-            if (layer.node == node) {
-                layer.opacity = opacity;
-                return;
-            }
+            if (layer.applyCompositedOpacity(update.node, update.opacity)) needs_layer_raster = true;
         }
+        if (needs_layer_raster) self.needs_raster = true;
     }
 
-    pub fn setActiveTabUrl(self: *Browser, url: *Url) void {
-        self.updateActiveTabUrl(url);
+    /// Publish an optimistic address-bar URL by copying it while the caller
+    /// still owns the Url. The public writer synchronizes with commit, chrome
+    /// paint, and bookmark toggles.
+    pub fn setActiveTabUrl(self: *Browser, url: *const Url) void {
+        self.lock.lock();
+        defer self.lock.unlock();
+        self.updateDisplayedActiveTabUrlLocked(url);
     }
 
-    fn updateActiveTabUrl(self: *Browser, url: *Url) void {
-        var buffer: [1024]u8 = undefined;
-        const url_str = url.toString(&buffer) catch |err| {
+    fn updateDisplayedActiveTabUrlLocked(self: *Browser, url: *const Url) void {
+        const copy = url.*.toOwnedString(self.allocator) catch |err| {
             std.log.warn("Failed to format URL for chrome: {}", .{err});
             return;
         };
 
         if (self.active_tab_url) |cached| {
-            if (std.mem.eql(u8, cached, url_str)) {
+            if (std.mem.eql(u8, cached, copy)) {
+                self.allocator.free(copy);
                 return;
             }
             self.allocator.free(cached);
         }
-
-        const copy = self.allocator.alloc(u8, url_str.len) catch |err| {
-            std.log.warn("Failed to allocate URL copy: {}", .{err});
-            self.active_tab_url = null;
-            return;
-        };
-        std.mem.copyForwards(u8, copy, url_str);
         self.active_tab_url = copy;
     }
 
-    fn clearActiveTabUrl(self: *Browser) void {
+    /// Commit replaces both independently owned snapshots atomically with
+    /// respect to Browser.lock. Bookmarks consult only the committed copy.
+    fn updateCommittedActiveTabUrlLocked(self: *Browser, url: *const Url) void {
+        const committed_copy = url.*.toOwnedString(self.allocator) catch |err| {
+            std.log.warn("Failed to format committed URL for chrome: {}", .{err});
+            return;
+        };
+        const displayed_copy = self.allocator.dupe(u8, committed_copy) catch |err| {
+            std.log.warn("Failed to copy committed URL for chrome: {}", .{err});
+            self.allocator.free(committed_copy);
+            return;
+        };
+
+        if (self.active_tab_url) |old| self.allocator.free(old);
+        if (self.active_tab_committed_url) |old| self.allocator.free(old);
+        self.active_tab_url = displayed_copy;
+        self.active_tab_committed_url = committed_copy;
+    }
+
+    /// Restore chrome after an optimistic load could not be scheduled.
+    pub fn restoreDisplayedUrlToCommitted(self: *Browser) void {
+        self.lock.lock();
+        defer self.lock.unlock();
+
+        const replacement = if (self.active_tab_committed_url) |committed|
+            self.allocator.dupe(u8, committed) catch |err| blk: {
+                std.log.warn("Failed to restore committed URL in chrome: {}", .{err});
+                break :blk null;
+            }
+        else
+            null;
+        if (self.active_tab_url) |old| self.allocator.free(old);
+        self.active_tab_url = replacement;
+    }
+
+    fn clearActiveTabUrlLocked(self: *Browser) void {
         if (self.active_tab_url) |old| {
             self.allocator.free(old);
         }
         self.active_tab_url = null;
+        if (self.active_tab_committed_url) |old| {
+            self.allocator.free(old);
+        }
+        self.active_tab_committed_url = null;
     }
 
     // Draw the browser content (composite from pre-rastered surfaces)
@@ -5156,22 +5931,20 @@ pub const Browser = struct {
         for (self.pending_new_tabs.items) |*url| url.free(self.allocator);
         self.pending_new_tabs.deinit(self.allocator);
 
+        if (self.owns_session) {
+            self.session_state.deinit();
+            self.allocator.destroy(self.session_state);
+        }
+
         if (self.active_tab_url) |url| {
+            self.allocator.free(url);
+        }
+        if (self.active_tab_committed_url) |url| {
             self.allocator.free(url);
         }
 
         self.composited_layers.deinit(self.allocator);
         self.tab_draw_list.deinit(self.allocator);
-
-        // No remaining task can use networking or shared browser state.
-        self.http_client.deinit();
-        self.http_cache.deinit();
-        var cookie_it = self.cookie_jar.iterator();
-        while (cookie_it.next()) |entry| {
-            self.allocator.free(entry.value_ptr.value);
-            self.allocator.free(entry.key_ptr.*);
-        }
-        self.cookie_jar.deinit();
 
         self.chrome.deinit();
 
@@ -5193,14 +5966,15 @@ pub const Browser = struct {
             tab_surface.deinit(self.allocator);
         }
 
-        self.measure.finish();
-
-        if (self.canvas) |canvas| {
-            sdl2.stopTextInput();
-            canvas.destroy();
+        if (self.owns_measure) {
+            self.measure.finish();
+            self.allocator.destroy(self.measure);
         }
+
+        if (self.owns_text_input) sdl2.stopTextInput();
+        if (self.canvas) |canvas| canvas.destroy();
         if (self.window) |window| window.destroy();
-        sdl2.quit();
+        if (self.owns_sdl) sdl2.quit();
     }
 };
 
@@ -5353,6 +6127,7 @@ const TabClickTaskContext = struct {
     x: i32,
     y: i32,
     button: ClickButton,
+    zoom: f32,
 
     fn create(
         allocator: std.mem.Allocator,
@@ -5361,6 +6136,7 @@ const TabClickTaskContext = struct {
         x: i32,
         y: i32,
         button: ClickButton,
+        zoom: f32,
     ) !*TabClickTaskContext {
         const ctx = try allocator.create(TabClickTaskContext);
         ctx.* = .{
@@ -5370,6 +6146,7 @@ const TabClickTaskContext = struct {
             .x = x,
             .y = y,
             .button = button,
+            .zoom = zoom,
         };
         return ctx;
     }
@@ -5379,7 +6156,7 @@ const TabClickTaskContext = struct {
     }
 
     fn run(self: *TabClickTaskContext) !void {
-        try self.tab.click(self.browser, self.x, self.y, self.button);
+        try self.tab.clickDevice(self.browser, self.x, self.y, self.button, self.zoom);
     }
 
     fn toOpaque(self: *TabClickTaskContext) *anyopaque {
@@ -6267,6 +7044,25 @@ fn jsRenderCallback(context: ?*anyopaque) anyerror!void {
     // Mark render work; let the main loop drive rendering to avoid re-entrancy.
     _ = browser;
     tab.setNeedsRender();
+}
+
+fn jsDomMutationCallback(context: ?*anyopaque, mutation_root: *parser.Node) void {
+    const ctx_ptr = context orelse return;
+    const raw_ctx: *align(1) JsRenderContext = @ptrCast(ctx_ptr);
+    const ctx: *JsRenderContext = @alignCast(raw_ctx);
+
+    const browser_ptr = ctx.browser_ptr orelse return;
+    const tab_ptr = ctx.tab_ptr orelse return;
+    const raw_browser: *align(1) Browser = @ptrCast(browser_ptr);
+    const browser: *Browser = @alignCast(raw_browser);
+    const raw_tab: *align(1) Tab = @ptrCast(tab_ptr);
+    const tab: *Tab = @alignCast(raw_tab);
+
+    const frame = tab.frameForWindowId(ctx.window_id) orelse return;
+    if (frame.document_generation == 0 or
+        !ctx.matchesGeneration(frame.document_generation)) return;
+
+    tab.prepareForDomMutation(browser, frame, mutation_root);
 }
 
 fn jsXhrCallback(

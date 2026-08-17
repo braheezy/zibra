@@ -32,10 +32,12 @@ The source tree is organized by responsibility:
 
 | Area | Responsibility |
 | --- | --- |
-| [`src/main.zig`](../src/main.zig) | Executable entry point, CLI parsing, process arena, isolated DOM/style/layout/display-list dumps, Browser construction, and screenshot mode. |
-| [`src/browser/root.zig`](../src/browser/root.zig) | Process-wide `Browser`, SDL event loop, navigation orchestration, fetch coordination, async host helpers, render commit, composition, raster, and draw. |
+| [`src/main.zig`](../src/main.zig) | Executable entry point, CLI parsing, process arena, isolated DOM/style/layout/display-list dumps, interactive `BrowserApp` construction, and standalone screenshot mode. |
+| [`src/browser/app.zig`](../src/browser/app.zig) | Process-wide interactive SDL event routing, heap-stable native-window registry, shared session/measurement ownership, generation broadcast, and addressed window shutdown. |
+| [`src/browser/root.zig`](../src/browser/root.zig) | Per-window `Browser`, navigation orchestration, fetch coordination, async host helpers, render commit, composition, raster, and draw; it also supports standalone headless construction. |
 | [`src/browser/tab.zig`](../src/browser/tab.zig) | `Tab` and `Frame` ownership, task serialization, history, frame lookup, accessibility, focus, and per-document state. |
 | [`src/browser/chrome.zig`](../src/browser/chrome.zig) | Browser chrome UI and its display data. |
+| [`src/browser/session_state.zig`](../src/browser/session_state.zig) | Window-independent HTTP client/cookies/cache plus visited/bookmarked URL state, generated bookmark HTML, and separate network/metadata synchronization. |
 | [`src/browser/render/layout.zig`](../src/browser/render/layout.zig) | Layout tree, invalidation dependencies, hit-test collection, paint, and image layout. |
 | [`src/browser/render/font.zig`](../src/browser/render/font.zig) | Font discovery, SDL_ttf handles, Unicode fallback selection, and owned RGBA glyph bitmaps. |
 | [`src/document/parser.zig`](../src/document/parser.zig) | HTML parser, DOM representation, style maps, images, and DOM tree utilities. |
@@ -57,15 +59,19 @@ The runtime currently has three kinds of execution context:
 
 ```text
 process main thread
-  Browser
-    interactive: SDL event loop and renderer
-    screenshot: windowless software loop
-    chrome, composite, raster, draw
-    committed Browser render snapshot
-    shared Layout / FontManager
-    optional main-thread SDL renderer
+  interactive BrowserApp
+    sole SDL event poller and text-input owner
+    shared BrowserSession (HTTP/cookies/cache/visited/bookmarks)
+    shared MeasureTime
+    native window registry
+      Browser A                 Browser B ...
+        tabs/chrome/render        tabs/chrome/render
+        Layout / FontManager      Layout / FontManager
+        SDL window/renderer       SDL window/renderer
+  or standalone screenshot Browser
+    windowless software loop and owned session/measurement
           |
-          | schedules Task values
+          | each Browser schedules Task values
           v
   one TaskRunner worker per Tab
     navigation, parsing, DOM, style, layout, paint, JavaScript host work
@@ -77,14 +83,16 @@ process main thread
           `---- enqueue completion Task values back onto the Tab worker
 ```
 
-The entry point uses `init.arena.allocator()` and constructs one process-wide
-heap-stable `Browser`; see `zibra` in [`src/main.zig`](../src/main.zig).
-Heap stability is required because z2d `Context` stores a pointer to
-`Browser.root_surface`. `Browser` owns the optional interactive platform and
-cross-tab state. Each
-`Tab` owns one `TaskRunner`. `Tab.start` must run only after the `Tab` reaches
-its final address because the worker retains a pointer to the tab-owned runner;
-see `Tab.start` in [`src/browser/tab.zig`](../src/browser/tab.zig).
+The entry point uses `init.arena.allocator()`. Interactive mode constructs one
+heap-stable `BrowserApp`, which allocates one heap-stable `Browser` per native
+window. Registry growth moves only borrowed Browser pointers. Browser heap
+stability is required because z2d `Context` stores a pointer to
+`Browser.root_surface`. Screenshot mode bypasses the App and constructs one
+standalone, windowless Browser so the headless compatibility path stays
+isolated. Each `Tab` owns one `TaskRunner`. `Tab.start` must run only after the
+Tab reaches its final address because the worker retains a pointer to the
+tab-owned runner; see `zibra` and `Tab.start` in
+[`src/main.zig`](../src/main.zig) and [`src/browser/tab.zig`](../src/browser/tab.zig).
 
 This is not currently a strict actor model. Main-thread input handlers read or
 mutate some `Tab`, `Frame`, accessibility, scroll, `Layout`, and `FontManager`
@@ -98,30 +106,77 @@ but no lock or owner-thread rule covers the complete mutable graph.
 | Process arena | Normal application allocations use the process arena in [`src/main.zig`](../src/main.zig). Individual `free` and `destroy` calls still express logical ownership even when the arena does not promptly reclaim most allocations. | Arena behavior can hide leaks and delay visible corruption. Ownership-sensitive code should also be exercised with `std.testing.allocator` or a GPA. |
 | Kiesel host object | With libgc enabled, `Js.init` allocates `Js` from BDWGC's scanned, uncollectable allocator so its embedded `Agent` remains a collector root. `Js.deinit` releases the agent/platform and destroys the host object through its storage allocator; see [`src/script/js.zig`](../src/script/js.zig). | Any Kiesel pointer reachable only from unscanned Zig memory must be rooted deliberately. The process arena is not a GC root. |
 | Zibra collections | `Browser`, `Tab`, `Frame`, DOM, layout, rules, tasks, and snapshots generally retain the caller allocator and provide explicit teardown paths. | The explicit lifetime remains authoritative even when production allocation behavior masks a bad free order. |
-| SDL and SDL_ttf | Window, renderer, textures, surfaces, fonts, and SDL_ttf handles are native resources. `FontManager.deinit` frees cached RGBA glyph bitmaps, closes fonts, and quits SDL_ttf; see [`src/browser/render/font.zig`](../src/browser/render/font.zig). | Native handles require deterministic release and an explicit thread-affinity rule. |
+| SDL and SDL_ttf | BrowserApp owns interactive SDL/text input, each Browser owns its native window/renderer/texture, and each `FontManager.deinit` frees cached RGBA glyph bitmaps, closes fonts, and releases its paired SDL_ttf reference. The App holds an extra refcounted SDL_ttf guard until all windows close. | Native handles require deterministic release and an explicit thread-affinity rule. |
 | z2d and zigimg | `Browser` owns long-lived z2d surfaces/contexts. `ImageData` owns a `zigimg.Image` and, when present, its encoded byte buffer; see [`src/document/parser.zig`](../src/document/parser.zig). | Layout and display items borrow pixel slices from these owners. The source image must outlive every borrower. |
 
 ## Ownership topology
 
-### Browser
+### BrowserApp and Browser
 
-`Browser` in [`src/browser/root.zig`](../src/browser/root.zig) owns:
+Interactive `BrowserApp` in
+[`src/browser/app.zig`](../src/browser/app.zig) owns:
 
-- in interactive mode, the SDL window, renderer, cached output texture, and
-  text-input lifecycle; screenshot mode leaves all four absent;
+- SDL video initialization, the process text-input lifecycle, and the only SDL
+  event-polling loop;
+- one extra SDL_ttf initialization reference held until every window's
+  `FontManager` has closed its own paired reference;
+- the heap-stable `BrowserSession` and `MeasureTime` shared by all windows;
+- a registry of heap-stable Browser pointers keyed by native window ID.
+
+The App removes a window from the registry before quiescing and destroying it,
+so queued events for a stale ID cannot reach a retired Browser. An addressed
+close destroys only that entry; closing the final entry exits the process
+loop. SDL quit is ID-less and global. Escape also requests global quit, but it
+first routes through a live source Browser so stale Escape events are ignored.
+
+Each `Browser` in [`src/browser/root.zig`](../src/browser/root.zig) owns:
+
+- in interactive mode, one SDL window, renderer, and cached output texture;
+  screenshot mode leaves all three absent;
 - root, chrome, and optional tab z2d surfaces plus the root z2d context;
-- the shared `std.http.Client`, cookie jar, and decoded HTTP response cache;
-- the shared `Layout`, including its `FontManager`;
+- one window-local `Layout`, including its `FontManager`;
 - default user-agent CSS rules;
-- all `Tab` allocations;
+- all `Tab` allocations grouped in that native window;
 - owning URLs queued by tab workers for browser-thread tab creation;
 - the active browser-side display-list snapshot, composited layers, and tab draw
   list;
-- browser chrome, measurement/profiling state, and browser render flags.
+- browser chrome, optimistic and committed active URL copies, and render flags.
+
+`Browser.initAppWindow` explicitly borrows SDL/text-input ownership plus the
+App's session and measurement pointers. Direct `Browser.init` instead owns all
+four services for the standalone screenshot path (and retains legacy
+standalone-interactive compatibility). The four `owns_*` flags make these two
+destruction paths explicit. `MeasureTime` is heap-stable because every tab
+worker across every window borrows it, and the App finishes it once only after
+all Browsers have stopped.
+
+`BrowserSession` owns the shared `std.http.Client`, cookie jar, decoded HTTP
+response cache, and canonical serialized strings for visited and bookmarked
+URLs. A dedicated network mutex serializes transport/cookie/cache access; its
+metadata mutex protects both URL sets independently of every `Browser.lock`.
+Atomic generations publish mutations without exposing map storage. The App
+polls those generations without holding either lock, then independently asks
+every Browser for visited RAF work or bookmark chrome reraster work. Bookmark-page
+generation first takes a lexicographically sorted snapshot whose list and
+strings are independent owners, then HTML-escapes both link attributes and
+labels. The HTML parser decodes references in attribute values into
+`Element.owned_strings`, while source-backed DOM text stays escaped until the
+layout text walker decodes it once. This preserves both injection safety and
+exact bookmark-link/label round trips. Session teardown occurs only after all
+tab workers and helpers have stopped. DOM anchors copy only a boolean
+annotation, so they never borrow a URL-set key.
+
+`Browser.fetchNavigationDocument` wraps document responses in a
+`NavigationDocument` that explicitly owns allocated HTTP/file bodies and the
+generated `about:bookmarks` HTML, while borrowed data/other-about bodies keep a
+null owner. Root and child-frame loaders share this helper and release the
+wrapper only after copying the body into the frame's decoded HTML owner.
 
 `Tab.browser` is a borrowed back-pointer. Task and helper contexts also borrow
 `Browser`; `Browser.deinit` therefore publishes shutdown, joins every tab
-worker, waits for every accounted helper, and only then destroys shared state.
+worker, waits for every accounted helper, and only then destroys that window's
+state. BrowserApp retains shared session and measurement storage until all such
+borrows from every window have ended.
 
 ### Tab
 
@@ -137,8 +192,9 @@ worker, waits for every accounted helper, and only then destroys shared state.
 - the accessibility tree and its backing strings;
 - per-tab dirty flags and composited updates.
 
-`Tab` borrows its `Browser` and the browser-owned `MeasureTime` used by its
-`TaskRunner`.
+`Tab` borrows its `Browser` and the heap-stable `MeasureTime` used by its
+`TaskRunner`. That measurement owner is BrowserApp in interactive mode and the
+standalone Browser in screenshot mode.
 
 ### Frame
 
@@ -157,6 +213,13 @@ The root frame normally borrows its URL from `Tab.history`; child frames may
 own their URL. `parent`, `tab`, `frame_element`, focus pointers, hit-test node
 pointers, `js_context`, and layout-related node pointers are borrowed.
 
+Each tab records the visited generation represented by its display list. A new
+session visit requests an animation frame; render compares generations before
+its early dirty check, re-annotates every current frame, and forces paint when
+stale. A middle-click records the target before transferring its owning URL to
+the pending-tab queue, so the still-visible source document can repaint at
+once; stale background documents refresh when activated.
+
 History is mutated only by the serialized tab worker. Ordinary successful
 navigation removes and releases entries after the current index before
 appending the new URL. Back and Forward retain the list, clone the target URL
@@ -169,7 +232,12 @@ the worker.
 
 `Frame.deinit` destroys display/layout state before DOM and destroys DOM before
 the decoded HTML source. That order is required because layout borrows DOM and
-DOM strings borrow the HTML source.
+DOM strings borrow the HTML source. The frame display list is also the
+authoritative synchronous click index: its optional provenance points at the
+layout object that generated an item and at the originating DOM node. Those
+pointers borrow exactly the current layout/DOM generation, so the list is
+retired before `DocumentLayout.layout` can rebuild descendants as well as
+before navigation or frame teardown destroys either tree.
 
 Fragment target entries borrow DOM element pointers and store their top edge in
 document-space CSS pixels. Layout collects block targets directly and inline
@@ -182,8 +250,12 @@ other hit-test data, then releases it before either layout or DOM teardown.
 Elements store children by value in `ArrayList(Node)` and store raw parent and
 layout pointers; see `Element` and `Node.appendChild` in
 [`src/document/parser.zig`](../src/document/parser.zig). Parser-created tag,
-text, attribute, and CSS value slices generally borrow their input buffer.
-Therefore:
+text, undecoded attribute, and CSS value slices generally borrow their input
+buffer. Attribute values containing recognized character references are
+decoded into strings owned by that `Element`; text references remain escaped
+in the source-backed DOM and are decoded once during layout. Diagnostic DOM
+serialization re-escapes decoded attribute values so quoted output remains
+well-formed. Therefore:
 
 1. the decoded HTML source must outlive the complete DOM;
 2. a stylesheet source must outlive all rule property names and values parsed
@@ -195,7 +267,23 @@ Therefore:
 
 The parser acknowledges child-array relocation by fixing parent pointers after
 tree construction rather than during `appendChild`. That repair only updates
-parent pointers; it does not repair every other retained `*Node`.
+parent pointers; it does not repair every other retained `*Node`. Because the
+inspection `Page` returns its root by value, dump callers repair parent pointers
+again after the returned page reaches its stable stack address and before
+layout paint performs visited/source ancestry walks.
+
+Supported in-place structural mutations use a synchronous invalidation
+boundary. `innerHTML` stages its replacement children and backing string,
+marks the target layout dirty, then invokes the frame's DOM-mutation callback
+before destroying the old children or replacing their array. The first native
+contenteditable child append invokes the same Tab seam before a fallible
+capacity change. That seam retires the frame display list and DOM-keyed bounds,
+clears the accessibility tree and pending composited node updates, and retires
+the active browser draw list, layers, and committed display list under
+`Browser.lock`. Dirty flags and an animation-frame request are published before
+the mutation proceeds, so allocation failure still rebuilds the retired state.
+A focused mutation root survives; focus is cleared only when the focused node
+is a strict descendant that the replacement removes.
 
 ### CSS rules and invalidation fields
 
@@ -276,6 +364,35 @@ Primitive entries are not self-contained:
 These leaf resources must outlive every frame-side and browser-side display
 list that references them.
 
+An uncomposed frame item may additionally carry `DisplayItemSource`. Its
+layout pointer identifies the actual stable generator for that command, while
+its optional node pointer identifies the originating DOM node. Inline commands
+produced by the transient line buffer use the containing `BlockLayout` as the
+generator and retain each `LineItem.node_ptr` as their node identity. A typed
+resolver consults that generator for every activation and rejects a fragment
+node outside its DOM subtree; anonymous blocks validate against their retained
+inline roots. Source metadata is never serialized by display-list dumps and is
+cleared recursively from the separately owned list composed for
+`Browser.commit`.
+
+`DisplayItem.hitTestDevice` is a pure walk over the retained frame list. It
+visits items in reverse paint order, inverts translation transforms, treats
+`dst_in` masks as clipping operators rather than click targets, and checks
+primitive paint geometry. Native click tasks retain the exact device point and
+the committed zoom snapshot; CSS positions and translations use the same
+truncating scale rule as raster, while cached glyph widths/heights remain exact
+device bitmap dimensions. `Frame.click` walks the hit node's ancestors to find
+iframe, anchor, input, button, or contenteditable behavior; iframe hits scale
+the combined `top - child_scroll` translation once before entering the child
+list, matching composition at fractional zoom. Compositor-only opacity
+animation updates also mutate the retained effect wrapper before the same
+update is committed, so invisible content stops participating in hit testing.
+The browser applies that update recursively through transforms in its committed
+tree; effects flattened into an ancestor or iframe layer update the layer-owned
+tree and mark its cached pixels for rerasterization.
+Layout-derived link and iframe bounds no longer decide click targets. Focus,
+accessibility, and fragment bounds retain their existing roles.
+
 Basic text direction is resolved per inline block through the acyclic layout
 parent chain. The CLI `-rtl` flag supplies the fallback direction; the nearest
 block ancestor with `dir=rtl` or `dir=ltr` overrides it. Glyphs are measured and
@@ -349,14 +466,16 @@ untagged slice with no destructor. `Browser.fetchBody` returns allocated bodies
 for file and HTTP paths, a slice into `Url.path` for `data:`, and borrowed data
 for `about:`. Callers currently infer ownership again from the URL scheme.
 
-The Browser-owned `HttpCache` in [`src/network/cache.zig`](../src/network/cache.zig)
-stores owned copies of decoded GET/200 response bodies, CSP headers, and final
-redirect URLs. Cache hits duplicate body and header data before returning, so
-they preserve the existing caller-owned HTTP response contract. Entries with
-`max-age` use the monotonic awake clock; `no-store`, malformed directives, and
-unknown directives bypass storage. Responses without `Cache-Control` remain
-cached for the current browser session, matching the exercise's simplified
-model. The Browser HTTP mutex serializes both the shared client and cache.
+The BrowserSession-owned `HttpCache` in
+[`src/network/cache.zig`](../src/network/cache.zig) stores owned copies of
+decoded GET/200 response bodies, CSP headers, and final redirect URLs. Cache
+hits duplicate body and header data before returning, so they preserve the
+existing caller-owned HTTP response contract. Entries with `max-age` use the
+monotonic awake clock; `no-store`, malformed directives, and unknown directives
+bypass storage. Responses without `Cache-Control` remain cached for the current
+browser session, matching the exercise's simplified model.
+`BrowserSession.network_lock` serializes its HTTP client, cookie jar, and cache
+across tabs and native windows without nesting the visited/bookmark mutex.
 
 `Url` wraps an owning `ada.Url` and has an explicit `free` method. Its component
 slices borrow that owner, except for separately allocated data-URL storage.
@@ -400,19 +519,28 @@ by `Url.free`; see `Url.init` in [`src/network/url.zig`](../src/network/url.zig)
 
 ### Main/UI/render thread
 
-The process main thread owns browser composition, raster, and draw phases. In
-interactive mode it also owns the SDL event loop, renderer, chrome/window
-events, and some direct reads or updates of active `Tab`/`Frame` state. In
-screenshot mode it runs a windowless quiescence loop and exports the software
-root surface directly. Page workers never mutate the tab collection: a
-middle-click resolves its link target on the serialized tab worker, transfers
-the owning URL into `Browser.pending_new_tabs` under `Browser.lock`, and the
-interactive main loop drains that queue before creating and activating tabs.
+The process main thread owns every Browser's composition, raster, and draw
+phases. In interactive mode, BrowserApp is the sole SDL event poller and text
+input owner. It derives the native ID from key, window, text-editing/text-input,
+mouse, drop, and user event payloads, ignores stale IDs, and forwards each
+event only to its addressed Browser. Nonrepeating Ctrl+N from a live source
+creates an `about:blank` native window; allocation or renderer failure logs and
+leaves existing windows alive. Window-close events remove only their addressed
+entry, SDL quit is global, and Escape routed through any live Browser is the
+documented global shortcut. After event dispatch, the App broadcasts shared
+session generations and ticks composition/raster/draw for every window. In
+screenshot mode a standalone Browser instead runs a windowless quiescence loop
+and exports the software root surface directly. Page workers never mutate the
+tab collection: a middle-click resolves its link target on the serialized tab
+worker, transfers the owning URL into `Browser.pending_new_tabs` under
+`Browser.lock`, and the containing Browser's tick drains that queue before
+creating and activating tabs in the same native window.
 `queueNewTab` transfers ownership only when append succeeds; `newTab` consumes
 the URL on entry so every creation and scheduling failure has one clear owner.
 Root navigation also copies the first DOM `title` into tab-owned sentinel
-storage under `Browser.lock`. The interactive main loop applies a dirty active
-title to SDL; switching tabs uses the same activation path and marks it dirty.
+storage under `Browser.lock`. The App tick applies each window's dirty active
+title to its SDL handle; switching tabs uses the same activation path and marks
+it dirty.
 Chrome's Back and Forward handlers read only atomic availability snapshots and
 enqueue a history task. The worker computes the target again before loading,
 so a click based on a stale disabled/enabled snapshot is harmless.
@@ -421,6 +549,14 @@ the input, preserves explicit schemes and obvious bare hosts, and otherwise
 constructs a Google query using `+` for whitespace and percent escapes for
 unsafe bytes. The result then enters the normal navigation path; document links
 continue to use strict relative URL resolution and can never become searches.
+Chrome owns an address-bar byte cursor in the inclusive range from zero through
+the buffer length. Interactive SDL text input admits only printable ASCII, so
+Left and Right move one byte, insertion occurs at that position, and Backspace
+removes the preceding byte without introducing a second Unicode boundary rule.
+Focus, blur, and successful submission reset the cursor; chrome rasterization
+measures the glyph prefix before the cursor to place the visible caret. Address
+focus takes precedence over retained DOM focus for text, Return, Space, and
+Backspace routing, including editing operations that are no-ops at a boundary.
 Primary same-document fragment links stay on the tab worker: they resolve the
 new URL, append it to indexed root history (or replace an iframe-owned URL),
 apply the clamped layout target, and request a paint commit. The existing DOM,
@@ -464,11 +600,22 @@ I/O to finish.
 
 ### Current locks
 
-- `Browser.lock` protects a subset of active-tab render state, dirty flags, and
-  shutdown/animation flags.
+- `Browser.lock` protects a subset of active-tab render state, dirty flags,
+  shutdown/animation flags, and the independently owned optimistic-display and
+  committed-document URL snapshots used by chrome.
 - `TaskRunner.mutex` and its condition protect the task queue and worker flags.
-- `http_client_mutex` serializes the shared HTTP client, cookie jar, and HTTP
-  response cache around fetches.
+- `BrowserSession.network_lock` serializes the shared HTTP client, cookie jar,
+  and response cache across every window around fetches.
+- `BrowserSession.lock` protects owned session URL sets. Its visited generation
+  is published atomically so render can detect stale link annotations without
+  reading the map outside that lock. Chrome bookmark lookup holds
+  `Browser.lock` only to stabilize the committed URL snapshot; bookmark
+  toggling copies that text before taking the session lock. Address submission
+  copies the optimistic display snapshot while it still owns the parsed URL,
+  before transferring navigation ownership to a tab worker.
+- BrowserApp samples both session generations without a session lock, then
+  acquires at most one Browser lock at a time while publishing RAF or chrome
+  work; it never holds a session and Browser lock together.
 - `JsLock` is a recursive-by-thread-ID wrapper used around evaluation and many
   callback operations in [`src/script/js.zig`](../src/script/js.zig).
 
@@ -482,20 +629,24 @@ lock across parsing, layout, JavaScript, and rendering.
 
 `Browser.loadInTab` in [`src/browser/root.zig`](../src/browser/root.zig):
 
-1. borrows the prior URL as referrer and fetches/decodes while its owner and old
-   document remain alive, so a fetch/decode failure preserves the old page;
-2. clears queued old-generation tasks and invalidates JavaScript roots and host
+1. borrows the prior URL as referrer and fetches or generates the document,
+   then decodes it while its owner and old document remain alive, so a failure
+   preserves the old page;
+2. records both the canonical requested and final redirect destinations after
+   a successful fetch, then annotates parsed anchors using the same resolution
+   policy as clicks;
+3. clears queued old-generation tasks and invalidates JavaScript roots and host
    callbacks;
-3. retires browser-side draw/layer/display snapshots under `Browser.lock`;
-4. destroys the old root `Frame`, including layout, DOM, and source backing;
-5. allocates and registers a new root `Frame`;
-6. transfers the decoded body to the frame as backing storage for the DOM;
-7. stages stylesheet source buffers and parsed rules together;
-8. assigns a unique document generation, parses scripts, builds layout/paint
+4. retires browser-side draw/layer/display snapshots under `Browser.lock`;
+5. destroys the old root `Frame`, including layout, DOM, and source backing;
+6. allocates and registers a new root `Frame`;
+7. transfers the decoded body to the frame as backing storage for the DOM;
+8. stages stylesheet source buffers and parsed rules together;
+9. assigns a unique document generation, parses scripts, builds layout/paint
    state, and commits browser-visible data;
-9. applies any final-URL fragment to the completed layout and clamps the frame
+10. applies any final-URL fragment to the completed layout and clamps the frame
    scroll range;
-10. commits the final URL by appending it to indexed history, or by replacing a
+11. commits the final URL by appending it to indexed history, or by replacing a
    successfully traversed entry and moving the current index.
 
 `Tab.invalidateJsContext` in [`src/browser/tab.zig`](../src/browser/tab.zig)
@@ -507,11 +658,16 @@ deinitialized only after this invalidation.
 
 Child-frame navigation reuses a `Frame` allocation.
 `Browser.resetFrameForNavigation` first clears JS node roots and render-context
-pointers, then destroys children, display state, layout, the old DOM, owned
+pointers, then retires provenance-bearing display state before destroying
+children, layout, the old DOM, owned
 rules, stylesheet text, and finally decoded HTML and URL backing. The fetch
-happens before reset so the referrer remains valid, and browser-side render
+happens through the same owned `NavigationDocument` helper before reset so the
+referrer remains valid, and browser-side render
 state is retired under `Browser.lock` before reset frees document resources.
-Installing the replacement assigns a fresh per-document generation.
+Installing the replacement assigns a fresh per-document generation. Initial
+iframe loads and later navigation within an existing child frame check both the
+requested and final redirect destinations against the parent document's CSP
+before recording the visit or installing the child.
 
 ### Stylesheet generation transfer
 
@@ -548,17 +704,26 @@ still prevent this from being a complete atomic transaction.
 
 ## Render and commit contract
 
-The tab worker styles, lays out, paints, and creates a frame-side display list.
-`Browser.commit` receives that list under `Browser.lock`, recursively clones
-`.blend` and `.transform` child lists and blend-mode strings, frees the incoming
-containers, and installs the clone as `active_tab_display_list`; see
-`cloneDisplayItem`, `cloneDisplayItemList`, and `commit` in
-[`src/browser/root.zig`](../src/browser/root.zig). Other variants are copied by
-value.
+The tab worker styles, lays out, and paints one authoritative uncomposed list
+per frame. It retains those lists for synchronous hit testing instead of moving
+the root list into a commit. `Tab.composeDisplayList` recursively copies the
+root and child-frame lists, replaces iframe placeholders with translated and
+clipped child content, owns every copied child slice/blend-mode string, and
+clears `DisplayItemSource` throughout the result. `Browser.commit` receives
+that separate list under `Browser.lock`, recursively clones its owning
+containers once more, frees the incoming composition, and installs the clone
+as `active_tab_display_list`; see `composeDisplayList`, `cloneDisplayItem`,
+`cloneDisplayItemList`, and `commit` in [`src/browser/tab.zig`](../src/browser/tab.zig)
+and [`src/browser/root.zig`](../src/browser/root.zig).
 
-The clone separates display-list container ownership from the tab worker, but
-it still borrows image bytes, glyph resources, composited layers, and DOM
-pointers. It is therefore not an independent resource snapshot.
+The composition/clone boundary separates container ownership and prevents the
+browser snapshot from retaining layout/DOM hit-test provenance. It still
+borrows image bytes, glyph resources, composited layers, and the existing
+effect-node identities, so it is not an independent resource snapshot.
+Selecting a clean tab publishes an atomic activation request to its serialized
+worker. That worker composes the retained lists and commits the frame's scroll
+and current URL even when no style/layout/paint dirty flag is set, avoiding a
+blank render or empty chrome URL after switching tabs.
 
 The unresolved render contract must choose one of these models:
 
@@ -590,6 +755,9 @@ Current enforced behavior includes:
 - `innerHTML` calls `removeHandlesForSubtree` for every removed child before
   destroying it, so descendant JavaScript handles are removed with the old
   subtree;
+- structural `innerHTML` invokes its dedicated synchronous DOM-mutation host
+  callback before old child storage retires; ordinary render callbacks remain
+  a separate, non-destructive invalidation path;
 - `JsRenderContext` connects a frame window to Browser/Tab/Js host pointers and
   carries a generation number while it is synchronously registered with
   Kiesel;
@@ -626,31 +794,39 @@ thread-ownership contract remains unresolved.
 
 ## SDL and graphics contract
 
-`Browser.init` always initializes SDL video because SDL_ttf requires it on
-macOS, then initializes `Layout`/`FontManager` and the z2d surfaces. Interactive
-mode additionally creates a window, accelerated renderer, presentation texture,
-and text-input lifecycle. Screenshot mode creates none of those presentation
-resources; it waits until the tab worker and all accounted helpers are
-quiescent, renders to z2d, and exports `root_surface` directly. See
+`BrowserApp.init` initializes SDL video, holds one process-level SDL_ttf
+reference, and starts text input before creating any window. Every
+`Browser.initAppWindow` then creates its own `Layout`/`FontManager`, native
+window, accelerated renderer, presentation texture, and z2d surfaces while
+borrowing those process services. SDL_ttf documents `TTF_Init`/`TTF_Quit` as a
+reference count: each FontManager retains its existing pair, while the App
+guard prevents closing one window from taking the library to zero beneath
+another. Direct `Browser.init` remains the standalone path and initializes its
+own SDL/session/measurement resources. Screenshot mode creates no native
+window, renderer, presentation texture, or text-input owner; it waits until the
+tab worker and all accounted helpers are quiescent, renders to z2d, and exports
+`root_surface` directly. See [`src/browser/app.zig`](../src/browser/app.zig) and
 [`src/browser/root.zig`](../src/browser/root.zig).
 `FontManager` does not retain the renderer. `getStyledGlyph` mutates SDL_ttf
 font state, renders a temporary SDL surface, converts it to canonical RGBA,
 and stores only allocator-owned bytes; see
 [`src/browser/render/font.zig`](../src/browser/render/font.zig).
 
-The same browser-global `Layout` and `FontManager` are reachable from tab
-layout/paint work and main-thread chrome paths. Interactive mode still lacks a
-shared lock or assertion establishing which thread may access the font glyph
-map or SDL_ttf handles. Screenshot mode closes that race by refusing to raster
-until the serialized tab worker and all accounted helpers are quiescent. The
-renderer no longer participates in glyph-cache mutation.
+Each Browser's window-local `Layout` and `FontManager` are reachable from that
+window's tab layout/paint work and main-thread chrome paths. Interactive mode
+still lacks a shared lock or assertion establishing which thread may access
+each font glyph map or SDL_ttf handle. Screenshot mode closes that race by
+refusing to raster until the serialized tab worker and all accounted helpers
+are quiescent. The renderer no longer participates in glyph-cache mutation.
 
-Normal `Browser.deinit` now quiesces tabs first, retires display snapshots,
-destroys document/network state, frees cached glyph bitmaps and closes fonts,
-tears down z2d state, then conditionally destroys interactive textures, text
-input, renderer, and window before calling `sdl2.quit`. `Browser.init` uses
-reverse-order `errdefer` rollback for both the interactive and windowless
-resource sets.
+Normal `Browser.deinit` quiesces its tabs first, retires display snapshots,
+destroys document state, frees cached glyph bitmaps and closes fonts, tears
+down z2d state, then destroys that window's texture, renderer, and native
+handle. An App-owned Browser leaves shared session, measurement, text input,
+and SDL untouched. After all entries are gone, BrowserApp destroys the shared
+network/session state, finishes measurement once, stops text input, releases
+its final SDL_ttf guard, and quits SDL. Standalone Browser owns those same final
+steps itself. Both constructors use reverse-order `errdefer` rollback.
 
 The intended SDL contract should be:
 
@@ -664,8 +840,7 @@ The intended SDL contract should be:
 
 ## Shutdown contract
 
-`Browser.finishRunLoop` publishes shutdown without relying on a delay.
-`Browser.deinit` and `Tab.shutdown` enforce these phases:
+`Browser.deinit`, `Tab.shutdown`, and BrowserApp teardown enforce these phases:
 
 1. publish shutdown and reject new browser/tab/JS work;
 2. wake long timer helpers, interrupt JavaScript running on each tab worker,
@@ -673,13 +848,14 @@ The intended SDL contract should be:
 3. wait for accounted helpers, whose completion tasks are rejected and cleaned
    by the stopped runner;
 4. retire browser render snapshots, then destroy tabs, frames, DOM, and JS;
-5. destroy HTTP/cookie, layout, font, and z2d resources;
-6. finish measurement state after no thread can record into it;
-7. destroy the optional renderer/window and quit SDL/SDL_ttf.
+5. destroy each Browser's layout, font, z2d, renderer, and window resources;
+6. after the final Browser is gone, destroy shared HTTP/cookie/cache/session
+   state and finish measurement once, when no thread can record into either;
+7. stop text input, release the App's SDL_ttf guard, and quit SDL.
 
 Async HTTP requests are not cancellable yet, so phase 3 can block on network
-I/O; it remains memory-safe because HTTP, Tab, Browser, and measurement owners
-stay alive through the wait.
+I/O; it remains memory-safe because BrowserSession, Tab, Browser, and
+measurement owners stay alive through the wait.
 
 ## Resolved lifetime repairs
 
@@ -709,11 +885,13 @@ reintroduced:
 5. **URL snapshots:** `Url.clone` creates independent Ada and data-URL storage;
    async XHR clones target/referrer inputs before spawning. Clone behavior is
    covered with normal, data, and `view-source:` URLs.
-6. **Shutdown owner order:** Browser publishes shutdown, joins tab workers,
-   waits helpers, retires render snapshots, then destroys tabs, network, fonts,
-   z2d, renderer, and window. Long timers poll cancellation and Kiesel polls a
-   host interrupt at VM safe points, so neither a distant timeout nor an
-   infinite page script can indefinitely prevent the worker join. See
+6. **Shutdown owner order:** Each Browser publishes shutdown, joins tab
+   workers, waits helpers, retires render snapshots, then destroys its tabs,
+   fonts, z2d, renderer, and window. BrowserApp destroys shared network/session
+   and measurement state only after the final window, then releases process SDL
+   state. Long timers poll cancellation and Kiesel polls a host interrupt at VM
+   safe points, so neither a distant timeout nor an infinite page script can
+   indefinitely prevent the worker join. See
    [`tests/manual/lifecycle-long-timeout.html`](../tests/manual/lifecycle-long-timeout.html).
 7. **Stylesheet generation ownership:** root and child stylesheet source
    buffers and parsed rules are staged, cleaned up on error, and moved into
@@ -731,14 +909,22 @@ reintroduced:
    [`src/network/url.zig`](../src/network/url.zig).
 11. **Glyph metadata:** cached `Glyph` values no longer retain a borrowed
    grapheme slice. See [`src/browser/render/font.zig`](../src/browser/render/font.zig).
-12. **Platform initialization rollback:** `Browser.init` and `Layout.init`
-   unwind previously created native/allocator resources in reverse dependency order;
-   font discovery and font insertion also clean partial allocations. `Browser`
-   is allocated at its final address before binding z2d `Context` to its root
-   surface, avoiding a self-pointer into an init-local copy.
+12. **Platform initialization rollback:** `BrowserApp.init`, `Browser.init`,
+   `Browser.initAppWindow`, and `Layout.init` unwind previously created
+   native/allocator resources in reverse dependency order; font discovery and
+   font insertion also clean partial allocations. Every Browser is allocated at
+   its final address before binding z2d `Context` to its root surface, avoiding
+   a self-pointer into an init-local copy.
 13. **JS context construction rollback:** origin keys and newly constructed
    Kiesel host contexts remain locally owned until insertion into the tab map,
    so allocation or map-insertion failure cannot strand either owner.
+14. **Structural DOM snapshot retirement:** `innerHTML` and the native first
+   contenteditable child append mark layout/render work and synchronously retire
+   frame/browser DOM-derived snapshots before a child can move or be destroyed.
+   Browser-side image/effect borrows retire under `Browser.lock`; focus on a
+   surviving mutation root is preserved, while removed-descendant focus and
+   accessibility/hit indexes are cleared. See `prepareDomMutation`,
+   `Tab.prepareForDomMutation`, and `Frame.retireDomMutationBorrows`.
 
 ## Confirmed unresolved lifetime risks
 
@@ -749,8 +935,10 @@ does not mean every run will manifest a crash.
 
 Children live by value in resizable arrays while layout, hit-test, focus,
 frame-element, accessibility, display, and JS structures store `*Node`.
-`innerHTML` now clears handles for the subtree it removes, but that local repair
-does not create stable identity for every other mutation or borrower. See
+The supported `innerHTML` and first contenteditable append paths now retire
+their DOM-derived browser state synchronously, and `innerHTML` clears handles
+for the subtree it removes. That boundary does not create stable identity for
+future mutation APIs or every retained JS/frame borrower. See
 [`src/document/parser.zig`](../src/document/parser.zig),
 [`src/script/js.zig`](../src/script/js.zig), and
 [`src/browser/tab.zig`](../src/browser/tab.zig).
@@ -770,17 +958,19 @@ primitive variants are copied by value. Those primitives contain borrowed
 image, glyph, DOM, and layer resources. See `cloneDisplayItem` in
 [`src/browser/root.zig`](../src/browser/root.zig).
 
-Snapshot retirement now closes navigation, replacement, and shutdown paths,
-but in-place DOM mutation can still retire a leaf before the replacement commit
-reaches the browser. The clone is not independently safe by type.
+Snapshot retirement now closes navigation, replacement, shutdown, and the
+supported in-place structural-mutation paths. The clone is still not
+independently safe by type; every future mutation path must enter the same
+synchronous retirement boundary before retiring a leaf.
 
 ### 4. Interactive Layout and FontManager access has no global contract
 
-The browser owns one mutable layout/font stack. Interactive resize and chrome
-paths use it from the main thread, while tab tasks use it for document layout
-and glyph creation. No common owner-thread assertion or lock covers those
-interactive paths. Windowless screenshot capture is excluded from this gap by
-its tab/helper quiescence gate, but the interactive concurrency gap remains.
+Each Browser owns one mutable layout/font stack. Interactive resize and chrome
+paths use it from the main thread, while that window's tab tasks use it for
+document layout and glyph creation. No common owner-thread assertion or lock
+covers those interactive paths. Windowless screenshot capture is excluded from
+this gap by its tab/helper quiescence gate, but the interactive concurrency gap
+remains.
 
 ### 5. Response and URL ownership is encoded in call-site convention
 
@@ -881,7 +1071,8 @@ Until stronger types enforce these contracts, new code should not:
 - retain a borrowed string or pixel slice without naming and retaining its
   owner;
 - call renderer-bound SDL APIs from an arbitrary worker thread;
-- destroy Browser services before joining every task/helper that can use them;
+- destroy a Browser before joining its tasks/helpers, or destroy BrowserApp
+  session/measurement/SDL services before every Browser has retired;
 - assume a short sleep, idle poll, generation mismatch, arena allocation, or
   process exit makes a lifetime safe;
 - add a lock to one field and infer that the entire object graph is protected.

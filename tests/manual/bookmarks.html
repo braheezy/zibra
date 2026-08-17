@@ -1,0 +1,22 @@
+<!--
+How to verify:
+  zig build run -- file://$PWD/tests/manual/bookmarks.html
+
+Click the * button. Its background should turn yellow. Enter
+about:bookmarks in the address bar; this page's file URL should appear as a
+link, and clicking that link should return here. Click * again to remove the
+bookmark, then revisit about:bookmarks and confirm the URL is gone.
+-->
+<!doctype html>
+<html>
+  <head>
+    <title>Bookmark fixture</title>
+    <style>
+      body { font-size: 24px; }
+    </style>
+  </head>
+  <body>
+    <h1>Bookmark this page</h1>
+    <p>The chrome bookmark button should retain this URL across navigation.</p>
+  </body>
+</html>

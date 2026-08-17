@@ -1,0 +1,26 @@
+<!--
+How to verify: click only visible painted targets. The transformed link and the
+iframe link must navigate; clicks beside text, in rounded corners, or through
+the covered lower target must not activate a hidden/empty link region.
+-->
+<!doctype html>
+<html>
+  <head>
+    <title>Display-list hit testing</title>
+    <style>
+      .target { background-color: lightblue; }
+      .shifted { transform: translate(80px, 0px); background-color: lightgreen; }
+      .clipped { width: 220px; height: 70px; overflow: clip; border-radius: 28px; background-color: orange; }
+      .cover { transform: translate(0px, -20px); background-color: gray; }
+    </style>
+  </head>
+  <body>
+    <h1>Display-list hit testing</h1>
+    <p><a class="target" href="display-list-hit-testing-target.html">painted link</a> — this surrounding text is not clickable.</p>
+    <div class="shifted"><a href="display-list-hit-testing-target.html">translated link</a></div>
+    <div class="clipped"><a href="display-list-hit-testing-target.html">rounded clipped target</a></div>
+    <p><a class="target" href="display-list-hit-testing-target.html">lower link</a></p>
+    <p class="cover">opaque cover over the lower link</p>
+    <iframe src="display-list-hit-testing-child.html" width="260" height="90"></iframe>
+  </body>
+</html>

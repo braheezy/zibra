@@ -21,16 +21,17 @@ architecture document.
 
 ## Map
 
-| Area                                   | Entry point     |
-| -------------------------------------- | --------------- |
-| CLI and isolated inspection modes      | `src/main.zig`  |
-| Browser, tabs, compositor, chrome      | `src/browser/`  |
-| DOM, HTML, CSS, selectors              | `src/document/` |
-| Kiesel host integration                | `src/script/`   |
-| URLs, HTTP, cookies, caching, decoding | `src/network/`  |
-| Tasking and synchronization            | `src/runtime/`  |
-| Shared low-level primitives            | `src/core/`     |
-| Fixtures and regression tests          | `tests/`        |
+| Area                                   | Entry point           |
+| -------------------------------------- | --------------------- |
+| CLI and isolated inspection modes      | `src/main.zig`        |
+| Interactive app and native windows     | `src/browser/app.zig` |
+| Per-window browser, tabs, chrome       | `src/browser/`        |
+| DOM, HTML, CSS, selectors              | `src/document/`       |
+| Kiesel host integration                | `src/script/`         |
+| URLs, HTTP, cookies, caching, decoding | `src/network/`        |
+| Tasking and synchronization            | `src/runtime/`        |
+| Shared low-level primitives            | `src/core/`           |
+| Fixtures and regression tests          | `tests/`              |
 
 ## Working rules
 

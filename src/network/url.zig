@@ -271,6 +271,11 @@ pub const Url = struct {
             std.mem.eql(u8, self.path, "blank");
     }
 
+    pub fn isAboutBookmarks(self: Url) bool {
+        return std.mem.eql(u8, self.scheme, "about") and
+            std.mem.eql(u8, self.path, "bookmarks");
+    }
+
     /// Return whether `input` begins with an RFC-style URL scheme.
     pub fn hasExplicitScheme(input: []const u8) bool {
         const colon = std.mem.indexOfScalar(u8, input, ':') orelse return false;
@@ -303,7 +308,8 @@ pub const Url = struct {
             std.mem.eql(u8, parsed.scheme, "https") or
             std.mem.eql(u8, parsed.scheme, "file") or
             std.mem.eql(u8, parsed.scheme, "data") or
-            parsed.isAboutBlank();
+            parsed.isAboutBlank() or
+            parsed.isAboutBookmarks();
         if (!supported) {
             parsed.free(allocator);
             return blank(allocator);
@@ -838,6 +844,18 @@ pub const Url = struct {
             return buffer[0 .. prefix.len + inner_url.len];
         }
         return self.toStringInner(buffer);
+    }
+
+    /// Allocate the complete canonical serialization of this URL. Unlike
+    /// `toString`, this has no caller-selected length limit. The returned text
+    /// is an independent owner suitable for browser-session sets.
+    pub fn toOwnedString(self: Url, allocator: std.mem.Allocator) ![]u8 {
+        const href = self.ada_url.getHref();
+        const prefix = if (self.view_source) "view-source:" else "";
+        const output = try allocator.alloc(u8, prefix.len + href.len);
+        @memcpy(output[0..prefix.len], prefix);
+        @memcpy(output[prefix.len..], href);
+        return output;
     }
 
     fn toStringInner(self: Url, buffer: []u8) ![]const u8 {

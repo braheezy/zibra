@@ -26,11 +26,15 @@ urlbar_bottom: i32 = 0,
 newtab_rect: Rect = undefined,
 back_rect: Rect = undefined,
 forward_rect: Rect = undefined,
+bookmark_rect: Rect = undefined,
 address_rect: Rect = undefined,
 bottom: i32 = 0,
 // Address bar editing state
 focus: ?[]const u8 = null,
 address_bar: std.ArrayList(u8) = undefined,
+// Byte insertion point in address_bar, always in the inclusive range 0..len.
+// Interactive text input is restricted to printable ASCII at the SDL boundary.
+address_cursor: usize = 0,
 allocator: std.mem.Allocator = undefined,
 
 pub fn init(font_manager: *font.FontManager, window_width: i32, allocator: std.mem.Allocator) !Chrome {
@@ -106,9 +110,25 @@ pub fn init(font_manager: *font.FontManager, window_width: i32, allocator: std.m
         .bottom = chrome.urlbar_bottom - chrome.padding,
     };
 
+    // Calculate bookmark button bounds
+    const bookmark_glyph = try font_manager.getStyledGlyph(
+        "*",
+        .Normal,
+        .Roman,
+        chrome.font_size,
+        .proportional,
+    );
+    const bookmark_width = bookmark_glyph.w + 2 * chrome.padding;
+    chrome.bookmark_rect = Rect{
+        .left = chrome.forward_rect.right + chrome.padding,
+        .top = chrome.urlbar_top + chrome.padding,
+        .right = chrome.forward_rect.right + chrome.padding + bookmark_width,
+        .bottom = chrome.urlbar_bottom - chrome.padding,
+    };
+
     // Calculate address bar bounds
     chrome.address_rect = Rect{
-        .left = chrome.forward_rect.right + chrome.padding,
+        .left = chrome.bookmark_rect.right + chrome.padding,
         .top = chrome.urlbar_top + chrome.padding,
         .right = window_width - chrome.padding,
         .bottom = chrome.urlbar_bottom - chrome.padding,
@@ -122,6 +142,13 @@ pub fn navigationButtonColor(enabled: bool) Color {
         .{ .r = 0, .g = 0, .b = 0, .a = 255 }
     else
         .{ .r = 160, .g = 160, .b = 160, .a = 255 };
+}
+
+pub fn bookmarkButtonFillColor(selected: bool) Color {
+    return if (selected)
+        .{ .r = 255, .g = 215, .b = 0, .a = 255 }
+    else
+        .{ .r = 255, .g = 255, .b = 255, .a = 255 };
 }
 
 /// Interpret address-bar text as an explicit URL, an obvious bare host, or a
@@ -391,6 +418,35 @@ pub fn paint(self: *Chrome, allocator: std.mem.Allocator, b: *const Browser) !st
         .color = forward_color,
     } });
 
+    // Draw bookmark toggle. Browser.lock stabilizes active_tab_url for this
+    // paint call; BrowserSession independently synchronizes bookmark lookup.
+    const page_is_bookmarked = b.activePageIsBookmarked();
+    try cmds.append(allocator, .{ .rect = .{
+        .x1 = self.bookmark_rect.left,
+        .y1 = self.bookmark_rect.top,
+        .x2 = self.bookmark_rect.right,
+        .y2 = self.bookmark_rect.bottom,
+        .color = bookmarkButtonFillColor(page_is_bookmarked),
+    } });
+    try cmds.append(allocator, .{ .outline = .{
+        .rect = self.bookmark_rect,
+        .color = .{ .r = 0, .g = 0, .b = 0, .a = 255 },
+        .thickness = 1,
+    } });
+    const bookmark_glyph = try b.layout_engine.font_manager.getStyledGlyph(
+        "*",
+        .Normal,
+        .Roman,
+        self.font_size,
+        .proportional,
+    );
+    try cmds.append(allocator, .{ .glyph = .{
+        .x = self.bookmark_rect.left + self.padding,
+        .y = self.bookmark_rect.top,
+        .glyph = bookmark_glyph,
+        .color = .{ .r = 0, .g = 0, .b = 0, .a = 255 },
+    } });
+
     // Draw address bar
     try cmds.append(allocator, .{ .outline = .{
         .rect = self.address_rect,
@@ -402,12 +458,14 @@ pub fn paint(self: *Chrome, allocator: std.mem.Allocator, b: *const Browser) !st
     if (self.focus) |focus_str| {
         if (std.mem.eql(u8, focus_str, "address bar")) {
             // Draw the typed text
+            std.debug.assert(self.address_cursor <= self.address_bar.items.len);
             var cursor_x = self.address_rect.left + self.padding;
             if (self.address_bar.items.len > 0) {
                 const address_text: []const u8 = self.address_bar.items;
                 var idx: usize = 0;
                 var text_x = cursor_x;
                 while (idx < address_text.len) {
+                    if (idx == self.address_cursor) cursor_x = text_x;
                     const advance = std.unicode.utf8ByteSequenceLength(address_text[idx]) catch 1;
                     const next_idx = @min(address_text.len, idx + advance);
                     const gme = address_text[idx..next_idx];
@@ -427,7 +485,7 @@ pub fn paint(self: *Chrome, allocator: std.mem.Allocator, b: *const Browser) !st
                     text_x += addr_glyph.w;
                     idx = next_idx;
                 }
-                cursor_x = text_x;
+                if (self.address_cursor == address_text.len) cursor_x = text_x;
             }
 
             try cmds.append(allocator, .{
@@ -474,6 +532,7 @@ pub fn paint(self: *Chrome, allocator: std.mem.Allocator, b: *const Browser) !st
 pub fn click(self: *Chrome, b: *Browser, x: i32, y: i32) !bool {
     // Clear focus by default
     self.focus = null;
+    self.address_cursor = 0;
 
     // Check if clicked on new tab button
     if (self.newtab_rect.containsPoint(x, y)) {
@@ -500,6 +559,12 @@ pub fn click(self: *Chrome, b: *Browser, x: i32, y: i32) !bool {
         return true;
     }
 
+    // Check if clicked on bookmark button
+    if (self.bookmark_rect.containsPoint(x, y)) {
+        _ = try b.toggleActiveBookmark();
+        return true;
+    }
+
     // Check if clicked on address bar
     if (self.address_rect.containsPoint(x, y)) {
         self.focusAddressBar();
@@ -523,26 +588,49 @@ pub fn click(self: *Chrome, b: *Browser, x: i32, y: i32) !bool {
 pub fn focusAddressBar(self: *Chrome) void {
     self.focus = "address bar";
     self.address_bar.clearRetainingCapacity();
+    self.address_cursor = 0;
+}
+
+pub fn isAddressBarFocused(self: *const Chrome) bool {
+    const focus = self.focus orelse return false;
+    return std.mem.eql(u8, focus, "address bar");
 }
 
 pub fn keypress(self: *Chrome, char: u8) !bool {
-    if (self.focus) |focus_str| {
-        if (std.mem.eql(u8, focus_str, "address bar")) {
-            try self.address_bar.append(self.allocator, char);
-            return true;
-        }
+    if (!self.isAddressBarFocused()) return false;
+    std.debug.assert(self.address_cursor <= self.address_bar.items.len);
+    try self.address_bar.insert(self.allocator, self.address_cursor, char);
+    self.address_cursor += 1;
+    return true;
+}
+
+pub fn backspace(self: *Chrome) bool {
+    if (!self.isAddressBarFocused()) return false;
+    std.debug.assert(self.address_cursor <= self.address_bar.items.len);
+    if (self.address_cursor > 0) {
+        _ = self.address_bar.orderedRemove(self.address_cursor - 1);
+        self.address_cursor -= 1;
+        return true;
     }
     return false;
 }
 
-pub fn backspace(self: *Chrome) bool {
-    if (self.focus) |focus_str| {
-        if (std.mem.eql(u8, focus_str, "address bar")) {
-            if (self.address_bar.items.len > 0) {
-                _ = self.address_bar.pop();
-                return true;
-            }
-        }
+pub fn moveCursorLeft(self: *Chrome) bool {
+    if (!self.isAddressBarFocused()) return false;
+    std.debug.assert(self.address_cursor <= self.address_bar.items.len);
+    if (self.address_cursor > 0) {
+        self.address_cursor -= 1;
+        return true;
+    }
+    return false;
+}
+
+pub fn moveCursorRight(self: *Chrome) bool {
+    if (!self.isAddressBarFocused()) return false;
+    std.debug.assert(self.address_cursor <= self.address_bar.items.len);
+    if (self.address_cursor < self.address_bar.items.len) {
+        self.address_cursor += 1;
+        return true;
     }
     return false;
 }
@@ -551,6 +639,7 @@ pub fn blur(self: *Chrome) void {
     self.focus = null;
     self.address_bar.clearAndFree(self.allocator);
     self.address_bar = std.ArrayList(u8).empty;
+    self.address_cursor = 0;
 }
 
 pub fn enter(self: *Chrome, b: *Browser) !bool {
@@ -576,19 +665,22 @@ pub fn enter(self: *Chrome, b: *Browser) !bool {
                     b.allocator.destroy(url_ptr);
                 };
 
+                // Copy the optimistic display URL before scheduleLoad can
+                // transfer url_ptr to a worker. Bookmarks continue using the
+                // Browser's separate committed URL snapshot.
+                b.setActiveTabUrl(url_ptr);
                 b.scheduleLoad(tab, url_ptr, null) catch |err| {
+                    b.restoreDisplayedUrlToCommitted();
                     std.log.err("Failed to load URL: {any}", .{err});
                     return false;
                 };
-                // Update the displayed URL immediately so we don't flash the old one
-                // while the new page loads.
-                b.setActiveTabUrl(url_ptr);
                 url_ptr_owned = false;
             }
 
             self.focus = null;
             self.address_bar.clearAndFree(self.allocator);
             self.address_bar = std.ArrayList(u8).empty;
+            self.address_cursor = 0;
             return true;
         }
     }

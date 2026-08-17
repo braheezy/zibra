@@ -1,0 +1,37 @@
+<!--
+How to verify:
+1. Open this page in one native Zibra window and press Ctrl+N once. Exactly one
+   additional native window should open; holding the chord must not create
+   repeat windows.
+2. Navigate the second window back to this fixture with `?window=second` in its
+   address bar. Scrolling, focus, tabs, and closing that window must not alter
+   or close the first window.
+3. Bookmark this page in the first window, then open `about:bookmarks` in the
+   second. The entry should be present because both windows share one browser
+   session, while each window keeps its own chrome and active-tab state.
+4. Open the target link below in one window and go Back. The same target link
+   should repaint purple in both windows because visits are session-wide.
+5. With both windows open, press Escape in either live window. Both should
+   close because Escape is the documented process-wide quit shortcut.
+-->
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <title>Multiple-window fixture</title>
+    <style>
+      body { font: 18px sans-serif; margin: 32px; max-width: 720px; }
+      section { background-color: #e8f2ff; border-radius: 12px; padding: 20px; }
+      code { background-color: #ffffff; padding: 2px 5px; }
+    </style>
+  </head>
+  <body>
+    <h1>Multiple-window fixture</h1>
+    <section>
+      <p><strong>Expected:</strong> <code>Ctrl+N</code> opens exactly one independent native window.</p>
+      <p>Close the new window and confirm this original window remains interactive.</p>
+      <p>Bookmarks and visited links are shared; chrome, tabs, focus, and scrolling are per window.</p>
+      <p><a href="visited-links-target.html">Shared visited-link target</a></p>
+    </section>
+  </body>
+</html>

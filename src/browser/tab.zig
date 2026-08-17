@@ -29,6 +29,21 @@ const FrameBoundEntry = struct {
     bounds: Bounds,
 };
 
+fn isStrictDomDescendant(node: *Node, ancestor: *Node) bool {
+    var current = switch (node.*) {
+        .element => |element| element.parent,
+        .text => |text| text.parent,
+    };
+    while (current) |candidate| {
+        if (candidate == ancestor) return true;
+        current = switch (candidate.*) {
+            .element => |element| element.parent,
+            .text => |text| text.parent,
+        };
+    }
+    return false;
+}
+
 pub const ClickButton = enum {
     primary,
     middle,
@@ -142,6 +157,10 @@ pub const Frame = struct {
         self.js_context = null;
         self.js_render_context_initialized = false;
 
+        // Display-item provenance borrows this frame's layout and DOM. Retire
+        // it before any descendant/layout/node generation can be destroyed.
+        self.retireDisplayList();
+
         self.input_bounds.deinit();
         self.link_bounds.deinit(self.allocator);
         self.iframe_bounds.deinit(self.allocator);
@@ -153,11 +172,6 @@ pub const Frame = struct {
             self.allocator.destroy(child);
         }
         self.children.deinit(self.allocator);
-
-        if (self.display_list) |items| {
-            DisplayItem.freeList(self.allocator, items);
-            self.display_list = null;
-        }
 
         if (self.document_layout) |doc| {
             doc.deinit();
@@ -199,8 +213,44 @@ pub const Frame = struct {
         self.current_url_owned = false;
     }
 
+    pub fn retireDisplayList(self: *Frame) void {
+        if (self.display_list) |items| {
+            DisplayItem.freeList(self.allocator, items);
+            self.display_list = null;
+        }
+    }
+
+    /// Retire every frame-side structure that borrows DOM or layout identity
+    /// before a structural DOM mutation can remove or relocate a Node.
+    pub fn retireDomMutationBorrows(self: *Frame, mutation_root: *Node) void {
+        if (self.focus) |focus_node| {
+            if (isStrictDomDescendant(focus_node, mutation_root)) {
+                switch (focus_node.*) {
+                    .element => |*element| {
+                        element.is_focused = false;
+                        parser.dirtyStyleForElement(element);
+                    },
+                    .text => {},
+                }
+                self.focus = null;
+            }
+        }
+        self.retireDisplayList();
+        self.input_bounds.clearRetainingCapacity();
+        self.link_bounds.clearRetainingCapacity();
+        self.iframe_bounds.clearRetainingCapacity();
+        self.focus_bounds.clearRetainingCapacity();
+        self.accessibility_bounds.clearRetainingCapacity();
+        self.fragment_targets.clearRetainingCapacity();
+    }
+
     pub fn render(self: *Frame, browser: *Browser, needs_style: bool, needs_layout: bool, needs_paint: bool) !void {
         if (self.current_node == null) return;
+        if (self.current_url) |base_url| {
+            // Re-annotate before any requested paint so DOM mutations and
+            // session visits made since the initial parse are reflected.
+            try browser.annotateVisitedLinks(&self.current_node.?, base_url);
+        }
         if (needs_style) {
             try parser.style(browser.allocator, &self.current_node.?, self.rules.items);
         }
@@ -275,9 +325,13 @@ pub const Frame = struct {
         return true;
     }
 
-    fn navigateSameDocumentFragment(self: *Frame, resolved_url: Url) !void {
+    fn navigateSameDocumentFragment(self: *Frame, b: *Browser, resolved_url: Url) !void {
         const fragment = resolved_url.fragment() orelse unreachable;
         const target_scroll = self.scrollOffsetForFragment(fragment);
+
+        // Same-document fragment navigations do not pass through loadInTab,
+        // but they still create a visited URL entry.
+        _ = try b.markVisited(&resolved_url);
 
         const url_ptr = self.allocator.create(Url) catch |err| {
             resolved_url.free(self.allocator);
@@ -329,7 +383,7 @@ pub const Frame = struct {
         }
 
         if (current_url_ptr.*.sameDocument(resolved_url) and resolved_url.fragment() != null) {
-            try self.navigateSameDocumentFragment(resolved_url);
+            try self.navigateSameDocumentFragment(b, resolved_url);
             return;
         }
 
@@ -368,106 +422,69 @@ pub const Frame = struct {
     }
 
     pub fn click(self: *Frame, b: *Browser, x: i32, y: i32, button: ClickButton) !bool {
-        for (self.iframe_bounds.items) |entry| {
-            const bounds = entry.bounds;
-            if (x >= bounds.x and x < bounds.x + bounds.width and
-                y >= bounds.y and y < bounds.y + bounds.height)
-            {
-                if (self.findFrameByElement(entry.node)) |child| {
-                    if (button == .primary) self.tab.focused_frame = child;
-                    const child_x = x - bounds.x;
-                    const child_y = y - bounds.y + child.scroll;
-                    _ = try child.click(b, child_x, child_y, button);
-                }
-                return true;
-            }
-        }
+        const zoom = self.tab.accessibility.zoom;
+        return self.clickDevice(
+            b,
+            DisplayItem.scaleLayoutPx(x, zoom),
+            DisplayItem.scaleLayoutPx(y, zoom),
+            button,
+            zoom,
+        );
+    }
 
-        for (self.link_bounds.items) |entry| {
-            const bounds = entry.bounds;
-            if (x >= bounds.x and x < bounds.x + bounds.width and
-                y >= bounds.y and y < bounds.y + bounds.height)
-            {
-                const link_node = entry.node;
-                if (button == .primary) {
-                    const do_default = self.dispatchEvent("click", link_node);
-                    if (!do_default) return true;
-                }
+    pub fn clickDevice(
+        self: *Frame,
+        b: *Browser,
+        device_x: i32,
+        device_y: i32,
+        button: ClickButton,
+        zoom: f32,
+    ) !bool {
+        const items = self.display_list orelse return false;
+        const hit = DisplayItem.hitTestDevice(items, device_x, device_y, zoom) orelse return false;
+        var current: ?*Node = hit.source.originatingNode();
 
-                switch (link_node.*) {
-                    .element => |*link_element| {
-                        if (link_element.attributes) |attrs| {
+        while (current) |node_ptr| {
+            switch (node_ptr.*) {
+                .element => |*e| {
+                    if (std.ascii.eqlIgnoreCase(e.tag, "iframe")) {
+                        const rect = switch (hit.item.*) {
+                            .iframe => |iframe_item| iframe_item.rect,
+                            else => return true,
+                        };
+                        if (self.findFrameByElement(node_ptr)) |child| {
+                            if (button == .primary) self.tab.focused_frame = child;
+                            const child_x = hit.device_x -| DisplayItem.scaleLayoutPx(rect.left, zoom);
+                            // Composition applies one translation for
+                            // `iframe_top - child_scroll`; scale that combined
+                            // CSS offset once so fractional truncation matches
+                            // the pixels the user clicked.
+                            const child_origin_y = rect.top -| child.scroll;
+                            const child_y = hit.device_y -| DisplayItem.scaleLayoutPx(child_origin_y, zoom);
+                            _ = try child.clickDevice(b, child_x, child_y, button, zoom);
+                        }
+                        return true;
+                    }
+
+                    if (std.ascii.eqlIgnoreCase(e.tag, "a")) {
+                        if (button == .primary) {
+                            const do_default = self.dispatchEvent("click", node_ptr);
+                            if (!do_default) return true;
+                        }
+                        if (e.attributes) |attrs| {
                             if (attrs.get("href")) |href| {
                                 std.log.info("Link click in window_id={d}: {s}", .{ self.window_id, href });
                                 try self.followLink(b, href, button);
                             }
                         }
-                    },
-                    else => {},
-                }
-                if (button == .primary) self.tab.focused_frame = self;
-                return true;
-            }
-        }
-        if (button == .middle) return false;
-
-        var best_focus: ?struct {
-            node: *Node,
-            bounds: Bounds,
-            priority: u8,
-        } = null;
-
-        for (self.focus_bounds.items) |entry| {
-            const bounds = entry.bounds;
-            if (x < bounds.x or x >= bounds.x + bounds.width or
-                y < bounds.y or y >= bounds.y + bounds.height)
-            {
-                continue;
-            }
-            var priority: u8 = 0;
-            switch (entry.node.*) {
-                .element => |e| {
-                    if (e.attributes) |attrs| {
-                        if (attrs.get("contenteditable") != null) {
-                            priority = 3;
-                        }
+                        if (button == .primary) self.tab.focused_frame = self;
+                        return true;
                     }
-                    if (std.mem.eql(u8, e.tag, "input") or std.mem.eql(u8, e.tag, "button")) {
-                        if (priority < 2) priority = 2;
-                    }
-                },
-                else => {},
-            }
-            if (priority == 0) continue;
 
-            if (best_focus == null) {
-                best_focus = .{ .node = entry.node, .bounds = bounds, .priority = priority };
-                continue;
-            }
-            const best = best_focus.?;
-            if (priority > best.priority) {
-                best_focus = .{ .node = entry.node, .bounds = bounds, .priority = priority };
-                continue;
-            }
-            if (priority == best.priority) {
-                const best_area = best.bounds.width * best.bounds.height;
-                const area = bounds.width * bounds.height;
-                if (area < best_area) {
-                    best_focus = .{ .node = entry.node, .bounds = bounds, .priority = priority };
-                }
-            }
-        }
-
-        if (best_focus) |hit| {
-            const node_ptr = hit.node;
-            const do_default = self.dispatchEvent("click", node_ptr);
-            if (!do_default) return true;
-            switch (node_ptr.*) {
-                .element => |*e| {
-                    if (std.mem.eql(u8, e.tag, "input")) {
-                        if (e.attributes) |*attrs| {
-                            try attrs.put("value", "");
-                        }
+                    if (button == .primary and std.ascii.eqlIgnoreCase(e.tag, "input")) {
+                        const do_default = self.dispatchEvent("click", node_ptr);
+                        if (!do_default) return true;
+                        if (e.attributes) |*attrs| try attrs.put("value", "");
                         e.is_focused = true;
                         parser.dirtyStyleForElement(e);
                         self.focus = node_ptr;
@@ -476,23 +493,36 @@ pub const Frame = struct {
                         self.tab.setNeedsRender();
                         return true;
                     }
-                    if (std.mem.eql(u8, e.tag, "button")) {
+
+                    if (button == .primary and std.ascii.eqlIgnoreCase(e.tag, "button")) {
+                        const do_default = self.dispatchEvent("click", node_ptr);
+                        if (!do_default) return true;
                         try self.tab.submitForm(b, self, node_ptr);
                         self.tab.focused_frame = self;
                         return true;
                     }
-                    e.is_focused = true;
-                    parser.dirtyStyleForElement(e);
-                    self.focus = node_ptr;
-                    self.tab.focused_frame = self;
-                    self.tab.updateAccessibilityFocus(b);
-                    self.tab.setNeedsRender();
-                    return true;
+
+                    const is_contenteditable = if (e.attributes) |attrs|
+                        attrs.get("contenteditable") != null
+                    else
+                        false;
+                    if (button == .primary and is_contenteditable) {
+                        const do_default = self.dispatchEvent("click", node_ptr);
+                        if (!do_default) return true;
+                        e.is_focused = true;
+                        parser.dirtyStyleForElement(e);
+                        self.focus = node_ptr;
+                        self.tab.focused_frame = self;
+                        self.tab.updateAccessibilityFocus(b);
+                        self.tab.setNeedsRender();
+                        return true;
+                    }
+
+                    current = e.parent;
                 },
-                else => {},
+                .text => |*text| current = text.parent,
             }
         }
-
         return false;
     }
 
@@ -663,6 +693,11 @@ shutting_down: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
 needs_style: bool = true,
 needs_layout: bool = true,
 needs_paint: bool = true,
+// Browser-session visited generation reflected by the current display list.
+visited_generation: u64 = 0,
+// Cross-thread activation request. Browser.setActiveTab publishes it, and the
+// serialized tab worker consumes it to republish a clean retained frame list.
+activation_commit_requested: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
 scroll_changed_in_tab: bool = false,
 // Composited visual effect updates for the current frame
 composited_updates: std.ArrayList(CompositedUpdate),
@@ -696,6 +731,8 @@ pub fn init(allocator: std.mem.Allocator, tab_width: i32, tab_height: i32, measu
         .task_runner = TaskRunner.init(allocator, measure),
         .async_thread_mutex = .init(measure.io),
         .async_thread_condition = .init(measure.io),
+        .visited_generation = 0,
+        .activation_commit_requested = std.atomic.Value(bool).init(false),
         .composited_updates = std.ArrayList(CompositedUpdate).empty,
         .accessibility_root = null,
         .accessibility_focused = null,
@@ -1060,6 +1097,26 @@ pub fn setNeedsRender(self: *Tab) void {
     self.browser.scheduleAnimationFrame();
 }
 
+/// Synchronous structural-mutation boundary. The caller marks the mutating
+/// element dirty, then invokes this before a child array can move or any child
+/// can be destroyed. Scheduling is published before control returns, so an
+/// allocation failure in the mutation still rebuilds the retired state.
+pub fn prepareForDomMutation(self: *Tab, b: *Browser, frame: *Frame, mutation_root: *Node) void {
+    std.debug.assert(frame.tab == self);
+
+    self.needs_style = true;
+    self.needs_layout = true;
+    self.needs_paint = true;
+    markFrameLayoutDirty(frame);
+
+    frame.retireDomMutationBorrows(mutation_root);
+    self.composited_updates.clearRetainingCapacity();
+    self.clearAccessibilityTree();
+    b.retireRenderStateForTab(self);
+    b.setNeedsAnimationFrame(self);
+    b.scheduleAnimationFrame();
+}
+
 pub fn setNeedsPaint(self: *Tab) void {
     self.needs_paint = true;
     self.browser.setNeedsAnimationFrame(self);
@@ -1130,16 +1187,20 @@ fn collectFramesPostOrder(self: *Tab, frame: *Frame, out: *std.ArrayList(*Frame)
 
 const IframeComposeError = error{OutOfMemory};
 
-fn composeDisplayList(self: *Tab, root: *Frame) IframeComposeError!void {
-    const root_list = root.display_list orelse return;
-    root.display_list = null;
+/// Build the browser-facing snapshot without consuming any frame's
+/// authoritative, uncomposed hit-test list. The returned list owns its nested
+/// containers and carries no layout/DOM provenance.
+pub fn composeDisplayList(self: *Tab, root: *Frame) IframeComposeError!?[]DisplayItem {
+    const root_list = root.display_list orelse return null;
 
     var combined = std.ArrayList(DisplayItem).empty;
     defer combined.deinit(self.allocator);
+    errdefer DisplayItem.freeItems(self.allocator, combined.items);
 
     try self.replaceIframesInList(root, root_list, &combined);
-    browser_mod.DisplayItem.freeList(self.allocator, root_list);
-    root.display_list = try combined.toOwnedSlice(self.allocator);
+    const composed = try combined.toOwnedSlice(self.allocator);
+    DisplayItem.clearSources(composed);
+    return composed;
 }
 
 fn replaceIframesInList(
@@ -1156,15 +1217,19 @@ fn replaceIframesInList(
             .blend => |blend_item| {
                 var children = std.ArrayList(DisplayItem).empty;
                 defer children.deinit(self.allocator);
+                errdefer DisplayItem.freeItems(self.allocator, children.items);
                 try self.replaceIframesInList(root, blend_item.children, &children);
 
-                const child_slice = try self.allocator.alloc(DisplayItem, children.items.len);
-                @memcpy(child_slice, children.items);
+                const child_slice = try children.toOwnedSlice(self.allocator);
+                var child_slice_owned = true;
+                errdefer if (child_slice_owned) DisplayItem.freeList(self.allocator, child_slice);
 
                 const mode_copy = if (blend_item.blend_mode) |mode|
                     try self.allocator.dupe(u8, mode)
                 else
                     null;
+                var mode_copy_owned = mode_copy != null;
+                errdefer if (mode_copy_owned) self.allocator.free(mode_copy.?);
 
                 try out.append(self.allocator, .{
                     .blend = .{
@@ -1174,16 +1239,21 @@ fn replaceIframesInList(
                         .node = blend_item.node,
                         .parent = null,
                         .needs_compositing = blend_item.needs_compositing,
+                        .source = null,
                     },
                 });
+                child_slice_owned = false;
+                mode_copy_owned = false;
             },
             .transform => |transform_item| {
                 var children = std.ArrayList(DisplayItem).empty;
                 defer children.deinit(self.allocator);
+                errdefer DisplayItem.freeItems(self.allocator, children.items);
                 try self.replaceIframesInList(root, transform_item.children, &children);
 
-                const child_slice = try self.allocator.alloc(DisplayItem, children.items.len);
-                @memcpy(child_slice, children.items);
+                const child_slice = try children.toOwnedSlice(self.allocator);
+                var child_slice_owned = true;
+                errdefer if (child_slice_owned) DisplayItem.freeList(self.allocator, child_slice);
 
                 try out.append(self.allocator, .{
                     .transform = .{
@@ -1191,8 +1261,10 @@ fn replaceIframesInList(
                         .translate_y = transform_item.translate_y,
                         .children = child_slice,
                         .node = transform_item.node,
+                        .source = null,
                     },
                 });
+                child_slice_owned = false;
             },
             else => try out.append(self.allocator, item),
         }
@@ -1238,13 +1310,16 @@ fn appendIframeContent(
 
     var expanded_children = std.ArrayList(DisplayItem).empty;
     defer expanded_children.deinit(self.allocator);
+    errdefer DisplayItem.freeItems(self.allocator, expanded_children.items);
     try self.replaceIframesInList(root, child_list, &expanded_children);
     const expanded_slice = try expanded_children.toOwnedSlice(self.allocator);
+    var expanded_slice_owned = true;
+    errdefer if (expanded_slice_owned) DisplayItem.freeList(self.allocator, expanded_slice);
 
     const transform_item = DisplayItem{
         .transform = .{
             .translate_x = iframe_data.rect.left,
-            .translate_y = iframe_data.rect.top - child_frame.?.scroll,
+            .translate_y = iframe_data.rect.top -| child_frame.?.scroll,
             .children = expanded_slice,
             .node = null,
         },
@@ -1261,8 +1336,13 @@ fn appendIframeContent(
     const clip_children = try self.allocator.alloc(DisplayItem, 2);
     clip_children[0] = transform_item;
     clip_children[1] = mask_item;
+    expanded_slice_owned = false;
+    var clip_children_owned = true;
+    errdefer if (clip_children_owned) DisplayItem.freeList(self.allocator, clip_children);
     const clip_blend_mode = try self.allocator.alloc(u8, 6);
     @memcpy(clip_blend_mode, "dst_in");
+    var clip_blend_mode_owned = true;
+    errdefer if (clip_blend_mode_owned) self.allocator.free(clip_blend_mode);
     try out.append(self.allocator, .{
         .blend = .{
             .opacity = 1.0,
@@ -1272,6 +1352,8 @@ fn appendIframeContent(
             .needs_compositing = true,
         },
     });
+    clip_children_owned = false;
+    clip_blend_mode_owned = false;
 
     try out.append(self.allocator, .{
         .outline = .{
@@ -1283,7 +1365,27 @@ fn appendIframeContent(
 }
 
 // Re-render the page without reloading (style, layout, paint)
+pub fn visitedLinksNeedRefresh(self: *const Tab, session_generation: u64) bool {
+    return self.visited_generation != session_generation;
+}
+
+/// RAF dirty gate. Session generation must participate before the frame
+/// decides whether a full render is needed; Tab.render's later check alone is
+/// too late for an otherwise-clean tab.
+pub fn animationFrameNeedsFullRender(self: *Tab, b: *Browser) bool {
+    const visited_generation = b.session_state.currentVisitedGeneration();
+    if (self.visitedLinksNeedRefresh(visited_generation)) self.needs_paint = true;
+    return self.needs_style or self.needs_layout or self.needs_paint;
+}
+
+pub fn requestActivationCommit(self: *Tab) void {
+    self.activation_commit_requested.store(true, .release);
+}
+
 pub fn render(self: *Tab, b: *Browser) !void {
+    const visited_generation = b.session_state.currentVisitedGeneration();
+    if (self.visitedLinksNeedRefresh(visited_generation)) self.needs_paint = true;
+
     // Check if any render phase is needed
     if (!self.needs_style and !self.needs_layout and !self.needs_paint) return;
 
@@ -1299,12 +1401,14 @@ pub fn render(self: *Tab, b: *Browser) !void {
         self.needs_style = false;
         self.needs_layout = false;
         self.needs_paint = false;
+        self.visited_generation = visited_generation;
         return;
     };
     if (frame.current_node == null) {
         self.needs_style = false;
         self.needs_layout = false;
         self.needs_paint = false;
+        self.visited_generation = visited_generation;
         return;
     }
 
@@ -1342,7 +1446,6 @@ pub fn render(self: *Tab, b: *Browser) !void {
         for (frames.items) |child_frame| {
             try child_frame.render(b, false, true, true);
         }
-        try self.composeDisplayList(frame);
         if (profiling) {
             layout_ns = @intCast(std.Io.Clock.awake.now(b.io).nanoseconds - layout_start);
         }
@@ -1355,6 +1458,9 @@ pub fn render(self: *Tab, b: *Browser) !void {
     }
 
     b.setNeedsCompositeRasterDraw();
+    // Store the generation captured before annotation. A concurrent visit
+    // leaves the tab conservatively stale for the next scheduled frame.
+    self.visited_generation = visited_generation;
 
     if (profiling) {
         const total_ns: u64 = @intCast(std.Io.Clock.awake.now(b.io).nanoseconds - render_start);
@@ -1371,6 +1477,7 @@ pub fn render(self: *Tab, b: *Browser) !void {
 
 pub fn runAnimationFrame(self: *Tab, scroll: i32) void {
     const frame = self.root_frame orelse return;
+    const activation_commit = self.activation_commit_requested.swap(false, .acq_rel);
     var frame_it = self.frames_by_id.valueIterator();
     while (frame_it.next()) |frame_ptr| {
         if (frame_ptr.*.js_render_context_initialized) {
@@ -1380,7 +1487,7 @@ pub fn runAnimationFrame(self: *Tab, scroll: i32) void {
         }
     }
 
-    if (!self.scroll_changed_in_tab) {
+    if (!self.scroll_changed_in_tab and !activation_commit) {
         frame.scroll = scroll;
     }
 
@@ -1401,7 +1508,7 @@ pub fn runAnimationFrame(self: *Tab, scroll: i32) void {
     // Only run full render if there are non-composited changes
     // Composited-only updates (like opacity) skip layout and paint
     const has_composited_updates = self.composited_updates.items.len > 0;
-    const needs_full_render = self.needs_style or self.needs_layout or self.needs_paint;
+    const needs_full_render = self.animationFrameNeedsFullRender(self.browser);
 
     if (needs_full_render) {
         self.render(self.browser) catch |err| {
@@ -1409,23 +1516,33 @@ pub fn runAnimationFrame(self: *Tab, scroll: i32) void {
         };
     }
 
-    var commit_scroll: ?i32 = null;
-    if (self.scroll_changed_in_tab) {
-        commit_scroll = frame.scroll;
-    }
+    const commit_scroll: ?i32 = if (activation_commit or self.scroll_changed_in_tab)
+        frame.scroll
+    else
+        null;
 
     // Only commit if we have something to send
-    if (needs_full_render or has_composited_updates) {
+    if (needs_full_render or has_composited_updates or activation_commit) {
+        const composed_list = if (needs_full_render or activation_commit)
+            self.composeDisplayList(frame) catch |err| blk: {
+                std.log.warn("Failed to compose retained display list: {}", .{err});
+                if (activation_commit) self.activation_commit_requested.store(true, .release);
+                self.needs_paint = true;
+                self.browser.setNeedsAnimationFrame(self);
+                self.browser.scheduleAnimationFrame();
+                break :blk null;
+            }
+        else
+            null;
         const commit_data = browser_mod.CommitData{
             .url = frame.current_url orelse null,
-            .display_list = frame.display_list,
+            .display_list = composed_list,
             .scroll = commit_scroll,
             .height = frame.content_height,
             .zoom = self.accessibility.zoom,
             .prefers_dark = self.accessibility.prefers_dark,
             .composited_updates = self.composited_updates.items,
         };
-        frame.display_list = null;
         self.browser.commit(self, commit_data);
     }
     self.scroll_changed_in_tab = false;
@@ -1456,10 +1573,14 @@ fn advanceAnimations(self: *Tab, node: *parser.Node) bool {
                                     }
                                 }
                             }
-                            self.composited_updates.append(self.allocator, .{
+                            const update = CompositedUpdate{
                                 .node = @ptrCast(elem),
                                 .opacity = anim.getValue(),
-                            }) catch {};
+                            };
+                            self.composited_updates.append(self.allocator, update) catch continue;
+                            if (self.root_frame) |root_frame| {
+                                applyRetainedCompositedOpacity(root_frame, update);
+                            }
                         }
                     }
                 }
@@ -1478,10 +1599,34 @@ fn advanceAnimations(self: *Tab, node: *parser.Node) bool {
     return any_running;
 }
 
+fn applyRetainedCompositedOpacity(frame: *Frame, update: CompositedUpdate) void {
+    if (frame.display_list) |items| {
+        _ = DisplayItem.applyCompositedOpacity(items, update.node, update.opacity);
+    }
+    for (frame.children.items) |child| applyRetainedCompositedOpacity(child, update);
+}
+
 // Handle click on tab content
 pub fn click(self: *Tab, b: *Browser, x: i32, y: i32, button: ClickButton) !void {
+    const zoom = self.accessibility.zoom;
+    return self.clickDevice(
+        b,
+        DisplayItem.scaleLayoutPx(x, zoom),
+        DisplayItem.scaleLayoutPx(y, zoom),
+        button,
+        zoom,
+    );
+}
+
+pub fn clickDevice(
+    self: *Tab,
+    b: *Browser,
+    device_x: i32,
+    device_y: i32,
+    button: ClickButton,
+    zoom: f32,
+) !void {
     const frame = self.root_frame orelse return;
-    try self.render(b);
 
     if (button == .primary) {
         if (self.focused_frame) |focused| {
@@ -1499,7 +1644,7 @@ pub fn click(self: *Tab, b: *Browser, x: i32, y: i32, button: ClickButton) !void
         self.focused_frame = frame;
     }
 
-    const handled = try frame.click(b, x, y, button);
+    const handled = try frame.clickDevice(b, device_x, device_y, button, zoom);
     if (button == .primary and !handled and self.focused_frame != null) {
         self.setNeedsRender();
     }
@@ -1839,7 +1984,6 @@ pub fn clearFocus(self: *Tab, b: *Browser) !void {
 
 // Handle keypress in focused input
 pub fn keypress(self: *Tab, b: *Browser, char: u8) !void {
-    _ = b;
     const frame = self.focused_frame orelse self.root_frame orelse return;
     if (frame.focus) |focus_node| {
         const do_default = frame.dispatchEvent("keydown", focus_node);
@@ -1895,11 +2039,14 @@ pub fn keypress(self: *Tab, b: *Browser, char: u8) !void {
                                 break :blk buffer;
                             }
                         };
+                        var new_text_owned = true;
+                        errdefer if (new_text_owned) self.allocator.free(new_text);
 
                         if (e.owned_strings == null) {
                             e.owned_strings = std.ArrayList([]const u8).empty;
                         }
                         try e.owned_strings.?.append(self.allocator, new_text);
+                        new_text_owned = false;
 
                         if (last_text_node) |text_node| {
                             switch (text_node.*) {
@@ -1911,8 +2058,18 @@ pub fn keypress(self: *Tab, b: *Browser, char: u8) !void {
                                 .text = new_text,
                                 .parent = focus_node,
                             } };
-                            try e.children.append(self.allocator, text_node);
+
+                            // Appending can relocate every by-value child.
+                            // Dirty and retire all current DOM-derived state
+                            // before the first fallible capacity change.
                             e.children_dirty = true;
+                            parser.dirtyStyleForElement(e);
+                            if (e.layout_ptr) |ptr| {
+                                if (e.layout_mark) |mark_fn| mark_fn(ptr);
+                            }
+                            self.prepareForDomMutation(b, frame, focus_node);
+                            try e.children.ensureUnusedCapacity(self.allocator, 1);
+                            e.children.appendAssumeCapacity(text_node);
                             parser.fixParentPointers(focus_node, e.parent);
                         }
 

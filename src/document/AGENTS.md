@@ -7,12 +7,19 @@ Read [`../../docs/architecture-and-lifetimes.md`](../../docs/architecture-and-li
 before changing DOM storage, parser source-buffer ownership, style invalidation,
 or selector/rule lifetime.
 
-- Parser-created text, attributes, and CSS property slices borrow decoded
-  document or stylesheet buffers. Preserve those buffers until all borrowers
-  retire.
+- Parser-created tag names, text, undecoded attributes, and CSS property slices
+  borrow document or stylesheet buffers. Attribute character references are
+  decoded into `Element.owned_strings`; DOM text stays source-backed and
+  escaped because layout decodes it exactly once. DOM dump serialization
+  re-escapes decoded attribute values before quoting them. Preserve all source
+  buffers until their remaining borrowers retire.
 - `Node` children are stored by value in resizable arrays. Do not retain a
   `*Node` across structural mutation unless all consumers are invalidated or a
   stable identity scheme is in place.
+- Supported structural mutation must enter the dedicated synchronous host
+  invalidation boundary after marking the target layout dirty and before child
+  storage can move or retire. Keep ordinary render callbacks separate so
+  style-only changes do not discard focus or hit/accessibility state.
 - CSS rules own selector/map allocations while their property slices borrow the
   stylesheet. Move and retire rules with their source text as one generation.
 - Concatenated tag/class selectors own a source-ordered `SelectorSequence` of
@@ -33,6 +40,12 @@ or selector/rule lifetime.
 - `collectDocumentTitle` copies the first `title` element's descendant text
   into an owned sentinel-terminated slice; native window state must never
   retain the DOM's source-backed text slices.
+- `Element.is_visited` is a non-owning browser-session annotation. Link URL
+  storage stays in the session owner; layout may inspect the annotation only
+  through the current document's synchronous parent chain during paint.
+- `inspection.Page.load` returns its DOM by value. Call
+  `Page.repairParentPointers` after the returned page reaches its final address
+  and before layout/paint performs any ancestry walk.
 - When adding a supported CSS property that has a shorthand, add its expansion
   to `CSSParser.putDeclaration`. Expand in source order for both stylesheet and
   inline declarations, preserve borrowed slices or static defaults, and test

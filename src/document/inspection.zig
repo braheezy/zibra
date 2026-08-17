@@ -39,6 +39,10 @@ pub const Page = struct {
             .css_texts = std.ArrayList([]u8).empty,
         };
         errdefer page.deinit();
+        // `root` moved into `page.root`; selectors may walk ancestors while
+        // Page.load styles below, so repair once at this intermediate stable
+        // address. The caller repairs again after the by-value return.
+        page.repairParentPointers();
 
         try page.appendRules(default_style_sheet, false);
         try page.loadDocumentStylesheets(init, source_url);
@@ -59,6 +63,13 @@ pub const Page = struct {
         self.css_texts.deinit(self.allocator);
         self.root.deinit(self.allocator);
         self.allocator.free(self.body);
+    }
+
+    /// `Page` is returned by value, so parser-installed pointers to the root
+    /// must be repaired once the caller has placed the page at its final
+    /// address and before any ancestry walk.
+    pub fn repairParentPointers(self: *Page) void {
+        parser.fixParentPointers(&self.root, null);
     }
 
     fn appendRules(self: *Page, stylesheet: []const u8, keep_text: bool) !void {

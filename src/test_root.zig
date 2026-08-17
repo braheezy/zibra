@@ -9,6 +9,10 @@ comptime {
     _ = @import("tests/browser_input.zig");
     _ = @import("tests/browser_history.zig");
     _ = @import("tests/browser_fragments.zig");
+    _ = @import("tests/browser_visited.zig");
+    _ = @import("tests/browser_bookmarks.zig");
+    _ = @import("tests/display_list_hits.zig");
+    _ = @import("tests/browser_windows.zig");
     _ = @import("tests/browser_resize.zig");
     _ = @import("tests/browser_scroll.zig");
     _ = @import("tests/parser.zig");

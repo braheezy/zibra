@@ -1,0 +1,23 @@
+<!--
+How to verify:
+  zig build run -- file://$PWD/tests/manual/visited-links.html
+
+On first load, "This page" is purple because the current URL is visited, while
+"Visit the target" is blue. Click the target and then Back. Both links should
+now be purple. Reloading or switching tabs must not forget the visited state.
+-->
+<!doctype html>
+<html>
+  <head>
+    <title>Visited links</title>
+    <style>
+      body { font-size: 24px; }
+      p { margin-bottom: 24px; }
+    </style>
+  </head>
+  <body>
+    <h1>Visited-link state</h1>
+    <p><a href="visited-links.html"><strong>This page</strong></a></p>
+    <p><a href="visited-links-target.html">Visit the target</a></p>
+  </body>
+</html>
