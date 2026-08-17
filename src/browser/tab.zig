@@ -497,7 +497,7 @@ pub const Frame = struct {
                     if (button == .primary and std.ascii.eqlIgnoreCase(e.tag, "button")) {
                         const do_default = self.dispatchEvent("click", node_ptr);
                         if (!do_default) return true;
-                        try self.tab.submitForm(b, self, node_ptr);
+                        _ = try self.tab.submitForm(b, self, node_ptr);
                         self.tab.focused_frame = self;
                         return true;
                     }
@@ -1650,17 +1650,17 @@ pub fn clickDevice(
     }
 }
 
-// Submit a form when a button is clicked
-fn submitForm(self: *Tab, b: *Browser, frame: *Frame, button_node: *Node) !void {
+// Submit the form containing an activated button or text entry.
+fn submitForm(self: *Tab, b: *Browser, frame: *Frame, control_node: *Node) !bool {
     // IMPORTANT: We cannot traverse parent pointers here because loadInTab
     // will free the tree, invalidating all pointers. Instead, we search
-    // the entire tree from the root to find which form contains this button.
+    // the entire tree from the root to find which form contains this control.
 
     std.log.info("submitForm called", .{});
 
     if (frame.current_node == null) {
         std.log.warn("No current_node", .{});
-        return;
+        return false;
     }
 
     // Get all nodes in the tree
@@ -1676,7 +1676,7 @@ fn submitForm(self: *Tab, b: *Browser, frame: *Frame, button_node: *Node) !void 
             .element => |e| {
                 if (std.mem.eql(u8, e.tag, "form")) {
                     std.log.info("Found form element", .{});
-                    // Check if this form contains the button
+                    // Check if this form contains the activated control.
                     var form_nodes = std.ArrayList(*Node).empty;
                     defer form_nodes.deinit(self.allocator);
                     try parser.treeToList(self.allocator, node_ptr, &form_nodes);
@@ -1684,26 +1684,27 @@ fn submitForm(self: *Tab, b: *Browser, frame: *Frame, button_node: *Node) !void 
                     std.log.info("Form has {} child nodes", .{form_nodes.items.len});
 
                     for (form_nodes.items) |form_child| {
-                        if (form_child == button_node) {
-                            std.log.info("Found button in form!", .{});
+                        if (form_child == control_node) {
+                            std.log.info("Found activated control in form", .{});
                             const do_default = frame.dispatchEvent("submit", node_ptr);
                             if (!do_default) {
                                 std.log.info("Default submit prevented", .{});
-                                return;
+                                return true;
                             }
-                            // Found the form containing this button
-                            if (e.attributes) |attrs| {
-                                if (attrs.get("action")) |action| {
-                                    std.log.info("Form action: {s}", .{action});
-                                    // Copy the action string before we free the tree
-                                    const action_copy = try self.allocator.alloc(u8, action.len);
-                                    @memcpy(action_copy, action);
-                                    defer self.allocator.free(action_copy);
 
-                                    try self.submitFormData(b, frame, node_ptr, action_copy);
-                                    return;
-                                }
-                            }
+                            // A missing action submits back to the current
+                            // document. Copy before scheduling navigation can
+                            // retire the DOM backing the attribute.
+                            const action = if (e.attributes) |attrs|
+                                attrs.get("action") orelse ""
+                            else
+                                "";
+                            std.log.info("Form action: {s}", .{action});
+                            const action_copy = try self.allocator.dupe(u8, action);
+                            defer self.allocator.free(action_copy);
+
+                            try self.submitFormData(b, frame, node_ptr, action_copy);
+                            return true;
                         }
                     }
                 }
@@ -1712,7 +1713,8 @@ fn submitForm(self: *Tab, b: *Browser, frame: *Frame, button_node: *Node) !void 
         }
     }
 
-    std.log.warn("No form found containing button", .{});
+    std.log.debug("No form found containing activated control", .{});
+    return false;
 }
 
 // Collect form inputs and submit via POST
@@ -1934,7 +1936,7 @@ pub fn activateFocusedElement(self: *Tab, b: *Browser) !void {
                         if (std.mem.eql(u8, raw_type, "submit") or std.mem.eql(u8, raw_type, "button")) {
                             const do_default = frame.dispatchEvent("click", node_ptr);
                             if (!do_default) return;
-                            try self.submitForm(b, frame, node_ptr);
+                            _ = try self.submitForm(b, frame, node_ptr);
                         }
                     }
                 }
@@ -1944,7 +1946,7 @@ pub fn activateFocusedElement(self: *Tab, b: *Browser) !void {
             if (std.mem.eql(u8, e.tag, "button")) {
                 const do_default = frame.dispatchEvent("click", node_ptr);
                 if (!do_default) return;
-                try self.submitForm(b, frame, node_ptr);
+                _ = try self.submitForm(b, frame, node_ptr);
                 return;
             }
 
@@ -1963,6 +1965,47 @@ pub fn activateFocusedElement(self: *Tab, b: *Browser) !void {
         },
         else => {},
     }
+}
+
+fn isTextEntryInput(element: *const parser.Element) bool {
+    if (!std.ascii.eqlIgnoreCase(element.tag, "input")) return false;
+    const input_type = if (element.attributes) |attrs|
+        attrs.get("type") orelse "text"
+    else
+        "text";
+
+    // Unknown input types use HTML's text-state fallback. Exclude the known
+    // non-text controls that should retain their ordinary activation behavior.
+    const non_text_types = [_][]const u8{
+        "button", "checkbox", "color", "file",   "hidden", "image",
+        "radio",  "range",    "reset", "submit",
+    };
+    for (non_text_types) |non_text_type| {
+        if (std.ascii.eqlIgnoreCase(input_type, non_text_type)) return false;
+    }
+    return true;
+}
+
+/// Handle Return for page content. Text entries submit their containing form;
+/// buttons, links, and other focused elements keep the existing activation
+/// behavior shared with accessibility and voice-command input.
+pub fn enter(self: *Tab, b: *Browser) !bool {
+    const frame = self.focused_frame orelse self.root_frame orelse return false;
+    const focus_node = frame.focus orelse return false;
+
+    switch (focus_node.*) {
+        .element => |*element| {
+            if (isTextEntryInput(element)) {
+                const do_default = frame.dispatchEvent("keydown", focus_node);
+                if (!do_default) return false;
+                return self.submitForm(b, frame, focus_node);
+            }
+        },
+        .text => {},
+    }
+
+    try self.activateFocusedElement(b);
+    return false;
 }
 
 // Clear focus (for Escape key)

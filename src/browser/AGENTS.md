@@ -42,6 +42,12 @@ before changing `root.zig`, `tab.zig`, `render/`, or browser task scheduling.
   successful Enter reset both the editing buffer lifecycle and cursor. While
   the address bar is focused it consumes editing and activation keys, even at
   cursor boundaries, so a stale DOM focus pointer cannot also edit the page.
+- Return in page content has its own `Tab.enter` path, separate from Space and
+  generic focused-element activation. A focused text-entry input dispatches
+  `keydown`, then submits its containing form through the same submit-event and
+  navigation path used by buttons; `preventDefault` cancels the default and a
+  missing `action` resolves to the current document. Inputs outside forms and
+  known non-text input types do not implicitly submit.
 - Each tab owns an indexed root-navigation history. Successful ordinary
   navigation truncates entries after the current index before appending; Back
   and Forward retain the list and move the index only after the replacement

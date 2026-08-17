@@ -557,6 +557,12 @@ Focus, blur, and successful submission reset the cursor; chrome rasterization
 measures the glyph prefix before the cursor to place the visible caret. Address
 focus takes precedence over retained DOM focus for text, Return, Space, and
 Backspace routing, including editing operations that are no-ops at a boundary.
+Once Return is routed to page content, `Tab.enter` distinguishes text entry
+from generic activation: a focused text input dispatches `keydown`, finds its
+containing form, dispatches the cancelable `submit` event, collects the current
+named input values, and schedules the existing form-navigation path. A missing
+form action resolves against the current document. Space continues to use only
+focused-element activation, and a text input outside a form does nothing.
 Primary same-document fragment links stay on the tab worker: they resolve the
 new URL, append it to indexed root history (or replace an iframe-owned URL),
 apply the clamped layout target, and request a paint commit. The existing DOM,

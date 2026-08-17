@@ -1,0 +1,38 @@
+<!--
+How to verify:
+1. Click the first input, type a short value, and press Enter/Return. The status
+   below must change to a green PASS message without leaving this page.
+2. Reload, click the second input (which is outside the form), and press Enter.
+   The status must remain "Waiting for form submission".
+-->
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <title>Enter submits focused text entry</title>
+    <style>
+      body { font: 18px sans-serif; margin: 32px; max-width: 720px; }
+      form, section { background-color: #e8f2ff; border-radius: 10px; margin: 16px 0; padding: 18px; }
+      .pass { color: green; font-weight: bold; }
+    </style>
+  </head>
+  <body>
+    <h1>Enter submits a text entry</h1>
+    <form action="/unused">
+      <label>Inside form: <input name="query" value=""></label>
+    </form>
+    <section>
+      <label>Outside form: <input name="outside" value=""></label>
+    </section>
+    <p class="status">Waiting for form submission</p>
+    <script>
+      var form = document.querySelectorAll("form")[0];
+      var input = document.querySelectorAll("input")[0];
+      var status = document.querySelectorAll(".status")[0];
+      form.addEventListener("submit", function(event) {
+        event.preventDefault();
+        status.innerHTML = '<span class="pass">PASS: submitted value "' + input.getAttribute("value") + '"</span>';
+      });
+    </script>
+  </body>
+</html>

@@ -31,6 +31,10 @@ entry must disappear after toggling the page off and revisiting the list.
 `tests/manual/address-bar-cursor.html` exercises clamped Left/Right movement,
 insertion at the address cursor, and Backspace deletion before it.
 
+`tests/manual/form-enter.html` verifies that Return in a focused text entry
+dispatches the containing form's submit event, while an input outside a form
+does not submit.
+
 `tests/manual/display-list-hit-testing.html` exercises painted-fragment,
 translation, rounded-clip, overlap, and iframe click routing. Only the visible
 topmost painted target should activate; its child and destination pages are

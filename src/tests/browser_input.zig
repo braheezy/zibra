@@ -15,6 +15,53 @@ fn initTestChrome(allocator: std.mem.Allocator) Chrome {
     };
 }
 
+fn enterOnFirstInput(html: []const u8) !bool {
+    const allocator = std.testing.allocator;
+    var html_parser = try parser_module.HTMLParser.init(allocator, html);
+    defer html_parser.deinit(allocator);
+
+    var tab: tab_module.Tab = undefined;
+    tab.allocator = allocator;
+    tab.root_frame = null;
+    tab.focused_frame = null;
+    tab.frames_by_id = std.AutoHashMap(u32, *tab_module.Frame).init(allocator);
+    defer tab.frames_by_id.deinit();
+    tab.parent_window_ids = std.AutoHashMap(u32, u32).init(allocator);
+    defer tab.parent_window_ids.deinit();
+
+    var frame = tab_module.Frame.init(allocator, &tab, null, null);
+    defer frame.deinit();
+    tab.root_frame = &frame;
+    tab.focused_frame = &frame;
+    frame.current_node = try html_parser.parse();
+    parser_module.fixParentPointers(&frame.current_node.?, null);
+
+    var nodes = std.ArrayList(*parser_module.Node).empty;
+    defer nodes.deinit(allocator);
+    try parser_module.treeToList(allocator, &frame.current_node.?, &nodes);
+    for (nodes.items) |node| {
+        switch (node.*) {
+            .element => |*element| {
+                if (std.ascii.eqlIgnoreCase(element.tag, "input")) {
+                    element.is_focused = true;
+                    frame.focus = node;
+                    break;
+                }
+            },
+            .text => {},
+        }
+    }
+    if (frame.focus == null) return error.TestInputMissing;
+
+    var current_url = try Url.init(allocator, "file:///tmp/form-enter.html");
+    defer current_url.free(allocator);
+    frame.current_url = &current_url;
+
+    var test_browser: browser.Browser = undefined;
+    test_browser.allocator = allocator;
+    return tab.enter(&test_browser);
+}
+
 test "address bar preserves URLs and turns ordinary text into a search" {
     const allocator = std.testing.allocator;
     const cases = [_]struct {
@@ -177,6 +224,24 @@ test "address cursor resets on focus blur and successful enter" {
     try std.testing.expectEqual(@as(usize, 0), chrome.address_cursor);
     try std.testing.expectEqual(@as(usize, 0), chrome.address_bar.items.len);
     try std.testing.expect(chrome.focus == null);
+}
+
+test "Enter in a focused text entry submits its containing form" {
+    try std.testing.expect(try enterOnFirstInput(
+        "<html><body><form><input name=q value=zig></form></body></html>",
+    ));
+    try std.testing.expect(try enterOnFirstInput(
+        "<html><body><form action=/search><input type=TeXt name=q></form></body></html>",
+    ));
+}
+
+test "Enter does not submit from a text entry outside a form or a non-text input" {
+    try std.testing.expect(!try enterOnFirstInput(
+        "<html><body><input type=text name=q></body></html>",
+    ));
+    try std.testing.expect(!try enterOnFirstInput(
+        "<html><body><form action=/search><input type=checkbox name=q></form></body></html>",
+    ));
 }
 
 test "mouse wheel delta preserves magnitude and normalizes direction" {

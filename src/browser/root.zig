@@ -2037,8 +2037,9 @@ pub const Browser = struct {
                 self.lock.unlock();
                 if (should_activate) {
                     if (tab) |active_tab| {
-                        active_tab.activateFocusedElement(self) catch |err| {
-                            std.log.warn("Failed to activate focused element: {}", .{err});
+                        _ = active_tab.enter(self) catch |err| {
+                            std.log.warn("Failed to handle Enter for focused element: {}", .{err});
+                            return;
                         };
                     }
                 }

@@ -54,31 +54,6 @@ To test chunked gzip responses, run `gzipServer.py` locally.
 
 See [Architecture and lifetimes](docs/architecture-and-lifetimes.md) for the source map, ownership contracts, threading model, and known lifetime risks.
 
-### Named worktrees
-
-Use [Worktrunk](https://worktrunk.dev/) directly—its commands are already the
-smallest useful wrapper around Git worktrees. Install it once on macOS with
-`brew install worktrunk`, then enable terminal navigation with
-`wt config shell install`.
-
-```sh
-# Create a named branch and worktree; no detached HEAD.
-wt switch --create http-data
-
-# Return to that worktree later.
-wt switch http-data
-
-# Commit and push normally while inside it.
-git add -A && git commit -m 'Handle HTTP data'
-git push -u origin http-data
-
-# After the work is merged, remove the worktree and redundant branch.
-wt remove http-data
-```
-
-`wt remove` refuses dirty or unintegrated work by default. Use `wt list` to
-review every worktree and its branch status.
-
 ## Known Issues
 
 - On Mac, the content is stretched while the window is being resized. Apparently this is known behavior in SDL2 because Mac blocks the main thread while the mouse is being held down to resize windows, preventing SDL from rendering the content properly...I think.
