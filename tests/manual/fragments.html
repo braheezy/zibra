@@ -1,0 +1,22 @@
+<!--
+How to verify:
+1. Open this file with `#section-one` appended to its URL; Section One starts at the top of the page.
+2. Return to the top, type into the input, and click either fragment link.
+3. The matching heading moves to the top, the address bar keeps the fragment, and the input value remains (the document was not reloaded).
+4. The encoded link scrolls to the element whose id contains a space.
+-->
+<!doctype html>
+<title>Fragment navigation</title>
+<style>
+    .spacer { height: 550px; }
+</style>
+<h1>Fragment navigation</h1>
+<p><a href="#section-one">Section One</a> | <a href="#section%20two">Section Two</a></p>
+<p><label>Reload check: <input value="type here"></label></p>
+<div class="spacer">Spacer before the first target</div>
+<h2 id="section-one">Section One</h2>
+<p>The first fragment target is aligned with the viewport top.</p>
+<div class="spacer">Spacer before the encoded target</div>
+<h2 id="section two">Section Two</h2>
+<p>The percent-encoded fragment matched an id containing a space.</p>
+<div class="spacer">Trailing space allows the second target to reach the top.</div>

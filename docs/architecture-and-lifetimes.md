@@ -150,7 +150,7 @@ worker, waits for every accounted helper, and only then destroys shared state.
 - document layout and the frame-side display list;
 - owned CSS rules and their source buffers, including decoded linked sheets
   and copied `<style>` text retained in DOM order;
-- hit-test collections and allowed-origin strings;
+- hit-test collections, fragment target positions, and allowed-origin strings;
 - a frame-owned URL only when `current_url_owned` is true.
 
 The root frame normally borrows its URL from `Tab.history`; child frames may
@@ -170,6 +170,12 @@ the worker.
 `Frame.deinit` destroys display/layout state before DOM and destroys DOM before
 the decoded HTML source. That order is required because layout borrows DOM and
 DOM strings borrow the HTML source.
+
+Fragment target entries borrow DOM element pointers and store their top edge in
+document-space CSS pixels. Layout collects block targets directly and inline
+targets from positioned line content, including an insertion point for empty
+inline targets. A frame copies that ephemeral layout-engine collection with its
+other hit-test data, then releases it before either layout or DOM teardown.
 
 ### DOM and source buffers
 
@@ -361,6 +367,13 @@ storage. Root and child navigation keep the prior URL owner alive through the
 synchronous fetch; async XHR clones its target and referrer before leaving the
 tab worker.
 
+Relative references are resolved by Ada against the complete href. Fragment
+accessors borrow Ada storage, and same-document comparison ignores only the
+fragment component, retaining query identity. HTTP cache keys and requests omit
+fragments; after a network response or cache hit, the final navigation URL
+inherits the requested fragment unless a redirect destination supplied one.
+URL serialization uses the Ada href so chrome retains query and fragment text.
+
 Document-replacing inputs use `Url.initForNavigation` or
 `Url.resolveForNavigation`. These preserve `OutOfMemory`, but turn URL syntax,
 data-payload, and unsupported-scheme failures into an independently owned
@@ -403,6 +416,11 @@ title to SDL; switching tabs uses the same activation path and marks it dirty.
 Chrome's Back and Forward handlers read only atomic availability snapshots and
 enqueue a history task. The worker computes the target again before loading,
 so a click based on a stale disabled/enabled snapshot is harmless.
+Primary same-document fragment links stay on the tab worker: they resolve the
+new URL, append it to indexed root history (or replace an iframe-owned URL),
+apply the clamped layout target, and request a paint commit. The existing DOM,
+JavaScript state, form controls, and document generation remain intact. Middle
+click still transfers the resolved URL to a new tab instead.
 
 Window resizing preserves that ownership boundary. The main thread allocates a
 complete replacement generation of the root/chrome/tab z2d surfaces and SDL
@@ -470,7 +488,9 @@ lock across parsing, layout, JavaScript, and rendering.
 7. stages stylesheet source buffers and parsed rules together;
 8. assigns a unique document generation, parses scripts, builds layout/paint
    state, and commits browser-visible data;
-9. commits the final URL by appending it to indexed history, or by replacing a
+9. applies any final-URL fragment to the completed layout and clamps the frame
+   scroll range;
+10. commits the final URL by appending it to indexed history, or by replacing a
    successfully traversed entry and moving the current index.
 
 `Tab.invalidateJsContext` in [`src/browser/tab.zig`](../src/browser/tab.zig)

@@ -2107,6 +2107,10 @@ pub const Browser = struct {
             try self.layoutTabNodes(frame, true);
         }
 
+        if (url.*.fragment()) |fragment| {
+            _ = frame.scrollToFragment(fragment);
+        }
+
         // Commit history only after the new document is ready. Ordinary
         // navigation truncates a forward branch; traversal replaces the
         // canonical target with the final URL after redirects.
@@ -2185,6 +2189,7 @@ pub const Browser = struct {
         frame.iframe_bounds.clearRetainingCapacity();
         frame.focus_bounds.clearRetainingCapacity();
         frame.accessibility_bounds.clearRetainingCapacity();
+        frame.fragment_targets.clearRetainingCapacity();
 
         for (frame.children.items) |child| {
             child.deinit();
@@ -2408,6 +2413,9 @@ pub const Browser = struct {
 
         try parser.style(self.allocator, &frame.current_node.?, frame.rules.items);
         try self.layoutTabNodes(frame, true);
+        if (url.*.fragment()) |fragment| {
+            _ = frame.scrollToFragment(fragment);
+        }
 
         frame.tab.setNeedsRender();
         frame.tab.runAnimationFrame(frame.scroll);

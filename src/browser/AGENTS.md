@@ -37,6 +37,11 @@ before changing `root.zig`, `tab.zig`, `render/`, or browser task scheduling.
   before DOM, and display snapshots must retire before `FontManager`.
 - `scroll.zig` is the single source of truth for CSS scroll ranges and native
   scrollbar-thumb geometry. Clamping and drawing must use the same metrics.
+- Fragment targets are layout-derived document-space positions that borrow DOM
+  node identity. A `Frame` copies them with its other hit-test data and retires
+  them before layout or DOM. Full navigation applies the fragment after layout;
+  same-document fragment links update URL/history and scroll on the tab worker,
+  then repaint without replacing the document.
 - Basic text direction keeps glyphs in source order and aligns completed lines:
   `-rtl` supplies the document fallback, while the nearest block ancestor's
   `dir=rtl` or `dir=ltr` overrides it. Unicode bidi reordering, `dir=auto`, and

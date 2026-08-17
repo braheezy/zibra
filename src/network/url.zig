@@ -196,8 +196,11 @@ pub const Url = struct {
         if (std.mem.eql(u8, u.scheme, "data")) {
             // ! ada will eventually support parsing data urls
             // ! https://github.com/ada-url/ada/pull/756/
-            const colon_index = std.mem.indexOfScalar(u8, url, ':') orelse return error.DataUriBadFormat;
-            var rest = url[colon_index + 1 ..];
+            // Parse the inner Ada URL so `view-source:data:` works, and keep
+            // the fragment out of the response body.
+            const data_url = hrefWithoutFragment(u.ada_url.getHref());
+            const colon_index = std.mem.indexOfScalar(u8, data_url, ':') orelse return error.DataUriBadFormat;
+            var rest = data_url[colon_index + 1 ..];
 
             // find the first comma, everything after is the data
             var data: []const u8 = undefined;
@@ -331,6 +334,25 @@ pub const Url = struct {
         return result;
     }
 
+    /// Return the URL fragment without its leading `#`. An explicitly empty
+    /// fragment is returned as an empty slice; a URL with no fragment returns
+    /// null. The slice borrows this URL's Ada backing storage.
+    pub fn fragment(self: Url) ?[]const u8 {
+        if (!self.ada_url.hasHash()) return null;
+        const hash = self.ada_url.getHash() orelse return "";
+        return if (hash.len > 0 and hash[0] == '#') hash[1..] else hash;
+    }
+
+    /// Compare complete URL identity except for the fragment component.
+    pub fn sameDocument(self: Url, other: Url) bool {
+        if (self.view_source != other.view_source) return false;
+        return std.mem.eql(
+            u8,
+            hrefWithoutFragment(self.ada_url.getHref()),
+            hrefWithoutFragment(other.ada_url.getHref()),
+        );
+    }
+
     /// Resolve a relative URL against this URL
     /// Handles:
     /// - Absolute URLs with a scheme (returned as-is)
@@ -346,93 +368,14 @@ pub const Url = struct {
             return try Url.init(allocator, relative_url);
         }
 
-        var resolved_url = std.ArrayList(u8).empty;
-        defer resolved_url.deinit(allocator);
-
-        // If it starts with "//", it's scheme-relative
-        if (std.mem.startsWith(u8, relative_url, "//")) {
-            // Use current scheme with the rest of the URL
-            try resolved_url.appendSlice(allocator, self.scheme);
-            try resolved_url.append(allocator, ':');
-            try resolved_url.appendSlice(allocator, relative_url);
-            return try Url.init(allocator, resolved_url.items);
-        }
-
-        // If it doesn't start with "/", it's path-relative
-        if (!std.mem.startsWith(u8, relative_url, "/")) {
-            // Get the directory part of the current path
-            var dir = self.path;
-            if (std.mem.lastIndexOf(u8, dir, "/")) |last_slash| {
-                dir = dir[0..last_slash];
-            } else {
-                dir = "";
-            }
-
-            // Handle parent directory navigation (..)
-            var working_dir = try allocator.alloc(u8, dir.len);
-            defer allocator.free(working_dir);
-            @memcpy(working_dir, dir);
-            var working_dir_len = dir.len;
-
-            var remaining_url = relative_url;
-            while (std.mem.startsWith(u8, remaining_url, "../")) {
-                // Remove one "../" from the URL
-                remaining_url = remaining_url[3..];
-
-                // Remove one directory level from working_dir
-                if (std.mem.lastIndexOf(u8, working_dir[0..working_dir_len], "/")) |last_slash| {
-                    working_dir_len = last_slash;
-                } else {
-                    working_dir_len = 0;
-                }
-            }
-
-            // Build the resolved path
-            try resolved_url.appendSlice(allocator, self.scheme);
-            try resolved_url.appendSlice(allocator, "://");
-
-            // For file:// URLs, there's no host
-            if (std.mem.eql(u8, self.scheme, "file")) {
-                try resolved_url.appendSlice(allocator, working_dir[0..working_dir_len]);
-                try resolved_url.append(allocator, '/');
-                try resolved_url.appendSlice(allocator, remaining_url);
-            } else {
-                const host = self.host.?;
-                try resolved_url.appendSlice(allocator, host);
-                if (!hostHasExplicitPort(host) and self.port != 80 and self.port != 443) {
-                    try resolved_url.append(allocator, ':');
-                    const port_str = try std.fmt.allocPrint(allocator, "{d}", .{self.port});
-                    defer allocator.free(port_str);
-                    try resolved_url.appendSlice(allocator, port_str);
-                }
-                try resolved_url.appendSlice(allocator, working_dir[0..working_dir_len]);
-                try resolved_url.append(allocator, '/');
-                try resolved_url.appendSlice(allocator, remaining_url);
-            }
-
-            return try Url.init(allocator, resolved_url.items);
-        }
-
-        // It's host-relative (starts with "/")
-        try resolved_url.appendSlice(allocator, self.scheme);
-        try resolved_url.appendSlice(allocator, "://");
-
-        // For file:// URLs, there's no host
-        if (std.mem.eql(u8, self.scheme, "file")) {
-            try resolved_url.appendSlice(allocator, relative_url);
-        } else {
-            const host = self.host.?;
-            try resolved_url.appendSlice(allocator, host);
-            if (!hostHasExplicitPort(host) and self.port != 80 and self.port != 443) {
-                try resolved_url.append(allocator, ':');
-                const port_str = try std.fmt.allocPrint(allocator, "{d}", .{self.port});
-                defer allocator.free(port_str);
-                try resolved_url.appendSlice(allocator, port_str);
-            }
-            try resolved_url.appendSlice(allocator, relative_url);
-        }
-
-        return try Url.init(allocator, resolved_url.items);
+        // Delegate relative-reference semantics to Ada. Besides simplifying
+        // path resolution, this preserves the current query for `#fragment`
+        // references and replaces only the fragment component.
+        const resolved_ada = try ada.Url.initWithBase(relative_url, self.ada_url.getHref());
+        defer resolved_ada.free();
+        var resolved = try Url.init(allocator, resolved_ada.getHref());
+        resolved.view_source = self.view_source;
+        return resolved;
     }
 
     /// Resolve a navigation target, recovering malformed results to the
@@ -464,6 +407,11 @@ pub const Url = struct {
     fn hostHasExplicitPort(host: []const u8) bool {
         if (std.mem.startsWith(u8, host, "[")) return false;
         return std.mem.lastIndexOfScalar(u8, host, ':') != null;
+    }
+
+    fn hrefWithoutFragment(href: []const u8) []const u8 {
+        const index = std.mem.indexOfScalar(u8, href, '#') orelse return href;
+        return href[0..index];
     }
 
     // Old HTTP helper functions removed - std.http.Client handles this now
@@ -531,7 +479,7 @@ pub const Url = struct {
         if (!is_http) return error.UnsupportedScheme;
         const use_cache = is_http and payload == null and cache != null;
         const href = url.ada_url.getHref();
-        const cache_key = if (std.mem.indexOfScalar(u8, href, '#')) |fragment| href[0..fragment] else href;
+        const cache_key = if (std.mem.indexOfScalar(u8, href, '#')) |fragment_index| href[0..fragment_index] else href;
 
         if (use_cache) {
             const lookup_time_ns = std.Io.Clock.awake.now(io).nanoseconds;
@@ -542,6 +490,7 @@ pub const Url = struct {
                     if (entry.final_url) |final_url_text| {
                         cached_final_url = try Url.init(allocator, final_url_text);
                         cached_final_url.?.view_source = url.view_source;
+                        try inheritFragment(allocator, url, &cached_final_url.?);
                     }
                 }
 
@@ -590,6 +539,7 @@ pub const Url = struct {
         }
 
         if (final_url) |output| {
+            if (fetched_final_url) |*resolved| try inheritFragment(allocator, url, resolved);
             output.* = fetched_final_url;
             fetched_final_url = null;
         }
@@ -619,6 +569,9 @@ pub const Url = struct {
             try url_builder.appendSlice(al, port_str);
         }
         try url_builder.appendSlice(al, self.path);
+        if (self.ada_url.getSearch()) |search| {
+            try url_builder.appendSlice(al, search);
+        }
         const url_str = try url_builder.toOwnedSlice(al);
         defer al.free(url_str);
 
@@ -888,42 +841,50 @@ pub const Url = struct {
     }
 
     fn toStringInner(self: Url, buffer: []u8) ![]const u8 {
-        // Handle special schemes
-        if (std.mem.eql(u8, self.scheme, "data")) {
-            return std.fmt.bufPrint(buffer, "data:{s}", .{self.path});
-        }
-
-        if (std.mem.eql(u8, self.scheme, "about")) {
-            return std.fmt.bufPrint(buffer, "about:{s}", .{self.path});
-        }
-
-        if (std.mem.eql(u8, self.scheme, "file")) {
-            return std.fmt.bufPrint(buffer, "file://{s}", .{self.path});
-        }
-
-        // For http/https, check if we should show port
-        const host_str = self.host orelse return error.NoHost;
-        const has_explicit_port = hostHasExplicitPort(host_str);
-
-        const show_port = !has_explicit_port and ((std.mem.eql(u8, self.scheme, "https") and self.port != 443) or
-            (std.mem.eql(u8, self.scheme, "http") and self.port != 80));
-
-        if (show_port) {
-            return std.fmt.bufPrint(buffer, "{s}://{s}:{d}{s}", .{
-                self.scheme,
-                host_str,
-                self.port,
-                self.path,
-            });
-        } else {
-            return std.fmt.bufPrint(buffer, "{s}://{s}{s}", .{
-                self.scheme,
-                host_str,
-                self.path,
-            });
-        }
+        const href = self.ada_url.getHref();
+        if (href.len > buffer.len) return error.NoSpaceLeft;
+        @memcpy(buffer[0..href.len], href);
+        return buffer[0..href.len];
     }
 };
+
+fn inheritFragment(allocator: std.mem.Allocator, source: Url, destination: *Url) !void {
+    if (destination.ada_url.hasHash()) return;
+    const hash = source.ada_url.getHash() orelse return;
+
+    var href = std.ArrayList(u8).empty;
+    defer href.deinit(allocator);
+    try href.appendSlice(allocator, destination.ada_url.getHref());
+    try href.appendSlice(allocator, hash);
+
+    var replacement = try Url.init(allocator, href.items);
+    replacement.view_source = destination.view_source;
+    destination.*.free(allocator);
+    destination.* = replacement;
+}
+
+/// Compare an encoded URL fragment with an HTML `id`. Valid percent escapes
+/// decode byte-for-byte; malformed escapes remain literal.
+pub fn fragmentMatchesId(fragment: []const u8, id: []const u8) bool {
+    var fragment_index: usize = 0;
+    var id_index: usize = 0;
+    while (fragment_index < fragment.len and id_index < id.len) {
+        var byte = fragment[fragment_index];
+        if (byte == '%' and fragment_index + 2 < fragment.len) {
+            if (percentByte(fragment[fragment_index + 1 .. fragment_index + 3])) |decoded| {
+                byte = decoded;
+                fragment_index += 3;
+            } else {
+                fragment_index += 1;
+            }
+        } else {
+            fragment_index += 1;
+        }
+        if (byte != id[id_index]) return false;
+        id_index += 1;
+    }
+    return fragment_index == fragment.len and id_index == id.len;
+}
 
 const expect = std.testing.expect;
 
@@ -1083,6 +1044,42 @@ test "file URLs resolve relative and root-relative resources" {
     try expect(std.mem.eql(u8, root_relative.path, "/images/logo.png"));
 }
 
+test "fragment references retain document identity and decode for HTML ids" {
+    const base = try Url.init(
+        std.testing.allocator,
+        "https://example.com/docs/page.html?mode=1#old",
+    );
+    defer base.free(std.testing.allocator);
+
+    const resolved = try base.resolve(std.testing.allocator, "#section%20two");
+    defer resolved.free(std.testing.allocator);
+
+    try std.testing.expect(base.sameDocument(resolved));
+    try std.testing.expectEqualStrings("section%20two", resolved.fragment().?);
+    try std.testing.expect(fragmentMatchesId(resolved.fragment().?, "section two"));
+    try std.testing.expect(!fragmentMatchesId(resolved.fragment().?, "section%20two"));
+
+    var buffer: [128]u8 = undefined;
+    try std.testing.expectEqualStrings(
+        "https://example.com/docs/page.html?mode=1#section%20two",
+        try resolved.toString(&buffer),
+    );
+
+    const other_query = try base.resolve(std.testing.allocator, "?mode=2#section%20two");
+    defer other_query.free(std.testing.allocator);
+    try std.testing.expect(!base.sameDocument(other_query));
+}
+
+test "final navigation URLs inherit a requested fragment" {
+    const requested = try Url.init(std.testing.allocator, "https://example.com/start#target");
+    defer requested.free(std.testing.allocator);
+    var destination = try Url.init(std.testing.allocator, "https://example.com/final");
+    defer destination.free(std.testing.allocator);
+
+    try inheritFragment(std.testing.allocator, requested, &destination);
+    try std.testing.expectEqualStrings("target", destination.fragment().?);
+}
+
 test "data request" {
     const url = try Url.init(std.testing.allocator, "data:text/html,Hello%20World!");
     defer url.free(std.testing.allocator);
@@ -1098,6 +1095,17 @@ test "data request supports the literal browser engineering exercise" {
     try expect(std.mem.eql(u8, url.scheme, "data"));
     try expect(std.mem.eql(u8, url.mime_type.?, "text/html"));
     try expect(std.mem.eql(u8, url.path, "Hello world!"));
+}
+
+test "data URL fragments are not part of the document body" {
+    const url = try Url.init(
+        std.testing.allocator,
+        "data:text/html,<h1 id=target>Target</h1>#target",
+    );
+    defer url.free(std.testing.allocator);
+
+    try std.testing.expectEqualStrings("<h1 id=target>Target</h1>", url.path);
+    try std.testing.expectEqualStrings("target", url.fragment().?);
 }
 
 test "data request with attributes" {
@@ -1645,7 +1653,7 @@ test "HTTP redirects follow relative and absolute locations and report the final
 
     const initial_url_text = try std.fmt.allocPrint(
         std.testing.allocator,
-        "http://127.0.0.1:{d}/start",
+        "http://127.0.0.1:{d}/start#target",
         .{port},
     );
     defer std.testing.allocator.free(initial_url_text);
@@ -1675,7 +1683,7 @@ test "HTTP redirects follow relative and absolute locations and report the final
 
     const expected_final_url = try std.fmt.allocPrint(
         std.testing.allocator,
-        "http://127.0.0.1:{d}/final",
+        "http://127.0.0.1:{d}/final#target",
         .{port},
     );
     defer std.testing.allocator.free(expected_final_url);

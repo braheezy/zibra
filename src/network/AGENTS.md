@@ -10,6 +10,12 @@ before changing URL or response ownership.
 
 - `Url` is logically move-only despite Zig value-copy syntax. Use `Url.clone`
   whenever two independently live owners are needed.
+- Relative references are resolved by Ada against the complete base href so
+  query and fragment components follow URL semantics. `Url.fragment` and
+  `Url.sameDocument` return borrowed views/comparisons; do not retain their
+  backing slices beyond the owning URL. HTTP requests omit fragments, while
+  final redirect and cache-hit URLs inherit the requested fragment when the
+  destination did not supply one.
 - Use `Url.initForNavigation` and `Url.resolveForNavigation` for targets that
   replace a document. They preserve allocation failures but normalize URL
   syntax/payload errors and unsupported schemes to `about:blank`.

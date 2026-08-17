@@ -467,6 +467,11 @@ const AccessibilityBoundEntry = struct {
     bounds: Bounds,
 };
 
+pub const FragmentTarget = struct {
+    node: *Node,
+    y: i32,
+};
+
 pub const Layout = @This();
 
 const TextDirection = enum {
@@ -900,6 +905,8 @@ iframe_bounds: std.ArrayList(IframeBoundEntry),
 focus_bounds: std.ArrayList(FocusBoundEntry),
 // Per-line bounds for accessible elements
 accessibility_bounds: std.ArrayList(AccessibilityBoundEntry),
+// Document-space top positions for elements carrying an HTML id.
+fragment_targets: std.ArrayList(FragmentTarget),
 // Inspection commands serialize geometry only; they do not need interactive
 // hit-test state or DOM-parent walks.
 collect_hit_test_bounds: bool = true,
@@ -1114,6 +1121,7 @@ pub fn init(
         .iframe_bounds = std.ArrayList(IframeBoundEntry).empty,
         .focus_bounds = std.ArrayList(FocusBoundEntry).empty,
         .accessibility_bounds = std.ArrayList(AccessibilityBoundEntry).empty,
+        .fragment_targets = std.ArrayList(FragmentTarget).empty,
         .style_stack = std.ArrayList(StyleSnapshot).empty,
     };
     errdefer layout.deinit();
@@ -1140,6 +1148,7 @@ pub fn deinit(self: *Layout) void {
     self.iframe_bounds.deinit(self.allocator);
     self.focus_bounds.deinit(self.allocator);
     self.accessibility_bounds.deinit(self.allocator);
+    self.fragment_targets.deinit(self.allocator);
 
     self.display_list.deinit(self.allocator);
     self.style_stack.deinit(self.allocator);
@@ -1162,6 +1171,11 @@ fn recurseNode(self: *Layout, node: Node, node_ptr: ?*Node, line_buffer: *std.Ar
         },
         .element => |e| {
             if (isNonRenderTag(e.tag)) return;
+            // Empty inline anchors have no glyph from which to derive a
+            // position, so retain their insertion point explicitly.
+            if (self.collect_hit_test_bounds and e.children.items.len == 0) {
+                if (node_ptr) |ptr| try self.recordFragmentTargets(ptr, self.cursor_y);
+            }
             // Apply CSS styles before processing this element
             try self.applyNodeStyles(e, line_buffer);
 
@@ -1685,6 +1699,7 @@ fn flushLine(self: *Layout, line_buffer: *std.ArrayList(LineItem)) !void {
                     });
                 }
                 try self.recordLinkBounds(ptr, bounds_x, line_bounds_y, item.width, line_box_height);
+                try self.recordFragmentTargets(ptr, line_bounds_y);
                 if (findFocusableNode(ptr)) |focus_node| {
                     const right = bounds_x + item.width;
                     const bottom = bounds_y + item.height;
@@ -2021,6 +2036,38 @@ fn recordLinkBounds(self: *Layout, node_ptr: *Node, x: i32, y: i32, width: i32, 
             .text => |*txt| {
                 current = txt.parent;
             },
+        }
+    }
+}
+
+fn recordFragmentTargets(self: *Layout, node_ptr: *Node, y: i32) !void {
+    var current: ?*Node = node_ptr;
+    while (current) |ptr| {
+        switch (ptr.*) {
+            .element => |*element| {
+                if (element.attributes) |attrs| {
+                    if (attrs.get("id")) |id| {
+                        if (id.len > 0) {
+                            var found = false;
+                            for (self.fragment_targets.items) |*target| {
+                                if (target.node == ptr) {
+                                    target.y = @min(target.y, y);
+                                    found = true;
+                                    break;
+                                }
+                            }
+                            if (!found) {
+                                try self.fragment_targets.append(self.allocator, .{
+                                    .node = ptr,
+                                    .y = y,
+                                });
+                            }
+                        }
+                    }
+                }
+                current = element.parent;
+            },
+            .text => |*text| current = text.parent,
         }
     }
 }
@@ -3209,6 +3256,7 @@ pub const DocumentLayout = struct {
         engine.iframe_bounds.clearRetainingCapacity();
         engine.focus_bounds.clearRetainingCapacity();
         engine.accessibility_bounds.clearRetainingCapacity();
+        engine.fragment_targets.clearRetainingCapacity();
 
         self.node = self.node_ptr.*;
 
@@ -3592,6 +3640,9 @@ const BlockLayout = struct {
         self.x.set(content_bounds.x);
         self.y.set(prev_y);
         self.width.set(specified_width orelse content_bounds.width);
+        if (engine.collect_hit_test_bounds) {
+            if (self.node_ptr) |ptr| try engine.recordFragmentTargets(ptr, prev_y);
+        }
 
         var is_block = self.isBlockContainer();
         if (self.node == .element) {

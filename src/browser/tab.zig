@@ -83,6 +83,7 @@ pub const Frame = struct {
     iframe_bounds: std.ArrayList(FrameBoundEntry),
     focus_bounds: std.ArrayList(FrameBoundEntry),
     accessibility_bounds: std.ArrayList(FrameBoundEntry),
+    fragment_targets: std.ArrayList(Layout.FragmentTarget),
     viewport_width: i32 = 0,
     viewport_height: i32 = 0,
     window_id: u32 = 0,
@@ -126,6 +127,7 @@ pub const Frame = struct {
             .iframe_bounds = std.ArrayList(FrameBoundEntry).empty,
             .focus_bounds = std.ArrayList(FrameBoundEntry).empty,
             .accessibility_bounds = std.ArrayList(FrameBoundEntry).empty,
+            .fragment_targets = std.ArrayList(Layout.FragmentTarget).empty,
         };
     }
 
@@ -145,6 +147,7 @@ pub const Frame = struct {
         self.iframe_bounds.deinit(self.allocator);
         self.focus_bounds.deinit(self.allocator);
         self.accessibility_bounds.deinit(self.allocator);
+        self.fragment_targets.deinit(self.allocator);
         for (self.children.items) |child| {
             child.deinit();
             self.allocator.destroy(child);
@@ -244,6 +247,116 @@ pub const Frame = struct {
                 .bounds = entry.bounds,
             });
         }
+
+        self.fragment_targets.clearRetainingCapacity();
+        try self.fragment_targets.appendSlice(self.allocator, engine.fragment_targets.items);
+    }
+
+    pub fn scrollOffsetForFragment(self: *const Frame, fragment: []const u8) ?i32 {
+        if (fragment.len == 0) return 0;
+        for (self.fragment_targets.items) |target| {
+            const element = switch (target.node.*) {
+                .element => |*value| value,
+                .text => continue,
+            };
+            const attributes = element.attributes orelse continue;
+            const id = attributes.get("id") orelse continue;
+            if (url_module.fragmentMatchesId(fragment, id)) {
+                return self.tab.clampScrollForFrame(self, target.y);
+            }
+        }
+        return null;
+    }
+
+    pub fn scrollToFragment(self: *Frame, fragment: []const u8) bool {
+        const target_scroll = self.scrollOffsetForFragment(fragment) orelse return false;
+        self.scroll = target_scroll;
+        self.tab.scroll_changed_in_tab = true;
+        return true;
+    }
+
+    fn navigateSameDocumentFragment(self: *Frame, resolved_url: Url) !void {
+        const fragment = resolved_url.fragment() orelse unreachable;
+        const target_scroll = self.scrollOffsetForFragment(fragment);
+
+        const url_ptr = self.allocator.create(Url) catch |err| {
+            resolved_url.free(self.allocator);
+            return err;
+        };
+        url_ptr.* = resolved_url;
+        var url_owned = true;
+        errdefer if (url_owned) {
+            url_ptr.*.free(self.allocator);
+            self.allocator.destroy(url_ptr);
+        };
+
+        if (self.parent == null) {
+            try self.tab.commitHistoryNavigation(url_ptr, .push);
+            url_owned = false;
+            self.current_url = url_ptr;
+            self.current_url_owned = false;
+        } else {
+            if (self.current_url_owned) {
+                if (self.current_url) |old_url| {
+                    old_url.*.free(self.allocator);
+                    self.allocator.destroy(old_url);
+                }
+            }
+            self.current_url = url_ptr;
+            self.current_url_owned = true;
+            url_owned = false;
+        }
+
+        if (target_scroll) |scroll| {
+            self.scroll = scroll;
+            self.tab.scroll_changed_in_tab = true;
+        }
+        // A paint commit carries both the new URL and scroll offset to chrome
+        // without rebuilding or replacing the document.
+        self.tab.setNeedsPaint();
+    }
+
+    fn followLink(self: *Frame, b: *Browser, href: []const u8, button: ClickButton) !void {
+        const current_url_ptr = self.current_url orelse return;
+        var resolved_url = try current_url_ptr.*.resolveForNavigation(self.allocator, href);
+
+        if (button == .middle) {
+            b.queueNewTab(resolved_url) catch |err| {
+                resolved_url.free(self.allocator);
+                std.log.err("Failed to queue new tab for {s}: {any}", .{ href, err });
+            };
+            return;
+        }
+
+        if (current_url_ptr.*.sameDocument(resolved_url) and resolved_url.fragment() != null) {
+            try self.navigateSameDocumentFragment(resolved_url);
+            return;
+        }
+
+        const new_url_ptr = self.allocator.create(Url) catch |alloc_err| {
+            std.log.err("Failed to allocate URL: {any}", .{alloc_err});
+            resolved_url.free(self.allocator);
+            return;
+        };
+        new_url_ptr.* = resolved_url;
+        var url_owned = true;
+        defer if (url_owned) {
+            new_url_ptr.*.free(self.allocator);
+            self.allocator.destroy(new_url_ptr);
+        };
+
+        if (self.parent != null) {
+            b.scheduleFrameLoad(self, new_url_ptr, null) catch |err| {
+                std.log.err("Failed to schedule iframe load for {s}: {any}", .{ href, err });
+                return;
+            };
+        } else {
+            b.scheduleLoad(self.tab, new_url_ptr, null) catch |err| {
+                std.log.err("Failed to schedule load for {s}: {any}", .{ href, err });
+                return;
+            };
+        }
+        url_owned = false;
     }
 
     pub fn dispatchEvent(self: *Frame, event_type: []const u8, node: *Node) bool {
@@ -286,41 +399,7 @@ pub const Frame = struct {
                         if (link_element.attributes) |attrs| {
                             if (attrs.get("href")) |href| {
                                 std.log.info("Link click in window_id={d}: {s}", .{ self.window_id, href });
-                                if (self.current_url) |current_url_ptr| {
-                                    var resolved_url = try current_url_ptr.*.resolveForNavigation(self.allocator, href);
-                                    if (button == .middle) {
-                                        b.queueNewTab(resolved_url) catch |err| {
-                                            resolved_url.free(self.allocator);
-                                            std.log.err("Failed to queue new tab for {s}: {any}", .{ href, err });
-                                        };
-                                        return true;
-                                    }
-
-                                    const new_url_ptr = self.allocator.create(Url) catch |alloc_err| {
-                                        std.log.err("Failed to allocate URL: {any}", .{alloc_err});
-                                        resolved_url.free(self.allocator);
-                                        return true;
-                                    };
-                                    new_url_ptr.* = resolved_url;
-                                    var url_owned = true;
-                                    defer if (url_owned) {
-                                        new_url_ptr.*.free(self.allocator);
-                                        self.allocator.destroy(new_url_ptr);
-                                    };
-
-                                    if (self.parent != null) {
-                                        b.scheduleFrameLoad(self, new_url_ptr, null) catch |err| {
-                                            std.log.err("Failed to schedule iframe load for {s}: {any}", .{ href, err });
-                                            return true;
-                                        };
-                                    } else {
-                                        b.scheduleLoad(self.tab, new_url_ptr, null) catch |err| {
-                                            std.log.err("Failed to schedule load for {s}: {any}", .{ href, err });
-                                            return true;
-                                        };
-                                    }
-                                    url_owned = false;
-                                }
+                                try self.followLink(b, href, button);
                             }
                         }
                     },
@@ -1031,7 +1110,7 @@ fn refreshFocusState(self: *Tab) !void {
     }
 }
 
-pub fn clampScrollForFrame(self: *Tab, frame: *Frame, scroll: i32) i32 {
+pub fn clampScrollForFrame(self: *const Tab, frame: *const Frame, scroll: i32) i32 {
     const zoom = if (self.accessibility.zoom > 0) self.accessibility.zoom else 1.0;
     const viewport_height = if (frame.viewport_height > 0) frame.viewport_height else self.tab_height;
     return clampScrollOffset(scroll, frame.content_height, viewport_height, zoom);
@@ -1729,25 +1808,8 @@ pub fn activateFocusedElement(self: *Tab, b: *Browser) !void {
                 if (!do_default) return;
                 if (e.attributes) |attrs| {
                     if (attrs.get("href")) |href| {
-                        if (frame.current_url) |current_url_ptr| {
-                            const resolved_url = try current_url_ptr.*.resolveForNavigation(self.allocator, href);
-                            const url_ptr = try self.allocator.create(Url);
-                            url_ptr.* = resolved_url;
-                            if (frame.parent != null) {
-                                b.scheduleFrameLoad(frame, url_ptr, null) catch |err| {
-                                    std.log.err("Failed to schedule iframe load for {s}: {any}", .{ href, err });
-                                    url_ptr.*.free(self.allocator);
-                                    self.allocator.destroy(url_ptr);
-                                };
-                            } else {
-                                b.scheduleLoad(self, url_ptr, null) catch |err| {
-                                    std.log.err("Failed to schedule load for {s}: {any}", .{ href, err });
-                                    url_ptr.*.free(self.allocator);
-                                    self.allocator.destroy(url_ptr);
-                                };
-                            }
-                            return;
-                        }
+                        try frame.followLink(b, href, .primary);
+                        return;
                     }
                 }
             }
