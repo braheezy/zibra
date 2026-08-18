@@ -161,6 +161,87 @@ test "address focus consumes editing keys despite stale document focus" {
     ));
 }
 
+test "tab blur clears focused elements across the frame tree" {
+    const allocator = std.testing.allocator;
+
+    var tab: tab_module.Tab = undefined;
+    tab.allocator = allocator;
+    tab.root_frame = null;
+    tab.focused_frame = null;
+    tab.accessibility_focused = null;
+    tab.frames_by_id = std.AutoHashMap(u32, *tab_module.Frame).init(allocator);
+    defer tab.frames_by_id.deinit();
+    tab.parent_window_ids = std.AutoHashMap(u32, u32).init(allocator);
+    defer tab.parent_window_ids.deinit();
+
+    var root = tab_module.Frame.init(allocator, &tab, null, null);
+    defer root.deinit();
+    tab.root_frame = &root;
+
+    const child = try allocator.create(tab_module.Frame);
+    var child_owned = true;
+    errdefer if (child_owned) {
+        child.deinit();
+        allocator.destroy(child);
+    };
+    child.* = tab_module.Frame.init(allocator, &tab, &root, null);
+    try root.children.append(allocator, child);
+    child_owned = false;
+
+    var root_parser = try parser_module.HTMLParser.init(
+        allocator,
+        "<html><body><input name=root></body></html>",
+    );
+    defer root_parser.deinit(allocator);
+    root.current_node = try root_parser.parse();
+    parser_module.fixParentPointers(&root.current_node.?, null);
+
+    var child_parser = try parser_module.HTMLParser.init(
+        allocator,
+        "<html><body><input name=child></body></html>",
+    );
+    defer child_parser.deinit(allocator);
+    child.current_node = try child_parser.parse();
+    parser_module.fixParentPointers(&child.current_node.?, null);
+
+    const root_input = find_root_input: {
+        var nodes = std.ArrayList(*parser_module.Node).empty;
+        defer nodes.deinit(allocator);
+        try parser_module.treeToList(allocator, &root.current_node.?, &nodes);
+        for (nodes.items) |node| {
+            if (node.* == .element and std.ascii.eqlIgnoreCase(node.element.tag, "input")) {
+                break :find_root_input node;
+            }
+        }
+        return error.TestInputMissing;
+    };
+    const child_input = find_child_input: {
+        var nodes = std.ArrayList(*parser_module.Node).empty;
+        defer nodes.deinit(allocator);
+        try parser_module.treeToList(allocator, &child.current_node.?, &nodes);
+        for (nodes.items) |node| {
+            if (node.* == .element and std.ascii.eqlIgnoreCase(node.element.tag, "input")) {
+                break :find_child_input node;
+            }
+        }
+        return error.TestInputMissing;
+    };
+
+    root_input.element.is_focused = true;
+    root.focus = root_input;
+    child_input.element.is_focused = true;
+    child.focus = child_input;
+    tab.focused_frame = child;
+
+    try std.testing.expect(tab.blur());
+    try std.testing.expect(root.focus == null);
+    try std.testing.expect(child.focus == null);
+    try std.testing.expect(!root_input.element.is_focused);
+    try std.testing.expect(!child_input.element.is_focused);
+    try std.testing.expect(tab.focused_frame == null);
+    try std.testing.expect(!tab.blur());
+}
+
 test "address input inserts at the cursor and backspace deletes before it" {
     var chrome = initTestChrome(std.testing.allocator);
     defer chrome.deinit();

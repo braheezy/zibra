@@ -51,6 +51,11 @@ before changing `root.zig`, `tab.zig`, `render/`, or browser task scheduling.
   no payload, while an explicit case-insensitive POST keeps that encoding in
   the owned request body. Inputs outside forms and known non-text input types
   do not implicitly submit.
+- Before chrome or another DOM target takes focus, enqueue or call `Tab.blur`
+  first; it clears focused state across the complete frame tree, resets
+  accessibility focus, and triggers a repaint when a content cursor was
+  removed. Address-bar transitions preserve tab-worker ownership by enqueueing
+  that blur instead of mutating frame focus directly from the UI thread.
 - Each tab owns an indexed root-navigation history. Successful ordinary
   navigation truncates entries after the current index before appending; Back
   and Forward retain the list and move the index only after the replacement

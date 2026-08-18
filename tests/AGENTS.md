@@ -39,6 +39,10 @@ does not submit.
 server that GET submission puts encoded controls in the URL query and sends no
 POST body.
 
+`tests/manual/focus-blur.html` verifies that moving focus between content and
+the address bar leaves exactly one visible cursor and clears the old focused
+input styling.
+
 `tests/manual/display-list-hit-testing.html` exercises painted-fragment,
 translation, rounded-clip, overlap, and iframe click routing. Only the visible
 topmost painted target should activate; its child and destination pages are

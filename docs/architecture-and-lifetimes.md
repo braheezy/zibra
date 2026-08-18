@@ -557,6 +557,13 @@ Focus, blur, and successful submission reset the cursor; chrome rasterization
 measures the glyph prefix before the cursor to place the visible caret. Address
 focus takes precedence over retained DOM focus for text, Return, Space, and
 Backspace routing, including editing operations that are no-ops at a boundary.
+Focus ownership also has a visual handoff: a chrome click queues `Tab.blur`
+before chrome selects its new focus, while content clicks, keyboard traversal,
+and accessibility activation call the same blur before selecting a DOM node.
+Blur clears every frame-local focus and
+`is_focused` marker in the tab, resets accessibility focus, and requests paint
+when it removed a content cursor. The chrome path never mutates those DOM
+borrows directly.
 Once Return is routed to page content, `Tab.enter` distinguishes text entry
 from generic activation: a focused text input dispatches `keydown`, finds its
 containing form, dispatches the cancelable `submit` event, collects the current

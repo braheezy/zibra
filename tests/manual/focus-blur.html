@@ -1,0 +1,25 @@
+<!--
+How to verify:
+1. Click the first text entry. It must show the content caret.
+2. Click the address bar. Only the red address-bar caret may remain; the page
+   caret and focused-input styling must disappear.
+3. Click the second text entry. The address caret must disappear and only the
+   second content caret may be visible.
+-->
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <title>Content and chrome focus blur</title>
+    <style>
+      body { font: 18px sans-serif; margin: 32px; max-width: 720px; }
+      section { background-color: #e8f2ff; border-radius: 10px; margin: 16px 0; padding: 18px; }
+      input { font-size: 18px; padding: 6px; }
+    </style>
+  </head>
+  <body>
+    <h1>Only one focus cursor</h1>
+    <section><label>First entry: <input name="first" value="first"></label></section>
+    <section><label>Second entry: <input name="second" value="second"></label></section>
+  </body>
+</html>

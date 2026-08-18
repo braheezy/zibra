@@ -1629,19 +1629,9 @@ pub fn clickDevice(
     const frame = self.root_frame orelse return;
 
     if (button == .primary) {
-        if (self.focused_frame) |focused| {
-            if (focused.focus) |focus_node| {
-                switch (focus_node.*) {
-                    .element => |*e| {
-                        e.is_focused = false;
-                        parser.dirtyStyleForElement(e);
-                    },
-                    else => {},
-                }
-                focused.focus = null;
-            }
-        }
+        const focus_changed = self.blur();
         self.focused_frame = frame;
+        if (focus_changed) self.setNeedsRender();
     }
 
     const handled = try frame.clickDevice(b, device_x, device_y, button, zoom);
@@ -1967,17 +1957,6 @@ pub fn cycleFocus(self: *Tab, b: *Browser, reverse: bool) !void {
     try self.collectFocusableElements(frame, &focusables);
     if (focusables.items.len == 0) return;
 
-    // Clear current focus
-    if (frame.focus) |focus_node| {
-        switch (focus_node.*) {
-            .element => |*e| {
-                e.is_focused = false;
-                parser.dirtyStyleForElement(e);
-            },
-            else => {},
-        }
-    }
-
     var found_index: ?usize = null;
     if (frame.focus) |current_focus| {
         for (focusables.items, 0..) |elem, i| {
@@ -1987,6 +1966,8 @@ pub fn cycleFocus(self: *Tab, b: *Browser, reverse: bool) !void {
             }
         }
     }
+
+    _ = self.blur();
 
     const next_index = if (found_index) |i| blk: {
         if (reverse) {
@@ -2098,9 +2079,8 @@ pub fn enter(self: *Tab, b: *Browser) !bool {
     return false;
 }
 
-// Clear focus (for Escape key)
-pub fn clearFocus(self: *Tab, b: *Browser) !void {
-    const frame = self.focused_frame orelse self.root_frame orelse return;
+fn blurFrame(frame: *Frame) bool {
+    var changed = false;
     if (frame.focus) |focus_node| {
         switch (focus_node.*) {
             .element => |*e| {
@@ -2110,9 +2090,21 @@ pub fn clearFocus(self: *Tab, b: *Browser) !void {
             else => {},
         }
         frame.focus = null;
-        self.updateAccessibilityFocus(b);
-        self.setNeedsRender();
+        changed = true;
     }
+    for (frame.children.items) |child| {
+        if (blurFrame(child)) changed = true;
+    }
+    return changed;
+}
+
+/// Remove every DOM focus in this tab before another focus owner is selected.
+/// Returns whether a focused element changed and therefore needs repainting.
+pub fn blur(self: *Tab) bool {
+    const changed = if (self.root_frame) |root| blurFrame(root) else false;
+    self.focused_frame = null;
+    self.accessibility_focused = null;
+    return changed;
 }
 
 // Handle keypress in focused input
@@ -2730,6 +2722,8 @@ fn commandClick(self: *Tab, query: []const u8) void {
     if (self.findAccessibilityByName(root, query)) |node| {
         self.accessibility_highlight = node;
         if (node.dom_node) |dom| {
+            _ = self.blur();
+            self.focused_frame = frame;
             frame.focus = dom;
             if (frame.focus) |focus_node| {
                 switch (focus_node.*) {

@@ -2086,7 +2086,7 @@ pub const Browser = struct {
                 self.lock.unlock();
                 if (should_clear_focus) {
                     if (tab_to_clear) |active_tab| {
-                        self.scheduleTabClearFocusTask(active_tab);
+                        self.scheduleTabBlurTask(active_tab);
                     }
                 }
                 // Chrome-only update (clear focus UI); avoid recomposite if the display list is unchanged.
@@ -2158,6 +2158,15 @@ pub const Browser = struct {
         self.lock.lock();
         const chrome_bottom = self.chrome.bottom;
         if (screen_y < chrome_bottom) {
+            const tab_to_blur = self.activeTab();
+            self.lock.unlock();
+
+            // Tab focus is worker-owned. Queue its blur before chrome changes
+            // focus so a preceding content click and this chrome click retain
+            // their event order on the serialized tab worker.
+            if (tab_to_blur) |active_tab| self.scheduleTabBlurTask(active_tab);
+
+            self.lock.lock();
             self.focus = null;
             self.lock.unlock();
             var chrome_changed = try self.chrome.click(self, screen_x, screen_y);
@@ -2342,18 +2351,18 @@ pub const Browser = struct {
         };
     }
 
-    fn scheduleTabClearFocusTask(self: *Browser, tab: *Tab) void {
-        const ctx = TabClearFocusTaskContext.create(self.allocator, self, tab) catch |err| {
-            std.log.err("Failed to allocate clear focus task: {}", .{err});
+    fn scheduleTabBlurTask(self: *Browser, tab: *Tab) void {
+        const ctx = TabBlurTaskContext.create(self.allocator, self, tab) catch |err| {
+            std.log.err("Failed to allocate tab blur task: {}", .{err});
             return;
         };
         const task_instance = Task.init(
             ctx.toOpaque(),
-            TabClearFocusTaskContext.runOpaque,
-            TabClearFocusTaskContext.cleanupOpaque,
+            TabBlurTaskContext.runOpaque,
+            TabBlurTaskContext.cleanupOpaque,
         );
         tab.task_runner.schedule(task_instance) catch |err| {
-            std.log.err("Failed to schedule clear focus: {}", .{err});
+            std.log.err("Failed to schedule tab blur: {}", .{err});
             ctx.destroy();
             return;
         };
@@ -6319,7 +6328,7 @@ const TabBackspaceTaskContext = struct {
     }
 };
 
-const TabClearFocusTaskContext = struct {
+const TabBlurTaskContext = struct {
     allocator: std.mem.Allocator,
     browser: *Browser,
     tab: *Tab,
@@ -6328,8 +6337,8 @@ const TabClearFocusTaskContext = struct {
         allocator: std.mem.Allocator,
         browser: *Browser,
         tab: *Tab,
-    ) !*TabClearFocusTaskContext {
-        const ctx = try allocator.create(TabClearFocusTaskContext);
+    ) !*TabBlurTaskContext {
+        const ctx = try allocator.create(TabBlurTaskContext);
         ctx.* = .{
             .allocator = allocator,
             .browser = browser,
@@ -6338,29 +6347,32 @@ const TabClearFocusTaskContext = struct {
         return ctx;
     }
 
-    fn destroy(self: *TabClearFocusTaskContext) void {
+    fn destroy(self: *TabBlurTaskContext) void {
         self.allocator.destroy(self);
     }
 
-    fn run(self: *TabClearFocusTaskContext) !void {
-        try self.tab.clearFocus(self.browser);
+    fn run(self: *TabBlurTaskContext) !void {
+        if (self.tab.blur()) {
+            self.tab.updateAccessibilityFocus(self.browser);
+            self.tab.setNeedsRender();
+        }
     }
 
-    fn toOpaque(self: *TabClearFocusTaskContext) *anyopaque {
+    fn toOpaque(self: *TabBlurTaskContext) *anyopaque {
         return @ptrCast(self);
     }
 
-    fn fromOpaque(context: *anyopaque) *TabClearFocusTaskContext {
-        const raw: *align(1) TabClearFocusTaskContext = @ptrCast(context);
+    fn fromOpaque(context: *anyopaque) *TabBlurTaskContext {
+        const raw: *align(1) TabBlurTaskContext = @ptrCast(context);
         return @alignCast(raw);
     }
 
     fn runOpaque(context: *anyopaque) anyerror!void {
-        try TabClearFocusTaskContext.fromOpaque(context).run();
+        try TabBlurTaskContext.fromOpaque(context).run();
     }
 
     fn cleanupOpaque(context: *anyopaque) void {
-        TabClearFocusTaskContext.fromOpaque(context).destroy();
+        TabBlurTaskContext.fromOpaque(context).destroy();
     }
 };
 
