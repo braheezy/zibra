@@ -2638,6 +2638,8 @@ const InputLayout = struct {
     bgcolor: browser.Color = .{ .r = 173, .g = 216, .b = 230, .a = 255 }, // lightblue
     text: []const u8 = "",
     is_focused: bool = false,
+    is_checkbox: bool = false,
+    is_checked: bool = false,
 
     fn init(allocator: std.mem.Allocator) InputLayout {
         return .{
@@ -2655,6 +2657,11 @@ const InputLayout = struct {
         self.font_family = engine.activeFontFamily();
         self.font_size = engine.scaledFontSize(engine.size);
         self.color = engine.text_color;
+        self.is_checkbox = element.isCheckbox();
+        self.is_checked = element.isChecked();
+        if (self.is_checkbox) {
+            self.bgcolor = .{ .r = 255, .g = 255, .b = 255, .a = 255 };
+        }
 
         if (element.style) |*style_map| {
             if (styleValue(style_map, "background-color")) |bg| {
@@ -2664,7 +2671,9 @@ const InputLayout = struct {
             }
         }
 
-        if (std.mem.eql(u8, element.tag, "input")) {
+        if (self.is_checkbox) {
+            self.text = "";
+        } else if (std.mem.eql(u8, element.tag, "input")) {
             if (element.attributes) |attrs| {
                 self.text = attrs.get("value") orelse "";
             }
@@ -2690,8 +2699,9 @@ const InputLayout = struct {
         const ascent_value = engine.toLayoutPx(glyph.ascent);
         const descent_value = engine.toLayoutPx(glyph.descent);
         const height_value = ascent_value + descent_value;
+        const width_value = if (self.is_checkbox) height_value else INPUT_WIDTH_PX;
         self.embed.setupDependencies(engine.inline_block, if (element.style) |*map| map else null);
-        self.embed.setMetrics(INPUT_WIDTH_PX, height_value, ascent_value, descent_value, engine.zoom(), self.font_size);
+        self.embed.setMetrics(width_value, height_value, ascent_value, descent_value, engine.zoom(), self.font_size);
         self.is_focused = element.is_focused;
     }
 
@@ -2718,6 +2728,52 @@ const InputLayout = struct {
                     .source = source,
                 },
             });
+        }
+
+        if (self.is_checkbox) {
+            const ink = engine.remapColor(.{ .r = 48, .g = 48, .b = 48, .a = 255 });
+            try commands.append(engine.allocator, DisplayItem{
+                .outline = .{
+                    .rect = .{
+                        .left = x,
+                        .top = y,
+                        .right = x + width_value,
+                        .bottom = y + height_value,
+                    },
+                    .color = ink,
+                    .thickness = 1,
+                    .source = source,
+                },
+            });
+            if (self.is_checked) {
+                const padding = @max(@divTrunc(height_value, 5), 2);
+                const joint_x = x + @divTrunc(width_value, 2) - 1;
+                const joint_y = y + height_value - padding;
+                const thickness = @max(@divTrunc(height_value, 7), 1);
+                try commands.append(engine.allocator, DisplayItem{
+                    .line = .{
+                        .x1 = x + padding,
+                        .y1 = y + @divTrunc(height_value, 2),
+                        .x2 = joint_x,
+                        .y2 = joint_y,
+                        .color = ink,
+                        .thickness = thickness,
+                        .source = source,
+                    },
+                });
+                try commands.append(engine.allocator, DisplayItem{
+                    .line = .{
+                        .x1 = joint_x,
+                        .y1 = joint_y,
+                        .x2 = x + width_value - padding,
+                        .y2 = y + padding,
+                        .color = ink,
+                        .thickness = thickness,
+                        .source = source,
+                    },
+                });
+            }
+            return;
         }
 
         var text_x = x + 2;

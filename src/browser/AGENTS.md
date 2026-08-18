@@ -56,6 +56,10 @@ before changing `root.zig`, `tab.zig`, `render/`, or browser task scheduling.
   accessibility focus, and triggers a repaint when a content cursor was
   removed. Address-bar transitions preserve tab-worker ownership by enqueueing
   that blur instead of mutating frame focus directly from the UI thread.
+- Checkbox state is the presence of the DOM `checked` attribute, not a second
+  widget-owned boolean. Primary or focused activation dispatches the cancelable
+  click first, then toggles that attribute and repaints. Form encoding omits
+  unchecked checkboxes and uses `on` for a checked checkbox without `value`.
 - Each tab owns an indexed root-navigation history. Successful ordinary
   navigation truncates entries after the current index before appending; Back
   and Forward retain the list and move the index only after the replacement

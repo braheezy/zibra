@@ -43,6 +43,10 @@ POST body.
 the address bar leaves exactly one visible cursor and clears the old focused
 input styling.
 
+`tests/manual/checkboxes.html` verifies checked and unchecked painting, click
+toggles, omission of unchecked controls, explicit values, and the default
+checked value `on` through a localhost GET submission.
+
 `tests/manual/display-list-hit-testing.html` exercises painted-fragment,
 translation, rounded-clip, overlap, and iframe click routing. Only the visible
 topmost painted target should activate; its child and destination pages are

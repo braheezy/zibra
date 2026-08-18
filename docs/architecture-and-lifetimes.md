@@ -572,6 +572,14 @@ form action resolves against the current document. The missing/invalid method
 default is GET: its encoded data replaces the action query and the scheduled
 network request has a null payload. An explicit case-insensitive POST instead
 transfers the owned encoded buffer to the load task after successful scheduling.
+Checkboxes keep no parallel widget state: the boolean state is the presence of
+the DOM `checked` attribute. Layout reads it to paint the mark, and a default
+activation toggles it only after the cancelable click event permits the action.
+When encoding successful controls, unchecked checkboxes are omitted; a checked
+checkbox contributes its explicit `value`, or the static default `on` when that
+attribute is absent. The `checked` key inserted by activation and its empty
+value are static slices, while parser-provided attributes continue to borrow
+the document buffer.
 Space continues to use only focused-element activation, and a text input outside
 a form does nothing.
 Primary same-document fragment links stay on the tab worker: they resolve the

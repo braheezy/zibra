@@ -381,6 +381,70 @@ test "POST form plans preserve the action and carry the encoded body" {
     try std.testing.expect(plan.owned_action == null);
 }
 
+test "checkbox controls toggle attribute state and encode only when checked" {
+    const allocator = std.testing.allocator;
+    const html =
+        "<html><body><form>" ++
+        "<input name=plain value='hi there'>" ++
+        "<input type=checkbox name=off value=no>" ++
+        "<input type=ChEcKbOx name=default checked>" ++
+        "<input type=checkbox name=custom checked=false value='yes &amp; more'>" ++
+        "<input type=checkbox checked value=nameless>" ++
+        "</form></body></html>";
+
+    var html_parser = try parser_module.HTMLParser.init(allocator, html);
+    defer html_parser.deinit(allocator);
+    var root = try html_parser.parse();
+    defer root.deinit(allocator);
+    parser_module.fixParentPointers(&root, null);
+
+    var nodes = std.ArrayList(*parser_module.Node).empty;
+    defer nodes.deinit(allocator);
+    try parser_module.treeToList(allocator, &root, &nodes);
+
+    var form: ?*parser_module.Node = null;
+    var unchecked: ?*parser_module.Element = null;
+    var default_value: ?*parser_module.Element = null;
+    for (nodes.items) |node| {
+        switch (node.*) {
+            .element => |*element| {
+                if (std.ascii.eqlIgnoreCase(element.tag, "form")) form = node;
+                if (!element.isCheckbox()) continue;
+                const attributes = element.attributes orelse continue;
+                const name = attributes.get("name") orelse continue;
+                if (std.mem.eql(u8, name, "off")) unchecked = element;
+                if (std.mem.eql(u8, name, "default")) default_value = element;
+            },
+            .text => {},
+        }
+    }
+
+    try std.testing.expect(form != null);
+    try std.testing.expect(unchecked != null);
+    try std.testing.expect(default_value != null);
+    try std.testing.expect(!unchecked.?.isChecked());
+    try std.testing.expect(default_value.?.isChecked());
+
+    const initial = try tab_module.encodeFormData(allocator, form.?);
+    defer allocator.free(initial);
+    try std.testing.expectEqualStrings(
+        "plain=hi%20there&default=on&custom=yes%20%26%20more",
+        initial,
+    );
+
+    try std.testing.expect(try unchecked.?.toggleChecked());
+    try std.testing.expect(!try default_value.?.toggleChecked());
+    try std.testing.expect(unchecked.?.isChecked());
+    try std.testing.expect(!default_value.?.isChecked());
+
+    const toggled = try tab_module.encodeFormData(allocator, form.?);
+    defer allocator.free(toggled);
+    try std.testing.expectEqualStrings(
+        "plain=hi%20there&off=no&custom=yes%20%26%20more",
+        toggled,
+    );
+}
+
 test "mouse wheel delta preserves magnitude and normalizes direction" {
     try std.testing.expectEqual(@as(i32, -100), browser.wheelScrollDelta(1, false));
     try std.testing.expectEqual(@as(i32, 300), browser.wheelScrollDelta(-3, false));

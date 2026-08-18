@@ -1,0 +1,30 @@
+<!doctype html>
+<!--
+How to verify:
+1. Serve tests/manual, for example:
+   python3 -m http.server 8000 --directory tests/manual
+2. Open http://127.0.0.1:8000/checkboxes.html in Zibra.
+3. "Default value" and "Remove me" start checked; "Explicit value" starts unchecked.
+4. Click "Explicit value" to check it and "Remove me" to uncheck it.
+5. Submit. The target URL must end in form-get-target.html?first=on&second=kept.
+   The unchecked third control must be absent and the request must have no POST body.
+-->
+<html>
+<head>
+  <title>Checkbox regression</title>
+  <style>
+    body { font: 18px sans-serif; }
+    label { display: block; margin: 12px; }
+    button { margin: 12px; }
+  </style>
+</head>
+<body>
+  <h1>Checkboxes</h1>
+  <form action="form-get-target.html" method="get">
+    <label><input type="checkbox" name="first" checked> Default value</label>
+    <label><input type="checkbox" name="second" value="kept"> Explicit value</label>
+    <label><input type="checkbox" name="third" value="removed" checked> Remove me</label>
+    <button>Submit</button>
+  </form>
+</body>
+</html>

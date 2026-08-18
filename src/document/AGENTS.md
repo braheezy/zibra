@@ -43,6 +43,10 @@ or selector/rule lifetime.
 - `Element.is_visited` is a non-owning browser-session annotation. Link URL
   storage stays in the session owner; layout may inspect the annotation only
   through the current document's synchronous parent chain during paint.
+- Checkbox state is represented only by presence or absence of the borrowed
+  `checked` attribute entry. Activation may insert the static empty value or
+  remove that entry; it must not replace the control's independent `value`.
+  Layout and successful-control serialization read the same attribute state.
 - `inspection.Page.load` returns its DOM by value. Call
   `Page.repairParentPointers` after the returned page reaches its final address
   and before layout/paint performs any ancestry walk.

@@ -484,7 +484,11 @@ pub const Frame = struct {
                     if (button == .primary and std.ascii.eqlIgnoreCase(e.tag, "input")) {
                         const do_default = self.dispatchEvent("click", node_ptr);
                         if (!do_default) return true;
-                        if (e.attributes) |*attrs| try attrs.put("value", "");
+                        if (e.isCheckbox()) {
+                            _ = try e.toggleChecked();
+                        } else if (e.attributes) |*attrs| {
+                            try attrs.put("value", "");
+                        }
                         e.is_focused = true;
                         parser.dirtyStyleForElement(e);
                         self.focus = node_ptr;
@@ -1784,6 +1788,42 @@ fn submitForm(self: *Tab, b: *Browser, frame: *Frame, control_node: *Node) !bool
     return false;
 }
 
+/// Encode the form's named input controls. Unchecked checkboxes are not
+/// successful controls; checked checkboxes use `on` when no value is present.
+pub fn encodeFormData(allocator: std.mem.Allocator, form_node: *Node) ![]u8 {
+    var node_list = std.ArrayList(*Node).empty;
+    defer node_list.deinit(allocator);
+    try parser.treeToList(allocator, form_node, &node_list);
+
+    var body = std.ArrayList(u8).empty;
+    defer body.deinit(allocator);
+    var wrote_pair = false;
+
+    for (node_list.items) |node_ptr| {
+        switch (node_ptr.*) {
+            .element => |*element| {
+                if (!std.ascii.eqlIgnoreCase(element.tag, "input")) continue;
+                const attributes = element.attributes orelse continue;
+                const name = attributes.get("name") orelse continue;
+                if (element.isCheckbox() and !element.isChecked()) continue;
+                const value = if (element.isCheckbox())
+                    attributes.get("value") orelse "on"
+                else
+                    attributes.get("value") orelse "";
+
+                if (wrote_pair) try body.append(allocator, '&');
+                try percentEncode(allocator, name, &body);
+                try body.append(allocator, '=');
+                try percentEncode(allocator, value, &body);
+                wrote_pair = true;
+            },
+            .text => {},
+        }
+    }
+
+    return body.toOwnedSlice(allocator);
+}
+
 // Collect form inputs and submit according to the form's GET/POST method.
 fn submitFormData(
     self: *Tab,
@@ -1793,59 +1833,7 @@ fn submitFormData(
     action: []const u8,
     method: FormMethod,
 ) !void {
-    // Get all descendents of the form
-    var node_list = std.ArrayList(*Node).empty;
-    defer node_list.deinit(self.allocator);
-
-    try parser.treeToList(self.allocator, form_node, &node_list);
-
-    // Collect all input elements with name attributes
-    var inputs = std.ArrayList(*Node).empty;
-    defer inputs.deinit(self.allocator);
-
-    for (node_list.items) |node_ptr| {
-        switch (node_ptr.*) {
-            .element => |e| {
-                if (std.mem.eql(u8, e.tag, "input")) {
-                    if (e.attributes) |attrs| {
-                        if (attrs.get("name")) |_| {
-                            try inputs.append(self.allocator, node_ptr);
-                        }
-                    }
-                }
-            },
-            else => {},
-        }
-    }
-
-    // Build the form-encoded body
-    var body = std.ArrayList(u8).empty;
-    defer body.deinit(self.allocator);
-
-    for (inputs.items, 0..) |input_node, i| {
-        switch (input_node.*) {
-            .element => |e| {
-                if (e.attributes) |attrs| {
-                    const name = attrs.get("name") orelse continue;
-                    const value = attrs.get("value") orelse "";
-
-                    // Add ampersand separator (except for first item)
-                    if (i > 0) {
-                        try body.append(self.allocator, '&');
-                    }
-
-                    // Percent-encode and append name=value
-                    try percentEncode(self.allocator, name, &body);
-                    try body.append(self.allocator, '=');
-                    try percentEncode(self.allocator, value, &body);
-                }
-            },
-            else => {},
-        }
-    }
-
-    // Get the form body
-    const body_slice = try body.toOwnedSlice(self.allocator);
+    const body_slice = try encodeFormData(self.allocator, form_node);
     var body_owned = true;
     defer if (body_owned) {
         self.allocator.free(body_slice);
@@ -2002,6 +1990,14 @@ pub fn activateFocusedElement(self: *Tab, b: *Browser) !void {
     switch (node_ptr.*) {
         .element => |*e| {
             if (std.mem.eql(u8, e.tag, "input")) {
+                if (e.isCheckbox()) {
+                    const do_default = frame.dispatchEvent("click", node_ptr);
+                    if (!do_default) return;
+                    _ = try e.toggleChecked();
+                    parser.dirtyStyleForElement(e);
+                    self.setNeedsRender();
+                    return;
+                }
                 if (e.attributes) |attrs| {
                     if (attrs.get("type")) |raw_type| {
                         if (std.mem.eql(u8, raw_type, "submit") or std.mem.eql(u8, raw_type, "button")) {
@@ -2071,6 +2067,8 @@ pub fn enter(self: *Tab, b: *Browser) !bool {
                 if (!do_default) return false;
                 return self.submitForm(b, frame, focus_node);
             }
+            // Checkboxes use Space/default activation rather than Return.
+            if (element.isCheckbox()) return false;
         },
         .text => {},
     }
@@ -2401,6 +2399,7 @@ fn accessibilityRole(element: *const parser.Element) []const u8 {
     if (std.mem.eql(u8, element.tag, "a")) return "link";
     if (std.mem.eql(u8, element.tag, "button")) return "button";
     if (std.mem.eql(u8, element.tag, "input")) {
+        if (element.isCheckbox()) return "checkbox";
         if (element.attributes) |attrs| {
             if (attrs.get("type")) |raw_type| {
                 if (std.mem.eql(u8, raw_type, "submit") or std.mem.eql(u8, raw_type, "button")) {

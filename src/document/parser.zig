@@ -299,6 +299,34 @@ pub const Element = struct {
         }
     }
 
+    /// Checkbox state lives in the DOM attribute map so layout, activation,
+    /// and form submission all observe the same source of truth.
+    pub fn isCheckbox(self: *const Element) bool {
+        if (!std.ascii.eqlIgnoreCase(self.tag, "input")) return false;
+        const attributes = self.attributes orelse return false;
+        const input_type = attributes.get("type") orelse return false;
+        return std.ascii.eqlIgnoreCase(std.mem.trim(u8, input_type, " \t\r\n"), "checkbox");
+    }
+
+    pub fn isChecked(self: *const Element) bool {
+        if (!self.isCheckbox()) return false;
+        const attributes = self.attributes orelse return false;
+        return attributes.get("checked") != null;
+    }
+
+    /// Toggle a checkbox's boolean `checked` attribute and return its new
+    /// state. Attribute keys and values borrow either document storage or the
+    /// static strings inserted here; the map never takes string ownership.
+    pub fn toggleChecked(self: *Element) !bool {
+        if (!self.isCheckbox()) return false;
+        if (self.attributes) |*attributes| {
+            if (attributes.remove("checked")) return false;
+            try attributes.put("checked", "");
+            return true;
+        }
+        unreachable;
+    }
+
     fn parse(self: *Element, al: std.mem.Allocator, raw: []const u8) !void {
         var idx: usize = 0;
         // Skip any leading whitespace.
