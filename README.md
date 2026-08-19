@@ -60,7 +60,13 @@ python3 server.py
 
 Then open `http://127.0.0.1:8005/`. Sign in with one of the tutorial accounts
 (for example `a` / `b`) to create topics and post messages. Each topic has its
-own root-level URL, such as `/cooking` or `/cars`.
+own root-level URL, such as `/cooking` or `/cars`. The server atomically saves
+the whole board to `message_board.json`, so topics and messages survive a
+restart. Set `ZIBRA_BOARD_DATA` to use a different data-file path:
+
+```sh
+ZIBRA_BOARD_DATA=/path/to/my-board.json python3 server.py
+```
 
 See [Architecture and lifetimes](docs/architecture-and-lifetimes.md) for the source map, ownership contracts, threading model, and known lifetime risks.
 

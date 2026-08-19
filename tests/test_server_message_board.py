@@ -1,6 +1,6 @@
-import copy
 import importlib.util
 from pathlib import Path
+import tempfile
 import unittest
 import urllib.parse
 
@@ -9,7 +9,6 @@ ROOT = Path(__file__).resolve().parents[1]
 SPEC = importlib.util.spec_from_file_location("zibra_server", ROOT / "server.py")
 server = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(server)
-INITIAL_TOPICS = copy.deepcopy(server.TOPICS)
 
 
 def request(session, method, path, params=None):
@@ -19,10 +18,14 @@ def request(session, method, path, params=None):
 
 class MessageBoardTests(unittest.TestCase):
     def setUp(self):
-        server.TOPICS.clear()
-        server.TOPICS.update(copy.deepcopy(INITIAL_TOPICS))
+        self.temporary_directory = tempfile.TemporaryDirectory()
+        server.DATA_PATH = Path(self.temporary_directory.name) / "message_board.json"
+        server.TOPICS = server.default_topics()
         server.ENTRIES = server.TOPICS["general"]["messages"]
         server.SESSIONS.clear()
+
+    def tearDown(self):
+        self.temporary_directory.cleanup()
 
     def test_home_lists_each_topic_at_its_own_url(self):
         status, body = request({}, "GET", "/")
@@ -120,6 +123,81 @@ class MessageBoardTests(unittest.TestCase):
         )
         self.assertEqual("400 Bad Request", status)
         self.assertNotIn("login", server.TOPICS)
+
+    def test_topics_and_messages_survive_a_simulated_restart(self):
+        session = {"user": "a", "nonce": "create"}
+        status, _ = request(
+            session,
+            "POST",
+            "/new-topic",
+            {
+                "topic": "Persistence",
+                "description": "State that outlives the process.",
+                "nonce": "create",
+            },
+        )
+        self.assertEqual("200 OK", status)
+
+        status, _ = request(
+            session,
+            "POST",
+            "/persistence/add",
+            {"message": "Still here after restart.", "nonce": session["nonce"]},
+        )
+        self.assertEqual("200 OK", status)
+        self.assertTrue(server.DATA_PATH.is_file())
+
+        server.TOPICS = server.default_topics()
+        server.ENTRIES = server.TOPICS["general"]["messages"]
+        server.initialize_storage(server.DATA_PATH)
+
+        self.assertIn("persistence", server.TOPICS)
+        self.assertEqual(
+            [("Still here after restart.", "a")],
+            server.TOPICS["persistence"]["messages"],
+        )
+        status, topic = request({}, "GET", "/persistence")
+        self.assertEqual("200 OK", status)
+        self.assertIn("Still here after restart.", topic)
+
+    def test_invalid_storage_is_rejected_without_replacing_live_state(self):
+        server.DATA_PATH.write_text('{"version": 99, "topics": {}}', encoding="utf8")
+        live_topics = server.TOPICS
+
+        with self.assertRaisesRegex(ValueError, "version"):
+            server.initialize_storage(server.DATA_PATH)
+
+        self.assertIs(live_topics, server.TOPICS)
+        self.assertEqual(
+            '{"version": 99, "topics": {}}',
+            server.DATA_PATH.read_text(encoding="utf8"),
+        )
+
+    def test_failed_writes_roll_back_in_memory_mutations(self):
+        server.DATA_PATH = Path(self.temporary_directory.name)
+        session = {"user": "a", "nonce": "topic"}
+
+        status, response = request(
+            session,
+            "POST",
+            "/new-topic",
+            {"topic": "Must Roll Back", "nonce": "topic"},
+        )
+        self.assertEqual("500 Internal Server Error", status)
+        self.assertNotIn("must-roll-back", server.TOPICS)
+        self.assertIn("could not be saved", response)
+
+        before = list(server.TOPICS["cars"]["messages"])
+        session["nonce"] = "message"
+        status, response = request(
+            session,
+            "POST",
+            "/cars/add",
+            {"message": "Do not retain me.", "nonce": "message"},
+        )
+        self.assertEqual("500 Internal Server Error", status)
+        self.assertEqual(before, server.TOPICS["cars"]["messages"])
+        self.assertIn("could not be saved", response)
 
 
 if __name__ == "__main__":

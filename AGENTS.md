@@ -58,7 +58,8 @@ architecture document.
   display-list commands when changing document-pipeline diagnostics.
 - On macOS, run `zig build test-screenshot` for the windowless software-rendering fixtures.
 - Run `python3 -m unittest tests/test_server_message_board.py` after changing
-  the tutorial server's routing, session, topic, or message behavior.
+  the tutorial server's routing, session, topic, message, or persistence
+  behavior.
 - Put human-facing regressions in `tests/manual/` with a short verification
   comment. Use the `zibra-screenshot` skill for Linux/Xvfb captures when a
   screenshot is required.

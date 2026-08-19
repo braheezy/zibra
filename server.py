@@ -1,40 +1,16 @@
 import html
+import json
+import os
+from pathlib import Path
 import random
 import re
 import socket
+import tempfile
 import unicodedata
 import urllib.parse
 
 
 SESSIONS = {}
-
-# Keep the tutorial's original entries as the seed for a General topic. The
-# alias remains useful for readers experimenting with earlier book chapters.
-ENTRIES = [
-    ("No names. We are nameless!", "cerealkiller"),
-    ("HACK THE PLANET!!!", "crashoverride"),
-]
-
-TOPICS = {
-    "general": {
-        "title": "General",
-        "description": "Introductions, announcements, and everything in between.",
-        "created_by": "system",
-        "messages": ENTRIES,
-    },
-    "cooking": {
-        "title": "Cooking",
-        "description": "Recipes, techniques, and strong opinions about cast iron.",
-        "created_by": "system",
-        "messages": [("What is your favorite weeknight meal?", "cerealkiller")],
-    },
-    "cars": {
-        "title": "Cars",
-        "description": "Repairs, road trips, and machines with personality.",
-        "created_by": "system",
-        "messages": [("Manual transmissions still count as user interfaces.", "crashoverride")],
-    },
-}
 
 LOGINS = {
     "crashoverride": "0cool",
@@ -52,6 +28,187 @@ RESERVED_TOPIC_SLUGS = {
     "new-topic",
     "xhr",
 }
+
+DATA_VERSION = 1
+DATA_PATH = Path(
+    os.environ.get("ZIBRA_BOARD_DATA", Path(__file__).with_name("message_board.json"))
+)
+
+
+def slugify_topic(title):
+    normalized = unicodedata.normalize("NFKD", title)
+    ascii_title = normalized.encode("ascii", "ignore").decode("ascii").casefold()
+    slug = "-".join(re.findall(r"[a-z0-9]+", ascii_title))
+    return slug[:48].strip("-")
+
+
+def default_topics():
+    """Return a fresh copy of the board shipped with the tutorial server."""
+    return {
+        "general": {
+            "title": "General",
+            "description": "Introductions, announcements, and everything in between.",
+            "created_by": "system",
+            "messages": [
+                ("No names. We are nameless!", "cerealkiller"),
+                ("HACK THE PLANET!!!", "crashoverride"),
+            ],
+        },
+        "cooking": {
+            "title": "Cooking",
+            "description": "Recipes, techniques, and strong opinions about cast iron.",
+            "created_by": "system",
+            "messages": [("What is your favorite weeknight meal?", "cerealkiller")],
+        },
+        "cars": {
+            "title": "Cars",
+            "description": "Repairs, road trips, and machines with personality.",
+            "created_by": "system",
+            "messages": [
+                ("Manual transmissions still count as user interfaces.", "crashoverride")
+            ],
+        },
+    }
+
+
+def topics_to_json(topics):
+    return {
+        "version": DATA_VERSION,
+        "topics": {
+            slug: {
+                "title": topic["title"],
+                "description": topic["description"],
+                "created_by": topic["created_by"],
+                "messages": [
+                    {"text": message, "author": author}
+                    for message, author in topic["messages"]
+                ],
+            }
+            for slug, topic in topics.items()
+        },
+    }
+
+
+def topics_from_json(data):
+    if not isinstance(data, dict) or data.get("version") != DATA_VERSION:
+        raise ValueError("unsupported message-board data version")
+    raw_topics = data.get("topics")
+    if not isinstance(raw_topics, dict):
+        raise ValueError("message-board topics must be an object")
+
+    topics = {}
+    for slug, raw_topic in raw_topics.items():
+        if (
+            not isinstance(slug, str)
+            or not slug
+            or slugify_topic(slug) != slug
+            or slug in RESERVED_TOPIC_SLUGS
+        ):
+            raise ValueError("message-board data contains an invalid topic slug")
+        if not isinstance(raw_topic, dict):
+            raise ValueError("message-board topic must be an object")
+
+        title = raw_topic.get("title")
+        description = raw_topic.get("description")
+        created_by = raw_topic.get("created_by")
+        raw_messages = raw_topic.get("messages")
+        if not isinstance(title, str) or not title.strip() or len(title) > 60:
+            raise ValueError("message-board topic has an invalid title")
+        if not isinstance(description, str) or len(description) > 120:
+            raise ValueError("message-board topic has an invalid description")
+        if not isinstance(created_by, str) or not created_by:
+            raise ValueError("message-board topic has an invalid creator")
+        if not isinstance(raw_messages, list):
+            raise ValueError("message-board messages must be an array")
+
+        messages = []
+        for raw_message in raw_messages:
+            if not isinstance(raw_message, dict):
+                raise ValueError("message-board message must be an object")
+            message = raw_message.get("text")
+            author = raw_message.get("author")
+            if (
+                not isinstance(message, str)
+                or not message.strip()
+                or len(message) > 280
+            ):
+                raise ValueError("message-board entry has invalid text")
+            if not isinstance(author, str) or not author:
+                raise ValueError("message-board entry has an invalid author")
+            messages.append((message, author))
+
+        topics[slug] = {
+            "title": title,
+            "description": description,
+            "created_by": created_by,
+            "messages": messages,
+        }
+
+    if "general" not in topics:
+        raise ValueError("message-board data must contain the General topic")
+    return topics
+
+
+def load_topics(path=None):
+    path = Path(path or DATA_PATH)
+    try:
+        with path.open(encoding="utf8") as source:
+            return topics_from_json(json.load(source))
+    except FileNotFoundError:
+        return default_topics()
+    except json.JSONDecodeError as error:
+        raise ValueError("message-board data is not valid JSON") from error
+
+
+def save_topics(topics=None, path=None):
+    """Atomically replace the on-disk board without exposing a partial file."""
+    topics = TOPICS if topics is None else topics
+    path = Path(path or DATA_PATH)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    descriptor, temporary_name = tempfile.mkstemp(
+        dir=path.parent,
+        prefix=path.name + ".",
+        suffix=".tmp",
+    )
+    descriptor_open = True
+    try:
+        with os.fdopen(descriptor, "w", encoding="utf8") as destination:
+            descriptor_open = False
+            json.dump(
+                topics_to_json(topics),
+                destination,
+                ensure_ascii=False,
+                indent=2,
+                sort_keys=True,
+            )
+            destination.write("\n")
+            destination.flush()
+            os.fsync(destination.fileno())
+        os.replace(temporary_name, path)
+        temporary_name = None
+    finally:
+        if descriptor_open:
+            os.close(descriptor)
+        if temporary_name is not None:
+            try:
+                os.unlink(temporary_name)
+            except FileNotFoundError:
+                pass
+
+
+def initialize_storage(path=None):
+    """Load a complete board, then publish it as the process-wide state."""
+    global DATA_PATH, TOPICS, ENTRIES
+    selected_path = Path(path or DATA_PATH)
+    topics = load_topics(selected_path)
+    DATA_PATH = selected_path
+    TOPICS = topics
+    # Compatibility alias for readers following the original guest-book code.
+    ENTRIES = TOPICS["general"]["messages"]
+
+
+TOPICS = default_topics()
+ENTRIES = TOPICS["general"]["messages"]
 
 
 def handle_connection(conx):
@@ -146,13 +303,6 @@ def form_decode(body):
         name, value = field.split("=", 1)
         params[urllib.parse.unquote_plus(name)] = urllib.parse.unquote_plus(value)
     return params
-
-
-def slugify_topic(title):
-    normalized = unicodedata.normalize("NFKD", title)
-    ascii_title = normalized.encode("ascii", "ignore").decode("ascii").casefold()
-    slug = "-".join(re.findall(r"[a-z0-9]+", ascii_title))
-    return slug[:48].strip("-")
 
 
 def issue_nonce(session):
@@ -279,7 +429,9 @@ def create_topic(session, params):
             error='A topic named "{}" already exists.'.format(TOPICS[slug]["title"]),
         )
     if len(description) > 120:
-        return "400 Bad Request", show_home(session, error="Descriptions are limited to 120 characters.")
+        return "400 Bad Request", show_home(
+            session, error="Descriptions are limited to 120 characters."
+        )
 
     TOPICS[slug] = {
         "title": title,
@@ -287,6 +439,14 @@ def create_topic(session, params):
         "created_by": session["user"],
         "messages": [],
     }
+    try:
+        save_topics()
+    except OSError:
+        del TOPICS[slug]
+        return "500 Internal Server Error", show_home(
+            session,
+            error="The topic could not be saved. Please try again.",
+        )
     return "200 OK", show_topic(
         session,
         slug,
@@ -303,13 +463,25 @@ def submit_message(session, slug, params):
 
     message = (params.get("message") or params.get("guest") or "").strip()
     if not message:
-        return "400 Bad Request", show_topic(session, slug, error="Messages cannot be empty.")
+        return "400 Bad Request", show_topic(
+            session, slug, error="Messages cannot be empty."
+        )
     if len(message) > 280:
         return "400 Bad Request", show_topic(
             session, slug, error="Messages are limited to 280 characters."
         )
 
-    TOPICS[slug]["messages"].append((message, session["user"]))
+    messages = TOPICS[slug]["messages"]
+    messages.append((message, session["user"]))
+    try:
+        save_topics()
+    except OSError:
+        messages.pop()
+        return "500 Internal Server Error", show_topic(
+            session,
+            slug,
+            error="The message could not be saved. Please try again.",
+        )
     return "200 OK", show_topic(session, slug, notice="Message posted.")
 
 
@@ -365,6 +537,7 @@ def not_found(url, method):
 
 
 if __name__ == "__main__":
+    initialize_storage()
     s = socket.socket(
         family=socket.AF_INET,
         type=socket.SOCK_STREAM,
