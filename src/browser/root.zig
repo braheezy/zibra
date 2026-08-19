@@ -47,6 +47,42 @@ const initial_window_width = 800;
 const initial_window_height = 600;
 pub const decodeUtf8Replace = url_module.decodeUtf8Replace;
 
+fn showPostResubmissionDialog(window: sdl2.Window) bool {
+    const cancel_label: [:0]const u8 = "Cancel";
+    const resubmit_label: [:0]const u8 = "Resubmit";
+    const title: [:0]const u8 = "Confirm form resubmission";
+    const message: [:0]const u8 =
+        "To display this page, Zibra must resend data that was previously submitted.\n" ++
+        "Resubmit the form?";
+    const buttons = [_]sdl2.c.SDL_MessageBoxButtonData{
+        .{
+            .flags = @intCast(sdl2.c.SDL_MESSAGEBOX_BUTTON_ESCAPEKEY_DEFAULT),
+            .buttonid = 0,
+            .text = cancel_label.ptr,
+        },
+        .{
+            .flags = @intCast(sdl2.c.SDL_MESSAGEBOX_BUTTON_RETURNKEY_DEFAULT),
+            .buttonid = 1,
+            .text = resubmit_label.ptr,
+        },
+    };
+    const data = sdl2.c.SDL_MessageBoxData{
+        .flags = @intCast(sdl2.c.SDL_MESSAGEBOX_WARNING),
+        .window = window.ptr,
+        .title = title.ptr,
+        .message = message.ptr,
+        .numbuttons = @intCast(buttons.len),
+        .buttons = &buttons[0],
+        .colorScheme = null,
+    };
+    var button_id: c_int = -1;
+    if (sdl2.c.SDL_ShowMessageBox(&data, &button_id) != 0) {
+        std.log.warn("Failed to show POST resubmission dialog", .{});
+        return false;
+    }
+    return button_id == 1;
+}
+
 /// A document-navigation response plus explicit ownership for its body and
 /// CSP header. Generated browser pages and fetched resources share this
 /// contract, so callers never infer ownership from the URL scheme.
@@ -962,6 +998,12 @@ const DocumentHandle = struct {
     }
 };
 
+const PendingPostResubmission = struct {
+    tab: *Tab,
+    target: usize,
+    history_generation: u64,
+};
+
 // Browser manages the window and tabs
 pub const Browser = struct {
     // Memory allocator for the browser
@@ -997,6 +1039,10 @@ pub const Browser = struct {
     // Owned link targets requested by tab workers. The browser thread drains
     // this queue because it exclusively creates tabs and updates chrome.
     pending_new_tabs: std.ArrayList(Url),
+    // A tab worker publishes only stable tab identity plus history indexes.
+    // The native confirmation dialog is consumed on the SDL/UI thread.
+    pending_post_resubmission: ?PendingPostResubmission = null,
+    post_resubmission_dialog_active: bool = false,
     // Index of the active tab
     active_tab_index: ?usize = null,
     // Set by tab workers under `lock`; consumed by the interactive main loop.
@@ -1440,6 +1486,9 @@ pub const Browser = struct {
         }
         if (found_idx) |idx| {
             self.active_tab_index = idx;
+            if (self.pending_post_resubmission) |pending| {
+                if (pending.tab != tab) self.pending_post_resubmission = null;
+            }
             tab.requestActivationCommit();
             self.window_title_dirty = true;
             self.active_tab_scroll = 0;
@@ -1663,6 +1712,7 @@ pub const Browser = struct {
 
         while (!quit) {
             self.openPendingTabs();
+            self.processPendingPostResubmission();
             self.applyWindowTitle();
 
             var handled_event = false;
@@ -1701,16 +1751,41 @@ pub const Browser = struct {
     /// responsible for SDL polling and calls this for every registered window.
     pub fn tick(self: *Browser) !bool {
         self.openPendingTabs();
+        self.processPendingPostResubmission();
         self.applyWindowTitle();
         try self.compositeRasterAndDraw();
         self.scheduleAnimationFrame();
         return self.isIdle();
     }
 
+    fn processPendingPostResubmission(self: *Browser) void {
+        self.lock.lock();
+        const pending = self.pending_post_resubmission;
+        self.pending_post_resubmission = null;
+        const should_prompt = if (pending) |request|
+            !self.shutting_down and self.activeTab() == request.tab and self.window != null
+        else
+            false;
+        if (should_prompt) self.post_resubmission_dialog_active = true;
+        self.lock.unlock();
+
+        const request = pending orelse return;
+        if (!should_prompt) return;
+        const confirmed = showPostResubmissionDialog(self.window.?);
+
+        self.lock.lock();
+        self.post_resubmission_dialog_active = false;
+        const still_live = !self.shutting_down and self.activeTab() == request.tab;
+        self.lock.unlock();
+
+        if (confirmed and still_live) self.scheduleConfirmedPostResubmission(request);
+    }
+
     fn finishRunLoop(self: *Browser) void {
         self.lock.lock();
         self.shutting_down = true;
         self.needs_animation_frame = false;
+        self.pending_post_resubmission = null;
         self.lock.unlock();
     }
 
@@ -2334,7 +2409,7 @@ pub const Browser = struct {
             self.allocator,
             self,
             tab,
-            direction,
+            .{ .direction = direction },
         ) catch |err| {
             std.log.err("Failed to allocate history traversal task: {}", .{err});
             return;
@@ -2348,6 +2423,52 @@ pub const Browser = struct {
             std.log.err("Failed to schedule history traversal: {}", .{err});
             ctx.destroy();
             return;
+        };
+    }
+
+    fn scheduleConfirmedPostResubmission(
+        self: *Browser,
+        request: PendingPostResubmission,
+    ) void {
+        const ctx = TabHistoryTaskContext.create(
+            self.allocator,
+            self,
+            request.tab,
+            .{ .resubmit = .{
+                .target = request.target,
+                .history_generation = request.history_generation,
+            } },
+        ) catch |err| {
+            std.log.err("Failed to allocate POST resubmission task: {}", .{err});
+            return;
+        };
+        const task_instance = Task.init(
+            ctx.toOpaque(),
+            TabHistoryTaskContext.runOpaque,
+            TabHistoryTaskContext.cleanupOpaque,
+        );
+        request.tab.task_runner.schedule(task_instance) catch |err| {
+            std.log.err("Failed to schedule POST resubmission: {}", .{err});
+            ctx.destroy();
+        };
+    }
+
+    /// Called only by the serialized tab worker. The UI thread validates that
+    /// the originating tab is still active before displaying the modal prompt.
+    pub fn requestPostResubmission(
+        self: *Browser,
+        tab: *Tab,
+        target: usize,
+        history_generation: u64,
+    ) void {
+        self.lock.lock();
+        defer self.lock.unlock();
+        if (self.shutting_down or self.activeTab() != tab) return;
+        if (self.pending_post_resubmission != null or self.post_resubmission_dialog_active) return;
+        self.pending_post_resubmission = .{
+            .tab = tab,
+            .target = target,
+            .history_generation = history_generation,
         };
     }
 
@@ -2545,8 +2666,20 @@ pub const Browser = struct {
         try self.recordSuccessfulNavigation(url, &final_url);
         const raw_body = response.body;
         const body_text = try decodeUtf8Replace(self.allocator, raw_body);
+        var body_text_owned = true;
+        defer if (body_text_owned) self.allocator.free(body_text);
         var document_title: ?[:0]u8 = null;
         defer if (document_title) |title| self.allocator.free(title);
+
+        // History owns an independent replay copy of a POST body. Complete
+        // those allocations before retiring the old document so an OOM leaves
+        // both the current page and history untouched.
+        var prepared_history = try tab.prepareHistoryNavigation(
+            url,
+            payload,
+            history_navigation,
+        );
+        defer prepared_history.deinit(tab.allocator);
 
         tab.task_runner.clear();
         tab.invalidateJsContext();
@@ -2587,11 +2720,8 @@ pub const Browser = struct {
             frame.current_html_source = null;
         }
 
-        var body_text_owned = true;
         if (url.*.view_source) {
             // Use the new layoutSourceCode function for view-source mode
-            defer self.allocator.free(body_text);
-
             self.layout_engine.accessibility = tab.accessibility;
 
             if (frame.display_list) |items| {
@@ -2614,7 +2744,6 @@ pub const Browser = struct {
             frame.content_height = self.layout_engine.content_height;
         } else {
             // Parse HTML into a node tree
-            errdefer if (body_text_owned) self.allocator.free(body_text);
             var html_parser = try HTMLParser.init(self.allocator, body_text);
             defer html_parser.deinit(self.allocator);
 
@@ -2775,7 +2904,7 @@ pub const Browser = struct {
         // Commit history only after the new document is ready. Ordinary
         // navigation truncates a forward branch; traversal replaces the
         // canonical target with the final URL after redirects.
-        try tab.commitHistoryNavigation(url, history_navigation);
+        tab.commitPreparedHistoryNavigation(&prepared_history);
         frame.current_url = url;
         frame.current_url_owned = false;
         self.updateTabTitle(tab, document_title);
@@ -5923,6 +6052,7 @@ pub const Browser = struct {
         self.lock.lock();
         self.shutting_down = true;
         self.needs_animation_frame = false;
+        self.pending_post_resubmission = null;
         self.lock.unlock();
         for (self.tabs.items) |tab| tab.shutdown();
 
@@ -6236,23 +6366,31 @@ const TabKeypressTaskContext = struct {
 };
 
 const TabHistoryTaskContext = struct {
+    const Request = union(enum) {
+        direction: HistoryDirection,
+        resubmit: struct {
+            target: usize,
+            history_generation: u64,
+        },
+    };
+
     allocator: std.mem.Allocator,
     browser: *Browser,
     tab: *Tab,
-    direction: HistoryDirection,
+    request: Request,
 
     fn create(
         allocator: std.mem.Allocator,
         browser: *Browser,
         tab: *Tab,
-        direction: HistoryDirection,
+        request: Request,
     ) !*TabHistoryTaskContext {
         const ctx = try allocator.create(TabHistoryTaskContext);
         ctx.* = .{
             .allocator = allocator,
             .browser = browser,
             .tab = tab,
-            .direction = direction,
+            .request = request,
         };
         return ctx;
     }
@@ -6262,7 +6400,14 @@ const TabHistoryTaskContext = struct {
     }
 
     fn run(self: *TabHistoryTaskContext) !void {
-        try self.tab.traverseHistory(self.browser, self.direction);
+        switch (self.request) {
+            .direction => |direction| try self.tab.traverseHistory(self.browser, direction),
+            .resubmit => |request| try self.tab.resubmitHistoryEntry(
+                self.browser,
+                request.target,
+                request.history_generation,
+            ),
+        }
     }
 
     fn toOpaque(self: *TabHistoryTaskContext) *anyopaque {

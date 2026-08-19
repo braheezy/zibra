@@ -544,6 +544,21 @@ it dirty.
 Chrome's Back and Forward handlers read only atomic availability snapshots and
 enqueue a history task. The worker computes the target again before loading,
 so a click based on a stale disabled/enabled snapshot is harmless.
+History entries are heap-stable owners of a URL, an explicit GET/POST method,
+and an independent POST-body copy. A navigation prepares the entry, body copy,
+and list capacity before retiring the current document, then transfers both the
+URL and prepared entry only after the replacement document is ready. Replacing
+or truncating entries frees their URL and POST bytes together.
+
+A GET history target is cloned and replayed directly on the tab worker. A POST
+target does not change the index or document; instead the worker publishes a
+tab pointer, target index, and history generation under `Browser.lock`. The
+interactive SDL thread consumes that request and displays a native modal
+confirmation without holding the lock. Cancel schedules nothing. Resubmit
+queues a task back to the originating tab, which validates the generation,
+copies the retained body for the load, and commits the new index only after the
+POST succeeds. Tab switches, shutdown, stale generations, dialog failures, and
+headless operation all cancel rather than replaying state-changing data.
 Address-bar submission is the sole URL-or-search policy boundary. Chrome trims
 the input, preserves explicit schemes and obvious bare hosts, and otherwise
 constructs a Google query using `+` for whitespace and percent escapes for

@@ -60,13 +60,18 @@ before changing `root.zig`, `tab.zig`, `render/`, or browser task scheduling.
   widget-owned boolean. Primary or focused activation dispatches the cancelable
   click first, then toggles that attribute and repaints. Form encoding omits
   unchecked checkboxes and uses `on` for a checked checkbox without `value`.
-- Each tab owns an indexed root-navigation history. Successful ordinary
-  navigation truncates entries after the current index before appending; Back
-  and Forward retain the list and move the index only after the replacement
-  document loads. History entries and the index are tab-worker state. Chrome
-  reads only the atomic back/forward availability flags and schedules traversal
-  back onto that worker. A traversal clones its target URL for the load so the
-  canonical entry remains owned until navigation succeeds.
+- Each tab owns an indexed root-navigation history. Every heap-stable entry
+  owns its URL, request method, and an independent POST-body copy when present;
+  prepare all entry allocations before retiring the current document.
+  Successful ordinary navigation truncates entries after the current index
+  before appending; Back and Forward retain the list and move the index only
+  after the replacement document loads. History entries and the index are
+  tab-worker state. Chrome reads only the atomic back/forward availability
+  flags and schedules traversal back onto that worker. GET targets replay
+  immediately. A POST target publishes a generation-stamped request under
+  `Browser.lock`; the UI thread asks through a native modal dialog, cancellation
+  leaves history untouched, and confirmation schedules a body-copying replay
+  only if the target generation is still current.
 - Tab workers must not create tabs or mutate browser chrome collections.
   Cross-thread new-tab requests transfer an owning `Url` through
   `Browser.pending_new_tabs`; the browser thread drains that queue.

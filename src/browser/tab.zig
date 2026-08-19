@@ -59,6 +59,63 @@ pub const HistoryNavigation = union(enum) {
     traverse: usize,
 };
 
+pub const HistoryMethod = enum {
+    get,
+    post,
+};
+
+/// One replayable root-navigation entry. The heap-stable URL is also borrowed
+/// by the installed root Frame; the optional POST bytes are an independent
+/// copy retained until this history entry is destroyed or replaced.
+pub const HistoryEntry = struct {
+    url: *Url,
+    method: HistoryMethod,
+    post_body: ?[]u8,
+
+    fn prepare(
+        allocator: std.mem.Allocator,
+        url: *Url,
+        payload: ?[]const u8,
+    ) !*HistoryEntry {
+        const entry = try allocator.create(HistoryEntry);
+        errdefer allocator.destroy(entry);
+        const body_copy = if (payload) |body| try allocator.dupe(u8, body) else null;
+        entry.* = .{
+            .url = url,
+            .method = if (payload == null) .get else .post,
+            .post_body = body_copy,
+        };
+        return entry;
+    }
+
+    pub fn deinit(self: *HistoryEntry, allocator: std.mem.Allocator) void {
+        if (self.post_body) |body| allocator.free(body);
+        self.url.*.free(allocator);
+        allocator.destroy(self.url);
+        allocator.destroy(self);
+    }
+};
+
+/// A history mutation whose allocations have succeeded but whose URL remains
+/// caller-owned until `commitPreparedHistoryNavigation` transfers the entry.
+pub const PreparedHistoryNavigation = struct {
+    entry: ?*HistoryEntry,
+    navigation: HistoryNavigation,
+
+    pub fn deinit(self: *PreparedHistoryNavigation, allocator: std.mem.Allocator) void {
+        const entry = self.entry orelse return;
+        if (entry.post_body) |body| allocator.free(body);
+        allocator.destroy(entry);
+        self.entry = null;
+    }
+};
+
+pub const HistoryTraversalTarget = struct {
+    index: usize,
+    generation: u64,
+    method: HistoryMethod,
+};
+
 /// Represents a composited visual effect update (e.g., opacity change during animation)
 pub const CompositedUpdate = struct {
     node: *anyopaque, // Pointer to the element that owns this effect
@@ -345,7 +402,11 @@ pub const Frame = struct {
         };
 
         if (self.parent == null) {
-            try self.tab.commitHistoryNavigation(url_ptr, .push);
+            const current_payload = if (self.tab.history_index) |index|
+                self.tab.history.items[index].post_body
+            else
+                null;
+            try self.tab.commitHistoryNavigation(url_ptr, current_payload, .push);
             url_owned = false;
             self.current_url = url_ptr;
             self.current_url_owned = false;
@@ -664,13 +725,16 @@ accessibility: AccessibilitySettings = .{},
 // Available height for tab content (window height minus chrome height)
 tab_width: i32 = 0,
 tab_height: i32 = 0,
-// History of visited URLs (owns Url pointers)
-history: std.ArrayList(*Url),
+// Replayable root-navigation history (owns HistoryEntry and Url pointers).
+history: std.ArrayList(*HistoryEntry),
 // Index of the currently displayed history entry. Forward entries remain
 // owned until a successful ordinary navigation replaces that branch.
 history_index: ?usize = null,
 history_can_go_back: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
 history_can_go_forward: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+// Invalidates a pending POST-resubmission decision if history changes while a
+// native confirmation dialog is pending.
+history_generation: u64 = 0,
 // Owned, sentinel-terminated title from the current root document.
 title: ?[:0]u8 = null,
 // Dynamically allocated text strings (e.g., from JavaScript results) that need to be freed
@@ -725,10 +789,11 @@ pub fn init(allocator: std.mem.Allocator, tab_width: i32, tab_height: i32, measu
         .accessibility = .{ .dark_palette = .{} },
         .tab_width = tab_width,
         .tab_height = tab_height,
-        .history = std.ArrayList(*Url).empty,
+        .history = std.ArrayList(*HistoryEntry).empty,
         .history_index = null,
         .history_can_go_back = std.atomic.Value(bool).init(false),
         .history_can_go_forward = std.atomic.Value(bool).init(false),
+        .history_generation = 0,
         .title = null,
         .dynamic_texts = std.ArrayList([]const u8).empty,
         .js_contexts = std.StringHashMap(*js_module).init(allocator),
@@ -873,10 +938,7 @@ pub fn deinit(self: *Tab) void {
     self.accessibility_strings.deinit(self.allocator);
 
     // Clean up history
-    for (self.history.items) |url_ptr| {
-        url_ptr.*.free(self.allocator);
-        self.allocator.destroy(url_ptr);
-    }
+    for (self.history.items) |entry| entry.deinit(self.allocator);
     self.history.deinit(self.allocator);
 
     self.task_runner.deinit();
@@ -1031,42 +1093,83 @@ fn updateHistoryAvailability(self: *Tab) void {
     );
 }
 
+/// Reserve every fallible allocation for a history mutation before a caller
+/// retires the currently installed document. The URL remains caller-owned
+/// until the prepared value is committed.
+pub fn prepareHistoryNavigation(
+    self: *Tab,
+    url: *Url,
+    payload: ?[]const u8,
+    navigation: HistoryNavigation,
+) !PreparedHistoryNavigation {
+    switch (navigation) {
+        .push => try self.history.ensureUnusedCapacity(self.allocator, 1),
+        .traverse => |target| {
+            if (target >= self.history.items.len) return error.InvalidHistoryTarget;
+        },
+    }
+    return .{
+        .entry = try HistoryEntry.prepare(self.allocator, url, payload),
+        .navigation = navigation,
+    };
+}
+
+/// Transfer a fully prepared entry into history without allocation.
+pub fn commitPreparedHistoryNavigation(
+    self: *Tab,
+    prepared: *PreparedHistoryNavigation,
+) void {
+    const entry = prepared.entry orelse return;
+    switch (prepared.navigation) {
+        .push => {
+            const retained_len = if (self.history_index) |index| index + 1 else 0;
+            while (self.history.items.len > retained_len) {
+                const stale = self.history.pop().?;
+                stale.deinit(self.allocator);
+            }
+            self.history.appendAssumeCapacity(entry);
+            self.history_index = self.history.items.len - 1;
+        },
+        .traverse => |target| {
+            std.debug.assert(target < self.history.items.len);
+            const replaced = self.history.items[target];
+            self.history.items[target] = entry;
+            replaced.deinit(self.allocator);
+            self.history_index = target;
+        },
+    }
+    prepared.entry = null;
+    self.history_generation +%= 1;
+    if (self.history_generation == 0) self.history_generation = 1;
+    self.updateHistoryAvailability();
+}
+
 /// Commit `url` as the canonical owner for a successful root navigation.
 /// Ownership transfers only on success.
 pub fn commitHistoryNavigation(
     self: *Tab,
     url: *Url,
+    payload: ?[]const u8,
     navigation: HistoryNavigation,
 ) !void {
-    switch (navigation) {
-        .push => {
-            try self.history.ensureUnusedCapacity(self.allocator, 1);
-            const retained_len = if (self.history_index) |index| index + 1 else 0;
-            while (self.history.items.len > retained_len) {
-                const stale = self.history.pop().?;
-                stale.*.free(self.allocator);
-                self.allocator.destroy(stale);
-            }
-            self.history.appendAssumeCapacity(url);
-            self.history_index = self.history.items.len - 1;
-        },
-        .traverse => |target| {
-            if (target >= self.history.items.len) return error.InvalidHistoryTarget;
-            const replaced = self.history.items[target];
-            self.history.items[target] = url;
-            replaced.*.free(self.allocator);
-            self.allocator.destroy(replaced);
-            self.history_index = target;
-        },
-    }
-    self.updateHistoryAvailability();
+    var prepared = try self.prepareHistoryNavigation(url, payload, navigation);
+    defer prepared.deinit(self.allocator);
+    self.commitPreparedHistoryNavigation(&prepared);
 }
 
-fn historyTarget(self: *const Tab, direction: HistoryDirection) ?usize {
+pub fn historyTraversalTarget(
+    self: *const Tab,
+    direction: HistoryDirection,
+) ?HistoryTraversalTarget {
     const current = self.history_index orelse return null;
-    return switch (direction) {
+    const index = switch (direction) {
         .back => if (current > 0) current - 1 else null,
         .forward => if (current + 1 < self.history.items.len) current + 1 else null,
+    } orelse return null;
+    return .{
+        .index = index,
+        .generation = self.history_generation,
+        .method = self.history.items[index].method,
     };
 }
 
@@ -1076,8 +1179,36 @@ pub fn requestHistoryTraversal(self: *Tab, b: *Browser, direction: HistoryDirect
 
 /// Runs on the serialized tab worker.
 pub fn traverseHistory(self: *Tab, b: *Browser, direction: HistoryDirection) !void {
-    const target = self.historyTarget(direction) orelse return;
-    const cloned_url = try self.history.items[target].*.clone(self.allocator);
+    const target = self.historyTraversalTarget(direction) orelse return;
+    if (target.method == .post) {
+        b.requestPostResubmission(self, target.index, target.generation);
+        return;
+    }
+    try self.loadHistoryEntry(b, target.index, target.generation);
+}
+
+/// Continue a POST traversal only if the confirmed entry is still the same
+/// history generation that was presented to the user.
+pub fn resubmitHistoryEntry(
+    self: *Tab,
+    b: *Browser,
+    target: usize,
+    generation: u64,
+) !void {
+    if (generation != self.history_generation or target >= self.history.items.len) return;
+    if (self.history.items[target].method != .post) return;
+    try self.loadHistoryEntry(b, target, generation);
+}
+
+fn loadHistoryEntry(
+    self: *Tab,
+    b: *Browser,
+    target: usize,
+    generation: u64,
+) !void {
+    if (generation != self.history_generation or target >= self.history.items.len) return;
+    const entry = self.history.items[target];
+    const cloned_url = try entry.url.*.clone(self.allocator);
     const url_ptr = self.allocator.create(Url) catch |err| {
         cloned_url.free(self.allocator);
         return err;
@@ -1089,7 +1220,13 @@ pub fn traverseHistory(self: *Tab, b: *Browser, direction: HistoryDirection) !vo
         self.allocator.destroy(url_ptr);
     };
 
-    try b.loadInTab(self, url_ptr, null, .{ .traverse = target });
+    const payload_copy = if (entry.post_body) |body|
+        try self.allocator.dupe(u8, body)
+    else
+        null;
+    defer if (payload_copy) |body| self.allocator.free(body);
+
+    try b.loadInTab(self, url_ptr, payload_copy, .{ .traverse = target });
     url_owned = false;
 }
 

@@ -1,0 +1,27 @@
+<!doctype html>
+<!--
+How to verify:
+1. In the repository root, run `python3 server.py` (port 8005).
+2. Separately run `python3 -m http.server 8000 --directory tests/manual`.
+3. Open http://127.0.0.1:8000/resubmit-requests.html in Zibra and submit the
+   prefilled form without clicking either input. The result says "Hello, a".
+4. Navigate through the address bar to http://127.0.0.1:8005/count.
+5. Press Back. A form-resubmission dialog appears. Choose Cancel: the count
+   page and its URL stay unchanged.
+6. Press Back again and choose Resubmit. Zibra repeats the original POST body
+   and returns to the page that says "Hello, a".
+-->
+<html>
+<head>
+  <title>POST resubmission regression</title>
+</head>
+<body>
+  <h1>POST resubmission</h1>
+  <p>This form uses the repository tutorial server's deterministic test login.</p>
+  <form action="http://127.0.0.1:8005/" method="post">
+    <p><label>Username <input name="username" value="a"></label></p>
+    <p><label>Password <input name="password" value="b"></label></p>
+    <button>Submit POST</button>
+  </form>
+</body>
+</html>
