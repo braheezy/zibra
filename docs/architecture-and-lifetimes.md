@@ -354,6 +354,12 @@ text is not retained as glyph metadata.
 Display-list container ownership is recursive: `.blend` and `.transform` own
 their child slices, and `.blend` owns its copied blend-mode string. See
 `DisplayItem.freeList` in [`src/browser/root.zig`](../src/browser/root.zig).
+`BlockLayout.display_list` is a persistent paint cache and recursively owns
+any such containers stored in it. Painting a frame deep-clones cached items
+before wrapping them in effects or transferring the resulting snapshot; frame
+retirement must therefore free only the clone and leave the cache reusable for
+paint-only animation frames. Relayout recursively releases cached containers
+before replacing the cache.
 Primitive entries are not self-contained:
 
 - `.image.pixels` borrows decoded image memory;
@@ -374,6 +380,18 @@ node outside its DOM subtree; anonymous blocks validate against their retained
 inline roots. Source metadata is never serialized by display-list dumps and is
 cleared recursively from the separately owned list composed for
 `Browser.commit`.
+
+Rich buttons remain one atomic item in their surrounding inline line, but
+their descendants are laid out through a temporary block subtree in local
+coordinates. Its paint commands and interactive bounds are transferred into
+the surrounding persistent block, with command sources rebased onto that
+stable layout origin before the temporary tree retires. The button's outer box
+unions structural and painted descendant bounds, so tall blocks, wrapping
+text, and translated overflow increase its inline dimensions instead of
+spilling into following content. Descendant paint provenance remains precise:
+an embedded link or input is activated before the ancestor button, while an
+uncovered button pixel activates the button itself. HTML parser recovery keeps
+a later button start out of this case by implicitly closing the active button.
 
 `DisplayItem.hitTestDevice` is a pure walk over the retained frame list. It
 visits items in reverse paint order, inverts translation transforms, treats

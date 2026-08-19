@@ -1245,3 +1245,65 @@ test "display defaults to inline and browser rules define block elements" {
         root.element.children.items[0].element.children.items[0].text.style.?.getPtr("display").?.get().*,
     );
 }
+
+test "nested button start tags implicitly close the outer button" {
+    const allocator = std.testing.allocator;
+    const html =
+        "<button id=outer>Outer <div>descendant " ++
+        "<button id=inner>Inner</button> tail</div></button>";
+
+    var html_parser = try HTMLParser.init(allocator, html);
+    defer html_parser.deinit(allocator);
+    var root = try html_parser.parse();
+    defer root.deinit(allocator);
+    document_parser.fixParentPointers(&root, null);
+
+    var nodes = std.ArrayList(*document_parser.Node).empty;
+    defer nodes.deinit(allocator);
+    try document_parser.treeToList(allocator, &root, &nodes);
+
+    var buttons = std.ArrayList(*document_parser.Node).empty;
+    defer buttons.deinit(allocator);
+    for (nodes.items) |node| {
+        if (node.* == .element and std.ascii.eqlIgnoreCase(node.element.tag, "button")) {
+            try buttons.append(allocator, node);
+        }
+    }
+
+    try std.testing.expectEqual(@as(usize, 2), buttons.items.len);
+    try std.testing.expect(buttons.items[0].element.parent == buttons.items[1].element.parent);
+    try std.testing.expect(buttons.items[1].element.parent != buttons.items[0]);
+}
+
+test "button keeps non-button element descendants in its DOM subtree" {
+    const allocator = std.testing.allocator;
+    const html =
+        "<button><span>label</span><div>block</div>" ++
+        "<input value=editable><a href=/target>link</a></button>";
+
+    var html_parser = try HTMLParser.init(allocator, html);
+    defer html_parser.deinit(allocator);
+    var root = try html_parser.parse();
+    defer root.deinit(allocator);
+    document_parser.fixParentPointers(&root, null);
+
+    var nodes = std.ArrayList(*document_parser.Node).empty;
+    defer nodes.deinit(allocator);
+    try document_parser.treeToList(allocator, &root, &nodes);
+
+    var button: ?*document_parser.Node = null;
+    var input: ?*document_parser.Node = null;
+    var anchor: ?*document_parser.Node = null;
+    for (nodes.items) |node| {
+        if (node.* != .element) continue;
+        if (std.ascii.eqlIgnoreCase(node.element.tag, "button")) button = node;
+        if (std.ascii.eqlIgnoreCase(node.element.tag, "input")) input = node;
+        if (std.ascii.eqlIgnoreCase(node.element.tag, "a")) anchor = node;
+    }
+
+    try std.testing.expect(button != null and input != null and anchor != null);
+    try std.testing.expect(input.?.element.parent != null);
+    try std.testing.expect(anchor.?.element.parent != null);
+    try std.testing.expect(input.?.element.parent.? == button.?);
+    try std.testing.expect(anchor.?.element.parent.? == button.?);
+}

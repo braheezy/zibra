@@ -60,6 +60,15 @@ before changing `root.zig`, `tab.zig`, `render/`, or browser task scheduling.
   widget-owned boolean. Primary or focused activation dispatches the cancelable
   click first, then toggles that attribute and repaints. Form encoding omits
   unchecked checkboxes and uses `on` for a checked checkbox without `value`.
+- A `<button>` is an atomic inline whose payload owns a temporary contained
+  block-layout subtree. Descendant commands and interactive bounds are laid
+  out in local coordinates, rebased onto the surrounding persistent block
+  origin, and translated only after the outer line chooses a baseline. The
+  orange box expands around tall, oversized, and negative-offset descendants;
+  descendant links and inputs retain their own topmost paint provenance.
+  Persistent block paint caches recursively own nested display containers;
+  every frame paint deep-clones cached items before effects or snapshots take
+  ownership, so retiring one frame never poisons a later paint-only pass.
 - Each tab owns an indexed root-navigation history. Every heap-stable entry
   owns its URL, request method, and an independent POST-body copy when present;
   prepare all entry allocations before retiring the current document.

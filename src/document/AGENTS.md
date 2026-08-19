@@ -47,6 +47,11 @@ or selector/rule lifetime.
   `checked` attribute entry. Activation may insert the static empty value or
   remove that entry; it must not replace the control's independent `value`.
   Layout and successful-control serialization read the same attribute state.
+- A `button` start tag implicitly closes an active button even through
+  intervening flow descendants, so malformed nested-button source produces
+  sibling controls. Other descendants, including non-conforming interactive
+  input and anchor elements, remain in the button's DOM subtree for layout and
+  closest-painted-target activation.
 - `inspection.Page.load` returns its DOM by value. Call
   `Page.repairParentPointers` after the returned page reaches its final address
   and before layout/paint performs any ancestry walk.

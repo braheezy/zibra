@@ -1,0 +1,43 @@
+<!--
+How to verify:
+1. Every orange button completely surrounds all of its visible descendants.
+2. The tall button grows around all three colored block rows instead of letting
+   them spill into the text below it.
+3. The input and link remain independently clickable inside their outer button;
+   clicking empty orange space activates the outer button.
+4. The invalid nested-button source becomes separate orange and blue buttons,
+   followed by unboxed text, as it does after HTML parsing in real browsers.
+-->
+<!doctype html>
+<style>
+  body { background-color: white; }
+  .row { display: block; background-color: lightgreen; }
+  .middle { display: block; background-color: lightblue; font-size: 28px; }
+  .last { display: block; background-color: pink; }
+</style>
+<h1>Rich buttons</h1>
+
+<p>Inline neighbors: before
+  <button><b>bold</b> and <i>italic</i> label</button>
+  after.
+</p>
+
+<p>
+  <button id=tall>
+    <span class=row>First contained row</span>
+    <span class=middle>Large contained middle row</span>
+    <span class=last>Last contained row</span>
+  </button>
+</p>
+<p id=after-tall>This sentence must begin below the complete tall button.</p>
+
+<form action="data:text/html,outer-button-submitted">
+  <button>
+    <b>Outer control</b>
+    <input name=inside value="editable child">
+    <a href="data:text/html,inner-link-won">independent child link</a>
+  </button>
+</form>
+
+<p>Invalid nested-button markup is parsed as siblings:</p>
+<button>Outer button <button style="background-color: lightblue">Inner button</button> trailing text</button>

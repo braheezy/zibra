@@ -1019,10 +1019,12 @@ pub const HTMLParser = struct {
         try self.unfinished.append(self.allocator, body_node);
     }
 
-    // Handle elements that can't contain themselves (p, li).
+    // Handle elements that can't contain themselves. A second button start
+    // tag implicitly closes the active button in real HTML parsing, making
+    // the two controls siblings instead of nested interactive descendants.
     fn handleSelfClosingElements(self: *HTMLParser, tag_name: []const u8) !void {
         // Tags that can't contain themselves directly
-        const self_closing_elements = [_][]const u8{ "p", "li" };
+        const self_closing_elements = [_][]const u8{ "p", "li", "button" };
 
         // Check if this is a tag that can't contain itself
         const is_self_closing_element = for (self_closing_elements) |elem| {
@@ -1034,7 +1036,7 @@ pub const HTMLParser = struct {
         }
     }
 
-    // Handle a specific implied-closing element (p or li).
+    // Handle a specific implied-closing element (p, li, or button).
     fn handleSelfClosingElement(self: *HTMLParser, tag_name: []const u8) !void {
         // For each element in the stack from top to bottom
         var i: usize = self.unfinished.items.len;
@@ -1056,8 +1058,12 @@ pub const HTMLParser = struct {
                 break;
             }
 
-            // Stop at structural elements
-            if (current.* == .element and (std.mem.eql(u8, current.element.tag, "div") or
+            // A button may contain arbitrary flow descendants in malformed
+            // source, and a later button start still closes it through those
+            // descendants. The simplified p/li recovery keeps its historical
+            // div boundary.
+            if (current.* == .element and ((!std.mem.eql(u8, tag_name, "button") and
+                std.mem.eql(u8, current.element.tag, "div")) or
                 std.mem.eql(u8, current.element.tag, "body") or
                 std.mem.eql(u8, current.element.tag, "html")))
             {

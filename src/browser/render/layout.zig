@@ -23,9 +23,16 @@ const list_item_indent = 24;
 const list_marker_size = 6;
 const list_marker_top_offset = 7;
 const toc_header_height = 24;
+const button_padding = 4;
 
 const ContentBounds = struct {
     x: i32,
+    width: i32,
+};
+
+const EmbeddedBlockBox = struct {
+    x: i32,
+    y: i32,
     width: i32,
 };
 
@@ -461,6 +468,7 @@ const LineItemPayload = union(enum) {
         color: browser.Color,
     },
     input: InputLayout,
+    button: ButtonLayout,
     image: ImageLayout,
     iframe: IframeLayout,
 
@@ -468,6 +476,7 @@ const LineItemPayload = union(enum) {
         switch (self.*) {
             .glyph => {},
             .input => |*input_payload| input_payload.deinit(),
+            .button => |*button_payload| button_payload.deinit(),
             .image => |*image_payload| image_payload.deinit(),
             .iframe => |*iframe_payload| iframe_payload.deinit(),
         }
@@ -1290,9 +1299,10 @@ fn recurseNode(self: *Layout, node: Node, node_ptr: ?*Node, line_buffer: *std.Ar
             // Handle br tag for line breaks
             if (std.mem.eql(u8, e.tag, "br")) {
                 try self.breakExplicitLine(line_buffer);
-            } else if (std.mem.eql(u8, e.tag, "input") or std.mem.eql(u8, e.tag, "button")) {
-                // Handle input and button elements - render as inline widgets
+            } else if (std.mem.eql(u8, e.tag, "input")) {
                 try self.handleInputElement(node, node_ptr, line_buffer);
+            } else if (std.mem.eql(u8, e.tag, "button")) {
+                try self.handleButtonElement(node, node_ptr, line_buffer);
             } else if (std.mem.eql(u8, e.tag, "img")) {
                 try self.handleImageElement(node, node_ptr, line_buffer);
             } else if (std.ascii.eqlIgnoreCase(e.tag, "iframe")) {
@@ -1330,6 +1340,28 @@ fn handleInputElement(self: *Layout, node: Node, node_ptr: ?*Node, line_buffer: 
 
     try input_layout.embed.appendInline(self, line_buffer, node_ptr, .{
         .input = input_layout,
+    });
+}
+
+fn handleButtonElement(
+    self: *Layout,
+    node: Node,
+    node_ptr: ?*Node,
+    line_buffer: *std.ArrayList(LineItem),
+) anyerror!void {
+    const element = switch (node) {
+        .element => |e| e,
+        else => return,
+    };
+    const button_node = node_ptr orelse return;
+    const parent_block = self.inline_block orelse return;
+    self.resetSoftHyphenWord();
+
+    var button_layout = ButtonLayout.init(self.allocator);
+    errdefer button_layout.deinit();
+    try button_layout.measure(self, button_node, element, parent_block);
+    try button_layout.embed.appendInline(self, line_buffer, button_node, .{
+        .button = button_layout,
     });
 }
 
@@ -1729,6 +1761,7 @@ fn flushLine(self: *Layout, line_buffer: *std.ArrayList(LineItem)) !void {
         const is_superscript = switch (item.payload) {
             .glyph => |glyph_payload| glyph_payload.glyph.is_superscript,
             .input => false,
+            .button => false,
             .image => false,
             .iframe => false,
         };
@@ -1760,12 +1793,13 @@ fn flushLine(self: *Layout, line_buffer: *std.ArrayList(LineItem)) !void {
     defer accessibility_map.deinit();
 
     // === PASS 2: Position glyphs ===
-    for (line_buffer.items) |item| {
+    for (line_buffer.items) |*item| {
         var final_y: i32 = undefined;
 
         const is_superscript = switch (item.payload) {
             .glyph => |glyph_payload| glyph_payload.glyph.is_superscript,
             .input => false,
+            .button => false,
             .image => false,
             .iframe => false,
         };
@@ -1860,6 +1894,15 @@ fn flushLine(self: *Layout, line_buffer: *std.ArrayList(LineItem)) !void {
             },
             .input => |input_payload| {
                 try input_payload.paintAt(self.current_display_target, self, item.x, final_y, source);
+            },
+            .button => |*button_payload| {
+                try button_payload.paintAt(
+                    self.current_display_target,
+                    self,
+                    item.x,
+                    final_y,
+                    source,
+                );
             },
             .image => |image_payload| {
                 try self.current_display_target.append(self.allocator, DisplayItem{
@@ -2627,7 +2670,8 @@ pub fn layoutSourceCode(self: *Layout, source: []const u8) ![]DisplayItem {
 
 const INPUT_WIDTH_PX: i32 = 200;
 
-// Input layout for form widgets (input and button elements)
+// Replaced input-control layout. Buttons use ButtonLayout below so their
+// descendant boxes participate in size and paint.
 const InputLayout = struct {
     embed: EmbedLayout,
     font_size: i32 = 16,
@@ -2676,15 +2720,6 @@ const InputLayout = struct {
         } else if (std.mem.eql(u8, element.tag, "input")) {
             if (element.attributes) |attrs| {
                 self.text = attrs.get("value") orelse "";
-            }
-        } else if (std.mem.eql(u8, element.tag, "button")) {
-            if (element.children.items.len == 1) {
-                switch (element.children.items[0]) {
-                    .text => |t| {
-                        self.text = t.text;
-                    },
-                    else => {},
-                }
             }
         }
 
@@ -2821,6 +2856,528 @@ const InputLayout = struct {
         }
     }
 };
+
+/// An inline button whose contents are laid out as a real block subtree. The
+/// subtree lives only while the surrounding line is being built; its painted
+/// commands are rebased onto the persistent outer BlockLayout before the
+/// temporary layout objects are retired.
+const ButtonLayout = struct {
+    embed: EmbedLayout,
+    root: ?*BlockLayout = null,
+    commands: std.ArrayList(DisplayItem),
+    bgcolor: browser.Color = .{ .r = 255, .g = 165, .b = 0, .a = 255 },
+    content_offset_x: i32 = button_padding,
+    content_offset_y: i32 = button_padding,
+    input_bounds: std.AutoHashMap(*Node, Bounds),
+    link_bounds: std.ArrayList(LinkBoundEntry),
+    iframe_bounds: std.ArrayList(IframeBoundEntry),
+    focus_bounds: std.ArrayList(FocusBoundEntry),
+    accessibility_bounds: std.ArrayList(AccessibilityBoundEntry),
+    fragment_targets: std.ArrayList(FragmentTarget),
+
+    fn init(allocator: std.mem.Allocator) ButtonLayout {
+        return .{
+            .embed = EmbedLayout.init(allocator),
+            .commands = std.ArrayList(DisplayItem).empty,
+            .input_bounds = std.AutoHashMap(*Node, Bounds).init(allocator),
+            .link_bounds = std.ArrayList(LinkBoundEntry).empty,
+            .iframe_bounds = std.ArrayList(IframeBoundEntry).empty,
+            .focus_bounds = std.ArrayList(FocusBoundEntry).empty,
+            .accessibility_bounds = std.ArrayList(AccessibilityBoundEntry).empty,
+            .fragment_targets = std.ArrayList(FragmentTarget).empty,
+        };
+    }
+
+    fn deinit(self: *ButtonLayout) void {
+        const allocator = self.embed.allocator;
+        DisplayItem.freeItems(allocator, self.commands.items);
+        self.commands.deinit(allocator);
+        if (self.root) |root| {
+            root.deinit();
+            allocator.destroy(root);
+            self.root = null;
+        }
+        self.input_bounds.deinit();
+        self.link_bounds.deinit(allocator);
+        self.iframe_bounds.deinit(allocator);
+        self.focus_bounds.deinit(allocator);
+        self.accessibility_bounds.deinit(allocator);
+        self.fragment_targets.deinit(allocator);
+        self.embed.deinit();
+    }
+
+    fn swapCollectors(self: *ButtonLayout, engine: *Layout) void {
+        std.mem.swap(@TypeOf(self.input_bounds), &self.input_bounds, &engine.input_bounds);
+        std.mem.swap(@TypeOf(self.link_bounds), &self.link_bounds, &engine.link_bounds);
+        std.mem.swap(@TypeOf(self.iframe_bounds), &self.iframe_bounds, &engine.iframe_bounds);
+        std.mem.swap(@TypeOf(self.focus_bounds), &self.focus_bounds, &engine.focus_bounds);
+        std.mem.swap(
+            @TypeOf(self.accessibility_bounds),
+            &self.accessibility_bounds,
+            &engine.accessibility_bounds,
+        );
+        std.mem.swap(
+            @TypeOf(self.fragment_targets),
+            &self.fragment_targets,
+            &engine.fragment_targets,
+        );
+    }
+
+    fn measure(
+        self: *ButtonLayout,
+        engine: *Layout,
+        button_node: *Node,
+        element: parser.Element,
+        parent_block: *BlockLayout,
+    ) !void {
+        if (element.style) |*style_map| {
+            if (styleValue(style_map, "background-color")) |background| {
+                if (parseColor(background)) |color| self.bgcolor = color;
+            }
+        }
+
+        // Preserve the former 200px control width while reserving real inner
+        // padding. Oversized descendants expand the final outer box below.
+        const content_width = @max(INPUT_WIDTH_PX - 2 * button_padding, 1);
+        const root = try BlockLayout.initRichButton(
+            self.embed.allocator,
+            button_node,
+            parent_block.document,
+            parent_block,
+            content_width,
+        );
+        self.root = root;
+
+        // Nested layout coordinates and interactive bounds are local to the
+        // button until its final baseline position is known.
+        self.swapCollectors(engine);
+        defer self.swapCollectors(engine);
+        try root.layout(engine);
+
+        for (root.display_list.items) |item| {
+            try appendClonedDisplayItem(self.embed.allocator, &self.commands, item);
+        }
+        for (root.children.items) |child| {
+            switch (child) {
+                .block => |block| try paintBlockTreeRecursive(&self.commands, engine, block),
+                .line => |line| try line.paintToList(&self.commands, engine),
+            }
+        }
+
+        rebaseDisplaySources(self.commands.items, parent_block);
+
+        const reference = try engine.font_manager.getStyledGlyph(
+            "X",
+            .Normal,
+            .Roman,
+            engine.scaledFontSize(engine.size),
+            engine.activeFontFamily(),
+        );
+        const minimum_content_height = @max(
+            engine.toLayoutPx(reference.ascent + reference.descent),
+            1,
+        );
+        var content_bounds = browser.Rect{
+            .left = 0,
+            .top = 0,
+            .right = content_width,
+            .bottom = @max(root.height.get().*, minimum_content_height),
+        };
+        if (displayListLayoutBounds(engine, self.commands.items, 0, 0)) |paint_bounds| {
+            content_bounds = unionRects(content_bounds, paint_bounds);
+        }
+
+        const box_metrics = buttonBoxMetrics(content_bounds);
+        self.content_offset_x = box_metrics.content_offset_x;
+        self.content_offset_y = box_metrics.content_offset_y;
+        self.embed.setupDependencies(parent_block, if (element.style) |*map| map else null);
+        self.embed.setMetrics(
+            box_metrics.width,
+            box_metrics.height,
+            box_metrics.height,
+            0,
+            engine.zoom(),
+            engine.size,
+        );
+    }
+
+    fn paintAt(
+        self: *ButtonLayout,
+        destination: *std.ArrayList(DisplayItem),
+        engine: *Layout,
+        x: i32,
+        y: i32,
+        source: ?browser.DisplayItemSource,
+    ) !void {
+        const translate_x = x + self.content_offset_x;
+        const translate_y = y + self.content_offset_y;
+        try self.mergeBounds(engine, translate_x, translate_y);
+
+        try destination.append(engine.allocator, .{ .rect = .{
+            .x1 = x,
+            .y1 = y,
+            .x2 = x + self.embed.width.get().*,
+            .y2 = y + self.embed.height.get().*,
+            .color = engine.remapColor(self.bgcolor),
+            .source = source,
+        } });
+
+        if (self.commands.items.len == 0) return;
+        const children = try self.commands.toOwnedSlice(engine.allocator);
+        var children_owned = true;
+        errdefer if (children_owned) DisplayItem.freeList(engine.allocator, children);
+        try destination.append(engine.allocator, .{ .transform = .{
+            .translate_x = translate_x,
+            .translate_y = translate_y,
+            .children = children,
+            .source = source,
+        } });
+        children_owned = false;
+    }
+
+    fn mergeBounds(self: *ButtonLayout, engine: *Layout, dx: i32, dy: i32) !void {
+        var input_iterator = self.input_bounds.iterator();
+        while (input_iterator.next()) |entry| {
+            try engine.input_bounds.put(entry.key_ptr.*, offsetBounds(entry.value_ptr.*, dx, dy));
+        }
+        for (self.link_bounds.items) |entry| try engine.link_bounds.append(engine.allocator, .{
+            .node = entry.node,
+            .bounds = offsetBounds(entry.bounds, dx, dy),
+        });
+        for (self.iframe_bounds.items) |entry| try engine.iframe_bounds.append(engine.allocator, .{
+            .node = entry.node,
+            .bounds = offsetBounds(entry.bounds, dx, dy),
+        });
+        for (self.focus_bounds.items) |entry| try engine.focus_bounds.append(engine.allocator, .{
+            .node = entry.node,
+            .bounds = offsetBounds(entry.bounds, dx, dy),
+        });
+        for (self.accessibility_bounds.items) |entry| try engine.accessibility_bounds.append(engine.allocator, .{
+            .node = entry.node,
+            .bounds = offsetBounds(entry.bounds, dx, dy),
+        });
+        for (self.fragment_targets.items) |entry| try engine.fragment_targets.append(engine.allocator, .{
+            .node = entry.node,
+            .y = entry.y + dy,
+        });
+    }
+};
+
+fn offsetBounds(bounds: Bounds, dx: i32, dy: i32) Bounds {
+    return .{
+        .x = bounds.x + dx,
+        .y = bounds.y + dy,
+        .width = bounds.width,
+        .height = bounds.height,
+    };
+}
+
+fn unionRects(a: browser.Rect, b: browser.Rect) browser.Rect {
+    return .{
+        .left = @min(a.left, b.left),
+        .top = @min(a.top, b.top),
+        .right = @max(a.right, b.right),
+        .bottom = @max(a.bottom, b.bottom),
+    };
+}
+
+const ButtonBoxMetrics = struct {
+    width: i32,
+    height: i32,
+    content_offset_x: i32,
+    content_offset_y: i32,
+};
+
+fn buttonBoxMetrics(content_bounds: browser.Rect) ButtonBoxMetrics {
+    return .{
+        .width = content_bounds.width() + 2 * button_padding,
+        .height = content_bounds.height() + 2 * button_padding,
+        .content_offset_x = button_padding - content_bounds.left,
+        .content_offset_y = button_padding - content_bounds.top,
+    };
+}
+
+test "rich button box encloses tall oversized and negative-offset content" {
+    const metrics = buttonBoxMetrics(.{
+        .left = -12,
+        .top = -3,
+        .right = 240,
+        .bottom = 117,
+    });
+    try std.testing.expectEqual(@as(i32, 260), metrics.width);
+    try std.testing.expectEqual(@as(i32, 128), metrics.height);
+    try std.testing.expectEqual(@as(i32, 16), metrics.content_offset_x);
+    try std.testing.expectEqual(@as(i32, 7), metrics.content_offset_y);
+}
+
+fn displayListLayoutBounds(
+    engine: *Layout,
+    items: []const DisplayItem,
+    translate_x: i32,
+    translate_y: i32,
+) ?browser.Rect {
+    var result: ?browser.Rect = null;
+    for (items) |item| {
+        const bounds: ?browser.Rect = switch (item) {
+            .glyph => |glyph| .{
+                .left = translate_x + glyph.x,
+                .top = translate_y + glyph.y,
+                .right = translate_x + glyph.x + engine.toLayoutPx(glyph.glyph.w),
+                .bottom = translate_y + glyph.y + engine.toLayoutPx(glyph.glyph.h),
+            },
+            .rect => |rect| .{
+                .left = translate_x + @min(rect.x1, rect.x2),
+                .top = translate_y + @min(rect.y1, rect.y2),
+                .right = translate_x + @max(rect.x1, rect.x2),
+                .bottom = translate_y + @max(rect.y1, rect.y2),
+            },
+            .image => |image| .{
+                .left = translate_x + @min(image.x1, image.x2),
+                .top = translate_y + @min(image.y1, image.y2),
+                .right = translate_x + @max(image.x1, image.x2),
+                .bottom = translate_y + @max(image.y1, image.y2),
+            },
+            .iframe => |iframe| .{
+                .left = translate_x + iframe.rect.left,
+                .top = translate_y + iframe.rect.top,
+                .right = translate_x + iframe.rect.right,
+                .bottom = translate_y + iframe.rect.bottom,
+            },
+            .rounded_rect => |rect| .{
+                .left = translate_x + @min(rect.x1, rect.x2),
+                .top = translate_y + @min(rect.y1, rect.y2),
+                .right = translate_x + @max(rect.x1, rect.x2),
+                .bottom = translate_y + @max(rect.y1, rect.y2),
+            },
+            .line => |line| .{
+                .left = translate_x + @min(line.x1, line.x2) - line.thickness,
+                .top = translate_y + @min(line.y1, line.y2) - line.thickness,
+                .right = translate_x + @max(line.x1, line.x2) + line.thickness,
+                .bottom = translate_y + @max(line.y1, line.y2) + line.thickness,
+            },
+            .outline => |outline| .{
+                .left = translate_x + outline.rect.left - outline.thickness,
+                .top = translate_y + outline.rect.top - outline.thickness,
+                .right = translate_x + outline.rect.right + outline.thickness,
+                .bottom = translate_y + outline.rect.bottom + outline.thickness,
+            },
+            .blend => |blend| displayListLayoutBounds(
+                engine,
+                blend.children,
+                translate_x,
+                translate_y,
+            ),
+            .transform => |transform| displayListLayoutBounds(
+                engine,
+                transform.children,
+                translate_x + transform.translate_x,
+                translate_y + transform.translate_y,
+            ),
+            .draw_composited_layer => null,
+        };
+        if (bounds) |rect| result = if (result) |existing| unionRects(existing, rect) else rect;
+    }
+    return result;
+}
+
+fn rebaseDisplaySources(items: []DisplayItem, parent_block: *BlockLayout) void {
+    for (items) |*item| {
+        switch (item.*) {
+            .blend => |*blend| {
+                if (blend.source) |source| blend.source = displaySource(parent_block, source.node);
+                rebaseDisplaySources(blend.children, parent_block);
+            },
+            .transform => |*transform| {
+                if (transform.source) |source| transform.source = displaySource(parent_block, source.node);
+                rebaseDisplaySources(transform.children, parent_block);
+            },
+            inline else => |*payload| {
+                if (payload.source) |source| payload.source = displaySource(parent_block, source.node);
+            },
+        }
+    }
+}
+
+/// Persistent BlockLayout paint caches own every nested display-list
+/// container they contain. Frame snapshots therefore deep-clone cached items
+/// before effects wrap or retain them; retiring a frame must never invalidate
+/// the cache used by a later paint-only pass.
+const DisplayListCloneError = error{OutOfMemory};
+
+fn cloneDisplayListOwned(
+    allocator: std.mem.Allocator,
+    items: []const DisplayItem,
+) DisplayListCloneError![]DisplayItem {
+    const copy = try allocator.alloc(DisplayItem, items.len);
+    var initialized: usize = 0;
+    errdefer {
+        DisplayItem.freeItems(allocator, copy[0..initialized]);
+        allocator.free(copy);
+    }
+    for (items, 0..) |item, index| {
+        copy[index] = try cloneDisplayItemOwned(allocator, item);
+        initialized += 1;
+    }
+    return copy;
+}
+
+fn cloneDisplayItemOwned(
+    allocator: std.mem.Allocator,
+    item: DisplayItem,
+) DisplayListCloneError!DisplayItem {
+    return switch (item) {
+        .blend => |blend| blk: {
+            const children = try cloneDisplayListOwned(allocator, blend.children);
+            var children_owned = true;
+            errdefer if (children_owned) DisplayItem.freeList(allocator, children);
+
+            const blend_mode = if (blend.blend_mode) |mode|
+                try allocator.dupe(u8, mode)
+            else
+                null;
+            children_owned = false;
+            break :blk .{ .blend = .{
+                .opacity = blend.opacity,
+                .blend_mode = blend_mode,
+                .children = children,
+                .node = blend.node,
+                .parent = null,
+                .needs_compositing = blend.needs_compositing,
+                .source = blend.source,
+            } };
+        },
+        .transform => |transform| .{ .transform = .{
+            .translate_x = transform.translate_x,
+            .translate_y = transform.translate_y,
+            .children = try cloneDisplayListOwned(allocator, transform.children),
+            .node = transform.node,
+            .source = transform.source,
+        } },
+        else => item,
+    };
+}
+
+fn appendClonedDisplayItem(
+    allocator: std.mem.Allocator,
+    destination: *std.ArrayList(DisplayItem),
+    item: DisplayItem,
+) !void {
+    var owned = [1]DisplayItem{try cloneDisplayItemOwned(allocator, item)};
+    var transferred = false;
+    errdefer if (!transferred) DisplayItem.freeItems(allocator, owned[0..]);
+    try destination.append(allocator, owned[0]);
+    transferred = true;
+}
+
+test "display-list cache clones recursively own nested containers" {
+    const allocator = std.testing.allocator;
+
+    const transform_children = try allocator.alloc(DisplayItem, 1);
+    transform_children[0] = .{ .rect = .{
+        .x1 = 1,
+        .y1 = 2,
+        .x2 = 30,
+        .y2 = 40,
+        .color = .{ .r = 1, .g = 2, .b = 3, .a = 255 },
+    } };
+    const blend_children = try allocator.alloc(DisplayItem, 1);
+    blend_children[0] = .{ .transform = .{
+        .translate_x = 5,
+        .translate_y = 7,
+        .children = transform_children,
+    } };
+    const blend_mode = try allocator.dupe(u8, "multiply");
+    var cached = [1]DisplayItem{.{ .blend = .{
+        .opacity = 0.5,
+        .blend_mode = blend_mode,
+        .children = blend_children,
+    } }};
+
+    const snapshot = try cloneDisplayListOwned(allocator, cached[0..]);
+    defer DisplayItem.freeList(allocator, snapshot);
+    DisplayItem.freeItems(allocator, cached[0..]);
+
+    try std.testing.expectEqualStrings("multiply", snapshot[0].blend.blend_mode.?);
+    try std.testing.expectEqual(@as(i32, 5), snapshot[0].blend.children[0].transform.translate_x);
+    try std.testing.expectEqual(@as(i32, 30), snapshot[0].blend.children[0].transform.children[0].rect.x2);
+}
+
+test "rich-button descendant paint retains its own activation origin" {
+    const allocator = std.testing.allocator;
+    var html_parser = try parser.HTMLParser.init(
+        allocator,
+        "<button><a href='/child'>child</a><input></button>",
+    );
+    defer html_parser.deinit(allocator);
+    var root = try html_parser.parse();
+    defer root.deinit(allocator);
+    parser.fixParentPointers(&root, null);
+
+    var nodes = std.ArrayList(*Node).empty;
+    defer nodes.deinit(allocator);
+    try parser.treeToList(allocator, &root, &nodes);
+    var button: ?*Node = null;
+    var anchor: ?*Node = null;
+    var input: ?*Node = null;
+    for (nodes.items) |node| switch (node.*) {
+        .element => |element| {
+            if (std.ascii.eqlIgnoreCase(element.tag, "button")) button = node;
+            if (std.ascii.eqlIgnoreCase(element.tag, "a")) anchor = node;
+            if (std.ascii.eqlIgnoreCase(element.tag, "input")) input = node;
+        },
+        .text => {},
+    };
+
+    var temporary_origin: BlockLayout = undefined;
+    temporary_origin.node_ptr = button.?;
+    temporary_origin.inline_nodes = null;
+    var persistent_origin: BlockLayout = undefined;
+    persistent_origin.node_ptr = button.?;
+    persistent_origin.inline_nodes = null;
+
+    var children = [2]DisplayItem{
+        .{ .rect = .{
+            .x1 = 0,
+            .y1 = 0,
+            .x2 = 20,
+            .y2 = 20,
+            .color = .{ .r = 0, .g = 0, .b = 255, .a = 255 },
+            .source = displaySource(&temporary_origin, anchor.?),
+        } },
+        .{ .rect = .{
+            .x1 = 20,
+            .y1 = 0,
+            .x2 = 40,
+            .y2 = 20,
+            .color = .{ .r = 173, .g = 216, .b = 230, .a = 255 },
+            .source = displaySource(&temporary_origin, input.?),
+        } },
+    };
+    var items = [2]DisplayItem{
+        .{ .rect = .{
+            .x1 = 0,
+            .y1 = 0,
+            .x2 = 70,
+            .y2 = 50,
+            .color = .{ .r = 255, .g = 165, .b = 0, .a = 255 },
+            .source = displaySource(&temporary_origin, button.?),
+        } },
+        .{ .transform = .{
+            .translate_x = 10,
+            .translate_y = 15,
+            .children = children[0..],
+            .source = displaySource(&temporary_origin, button.?),
+        } },
+    };
+    rebaseDisplaySources(items[0..], &persistent_origin);
+
+    const link_hit = DisplayItem.hitTest(items[0..], 12, 17, 1.0).?;
+    try std.testing.expect(link_hit.source.originatingNode() == anchor.?);
+    const input_hit = DisplayItem.hitTest(items[0..], 32, 17, 1.0).?;
+    try std.testing.expect(input_hit.source.originatingNode() == input.?);
+    const background_hit = DisplayItem.hitTest(items[0..], 60, 20, 1.0).?;
+    try std.testing.expect(background_hit.source.originatingNode() == button.?);
+}
 
 // Text layout for individual words
 const TextLayout = struct {
@@ -3527,6 +4084,10 @@ const BlockLayout = struct {
     // An anonymous block owns this pointer slice and lays out each sibling as
     // one inline run. Normal blocks retain their single DOM node instead.
     inline_nodes: ?[]*Node = null,
+    // Rich buttons create a temporary, locally positioned block subtree whose
+    // commands are later translated into the surrounding inline line box.
+    embedded_box: ?EmbeddedBlockBox = null,
+    rich_button_root: bool = false,
 
     // ProtectedField-wrapped layout properties
     zoom: ProtectedField(f32),
@@ -3570,6 +4131,8 @@ const BlockLayout = struct {
             .height = ProtectedField(i32).init(allocator, 0),
             .children = std.ArrayList(LayoutChild).empty,
             .display_list = std.ArrayList(DisplayItem).empty,
+            .embedded_box = null,
+            .rich_button_root = false,
             .children_epoch = 0,
             .children_version = ProtectedField(u64).init(allocator, 0),
         };
@@ -3634,6 +4197,26 @@ const BlockLayout = struct {
         return block;
     }
 
+    fn initRichButton(
+        allocator: std.mem.Allocator,
+        node_ptr: *Node,
+        document: *DocumentLayout,
+        parent_block: *BlockLayout,
+        content_width: i32,
+    ) !*BlockLayout {
+        const block = try BlockLayout.init(
+            allocator,
+            node_ptr.*,
+            node_ptr,
+            document,
+            parent_block,
+            null,
+        );
+        block.embedded_box = .{ .x = 0, .y = 0, .width = content_width };
+        block.rich_button_root = true;
+        return block;
+    }
+
     fn specifiedPixelDimension(
         self: *BlockLayout,
         property: []const u8,
@@ -3691,6 +4274,7 @@ const BlockLayout = struct {
         }
         self.children.deinit(self.allocator);
         if (self.inline_nodes) |nodes| self.allocator.free(nodes);
+        DisplayItem.freeItems(self.allocator, self.display_list.items);
         self.display_list.deinit(self.allocator);
         self.zoom.deinit();
         self.x.deinit();
@@ -3730,8 +4314,10 @@ const BlockLayout = struct {
         switch (self.node) {
             .text => return false,
             .element => |e| {
-                // Input, button, and iframe elements are always inline, even though they may have no children
-                if (std.ascii.eqlIgnoreCase(e.tag, "input") or std.ascii.eqlIgnoreCase(e.tag, "button") or
+                // Replaced controls are atomic in their surrounding line. A
+                // rich button's temporary root is the contained exception.
+                if (std.ascii.eqlIgnoreCase(e.tag, "input") or
+                    (std.ascii.eqlIgnoreCase(e.tag, "button") and !self.rich_button_root) or
                     std.ascii.eqlIgnoreCase(e.tag, "img") or std.ascii.eqlIgnoreCase(e.tag, "iframe"))
                 {
                     return false;
@@ -3823,11 +4409,20 @@ const BlockLayout = struct {
             self.document.y.read(&self.y).*;
 
         // Set x, y, width early so children can read them
-        const content_bounds = contentBoundsForNode(self.node, parent_x, parent_width);
-        const specified_width = self.specifiedPixelDimension("width", &self.width);
-        const specified_height = self.specifiedPixelDimension("height", &self.height);
+        const content_bounds = if (self.embedded_box) |embedded|
+            ContentBounds{ .x = embedded.x, .width = embedded.width }
+        else
+            contentBoundsForNode(self.node, parent_x, parent_width);
+        const specified_width = if (self.embedded_box == null)
+            self.specifiedPixelDimension("width", &self.width)
+        else
+            null;
+        const specified_height = if (self.embedded_box == null)
+            self.specifiedPixelDimension("height", &self.height)
+        else
+            null;
         self.x.set(content_bounds.x);
-        self.y.set(prev_y);
+        self.y.set(if (self.embedded_box) |embedded| embedded.y else prev_y);
         self.width.set(specified_width orelse content_bounds.width);
         if (engine.collect_hit_test_bounds) {
             if (self.node_ptr) |ptr| try engine.recordFragmentTargets(ptr, prev_y);
@@ -3836,7 +4431,8 @@ const BlockLayout = struct {
         var is_block = self.isBlockContainer();
         if (self.node == .element) {
             const tag = self.node.element.tag;
-            if (std.ascii.eqlIgnoreCase(tag, "input") or std.ascii.eqlIgnoreCase(tag, "button") or
+            if (std.ascii.eqlIgnoreCase(tag, "input") or
+                (std.ascii.eqlIgnoreCase(tag, "button") and !self.rich_button_root) or
                 std.ascii.eqlIgnoreCase(tag, "img") or std.ascii.eqlIgnoreCase(tag, "iframe"))
             {
                 is_block = false;
@@ -3844,6 +4440,7 @@ const BlockLayout = struct {
         }
 
         // Reset any cached inline commands
+        DisplayItem.freeItems(self.allocator, self.display_list.items);
         self.display_list.clearRetainingCapacity();
 
         if (is_block) {
@@ -3994,11 +4591,14 @@ const BlockLayout = struct {
     }
 
     fn shouldPaint(self: *const BlockLayout) bool {
+        // Anonymous blocks may use an input or button as their representative
+        // node, but their display list contains the replaced control itself.
+        // Only suppress a DOM-backed control block's redundant background.
+        if (self.inline_nodes != null) return true;
         switch (self.node) {
             .text => return true,
             .element => |e| {
-                // Don't paint background for input/button in BlockLayout
-                // They paint themselves in InputLayout
+                // Controls paint their own background in their inline layout.
                 return !std.mem.eql(u8, e.tag, "input") and !std.mem.eql(u8, e.tag, "button");
             },
         }
@@ -4042,6 +4642,21 @@ test "block display provenance rejects fragments outside its DOM origin" {
     try std.testing.expect(displaySource(&block, inside_text.?).originatingNode() == inside_text.?);
     try std.testing.expect(displaySource(&block, null).originatingNode() == anchor.?);
     try std.testing.expect(displaySource(&block, paragraph.?).originatingNode() == null);
+}
+
+test "anonymous inline run paints when its representative node is a button" {
+    const allocator = std.testing.allocator;
+    var button = Node{ .element = try parser.Element.init(allocator, "button", null) };
+    defer button.deinit(allocator);
+    var roots = [1]*Node{&button};
+
+    var anonymous: BlockLayout = undefined;
+    anonymous.node = button;
+    anonymous.inline_nodes = roots[0..];
+    try std.testing.expect(anonymous.shouldPaint());
+
+    anonymous.inline_nodes = null;
+    try std.testing.expect(!anonymous.shouldPaint());
 }
 
 fn findLastTextLayout(block: *BlockLayout) ?*TextLayout {
@@ -4274,8 +4889,10 @@ fn layoutInlineBlock(self: *Layout, block: *BlockLayout) !void {
                 try self.breakExplicitLine(&line_buffer);
             }
 
-            if (std.ascii.eqlIgnoreCase(e.tag, "input") or std.ascii.eqlIgnoreCase(e.tag, "button")) {
+            if (std.ascii.eqlIgnoreCase(e.tag, "input")) {
                 try self.handleInputElement(block.node, block.node_ptr, &line_buffer);
+            } else if (std.ascii.eqlIgnoreCase(e.tag, "button") and !block.rich_button_root) {
+                try self.handleButtonElement(block.node, block.node_ptr, &line_buffer);
             } else if (std.ascii.eqlIgnoreCase(e.tag, "img")) {
                 try self.handleImageElement(block.node, block.node_ptr, &line_buffer);
             } else if (std.ascii.eqlIgnoreCase(e.tag, "iframe")) {
@@ -4353,6 +4970,10 @@ fn parseColor(color_str: []const u8) ?browser.Color {
 fn addBackgroundIfNeeded(self: *Layout, block: *const BlockLayout) !void {
     // Skip painting if shouldPaint returns false
     if (!block.shouldPaint()) return;
+    // Anonymous inline-run blocks copy their first node only as a layout
+    // representative; that node's background belongs to its own inline
+    // payload, not to the full-width anonymous wrapper.
+    if (block.inline_nodes != null) return;
 
     switch (block.node) {
         .element => |e| {
@@ -4489,7 +5110,7 @@ fn paintBlockTree(self: *Layout, block: *BlockLayout) !void {
 
     // Add the block's display items (from children like text, etc.)
     for (block.display_list.items) |item| {
-        try commands.append(self.allocator, item);
+        try appendClonedDisplayItem(self.allocator, &commands, item);
     }
     try appendListMarker(self, &commands, block);
 
@@ -4591,7 +5212,7 @@ fn paintBlockTreeRecursive(commands: *std.ArrayList(DisplayItem), self: *Layout,
 
     // Add display items (from text, etc.)
     for (block.display_list.items) |item| {
-        try block_commands.append(self.allocator, item);
+        try appendClonedDisplayItem(self.allocator, &block_commands, item);
     }
     try appendListMarker(self, &block_commands, block);
 
@@ -4799,6 +5420,7 @@ fn applyPaintEffects(self: *Layout, block: *BlockLayout, commands: []DisplayItem
 fn addBackgroundIfNeededToList(self: *Layout, commands: *std.ArrayList(DisplayItem), block: *const BlockLayout) !void {
     // Skip painting if shouldPaint returns false
     if (!block.shouldPaint()) return;
+    if (block.inline_nodes != null) return;
 
     switch (block.node) {
         .element => |e| {

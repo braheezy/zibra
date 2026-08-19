@@ -51,6 +51,10 @@ input styling.
 toggles, omission of unchecked controls, explicit values, and the default
 checked value `on` through a localhost GET submission.
 
+`tests/manual/rich-buttons.html` verifies inline rich-button containment,
+block-driven height growth, independently targetable input/link descendants,
+and nested-button parser recovery.
+
 `tests/manual/resubmit-requests.html` uses the tutorial server's deterministic
 POST login to verify that Back to a POST target asks before replaying, Cancel
 does not navigate, and Resubmit sends the retained body again.
