@@ -52,6 +52,16 @@ zig build test-screenshot
 
 To test chunked gzip responses, run `gzipServer.py` locally.
 
+The tutorial server is now a small topic-based message board. Start it with:
+
+```sh
+python3 server.py
+```
+
+Then open `http://127.0.0.1:8005/`. Sign in with one of the tutorial accounts
+(for example `a` / `b`) to create topics and post messages. Each topic has its
+own root-level URL, such as `/cooking` or `/cars`.
+
 See [Architecture and lifetimes](docs/architecture-and-lifetimes.md) for the source map, ownership contracts, threading model, and known lifetime risks.
 
 ## Known Issues

@@ -19,6 +19,9 @@ Current checks:
   including the inherited alternate-text-direction, multiline centered-title,
   and scoped superscript, small-caps, and preformatted-text fixtures, plus
   discretionary soft-hyphen wrapping.
+- `python3 -m unittest tests/test_server_message_board.py` — pure tutorial
+  server routing, topic creation, authorization, escaping, and message
+  isolation without binding a network port.
 
 `tests/manual/visited-links.html` is the session-state regression: its self
 link is purple initially, and its target becomes purple after visiting it and

@@ -31,6 +31,7 @@ architecture document.
 | URLs, HTTP, cookies, caching, decoding | `src/network/`        |
 | Tasking and synchronization            | `src/runtime/`        |
 | Shared low-level primitives            | `src/core/`           |
+| Tutorial message-board server          | `server.py`           |
 | Fixtures and regression tests          | `tests/`              |
 
 ## Working rules
@@ -56,6 +57,8 @@ architecture document.
 - Exercise `tests/manual/dump-pipeline.html` with the style, layout, and
   display-list commands when changing document-pipeline diagnostics.
 - On macOS, run `zig build test-screenshot` for the windowless software-rendering fixtures.
+- Run `python3 -m unittest tests/test_server_message_board.py` after changing
+  the tutorial server's routing, session, topic, or message behavior.
 - Put human-facing regressions in `tests/manual/` with a short verification
   comment. Use the `zibra-screenshot` skill for Linux/Xvfb captures when a
   screenshot is required.
