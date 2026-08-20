@@ -184,6 +184,9 @@ const WindowContext = struct {
     realm: *Realm,
     node_to_handle: std.AutoHashMap(*Node, u32),
     handle_to_node: std.AutoHashMap(u32, *Node),
+    // Heap-stable owners for createElement results that have not yet been
+    // transferred into a DOM child array.
+    detached_nodes: std.AutoHashMap(*Node, void),
     next_handle: u32,
     current_nodes: ?*Node,
     pending_messages: std.ArrayList(PendingMessage),
@@ -255,6 +258,7 @@ fn ensureWindow(self: *Js, window_id: u32) !void {
         .realm = self.realm.?,
         .node_to_handle = std.AutoHashMap(*Node, u32).init(self.allocator),
         .handle_to_node = std.AutoHashMap(u32, *Node).init(self.allocator),
+        .detached_nodes = std.AutoHashMap(*Node, void).init(self.allocator),
         .next_handle = 0,
         .current_nodes = null,
         .pending_messages = std.ArrayList(PendingMessage).empty,
@@ -351,8 +355,10 @@ pub fn deinit(self: *Js, allocator: std.mem.Allocator) void {
     self.lock.lock();
     var it = self.windows.valueIterator();
     while (it.next()) |window| {
+        self.clearDetachedNodes(window);
         window.node_to_handle.deinit();
         window.handle_to_node.deinit();
+        window.detached_nodes.deinit();
         for (window.pending_messages.items) |msg| {
             self.allocator.free(msg.message);
             self.allocator.free(msg.origin);
@@ -465,6 +471,17 @@ pub fn evaluate(self: *Js, window_id: u32, code: []const u8) !Value {
         \\Node.prototype.setAttribute = function(name, value) {
         \\  var text = value == null ? "" : value.toString();
         \\  __native.setAttribute(this.handle, name, text);
+        \\};
+        \\
+        \\Node.prototype.appendChild = function(child) {
+        \\  __native.appendChild(this.handle, child && child.handle);
+        \\  return child;
+        \\};
+        \\
+        \\Node.prototype.insertBefore = function(child, reference) {
+        \\  var referenceHandle = reference === null ? null : reference && reference.handle;
+        \\  __native.insertBefore(this.handle, child && child.handle, referenceHandle);
+        \\  return child;
         \\};
         \\
         \\// Snapshot the immediate element children as wrapped Node objects.
@@ -592,6 +609,10 @@ pub fn evaluate(self: *Js, window_id: u32, code: []const u8) !Value {
         \\    var handles = originalQuerySelectorAll.call(this, selector);
         \\    return handles.map(function(h) { return new Node(h); });
         \\  };
+        \\  document.createElement = function(tagName) {
+        \\    var text = tagName == null ? "" : tagName.toString();
+        \\    return new Node(__native.createElement(text));
+        \\  };
         \\})();
     ;
 
@@ -648,6 +669,7 @@ pub fn setNodes(self: *Js, window_id: u32, nodes: ?*Node) void {
     self.lock.lock();
     defer self.lock.unlock();
     const window = self.setCurrentWindow(window_id) catch return;
+    self.clearDetachedNodes(window);
     window.current_nodes = nodes;
     // Clear handle mappings when nodes change
     window.node_to_handle.clearRetainingCapacity();
@@ -729,11 +751,14 @@ fn getHandle(self: *Js, window: *WindowContext, node: *Node) !u32 {
         return handle;
     }
 
+    // Reserve both directions before publishing either half of the mapping.
+    // A failed allocation must not leave a one-way handle or consume an ID.
+    try window.node_to_handle.ensureUnusedCapacity(1);
+    try window.handle_to_node.ensureUnusedCapacity(1);
     const handle = window.next_handle;
     window.next_handle += 1;
-
-    try window.node_to_handle.put(node, handle);
-    try window.handle_to_node.put(handle, node);
+    window.node_to_handle.putAssumeCapacity(node, handle);
+    window.handle_to_node.putAssumeCapacity(handle, node);
 
     return handle;
 }
@@ -742,6 +767,135 @@ fn getHandle(self: *Js, window: *WindowContext, node: *Node) !u32 {
 fn getNode(self: *Js, window: *WindowContext, handle: u32) ?*Node {
     _ = self;
     return window.handle_to_node.get(handle);
+}
+
+fn clearDetachedNodes(self: *Js, window: *WindowContext) void {
+    var it = window.detached_nodes.keyIterator();
+    while (it.next()) |node_ptr| {
+        const node = node_ptr.*;
+        node.deinit(self.allocator);
+        self.allocator.destroy(node);
+    }
+    window.detached_nodes.clearRetainingCapacity();
+}
+
+const DirectChildHandle = struct {
+    old_ptr: *Node,
+    old_index: usize,
+    handle: u32,
+};
+
+fn snapshotDirectChildHandles(
+    self: *Js,
+    window: *WindowContext,
+    parent: *Node,
+) !std.ArrayList(DirectChildHandle) {
+    var bindings = std.ArrayList(DirectChildHandle).empty;
+    errdefer bindings.deinit(self.allocator);
+
+    switch (parent.*) {
+        .text => {},
+        .element => |*element| {
+            for (element.children.items, 0..) |*child, index| {
+                if (window.node_to_handle.get(child)) |handle| {
+                    try bindings.append(self.allocator, .{
+                        .old_ptr = child,
+                        .old_index = index,
+                        .handle = handle,
+                    });
+                }
+            }
+        },
+    }
+    return bindings;
+}
+
+fn nodeParent(node: *Node) ?*Node {
+    return switch (node.*) {
+        .text => |text| text.parent,
+        .element => |element| element.parent,
+    };
+}
+
+fn isAttachedToCurrentDocument(window: *WindowContext, node: *Node) bool {
+    const root = window.current_nodes orelse return false;
+    var current = node;
+    while (nodeParent(current)) |parent| current = parent;
+    return current == root;
+}
+
+fn isInclusiveAncestor(ancestor: *Node, node: *Node) bool {
+    var current: ?*Node = node;
+    while (current) |candidate| {
+        if (candidate == ancestor) return true;
+        current = nodeParent(candidate);
+    }
+    return false;
+}
+
+fn directChildIndex(parent: *Node, child: *Node) ?usize {
+    return switch (parent.*) {
+        .text => null,
+        .element => |*element| index: {
+            for (element.children.items, 0..) |*candidate, i| {
+                if (candidate == child) break :index i;
+            }
+            break :index null;
+        },
+    };
+}
+
+/// Move a window-owned detached root into an element's by-value child array.
+/// Every fallible allocation happens before handle maps or detached ownership
+/// change; after capacity succeeds, insertion and rebinding are infallible.
+fn insertDetachedChild(
+    self: *Js,
+    window: *WindowContext,
+    parent: *Node,
+    child: *Node,
+    insert_index: usize,
+) !void {
+    var bindings = try self.snapshotDirectChildHandles(window, parent);
+    defer bindings.deinit(self.allocator);
+
+    const parent_is_attached = isAttachedToCurrentDocument(window, parent);
+    const parent_parent = nodeParent(parent);
+    const child_handle = window.node_to_handle.get(child).?;
+    const element = &parent.element;
+
+    element.children_dirty = true;
+    parser.dirtyStyleForElement(element);
+    markElementLayoutDirty(element);
+    if (parent_is_attached) self.prepareDomMutation(parent);
+
+    // This is the last fallible step. On failure the callback has already
+    // scheduled a safe rebuild of the retired render generation.
+    try element.children.ensureUnusedCapacity(self.allocator, 1);
+
+    // Capacity growth and insertion can relocate or shift every immediate
+    // child. Remove all old pointer keys before any new address is installed.
+    for (bindings.items) |binding| {
+        _ = window.node_to_handle.remove(binding.old_ptr);
+    }
+    _ = window.node_to_handle.remove(child);
+
+    element.children.insertAssumeCapacity(insert_index, child.*);
+    _ = window.detached_nodes.remove(child);
+    self.allocator.destroy(child);
+
+    for (bindings.items) |binding| {
+        const new_index = binding.old_index + @intFromBool(binding.old_index >= insert_index);
+        const new_ptr = &element.children.items[new_index];
+        window.node_to_handle.putAssumeCapacity(new_ptr, binding.handle);
+        window.handle_to_node.putAssumeCapacity(binding.handle, new_ptr);
+    }
+
+    const installed_child = &element.children.items[insert_index];
+    window.node_to_handle.putAssumeCapacity(installed_child, child_handle);
+    window.handle_to_node.putAssumeCapacity(child_handle, installed_child);
+    parser.fixParentPointers(parent, parent_parent);
+
+    if (parent_is_attached) self.requestRender();
 }
 
 fn removeHandlesForSubtree(self: *Js, window: *WindowContext, node: *Node) void {
@@ -1128,6 +1282,102 @@ test "Node.children reflects a later innerHTML generation" {
     try std.testing.expect(result.toBoolean());
 }
 
+const DomMutationTestContext = struct {
+    count: usize = 0,
+
+    fn callback(context: ?*anyopaque, _: *Node) void {
+        const raw = context orelse return;
+        const unaligned: *align(1) DomMutationTestContext = @ptrCast(raw);
+        const self: *DomMutationTestContext = @alignCast(unaligned);
+        self.count += 1;
+    }
+};
+
+test "createElement appendChild and insertBefore preserve handles and order" {
+    const allocator = std.testing.allocator;
+    var html_parser = try parser.HTMLParser.init(
+        allocator,
+        "<main><section id=target><i id=anchor></i></section></main>",
+    );
+    html_parser.use_implicit_tags = false;
+    defer html_parser.deinit(allocator);
+    var root = try html_parser.parse();
+    defer root.deinit(allocator);
+    parser.fixParentPointers(&root, null);
+
+    var environ = std.process.Environ.Map.init(allocator);
+    defer environ.deinit();
+    var js = try Js.init(allocator, std.testing.io, &environ);
+    defer js.deinit(allocator);
+    js.setNodes(0, &root);
+    defer js.setNodes(0, null);
+
+    var mutation_context = DomMutationTestContext{};
+    js.setDomMutationCallback(0, DomMutationTestContext.callback, &mutation_context);
+
+    const result = try js.evaluate(0,
+        \\var target = document.querySelectorAll('section')[0];
+        \\var anchor = target.children[0];
+        \\var article = document.createElement('ARTICLE');
+        \\article.setAttribute('id', 'created');
+        \\var nested = document.createElement('strong');
+        \\nested.setAttribute('id', 'nested');
+        \\var nestedReturn = article.appendChild(nested);
+        \\var appendReturn = target.appendChild(article);
+        \\var before = document.createElement('em');
+        \\before.setAttribute('id', 'before');
+        \\var beforeReturn = target.insertBefore(before, anchor);
+        \\var tail = document.createElement('small');
+        \\tail.setAttribute('id', 'tail');
+        \\var tailReturn = target.insertBefore(tail, null);
+        \\var children = target.children;
+        \\nestedReturn === nested && appendReturn === article &&
+        \\beforeReturn === before && tailReturn === tail &&
+        \\children.length === 4 &&
+        \\children[0].handle === before.handle &&
+        \\children[1].handle === anchor.handle &&
+        \\children[2].handle === article.handle &&
+        \\children[3].handle === tail.handle &&
+        \\anchor.getAttribute('id') === 'anchor' &&
+        \\article.getAttribute('id') === 'created' &&
+        \\article.children[0].handle === nested.handle &&
+        \\document.querySelectorAll('article').length === 1
+    );
+    try std.testing.expect(result.toBoolean());
+    // Building the article subtree while detached does not invalidate the
+    // installed document; its three later insertions do.
+    try std.testing.expectEqual(@as(usize, 3), mutation_context.count);
+}
+
+test "createElement detached ownership is released with the document" {
+    const allocator = std.testing.allocator;
+    var html_parser = try parser.HTMLParser.init(allocator, "<main></main>");
+    html_parser.use_implicit_tags = false;
+    defer html_parser.deinit(allocator);
+    var root = try html_parser.parse();
+    defer root.deinit(allocator);
+    parser.fixParentPointers(&root, null);
+
+    var environ = std.process.Environ.Map.init(allocator);
+    defer environ.deinit();
+    var js = try Js.init(allocator, std.testing.io, &environ);
+    defer js.deinit(allocator);
+    js.setNodes(0, &root);
+
+    const result = try js.evaluate(0,
+        \\var abandoned = document.createElement('DIV');
+        \\var nested = document.createElement('span');
+        \\abandoned.appendChild(nested);
+        \\abandoned.children.length === 1 &&
+        \\abandoned.children[0].handle === nested.handle
+    );
+    try std.testing.expect(result.toBoolean());
+    try std.testing.expectEqual(@as(usize, 1), js.windows.getPtr(0).?.detached_nodes.count());
+
+    js.setNodes(0, null);
+    try std.testing.expectEqual(@as(usize, 0), js.windows.getPtr(0).?.detached_nodes.count());
+}
+
 test "native style_set updates element style attribute" {
     var environ = std.process.Environ.Map.init(std.testing.allocator);
     defer environ.deinit();
@@ -1310,6 +1560,63 @@ fn setupDocument(self: *Js, realm: *Realm) !void {
         PropertyKey.from("children"),
         .{
             .value_or_accessor = .{ .value = Value.from(&children_fn.object) },
+            .attributes = .builtin_default,
+        },
+    );
+
+    const create_element_fn = try kiesel.builtins.createBuiltinFunction(
+        &self.agent,
+        .{ .function = createElement },
+        1,
+        "createElement",
+        .{
+            .realm = realm,
+            .additional_fields = self_ptr,
+        },
+    );
+    try native_obj.definePropertyDirect(
+        &self.agent,
+        PropertyKey.from("createElement"),
+        .{
+            .value_or_accessor = .{ .value = Value.from(&create_element_fn.object) },
+            .attributes = .builtin_default,
+        },
+    );
+
+    const append_child_fn = try kiesel.builtins.createBuiltinFunction(
+        &self.agent,
+        .{ .function = appendChild },
+        2,
+        "appendChild",
+        .{
+            .realm = realm,
+            .additional_fields = self_ptr,
+        },
+    );
+    try native_obj.definePropertyDirect(
+        &self.agent,
+        PropertyKey.from("appendChild"),
+        .{
+            .value_or_accessor = .{ .value = Value.from(&append_child_fn.object) },
+            .attributes = .builtin_default,
+        },
+    );
+
+    const insert_before_fn = try kiesel.builtins.createBuiltinFunction(
+        &self.agent,
+        .{ .function = insertBefore },
+        3,
+        "insertBefore",
+        .{
+            .realm = realm,
+            .additional_fields = self_ptr,
+        },
+    );
+    try native_obj.definePropertyDirect(
+        &self.agent,
+        PropertyKey.from("insertBefore"),
+        .{
+            .value_or_accessor = .{ .value = Value.from(&insert_before_fn.object) },
             .attributes = .builtin_default,
         },
     );
@@ -1752,6 +2059,193 @@ fn getChildren(agent: *Agent, this_value: Value, arguments: kiesel.types.Argumen
     }
 
     return Value.from(&result.object);
+}
+
+fn isValidCreatedTagName(tag: []const u8) bool {
+    if (tag.len == 0) return false;
+    for (tag) |byte| {
+        if (std.ascii.isWhitespace(byte) or switch (byte) {
+            0, '<', '>', '/', '=', '"', '\'' => true,
+            else => false,
+        }) return false;
+    }
+    return true;
+}
+
+/// __native.createElement implementation. A created node is owned by its
+/// WindowContext until appendChild/insertBefore transfers it into a DOM tree.
+fn createElement(agent: *Agent, this_value: Value, arguments: kiesel.types.Arguments) Agent.Error!Value {
+    const function_obj = agent.activeFunctionObject();
+    const builtin_fn = function_obj.as(kiesel.builtins.BuiltinFunction);
+    const js_instance = builtin_fn.fields.additionalFieldsAs(Js);
+    const window_id = js_instance.current_window_id orelse return agent.throwException(
+        .internal_error,
+        "Missing active window",
+        .{},
+    );
+    const window = js_instance.windows.getPtr(window_id) orelse return agent.throwException(
+        .internal_error,
+        "Missing window context",
+        .{},
+    );
+    _ = this_value;
+
+    const tag_arg = arguments.get(0);
+    if (!tag_arg.isString()) {
+        return agent.throwException(.type_error, "createElement requires a tag name", .{});
+    }
+    const tag = try tag_arg.asString().toUtf8(js_instance.allocator);
+    defer js_instance.allocator.free(tag);
+    if (!isValidCreatedTagName(tag)) {
+        return agent.throwException(.syntax_error, "Invalid element tag name", .{});
+    }
+
+    const owned_tag = try js_instance.allocator.dupe(u8, tag);
+    var tag_owned = true;
+    errdefer if (tag_owned) js_instance.allocator.free(owned_tag);
+    for (owned_tag) |*byte| byte.* = std.ascii.toLower(byte.*);
+
+    var element = parser.Element.init(js_instance.allocator, owned_tag, null) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return agent.throwException(.internal_error, "Could not create element", .{}),
+    };
+    var element_owned = true;
+    errdefer if (element_owned) element.deinit(js_instance.allocator);
+    if (element.owned_strings == null) {
+        element.owned_strings = std.ArrayList([]const u8).empty;
+    }
+    try element.owned_strings.?.append(js_instance.allocator, owned_tag);
+    tag_owned = false;
+
+    const node = try js_instance.allocator.create(Node);
+    var node_owned = true;
+    errdefer if (node_owned) {
+        node.deinit(js_instance.allocator);
+        js_instance.allocator.destroy(node);
+    };
+    node.* = .{ .element = element };
+    element_owned = false;
+
+    try window.detached_nodes.ensureUnusedCapacity(1);
+    const handle = try js_instance.getHandle(window, node);
+    window.detached_nodes.putAssumeCapacity(node, {});
+    node_owned = false;
+
+    return Value.from(@as(f64, @floatFromInt(handle)));
+}
+
+fn appendChild(agent: *Agent, this_value: Value, arguments: kiesel.types.Arguments) Agent.Error!Value {
+    const function_obj = agent.activeFunctionObject();
+    const builtin_fn = function_obj.as(kiesel.builtins.BuiltinFunction);
+    const js_instance = builtin_fn.fields.additionalFieldsAs(Js);
+    const window_id = js_instance.current_window_id orelse return agent.throwException(
+        .internal_error,
+        "Missing active window",
+        .{},
+    );
+    const window = js_instance.windows.getPtr(window_id) orelse return agent.throwException(
+        .internal_error,
+        "Missing window context",
+        .{},
+    );
+    _ = this_value;
+
+    const parent_arg = arguments.get(0);
+    const child_arg = arguments.get(1);
+    if (!parent_arg.isNumber() or !child_arg.isNumber()) {
+        return agent.throwException(.type_error, "appendChild requires two Nodes", .{});
+    }
+    const parent_handle: u32 = @intFromFloat(parent_arg.asNumber().asFloat());
+    const child_handle: u32 = @intFromFloat(child_arg.asNumber().asFloat());
+    const parent = js_instance.getNode(window, parent_handle) orelse return agent.throwException(
+        .internal_error,
+        "Invalid parent node handle",
+        .{},
+    );
+    const child = js_instance.getNode(window, child_handle) orelse return agent.throwException(
+        .internal_error,
+        "Invalid child node handle",
+        .{},
+    );
+    if (parent.* != .element) {
+        return agent.throwException(.type_error, "Text nodes do not support appendChild", .{});
+    }
+    if (!window.detached_nodes.contains(child)) {
+        return agent.throwException(.type_error, "appendChild requires a detached created element", .{});
+    }
+    if (isInclusiveAncestor(child, parent)) {
+        return agent.throwException(.type_error, "appendChild would create a cycle", .{});
+    }
+
+    try js_instance.insertDetachedChild(window, parent, child, parent.element.children.items.len);
+    return .undefined;
+}
+
+fn insertBefore(agent: *Agent, this_value: Value, arguments: kiesel.types.Arguments) Agent.Error!Value {
+    const function_obj = agent.activeFunctionObject();
+    const builtin_fn = function_obj.as(kiesel.builtins.BuiltinFunction);
+    const js_instance = builtin_fn.fields.additionalFieldsAs(Js);
+    const window_id = js_instance.current_window_id orelse return agent.throwException(
+        .internal_error,
+        "Missing active window",
+        .{},
+    );
+    const window = js_instance.windows.getPtr(window_id) orelse return agent.throwException(
+        .internal_error,
+        "Missing window context",
+        .{},
+    );
+    _ = this_value;
+
+    const parent_arg = arguments.get(0);
+    const child_arg = arguments.get(1);
+    if (!parent_arg.isNumber() or !child_arg.isNumber()) {
+        return agent.throwException(.type_error, "insertBefore requires parent and child Nodes", .{});
+    }
+    const parent_handle: u32 = @intFromFloat(parent_arg.asNumber().asFloat());
+    const child_handle: u32 = @intFromFloat(child_arg.asNumber().asFloat());
+    const parent = js_instance.getNode(window, parent_handle) orelse return agent.throwException(
+        .internal_error,
+        "Invalid parent node handle",
+        .{},
+    );
+    const child = js_instance.getNode(window, child_handle) orelse return agent.throwException(
+        .internal_error,
+        "Invalid child node handle",
+        .{},
+    );
+    if (parent.* != .element) {
+        return agent.throwException(.type_error, "Text nodes do not support insertBefore", .{});
+    }
+    if (!window.detached_nodes.contains(child)) {
+        return agent.throwException(.type_error, "insertBefore requires a detached created element", .{});
+    }
+    if (isInclusiveAncestor(child, parent)) {
+        return agent.throwException(.type_error, "insertBefore would create a cycle", .{});
+    }
+
+    const reference_arg = arguments.get(2);
+    const insert_index = if (reference_arg.isNull())
+        parent.element.children.items.len
+    else index: {
+        if (!reference_arg.isNumber()) {
+            return agent.throwException(.type_error, "insertBefore reference must be a Node or null", .{});
+        }
+        const reference_handle: u32 = @intFromFloat(reference_arg.asNumber().asFloat());
+        const reference = js_instance.getNode(window, reference_handle) orelse return agent.throwException(
+            .internal_error,
+            "Invalid reference node handle",
+            .{},
+        );
+        break :index directChildIndex(parent, reference) orelse return agent.throwException(
+            .type_error,
+            "insertBefore reference is not a child of this node",
+            .{},
+        );
+    };
+
+    try js_instance.insertDetachedChild(window, parent, child, insert_index);
+    return .undefined;
 }
 
 /// __native.setAttribute implementation

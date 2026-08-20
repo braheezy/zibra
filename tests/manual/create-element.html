@@ -1,0 +1,49 @@
+<!--
+How to verify:
+Open this page normally. Three colored boxes must appear around the original
+"anchor" text, followed by a green PASS message. The script builds each box
+with createElement and attaches it with appendChild or insertBefore; it does
+not use innerHTML.
+-->
+<!doctype html>
+<title>createElement DOM insertion</title>
+<style>
+  .target { border: 1px solid black; padding: 4px; }
+  .box { display: block; width: 180px; height: 24px; }
+  .before { background-color: lightblue; }
+  .appended { background-color: lightgreen; }
+  .tail { background-color: pink; }
+</style>
+<h1>createElement fixture</h1>
+<div class="target"><span id="anchor">anchor</span></div>
+<p class="pass" style="display: none; color: green">PASS: created nodes attached in order</p>
+<script>
+  var target = document.querySelectorAll(".target")[0];
+  var anchor = target.children[0];
+
+  var appended = document.createElement("DIV");
+  appended.setAttribute("id", "appended");
+  appended.setAttribute("class", "box appended");
+  target.appendChild(appended);
+
+  var before = document.createElement("div");
+  before.setAttribute("id", "before");
+  before.setAttribute("class", "box before");
+  target.insertBefore(before, anchor);
+
+  var tail = document.createElement("div");
+  tail.setAttribute("id", "tail");
+  tail.setAttribute("class", "box tail");
+  target.insertBefore(tail, null);
+
+  var children = target.children;
+  var passed = children.length === 4 &&
+    children[0].getAttribute("id") === "before" &&
+    children[1].getAttribute("id") === "anchor" &&
+    children[2].getAttribute("id") === "appended" &&
+    children[3].getAttribute("id") === "tail" &&
+    document.querySelectorAll(".box").length === 3;
+  if (passed) {
+    document.querySelectorAll(".pass")[0].setAttribute("style", "color: green");
+  }
+</script>

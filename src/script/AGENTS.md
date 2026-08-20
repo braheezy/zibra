@@ -13,6 +13,10 @@ or Kiesel allocation/locking.
   for immediate element children in DOM order, excludes text and deeper
   descendants, and relies on the existing handle invalidation boundary when a
   structural mutation retires child storage.
+- `document.createElement` returns a window-owned, heap-stable detached Node.
+  `appendChild` and `insertBefore` transfer only such detached roots into a
+  child array, rebind handles for every relocated immediate child, and invoke
+  the synchronous DOM-mutation boundary before attached storage can move.
 - Detached/queued work must use the document generation contract from
   `src/browser/`; never retain a callback context or frame as a long-lived
   pointer.

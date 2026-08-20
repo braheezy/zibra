@@ -292,13 +292,18 @@ boundary. `innerHTML` stages its replacement children and backing string,
 marks the target layout dirty, then invokes the frame's DOM-mutation callback
 before destroying the old children or replacing their array. The first native
 contenteditable child append invokes the same Tab seam before a fallible
-capacity change. That seam retires the frame display list and DOM-keyed bounds,
-clears the accessibility tree and pending composited node updates, and retires
-the active browser draw list, layers, and committed display list under
-`Browser.lock`. Dirty flags and an animation-frame request are published before
-the mutation proceeds, so allocation failure still rebuilds the retired state.
-A focused mutation root survives; focus is cleared only when the focused node
-is a strict descendant that the replacement removes.
+capacity change. JavaScript `createElement` results are heap-stable roots owned
+by their window while detached. `appendChild` and `insertBefore` accept those
+detached roots, snapshot immediate-child handle bindings, enter the same
+invalidation seam, reserve capacity, and then transfer the new owner into the
+by-value child array while rebinding every relocated handle. That seam retires
+the frame display list and DOM-keyed bounds, clears the accessibility tree and
+pending composited node updates, and retires the active browser draw list,
+layers, and committed display list under `Browser.lock`. Dirty flags and an
+animation-frame request are published before the mutation proceeds, so
+allocation failure still rebuilds the retired state. A focused mutation root
+survives; focus is cleared only when the focused node is a strict descendant
+that the replacement removes.
 
 ### CSS rules and invalidation fields
 
@@ -828,6 +833,10 @@ Current enforced behavior includes:
 - the `Node.children` getter snapshots immediate element-child handles in DOM
   order and wraps them as JavaScript Nodes; text children and deeper
   descendants are excluded, and every getter call creates a new array;
+- `document.createElement` owns a lowercase-tagged detached element in its
+  `WindowContext`; `Node.appendChild` and `Node.insertBefore` transfer only a
+  detached root, preserve its handle, and rebind handles for immediate siblings
+  relocated by the insertion;
 - `innerHTML` calls `removeHandlesForSubtree` for every removed child before
   destroying it, so descendant JavaScript handles are removed with the old
   subtree;
@@ -996,13 +1005,16 @@ reintroduced:
 13. **JS context construction rollback:** origin keys and newly constructed
    Kiesel host contexts remain locally owned until insertion into the tab map,
    so allocation or map-insertion failure cannot strand either owner.
-14. **Structural DOM snapshot retirement:** `innerHTML` and the native first
-   contenteditable child append mark layout/render work and synchronously retire
-   frame/browser DOM-derived snapshots before a child can move or be destroyed.
-   Browser-side image/effect borrows retire under `Browser.lock`; focus on a
-   surviving mutation root is preserved, while removed-descendant focus and
-   accessibility/hit indexes are cleared. See `prepareDomMutation`,
-   `Tab.prepareForDomMutation`, and `Frame.retireDomMutationBorrows`.
+14. **Structural DOM snapshot retirement:** `innerHTML`, detached-root
+   `appendChild`/`insertBefore`, and the native first contenteditable child
+   append mark layout/render work and synchronously retire frame/browser
+   DOM-derived snapshots before a child can move or be destroyed. Browser-side
+   image/effect borrows retire under `Browser.lock`; focus on a surviving
+   mutation root is preserved, while removed-descendant focus and
+   accessibility/hit indexes are cleared. JavaScript insertion additionally
+   rebinds handles for immediate siblings shifted or relocated by the child
+   array. See `prepareDomMutation`, `Tab.prepareForDomMutation`, and
+   `Frame.retireDomMutationBorrows`.
 
 ## Confirmed unresolved lifetime risks
 
@@ -1015,8 +1027,10 @@ Children live by value in resizable arrays while layout, hit-test, focus,
 frame-element, accessibility, display, and JS structures store `*Node`.
 The supported `innerHTML` and first contenteditable append paths now retire
 their DOM-derived browser state synchronously, and `innerHTML` clears handles
-for the subtree it removes. That boundary does not create stable identity for
-future mutation APIs or every retained JS/frame borrower. See
+for the subtree it removes. The supported detached-root insertion paths also
+rebind immediate-child JavaScript handles after relocation. These boundaries
+do not create stable identity for future mutation APIs or every retained
+JS/frame borrower. See
 [`src/document/parser.zig`](../src/document/parser.zig),
 [`src/script/js.zig`](../src/script/js.zig), and
 [`src/browser/tab.zig`](../src/browser/tab.zig).

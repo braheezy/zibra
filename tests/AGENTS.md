@@ -63,6 +63,10 @@ the stable page/chrome boundary.
 returns immediate elements in source order, skips interleaved text, excludes
 deeper descendants, and produces a visible in-page result.
 
+`tests/manual/create-element.html` builds and orders new elements without HTML
+parsing, covering `document.createElement`, `appendChild`, `insertBefore`, and
+the `null` reference append case with a visible in-page result.
+
 `tests/manual/resubmit-requests.html` uses the tutorial server's deterministic
 POST login to verify that Back to a POST target asks before replaying, Cancel
 does not navigate, and Resubmit sends the retained body again.
