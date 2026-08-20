@@ -13,6 +13,11 @@ or selector/rule lifetime.
   escaped because layout decodes it exactly once. DOM dump serialization
   re-escapes decoded attribute values before quoting them. Preserve all source
   buffers until their remaining borrowers retire.
+- Live HTML serialization emits attributes in deterministic name order, always
+  quotes and escapes their current values, recursively emits ordinary element
+  closing tags, and omits closing tags/children from void-element outer HTML.
+  Copy source-backed DOM text verbatim so existing character references are
+  not escaped a second time.
 - `Node` children are stored by value in resizable arrays. Do not retain a
   `*Node` across structural mutation unless all consumers are invalidated or a
   stable identity scheme is in place.

@@ -1,0 +1,42 @@
+<!--
+How to verify: load this page and confirm the result is green and shows PASS.
+The script checks id="bar", escaped live attributes, nested markup, and a void
+input without an invented closing tag.
+-->
+<!doctype html>
+<html>
+<head>
+  <title>HTML serialization regression</title>
+  <style>
+    body { font: 16px sans-serif; margin: 24px; }
+    #holder { border: 1px solid #789; padding: 10px; }
+    #resultMessage { background: #eee; margin-top: 14px; padding: 10px; }
+    #resultMessage.pass { background: #cfc; color: #163; }
+  </style>
+</head>
+<body>
+  <h1>Live HTML serialization</h1>
+  <div id="holder"><span id="foo">Chris &amp; company</span><input checked></div>
+  <p id="resultMessage" style="color: red">PASS if green: live HTML matches</p>
+
+  <script>
+    var element = foo;
+    element.id = 'bar';
+    element.setAttribute('title', 'A & "quote"');
+
+    var expectedSpan = '<span id="bar" title="A &amp; &quot;quote&quot;">Chris &amp; company</span>';
+    var expectedInner = expectedSpan + '<input checked="">';
+    var passed =
+      element.innerHTML === 'Chris &amp; company' &&
+      element.outerHTML === expectedSpan &&
+      holder.innerHTML === expectedInner &&
+      holder.outerHTML === '<div id="holder">' + expectedInner + '</div>' &&
+      typeof foo === 'undefined' && bar.handle === element.handle;
+
+    if (passed) {
+      resultMessage.setAttribute('class', 'pass');
+      resultMessage.setAttribute('style', 'color: green');
+    }
+  </script>
+</body>
+</html>

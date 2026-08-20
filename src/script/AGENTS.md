@@ -25,6 +25,11 @@ or Kiesel allocation/locking.
   with existing globals are skipped. Refresh the per-window registry whenever
   attached structure or an attached element's `id` changes, clearing old
   wrappers before any DOM pointer can move or disappear.
+- `Node.id` reflects the live `id` attribute. `innerHTML` reads serialize the
+  current children while writes retain the structural-mutation boundary;
+  `outerHTML` reads include the element itself. Serialized buffers passed to
+  Kiesel must use its traced allocator because ASCII String construction can
+  retain the supplied bytes.
 - DOM listeners are scoped by window and a dispatched event follows a
   snapshotted target-to-root handle path. Reuse one Event while bubbling,
   update `currentTarget` for each node, keep `target` fixed, let

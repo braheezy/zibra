@@ -80,6 +80,10 @@ targets, target-to-root listener order, same-node listener completion after
 `stopPropagation`, and ancestor `preventDefault` cancellation of link
 navigation.
 
+`tests/manual/html-serialization.html` verifies live `innerHTML` and
+`outerHTML`, reflected `id` mutation, attribute escaping, nested markup, and
+void-element serialization with a visible in-page result.
+
 `tests/manual/resubmit-requests.html` uses the tutorial server's deterministic
 POST login to verify that Back to a POST target asks before replaying, Cancel
 does not navigate, and Resubmit sends the retained body again.

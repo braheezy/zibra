@@ -503,6 +503,13 @@ pub fn evaluate(self: *Js, window_id: u32, code: []const u8) !Value {
         \\  __native.setAttribute(this.handle, name, text);
         \\};
         \\
+        \\Object.defineProperty(Node.prototype, "id", {
+        \\  get: function() { return this.getAttribute("id") || ""; },
+        \\  set: function(value) {
+        \\    this.setAttribute("id", value == null ? "" : value.toString());
+        \\  }
+        \\});
+        \\
         \\Node.prototype.appendChild = function(child) {
         \\  __native.appendChild(this.handle, child && child.handle);
         \\  return child;
@@ -526,11 +533,20 @@ pub fn evaluate(self: *Js, window_id: u32, code: []const u8) !Value {
         \\  }
         \\});
         \\
-        \\// Add innerHTML setter to Node prototype
+        \\// Serialize or replace an element's child HTML.
         \\Object.defineProperty(Node.prototype, "innerHTML", {
+        \\  get: function() {
+        \\    return __native.getInnerHTML(this.handle);
+        \\  },
         \\  set: function(value) {
         \\    var text = value == null ? "" : value.toString();
         \\    __native.innerHTML(this.handle, text);
+        \\  }
+        \\});
+        \\
+        \\Object.defineProperty(Node.prototype, "outerHTML", {
+        \\  get: function() {
+        \\    return __native.getOuterHTML(this.handle);
         \\  }
         \\});
         \\
@@ -1792,6 +1808,69 @@ test "Node.children reflects a later innerHTML generation" {
     try std.testing.expect(result.toBoolean());
 }
 
+test "innerHTML and outerHTML serialize the live DOM" {
+    const allocator = std.testing.allocator;
+    var html_parser = try parser.HTMLParser.init(
+        allocator,
+        "<main><div id=holder class=box></div></main>",
+    );
+    html_parser.use_implicit_tags = false;
+    defer html_parser.deinit(allocator);
+    var root = try html_parser.parse();
+    defer root.deinit(allocator);
+    parser.fixParentPointers(&root, null);
+
+    var environ = std.process.Environ.Map.init(allocator);
+    defer environ.deinit();
+    var js = try Js.init(allocator, std.testing.io, &environ);
+    defer js.deinit(allocator);
+    js.setNodes(0, &root);
+    defer js.setNodes(0, null);
+
+    _ = try js.evaluate(0,
+        \\var container = holder;
+        \\container.innerHTML = '<span id=foo>Chris &amp; company</span><input checked>';
+        \\var element = foo;
+        \\element.id = 'bar';
+        \\element.setAttribute('title', 'A & "quote" <tag>');
+        \\var expectedSpan = '<span id="bar" title="A &amp; &quot;quote&quot; &lt;tag&gt;">Chris &amp; company</span>';
+        \\var expectedInner = expectedSpan + '<input checked="">';
+    );
+    try std.testing.expect((try js.evaluate(0, "element.id === 'bar'")).toBoolean());
+    try std.testing.expect((try js.evaluate(
+        0,
+        "typeof foo === 'undefined' && bar.handle === element.handle",
+    )).toBoolean());
+    try std.testing.expect((try js.evaluate(0, "container.innerHTML === expectedInner")).toBoolean());
+    try std.testing.expect((try js.evaluate(0, "element.outerHTML === expectedSpan")).toBoolean());
+    const container_outer_value = try js.evaluate(0, "container.outerHTML");
+    const container_outer = try container_outer_value.asString().toUtf8(allocator);
+    defer allocator.free(container_outer);
+    try std.testing.expectEqualStrings(
+        "<div class=\"box\" id=\"holder\">" ++
+            "<span id=\"bar\" title=\"A &amp; &quot;quote&quot; &lt;tag&gt;\">" ++
+            "Chris &amp; company</span><input checked=\"\"></div>",
+        container_outer,
+    );
+    try std.testing.expect((try js.evaluate(
+        0,
+        "container.children[1].outerHTML === '<input checked=\"\">'",
+    )).toBoolean());
+    try std.testing.expect((try js.evaluate(0, "container.children[1].innerHTML === ''")).toBoolean());
+
+    const result = try js.evaluate(0,
+        \\var tail = document.createElement('EM');
+        \\tail.id = 'tail';
+        \\container.appendChild(tail);
+        \\var appended = container.innerHTML === expectedInner + '<em id="tail"></em>';
+        \\var removed = container.removeChild(element);
+        \\appended && removed === element &&
+        \\  typeof bar === 'undefined' && removed.outerHTML === expectedSpan &&
+        \\  container.innerHTML === '<input checked=""><em id="tail"></em>'
+    );
+    try std.testing.expect(result.toBoolean());
+}
+
 const DomMutationTestContext = struct {
     count: usize = 0,
 
@@ -2291,6 +2370,28 @@ fn setupDocument(self: *Js, realm: *Realm) !void {
         },
     );
 
+    const get_inner_html_fn = try kiesel.builtins.createBuiltinFunction(
+        &self.agent,
+        .{ .function = getInnerHTML },
+        1,
+        "getInnerHTML",
+        .{
+            .realm = realm,
+            .additional_fields = self_ptr,
+        },
+    );
+
+    const get_outer_html_fn = try kiesel.builtins.createBuiltinFunction(
+        &self.agent,
+        .{ .function = getOuterHTML },
+        1,
+        "getOuterHTML",
+        .{
+            .realm = realm,
+            .additional_fields = self_ptr,
+        },
+    );
+
     // Create style_set function with self pointer
     const style_set_fn = try kiesel.builtins.createBuiltinFunction(
         &self.agent,
@@ -2309,6 +2410,24 @@ fn setupDocument(self: *Js, realm: *Realm) !void {
         PropertyKey.from("innerHTML"),
         .{
             .value_or_accessor = .{ .value = Value.from(&inner_html_fn.object) },
+            .attributes = .builtin_default,
+        },
+    );
+
+    try native_obj.definePropertyDirect(
+        &self.agent,
+        PropertyKey.from("getInnerHTML"),
+        .{
+            .value_or_accessor = .{ .value = Value.from(&get_inner_html_fn.object) },
+            .attributes = .builtin_default,
+        },
+    );
+
+    try native_obj.definePropertyDirect(
+        &self.agent,
+        PropertyKey.from("getOuterHTML"),
+        .{
+            .value_or_accessor = .{ .value = Value.from(&get_outer_html_fn.object) },
             .attributes = .builtin_default,
         },
     );
@@ -3101,7 +3220,77 @@ fn setAttribute(agent: *Agent, this_value: Value, arguments: kiesel.types.Argume
     }
 }
 
-/// __native.innerHTML implementation (setter only)
+fn serializeHTMLProperty(
+    agent: *Agent,
+    arguments: kiesel.types.Arguments,
+    include_element: bool,
+) Agent.Error!Value {
+    const function_obj = agent.activeFunctionObject();
+    const builtin_fn = function_obj.as(kiesel.builtins.BuiltinFunction);
+    const js_instance = builtin_fn.fields.additionalFieldsAs(Js);
+    const window_id = js_instance.current_window_id orelse return agent.throwException(
+        .internal_error,
+        "Missing active window",
+        .{},
+    );
+    const window = js_instance.windows.getPtr(window_id) orelse return agent.throwException(
+        .internal_error,
+        "Missing window context",
+        .{},
+    );
+
+    const handle_arg = arguments.get(0);
+    if (!handle_arg.isNumber()) {
+        return agent.throwException(
+            .type_error,
+            "HTML serialization requires a numeric node handle",
+            .{},
+        );
+    }
+    const handle: u32 = @intFromFloat(handle_arg.asNumber().asFloat());
+    const node = js_instance.getNode(window, handle) orelse return agent.throwException(
+        .internal_error,
+        "Invalid node handle",
+        .{},
+    );
+    if (node.* != .element) {
+        return agent.throwException(
+            .type_error,
+            "HTML serialization requires an Element",
+            .{},
+        );
+    }
+
+    // Kiesel's ASCII String constructor takes ownership of a previously
+    // unseen input slice. Allocate in the Agent's traced heap and deliberately
+    // transfer that buffer instead of freeing it when this host call returns.
+    const html = if (include_element)
+        parser.serializeOuterHtml(agent.gc_allocator, node) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            else => return agent.throwException(.internal_error, "Could not serialize outerHTML", .{}),
+        }
+    else
+        parser.serializeInnerHtml(agent.gc_allocator, node) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            else => return agent.throwException(.internal_error, "Could not serialize innerHTML", .{}),
+        };
+    return Value.from(try kiesel.types.String.fromUtf8(agent, html));
+}
+
+/// __native.getInnerHTML serializes the live children instead of replaying the
+/// string most recently assigned to the setter.
+fn getInnerHTML(agent: *Agent, this_value: Value, arguments: kiesel.types.Arguments) Agent.Error!Value {
+    _ = this_value;
+    return serializeHTMLProperty(agent, arguments, false);
+}
+
+/// __native.getOuterHTML includes the current element start/end tags.
+fn getOuterHTML(agent: *Agent, this_value: Value, arguments: kiesel.types.Arguments) Agent.Error!Value {
+    _ = this_value;
+    return serializeHTMLProperty(agent, arguments, true);
+}
+
+/// __native.innerHTML setter implementation.
 fn innerHTML(agent: *Agent, this_value: Value, arguments: kiesel.types.Arguments) Agent.Error!Value {
     // Get the Js instance from the function's additional_fields
     const function_obj = agent.activeFunctionObject();

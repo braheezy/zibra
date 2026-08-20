@@ -270,7 +270,11 @@ buffer. Attribute values containing recognized character references are
 decoded into strings owned by that `Element`; text references remain escaped
 in the source-backed DOM and are decoded once during layout. Diagnostic DOM
 serialization re-escapes decoded attribute values so quoted output remains
-well-formed. Therefore:
+well-formed. JavaScript `innerHTML`/`outerHTML` reads use the live DOM rather
+than retaining the last assigned source: current attributes are sorted,
+quoted, and escaped, ordinary descendants are recursive, and void-element
+outer HTML ends after its start tag. Source-backed text is copied verbatim to
+avoid double-escaping its retained character references. Therefore:
 
 1. the decoded HTML source must outlive the complete DOM;
 2. a stylesheet source must outlive all rule property names and values parsed
@@ -868,6 +872,10 @@ Current enforced behavior includes:
   only the active window's first element for each non-empty ID is installed,
   pre-existing global names win, and realm activation swaps registries without
   exposing another window's nodes;
+- `Node.id` reflects `getAttribute`/`setAttribute`. `innerHTML` reads serialize
+  current children, `outerHTML` includes the element, and the returned source
+  buffer is allocated in Kiesel's traced heap because its ASCII string cache
+  may retain the supplied bytes instead of copying them;
 - the `Node.children` getter snapshots immediate element-child handles in DOM
   order and wraps them as JavaScript Nodes; text children and deeper
   descendants are excluded, and every getter call creates a new array;

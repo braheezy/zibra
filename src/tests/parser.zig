@@ -31,6 +31,34 @@ test "Parse basic HTML" {
     try std.testing.expectEqualStrings("Hello, world!", text.text);
 }
 
+test "HTML serialization emits live attributes children and void elements" {
+    const allocator = std.testing.allocator;
+    const html =
+        "<section z=last empty data=\"a&amp;&quot;&lt;&gt;&apos;\">" ++
+        "<span id=foo>Chris &amp; here</span><input checked></section>";
+
+    var html_parser = try HTMLParser.init(allocator, html);
+    html_parser.use_implicit_tags = false;
+    defer html_parser.deinit(allocator);
+    var root = try html_parser.parse();
+    defer root.deinit(allocator);
+
+    const inner = try document_parser.serializeInnerHtml(allocator, &root);
+    defer allocator.free(inner);
+    try std.testing.expectEqualStrings(
+        "<span id=\"foo\">Chris &amp; here</span><input checked=\"\">",
+        inner,
+    );
+
+    const outer = try document_parser.serializeOuterHtml(allocator, &root);
+    defer allocator.free(outer);
+    try std.testing.expectEqualStrings(
+        "<section data=\"a&amp;&quot;&lt;&gt;&apos;\" empty=\"\" z=\"last\">" ++
+            "<span id=\"foo\">Chris &amp; here</span><input checked=\"\"></section>",
+        outer,
+    );
+}
+
 test "style element text can be collected and parsed as CSS" {
     const allocator = std.testing.allocator;
     const html =
