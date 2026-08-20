@@ -482,6 +482,85 @@ pub const Frame = struct {
         };
     }
 
+    /// Dispatch on the actual event target, then recover the node that owns a
+    /// browser default action through its stable JavaScript handle. A listener
+    /// can move or remove by-value DOM nodes while dispatch is in progress, so
+    /// retaining only `default_node` across the callback would be unsafe.
+    fn dispatchEventForDefault(
+        self: *Frame,
+        event_type: []const u8,
+        target: *Node,
+        default_node: *Node,
+    ) ?*Node {
+        const ctx = self.js_context orelse {
+            return if (self.dispatchEvent(event_type, target)) default_node else null;
+        };
+        const handle = ctx.captureNodeHandle(self.window_id, default_node) catch |err| {
+            std.log.warn("Failed to capture {s} default-action target: {}", .{ event_type, err });
+            return null;
+        };
+        if (!self.dispatchEvent(event_type, target)) return null;
+        return ctx.resolveAttachedNode(self.window_id, handle);
+    }
+
+    const ClickActionKind = enum {
+        iframe,
+        link,
+        input,
+        button,
+        contenteditable,
+    };
+
+    const ClickAction = struct {
+        node: *Node,
+        kind: ClickActionKind,
+    };
+
+    fn clickTarget(node: *Node) ?*Node {
+        var current: ?*Node = node;
+        while (current) |candidate| {
+            switch (candidate.*) {
+                .element => return candidate,
+                .text => |text| current = text.parent,
+            }
+        }
+        return null;
+    }
+
+    fn findClickAction(target: *Node, button: ClickButton) ?ClickAction {
+        var current: ?*Node = target;
+        while (current) |node| {
+            switch (node.*) {
+                .element => |element| {
+                    if (std.ascii.eqlIgnoreCase(element.tag, "iframe")) {
+                        return .{ .node = node, .kind = .iframe };
+                    }
+                    if (std.ascii.eqlIgnoreCase(element.tag, "a")) {
+                        return .{ .node = node, .kind = .link };
+                    }
+                    if (button == .primary and std.ascii.eqlIgnoreCase(element.tag, "input")) {
+                        return .{ .node = node, .kind = .input };
+                    }
+                    if (button == .primary and std.ascii.eqlIgnoreCase(element.tag, "button")) {
+                        return .{ .node = node, .kind = .button };
+                    }
+                    if (button == .primary) {
+                        const is_contenteditable = if (element.attributes) |attributes|
+                            attributes.get("contenteditable") != null
+                        else
+                            false;
+                        if (is_contenteditable) {
+                            return .{ .node = node, .kind = .contenteditable };
+                        }
+                    }
+                    current = element.parent;
+                },
+                .text => |text| current = text.parent,
+            }
+        }
+        return null;
+    }
+
     pub fn click(self: *Frame, b: *Browser, x: i32, y: i32, button: ClickButton) !bool {
         const zoom = self.tab.accessibility.zoom;
         return self.clickDevice(
@@ -503,92 +582,90 @@ pub const Frame = struct {
     ) !bool {
         const items = self.display_list orelse return false;
         const hit = DisplayItem.hitTestDevice(items, device_x, device_y, zoom) orelse return false;
-        var current: ?*Node = hit.source.originatingNode();
+        const target = clickTarget(hit.source.originatingNode() orelse return false) orelse return false;
+        const action = findClickAction(target, button);
 
-        while (current) |node_ptr| {
-            switch (node_ptr.*) {
-                .element => |*e| {
-                    if (std.ascii.eqlIgnoreCase(e.tag, "iframe")) {
-                        const rect = switch (hit.item.*) {
-                            .iframe => |iframe_item| iframe_item.rect,
-                            else => return true,
-                        };
-                        if (self.findFrameByElement(node_ptr)) |child| {
-                            if (button == .primary) self.tab.focused_frame = child;
-                            const child_x = hit.device_x -| DisplayItem.scaleLayoutPx(rect.left, zoom);
-                            // Composition applies one translation for
-                            // `iframe_top - child_scroll`; scale that combined
-                            // CSS offset once so fractional truncation matches
-                            // the pixels the user clicked.
-                            const child_origin_y = rect.top -| child.scroll;
-                            const child_y = hit.device_y -| DisplayItem.scaleLayoutPx(child_origin_y, zoom);
-                            _ = try child.clickDevice(b, child_x, child_y, button, zoom);
-                        }
-                        return true;
-                    }
-
-                    if (std.ascii.eqlIgnoreCase(e.tag, "a")) {
-                        if (button == .primary) {
-                            const do_default = self.dispatchEvent("click", node_ptr);
-                            if (!do_default) return true;
-                        }
-                        if (e.attributes) |attrs| {
-                            if (attrs.get("href")) |href| {
-                                std.log.info("Link click in window_id={d}: {s}", .{ self.window_id, href });
-                                try self.followLink(b, href, button);
-                            }
-                        }
-                        if (button == .primary) self.tab.focused_frame = self;
-                        return true;
-                    }
-
-                    if (button == .primary and std.ascii.eqlIgnoreCase(e.tag, "input")) {
-                        const do_default = self.dispatchEvent("click", node_ptr);
-                        if (!do_default) return true;
-                        if (e.isCheckbox()) {
-                            _ = try e.toggleChecked();
-                        } else if (e.attributes) |*attrs| {
-                            try attrs.put("value", "");
-                        }
-                        e.is_focused = true;
-                        parser.dirtyStyleForElement(e);
-                        self.focus = node_ptr;
-                        self.tab.focused_frame = self;
-                        self.tab.updateAccessibilityFocus(b);
-                        self.tab.setNeedsRender();
-                        return true;
-                    }
-
-                    if (button == .primary and std.ascii.eqlIgnoreCase(e.tag, "button")) {
-                        const do_default = self.dispatchEvent("click", node_ptr);
-                        if (!do_default) return true;
-                        _ = try self.tab.submitForm(b, self, node_ptr);
-                        self.tab.focused_frame = self;
-                        return true;
-                    }
-
-                    const is_contenteditable = if (e.attributes) |attrs|
-                        attrs.get("contenteditable") != null
-                    else
-                        false;
-                    if (button == .primary and is_contenteditable) {
-                        const do_default = self.dispatchEvent("click", node_ptr);
-                        if (!do_default) return true;
-                        e.is_focused = true;
-                        parser.dirtyStyleForElement(e);
-                        self.focus = node_ptr;
-                        self.tab.focused_frame = self;
-                        self.tab.updateAccessibilityFocus(b);
-                        self.tab.setNeedsRender();
-                        return true;
-                    }
-
-                    current = e.parent;
-                },
-                .text => |*text| current = text.parent,
+        if (action) |candidate| {
+            if (candidate.kind == .iframe) {
+                const rect = switch (hit.item.*) {
+                    .iframe => |iframe_item| iframe_item.rect,
+                    else => return true,
+                };
+                if (self.findFrameByElement(candidate.node)) |child| {
+                    if (button == .primary) self.tab.focused_frame = child;
+                    const child_x = hit.device_x -| DisplayItem.scaleLayoutPx(rect.left, zoom);
+                    // Composition applies one translation for
+                    // `iframe_top - child_scroll`; scale that combined CSS
+                    // offset once so fractional truncation matches the pixels
+                    // the user clicked.
+                    const child_origin_y = rect.top -| child.scroll;
+                    const child_y = hit.device_y -| DisplayItem.scaleLayoutPx(child_origin_y, zoom);
+                    _ = try child.clickDevice(b, child_x, child_y, button, zoom);
+                }
+                return true;
             }
         }
-        return false;
+
+        if (button != .primary) {
+            const candidate = action orelse return false;
+            const element = &candidate.node.element;
+            if (element.attributes) |attributes| {
+                if (attributes.get("href")) |href| {
+                    std.log.info("Link click in window_id={d}: {s}", .{ self.window_id, href });
+                    try self.followLink(b, href, button);
+                }
+            }
+            return true;
+        }
+
+        const candidate = action orelse {
+            _ = self.dispatchEvent("click", target);
+            return true;
+        };
+        const live_node = self.dispatchEventForDefault("click", target, candidate.node) orelse return true;
+        const element = switch (live_node.*) {
+            .element => |*value| value,
+            .text => return true,
+        };
+
+        switch (candidate.kind) {
+            .iframe => unreachable,
+            .link => {
+                if (element.attributes) |attributes| {
+                    if (attributes.get("href")) |href| {
+                        std.log.info("Link click in window_id={d}: {s}", .{ self.window_id, href });
+                        try self.followLink(b, href, button);
+                    }
+                }
+                self.tab.focused_frame = self;
+            },
+            .input => {
+                if (element.isCheckbox()) {
+                    _ = try element.toggleChecked();
+                } else if (element.attributes) |*attributes| {
+                    try attributes.put("value", "");
+                }
+                element.is_focused = true;
+                parser.dirtyStyleForElement(element);
+                self.focus = live_node;
+                self.tab.focused_frame = self;
+                self.tab.updateAccessibilityFocus(b);
+                self.tab.setNeedsRender();
+            },
+            .button => {
+                _ = try self.tab.submitForm(b, self, live_node);
+                self.tab.focused_frame = self;
+            },
+            .contenteditable => {
+                element.is_focused = true;
+                parser.dirtyStyleForElement(element);
+                self.focus = live_node;
+                self.tab.focused_frame = self;
+                self.tab.updateAccessibilityFocus(b);
+                self.tab.setNeedsRender();
+            },
+        }
+        return true;
     }
 
     pub fn findFrameByElement(self: *Frame, node: *Node) ?*Frame {
@@ -1903,20 +1980,27 @@ fn submitForm(self: *Tab, b: *Browser, frame: *Frame, control_node: *Node) !bool
                     for (form_nodes.items) |form_child| {
                         if (form_child == control_node) {
                             std.log.info("Found activated control in form", .{});
-                            const do_default = frame.dispatchEvent("submit", node_ptr);
-                            if (!do_default) {
+                            const live_form_node = frame.dispatchEventForDefault(
+                                "submit",
+                                node_ptr,
+                                node_ptr,
+                            ) orelse {
                                 std.log.info("Default submit prevented", .{});
                                 return true;
-                            }
+                            };
+                            const live_form = switch (live_form_node.*) {
+                                .element => |*element| element,
+                                .text => return true,
+                            };
 
                             // A missing action submits back to the current
                             // document. Copy before scheduling navigation can
                             // retire the DOM backing the attribute.
-                            const action = if (e.attributes) |attrs|
+                            const action = if (live_form.attributes) |attrs|
                                 attrs.get("action") orelse ""
                             else
                                 "";
-                            const method = parseFormMethod(if (e.attributes) |attrs|
+                            const method = parseFormMethod(if (live_form.attributes) |attrs|
                                 attrs.get("method")
                             else
                                 null);
@@ -1924,7 +2008,7 @@ fn submitForm(self: *Tab, b: *Browser, frame: *Frame, control_node: *Node) !bool
                             const action_copy = try self.allocator.dupe(u8, action);
                             defer self.allocator.free(action_copy);
 
-                            try self.submitFormData(b, frame, node_ptr, action_copy, method);
+                            try self.submitFormData(b, frame, live_form_node, action_copy, method);
                             return true;
                         }
                     }
@@ -2141,19 +2225,29 @@ pub fn activateFocusedElement(self: *Tab, b: *Browser) !void {
         .element => |*e| {
             if (std.mem.eql(u8, e.tag, "input")) {
                 if (e.isCheckbox()) {
-                    const do_default = frame.dispatchEvent("click", node_ptr);
-                    if (!do_default) return;
-                    _ = try e.toggleChecked();
-                    parser.dirtyStyleForElement(e);
+                    const live_node = frame.dispatchEventForDefault(
+                        "click",
+                        node_ptr,
+                        node_ptr,
+                    ) orelse return;
+                    const live_element = switch (live_node.*) {
+                        .element => |*element| element,
+                        .text => return,
+                    };
+                    _ = try live_element.toggleChecked();
+                    parser.dirtyStyleForElement(live_element);
                     self.setNeedsRender();
                     return;
                 }
                 if (e.attributes) |attrs| {
                     if (attrs.get("type")) |raw_type| {
                         if (std.mem.eql(u8, raw_type, "submit") or std.mem.eql(u8, raw_type, "button")) {
-                            const do_default = frame.dispatchEvent("click", node_ptr);
-                            if (!do_default) return;
-                            _ = try self.submitForm(b, frame, node_ptr);
+                            const live_node = frame.dispatchEventForDefault(
+                                "click",
+                                node_ptr,
+                                node_ptr,
+                            ) orelse return;
+                            _ = try self.submitForm(b, frame, live_node);
                         }
                     }
                 }
@@ -2161,21 +2255,32 @@ pub fn activateFocusedElement(self: *Tab, b: *Browser) !void {
             }
 
             if (std.mem.eql(u8, e.tag, "button")) {
-                const do_default = frame.dispatchEvent("click", node_ptr);
-                if (!do_default) return;
-                _ = try self.submitForm(b, frame, node_ptr);
+                const live_node = frame.dispatchEventForDefault(
+                    "click",
+                    node_ptr,
+                    node_ptr,
+                ) orelse return;
+                _ = try self.submitForm(b, frame, live_node);
                 return;
             }
 
             if (std.mem.eql(u8, e.tag, "a")) {
-                const do_default = frame.dispatchEvent("click", node_ptr);
-                if (!do_default) return;
-                if (e.attributes) |attrs| {
+                const live_node = frame.dispatchEventForDefault(
+                    "click",
+                    node_ptr,
+                    node_ptr,
+                ) orelse return;
+                const live_element = switch (live_node.*) {
+                    .element => |*element| element,
+                    .text => return,
+                };
+                if (live_element.attributes) |attrs| {
                     if (attrs.get("href")) |href| {
                         try frame.followLink(b, href, .primary);
                         return;
                     }
                 }
+                return;
             }
 
             _ = frame.dispatchEvent("click", node_ptr);
@@ -2213,9 +2318,12 @@ pub fn enter(self: *Tab, b: *Browser) !bool {
     switch (focus_node.*) {
         .element => |*element| {
             if (isTextEntryInput(element)) {
-                const do_default = frame.dispatchEvent("keydown", focus_node);
-                if (!do_default) return false;
-                return self.submitForm(b, frame, focus_node);
+                const live_node = frame.dispatchEventForDefault(
+                    "keydown",
+                    focus_node,
+                    focus_node,
+                ) orelse return false;
+                return self.submitForm(b, frame, live_node);
             }
             // Checkboxes use Space/default activation rather than Return.
             if (element.isCheckbox()) return false;
@@ -2259,12 +2367,15 @@ pub fn blur(self: *Tab) bool {
 pub fn keypress(self: *Tab, b: *Browser, char: u8) !void {
     const frame = self.focused_frame orelse self.root_frame orelse return;
     if (frame.focus) |focus_node| {
-        const do_default = frame.dispatchEvent("keydown", focus_node);
-        if (!do_default) {
+        const live_focus_node = frame.dispatchEventForDefault(
+            "keydown",
+            focus_node,
+            focus_node,
+        ) orelse {
             std.log.info("Default keydown prevented", .{});
             return;
-        }
-        switch (focus_node.*) {
+        };
+        switch (live_focus_node.*) {
             .element => |*e| {
                 if (std.mem.eql(u8, e.tag, "input")) {
                     if (e.attributes) |*attrs| {
@@ -2285,7 +2396,7 @@ pub fn keypress(self: *Tab, b: *Browser, char: u8) !void {
                     if (attrs.get("contenteditable") != null) {
                         var node_list = std.ArrayList(*Node).empty;
                         defer node_list.deinit(self.allocator);
-                        try parser.treeToList(self.allocator, focus_node, &node_list);
+                        try parser.treeToList(self.allocator, live_focus_node, &node_list);
 
                         var last_text_node: ?*Node = null;
                         for (node_list.items) |node_ptr| {
@@ -2329,7 +2440,7 @@ pub fn keypress(self: *Tab, b: *Browser, char: u8) !void {
                         } else {
                             const text_node = Node{ .text = .{
                                 .text = new_text,
-                                .parent = focus_node,
+                                .parent = live_focus_node,
                             } };
 
                             // Appending can relocate every by-value child.
@@ -2341,10 +2452,10 @@ pub fn keypress(self: *Tab, b: *Browser, char: u8) !void {
                                 if (e.layout_mark) |mark_fn| mark_fn(ptr);
                             }
                             parser.clearStyleInvalidations(&frame.current_node.?);
-                            self.prepareForDomMutation(b, frame, focus_node);
+                            self.prepareForDomMutation(b, frame, live_focus_node);
                             try e.children.ensureUnusedCapacity(self.allocator, 1);
                             e.children.appendAssumeCapacity(text_node);
-                            parser.fixParentPointers(focus_node, e.parent);
+                            parser.fixParentPointers(live_focus_node, e.parent);
                         }
 
                         self.setNeedsRender();

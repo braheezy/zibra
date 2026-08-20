@@ -125,8 +125,13 @@ before changing `root.zig`, `tab.zig`, `render/`, or browser task scheduling.
   still alive; the next full render rebuilds it. Schedule the replacement paint
   before any fallible mutation step. Preserve focus when the mutation root
   itself survives; clear it only for a removed descendant.
-- Content clicks walk the retained list in reverse paint order and then walk
-  the hit node's DOM ancestry. `link_bounds` and `iframe_bounds` may support
+- Content clicks walk the retained list in reverse paint order. A primary hit
+  dispatches one click at the painted element and bubbles through its
+  snapshotted DOM ancestry, even when no native control owns a default action;
+  iframe events stay inside the child document. Resolve link/input/button
+  default actions through stable JS handles after listeners return, and let
+  `preventDefault` cancel the action without conflating it with
+  `stopPropagation`. `link_bounds` and `iframe_bounds` may support
   layout-derived accessibility/coordinate bookkeeping, but must not select a
   click target; keep focus, accessibility, and fragment bounds intact.
 - `scroll.zig` is the single source of truth for CSS scroll ranges and native

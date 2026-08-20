@@ -441,17 +441,32 @@ pub fn evaluate(self: *Js, window_id: u32, code: []const u8) !Value {
         \\function Event(type) {
         \\  this.type = type;
         \\  this.do_default = true;
+        \\  this.defaultPrevented = false;
+        \\  this.propagation_stopped = false;
+        \\  this.target = null;
+        \\  this.currentTarget = null;
         \\}
         \\
         \\Event.prototype.preventDefault = function() {
         \\  this.do_default = false;
+        \\  this.defaultPrevented = true;
         \\};
         \\
-        \\var LISTENERS = {};
+        \\Event.prototype.stopPropagation = function() {
+        \\  this.propagation_stopped = true;
+        \\};
+        \\
+        \\var WINDOW_NODE_LISTENERS = {};
+        \\
+        \\function listenersForWindow(windowId) {
+        \\  if (!WINDOW_NODE_LISTENERS[windowId]) WINDOW_NODE_LISTENERS[windowId] = {};
+        \\  return WINDOW_NODE_LISTENERS[windowId];
+        \\}
         \\
         \\Node.prototype.addEventListener = function(type, listener) {
-        \\  if (!LISTENERS[this.handle]) LISTENERS[this.handle] = {};
-        \\  var dict = LISTENERS[this.handle];
+        \\  var listeners = listenersForWindow(window.__id);
+        \\  if (!listeners[this.handle]) listeners[this.handle] = {};
+        \\  var dict = listeners[this.handle];
         \\  if (!dict[type]) dict[type] = [];
         \\  var list = dict[type];
         \\  list.push(listener);
@@ -459,11 +474,21 @@ pub fn evaluate(self: *Js, window_id: u32, code: []const u8) !Value {
         \\
         \\Node.prototype.dispatchEvent = function(evt) {
         \\  var event = typeof evt === "string" ? new Event(evt) : evt;
-        \\  var handle = this.handle;
-        \\  var list = (LISTENERS[handle] && LISTENERS[handle][event.type]) || [];
-        \\  for (var i = 0; i < list.length; i++) {
-        \\    list[i].call(this, event);
+        \\  var path = __native.eventPath(this.handle);
+        \\  var listeners = listenersForWindow(window.__id);
+        \\  event.propagation_stopped = false;
+        \\  event.target = path.length ? new Node(path[0]) : this;
+        \\  for (var pathIndex = 0; pathIndex < path.length; pathIndex++) {
+        \\    var currentTarget = new Node(path[pathIndex]);
+        \\    event.currentTarget = currentTarget;
+        \\    var dict = listeners[path[pathIndex]];
+        \\    var list = (dict && dict[event.type]) || [];
+        \\    for (var listenerIndex = 0; listenerIndex < list.length; listenerIndex++) {
+        \\      list[listenerIndex].call(currentTarget, event);
+        \\    }
+        \\    if (event.propagation_stopped) break;
         \\  }
+        \\  event.currentTarget = null;
         \\  return event.do_default;
         \\};
         \\
@@ -525,8 +550,8 @@ pub fn evaluate(self: *Js, window_id: u32, code: []const u8) !Value {
         \\globalThis.XMLHttpRequest = XMLHttpRequest;
         \\
         \\globalThis.__resetEventListeners = function(windowId) {
-        \\  LISTENERS = {};
         \\  var targetId = (windowId === undefined || windowId === null) ? window.__id : windowId;
+        \\  delete WINDOW_NODE_LISTENERS[targetId];
         \\  delete WINDOW_MESSAGE_LISTENERS[targetId];
         \\  delete WINDOW_ONMESSAGE[targetId];
         \\};
@@ -1209,6 +1234,28 @@ pub fn dispatchEvent(self: *Js, window_id: u32, event_type: []const u8, node: *N
     return do_default;
 }
 
+/// Capture the stable JavaScript handle for a node before dispatch. Event
+/// listeners may relocate by-value DOM children, so browser default actions
+/// must resolve this identity again instead of retaining only a raw pointer.
+pub fn captureNodeHandle(self: *Js, window_id: u32, node: *Node) !u32 {
+    self.lock.lock();
+    defer self.lock.unlock();
+    const window = try self.setCurrentWindow(window_id);
+    if (!isAttachedToCurrentDocument(window, node)) return error.DetachedNode;
+    return self.getHandle(window, node);
+}
+
+/// Resolve a previously captured node handle only while it remains attached
+/// to this window's current document. Removed nodes retain JavaScript handles
+/// for possible reattachment, but they cannot receive browser default actions.
+pub fn resolveAttachedNode(self: *Js, window_id: u32, handle: u32) ?*Node {
+    self.lock.lock();
+    defer self.lock.unlock();
+    const window = self.windows.getPtr(window_id) orelse return null;
+    const node = self.getNode(window, handle) orelse return null;
+    return if (isAttachedToCurrentDocument(window, node)) node else null;
+}
+
 pub fn dispatchPostMessage(
     self: *Js,
     window_id: u32,
@@ -1389,6 +1436,112 @@ test "Js roots Kiesel Agent state across garbage collections" {
         "typeof Node === 'function' && typeof __native === 'object'",
     );
     try std.testing.expect(result.toBoolean());
+}
+
+fn findTestElementById(root: *Node, id: []const u8) !*Node {
+    var nodes = std.ArrayList(*Node).empty;
+    defer nodes.deinit(std.testing.allocator);
+    try parser.treeToList(std.testing.allocator, root, &nodes);
+    for (nodes.items) |node| {
+        if (node.* != .element) continue;
+        const attributes = node.element.attributes orelse continue;
+        if (attributes.get("id")) |candidate| {
+            if (std.mem.eql(u8, candidate, id)) return node;
+        }
+    }
+    return error.MissingTestElement;
+}
+
+test "DOM events bubble with stable targets propagation control and cancellation" {
+    const allocator = std.testing.allocator;
+    const html =
+        "<main id=root>" ++
+        "<section id=parent><span id=target>ordinary target</span></section>" ++
+        "<a id=link href=/next><b id=linkTarget>link target</b></a>" ++
+        "<div id=mutationParent><i id=mutationTarget>mutating target</i></div>" ++
+        "</main>";
+
+    var html_parser = try parser.HTMLParser.init(allocator, html);
+    html_parser.use_implicit_tags = false;
+    defer html_parser.deinit(allocator);
+    var root = try html_parser.parse();
+    defer root.deinit(allocator);
+    parser.fixParentPointers(&root, null);
+
+    const target = try findTestElementById(&root, "target");
+    const link_target = try findTestElementById(&root, "linkTarget");
+    const mutation_target = try findTestElementById(&root, "mutationTarget");
+
+    var environ = std.process.Environ.Map.init(allocator);
+    defer environ.deinit();
+    var js = try Js.init(allocator, std.testing.io, &environ);
+    defer js.deinit(allocator);
+    js.setNodes(0, &root);
+    defer js.setNodes(0, null);
+
+    _ = try js.evaluate(0,
+        \\var bubbleLog = [];
+        \\var lastEvent = null;
+        \\var targetNode = document.querySelectorAll('span')[0];
+        \\var parentNode = document.querySelectorAll('section')[0];
+        \\var rootNode = document.querySelectorAll('main')[0];
+        \\var linkNode = document.querySelectorAll('a')[0];
+        \\var linkTargetNode = document.querySelectorAll('b')[0];
+        \\var mutationParentNode = document.querySelectorAll('div')[0];
+        \\var mutationTargetNode = document.querySelectorAll('i')[0];
+        \\targetNode.addEventListener('click', function(event) {
+        \\  lastEvent = event;
+        \\  bubbleLog.push('target:' + event.target.getAttribute('id') + ':' +
+        \\    event.currentTarget.getAttribute('id') + ':' + this.getAttribute('id'));
+        \\});
+        \\parentNode.addEventListener('click', function(event) {
+        \\  bubbleLog.push('parent-one');
+        \\  event.stopPropagation();
+        \\});
+        \\parentNode.addEventListener('click', function() { bubbleLog.push('parent-two'); });
+        \\rootNode.addEventListener('click', function(event) {
+        \\  bubbleLog.push('root:' + event.target.getAttribute('id'));
+        \\  if (event.target.getAttribute('id') === 'linkTarget') event.preventDefault();
+        \\});
+        \\linkTargetNode.addEventListener('click', function(event) {
+        \\  lastEvent = event;
+        \\  bubbleLog.push('link-target');
+        \\});
+        \\linkNode.addEventListener('click', function(event) {
+        \\  bubbleLog.push('link:' + event.target.getAttribute('id'));
+        \\});
+        \\mutationTargetNode.addEventListener('click', function() {
+        \\  bubbleLog.push('mutation-target');
+        \\  mutationParentNode.innerHTML = '';
+        \\});
+        \\mutationParentNode.addEventListener('click', function(event) {
+        \\  bubbleLog.push('mutation-parent');
+        \\  event.stopPropagation();
+        \\});
+    );
+
+    try std.testing.expect(try js.dispatchEvent(0, "click", target));
+    const stopped = try js.evaluate(0,
+        \\bubbleLog.join(',') === 'target:target:target:target,parent-one,parent-two' &&
+        \\lastEvent.currentTarget === null && !lastEvent.defaultPrevented
+    );
+    try std.testing.expect(stopped.toBoolean());
+
+    _ = try js.evaluate(0, "bubbleLog = []");
+    try std.testing.expect(!try js.dispatchEvent(0, "click", link_target));
+    const cancelled = try js.evaluate(0,
+        \\bubbleLog.join(',') === 'link-target,link:linkTarget,root:linkTarget' &&
+        \\lastEvent.currentTarget === null && lastEvent.defaultPrevented
+    );
+    try std.testing.expect(cancelled.toBoolean());
+
+    _ = try js.evaluate(0, "bubbleLog = []");
+    try std.testing.expect(try js.dispatchEvent(0, "click", mutation_target));
+    const mutated = try js.evaluate(
+        0,
+        "bubbleLog.join(',') === 'mutation-target,mutation-parent'",
+    );
+    try std.testing.expect(mutated.toBoolean());
 }
 
 test "querySelectorAll matches ordered descendant selector chains" {
@@ -2008,6 +2161,26 @@ fn setupDocument(self: *Js, realm: *Realm) !void {
         },
     );
 
+    const event_path_fn = try kiesel.builtins.createBuiltinFunction(
+        &self.agent,
+        .{ .function = getEventPath },
+        1,
+        "eventPath",
+        .{
+            .realm = realm,
+            .additional_fields = self_ptr,
+        },
+    );
+
+    try native_obj.definePropertyDirect(
+        &self.agent,
+        PropertyKey.from("eventPath"),
+        .{
+            .value_or_accessor = .{ .value = Value.from(&event_path_fn.object) },
+            .attributes = .builtin_default,
+        },
+    );
+
     const create_element_fn = try kiesel.builtins.createBuiltinFunction(
         &self.agent,
         .{ .function = createElement },
@@ -2519,6 +2692,63 @@ fn getChildren(agent: *Agent, this_value: Value, arguments: kiesel.types.Argumen
             );
             output_index += 1;
         }
+    }
+
+    return Value.from(&result.object);
+}
+
+/// Snapshot a node's target-to-root event path before any listener runs.
+/// JavaScript dispatch consumes only numeric handles after this returns, so a
+/// listener may structurally mutate the DOM without invalidating the remaining
+/// bubbling traversal.
+fn getEventPath(agent: *Agent, this_value: Value, arguments: kiesel.types.Arguments) Agent.Error!Value {
+    const function_obj = agent.activeFunctionObject();
+    const builtin_fn = function_obj.as(kiesel.builtins.BuiltinFunction);
+    const js_instance = builtin_fn.fields.additionalFieldsAs(Js);
+    const window_id = js_instance.current_window_id orelse return agent.throwException(
+        .internal_error,
+        "Missing active window",
+        .{},
+    );
+    const window = js_instance.windows.getPtr(window_id) orelse return agent.throwException(
+        .internal_error,
+        "Missing window context",
+        .{},
+    );
+    _ = this_value;
+
+    const handle_arg = arguments.get(0);
+    if (!handle_arg.isNumber()) {
+        return agent.throwException(
+            .type_error,
+            "eventPath requires a numeric node handle",
+            .{},
+        );
+    }
+    const handle: u32 = @intFromFloat(handle_arg.asNumber().asFloat());
+    const target = js_instance.getNode(window, handle) orelse return agent.throwException(
+        .internal_error,
+        "Invalid node handle",
+        .{},
+    );
+
+    var path_length: usize = 1;
+    var ancestor = nodeParent(target);
+    while (ancestor) |node| : (ancestor = nodeParent(node)) path_length += 1;
+
+    const result = try kiesel.builtins.arrayCreate(agent, @intCast(path_length), null);
+    var current: ?*Node = target;
+    var index: usize = 0;
+    while (current) |node| : (current = nodeParent(node)) {
+        const node_handle = try js_instance.getHandle(window, node);
+        try result.object.createDataPropertyDirect(
+            agent,
+            kiesel.types.PropertyKey.from(
+                @as(kiesel.types.PropertyKey.IntegerIndex, @intCast(index)),
+            ),
+            Value.from(@as(f64, @floatFromInt(node_handle))),
+        );
+        index += 1;
     }
 
     return Value.from(&result.object);

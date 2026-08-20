@@ -1,0 +1,92 @@
+<!--
+How to verify:
+1. Click "ordinary target": the log must read target -> parent -> outer.
+2. Click "stop at parent": both parent listeners must run, but outer must not.
+3. Click the words inside the protected link: the nested target, link, and
+   outer listeners must run, the status turns green, and the page must not
+   navigate to the red failure page.
+-->
+<!doctype html>
+<html>
+<head>
+  <title>Event bubbling regression</title>
+  <style>
+    body { font: 16px sans-serif; margin: 24px; }
+    .card { border: 2px solid #345; margin: 12px 0; padding: 14px; }
+    .target { background: #def; border: 1px solid #579; padding: 8px; }
+    #status { background: #eee; margin-top: 16px; padding: 10px; }
+    #status.pass { background: #cfc; color: #163; }
+  </style>
+</head>
+<body>
+  <h1>Event bubbling</h1>
+
+  <div class="card" id="ordinaryOuter">
+    <div id="ordinaryParent">
+      <span class="target" id="ordinaryTarget">ordinary target</span>
+    </div>
+  </div>
+
+  <div class="card" id="stoppedOuter">
+    <div id="stoppedParent">
+      <span class="target" id="stoppedTarget">stop at parent</span>
+    </div>
+  </div>
+
+  <div class="card" id="linkOuter">
+    <a id="protectedLink" href="data:text/html,<h1 style='color:red'>FAILED: preventDefault did not cancel navigation</h1>">
+      <strong id="linkTarget">protected nested link text</strong>
+    </a>
+  </div>
+
+  <p id="status">Click a target. The latest listener order appears here.</p>
+
+  <script>
+    var log = [];
+    var statusNode = document.querySelectorAll('p')[0];
+
+    function show(expected, successText) {
+      statusNode.innerHTML = log.join(' -&gt; ');
+      if (log.join(',') === expected) {
+        statusNode.setAttribute('class', 'pass');
+        statusNode.innerHTML = successText + ': ' + log.join(' -&gt; ');
+      } else {
+        statusNode.setAttribute('class', '');
+      }
+    }
+
+    ordinaryTarget.addEventListener('click', function(event) {
+      log = ['target=' + event.target.getAttribute('id')];
+    });
+    ordinaryParent.addEventListener('click', function() { log.push('parent'); });
+    ordinaryOuter.addEventListener('click', function() {
+      log.push('outer');
+      show('target=ordinaryTarget,parent,outer', 'PASS ordinary bubbling');
+    });
+
+    stoppedTarget.addEventListener('click', function() { log = ['target']; });
+    stoppedParent.addEventListener('click', function(event) {
+      log.push('parent-one');
+      event.stopPropagation();
+    });
+    stoppedParent.addEventListener('click', function() {
+      log.push('parent-two');
+      show('target,parent-one,parent-two', 'PASS propagation stopped after current target');
+    });
+    stoppedOuter.addEventListener('click', function() {
+      log.push('ERROR outer');
+      show('', 'FAIL');
+    });
+
+    linkTarget.addEventListener('click', function(event) {
+      log = ['target=' + event.target.getAttribute('id')];
+    });
+    protectedLink.addEventListener('click', function() { log.push('link'); });
+    linkOuter.addEventListener('click', function(event) {
+      log.push('outer');
+      event.preventDefault();
+      show('target=linkTarget,link,outer', 'PASS link default prevented by ancestor');
+    });
+  </script>
+</body>
+</html>

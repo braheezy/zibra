@@ -75,6 +75,11 @@ same Node object under a different parent with a visible in-page result.
 IDs as JavaScript globals, including `innerHTML`, rename, detach, reattach, and
 non-identifier access through `window[...]`.
 
+`tests/manual/event-bubbling.html` verifies painted ordinary-element click
+targets, target-to-root listener order, same-node listener completion after
+`stopPropagation`, and ancestor `preventDefault` cancellation of link
+navigation.
+
 `tests/manual/resubmit-requests.html` uses the tutorial server's deterministic
 POST login to verify that Back to a POST target asks before replaying, Cancel
 does not navigate, and Resubmit sends the retained body again.

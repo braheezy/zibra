@@ -8,6 +8,7 @@ const tab_module = @import("../browser/tab.zig");
 const inspection = @import("../document/inspection.zig");
 const parser = @import("../document/parser.zig");
 const Url = @import("../network/url.zig").Url;
+const ScriptJs = @import("../script/js.zig");
 
 const DisplayItem = browser.DisplayItem;
 const Node = parser.Node;
@@ -484,6 +485,74 @@ test "frame clicks use painted link fragments when link bounds are empty" {
     try std.testing.expect(try frame.click(&test_browser, 15, 25, .middle));
     try std.testing.expectEqual(@as(usize, 1), test_browser.pending_new_tabs.items.len);
     try std.testing.expectEqualStrings("/docs/next.html", test_browser.pending_new_tabs.items[0].path);
+}
+
+test "painted ordinary elements dispatch click events from target through ancestors" {
+    const allocator = std.testing.allocator;
+    var html_parser = try parser.HTMLParser.init(
+        allocator,
+        "<main><div id=ancestor><span id=painted>click me</span></div>" ++
+            "<a><strong id=paintedLinkChild>link child</strong></a></main>",
+    );
+    defer html_parser.deinit(allocator);
+    var root = try html_parser.parse();
+    defer root.deinit(allocator);
+    parser.fixParentPointers(&root, null);
+    const painted = try findElement(&root, "span");
+    const painted_link_child = try findElement(&root, "strong");
+
+    var environ = std.process.Environ.Map.init(allocator);
+    defer environ.deinit();
+    var js = try ScriptJs.init(allocator, std.testing.io, &environ);
+    defer js.deinit(allocator);
+    js.setNodes(73, &root);
+    defer js.setNodes(73, null);
+    _ = try js.evaluate(73,
+        \\var clicks = [];
+        \\painted.addEventListener('click', function(event) {
+        \\  clicks.push(event.target.getAttribute('id'));
+        \\});
+        \\ancestor.addEventListener('click', function() { clicks.push('ancestor'); });
+        \\document.querySelectorAll('main')[0].addEventListener('click', function() {
+        \\  clicks.push('main');
+        \\});
+        \\var linkClicks = [];
+        \\paintedLinkChild.addEventListener('click', function() { linkClicks.push('target'); });
+        \\document.querySelectorAll('a')[0].addEventListener('click', function() {
+        \\  linkClicks.push('link');
+        \\});
+    );
+
+    var tab: tab_module.Tab = undefined;
+    initClickTab(&tab, allocator);
+    defer deinitClickTab(&tab);
+    var frame = tab_module.Frame.init(allocator, &tab, null, null);
+    defer frame.deinit();
+    tab.root_frame = &frame;
+    frame.js_context = js;
+    frame.window_id = 73;
+
+    const generator = TestLayoutOrigin{ .node_ptr = painted };
+    const link_generator = TestLayoutOrigin{ .node_ptr = painted_link_child };
+    const display_list = try allocator.alloc(DisplayItem, 2);
+    display_list[0] = rect(10, 10, 80, 30, sourceFromOrigin(&generator, painted));
+    display_list[1] = rect(
+        90,
+        10,
+        160,
+        30,
+        sourceFromOrigin(&link_generator, painted_link_child),
+    );
+    frame.display_list = display_list;
+
+    var unused_browser: browser.Browser = undefined;
+    try std.testing.expect(try frame.clickDevice(&unused_browser, 20, 20, .primary, 1.0));
+    const result = try js.evaluate(73, "clicks.join(',') === 'painted,ancestor,main'");
+    try std.testing.expect(result.toBoolean());
+
+    try std.testing.expect(try frame.clickDevice(&unused_browser, 100, 20, .primary, 1.0));
+    const link_result = try js.evaluate(73, "linkClicks.join(',') === 'target,link'");
+    try std.testing.expect(link_result.toBoolean());
 }
 
 test "iframe display hit translates into the child frame list" {

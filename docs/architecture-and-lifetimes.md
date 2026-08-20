@@ -438,10 +438,18 @@ visits items in reverse paint order, inverts translation transforms, treats
 primitive paint geometry. Native click tasks retain the exact device point and
 the committed zoom snapshot; CSS positions and translations use the same
 truncating scale rule as raster, while cached glyph widths/heights remain exact
-device bitmap dimensions. `Frame.click` walks the hit node's ancestors to find
-iframe, anchor, input, button, or contenteditable behavior; iframe hits scale
-the combined `top - child_scroll` translation once before entering the child
-list, matching composition at fractional zoom. Compositor-only opacity
+device bitmap dimensions. `Frame.click` normalizes the hit to its painted
+element and dispatches one primary click there, including for elements with no
+built-in action. The event bubbles over a target-to-root handle snapshot;
+iframe hits instead enter the child document and scale the combined
+`top - child_scroll` translation once, matching composition at fractional
+zoom. Before JavaScript runs, a clickable ancestor's stable handle is captured;
+after listeners return, the frame resolves that handle against the attached
+document before performing anchor, input, button, or contenteditable behavior.
+Thus structural listener mutation cannot leave the default-action path holding
+a relocated raw Node pointer. `stopPropagation` controls only ancestor
+delivery, while `preventDefault` cancels that resolved browser action.
+Compositor-only opacity
 animation updates also mutate the retained effect wrapper before the same
 update is committed, so invisible content stops participating in hit testing.
 The browser applies that update recursively through transforms in its committed
@@ -844,6 +852,10 @@ Current enforced behavior includes:
 
 - the scanned, uncollectable `Js` allocation roots the embedded Kiesel `Agent`;
 - entry into evaluation and callback execution is serialized by `JsLock`;
+- node listener maps are window-scoped. Dispatch snapshots target and ancestor
+  handles before invoking the first listener, then reuses one Event with a
+  fixed `target` and per-node `currentTarget`; `stopPropagation` stops before
+  the next ancestor but does not skip remaining listeners on the current node;
 - every tab-owned `Js` installs a Kiesel host-interrupt callback that reads the
   tab's atomic shutdown flag; the VM polls it at bytecode safe points and turns
   it into an uncatchable host error at the `Js.evaluate` boundary;

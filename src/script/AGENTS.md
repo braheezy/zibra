@@ -25,6 +25,11 @@ or Kiesel allocation/locking.
   with existing globals are skipped. Refresh the per-window registry whenever
   attached structure or an attached element's `id` changes, clearing old
   wrappers before any DOM pointer can move or disappear.
+- DOM listeners are scoped by window and a dispatched event follows a
+  snapshotted target-to-root handle path. Reuse one Event while bubbling,
+  update `currentTarget` for each node, keep `target` fixed, let
+  `stopPropagation` finish the current node's listeners before stopping, and
+  keep propagation control independent from `preventDefault`.
 - Structural JavaScript mutation also clears current style-field subscriber
   maps while every endpoint is alive; the mandatory full style/layout render
   rebuilds dependencies after mutation.
