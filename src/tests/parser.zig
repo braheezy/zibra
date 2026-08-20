@@ -906,6 +906,7 @@ test ":has selectors match strict descendants, cascade, and recompute" {
     defer html_parser.deinit(allocator);
     var root = try html_parser.parse();
     defer root.deinit(allocator);
+    document_parser.fixParentPointers(&root, null);
 
     var css_parser = try CSSParser.init(allocator, css, false);
     defer css_parser.deinit(allocator);
