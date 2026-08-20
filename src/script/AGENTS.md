@@ -9,6 +9,10 @@ before changing callback registration, DOM handles, asynchronous completion,
 or Kiesel allocation/locking.
 
 - JavaScript node handles must not silently retarget after DOM mutation.
+- `Node.children` is a fresh JavaScript array on each access. It wraps handles
+  for immediate element children in DOM order, excludes text and deeper
+  descendants, and relies on the existing handle invalidation boundary when a
+  structural mutation retires child storage.
 - Detached/queued work must use the document generation contract from
   `src/browser/`; never retain a callback context or frame as a long-lived
   pointer.

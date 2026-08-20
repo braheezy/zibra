@@ -825,6 +825,9 @@ Current enforced behavior includes:
   it into an uncatchable host error at the `Js.evaluate` boundary;
 - `Js.setNodes` changes the root, clears both handle maps, and resets callbacks
   when the root becomes null;
+- the `Node.children` getter snapshots immediate element-child handles in DOM
+  order and wraps them as JavaScript Nodes; text children and deeper
+  descendants are excluded, and every getter call creates a new array;
 - `innerHTML` calls `removeHandlesForSubtree` for every removed child before
   destroying it, so descendant JavaScript handles are removed with the old
   subtree;

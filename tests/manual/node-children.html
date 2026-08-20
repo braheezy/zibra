@@ -1,0 +1,29 @@
+<!--
+How to verify:
+Open this page normally. The result below must become a green PASS message.
+The fixture deliberately interleaves text with two element children and nests
+a third element more deeply; Node.children must return only the first two.
+-->
+<!doctype html>
+<title>Node.children</title>
+<h1>Node.children fixture</h1>
+<div class="fixture">
+  leading text
+  <span id="first">first <b id="nested">nested</b></span>
+  middle text
+  <em id="second">second</em>
+  trailing text
+</div>
+<p class="pass" style="display: none; color: green">PASS: immediate element children only</p>
+<script>
+  var target = document.querySelectorAll(".fixture")[0];
+  var elements = target.children;
+  var passed = elements.length === 2 &&
+    elements[0].getAttribute("id") === "first" &&
+    elements[1].getAttribute("id") === "second" &&
+    elements[0].children.length === 1 &&
+    elements[0].children[0].getAttribute("id") === "nested";
+  if (passed) {
+    document.querySelectorAll(".pass")[0].setAttribute("style", "color: green");
+  }
+</script>

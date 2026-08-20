@@ -59,6 +59,10 @@ and nested-button parser recovery.
 actions, input editing, anchor-based tab selection, history-state styling, and
 the stable page/chrome boundary.
 
+`tests/manual/node-children.html` verifies that JavaScript `Node.children`
+returns immediate elements in source order, skips interleaved text, excludes
+deeper descendants, and produces a visible in-page result.
+
 `tests/manual/resubmit-requests.html` uses the tutorial server's deterministic
 POST login to verify that Back to a POST target asks before replaying, Cancel
 does not navigate, and Resubmit sends the retained body again.

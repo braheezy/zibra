@@ -467,6 +467,13 @@ pub fn evaluate(self: *Js, window_id: u32, code: []const u8) !Value {
         \\  __native.setAttribute(this.handle, name, text);
         \\};
         \\
+        \\// Snapshot the immediate element children as wrapped Node objects.
+        \\Object.defineProperty(Node.prototype, "children", {
+        \\  get: function() {
+        \\    return __native.children(this.handle).map(function(h) { return new Node(h); });
+        \\  }
+        \\});
+        \\
         \\// Add innerHTML setter to Node prototype
         \\Object.defineProperty(Node.prototype, "innerHTML", {
         \\  set: function(value) {
@@ -1050,6 +1057,77 @@ test "querySelectorAll matches :has selectors through strict descendants" {
     try std.testing.expect(result.toBoolean());
 }
 
+test "Node.children returns immediate element children in source order" {
+    const allocator = std.testing.allocator;
+    const html =
+        "<main>" ++
+        "<section id=parent>leading text<span id=first>one</span>middle text" ++
+        "<em id=second><b id=nested>nested</b></em>trailing text</section>" ++
+        "<aside id=empty>text only</aside>" ++
+        "</main>";
+
+    var html_parser = try parser.HTMLParser.init(allocator, html);
+    html_parser.use_implicit_tags = false;
+    defer html_parser.deinit(allocator);
+    var root = try html_parser.parse();
+    defer root.deinit(allocator);
+    parser.fixParentPointers(&root, null);
+
+    var environ = std.process.Environ.Map.init(allocator);
+    defer environ.deinit();
+    var js = try Js.init(allocator, std.testing.io, &environ);
+    defer js.deinit(allocator);
+    js.setNodes(0, &root);
+    defer js.setNodes(0, null);
+
+    const result = try js.evaluate(0,
+        \\var target = document.querySelectorAll('section')[0];
+        \\var children = target.children;
+        \\var empty = document.querySelectorAll('aside')[0];
+        \\typeof children.map === 'function' &&
+        \\children !== target.children &&
+        \\children.length === 2 &&
+        \\children[0].getAttribute('id') === 'first' &&
+        \\children[1].getAttribute('id') === 'second' &&
+        \\children[0].children.length === 0 &&
+        \\children[1].children.length === 1 &&
+        \\children[1].children[0].getAttribute('id') === 'nested' &&
+        \\empty.children.length === 0
+    );
+    try std.testing.expect(result.toBoolean());
+}
+
+test "Node.children reflects a later innerHTML generation" {
+    const allocator = std.testing.allocator;
+    var html_parser = try parser.HTMLParser.init(
+        allocator,
+        "<section><span id=old-one></span>text<em id=old-two></em></section>",
+    );
+    html_parser.use_implicit_tags = false;
+    defer html_parser.deinit(allocator);
+    var root = try html_parser.parse();
+    defer root.deinit(allocator);
+    parser.fixParentPointers(&root, null);
+
+    var environ = std.process.Environ.Map.init(allocator);
+    defer environ.deinit();
+    var js = try Js.init(allocator, std.testing.io, &environ);
+    defer js.deinit(allocator);
+    js.setNodes(0, &root);
+    defer js.setNodes(0, null);
+
+    const result = try js.evaluate(0,
+        \\var target = document.querySelectorAll('section')[0];
+        \\var before = target.children;
+        \\target.innerHTML = 'text<i id="replacement">new</i>more text';
+        \\var after = target.children;
+        \\before.length === 2 &&
+        \\after.length === 1 &&
+        \\after[0].getAttribute('id') === 'replacement'
+    );
+    try std.testing.expect(result.toBoolean());
+}
+
 test "native style_set updates element style attribute" {
     var environ = std.process.Environ.Map.init(std.testing.allocator);
     defer environ.deinit();
@@ -1212,6 +1290,26 @@ fn setupDocument(self: *Js, realm: *Realm) !void {
         PropertyKey.from("getAttribute"),
         .{
             .value_or_accessor = .{ .value = Value.from(&get_attribute_fn.object) },
+            .attributes = .builtin_default,
+        },
+    );
+
+    const children_fn = try kiesel.builtins.createBuiltinFunction(
+        &self.agent,
+        .{ .function = getChildren },
+        1,
+        "children",
+        .{
+            .realm = realm,
+            .additional_fields = self_ptr,
+        },
+    );
+
+    try native_obj.definePropertyDirect(
+        &self.agent,
+        PropertyKey.from("children"),
+        .{
+            .value_or_accessor = .{ .value = Value.from(&children_fn.object) },
             .attributes = .builtin_default,
         },
     );
@@ -1589,6 +1687,71 @@ fn getAttribute(agent: *Agent, this_value: Value, arguments: kiesel.types.Argume
             return .null;
         },
     }
+}
+
+/// __native.children implementation. The returned handle array is a snapshot
+/// of immediate element children; text nodes and deeper descendants are not
+/// exposed by this property.
+fn getChildren(agent: *Agent, this_value: Value, arguments: kiesel.types.Arguments) Agent.Error!Value {
+    const function_obj = agent.activeFunctionObject();
+    const builtin_fn = function_obj.as(kiesel.builtins.BuiltinFunction);
+    const js_instance = builtin_fn.fields.additionalFieldsAs(Js);
+    const window_id = js_instance.current_window_id orelse return agent.throwException(
+        .internal_error,
+        "Missing active window",
+        .{},
+    );
+    const window = js_instance.windows.getPtr(window_id) orelse return agent.throwException(
+        .internal_error,
+        "Missing window context",
+        .{},
+    );
+    _ = this_value;
+
+    const handle_arg = arguments.get(0);
+    if (!handle_arg.isNumber()) {
+        return agent.throwException(
+            .type_error,
+            "children requires a numeric node handle",
+            .{},
+        );
+    }
+    const handle: u32 = @intFromFloat(handle_arg.asNumber().asFloat());
+    const node = js_instance.getNode(window, handle) orelse return agent.throwException(
+        .internal_error,
+        "Invalid node handle",
+        .{},
+    );
+
+    const child_count: usize = switch (node.*) {
+        .text => 0,
+        .element => |element| count: {
+            var count: usize = 0;
+            for (element.children.items) |child| {
+                if (child == .element) count += 1;
+            }
+            break :count count;
+        },
+    };
+    const result = try kiesel.builtins.arrayCreate(agent, @intCast(child_count), null);
+
+    if (node.* == .element) {
+        var output_index: usize = 0;
+        for (node.element.children.items) |*child| {
+            if (child.* != .element) continue;
+            const child_handle = try js_instance.getHandle(window, child);
+            try result.object.createDataPropertyDirect(
+                agent,
+                kiesel.types.PropertyKey.from(
+                    @as(kiesel.types.PropertyKey.IntegerIndex, @intCast(output_index)),
+                ),
+                Value.from(@as(f64, @floatFromInt(child_handle))),
+            );
+            output_index += 1;
+        }
+    }
+
+    return Value.from(&result.object);
 }
 
 /// __native.setAttribute implementation
