@@ -67,6 +67,10 @@ deeper descendants, and produces a visible in-page result.
 parsing, covering `document.createElement`, `appendChild`, `insertBefore`, and
 the `null` reference append case with a visible in-page result.
 
+`tests/manual/remove-child.html` removes an attached subtree into detached
+ownership, verifies its nested and shifted-sibling handles, and reattaches the
+same Node object under a different parent with a visible in-page result.
+
 `tests/manual/resubmit-requests.html` uses the tutorial server's deterministic
 POST login to verify that Back to a POST target asks before replaying, Cancel
 does not navigate, and Resubmit sends the retained body again.

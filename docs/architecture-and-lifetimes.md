@@ -296,8 +296,14 @@ capacity change. JavaScript `createElement` results are heap-stable roots owned
 by their window while detached. `appendChild` and `insertBefore` accept those
 detached roots, snapshot immediate-child handle bindings, enter the same
 invalidation seam, reserve capacity, and then transfer the new owner into the
-by-value child array while rebinding every relocated handle. That seam retires
-the frame display list and DOM-keyed bounds, clears the accessibility tree and
+by-value child array while rebinding every relocated handle. `removeChild`
+preallocates the inverse heap-stable owner, enters the seam, moves the direct
+child out of attached storage, and rebinds the removed root plus every shifted
+sibling. The detached subtree keeps its owning DOM resources and handles, but
+clears layout back-pointers and dirties retained style fields. Reattachment
+registers inherited-style dependencies against the current parent before a
+frozen dependency read. That seam retires the frame display list and DOM-keyed
+bounds, clears the accessibility tree and
 pending composited node updates, and retires the active browser draw list,
 layers, and committed display list under `Browser.lock`. Dirty flags and an
 animation-frame request are published before the mutation proceeds, so
@@ -837,6 +843,10 @@ Current enforced behavior includes:
   `WindowContext`; `Node.appendChild` and `Node.insertBefore` transfer only a
   detached root, preserve its handle, and rebind handles for immediate siblings
   relocated by the insertion;
+- `Node.removeChild` accepts only a direct child, moves its complete subtree to
+  a heap-stable `WindowContext` owner, preserves its handles, rebinds shifted
+  sibling handles, and returns the same root eligible for either insertion
+  method;
 - `innerHTML` calls `removeHandlesForSubtree` for every removed child before
   destroying it, so descendant JavaScript handles are removed with the old
   subtree;
@@ -1006,14 +1016,16 @@ reintroduced:
    Kiesel host contexts remain locally owned until insertion into the tab map,
    so allocation or map-insertion failure cannot strand either owner.
 14. **Structural DOM snapshot retirement:** `innerHTML`, detached-root
-   `appendChild`/`insertBefore`, and the native first contenteditable child
-   append mark layout/render work and synchronously retire frame/browser
-   DOM-derived snapshots before a child can move or be destroyed. Browser-side
-   image/effect borrows retire under `Browser.lock`; focus on a surviving
-   mutation root is preserved, while removed-descendant focus and
-   accessibility/hit indexes are cleared. JavaScript insertion additionally
-   rebinds handles for immediate siblings shifted or relocated by the child
-   array. See `prepareDomMutation`, `Tab.prepareForDomMutation`, and
+   `appendChild`/`insertBefore`, `removeChild`, and the native first
+   contenteditable child append mark layout/render work and synchronously
+   retire frame/browser DOM-derived snapshots before a child can move or be
+   destroyed. Browser-side image/effect borrows retire under `Browser.lock`;
+   focus on a surviving mutation root is preserved, while removed-descendant
+   focus and accessibility/hit indexes are cleared. JavaScript insertion
+   additionally rebinds handles for immediate siblings shifted or relocated by
+   the child array; removal also rebinds the detached root and clears its
+   obsolete layout pointers. See `prepareDomMutation`,
+   `Tab.prepareForDomMutation`, and
    `Frame.retireDomMutationBorrows`.
 
 ## Confirmed unresolved lifetime risks
@@ -1027,10 +1039,10 @@ Children live by value in resizable arrays while layout, hit-test, focus,
 frame-element, accessibility, display, and JS structures store `*Node`.
 The supported `innerHTML` and first contenteditable append paths now retire
 their DOM-derived browser state synchronously, and `innerHTML` clears handles
-for the subtree it removes. The supported detached-root insertion paths also
-rebind immediate-child JavaScript handles after relocation. These boundaries
-do not create stable identity for future mutation APIs or every retained
-JS/frame borrower. See
+for the subtree it removes. The supported detached-root insertion and removal
+paths also rebind immediate-child JavaScript handles after relocation. These
+boundaries do not create stable identity for future mutation APIs or every
+retained JS/frame borrower. See
 [`src/document/parser.zig`](../src/document/parser.zig),
 [`src/script/js.zig`](../src/script/js.zig), and
 [`src/browser/tab.zig`](../src/browser/tab.zig).

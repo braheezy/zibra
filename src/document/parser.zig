@@ -1262,6 +1262,21 @@ pub fn dirtyStyleForElement(e: *Element) void {
     }
 }
 
+/// Mark an entire retained subtree for recomputation after it is detached.
+/// Unlike dirtyStyleForElement, this deliberately does not walk above the
+/// subtree root, whose parent link has already been cleared.
+pub fn dirtyStyleSubtree(node: *Node) void {
+    switch (node.*) {
+        .text => |*text| {
+            if (text.style) |*style_map| dirtyStyleMap(style_map);
+        },
+        .element => |*element| {
+            if (element.style) |*style_map| dirtyStyleMap(style_map);
+            for (element.children.items) |*child| dirtyStyleSubtree(child);
+        },
+    }
+}
+
 fn dirtyStyleMap(style_map: *StyleMap) void {
     var it = style_map.iterator();
     while (it.next()) |entry| entry.value_ptr.mark();
@@ -1348,10 +1363,13 @@ fn inheritedValue(
 ) []const u8 {
     // The synthetic root parent is destroyed at the end of every style pass,
     // so root fields may read it but must never register a dependency on it.
-    return if (parent_is_ephemeral_default)
-        parent_field.get().*
-    else
-        parent_field.read(child_field).*;
+    if (parent_is_ephemeral_default) return parent_field.get().*;
+
+    // A retained style map can move between parents through removeChild.
+    // Register the current edge before a frozen dependency read. Former edges
+    // remain registered under ProtectedField's current no-unsubscribe model.
+    child_field.addDependency(parent_field);
+    return parent_field.read(child_field).*;
 }
 
 fn styleWithParent(

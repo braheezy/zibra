@@ -17,6 +17,9 @@ or Kiesel allocation/locking.
   `appendChild` and `insertBefore` transfer only such detached roots into a
   child array, rebind handles for every relocated immediate child, and invoke
   the synchronous DOM-mutation boundary before attached storage can move.
+- `removeChild` performs the inverse transfer: it accepts only a direct child,
+  moves that subtree into a heap-stable window-owned detached root, preserves
+  subtree handles, and rebinds siblings shifted in the attached child array.
 - Detached/queued work must use the document generation contract from
   `src/browser/`; never retain a callback context or frame as a long-lived
   pointer.

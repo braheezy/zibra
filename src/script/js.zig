@@ -184,8 +184,8 @@ const WindowContext = struct {
     realm: *Realm,
     node_to_handle: std.AutoHashMap(*Node, u32),
     handle_to_node: std.AutoHashMap(u32, *Node),
-    // Heap-stable owners for createElement results that have not yet been
-    // transferred into a DOM child array.
+    // Heap-stable owners for createElement results and removeChild subtrees
+    // that have not yet been transferred into a DOM child array.
     detached_nodes: std.AutoHashMap(*Node, void),
     next_handle: u32,
     current_nodes: ?*Node,
@@ -481,6 +481,11 @@ pub fn evaluate(self: *Js, window_id: u32, code: []const u8) !Value {
         \\Node.prototype.insertBefore = function(child, reference) {
         \\  var referenceHandle = reference === null ? null : reference && reference.handle;
         \\  __native.insertBefore(this.handle, child && child.handle, referenceHandle);
+        \\  return child;
+        \\};
+        \\
+        \\Node.prototype.removeChild = function(child) {
+        \\  __native.removeChild(this.handle, child && child.handle);
         \\  return child;
         \\};
         \\
@@ -894,6 +899,72 @@ fn insertDetachedChild(
     window.node_to_handle.putAssumeCapacity(installed_child, child_handle);
     window.handle_to_node.putAssumeCapacity(child_handle, installed_child);
     parser.fixParentPointers(parent, parent_parent);
+
+    if (parent_is_attached) self.requestRender();
+}
+
+fn clearDetachedLayoutPointers(node: *Node) void {
+    switch (node.*) {
+        .text => {},
+        .element => |*element| {
+            element.layout_ptr = null;
+            element.layout_mark = null;
+            element.children_dirty = true;
+            for (element.children.items) |*child| clearDetachedLayoutPointers(child);
+        },
+    }
+}
+
+/// Move one by-value child into a heap-stable, window-owned detached root.
+/// All fallible work precedes the child-array mutation; the remainder is an
+/// infallible ownership and handle-rebinding transaction.
+fn detachChild(
+    self: *Js,
+    window: *WindowContext,
+    parent: *Node,
+    child: *Node,
+    remove_index: usize,
+) !void {
+    var bindings = try self.snapshotDirectChildHandles(window, parent);
+    defer bindings.deinit(self.allocator);
+
+    const detached = try self.allocator.create(Node);
+    errdefer self.allocator.destroy(detached);
+    try window.detached_nodes.ensureUnusedCapacity(1);
+
+    const parent_is_attached = isAttachedToCurrentDocument(window, parent);
+    const parent_parent = nodeParent(parent);
+    const child_handle = window.node_to_handle.get(child).?;
+    const element = &parent.element;
+
+    element.children_dirty = true;
+    parser.dirtyStyleForElement(element);
+    markElementLayoutDirty(element);
+    if (parent_is_attached) self.prepareDomMutation(parent);
+
+    // orderedRemove shifts later children, invalidating their pointer keys.
+    // Remove every published direct-child address before performing the move.
+    for (bindings.items) |binding| {
+        _ = window.node_to_handle.remove(binding.old_ptr);
+    }
+
+    detached.* = element.children.orderedRemove(remove_index);
+    window.detached_nodes.putAssumeCapacity(detached, {});
+
+    for (bindings.items) |binding| {
+        if (binding.old_index == remove_index) continue;
+        const new_index = binding.old_index - @intFromBool(binding.old_index > remove_index);
+        const new_ptr = &element.children.items[new_index];
+        window.node_to_handle.putAssumeCapacity(new_ptr, binding.handle);
+        window.handle_to_node.putAssumeCapacity(binding.handle, new_ptr);
+    }
+
+    window.node_to_handle.putAssumeCapacity(detached, child_handle);
+    window.handle_to_node.putAssumeCapacity(child_handle, detached);
+    parser.fixParentPointers(parent, parent_parent);
+    parser.fixParentPointers(detached, null);
+    clearDetachedLayoutPointers(detached);
+    parser.dirtyStyleSubtree(detached);
 
     if (parent_is_attached) self.requestRender();
 }
@@ -1349,6 +1420,91 @@ test "createElement appendChild and insertBefore preserve handles and order" {
     try std.testing.expectEqual(@as(usize, 3), mutation_context.count);
 }
 
+test "removeChild detaches a subtree and preserves handles across reattachment" {
+    const allocator = std.testing.allocator;
+    const html =
+        "<main>" ++
+        "<section><article><strong>nested</strong></article><i id=stay></i></section>" ++
+        "<aside></aside>" ++
+        "</main>";
+    const css = "section article { color: red; } aside article { color: green; }";
+
+    var html_parser = try parser.HTMLParser.init(allocator, html);
+    html_parser.use_implicit_tags = false;
+    defer html_parser.deinit(allocator);
+    var root = try html_parser.parse();
+    defer root.deinit(allocator);
+    parser.fixParentPointers(&root, null);
+
+    var css_parser = try CSSParser.init(allocator, css, false);
+    defer css_parser.deinit(allocator);
+    const rules = try css_parser.parse(allocator);
+    defer {
+        for (rules) |*rule| rule.deinit(allocator);
+        allocator.free(rules);
+    }
+    try parser.style(allocator, &root, rules);
+    const initial_article = &root.element.children.items[0].element.children.items[0].element;
+    try std.testing.expectEqualStrings("red", initial_article.style.?.getPtr("color").?.get().*);
+
+    var environ = std.process.Environ.Map.init(allocator);
+    defer environ.deinit();
+    var js = try Js.init(allocator, std.testing.io, &environ);
+    defer js.deinit(allocator);
+    js.setNodes(0, &root);
+    defer js.setNodes(0, null);
+
+    var mutation_context = DomMutationTestContext{};
+    js.setDomMutationCallback(0, DomMutationTestContext.callback, &mutation_context);
+
+    const detached_result = try js.evaluate(0,
+        \\var source = document.querySelectorAll('section')[0];
+        \\var destination = document.querySelectorAll('aside')[0];
+        \\var moving = document.querySelectorAll('article')[0];
+        \\var nested = moving.children[0];
+        \\var stay = source.children[1];
+        \\var observed = 0;
+        \\moving.addEventListener('probe', function() { observed += 1; });
+        \\var descendantRejected = false;
+        \\try { source.removeChild(nested); } catch (error) { descendantRejected = true; }
+        \\var removed = source.removeChild(moving);
+        \\var rejected = false;
+        \\try { source.removeChild(moving); } catch (error) { rejected = true; }
+        \\removed === moving && descendantRejected && rejected &&
+        \\source.children.length === 1 &&
+        \\source.children[0].handle === stay.handle &&
+        \\moving.children.length === 1 &&
+        \\moving.children[0].handle === nested.handle &&
+        \\document.querySelectorAll('article').length === 0
+    );
+    try std.testing.expect(detached_result.toBoolean());
+    try std.testing.expectEqual(@as(usize, 1), js.windows.getPtr(0).?.detached_nodes.count());
+    try std.testing.expectEqual(@as(usize, 1), mutation_context.count);
+
+    const reattached_result = try js.evaluate(0,
+        \\moving.setAttribute('id', 'moved');
+        \\var appendReturn = destination.appendChild(removed);
+        \\appendReturn === moving &&
+        \\destination.children.length === 1 &&
+        \\destination.children[0].handle === moving.handle &&
+        \\moving.children[0].handle === nested.handle &&
+        \\moving.getAttribute('id') === 'moved' &&
+        \\moving.dispatchEvent(new Event('probe')) && observed === 1 &&
+        \\document.querySelectorAll('article').length === 1
+    );
+    try std.testing.expect(reattached_result.toBoolean());
+    try std.testing.expectEqual(@as(usize, 0), js.windows.getPtr(0).?.detached_nodes.count());
+    try std.testing.expectEqual(@as(usize, 2), mutation_context.count);
+
+    // Reparenting a previously styled subtree must recompute both selector
+    // matches and inherited descendant values against the new parent chain.
+    try parser.style(allocator, &root, rules);
+    const moved_article = &root.element.children.items[1].element.children.items[0].element;
+    const moved_strong = &moved_article.children.items[0].element;
+    try std.testing.expectEqualStrings("green", moved_article.style.?.getPtr("color").?.get().*);
+    try std.testing.expectEqualStrings("green", moved_strong.style.?.getPtr("color").?.get().*);
+}
+
 test "createElement detached ownership is released with the document" {
     const allocator = std.testing.allocator;
     var html_parser = try parser.HTMLParser.init(allocator, "<main></main>");
@@ -1368,11 +1524,13 @@ test "createElement detached ownership is released with the document" {
         \\var abandoned = document.createElement('DIV');
         \\var nested = document.createElement('span');
         \\abandoned.appendChild(nested);
-        \\abandoned.children.length === 1 &&
-        \\abandoned.children[0].handle === nested.handle
+        \\var removed = abandoned.removeChild(nested);
+        \\removed === nested &&
+        \\abandoned.children.length === 0 &&
+        \\removed.getAttribute('missing') === null
     );
     try std.testing.expect(result.toBoolean());
-    try std.testing.expectEqual(@as(usize, 1), js.windows.getPtr(0).?.detached_nodes.count());
+    try std.testing.expectEqual(@as(usize, 2), js.windows.getPtr(0).?.detached_nodes.count());
 
     js.setNodes(0, null);
     try std.testing.expectEqual(@as(usize, 0), js.windows.getPtr(0).?.detached_nodes.count());
@@ -1617,6 +1775,25 @@ fn setupDocument(self: *Js, realm: *Realm) !void {
         PropertyKey.from("insertBefore"),
         .{
             .value_or_accessor = .{ .value = Value.from(&insert_before_fn.object) },
+            .attributes = .builtin_default,
+        },
+    );
+
+    const remove_child_fn = try kiesel.builtins.createBuiltinFunction(
+        &self.agent,
+        .{ .function = removeChild },
+        2,
+        "removeChild",
+        .{
+            .realm = realm,
+            .additional_fields = self_ptr,
+        },
+    );
+    try native_obj.definePropertyDirect(
+        &self.agent,
+        PropertyKey.from("removeChild"),
+        .{
+            .value_or_accessor = .{ .value = Value.from(&remove_child_fn.object) },
             .attributes = .builtin_default,
         },
     );
@@ -2171,7 +2348,7 @@ fn appendChild(agent: *Agent, this_value: Value, arguments: kiesel.types.Argumen
         return agent.throwException(.type_error, "Text nodes do not support appendChild", .{});
     }
     if (!window.detached_nodes.contains(child)) {
-        return agent.throwException(.type_error, "appendChild requires a detached created element", .{});
+        return agent.throwException(.type_error, "appendChild requires a detached element", .{});
     }
     if (isInclusiveAncestor(child, parent)) {
         return agent.throwException(.type_error, "appendChild would create a cycle", .{});
@@ -2218,7 +2395,7 @@ fn insertBefore(agent: *Agent, this_value: Value, arguments: kiesel.types.Argume
         return agent.throwException(.type_error, "Text nodes do not support insertBefore", .{});
     }
     if (!window.detached_nodes.contains(child)) {
-        return agent.throwException(.type_error, "insertBefore requires a detached created element", .{});
+        return agent.throwException(.type_error, "insertBefore requires a detached element", .{});
     }
     if (isInclusiveAncestor(child, parent)) {
         return agent.throwException(.type_error, "insertBefore would create a cycle", .{});
@@ -2245,6 +2422,52 @@ fn insertBefore(agent: *Agent, this_value: Value, arguments: kiesel.types.Argume
     };
 
     try js_instance.insertDetachedChild(window, parent, child, insert_index);
+    return .undefined;
+}
+
+fn removeChild(agent: *Agent, this_value: Value, arguments: kiesel.types.Arguments) Agent.Error!Value {
+    const function_obj = agent.activeFunctionObject();
+    const builtin_fn = function_obj.as(kiesel.builtins.BuiltinFunction);
+    const js_instance = builtin_fn.fields.additionalFieldsAs(Js);
+    const window_id = js_instance.current_window_id orelse return agent.throwException(
+        .internal_error,
+        "Missing active window",
+        .{},
+    );
+    const window = js_instance.windows.getPtr(window_id) orelse return agent.throwException(
+        .internal_error,
+        "Missing window context",
+        .{},
+    );
+    _ = this_value;
+
+    const parent_arg = arguments.get(0);
+    const child_arg = arguments.get(1);
+    if (!parent_arg.isNumber() or !child_arg.isNumber()) {
+        return agent.throwException(.type_error, "removeChild requires two Nodes", .{});
+    }
+    const parent_handle: u32 = @intFromFloat(parent_arg.asNumber().asFloat());
+    const child_handle: u32 = @intFromFloat(child_arg.asNumber().asFloat());
+    const parent = js_instance.getNode(window, parent_handle) orelse return agent.throwException(
+        .internal_error,
+        "Invalid parent node handle",
+        .{},
+    );
+    const child = js_instance.getNode(window, child_handle) orelse return agent.throwException(
+        .internal_error,
+        "Invalid child node handle",
+        .{},
+    );
+    if (parent.* != .element) {
+        return agent.throwException(.type_error, "Text nodes do not support removeChild", .{});
+    }
+    const remove_index = directChildIndex(parent, child) orelse return agent.throwException(
+        .type_error,
+        "removeChild target is not a child of this node",
+        .{},
+    );
+
+    try js_instance.detachChild(window, parent, child, remove_index);
     return .undefined;
 }
 

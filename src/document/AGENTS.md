@@ -20,6 +20,9 @@ or selector/rule lifetime.
   invalidation boundary after marking the target layout dirty and before child
   storage can move or retire. Keep ordinary render callbacks separate so
   style-only changes do not discard focus or hit/accessibility state.
+- A detached retained subtree keeps its style maps but dirties every field and
+  clears layout back-pointers. When it is reparented, inherited style reads
+  register the current parent dependency before using a frozen field.
 - CSS rules own selector/map allocations while their property slices borrow the
   stylesheet. Move and retire rules with their source text as one generation.
 - Concatenated tag/class selectors own a source-ordered `SelectorSequence` of

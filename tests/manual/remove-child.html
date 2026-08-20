@@ -1,0 +1,52 @@
+<!--
+How to verify:
+Open this page normally. The "moved card" must be green under the destination
+label (not in the blue source box), its nested label must remain, and the
+STATUS line must be green rather than red. The script removes the card, checks
+its detached subtree and absence from document queries, then reattaches the
+same Node object with appendChild.
+-->
+<!doctype html>
+<title>removeChild detachment and reattachment</title>
+<style>
+  .region { display: block; width: 320px; padding: 8px; }
+  .source { background-color: lightblue; }
+  .destination { background-color: lightgreen; }
+  .card { display: block; height: 36px; }
+  .source .card { background-color: lightblue; }
+  .destination .card { background-color: lightgreen; }
+  .status { color: red; }
+</style>
+<h1>removeChild fixture</h1>
+<div class="region source">
+  source
+  <article class="card" id="moving">moved card <strong id="nested">nested label</strong></article>
+  <i id="stay">source sibling</i>
+</div>
+<div class="region destination">destination</div>
+<p class="status">STATUS: subtree detached and reattached intact</p>
+<script>
+  var source = document.querySelectorAll(".source")[0];
+  var destination = document.querySelectorAll(".destination")[0];
+  var moving = document.querySelectorAll("article")[0];
+  var nested = moving.children[0];
+  var stay = source.children[1];
+
+  var removed = source.removeChild(moving);
+  var detached = removed === moving &&
+    source.children.length === 1 &&
+    source.children[0].handle === stay.handle &&
+    moving.children[0].handle === nested.handle &&
+    document.querySelectorAll("article").length === 0;
+
+  var appended = destination.appendChild(removed);
+  var reattached = appended === moving &&
+    destination.children.length === 1 &&
+    destination.children[0].handle === moving.handle &&
+    moving.children[0].handle === nested.handle &&
+    document.querySelectorAll("article").length === 1;
+
+  if (detached && reattached) {
+    document.querySelectorAll(".status")[0].setAttribute("style", "color: green");
+  }
+</script>
