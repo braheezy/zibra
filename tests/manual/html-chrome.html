@@ -1,0 +1,16 @@
+<!--
+How to verify:
+1. Open this page normally. The chrome above the page is rendered from an
+   internal HTML document: +, Back, Forward, and * are buttons; the URL is an
+   input; and this page's tab name is a blue anchor.
+2. Click the address input, type and edit text, then press Enter. Its existing
+   cursor and navigation behavior should be unchanged.
+3. Click + to create a second tab, then click either blue tab name to switch.
+4. Follow the link below and use the Back and Forward buttons. The disabled
+   direction is gray, and the page content must remain below a stable border.
+-->
+<!doctype html>
+<title>HTML chrome</title>
+<h1>HTML chrome fixture</h1>
+<p>The browser controls above this page should be ordinary rendered HTML controls.</p>
+<p><a href="html-chrome.html?destination=1">Open a history destination</a></p>

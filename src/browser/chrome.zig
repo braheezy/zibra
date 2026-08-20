@@ -1,18 +1,38 @@
 //! Browser-owned chrome UI for tabs, navigation, and address entry.
 //!
-//! Chrome borrows the browser's font manager while it is alive and owns its
-//! address-entry buffer. Input methods run on the browser thread.
+//! Chrome owns a small internal HTML document and a dedicated layout engine,
+//! plus its address-entry buffer. Input methods and internal document rebuilds
+//! run on the browser thread.
 
 const std = @import("std");
 const browser = @import("root.zig");
 const Rect = browser.Rect;
 const Color = browser.Color;
 const DisplayItem = browser.DisplayItem;
-const font = @import("render/font.zig");
+const Layout = @import("render/layout.zig");
+const document = @import("../document/parser.zig");
+const Node = document.Node;
+const HTMLParser = document.HTMLParser;
+const CSSParser = @import("../document/css_parser.zig").CSSParser;
 const Browser = browser.Browser;
 const Url = @import("../network/url.zig").Url;
 
 const search_url_prefix = "https://google.com/search?q=";
+// Keep the document viewport origin compatible with the former hand-painted
+// chrome. Screenshot comparisons intentionally ignore chrome pixels, but page
+// content must not move merely because its implementation changed.
+const chrome_height: i32 = 66;
+const chrome_row_height: i32 = 33;
+const control_height: i32 = 24;
+const control_width: i32 = 32;
+const chrome_style_sheet =
+    \\html { display: block; background-color: white; }
+    \\body { display: block; background-color: white; font-size: 16px; }
+    \\div { display: block; height: 33px; }
+    \\button { width: 32px; height: 24px; background-color: lightgray; font-size: 16px; }
+    \\input { height: 24px; background-color: white; font-size: 16px; }
+    \\a { color: blue; }
+;
 
 // Chrome represents the browser UI (tab bar, buttons, etc.)
 pub const Chrome = @This();
@@ -36,105 +56,66 @@ address_bar: std.ArrayList(u8) = undefined,
 // Interactive text input is restricted to printable ASCII at the SDL boundary.
 address_cursor: usize = 0,
 allocator: std.mem.Allocator = undefined,
+// The HTML chrome has its own layout/font state because tab layout runs on
+// workers while native chrome is rebuilt synchronously on the UI thread.
+layout_engine: ?*Layout = null,
+rules: ?[]CSSParser.CSSRule = null,
+html_source: ?[]u8 = null,
+document_root: ?*Node = null,
+document_layout: ?*Layout.DocumentLayout = null,
+display_list: ?[]DisplayItem = null,
 
-pub fn init(font_manager: *font.FontManager, window_width: i32, allocator: std.mem.Allocator) !Chrome {
+pub fn init(
+    io: std.Io,
+    environ: *const std.process.Environ.Map,
+    window_width: i32,
+    allocator: std.mem.Allocator,
+    rtl_text: bool,
+) !Chrome {
     var chrome = Chrome{
         .address_bar = std.ArrayList(u8).empty,
         .allocator = allocator,
     };
+    errdefer chrome.deinit();
 
-    // Measure font height
-    const test_glyph = try font_manager.getStyledGlyph(
-        "X",
-        .Normal,
-        .Roman,
-        chrome.font_size,
-        .proportional,
+    chrome.layout_engine = try Layout.init(
+        allocator,
+        io,
+        environ,
+        window_width,
+        chrome_height,
+        rtl_text,
     );
-    chrome.font_height = test_glyph.ascent + test_glyph.descent;
+    var css_parser = try CSSParser.init(allocator, chrome_style_sheet, false);
+    defer css_parser.deinit(allocator);
+    chrome.rules = try css_parser.parse(allocator);
 
-    // Calculate tabbar bounds
+    // Stable fallback geometry remains available before the first raster and
+    // in focused unit tests that deliberately construct Chrome without SDL.
+    chrome.font_size = 12;
+    chrome.font_height = control_height;
+    chrome.padding = 4;
     chrome.tabbar_top = 0;
-    chrome.tabbar_bottom = chrome.font_height + 2 * chrome.padding;
-
-    // Calculate URL bar bounds
+    chrome.tabbar_bottom = chrome_row_height;
     chrome.urlbar_top = chrome.tabbar_bottom;
-    chrome.urlbar_bottom = chrome.urlbar_top + chrome.font_height + 2 * chrome.padding;
-    chrome.bottom = chrome.urlbar_bottom;
-
-    // Calculate new tab button bounds
-    const plus_glyph = try font_manager.getStyledGlyph(
-        "+",
-        .Normal,
-        .Roman,
-        chrome.font_size,
-        .proportional,
-    );
-    const plus_width = plus_glyph.w + 2 * chrome.padding;
-    chrome.newtab_rect = Rect{
-        .left = chrome.padding,
-        .top = chrome.padding,
-        .right = chrome.padding + plus_width,
-        .bottom = chrome.padding + chrome.font_height,
-    };
-
-    // Calculate back button bounds
-    const back_glyph = try font_manager.getStyledGlyph(
-        "<",
-        .Normal,
-        .Roman,
-        chrome.font_size,
-        .proportional,
-    );
-    const back_width = back_glyph.w + 2 * chrome.padding;
-    chrome.back_rect = Rect{
-        .left = chrome.padding,
-        .top = chrome.urlbar_top + chrome.padding,
-        .right = chrome.padding + back_width,
-        .bottom = chrome.urlbar_bottom - chrome.padding,
-    };
-
-    // Calculate forward button bounds
-    const forward_glyph = try font_manager.getStyledGlyph(
-        ">",
-        .Normal,
-        .Roman,
-        chrome.font_size,
-        .proportional,
-    );
-    const forward_width = forward_glyph.w + 2 * chrome.padding;
-    chrome.forward_rect = Rect{
-        .left = chrome.back_rect.right + chrome.padding,
-        .top = chrome.urlbar_top + chrome.padding,
-        .right = chrome.back_rect.right + chrome.padding + forward_width,
-        .bottom = chrome.urlbar_bottom - chrome.padding,
-    };
-
-    // Calculate bookmark button bounds
-    const bookmark_glyph = try font_manager.getStyledGlyph(
-        "*",
-        .Normal,
-        .Roman,
-        chrome.font_size,
-        .proportional,
-    );
-    const bookmark_width = bookmark_glyph.w + 2 * chrome.padding;
-    chrome.bookmark_rect = Rect{
-        .left = chrome.forward_rect.right + chrome.padding,
-        .top = chrome.urlbar_top + chrome.padding,
-        .right = chrome.forward_rect.right + chrome.padding + bookmark_width,
-        .bottom = chrome.urlbar_bottom - chrome.padding,
-    };
-
-    // Calculate address bar bounds
-    chrome.address_rect = Rect{
-        .left = chrome.bookmark_rect.right + chrome.padding,
-        .top = chrome.urlbar_top + chrome.padding,
-        .right = window_width - chrome.padding,
-        .bottom = chrome.urlbar_bottom - chrome.padding,
-    };
+    chrome.urlbar_bottom = chrome_height;
+    chrome.bottom = chrome_height;
+    chrome.updateFallbackGeometry(window_width);
 
     return chrome;
+}
+
+fn updateFallbackGeometry(self: *Chrome, window_width: i32) void {
+    self.newtab_rect = .{ .left = 0, .top = 0, .right = control_width, .bottom = control_height };
+    self.back_rect = .{ .left = 0, .top = chrome_row_height, .right = control_width, .bottom = chrome_row_height + control_height };
+    self.forward_rect = .{ .left = control_width, .top = chrome_row_height, .right = 2 * control_width, .bottom = chrome_row_height + control_height };
+    self.bookmark_rect = .{ .left = 2 * control_width, .top = chrome_row_height, .right = 3 * control_width, .bottom = chrome_row_height + control_height };
+    self.address_rect = .{
+        .left = 3 * control_width,
+        .top = chrome_row_height,
+        .right = @max(3 * control_width, window_width - browser.scrollbar_width - 2 * browser.h_offset),
+        .bottom = chrome_row_height + control_height,
+    };
 }
 
 pub fn navigationButtonColor(enabled: bool) Color {
@@ -238,15 +219,32 @@ fn appendSearchQuery(
 }
 
 pub fn deinit(self: *Chrome) void {
+    self.retireDocument();
+    if (self.rules) |rules| {
+        for (rules) |*rule| rule.deinit(self.allocator);
+        self.allocator.free(rules);
+        self.rules = null;
+    }
+    if (self.layout_engine) |engine| {
+        engine.deinit();
+        self.layout_engine = null;
+    }
     self.address_bar.deinit(self.allocator);
 }
 
 /// Update chrome geometry that depends on the native window width.
 pub fn resize(self: *Chrome, window_width: i32) void {
-    self.address_rect.right = @max(
-        self.address_rect.left,
-        window_width - self.padding,
-    );
+    self.address_rect.right = @max(self.address_rect.left, window_width - self.padding);
+}
+
+/// Resize the live internal HTML document. Kept separate from resize() so the
+/// longstanding geometry-only test seam can use a deliberately partial value.
+pub fn resizeDocument(self: *Chrome, window_width: i32) void {
+    if (self.layout_engine) |engine| {
+        self.retireDocument();
+        engine.window_width = window_width;
+    }
+    self.updateFallbackGeometry(window_width);
 }
 
 fn tabRect(self: *const Chrome, i: usize) Rect {
@@ -261,278 +259,328 @@ fn tabRect(self: *const Chrome, i: usize) Rect {
     };
 }
 
-pub fn paint(self: *Chrome, allocator: std.mem.Allocator, b: *const Browser) !std.ArrayList(DisplayItem) {
-    var cmds = std.ArrayList(DisplayItem).empty;
+const ChromeAction = union(enum) {
+    new_tab,
+    back,
+    forward,
+    bookmark,
+    address,
+    tab: usize,
+};
 
-    // Draw white background for chrome
-    try cmds.append(allocator, .{ .rect = .{
-        .x1 = 0,
-        .y1 = 0,
-        .x2 = b.window_width,
-        .y2 = self.bottom,
-        .color = .{ .r = 255, .g = 255, .b = 255, .a = 255 },
-    } });
-
-    // Draw bottom border of chrome
-    try cmds.append(allocator, .{ .line = .{
-        .x1 = 0,
-        .y1 = self.bottom,
-        .x2 = b.window_width,
-        .y2 = self.bottom,
-        .color = .{ .r = 0, .g = 0, .b = 0, .a = 255 },
-        .thickness = 1,
-    } });
-
-    // Draw new tab button outline
-    try cmds.append(allocator, .{ .outline = .{
-        .rect = self.newtab_rect,
-        .color = .{ .r = 0, .g = 0, .b = 0, .a = 255 },
-        .thickness = 1,
-    } });
-
-    // Draw "+" text
-    const plus_glyph = try b.layout_engine.font_manager.getStyledGlyph(
-        "+",
-        .Normal,
-        .Roman,
-        self.font_size,
-        .proportional,
-    );
-    try cmds.append(allocator, .{ .glyph = .{
-        .x = self.newtab_rect.left + self.padding,
-        .y = self.newtab_rect.top,
-        .glyph = plus_glyph,
-        .color = .{ .r = 0, .g = 0, .b = 0, .a = 255 },
-    } });
-
-    // Draw tabs
-    for (b.tabs.items, 0..) |_, i| {
-        const bounds = self.tabRect(i);
-
-        // Draw left border
-        try cmds.append(allocator, .{ .line = .{
-            .x1 = bounds.left,
-            .y1 = 0,
-            .x2 = bounds.left,
-            .y2 = bounds.bottom,
-            .color = .{ .r = 0, .g = 0, .b = 0, .a = 255 },
-            .thickness = 1,
-        } });
-
-        // Draw right border
-        try cmds.append(allocator, .{ .line = .{
-            .x1 = bounds.right,
-            .y1 = 0,
-            .x2 = bounds.right,
-            .y2 = bounds.bottom,
-            .color = .{ .r = 0, .g = 0, .b = 0, .a = 255 },
-            .thickness = 1,
-        } });
-
-        // If this is the active tab, draw the file folder effect
-        if (b.active_tab_index) |active_idx| {
-            if (i == active_idx) {
-                // Draw line from left edge to tab start
-                try cmds.append(allocator, .{ .line = .{
-                    .x1 = 0,
-                    .y1 = bounds.bottom,
-                    .x2 = bounds.left,
-                    .y2 = bounds.bottom,
-                    .color = .{ .r = 0, .g = 0, .b = 0, .a = 255 },
-                    .thickness = 1,
-                } });
-
-                // Draw line from tab end to right edge
-                try cmds.append(allocator, .{ .line = .{
-                    .x1 = bounds.right,
-                    .y1 = bounds.bottom,
-                    .x2 = b.window_width,
-                    .y2 = bounds.bottom,
-                    .color = .{ .r = 0, .g = 0, .b = 0, .a = 255 },
-                    .thickness = 1,
-                } });
-            }
+fn appendHtmlEscaped(
+    allocator: std.mem.Allocator,
+    output: *std.ArrayList(u8),
+    value: []const u8,
+) !void {
+    for (value) |byte| {
+        const escaped = switch (byte) {
+            '&' => "&amp;",
+            '<' => "&lt;",
+            '>' => "&gt;",
+            '"' => "&quot;",
+            '\'' => "&apos;",
+            else => null,
+        };
+        if (escaped) |replacement| {
+            try output.appendSlice(allocator, replacement);
+        } else {
+            try output.append(allocator, byte);
         }
+    }
+}
 
-        // Draw tab label
-        var tab_label_buf: [20]u8 = undefined;
-        const tab_label = try std.fmt.bufPrint(&tab_label_buf, "Tab {d}", .{i});
-        const tab_glyph = try b.layout_engine.font_manager.getStyledGlyph(
-            tab_label,
+fn appendFormatted(
+    allocator: std.mem.Allocator,
+    output: *std.ArrayList(u8),
+    comptime format: []const u8,
+    args: anytype,
+) !void {
+    const fragment = try std.fmt.allocPrint(allocator, format, args);
+    defer allocator.free(fragment);
+    try output.appendSlice(allocator, fragment);
+}
+
+fn buildHtml(self: *const Chrome, b: *const Browser) ![]u8 {
+    var html = std.ArrayList(u8).empty;
+    errdefer html.deinit(self.allocator);
+
+    try html.appendSlice(self.allocator, "<html><body><div><button id=\"new-tab\">+</button>");
+    for (b.tabs.items, 0..) |_, index| {
+        try appendFormatted(self.allocator, &html, "<a href=\"zibra-tab:{d}\"", .{index});
+        if (b.active_tab_index != null and b.active_tab_index.? == index) {
+            try html.appendSlice(self.allocator, " style=\"font-weight:bold\"");
+        }
+        try html.append(self.allocator, '>');
+        try appendFormatted(self.allocator, &html, "Tab {d}", .{index});
+        try html.appendSlice(self.allocator, "</a>");
+    }
+
+    try html.appendSlice(self.allocator, "</div><div><button id=\"back\"");
+    if (b.activeTab()) |tab| {
+        if (!tab.canGoBack()) try html.appendSlice(self.allocator, " style=\"color:gray\"");
+    } else {
+        try html.appendSlice(self.allocator, " style=\"color:gray\"");
+    }
+    try html.appendSlice(self.allocator, ">&lt;</button><button id=\"forward\"");
+    if (b.activeTab()) |tab| {
+        if (!tab.canGoForward()) try html.appendSlice(self.allocator, " style=\"color:gray\"");
+    } else {
+        try html.appendSlice(self.allocator, " style=\"color:gray\"");
+    }
+    try html.appendSlice(self.allocator, ">&gt;</button><button id=\"bookmark\"");
+    if (b.activePageIsBookmarked()) {
+        try html.appendSlice(self.allocator, " style=\"background-color:yellow\"");
+    }
+    try html.appendSlice(self.allocator, ">*</button>");
+
+    const layout_width = @max(
+        b.window_width - browser.scrollbar_width - 2 * browser.h_offset,
+        1,
+    );
+    const address_width = @max(layout_width - 3 * control_width, 1);
+    try appendFormatted(
+        self.allocator,
+        &html,
+        "<input id=\"address\" style=\"width:{d}px;height:{d}px;background-color:white\" value=\"",
+        .{ address_width, control_height },
+    );
+    const address_text = if (self.isAddressBarFocused())
+        self.address_bar.items
+    else
+        b.active_tab_url orelse "";
+    try appendHtmlEscaped(self.allocator, &html, address_text);
+    try html.appendSlice(self.allocator, "\"></div></body></html>");
+    return html.toOwnedSlice(self.allocator);
+}
+
+fn retireDocument(self: *Chrome) void {
+    if (self.display_list) |items| {
+        DisplayItem.freeList(self.allocator, items);
+        self.display_list = null;
+    }
+    if (self.document_layout) |layout| {
+        layout.deinit();
+        self.allocator.destroy(layout);
+        self.document_layout = null;
+    }
+    if (self.document_root) |root| {
+        root.deinit(self.allocator);
+        self.allocator.destroy(root);
+        self.document_root = null;
+    }
+    if (self.html_source) |source| {
+        self.allocator.free(source);
+        self.html_source = null;
+    }
+}
+
+fn nodeAttribute(node: *Node, name: []const u8) ?[]const u8 {
+    return switch (node.*) {
+        .element => |*element| if (element.attributes) |*attrs| attrs.get(name) else null,
+        .text => null,
+    };
+}
+
+fn actionForNode(start: *Node) ?ChromeAction {
+    var current: ?*Node = start;
+    while (current) |node| {
+        switch (node.*) {
+            .text => |*text_node| current = text_node.parent,
+            .element => |*element| {
+                if (std.ascii.eqlIgnoreCase(element.tag, "input")) {
+                    if (nodeAttribute(node, "id")) |id| {
+                        if (std.mem.eql(u8, id, "address")) return .address;
+                    }
+                } else if (std.ascii.eqlIgnoreCase(element.tag, "button")) {
+                    if (nodeAttribute(node, "id")) |id| {
+                        if (std.mem.eql(u8, id, "new-tab")) return .new_tab;
+                        if (std.mem.eql(u8, id, "back")) return .back;
+                        if (std.mem.eql(u8, id, "forward")) return .forward;
+                        if (std.mem.eql(u8, id, "bookmark")) return .bookmark;
+                    }
+                } else if (std.ascii.eqlIgnoreCase(element.tag, "a")) {
+                    if (nodeAttribute(node, "href")) |href| {
+                        const prefix = "zibra-tab:";
+                        if (std.mem.startsWith(u8, href, prefix)) {
+                            const index = std.fmt.parseInt(usize, href[prefix.len..], 10) catch return null;
+                            return .{ .tab = index };
+                        }
+                    }
+                }
+                current = element.parent;
+            },
+        }
+    }
+    return null;
+}
+
+fn findElementById(node: *Node, id: []const u8) ?*Node {
+    switch (node.*) {
+        .text => return null,
+        .element => |*element| {
+            if (nodeAttribute(node, "id")) |candidate| {
+                if (std.mem.eql(u8, candidate, id)) return node;
+            }
+            for (element.children.items) |*child| {
+                if (findElementById(child, id)) |found| return found;
+            }
+        },
+    }
+    return null;
+}
+
+fn updateAddressBounds(self: *Chrome) void {
+    const root = self.document_root orelse return;
+    const engine = self.layout_engine orelse return;
+    const input = findElementById(root, "address") orelse return;
+    const bounds = engine.input_bounds.get(input) orelse return;
+    self.address_rect = .{
+        .left = bounds.x - browser.h_offset,
+        .top = bounds.y - browser.v_offset,
+        .right = bounds.x - browser.h_offset + bounds.width,
+        .bottom = bounds.y - browser.v_offset + bounds.height,
+    };
+}
+
+fn appendAddressCaret(self: *Chrome, commands: *std.ArrayList(DisplayItem)) !void {
+    if (!self.isAddressBarFocused()) return;
+    std.debug.assert(self.address_cursor <= self.address_bar.items.len);
+    const engine = self.layout_engine orelse return;
+
+    var cursor_x = self.address_rect.left + 2;
+    var index: usize = 0;
+    while (index < self.address_cursor) {
+        const advance = std.unicode.utf8ByteSequenceLength(self.address_bar.items[index]) catch 1;
+        const next = @min(self.address_cursor, index + advance);
+        const glyph = try engine.font_manager.getStyledGlyph(
+            self.address_bar.items[index..next],
             .Normal,
             .Roman,
             self.font_size,
             .proportional,
         );
-        try cmds.append(allocator, .{ .glyph = .{
-            .x = bounds.left + self.padding,
-            .y = bounds.top + self.padding,
-            .glyph = tab_glyph,
-            .color = .{ .r = 0, .g = 0, .b = 0, .a = 255 },
-        } });
+        cursor_x += glyph.w;
+        index = next;
     }
-
-    const active_tab = b.activeTab();
-    const back_color = navigationButtonColor(if (active_tab) |tab| tab.canGoBack() else false);
-    const forward_color = navigationButtonColor(if (active_tab) |tab| tab.canGoForward() else false);
-
-    // Draw back button
-    try cmds.append(allocator, .{ .outline = .{
-        .rect = self.back_rect,
-        .color = back_color,
+    try commands.append(self.allocator, .{ .line = .{
+        .x1 = cursor_x,
+        .y1 = self.address_rect.top,
+        .x2 = cursor_x,
+        .y2 = self.address_rect.bottom,
+        .color = .{ .r = 255, .g = 0, .b = 0, .a = 255 },
         .thickness = 1,
     } });
+}
 
-    const back_glyph = try b.layout_engine.font_manager.getStyledGlyph(
-        "<",
-        .Normal,
-        .Roman,
-        self.font_size,
-        .proportional,
-    );
-    try cmds.append(allocator, .{ .glyph = .{
-        .x = self.back_rect.left + self.padding,
-        .y = self.back_rect.top,
-        .glyph = back_glyph,
-        .color = back_color,
-    } });
+fn rebuildDocument(self: *Chrome, b: *const Browser) !void {
+    const engine = self.layout_engine orelse return error.ChromeLayoutUnavailable;
+    const rules = self.rules orelse return error.ChromeStylesUnavailable;
+    self.retireDocument();
 
-    // Draw forward button
-    try cmds.append(allocator, .{ .outline = .{
-        .rect = self.forward_rect,
-        .color = forward_color,
-        .thickness = 1,
-    } });
+    self.html_source = try self.buildHtml(b);
+    errdefer self.retireDocument();
 
-    const forward_glyph = try b.layout_engine.font_manager.getStyledGlyph(
-        ">",
-        .Normal,
-        .Roman,
-        self.font_size,
-        .proportional,
-    );
-    try cmds.append(allocator, .{ .glyph = .{
-        .x = self.forward_rect.left + self.padding,
-        .y = self.forward_rect.top,
-        .glyph = forward_glyph,
-        .color = forward_color,
-    } });
+    var html_parser = try HTMLParser.init(self.allocator, self.html_source.?);
+    defer html_parser.deinit(self.allocator);
+    const root = try self.allocator.create(Node);
+    var root_owned = true;
+    errdefer if (root_owned) self.allocator.destroy(root);
+    root.* = try html_parser.parse();
+    self.document_root = root;
+    root_owned = false;
+    document.fixParentPointers(root, null);
+    try document.style(self.allocator, root, rules);
 
-    // Draw bookmark toggle. Browser.lock stabilizes active_tab_url for this
-    // paint call; BrowserSession independently synchronizes bookmark lookup.
-    const page_is_bookmarked = b.activePageIsBookmarked();
-    try cmds.append(allocator, .{ .rect = .{
-        .x1 = self.bookmark_rect.left,
-        .y1 = self.bookmark_rect.top,
-        .x2 = self.bookmark_rect.right,
-        .y2 = self.bookmark_rect.bottom,
-        .color = bookmarkButtonFillColor(page_is_bookmarked),
-    } });
-    try cmds.append(allocator, .{ .outline = .{
-        .rect = self.bookmark_rect,
-        .color = .{ .r = 0, .g = 0, .b = 0, .a = 255 },
-        .thickness = 1,
-    } });
-    const bookmark_glyph = try b.layout_engine.font_manager.getStyledGlyph(
-        "*",
-        .Normal,
-        .Roman,
-        self.font_size,
-        .proportional,
-    );
-    try cmds.append(allocator, .{ .glyph = .{
-        .x = self.bookmark_rect.left + self.padding,
-        .y = self.bookmark_rect.top,
-        .glyph = bookmark_glyph,
-        .color = .{ .r = 0, .g = 0, .b = 0, .a = 255 },
-    } });
+    const layout = try engine.buildDocument(root);
+    self.document_layout = layout;
+    const painted = try engine.paintDocument(layout);
+    var painted_owned = true;
+    errdefer if (painted_owned) DisplayItem.freeList(self.allocator, painted);
 
-    // Draw address bar
-    try cmds.append(allocator, .{ .outline = .{
-        .rect = self.address_rect,
-        .color = .{ .r = 0, .g = 0, .b = 0, .a = 255 },
-        .thickness = 1,
-    } });
-
-    // Draw address bar content (either typed text or current URL)
-    if (self.focus) |focus_str| {
-        if (std.mem.eql(u8, focus_str, "address bar")) {
-            // Draw the typed text
-            std.debug.assert(self.address_cursor <= self.address_bar.items.len);
-            var cursor_x = self.address_rect.left + self.padding;
-            if (self.address_bar.items.len > 0) {
-                const address_text: []const u8 = self.address_bar.items;
-                var idx: usize = 0;
-                var text_x = cursor_x;
-                while (idx < address_text.len) {
-                    if (idx == self.address_cursor) cursor_x = text_x;
-                    const advance = std.unicode.utf8ByteSequenceLength(address_text[idx]) catch 1;
-                    const next_idx = @min(address_text.len, idx + advance);
-                    const gme = address_text[idx..next_idx];
-                    const addr_glyph = try b.layout_engine.font_manager.getStyledGlyph(
-                        gme,
-                        .Normal,
-                        .Roman,
-                        self.font_size,
-                        .proportional,
-                    );
-                    try cmds.append(allocator, .{ .glyph = .{
-                        .x = text_x,
-                        .y = self.address_rect.top,
-                        .glyph = addr_glyph,
-                        .color = .{ .r = 0, .g = 0, .b = 0, .a = 255 },
-                    } });
-                    text_x += addr_glyph.w;
-                    idx = next_idx;
-                }
-                if (self.address_cursor == address_text.len) cursor_x = text_x;
-            }
-
-            try cmds.append(allocator, .{
-                .line = .{
-                    .x1 = cursor_x,
-                    .y1 = self.address_rect.top,
-                    .x2 = cursor_x,
-                    .y2 = self.address_rect.bottom,
-                    .color = .{ .r = 255, .g = 0, .b = 0, .a = 255 }, // Red cursor
-                    .thickness = 1,
-                },
-            });
-        }
-    } else {
-        if (b.active_tab_url) |url_text| {
-            var idx: usize = 0;
-            var text_x = self.address_rect.left + self.padding;
-            while (idx < url_text.len) {
-                const advance = std.unicode.utf8ByteSequenceLength(url_text[idx]) catch 1;
-                const next_idx = @min(url_text.len, idx + advance);
-                const gme = url_text[idx..next_idx];
-                const url_glyph = try b.layout_engine.font_manager.getStyledGlyph(
-                    gme,
-                    .Normal,
-                    .Roman,
-                    self.font_size,
-                    .proportional,
-                );
-                try cmds.append(allocator, .{ .glyph = .{
-                    .x = text_x,
-                    .y = self.address_rect.top,
-                    .glyph = url_glyph,
-                    .color = .{ .r = 0, .g = 0, .b = 0, .a = 255 },
-                } });
-                text_x += url_glyph.w;
-                idx = next_idx;
-            }
-        }
+    var commands = std.ArrayList(DisplayItem).empty;
+    errdefer {
+        DisplayItem.freeItems(self.allocator, commands.items);
+        commands.deinit(self.allocator);
     }
+    try commands.append(self.allocator, .{ .transform = .{
+        .translate_x = -browser.h_offset,
+        .translate_y = -browser.v_offset,
+        .children = painted,
+    } });
+    painted_owned = false;
+    self.updateAddressBounds();
+    try commands.append(self.allocator, .{ .line = .{
+        .x1 = 0,
+        .y1 = self.bottom - 1,
+        .x2 = b.window_width,
+        .y2 = self.bottom - 1,
+        .color = .{ .r = 0, .g = 0, .b = 0, .a = 255 },
+        .thickness = 1,
+    } });
+    try self.appendAddressCaret(&commands);
+    self.display_list = try commands.toOwnedSlice(self.allocator);
+}
 
-    return cmds;
+/// Rebuild and paint the browser-owned internal HTML document. The returned
+/// list is borrowed until the next chrome paint, resize, or deinit.
+pub fn paint(self: *Chrome, b: *const Browser) ![]const DisplayItem {
+    try self.rebuildDocument(b);
+    return self.display_list orelse &.{};
+}
+
+fn actionAt(self: *const Chrome, x: i32, y: i32) ?ChromeAction {
+    const items = self.display_list orelse return null;
+    const hit = DisplayItem.hitTestDevice(items, x, y, 1.0) orelse return null;
+    const node = hit.source.originatingNode() orelse return null;
+    return actionForNode(node);
+}
+
+fn activateAction(self: *Chrome, b: *Browser, action: ChromeAction) !bool {
+    switch (action) {
+        .new_tab => {
+            const url = try Url.init(b.allocator, "https://browser.engineering/");
+            b.newTab(url) catch |err| {
+                std.log.err("Failed to create new tab: {any}", .{err});
+            };
+            return true;
+        },
+        .back => {
+            if (b.activeTab()) |tab| if (tab.canGoBack()) tab.requestHistoryTraversal(b, .back);
+            return true;
+        },
+        .forward => {
+            if (b.activeTab()) |tab| if (tab.canGoForward()) tab.requestHistoryTraversal(b, .forward);
+            return true;
+        },
+        .bookmark => {
+            _ = try b.toggleActiveBookmark();
+            return true;
+        },
+        .address => {
+            self.focusAddressBar();
+            return true;
+        },
+        .tab => |index| {
+            if (index >= b.tabs.items.len) return false;
+            if (b.active_tab_index == null or b.active_tab_index.? != index) {
+                b.setActiveTab(b.tabs.items[index]);
+                return true;
+            }
+            return false;
+        },
+    }
 }
 
 pub fn click(self: *Chrome, b: *Browser, x: i32, y: i32) !bool {
+    const has_html_document = self.display_list != null;
+    const html_action = self.actionAt(x, y);
     // Clear focus by default
     self.focus = null;
     self.address_cursor = 0;
+
+    if (html_action) |action| return self.activateAction(b, action);
+    if (has_html_document) return false;
 
     // Check if clicked on new tab button
     if (self.newtab_rect.containsPoint(x, y)) {
@@ -685,4 +733,35 @@ pub fn enter(self: *Chrome, b: *Browser) !bool {
         }
     }
     return false;
+}
+
+test "HTML chrome semantic actions resolve through descendant paint sources" {
+    const allocator = std.testing.allocator;
+    const source =
+        "<html><body><button id=\"new-tab\"><b>+</b></button>" ++
+        "<input id=\"address\"><a href=\"zibra-tab:7\"><span>Recipes</span></a></body></html>";
+    var html_parser = try HTMLParser.init(allocator, source);
+    defer html_parser.deinit(allocator);
+    var root = try html_parser.parse();
+    defer root.deinit(allocator);
+    document.fixParentPointers(&root, null);
+
+    const new_tab = findElementById(&root, "new-tab").?;
+    const button_child = &new_tab.element.children.items[0].element.children.items[0];
+    try std.testing.expect(actionForNode(button_child).? == .new_tab);
+
+    const address = findElementById(&root, "address").?;
+    try std.testing.expect(actionForNode(address).? == .address);
+
+    const link = &new_tab.element.parent.?.element.children.items[2].element.children.items[0];
+    const tab_action = actionForNode(link).?;
+    try std.testing.expectEqual(@as(usize, 7), tab_action.tab);
+}
+
+test "HTML chrome generated values are attribute safe" {
+    const allocator = std.testing.allocator;
+    var output = std.ArrayList(u8).empty;
+    defer output.deinit(allocator);
+    try appendHtmlEscaped(allocator, &output, "<&\"'>");
+    try std.testing.expectEqualStrings("&lt;&amp;&quot;&apos;&gt;", output.items);
 }

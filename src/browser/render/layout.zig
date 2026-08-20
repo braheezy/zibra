@@ -2733,8 +2733,19 @@ const InputLayout = struct {
 
         const ascent_value = engine.toLayoutPx(glyph.ascent);
         const descent_value = engine.toLayoutPx(glyph.descent);
-        const height_value = ascent_value + descent_value;
-        const width_value = if (self.is_checkbox) height_value else INPUT_WIDTH_PX;
+        const natural_height = ascent_value + descent_value;
+        var width_value = if (self.is_checkbox) natural_height else INPUT_WIDTH_PX;
+        var height_value = natural_height;
+        if (!self.is_checkbox) {
+            if (element.style) |*style_map| {
+                if (styleValue(style_map, "width")) |width| {
+                    if (parseCssPixelLength(width)) |pixels| width_value = @max(pixels, 1);
+                }
+                if (styleValue(style_map, "height")) |height| {
+                    if (parseCssPixelLength(height)) |pixels| height_value = @max(pixels, natural_height);
+                }
+            }
+        }
         self.embed.setupDependencies(engine.inline_block, if (element.style) |*map| map else null);
         self.embed.setMetrics(width_value, height_value, ascent_value, descent_value, engine.zoom(), self.font_size);
         self.is_focused = element.is_focused;
@@ -2936,9 +2947,20 @@ const ButtonLayout = struct {
             }
         }
 
-        // Preserve the former 200px control width while reserving real inner
-        // padding. Oversized descendants expand the final outer box below.
-        const content_width = @max(INPUT_WIDTH_PX - 2 * button_padding, 1);
+        // Preserve the former 200px control width while allowing chrome and
+        // authored pages to size a control explicitly. Oversized descendants
+        // still expand the final outer box below instead of spilling out.
+        var requested_width = INPUT_WIDTH_PX;
+        var requested_height: ?i32 = null;
+        if (element.style) |*style_map| {
+            if (styleValue(style_map, "width")) |width| {
+                if (parseCssPixelLength(width)) |pixels| requested_width = @max(pixels, 1);
+            }
+            if (styleValue(style_map, "height")) |height| {
+                if (parseCssPixelLength(height)) |pixels| requested_height = @max(pixels, 1);
+            }
+        }
+        const content_width = @max(requested_width - 2 * button_padding, 1);
         const root = try BlockLayout.initRichButton(
             self.embed.allocator,
             button_node,
@@ -2981,7 +3003,13 @@ const ButtonLayout = struct {
             .left = 0,
             .top = 0,
             .right = content_width,
-            .bottom = @max(root.height.get().*, minimum_content_height),
+            .bottom = @max(
+                root.height.get().*,
+                @max(
+                    minimum_content_height,
+                    if (requested_height) |height| @max(height - 2 * button_padding, 1) else 1,
+                ),
+            ),
         };
         if (displayListLayoutBounds(engine, self.commands.items, 0, 0)) |paint_bounds| {
             content_bounds = unionRects(content_bounds, paint_bounds);

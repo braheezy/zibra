@@ -1252,7 +1252,13 @@ pub const Browser = struct {
 
         const profiling_enabled = isProfilingEnabled(environ);
 
-        var chrome = try Chrome.init(&layout_engine.font_manager, initial_window_width, al);
+        var chrome = try Chrome.init(
+            io,
+            environ,
+            initial_window_width,
+            al,
+            rtl_flag,
+        );
         errdefer chrome.deinit();
         if (screen) |window| {
             window.setMinimumSize(
@@ -1915,7 +1921,7 @@ pub const Browser = struct {
                 self.needs_raster = true;
                 self.needs_draw = true;
                 self.lock.unlock();
-                self.chrome.resize(geometry.window_width);
+                self.chrome.resizeDocument(geometry.window_width);
 
                 const generation = self.resize_generation.fetchAdd(1, .seq_cst) +% 1;
                 for (self.tabs.items) |tab| {
@@ -4618,9 +4624,8 @@ pub const Browser = struct {
         try chrome_context.fill();
 
         // Draw chrome content
-        var chrome_cmds = try self.chrome.paint(self.allocator, self);
-        defer chrome_cmds.deinit(self.allocator);
-        for (chrome_cmds.items) |item| {
+        const chrome_cmds = try self.chrome.paint(self);
+        for (chrome_cmds) |item| {
             try self.drawDisplayItemZ2dContext(&chrome_context, item, 0, 1.0);
         }
     }

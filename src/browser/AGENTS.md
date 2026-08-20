@@ -36,6 +36,16 @@ before changing `root.zig`, `tab.zig`, `render/`, or browser task scheduling.
   resolution. Explicit schemes and obvious bare hosts navigate directly;
   ordinary text becomes a form-encoded Google query. Keep document-authored
   links strict so a malformed link never silently becomes a search.
+- Native chrome is an internal HTML document: buttons represent new-tab and
+  history/bookmark actions, the address field is an input, and tab names are
+  anchors. `Chrome` owns a dedicated UI-thread-only Layout/FontManager, parsed
+  stylesheet, DOM, document layout, and retained provenance-bearing display
+  list; never share the tab-worker layout engine for this work. Rebuilds retire
+  the old list before its layout, DOM, and source buffer, in that order. Chrome
+  clicks hit-test painted commands and walk their internal DOM ancestry to a
+  semantic action; fixed rectangles remain only as a pre-raster/test fallback.
+  Preserve the 66px chrome boundary so changing its implementation does not
+  shift document screenshots or viewport calculations.
 - Address-bar editing uses a byte insertion point in the inclusive range
   `0..address_bar.items.len`. SDL admits only printable ASCII into this buffer,
   so Left, Right, insertion, and Backspace operate on bytes; focus, blur, and a

@@ -36,7 +36,7 @@ The source tree is organized by responsibility:
 | [`src/browser/app.zig`](../src/browser/app.zig) | Process-wide interactive SDL event routing, heap-stable native-window registry, shared session/measurement ownership, generation broadcast, and addressed window shutdown. |
 | [`src/browser/root.zig`](../src/browser/root.zig) | Per-window `Browser`, navigation orchestration, fetch coordination, async host helpers, render commit, composition, raster, and draw; it also supports standalone headless construction. |
 | [`src/browser/tab.zig`](../src/browser/tab.zig) | `Tab` and `Frame` ownership, task serialization, history, frame lookup, accessibility, focus, and per-document state. |
-| [`src/browser/chrome.zig`](../src/browser/chrome.zig) | Browser chrome UI and its display data. |
+| [`src/browser/chrome.zig`](../src/browser/chrome.zig) | Browser-owned internal HTML chrome, its dedicated layout/font state, semantic actions, address editing, and retained display data. |
 | [`src/browser/session_state.zig`](../src/browser/session_state.zig) | Window-independent HTTP client/cookies/cache plus visited/bookmarked URL state, generated bookmark HTML, and separate network/metadata synchronization. |
 | [`src/browser/render/layout.zig`](../src/browser/render/layout.zig) | Layout tree, invalidation dependencies, hit-test collection, paint, and image layout. |
 | [`src/browser/render/font.zig`](../src/browser/render/font.zig) | Font discovery, SDL_ttf handles, Unicode fallback selection, and owned RGBA glyph bitmaps. |
@@ -66,7 +66,8 @@ process main thread
     native window registry
       Browser A                 Browser B ...
         tabs/chrome/render        tabs/chrome/render
-        Layout / FontManager      Layout / FontManager
+        page + chrome Layouts     page + chrome Layouts
+        two FontManagers          two FontManagers
         SDL window/renderer       SDL window/renderer
   or standalone screenshot Browser
     windowless software loop and owned session/measurement
@@ -134,7 +135,8 @@ Each `Browser` in [`src/browser/root.zig`](../src/browser/root.zig) owns:
 - in interactive mode, one SDL window, renderer, and cached output texture;
   screenshot mode leaves all three absent;
 - root, chrome, and optional tab z2d surfaces plus the root z2d context;
-- one window-local `Layout`, including its `FontManager`;
+- one window-local page `Layout`, including its `FontManager`, plus Chrome's
+  independent UI-thread-only `Layout`/`FontManager`;
 - default user-agent CSS rules;
 - all `Tab` allocations grouped in that native window;
 - owning URLs queued by tab workers for browser-thread tab creation;
@@ -149,6 +151,19 @@ standalone-interactive compatibility). The four `owns_*` flags make these two
 destruction paths explicit. `MeasureTime` is heap-stable because every tab
 worker across every window borrows it, and the App finishes it once only after
 all Browsers have stopped.
+
+Chrome is rebuilt as a small internal HTML document on the browser/UI thread.
+Its DOM uses buttons for browser actions, an input for the address field, and
+anchors for tab selection; its private stylesheet supplies the simplified
+control geometry. Painted-command provenance is retained only with that chrome
+generation, and click handling hit-tests the display list before walking the
+internal DOM ancestry to a semantic action. The ownership order is display
+list, document layout, DOM, source HTML, parsed rules, then the dedicated
+layout/font engine. Rebuild and resize retire the previous generation in that
+order. Chrome does not borrow the page layout engine because tab workers use
+that engine concurrently. Its fixed 66px outer boundary remains part of the
+document viewport contract even though the pixels within that boundary may
+change independently of page screenshot goldens.
 
 `BrowserSession` owns the shared `std.http.Client`, cookie jar, decoded HTTP
 response cache, and canonical serialized strings for visited and bookmarked
@@ -854,10 +869,11 @@ thread-ownership contract remains unresolved.
 
 `BrowserApp.init` initializes SDL video, holds one process-level SDL_ttf
 reference, and starts text input before creating any window. Every
-`Browser.initAppWindow` then creates its own `Layout`/`FontManager`, native
-window, accelerated renderer, presentation texture, and z2d surfaces while
-borrowing those process services. SDL_ttf documents `TTF_Init`/`TTF_Quit` as a
-reference count: each FontManager retains its existing pair, while the App
+`Browser.initAppWindow` then creates its page and chrome `Layout`/`FontManager`
+pairs, native window, accelerated renderer, presentation texture, and z2d
+surfaces while borrowing those process services. SDL_ttf documents
+`TTF_Init`/`TTF_Quit` as a reference count: each FontManager retains its
+existing pair, while the App
 guard prevents closing one window from taking the library to zero beneath
 another. Direct `Browser.init` remains the standalone path and initializes its
 own SDL/session/measurement resources. Screenshot mode creates no native
@@ -870,9 +886,10 @@ font state, renders a temporary SDL surface, converts it to canonical RGBA,
 and stores only allocator-owned bytes; see
 [`src/browser/render/font.zig`](../src/browser/render/font.zig).
 
-Each Browser's window-local `Layout` and `FontManager` are reachable from that
-window's tab layout/paint work and main-thread chrome paths. Interactive mode
-still lacks a shared lock or assertion establishing which thread may access
+Each Browser's page `Layout` and `FontManager` are reachable from that window's
+tab layout/paint work and some main-thread page-input paths. Chrome uses a
+second main-thread-only pair. Interactive mode still lacks a shared lock or
+assertion establishing which thread may access
 each font glyph map or SDL_ttf handle. Screenshot mode closes that race by
 refusing to raster until the serialized tab worker and all accounted helpers
 are quiescent. The renderer no longer participates in glyph-cache mutation.
@@ -1023,12 +1040,13 @@ synchronous retirement boundary before retiring a leaf.
 
 ### 4. Interactive Layout and FontManager access has no global contract
 
-Each Browser owns one mutable layout/font stack. Interactive resize and chrome
-paths use it from the main thread, while that window's tab tasks use it for
-document layout and glyph creation. No common owner-thread assertion or lock
-covers those interactive paths. Windowless screenshot capture is excluded from
-this gap by its tab/helper quiescence gate, but the interactive concurrency gap
-remains.
+Each Browser owns a mutable page layout/font stack, and Chrome owns a separate
+UI-thread-only stack. This removes chrome rasterization from the page stack,
+but interactive resize and page-input paths still reach page layout state from
+the main thread while that window's tab tasks use it for document layout and
+glyph creation. No common owner-thread assertion or lock covers those remaining
+interactive paths. Windowless screenshot capture is excluded from this gap by
+its tab/helper quiescence gate, but the interactive concurrency gap remains.
 
 ### 5. Response and URL ownership is encoded in call-site convention
 
