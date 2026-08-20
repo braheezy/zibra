@@ -1248,12 +1248,25 @@ pub fn prepareForDomMutation(self: *Tab, b: *Browser, frame: *Frame, mutation_ro
     self.needs_style = true;
     self.needs_layout = true;
     self.needs_paint = true;
-    markFrameLayoutDirty(frame);
 
     frame.retireDomMutationBorrows(mutation_root);
     self.composited_updates.clearRetainingCapacity();
     self.clearAccessibilityTree();
     b.retireRenderStateForTab(self);
+
+    // Structural mutation can invalidate arbitrary raw style/layout
+    // subscriptions and Node addresses inside the retained tree. Once every
+    // display consumer is retired, destroy this frame's complete layout while
+    // the old DOM is still alive; the next full render builds a fresh graph.
+    if (frame.document_layout) |doc| {
+        doc.deinit();
+        self.allocator.destroy(doc);
+        frame.document_layout = null;
+    }
+    // Descendant frames own independent DOM/layout trees but still need dirty
+    // propagation when an ancestor iframe element changes.
+    markFrameLayoutDirty(frame);
+
     b.setNeedsAnimationFrame(self);
     b.scheduleAnimationFrame();
 }
@@ -2327,6 +2340,7 @@ pub fn keypress(self: *Tab, b: *Browser, char: u8) !void {
                             if (e.layout_ptr) |ptr| {
                                 if (e.layout_mark) |mark_fn| mark_fn(ptr);
                             }
+                            parser.clearStyleInvalidations(&frame.current_node.?);
                             self.prepareForDomMutation(b, frame, focus_node);
                             try e.children.ensureUnusedCapacity(self.allocator, 1);
                             e.children.appendAssumeCapacity(text_node);

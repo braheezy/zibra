@@ -189,6 +189,10 @@ const WindowContext = struct {
     detached_nodes: std.AutoHashMap(*Node, void),
     next_handle: u32,
     current_nodes: ?*Node,
+    // The shared Kiesel realm exposes named element globals for only the
+    // active window. This records whether the JavaScript-side per-window
+    // registry reflects current_nodes.
+    named_globals_synced: bool,
     pending_messages: std.ArrayList(PendingMessage),
     render_callback: RenderCallback,
     dom_mutation_callback: DomMutationCallback,
@@ -261,6 +265,7 @@ fn ensureWindow(self: *Js, window_id: u32) !void {
         .detached_nodes = std.AutoHashMap(*Node, void).init(self.allocator),
         .next_handle = 0,
         .current_nodes = null,
+        .named_globals_synced = false,
         .pending_messages = std.ArrayList(PendingMessage).empty,
         .render_callback = .{},
         .dom_mutation_callback = .{},
@@ -558,6 +563,8 @@ pub fn evaluate(self: *Js, window_id: u32, code: []const u8) !Value {
         \\
         \\var WINDOW_MESSAGE_LISTENERS = {};
         \\var WINDOW_ONMESSAGE = {};
+        \\var WINDOW_ID_GLOBALS = {};
+        \\var ACTIVE_ID_GLOBALS = [];
         \\
         \\globalThis.window = globalThis;
         \\window.__id = __native.getWindowId();
@@ -582,8 +589,43 @@ pub fn evaluate(self: *Js, window_id: u32, code: []const u8) !Value {
         \\    return { __id: parentId, postMessage: function(message, targetOrigin) { var payload = message == null ? "null" : message.toString(); var origin = targetOrigin === undefined ? "*" : targetOrigin.toString(); __native.postMessage(payload, parentId, origin); } };
         \\  }
         \\});
+        \\function clearActiveIdGlobals() {
+        \\  for (var i = 0; i < ACTIVE_ID_GLOBALS.length; i++) {
+        \\    var entry = ACTIVE_ID_GLOBALS[i];
+        \\    if (globalThis[entry[0]] === entry[1]) delete globalThis[entry[0]];
+        \\  }
+        \\  ACTIVE_ID_GLOBALS = [];
+        \\}
+        \\function installActiveIdGlobals(entries) {
+        \\  for (var i = 0; i < entries.length; i++) {
+        \\    var entry = entries[i];
+        \\    var name = entry[0];
+        \\    if (name in globalThis) continue;
+        \\    Object.defineProperty(globalThis, name, {
+        \\      value: entry[1], writable: true, enumerable: true, configurable: true
+        \\    });
+        \\    ACTIVE_ID_GLOBALS.push(entry);
+        \\  }
+        \\}
+        \\globalThis.__clearIdGlobals = function(windowId) {
+        \\  if (window.__id === windowId) clearActiveIdGlobals();
+        \\  delete WINDOW_ID_GLOBALS[windowId];
+        \\};
+        \\globalThis.__setIdGlobals = function(windowId, names, handles) {
+        \\  var entries = [];
+        \\  for (var i = 0; i < names.length; i++) {
+        \\    entries.push([names[i], new Node(handles[i])]);
+        \\  }
+        \\  WINDOW_ID_GLOBALS[windowId] = entries;
+        \\  if (window.__id === windowId) {
+        \\    clearActiveIdGlobals();
+        \\    installActiveIdGlobals(entries);
+        \\  }
+        \\};
         \\globalThis.__setActiveWindow = function(id) {
+        \\  if (window.__id !== id) clearActiveIdGlobals();
         \\  window.__id = id;
+        \\  installActiveIdGlobals(WINDOW_ID_GLOBALS[id] || []);
         \\};
         \\globalThis.__dispatchMessageEvent = function(message, origin, sourceId, targetId) {
         \\  var evt = { type: 'message', data: message, origin: origin, source: { __id: sourceId } };
@@ -644,6 +686,7 @@ pub fn evaluate(self: *Js, window_id: u32, code: []const u8) !Value {
         }
     }
     try self.setActiveWindow(window_id, window);
+    if (!window.named_globals_synced) try self.syncNamedIdGlobals(window_id, window);
 
     // Now evaluate the user's code
     const script = try Script.parse(
@@ -674,6 +717,17 @@ pub fn setNodes(self: *Js, window_id: u32, nodes: ?*Node) void {
     self.lock.lock();
     defer self.lock.unlock();
     const window = self.setCurrentWindow(window_id) catch return;
+    if (nodes != null) {
+        self.clearNamedIdGlobals(window_id, window) catch |err| {
+            std.log.warn("Failed to clear named element globals: {}", .{err});
+        };
+    } else {
+        // Shutdown/navigation invalidation can run outside the tab worker.
+        // Do not re-enter Kiesel here: clearing the native handle maps below
+        // makes every retained numeric Node wrapper inert, and a subsequent
+        // non-null install clears the JavaScript registry before reuse.
+        window.named_globals_synced = false;
+    }
     self.clearDetachedNodes(window);
     window.current_nodes = nodes;
     // Clear handle mappings when nodes change
@@ -690,6 +744,9 @@ pub fn setNodes(self: *Js, window_id: u32, nodes: ?*Node) void {
     } else {
         // Reset JavaScript-side listener state when the DOM changes.
         self.resetEventListenersImpl(window, window_id);
+        self.syncNamedIdGlobals(window_id, window) catch |err| {
+            std.log.warn("Failed to publish named element globals: {}", .{err});
+        };
     }
 }
 
@@ -774,6 +831,96 @@ fn getNode(self: *Js, window: *WindowContext, handle: u32) ?*Node {
     return window.handle_to_node.get(handle);
 }
 
+const NamedElement = struct {
+    name: []const u8,
+    node: *Node,
+};
+
+/// Collect the first element for each non-empty ID in document order. HTML
+/// permits duplicate IDs even though pages should avoid them; named access
+/// follows the same first-match behavior as a document lookup.
+fn collectNamedElements(
+    self: *Js,
+    node: *Node,
+    seen: *std.StringHashMap(void),
+    named: *std.ArrayList(NamedElement),
+) !void {
+    switch (node.*) {
+        .text => {},
+        .element => |*element| {
+            if (element.attributes) |attributes| {
+                if (attributes.get("id")) |id| {
+                    if (id.len != 0 and !seen.contains(id)) {
+                        try seen.put(id, {});
+                        try named.append(self.allocator, .{ .name = id, .node = node });
+                    }
+                }
+            }
+            for (element.children.items) |*child| {
+                try self.collectNamedElements(child, seen, named);
+            }
+        },
+    }
+}
+
+/// Replace one window's JavaScript-side ID registry with wrappers for its
+/// current DOM generation. Only the active window's registry is installed on
+/// globalThis; __setActiveWindow swaps registries when realms are activated.
+fn syncNamedIdGlobals(self: *Js, window_id: u32, window: *WindowContext) Agent.Error!void {
+    if (!self.runtime_initialized) {
+        window.named_globals_synced = false;
+        return;
+    }
+
+    var seen = std.StringHashMap(void).init(self.allocator);
+    defer seen.deinit();
+    var named = std.ArrayList(NamedElement).empty;
+    defer named.deinit(self.allocator);
+    if (window.current_nodes) |root| {
+        try self.collectNamedElements(root, &seen, &named);
+    }
+
+    const names = try kiesel.builtins.arrayCreate(&self.agent, @intCast(named.items.len), null);
+    const handles = try kiesel.builtins.arrayCreate(&self.agent, @intCast(named.items.len), null);
+    for (named.items, 0..) |entry, index| {
+        const property_key = kiesel.types.PropertyKey.from(
+            @as(kiesel.types.PropertyKey.IntegerIndex, @intCast(index)),
+        );
+        try names.object.createDataPropertyDirect(
+            &self.agent,
+            property_key,
+            try self.stringToJsValue(entry.name),
+        );
+        const handle = try self.getHandle(window, entry.node);
+        try handles.object.createDataPropertyDirect(
+            &self.agent,
+            property_key,
+            Value.from(@as(f64, @floatFromInt(handle))),
+        );
+    }
+
+    const key = kiesel.types.PropertyKey.from("__setIdGlobals");
+    const fn_value = try window.realm.global_object.get(&self.agent, key);
+    if (!fn_value.isCallable()) return;
+    const window_value = Value.from(@as(f64, @floatFromInt(window_id)));
+    _ = try fn_value.call(
+        &self.agent,
+        .undefined,
+        &.{ window_value, Value.from(&names.object), Value.from(&handles.object) },
+    );
+    window.named_globals_synced = true;
+}
+
+fn clearNamedIdGlobals(self: *Js, window_id: u32, window: *WindowContext) Agent.Error!void {
+    window.named_globals_synced = false;
+    if (!self.runtime_initialized) return;
+    const key = kiesel.types.PropertyKey.from("__clearIdGlobals");
+    const fn_value = try window.realm.global_object.get(&self.agent, key);
+    if (!fn_value.isCallable()) return;
+    const window_value = Value.from(@as(f64, @floatFromInt(window_id)));
+    _ = try fn_value.call(&self.agent, .undefined, &.{window_value});
+}
+
 fn clearDetachedNodes(self: *Js, window: *WindowContext) void {
     var it = window.detached_nodes.keyIterator();
     while (it.next()) |node_ptr| {
@@ -851,8 +998,9 @@ fn directChildIndex(parent: *Node, child: *Node) ?usize {
 }
 
 /// Move a window-owned detached root into an element's by-value child array.
-/// Every fallible allocation happens before handle maps or detached ownership
-/// change; after capacity succeeds, insertion and rebinding are infallible.
+/// All mutation-related allocations happen before handle maps or detached
+/// ownership change. Republishing named globals can still fail afterward, but
+/// stale globals have already been removed before any node moves.
 fn insertDetachedChild(
     self: *Js,
     window: *WindowContext,
@@ -873,8 +1021,15 @@ fn insertDetachedChild(
     markElementLayoutDirty(element);
     if (parent_is_attached) self.prepareDomMutation(parent);
 
-    // This is the last fallible step. On failure the callback has already
-    // scheduled a safe rebuild of the retired render generation.
+    const window_id = self.current_window_id.?;
+    if (parent_is_attached) try self.clearNamedIdGlobals(window_id, window);
+    var mutation_started = false;
+    errdefer if (parent_is_attached and !mutation_started) {
+        self.syncNamedIdGlobals(window_id, window) catch {};
+    };
+
+    // Capacity growth may relocate the by-value children. No JavaScript call
+    // may occur between this operation and the handle-map repair below.
     try element.children.ensureUnusedCapacity(self.allocator, 1);
 
     // Capacity growth and insertion can relocate or shift every immediate
@@ -884,6 +1039,7 @@ fn insertDetachedChild(
     }
     _ = window.node_to_handle.remove(child);
 
+    mutation_started = true;
     element.children.insertAssumeCapacity(insert_index, child.*);
     _ = window.detached_nodes.remove(child);
     self.allocator.destroy(child);
@@ -900,7 +1056,10 @@ fn insertDetachedChild(
     window.handle_to_node.putAssumeCapacity(child_handle, installed_child);
     parser.fixParentPointers(parent, parent_parent);
 
-    if (parent_is_attached) self.requestRender();
+    if (parent_is_attached) {
+        try self.syncNamedIdGlobals(window_id, window);
+        self.requestRender();
+    }
 }
 
 fn clearDetachedLayoutPointers(node: *Node) void {
@@ -916,8 +1075,8 @@ fn clearDetachedLayoutPointers(node: *Node) void {
 }
 
 /// Move one by-value child into a heap-stable, window-owned detached root.
-/// All fallible work precedes the child-array mutation; the remainder is an
-/// infallible ownership and handle-rebinding transaction.
+/// Allocation for the ownership move precedes the child-array mutation. ID
+/// globals are cleared before pointer relocation and republished afterward.
 fn detachChild(
     self: *Js,
     window: *WindowContext,
@@ -929,13 +1088,17 @@ fn detachChild(
     defer bindings.deinit(self.allocator);
 
     const detached = try self.allocator.create(Node);
-    errdefer self.allocator.destroy(detached);
+    var detached_owned = true;
+    errdefer if (detached_owned) self.allocator.destroy(detached);
     try window.detached_nodes.ensureUnusedCapacity(1);
 
     const parent_is_attached = isAttachedToCurrentDocument(window, parent);
     const parent_parent = nodeParent(parent);
     const child_handle = window.node_to_handle.get(child).?;
     const element = &parent.element;
+    const window_id = self.current_window_id.?;
+
+    if (parent_is_attached) try self.clearNamedIdGlobals(window_id, window);
 
     element.children_dirty = true;
     parser.dirtyStyleForElement(element);
@@ -950,6 +1113,7 @@ fn detachChild(
 
     detached.* = element.children.orderedRemove(remove_index);
     window.detached_nodes.putAssumeCapacity(detached, {});
+    detached_owned = false;
 
     for (bindings.items) |binding| {
         if (binding.old_index == remove_index) continue;
@@ -966,7 +1130,10 @@ fn detachChild(
     clearDetachedLayoutPointers(detached);
     parser.dirtyStyleSubtree(detached);
 
-    if (parent_is_attached) self.requestRender();
+    if (parent_is_attached) {
+        try self.syncNamedIdGlobals(window_id, window);
+        self.requestRender();
+    }
 }
 
 fn removeHandlesForSubtree(self: *Js, window: *WindowContext, node: *Node) void {
@@ -999,6 +1166,7 @@ fn requestRender(self: *Js) void {
 fn prepareDomMutation(self: *Js, mutation_root: *Node) void {
     const window_id = self.current_window_id orelse return;
     const window = self.windows.getPtr(window_id) orelse return;
+    if (window.current_nodes) |root| parser.clearStyleInvalidations(root);
     if (window.dom_mutation_callback.function) |callback| {
         callback(window.dom_mutation_callback.context, mutation_root);
     }
@@ -1280,6 +1448,124 @@ test "querySelectorAll matches :has selectors through strict descendants" {
         \\document.querySelectorAll('span.badge:has(.badge)').length === 0
     );
     try std.testing.expect(result.toBoolean());
+}
+
+test "element IDs expose first-match globals without replacing existing names" {
+    const allocator = std.testing.allocator;
+    const html =
+        "<main>" ++
+        "<div id=foo></div><span id=duplicate></span><em id=duplicate></em>" ++
+        "<p id=dash-id></p><aside id=document></aside>" ++
+        "</main>";
+
+    var html_parser = try parser.HTMLParser.init(allocator, html);
+    html_parser.use_implicit_tags = false;
+    defer html_parser.deinit(allocator);
+    var root = try html_parser.parse();
+    defer root.deinit(allocator);
+    parser.fixParentPointers(&root, null);
+
+    var environ = std.process.Environ.Map.init(allocator);
+    defer environ.deinit();
+    var js = try Js.init(allocator, std.testing.io, &environ);
+    defer js.deinit(allocator);
+    js.setNodes(0, &root);
+    defer js.setNodes(0, null);
+
+    const result = try js.evaluate(0,
+        \\var container = document.querySelectorAll('main')[0];
+        \\var firstDuplicate = document.querySelectorAll('span')[0];
+        \\var secondDuplicate = document.querySelectorAll('em')[0];
+        \\var initial = foo.handle === document.querySelectorAll('div')[0].handle &&
+        \\  duplicate.handle === firstDuplicate.handle &&
+        \\  window['dash-id'].handle === document.querySelectorAll('p')[0].handle &&
+        \\  typeof document.querySelectorAll === 'function' &&
+        \\  document.querySelectorAll('aside')[0].handle !== document.handle;
+        \\container.removeChild(firstDuplicate);
+        \\initial && duplicate.handle === secondDuplicate.handle
+    );
+    try std.testing.expect(result.toBoolean());
+}
+
+test "ID globals follow innerHTML attributes detach and reattachment" {
+    const allocator = std.testing.allocator;
+    var html_parser = try parser.HTMLParser.init(
+        allocator,
+        "<main><section id=mount><span id=oldChild></span></section><p id=preserved></p></main>",
+    );
+    html_parser.use_implicit_tags = false;
+    defer html_parser.deinit(allocator);
+    var root = try html_parser.parse();
+    defer root.deinit(allocator);
+    parser.fixParentPointers(&root, null);
+    try parser.style(allocator, &root, &.{});
+
+    var environ = std.process.Environ.Map.init(allocator);
+    defer environ.deinit();
+    var js = try Js.init(allocator, std.testing.io, &environ);
+    defer js.deinit(allocator);
+    js.setNodes(0, &root);
+    defer js.setNodes(0, null);
+
+    const result = try js.evaluate(0,
+        \\var target = document.querySelectorAll('section')[0];
+        \\var oldWasPublished = oldChild.handle === target.children[0].handle;
+        \\window.preserved = 17;
+        \\target.innerHTML = '<i id="newChild"></i>';
+        \\var replacementWorked = typeof oldChild === 'undefined' &&
+        \\  newChild.handle === target.children[0].handle;
+        \\var created = document.createElement('button');
+        \\created.setAttribute('id', 'dynamicChild');
+        \\var detachedWasHidden = typeof dynamicChild === 'undefined';
+        \\target.appendChild(created);
+        \\var appendPublished = dynamicChild.handle === created.handle;
+        \\created.setAttribute('id', 'renamedChild');
+        \\var renamePublished = typeof dynamicChild === 'undefined' &&
+        \\  renamedChild.handle === created.handle;
+        \\target.removeChild(created);
+        \\var removalCleared = typeof renamedChild === 'undefined';
+        \\target.appendChild(created);
+        \\oldWasPublished && replacementWorked && detachedWasHidden && appendPublished &&
+        \\renamePublished && removalCleared && renamedChild.handle === created.handle &&
+        \\window.preserved === 17
+    );
+    try std.testing.expect(result.toBoolean());
+    // Structural mutation clears raw parent/child style subscriptions before
+    // removed fields are destroyed; a complete pass then rebuilds live edges.
+    try parser.style(allocator, &root, &.{});
+}
+
+test "ID globals are isolated between active window documents" {
+    const allocator = std.testing.allocator;
+    var parser_a = try parser.HTMLParser.init(allocator, "<main><p id=alpha></p></main>");
+    parser_a.use_implicit_tags = false;
+    defer parser_a.deinit(allocator);
+    var root_a = try parser_a.parse();
+    defer root_a.deinit(allocator);
+    parser.fixParentPointers(&root_a, null);
+
+    var parser_b = try parser.HTMLParser.init(allocator, "<main><p id=beta></p></main>");
+    parser_b.use_implicit_tags = false;
+    defer parser_b.deinit(allocator);
+    var root_b = try parser_b.parse();
+    defer root_b.deinit(allocator);
+    parser.fixParentPointers(&root_b, null);
+
+    var environ = std.process.Environ.Map.init(allocator);
+    defer environ.deinit();
+    var js = try Js.init(allocator, std.testing.io, &environ);
+    defer js.deinit(allocator);
+    js.setNodes(10, &root_a);
+    defer js.setNodes(10, null);
+    js.setNodes(20, &root_b);
+    defer js.setNodes(20, null);
+
+    const first = try js.evaluate(10, "typeof alpha === 'object' && typeof beta === 'undefined'");
+    try std.testing.expect(first.toBoolean());
+    const second = try js.evaluate(20, "typeof alpha === 'undefined' && typeof beta === 'object'");
+    try std.testing.expect(second.toBoolean());
+    const restored = try js.evaluate(10, "typeof alpha === 'object' && typeof beta === 'undefined'");
+    try std.testing.expect(restored.toBoolean());
 }
 
 test "Node.children returns immediate element children in source order" {
@@ -2536,11 +2822,27 @@ fn setAttribute(agent: *Agent, this_value: Value, arguments: kiesel.types.Argume
                 e.owned_strings = std.ArrayList([]const u8).empty;
             }
 
+            try e.attributes.?.ensureUnusedCapacity(1);
+            try e.owned_strings.?.ensureUnusedCapacity(js_instance.allocator, 2);
+
             const owned_name = try js_instance.allocator.dupe(u8, attr_name);
+            var name_owned = true;
+            errdefer if (name_owned) js_instance.allocator.free(owned_name);
             const owned_value = try js_instance.allocator.dupe(u8, attr_value);
-            try e.owned_strings.?.append(js_instance.allocator, owned_name);
-            try e.owned_strings.?.append(js_instance.allocator, owned_value);
-            try e.attributes.?.put(owned_name, owned_value);
+            var value_owned = true;
+            errdefer if (value_owned) js_instance.allocator.free(owned_value);
+
+            const refresh_id_globals = std.mem.eql(u8, attr_name, "id") and
+                isAttachedToCurrentDocument(window, node);
+            if (refresh_id_globals) {
+                try js_instance.clearNamedIdGlobals(window_id, window);
+            }
+
+            e.owned_strings.?.appendAssumeCapacity(owned_name);
+            name_owned = false;
+            e.owned_strings.?.appendAssumeCapacity(owned_value);
+            value_owned = false;
+            e.attributes.?.putAssumeCapacity(owned_name, owned_value);
             parser.dirtyStyleForElement(e);
 
             if ((std.mem.eql(u8, e.tag, "img") or std.mem.eql(u8, e.tag, "iframe")) and
@@ -2550,7 +2852,13 @@ fn setAttribute(agent: *Agent, this_value: Value, arguments: kiesel.types.Argume
                 markElementLayoutDirty(e);
             }
 
+            // Attribute ownership and dirty state are already committed. A
+            // later allocation failure while rebuilding ID wrappers must not
+            // suppress the corresponding browser render.
             js_instance.requestRender();
+            if (refresh_id_globals) {
+                try js_instance.syncNamedIdGlobals(window_id, window);
+            }
             return .undefined;
         },
         .text => {
@@ -2679,6 +2987,10 @@ fn innerHTML(agent: *Agent, this_value: Value, arguments: kiesel.types.Arguments
                 e.owned_strings = std.ArrayList([]const u8).empty;
             }
             try e.owned_strings.?.ensureUnusedCapacity(js_instance.allocator, 1);
+            const is_attached = isAttachedToCurrentDocument(window, node);
+            if (is_attached) {
+                try js_instance.clearNamedIdGlobals(window_id, window);
+            }
 
             // Child arrays store Nodes by value. Retire every browser-side
             // borrower before destroying the old nodes or replacing their
@@ -2686,7 +2998,7 @@ fn innerHTML(agent: *Agent, this_value: Value, arguments: kiesel.types.Arguments
             // before this point, so any later failure remains recoverable.
             e.children_dirty = true;
             markElementLayoutDirty(e);
-            js_instance.prepareDomMutation(node);
+            if (is_attached) js_instance.prepareDomMutation(node);
 
             for (e.children.items) |*child| {
                 js_instance.removeHandlesForSubtree(window, child);
@@ -2701,6 +3013,9 @@ fn innerHTML(agent: *Agent, this_value: Value, arguments: kiesel.types.Arguments
 
             parser.fixParentPointers(node, e.parent);
 
+            if (is_attached) {
+                try js_instance.syncNamedIdGlobals(window_id, window);
+            }
             js_instance.requestRender();
 
             return .undefined;

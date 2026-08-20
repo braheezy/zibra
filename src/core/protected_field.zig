@@ -77,6 +77,13 @@ pub fn ProtectedField(comptime T: type) type {
             self.frozen_dependencies = true;
         }
 
+        /// Drop every raw subscriber pointer while their targets are still
+        /// alive. Callers that use this coarse structural-mutation boundary
+        /// must force a complete recomputation so dependencies are rebuilt.
+        pub fn clearInvalidations(self: *@This()) void {
+            self.invalidations.clearRetainingCapacity();
+        }
+
         fn notify(self: *@This()) void {
             if (DEBUG_PROTECTED_FIELDS) {
                 std.debug.print("  [NOTIFY] notifying {} dependents\n", .{self.invalidations.count()});
@@ -150,4 +157,22 @@ pub fn ProtectedField(comptime T: type) type {
             self.dirty = false;
         }
     };
+}
+
+test "clearInvalidations detaches subscribers before their lifetime ends" {
+    const Field = ProtectedField(i32);
+    var source = Field.init(std.testing.allocator, 1);
+    defer source.deinit();
+    var subscriber = Field.init(std.testing.allocator, 2);
+    defer subscriber.deinit();
+    source.set(1);
+    subscriber.set(2);
+
+    subscriber.addDependency(&source);
+    try std.testing.expectEqual(@as(usize, 1), source.invalidations.count());
+    source.clearInvalidations();
+    try std.testing.expectEqual(@as(usize, 0), source.invalidations.count());
+
+    source.set(3);
+    try std.testing.expect(!subscriber.dirty);
 }

@@ -20,6 +20,9 @@ or selector/rule lifetime.
   invalidation boundary after marking the target layout dirty and before child
   storage can move or retire. Keep ordinary render callbacks separate so
   style-only changes do not discard focus or hit/accessibility state.
+- Before structural mutation destroys or relocates style fields, clear raw
+  `ProtectedField` subscribers across the installed document. The required
+  full style/layout pass rebuilds live dependency edges afterward.
 - A detached retained subtree keeps its style maps but dirties every field and
   clears layout back-pointers. When it is reparented, inherited style reads
   register the current parent dependency before using a frozen field.

@@ -120,9 +120,11 @@ before changing `root.zig`, `tab.zig`, `render/`, or browser task scheduling.
   ordinary render invalidation. Before a child array moves or a child is
   destroyed, mark layout/render dirty, retire the frame's display and DOM-keyed
   interaction state, clear tab accessibility/composited borrows, and retire
-  active Browser draw/layer/display state under `Browser.lock`. Schedule the
-  replacement paint before any fallible mutation step. Preserve focus when the
-  mutation root itself survives; clear it only for a removed descendant.
+  active Browser draw/layer/display state under `Browser.lock`. Then destroy
+  the mutating frame's complete layout dependency graph while the old DOM is
+  still alive; the next full render rebuilds it. Schedule the replacement paint
+  before any fallible mutation step. Preserve focus when the mutation root
+  itself survives; clear it only for a removed descendant.
 - Content clicks walk the retained list in reverse paint order and then walk
   the hit node's DOM ancestry. `link_bounds` and `iframe_bounds` may support
   layout-derived accessibility/coordinate bookkeeping, but must not select a

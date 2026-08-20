@@ -289,11 +289,14 @@ layout paint performs visited/source ancestry walks.
 
 Supported in-place structural mutations use a synchronous invalidation
 boundary. `innerHTML` stages its replacement children and backing string,
-marks the target layout dirty, then invokes the frame's DOM-mutation callback
-before destroying the old children or replacing their array. The first native
-contenteditable child append invokes the same Tab seam before a fallible
-capacity change. JavaScript `createElement` results are heap-stable roots owned
-by their window while detached. `appendChild` and `insertBefore` accept those
+marks the target layout dirty, clears every current DOM style field's raw
+subscriber map while all endpoints are alive, then invokes the frame's
+DOM-mutation callback before destroying the old children or replacing their
+array. The first native contenteditable child append invokes the same Tab seam
+before a fallible
+capacity change and performs the same subscriber clear. JavaScript
+`createElement` results are heap-stable roots owned by their window while
+detached. `appendChild` and `insertBefore` accept those
 detached roots, snapshot immediate-child handle bindings, enter the same
 invalidation seam, reserve capacity, and then transfer the new owner into the
 by-value child array while rebinding every relocated handle. `removeChild`
@@ -305,8 +308,10 @@ registers inherited-style dependencies against the current parent before a
 frozen dependency read. That seam retires the frame display list and DOM-keyed
 bounds, clears the accessibility tree and
 pending composited node updates, and retires the active browser draw list,
-layers, and committed display list under `Browser.lock`. Dirty flags and an
-animation-frame request are published before the mutation proceeds, so
+layers, and committed display list under `Browser.lock`. It then destroys the
+mutating frame's complete `DocumentLayout` while the old DOM still exists, so
+the full replacement render constructs a fresh dependency graph. Dirty flags
+and an animation-frame request are published before the mutation proceeds, so
 allocation failure still rebuilds the retired state. A focused mutation root
 survives; focus is cleared only when the focused node is a strict descendant
 that the replacement removes.
@@ -352,6 +357,13 @@ that field from maps in its dependencies. See `addDependency`,
 `addInvalidation`, `notify`, and `deinit` in
 [`src/core/protected_field.zig`](../src/core/protected_field.zig).
 
+Supported structural DOM mutation uses a coarse lifetime boundary:
+`clearStyleInvalidations` drops every raw subscriber from every installed DOM
+style field before child storage moves or retires, and the already-required
+full style/layout pass rebuilds live edges. This prevents surviving parent
+style sources from notifying destroyed child-style or layout subscribers on
+these paths without pretending to provide general per-edge unsubscription.
+
 Inherited style fields establish these edges between parent and child DOM
 styles in [`src/document/parser.zig`](../src/document/parser.zig). Layout fields
 establish similar edges between document, parent, previous sibling, and child
@@ -359,8 +371,9 @@ layout objects in [`src/browser/render/layout.zig`](../src/browser/render/layout
 The synthetic default-parent style used at the root is ephemeral to one style
 pass: root fields read its defaults directly and never register dependency edges
 to it.
-The unresolved contract is how an invalidation subscriber unregisters before
-its address becomes invalid.
+The general unresolved contract is how an individual invalidation subscriber
+unregisters before its address becomes invalid outside that full structural
+rebuild boundary.
 
 ### Layout, fonts, images, and display items
 
@@ -835,7 +848,14 @@ Current enforced behavior includes:
   tab's atomic shutdown flag; the VM polls it at bytecode safe points and turns
   it into an uncatchable host error at the `Js.evaluate` boundary;
 - `Js.setNodes` changes the root, clears both handle maps, and resets callbacks
-  when the root becomes null;
+  when the root becomes null. Null-root invalidation can run during main-thread
+  teardown, so it does not re-enter Kiesel; retained numeric wrappers become
+  inert immediately, and a later non-null install clears/rebuilds the registry
+  on the tab worker before evaluation;
+- each `WindowContext` has a JavaScript-side registry of named element globals;
+  only the active window's first element for each non-empty ID is installed,
+  pre-existing global names win, and realm activation swaps registries without
+  exposing another window's nodes;
 - the `Node.children` getter snapshots immediate element-child handles in DOM
   order and wraps them as JavaScript Nodes; text children and deeper
   descendants are excluded, and every getter call creates a new array;
@@ -850,6 +870,10 @@ Current enforced behavior includes:
 - `innerHTML` calls `removeHandlesForSubtree` for every removed child before
   destroying it, so descendant JavaScript handles are removed with the old
   subtree;
+- attached `innerHTML`, `appendChild`, `insertBefore`, `removeChild`, and `id`
+  attribute changes clear named globals before mutation and republish them
+  afterward. Detached elements remain absent until insertion, and detached
+  subtrees disappear immediately while retaining handles for reattachment;
 - structural `innerHTML` invokes its dedicated synchronous DOM-mutation host
   callback before old child storage retires; ordinary render callbacks remain
   a separate, non-destructive invalidation path;
@@ -1054,6 +1078,9 @@ does not remove those entries from the source, while style/layout rebuilding
 can destroy dependents before their sources. The missing reverse edge or
 subscription token is visible in
 [`src/core/protected_field.zig`](../src/core/protected_field.zig).
+Supported structural DOM paths now clear all style-source subscriber maps
+before mutation and force a full rebuild; arbitrary or incremental teardown
+still lacks an edge-specific lifetime mechanism.
 
 ### 3. Display-list cloning does not make leaf resources independent
 
@@ -1114,7 +1141,7 @@ targeted stress test:
 - a browser display list reading image bytes or DOM identity after the tab
   worker mutates a subtree before publishing the replacement commit;
 - `ProtectedField.notify` reaching a destroyed child style/layout field after a
-  subtree mutation or layout rebuild;
+  mutation or rebuild outside the supported structural clear-and-rebuild seam;
 - main-thread accessibility hit testing racing a worker rebuild and observing
   a retired tree, despite the repaired string-generation ownership;
 - simultaneous main-thread and tab-thread font/cache mutation corrupting

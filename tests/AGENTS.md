@@ -71,6 +71,10 @@ the `null` reference append case with a visible in-page result.
 ownership, verifies its nested and shifted-sibling handles, and reattaches the
 same Node object under a different parent with a visible in-page result.
 
+`tests/manual/id-globals.html` verifies source and dynamically added element
+IDs as JavaScript globals, including `innerHTML`, rename, detach, reattach, and
+non-identifier access through `window[...]`.
+
 `tests/manual/resubmit-requests.html` uses the tutorial server's deterministic
 POST login to verify that Back to a POST target asks before replaying, Cancel
 does not navigate, and Resubmit sends the retained body again.

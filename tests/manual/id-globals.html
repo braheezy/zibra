@@ -1,0 +1,45 @@
+<!--
+How to verify:
+Open this page normally. The final line must be a green PASS message. The
+script accesses source IDs as variables, removes and restores a source node,
+replaces it through innerHTML, then publishes, renames, removes, and reattaches
+a created element.
+-->
+<!doctype html>
+<title>Element ID globals</title>
+<h1>ID globals fixture</h1>
+<div id="fixture"><span id="sourceChild">source child</span></div>
+<p id="hyphen-name">hyphenated ID</p>
+<p id="resultMessage" style="color: red">PASS if green: ID globals follow the live document</p>
+<script>
+  var holder = fixture;
+  var sourcePublished = sourceChild.handle === holder.children[0].handle &&
+    window["hyphen-name"].getAttribute("id") === "hyphen-name";
+  var removedSource = holder.removeChild(sourceChild);
+  var sourceCleared = typeof sourceChild === "undefined";
+  holder.appendChild(removedSource);
+  var sourceRestored = sourceChild.handle === removedSource.handle;
+  holder.innerHTML = '<strong id="replacementChild">replacement child</strong>';
+  var replacementPublished = typeof sourceChild === "undefined" &&
+    replacementChild.handle === holder.children[0].handle;
+
+  var created = document.createElement("button");
+  created.setAttribute("id", "dynamicChild");
+  var detachedHidden = typeof dynamicChild === "undefined";
+  holder.appendChild(created);
+  var appendPublished = dynamicChild.handle === created.handle;
+
+  created.setAttribute("id", "renamedChild");
+  var renamePublished = typeof dynamicChild === "undefined" &&
+    renamedChild.handle === created.handle;
+  holder.removeChild(created);
+  var removalCleared = typeof renamedChild === "undefined";
+  holder.appendChild(created);
+
+  var passed = sourcePublished && sourceCleared && sourceRestored &&
+    replacementPublished && detachedHidden && appendPublished &&
+    renamePublished && removalCleared && renamedChild.handle === created.handle;
+  if (passed) {
+    resultMessage.setAttribute("style", "color: green");
+  }
+</script>

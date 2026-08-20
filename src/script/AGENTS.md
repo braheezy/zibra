@@ -20,6 +20,18 @@ or Kiesel allocation/locking.
 - `removeChild` performs the inverse transfer: it accepts only a direct child,
   moves that subtree into a heap-stable window-owned detached root, preserves
   subtree handles, and rebinds siblings shifted in the attached child array.
+- Element IDs are exposed as named globals for only the active window. The
+  first duplicate ID in document order wins; empty IDs and names colliding
+  with existing globals are skipped. Refresh the per-window registry whenever
+  attached structure or an attached element's `id` changes, clearing old
+  wrappers before any DOM pointer can move or disappear.
+- Structural JavaScript mutation also clears current style-field subscriber
+  maps while every endpoint is alive; the mandatory full style/layout render
+  rebuilds dependencies after mutation.
+- Null-root invalidation may run outside the Kiesel-owning tab worker. It must
+  make wrappers inert by clearing native handle maps without calling back into
+  JavaScript; a later non-null root install clears and rebuilds the registry on
+  the worker before evaluation resumes.
 - Detached/queued work must use the document generation contract from
   `src/browser/`; never retain a callback context or frame as a long-lived
   pointer.
