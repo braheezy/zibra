@@ -561,13 +561,24 @@ for `about:`. Callers currently infer ownership again from the URL scheme.
 The BrowserSession-owned `HttpCache` in
 [`src/network/cache.zig`](../src/network/cache.zig) stores owned copies of
 decoded GET/200 response bodies, CSP headers, and final redirect URLs. Cache
-hits duplicate body and header data before returning, so they preserve the
-existing caller-owned HTTP response contract. Entries with `max-age` use the
-monotonic awake clock; `no-store`, malformed directives, and unknown directives
-bypass storage. Responses without `Cache-Control` remain cached for the current
-browser session, matching the exercise's simplified model.
+entries also retain the parsed Referrer-Policy enum. Cache hits duplicate body
+and header data and restore the policy before returning, so they preserve the
+existing caller-owned HTTP response contract and the document's later request
+behavior. Entries with `max-age` use the monotonic awake clock; `no-store`,
+malformed directives, and unknown directives bypass storage. Responses without
+`Cache-Control` remain cached for the current browser session, matching the
+exercise's simplified model.
 `BrowserSession.network_lock` serializes its HTTP client, cookie jar, and cache
 across tabs and native windows without nesting the visited/bookmark mutex.
+
+Every document Frame stores the Referrer-Policy parsed from its response.
+Navigation, images, iframes, scripts, stylesheets, and XHR pass both that policy
+and the source URL into the network layer. Referer generation omits fragments;
+`no-referrer` suppresses it for every destination and `same-origin` suppresses
+it when scheme, host, or port differs. The source URL remains a separate
+synchronous request-context borrow even when the header is suppressed, because
+SameSite cookie selection still needs the actual initiator. Async XHR clones
+the source URL and copies the policy before leaving the document generation.
 
 Cross-origin XHR derives an independently owned canonical origin from its
 copied referrer, sends it in the HTTP `Origin` header alongside any eligible
@@ -785,9 +796,9 @@ lock across parsing, layout, JavaScript, and rendering.
 
 `Browser.loadInTab` in [`src/browser/root.zig`](../src/browser/root.zig):
 
-1. borrows the prior URL as referrer and fetches or generates the document,
-   then decodes it while its owner and old document remain alive, so a failure
-   preserves the old page;
+1. borrows the prior URL and copies its Frame's Referrer-Policy, then fetches or
+   generates the document and decodes it while the URL owner and old document
+   remain alive, so a failure preserves the old page;
 2. records both the canonical requested and final redirect destinations after
    a successful fetch, then annotates parsed anchors using the same resolution
    policy as clicks;
@@ -796,7 +807,8 @@ lock across parsing, layout, JavaScript, and rendering.
 4. retires browser-side draw/layer/display snapshots under `Browser.lock`;
 5. destroys the old root `Frame`, including layout, DOM, and source backing;
 6. allocates and registers a new root `Frame`;
-7. transfers the decoded body to the frame as backing storage for the DOM;
+7. installs the response's Referrer-Policy before subresource discovery and
+   transfers the decoded body to the frame as backing storage for the DOM;
 8. stages stylesheet source buffers and parsed rules together;
 9. assigns a unique document generation, parses scripts, builds layout/paint
    state, and commits browser-visible data;
@@ -818,7 +830,7 @@ pointers, then retires provenance-bearing display state before destroying
 children, layout, the old DOM, owned
 rules, stylesheet text, and finally decoded HTML and URL backing. The fetch
 happens through the same owned `NavigationDocument` helper before reset so the
-referrer remains valid, and browser-side render
+referrer and its copied policy remain valid, and browser-side render
 state is retired under `Browser.lock` before reset frees document resources.
 Installing the replacement assigns a fresh per-document generation. Initial
 iframe loads and later navigation within an existing child frame check both the

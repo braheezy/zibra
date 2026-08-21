@@ -12,6 +12,7 @@ const cache_module = @import("cache.zig");
 
 pub const CacheControl = cache_module.CacheControl;
 pub const HttpCache = cache_module.HttpCache;
+pub const ReferrerPolicy = cache_module.ReferrerPolicy;
 
 const user_agent = "Zibra/0.0.0";
 const redirect_limit: u16 = 3;
@@ -314,7 +315,18 @@ pub const HttpResponse = struct {
     access_control_allow_origin: ?[]u8 = null,
     status: ?std.http.Status = null,
     cache_control: CacheControl = .default,
+    referrer_policy: ReferrerPolicy = .default,
 };
+
+/// Parse the two response policy tokens supported by this exercise. Unknown
+/// values are ignored so they do not accidentally become more permissive than
+/// a recognized policy from another header line.
+pub fn parseReferrerPolicy(value: []const u8) ?ReferrerPolicy {
+    const trimmed = std.mem.trim(u8, value, " \t\r\n");
+    if (std.ascii.eqlIgnoreCase(trimmed, "no-referrer")) return .no_referrer;
+    if (std.ascii.eqlIgnoreCase(trimmed, "same-origin")) return .same_origin;
+    return null;
+}
 
 /// Same-origin XHR needs no response opt-in. Cross-origin XHR exposes its body
 /// only when the server returns the caller's exact serialized origin or `*`.
@@ -733,7 +745,24 @@ pub const Url = struct {
         referrer: ?Url,
         payload: ?[]const u8,
     ) !HttpResponse {
-        return fetchBodyInternal(allocator, io, http_client, cookie_jar, cache, url, referrer, payload, null, null);
+        return fetchBodyInternal(allocator, io, http_client, cookie_jar, cache, url, referrer, payload, null, null, .default);
+    }
+
+    /// Fetch with the source document's policy controlling only the outbound
+    /// Referer header. The unsuppressed source URL remains available to cookie
+    /// SameSite checks and other request-context decisions.
+    pub fn fetchBodyWithReferrerPolicy(
+        allocator: std.mem.Allocator,
+        io: std.Io,
+        http_client: *std.http.Client,
+        cookie_jar: *std.StringHashMap(CookieEntry),
+        cache: ?*HttpCache,
+        url: Url,
+        referrer: ?Url,
+        payload: ?[]const u8,
+        referrer_policy: ReferrerPolicy,
+    ) !HttpResponse {
+        return fetchBodyInternal(allocator, io, http_client, cookie_jar, cache, url, referrer, payload, null, null, referrer_policy);
     }
 
     /// Fetch an XHR while attaching the caller's serialized origin. CORS
@@ -750,6 +779,32 @@ pub const Url = struct {
         payload: ?[]const u8,
         request_origin: []const u8,
     ) !HttpResponse {
+        return fetchBodyWithOriginAndReferrerPolicy(
+            allocator,
+            io,
+            http_client,
+            cookie_jar,
+            cache,
+            url,
+            referrer,
+            payload,
+            request_origin,
+            .default,
+        );
+    }
+
+    pub fn fetchBodyWithOriginAndReferrerPolicy(
+        allocator: std.mem.Allocator,
+        io: std.Io,
+        http_client: *std.http.Client,
+        cookie_jar: *std.StringHashMap(CookieEntry),
+        cache: ?*HttpCache,
+        url: Url,
+        referrer: ?Url,
+        payload: ?[]const u8,
+        request_origin: []const u8,
+        referrer_policy: ReferrerPolicy,
+    ) !HttpResponse {
         return fetchBodyInternal(
             allocator,
             io,
@@ -761,6 +816,7 @@ pub const Url = struct {
             payload,
             null,
             request_origin,
+            referrer_policy,
         );
     }
 
@@ -777,8 +833,34 @@ pub const Url = struct {
         payload: ?[]const u8,
         final_url: *?Url,
     ) !HttpResponse {
+        return fetchBodyWithFinalUrlAndReferrerPolicy(
+            allocator,
+            io,
+            http_client,
+            cookie_jar,
+            cache,
+            url,
+            referrer,
+            payload,
+            final_url,
+            .default,
+        );
+    }
+
+    pub fn fetchBodyWithFinalUrlAndReferrerPolicy(
+        allocator: std.mem.Allocator,
+        io: std.Io,
+        http_client: *std.http.Client,
+        cookie_jar: *std.StringHashMap(CookieEntry),
+        cache: ?*HttpCache,
+        url: Url,
+        referrer: ?Url,
+        payload: ?[]const u8,
+        final_url: *?Url,
+        referrer_policy: ReferrerPolicy,
+    ) !HttpResponse {
         final_url.* = null;
-        return fetchBodyInternal(allocator, io, http_client, cookie_jar, cache, url, referrer, payload, final_url, null);
+        return fetchBodyInternal(allocator, io, http_client, cookie_jar, cache, url, referrer, payload, final_url, null, referrer_policy);
     }
 
     /// Zig's HTTP client maps TLS handshake-init failures, including
@@ -800,6 +882,7 @@ pub const Url = struct {
         payload: ?[]const u8,
         final_url: ?*?Url,
         request_origin: ?[]const u8,
+        referrer_policy: ReferrerPolicy,
     ) !HttpResponse {
         if (std.mem.eql(u8, url.scheme, "file")) {
             return .{ .body = try url.fileRequest(allocator, io) };
@@ -844,6 +927,7 @@ pub const Url = struct {
                     .csp_header = csp_header,
                     .status = .ok,
                     .cache_control = entry.policy,
+                    .referrer_policy = entry.referrer_policy,
                 };
             }
         }
@@ -859,6 +943,7 @@ pub const Url = struct {
             payload,
             final_url_output,
             request_origin,
+            referrer_policy,
         );
 
         if (use_cache and response.status == .ok and response.cache_control.isCacheable()) {
@@ -869,6 +954,7 @@ pub const Url = struct {
                 response.csp_header,
                 final_url_text,
                 response.cache_control,
+                response.referrer_policy,
                 std.Io.Clock.awake.now(io).nanoseconds,
             ) catch |err| {
                 std.log.warn("Failed to cache {s}: {}", .{ cache_key, err });
@@ -892,6 +978,7 @@ pub const Url = struct {
         payload: ?[]const u8,
         final_url: ?*?Url,
         request_origin: ?[]const u8,
+        referrer_policy: ReferrerPolicy,
     ) !HttpResponse {
         // Build full URL for std.http.Client
         var url_builder = std.ArrayList(u8).empty;
@@ -931,6 +1018,13 @@ pub const Url = struct {
             });
         }
 
+        if (refererHeaderValue(referrer, self, referrer_policy)) |referer| {
+            try extra_headers.append(al, .{
+                .name = "Referer",
+                .value = referer,
+            });
+        }
+
         if (self.host) |host_slice| {
             if (cookieForRequest(
                 al,
@@ -967,6 +1061,7 @@ pub const Url = struct {
         var access_control_allow_origin_cleanup = true;
         defer if (access_control_allow_origin_cleanup) if (access_control_allow_origin) |hdr| al.free(hdr);
         var cache_control: CacheControl = .default;
+        var response_referrer_policy: ReferrerPolicy = .default;
 
         const max_attempts: usize = 2;
         var attempt: usize = 0;
@@ -1047,6 +1142,10 @@ pub const Url = struct {
                         access_control_allow_origin = try al.dupe(u8, trimmed);
                     } else if (std.ascii.eqlIgnoreCase(header.name, "cache-control")) {
                         cache_control.apply(header.value);
+                    } else if (std.ascii.eqlIgnoreCase(header.name, "referrer-policy")) {
+                        if (parseReferrerPolicy(header.value)) |parsed| {
+                            response_referrer_policy = parsed;
+                        }
                     }
                 }
             }
@@ -1115,6 +1214,7 @@ pub const Url = struct {
                 .access_control_allow_origin = access_control_allow_origin,
                 .status = response.head.status,
                 .cache_control = cache_control,
+                .referrer_policy = response_referrer_policy,
             };
             csp_header_cleanup = false;
             access_control_allow_origin_cleanup = false;
@@ -1167,6 +1267,25 @@ pub const Url = struct {
         return buffer[0..href.len];
     }
 };
+
+/// Return the borrowed Referer request-header value for an outgoing request.
+/// Fragments never cross the network, and policy suppression affects only this
+/// header—not the source URL used for SameSite cookie decisions.
+pub fn refererHeaderValue(
+    referrer: ?Url,
+    target: Url,
+    policy: ReferrerPolicy,
+) ?[]const u8 {
+    const source = referrer orelse return null;
+    switch (policy) {
+        .default => {},
+        .no_referrer => return null,
+        .same_origin => if (!source.sameOrigin(target)) return null,
+    }
+    const href = source.ada_url.getHref();
+    const fragment = std.mem.indexOfScalar(u8, href, '#') orelse return href;
+    return href[0..fragment];
+}
 
 fn inheritFragment(allocator: std.mem.Allocator, source: Url, destination: *Url) !void {
     if (destination.ada_url.hasHash()) return;
@@ -1542,6 +1661,7 @@ test "CORS fetch sends Origin and target cookies and retains response opt-in" {
         io: std.Io,
         saw_origin: bool = false,
         saw_cookie: bool = false,
+        saw_referer: bool = false,
         err: ?anyerror = null,
 
         fn run(self: *@This()) void {
@@ -1571,6 +1691,8 @@ test "CORS fetch sends Origin and target cookies and retains response opt-in" {
                     self.saw_origin = std.mem.eql(u8, value, "http://source.example:8080");
                 } else if (std.ascii.eqlIgnoreCase(name, "cookie")) {
                     self.saw_cookie = std.mem.eql(u8, value, "token=secret");
+                } else if (std.ascii.eqlIgnoreCase(name, "referer")) {
+                    self.saw_referer = std.mem.eql(u8, value, "http://source.example:8080/page");
                 }
             }
 
@@ -1578,6 +1700,7 @@ test "CORS fetch sends Origin and target cookies and retains response opt-in" {
                 "HTTP/1.1 200 OK\r\n" ++
                     "Content-Length: 7\r\n" ++
                     "Access-Control-Allow-Origin: http://source.example:8080\r\n" ++
+                    "Referrer-Policy: same-origin\r\n" ++
                     "Connection: close\r\n\r\n" ++
                     "allowed",
             );
@@ -1621,7 +1744,7 @@ test "CORS fetch sends Origin and target cookies and retains response opt-in" {
         .http,
         1_600_000_000,
     ));
-    const source = try Url.init(allocator, "http://source.example:8080/page");
+    const source = try Url.init(allocator, "http://source.example:8080/page#private");
     defer source.free(allocator);
 
     const response = try Url.fetchBodyWithOrigin(
@@ -1644,7 +1767,9 @@ test "CORS fetch sends Origin and target cookies and retains response opt-in" {
     if (context.err) |err| return err;
     try std.testing.expect(context.saw_origin);
     try std.testing.expect(context.saw_cookie);
+    try std.testing.expect(context.saw_referer);
     try std.testing.expectEqualStrings("allowed", response.body);
+    try std.testing.expectEqual(ReferrerPolicy.same_origin, response.referrer_policy);
     try std.testing.expectEqualStrings(
         "http://source.example:8080",
         response.access_control_allow_origin.?,

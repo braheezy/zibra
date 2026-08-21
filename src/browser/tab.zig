@@ -165,6 +165,9 @@ pub const Frame = struct {
     // certificate navigation. Root-frame commits use this to suppress the
     // HTTPS padlock while retaining the requested URL in chrome and history.
     certificate_error: bool = false,
+    /// Policy received with this document generation. Every navigation and
+    /// subresource request originating here consults it before adding Referer.
+    referrer_policy: url_module.ReferrerPolicy = .default,
     current_html_source: ?[]const u8 = null,
     current_node: ?Node = null,
     document_layout: ?*Layout.DocumentLayout = null,

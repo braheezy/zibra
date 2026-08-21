@@ -2593,10 +2593,20 @@ pub const Browser = struct {
 
     // Update the scroll offset
     pub fn fetchBody(self: *Browser, url: Url, referrer: ?Url, payload: ?[]const u8) !url_module.HttpResponse {
+        return self.fetchBodyWithReferrerPolicy(url, referrer, payload, .default);
+    }
+
+    fn fetchBodyWithReferrerPolicy(
+        self: *Browser,
+        url: Url,
+        referrer: ?Url,
+        payload: ?[]const u8,
+        referrer_policy: url_module.ReferrerPolicy,
+    ) !url_module.HttpResponse {
         self.session_state.network_lock.lock();
         defer self.session_state.network_lock.unlock();
 
-        return url_module.Url.fetchBody(
+        return url_module.Url.fetchBodyWithReferrerPolicy(
             self.allocator,
             self.io,
             &self.session_state.http_client,
@@ -2605,6 +2615,7 @@ pub const Browser = struct {
             url,
             referrer,
             payload,
+            referrer_policy,
         );
     }
 
@@ -2614,11 +2625,12 @@ pub const Browser = struct {
         referrer: ?Url,
         payload: ?[]const u8,
         request_origin: []const u8,
+        referrer_policy: url_module.ReferrerPolicy,
     ) !url_module.HttpResponse {
         self.session_state.network_lock.lock();
         defer self.session_state.network_lock.unlock();
 
-        return url_module.Url.fetchBodyWithOrigin(
+        return url_module.Url.fetchBodyWithOriginAndReferrerPolicy(
             self.allocator,
             self.io,
             &self.session_state.http_client,
@@ -2628,6 +2640,7 @@ pub const Browser = struct {
             referrer,
             payload,
             request_origin,
+            referrer_policy,
         );
     }
 
@@ -2637,11 +2650,12 @@ pub const Browser = struct {
         referrer: ?Url,
         payload: ?[]const u8,
         final_url: *?Url,
+        referrer_policy: url_module.ReferrerPolicy,
     ) !url_module.HttpResponse {
         self.session_state.network_lock.lock();
         defer self.session_state.network_lock.unlock();
 
-        return url_module.Url.fetchBodyWithFinalUrl(
+        return url_module.Url.fetchBodyWithFinalUrlAndReferrerPolicy(
             self.allocator,
             self.io,
             &self.session_state.http_client,
@@ -2651,6 +2665,7 @@ pub const Browser = struct {
             referrer,
             payload,
             final_url,
+            referrer_policy,
         );
     }
 
@@ -2663,6 +2678,23 @@ pub const Browser = struct {
         payload: ?[]const u8,
         final_url: ?*?Url,
     ) !NavigationDocument {
+        return self.fetchNavigationDocumentWithReferrerPolicy(
+            url,
+            referrer,
+            payload,
+            final_url,
+            .default,
+        );
+    }
+
+    fn fetchNavigationDocumentWithReferrerPolicy(
+        self: *Browser,
+        url: Url,
+        referrer: ?Url,
+        payload: ?[]const u8,
+        final_url: ?*?Url,
+        referrer_policy: url_module.ReferrerPolicy,
+    ) !NavigationDocument {
         if (final_url) |output| output.* = null;
 
         if (url.isAboutBookmarks()) {
@@ -2674,7 +2706,7 @@ pub const Browser = struct {
         }
 
         const response = if (final_url) |output|
-            self.fetchBodyForNavigation(url, referrer, payload, output) catch |err| {
+            self.fetchBodyForNavigation(url, referrer, payload, output, referrer_policy) catch |err| {
                 if (!url_module.Url.isCertificateError(err)) return err;
                 const body = try certificateWarningHtml(self.allocator, &url, err);
                 return .{
@@ -2684,7 +2716,7 @@ pub const Browser = struct {
                 };
             }
         else
-            self.fetchBody(url, referrer, payload) catch |err| {
+            self.fetchBodyWithReferrerPolicy(url, referrer, payload, referrer_policy) catch |err| {
                 if (!url_module.Url.isCertificateError(err)) return err;
                 const body = try certificateWarningHtml(self.allocator, &url, err);
                 return .{
@@ -2759,7 +2791,9 @@ pub const Browser = struct {
         std.log.info("Loading: {s}", .{url.*.path});
 
         var referrer_value: ?Url = null;
+        var referrer_policy: url_module.ReferrerPolicy = .default;
         if (tab.root_frame) |old_frame| {
+            referrer_policy = old_frame.referrer_policy;
             if (old_frame.current_url) |ref_ptr| {
                 referrer_value = ref_ptr.*;
             }
@@ -2769,11 +2803,12 @@ pub const Browser = struct {
         // remains usable if navigation fails before commit.
         var final_url: ?Url = null;
         errdefer if (final_url) |resolved| resolved.free(self.allocator);
-        var document = try self.fetchNavigationDocument(
+        var document = try self.fetchNavigationDocumentWithReferrerPolicy(
             url.*,
             referrer_value,
             payload,
             &final_url,
+            referrer_policy,
         );
         defer document.deinit(self.allocator);
         const response = document.response;
@@ -2817,6 +2852,7 @@ pub const Browser = struct {
         frame.viewport_width = tab.tab_width;
         frame.viewport_height = tab.tab_height;
         frame.certificate_error = document.certificate_error;
+        frame.referrer_policy = response.referrer_policy;
         tab.focused_frame = frame;
 
         frame.scroll = 0;
@@ -3129,6 +3165,7 @@ pub const Browser = struct {
         frame.current_url = null;
         frame.current_url_owned = false;
         frame.certificate_error = false;
+        frame.referrer_policy = .default;
         frame.resources_dirty = false;
         frame.content_height = 0;
         frame.scroll = 0;
@@ -3155,17 +3192,19 @@ pub const Browser = struct {
         }
 
         var referrer_value: ?Url = null;
+        const referrer_policy = frame.referrer_policy;
         if (frame.current_url) |ref_ptr| {
             referrer_value = ref_ptr.*;
         }
 
         var final_url: ?Url = null;
         errdefer if (final_url) |resolved| resolved.free(self.allocator);
-        var document = try self.fetchNavigationDocument(
+        var document = try self.fetchNavigationDocumentWithReferrerPolicy(
             url.*,
             referrer_value,
             payload,
             &final_url,
+            referrer_policy,
         );
         defer document.deinit(self.allocator);
         const response = document.response;
@@ -3205,6 +3244,7 @@ pub const Browser = struct {
         self.retireRenderStateForTab(frame.tab);
         self.resetFrameForNavigation(frame);
         frame.certificate_error = document.certificate_error;
+        frame.referrer_policy = response.referrer_policy;
 
         frame.clearAllowedOrigins();
         if (response.csp_header) |hdr| {
@@ -3380,7 +3420,12 @@ pub const Browser = struct {
                         continue;
                     }
 
-                    const image_response = self.fetchBody(image_url, page_url.*, null) catch |err| {
+                    const image_response = self.fetchBodyWithReferrerPolicy(
+                        image_url,
+                        page_url.*,
+                        null,
+                        frame.referrer_policy,
+                    ) catch |err| {
                         std.log.warn("Failed to load image {s}: {}", .{ src, err });
                         self.allocator.free(cache_key);
                         if (element.image_data) |*existing| {
@@ -3543,11 +3588,12 @@ pub const Browser = struct {
 
         var final_url: ?Url = null;
         errdefer if (final_url) |resolved| resolved.free(self.allocator);
-        var document = try self.fetchNavigationDocument(
+        var document = try self.fetchNavigationDocumentWithReferrerPolicy(
             iframe_url,
             page_url.*,
             null,
             &final_url,
+            parent.referrer_policy,
         );
         defer document.deinit(self.allocator);
         const response = document.response;
@@ -3565,6 +3611,7 @@ pub const Browser = struct {
         const frame = try parent.allocator.create(Frame);
         frame.* = Frame.init(parent.allocator, parent.tab, parent, iframe_node);
         frame.certificate_error = document.certificate_error;
+        frame.referrer_policy = response.referrer_policy;
         errdefer {
             frame.deinit();
             parent.allocator.destroy(frame);
@@ -3706,7 +3753,12 @@ pub const Browser = struct {
             return;
         }
 
-        const script_response = self.fetchBody(script_url, page_url.*, null) catch |err| {
+        const script_response = self.fetchBodyWithReferrerPolicy(
+            script_url,
+            page_url.*,
+            null,
+            frame.referrer_policy,
+        ) catch |err| {
             std.log.warn("Failed to load script {s}: {}", .{ src, err });
             return;
         };
@@ -3978,7 +4030,12 @@ pub const Browser = struct {
                 continue;
             }
 
-            const css_response = self.fetchBody(stylesheet_url, page_url.*, null) catch |err| {
+            const css_response = self.fetchBodyWithReferrerPolicy(
+                stylesheet_url,
+                page_url.*,
+                null,
+                frame.referrer_policy,
+            ) catch |err| {
                 std.log.warn("Failed to load stylesheet {s}: {}", .{ href, err });
                 continue;
             };
@@ -4139,6 +4196,7 @@ pub const Browser = struct {
         js_context: *JsRenderContext,
         resolved_url: Url,
         referrer: ?Url,
+        referrer_policy: url_module.ReferrerPolicy,
         payload: ?[]const u8,
         handle: u32,
     ) !void {
@@ -4166,6 +4224,7 @@ pub const Browser = struct {
             },
             resolved_copy,
             referrer_copy,
+            referrer_policy,
             payload,
             handle,
         );
@@ -7183,6 +7242,7 @@ const XhrThreadContext = struct {
     document: DocumentHandle,
     resolved_url: Url,
     referrer: ?Url,
+    referrer_policy: url_module.ReferrerPolicy,
     payload: ?[]const u8,
     handle: u32,
 
@@ -7193,6 +7253,7 @@ const XhrThreadContext = struct {
         document: DocumentHandle,
         resolved_url: Url,
         referrer: ?Url,
+        referrer_policy: url_module.ReferrerPolicy,
         payload: ?[]const u8,
         handle: u32,
     ) !*XhrThreadContext {
@@ -7211,6 +7272,7 @@ const XhrThreadContext = struct {
             .document = document,
             .resolved_url = resolved_url,
             .referrer = referrer,
+            .referrer_policy = referrer_policy,
             .payload = payload_copy,
             .handle = handle,
         };
@@ -7273,12 +7335,14 @@ fn runXhrThread(ctx: *XhrThreadContext) void {
             ctx.referrer,
             ctx.payload,
             origin,
+            ctx.referrer_policy,
         )
     else
-        ctx.browser.fetchBody(
+        ctx.browser.fetchBodyWithReferrerPolicy(
             ctx.resolved_url,
             ctx.referrer,
             ctx.payload,
+            ctx.referrer_policy,
         )) catch |err| {
         std.log.warn("Async XHR failed: {}", .{err});
         return;
@@ -7560,7 +7624,15 @@ fn jsXhrCallback(
     }
 
     if (is_async) {
-        try browser.scheduleAsyncXhr(tab, ctx, resolved_url, current_url_value, body, handle);
+        try browser.scheduleAsyncXhr(
+            tab,
+            ctx,
+            resolved_url,
+            current_url_value,
+            frame.referrer_policy,
+            body,
+            handle,
+        );
         return .{ .data = "", .allocator = null, .should_free = false };
     }
 
@@ -7568,9 +7640,20 @@ fn jsXhrCallback(
     defer if (request_origin) |origin| allocator.free(origin);
 
     const response = if (request_origin) |origin|
-        try browser.fetchBodyWithOrigin(resolved_url, current_url_value, body, origin)
+        try browser.fetchBodyWithOrigin(
+            resolved_url,
+            current_url_value,
+            body,
+            origin,
+            frame.referrer_policy,
+        )
     else
-        try browser.fetchBody(resolved_url, current_url_value, body);
+        try browser.fetchBodyWithReferrerPolicy(
+            resolved_url,
+            current_url_value,
+            body,
+            frame.referrer_policy,
+        );
     defer if (response.csp_header) |hdr| allocator.free(hdr);
     defer if (response.access_control_allow_origin) |hdr| allocator.free(hdr);
 

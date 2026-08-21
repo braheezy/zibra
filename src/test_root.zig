@@ -19,6 +19,7 @@ comptime {
     _ = @import("tests/browser_security.zig");
     _ = @import("tests/browser_cookies.zig");
     _ = @import("tests/browser_cors.zig");
+    _ = @import("tests/browser_referrer.zig");
     _ = @import("tests/parser.zig");
     _ = @import("network/url.zig");
     _ = @import("runtime/task.zig");

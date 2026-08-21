@@ -43,6 +43,11 @@ before changing `root.zig`, `tab.zig`, `render/`, or browser task scheduling.
   for an exact or wildcard Access-Control-Allow-Origin response. Synchronous
   denial becomes `CrossOriginBlocked`; asynchronous denial discards the owned
   response and never queues `onload`. CSP can still block before the fetch.
+- Each Frame stores the Referrer-Policy received with its current document
+  generation. Install it before discovering images, iframes, scripts, and
+  stylesheets; navigations and XHR also use that source policy. Async XHR must
+  copy the policy alongside its cloned target and referrer so later navigation
+  cannot change an in-flight request's disclosure decision.
 - Address-bar interpretation belongs to `chrome.zig`, not general URL or link
   resolution. Explicit schemes and obvious bare hosts navigate directly;
   ordinary text becomes a form-encoded Google query. Keep document-authored

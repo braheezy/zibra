@@ -1,0 +1,34 @@
+<!--
+How to verify:
+1. Run `python3 server.py` from the repository root.
+2. Open this file in Zibra and follow the two probe links below.
+3. On the default page, both target links must show the complete source URL
+   without its `#private-fragment`.
+4. On the no-referrer page, both target links must show `(none)`.
+5. On the same-origin page, its same-origin target must show the complete
+   source URL without a fragment. Its cross-origin target must show `(none)`.
+   Keep `localhost` in the source URL; the cross-origin link deliberately uses
+   `127.0.0.1` on the same server.
+-->
+<!doctype html>
+<html>
+  <head>
+    <title>Referrer policy checks</title>
+    <style>
+      body { font: 18px sans-serif; margin: 32px; }
+      a { display: block; margin: 18px 0; }
+    </style>
+  </head>
+  <body>
+    <h1>Referrer policy checks</h1>
+    <a href="http://localhost:8005/referrer-policy?policy=default#private-fragment">
+      Test default Referer
+    </a>
+    <a href="http://localhost:8005/referrer-policy?policy=no-referrer#private-fragment">
+      Test no-referrer
+    </a>
+    <a href="http://localhost:8005/referrer-policy?policy=same-origin#private-fragment">
+      Test same-origin
+    </a>
+  </body>
+</html>

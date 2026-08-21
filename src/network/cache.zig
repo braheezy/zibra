@@ -1,10 +1,19 @@
 //! Browser-session HTTP response cache and Cache-Control policy parsing.
 //!
 //! Entries own their URL key, decoded response body, CSP header, and final
-//! redirect URL. `lookup` returns borrowed entry data; callers must copy any
+//! redirect URL. They also retain response policies needed when recreating a
+//! document fetch. `lookup` returns borrowed entry data; callers must copy any
 //! fields that need to outlive the next cache mutation.
 
 const std = @import("std");
+
+/// The Referrer-Policy values understood by Zibra. `default` preserves the
+/// tutorial's behavior of sending the source URL to any HTTP(S) destination.
+pub const ReferrerPolicy = enum {
+    default,
+    no_referrer,
+    same_origin,
+};
 
 /// The subset of Cache-Control understood by Zibra.
 pub const CacheControl = union(enum) {
@@ -77,6 +86,7 @@ pub const HttpCache = struct {
         csp_header: ?[]u8,
         final_url: ?[]u8,
         policy: CacheControl,
+        referrer_policy: ReferrerPolicy,
         expires_at_ns: ?i96,
     };
 
@@ -123,6 +133,7 @@ pub const HttpCache = struct {
         csp_header: ?[]const u8,
         final_url: ?[]const u8,
         policy: CacheControl,
+        referrer_policy: ReferrerPolicy,
         now_ns: i96,
     ) !void {
         std.debug.assert(policy.isCacheable());
@@ -144,6 +155,7 @@ pub const HttpCache = struct {
             .csp_header = csp_copy,
             .final_url = final_url_copy,
             .policy = policy,
+            .referrer_policy = referrer_policy,
             .expires_at_ns = expires_at_ns,
         };
 
@@ -189,10 +201,11 @@ test "HTTP cache expires max-age entries and retains default entries" {
     var cache = HttpCache.init(std.testing.allocator);
     defer cache.deinit();
 
-    try cache.store("https://example.com/default", "default", null, null, .default, 10);
+    try cache.store("https://example.com/default", "default", null, null, .default, .same_origin, 10);
     try std.testing.expectEqualStrings("default", cache.lookup("https://example.com/default", 1_000_000).?.body);
+    try std.testing.expectEqual(ReferrerPolicy.same_origin, cache.lookup("https://example.com/default", 1_000_000).?.referrer_policy);
 
-    try cache.store("https://example.com/timed", "timed", null, null, .{ .max_age = 2 }, 10);
+    try cache.store("https://example.com/timed", "timed", null, null, .{ .max_age = 2 }, .default, 10);
     try std.testing.expect(cache.lookup("https://example.com/timed", 10 + std.time.ns_per_s) != null);
     try std.testing.expect(cache.lookup("https://example.com/timed", 10 + 2 * std.time.ns_per_s) == null);
 }

@@ -39,9 +39,14 @@ before changing URL or response ownership.
   boundary; document navigation may turn it into browser UI, while subresource
   fetches must continue returning the transport error to their caller.
 - Cache hits must preserve the normal fetch ownership contract by returning
-  caller-owned body and header copies. Interactive cache, cookie, and HTTP
-  client state belongs to the shared `BrowserSession` and is protected by its
-  dedicated network mutex; standalone screenshot browsers own their session.
+  caller-owned body and header copies, and must reproduce response metadata
+  such as Referrer-Policy. Interactive cache, cookie, and HTTP client state
+  belongs to the shared `BrowserSession` and is protected by its dedicated
+  network mutex; standalone screenshot browsers own their session.
+- Referer generation borrows the source URL only for the synchronous request,
+  omits its fragment, and applies the source document's `no-referrer` or
+  `same-origin` policy. Policy suppression must not erase the request context:
+  SameSite cookie checks still receive the unsuppressed source URL.
 - Cross-origin XHR uses the explicit Origin-bearing fetch path. That path
   bypasses the ordinary response cache, still selects target-host cookies, and
   returns an owned `access_control_allow_origin` header for the XHR policy

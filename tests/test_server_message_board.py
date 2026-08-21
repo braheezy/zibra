@@ -107,6 +107,30 @@ class MessageBoardTests(unittest.TestCase):
         self.assertIn(b"Access-Control-Allow-Origin: *\r\n", headers + b"\r\n")
         self.assertEqual(b"XHR OK", body)
 
+    def test_referrer_policy_probe_emits_policy_and_echoes_referer(self):
+        connection = MemoryConnection(
+            b"GET /referrer-policy?policy=no-referrer HTTP/1.0\r\n"
+            b"Host: localhost:8005\r\n\r\n"
+        )
+        server.handle_connection(connection, now=1_000)
+        headers, body = connection.response.split(b"\r\n\r\n", 1)
+        self.assertIn(b"Referrer-Policy: no-referrer\r\n", headers + b"\r\n")
+        self.assertIn(b"Same-origin target", body)
+        self.assertIn(b"Cross-origin target", body)
+
+        status, echoed = server.do_request(
+            {},
+            "GET",
+            "/referer",
+            {"referer": "http://localhost:8005/source?private=yes"},
+            None,
+        )
+        self.assertEqual("200 OK", status)
+        self.assertIn("http://localhost:8005/source?private=yes", echoed)
+
+        _, absent = server.do_request({}, "GET", "/referer", {}, None)
+        self.assertIn("(none)", absent)
+
     def test_home_lists_each_topic_at_its_own_url(self):
         status, body = request({}, "GET", "/")
 

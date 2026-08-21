@@ -29,6 +29,8 @@ RESERVED_TOPIC_SLUGS = {
     "eventloop-js",
     "login",
     "new-topic",
+    "referer",
+    "referrer-policy",
     "xhr",
     "xhr-denied",
 }
@@ -289,6 +291,11 @@ def handle_connection(conx, now=None):
     response += template.format(token, expiration)
     if urllib.parse.urlsplit(url).path.rstrip("/") == "/xhr":
         response += "Access-Control-Allow-Origin: *\r\n"
+    request_url = urllib.parse.urlsplit(url)
+    if request_url.path.rstrip("/") == "/referrer-policy":
+        policy = urllib.parse.parse_qs(request_url.query).get("policy", [""])[0]
+        if policy in {"no-referrer", "same-origin"}:
+            response += "Referrer-Policy: {}\r\n".format(policy)
     response += "Content-Security-Policy: default-src 'self'\r\n"
     response += "\r\n"
     conx.sendall(response.encode("utf8") + encoded_body)
@@ -296,8 +303,8 @@ def handle_connection(conx, now=None):
 
 
 def do_request(session, method, url, headers, body):
-    del headers  # The application routes below currently need only session state.
-    path = urllib.parse.urlsplit(url).path
+    request_url = urllib.parse.urlsplit(url)
+    path = request_url.path
     if len(path) > 1:
         path = path.rstrip("/")
 
@@ -324,6 +331,12 @@ def do_request(session, method, url, headers, body):
         return "200 OK", "XHR OK"
     elif method == "GET" and path == "/xhr-denied":
         return "200 OK", "This response is intentionally not CORS-enabled"
+    elif method == "GET" and path == "/referer":
+        return "200 OK", show_referer(headers.get("referer"))
+    elif method == "GET" and path == "/referrer-policy":
+        policy = urllib.parse.parse_qs(request_url.query).get("policy", [""])[0]
+        if policy in {"default", "no-referrer", "same-origin"}:
+            return "200 OK", show_referrer_policy(policy)
 
     parts = [urllib.parse.unquote(part) for part in path.split("/") if part]
     if method == "GET" and len(parts) == 1 and parts[0] in TOPICS:
@@ -550,6 +563,27 @@ def show_count():
     out += "<div>XHR result pending</div>"
     out += "<script src=/eventloop.js></script>"
     return out
+
+
+def show_referer(value):
+    shown = value or "(none)"
+    return page(
+        "Referer received",
+        "<h1>Referer received</h1><p id=result>{}</p>".format(html.escape(shown)),
+    )
+
+
+def show_referrer_policy(policy):
+    return page(
+        "Referrer policy probe",
+        (
+            "<h1>Referrer-Policy: {policy}</h1>"
+            "<p><a href=/referer>Same-origin target</a></p>"
+            "<p><a href=http://127.0.0.1:8005/referer>Cross-origin target</a></p>"
+            "<p>Open this page through <b>localhost</b>, not 127.0.0.1, "
+            "so the second link changes origin.</p>"
+        ).format(policy=html.escape(policy)),
+    )
 
 
 def login_form(session):
