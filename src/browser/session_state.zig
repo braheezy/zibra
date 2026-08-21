@@ -13,6 +13,7 @@ const HttpCache = url_module.HttpCache;
 
 pub const BrowserSession = struct {
     allocator: std.mem.Allocator,
+    io: std.Io,
     /// Navigation metadata uses `lock`; network transport/cache/cookie state
     /// has an independent lock so fetches never nest with visited/bookmark
     /// publication.
@@ -39,6 +40,7 @@ pub const BrowserSession = struct {
     pub fn init(allocator: std.mem.Allocator, io: std.Io) BrowserSession {
         return .{
             .allocator = allocator,
+            .io = io,
             .lock = .init(io),
             .network_lock = .init(io),
             .http_client = .{ .allocator = allocator, .io = io },
@@ -78,7 +80,12 @@ pub const BrowserSession = struct {
     pub fn readCookieForScript(self: *BrowserSession, allocator: std.mem.Allocator, host: []const u8) ![]u8 {
         self.network_lock.lock();
         defer self.network_lock.unlock();
-        return url_module.cookieForScript(allocator, &self.cookie_jar, host);
+        return url_module.cookieForScript(
+            allocator,
+            &self.cookie_jar,
+            host,
+            std.Io.Clock.real.now(self.io).toSeconds(),
+        );
     }
 
     /// Apply one document.cookie assignment. Existing or incoming HttpOnly
@@ -86,7 +93,14 @@ pub const BrowserSession = struct {
     pub fn writeCookieFromScript(self: *BrowserSession, host: []const u8, value: []const u8) !bool {
         self.network_lock.lock();
         defer self.network_lock.unlock();
-        return url_module.applySetCookie(self.allocator, &self.cookie_jar, host, value, .script);
+        return url_module.applySetCookie(
+            self.allocator,
+            &self.cookie_jar,
+            host,
+            value,
+            .script,
+            std.Io.Clock.real.now(self.io).toSeconds(),
+        );
     }
 
     /// Record a canonical URL for this browser session. Returns whether a new

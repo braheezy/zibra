@@ -17,6 +17,7 @@ test "script cookies retain parameters and cannot access HttpOnly entries" {
         "private.example",
         "token=secret; SameSite=Lax; HttpOnly",
         .http,
+        1_600_000_000,
     ));
     const private_entry = session.cookie_jar.get("private.example").?;
     try std.testing.expectEqualStrings("token=secret", private_entry.value);
@@ -28,10 +29,12 @@ test "script cookies retain parameters and cannot access HttpOnly entries" {
     try std.testing.expectEqualStrings(
         "token=secret",
         url_module.cookieForRequest(
+            allocator,
             &session.cookie_jar,
             "private.example",
             .POST,
             same_origin,
+            1_600_000_000,
         ).?,
     );
 
@@ -53,6 +56,7 @@ test "script cookies retain parameters and cannot access HttpOnly entries" {
         "public.example",
         "theme=dark; SameSite=Lax; Path=/",
         .http,
+        1_600_000_000,
     ));
     const initial = try session.readCookieForScript(allocator, "public.example");
     defer allocator.free(initial);
@@ -76,6 +80,78 @@ test "script cookies retain parameters and cannot access HttpOnly entries" {
     const other_host = try session.readCookieForScript(allocator, "other.example");
     defer allocator.free(other_host);
     try std.testing.expectEqualStrings("", other_host);
+}
+
+test "cookie Expires is parsed, replaceable, and lazily evicted" {
+    const allocator = std.testing.allocator;
+    var jar = std.StringHashMap(url_module.CookieEntry).init(allocator);
+    defer {
+        var iterator = jar.iterator();
+        while (iterator.next()) |entry| {
+            entry.value_ptr.deinit(allocator);
+            allocator.free(entry.key_ptr.*);
+        }
+        jar.deinit();
+    }
+
+    const now: i64 = 1_600_000_000;
+    try std.testing.expectEqual(
+        @as(?i64, 1_623_233_894),
+        url_module.parseCookieExpiration("Wed, 09 Jun 2021 10:18:14 GMT"),
+    );
+    try std.testing.expect(url_module.parseCookieExpiration("Wed, 31 Feb 2021 10:18:14 GMT") == null);
+
+    try std.testing.expect(try url_module.applySetCookie(
+        allocator,
+        &jar,
+        "expiry.example",
+        "token=first; Expires=Wed, 09 Jun 2021 10:18:14 GMT; SameSite=Lax",
+        .http,
+        now,
+    ));
+    try std.testing.expectEqual(@as(?i64, 1_623_233_894), jar.get("expiry.example").?.expires_at);
+
+    // A later Set-Cookie for the same host replaces both the value and its
+    // absolute expiration instead of retaining the earlier deadline.
+    try std.testing.expect(try url_module.applySetCookie(
+        allocator,
+        &jar,
+        "expiry.example",
+        "token=second; Expires=Tue, 01 Jan 2030 00:00:00 GMT",
+        .http,
+        now,
+    ));
+    try std.testing.expectEqualStrings("token=second", jar.get("expiry.example").?.value);
+    try std.testing.expectEqual(@as(?i64, 1_893_456_000), jar.get("expiry.example").?.expires_at);
+
+    const visible = try url_module.cookieForScript(allocator, &jar, "expiry.example", 1_800_000_000);
+    defer allocator.free(visible);
+    try std.testing.expectEqualStrings(
+        "token=second; Expires=Tue, 01 Jan 2030 00:00:00 GMT",
+        visible,
+    );
+
+    // The read at the exact expiry boundary deletes the owning key/value and
+    // exposes neither a Cookie header nor a document.cookie value afterward.
+    try std.testing.expect(url_module.cookieForRequest(
+        allocator,
+        &jar,
+        "expiry.example",
+        .GET,
+        null,
+        1_893_456_000,
+    ) == null);
+    try std.testing.expect(jar.get("expiry.example") == null);
+
+    try std.testing.expect(try url_module.applySetCookie(
+        allocator,
+        &jar,
+        "expiry.example",
+        "token=gone; Expires=Thu, 01 Jan 1970 00:00:00 GMT",
+        .script,
+        now,
+    ));
+    try std.testing.expect(jar.get("expiry.example") == null);
 }
 
 const MockCookieContext = struct {

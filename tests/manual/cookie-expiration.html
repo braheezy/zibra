@@ -1,0 +1,29 @@
+<!--
+How to verify:
+1. Serve tests/manual from a local HTTP server:
+   python3 -m http.server 8000 --directory tests/manual
+2. Open http://127.0.0.1:8000/cookie-expiration.html in Zibra.
+3. The page must report PASS. The future cookie must be visible before the same
+   host cookie is overwritten with an expiration in the past and disappears.
+-->
+<!doctype html>
+<html>
+  <head><title>Cookie expiration</title></head>
+  <body>
+    <h1>Cookie expiration</h1>
+    <p id="status">FAIL: script did not run</p>
+    <script>
+      document.cookie = "expiry=future; Expires=Tue, 09 Jun 2099 10:18:14 GMT";
+      var before = document.cookie;
+      document.cookie = "expiry=gone; Expires=Thu, 01 Jan 1970 00:00:00 GMT";
+      var after = document.cookie;
+      if (before === "expiry=future; Expires=Tue, 09 Jun 2099 10:18:14 GMT" &&
+          after === "") {
+        status.innerHTML = "PASS: future cookie retained, past cookie deleted";
+      } else {
+        status.innerHTML = "FAIL: before=" + before + " after=" + after;
+      }
+      undefined;
+    </script>
+  </body>
+</html>

@@ -47,6 +47,9 @@ pub const CookieEntry = struct {
     parameters: ?[]u8 = null,
     same_site: SameSiteMode = .none,
     http_only: bool = false,
+    /// Absolute Unix time parsed from Expires. Null entries last for the
+    /// browser session; expired entries are removed before any read.
+    expires_at: ?i64 = null,
 
     pub fn deinit(self: *CookieEntry, allocator: std.mem.Allocator) void {
         allocator.free(self.value);
@@ -65,7 +68,78 @@ const ParsedCookie = struct {
     parameters: ?[]const u8,
     same_site: SameSiteMode,
     http_only: bool,
+    expires_at: ?i64,
 };
+
+fn cookieMonth(value: []const u8) ?u8 {
+    const names = [_][]const u8{
+        "Jan", "Feb", "Mar", "Apr", "May", "Jun",
+        "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
+    };
+    for (names, 1..) |name, month| {
+        if (std.ascii.eqlIgnoreCase(value, name)) return @intCast(month);
+    }
+    return null;
+}
+
+fn cookieDaysInMonth(year: i64, month: u8) u8 {
+    return switch (month) {
+        1, 3, 5, 7, 8, 10, 12 => 31,
+        4, 6, 9, 11 => 30,
+        2 => if (@mod(year, 4) == 0 and (@mod(year, 100) != 0 or @mod(year, 400) == 0)) 29 else 28,
+        else => 0,
+    };
+}
+
+/// Convert a civil UTC date to days since 1970-01-01. This is the inverse of
+/// the standard epoch decomposition and also handles valid pre-epoch dates.
+fn daysFromCivil(year_value: i64, month: u8, day: u8) i64 {
+    var year = year_value;
+    if (month <= 2) year -= 1;
+    const era = @divFloor(year, 400);
+    const year_of_era = year - era * 400;
+    const month_shift: i64 = if (month > 2) -3 else 9;
+    const shifted_month: i64 = @as(i64, month) + month_shift;
+    const day_of_year = @divFloor(153 * shifted_month + 2, 5) + @as(i64, day) - 1;
+    const day_of_era = year_of_era * 365 + @divFloor(year_of_era, 4) -
+        @divFloor(year_of_era, 100) + day_of_year;
+    return era * 146097 + day_of_era - 719468;
+}
+
+/// Parse the IMF-fixdate form emitted by HTTP servers, for example
+/// `Wed, 09 Jun 2021 10:18:14 GMT`. Invalid Expires attributes are ignored by
+/// the cookie parser rather than rejecting an otherwise usable cookie.
+pub fn parseCookieExpiration(value: []const u8) ?i64 {
+    const trimmed = std.mem.trim(u8, value, " \t\r\n");
+    const date = if (std.mem.indexOfScalar(u8, trimmed, ',')) |comma|
+        std.mem.trim(u8, trimmed[comma + 1 ..], " \t")
+    else
+        trimmed;
+
+    var parts = std.mem.tokenizeAny(u8, date, " \t");
+    const day_text = parts.next() orelse return null;
+    const month_text = parts.next() orelse return null;
+    const year_text = parts.next() orelse return null;
+    const time_text = parts.next() orelse return null;
+    const zone = parts.next() orelse return null;
+    if (parts.next() != null or !std.ascii.eqlIgnoreCase(zone, "GMT")) return null;
+
+    const day = std.fmt.parseInt(u8, day_text, 10) catch return null;
+    const month = cookieMonth(month_text) orelse return null;
+    var year = std.fmt.parseInt(i64, year_text, 10) catch return null;
+    if (year_text.len == 2) year += if (year >= 70) 1900 else 2000;
+    if (year < 1601 or year > 9999 or day == 0 or day > cookieDaysInMonth(year, month)) return null;
+
+    var clock = std.mem.splitScalar(u8, time_text, ':');
+    const hour = std.fmt.parseInt(u8, clock.next() orelse return null, 10) catch return null;
+    const minute = std.fmt.parseInt(u8, clock.next() orelse return null, 10) catch return null;
+    const second = std.fmt.parseInt(u8, clock.next() orelse return null, 10) catch return null;
+    if (clock.next() != null or hour > 23 or minute > 59 or second > 59) return null;
+
+    return daysFromCivil(year, month, day) * std.time.s_per_day +
+        @as(i64, hour) * std.time.s_per_hour +
+        @as(i64, minute) * std.time.s_per_min + second;
+}
 
 fn parseSetCookie(value: []const u8) ?ParsedCookie {
     const trimmed = std.mem.trim(u8, value, " \t\r\n");
@@ -85,6 +159,7 @@ fn parseSetCookie(value: []const u8) ?ParsedCookie {
     } else null;
     var same_site: SameSiteMode = .none;
     var http_only = false;
+    var expires_at: ?i64 = null;
     if (parameters) |attributes| {
         var iterator = std.mem.tokenizeScalar(u8, attributes, ';');
         while (iterator.next()) |raw_attribute| {
@@ -95,6 +170,8 @@ fn parseSetCookie(value: []const u8) ?ParsedCookie {
                 const attribute_value = std.mem.trim(u8, attribute[equals + 1 ..], " \t");
                 if (std.ascii.eqlIgnoreCase(key, "samesite")) {
                     same_site = if (std.ascii.eqlIgnoreCase(attribute_value, "lax")) .lax else .none;
+                } else if (std.ascii.eqlIgnoreCase(key, "expires")) {
+                    expires_at = parseCookieExpiration(attribute_value);
                 }
             } else if (std.ascii.eqlIgnoreCase(attribute, "samesite")) {
                 same_site = .lax;
@@ -108,7 +185,32 @@ fn parseSetCookie(value: []const u8) ?ParsedCookie {
         .parameters = parameters,
         .same_site = same_site,
         .http_only = http_only,
+        .expires_at = expires_at,
     };
+}
+
+fn removeCookie(
+    allocator: std.mem.Allocator,
+    cookie_jar: *std.StringHashMap(CookieEntry),
+    host: []const u8,
+) bool {
+    const removed = cookie_jar.fetchRemove(host) orelse return false;
+    var value = removed.value;
+    value.deinit(allocator);
+    allocator.free(removed.key);
+    return true;
+}
+
+fn removeCookieIfExpired(
+    allocator: std.mem.Allocator,
+    cookie_jar: *std.StringHashMap(CookieEntry),
+    host: []const u8,
+    now_seconds: i64,
+) bool {
+    const entry = cookie_jar.get(host) orelse return false;
+    const expires_at = entry.expires_at orelse return false;
+    if (expires_at > now_seconds) return false;
+    return removeCookie(allocator, cookie_jar, host);
 }
 
 /// Parse and atomically install one tutorial-style cookie for a host. HTTP
@@ -120,13 +222,21 @@ pub fn applySetCookie(
     host: []const u8,
     raw_value: []const u8,
     source: CookieSource,
+    now_seconds: i64,
 ) !bool {
     if (host.len == 0) return false;
     const parsed = parseSetCookie(raw_value) orelse return false;
+    _ = removeCookieIfExpired(allocator, cookie_jar, host, now_seconds);
     if (source == .script and parsed.http_only) return false;
     if (source == .script) {
         if (cookie_jar.get(host)) |existing| {
             if (existing.http_only) return false;
+        }
+    }
+    if (parsed.expires_at) |expires_at| {
+        if (expires_at <= now_seconds) {
+            _ = removeCookie(allocator, cookie_jar, host);
+            return true;
         }
     }
 
@@ -143,6 +253,7 @@ pub fn applySetCookie(
         .parameters = parameters_copy,
         .same_site = parsed.same_site,
         .http_only = parsed.http_only,
+        .expires_at = parsed.expires_at,
     };
     if (cookie_jar.getPtr(host)) |existing| {
         existing.deinit(allocator);
@@ -160,9 +271,11 @@ pub fn applySetCookie(
 /// indistinguishable from a missing cookie at this boundary.
 pub fn cookieForScript(
     allocator: std.mem.Allocator,
-    cookie_jar: *const std.StringHashMap(CookieEntry),
+    cookie_jar: *std.StringHashMap(CookieEntry),
     host: []const u8,
+    now_seconds: i64,
 ) ![]u8 {
+    _ = removeCookieIfExpired(allocator, cookie_jar, host, now_seconds);
     const entry = cookie_jar.get(host) orelse return allocator.dupe(u8, "");
     if (entry.http_only) return allocator.dupe(u8, "");
     if (entry.parameters) |parameters| {
@@ -175,11 +288,14 @@ pub fn cookieForScript(
 /// visibility; it never prevents the browser from authenticating HTTP or XHR
 /// requests. SameSite keeps its existing tutorial behavior.
 pub fn cookieForRequest(
-    cookie_jar: *const std.StringHashMap(CookieEntry),
+    allocator: std.mem.Allocator,
+    cookie_jar: *std.StringHashMap(CookieEntry),
     host: []const u8,
     method: std.http.Method,
     referrer: ?Url,
+    now_seconds: i64,
 ) ?[]const u8 {
+    _ = removeCookieIfExpired(allocator, cookie_jar, host, now_seconds);
     const entry = cookie_jar.get(host) orelse return null;
     if (entry.same_site == .lax and method != .GET) {
         if (referrer) |ref| {
@@ -747,7 +863,14 @@ pub const Url = struct {
         const method: std.http.Method = if (payload != null) .POST else .GET;
 
         if (self.host) |host_slice| {
-            if (cookieForRequest(cookie_jar, host_slice, method, referrer)) |cookie_value| {
+            if (cookieForRequest(
+                al,
+                cookie_jar,
+                host_slice,
+                method,
+                referrer,
+                std.Io.Clock.real.now(http_client.io).toSeconds(),
+            )) |cookie_value| {
                 try extra_headers.append(al, .{
                     .name = "Cookie",
                     .value = cookie_value,
@@ -828,7 +951,14 @@ pub const Url = struct {
                 var header_it = response.head.iterateHeaders();
                 while (header_it.next()) |header| {
                     if (std.ascii.eqlIgnoreCase(header.name, "set-cookie")) {
-                        _ = try applySetCookie(al, cookie_jar, cookie_host, header.value, .http);
+                        _ = try applySetCookie(
+                            al,
+                            cookie_jar,
+                            cookie_host,
+                            header.value,
+                            .http,
+                            std.Io.Clock.real.now(http_client.io).toSeconds(),
+                        );
                     } else if (std.ascii.eqlIgnoreCase(header.name, "content-security-policy")) {
                         if (csp_header) |existing| {
                             al.free(existing);

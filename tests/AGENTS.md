@@ -64,6 +64,11 @@ getter/setter and retained parameter serialization when served from localhost;
 unit coverage supplies server-originated HttpOnly entries and proves they are
 still request-visible but script-hidden and script-immutable.
 
+`tests/manual/cookie-expiration.html` verifies that a future absolute Expires
+date remains script-visible and that replacing it with a past date deletes the
+cookie immediately. The tutorial message-board tests cover matching server-side
+deadlines, sliding renewal, and stale-session cleanup.
+
 `tests/manual/rich-buttons.html` verifies inline rich-button containment,
 block-driven height growth, independently targetable input/link descendants,
 and nested-button parser recovery.

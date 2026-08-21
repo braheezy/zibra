@@ -1,4 +1,5 @@
 import importlib.util
+import io
 from pathlib import Path
 import tempfile
 import unittest
@@ -16,6 +17,23 @@ def request(session, method, path, params=None):
     return server.do_request(session, method, path, {}, body)
 
 
+class MemoryConnection:
+    def __init__(self, request_bytes):
+        self.request = io.BytesIO(request_bytes)
+        self.response = b""
+        self.closed = False
+
+    def makefile(self, mode):
+        self.assert_binary_mode = mode
+        return self.request
+
+    def sendall(self, data):
+        self.response += data
+
+    def close(self):
+        self.closed = True
+
+
 class MessageBoardTests(unittest.TestCase):
     def setUp(self):
         self.temporary_directory = tempfile.TemporaryDirectory()
@@ -26,6 +44,56 @@ class MessageBoardTests(unittest.TestCase):
 
     def tearDown(self):
         self.temporary_directory.cleanup()
+
+    def test_sessions_store_and_refresh_their_cookie_expiration(self):
+        token, session, first_expiration = server.open_session(now=1_000)
+        self.assertEqual(1_000 + server.SESSION_LIFETIME_SECONDS, first_expiration)
+        self.assertIs(session, server.SESSIONS[token]["data"])
+        self.assertEqual(first_expiration, server.SESSIONS[token]["expires_at"])
+
+        session["user"] = "a"
+        same_token, same_session, later_expiration = server.open_session(
+            "unrelated=x; token={}; another=y".format(token),
+            now=2_000,
+        )
+        self.assertEqual(token, same_token)
+        self.assertIs(session, same_session)
+        self.assertEqual("a", same_session["user"])
+        self.assertGreater(later_expiration, first_expiration)
+        self.assertEqual(later_expiration, server.SESSIONS[token]["expires_at"])
+
+    def test_expired_sessions_are_deleted_before_cookie_lookup(self):
+        server.SESSIONS.update(
+            {
+                "expired": {"data": {"user": "a"}, "expires_at": 99},
+                "live": {"data": {"user": "b"}, "expires_at": 101},
+            }
+        )
+
+        self.assertEqual(1, server.delete_expired_sessions(now=100))
+        self.assertNotIn("expired", server.SESSIONS)
+        self.assertIn("live", server.SESSIONS)
+
+        replacement, _, _ = server.open_session("token=expired", now=100)
+        self.assertNotEqual("expired", replacement)
+        self.assertNotIn("expired", server.SESSIONS)
+        self.assertIn(replacement, server.SESSIONS)
+
+    def test_http_response_resends_cookie_with_matching_expires_date(self):
+        connection = MemoryConnection(b"GET / HTTP/1.0\r\nHost: localhost\r\n\r\n")
+        server.handle_connection(connection, now=1_000)
+
+        response = connection.response.decode("utf8")
+        token = next(iter(server.SESSIONS))
+        expiration = server.SESSIONS[token]["expires_at"]
+        self.assertIn(
+            "Set-Cookie: token={}; Expires={}; SameSite=Lax\r\n".format(
+                token,
+                server.email.utils.formatdate(expiration, usegmt=True),
+            ),
+            response,
+        )
+        self.assertTrue(connection.closed)
 
     def test_home_lists_each_topic_at_its_own_url(self):
         status, body = request({}, "GET", "/")

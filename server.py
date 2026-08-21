@@ -1,3 +1,4 @@
+import email.utils
 import html
 import json
 import os
@@ -6,11 +7,13 @@ import random
 import re
 import socket
 import tempfile
+import time
 import unicodedata
 import urllib.parse
 
 
 SESSIONS = {}
+SESSION_LIFETIME_SECONDS = 30 * 24 * 60 * 60
 
 LOGINS = {
     "crashoverride": "0cool",
@@ -211,7 +214,51 @@ TOPICS = default_topics()
 ENTRIES = TOPICS["general"]["messages"]
 
 
-def handle_connection(conx):
+def cookie_token(cookie_header):
+    """Return the token cookie without assuming it is the only cookie."""
+    if not cookie_header:
+        return None
+    for raw_cookie in cookie_header.split(";"):
+        name, separator, value = raw_cookie.strip().partition("=")
+        if separator and name.casefold() == "token":
+            return value
+    return None
+
+
+def delete_expired_sessions(now=None):
+    """Drop inactive session records whose browser cookie is no longer valid."""
+    now = time.time() if now is None else now
+    expired_tokens = [
+        token
+        for token, record in SESSIONS.items()
+        if record["expires_at"] <= now
+    ]
+    for token in expired_tokens:
+        del SESSIONS[token]
+    return len(expired_tokens)
+
+
+def open_session(cookie_header=None, now=None):
+    """Return a sliding-expiration session and the matching cookie deadline."""
+    now = time.time() if now is None else now
+    delete_expired_sessions(now)
+    token = cookie_token(cookie_header)
+    record = SESSIONS.get(token)
+    if record is None:
+        while True:
+            token = str(random.random())[2:]
+            if token not in SESSIONS:
+                break
+        record = {"data": {}, "expires_at": now + SESSION_LIFETIME_SECONDS}
+        SESSIONS[token] = record
+    else:
+        # Active sessions slide forward. Re-sending the same cookie with this
+        # later Expires date exercises browser-side replacement semantics.
+        record["expires_at"] = now + SESSION_LIFETIME_SECONDS
+    return token, record["data"], record["expires_at"]
+
+
+def handle_connection(conx, now=None):
     req = conx.makefile("b")
     reqline = req.readline().decode("utf8")
     method, url, version = reqline.split(" ", 2)
@@ -229,21 +276,16 @@ def handle_connection(conx):
     else:
         body = None
 
-    if "cookie" in headers:
-        token = headers["cookie"][len("token=") :]
-    else:
-        token = str(random.random())[2:]
-
-    session = SESSIONS.setdefault(token, {})
+    token, session, expires_at = open_session(headers.get("cookie"), now)
     status, body = do_request(session, method, url, headers, body)
     encoded_body = body.encode("utf8")
 
     response = "HTTP/1.0 {}\r\n".format(status)
     response += "Content-Length: {}\r\n".format(len(encoded_body))
     response += "Content-Type: text/html; charset=utf-8\r\n"
-    if "cookie" not in headers:
-        template = "Set-Cookie: token={}; SameSite=Lax\r\n"
-        response += template.format(token)
+    expiration = email.utils.formatdate(expires_at, usegmt=True)
+    template = "Set-Cookie: token={}; Expires={}; SameSite=Lax\r\n"
+    response += template.format(token, expiration)
     response += "Content-Security-Policy: default-src 'self'\r\n"
     response += "\r\n"
     conx.sendall(response.encode("utf8") + encoded_body)
