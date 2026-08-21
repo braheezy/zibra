@@ -30,6 +30,7 @@ RESERVED_TOPIC_SLUGS = {
     "login",
     "new-topic",
     "xhr",
+    "xhr-denied",
 }
 
 DATA_VERSION = 1
@@ -286,6 +287,8 @@ def handle_connection(conx, now=None):
     expiration = email.utils.formatdate(expires_at, usegmt=True)
     template = "Set-Cookie: token={}; Expires={}; SameSite=Lax\r\n"
     response += template.format(token, expiration)
+    if urllib.parse.urlsplit(url).path.rstrip("/") == "/xhr":
+        response += "Access-Control-Allow-Origin: *\r\n"
     response += "Content-Security-Policy: default-src 'self'\r\n"
     response += "\r\n"
     conx.sendall(response.encode("utf8") + encoded_body)
@@ -319,6 +322,8 @@ def do_request(session, method, url, headers, body):
         return "200 OK", show_count()
     elif method == "GET" and path == "/xhr":
         return "200 OK", "XHR OK"
+    elif method == "GET" and path == "/xhr-denied":
+        return "200 OK", "This response is intentionally not CORS-enabled"
 
     parts = [urllib.parse.unquote(part) for part in path.split("/") if part]
     if method == "GET" and len(parts) == 1 and parts[0] in TOPICS:

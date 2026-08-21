@@ -2608,6 +2608,29 @@ pub const Browser = struct {
         );
     }
 
+    fn fetchBodyWithOrigin(
+        self: *Browser,
+        url: Url,
+        referrer: ?Url,
+        payload: ?[]const u8,
+        request_origin: []const u8,
+    ) !url_module.HttpResponse {
+        self.session_state.network_lock.lock();
+        defer self.session_state.network_lock.unlock();
+
+        return url_module.Url.fetchBodyWithOrigin(
+            self.allocator,
+            self.io,
+            &self.session_state.http_client,
+            &self.session_state.cookie_jar,
+            &self.session_state.http_cache,
+            url,
+            referrer,
+            payload,
+            request_origin,
+        );
+    }
+
     fn fetchBodyForNavigation(
         self: *Browser,
         url: Url,
@@ -7205,6 +7228,24 @@ const XhrThreadContext = struct {
     }
 };
 
+fn ownedXhrRequestOrigin(
+    allocator: std.mem.Allocator,
+    resolved_url: Url,
+    referrer: ?Url,
+) !?[]u8 {
+    const source = referrer orelse return null;
+    if (source.sameOrigin(resolved_url)) return null;
+    return try source.toOwnedOrigin(allocator);
+}
+
+fn freeRawXhrBody(allocator: std.mem.Allocator, url: Url, body: []const u8) void {
+    if (!std.mem.eql(u8, url.scheme, "about") and
+        !std.mem.eql(u8, url.scheme, "data"))
+    {
+        allocator.free(body);
+    }
+}
+
 fn runXhrThread(ctx: *XhrThreadContext) void {
     const tab = ctx.tab;
     defer {
@@ -7216,15 +7257,43 @@ fn runXhrThread(ctx: *XhrThreadContext) void {
         std.log.warn("Failed to register XHR thread: {}", .{err});
     };
 
-    const response_result = ctx.browser.fetchBody(
+    const request_origin = ownedXhrRequestOrigin(
+        ctx.allocator,
         ctx.resolved_url,
         ctx.referrer,
-        ctx.payload,
     ) catch |err| {
+        std.log.warn("Failed to serialize async XHR origin: {}", .{err});
+        return;
+    };
+    defer if (request_origin) |origin| ctx.allocator.free(origin);
+
+    const response_result = (if (request_origin) |origin|
+        ctx.browser.fetchBodyWithOrigin(
+            ctx.resolved_url,
+            ctx.referrer,
+            ctx.payload,
+            origin,
+        )
+    else
+        ctx.browser.fetchBody(
+            ctx.resolved_url,
+            ctx.referrer,
+            ctx.payload,
+        )) catch |err| {
         std.log.warn("Async XHR failed: {}", .{err});
         return;
     };
     defer if (response_result.csp_header) |hdr| ctx.allocator.free(hdr);
+    defer if (response_result.access_control_allow_origin) |hdr| ctx.allocator.free(hdr);
+
+    if (!url_module.corsAllowsResponse(
+        request_origin,
+        response_result.access_control_allow_origin,
+    )) {
+        freeRawXhrBody(ctx.allocator, ctx.resolved_url, response_result.body);
+        std.log.warn("Discarded cross-origin XHR response without matching Access-Control-Allow-Origin", .{});
+        return;
+    }
 
     var response_body = response_result.body;
     var should_free_response = true;
@@ -7476,18 +7545,6 @@ fn jsXhrCallback(
 
     defer resolved_url.free(allocator);
 
-    if (frame.current_url) |current_ptr| {
-        if (!current_ptr.*.sameOrigin(resolved_url)) {
-            const current_host = current_ptr.*.host orelse "";
-            const target_host = resolved_url.host orelse "";
-            std.log.warn(
-                "Blocked cross-origin XHR {s}://{s}:{d} -> {s}://{s}:{d}",
-                .{ current_ptr.*.scheme, current_host, current_ptr.*.port, resolved_url.scheme, target_host, resolved_url.port },
-            );
-            return error.CrossOriginBlocked;
-        }
-    }
-
     if (!frame.allowedRequest(resolved_url, frame.current_url)) {
         const target_host = resolved_url.host orelse "";
         std.log.warn(
@@ -7507,8 +7564,20 @@ fn jsXhrCallback(
         return .{ .data = "", .allocator = null, .should_free = false };
     }
 
-    const response = try browser.fetchBody(resolved_url, current_url_value, body);
+    const request_origin = try ownedXhrRequestOrigin(allocator, resolved_url, current_url_value);
+    defer if (request_origin) |origin| allocator.free(origin);
+
+    const response = if (request_origin) |origin|
+        try browser.fetchBodyWithOrigin(resolved_url, current_url_value, body, origin)
+    else
+        try browser.fetchBody(resolved_url, current_url_value, body);
     defer if (response.csp_header) |hdr| allocator.free(hdr);
+    defer if (response.access_control_allow_origin) |hdr| allocator.free(hdr);
+
+    if (!url_module.corsAllowsResponse(request_origin, response.access_control_allow_origin)) {
+        freeRawXhrBody(allocator, resolved_url, response.body);
+        return error.CrossOriginBlocked;
+    }
 
     var response_body = response.body;
 

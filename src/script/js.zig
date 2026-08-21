@@ -1404,6 +1404,16 @@ fn stringToJsValue(self: *Js, text: []const u8) !Value {
     return Value.from(js_string);
 }
 
+/// Kiesel may cache ASCII strings by retaining their input bytes. Use this for
+/// callback/task-owned buffers that are released after the host call returns.
+fn copiedStringToJsValue(self: *Js, text: []const u8) !Value {
+    const stable_text = if (text.len == 0)
+        text
+    else
+        try self.agent.gc_allocator.dupe(u8, text);
+    return self.stringToJsValue(stable_text);
+}
+
 fn setActiveWindow(self: *Js, window_id: u32, window: *WindowContext) !void {
     if (!self.runtime_initialized) return;
     const key = kiesel.types.PropertyKey.from("__setActiveWindow");
@@ -1422,7 +1432,7 @@ pub fn runXhrOnload(self: *Js, window_id: u32, handle: u32, body: []const u8) !v
     const fn_value = try window.realm.global_object.get(&self.agent, key);
     if (!fn_value.isCallable()) return error.MissingXhrCallback;
 
-    const body_value = try self.stringToJsValue(body);
+    const body_value = try self.copiedStringToJsValue(body);
     const handle_value = Value.from(@as(f64, @floatFromInt(handle)));
     _ = try fn_value.call(&self.agent, .undefined, &.{ body_value, handle_value });
 }
@@ -3794,15 +3804,19 @@ fn xhrSend(agent: *Agent, this_value: Value, arguments: kiesel.types.Arguments) 
         return .undefined;
     }
 
-    const js_string = try kiesel.types.String.fromUtf8(agent, result.data);
-
-    if (result.should_free) {
+    defer if (result.should_free) {
         if (result.allocator) |alloc| {
             alloc.free(result.data);
         } else {
             js_instance.allocator.free(result.data);
         }
-    }
+    };
+
+    const stable_data = if (result.data.len == 0)
+        result.data
+    else
+        try agent.gc_allocator.dupe(u8, result.data);
+    const js_string = try kiesel.types.String.fromUtf8(agent, stable_data);
 
     return Value.from(js_string);
 }

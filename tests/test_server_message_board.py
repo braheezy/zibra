@@ -95,6 +95,18 @@ class MessageBoardTests(unittest.TestCase):
         )
         self.assertTrue(connection.closed)
 
+    def test_xhr_endpoint_opts_into_cross_origin_reads(self):
+        connection = MemoryConnection(
+            b"GET /xhr HTTP/1.0\r\n"
+            b"Host: localhost\r\n"
+            b"Origin: http://127.0.0.1:8000\r\n\r\n"
+        )
+        server.handle_connection(connection, now=1_000)
+
+        headers, body = connection.response.split(b"\r\n\r\n", 1)
+        self.assertIn(b"Access-Control-Allow-Origin: *\r\n", headers + b"\r\n")
+        self.assertEqual(b"XHR OK", body)
+
     def test_home_lists_each_topic_at_its_own_url(self):
         status, body = request({}, "GET", "/")
 

@@ -569,6 +569,18 @@ browser session, matching the exercise's simplified model.
 `BrowserSession.network_lock` serializes its HTTP client, cookie jar, and cache
 across tabs and native windows without nesting the visited/bookmark mutex.
 
+Cross-origin XHR derives an independently owned canonical origin from its
+copied referrer, sends it in the HTTP `Origin` header alongside any eligible
+target-host cookie, and bypasses the ordinary response cache. The final
+response carries an owned `Access-Control-Allow-Origin` copy only on this
+path. Exact-origin and wildcard values authorize body delivery; a missing or
+mismatched value causes synchronous XHR to throw and asynchronous XHR to free
+the response without queueing `onload`. Same-origin XHR sends no Origin header
+and needs no response opt-in. Authorized synchronous and asynchronous response
+strings move into Kiesel's traced heap before their callback/task buffers are
+freed, because its ASCII cache may retain input bytes. CSP remains an earlier
+request-side gate.
+
 `Url` wraps an owning `ada.Url` and has an explicit `free` method. Its component
 slices borrow that owner, except for separately allocated data-URL storage.
 Ordinary Zig value copies of `Url` are shallow. Treat `Url` as move-only unless

@@ -69,6 +69,10 @@ date remains script-visible and that replacing it with a past date deletes the
 cookie immediately. The tutorial message-board tests cover matching server-side
 deadlines, sliding renewal, and stale-session cleanup.
 
+`tests/manual/cors.html` uses different localhost ports for its page and XHR
+server. It verifies wildcard opt-in exposes a cross-origin response while the
+same server's headerless endpoint is fetched but remains unreadable.
+
 `tests/manual/rich-buttons.html` verifies inline rich-button containment,
 block-driven height growth, independently targetable input/link descendants,
 and nested-button parser recovery.

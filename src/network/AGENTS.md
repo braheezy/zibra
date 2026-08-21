@@ -42,6 +42,10 @@ before changing URL or response ownership.
   caller-owned body and header copies. Interactive cache, cookie, and HTTP
   client state belongs to the shared `BrowserSession` and is protected by its
   dedicated network mutex; standalone screenshot browsers own their session.
+- Cross-origin XHR uses the explicit Origin-bearing fetch path. That path
+  bypasses the ordinary response cache, still selects target-host cookies, and
+  returns an owned `access_control_allow_origin` header for the XHR policy
+  check. Navigation and ordinary subresources never request or own that field.
 - The tutorial cookie jar owns one entry per normalized host. Server
   Set-Cookie and script assignments share one parser that retains the raw
   parameter string and derives SameSite/HttpOnly/Expires state. Absolute

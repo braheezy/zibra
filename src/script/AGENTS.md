@@ -35,6 +35,12 @@ or Kiesel allocation/locking.
   allocator before temporary callback storage is freed, because ASCII String
   construction may retain the supplied bytes. Callback invalidation follows
   the same document-generation boundary as XHR and DOM callbacks.
+- XHR same-origin/CORS policy belongs to the browser callback, not the
+  JavaScript shim. A synchronous denied response surfaces as the existing
+  cross-origin exception; asynchronous denial intentionally has no `onload`
+  delivery because this exercise does not yet expose an `onerror` event. Both
+  synchronous responseText and asynchronous onload delivery copy callback-owned
+  bytes into Kiesel's traced heap before their native buffers are released.
 - DOM listeners are scoped by window and a dispatched event follows a
   snapshotted target-to-root handle path. Reuse one Event while bubbling,
   update `currentTarget` for each node, keep `target` fixed, let

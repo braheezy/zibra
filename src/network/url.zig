@@ -309,9 +309,24 @@ pub fn cookieForRequest(
 pub const HttpResponse = struct {
     body: []const u8,
     csp_header: ?[]u8 = null,
+    /// Owned only for requests that supplied an Origin header. Ordinary
+    /// navigation/subresource responses leave this null.
+    access_control_allow_origin: ?[]u8 = null,
     status: ?std.http.Status = null,
     cache_control: CacheControl = .default,
 };
+
+/// Same-origin XHR needs no response opt-in. Cross-origin XHR exposes its body
+/// only when the server returns the caller's exact serialized origin or `*`.
+pub fn corsAllowsResponse(
+    request_origin: ?[]const u8,
+    access_control_allow_origin: ?[]const u8,
+) bool {
+    const origin = request_origin orelse return true;
+    const allowed = access_control_allow_origin orelse return false;
+    const trimmed = std.mem.trim(u8, allowed, " \t\r\n");
+    return std.mem.eql(u8, trimmed, "*") or std.mem.eql(u8, trimmed, origin);
+}
 
 /// Decode bytes as UTF-8, replacing each malformed sequence with U+FFFD.
 /// The returned buffer is owned by `allocator`.
@@ -672,8 +687,24 @@ pub const Url = struct {
         return self.port == other.port;
     }
 
+    /// Allocate the serialized origin used by the HTTP Origin header and CORS
+    /// response comparison. Hostless sources have an opaque `null` origin.
+    pub fn toOwnedOrigin(self: Url, allocator: std.mem.Allocator) ![]u8 {
+        const host = self.host orelse return allocator.dupe(u8, "null");
+        const uses_default_port =
+            (std.ascii.eqlIgnoreCase(self.scheme, "http") and self.port == 80) or
+            (std.ascii.eqlIgnoreCase(self.scheme, "https") and self.port == 443);
+        if (uses_default_port or hostHasExplicitPort(host)) {
+            return std.fmt.allocPrint(allocator, "{s}://{s}", .{ self.scheme, host });
+        }
+        return std.fmt.allocPrint(allocator, "{s}://{s}:{d}", .{ self.scheme, host, self.port });
+    }
+
     fn hostHasExplicitPort(host: []const u8) bool {
-        if (std.mem.startsWith(u8, host, "[")) return false;
+        if (std.mem.startsWith(u8, host, "[")) {
+            const close = std.mem.indexOfScalar(u8, host, ']') orelse return false;
+            return close + 1 < host.len and host[close + 1] == ':';
+        }
         return std.mem.lastIndexOfScalar(u8, host, ':') != null;
     }
 
@@ -702,7 +733,35 @@ pub const Url = struct {
         referrer: ?Url,
         payload: ?[]const u8,
     ) !HttpResponse {
-        return fetchBodyInternal(allocator, io, http_client, cookie_jar, cache, url, referrer, payload, null);
+        return fetchBodyInternal(allocator, io, http_client, cookie_jar, cache, url, referrer, payload, null, null);
+    }
+
+    /// Fetch an XHR while attaching the caller's serialized origin. CORS
+    /// requests intentionally bypass the ordinary response cache so access
+    /// permission is decided from the current network response.
+    pub fn fetchBodyWithOrigin(
+        allocator: std.mem.Allocator,
+        io: std.Io,
+        http_client: *std.http.Client,
+        cookie_jar: *std.StringHashMap(CookieEntry),
+        cache: ?*HttpCache,
+        url: Url,
+        referrer: ?Url,
+        payload: ?[]const u8,
+        request_origin: []const u8,
+    ) !HttpResponse {
+        return fetchBodyInternal(
+            allocator,
+            io,
+            http_client,
+            cookie_jar,
+            cache,
+            url,
+            referrer,
+            payload,
+            null,
+            request_origin,
+        );
     }
 
     /// Fetch a URL and, for HTTP(S), return the final URL after redirects.
@@ -719,7 +778,7 @@ pub const Url = struct {
         final_url: *?Url,
     ) !HttpResponse {
         final_url.* = null;
-        return fetchBodyInternal(allocator, io, http_client, cookie_jar, cache, url, referrer, payload, final_url);
+        return fetchBodyInternal(allocator, io, http_client, cookie_jar, cache, url, referrer, payload, final_url, null);
     }
 
     /// Zig's HTTP client maps TLS handshake-init failures, including
@@ -740,6 +799,7 @@ pub const Url = struct {
         referrer: ?Url,
         payload: ?[]const u8,
         final_url: ?*?Url,
+        request_origin: ?[]const u8,
     ) !HttpResponse {
         if (std.mem.eql(u8, url.scheme, "file")) {
             return .{ .body = try url.fileRequest(allocator, io) };
@@ -753,7 +813,7 @@ pub const Url = struct {
 
         const is_http = std.mem.eql(u8, url.scheme, "http") or std.mem.eql(u8, url.scheme, "https");
         if (!is_http) return error.UnsupportedScheme;
-        const use_cache = is_http and payload == null and cache != null;
+        const use_cache = is_http and payload == null and cache != null and request_origin == null;
         const href = url.ada_url.getHref();
         const cache_key = if (std.mem.indexOfScalar(u8, href, '#')) |fragment_index| href[0..fragment_index] else href;
 
@@ -798,6 +858,7 @@ pub const Url = struct {
             referrer,
             payload,
             final_url_output,
+            request_origin,
         );
 
         if (use_cache and response.status == .ok and response.cache_control.isCacheable()) {
@@ -830,6 +891,7 @@ pub const Url = struct {
         referrer: ?Url,
         payload: ?[]const u8,
         final_url: ?*?Url,
+        request_origin: ?[]const u8,
     ) !HttpResponse {
         // Build full URL for std.http.Client
         var url_builder = std.ArrayList(u8).empty;
@@ -861,6 +923,13 @@ pub const Url = struct {
         var extra_headers: std.ArrayList(std.http.Header) = .empty;
         defer extra_headers.deinit(al);
         const method: std.http.Method = if (payload != null) .POST else .GET;
+
+        if (request_origin) |origin| {
+            try extra_headers.append(al, .{
+                .name = "Origin",
+                .value = origin,
+            });
+        }
 
         if (self.host) |host_slice| {
             if (cookieForRequest(
@@ -894,6 +963,9 @@ pub const Url = struct {
         var csp_header: ?[]u8 = null;
         var csp_header_cleanup = true;
         defer if (csp_header_cleanup) if (csp_header) |hdr| al.free(hdr);
+        var access_control_allow_origin: ?[]u8 = null;
+        var access_control_allow_origin_cleanup = true;
+        defer if (access_control_allow_origin_cleanup) if (access_control_allow_origin) |hdr| al.free(hdr);
         var cache_control: CacheControl = .default;
 
         const max_attempts: usize = 2;
@@ -967,6 +1039,12 @@ pub const Url = struct {
                         const copy = try al.alloc(u8, trimmed.len);
                         @memcpy(copy, trimmed);
                         csp_header = copy;
+                    } else if (request_origin != null and
+                        std.ascii.eqlIgnoreCase(header.name, "access-control-allow-origin"))
+                    {
+                        if (access_control_allow_origin) |existing| al.free(existing);
+                        const trimmed = std.mem.trim(u8, header.value, " \t");
+                        access_control_allow_origin = try al.dupe(u8, trimmed);
                     } else if (std.ascii.eqlIgnoreCase(header.name, "cache-control")) {
                         cache_control.apply(header.value);
                     }
@@ -1034,10 +1112,12 @@ pub const Url = struct {
             const result = HttpResponse{
                 .body = body,
                 .csp_header = csp_header,
+                .access_control_allow_origin = access_control_allow_origin,
                 .status = response.head.status,
                 .cache_control = cache_control,
             };
             csp_header_cleanup = false;
+            access_control_allow_origin_cleanup = false;
             return result;
         }
 
@@ -1454,6 +1534,121 @@ test "HTTP requests identify Zibra and keep HTTP/1.1 connections alive" {
     try std.testing.expectEqual(@as(usize, 1), options.extra_headers.len);
     try std.testing.expectEqualStrings("X-Zibra-Test", options.extra_headers[0].name);
     try std.testing.expectEqualStrings("present", options.extra_headers[0].value);
+}
+
+test "CORS fetch sends Origin and target cookies and retains response opt-in" {
+    const CorsServer = struct {
+        server: std.Io.net.Server,
+        io: std.Io,
+        saw_origin: bool = false,
+        saw_cookie: bool = false,
+        err: ?anyerror = null,
+
+        fn run(self: *@This()) void {
+            self.serve() catch |err| {
+                self.err = err;
+            };
+        }
+
+        fn serve(self: *@This()) !void {
+            var stream = try self.server.accept(self.io);
+            defer stream.socket.close(self.io);
+
+            var read_buffer: [4096]u8 = undefined;
+            var reader = stream.reader(self.io, &read_buffer);
+            var write_buffer: [1024]u8 = undefined;
+            var writer = stream.writer(self.io, &write_buffer);
+
+            const request_line = try readTestHttpLine(&reader.interface);
+            if (!std.mem.startsWith(u8, request_line, "GET /cors ")) return error.InvalidRequest;
+            while (true) {
+                const header = try readTestHttpLine(&reader.interface);
+                if (header.len == 0) break;
+                const colon = std.mem.indexOfScalar(u8, header, ':') orelse continue;
+                const name = header[0..colon];
+                const value = std.mem.trim(u8, header[colon + 1 ..], " \t");
+                if (std.ascii.eqlIgnoreCase(name, "origin")) {
+                    self.saw_origin = std.mem.eql(u8, value, "http://source.example:8080");
+                } else if (std.ascii.eqlIgnoreCase(name, "cookie")) {
+                    self.saw_cookie = std.mem.eql(u8, value, "token=secret");
+                }
+            }
+
+            try writer.interface.writeAll(
+                "HTTP/1.1 200 OK\r\n" ++
+                    "Content-Length: 7\r\n" ++
+                    "Access-Control-Allow-Origin: http://source.example:8080\r\n" ++
+                    "Connection: close\r\n\r\n" ++
+                    "allowed",
+            );
+            try writer.interface.flush();
+        }
+    };
+
+    const allocator = std.testing.allocator;
+    const address = try std.Io.net.IpAddress.parse("127.0.0.1", 0);
+    var server = try address.listen(std.testing.io, .{});
+    defer server.deinit(std.testing.io);
+    var context = CorsServer{ .server = server, .io = std.testing.io };
+    const thread = try std.Thread.spawn(.{}, CorsServer.run, .{&context});
+    var thread_joined = false;
+    defer if (!thread_joined) thread.join();
+
+    var http_client: std.http.Client = .{ .allocator = allocator, .io = std.testing.io };
+    defer http_client.deinit();
+    var cookie_jar = std.StringHashMap(CookieEntry).init(allocator);
+    defer {
+        var iterator = cookie_jar.iterator();
+        while (iterator.next()) |entry| {
+            entry.value_ptr.deinit(allocator);
+            allocator.free(entry.key_ptr.*);
+        }
+        cookie_jar.deinit();
+    }
+    const target_text = try std.fmt.allocPrint(
+        allocator,
+        "http://127.0.0.1:{d}/cors",
+        .{server.socket.address.getPort()},
+    );
+    defer allocator.free(target_text);
+    const target = try Url.init(allocator, target_text);
+    defer target.free(allocator);
+    try std.testing.expect(try applySetCookie(
+        allocator,
+        &cookie_jar,
+        target.host.?,
+        "token=secret",
+        .http,
+        1_600_000_000,
+    ));
+    const source = try Url.init(allocator, "http://source.example:8080/page");
+    defer source.free(allocator);
+
+    const response = try Url.fetchBodyWithOrigin(
+        allocator,
+        std.testing.io,
+        &http_client,
+        &cookie_jar,
+        null,
+        target,
+        source,
+        null,
+        "http://source.example:8080",
+    );
+    defer allocator.free(response.body);
+    defer if (response.csp_header) |header| allocator.free(header);
+    defer if (response.access_control_allow_origin) |header| allocator.free(header);
+
+    thread.join();
+    thread_joined = true;
+    if (context.err) |err| return err;
+    try std.testing.expect(context.saw_origin);
+    try std.testing.expect(context.saw_cookie);
+    try std.testing.expectEqualStrings("allowed", response.body);
+    try std.testing.expectEqualStrings(
+        "http://source.example:8080",
+        response.access_control_allow_origin.?,
+    );
 }
 
 test "HTTP requests negotiate and decode chunked gzip responses" {

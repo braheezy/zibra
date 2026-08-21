@@ -38,6 +38,11 @@ before changing `root.zig`, `tab.zig`, `render/`, or browser task scheduling.
   retains a cookie-map key or value pointer after releasing that lock. Cookie
   callbacks sample the session's real clock and may synchronously evict an
   expired owning entry while holding that lock.
+- Cross-origin XHR is fetched rather than rejected up front. It sends the
+  caller's canonical Origin and target-host cookies, then exposes the body only
+  for an exact or wildcard Access-Control-Allow-Origin response. Synchronous
+  denial becomes `CrossOriginBlocked`; asynchronous denial discards the owned
+  response and never queues `onload`. CSP can still block before the fetch.
 - Address-bar interpretation belongs to `chrome.zig`, not general URL or link
   resolution. Explicit schemes and obvious bare hosts navigate directly;
   ordinary text becomes a form-encoded Google query. Keep document-authored

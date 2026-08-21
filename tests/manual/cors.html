@@ -1,0 +1,40 @@
+<!--
+How to verify:
+1. In the repository root, start the CORS-enabled tutorial server:
+   python3 server.py
+2. In another terminal, serve this directory on a different origin:
+   python3 -m http.server 8000 --directory tests/manual
+3. Open http://127.0.0.1:8000/cors.html in Zibra.
+4. The page must report PASS. /xhr opts in with `*`; /xhr-denied returns a body
+   but no Access-Control-Allow-Origin header and must throw instead of exposing it.
+-->
+<!doctype html>
+<html>
+  <head><title>Cross-origin XMLHttpRequest</title></head>
+  <body>
+    <h1>Cross-origin XMLHttpRequest</h1>
+    <p id="status">FAIL: script did not run</p>
+    <script>
+      var allowed = new XMLHttpRequest();
+      allowed.open("GET", "http://127.0.0.1:8005/xhr", false);
+      allowed.send();
+
+      var deniedWasBlocked = false;
+      try {
+        var denied = new XMLHttpRequest();
+        denied.open("GET", "http://127.0.0.1:8005/xhr-denied", false);
+        denied.send();
+      } catch (error) {
+        deniedWasBlocked = true;
+      }
+
+      if (allowed.responseText === "XHR OK" && deniedWasBlocked) {
+        status.innerHTML = "PASS: allowed response exposed; denied response discarded";
+      } else {
+        status.innerHTML = "FAIL: allowed=" + allowed.responseText +
+          " deniedBlocked=" + deniedWasBlocked;
+      }
+      undefined;
+    </script>
+  </body>
+</html>
