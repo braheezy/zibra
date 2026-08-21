@@ -2798,30 +2798,9 @@ pub const Browser = struct {
                 std.log.warn("Failed to load images: {}", .{err});
             };
 
-            // Queue external scripts to run later
-            for (node_list.items) |node| {
-                switch (node.*) {
-                    .element => |e| {
-                        if (std.mem.eql(u8, e.tag, "script")) {
-                            if (e.attributes) |attrs| {
-                                if (attrs.get("src")) |src| {
-                                    self.scheduleScriptTask(tab, frame, url, src) catch |err| {
-                                        std.log.warn("Failed to schedule script {s}: {}", .{ src, err });
-                                    };
-                                    continue;
-                                }
-                            }
-                            if (self.collectInlineScriptText(node)) |script_body| {
-                                defer self.allocator.free(script_body);
-                                self.scheduleInlineScriptTask(tab, frame, url, script_body) catch |err| {
-                                    std.log.warn("Failed to schedule inline script: {}", .{err});
-                                };
-                            }
-                        }
-                    },
-                    .text => {},
-                }
-            }
+            // Queue scripts in document order and mark their element identity
+            // so later resource rescans do not evaluate them again.
+            _ = self.scheduleDocumentScripts(tab, frame, url, node_list.items);
 
             // Create and load iframe subdocuments after scheduling parent scripts.
             self.loadIframes(frame, url, node_list.items) catch |err| {
@@ -3034,6 +3013,7 @@ pub const Browser = struct {
         }
         frame.current_url = null;
         frame.current_url_owned = false;
+        frame.resources_dirty = false;
         frame.content_height = 0;
         frame.scroll = 0;
         frame.focus = null;
@@ -3159,30 +3139,7 @@ pub const Browser = struct {
             std.log.warn("Failed to load iframe images: {}", .{err});
         };
 
-        // Queue external scripts to run later
-        for (node_list.items) |node| {
-            switch (node.*) {
-                .element => |e| {
-                    if (std.mem.eql(u8, e.tag, "script")) {
-                        if (e.attributes) |attrs| {
-                            if (attrs.get("src")) |script_src| {
-                                self.scheduleScriptTask(frame.tab, frame, url, script_src) catch |err| {
-                                    std.log.warn("Failed to schedule iframe script {s}: {}", .{ script_src, err });
-                                };
-                                continue;
-                            }
-                        }
-                        if (self.collectInlineScriptText(node)) |script_body| {
-                            defer self.allocator.free(script_body);
-                            self.scheduleInlineScriptTask(frame.tab, frame, url, script_body) catch |err| {
-                                std.log.warn("Failed to schedule iframe inline script: {}", .{err});
-                            };
-                        }
-                    }
-                },
-                .text => {},
-            }
-        }
+        _ = self.scheduleDocumentScripts(frame.tab, frame, url, node_list.items);
 
         // Load nested iframes in this frame.
         self.loadIframes(frame, url, node_list.items) catch |err| {
@@ -3553,30 +3510,7 @@ pub const Browser = struct {
             std.log.warn("Failed to load iframe images: {}", .{err});
         };
 
-        // Queue external scripts to run later
-        for (node_list.items) |node| {
-            switch (node.*) {
-                .element => |e| {
-                    if (std.mem.eql(u8, e.tag, "script")) {
-                        if (e.attributes) |attrs| {
-                            if (attrs.get("src")) |script_src| {
-                                self.scheduleScriptTask(parent.tab, frame, frame_url_ptr, script_src) catch |err| {
-                                    std.log.warn("Failed to schedule iframe script {s}: {}", .{ script_src, err });
-                                };
-                                continue;
-                            }
-                        }
-                        if (self.collectInlineScriptText(node)) |script_body| {
-                            defer self.allocator.free(script_body);
-                            self.scheduleInlineScriptTask(parent.tab, frame, frame_url_ptr, script_body) catch |err| {
-                                std.log.warn("Failed to schedule iframe inline script: {}", .{err});
-                            };
-                        }
-                    }
-                },
-                .text => {},
-            }
-        }
+        _ = self.scheduleDocumentScripts(parent.tab, frame, frame_url_ptr, node_list.items);
 
         var new_css_texts = std.ArrayList([]const u8).empty;
         defer {
@@ -3708,6 +3642,134 @@ pub const Browser = struct {
             },
             else => return null,
         }
+    }
+
+    /// Queue each attached classic script at most once. `script_started` is
+    /// stored on the DOM element rather than in a transient node list so the
+    /// guarantee survives removeChild followed by re-attachment. Marking is
+    /// committed only after scheduling succeeds; allocation failures remain
+    /// retryable on the next resource scan.
+    fn scheduleDocumentScripts(
+        self: *Browser,
+        tab: *Tab,
+        frame: *Frame,
+        page_url: *Url,
+        nodes: []*Node,
+    ) bool {
+        var all_started = true;
+        for (nodes) |node| {
+            const element = switch (node.*) {
+                .element => |*value| value,
+                .text => continue,
+            };
+            if (!std.mem.eql(u8, element.tag, "script") or element.script_started) continue;
+
+            if (element.attributes) |attrs| {
+                if (attrs.get("src")) |src| {
+                    self.scheduleScriptTask(tab, frame, page_url, src) catch |err| {
+                        std.log.warn("Failed to schedule script {s}: {}", .{ src, err });
+                        all_started = false;
+                        continue;
+                    };
+                    element.script_started = true;
+                    continue;
+                }
+            }
+
+            if (self.collectInlineScriptText(node)) |script_body| {
+                defer self.allocator.free(script_body);
+                self.scheduleInlineScriptTask(tab, frame, page_url, script_body) catch |err| {
+                    std.log.warn("Failed to schedule inline script: {}", .{err});
+                    all_started = false;
+                    continue;
+                };
+            }
+            element.script_started = true;
+        }
+        return all_started;
+    }
+
+    /// Rebuild an author stylesheet generation from the currently attached
+    /// DOM. Rules and their borrowed text buffers are staged and transferred
+    /// together, so removing a `<link>` retires its rules without creating a
+    /// dangling CSS string borrow.
+    fn replaceFrameStylesheets(
+        self: *Browser,
+        frame: *Frame,
+        page_url: *Url,
+        nodes: []*Node,
+    ) !void {
+        var new_css_texts = std.ArrayList([]const u8).empty;
+        defer {
+            for (new_css_texts.items) |css_text| self.allocator.free(css_text);
+            new_css_texts.deinit(self.allocator);
+        }
+
+        var new_rules = std.ArrayList(CSSParser.CSSRule).empty;
+        defer {
+            for (new_rules.items) |*rule| {
+                if (rule.owned) rule.deinit(self.allocator);
+            }
+            new_rules.deinit(self.allocator);
+        }
+
+        for (self.default_style_sheet_rules) |rule| {
+            try new_rules.append(self.allocator, rule);
+        }
+        try self.appendDocumentStylesheets(
+            frame,
+            page_url,
+            nodes,
+            &new_css_texts,
+            &new_rules,
+        );
+
+        std.mem.sort(CSSParser.CSSRule, new_rules.items, {}, struct {
+            fn lessThan(_: void, a: CSSParser.CSSRule, b: CSSParser.CSSRule) bool {
+                return a.cascadePriority() < b.cascadePriority();
+            }
+        }.lessThan);
+
+        // Rules borrow the old CSS buffers, so destroy them before freeing the
+        // buffers and then atomically install the staged generation.
+        for (frame.rules.items) |*rule| {
+            if (rule.owned) rule.deinit(self.allocator);
+        }
+        frame.rules.deinit(self.allocator);
+        for (frame.css_texts.items) |css_text| self.allocator.free(css_text);
+        frame.css_texts.deinit(self.allocator);
+
+        frame.default_rules_count = self.default_style_sheet_rules.len;
+        frame.rules = new_rules;
+        new_rules = .empty;
+        frame.css_texts = new_css_texts;
+        new_css_texts = .empty;
+    }
+
+    /// Refresh resources after an attached structural DOM mutation. This is
+    /// called only by the serialized tab worker, after the mutation host call
+    /// has returned, so fetching and queueing cannot re-enter Kiesel.
+    pub fn refreshFrameResources(self: *Browser, frame: *Frame) !void {
+        if (!frame.resources_dirty) return;
+        const root = if (frame.current_node) |*node| node else {
+            frame.resources_dirty = false;
+            return;
+        };
+        const page_url = frame.current_url orelse {
+            frame.resources_dirty = false;
+            return;
+        };
+
+        frame.resources_dirty = false;
+        errdefer frame.resources_dirty = true;
+
+        var nodes = std.ArrayList(*Node).empty;
+        defer nodes.deinit(self.allocator);
+        try parser.treeToList(self.allocator, root, &nodes);
+
+        const scripts_started = self.scheduleDocumentScripts(frame.tab, frame, page_url, nodes.items);
+        try self.replaceFrameStylesheets(frame, page_url, nodes.items);
+        if (!scripts_started) frame.resources_dirty = true;
     }
 
     /// Parse one owned document stylesheet into staged frame storage. The

@@ -100,6 +100,13 @@ before changing `root.zig`, `tab.zig`, `render/`, or browser task scheduling.
 - A frame's `css_texts` owns decoded linked stylesheets and copied `<style>`
   text in DOM order. Its author rules borrow those buffers; rebuild and retire
   the text and rules as one generation for root documents and iframes.
+- Attached structural DOM mutation marks that frame's document resources
+  dirty. Before the next style pass, the tab worker queues newly attached
+  scripts once and rebuilds the complete author-sheet generation from the
+  live DOM, so inserted `<style>`/`<link>` nodes participate and detached links
+  stop participating. Script source tasks own their copies after queueing;
+  removing a script never rolls back code and reattaching that same element
+  never evaluates it again.
 - `render/layout.zig` and `render/font.zig` borrow DOM/image state and own
   layout/font resources. `FontManager` owns canonical RGBA glyph bitmaps;
   display-list `Glyph` values borrow those bytes, and `pixel_mode` tells paint

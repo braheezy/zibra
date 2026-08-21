@@ -15,6 +15,7 @@ comptime {
     _ = @import("tests/browser_windows.zig");
     _ = @import("tests/browser_resize.zig");
     _ = @import("tests/browser_scroll.zig");
+    _ = @import("tests/browser_dynamic_resources.zig");
     _ = @import("tests/parser.zig");
     _ = @import("network/url.zig");
     _ = @import("runtime/task.zig");

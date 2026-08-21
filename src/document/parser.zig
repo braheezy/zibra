@@ -232,6 +232,9 @@ pub const Element = struct {
     // Browser-session annotation used only while painting link descendants.
     // It owns no URL or session storage.
     is_visited: bool = false,
+    // Classic scripts are evaluated at most once for the lifetime of this
+    // element, including when a detached node is later re-attached.
+    script_started: bool = false,
     children_dirty: bool = true,
     // Animation state for CSS transitions, keyed by property name (e.g., "opacity")
     animations: ?std.StringHashMap(NumericAnimation) = null,
@@ -248,6 +251,7 @@ pub const Element = struct {
             .owned_strings = null,
             .is_focused = false,
             .is_visited = false,
+            .script_started = false,
             .animations = null,
             .image_data = null,
         };

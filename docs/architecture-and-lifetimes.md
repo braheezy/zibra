@@ -228,6 +228,16 @@ The root frame normally borrows its URL from `Tab.history`; child frames may
 own their URL. `parent`, `tab`, `frame_element`, focus pointers, hit-test node
 pointers, `js_context`, and layout-related node pointers are borrowed.
 
+Structural DOM mutation also marks the affected frame's resources dirty. On
+the serialized tab worker, after the JavaScript host call has completed and
+before the next style pass, the browser scans the final attached tree. Newly
+attached classic scripts are copied into queued tasks and their DOM elements
+record that evaluation has started; this identity moves with remove/re-attach,
+while evaluated code remains in the document realm. Author stylesheets are
+rebuilt as a staged rules-plus-source-buffer generation from the current DOM,
+which both loads inserted `<style>`/`<link>` elements and retires rules from
+detached links without leaving property slices pointing at freed CSS text.
+
 Each tab records the visited generation represented by its display list. A new
 session visit requests an animation frame; render compares generations before
 its early dirty check, re-annotates every current frame, and forces paint when

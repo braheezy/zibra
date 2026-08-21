@@ -391,6 +391,7 @@ test "structural mutation retires a painted link before DOM removal" {
     try std.testing.expectEqual(@as(usize, 0), frame.focus_bounds.items.len);
     try std.testing.expect(test_browser.active_tab_display_list == null);
     try std.testing.expect(tab.needs_style and tab.needs_layout and tab.needs_paint);
+    try std.testing.expect(frame.resources_dirty);
     try std.testing.expect(test_browser.needs_animation_frame);
 
     for (body.element.children.items) |*child| child.deinit(allocator);

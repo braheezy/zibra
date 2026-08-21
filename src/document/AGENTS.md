@@ -48,6 +48,11 @@ or selector/rule lifetime.
 - `<style>` element text is copied into the same owned stylesheet generation as
   decoded external CSS. Keep inline and linked sheets in DOM order, and make
   isolated inspection and interactive frame loading follow the same cascade.
+- `Element.script_started` is document-lifetime execution identity. It moves
+  with a detached/re-attached node and prevents a previously queued classic
+  script from running again; newly parsed or created script elements start
+  unset. Structural mutation causes the owning frame to rescan attached
+  resources after the JavaScript host call returns.
 - `collectDocumentTitle` copies the first `title` element's descendant text
   into an owned sentinel-terminated slice; native window state must never
   retain the DOM's source-backed text slices.

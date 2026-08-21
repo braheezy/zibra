@@ -177,6 +177,10 @@ pub const Frame = struct {
     // Owned linked and inline author stylesheet buffers in DOM order. Owned
     // rules borrow their property strings from these allocations.
     css_texts: std.ArrayList([]const u8),
+    // Structural DOM mutation can add scripts/stylesheets or remove linked
+    // stylesheets. The next worker-side render rebuilds resources from the
+    // final attached DOM generation.
+    resources_dirty: bool = false,
     allowed_origins: ?std.ArrayList([]const u8) = null,
     children: std.ArrayList(*Frame),
 
@@ -1325,6 +1329,7 @@ pub fn prepareForDomMutation(self: *Tab, b: *Browser, frame: *Frame, mutation_ro
     self.needs_style = true;
     self.needs_layout = true;
     self.needs_paint = true;
+    frame.resources_dirty = true;
 
     frame.retireDomMutationBorrows(mutation_root);
     self.composited_updates.clearRetainingCapacity();
@@ -1641,6 +1646,17 @@ pub fn render(self: *Tab, b: *Browser) !void {
         self.needs_paint = false;
         self.visited_generation = visited_generation;
         return;
+    }
+
+    // JavaScript structural mutations are complete by the time their
+    // delayed render task runs. Refresh resources before style so newly
+    // attached sheets participate in this frame and removed sheets no longer
+    // do. Script tasks are queued behind this render and retain owned source.
+    var resource_frames = std.ArrayList(*Frame).empty;
+    defer resource_frames.deinit(self.allocator);
+    try self.collectFramesPostOrder(frame, &resource_frames);
+    for (resource_frames.items) |resource_frame| {
+        try b.refreshFrameResources(resource_frame);
     }
 
     b.layout_engine.accessibility = self.accessibility;

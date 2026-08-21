@@ -1,0 +1,26 @@
+<!doctype html>
+<!--
+How to verify:
+1. Open this file in Zibra and wait for script tasks to settle.
+2. "PASS: inserted script executed" must be green and bold. This proves the
+   script and linked stylesheet inserted through innerHTML were processed.
+3. "PASS: removed stylesheet is inactive" must not be red or bold. This
+   proves removing the original link retired its author rules.
+-->
+<html>
+<head>
+</head>
+<body>
+  <h1>Dynamic resources</h1>
+  <div id="oldHost"><link id="oldSheet" rel="stylesheet" href="dynamic-resources-old.css"></div>
+  <div id="mount"><span>placeholder</span></div>
+  <p id="status">PASS: inserted script executed</p>
+  <p class="retired">PASS: removed stylesheet is inactive</p>
+  <script>
+    mount.innerHTML = '<link rel="stylesheet" href="dynamic-resources-new.css">' +
+      '<script>status.setAttribute("class", "pass");<' + '/script>';
+    oldHost.removeChild(oldSheet);
+    undefined;
+  </script>
+</body>
+</html>
