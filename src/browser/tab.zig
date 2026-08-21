@@ -161,6 +161,10 @@ pub const Frame = struct {
     window_id: u32 = 0,
     current_url: ?*Url = null,
     current_url_owned: bool = false,
+    // True only for a browser-generated document replacing a failed TLS
+    // certificate navigation. Root-frame commits use this to suppress the
+    // HTTPS padlock while retaining the requested URL in chrome and history.
+    certificate_error: bool = false,
     current_html_source: ?[]const u8 = null,
     current_node: ?Node = null,
     document_layout: ?*Layout.DocumentLayout = null,
@@ -1783,6 +1787,7 @@ pub fn runAnimationFrame(self: *Tab, scroll: i32) void {
             null;
         const commit_data = browser_mod.CommitData{
             .url = frame.current_url orelse null,
+            .certificate_error = frame.certificate_error,
             .display_list = composed_list,
             .scroll = commit_scroll,
             .height = frame.content_height,

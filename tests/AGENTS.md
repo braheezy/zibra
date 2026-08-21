@@ -55,6 +55,10 @@ checked value `on` through a localhost GET submission.
 layout or focus space, password values paint as stars, and both control types
 retain their real values for form submission.
 
+`tests/manual/certificate-errors.html` links to valid and invalid HTTPS
+endpoints to verify committed-page padlocks, owned certificate warning pages,
+and the absence of a proceed-anyway path.
+
 `tests/manual/rich-buttons.html` verifies inline rich-button containment,
 block-driven height growth, independently targetable input/link descendants,
 and nested-button parser recovery.

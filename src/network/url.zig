@@ -460,6 +460,14 @@ pub const Url = struct {
         return fetchBodyInternal(allocator, io, http_client, cookie_jar, cache, url, referrer, payload, final_url);
     }
 
+    /// Zig's HTTP client maps TLS handshake-init failures, including
+    /// certificate verification failures, to this public error. Keep that
+    /// transport detail here so navigation can distinguish a security warning
+    /// from ordinary DNS, connection, and HTTP failures.
+    pub fn isCertificateError(err: anyerror) bool {
+        return err == error.TlsInitializationFailed;
+    }
+
     fn fetchBodyInternal(
         allocator: std.mem.Allocator,
         io: std.Io,

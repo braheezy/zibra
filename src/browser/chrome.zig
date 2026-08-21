@@ -18,6 +18,7 @@ const Browser = browser.Browser;
 const Url = @import("../network/url.zig").Url;
 
 const search_url_prefix = "https://google.com/search?q=";
+pub const secure_address_prefix = "🔒 ";
 // Keep the document viewport origin compatible with the former hand-painted
 // chrome. Screenshot comparisons intentionally ignore chrome pixels, but page
 // content must not move merely because its implementation changed.
@@ -301,6 +302,20 @@ fn appendFormatted(
     try output.appendSlice(allocator, fragment);
 }
 
+/// A typed or pending HTTPS target must never inherit the padlock from the
+/// document still on screen. The indicator appears only when the displayed
+/// and committed snapshots identify the same successfully verified page.
+pub fn shouldShowPadlock(
+    displayed_url: ?[]const u8,
+    committed_url: ?[]const u8,
+    security: browser.NavigationSecurity,
+) bool {
+    if (security != .secure) return false;
+    const displayed = displayed_url orelse return false;
+    const committed = committed_url orelse return false;
+    return std.mem.eql(u8, displayed, committed);
+}
+
 fn buildHtml(self: *const Chrome, b: *const Browser) ![]u8 {
     var html = std.ArrayList(u8).empty;
     errdefer html.deinit(self.allocator);
@@ -349,6 +364,13 @@ fn buildHtml(self: *const Chrome, b: *const Browser) ![]u8 {
         self.address_bar.items
     else
         b.active_tab_url orelse "";
+    if (!self.isAddressBarFocused() and shouldShowPadlock(
+        b.active_tab_url,
+        b.active_tab_committed_url,
+        b.active_tab_committed_security,
+    )) {
+        try html.appendSlice(self.allocator, secure_address_prefix);
+    }
     try appendHtmlEscaped(self.allocator, &html, address_text);
     try html.appendSlice(self.allocator, "\"></div></body></html>");
     return html.toOwnedSlice(self.allocator);

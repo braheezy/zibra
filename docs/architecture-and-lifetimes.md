@@ -184,8 +184,10 @@ annotation, so they never borrow a URL-set key.
 `Browser.fetchNavigationDocument` wraps document responses in a
 `NavigationDocument` that explicitly owns allocated HTTP/file bodies and the
 generated `about:bookmarks` HTML, while borrowed data/other-about bodies keep a
-null owner. Root and child-frame loaders share this helper and release the
-wrapper only after copying the body into the frame's decoded HTML owner.
+null owner. TLS certificate failures use the same contract for an owned,
+peer-independent warning document and carry a certificate-error bit into the
+installed frame. Root and child-frame loaders share this helper and release
+the wrapper only after copying the body into the frame's decoded HTML owner.
 
 `Tab.browser` is a borrowed back-pointer. Task and helper contexts also borrow
 `Browser`; `Browser.deinit` therefore publishes shutdown, joins every tab
@@ -728,7 +730,10 @@ I/O to finish.
 
 - `Browser.lock` protects a subset of active-tab render state, dirty flags,
   shutdown/animation flags, and the independently owned optimistic-display and
-  committed-document URL snapshots used by chrome.
+  committed-document URL snapshots used by chrome. The committed snapshot's
+  security state is published in the same commit: chrome emits a padlock only
+  for a matching, verified HTTPS document, never for optimistic navigation
+  text or a certificate-warning document.
 - `TaskRunner.mutex` and its condition protect the task queue and worker flags.
 - `BrowserSession.network_lock` serializes the shared HTTP client, cookie jar,
   and response cache across every window around fetches.

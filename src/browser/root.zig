@@ -89,6 +89,7 @@ fn showPostResubmissionDialog(window: sdl2.Window) bool {
 pub const NavigationDocument = struct {
     response: url_module.HttpResponse,
     owned_body: ?[]const u8,
+    certificate_error: bool = false,
 
     pub fn deinit(self: *NavigationDocument, allocator: std.mem.Allocator) void {
         if (self.response.csp_header) |header| allocator.free(header);
@@ -96,6 +97,69 @@ pub const NavigationDocument = struct {
         self.* = undefined;
     }
 };
+
+pub const NavigationSecurity = enum {
+    none,
+    secure,
+    certificate_error,
+};
+
+pub fn navigationSecurity(url: ?*const Url, certificate_error: bool) NavigationSecurity {
+    if (certificate_error) return .certificate_error;
+    const current = url orelse return .none;
+    return if (std.ascii.eqlIgnoreCase(current.scheme, "https")) .secure else .none;
+}
+
+fn appendWarningHtmlEscaped(
+    allocator: std.mem.Allocator,
+    output: *std.ArrayList(u8),
+    value: []const u8,
+) !void {
+    for (value) |byte| {
+        const replacement: ?[]const u8 = switch (byte) {
+            '&' => "&amp;",
+            '<' => "&lt;",
+            '>' => "&gt;",
+            '"' => "&quot;",
+            '\'' => "&apos;",
+            else => null,
+        };
+        if (replacement) |escaped| {
+            try output.appendSlice(allocator, escaped);
+        } else {
+            try output.append(allocator, byte);
+        }
+    }
+}
+
+/// Build a self-contained warning document without incorporating bytes from
+/// the untrusted peer. There is deliberately no proceed-anyway action.
+pub fn certificateWarningHtml(
+    allocator: std.mem.Allocator,
+    requested_url: *const Url,
+    certificate_error: anyerror,
+) ![]u8 {
+    const target = try requested_url.*.toOwnedString(allocator);
+    defer allocator.free(target);
+
+    var html = std.ArrayList(u8).empty;
+    errdefer html.deinit(allocator);
+    try html.appendSlice(
+        allocator,
+        "<html><head><title>Certificate error</title></head>" ++
+            "<body><h1>Certificate error</h1>" ++
+            "<p>Zibra could not verify the security certificate for <strong>",
+    );
+    try appendWarningHtmlEscaped(allocator, &html, target);
+    try html.appendSlice(
+        allocator,
+        "</strong>.</p><p>The connection was stopped before any page data was loaded.</p>" ++
+            "<p>Error: <code>",
+    );
+    try appendWarningHtmlEscaped(allocator, &html, @errorName(certificate_error));
+    try html.appendSlice(allocator, "</code></p></body></html>");
+    return html.toOwnedSlice(allocator);
+}
 
 fn createBrokenImage(allocator: std.mem.Allocator) !zigimg.Image {
     const width: usize = 16;
@@ -1065,6 +1129,7 @@ pub const Browser = struct {
     // the separately owned URL from the latest committed document.
     active_tab_url: ?[]u8 = null,
     active_tab_committed_url: ?[]u8 = null,
+    active_tab_committed_security: NavigationSecurity = .none,
     active_tab_scroll: i32 = 0,
     active_tab_height: i32 = 0,
     active_tab_zoom: f32 = 1.0,
@@ -1508,6 +1573,7 @@ pub const Browser = struct {
                 self.allocator.free(url);
             }
             self.active_tab_committed_url = null;
+            self.active_tab_committed_security = .none;
 
             self.retireActiveRenderStateLocked();
 
@@ -2585,9 +2651,25 @@ pub const Browser = struct {
         }
 
         const response = if (final_url) |output|
-            try self.fetchBodyForNavigation(url, referrer, payload, output)
+            self.fetchBodyForNavigation(url, referrer, payload, output) catch |err| {
+                if (!url_module.Url.isCertificateError(err)) return err;
+                const body = try certificateWarningHtml(self.allocator, &url, err);
+                return .{
+                    .response = .{ .body = body },
+                    .owned_body = body,
+                    .certificate_error = true,
+                };
+            }
         else
-            try self.fetchBody(url, referrer, payload);
+            self.fetchBody(url, referrer, payload) catch |err| {
+                if (!url_module.Url.isCertificateError(err)) return err;
+                const body = try certificateWarningHtml(self.allocator, &url, err);
+                return .{
+                    .response = .{ .body = body },
+                    .owned_body = body,
+                    .certificate_error = true,
+                };
+            };
         const body_is_owned = !std.mem.eql(u8, url.scheme, "about") and
             !std.mem.eql(u8, url.scheme, "data");
         return .{
@@ -2668,8 +2750,11 @@ pub const Browser = struct {
         const response = document.response;
 
         // The requested link and its final redirect destination are distinct
-        // visits. Record them only after the fetch/generation succeeds.
-        try self.recordSuccessfulNavigation(url, &final_url);
+        // visits. A certificate warning is browser UI, not a successful visit
+        // to the untrusted destination.
+        if (!document.certificate_error) {
+            try self.recordSuccessfulNavigation(url, &final_url);
+        }
         const raw_body = response.body;
         const body_text = try decodeUtf8Replace(self.allocator, raw_body);
         var body_text_owned = true;
@@ -2702,6 +2787,7 @@ pub const Browser = struct {
         tab.registerFrame(frame);
         frame.viewport_width = tab.tab_width;
         frame.viewport_height = tab.tab_height;
+        frame.certificate_error = document.certificate_error;
         tab.focused_frame = frame;
 
         frame.scroll = 0;
@@ -2726,7 +2812,7 @@ pub const Browser = struct {
             frame.current_html_source = null;
         }
 
-        if (url.*.view_source) {
+        if (url.*.view_source and !document.certificate_error) {
             // Use the new layoutSourceCode function for view-source mode
             self.layout_engine.accessibility = tab.accessibility;
 
@@ -3013,6 +3099,7 @@ pub const Browser = struct {
         }
         frame.current_url = null;
         frame.current_url_owned = false;
+        frame.certificate_error = false;
         frame.resources_dirty = false;
         frame.content_height = 0;
         frame.scroll = 0;
@@ -3064,7 +3151,9 @@ pub const Browser = struct {
             }
         }
 
-        try self.recordSuccessfulNavigation(url, &final_url);
+        if (!document.certificate_error) {
+            try self.recordSuccessfulNavigation(url, &final_url);
+        }
 
         const raw_body = response.body;
         const body_text = try decodeUtf8Replace(self.allocator, raw_body);
@@ -3086,6 +3175,7 @@ pub const Browser = struct {
         // retire it before installing the response as the new generation.
         self.retireRenderStateForTab(frame.tab);
         self.resetFrameForNavigation(frame);
+        frame.certificate_error = document.certificate_error;
 
         frame.clearAllowedOrigins();
         if (response.csp_header) |hdr| {
@@ -3439,10 +3529,13 @@ pub const Browser = struct {
             return error.IframeRedirectBlockedByCsp;
         }
 
-        try self.recordSuccessfulNavigation(&iframe_url, &final_url);
+        if (!document.certificate_error) {
+            try self.recordSuccessfulNavigation(&iframe_url, &final_url);
+        }
 
         const frame = try parent.allocator.create(Frame);
         frame.* = Frame.init(parent.allocator, parent.tab, parent, iframe_node);
+        frame.certificate_error = document.certificate_error;
         errdefer {
             frame.deinit();
             parent.allocator.destroy(frame);
@@ -4876,7 +4969,10 @@ pub const Browser = struct {
         self.active_tab_prefers_dark = data.prefers_dark;
 
         if (data.url) |url| {
-            self.updateCommittedActiveTabUrlLocked(url);
+            self.updateCommittedActiveTabUrlLocked(
+                url,
+                navigationSecurity(url, data.certificate_error),
+            );
         } else {
             self.clearActiveTabUrlLocked();
         }
@@ -4947,7 +5043,11 @@ pub const Browser = struct {
 
     /// Commit replaces both independently owned snapshots atomically with
     /// respect to Browser.lock. Bookmarks consult only the committed copy.
-    fn updateCommittedActiveTabUrlLocked(self: *Browser, url: *const Url) void {
+    fn updateCommittedActiveTabUrlLocked(
+        self: *Browser,
+        url: *const Url,
+        security: NavigationSecurity,
+    ) void {
         const committed_copy = url.*.toOwnedString(self.allocator) catch |err| {
             std.log.warn("Failed to format committed URL for chrome: {}", .{err});
             return;
@@ -4962,6 +5062,7 @@ pub const Browser = struct {
         if (self.active_tab_committed_url) |old| self.allocator.free(old);
         self.active_tab_url = displayed_copy;
         self.active_tab_committed_url = committed_copy;
+        self.active_tab_committed_security = security;
     }
 
     /// Restore chrome after an optimistic load could not be scheduled.
@@ -4989,6 +5090,7 @@ pub const Browser = struct {
             self.allocator.free(old);
         }
         self.active_tab_committed_url = null;
+        self.active_tab_committed_security = .none;
     }
 
     // Draw the browser content (composite from pre-rastered surfaces)
@@ -6187,6 +6289,7 @@ pub const Browser = struct {
 
 pub const CommitData = struct {
     url: ?*Url,
+    certificate_error: bool = false,
     display_list: ?[]DisplayItem,
     scroll: ?i32,
     height: i32,

@@ -1,0 +1,18 @@
+<!--
+How to verify:
+1. Open the valid HTTPS link. Its committed URL should show a 🔒 in chrome.
+2. Return here and open either badssl.com link. Zibra should replace the failed
+   navigation with a visible "Certificate error" warning for that URL, with no
+   padlock and no proceed-anyway link.
+3. Return here once more. This local file URL must not show a padlock.
+-->
+<!doctype html>
+<html>
+  <head><title>Certificate security checks</title></head>
+  <body>
+    <h1>Certificate security checks</h1>
+    <p><a href="https://example.com/">Valid HTTPS certificate</a></p>
+    <p><a href="https://expired.badssl.com/">Expired certificate</a></p>
+    <p><a href="https://self-signed.badssl.com/">Self-signed certificate</a></p>
+  </body>
+</html>

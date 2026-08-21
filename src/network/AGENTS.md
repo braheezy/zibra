@@ -34,6 +34,10 @@ before changing URL or response ownership.
 - `Url.fetchBody` is browser-independent. Keep it free of SDL, tabs, and
   renderer concerns so inspection commands can reuse it. Caching is an
   explicitly supplied dependency; inspection callers may opt out.
+- Zig's HTTP client exposes TLS handshake and certificate-verification setup
+  failures as `TlsInitializationFailed`. Keep that classification at the URL
+  boundary; document navigation may turn it into browser UI, while subresource
+  fetches must continue returning the transport error to their caller.
 - Cache hits must preserve the normal fetch ownership contract by returning
   caller-owned body and header copies. Interactive cache, cookie, and HTTP
   client state belongs to the shared `BrowserSession` and is protected by its

@@ -169,6 +169,12 @@ before changing `root.zig`, `tab.zig`, `render/`, or browser task scheduling.
   background. Document navigation for `about:bookmarks` uses
   `NavigationDocument`, whose explicit owned-body field covers both generated
   HTML and ordinary allocated fetches.
+- Certificate-validation failures become owned, browser-generated warning
+  documents with no bypass and are not recorded as successful visits. Each
+  root frame commits its certificate-error bit with its URL. Chrome shows a
+  lock only when the displayed URL exactly matches a successfully verified,
+  committed HTTPS URL, so pending text and warning documents cannot inherit a
+  stale secure indicator.
 - Basic text direction keeps glyphs in source order and aligns completed lines:
   `-rtl` supplies the document fallback, while the nearest block ancestor's
   `dir=rtl` or `dir=ltr` overrides it. Unicode bidi reordering, `dir=auto`, and
