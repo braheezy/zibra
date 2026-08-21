@@ -70,6 +70,11 @@ before changing `root.zig`, `tab.zig`, `render/`, or browser task scheduling.
   widget-owned boolean. Primary or focused activation dispatches the cancelable
   click first, then toggles that attribute and repaints. Form encoding omits
   unchecked checkboxes and uses `on` for a checked checkbox without `value`.
+- Hidden inputs remain successful form controls but create no layout box,
+  painted command, hit target, focus stop, or accessibility node. Password
+  inputs retain ordinary text-entry editing and submission behavior; only
+  presentation is masked, with one star per grapheme, and accessibility output
+  must not log or name the backing value.
 - A `<button>` is an atomic inline whose payload owns a temporary contained
   block-layout subtree. Descendant commands and interactive bounds are laid
   out in local coordinates, rebased onto the surrounding persistent block

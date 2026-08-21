@@ -1264,7 +1264,7 @@ fn recurseNode(self: *Layout, node: Node, node_ptr: ?*Node, line_buffer: *std.Ar
             if (t.parent) |parent| {
                 switch (parent.*) {
                     .element => |e| {
-                        if (isNonRenderTag(e.tag)) return;
+                        if (isNonRenderedElement(&e)) return;
                     },
                     else => {},
                 }
@@ -1272,7 +1272,7 @@ fn recurseNode(self: *Layout, node: Node, node_ptr: ?*Node, line_buffer: *std.Ar
             try self.handleTextToken(t.text, line_buffer, node_ptr);
         },
         .element => |e| {
-            if (isNonRenderTag(e.tag)) return;
+            if (isNonRenderedElement(&e)) return;
             // Empty inline anchors have no glyph from which to derive a
             // position, so retain their insertion point explicitly.
             if (self.collect_hit_test_bounds and e.children.items.len == 0) {
@@ -1328,11 +1328,16 @@ fn isNonRenderTag(tag: []const u8) bool {
         std.ascii.eqlIgnoreCase(tag, "title");
 }
 
+fn isNonRenderedElement(element: *const parser.Element) bool {
+    return isNonRenderTag(element.tag) or element.isHiddenInput();
+}
+
 fn handleInputElement(self: *Layout, node: Node, node_ptr: ?*Node, line_buffer: *std.ArrayList(LineItem)) !void {
     const element = switch (node) {
         .element => |e| e,
         else => return,
     };
+    if (element.isHiddenInput()) return;
     self.resetSoftHyphenWord();
 
     var input_layout = InputLayout.init(self.allocator);
@@ -2232,6 +2237,7 @@ fn isTabIndexFocusable(element: *const parser.Element) bool {
 }
 
 fn isElementFocusable(element: *const parser.Element) bool {
+    if (element.isHiddenInput()) return false;
     if (std.mem.eql(u8, element.tag, "input") or std.mem.eql(u8, element.tag, "button")) {
         return true;
     }
@@ -2684,6 +2690,7 @@ const InputLayout = struct {
     is_focused: bool = false,
     is_checkbox: bool = false,
     is_checked: bool = false,
+    is_password: bool = false,
 
     fn init(allocator: std.mem.Allocator) InputLayout {
         return .{
@@ -2703,6 +2710,7 @@ const InputLayout = struct {
         self.color = engine.text_color;
         self.is_checkbox = element.isCheckbox();
         self.is_checked = element.isChecked();
+        self.is_password = element.isPasswordInput();
         if (self.is_checkbox) {
             self.bgcolor = .{ .r = 255, .g = 255, .b = 255, .a = 255 };
         }
@@ -2829,10 +2837,7 @@ const InputLayout = struct {
 
             while (g_iter.next()) |gc| {
                 const gme = gc.bytes(self.text);
-                const glyph_text = if (std.mem.eql(u8, gme, "\n") or std.mem.eql(u8, gme, "\r"))
-                    " "
-                else
-                    gme;
+                const glyph_text = inputDisplayGrapheme(self.is_password, gme);
                 const glyph = try engine.font_manager.getStyledGlyph(
                     glyph_text,
                     self.font_weight,
@@ -2867,6 +2872,43 @@ const InputLayout = struct {
         }
     }
 };
+
+fn inputDisplayGrapheme(is_password: bool, source: []const u8) []const u8 {
+    if (is_password) return "*";
+    if (std.mem.eql(u8, source, "\n") or std.mem.eql(u8, source, "\r")) return " ";
+    return source;
+}
+
+test "hidden inputs emit no inline box and password graphemes paint as stars" {
+    const allocator = std.testing.allocator;
+    var hidden_node = Node{ .element = try parser.Element.init(
+        allocator,
+        "input type=hidden value=secret",
+        null,
+    ) };
+    defer hidden_node.deinit(allocator);
+
+    // The hidden check precedes every access to layout/font state, proving it
+    // contributes no atomic input item, width, or line metrics.
+    var unused_engine: Layout = undefined;
+    var line_items = std.ArrayList(LineItem).empty;
+    defer line_items.deinit(allocator);
+    try unused_engine.handleInputElement(hidden_node, &hidden_node, &line_items);
+    try std.testing.expectEqual(@as(usize, 0), line_items.items.len);
+
+    const password = "aé🙂";
+    var iterator = grapheme.iterator(password);
+    var masked_count: usize = 0;
+    while (iterator.next()) |cluster| {
+        try std.testing.expectEqualStrings(
+            "*",
+            inputDisplayGrapheme(true, cluster.bytes(password)),
+        );
+        masked_count += 1;
+    }
+    try std.testing.expectEqual(@as(usize, 3), masked_count);
+    try std.testing.expectEqualStrings("x", inputDisplayGrapheme(false, "x"));
+}
 
 /// An inline button whose contents are laid out as a real block subtree. The
 /// subtree lives only while the surrounding line is being built; its painted

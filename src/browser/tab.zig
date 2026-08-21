@@ -2151,6 +2151,7 @@ fn isTabIndexFocusable(element: *const parser.Element) bool {
 }
 
 fn isElementFocusable(element: *const parser.Element) bool {
+    if (element.isHiddenInput()) return false;
     if (std.mem.eql(u8, element.tag, "input") or std.mem.eql(u8, element.tag, "button")) {
         return true;
     }
@@ -2165,6 +2166,20 @@ fn isElementFocusable(element: *const parser.Element) bool {
         }
     }
     return isTabIndexFocusable(element);
+}
+
+test "hidden inputs are skipped by focus while password inputs remain editable" {
+    const allocator = std.testing.allocator;
+    var hidden = try parser.Element.init(allocator, "input type=HiDdEn tabindex=0", null);
+    defer hidden.deinit(allocator);
+    var password = try parser.Element.init(allocator, "input type=PASSWORD", null);
+    defer password.deinit(allocator);
+
+    try std.testing.expect(hidden.isHiddenInput());
+    try std.testing.expect(!isElementFocusable(&hidden));
+    try std.testing.expect(password.isPasswordInput());
+    try std.testing.expect(isElementFocusable(&password));
+    try std.testing.expect(isTextEntryInput(&password));
 }
 
 fn collectFocusableElements(self: *Tab, frame: *Frame, out: *std.ArrayList(*Node)) !void {
@@ -2307,10 +2322,7 @@ pub fn activateFocusedElement(self: *Tab, b: *Browser) !void {
 
 fn isTextEntryInput(element: *const parser.Element) bool {
     if (!std.ascii.eqlIgnoreCase(element.tag, "input")) return false;
-    const input_type = if (element.attributes) |attrs|
-        attrs.get("type") orelse "text"
-    else
-        "text";
+    const input_type = element.inputType();
 
     // Unknown input types use HTML's text-state fallback. Exclude the known
     // non-text controls that should retain their ordinary activation behavior.
@@ -2394,6 +2406,7 @@ pub fn keypress(self: *Tab, b: *Browser, char: u8) !void {
         switch (live_focus_node.*) {
             .element => |*e| {
                 if (std.mem.eql(u8, e.tag, "input")) {
+                    if (!isTextEntryInput(e)) return;
                     if (e.attributes) |*attrs| {
                         const old_value = attrs.get("value") orelse "";
                         // Append the character
@@ -2491,6 +2504,7 @@ pub fn backspace(self: *Tab, b: *Browser) !void {
         switch (focus_node.*) {
             .element => |*e| {
                 if (std.mem.eql(u8, e.tag, "input")) {
+                    if (!isTextEntryInput(e)) return;
                     if (e.attributes) |*attrs| {
                         const old_value = attrs.get("value") orelse "";
                         if (old_value.len > 0) {
@@ -2617,6 +2631,7 @@ fn appendAccessibilityNodes(
         .text => {},
         .element => |*e| {
             if (isAriaHidden(e)) return;
+            if (e.isHiddenInput()) return;
             if (isPresentationalTag(e.tag)) {
                 for (e.children.items) |*child| {
                     try self.appendAccessibilityNodes(out, child, bounds_map);
@@ -2731,13 +2746,16 @@ fn accessibilityName(self: *Tab, node_ptr: *Node, element: *const parser.Element
 
     if (std.mem.eql(u8, element.tag, "input")) {
         if (element.attributes) |attrs| {
-            if (attrs.get("value")) |value| {
-                if (value.len > 0) return self.copyAccessibilityString(value);
+            if (!element.isPasswordInput()) {
+                if (attrs.get("value")) |value| {
+                    if (value.len > 0) return self.copyAccessibilityString(value);
+                }
             }
             if (attrs.get("placeholder")) |placeholder| {
                 if (placeholder.len > 0) return self.copyAccessibilityString(placeholder);
             }
         }
+        if (element.isPasswordInput()) return self.copyAccessibilityString("password input");
         return self.copyAccessibilityString("input");
     }
 
@@ -2856,9 +2874,11 @@ fn speakAccessibilityNode(self: *Tab, node: *AccessibilityNode, reason: []const 
         switch (dom.*) {
             .element => |*e| {
                 if (std.mem.eql(u8, e.tag, "input")) {
-                    if (e.attributes) |attrs| {
-                        if (attrs.get("value")) |val| {
-                            value_text = val;
+                    if (!e.isPasswordInput()) {
+                        if (e.attributes) |attrs| {
+                            if (attrs.get("value")) |val| {
+                                value_text = val;
+                            }
                         }
                     }
                 }

@@ -31,6 +31,22 @@ test "Parse basic HTML" {
     try std.testing.expectEqualStrings("Hello, world!", text.text);
 }
 
+test "input type helpers recognize hidden password and text defaults" {
+    const allocator = std.testing.allocator;
+    var hidden = try document_parser.Element.init(allocator, "input type=' HiDdEn '", null);
+    defer hidden.deinit(allocator);
+    var password = try document_parser.Element.init(allocator, "input type=PASSWORD", null);
+    defer password.deinit(allocator);
+    var text = try document_parser.Element.init(allocator, "input", null);
+    defer text.deinit(allocator);
+
+    try std.testing.expectEqualStrings("HiDdEn", hidden.inputType());
+    try std.testing.expect(hidden.isHiddenInput());
+    try std.testing.expect(!hidden.isPasswordInput());
+    try std.testing.expect(password.isPasswordInput());
+    try std.testing.expectEqualStrings("text", text.inputType());
+}
+
 test "HTML serialization emits live attributes children and void elements" {
     const allocator = std.testing.allocator;
     const html =

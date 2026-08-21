@@ -1,0 +1,33 @@
+<!doctype html>
+<!--
+How to verify:
+1. The first line reads exactly "LEFTRIGHT": the hidden input between those
+   words must have no box, cursor target, or spacing.
+2. The password box initially contains six stars, never the word "secret".
+3. Press Tab from the page: focus must skip the hidden input and reach the
+   password input. Typed characters must continue to appear only as stars.
+4. The final status is green, proving both controls retain their real backing
+   values even though one is absent and the other is masked.
+-->
+<html>
+<head>
+  <style>
+    .pass { color: green; font-weight: bold; }
+    .fail { color: red; font-weight: bold; }
+  </style>
+</head>
+<body>
+  <h1>Hidden and password inputs</h1>
+  <p>LEFT<input id="token" type="hidden" name="csrf" value="private-token">RIGHT</p>
+  <p><label>Password: <input id="password" type="password" name="password" value="secret"></label></p>
+  <p id="status" class="fail">PASS: real control values remain available for submission</p>
+  <script>
+    if (token.getAttribute("value") === "private-token" &&
+        password.getAttribute("value") === "secret") {
+      status.setAttribute("class", "pass");
+    }
+    undefined;
+  </script>
+</body>
+</html>
+

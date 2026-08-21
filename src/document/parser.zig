@@ -303,13 +303,32 @@ pub const Element = struct {
         }
     }
 
+    /// Return the normalized input type. Unknown types are intentionally left
+    /// intact so callers can apply HTML's text-state fallback where needed.
+    pub fn inputType(self: *const Element) []const u8 {
+        if (!std.ascii.eqlIgnoreCase(self.tag, "input")) return "";
+        const attributes = self.attributes orelse return "text";
+        const input_type = attributes.get("type") orelse return "text";
+        return std.mem.trim(u8, input_type, " \t\r\n");
+    }
+
+    pub fn isInputType(self: *const Element, expected: []const u8) bool {
+        if (!std.ascii.eqlIgnoreCase(self.tag, "input")) return false;
+        return std.ascii.eqlIgnoreCase(self.inputType(), expected);
+    }
+
     /// Checkbox state lives in the DOM attribute map so layout, activation,
     /// and form submission all observe the same source of truth.
     pub fn isCheckbox(self: *const Element) bool {
-        if (!std.ascii.eqlIgnoreCase(self.tag, "input")) return false;
-        const attributes = self.attributes orelse return false;
-        const input_type = attributes.get("type") orelse return false;
-        return std.ascii.eqlIgnoreCase(std.mem.trim(u8, input_type, " \t\r\n"), "checkbox");
+        return self.isInputType("checkbox");
+    }
+
+    pub fn isHiddenInput(self: *const Element) bool {
+        return self.isInputType("hidden");
+    }
+
+    pub fn isPasswordInput(self: *const Element) bool {
+        return self.isInputType("password");
     }
 
     pub fn isChecked(self: *const Element) bool {

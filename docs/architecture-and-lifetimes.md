@@ -674,6 +674,13 @@ checkbox contributes its explicit `value`, or the static default `on` when that
 attribute is absent. The `checked` key inserted by activation and its empty
 value are static slices, while parser-provided attributes continue to borrow
 the document buffer.
+Hidden and password controls likewise keep one authoritative DOM `value`.
+Hidden inputs remain part of successful-control form encoding but are excluded
+before inline measurement, so they produce no geometry, paint provenance,
+focus stop, hit target, or accessibility node. Password inputs follow the
+ordinary text-entry event/edit/Return path; input paint substitutes one `*`
+glyph per source grapheme while form encoding retains the original value.
+Accessibility naming and speech never copy that password value.
 Space continues to use only focused-element activation, and a text input outside
 a form does nothing.
 Primary same-document fragment links stay on the tab worker: they resolve the

@@ -51,6 +51,10 @@ input styling.
 toggles, omission of unchecked controls, explicit values, and the default
 checked value `on` through a localhost GET submission.
 
+`tests/manual/new-input-types.html` verifies that hidden inputs occupy no
+layout or focus space, password values paint as stars, and both control types
+retain their real values for form submission.
+
 `tests/manual/rich-buttons.html` verifies inline rich-button containment,
 block-driven height growth, independently targetable input/link descendants,
 and nested-button parser recovery.

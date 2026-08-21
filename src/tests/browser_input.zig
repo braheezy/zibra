@@ -314,6 +314,9 @@ test "Enter in a focused text entry submits its containing form" {
     try std.testing.expect(try enterOnFirstInput(
         "<html><body><form action=/search><input type=TeXt name=q></form></body></html>",
     ));
+    try std.testing.expect(try enterOnFirstInput(
+        "<html><body><form action=/login><input type=PaSsWoRd name=password></form></body></html>",
+    ));
 }
 
 test "Enter does not submit from a text entry outside a form or a non-text input" {
@@ -323,6 +326,30 @@ test "Enter does not submit from a text entry outside a form or a non-text input
     try std.testing.expect(!try enterOnFirstInput(
         "<html><body><form action=/search><input type=checkbox name=q></form></body></html>",
     ));
+    try std.testing.expect(!try enterOnFirstInput(
+        "<html><body><form action=/search><input type=hidden name=token></form></body></html>",
+    ));
+}
+
+test "hidden and password controls submit their unmasked values" {
+    const allocator = std.testing.allocator;
+    var html_parser = try parser_module.HTMLParser.init(
+        allocator,
+        "<form><input type=hidden name=csrf value='a b'>" ++
+            "<input type=password name=password value='s&amp;cret'></form>",
+    );
+    html_parser.use_implicit_tags = false;
+    defer html_parser.deinit(allocator);
+    var form = try html_parser.parse();
+    defer form.deinit(allocator);
+    parser_module.fixParentPointers(&form, null);
+
+    const encoded = try tab_module.encodeFormData(allocator, &form);
+    defer allocator.free(encoded);
+    try std.testing.expectEqualStrings(
+        "csrf=a%20b&password=s%26cret",
+        encoded,
+    );
 }
 
 test "form method defaults to GET and recognizes POST case-insensitively" {

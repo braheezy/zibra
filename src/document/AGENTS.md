@@ -63,6 +63,10 @@ or selector/rule lifetime.
   `checked` attribute entry. Activation may insert the static empty value or
   remove that entry; it must not replace the control's independent `value`.
   Layout and successful-control serialization read the same attribute state.
+- Input-type comparisons are ASCII case-insensitive and use the normalized
+  `Element.inputType` view. Hidden and password inputs keep their real `value`
+  attribute in the DOM: layout suppresses hidden controls and masks password
+  paint without replacing or duplicating that submission value.
 - A `button` start tag implicitly closes an active button even through
   intervening flow descendants, so malformed nested-button source produces
   sibling controls. Other descendants, including non-conforming interactive
