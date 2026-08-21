@@ -41,8 +41,154 @@ pub const SameSiteMode = enum { none, lax };
 
 pub const CookieEntry = struct {
     value: []u8,
+    // Owned Set-Cookie attributes without the leading semicolon. The tutorial
+    // jar stores one cookie per host and exposes these parameters through
+    // document.cookie unless the entry is HttpOnly.
+    parameters: ?[]u8 = null,
     same_site: SameSiteMode = .none,
+    http_only: bool = false,
+
+    pub fn deinit(self: *CookieEntry, allocator: std.mem.Allocator) void {
+        allocator.free(self.value);
+        if (self.parameters) |parameters| allocator.free(parameters);
+        self.* = undefined;
+    }
 };
+
+pub const CookieSource = enum {
+    http,
+    script,
+};
+
+const ParsedCookie = struct {
+    value: []const u8,
+    parameters: ?[]const u8,
+    same_site: SameSiteMode,
+    http_only: bool,
+};
+
+fn parseSetCookie(value: []const u8) ?ParsedCookie {
+    const trimmed = std.mem.trim(u8, value, " \t\r\n");
+    if (trimmed.len == 0) return null;
+
+    const semicolon = std.mem.indexOfScalar(u8, trimmed, ';');
+    const cookie_value = std.mem.trim(
+        u8,
+        if (semicolon) |index| trimmed[0..index] else trimmed,
+        " \t",
+    );
+    if (cookie_value.len == 0 or std.mem.indexOfScalar(u8, cookie_value, '=') == null) return null;
+
+    const parameters = if (semicolon) |index| blk: {
+        const attributes = std.mem.trim(u8, trimmed[index + 1 ..], " \t");
+        break :blk if (attributes.len == 0) null else attributes;
+    } else null;
+    var same_site: SameSiteMode = .none;
+    var http_only = false;
+    if (parameters) |attributes| {
+        var iterator = std.mem.tokenizeScalar(u8, attributes, ';');
+        while (iterator.next()) |raw_attribute| {
+            const attribute = std.mem.trim(u8, raw_attribute, " \t");
+            if (attribute.len == 0) continue;
+            if (std.mem.indexOfScalar(u8, attribute, '=')) |equals| {
+                const key = std.mem.trim(u8, attribute[0..equals], " \t");
+                const attribute_value = std.mem.trim(u8, attribute[equals + 1 ..], " \t");
+                if (std.ascii.eqlIgnoreCase(key, "samesite")) {
+                    same_site = if (std.ascii.eqlIgnoreCase(attribute_value, "lax")) .lax else .none;
+                }
+            } else if (std.ascii.eqlIgnoreCase(attribute, "samesite")) {
+                same_site = .lax;
+            } else if (std.ascii.eqlIgnoreCase(attribute, "httponly")) {
+                http_only = true;
+            }
+        }
+    }
+    return .{
+        .value = cookie_value,
+        .parameters = parameters,
+        .same_site = same_site,
+        .http_only = http_only,
+    };
+}
+
+/// Parse and atomically install one tutorial-style cookie for a host. HTTP
+/// responses may replace any entry. Script cannot create an HttpOnly entry or
+/// replace an entry that the server marked HttpOnly.
+pub fn applySetCookie(
+    allocator: std.mem.Allocator,
+    cookie_jar: *std.StringHashMap(CookieEntry),
+    host: []const u8,
+    raw_value: []const u8,
+    source: CookieSource,
+) !bool {
+    if (host.len == 0) return false;
+    const parsed = parseSetCookie(raw_value) orelse return false;
+    if (source == .script and parsed.http_only) return false;
+    if (source == .script) {
+        if (cookie_jar.get(host)) |existing| {
+            if (existing.http_only) return false;
+        }
+    }
+
+    const value_copy = try allocator.dupe(u8, parsed.value);
+    errdefer allocator.free(value_copy);
+    const parameters_copy = if (parsed.parameters) |parameters|
+        try allocator.dupe(u8, parameters)
+    else
+        null;
+    errdefer if (parameters_copy) |parameters| allocator.free(parameters);
+
+    const replacement = CookieEntry{
+        .value = value_copy,
+        .parameters = parameters_copy,
+        .same_site = parsed.same_site,
+        .http_only = parsed.http_only,
+    };
+    if (cookie_jar.getPtr(host)) |existing| {
+        existing.deinit(allocator);
+        existing.* = replacement;
+        return true;
+    }
+
+    try cookie_jar.ensureUnusedCapacity(1);
+    const host_copy = try allocator.dupe(u8, host);
+    cookie_jar.putAssumeCapacity(host_copy, replacement);
+    return true;
+}
+
+/// Return an independent script-visible serialization. HttpOnly entries are
+/// indistinguishable from a missing cookie at this boundary.
+pub fn cookieForScript(
+    allocator: std.mem.Allocator,
+    cookie_jar: *const std.StringHashMap(CookieEntry),
+    host: []const u8,
+) ![]u8 {
+    const entry = cookie_jar.get(host) orelse return allocator.dupe(u8, "");
+    if (entry.http_only) return allocator.dupe(u8, "");
+    if (entry.parameters) |parameters| {
+        return std.fmt.allocPrint(allocator, "{s}; {s}", .{ entry.value, parameters });
+    }
+    return allocator.dupe(u8, entry.value);
+}
+
+/// Select the Cookie request-header value. HttpOnly affects only script
+/// visibility; it never prevents the browser from authenticating HTTP or XHR
+/// requests. SameSite keeps its existing tutorial behavior.
+pub fn cookieForRequest(
+    cookie_jar: *const std.StringHashMap(CookieEntry),
+    host: []const u8,
+    method: std.http.Method,
+    referrer: ?Url,
+) ?[]const u8 {
+    const entry = cookie_jar.get(host) orelse return null;
+    if (entry.same_site == .lax and method != .GET) {
+        if (referrer) |ref| {
+            const ref_host = ref.host orelse return null;
+            if (!std.ascii.eqlIgnoreCase(host, ref_host)) return null;
+        }
+    }
+    return entry.value;
+}
 
 pub const HttpResponse = struct {
     body: []const u8,
@@ -601,24 +747,11 @@ pub const Url = struct {
         const method: std.http.Method = if (payload != null) .POST else .GET;
 
         if (self.host) |host_slice| {
-            if (cookie_jar.get(host_slice)) |entry| {
-                var allow_cookie = true;
-                if (entry.same_site == .lax and method != .GET) {
-                    if (referrer) |ref| {
-                        if (ref.host) |ref_host| {
-                            allow_cookie = std.ascii.eqlIgnoreCase(host_slice, ref_host);
-                        } else {
-                            allow_cookie = false;
-                        }
-                    }
-                }
-
-                if (allow_cookie) {
-                    try extra_headers.append(al, .{
-                        .name = "Cookie",
-                        .value = entry.value,
-                    });
-                }
+            if (cookieForRequest(cookie_jar, host_slice, method, referrer)) |cookie_value| {
+                try extra_headers.append(al, .{
+                    .name = "Cookie",
+                    .value = cookie_value,
+                });
             }
         }
 
@@ -695,56 +828,7 @@ pub const Url = struct {
                 var header_it = response.head.iterateHeaders();
                 while (header_it.next()) |header| {
                     if (std.ascii.eqlIgnoreCase(header.name, "set-cookie")) {
-                        var raw_value = std.mem.trim(u8, header.value, " ");
-                        var same_site_mode: SameSiteMode = .none;
-
-                        if (std.mem.indexOfScalar(u8, raw_value, ';')) |semicolon| {
-                            const attributes_slice = raw_value[semicolon + 1 ..];
-                            raw_value = std.mem.trim(u8, raw_value[0..semicolon], " ");
-
-                            var attr_iter = std.mem.tokenizeScalar(u8, attributes_slice, ';');
-                            while (attr_iter.next()) |attr_raw| {
-                                const attr_trimmed = std.mem.trim(u8, attr_raw, " ");
-                                if (attr_trimmed.len == 0) continue;
-
-                                if (std.mem.indexOfScalar(u8, attr_trimmed, '=')) |eq_index| {
-                                    const key = std.mem.trim(u8, attr_trimmed[0..eq_index], " ");
-                                    const value = std.mem.trim(u8, attr_trimmed[eq_index + 1 ..], " ");
-                                    if (std.ascii.eqlIgnoreCase(key, "samesite")) {
-                                        if (std.ascii.eqlIgnoreCase(value, "lax")) {
-                                            same_site_mode = .lax;
-                                        } else {
-                                            same_site_mode = .none;
-                                        }
-                                    }
-                                } else if (std.ascii.eqlIgnoreCase(attr_trimmed, "samesite")) {
-                                    same_site_mode = .lax;
-                                }
-                            }
-                        }
-
-                        const cookie_copy = try al.alloc(u8, raw_value.len);
-                        @memcpy(cookie_copy, raw_value);
-
-                        if (cookie_jar.getPtr(cookie_host)) |entry_ptr| {
-                            al.free(entry_ptr.value);
-                            entry_ptr.* = CookieEntry{
-                                .value = cookie_copy,
-                                .same_site = same_site_mode,
-                            };
-                        } else {
-                            const host_copy = try al.alloc(u8, cookie_host.len);
-                            @memcpy(host_copy, cookie_host);
-                            const new_entry = CookieEntry{
-                                .value = cookie_copy,
-                                .same_site = same_site_mode,
-                            };
-                            cookie_jar.put(host_copy, new_entry) catch |err| {
-                                al.free(cookie_copy);
-                                al.free(host_copy);
-                                return err;
-                            };
-                        }
+                        _ = try applySetCookie(al, cookie_jar, cookie_host, header.value, .http);
                     } else if (std.ascii.eqlIgnoreCase(header.name, "content-security-policy")) {
                         if (csp_header) |existing| {
                             al.free(existing);

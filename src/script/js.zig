@@ -174,6 +174,21 @@ const XhrCallback = struct {
     context: ?*anyopaque = null,
 };
 
+pub const CookieResult = struct {
+    data: []const u8,
+    allocator: ?std.mem.Allocator = null,
+    should_free: bool = false,
+};
+
+pub const CookieGetCallbackFn = *const fn (context: ?*anyopaque) anyerror!CookieResult;
+pub const CookieSetCallbackFn = *const fn (context: ?*anyopaque, value: []const u8) anyerror!void;
+
+const CookieCallback = struct {
+    get_function: ?CookieGetCallbackFn = null,
+    set_function: ?CookieSetCallbackFn = null,
+    context: ?*anyopaque = null,
+};
+
 const PendingMessage = struct {
     message: []u8,
     origin: []u8,
@@ -199,6 +214,7 @@ const WindowContext = struct {
     set_timeout_callback: SetTimeoutCallback,
     post_message_callback: PostMessageCallback,
     xhr_callback: XhrCallback,
+    cookie_callback: CookieCallback,
     animation_frame_callback: AnimationFrameCallback,
 };
 
@@ -272,6 +288,7 @@ fn ensureWindow(self: *Js, window_id: u32) !void {
         .set_timeout_callback = .{},
         .post_message_callback = .{},
         .xhr_callback = .{},
+        .cookie_callback = .{},
         .animation_frame_callback = .{},
     };
 
@@ -701,6 +718,14 @@ pub fn evaluate(self: *Js, window_id: u32, code: []const u8) !Value {
         \\    var text = tagName == null ? "" : tagName.toString();
         \\    return new Node(__native.createElement(text));
         \\  };
+        \\  Object.defineProperty(document, "cookie", {
+        \\    get: function() { return __native.cookieGet(); },
+        \\    set: function(value) {
+        \\      __native.cookieSet(value == null ? "" : value.toString());
+        \\    },
+        \\    enumerable: true,
+        \\    configurable: true
+        \\  });
         \\})();
     ;
 
@@ -779,6 +804,7 @@ pub fn setNodes(self: *Js, window_id: u32, nodes: ?*Node) void {
         window.render_callback = .{};
         window.dom_mutation_callback = .{};
         window.xhr_callback = .{};
+        window.cookie_callback = .{};
         window.set_timeout_callback = .{};
         window.post_message_callback = .{};
         window.animation_frame_callback = .{};
@@ -811,6 +837,21 @@ pub fn setXhrCallback(self: *Js, window_id: u32, callback: ?XhrCallbackFn, conte
     const window = self.setCurrentWindow(window_id) catch return;
     window.xhr_callback = .{
         .function = callback,
+        .context = context,
+    };
+}
+
+pub fn setCookieCallbacks(
+    self: *Js,
+    window_id: u32,
+    get_callback: ?CookieGetCallbackFn,
+    set_callback: ?CookieSetCallbackFn,
+    context: ?*anyopaque,
+) void {
+    const window = self.setCurrentWindow(window_id) catch return;
+    window.cookie_callback = .{
+        .get_function = get_callback,
+        .set_function = set_callback,
         .context = context,
     };
 }
@@ -2442,6 +2483,44 @@ fn setupDocument(self: *Js, realm: *Realm) !void {
         },
     );
 
+    const cookie_get_fn = try kiesel.builtins.createBuiltinFunction(
+        &self.agent,
+        .{ .function = cookieGetNative },
+        0,
+        "cookieGet",
+        .{
+            .realm = realm,
+            .additional_fields = self_ptr,
+        },
+    );
+    try native_obj.definePropertyDirect(
+        &self.agent,
+        PropertyKey.from("cookieGet"),
+        .{
+            .value_or_accessor = .{ .value = Value.from(&cookie_get_fn.object) },
+            .attributes = .builtin_default,
+        },
+    );
+
+    const cookie_set_fn = try kiesel.builtins.createBuiltinFunction(
+        &self.agent,
+        .{ .function = cookieSetNative },
+        1,
+        "cookieSet",
+        .{
+            .realm = realm,
+            .additional_fields = self_ptr,
+        },
+    );
+    try native_obj.definePropertyDirect(
+        &self.agent,
+        PropertyKey.from("cookieSet"),
+        .{
+            .value_or_accessor = .{ .value = Value.from(&cookie_set_fn.object) },
+            .attributes = .builtin_default,
+        },
+    );
+
     // Create xhrSend function with self pointer
     const xhr_send_fn = try kiesel.builtins.createBuiltinFunction(
         &self.agent,
@@ -3559,6 +3638,77 @@ fn styleSet(agent: *Agent, this_value: Value, arguments: kiesel.types.Arguments)
             );
         },
     }
+}
+
+fn cookieGetNative(agent: *Agent, this_value: Value, _: kiesel.types.Arguments) Agent.Error!Value {
+    _ = this_value;
+    const function_obj = agent.activeFunctionObject();
+    const builtin_fn = function_obj.as(kiesel.builtins.BuiltinFunction);
+    const js_instance = builtin_fn.fields.additionalFieldsAs(Js);
+    const window_id = js_instance.current_window_id orelse return agent.throwException(
+        .internal_error,
+        "Missing active window",
+        .{},
+    );
+    const window = js_instance.windows.getPtr(window_id) orelse return agent.throwException(
+        .internal_error,
+        "Missing window context",
+        .{},
+    );
+
+    var result = CookieResult{ .data = "" };
+    if (window.cookie_callback.get_function) |callback| {
+        result = callback(window.cookie_callback.context) catch |err| {
+            std.log.err("document.cookie read failed: {}", .{err});
+            return agent.throwException(.type_error, "document.cookie read failed", .{});
+        };
+    }
+    defer if (result.should_free) {
+        if (result.allocator) |allocator| {
+            allocator.free(result.data);
+        } else {
+            js_instance.allocator.free(result.data);
+        }
+    };
+    // Kiesel may retain an ASCII input buffer in its string cache. Move an
+    // independent copy into the traced heap before the callback-owned result
+    // is released at the end of this host call.
+    const stable_data = if (result.data.len == 0)
+        result.data
+    else
+        try agent.gc_allocator.dupe(u8, result.data);
+    const js_string = try kiesel.types.String.fromUtf8(agent, stable_data);
+    return Value.from(js_string);
+}
+
+fn cookieSetNative(agent: *Agent, this_value: Value, arguments: kiesel.types.Arguments) Agent.Error!Value {
+    _ = this_value;
+    const function_obj = agent.activeFunctionObject();
+    const builtin_fn = function_obj.as(kiesel.builtins.BuiltinFunction);
+    const js_instance = builtin_fn.fields.additionalFieldsAs(Js);
+    const window_id = js_instance.current_window_id orelse return agent.throwException(
+        .internal_error,
+        "Missing active window",
+        .{},
+    );
+    const window = js_instance.windows.getPtr(window_id) orelse return agent.throwException(
+        .internal_error,
+        "Missing window context",
+        .{},
+    );
+    const value_arg = arguments.get(0);
+    if (!value_arg.isString()) {
+        return agent.throwException(.type_error, "document.cookie value must be a string", .{});
+    }
+    const value = try value_arg.asString().toUtf8(js_instance.allocator);
+    defer js_instance.allocator.free(value);
+    if (window.cookie_callback.set_function) |callback| {
+        callback(window.cookie_callback.context, value) catch |err| {
+            std.log.err("document.cookie write failed: {}", .{err});
+            return agent.throwException(.type_error, "document.cookie write failed", .{});
+        };
+    }
+    return .undefined;
 }
 
 /// __native.xhrSend implementation

@@ -42,5 +42,10 @@ before changing URL or response ownership.
   caller-owned body and header copies. Interactive cache, cookie, and HTTP
   client state belongs to the shared `BrowserSession` and is protected by its
   dedicated network mutex; standalone screenshot browsers own their session.
+- The tutorial cookie jar owns one entry per normalized host. Server
+  Set-Cookie and script assignments share one parser that retains the raw
+  parameter string and derives SameSite/HttpOnly state. HttpOnly entries still
+  supply the HTTP Cookie header but are hidden from, and immutable through,
+  `document.cookie`; script cannot create an HttpOnly entry.
 - Add data/file tests for ownership changes; use a local fixture/server for
   HTTP, redirects, cookies, compression, or CSP behavior.

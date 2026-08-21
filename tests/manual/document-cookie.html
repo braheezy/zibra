@@ -1,0 +1,30 @@
+<!--
+How to verify:
+1. Serve tests/manual from a local HTTP server; file: URLs have no cookie host:
+   python3 -m http.server 8000 --directory tests/manual
+2. Open http://127.0.0.1:8000/document-cookie.html in Zibra.
+3. The page must report PASS and show both updated values with their retained
+   parameters. HttpOnly hiding/overwrite rejection is covered by the unit
+   suite because Python's simple file server does not emit Set-Cookie headers.
+-->
+<!doctype html>
+<html>
+  <head><title>document.cookie</title></head>
+  <body>
+    <h1>document.cookie</h1>
+    <p id="status">FAIL: script did not run</p>
+    <script>
+      document.cookie = "theme=dark; SameSite=Lax";
+      var first = document.cookie;
+      document.cookie = "theme=light; Path=/settings";
+      var second = document.cookie;
+      if (first === "theme=dark; SameSite=Lax" &&
+          second === "theme=light; Path=/settings") {
+        status.innerHTML = "PASS: " + first + " | " + second;
+      } else {
+        status.innerHTML = "FAIL: " + first + " | " + second;
+      }
+      undefined;
+    </script>
+  </body>
+</html>

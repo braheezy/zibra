@@ -2702,6 +2702,12 @@ pub const Browser = struct {
             @ptrCast(render_context),
         );
         js_context.setXhrCallback(frame.window_id, jsXhrCallback, @ptrCast(render_context));
+        js_context.setCookieCallbacks(
+            frame.window_id,
+            jsCookieGetCallback,
+            jsCookieSetCallback,
+            @ptrCast(render_context),
+        );
         js_context.setAnimationFrameCallback(
             frame.window_id,
             jsRequestAnimationFrameCallback,
@@ -7391,6 +7397,48 @@ fn jsDomMutationCallback(context: ?*anyopaque, mutation_root: *parser.Node) void
         !ctx.matchesGeneration(frame.document_generation)) return;
 
     tab.prepareForDomMutation(browser, frame, mutation_root);
+}
+
+fn jsCookieGetCallback(context: ?*anyopaque) anyerror!js_module.CookieResult {
+    const ctx_ptr = context orelse return error.MissingJsContext;
+    const raw_ctx: *align(1) JsRenderContext = @ptrCast(ctx_ptr);
+    const ctx: *JsRenderContext = @alignCast(raw_ctx);
+    const browser_ptr = ctx.browser_ptr orelse return error.MissingJsContext;
+    const tab_ptr = ctx.tab_ptr orelse return error.MissingJsContext;
+    const raw_browser: *align(1) Browser = @ptrCast(browser_ptr);
+    const browser: *Browser = @alignCast(raw_browser);
+    const raw_tab: *align(1) Tab = @ptrCast(tab_ptr);
+    const tab: *Tab = @alignCast(raw_tab);
+    const frame = tab.frameForWindowId(ctx.window_id) orelse return error.MissingJsContext;
+    if (frame.document_generation == 0 or
+        !ctx.matchesGeneration(frame.document_generation)) return error.StaleDocument;
+    const current_url = frame.current_url orelse return .{ .data = "" };
+    const host = current_url.host orelse return .{ .data = "" };
+
+    const data = try browser.session_state.readCookieForScript(browser.allocator, host);
+    return .{
+        .data = data,
+        .allocator = browser.allocator,
+        .should_free = true,
+    };
+}
+
+fn jsCookieSetCallback(context: ?*anyopaque, value: []const u8) anyerror!void {
+    const ctx_ptr = context orelse return error.MissingJsContext;
+    const raw_ctx: *align(1) JsRenderContext = @ptrCast(ctx_ptr);
+    const ctx: *JsRenderContext = @alignCast(raw_ctx);
+    const browser_ptr = ctx.browser_ptr orelse return error.MissingJsContext;
+    const tab_ptr = ctx.tab_ptr orelse return error.MissingJsContext;
+    const raw_browser: *align(1) Browser = @ptrCast(browser_ptr);
+    const browser: *Browser = @alignCast(raw_browser);
+    const raw_tab: *align(1) Tab = @ptrCast(tab_ptr);
+    const tab: *Tab = @alignCast(raw_tab);
+    const frame = tab.frameForWindowId(ctx.window_id) orelse return error.MissingJsContext;
+    if (frame.document_generation == 0 or
+        !ctx.matchesGeneration(frame.document_generation)) return error.StaleDocument;
+    const current_url = frame.current_url orelse return;
+    const host = current_url.host orelse return;
+    _ = try browser.session_state.writeCookieFromScript(host, value);
 }
 
 fn jsXhrCallback(

@@ -30,6 +30,11 @@ or Kiesel allocation/locking.
   `outerHTML` reads include the element itself. Serialized buffers passed to
   Kiesel must use its traced allocator because ASCII String construction can
   retain the supplied bytes.
+- `document.cookie` is a native accessor resolved through the active window's
+  synchronous document callback. Getter results must move into Kiesel's traced
+  allocator before temporary callback storage is freed, because ASCII String
+  construction may retain the supplied bytes. Callback invalidation follows
+  the same document-generation boundary as XHR and DOM callbacks.
 - DOM listeners are scoped by window and a dispatched event follows a
   snapshotted target-to-root handle path. Reuse one Event while bubbling,
   update `currentTarget` for each node, keep `target` fixed, let

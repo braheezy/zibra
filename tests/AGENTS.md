@@ -59,6 +59,11 @@ retain their real values for form submission.
 endpoints to verify committed-page padlocks, owned certificate warning pages,
 and the absence of a proceed-anyway path.
 
+`tests/manual/document-cookie.html` verifies the native JavaScript cookie
+getter/setter and retained parameter serialization when served from localhost;
+unit coverage supplies server-originated HttpOnly entries and proves they are
+still request-visible but script-hidden and script-immutable.
+
 `tests/manual/rich-buttons.html` verifies inline rich-button containment,
 block-driven height growth, independently targetable input/link descendants,
 and nested-button parser recovery.

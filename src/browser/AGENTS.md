@@ -32,6 +32,10 @@ before changing `root.zig`, `tab.zig`, `render/`, or browser task scheduling.
   boolean; monotonically increasing generations let `BrowserApp` broadcast
   visited RAF work and bookmark chrome reraster work to every live window
   without nesting session and browser locks.
+- Per-document cookie callbacks resolve their live frame URL synchronously,
+  then read or update the session jar by host under `network_lock`. The result
+  returned to JavaScript is an independent allocation; no script or frame
+  retains a cookie-map key or value pointer after releasing that lock.
 - Address-bar interpretation belongs to `chrome.zig`, not general URL or link
   resolution. Explicit schemes and obvious bare hosts navigate directly;
   ordinary text becomes a form-encoded Google query. Keep document-authored

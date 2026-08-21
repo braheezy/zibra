@@ -59,7 +59,7 @@ pub const BrowserSession = struct {
         self.http_cache.deinit();
         var cookie_iterator = self.cookie_jar.iterator();
         while (cookie_iterator.next()) |entry| {
-            self.allocator.free(entry.value_ptr.value);
+            entry.value_ptr.deinit(self.allocator);
             self.allocator.free(entry.key_ptr.*);
         }
         self.cookie_jar.deinit();
@@ -71,6 +71,22 @@ pub const BrowserSession = struct {
         var bookmark_iterator = self.bookmarked_urls.keyIterator();
         while (bookmark_iterator.next()) |key| self.allocator.free(key.*);
         self.bookmarked_urls.deinit();
+    }
+
+    /// Return an owned document.cookie snapshot. This shares the network lock
+    /// with HTTP because both paths mutate/read the same owning jar entries.
+    pub fn readCookieForScript(self: *BrowserSession, allocator: std.mem.Allocator, host: []const u8) ![]u8 {
+        self.network_lock.lock();
+        defer self.network_lock.unlock();
+        return url_module.cookieForScript(allocator, &self.cookie_jar, host);
+    }
+
+    /// Apply one document.cookie assignment. Existing or incoming HttpOnly
+    /// entries are rejected by the shared Set-Cookie parser.
+    pub fn writeCookieFromScript(self: *BrowserSession, host: []const u8, value: []const u8) !bool {
+        self.network_lock.lock();
+        defer self.network_lock.unlock();
+        return url_module.applySetCookie(self.allocator, &self.cookie_jar, host, value, .script);
     }
 
     /// Record a canonical URL for this browser session. Returns whether a new

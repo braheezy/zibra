@@ -169,6 +169,13 @@ change independently of page screenshot goldens.
 response cache, and canonical serialized strings for visited and bookmarked
 URLs. A dedicated network mutex serializes transport/cookie/cache access; its
 metadata mutex protects both URL sets independently of every `Browser.lock`.
+The tutorial jar owns one host key, cookie value, retained parameter string,
+and derived SameSite/HttpOnly flags per site. HTTP Set-Cookie and JavaScript
+assignments use the same transactional parser. HttpOnly values remain eligible
+for browser-generated Cookie request headers but are omitted from script reads
+and reject script replacement. `document.cookie` callbacks copy their result
+while holding the network mutex, release it, and then transfer a second copy to
+Kiesel's traced heap because its ASCII string cache may retain input bytes.
 Atomic generations publish mutations without exposing map storage. The App
 polls those generations without holding either lock, then independently asks
 every Browser for visited RAF work or bookmark chrome reraster work. Bookmark-page
@@ -736,7 +743,9 @@ I/O to finish.
   text or a certificate-warning document.
 - `TaskRunner.mutex` and its condition protect the task queue and worker flags.
 - `BrowserSession.network_lock` serializes the shared HTTP client, cookie jar,
-  and response cache across every window around fetches.
+  and response cache across every window around fetches and synchronous
+  `document.cookie` callbacks. A callback never retains a jar slice after
+  releasing this lock.
 - `BrowserSession.lock` protects owned session URL sets. Its visited generation
   is published atomically so render can detect stale link annotations without
   reading the map outside that lock. Chrome bookmark lookup holds
