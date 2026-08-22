@@ -18,6 +18,7 @@ comptime {
     _ = @import("tests/browser_touch.zig");
     _ = @import("tests/browser_timers.zig");
     _ = @import("tests/browser_frame_timing.zig");
+    _ = @import("tests/browser_raster_worker.zig");
     _ = @import("tests/browser_dynamic_resources.zig");
     _ = @import("tests/browser_networking.zig");
     _ = @import("tests/browser_security.zig");

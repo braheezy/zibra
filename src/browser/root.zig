@@ -35,6 +35,7 @@ const touch_input = @import("touch.zig");
 const Chrome = @import("chrome.zig");
 const task_module = @import("../runtime/task.zig");
 const Task = task_module.Task;
+const TaskRunner = task_module.TaskRunner;
 const MeasureTime = @import("../runtime/measure_time.zig").MeasureTime;
 const thread_batch = @import("../runtime/thread_batch.zig");
 
@@ -1441,6 +1442,192 @@ const PendingPostResubmission = struct {
     history_generation: u64,
 };
 
+/// One self-contained display-list generation handed to the raster worker.
+/// Structural containers, blend-mode strings, glyph bitmaps, and image pixels
+/// are all independently owned; no document, layout, font-cache, or chrome
+/// generation has to remain alive while the worker consumes it.
+pub const RasterSnapshot = struct {
+    const CloneError = std.mem.Allocator.Error || error{CompositedLayerCannotCrossRasterBoundary};
+
+    allocator: std.mem.Allocator,
+    items: []DisplayItem,
+    pixel_buffers: std.ArrayList([]u8) = .empty,
+
+    pub fn clone(allocator: std.mem.Allocator, items: []const DisplayItem) CloneError!RasterSnapshot {
+        var snapshot = RasterSnapshot{
+            .allocator = allocator,
+            .items = &.{},
+        };
+        errdefer snapshot.deinit();
+        snapshot.items = try snapshot.cloneList(items);
+        return snapshot;
+    }
+
+    fn clonePixelBuffer(self: *RasterSnapshot, source: []const u8) CloneError![]u8 {
+        const copy = try self.allocator.dupe(u8, source);
+        errdefer self.allocator.free(copy);
+        try self.pixel_buffers.append(self.allocator, copy);
+        return copy;
+    }
+
+    fn cloneList(self: *RasterSnapshot, items: []const DisplayItem) CloneError![]DisplayItem {
+        const copy = try self.allocator.alloc(DisplayItem, items.len);
+        var initialized: usize = 0;
+        errdefer {
+            DisplayItem.freeItems(self.allocator, copy[0..initialized]);
+            self.allocator.free(copy);
+        }
+        for (items, 0..) |item, index| {
+            copy[index] = try self.cloneItem(item);
+            initialized = index + 1;
+        }
+        return copy;
+    }
+
+    fn cloneItem(self: *RasterSnapshot, item: DisplayItem) CloneError!DisplayItem {
+        return switch (item) {
+            .glyph => |glyph_item| blk: {
+                var copy = glyph_item;
+                copy.source = null;
+                if (glyph_item.glyph.pixels) |pixels| {
+                    copy.glyph.pixels = try self.clonePixelBuffer(pixels);
+                }
+                break :blk .{ .glyph = copy };
+            },
+            .image => |image_item| blk: {
+                var copy = image_item;
+                copy.source = null;
+                copy.pixels = try self.clonePixelBuffer(image_item.pixels);
+                break :blk .{ .image = copy };
+            },
+            .blend => |blend_item| blk: {
+                const children = try self.cloneList(blend_item.children);
+                errdefer DisplayItem.freeList(self.allocator, children);
+                const mode_copy = if (blend_item.blend_mode) |mode|
+                    try self.allocator.dupe(u8, mode)
+                else
+                    null;
+                break :blk .{ .blend = .{
+                    .opacity = blend_item.opacity,
+                    .blend_mode = mode_copy,
+                    .blur_radius = blend_item.blur_radius,
+                    .hit_clip = blend_item.hit_clip,
+                    .children = children,
+                    .node = null,
+                    .parent = null,
+                    .needs_compositing = blend_item.needs_compositing,
+                    .source = null,
+                } };
+            },
+            .transform => |transform_item| .{ .transform = .{
+                .translate_x = transform_item.translate_x,
+                .translate_y = transform_item.translate_y,
+                .children = try self.cloneList(transform_item.children),
+                .node = null,
+                .source = null,
+            } },
+            .draw_composited_layer => error.CompositedLayerCannotCrossRasterBoundary,
+            .rect => |payload| blk: {
+                var copy = payload;
+                copy.source = null;
+                break :blk .{ .rect = copy };
+            },
+            .iframe => |payload| blk: {
+                var copy = payload;
+                copy.source = null;
+                break :blk .{ .iframe = copy };
+            },
+            .rounded_rect => |payload| blk: {
+                var copy = payload;
+                copy.source = null;
+                break :blk .{ .rounded_rect = copy };
+            },
+            .line => |payload| blk: {
+                var copy = payload;
+                copy.source = null;
+                break :blk .{ .line = copy };
+            },
+            .outline => |payload| blk: {
+                var copy = payload;
+                copy.source = null;
+                break :blk .{ .outline = copy };
+            },
+        };
+    }
+
+    pub fn deinit(self: *RasterSnapshot) void {
+        if (self.items.len > 0) DisplayItem.freeList(self.allocator, self.items);
+        self.items = &.{};
+        for (self.pixel_buffers.items) |pixels| self.allocator.free(pixels);
+        self.pixel_buffers.deinit(self.allocator);
+    }
+};
+
+const RasterResult = struct {
+    allocator: std.mem.Allocator,
+    surface: z2d.Surface,
+    interest_region: scroll_model.InterestRegion,
+    interest_region_valid: bool,
+    window_width: i32,
+    window_height: i32,
+    active_tab: ?*Tab,
+    duration_ns: u64,
+    sample_animation_work: bool,
+
+    fn deinit(self: *RasterResult) void {
+        self.surface.deinit(self.allocator);
+    }
+};
+
+const RasterTaskContext = struct {
+    allocator: std.mem.Allocator,
+    browser: *Browser,
+    page: ?RasterSnapshot,
+    chrome: ?RasterSnapshot,
+    raster: bool,
+    window_width: i32,
+    window_height: i32,
+    chrome_bottom: i32,
+    active_tab: ?*Tab,
+    scroll: i32,
+    document_height: i32,
+    zoom: f32,
+    interest_region: scroll_model.InterestRegion,
+    sample_animation_work: bool,
+    profiling: bool,
+    ran: bool = false,
+
+    fn runOpaque(ptr: *anyopaque) anyerror!void {
+        const self: *RasterTaskContext = @ptrCast(@alignCast(ptr));
+        self.ran = true;
+        try self.browser.runRasterTask(self);
+    }
+
+    fn cleanupOpaque(ptr: *anyopaque) void {
+        const self: *RasterTaskContext = @ptrCast(@alignCast(ptr));
+        if (!self.ran) self.browser.cancelRasterTask(self.sample_animation_work);
+        if (self.page) |*page| page.deinit();
+        if (self.chrome) |*chrome| chrome.deinit();
+        const allocator = self.allocator;
+        allocator.destroy(self);
+    }
+};
+
+/// A one-child dst_in command is a list-level mask for already-painted
+/// siblings inside its enclosing isolated group. Every other compositing
+/// boundary receives its own temporary surface on the raster worker.
+pub fn rasterBlendNeedsIsolation(
+    needs_compositing: bool,
+    blend_mode: ?[]const u8,
+    child_count: usize,
+) bool {
+    if (!needs_compositing) return false;
+    if (blend_mode) |mode| {
+        if (std.mem.eql(u8, mode, "dst_in") and child_count == 1) return false;
+    }
+    return true;
+}
+
 // Browser manages the window and tabs
 pub const Browser = struct {
     // Memory allocator for the browser
@@ -1459,6 +1646,7 @@ pub const Browser = struct {
     canvas: ?sdl2.Renderer,
     // z2d surface for drawing (RGBA format like the tutorial)
     root_surface: z2d.Surface,
+    root_surface_allocator: std.mem.Allocator,
     // z2d context for drawing operations
     context: z2d.Context,
     // Separate surface for browser chrome (UI)
@@ -1514,6 +1702,19 @@ pub const Browser = struct {
     // Heap-stable because every tab worker and every App window shares it.
     measure: *MeasureTime,
     lock: Mutex,
+    // A per-window serialized worker owns all z2d raster and software draw
+    // work. The UI thread only snapshots commands, accepts completed surfaces,
+    // and performs renderer-bound SDL upload/copy/present calls.
+    raster_task_runner: TaskRunner,
+    raster_allocator: std.mem.Allocator,
+    raster_task_active: bool = false,
+    raster_result: ?RasterResult = null,
+    // Worker-thread-only bounded caches. They are joined before UI-thread
+    // teardown reads or destroys them.
+    worker_chrome_surface: ?z2d.Surface = null,
+    worker_tab_surface: ?z2d.Surface = null,
+    worker_interest_region: scroll_model.InterestRegion = .{ .start_px = 0, .height_px = 0 },
+    worker_interest_region_valid: bool = false,
     // Optimistic address-bar text may lead a pending load. Bookmark state uses
     // the separately owned URL from the latest committed document.
     active_tab_url: ?[]u8 = null,
@@ -1737,6 +1938,7 @@ pub const Browser = struct {
             .window = screen,
             .canvas = renderer,
             .root_surface = root_surface,
+            .root_surface_allocator = al,
             .context = undefined,
             .chrome_surface = undefined, // Will be set below
             .tab_surface = null,
@@ -1747,6 +1949,8 @@ pub const Browser = struct {
             .chrome = chrome,
             .measure = measure,
             .lock = .init(io),
+            .raster_task_runner = TaskRunner.initNamed(std.heap.smp_allocator, measure, "Raster and draw thread"),
+            .raster_allocator = std.heap.smp_allocator,
             .cached_texture = cached_texture,
             .touch_tracker = touch_input.Tracker.init(al),
             .composited_layers = std.ArrayList(CompositedLayer).empty,
@@ -1762,6 +1966,9 @@ pub const Browser = struct {
         // Create chrome surface (fixed height based on chrome.bottom)
         browser.chrome_surface = try z2d.Surface.init(.image_surface_rgba, al, initial_window_width, @intCast(browser.chrome.bottom));
         errdefer browser.chrome_surface.deinit(al);
+
+        try browser.raster_task_runner.start();
+        errdefer browser.raster_task_runner.deinit();
 
         _ = browser.measure.registerThread("Browser thread") catch |err| {
             std.log.warn("Failed to register browser thread: {}", .{err});
@@ -2325,6 +2532,8 @@ pub const Browser = struct {
             !self.needs_composite and
             !self.needs_raster and
             !self.needs_draw and
+            !self.raster_task_active and
+            self.raster_result == null and
             !self.needs_animation_frame and
             !self.animation_timer_active;
         self.lock.unlock();
@@ -2349,7 +2558,9 @@ pub const Browser = struct {
     pub fn isIdle(self: *Browser) bool {
         self.lock.lock();
         defer self.lock.unlock();
-        return !self.needs_composite and !self.needs_raster and !self.needs_draw and !self.needs_animation_frame;
+        return !self.needs_composite and !self.needs_raster and !self.needs_draw and
+            !self.raster_task_active and self.raster_result == null and
+            !self.needs_animation_frame;
     }
 
     // Handle a single SDL event. Returns true if quit was requested.
@@ -2556,8 +2767,9 @@ pub const Browser = struct {
 
     fn installResizeTargets(self: *Browser, targets: ResizeTargets) void {
         self.context.deinit();
-        self.root_surface.deinit(self.allocator);
+        self.root_surface.deinit(self.root_surface_allocator);
         self.root_surface = targets.root_surface;
+        self.root_surface_allocator = self.allocator;
         self.context = z2d.Context.init(self.io, self.allocator, &self.root_surface);
 
         self.chrome_surface.deinit(self.allocator);
@@ -2661,7 +2873,6 @@ pub const Browser = struct {
                 if (chrome_changed) {
                     // Chrome-only update (clear address bar text); avoid recomposite if the display list is unchanged.
                     self.setNeedsRasterDraw();
-                    try self.compositeRasterAndDraw();
                     return;
                 }
 
@@ -2735,7 +2946,6 @@ pub const Browser = struct {
                 }
                 // Chrome-only update (clear focus UI); avoid recomposite if the display list is unchanged.
                 self.setNeedsRasterDraw();
-                try self.compositeRasterAndDraw();
                 return;
             },
             .backspace => {
@@ -2763,7 +2973,6 @@ pub const Browser = struct {
                 if (chrome_changed) {
                     // Chrome-only update (address bar text); avoid recomposite if the display list is unchanged.
                     self.setNeedsRasterDraw();
-                    try self.compositeRasterAndDraw();
                 }
                 return;
             },
@@ -2771,7 +2980,6 @@ pub const Browser = struct {
                 if (self.chrome.moveCursorLeft()) {
                     // Chrome-only update (address cursor); avoid recomposite if the display list is unchanged.
                     self.setNeedsRasterDraw();
-                    try self.compositeRasterAndDraw();
                 }
                 return;
             },
@@ -2779,7 +2987,6 @@ pub const Browser = struct {
                 if (self.chrome.moveCursorRight()) {
                     // Chrome-only update (address cursor); avoid recomposite if the display list is unchanged.
                     self.setNeedsRasterDraw();
-                    try self.compositeRasterAndDraw();
                 }
                 return;
             },
@@ -2824,7 +3031,6 @@ pub const Browser = struct {
             if (chrome_changed) {
                 // Chrome-only update; avoid recomposite if the display list is unchanged.
                 self.setNeedsRasterDraw();
-                try self.compositeRasterAndDraw();
             }
             return;
         }
@@ -2846,7 +3052,6 @@ pub const Browser = struct {
         self.lock.unlock();
 
         self.setNeedsCompositeRasterDraw();
-        try self.compositeRasterAndDraw();
 
         const tab_y = screen_y - chrome_bottom;
         const page_y = tab_y +| scroll_device;
@@ -5302,7 +5507,7 @@ pub const Browser = struct {
                         layer_items[0] = cloned;
                         cloned_owned = false;
 
-                        const bounds = self.getDisplayItemBounds(item);
+                        const bounds = self.getDisplayItemBounds(item, self.activeZoom());
                         const layer_blend_mode = if (cloned == .blend) cloned.blend.blend_mode else blend_item.blend_mode;
 
                         var layer = CompositedLayer.init(
@@ -5334,7 +5539,7 @@ pub const Browser = struct {
                     // Calculate bounds from flattened children
                     var bounds = Rect{ .left = std.math.maxInt(i32), .top = std.math.maxInt(i32), .right = std.math.minInt(i32), .bottom = std.math.minInt(i32) };
                     for (flattened_items) |child| {
-                        const child_bounds = self.getDisplayItemBounds(child);
+                        const child_bounds = self.getDisplayItemBounds(child, self.activeZoom());
                         bounds.left = @min(bounds.left, child_bounds.left);
                         bounds.top = @min(bounds.top, child_bounds.top);
                         bounds.right = @max(bounds.right, child_bounds.right);
@@ -5491,11 +5696,11 @@ pub const Browser = struct {
         }
     }
 
-    fn displayItemsBounds(self: *Browser, items: []const DisplayItem) ?Rect {
+    fn displayItemsBounds(self: *Browser, items: []const DisplayItem, zoom: f32) ?Rect {
         if (items.len == 0) return null;
-        var bounds = self.getDisplayItemBounds(items[0]);
+        var bounds = self.getDisplayItemBounds(items[0], zoom);
         for (items[1..]) |child| {
-            const child_bounds = self.getDisplayItemBounds(child);
+            const child_bounds = self.getDisplayItemBounds(child, zoom);
             bounds.left = @min(bounds.left, child_bounds.left);
             bounds.top = @min(bounds.top, child_bounds.top);
             bounds.right = @max(bounds.right, child_bounds.right);
@@ -5504,70 +5709,70 @@ pub const Browser = struct {
         return bounds;
     }
 
-    fn blurOutset(self: *Browser, radius: f64) i32 {
-        const zoom = if (self.active_tab_zoom > 0) self.active_tab_zoom else 1.0;
+    fn blurOutset(self: *Browser, radius: f64, zoom: f32) i32 {
+        _ = self;
         return @intCast(blurKernelRadius(radius * @as(f64, zoom)));
     }
 
     /// Get the bounding rect of a display item in device/document coordinates.
-    fn getDisplayItemBounds(self: *Browser, item: DisplayItem) Rect {
+    fn getDisplayItemBounds(self: *Browser, item: DisplayItem, zoom: f32) Rect {
         return switch (item) {
             .glyph => |g| Rect{
-                .left = self.scalePx(g.x),
-                .top = self.scalePx(g.y),
-                .right = self.scalePx(g.x) + g.glyph.w,
-                .bottom = self.scalePx(g.y) + g.glyph.h,
+                .left = self.scalePxWithZoom(g.x, zoom),
+                .top = self.scalePxWithZoom(g.y, zoom),
+                .right = self.scalePxWithZoom(g.x, zoom) + g.glyph.w,
+                .bottom = self.scalePxWithZoom(g.y, zoom) + g.glyph.h,
             },
             .rect => |r| Rect{
-                .left = self.scalePx(r.x1),
-                .top = self.scalePx(r.y1),
-                .right = self.scalePx(r.x2),
-                .bottom = self.scalePx(r.y2),
+                .left = self.scalePxWithZoom(r.x1, zoom),
+                .top = self.scalePxWithZoom(r.y1, zoom),
+                .right = self.scalePxWithZoom(r.x2, zoom),
+                .bottom = self.scalePxWithZoom(r.y2, zoom),
             },
             .image => |img| Rect{
-                .left = self.scalePx(img.x1),
-                .top = self.scalePx(img.y1),
-                .right = self.scalePx(img.x2),
-                .bottom = self.scalePx(img.y2),
+                .left = self.scalePxWithZoom(img.x1, zoom),
+                .top = self.scalePxWithZoom(img.y1, zoom),
+                .right = self.scalePxWithZoom(img.x2, zoom),
+                .bottom = self.scalePxWithZoom(img.y2, zoom),
             },
             .iframe => |iframe_item| Rect{
-                .left = self.scalePx(iframe_item.rect.left),
-                .top = self.scalePx(iframe_item.rect.top),
-                .right = self.scalePx(iframe_item.rect.right),
-                .bottom = self.scalePx(iframe_item.rect.bottom),
+                .left = self.scalePxWithZoom(iframe_item.rect.left, zoom),
+                .top = self.scalePxWithZoom(iframe_item.rect.top, zoom),
+                .right = self.scalePxWithZoom(iframe_item.rect.right, zoom),
+                .bottom = self.scalePxWithZoom(iframe_item.rect.bottom, zoom),
             },
             .rounded_rect => |r| Rect{
-                .left = self.scalePx(r.x1),
-                .top = self.scalePx(r.y1),
-                .right = self.scalePx(r.x2),
-                .bottom = self.scalePx(r.y2),
+                .left = self.scalePxWithZoom(r.x1, zoom),
+                .top = self.scalePxWithZoom(r.y1, zoom),
+                .right = self.scalePxWithZoom(r.x2, zoom),
+                .bottom = self.scalePxWithZoom(r.y2, zoom),
             },
             .line => |l| Rect{
-                .left = self.scalePx(@min(l.x1, l.x2)),
-                .top = self.scalePx(@min(l.y1, l.y2)),
-                .right = self.scalePx(@max(l.x1, l.x2)) + self.scalePx(l.thickness),
-                .bottom = self.scalePx(@max(l.y1, l.y2)) + self.scalePx(l.thickness),
+                .left = self.scalePxWithZoom(@min(l.x1, l.x2), zoom),
+                .top = self.scalePxWithZoom(@min(l.y1, l.y2), zoom),
+                .right = self.scalePxWithZoom(@max(l.x1, l.x2), zoom) + self.scalePxWithZoom(l.thickness, zoom),
+                .bottom = self.scalePxWithZoom(@max(l.y1, l.y2), zoom) + self.scalePxWithZoom(l.thickness, zoom),
             },
             .outline => |o| Rect{
-                .left = self.scalePx(o.rect.left),
-                .top = self.scalePx(o.rect.top),
-                .right = self.scalePx(o.rect.right),
-                .bottom = self.scalePx(o.rect.bottom),
+                .left = self.scalePxWithZoom(o.rect.left, zoom),
+                .top = self.scalePxWithZoom(o.rect.top, zoom),
+                .right = self.scalePxWithZoom(o.rect.right, zoom),
+                .bottom = self.scalePxWithZoom(o.rect.bottom, zoom),
             },
             .blend => |b| blk: {
                 if (b.blend_mode) |mode| {
                     if (std.mem.eql(u8, mode, "dst_in") and b.children.len > 0) {
                         const mask_child = b.children[b.children.len - 1];
-                        break :blk self.getDisplayItemBounds(mask_child);
+                        break :blk self.getDisplayItemBounds(mask_child, zoom);
                     }
                 }
-                var bounds = self.displayItemsBounds(b.children) orelse Rect{
+                var bounds = self.displayItemsBounds(b.children, zoom) orelse Rect{
                     .left = 0,
                     .top = 0,
                     .right = 0,
                     .bottom = 0,
                 };
-                if (b.blur_radius > 0.0) bounds = bounds.outset(self.blurOutset(b.blur_radius));
+                if (b.blur_radius > 0.0) bounds = bounds.outset(self.blurOutset(b.blur_radius, zoom));
                 break :blk bounds;
             },
             .draw_composited_layer => |dcl| dcl.layer.bounds,
@@ -5575,7 +5780,7 @@ pub const Browser = struct {
                 // Get children bounds and apply translation offset
                 var bounds = Rect{ .left = std.math.maxInt(i32), .top = std.math.maxInt(i32), .right = std.math.minInt(i32), .bottom = std.math.minInt(i32) };
                 for (t.children) |child| {
-                    const child_bounds = self.getDisplayItemBounds(child);
+                    const child_bounds = self.getDisplayItemBounds(child, zoom);
                     bounds.left = @min(bounds.left, child_bounds.left);
                     bounds.top = @min(bounds.top, child_bounds.top);
                     bounds.right = @max(bounds.right, child_bounds.right);
@@ -5583,10 +5788,10 @@ pub const Browser = struct {
                 }
                 // Apply translation to get absolute bounds
                 break :blk Rect{
-                    .left = bounds.left + self.scalePx(t.translate_x),
-                    .top = bounds.top + self.scalePx(t.translate_y),
-                    .right = bounds.right + self.scalePx(t.translate_x),
-                    .bottom = bounds.bottom + self.scalePx(t.translate_y),
+                    .left = bounds.left + self.scalePxWithZoom(t.translate_x, zoom),
+                    .top = bounds.top + self.scalePxWithZoom(t.translate_y, zoom),
+                    .right = bounds.right + self.scalePxWithZoom(t.translate_x, zoom),
+                    .bottom = bounds.bottom + self.scalePxWithZoom(t.translate_y, zoom),
                 };
             },
         };
@@ -5672,6 +5877,198 @@ pub const Browser = struct {
         }
     }
 
+    fn imageSurfacePixels(surface: *z2d.Surface) ![]z2d.pixel.RGBA {
+        return switch (surface.*) {
+            .image_surface_rgba => |*image_surface| image_surface.buf,
+            else => error.UnsupportedSurfaceType,
+        };
+    }
+
+    /// Produce a complete software frame from an immutable, independently
+    /// owned job. This function runs only on the raster-and-draw worker and
+    /// deliberately touches no SDL window, renderer, texture, or event API.
+    fn renderRasterSnapshot(self: *Browser, task: *const RasterTaskContext) !z2d.Surface {
+        if (task.window_width <= 0 or task.window_height <= 0) {
+            return error.InvalidRasterDimensions;
+        }
+        if (task.raster) try self.rasterWorkerCaches(task);
+        const chrome_surface = if (self.worker_chrome_surface) |*surface|
+            surface
+        else
+            return error.MissingChromeRasterCache;
+        if (task.active_tab != null and
+            (self.worker_tab_surface == null or !self.worker_interest_region_valid))
+        {
+            return error.MissingTabRasterCache;
+        }
+
+        var root = try z2d.Surface.init(
+            .image_surface_rgba,
+            task.allocator,
+            task.window_width,
+            task.window_height,
+        );
+        errdefer root.deinit(task.allocator);
+        @memset(try imageSurfacePixels(&root), .{ .r = 255, .g = 255, .b = 255, .a = 255 });
+
+        if (self.worker_tab_surface) |*tab_surface| {
+            const scroll_px = scroll_model.scaleCssPx(task.scroll, task.zoom);
+            const destination_y_i64 = @as(i64, task.chrome_bottom) +
+                @as(i64, self.worker_interest_region.start_px) - @as(i64, scroll_px);
+            const destination_y: i32 = @intCast(std.math.clamp(
+                destination_y_i64,
+                @as(i64, std.math.minInt(i32)),
+                @as(i64, std.math.maxInt(i32)),
+            ));
+            try copyRasterRows(
+                &root,
+                tab_surface,
+                destination_y,
+                task.chrome_bottom,
+            );
+        }
+
+        z2d.Surface.composite(&root, chrome_surface, .src_over, 0, 0, .{});
+        var root_context = z2d.Context.init(self.io, task.allocator, &root);
+        defer root_context.deinit();
+        try drawRasterScrollbar(
+            &root_context,
+            task.window_width,
+            task.window_height,
+            task.chrome_bottom,
+            task.document_height,
+            task.scroll,
+            task.zoom,
+        );
+        return root;
+    }
+
+    fn rasterWorkerCaches(self: *Browser, task: *const RasterTaskContext) !void {
+        const chrome = task.chrome orelse return error.MissingChromeRasterSnapshot;
+        var chrome_surface = try z2d.Surface.init(
+            .image_surface_rgba,
+            task.allocator,
+            task.window_width,
+            @max(task.chrome_bottom, 1),
+        );
+        var chrome_owned = true;
+        errdefer if (chrome_owned) chrome_surface.deinit(task.allocator);
+        @memset(try imageSurfacePixels(&chrome_surface), .{ .r = 255, .g = 255, .b = 255, .a = 255 });
+        var chrome_context = z2d.Context.init(self.io, task.allocator, &chrome_surface);
+        defer chrome_context.deinit();
+        for (chrome.items) |item| {
+            try self.drawDisplayItemZ2dContextForLayer(&chrome_context, item, 0, 0, 1.0);
+        }
+
+        var tab_surface: ?z2d.Surface = null;
+        var tab_owned = false;
+        errdefer if (tab_owned) if (tab_surface) |*surface| surface.deinit(task.allocator);
+        if (task.page) |page| {
+            tab_surface = try z2d.Surface.init(
+                .image_surface_rgba,
+                task.allocator,
+                task.window_width,
+                @max(task.interest_region.height_px, 1),
+            );
+            tab_owned = true;
+            @memset(try imageSurfacePixels(&tab_surface.?), .{ .r = 255, .g = 255, .b = 255, .a = 255 });
+            var tab_context = z2d.Context.init(self.io, task.allocator, &tab_surface.?);
+            defer tab_context.deinit();
+            for (page.items) |item| {
+                try self.drawDisplayItemZ2dContextForLayer(
+                    &tab_context,
+                    item,
+                    0,
+                    task.interest_region.start_px,
+                    task.zoom,
+                );
+            }
+        }
+
+        if (self.worker_chrome_surface) |*old| old.deinit(task.allocator);
+        self.worker_chrome_surface = chrome_surface;
+        chrome_owned = false;
+        if (self.worker_tab_surface) |*old| old.deinit(task.allocator);
+        self.worker_tab_surface = tab_surface;
+        tab_owned = false;
+        self.worker_interest_region = task.interest_region;
+        self.worker_interest_region_valid = task.page != null;
+    }
+
+    fn copyRasterRows(
+        destination_surface: *z2d.Surface,
+        source_surface: *z2d.Surface,
+        destination_y: i32,
+        chrome_bottom: i32,
+    ) !void {
+        const destination = switch (destination_surface.*) {
+            .image_surface_rgba => |*image_surface| image_surface,
+            else => return error.UnsupportedSurfaceType,
+        };
+        const source = switch (source_surface.*) {
+            .image_surface_rgba => |*image_surface| image_surface,
+            else => return error.UnsupportedSurfaceType,
+        };
+        const copy_width_i32 = @min(destination.width, source.width);
+        if (copy_width_i32 <= 0) return;
+
+        const destination_top = @max(@max(destination_y, chrome_bottom), 0);
+        const destination_bottom = @min(destination.height, destination_y +| source.height);
+        if (destination_bottom <= destination_top) return;
+
+        const source_top = destination_top - destination_y;
+        const copy_width: usize = @intCast(copy_width_i32);
+        const destination_width: usize = @intCast(destination.width);
+        const source_width: usize = @intCast(source.width);
+        var row: i32 = 0;
+        while (row < destination_bottom - destination_top) : (row += 1) {
+            const destination_offset = @as(usize, @intCast(destination_top + row)) * destination_width;
+            const source_offset = @as(usize, @intCast(source_top + row)) * source_width;
+            @memcpy(
+                destination.buf[destination_offset..][0..copy_width],
+                source.buf[source_offset..][0..copy_width],
+            );
+        }
+    }
+
+    fn drawRasterScrollbar(
+        context: *z2d.Context,
+        window_width: i32,
+        window_height: i32,
+        chrome_bottom: i32,
+        document_height: i32,
+        scroll: i32,
+        zoom: f32,
+    ) !void {
+        const metrics = scroll_model.calculate(
+            document_height,
+            window_height - chrome_bottom,
+            scroll,
+            zoom,
+        );
+        if (!metrics.visible) return;
+
+        const track_x = window_width - scrollbar_width;
+        context.resetPath();
+        context.setSource(.{ .opaque_pattern = .{ .pixel = .{ .rgba = .{ .r = 200, .g = 200, .b = 200, .a = 255 } } } });
+        try context.moveTo(@floatFromInt(track_x), @floatFromInt(chrome_bottom));
+        try context.lineTo(@floatFromInt(track_x + scrollbar_width), @floatFromInt(chrome_bottom));
+        try context.lineTo(@floatFromInt(track_x + scrollbar_width), @floatFromInt(chrome_bottom + metrics.track_height_px));
+        try context.lineTo(@floatFromInt(track_x), @floatFromInt(chrome_bottom + metrics.track_height_px));
+        try context.closePath();
+        try context.fill();
+
+        const thumb_y = chrome_bottom + metrics.thumb_offset_px;
+        context.setSource(.{ .opaque_pattern = .{ .pixel = .{ .rgba = .{ .r = 0, .g = 102, .b = 204, .a = 255 } } } });
+        try context.moveTo(@floatFromInt(track_x), @floatFromInt(thumb_y));
+        try context.lineTo(@floatFromInt(track_x + scrollbar_width), @floatFromInt(thumb_y));
+        try context.lineTo(@floatFromInt(track_x + scrollbar_width), @floatFromInt(thumb_y + metrics.thumb_height_px));
+        try context.lineTo(@floatFromInt(track_x), @floatFromInt(thumb_y + metrics.thumb_height_px));
+        try context.closePath();
+        try context.fill();
+        context.resetPath();
+    }
+
     // Raster the browser chrome to the chrome surface
     pub fn rasterChrome(self: *Browser) !void {
         // Create a temporary context for the chrome surface
@@ -5749,85 +6146,202 @@ pub const Browser = struct {
         self.tab_interest_region_valid = true;
     }
 
+    /// Pump the asynchronous software presentation pipeline. This method is
+    /// intentionally short on the UI thread: accept a completed surface,
+    /// perform the SDL-only upload/present, then enqueue at most one new owned
+    /// snapshot. z2d raster and software composition happen on the worker.
     fn compositeRasterAndDraw(self: *Browser) !void {
-        self.lock.lock();
-        defer self.lock.unlock();
+        try self.presentRasterResult();
+        try self.scheduleRasterTask();
+    }
 
-        const profiling = self.profiling_enabled;
-        const sample_animation_work = self.animation_frame_present_pending;
-        self.animation_frame_present_pending = false;
-        const measure_pipeline = profiling or sample_animation_work;
-        const start_ns = if (measure_pipeline) std.Io.Clock.awake.now(self.io).nanoseconds else 0;
-        defer if (sample_animation_work) {
-            const duration_ns = std.Io.Clock.awake.now(self.io).nanoseconds - start_ns;
-            self.frame_time_estimator.observeBrowserWork(duration_ns);
+    fn cancelRasterTask(self: *Browser, sample_animation_work: bool) void {
+        self.lock.lock();
+        self.raster_task_active = false;
+        if (!self.shutting_down) {
+            self.needs_composite = true;
+            self.needs_raster = true;
+            self.needs_draw = true;
+            if (sample_animation_work) self.animation_frame_present_pending = true;
+        }
+        self.lock.unlock();
+    }
+
+    fn scheduleRasterTask(self: *Browser) !void {
+        self.lock.lock();
+        if (self.shutting_down or self.raster_task_active or
+            (!self.needs_composite and !self.needs_raster and !self.needs_draw))
+        {
+            self.lock.unlock();
+            return;
+        }
+
+        const raster = self.needs_composite or self.needs_raster;
+
+        const raster_allocator = self.raster_allocator;
+        const context = raster_allocator.create(RasterTaskContext) catch |err| {
+            self.lock.unlock();
+            return err;
+        };
+        var context_owned = true;
+        errdefer if (context_owned) raster_allocator.destroy(context);
+
+        var page_snapshot: ?RasterSnapshot = null;
+        errdefer if (page_snapshot) |*snapshot| snapshot.deinit();
+        if (raster) if (self.active_tab_display_list) |items| {
+            page_snapshot = RasterSnapshot.clone(raster_allocator, items) catch |err| {
+                self.lock.unlock();
+                return err;
+            };
         };
 
-        // Check if any phase is needed
-        if (!self.needs_composite and !self.needs_raster and !self.needs_draw) return;
-
-        var composite_ns: u64 = 0;
-        var raster_ns: u64 = 0;
-        var draw_ns: u64 = 0;
-
-        const trace_raster = self.measure.begin("composite_raster_draw");
-        defer if (trace_raster) self.measure.end("composite_raster_draw");
-
-        // Log which phases will run for animation debugging
-        std.log.debug("compositeRasterAndDraw: composite={} raster={} draw={}", .{
-            self.needs_composite,
-            self.needs_raster,
-            self.needs_draw,
-        });
-
-        // Composite phase: rebuild composited layers from display list
-        if (self.needs_composite) {
-            const phase_start = if (profiling) std.Io.Clock.awake.now(self.io).nanoseconds else 0;
-            _ = try self.composite();
-            try self.paintDrawList();
-            self.needs_composite = false;
-            // Compositing implies we need to raster the new layers
-            self.needs_raster = true;
-            if (profiling) {
-                composite_ns = @intCast(std.Io.Clock.awake.now(self.io).nanoseconds - phase_start);
-            }
+        var chrome_snapshot: ?RasterSnapshot = null;
+        errdefer if (chrome_snapshot) |*snapshot| snapshot.deinit();
+        if (raster) {
+            // Chrome owns a separate UI-thread-only DOM/layout/font generation.
+            // Paint it before cloning, while Browser.lock provides the same
+            // stable active-URL/tab view the former synchronous pass used.
+            const chrome_items = self.chrome.paint(self) catch |err| {
+                self.lock.unlock();
+                return err;
+            };
+            chrome_snapshot = RasterSnapshot.clone(raster_allocator, chrome_items) catch |err| {
+                self.lock.unlock();
+                return err;
+            };
         }
 
-        // Raster phase: render layers to surfaces
-        if (self.needs_raster) {
-            const phase_start = if (profiling) std.Io.Clock.awake.now(self.io).nanoseconds else 0;
-            try self.rasterChrome();
-            try self.rasterTabSurfaces();
-            self.needs_raster = false;
-            // Rastering implies we need to draw
-            self.needs_draw = true;
-            if (profiling) {
-                raster_ns = @intCast(std.Io.Clock.awake.now(self.io).nanoseconds - phase_start);
-            }
+        const zoom = self.activeZoom();
+        context.* = .{
+            .allocator = raster_allocator,
+            .browser = self,
+            .page = page_snapshot,
+            .chrome = chrome_snapshot,
+            .raster = raster,
+            .window_width = self.window_width,
+            .window_height = self.window_height,
+            .chrome_bottom = self.chrome.bottom,
+            .active_tab = self.activeTab(),
+            .scroll = self.active_tab_scroll,
+            .document_height = self.active_tab_height,
+            .zoom = zoom,
+            .interest_region = if (raster)
+                self.interestRegionForScroll(self.active_tab_scroll)
+            else
+                self.tab_interest_region,
+            .sample_animation_work = self.animation_frame_present_pending,
+            .profiling = self.profiling_enabled,
+        };
+        page_snapshot = null;
+        chrome_snapshot = null;
+        context_owned = false;
+
+        self.animation_frame_present_pending = false;
+        self.needs_composite = false;
+        self.needs_raster = false;
+        self.needs_draw = false;
+        self.raster_task_active = true;
+        self.lock.unlock();
+
+        const task_instance = Task.init(
+            .rendering,
+            "task:raster_and_draw",
+            context,
+            RasterTaskContext.runOpaque,
+            RasterTaskContext.cleanupOpaque,
+        );
+        self.raster_task_runner.schedule(task_instance) catch |err| {
+            // TaskRunner retains nothing when queue allocation fails.
+            RasterTaskContext.cleanupOpaque(context);
+            return err;
+        };
+    }
+
+    fn runRasterTask(self: *Browser, task: *RasterTaskContext) !void {
+        errdefer self.cancelRasterTask(task.sample_animation_work);
+        const start_ns = std.Io.Clock.awake.now(self.io).nanoseconds;
+        var surface = try self.renderRasterSnapshot(task);
+        var surface_owned = true;
+        errdefer if (surface_owned) surface.deinit(task.allocator);
+        const elapsed = std.Io.Clock.awake.now(self.io).nanoseconds - start_ns;
+        const duration_ns: u64 = if (elapsed <= 0)
+            0
+        else
+            @intCast(@min(elapsed, @as(i96, std.math.maxInt(u64))));
+
+        var result = RasterResult{
+            .allocator = task.allocator,
+            .surface = surface,
+            .interest_region = self.worker_interest_region,
+            .interest_region_valid = self.worker_interest_region_valid,
+            .window_width = task.window_width,
+            .window_height = task.window_height,
+            .active_tab = task.active_tab,
+            .duration_ns = duration_ns,
+            .sample_animation_work = task.sample_animation_work,
+        };
+        surface_owned = false;
+
+        self.lock.lock();
+        const current = !self.shutting_down and
+            self.window_width == result.window_width and
+            self.window_height == result.window_height and
+            self.activeTab() == result.active_tab and
+            !self.needs_composite and !self.needs_raster and !self.needs_draw;
+        var replaced: ?RasterResult = null;
+        if (current) {
+            replaced = self.raster_result;
+            self.raster_result = result;
+        } else if (result.sample_animation_work and !self.shutting_down) {
+            // A newer commit superseded this sample before presentation.
+            self.animation_frame_present_pending = true;
+        }
+        self.raster_task_active = false;
+        self.lock.unlock();
+
+        if (replaced) |*old| old.deinit();
+        if (!current) result.deinit();
+        if (task.profiling) {
+            std.log.info("profile: raster worker total={}ms", .{@divTrunc(duration_ns, 1_000_000)});
+        }
+    }
+
+    fn presentRasterResult(self: *Browser) !void {
+        self.lock.lock();
+        var result = self.raster_result orelse {
+            self.lock.unlock();
+            return;
+        };
+        self.raster_result = null;
+        const current = self.window_width == result.window_width and
+            self.window_height == result.window_height and
+            self.activeTab() == result.active_tab and
+            !self.needs_composite and !self.needs_raster and !self.needs_draw;
+        self.lock.unlock();
+
+        if (!current) {
+            result.deinit();
+            return;
         }
 
-        // Draw phase: composite surfaces to screen
-        if (self.needs_draw) {
-            const phase_start = if (profiling) std.Io.Clock.awake.now(self.io).nanoseconds else 0;
-            try self.draw();
-            if (self.canvas) |canvas| canvas.present();
-            self.needs_draw = false;
-            if (profiling) {
-                draw_ns = @intCast(std.Io.Clock.awake.now(self.io).nanoseconds - phase_start);
-            }
-        }
+        self.context.deinit();
+        self.root_surface.deinit(self.root_surface_allocator);
+        self.root_surface = result.surface;
+        self.root_surface_allocator = result.allocator;
+        self.context = z2d.Context.init(self.io, self.allocator, &self.root_surface);
+        self.tab_interest_region = result.interest_region;
+        self.tab_interest_region_valid = result.interest_region_valid;
 
-        if (profiling) {
-            const total_ns: u64 = @intCast(std.Io.Clock.awake.now(self.io).nanoseconds - start_ns);
-            std.log.info(
-                "profile: composite total={}ms comp={}ms raster={}ms draw={}ms",
-                .{
-                    @divTrunc(total_ns, 1_000_000),
-                    @divTrunc(composite_ns, 1_000_000),
-                    @divTrunc(raster_ns, 1_000_000),
-                    @divTrunc(draw_ns, 1_000_000),
-                },
-            );
+        const upload_start = std.Io.Clock.awake.now(self.io).nanoseconds;
+        try self.copyZ2dToSDL();
+        if (self.canvas) |canvas| canvas.present();
+        const upload_elapsed = std.Io.Clock.awake.now(self.io).nanoseconds - upload_start;
+
+        if (result.sample_animation_work) {
+            const total = @as(i96, @intCast(result.duration_ns)) +| upload_elapsed;
+            self.lock.lock();
+            self.frame_time_estimator.observeBrowserWork(total);
+            self.lock.unlock();
         }
     }
 
@@ -6159,23 +6673,13 @@ pub const Browser = struct {
 
         // Copy pixels from z2d to SDL texture
         // Both use ABGR8888 format (z2d RGBA has r at lowest address)
-        const bytes_per_pixel = 4;
+        const bytes_per_pixel = @sizeOf(z2d.pixel.RGBA);
+        const source_bytes = std.mem.sliceAsBytes(pixel_data);
         for (0..@intCast(surface_height)) |y| {
-            const src_row_start = y * @as(usize, @intCast(surface_width));
+            const src_row_start = y * @as(usize, @intCast(surface_width)) * bytes_per_pixel;
             const dst_row_start = y * stride;
-
-            for (0..@intCast(surface_width)) |x| {
-                const src_idx = src_row_start + x;
-                const dst_idx = dst_row_start + x * bytes_per_pixel;
-
-                const src_pixel = pixel_data[src_idx];
-
-                // Direct copy - z2d RGBA matches SDL ABGR8888 layout
-                pixels[dst_idx + 0] = src_pixel.r;
-                pixels[dst_idx + 1] = src_pixel.g;
-                pixels[dst_idx + 2] = src_pixel.b;
-                pixels[dst_idx + 3] = src_pixel.a;
-            }
+            const row_bytes = @as(usize, @intCast(surface_width)) * bytes_per_pixel;
+            @memcpy(pixels[dst_row_start..][0..row_bytes], source_bytes[src_row_start..][0..row_bytes]);
         }
 
         // MUST unlock before copying to canvas
@@ -6370,7 +6874,7 @@ pub const Browser = struct {
         destination_y_offset: i32,
         zoom: f32,
     ) anyerror!void {
-        const content_bounds = self.displayItemsBounds(children) orelse return;
+        const content_bounds = self.displayItemsBounds(children, zoom) orelse return;
         const sigma = radius * @as(f64, zoom);
         const outset: i32 = @intCast(blurKernelRadius(sigma));
         if (outset == 0) {
@@ -6391,15 +6895,16 @@ pub const Browser = struct {
         const height = blur_bounds.height();
         if (width <= 0 or height <= 0) return;
 
-        var surface = try z2d.Surface.init(.image_surface_rgba, self.allocator, width, height);
-        defer surface.deinit(self.allocator);
+        const render_allocator = self.raster_allocator;
+        var surface = try z2d.Surface.init(.image_surface_rgba, render_allocator, width, height);
+        defer surface.deinit(render_allocator);
         const pixels = switch (surface) {
             .image_surface_rgba => |*image_surface| image_surface.buf,
             else => return error.UnsupportedSurfaceType,
         };
         @memset(pixels, .{ .r = 0, .g = 0, .b = 0, .a = 0 });
 
-        var blur_context = z2d.Context.init(self.io, self.allocator, &surface);
+        var blur_context = z2d.Context.init(self.io, render_allocator, &surface);
         defer blur_context.deinit();
         for (children) |child| {
             try self.drawDisplayItemZ2dContextForLayer(
@@ -6411,7 +6916,7 @@ pub const Browser = struct {
             );
         }
         try gaussianBlurPixels(
-            self.allocator,
+            render_allocator,
             pixels,
             @intCast(width),
             @intCast(height),
@@ -6445,8 +6950,9 @@ pub const Browser = struct {
         const height = context.surface.getHeight();
         if (width <= 0 or height <= 0) return;
 
-        var mask_surface = try z2d.Surface.init(.image_surface_rgba, self.allocator, width, height);
-        defer mask_surface.deinit(self.allocator);
+        const render_allocator = self.raster_allocator;
+        var mask_surface = try z2d.Surface.init(.image_surface_rgba, render_allocator, width, height);
+        defer mask_surface.deinit(render_allocator);
         const mask_pixels = switch (mask_surface) {
             .image_surface_rgba => |*image_surface| image_surface.buf,
             else => return error.UnsupportedSurfaceType,
@@ -6497,7 +7003,7 @@ pub const Browser = struct {
                 }
             }
         } else {
-            var mask_context = z2d.Context.init(self.io, self.allocator, &mask_surface);
+            var mask_context = z2d.Context.init(self.io, render_allocator, &mask_surface);
             defer mask_context.deinit();
             try self.drawDisplayItemZ2dContextForLayer(&mask_context, mask, layer_x, layer_y, zoom);
         }
@@ -6515,6 +7021,59 @@ pub const Browser = struct {
                 .dst_in,
             );
         }
+    }
+
+    /// Raster one compositing boundary into an isolated transparent surface.
+    /// This preserves the old layer semantics without sharing mutable cached
+    /// `CompositedLayer` objects across threads: inner masks cannot consume
+    /// pixels painted by an earlier sibling outside this effect subtree.
+    fn drawIsolatedBlendForLayer(
+        self: *Browser,
+        context: *z2d.Context,
+        blend_item: DisplayItem,
+        layer_x: i32,
+        layer_y: i32,
+        zoom: f32,
+    ) anyerror!void {
+        std.debug.assert(blend_item == .blend);
+        const blend = blend_item.blend;
+        const bounds = self.getDisplayItemBounds(blend_item, zoom);
+        const width = bounds.width();
+        const height = bounds.height();
+        if (width <= 0 or height <= 0) return;
+
+        const render_allocator = self.raster_allocator;
+        var surface = try z2d.Surface.init(.image_surface_rgba, render_allocator, width, height);
+        defer surface.deinit(render_allocator);
+        @memset(try imageSurfacePixels(&surface), .{ .r = 0, .g = 0, .b = 0, .a = 0 });
+
+        var isolated_context = z2d.Context.init(self.io, render_allocator, &surface);
+        defer isolated_context.deinit();
+        var isolated_item = blend_item;
+        isolated_item.blend.needs_compositing = false;
+        isolated_item.blend.opacity = 1.0;
+        const is_destination_mask = if (blend.blend_mode) |mode|
+            std.mem.eql(u8, mode, "dst_in")
+        else
+            false;
+        if (!is_destination_mask) isolated_item.blend.blend_mode = null;
+        try self.drawDisplayItemZ2dContextForLayer(
+            &isolated_context,
+            isolated_item,
+            bounds.left,
+            bounds.top,
+            zoom,
+        );
+
+        const operator = if (blend.blend_mode) |mode| self.parseBlendMode(mode) else .src_over;
+        try self.compositePremultipliedSurface(
+            context,
+            &surface,
+            bounds.left - layer_x,
+            bounds.top - layer_y,
+            blend.opacity,
+            operator,
+        );
     }
 
     fn drawDisplayItemZ2dContext(self: *Browser, context: *z2d.Context, item: DisplayItem, scroll_offset: i32, zoom: f32) !void {
@@ -7237,6 +7796,20 @@ pub const Browser = struct {
                 context.resetPath();
             },
             .blend => |blend_item| {
+                if (rasterBlendNeedsIsolation(
+                    blend_item.needs_compositing,
+                    blend_item.blend_mode,
+                    blend_item.children.len,
+                )) {
+                    try self.drawIsolatedBlendForLayer(
+                        context,
+                        item,
+                        layer_x,
+                        layer_y,
+                        zoom,
+                    );
+                    return;
+                }
                 if (blend_item.blur_radius > 0.0) {
                     try self.drawBlurredChildren(
                         context,
@@ -7442,6 +8015,23 @@ pub const Browser = struct {
         self.invalidateAnimationTimerLocked();
         self.pending_post_resubmission = null;
         self.lock.unlock();
+
+        // The raster worker may still be producing a self-contained software
+        // frame and publishing it back to this Browser. Join it before tabs,
+        // Browser surfaces, SDL handles, or shared measurement can retire.
+        self.raster_task_runner.deinit();
+        self.lock.lock();
+        var pending_raster_result = self.raster_result;
+        self.raster_result = null;
+        self.raster_task_active = false;
+        self.lock.unlock();
+        if (pending_raster_result) |*result| result.deinit();
+        if (self.worker_chrome_surface) |*surface| surface.deinit(self.raster_allocator);
+        self.worker_chrome_surface = null;
+        if (self.worker_tab_surface) |*surface| surface.deinit(self.raster_allocator);
+        self.worker_tab_surface = null;
+        self.worker_interest_region_valid = false;
+
         for (self.tabs.items) |tab| tab.shutdown();
 
         // No tab can publish another commit now. Retire browser-side display
@@ -7489,7 +8079,7 @@ pub const Browser = struct {
         self.layout_engine.deinit();
 
         self.context.deinit();
-        self.root_surface.deinit(self.allocator);
+        self.root_surface.deinit(self.root_surface_allocator);
         self.chrome_surface.deinit(self.allocator);
         if (self.tab_surface) |*tab_surface| {
             tab_surface.deinit(self.allocator);

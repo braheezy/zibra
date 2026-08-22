@@ -1,0 +1,47 @@
+<!--
+How to verify:
+1. Open or reload this page and immediately type continuously in the editable
+   field and in the address bar while the large blurred subtree rasterizes.
+2. Keystrokes, cursor movement, tab switching, and clicks should be handled
+   without waiting for the large blurred subtree to finish rastering.
+3. Repeat reload, tab switching, scrolling, and typing several times; the
+   finished frame must remain visually stable.
+4. With ZIBRA_TRACE=1, task:raster_and_draw spans belong to the named
+   "Raster and draw thread". SDL event handling stays on the Browser thread.
+-->
+<!doctype html>
+<html>
+<head>
+  <title>raster and draw worker responsiveness</title>
+  <style>
+    body { background-color: white; color: black; font-size: 16px; }
+    input { width: 720px; height: 28px; }
+    #stress { width: 760px; filter: blur(5px); }
+    .stripe { height: 12px; background-color: orange; }
+    .stripe.alt { background-color: #1677ff; }
+  </style>
+</head>
+<body>
+  <h1>Raster worker input responsiveness</h1>
+  <p>Type while rendering: <input id="typing" value=""></p>
+  <p>Expected: <input id="progress" value="input stays responsive while this page rasterizes"></p>
+  <div id="stress">
+    <div class="stripe"></div><div class="stripe alt"></div>
+    <div class="stripe"></div><div class="stripe alt"></div>
+    <div class="stripe"></div><div class="stripe alt"></div>
+    <div class="stripe"></div><div class="stripe alt"></div>
+    <div class="stripe"></div><div class="stripe alt"></div>
+    <div class="stripe"></div><div class="stripe alt"></div>
+    <div class="stripe"></div><div class="stripe alt"></div>
+    <div class="stripe"></div><div class="stripe alt"></div>
+    <div class="stripe"></div><div class="stripe alt"></div>
+    <div class="stripe"></div><div class="stripe alt"></div>
+    <div class="stripe"></div><div class="stripe alt"></div>
+    <div class="stripe"></div><div class="stripe alt"></div>
+    <div class="stripe"></div><div class="stripe alt"></div>
+    <div class="stripe"></div><div class="stripe alt"></div>
+    <div class="stripe"></div><div class="stripe alt"></div>
+    <div class="stripe"></div><div class="stripe alt"></div>
+  </div>
+</body>
+</html>

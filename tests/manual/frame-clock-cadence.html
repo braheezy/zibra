@@ -8,7 +8,7 @@ How to verify:
    (66ms, 99ms, and so on) instead of alternating random stalls with immediate
    catch-up frames. Individual minimum and maximum values may still vary.
 4. Run with ZIBRA_TRACE=1 to confirm task:animation_frame work on the tab
-   worker overlaps composite_raster_draw work on the main thread.
+   worker overlaps task:raster_and_draw work on the raster worker.
 -->
 <!doctype html>
 <html>

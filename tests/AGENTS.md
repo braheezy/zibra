@@ -160,7 +160,13 @@ while forcing style, layout, paint, blur rasterization, and draw work. Its
 warm-up lets the estimator settle; the measured average should remain near
 33ms on a sustainable page or a consistent 33ms multiple under overload,
 without immediate catch-up bursts. A trace also shows animation-frame tasks
-starting before and overlapping main-thread composition/raster/draw.
+starting before and overlapping raster-worker execution.
+
+`tests/manual/raster-draw-thread.html` provides a large blurred subtree to
+reload while the user types, moves the address cursor, clicks, and switches
+tabs. Input remains responsive, and traces attribute `task:raster_and_draw` to
+the named per-window worker while SDL event and presentation calls remain on
+the Browser/UI thread.
 
 `tests/manual/task-scheduler.html` combines 32 CPU-heavy same-deadline timeout
 callbacks with 48 animation frames. Frame cadence remains visible while every

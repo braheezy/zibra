@@ -69,6 +69,7 @@ process main thread
     native window registry
       Browser A                 Browser B ...
         tabs/chrome/render        tabs/chrome/render
+        Raster/draw worker        Raster/draw worker
         page + chrome Layouts     page + chrome Layouts
         two FontManagers          two FontManagers
         SDL window/renderer       SDL window/renderer
@@ -121,6 +122,7 @@ but no lock or owner-thread rule covers the complete mutable graph.
 | Process arena | Normal application allocations use the process arena in [`src/main.zig`](../src/main.zig). Individual `free` and `destroy` calls still express logical ownership even when the arena does not promptly reclaim most allocations. | Arena behavior can hide leaks and delay visible corruption. Ownership-sensitive code should also be exercised with `std.testing.allocator` or a GPA. |
 | Kiesel host object | With libgc enabled, `Js.init` allocates `Js` from BDWGC's scanned, uncollectable allocator so its embedded `Agent` remains a collector root. `Js.deinit` releases the agent/platform and destroys the host object through its storage allocator; see [`src/script/js.zig`](../src/script/js.zig). | Any Kiesel pointer reachable only from unscanned Zig memory must be rooted deliberately. The process arena is not a GC root. |
 | Zibra collections | `Browser`, `Tab`, `Frame`, DOM, layout, rules, tasks, and snapshots generally retain the caller allocator and provide explicit teardown paths. | The explicit lifetime remains authoritative even when production allocation behavior masks a bad free order. |
+| Raster worker | Raster task queues, snapshots, copied leaf pixels, z2d temporaries/caches, and completed surfaces use `std.heap.smp_allocator`; `root_surface_allocator` follows a transferred result into UI ownership. | The process arena is not used concurrently by the raster worker, and every transferred surface must be released through the allocator that created it. |
 | SDL and SDL_ttf | BrowserApp owns interactive SDL/text input, each Browser owns its native window/renderer/texture, and each `FontManager.deinit` frees cached RGBA glyph bitmaps, closes fonts, and releases its paired SDL_ttf reference. The App holds an extra refcounted SDL_ttf guard until all windows close. | Native handles require deterministic release and an explicit thread-affinity rule. |
 | z2d and zigimg | `Browser` owns long-lived z2d surfaces/contexts. `ImageData` owns a `zigimg.Image` and, when present, its encoded byte buffer; see [`src/document/parser.zig`](../src/document/parser.zig). | Layout and display items borrow pixel slices from these owners. The source image must outlive every borrower. |
 
@@ -166,6 +168,9 @@ Each `Browser` in [`src/browser/root.zig`](../src/browser/root.zig) owns:
 - owning URLs queued by tab workers for browser-thread tab creation;
 - the active browser-side display-list snapshot, composited layers, and tab draw
   list;
+- one named serialized raster-and-draw runner, any queued self-contained
+  command snapshot, and at most one completed software surface awaiting UI
+  presentation;
 - browser chrome, optimistic and committed active URL copies, and render flags.
 
 `Browser.initAppWindow` explicitly borrows SDL/text-input ownership plus the
@@ -556,16 +561,17 @@ operator is applied only when the completed surface is placed. Hit testing
 continues through the original child commands, so the blur's visual haze does
 not enlarge interactive geometry.
 
-The per-window tab surface is a bounded raster cache rather than a full-page
-bitmap. `scroll.zig` chooses a device-pixel interest region no taller than four
+The per-window worker-owned tab surface is a bounded raster cache rather than a
+full-page bitmap. `scroll.zig` chooses a device-pixel interest region no taller than four
 native window heights, with one viewport of scroll-back headroom where page
 bounds permit. Raster translates page commands by that region's page-space
 start and publishes the coordinates only after all fallible drawing succeeds.
-Final draw moves the cached surface by `region_start - root_scroll` beneath
+Final software draw moves the cached surface by `region_start - root_scroll` beneath
 chrome. z2d has no public `clipRect`, so final composition slices source and
 destination pixel rows to the content viewport, providing the same hard clip
 as the book's Skia operation. A root scroll whose complete viewport remains in
-the published region is draw-only. Crossing an edge rerasterizes a new region,
+the published region queues a draw-only worker job without cloning commands.
+Crossing an edge rerasterizes a new region,
 while display-list replacement, resize, zoom, content-height change, and
 structural retirement invalidate the cache. Compositor-only visual updates
 also reraster the bounded surface because it owns the assembled page pixels,
@@ -726,11 +732,13 @@ by `Url.free`; see `Url.init` in [`src/network/url.zig`](../src/network/url.zig)
 
 ## Thread ownership and synchronization
 
-### Main/UI/render thread
+### Main/UI thread and raster workers
 
-The process main thread owns every Browser's composition, raster, and draw
-phases. In interactive mode, BrowserApp is the sole SDL event poller and text
-input owner. It derives the native ID from key, window, text-editing/text-input,
+The process main thread owns every Browser's input dispatch, chrome rebuild,
+render-job snapshot, and SDL presentation phases. Each Browser owns a separate
+named `TaskRunner` for z2d raster and software draw. In interactive mode,
+BrowserApp is the sole SDL event poller and text input owner. It derives the
+native ID from key, window, text-editing/text-input,
 mouse, drop, and user event payloads, ignores stale IDs, and forwards each
 event only to its addressed Browser. Nonrepeating Ctrl+N from a live source
 creates an `about:blank` native window; allocation or renderer failure logs and
@@ -738,14 +746,31 @@ leaves existing windows alive. Window-close events remove only their addressed
 entry, SDL quit is global, and Escape routed through any live Browser is the
 documented global shortcut. After event dispatch, the App broadcasts shared
 session generations and ticks every window. Each tick schedules requested
-tab-worker animation work before composition/raster/draw consumes the previous
-commit, so document rendering can overlap main-thread raster and draw. In
+tab-worker animation work before queueing the previous commit for its raster
+worker, so tab work and software presentation can overlap while the UI thread
+returns to SDL event polling. In
 screenshot mode a standalone Browser instead runs a windowless quiescence loop
 and exports the software root surface directly. Page workers never mutate the
 tab collection: a middle-click resolves its link target on the serialized tab
 worker, transfers the owning URL into `Browser.pending_new_tabs` under
 `Browser.lock`, and the containing Browser's tick drains that queue before
 creating and activating tabs in the same native window.
+
+The UI thread rebuilds Chrome, then holds `Browser.lock` only while cloning the
+chrome and committed page command trees. `RasterSnapshot` owns every recursive
+container and blend-mode string and copies each borrowed font glyph bitmap and
+image byte buffer. The queued job therefore contains no layout, DOM,
+FontManager, ImageData, or chrome-generation borrow. Tab commits, structural
+mutation, navigation, scrolling, and input may continue while it runs. A newer
+dirty commit or a window/tab mismatch causes the completed result to be
+discarded; otherwise the UI thread swaps in the owned z2d root surface. The
+job queue, snapshots, caches, and surfaces use the thread-safe SMP allocator;
+Browser records the current root surface's allocator when ownership transfers.
+The worker never calls SDL. Texture lock/upload, renderer copy, `present`, native
+window/title/dialog operations, event polling, and resize-time texture
+creation/destruction remain on the Browser/UI thread. Input callbacks only
+publish dirty flags and queued tab work; they do not synchronously raster or
+present.
 `queueNewTab` transfers ownership only when append succeeds; `newTab` consumes
 the URL on entry so every creation and scheduling failure has one clear owner.
 Root navigation also copies the first DOM `title` into tab-owned sentinel
@@ -884,7 +909,7 @@ Animation timers wait for an absolute timestamp on the monotonic `awake` clock.
 The first requested frame anchors a deadline one estimated interval in the
 future; a continuous chain advances from the prior deadline rather than from
 the preceding frame's completion. The estimator measures timer-delivered tab
-work and the corresponding browser-thread composite/raster/draw pass as two
+work and the corresponding raster-worker/software-presentation pass as two
 overlapping stages, smooths each independently, and uses the slower stage. It
 rounds the required budget plus 3ms headroom up to a 33ms multiple, so an
 overloaded page settles at 66ms, 99ms, or a slower bounded cadence rather than
@@ -901,8 +926,8 @@ estimate remains useful. Detached timer helpers and their queued
 only that generation. This lets reset paths supersede a helper without joining
 it and prevents stale wakeups from clearing or enqueueing work for a newer
 active tab. A timer-delivered commit carries the same generation and marks one
-presentation-duration sample for the browser thread; direct load/test commits
-deliberately do neither.
+duration sample spanning worker raster/software draw plus the UI-thread SDL
+upload; direct load/test commits deliberately do neither.
 `setInterval` does not add a permanently looping helper. Its per-window
 JavaScript registry retains the callback and requested delay; each live
 delivery schedules exactly one new generation-stamped one-shot helper after
@@ -925,7 +950,9 @@ shutdown can safely wait but may wait for network I/O to finish.
   for a matching, verified HTTPS document, never for optimistic navigation
   text or a certificate-warning document. The active page's frame-time
   estimates and pending presentation-sample bit share this lock with its timer
-  deadline/generation.
+  deadline/generation. Raster-job active/completed state crosses the worker/UI
+  boundary under this lock; the worker holds it only to publish or reject a
+  finished surface, never during z2d work.
 - `TaskRunner.mutex` and its condition protect the task queue and worker flags.
 - `BrowserSession.network_runner` serializes ordinary browser fetch dispatch.
   Linked-resource parallelism is represented as one queued task with joined
@@ -1175,13 +1202,25 @@ and stores only allocator-owned bytes; see
 
 Each Browser's page `Layout` and `FontManager` are reachable from that window's
 tab layout/paint work and some main-thread page-input paths. Chrome uses a
-second main-thread-only pair. Interactive mode still lacks a shared lock or
-assertion establishing which thread may access
-each font glyph map or SDL_ttf handle. Screenshot mode closes that race by
-refusing to raster until the serialized tab worker and all accounted helpers
-are quiescent. The renderer no longer participates in glyph-cache mutation.
+second main-thread-only pair. The raster worker never enters either layout or
+font manager: its UI-created snapshot copies canonical glyph RGBA and image
+bytes while `Browser.lock` prevents source-generation retirement. Screenshot
+mode still waits for the serialized tab worker and all accounted helpers before
+snapshotting so captures are deterministic. The renderer never participates in
+glyph-cache mutation.
 
-Normal `Browser.deinit` quiesces its tabs first, retires display snapshots,
+Each worker builds a complete root z2d surface, including the bounded page
+interest region, isolated blend/filter/mask groups, chrome commands, and the
+scrollbar. A one-child `dst_in` remains a list-level mask within its enclosing
+isolated group; other `needs_compositing` boundaries receive independent
+temporary surfaces, so a clip cannot consume unrelated earlier pixels. The
+completed surface transfers to the UI thread as a single owner. Only that
+thread replaces `Browser.root_surface`, locks/copies the streaming SDL texture,
+copies it to the renderer, and calls `present`. The row-wise texture copy keeps
+this unavoidable SDL section short.
+
+Normal `Browser.deinit` publishes shutdown and joins its raster worker first,
+then quiesces its tabs and retires display snapshots,
 destroys document state, frees cached glyph bitmaps and closes fonts, tears
 down z2d state, then destroys that window's texture, renderer, and native
 handle. An App-owned Browser leaves shared session, measurement, text input,
@@ -1191,10 +1230,10 @@ measurement once, stops text input, releases
 its final SDL_ttf guard, and quits SDL. Standalone Browser owns those same final
 steps itself. Both constructors use reverse-order `errdefer` rollback.
 
-The intended SDL contract should be:
+The enforced SDL contract is:
 
-1. designate one thread as the owner of the SDL renderer and all renderer-bound
-   textures;
+1. the Browser/UI thread exclusively owns the SDL renderer and all
+   renderer-bound textures; raster workers perform software-only z2d work;
 2. separately serialize mutable SDL_ttf font and glyph-cache access;
 3. stop workers before freeing glyph bitmaps or destroying fonts, surfaces,
    renderer, or window;
@@ -1206,16 +1245,17 @@ The intended SDL contract should be:
 `Browser.deinit`, `Tab.shutdown`, and BrowserApp teardown enforce these phases:
 
 1. publish shutdown and reject new browser/tab/JS work;
-2. wake long timer helpers, interrupt JavaScript running on each tab worker,
+2. stop/join each Browser's raster runner and release any completed surface;
+3. wake long timer helpers, interrupt JavaScript running on each tab worker,
    and stop/join the workers;
-3. wait for accounted helpers, whose completion tasks are rejected and cleaned
+4. wait for accounted helpers, whose completion tasks are rejected and cleaned
    by the stopped runner;
-4. retire browser render snapshots, then destroy tabs, frames, DOM, and JS;
-5. destroy each Browser's layout, font, z2d, renderer, and window resources;
-6. after the final Browser is gone, stop/join the networking runner, destroy
+5. retire browser render snapshots, then destroy tabs, frames, DOM, and JS;
+6. destroy each Browser's layout, font, z2d, renderer, and window resources;
+7. after the final Browser is gone, stop/join the networking runner, destroy
    shared HTTP/cookie/cache/session state, and finish measurement once, when no
    thread can record into either;
-7. stop text input, release the App's SDL_ttf guard, and quit SDL.
+8. stop text input, release the App's SDL_ttf guard, and quit SDL.
 
 Async HTTP requests are not cancellable yet, so phase 3 can block on network
 I/O; it remains memory-safe because BrowserSession, Tab, Browser, and

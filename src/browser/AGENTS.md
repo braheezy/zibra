@@ -31,20 +31,34 @@ before changing `root.zig`, `tab.zig`, `render/`, or browser task scheduling.
   relative delay after each completed frame. A continuous chain advances from
   its preceding deadline using a bounded estimator-selected cadence; an idle
   chain starts from the current clock. The estimator smooths tab animation work
-  and browser-thread composite/raster/draw work independently, selects the
+  and raster-worker/software-presentation work independently, selects the
   slower overlapping stage, and rounds up to a 33ms cadence bucket with 3ms of
   headroom. Overload raises the estimate quickly, recovery lowers it gradually,
   and active-tab or successful root-document changes reset it. Every detached
   timer and queued animation task carries a generation so superseded helpers
   cannot publish work or clear newer state. The Browser UI tick starts
-  requested tab-worker animation work before consuming the preceding commit in
-  composition/raster/draw, allowing the two threads to overlap. CSS animations
+  requested tab-worker animation work before snapshotting the preceding commit
+  for the raster worker, allowing the two threads to overlap. CSS animations
   must publish `needs_animation_frame`, just like JavaScript
   `requestAnimationFrame`, before attempting to schedule again.
 - Browser task producers classify animation frames and native input as urgent,
   navigation and script discovery as normal, and timeout/interval/XHR/message
   callbacks as JavaScript-low. Do not infer priority from the trace label:
   `Task.init` requires both so renaming diagnostics cannot change scheduling.
+- Every Browser owns one named raster-and-draw `TaskRunner`. The UI thread
+  rebuilds chrome, then clones the chrome/page command trees into a
+  self-contained job while `Browser.lock` stabilizes their borrowed source
+  pixels. Jobs independently own structural containers, blend strings, glyph
+  bitmaps, and image bytes; the worker may therefore raster z2d surfaces after
+  a tab commit, mutation, or navigation retires the source generation. A newer
+  dirty commit makes an in-flight result stale. Jobs, z2d temporaries, caches,
+  and result surfaces use the thread-safe SMP allocator; when a result becomes
+  `root_surface`, Browser tracks that allocator through resize/teardown. The
+  worker never calls SDL;
+  the UI thread accepts only a current completed surface, uploads it to the
+  window texture, copies it to the renderer, and presents it. Input handlers
+  only publish dirty work and return. Shutdown joins this runner before tabs,
+  font caches, z2d surfaces, SDL handles, or shared measurement retire.
 - Each tab owns a sentinel-terminated copy of its root document title. Tab
   workers replace it under `Browser.lock`; only the interactive App/UI thread
   may pass it to the addressed native window, including after tab switches.
@@ -88,8 +102,10 @@ before changing `root.zig`, `tab.zig`, `render/`, or browser task scheduling.
   the old list before its layout, DOM, and source buffer, in that order. Chrome
   clicks hit-test painted commands and walk their internal DOM ancestry to a
   semantic action; fixed rectangles remain only as a pre-raster/test fallback.
-  Preserve the 66px chrome boundary so changing its implementation does not
-  shift document screenshots or viewport calculations.
+  Chrome rebuild/paint stays on that UI thread; only its independently owned
+  command/pixel snapshot crosses to the raster worker. Preserve the 66px chrome
+  boundary so changing its implementation does not shift document screenshots
+  or viewport calculations.
 - Address-bar editing uses a byte insertion point in the inclusive range
   `0..address_bar.items.len`. SDL admits only printable ASCII into this buffer,
   so Left, Right, insertion, and Backspace operate on bytes; focus, blur, and a
@@ -178,7 +194,9 @@ before changing `root.zig`, `tab.zig`, `render/`, or browser task scheduling.
   layout/font resources. `FontManager` owns canonical RGBA glyph bitmaps;
   display-list `Glyph` values borrow those bytes, and `pixel_mode` tells paint
   whether to tint an alpha mask or preserve native color. Layout must retire
-  before DOM, and display snapshots must retire before `FontManager`.
+  before DOM, and committed display snapshots must retire before `FontManager`.
+  Raster jobs are the exception: they copy every glyph/image buffer before
+  releasing `Browser.lock` and do not borrow either source generation.
 - Every frame retains its authoritative uncomposed display list for synchronous
   worker-thread clicks. Its optional `DisplayItemSource` pointers borrow the
   current layout and DOM generation, so retire that list before layout rebuild
