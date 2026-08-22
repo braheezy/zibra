@@ -28,14 +28,19 @@ before changing `root.zig`, `tab.zig`, `render/`, or browser task scheduling.
   applicable keys before document state can retire. JavaScript interval
   callbacks and rescheduling still run only on the serialized Tab worker.
 - Animation frames use absolute monotonic `awake`-clock deadlines, not a new
-  relative 33ms sleep after each completed frame. A continuous chain advances
-  from its preceding deadline; an idle chain or forced reset starts from the
-  current clock. Every detached timer and queued animation task carries a
-  generation so superseded helpers cannot publish work or clear newer state.
-  The Browser UI tick starts requested tab-worker animation work before
-  consuming the preceding commit in composition/raster/draw, allowing the two
-  threads to overlap. CSS animations must publish `needs_animation_frame`, just
-  like JavaScript `requestAnimationFrame`, before attempting to schedule again.
+  relative delay after each completed frame. A continuous chain advances from
+  its preceding deadline using a bounded estimator-selected cadence; an idle
+  chain starts from the current clock. The estimator smooths tab animation work
+  and browser-thread composite/raster/draw work independently, selects the
+  slower overlapping stage, and rounds up to a 33ms cadence bucket with 3ms of
+  headroom. Overload raises the estimate quickly, recovery lowers it gradually,
+  and active-tab or successful root-document changes reset it. Every detached
+  timer and queued animation task carries a generation so superseded helpers
+  cannot publish work or clear newer state. The Browser UI tick starts
+  requested tab-worker animation work before consuming the preceding commit in
+  composition/raster/draw, allowing the two threads to overlap. CSS animations
+  must publish `needs_animation_frame`, just like JavaScript
+  `requestAnimationFrame`, before attempting to schedule again.
 - Browser task producers classify animation frames and native input as urgent,
   navigation and script discovery as normal, and timeout/interval/XHR/message
   callbacks as JavaScript-low. Do not infer priority from the trace label:

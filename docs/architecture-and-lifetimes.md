@@ -881,17 +881,28 @@ heap-stable Tab under that helper reference and pair it with the timer
 generation described below.
 
 Animation timers wait for an absolute timestamp on the monotonic `awake` clock.
-The first requested frame anchors a deadline 33ms in the future; a continuous
-chain advances by 33ms from the prior deadline rather than from the preceding
-frame's completion. If work finishes late, the next wait is immediately due;
-choosing a sustainable slower cadence belongs to the separate frame-estimator
-policy. When no follow-up frame is requested, or input/tab lifecycle forces a
-fresh generation, the deadline anchor is cleared. Detached timer helpers and
-their queued `task:animation_frame` values carry the Browser's generation and
-may finish only that generation. This lets reset paths supersede a helper
-without joining it and prevents stale wakeups from clearing or enqueueing work
-for a newer active tab. A timer-delivered commit carries the same generation;
-direct load/test commits deliberately do not consume a live timer generation.
+The first requested frame anchors a deadline one estimated interval in the
+future; a continuous chain advances from the prior deadline rather than from
+the preceding frame's completion. The estimator measures timer-delivered tab
+work and the corresponding browser-thread composite/raster/draw pass as two
+overlapping stages, smooths each independently, and uses the slower stage. It
+rounds the required budget plus 3ms headroom up to a 33ms multiple, so an
+overloaded page settles at 66ms, 99ms, or a slower bounded cadence rather than
+repeatedly scheduling expired 33ms deadlines and pegging the CPU. Upward
+half-delta smoothing reacts quickly; downward eighth-delta smoothing prevents
+bucket oscillation and eventually restores 33ms when work becomes cheap.
+Successful root navigation and active-tab changes reset samples so one page's
+cost does not throttle another.
+
+When no follow-up frame is requested, or input/tab lifecycle forces a fresh
+generation, the deadline anchor is cleared while the same-document cost
+estimate remains useful. Detached timer helpers and their queued
+`task:animation_frame` values carry the Browser's generation and may finish
+only that generation. This lets reset paths supersede a helper without joining
+it and prevents stale wakeups from clearing or enqueueing work for a newer
+active tab. A timer-delivered commit carries the same generation and marks one
+presentation-duration sample for the browser thread; direct load/test commits
+deliberately do neither.
 `setInterval` does not add a permanently looping helper. Its per-window
 JavaScript registry retains the callback and requested delay; each live
 delivery schedules exactly one new generation-stamped one-shot helper after
@@ -912,7 +923,9 @@ shutdown can safely wait but may wait for network I/O to finish.
   committed-document URL snapshots used by chrome. The committed snapshot's
   security state is published in the same commit: chrome emits a padlock only
   for a matching, verified HTTPS document, never for optimistic navigation
-  text or a certificate-warning document.
+  text or a certificate-warning document. The active page's frame-time
+  estimates and pending presentation-sample bit share this lock with its timer
+  deadline/generation.
 - `TaskRunner.mutex` and its condition protect the task queue and worker flags.
 - `BrowserSession.network_runner` serializes ordinary browser fetch dispatch.
   Linked-resource parallelism is represented as one queued task with joined

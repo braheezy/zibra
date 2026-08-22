@@ -352,7 +352,72 @@ pub const v_offset = 18;
 pub const scrollbar_width = 10;
 const scroll_step: i32 = 100;
 pub const animation_frame_interval_ns: i96 = 33_000_000; // ~30 FPS
+pub const animation_frame_headroom_ns: u64 = 3_000_000;
+pub const maximum_estimated_frame_work_ns: u64 = 1_000_000_000;
 // *********************************************************
+
+/// Estimates the sustainable cadence of the two-stage frame pipeline. Tab
+/// work and browser-thread presentation overlap, so the slower smoothed stage
+/// determines the next interval. Upward changes react quickly to overload;
+/// downward changes recover gradually to avoid oscillating around a boundary.
+pub const FrameTimeEstimator = struct {
+    tab_work_ns: ?u64 = null,
+    browser_work_ns: ?u64 = null,
+
+    pub fn reset(self: *FrameTimeEstimator) void {
+        self.* = .{};
+    }
+
+    pub fn observeTabWork(self: *FrameTimeEstimator, duration_ns: i96) void {
+        updateEstimate(&self.tab_work_ns, duration_ns);
+    }
+
+    pub fn observeBrowserWork(self: *FrameTimeEstimator, duration_ns: i96) void {
+        updateEstimate(&self.browser_work_ns, duration_ns);
+    }
+
+    fn updateEstimate(slot: *?u64, duration_ns: i96) void {
+        const normalized: u64 = if (duration_ns <= 0)
+            0
+        else
+            @intCast(@min(duration_ns, @as(i96, maximum_estimated_frame_work_ns)));
+        const previous = slot.* orelse {
+            slot.* = normalized;
+            return;
+        };
+
+        if (normalized >= previous) {
+            // Half of an upward delta is enough to leave an overloaded cadence
+            // within a couple of frames without treating one spike as truth.
+            slot.* = previous +| @divTrunc(normalized - previous + 1, 2);
+        } else {
+            // Recover over several frames so neighboring cadence buckets do
+            // not alternate when work duration is close to their boundary.
+            slot.* = previous - @divTrunc(previous - normalized + 7, 8);
+        }
+    }
+
+    pub fn estimatedWorkNs(self: *const FrameTimeEstimator) u64 {
+        return @max(self.tab_work_ns orelse 0, self.browser_work_ns orelse 0);
+    }
+
+    /// Select the smallest 33ms cadence bucket with 3ms of idle headroom. The
+    /// one-second sample clamp also bounds the largest recommended interval.
+    pub fn intervalNs(self: *const FrameTimeEstimator) i96 {
+        const estimated_work = self.estimatedWorkNs();
+        if (estimated_work == 0) return animation_frame_interval_ns;
+
+        const base: u64 = @intCast(animation_frame_interval_ns);
+        const required = estimated_work +| animation_frame_headroom_ns;
+        const maximum_steps = @divTrunc(
+            maximum_estimated_frame_work_ns + animation_frame_headroom_ns + base - 1,
+            base,
+        );
+        const requested_steps = @divTrunc(required +| base - 1, base);
+        const steps = std.math.clamp(requested_steps, @as(u64, 1), maximum_steps);
+        return @intCast(steps * base);
+    }
+};
 
 pub const AnimationFrameTiming = struct {
     deadline_ns: i96,
@@ -360,13 +425,19 @@ pub const AnimationFrameTiming = struct {
 };
 
 /// Advance the cadence from its prior absolute deadline, not from the time the
-/// previous frame happened to finish. A late frame therefore schedules the
-/// next deadline immediately instead of adding another full 33ms delay.
-pub fn nextAnimationFrameTiming(previous_deadline_ns: ?i96, now_ns: i96) AnimationFrameTiming {
+/// previous frame happened to finish. `interval_ns` is supplied by the frame
+/// estimator, so an overloaded continuous chain advances at its sustainable
+/// cadence instead of repeatedly choosing an already-expired 33ms deadline.
+pub fn nextAnimationFrameTiming(
+    previous_deadline_ns: ?i96,
+    now_ns: i96,
+    interval_ns: i96,
+) AnimationFrameTiming {
+    std.debug.assert(interval_ns > 0);
     const deadline_ns = if (previous_deadline_ns) |previous|
-        previous +| animation_frame_interval_ns
+        previous +| interval_ns
     else
-        now_ns +| animation_frame_interval_ns;
+        now_ns +| interval_ns;
     const remaining_ns = deadline_ns -| now_ns;
     const delay_ns: u64 = if (remaining_ns <= 0)
         0
@@ -1425,6 +1496,15 @@ pub const Browser = struct {
     // the monotonic clock rather than to completion of the prior frame.
     animation_timer_generation: u64 = 0,
     animation_frame_deadline_ns: ?i96 = null,
+    frame_time_estimator: FrameTimeEstimator = .{},
+    /// Set by a timer-generation commit and consumed by the browser-thread
+    /// presentation pass so only animation work contributes that stage's
+    /// duration sample.
+    animation_frame_present_pending: bool = false,
+    /// Latest timer generation that produced a commit. A completed animation
+    /// task without this marker contributes a zero-cost browser-stage sample,
+    /// allowing an old raster estimate to recover when later frames are JS-only.
+    animation_frame_last_commit_generation: u64 = 0,
     needs_composite: bool = true,
     needs_raster: bool = true,
     needs_draw: bool = true,
@@ -1941,6 +2021,9 @@ pub const Browser = struct {
             self.needs_draw = true;
             self.needs_animation_frame = true;
             self.invalidateAnimationTimerLocked();
+            self.frame_time_estimator.reset();
+            self.animation_frame_present_pending = false;
+            self.animation_frame_last_commit_generation = 0;
             should_schedule = true;
         }
         self.lock.unlock();
@@ -2002,6 +2085,15 @@ pub const Browser = struct {
         self.needs_composite = true;
         self.needs_raster = true;
         self.needs_draw = true;
+    }
+
+    fn resetFrameTimeEstimatorForTab(self: *Browser, tab: *Tab) void {
+        self.lock.lock();
+        defer self.lock.unlock();
+        if (self.activeTab() != tab) return;
+        self.frame_time_estimator.reset();
+        self.animation_frame_present_pending = false;
+        self.animation_frame_last_commit_generation = 0;
     }
 
     // Create a new tab and load a URL into it
@@ -3595,6 +3687,7 @@ pub const Browser = struct {
         frame.current_url_owned = false;
         self.updateTabTitle(tab, document_title);
         document_title = null;
+        self.resetFrameTimeEstimatorForTab(tab);
         tab.setNeedsRender();
         // Render and commit immediately to ensure first paint even if animation scheduling stalls.
         tab.runAnimationFrame(frame.scroll);
@@ -4815,6 +4908,21 @@ pub const Browser = struct {
         self.animation_frame_deadline_ns = null;
     }
 
+    fn observeAnimationFrameTabWork(
+        self: *Browser,
+        tab: *Tab,
+        generation: u64,
+        duration_ns: i96,
+    ) void {
+        self.lock.lock();
+        defer self.lock.unlock();
+        if (self.shutting_down or self.activeTab() != tab) return;
+        self.frame_time_estimator.observeTabWork(duration_ns);
+        if (self.animation_frame_last_commit_generation != generation) {
+            self.frame_time_estimator.observeBrowserWork(0);
+        }
+    }
+
     fn animationTimerMatchesLocked(self: *const Browser, tab: *Tab, generation: u64) bool {
         return self.animation_timer_active and
             self.animation_timer_generation == generation and
@@ -4857,7 +4965,11 @@ pub const Browser = struct {
         }
         const tab = self.activeTab().?;
         const now_ns = std.Io.Clock.awake.now(self.io).nanoseconds;
-        const timing = nextAnimationFrameTiming(self.animation_frame_deadline_ns, now_ns);
+        const timing = nextAnimationFrameTiming(
+            self.animation_frame_deadline_ns,
+            now_ns,
+            self.frame_time_estimator.intervalNs(),
+        );
         const generation = self.advanceAnimationTimerGenerationLocked();
         self.animation_timer_active = true;
         self.animation_frame_deadline_ns = timing.deadline_ns;
@@ -5641,11 +5753,19 @@ pub const Browser = struct {
         self.lock.lock();
         defer self.lock.unlock();
 
+        const profiling = self.profiling_enabled;
+        const sample_animation_work = self.animation_frame_present_pending;
+        self.animation_frame_present_pending = false;
+        const measure_pipeline = profiling or sample_animation_work;
+        const start_ns = if (measure_pipeline) std.Io.Clock.awake.now(self.io).nanoseconds else 0;
+        defer if (sample_animation_work) {
+            const duration_ns = std.Io.Clock.awake.now(self.io).nanoseconds - start_ns;
+            self.frame_time_estimator.observeBrowserWork(duration_ns);
+        };
+
         // Check if any phase is needed
         if (!self.needs_composite and !self.needs_raster and !self.needs_draw) return;
 
-        const profiling = self.profiling_enabled;
-        const start_ns = if (profiling) std.Io.Clock.awake.now(self.io).nanoseconds else 0;
         var composite_ns: u64 = 0;
         var raster_ns: u64 = 0;
         var draw_ns: u64 = 0;
@@ -5787,10 +5907,13 @@ pub const Browser = struct {
             self.clearActiveTabUrlLocked();
         }
 
-        const should_schedule_animation = if (data.animation_generation) |generation|
-            self.finishAnimationFrameLocked(tab, generation)
-        else
-            false;
+        const should_schedule_animation = if (data.animation_generation) |generation| blk: {
+            if (self.animationTimerMatchesLocked(tab, generation)) {
+                self.animation_frame_present_pending = true;
+                self.animation_frame_last_commit_generation = generation;
+            }
+            break :blk self.finishAnimationFrameLocked(tab, generation);
+        } else false;
 
         // Determine which phases need to run based on what changed
         if (has_display_list_change) {
@@ -8351,7 +8474,14 @@ const AnimationRenderTaskContext = struct {
         self.browser.lock.unlock();
 
         if (!is_current) return;
+        const started_ns = std.Io.Clock.awake.now(self.browser.io).nanoseconds;
         self.tab.runAnimationFrameForGeneration(self.scroll, self.generation);
+        const duration_ns = std.Io.Clock.awake.now(self.browser.io).nanoseconds - started_ns;
+        self.browser.observeAnimationFrameTabWork(
+            self.tab,
+            self.generation,
+            duration_ns,
+        );
 
         // A commit normally consumes this generation. Frames with no visual
         // commit still have to release it and possibly chain the next request.

@@ -3,16 +3,17 @@ How to verify:
 1. Open this page and wait until the status field starts with "DONE".
 2. The page records 48 requestAnimationFrame gaps while repeatedly forcing
    style, layout, paint, blur rasterization, and draw work.
-3. The average should stay near the requested 33ms cadence instead of growing
-   by roughly 33ms plus the duration of the previous rendering pipeline.
-   Individual minimum and maximum values may vary with machine load.
+3. On a machine that can sustain the workload, the average should remain near
+   33ms. Under overload it should settle near a consistent slower 33ms multiple
+   (66ms, 99ms, and so on) instead of alternating random stalls with immediate
+   catch-up frames. Individual minimum and maximum values may still vary.
 4. Run with ZIBRA_TRACE=1 to confirm task:animation_frame work on the tab
    worker overlaps composite_raster_draw work on the main thread.
 -->
 <!doctype html>
 <html>
 <head>
-  <title>clock-based animation frame cadence</title>
+  <title>estimated animation frame cadence</title>
   <style>
     body { background-color: white; color: black; font-size: 16px; }
     input { width: 700px; height: 26px; }
@@ -21,7 +22,7 @@ How to verify:
   </style>
 </head>
 <body>
-  <h1>Absolute animation-frame timing</h1>
+  <h1>Estimated animation-frame timing</h1>
   <p>Frame timing: <input id="result" value="collecting 48 frame gaps"></p>
   <p>Pipeline work: <input id="work" value="running"></p>
 
@@ -50,7 +51,7 @@ How to verify:
     // and the already-anchored first deadline as warm-ups so the report
     // contains only steady-state timer-delivered frame gaps.
     var previous = null;
-    var warmupGaps = 1;
+    var warmupGaps = 8;
 
     function recordFrame() {
       var current = Date.now();
@@ -73,7 +74,7 @@ How to verify:
         if (gaps[i] < minimum) minimum = gaps[i];
         if (gaps[i] > maximum) maximum = gaps[i];
       }
-      result.setAttribute('value', 'DONE requested=33ms samples=48 avg=' +
+      result.setAttribute('value', 'DONE base=33ms adaptive samples=48 avg=' +
         (total / gaps.length).toFixed(1) + 'ms min=' + minimum +
         'ms max=' + maximum + 'ms');
       work.setAttribute('value', 'DONE style/layout/paint/blur/draw exercised');
