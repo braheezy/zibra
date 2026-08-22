@@ -2666,6 +2666,7 @@ pub const Browser = struct {
             return;
         };
         const task_instance = Task.init(
+            .user_input,
             "task:click",
             ctx.toOpaque(),
             TabClickTaskContext.runOpaque,
@@ -2684,6 +2685,7 @@ pub const Browser = struct {
             return;
         };
         const task_instance = Task.init(
+            .user_input,
             "task:keypress",
             ctx.toOpaque(),
             TabKeypressTaskContext.runOpaque,
@@ -2702,6 +2704,7 @@ pub const Browser = struct {
             return;
         };
         const task_instance = Task.init(
+            .user_input,
             "task:backspace",
             ctx.toOpaque(),
             TabBackspaceTaskContext.runOpaque,
@@ -2720,6 +2723,7 @@ pub const Browser = struct {
             return;
         };
         const task_instance = Task.init(
+            .user_input,
             "task:scroll",
             ctx.toOpaque(),
             TabScrollTaskContext.runOpaque,
@@ -2747,6 +2751,7 @@ pub const Browser = struct {
             return;
         };
         const task_instance = Task.init(
+            .user_input,
             "task:history_traversal",
             ctx.toOpaque(),
             TabHistoryTaskContext.runOpaque,
@@ -2776,6 +2781,7 @@ pub const Browser = struct {
             return;
         };
         const task_instance = Task.init(
+            .user_input,
             "task:post_resubmission",
             ctx.toOpaque(),
             TabHistoryTaskContext.runOpaque,
@@ -2812,6 +2818,7 @@ pub const Browser = struct {
             return;
         };
         const task_instance = Task.init(
+            .user_input,
             "task:blur",
             ctx.toOpaque(),
             TabBlurTaskContext.runOpaque,
@@ -2843,6 +2850,7 @@ pub const Browser = struct {
             return;
         };
         const task_instance = Task.init(
+            .user_input,
             "task:resize",
             ctx.toOpaque(),
             TabResizeTaskContext.runOpaque,
@@ -3334,6 +3342,7 @@ pub const Browser = struct {
         );
         tab.task_runner.clear();
         const task_instance = Task.init(
+            .normal,
             "task:navigate",
             ctx.toOpaque(),
             LoadTaskContext.runOpaque,
@@ -3360,6 +3369,7 @@ pub const Browser = struct {
             payload,
         );
         const task_instance = Task.init(
+            .normal,
             "task:frame_navigate",
             ctx.toOpaque(),
             FrameLoadTaskContext.runOpaque,
@@ -4059,6 +4069,7 @@ pub const Browser = struct {
         errdefer ctx.destroy();
 
         const task_instance = Task.init(
+            .normal,
             "task:external_script",
             ctx.toOpaque(),
             ScriptTaskContext.runOpaque,
@@ -4385,6 +4396,7 @@ pub const Browser = struct {
         errdefer ctx.destroy();
 
         const task_instance = Task.init(
+            .normal,
             "task:inline_script",
             ctx.toOpaque(),
             ScriptTaskContext.runOpaque,
@@ -7749,6 +7761,7 @@ fn runSetTimeoutThread(ctx: *SetTimeoutThreadContext) void {
     errdefer task_ctx.destroy();
 
     const task = Task.init(
+        .javascript,
         if (ctx.is_interval) "task:interval" else "task:timeout",
         task_ctx.toOpaque(),
         SetTimeoutTaskContext.runOpaque,
@@ -7915,6 +7928,7 @@ fn runAnimationTimerThread(ctx: *AnimationTimerContext) void {
     };
 
     const task = Task.init(
+        .rendering,
         "task:animation_frame",
         render_ctx.toOpaque(),
         AnimationRenderTaskContext.runOpaque,
@@ -8170,6 +8184,7 @@ fn runXhrThread(ctx: *XhrThreadContext) void {
     };
 
     const task = Task.init(
+        .javascript,
         "task:xhr_onload",
         task_ctx.toOpaque(),
         XhrOnloadTaskContext.runOpaque,
@@ -8594,6 +8609,7 @@ fn jsPostMessageCallback(
         source_origin,
     );
     const task = Task.init(
+        .javascript,
         "task:post_message",
         task_ctx.toOpaque(),
         PostMessageTaskContext.runOpaque,

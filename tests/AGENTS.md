@@ -160,6 +160,10 @@ while forcing style, layout, paint, blur rasterization, and draw work. Its
 average exposes relative-delay drift; a trace also shows animation-frame tasks
 starting before and overlapping main-thread composition/raster/draw.
 
+`tests/manual/task-scheduler.html` combines 32 CPU-heavy same-deadline timeout
+callbacks with 48 animation frames. Frame cadence remains visible while every
+timeout must eventually complete, covering both priority and starvation.
+
 Choose the narrowest check that covers the pipeline stage under change. A DOM
 or parser regression should normally add a DOM dump or unit fixture before a
 full screenshot fixture.

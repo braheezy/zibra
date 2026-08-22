@@ -811,6 +811,18 @@ around `run_fn`, including error returns, but not around cleanup. Production
 names are string literals, so their lifetime exceeds queued execution; a
 dynamic name would need an owner with the same lifetime as the task context.
 
+Each producer separately assigns one of four semantic priorities. Rendering
+and direct user-input variants share the urgent rank, navigation/document work
+uses the normal rank, and callbacks originating in `setTimeout`, `setInterval`,
+XHR, or `postMessage` use the JavaScript-low rank. The trace name is diagnostic
+only and never determines priority. Selection is FIFO within a rank. Ordinarily
+the worker removes the oldest task at the greatest rank; after eight such
+selections have bypassed lower-ranked entries, it removes exactly one oldest
+lower-ranked entry and resets the burst. This bounded priority burst lets a due
+animation frame jump a timeout backlog while guaranteeing eventual progress
+for every finite older backlog. Queue clearing resets the burst state and still
+cleans each discarded context exactly once.
+
 Scheduling after shutdown immediately invokes cleanup. This is a useful local
 contract. `TaskRunner.shutdown` publishes quit, cleans queued work, and joins
 the active worker; after it returns, neither the runner nor an active task

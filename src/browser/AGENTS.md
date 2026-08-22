@@ -36,6 +36,10 @@ before changing `root.zig`, `tab.zig`, `render/`, or browser task scheduling.
   consuming the preceding commit in composition/raster/draw, allowing the two
   threads to overlap. CSS animations must publish `needs_animation_frame`, just
   like JavaScript `requestAnimationFrame`, before attempting to schedule again.
+- Browser task producers classify animation frames and native input as urgent,
+  navigation and script discovery as normal, and timeout/interval/XHR/message
+  callbacks as JavaScript-low. Do not infer priority from the trace label:
+  `Task.init` requires both so renaming diagnostics cannot change scheduling.
 - Each tab owns a sentinel-terminated copy of its root document title. Tab
   workers replace it under `Browser.lock`; only the interactive App/UI thread
   may pass it to the addressed native window, including after tab switches.

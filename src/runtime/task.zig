@@ -5,13 +5,36 @@
 //! without running when pending work is cleared. `shutdown` rejects new work,
 //! cleans pending work, and joins the worker. Once it returns, no worker can
 //! access the runner or an active task context. Every executed callback is
-//! bracketed by a producer-named `task:*` Chrome trace span.
+//! bracketed by a producer-named `task:*` Chrome trace span. The queue favors
+//! rendering and user input over ordinary browser work and JavaScript API
+//! callbacks, but periodically runs the oldest lower-priority task so a busy
+//! page cannot starve it forever.
 
 const std = @import("std");
 const MeasureTime = @import("measure_time.zig").MeasureTime;
 const sync = @import("sync.zig");
 
 pub const Task = struct {
+    pub const Priority = enum {
+        /// requestAnimationFrame and rendering-pipeline work.
+        rendering,
+        /// Direct keyboard, pointer, history, focus, and resize work.
+        user_input,
+        /// Navigation, parsing, and document-authored script evaluation.
+        normal,
+        /// Callbacks originating in asynchronous JavaScript APIs.
+        javascript,
+
+        fn rank(self: Priority) u8 {
+            return switch (self) {
+                .rendering, .user_input => 2,
+                .normal => 1,
+                .javascript => 0,
+            };
+        }
+    };
+
+    priority: Priority,
     /// Borrowed diagnostic label. The producer must keep it alive until this
     /// task is either executed or discarded; production callers use literals.
     trace_name: []const u8,
@@ -20,12 +43,14 @@ pub const Task = struct {
     cleanup_fn: ?*const fn (*anyopaque) void = null,
 
     pub fn init(
+        priority: Priority,
         trace_name: []const u8,
         context: *anyopaque,
         run_fn: *const fn (*anyopaque) anyerror!void,
         cleanup_fn: ?*const fn (*anyopaque) void,
     ) Task {
         return .{
+            .priority = priority,
             .trace_name = trace_name,
             .context = context,
             .run_fn = run_fn,
@@ -47,6 +72,10 @@ pub const Task = struct {
 };
 
 pub const TaskRunner = struct {
+    /// After this many higher-rank selections bypass older lower-priority
+    /// work, run exactly one oldest lower-priority task before resuming.
+    pub const priority_burst_limit: usize = 8;
+
     allocator: std.mem.Allocator,
     tasks: std.ArrayList(Task),
     mutex: sync.Mutex,
@@ -55,6 +84,8 @@ pub const TaskRunner = struct {
     shutting_down: bool = false,
     join_in_progress: bool = false,
     active_tasks: usize = 0,
+    priority_burst_rank: ?u8 = null,
+    priority_burst_count: usize = 0,
     thread: ?std.Thread = null,
     worker_id: ?std.Thread.Id = null,
     measure: *MeasureTime,
@@ -111,6 +142,52 @@ pub const TaskRunner = struct {
         while (self.tasks.pop()) |task| {
             task.cleanup();
         }
+        self.priority_burst_rank = null;
+        self.priority_burst_count = 0;
+    }
+
+    /// Select the oldest task at the greatest priority. A bounded burst of
+    /// higher-priority work may bypass lower-priority entries; the next pick
+    /// is then the oldest bypassed entry, which provides deterministic aging
+    /// without wall-clock sleeps or a second owning queue.
+    fn takeNextTaskLocked(self: *TaskRunner) Task {
+        std.debug.assert(self.tasks.items.len > 0);
+
+        var highest_index: usize = 0;
+        var highest_rank = self.tasks.items[0].priority.rank();
+        for (self.tasks.items[1..], 1..) |task, index| {
+            const rank = task.priority.rank();
+            if (rank > highest_rank) {
+                highest_index = index;
+                highest_rank = rank;
+            }
+        }
+
+        var oldest_lower_index: ?usize = null;
+        for (self.tasks.items, 0..) |task, index| {
+            if (task.priority.rank() < highest_rank) {
+                oldest_lower_index = index;
+                break;
+            }
+        }
+
+        if (oldest_lower_index) |lower_index| {
+            if (self.priority_burst_rank != highest_rank) {
+                self.priority_burst_rank = highest_rank;
+                self.priority_burst_count = 0;
+            }
+            if (self.priority_burst_count >= priority_burst_limit) {
+                self.priority_burst_rank = null;
+                self.priority_burst_count = 0;
+                return self.tasks.orderedRemove(lower_index);
+            }
+            self.priority_burst_count += 1;
+        } else {
+            self.priority_burst_rank = null;
+            self.priority_burst_count = 0;
+        }
+
+        return self.tasks.orderedRemove(highest_index);
     }
 
     pub fn isIdle(self: *TaskRunner) bool {
@@ -176,7 +253,7 @@ fn runThread(runner: *TaskRunner) void {
             return;
         }
 
-        task_to_run = runner.tasks.orderedRemove(0);
+        task_to_run = runner.takeNextTaskLocked();
         runner.active_tasks += 1;
         runner.mutex.unlock();
 
@@ -193,6 +270,93 @@ fn runThread(runner: *TaskRunner) void {
             runner.mutex.unlock();
         }
     }
+}
+
+const TestTaskRecorder = struct {
+    io: std.Io,
+    labels: [32]u8 = undefined,
+    next_index: std.atomic.Value(usize) = .init(0),
+    completed: std.Io.Semaphore = .{},
+
+    fn waitFor(self: *TestTaskRecorder, count: usize) void {
+        for (0..count) |_| self.completed.waitUncancelable(self.io);
+    }
+};
+
+const TestTaskContext = struct {
+    recorder: *TestTaskRecorder,
+    label: u8,
+
+    fn run(raw_context: *anyopaque) !void {
+        const context: *@This() = @ptrCast(@alignCast(raw_context));
+        const index = context.recorder.next_index.fetchAdd(1, .monotonic);
+        context.recorder.labels[index] = context.label;
+        context.recorder.completed.post(context.recorder.io);
+    }
+};
+
+test "task runner prioritizes rendering and input while preserving priority FIFO" {
+    var environ = std.process.Environ.Map.init(std.testing.allocator);
+    defer environ.deinit();
+    var measure = try MeasureTime.init(std.testing.allocator, std.testing.io, &environ);
+    defer measure.finish();
+
+    var runner = TaskRunner.init(std.testing.allocator, &measure);
+    defer runner.deinit();
+    var recorder = TestTaskRecorder{ .io = std.testing.io };
+    var contexts = [_]TestTaskContext{
+        .{ .recorder = &recorder, .label = 'j' },
+        .{ .recorder = &recorder, .label = 'n' },
+        .{ .recorder = &recorder, .label = 'i' },
+        .{ .recorder = &recorder, .label = 'r' },
+        .{ .recorder = &recorder, .label = 'k' },
+    };
+    const priorities = [_]Task.Priority{
+        .javascript,
+        .normal,
+        .user_input,
+        .rendering,
+        .user_input,
+    };
+
+    for (&contexts, priorities) |*context, priority| {
+        try runner.schedule(.init(priority, "task:test_priority", context, TestTaskContext.run, null));
+    }
+    try runner.start();
+    recorder.waitFor(contexts.len);
+    runner.shutdown();
+
+    try std.testing.expectEqualStrings("irknj", recorder.labels[0..contexts.len]);
+}
+
+test "task runner gives oldest low-priority work a bounded starvation escape" {
+    var environ = std.process.Environ.Map.init(std.testing.allocator);
+    defer environ.deinit();
+    var measure = try MeasureTime.init(std.testing.allocator, std.testing.io, &environ);
+    defer measure.finish();
+
+    var runner = TaskRunner.init(std.testing.allocator, &measure);
+    defer runner.deinit();
+    var recorder = TestTaskRecorder{ .io = std.testing.io };
+    var contexts: [TaskRunner.priority_burst_limit + 2]TestTaskContext = undefined;
+    contexts[0] = .{ .recorder = &recorder, .label = 'j' };
+    try runner.schedule(.init(.javascript, "task:test_starved", &contexts[0], TestTaskContext.run, null));
+    for (0..TaskRunner.priority_burst_limit + 1) |index| {
+        contexts[index + 1] = .{ .recorder = &recorder, .label = @intCast('0' + index) };
+        try runner.schedule(.init(
+            .rendering,
+            "task:test_urgent",
+            &contexts[index + 1],
+            TestTaskContext.run,
+            null,
+        ));
+    }
+
+    try runner.start();
+    recorder.waitFor(contexts.len);
+    runner.shutdown();
+
+    try std.testing.expectEqualStrings("01234567j8", recorder.labels[0..contexts.len]);
 }
 
 test "shutdown joins an active worker and cleans pending tasks" {
@@ -255,11 +419,11 @@ test "shutdown joins an active worker and cleans pending tasks" {
     try runner.start();
 
     var active = ActiveContext{ .io = std.testing.io };
-    try runner.schedule(.init("task:test_active", &active, ActiveContext.run, ActiveContext.cleanup));
+    try runner.schedule(.init(.normal, "task:test_active", &active, ActiveContext.run, ActiveContext.cleanup));
     active.started.waitUncancelable(std.testing.io);
 
     var pending = PendingContext{};
-    try runner.schedule(.init("task:test_pending", &pending, PendingContext.run, PendingContext.cleanup));
+    try runner.schedule(.init(.normal, "task:test_pending", &pending, PendingContext.run, PendingContext.cleanup));
 
     var shutdown_context = ShutdownContext{ .runner = &runner };
     const shutdown_thread = try std.Thread.spawn(.{}, ShutdownContext.run, .{&shutdown_context});
@@ -286,7 +450,7 @@ test "shutdown joins an active worker and cleans pending tasks" {
     // Repeated shutdown is a no-op, and rejected work is still cleaned once.
     runner.shutdown();
     var rejected = PendingContext{};
-    try runner.schedule(.init("task:test_rejected", &rejected, PendingContext.run, PendingContext.cleanup));
+    try runner.schedule(.init(.normal, "task:test_rejected", &rejected, PendingContext.run, PendingContext.cleanup));
     try std.testing.expectEqual(@as(usize, 1), rejected.cleanup_count.load(.monotonic));
     try std.testing.expectEqual(@as(usize, 0), rejected.run_count.load(.monotonic));
 }
