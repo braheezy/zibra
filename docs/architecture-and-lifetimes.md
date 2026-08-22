@@ -803,6 +803,12 @@ owns its opaque context through one of these paths:
 - execute `run_fn`, then call `cleanup_fn`; or
 - if discarded before execution, call `cleanup_fn` while clearing the queue.
 
+Each accepted task also borrows a stable diagnostic name from its producer.
+The worker emits a matched Chrome trace begin/end pair named `task:<operation>`
+around `run_fn`, including error returns, but not around cleanup. Production
+names are string literals, so their lifetime exceeds queued execution; a
+dynamic name would need an owner with the same lifetime as the task context.
+
 Scheduling after shutdown immediately invokes cleanup. This is a useful local
 contract. `TaskRunner.shutdown` publishes quit, cleans queued work, and joins
 the active worker; after it returns, neither the runner nor an active task

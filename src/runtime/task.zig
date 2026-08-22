@@ -4,30 +4,38 @@
 //! runner executes and cleans each accepted task exactly once, or cleans it
 //! without running when pending work is cleared. `shutdown` rejects new work,
 //! cleans pending work, and joins the worker. Once it returns, no worker can
-//! access the runner or an active task context.
+//! access the runner or an active task context. Every executed callback is
+//! bracketed by a producer-named `task:*` Chrome trace span.
 
 const std = @import("std");
 const MeasureTime = @import("measure_time.zig").MeasureTime;
 const sync = @import("sync.zig");
 
 pub const Task = struct {
+    /// Borrowed diagnostic label. The producer must keep it alive until this
+    /// task is either executed or discarded; production callers use literals.
+    trace_name: []const u8,
     context: *anyopaque,
     run_fn: *const fn (*anyopaque) anyerror!void,
     cleanup_fn: ?*const fn (*anyopaque) void = null,
 
     pub fn init(
+        trace_name: []const u8,
         context: *anyopaque,
         run_fn: *const fn (*anyopaque) anyerror!void,
         cleanup_fn: ?*const fn (*anyopaque) void,
     ) Task {
         return .{
+            .trace_name = trace_name,
             .context = context,
             .run_fn = run_fn,
             .cleanup_fn = cleanup_fn,
         };
     }
 
-    fn run(self: Task) anyerror!void {
+    fn run(self: Task, measure: *MeasureTime) anyerror!void {
+        const tracing = measure.begin(self.trace_name);
+        defer if (tracing) measure.end(self.trace_name);
         try self.run_fn(self.context);
     }
 
@@ -173,7 +181,7 @@ fn runThread(runner: *TaskRunner) void {
         runner.mutex.unlock();
 
         if (task_to_run) |task| {
-            task.run() catch |err| {
+            task.run(runner.measure) catch |err| {
                 std.log.err("Task failed: {}", .{err});
             };
             task.cleanup();
@@ -247,11 +255,11 @@ test "shutdown joins an active worker and cleans pending tasks" {
     try runner.start();
 
     var active = ActiveContext{ .io = std.testing.io };
-    try runner.schedule(.init(&active, ActiveContext.run, ActiveContext.cleanup));
+    try runner.schedule(.init("task:test_active", &active, ActiveContext.run, ActiveContext.cleanup));
     active.started.waitUncancelable(std.testing.io);
 
     var pending = PendingContext{};
-    try runner.schedule(.init(&pending, PendingContext.run, PendingContext.cleanup));
+    try runner.schedule(.init("task:test_pending", &pending, PendingContext.run, PendingContext.cleanup));
 
     var shutdown_context = ShutdownContext{ .runner = &runner };
     const shutdown_thread = try std.Thread.spawn(.{}, ShutdownContext.run, .{&shutdown_context});
@@ -278,7 +286,7 @@ test "shutdown joins an active worker and cleans pending tasks" {
     // Repeated shutdown is a no-op, and rejected work is still cleaned once.
     runner.shutdown();
     var rejected = PendingContext{};
-    try runner.schedule(.init(&rejected, PendingContext.run, PendingContext.cleanup));
+    try runner.schedule(.init("task:test_rejected", &rejected, PendingContext.run, PendingContext.cleanup));
     try std.testing.expectEqual(@as(usize, 1), rejected.cleanup_count.load(.monotonic));
     try std.testing.expectEqual(@as(usize, 0), rejected.run_count.load(.monotonic));
 }

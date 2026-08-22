@@ -2635,6 +2635,7 @@ pub const Browser = struct {
             return;
         };
         const task_instance = Task.init(
+            "task:click",
             ctx.toOpaque(),
             TabClickTaskContext.runOpaque,
             TabClickTaskContext.cleanupOpaque,
@@ -2652,6 +2653,7 @@ pub const Browser = struct {
             return;
         };
         const task_instance = Task.init(
+            "task:keypress",
             ctx.toOpaque(),
             TabKeypressTaskContext.runOpaque,
             TabKeypressTaskContext.cleanupOpaque,
@@ -2669,6 +2671,7 @@ pub const Browser = struct {
             return;
         };
         const task_instance = Task.init(
+            "task:backspace",
             ctx.toOpaque(),
             TabBackspaceTaskContext.runOpaque,
             TabBackspaceTaskContext.cleanupOpaque,
@@ -2686,6 +2689,7 @@ pub const Browser = struct {
             return;
         };
         const task_instance = Task.init(
+            "task:scroll",
             ctx.toOpaque(),
             TabScrollTaskContext.runOpaque,
             TabScrollTaskContext.cleanupOpaque,
@@ -2712,6 +2716,7 @@ pub const Browser = struct {
             return;
         };
         const task_instance = Task.init(
+            "task:history_traversal",
             ctx.toOpaque(),
             TabHistoryTaskContext.runOpaque,
             TabHistoryTaskContext.cleanupOpaque,
@@ -2740,6 +2745,7 @@ pub const Browser = struct {
             return;
         };
         const task_instance = Task.init(
+            "task:post_resubmission",
             ctx.toOpaque(),
             TabHistoryTaskContext.runOpaque,
             TabHistoryTaskContext.cleanupOpaque,
@@ -2775,6 +2781,7 @@ pub const Browser = struct {
             return;
         };
         const task_instance = Task.init(
+            "task:blur",
             ctx.toOpaque(),
             TabBlurTaskContext.runOpaque,
             TabBlurTaskContext.cleanupOpaque,
@@ -2805,6 +2812,7 @@ pub const Browser = struct {
             return;
         };
         const task_instance = Task.init(
+            "task:resize",
             ctx.toOpaque(),
             TabResizeTaskContext.runOpaque,
             TabResizeTaskContext.cleanupOpaque,
@@ -3295,6 +3303,7 @@ pub const Browser = struct {
         );
         tab.task_runner.clear();
         const task_instance = Task.init(
+            "task:navigate",
             ctx.toOpaque(),
             LoadTaskContext.runOpaque,
             LoadTaskContext.cleanupOpaque,
@@ -3320,6 +3329,7 @@ pub const Browser = struct {
             payload,
         );
         const task_instance = Task.init(
+            "task:frame_navigate",
             ctx.toOpaque(),
             FrameLoadTaskContext.runOpaque,
             FrameLoadTaskContext.cleanupOpaque,
@@ -4018,6 +4028,7 @@ pub const Browser = struct {
         errdefer ctx.destroy();
 
         const task_instance = Task.init(
+            "task:external_script",
             ctx.toOpaque(),
             ScriptTaskContext.runOpaque,
             ScriptTaskContext.cleanupOpaque,
@@ -4343,6 +4354,7 @@ pub const Browser = struct {
         errdefer ctx.destroy();
 
         const task_instance = Task.init(
+            "task:inline_script",
             ctx.toOpaque(),
             ScriptTaskContext.runOpaque,
             ScriptTaskContext.cleanupOpaque,
@@ -7649,6 +7661,7 @@ fn runSetTimeoutThread(ctx: *SetTimeoutThreadContext) void {
     errdefer task_ctx.destroy();
 
     const task = Task.init(
+        if (ctx.is_interval) "task:interval" else "task:timeout",
         task_ctx.toOpaque(),
         SetTimeoutTaskContext.runOpaque,
         SetTimeoutTaskContext.cleanupOpaque,
@@ -7807,6 +7820,7 @@ fn runAnimationTimerThread(ctx: *AnimationTimerContext) void {
     };
 
     const task = Task.init(
+        "task:animation_frame",
         render_ctx.toOpaque(),
         AnimationRenderTaskContext.runOpaque,
         AnimationRenderTaskContext.cleanupOpaque,
@@ -8059,6 +8073,7 @@ fn runXhrThread(ctx: *XhrThreadContext) void {
     };
 
     const task = Task.init(
+        "task:xhr_onload",
         task_ctx.toOpaque(),
         XhrOnloadTaskContext.runOpaque,
         XhrOnloadTaskContext.cleanupOpaque,
@@ -8482,6 +8497,7 @@ fn jsPostMessageCallback(
         source_origin,
     );
     const task = Task.init(
+        "task:post_message",
         task_ctx.toOpaque(),
         PostMessageTaskContext.runOpaque,
         PostMessageTaskContext.cleanupOpaque,
