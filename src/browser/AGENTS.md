@@ -45,8 +45,12 @@ before changing `root.zig`, `tab.zig`, `render/`, or browser task scheduling.
   may pass it to the addressed native window, including after tab switches.
 - Browser-session state lives in `session_state.zig`, separately from any
   native window. It owns the shared HTTP client, cookie jar, response cache,
-  and a dedicated network mutex, plus canonical visited and bookmarked URL
-  strings under an independent metadata mutex. Bookmark snapshots own
+  one heap-stable networking task runner, and a dedicated network-data mutex,
+  plus canonical visited and bookmarked URL strings under an independent
+  metadata mutex. Every ordinary Browser fetch synchronously bridges through
+  that runner; only its joined linked-resource batch workers call transport
+  directly. The runner is stopped after all windows but before its borrowed
+  MeasureTime and transport state. Bookmark snapshots own
   independent sorted string copies. DOM anchors retain only an `is_visited`
   boolean; monotonically increasing generations let `BrowserApp` broadcast
   visited RAF work and bookmark chrome reraster work to every live window
@@ -151,11 +155,13 @@ before changing `root.zig`, `tab.zig`, `render/`, or browser task scheduling.
   text in DOM order. Its author rules borrow those buffers; rebuild and retire
   the text and rules as one generation for root documents and iframes.
 - External classic scripts and linked stylesheets are first discovered into a
-  fixed caller-owned batch. Each entry owns its resolved URL, referrer, and
-  eventual response; all network workers join synchronously before any entry
-  or document generation can retire. Completion order is irrelevant: scripts
-  are queued and styles are parsed by walking the DOM in source order after the
-  join. Root loads, child-frame loads, and mutation rescans share this path.
+  fixed caller-owned batch. The tab submits that complete batch as one task to
+  the session networking runner. Each entry owns its resolved URL, referrer,
+  and eventual response; the network task starts and joins all transport
+  workers before any entry or document generation can retire. Completion order
+  is irrelevant: scripts are queued and styles are parsed by walking the DOM
+  in source order after the join. Root loads, child-frame loads, and mutation
+  rescans share this path.
 - Attached structural DOM mutation marks that frame's document resources
   dirty. Before the next style pass, the tab worker queues newly attached
   scripts once and rebuilds the complete author-sheet generation from the

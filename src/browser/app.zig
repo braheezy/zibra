@@ -270,6 +270,9 @@ pub const BrowserApp = struct {
         measure.* = try MeasureTime.init(allocator, io, environ);
         errdefer measure.finish();
 
+        try session.startNetworking(measure);
+        errdefer session.stopNetworking();
+
         const app = try allocator.create(BrowserApp);
         errdefer allocator.destroy(app);
         app.* = .{

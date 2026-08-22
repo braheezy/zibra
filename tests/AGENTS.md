@@ -168,7 +168,9 @@ timeout must eventually complete, covering both priority and starvation.
 same-specificity stylesheets. Run its adjacent threaded Python server to give
 each response equal latency: all four requests start together while the visible
 script result and final green style prove that consumption remains in DOM
-source order.
+source order. With `ZIBRA_TRACE=1`, the document navigation and resource-batch
+spans must be attributed to `Networking thread`, while the four batch requests
+still overlap.
 
 Choose the narrowest check that covers the pipeline stage under change. A DOM
 or parser regression should normally add a DOM dump or unit fixture before a

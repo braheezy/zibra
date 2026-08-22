@@ -37,7 +37,7 @@ The source tree is organized by responsibility:
 | [`src/browser/root.zig`](../src/browser/root.zig) | Per-window `Browser`, navigation orchestration, fetch coordination, async host helpers, render commit, composition, raster, and draw; it also supports standalone headless construction. |
 | [`src/browser/tab.zig`](../src/browser/tab.zig) | `Tab` and `Frame` ownership, task serialization, history, frame lookup, accessibility, focus, and per-document state. |
 | [`src/browser/chrome.zig`](../src/browser/chrome.zig) | Browser-owned internal HTML chrome, its dedicated layout/font state, semantic actions, address editing, and retained display data. |
-| [`src/browser/session_state.zig`](../src/browser/session_state.zig) | Window-independent HTTP client/cookies/cache plus visited/bookmarked URL state, generated bookmark HTML, and separate network/metadata synchronization. |
+| [`src/browser/session_state.zig`](../src/browser/session_state.zig) | Window-independent networking task runner, HTTP client/cookies/cache, visited/bookmarked URL state, generated bookmark HTML, and separate network-data/metadata synchronization. |
 | [`src/browser/render/layout.zig`](../src/browser/render/layout.zig) | Layout tree, invalidation dependencies, hit-test collection, paint, and image layout. |
 | [`src/browser/render/font.zig`](../src/browser/render/font.zig) | Font discovery, SDL_ttf handles, Unicode fallback selection, and owned RGBA glyph bitmaps. |
 | [`src/document/parser.zig`](../src/document/parser.zig) | HTML parser, DOM representation, style maps, images, and DOM tree utilities. |
@@ -47,7 +47,7 @@ The source tree is organized by responsibility:
 | [`src/network/url.zig`](../src/network/url.zig) | Owning `Url`, URL resolution, schemes, HTTP requests, redirects, cookies, response bodies, and cache integration. |
 | [`src/network/cache.zig`](../src/network/cache.zig) | Browser-session HTTP response entries, expiry, and strict `Cache-Control` policy parsing. |
 | [`src/script/js.zig`](../src/script/js.zig) | Kiesel host integration, realms/windows, DOM handles, JavaScript evaluation, events, timers, XHR, and host callbacks. |
-| [`src/runtime/task.zig`](../src/runtime/task.zig) | Per-tab serialized task worker and opaque task-context cleanup. |
+| [`src/runtime/task.zig`](../src/runtime/task.zig) | Named serialized task workers for tabs/networking and opaque task-context cleanup. |
 | [`src/runtime/thread_batch.zig`](../src/runtime/thread_batch.zig) | Synchronous start-all/join-all thread batches with caller-owned job/result slots. |
 | [`src/runtime/sync.zig`](../src/runtime/sync.zig) | Runtime synchronization wrappers. |
 | [`src/runtime/measure_time.zig`](../src/runtime/measure_time.zig) | Cross-thread measurement and profiling state. |
@@ -56,13 +56,15 @@ The source tree is organized by responsibility:
 
 ## Runtime topology
 
-The runtime currently has three kinds of execution context:
+The runtime currently separates its owner threads and accounted helpers as
+follows:
 
 ```text
 process main thread
   interactive BrowserApp
     sole SDL event poller and text-input owner
     shared BrowserSession (HTTP/cookies/cache/visited/bookmarks)
+      one Networking thread and queued browser fetches
     shared MeasureTime
     native window registry
       Browser A                 Browser B ...
@@ -78,10 +80,20 @@ process main thread
   one TaskRunner worker per Tab
     navigation, parsing, DOM, style, layout, paint, JavaScript host work
           |
-          | spawns accounted helper threads
+          | synchronous fetch bridge submits borrowed request inputs
+          v
+    shared BrowserSession Networking thread
+      navigation, image, iframe, XHR, script/style batch dispatch
+          |
+          | linked-resource batches start/join transport workers
+          | (results remain in source-order slots)
+          v
+    HTTP/file/data transport and response ownership
+
+  Tab work also spawns accounted non-transport helper threads
           v
     setTimeout/setInterval helper thread(s), animation timer thread,
-    async XHR thread(s)
+    async XHR completion thread(s)
           |
           `---- enqueue completion Task values back onto the Tab worker
 ```
@@ -177,9 +189,17 @@ that engine concurrently. Its fixed 66px outer boundary remains part of the
 document viewport contract even though the pixels within that boundary may
 change independently of page screenshot goldens.
 
-`BrowserSession` owns the shared `std.http.Client`, cookie jar, decoded HTTP
-response cache, and canonical serialized strings for visited and bookmarked
-URLs. Zig opens client connections thread-safely. A dedicated network mutex
+`BrowserSession` owns one heap-stable named `TaskRunner`, the shared
+`std.http.Client`, cookie jar, decoded HTTP response cache, and canonical
+serialized strings for visited and bookmarked URLs. Ordinary Browser fetches
+submit a stack-backed request context to this networking runner and wait until
+the task's cleanup callback posts completion. Request URL/referrer/payload
+values are synchronous borrows across that wait; the response and optional
+redirect URL then move back to the producer. Queue rejection still runs
+cleanup, so shutdown cannot strand a waiter. The runner borrows shared
+`MeasureTime` and must stop before either measurement or transport storage.
+
+Zig opens client connections thread-safely. A dedicated network-data mutex
 stabilizes cookie/cache lookup, copying, eviction, and mutation, but does not
 cover a complete transport round trip; its metadata mutex protects both URL
 sets independently of every `Browser.lock`.
@@ -268,14 +288,17 @@ detached links without leaving property slices pointing at freed CSS text.
 
 Root documents, child documents, and those mutation rescans discover every
 external classic script and linked stylesheet into one fixed batch. Each slot
-owns a resolved resource URL and independent referrer URL before its worker
-starts, and retains its response until the tab worker consumes it. The batch
-starts every available request before joining any thread; native spawn failure
-falls back to a synchronous fetch for that slot. After the complete join, the
-worker walks the DOM again, queueing scripts and parsing stylesheets in source
-order. Thus network completion cannot reorder classic-script execution or the
-CSS cascade, and navigation/shutdown cannot retire the Browser, Frame, or URLs
-while a batch thread still borrows them.
+owns a resolved resource URL and independent referrer URL before work starts,
+and retains its response until the tab worker consumes it. The complete batch
+crosses the session networking queue as one synchronous task. On the networking
+thread it starts every available transport worker before joining any thread;
+native spawn failure falls back to a synchronous fetch for that slot. These
+joined workers use the low-level synchronized transport directly, rather than
+deadlocking by submitting back to their waiting coordinator. After the
+complete join, the tab worker walks the DOM again, queueing scripts and parsing
+stylesheets in source order. Thus network completion cannot reorder
+classic-script execution or the CSS cascade, and navigation/shutdown cannot
+retire the Browser, Frame, or URLs while a batch worker still borrows them.
 
 Each tab records the visited generation represented by its display list. A new
 session visit requests an animation frame; render compares generations before
@@ -891,6 +914,9 @@ shutdown can safely wait but may wait for network I/O to finish.
   for a matching, verified HTTPS document, never for optimistic navigation
   text or a certificate-warning document.
 - `TaskRunner.mutex` and its condition protect the task queue and worker flags.
+- `BrowserSession.network_runner` serializes ordinary browser fetch dispatch.
+  Linked-resource parallelism is represented as one queued task with joined
+  child workers, so no child recursively waits on its coordinator's queue.
 - `BrowserSession.network_lock` serializes shared cookie-jar and response-cache
   access across every window, plus synchronous `document.cookie` callbacks;
   it deliberately does not serialize the HTTP round trip. Requests own copied
@@ -1146,8 +1172,9 @@ Normal `Browser.deinit` quiesces its tabs first, retires display snapshots,
 destroys document state, frees cached glyph bitmaps and closes fonts, tears
 down z2d state, then destroys that window's texture, renderer, and native
 handle. An App-owned Browser leaves shared session, measurement, text input,
-and SDL untouched. After all entries are gone, BrowserApp destroys the shared
-network/session state, finishes measurement once, stops text input, releases
+and SDL untouched. After all entries are gone, BrowserApp stops and joins the
+networking runner, destroys the shared HTTP/cookie/cache/session state, finishes
+measurement once, stops text input, releases
 its final SDL_ttf guard, and quits SDL. Standalone Browser owns those same final
 steps itself. Both constructors use reverse-order `errdefer` rollback.
 
@@ -1172,8 +1199,9 @@ The intended SDL contract should be:
    by the stopped runner;
 4. retire browser render snapshots, then destroy tabs, frames, DOM, and JS;
 5. destroy each Browser's layout, font, z2d, renderer, and window resources;
-6. after the final Browser is gone, destroy shared HTTP/cookie/cache/session
-   state and finish measurement once, when no thread can record into either;
+6. after the final Browser is gone, stop/join the networking runner, destroy
+   shared HTTP/cookie/cache/session state, and finish measurement once, when no
+   thread can record into either;
 7. stop text input, release the App's SDL_ttf guard, and quit SDL.
 
 Async HTTP requests are not cancellable yet, so phase 3 can block on network

@@ -1,7 +1,7 @@
 # Runtime subsystem guide
 
-This directory owns the per-tab task runner, synchronization wrappers, and
-measurement support.
+This directory owns the named task runners used by tabs and the networking
+dispatcher, synchronization wrappers, and measurement support.
 
 Read [`../../docs/architecture-and-lifetimes.md`](../../docs/architecture-and-lifetimes.md)
 before changing queues, thread lifetime, shutdown, or helper accounting.
@@ -22,6 +22,9 @@ before changing queues, thread lifetime, shutdown, or helper accounting.
   priority.
 - `TaskRunner.shutdown` is a quiescence boundary: it rejects/cleans pending
   work and joins the worker. Do not reintroduce detached workers.
+- `TaskRunner.initNamed` borrows a stable worker label for native thread naming
+  and trace registration. BrowserSession uses one heap-stable runner named
+  `Networking thread`; it must stop before the shared `MeasureTime` it borrows.
 - `thread_batch.zig` is a synchronous join boundary for caller-owned job/result
   slots. Construct the complete slice before starting it; every native thread
   must be joined before return, and a spawn failure must retain correct

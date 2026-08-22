@@ -34,6 +34,12 @@ before changing URL or response ownership.
 - `Url.fetchBody` is browser-independent. Keep it free of SDL, tabs, and
   renderer concerns so inspection commands can reuse it. Caching is an
   explicitly supplied dependency; inspection callers may opt out.
+- Browser-owned requests enter the session networking task runner before
+  calling the synchronized URL transport. The browser-free inspection CLI is
+  the intentional direct-fetch exception because it owns no BrowserSession.
+  A document's linked-resource batch is one queued network task whose joined
+  transport workers use the low-level synchronized API; this preserves request
+  parallelism without letting tab code bypass the networking owner.
 - Zig's HTTP client exposes TLS handshake and certificate-verification setup
   failures as `TlsInitializationFailed`. Keep that classification at the URL
   boundary; document navigation may turn it into browser UI, while subresource

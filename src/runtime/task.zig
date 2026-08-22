@@ -1,4 +1,4 @@
-//! Per-tab serialized background task execution.
+//! Named serialized background task execution for tabs and browser services.
 //!
 //! A `Task` borrows its opaque context until its cleanup callback runs. The
 //! runner executes and cleans each accepted task exactly once, or cleans it
@@ -89,14 +89,26 @@ pub const TaskRunner = struct {
     thread: ?std.Thread = null,
     worker_id: ?std.Thread.Id = null,
     measure: *MeasureTime,
+    /// Borrowed stable label used for the native thread name and trace
+    /// metadata. Production owners pass string literals.
+    worker_name: []const u8,
 
     pub fn init(allocator: std.mem.Allocator, measure: *MeasureTime) TaskRunner {
+        return initNamed(allocator, measure, "Tab main thread");
+    }
+
+    pub fn initNamed(
+        allocator: std.mem.Allocator,
+        measure: *MeasureTime,
+        worker_name: []const u8,
+    ) TaskRunner {
         return .{
             .allocator = allocator,
             .tasks = std.ArrayList(Task).empty,
             .mutex = .init(measure.io),
             .condition = .init(measure.io),
             .measure = measure,
+            .worker_name = worker_name,
         };
     }
 
@@ -113,8 +125,8 @@ pub const TaskRunner = struct {
         if (self.thread != null) return error.TaskRunnerAlreadyStarted;
 
         const thread = try std.Thread.spawn(.{}, runThread, .{self});
-        _ = thread.setName(self.measure.io, "Tab main thread") catch |err| {
-            std.log.warn("Failed to name tab thread: {}", .{err});
+        _ = thread.setName(self.measure.io, self.worker_name) catch |err| {
+            std.log.warn("Failed to name {s}: {}", .{ self.worker_name, err });
         };
         self.thread = thread;
     }
@@ -239,7 +251,7 @@ fn runThread(runner: *TaskRunner) void {
     runner.condition.broadcast();
     runner.mutex.unlock();
 
-    _ = runner.measure.registerThread("Tab main thread") catch {};
+    _ = runner.measure.registerThread(runner.worker_name) catch {};
 
     while (true) {
         var task_to_run: ?Task = null;

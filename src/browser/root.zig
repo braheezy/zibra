@@ -126,7 +126,10 @@ const DocumentResourceFetch = struct {
 
     fn runOpaque(raw: *anyopaque) void {
         const self: *@This() = @ptrCast(@alignCast(raw));
-        self.response = self.browser.fetchBodyWithReferrerPolicy(
+        // The networking dispatcher owns this complete parallel batch. Its
+        // joined child workers use the low-level transport directly so one
+        // queued batch does not serialize its independent resources.
+        self.response = self.browser.fetchBodyWithReferrerPolicyDirect(
             self.resource_url,
             self.referrer_url,
             null,
@@ -148,6 +151,88 @@ const DocumentResourceFetch = struct {
         self.resource_url.free(allocator);
         self.referrer_url.free(allocator);
         self.* = undefined;
+    }
+};
+
+const NetworkFetchMode = enum {
+    ordinary,
+    cors,
+    navigation,
+};
+
+/// Synchronous bridge from a browser/tab caller to the session's networking
+/// dispatcher. Every request value is borrowed because the producer waits
+/// until cleanup posts `completed`; response and final-URL ownership then move
+/// back to that producer.
+const NetworkFetchContext = struct {
+    browser: *Browser,
+    mode: NetworkFetchMode,
+    url: Url,
+    referrer: ?Url,
+    payload: ?[]const u8,
+    request_origin: ?[]const u8,
+    referrer_policy: url_module.ReferrerPolicy,
+    response: ?url_module.HttpResponse = null,
+    final_url: ?Url = null,
+    fetch_error: ?anyerror = error.NetworkTaskCancelled,
+    completed: std.Io.Semaphore = .{},
+
+    fn runOpaque(raw: *anyopaque) anyerror!void {
+        const self: *@This() = @ptrCast(@alignCast(raw));
+        self.response = switch (self.mode) {
+            .ordinary => self.browser.fetchBodyWithReferrerPolicyDirect(
+                self.url,
+                self.referrer,
+                self.payload,
+                self.referrer_policy,
+            ),
+            .cors => self.browser.fetchBodyWithOriginDirect(
+                self.url,
+                self.referrer,
+                self.payload,
+                self.request_origin.?,
+                self.referrer_policy,
+            ),
+            .navigation => self.browser.fetchBodyForNavigationDirect(
+                self.url,
+                self.referrer,
+                self.payload,
+                &self.final_url,
+                self.referrer_policy,
+            ),
+        } catch |err| {
+            self.fetch_error = err;
+            return;
+        };
+        self.fetch_error = null;
+    }
+
+    fn cleanupOpaque(raw: *anyopaque) void {
+        const self: *@This() = @ptrCast(@alignCast(raw));
+        // This is deliberately the last context access. The waiting producer
+        // may release its stack frame immediately after the post.
+        self.completed.post(self.browser.io);
+    }
+};
+
+const NetworkResourceBatchContext = struct {
+    browser: *Browser,
+    batch: *DocumentResourceBatch,
+    run_error: ?anyerror = error.NetworkTaskCancelled,
+    completed: std.Io.Semaphore = .{},
+
+    fn runOpaque(raw: *anyopaque) anyerror!void {
+        const self: *@This() = @ptrCast(@alignCast(raw));
+        self.batch.runAndJoin() catch |err| {
+            self.run_error = err;
+            return;
+        };
+        self.run_error = null;
+    }
+
+    fn cleanupOpaque(raw: *anyopaque) void {
+        const self: *@This() = @ptrCast(@alignCast(raw));
+        self.completed.post(self.browser.io);
     }
 };
 
@@ -1390,6 +1475,9 @@ pub const Browser = struct {
         errdefer al.destroy(measure);
         measure.* = try MeasureTime.init(al, io, environ);
         errdefer measure.finish();
+
+        try session_state.startNetworking(measure);
+        errdefer session_state.stopNetworking();
 
         try sdl2.init(.{
             .video = true,
@@ -2951,6 +3039,26 @@ pub const Browser = struct {
         payload: ?[]const u8,
         referrer_policy: url_module.ReferrerPolicy,
     ) !url_module.HttpResponse {
+        return self.runNetworkFetch(
+            .ordinary,
+            .normal,
+            "task:network_fetch",
+            url,
+            referrer,
+            payload,
+            null,
+            null,
+            referrer_policy,
+        );
+    }
+
+    fn fetchBodyWithReferrerPolicyDirect(
+        self: *Browser,
+        url: Url,
+        referrer: ?Url,
+        payload: ?[]const u8,
+        referrer_policy: url_module.ReferrerPolicy,
+    ) !url_module.HttpResponse {
         return url_module.Url.fetchBodyWithReferrerPolicySynchronized(
             self.allocator,
             self.io,
@@ -2965,7 +3073,28 @@ pub const Browser = struct {
         );
     }
 
-    fn fetchBodyWithOrigin(
+    fn fetchBodyForXhr(
+        self: *Browser,
+        url: Url,
+        referrer: ?Url,
+        payload: ?[]const u8,
+        request_origin: ?[]const u8,
+        referrer_policy: url_module.ReferrerPolicy,
+    ) !url_module.HttpResponse {
+        return self.runNetworkFetch(
+            if (request_origin != null) .cors else .ordinary,
+            .javascript,
+            "task:network_xhr",
+            url,
+            referrer,
+            payload,
+            request_origin,
+            null,
+            referrer_policy,
+        );
+    }
+
+    fn fetchBodyWithOriginDirect(
         self: *Browser,
         url: Url,
         referrer: ?Url,
@@ -2996,6 +3125,28 @@ pub const Browser = struct {
         final_url: *?Url,
         referrer_policy: url_module.ReferrerPolicy,
     ) !url_module.HttpResponse {
+        final_url.* = null;
+        return self.runNetworkFetch(
+            .navigation,
+            .normal,
+            "task:network_navigation",
+            url,
+            referrer,
+            payload,
+            null,
+            final_url,
+            referrer_policy,
+        );
+    }
+
+    fn fetchBodyForNavigationDirect(
+        self: *Browser,
+        url: Url,
+        referrer: ?Url,
+        payload: ?[]const u8,
+        final_url: *?Url,
+        referrer_policy: url_module.ReferrerPolicy,
+    ) !url_module.HttpResponse {
         return url_module.Url.fetchBodyWithFinalUrlAndReferrerPolicySynchronized(
             self.allocator,
             self.io,
@@ -3009,6 +3160,49 @@ pub const Browser = struct {
             final_url,
             referrer_policy,
         );
+    }
+
+    fn runNetworkFetch(
+        self: *Browser,
+        mode: NetworkFetchMode,
+        priority: Task.Priority,
+        trace_name: []const u8,
+        url: Url,
+        referrer: ?Url,
+        payload: ?[]const u8,
+        request_origin: ?[]const u8,
+        final_url_output: ?*?Url,
+        referrer_policy: url_module.ReferrerPolicy,
+    ) !url_module.HttpResponse {
+        var context = NetworkFetchContext{
+            .browser = self,
+            .mode = mode,
+            .url = url,
+            .referrer = referrer,
+            .payload = payload,
+            .request_origin = request_origin,
+            .referrer_policy = referrer_policy,
+        };
+        try self.session_state.scheduleNetworkTask(Task.init(
+            priority,
+            trace_name,
+            &context,
+            NetworkFetchContext.runOpaque,
+            NetworkFetchContext.cleanupOpaque,
+        ));
+        context.completed.waitUncancelable(self.io);
+
+        if (context.fetch_error) |err| {
+            if (context.final_url) |resolved| resolved.free(self.allocator);
+            return err;
+        }
+        if (final_url_output) |output| {
+            output.* = context.final_url;
+            context.final_url = null;
+        } else if (context.final_url) |resolved| {
+            resolved.free(self.allocator);
+        }
+        return context.response orelse error.NetworkTaskMissingResponse;
     }
 
     /// Fetch or generate a navigated document with explicit response-body
@@ -4173,7 +4367,19 @@ pub const Browser = struct {
             referrer_url_owned = false;
         }
 
-        try batch.runAndJoin();
+        var network_context = NetworkResourceBatchContext{
+            .browser = self,
+            .batch = &batch,
+        };
+        try self.session_state.scheduleNetworkTask(Task.init(
+            .normal,
+            "task:network_resource_batch",
+            &network_context,
+            NetworkResourceBatchContext.runOpaque,
+            NetworkResourceBatchContext.cleanupOpaque,
+        ));
+        network_context.completed.waitUncancelable(self.io);
+        if (network_context.run_error) |err| return err;
         return batch;
     }
 
@@ -8249,21 +8455,13 @@ fn runXhrThread(ctx: *XhrThreadContext) void {
     };
     defer if (request_origin) |origin| ctx.allocator.free(origin);
 
-    const response_result = (if (request_origin) |origin|
-        ctx.browser.fetchBodyWithOrigin(
-            ctx.resolved_url,
-            ctx.referrer,
-            ctx.payload,
-            origin,
-            ctx.referrer_policy,
-        )
-    else
-        ctx.browser.fetchBodyWithReferrerPolicy(
-            ctx.resolved_url,
-            ctx.referrer,
-            ctx.payload,
-            ctx.referrer_policy,
-        )) catch |err| {
+    const response_result = ctx.browser.fetchBodyForXhr(
+        ctx.resolved_url,
+        ctx.referrer,
+        ctx.payload,
+        request_origin,
+        ctx.referrer_policy,
+    ) catch |err| {
         std.log.warn("Async XHR failed: {}", .{err});
         return;
     };
@@ -8561,21 +8759,13 @@ fn jsXhrCallback(
     const request_origin = try ownedXhrRequestOrigin(allocator, resolved_url, current_url_value);
     defer if (request_origin) |origin| allocator.free(origin);
 
-    const response = if (request_origin) |origin|
-        try browser.fetchBodyWithOrigin(
-            resolved_url,
-            current_url_value,
-            body,
-            origin,
-            frame.referrer_policy,
-        )
-    else
-        try browser.fetchBodyWithReferrerPolicy(
-            resolved_url,
-            current_url_value,
-            body,
-            frame.referrer_policy,
-        );
+    const response = try browser.fetchBodyForXhr(
+        resolved_url,
+        current_url_value,
+        body,
+        request_origin,
+        frame.referrer_policy,
+    );
     defer if (response.csp_header) |hdr| allocator.free(hdr);
     defer if (response.access_control_allow_origin) |hdr| allocator.free(hdr);
 

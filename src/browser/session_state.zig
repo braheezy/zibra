@@ -1,12 +1,17 @@
-//! Browser-session navigation state shared independently of any one tab or
-//! native window.
+//! Browser-session networking and navigation state shared independently of
+//! any one tab or native window.
 //!
 //! URL sets own canonical serialized URL strings. A `BrowserSession` may be
-//! shared by multiple browser windows; its mutex protects cross-window and
-//! tab-worker access. The owner must outlive every Browser/Tab that borrows it.
+//! shared by multiple browser windows; its named networking runner serializes
+//! fetch dispatch while separate mutexes protect transport metadata and URL
+//! sets. The owner must outlive every Browser/Tab that borrows it.
 
 const std = @import("std");
 const Mutex = @import("../runtime/sync.zig").Mutex;
+const task_module = @import("../runtime/task.zig");
+const Task = task_module.Task;
+const TaskRunner = task_module.TaskRunner;
+const MeasureTime = @import("../runtime/measure_time.zig").MeasureTime;
 const url_module = @import("../network/url.zig");
 const Url = url_module.Url;
 const HttpCache = url_module.HttpCache;
@@ -22,6 +27,9 @@ pub const BrowserSession = struct {
     http_client: std.http.Client,
     cookie_jar: std.StringHashMap(url_module.CookieEntry),
     http_cache: HttpCache,
+    /// Heap-stable because the worker retains its runner address. It is
+    /// started only after the owning Browser/App has created MeasureTime.
+    network_runner: ?*TaskRunner,
     visited_urls: std.StringHashMap(void),
     bookmarked_urls: std.StringHashMap(void),
     visited_generation: std.atomic.Value(u64),
@@ -46,6 +54,7 @@ pub const BrowserSession = struct {
             .http_client = .{ .allocator = allocator, .io = io },
             .cookie_jar = std.StringHashMap(url_module.CookieEntry).init(allocator),
             .http_cache = HttpCache.init(allocator),
+            .network_runner = null,
             .visited_urls = std.StringHashMap(void).init(allocator),
             .bookmarked_urls = std.StringHashMap(void).init(allocator),
             .visited_generation = std.atomic.Value(u64).init(0),
@@ -57,6 +66,8 @@ pub const BrowserSession = struct {
     /// session. URL keys are owned independently of the Url values that
     /// supplied them.
     pub fn deinit(self: *BrowserSession) void {
+        self.stopNetworking();
+
         self.http_client.deinit();
         self.http_cache.deinit();
         var cookie_iterator = self.cookie_jar.iterator();
@@ -73,6 +84,37 @@ pub const BrowserSession = struct {
         var bookmark_iterator = self.bookmarked_urls.keyIterator();
         while (bookmark_iterator.next()) |key| self.allocator.free(key.*);
         self.bookmarked_urls.deinit();
+    }
+
+    /// Start the session's single networking dispatcher after both this
+    /// session and the shared measurement service are at stable addresses.
+    pub fn startNetworking(self: *BrowserSession, measure: *MeasureTime) !void {
+        if (self.network_runner != null) return error.NetworkRunnerAlreadyStarted;
+
+        const runner = try self.allocator.create(TaskRunner);
+        errdefer self.allocator.destroy(runner);
+        runner.* = TaskRunner.initNamed(self.allocator, measure, "Networking thread");
+        errdefer runner.deinit();
+        try runner.start();
+        self.network_runner = runner;
+    }
+
+    /// Join the dispatcher before its borrowed MeasureTime or the transport
+    /// state below can be destroyed. Safe to call repeatedly during rollback.
+    pub fn stopNetworking(self: *BrowserSession) void {
+        if (self.network_runner) |runner| {
+            runner.deinit();
+            self.allocator.destroy(runner);
+            self.network_runner = null;
+        }
+    }
+
+    /// Queue one task on the networking dispatcher. Rejected tasks retain
+    /// TaskRunner's exactly-once cleanup contract so synchronous waiters are
+    /// always released during shutdown.
+    pub fn scheduleNetworkTask(self: *BrowserSession, task: Task) !void {
+        const runner = self.network_runner orelse return error.NetworkRunnerNotStarted;
+        try runner.schedule(task);
     }
 
     /// Return an owned document.cookie snapshot. This shares the network lock

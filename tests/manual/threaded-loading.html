@@ -7,6 +7,9 @@ How to verify:
 3. The status box must be green and the terminal must print
    "THREAD ORDER PASS: AB". This proves scripts execute in source order and
    the later stylesheet still wins.
+4. Repeat with `ZIBRA_TRACE=1`. In browser.trace, task:network_navigation and
+   task:network_resource_batch must run on Networking thread; the four delayed
+   requests must still overlap rather than becoming one serialized queue.
 -->
 <!doctype html>
 <html>

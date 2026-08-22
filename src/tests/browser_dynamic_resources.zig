@@ -5,6 +5,7 @@ const browser = @import("../browser/root.zig");
 const tab_module = @import("../browser/tab.zig");
 const parser = @import("../document/parser.zig");
 const BrowserSession = @import("../browser/session_state.zig").BrowserSession;
+const MeasureTime = @import("../runtime/measure_time.zig").MeasureTime;
 const Url = @import("../network/url.zig").Url;
 
 fn findElement(root: *parser.Node, tag: []const u8) ?*parser.Node {
@@ -23,8 +24,14 @@ fn findElement(root: *parser.Node, tag: []const u8) ?*parser.Node {
 test "resource refresh adds and removes live linked stylesheet generations" {
     const allocator = std.testing.allocator;
 
+    var environ = std.process.Environ.Map.init(allocator);
+    defer environ.deinit();
+    var measure = try MeasureTime.init(allocator, std.testing.io, &environ);
+    defer measure.finish();
+
     var session = BrowserSession.init(allocator, std.testing.io);
     defer session.deinit();
+    try session.startNetworking(&measure);
 
     var tab: tab_module.Tab = undefined;
     tab.allocator = allocator;
@@ -96,8 +103,14 @@ test "resource refresh adds and removes live linked stylesheet generations" {
 test "parallel stylesheet fetches are applied in DOM source order" {
     const allocator = std.testing.allocator;
 
+    var environ = std.process.Environ.Map.init(allocator);
+    defer environ.deinit();
+    var measure = try MeasureTime.init(allocator, std.testing.io, &environ);
+    defer measure.finish();
+
     var session = BrowserSession.init(allocator, std.testing.io);
     defer session.deinit();
+    try session.startNetworking(&measure);
 
     var tab: tab_module.Tab = undefined;
     tab.allocator = allocator;
