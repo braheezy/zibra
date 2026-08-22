@@ -249,20 +249,18 @@ pub fn resizeGeometry(
         0,
         std.math.maxInt(i32),
     ));
-    const effective_zoom = if (zoom > 0) zoom else 1.0;
-    const safe_content_height = @max(content_height, 0);
-    const scaled_height = @as(f64, @floatFromInt(safe_content_height)) * @as(f64, effective_zoom);
-    const scaled_content_height: i32 = if (!(scaled_height < @as(f64, @floatFromInt(std.math.maxInt(i32)))))
-        std.math.maxInt(i32)
-    else
-        @intFromFloat(scaled_height);
+    const scaled_content_height = scroll_model.scaleCssPx(content_height, zoom);
 
     return .{
         .window_width = window_width,
         .window_height = window_height,
         .tab_viewport_height = viewport_height,
         .tab_surface_height = if (has_tab_surface)
-            @max(@max(scaled_content_height, viewport_height), 1)
+            scroll_model.interestSurfaceHeight(
+                scaled_content_height,
+                viewport_height,
+                window_height,
+            )
         else
             null,
     };
@@ -1211,8 +1209,10 @@ pub const Browser = struct {
     context: z2d.Context,
     // Separate surface for browser chrome (UI)
     chrome_surface: z2d.Surface,
-    // Separate surface for current tab content (can be taller than window)
+    // Bounded cache for the current tab's device-pixel interest region.
     tab_surface: ?z2d.Surface,
+    tab_interest_region: scroll_model.InterestRegion = .{ .start_px = 0, .height_px = 0 },
+    tab_interest_region_valid: bool = false,
     // Window dimensions
     window_width: i32 = initial_window_width,
     window_height: i32 = initial_window_height,
@@ -1634,6 +1634,39 @@ pub const Browser = struct {
         return value * @as(f64, zoom);
     }
 
+    fn tabViewportHeightPx(self: *const Browser) i32 {
+        const viewport_i64 = @as(i64, self.window_height) - @as(i64, self.chrome.bottom);
+        return @intCast(std.math.clamp(
+            viewport_i64,
+            0,
+            @as(i64, std.math.maxInt(i32)),
+        ));
+    }
+
+    /// Calculate the device-pixel cache window for one root scroll position.
+    /// Browser.lock stabilizes the active document geometry at every call site.
+    fn interestRegionForScroll(self: *const Browser, scroll_css: i32) scroll_model.InterestRegion {
+        const zoom = self.activeZoom();
+        return scroll_model.calculateInterestRegion(
+            scroll_model.scaleCssPx(self.active_tab_height, zoom),
+            self.tabViewportHeightPx(),
+            self.window_height,
+            scroll_model.scaleCssPx(scroll_css, zoom),
+        );
+    }
+
+    fn interestRegionContainsScroll(self: *const Browser, scroll_css: i32) bool {
+        if (!self.tab_interest_region_valid) return false;
+        return self.tab_interest_region.containsViewport(
+            scroll_model.scaleCssPx(scroll_css, self.activeZoom()),
+            self.tabViewportHeightPx(),
+        );
+    }
+
+    fn invalidateInterestRegion(self: *Browser) void {
+        self.tab_interest_region_valid = false;
+    }
+
     pub fn handleScroll(self: *Browser, delta: i32) void {
         var should_schedule = false;
         self.lock.lock();
@@ -1646,11 +1679,17 @@ pub const Browser = struct {
                     frame.scroll = new_scroll;
                     if (frame == active.root_frame) {
                         self.active_tab_scroll = new_scroll;
+                        // Scrolling inside the raster cache only moves the
+                        // cached surface. Crossing an edge requests a new
+                        // interest-region raster around the viewport.
+                        if (!self.interestRegionContainsScroll(new_scroll)) {
+                            self.needs_raster = true;
+                        }
                     } else {
                         active.setNeedsPaint();
+                        self.needs_composite = true;
+                        self.needs_raster = true;
                     }
-                    self.needs_composite = true;
-                    self.needs_raster = true;
                     self.needs_draw = true;
                     self.needs_animation_frame = true;
                     self.animation_timer_active = false;
@@ -1740,6 +1779,7 @@ pub const Browser = struct {
     /// Retire derived draw state before the committed display list it borrows.
     /// Caller must hold `self.lock`.
     fn retireActiveRenderStateLocked(self: *Browser) void {
+        self.invalidateInterestRegion();
         if (self.tab_draw_list.items.len > 0) {
             DisplayItem.freeItems(self.allocator, self.tab_draw_list.items);
             self.tab_draw_list.items.len = 0;
@@ -2104,6 +2144,7 @@ pub const Browser = struct {
                 self.lock.lock();
                 self.window_width = geometry.window_width;
                 self.window_height = geometry.window_height;
+                self.invalidateInterestRegion();
                 self.needs_composite = true;
                 self.needs_raster = true;
                 self.needs_draw = true;
@@ -5005,10 +5046,13 @@ pub const Browser = struct {
 
     // Raster tab content to surfaces (without rebuilding composite/draw lists)
     fn rasterTabSurfaces(self: *Browser) !void {
-        if (self.active_tab_display_list == null) return;
+        if (self.active_tab_display_list == null) {
+            self.invalidateInterestRegion();
+            return;
+        }
 
-        const scaled_height = self.scalePx(self.active_tab_height);
-        const tab_height = @max(@max(scaled_height, self.window_height - self.chrome.bottom), 1);
+        const region = self.interestRegionForScroll(self.active_tab_scroll);
+        const tab_height = region.height_px;
 
         if (self.tab_surface) |*existing_surface| {
             const current_width = existing_surface.getWidth();
@@ -5027,6 +5071,10 @@ pub const Browser = struct {
             self.tab_surface = try z2d.Surface.init(.image_surface_rgba, self.allocator, self.window_width, tab_height);
         }
 
+        // The surface is mutated in place below. Do not expose stale region
+        // coordinates if a fallible draw operation aborts this raster pass.
+        self.invalidateInterestRegion();
+
         var tab_context = z2d.Context.init(self.io, self.allocator, &self.tab_surface.?);
         defer tab_context.deinit();
 
@@ -5044,8 +5092,11 @@ pub const Browser = struct {
         const base_list = self.active_tab_display_list orelse &.{};
         const draw_list = if (self.tab_draw_list.items.len > 0) self.tab_draw_list.items else base_list;
         for (draw_list) |item| {
-            try self.drawDisplayItemZ2dContext(&tab_context, item, 0, zoom);
+            try self.drawDisplayItemZ2dContext(&tab_context, item, region.start_px, zoom);
         }
+
+        self.tab_interest_region = region;
+        self.tab_interest_region_valid = true;
     }
 
     fn compositeRasterAndDraw(self: *Browser) !void {
@@ -5158,6 +5209,9 @@ pub const Browser = struct {
             return;
         }
 
+        const previous_scroll = self.active_tab_scroll;
+        const previous_height = self.active_tab_height;
+        const previous_zoom = self.active_tab_zoom;
         var has_display_list_change = false;
         if (data.display_list) |list| {
             var incoming_list = list;
@@ -5205,10 +5259,24 @@ pub const Browser = struct {
             self.needs_raster = true;
             self.needs_draw = true;
         } else if (data.composited_updates.len > 0) {
-            // Composited updates (e.g., opacity animation) only need draw
-            // Apply the composited updates to existing layers
+            // The bounded tab surface caches the fully assembled page region,
+            // so compositor-only changes must be copied into that cache again.
             for (data.composited_updates) |update| {
                 self.applyCompositedUpdate(update);
+            }
+            self.needs_raster = true;
+            self.needs_draw = true;
+        }
+
+        const geometry_changed = previous_height != self.active_tab_height or
+            previous_zoom != self.active_tab_zoom;
+        if (geometry_changed) {
+            self.invalidateInterestRegion();
+            self.needs_raster = true;
+            self.needs_draw = true;
+        } else if (previous_scroll != self.active_tab_scroll) {
+            if (!self.interestRegionContainsScroll(self.active_tab_scroll)) {
+                self.needs_raster = true;
             }
             self.needs_draw = true;
         }
@@ -5311,6 +5379,45 @@ pub const Browser = struct {
         self.active_tab_committed_security = .none;
     }
 
+    /// Copy the opaque tab cache into the content viewport. z2d does not expose
+    /// Skia's clipRect API; slicing both pixel rows here is the equivalent hard
+    /// clip and avoids asking its surface compositor to consume a source taller
+    /// than the destination.
+    fn copyTabInterestToRoot(self: *Browser, tab_surface: *const z2d.Surface, destination_y: i32) !void {
+        const destination = switch (self.root_surface) {
+            .image_surface_rgba => |*surface| surface,
+            else => return error.UnsupportedRootSurface,
+        };
+        const source = switch (tab_surface.*) {
+            .image_surface_rgba => |*surface| surface,
+            else => return error.UnsupportedTabSurface,
+        };
+
+        const copy_width_i32 = @min(destination.width, source.width);
+        if (copy_width_i32 <= 0) return;
+
+        const destination_top = @max(@max(destination_y, self.chrome.bottom), 0);
+        const destination_bottom = @min(
+            destination.height,
+            destination_y +| source.height,
+        );
+        if (destination_bottom <= destination_top) return;
+
+        const source_top = destination_top - destination_y;
+        const copy_width: usize = @intCast(copy_width_i32);
+        const destination_width: usize = @intCast(destination.width);
+        const source_width: usize = @intCast(source.width);
+        var row: i32 = 0;
+        while (row < destination_bottom - destination_top) : (row += 1) {
+            const destination_offset = @as(usize, @intCast(destination_top + row)) * destination_width;
+            const source_offset = @as(usize, @intCast(source_top + row)) * source_width;
+            @memcpy(
+                destination.buf[destination_offset..][0..copy_width],
+                source.buf[source_offset..][0..copy_width],
+            );
+        }
+    }
+
     // Draw the browser content (composite from pre-rastered surfaces)
     pub fn draw(self: *Browser) !void {
         // Skip drawing if window dimensions are invalid
@@ -5330,15 +5437,22 @@ pub const Browser = struct {
         try self.context.lineTo(0, @floatFromInt(self.window_height));
         try self.context.closePath();
         try self.context.fill();
+        self.context.resetPath();
 
-        // Draw the active tab using the composited draw list when available.
-        if (self.active_tab_display_list != null) {
-            const zoom = self.activeZoom();
-            const scroll_offset = self.scalePxWithZoom(self.active_tab_scroll, zoom) - self.chrome.bottom;
-            const base_list = self.active_tab_display_list orelse &.{};
-            const draw_list = if (self.tab_draw_list.items.len > 0) self.tab_draw_list.items else base_list;
-            for (draw_list) |item| {
-                try self.drawDisplayItemZ2dContext(&self.context, item, scroll_offset, zoom);
+        // Move the already-rastered interest region into the clipped page
+        // viewport. Chrome is composited separately afterward.
+        if (self.active_tab_display_list != null and self.tab_interest_region_valid) {
+            if (self.tab_surface) |*tab_surface| {
+                const scroll_px = scroll_model.scaleCssPx(self.active_tab_scroll, self.activeZoom());
+                const destination_y_i64 = @as(i64, self.chrome.bottom) +
+                    @as(i64, self.tab_interest_region.start_px) -
+                    @as(i64, scroll_px);
+                const destination_y: i32 = @intCast(std.math.clamp(
+                    destination_y_i64,
+                    @as(i64, std.math.minInt(i32)),
+                    @as(i64, std.math.maxInt(i32)),
+                ));
+                try self.copyTabInterestToRoot(tab_surface, destination_y);
             }
         }
 
@@ -5756,7 +5870,7 @@ pub const Browser = struct {
                 const height = bottom - top;
 
                 // Only draw if rect has valid dimensions and is visible
-                if (width > 1 and height > 1 and bottom > 0 and top < self.window_height) {
+                if (width > 1 and height > 1 and bottom > 0 and top < context.surface.getHeight()) {
                     // Reset path first to ensure clean state
                     context.resetPath();
 
@@ -5801,7 +5915,7 @@ pub const Browser = struct {
                 const right = self.scalePxWithZoom(rounded_item.x2, zoom);
                 const top = self.scalePxWithZoom(rounded_item.y1, zoom) - scroll_offset;
                 const bottom = self.scalePxWithZoom(rounded_item.y2, zoom) - scroll_offset;
-                if (bottom > 0 and top < self.window_height) {
+                if (bottom > 0 and top < context.surface.getHeight()) {
                     const width = right - left;
                     const height = bottom - top;
                     if (width > 1 and height > 1) {
@@ -6127,7 +6241,7 @@ pub const Browser = struct {
                 const width = right - left;
                 const height = bottom - top;
 
-                if (width > 1 and height > 1 and bottom > 0 and top < self.window_height) {
+                if (width > 1 and height > 1 and bottom > 0 and top < context.surface.getHeight()) {
                     context.resetPath();
                     context.setSource(.{ .opaque_pattern = .{ .pixel = .{ .rgba = .{
                         .r = rect_item.color.r,
@@ -6171,7 +6285,7 @@ pub const Browser = struct {
                 const right = self.scalePxWithZoom(rr.x2, zoom) + x_offset;
                 const width = right - left;
                 const height = bottom - top;
-                if (width > 1 and height > 1 and bottom > 0 and top < self.window_height) {
+                if (width > 1 and height > 1 and bottom > 0 and top < context.surface.getHeight()) {
                     context.resetPath();
                     context.setSource(.{ .opaque_pattern = .{ .pixel = .{ .rgba = rr.color.toZ2dRgba() } } });
                     const max_radius = @min(
@@ -6632,6 +6746,7 @@ pub const Browser = struct {
         if (!metrics.visible) return;
 
         // Draw scrollbar track (background) - start below chrome
+        self.context.resetPath();
         self.context.setSource(.{ .opaque_pattern = .{ .pixel = .{ .rgba = .{ .r = 200, .g = 200, .b = 200, .a = 255 } } } }); // Light gray
         const track_x = self.window_width - scrollbar_width;
         const track_y = self.chrome.bottom;
@@ -6652,6 +6767,7 @@ pub const Browser = struct {
         try self.context.lineTo(@floatFromInt(thumb_x), @floatFromInt(thumb_y + metrics.thumb_height_px));
         try self.context.closePath();
         try self.context.fill();
+        self.context.resetPath();
     }
 
     pub fn deinit(self: *Browser) void {

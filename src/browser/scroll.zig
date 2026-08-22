@@ -5,6 +5,86 @@
 
 const std = @import("std");
 
+/// The tab raster cache is deliberately bounded independently of document
+/// height. Values in this model are native/device pixels, not CSS pixels.
+pub const interest_region_window_multiplier: i32 = 4;
+
+pub const InterestRegion = struct {
+    start_px: i32,
+    height_px: i32,
+
+    pub fn endPx(self: InterestRegion) i32 {
+        return @intCast(@min(
+            @as(i64, self.start_px) + @as(i64, self.height_px),
+            std.math.maxInt(i32),
+        ));
+    }
+
+    /// Whether the complete viewport can be copied from this cached region.
+    pub fn containsViewport(
+        self: InterestRegion,
+        scroll_px: i32,
+        viewport_height_px: i32,
+    ) bool {
+        if (self.height_px <= 0) return false;
+        const viewport_start = @max(@as(i64, scroll_px), 0);
+        const viewport_end = viewport_start + @max(@as(i64, viewport_height_px), 0);
+        const region_start = @as(i64, self.start_px);
+        const region_end = region_start + @as(i64, self.height_px);
+        return viewport_start >= region_start and viewport_end <= region_end;
+    }
+};
+
+/// Scale a non-negative CSS coordinate into device pixels without allowing an
+/// extreme document height or zoom to overflow the renderer's i32 geometry.
+pub fn scaleCssPx(value: i32, zoom_value: f32) i32 {
+    const safe_value = @max(value, 0);
+    const zoom: f32 = if (zoom_value > 0 and std.math.isFinite(zoom_value)) zoom_value else 1.0;
+    const scaled = @as(f32, @floatFromInt(safe_value)) * zoom;
+    const max_i32_float: f32 = @floatFromInt(std.math.maxInt(i32));
+    if (!(scaled < max_i32_float)) return std.math.maxInt(i32);
+    return @intFromFloat(scaled);
+}
+
+/// Height of the bounded page-raster cache. Short pages use only what they
+/// need; long pages cannot allocate more than four native window heights.
+pub fn interestSurfaceHeight(
+    content_height_px: i32,
+    viewport_height_px: i32,
+    window_height_px: i32,
+) i32 {
+    const total_height = @max(@max(content_height_px, viewport_height_px), 1);
+    const base_height = @max(@max(window_height_px, viewport_height_px), 1);
+    const capacity_i64 = @as(i64, base_height) * interest_region_window_multiplier;
+    const capacity: i32 = @intCast(@min(capacity_i64, std.math.maxInt(i32)));
+    return @min(total_height, capacity);
+}
+
+/// Choose a cache window around the current viewport. Keeping one viewport of
+/// pixels behind the scroll position makes small reversals cheap while the
+/// remaining cache provides forward scroll headroom.
+pub fn calculateInterestRegion(
+    content_height_px: i32,
+    viewport_height_px: i32,
+    window_height_px: i32,
+    scroll_px: i32,
+) InterestRegion {
+    const viewport_height = @max(viewport_height_px, 0);
+    const total_height = @max(@max(content_height_px, viewport_height), 1);
+    const height = interestSurfaceHeight(total_height, viewport_height, window_height_px);
+    const max_scroll = @max(
+        @as(i64, total_height) - @as(i64, viewport_height),
+        0,
+    );
+    const clamped_scroll = std.math.clamp(@as(i64, scroll_px), 0, max_scroll);
+    const preferred_start = @max(clamped_scroll - @as(i64, viewport_height), 0);
+    const max_start = @max(@as(i64, total_height) - @as(i64, height), 0);
+    return .{
+        .start_px = @intCast(@min(preferred_start, max_start)),
+        .height_px = height,
+    };
+}
+
 pub const Metrics = struct {
     visible: bool,
     viewport_height_css: i32,

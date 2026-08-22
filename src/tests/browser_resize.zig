@@ -50,7 +50,10 @@ test "resize geometry validates native sizes and sizes tab targets" {
         3.0,
         true,
     ).?;
-    try std.testing.expectEqual(@as(?i32, std.math.maxInt(i32)), saturated.tab_surface_height);
+    try std.testing.expectEqual(@as(?i32, 2400), saturated.tab_surface_height);
+
+    const long_page = browser.resizeGeometry(800, 600, 80, 100_000, 1.0, true).?;
+    try std.testing.expectEqual(@as(?i32, 2400), long_page.tab_surface_height);
 }
 
 test "chrome resize tracks the address bar edge and clamps narrow windows" {

@@ -127,6 +127,11 @@ support fixtures in the same directory.
 ordinary blocks, rich buttons, and text inputs. Corner clicks leave the visible
 counters unchanged while clicks in painted centers increment exactly one.
 
+`tests/manual/interest-region.html` is a deliberately long, color-banded page
+for crossing and reversing over tab raster-cache boundaries. Scrolling and
+resizing must remain continuous while the cached surface stays bounded to four
+native window heights.
+
 `tests/manual/blur-filter.html` exercises subtree blur together with rounded
 overflow clipping, group opacity, and translation. Its display-list dump also
 keeps the filter wrapper's serialized contract pointer-free.

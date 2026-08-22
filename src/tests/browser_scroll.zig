@@ -67,3 +67,41 @@ test "geometry remains bounded for extreme and invalid inputs" {
     try std.testing.expectEqual(@as(i32, 0), empty_track.track_height_px);
     try std.testing.expectEqual(@as(i32, 0), empty_track.thumb_height_px);
 }
+
+test "interest regions bound long pages and reuse nearby pixels" {
+    const top = scroll.calculateInterestRegion(10_000, 534, 600, 0);
+    try std.testing.expectEqual(@as(i32, 0), top.start_px);
+    try std.testing.expectEqual(@as(i32, 2400), top.height_px);
+    try std.testing.expect(top.containsViewport(1800, 534));
+    try std.testing.expect(!top.containsViewport(1900, 534));
+
+    const middle = scroll.calculateInterestRegion(10_000, 534, 600, 1900);
+    try std.testing.expectEqual(@as(i32, 1366), middle.start_px);
+    try std.testing.expectEqual(@as(i32, 3766), middle.endPx());
+    try std.testing.expect(middle.containsViewport(1900, 534));
+
+    const bottom = scroll.calculateInterestRegion(10_000, 534, 600, 9466);
+    try std.testing.expectEqual(@as(i32, 7600), bottom.start_px);
+    try std.testing.expectEqual(@as(i32, 10_000), bottom.endPx());
+    try std.testing.expect(bottom.containsViewport(9466, 534));
+}
+
+test "interest regions use short-page size and saturate extreme geometry" {
+    const short = scroll.calculateInterestRegion(300, 534, 600, 100);
+    try std.testing.expectEqual(@as(i32, 0), short.start_px);
+    try std.testing.expectEqual(@as(i32, 534), short.height_px);
+    try std.testing.expect(short.containsViewport(0, 534));
+
+    try std.testing.expectEqual(
+        @as(i32, std.math.maxInt(i32)),
+        scroll.scaleCssPx(std.math.maxInt(i32), 3.0),
+    );
+    const huge = scroll.calculateInterestRegion(
+        std.math.maxInt(i32),
+        520,
+        600,
+        std.math.maxInt(i32),
+    );
+    try std.testing.expectEqual(@as(i32, 2400), huge.height_px);
+    try std.testing.expect(huge.containsViewport(std.math.maxInt(i32) - 520, 520));
+}

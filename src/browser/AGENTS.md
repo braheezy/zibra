@@ -178,6 +178,12 @@ before changing `root.zig`, `tab.zig`, `render/`, or browser task scheduling.
   clones and translation walks, including at fractional zoom.
 - `scroll.zig` is the single source of truth for CSS scroll ranges and native
   scrollbar-thumb geometry. Clamping and drawing must use the same metrics.
+  It also owns device-pixel interest-region geometry. The current tab surface
+  caches at most four native window heights; its page-space start is valid only
+  after a successful raster. Root scrolling inside that region is draw-only,
+  while crossing either edge requests a new raster around the viewport.
+  Resize, zoom, display-list retirement, and document geometry changes
+  invalidate the region before any cached pixels can be reused.
 - Fragment targets are layout-derived document-space positions that borrow DOM
   node identity. A `Frame` copies them with its other hit-test data and retires
   them before layout or DOM. Full navigation applies the fragment after layout;

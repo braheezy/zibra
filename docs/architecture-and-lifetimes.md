@@ -506,6 +506,21 @@ operator is applied only when the completed surface is placed. Hit testing
 continues through the original child commands, so the blur's visual haze does
 not enlarge interactive geometry.
 
+The per-window tab surface is a bounded raster cache rather than a full-page
+bitmap. `scroll.zig` chooses a device-pixel interest region no taller than four
+native window heights, with one viewport of scroll-back headroom where page
+bounds permit. Raster translates page commands by that region's page-space
+start and publishes the coordinates only after all fallible drawing succeeds.
+Final draw moves the cached surface by `region_start - root_scroll` beneath
+chrome. z2d has no public `clipRect`, so final composition slices source and
+destination pixel rows to the content viewport, providing the same hard clip
+as the book's Skia operation. A root scroll whose complete viewport remains in
+the published region is draw-only. Crossing an edge rerasterizes a new region,
+while display-list replacement, resize, zoom, content-height change, and
+structural retirement invalidate the cache. Compositor-only visual updates
+also reraster the bounded surface because it owns the assembled page pixels,
+even when an underlying layer can reuse its private raster.
+
 Basic text direction is resolved per inline block through the acyclic layout
 parent chain. The CLI `-rtl` flag supplies the fallback direction; the nearest
 block ancestor with `dir=rtl` or `dir=ltr` overrides it. Glyphs are measured and
@@ -747,9 +762,10 @@ JavaScript state, form controls, and document generation remain intact. Middle
 click still transfers the resolved URL to a new tab instead.
 
 Window resizing preserves that ownership boundary. The main thread allocates a
-complete replacement generation of the root/chrome/tab z2d surfaces and SDL
-texture before retiring the live generation, updates chrome geometry, and then
-queues viewport snapshots to each tab. Obsolete drag-resize snapshots are
+complete replacement generation of the root/chrome/bounded-tab z2d surfaces
+and SDL texture before retiring the live generation, invalidates the tab
+interest coordinates, updates chrome geometry, and then queues viewport
+snapshots to each tab. Obsolete drag-resize snapshots are
 discarded by generation. A tab worker updates its root-frame viewport, marks
 every frame layout dirty, re-clamps scroll, and requests the active tab's next
 animation frame; it does not mutate native render targets.

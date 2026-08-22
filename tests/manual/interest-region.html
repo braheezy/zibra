@@ -1,0 +1,38 @@
+<!--
+How to verify:
+1. Open this page and scroll slowly from section 1 through section 12, then
+   reverse direction across several section boundaries.
+2. Every colored section and boundary label must remain continuous: no white
+   gaps, jumps, or stale pixels may appear when the raster interest region is
+   replaced.
+3. Resize the window and repeat. The tab raster cache should remain bounded to
+   four native window heights instead of growing to this document's height.
+-->
+<!doctype html>
+<html>
+<head>
+  <title>Interest region</title>
+  <style>
+    body { margin: 0; font-size: 22px; }
+    .section { height: 520px; padding: 24px; color: #17233b; }
+    .a { background-color: #cce8ff; }
+    .b { background-color: #ffe1b8; }
+    .c { background-color: #d8f3dc; }
+    .marker { background-color: #17233b; color: white; padding: 8px; }
+  </style>
+</head>
+<body>
+  <div class="section a"><p class="marker">Section 1 / top</p><p>Start of the long interest-region fixture.</p></div>
+  <div class="section b"><p class="marker">Section 2</p><p>The colors must meet without a white gap.</p></div>
+  <div class="section c"><p class="marker">Section 3</p><p>This boundary crosses the initial raster cache.</p></div>
+  <div class="section a"><p class="marker">Section 4</p><p>Continue scrolling; repainting should be invisible.</p></div>
+  <div class="section b"><p class="marker">Section 5</p><p>Reverse direction here to reuse cached pixels.</p></div>
+  <div class="section c"><p class="marker">Section 6 / middle</p><p>Halfway through the document.</p></div>
+  <div class="section a"><p class="marker">Section 7</p><p>The surface is much shorter than the page.</p></div>
+  <div class="section b"><p class="marker">Section 8</p><p>Only the nearby device-pixel region is rastered.</p></div>
+  <div class="section c"><p class="marker">Section 9</p><p>Scrollbar position still follows the full document.</p></div>
+  <div class="section a"><p class="marker">Section 10</p><p>Resize and revisit this boundary.</p></div>
+  <div class="section b"><p class="marker">Section 11</p><p>The final cache window anchors to the page bottom.</p></div>
+  <div class="section c"><p class="marker">Section 12 / bottom</p><p>End of the long interest-region fixture.</p></div>
+</body>
+</html>
