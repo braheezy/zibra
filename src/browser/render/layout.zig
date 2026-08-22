@@ -249,6 +249,38 @@ fn parseTranslate(value: []const u8) ?struct { x: i32, y: i32 } {
     return .{ .x = x, .y = y };
 }
 
+/// Parse the supported CSS filter syntax. Zibra intentionally implements one
+/// filter function for now, so unsupported chains are ignored as a whole.
+pub fn parseBlurFilter(value: []const u8) ?f64 {
+    const trimmed = std.mem.trim(u8, value, " \t\r\n");
+    if (std.mem.eql(u8, trimmed, "none")) return null;
+
+    const prefix = "blur(";
+    if (!std.mem.startsWith(u8, trimmed, prefix) or !std.mem.endsWith(u8, trimmed, ")")) return null;
+    const argument = std.mem.trim(u8, trimmed[prefix.len .. trimmed.len - 1], " \t\r\n");
+    if (argument.len == 0) return null;
+
+    const number = if (std.mem.endsWith(u8, argument, "px"))
+        std.mem.trim(u8, argument[0 .. argument.len - 2], " \t\r\n")
+    else if (std.mem.eql(u8, argument, "0"))
+        argument
+    else
+        return null;
+    const radius = std.fmt.parseFloat(f64, number) catch return null;
+    if (!std.math.isFinite(radius) or radius < 0) return null;
+    return radius;
+}
+
+test "blur filter parser accepts pixel lengths and rejects unsupported filters" {
+    try std.testing.expectEqual(@as(?f64, 4.5), parseBlurFilter(" blur( 4.5px ) "));
+    try std.testing.expectEqual(@as(?f64, 0.0), parseBlurFilter("blur(0)"));
+    try std.testing.expect(parseBlurFilter("none") == null);
+    try std.testing.expect(parseBlurFilter("blur(-1px)") == null);
+    try std.testing.expect(parseBlurFilter("grayscale(1)") == null);
+    try std.testing.expect(parseBlurFilter("blur(2em)") == null);
+    try std.testing.expect(parseBlurFilter("blur(2px) opacity(.5)") == null);
+}
+
 const EmbedLayout = struct {
     allocator: std.mem.Allocator,
     deps_initialized: bool = false,
@@ -3309,6 +3341,7 @@ fn cloneDisplayItemOwned(
             break :blk .{ .blend = .{
                 .opacity = blend.opacity,
                 .blend_mode = blend_mode,
+                .blur_radius = blend.blur_radius,
                 .children = children,
                 .node = blend.node,
                 .parent = null,
@@ -3360,6 +3393,7 @@ test "display-list cache clones recursively own nested containers" {
     var cached = [1]DisplayItem{.{ .blend = .{
         .opacity = 0.5,
         .blend_mode = blend_mode,
+        .blur_radius = 3.0,
         .children = blend_children,
     } }};
 
@@ -3368,6 +3402,7 @@ test "display-list cache clones recursively own nested containers" {
     DisplayItem.freeItems(allocator, cached[0..]);
 
     try std.testing.expectEqualStrings("multiply", snapshot[0].blend.blend_mode.?);
+    try std.testing.expectEqual(@as(f64, 3.0), snapshot[0].blend.blur_radius);
     try std.testing.expectEqual(@as(i32, 5), snapshot[0].blend.children[0].transform.translate_x);
     try std.testing.expectEqual(@as(i32, 30), snapshot[0].blend.children[0].transform.children[0].rect.x2);
 }
@@ -5256,7 +5291,11 @@ fn writeDisplayItemsDebug(writer: *std.Io.Writer, items: []const DisplayItem, in
             .line => |line| try writer.print("line x1={d} y1={d} x2={d} y2={d} thickness={d} color=#{x:0>2}{x:0>2}{x:0>2}{x:0>2}\n", .{ line.x1, line.y1, line.x2, line.y2, line.thickness, line.color.r, line.color.g, line.color.b, line.color.a }),
             .outline => |outline| try writer.print("outline left={d} top={d} right={d} bottom={d} thickness={d} color=#{x:0>2}{x:0>2}{x:0>2}{x:0>2}\n", .{ outline.rect.left, outline.rect.top, outline.rect.right, outline.rect.bottom, outline.thickness, outline.color.r, outline.color.g, outline.color.b, outline.color.a }),
             .blend => |blend| {
-                try writer.print("blend opacity={d} mode={s}\n", .{ blend.opacity, blend.blend_mode orelse "normal" });
+                if (blend.blur_radius > 0.0) {
+                    try writer.print("filter blur({d}px)\n", .{blend.blur_radius});
+                } else {
+                    try writer.print("blend opacity={d} mode={s}\n", .{ blend.opacity, blend.blend_mode orelse "normal" });
+                }
                 try writeDisplayItemsDebug(writer, blend.children, indent + 2);
             },
             .transform => |transform| {
@@ -5310,9 +5349,10 @@ fn paintBlockTreeRecursive(commands: *std.ArrayList(DisplayItem), self: *Layout,
 
 // Apply visual effects like opacity, blend modes, and clipping to a list of display commands
 fn applyPaintEffects(self: *Layout, block: *BlockLayout, commands: []DisplayItem) ![]DisplayItem {
-    // Check for opacity, blend mode, and overflow clipping
+    // Check for filter, opacity, blend mode, overflow clipping, and transform.
     var opacity: f64 = 1.0;
     var blend_mode: ?[]const u8 = null;
+    var blur_radius: f64 = 0.0;
     var should_clip = false;
     var border_radius: f64 = 0.0;
     var transform_x: i32 = 0;
@@ -5337,7 +5377,12 @@ fn applyPaintEffects(self: *Layout, block: *BlockLayout, commands: []DisplayItem
                 }
             }
             if (styleValue(style_map, "mix-blend-mode")) |blend_str| {
-                blend_mode = blend_str;
+                if (blend_str.len > 0 and !std.mem.eql(u8, blend_str, "normal")) {
+                    blend_mode = blend_str;
+                }
+            }
+            if (styleValue(style_map, "filter")) |filter_str| {
+                blur_radius = parseBlurFilter(filter_str) orelse 0.0;
             }
             if (std.mem.eql(u8, styleValue(style_map, "overflow") orelse "visible", "clip")) {
                 should_clip = true;
@@ -5365,7 +5410,33 @@ fn applyPaintEffects(self: *Layout, block: *BlockLayout, commands: []DisplayItem
     var owned_commands: ?[]DisplayItem = null;
     defer if (owned_commands) |owned| self.allocator.free(owned);
 
-    // Apply clipping first if needed
+    // CSS filters consume the fully painted element subtree as one image.
+    // Keep this wrapper inside clipping and opacity: filter first, then clip,
+    // then group opacity/blending; translation remains outermost below.
+    if (blur_radius > 0.0) {
+        const blur_children = try self.allocator.alloc(DisplayItem, current_commands.len);
+        @memcpy(blur_children, current_commands);
+
+        const filtered_commands = try self.allocator.alloc(DisplayItem, 1);
+        filtered_commands[0] = .{
+            .blend = .{
+                .opacity = 1.0,
+                .blend_mode = null,
+                .blur_radius = blur_radius,
+                .children = blur_children,
+                // The outer group owns compositor animation identity. Sharing it
+                // here would apply one opacity update to both wrappers.
+                .node = null,
+                .needs_compositing = true,
+                .source = displaySource(block, block.node_ptr),
+            },
+        };
+        current_commands = filtered_commands;
+        owned_commands = filtered_commands;
+    }
+
+    // Clipping is applied to the filtered result, so blur pixels cannot escape
+    // an overflow clip even though content outside the edge contributes.
     if (should_clip and border_radius > 0) {
         // Create a clipping mask using dst_in blend mode.
         // The mask is a white rounded rectangle that will clip the content.
@@ -5404,6 +5475,7 @@ fn applyPaintEffects(self: *Layout, block: *BlockLayout, commands: []DisplayItem
         const new_commands = try self.allocator.alloc(DisplayItem, current_commands.len + 1);
         @memcpy(new_commands[0..current_commands.len], current_commands);
         new_commands[current_commands.len] = clip_blend;
+        if (owned_commands) |old_container| self.allocator.free(old_container);
         current_commands = new_commands;
         owned_commands = new_commands;
     }
@@ -5417,7 +5489,7 @@ fn applyPaintEffects(self: *Layout, block: *BlockLayout, commands: []DisplayItem
     }
 
     // Only create a blend operation if we have effects to apply
-    if (opacity < 1.0 or final_blend_mode != null) {
+    if (opacity < 1.0 or final_blend_mode != null or blur_radius > 0.0) {
         const wrapped_commands = try self.allocator.alloc(DisplayItem, current_commands.len);
         @memcpy(wrapped_commands, current_commands);
 
@@ -5425,7 +5497,9 @@ fn applyPaintEffects(self: *Layout, block: *BlockLayout, commands: []DisplayItem
         const node_ptr = opaqueElementForNode(block.node_ptr);
 
         // Determine if this blend needs compositing (does actual work)
-        const needs_compositing = opacity < 1.0 or final_blend_mode != null;
+        // Blur uses an inner blend so clipping can follow it; this outer group
+        // keeps the ordered filter/clip sequence in one composited surface.
+        const needs_compositing = opacity < 1.0 or final_blend_mode != null or blur_radius > 0.0;
 
         const blend_item = DisplayItem{
             .blend = .{

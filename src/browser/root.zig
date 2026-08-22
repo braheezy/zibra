@@ -318,6 +318,108 @@ pub const Color = struct {
     }
 };
 
+const max_blur_kernel_radius: usize = 128;
+
+fn blurKernelRadius(sigma: f64) usize {
+    if (!std.math.isFinite(sigma) or sigma <= 0.0) return 0;
+    return @intFromFloat(@min(@ceil(sigma * 3.0), @as(f64, @floatFromInt(max_blur_kernel_radius))));
+}
+
+fn rgbaFromWeightedSums(r: f64, g: f64, b: f64, a: f64) z2d.pixel.RGBA {
+    return .{
+        .r = @intFromFloat(@round(std.math.clamp(r, 0.0, 255.0))),
+        .g = @intFromFloat(@round(std.math.clamp(g, 0.0, 255.0))),
+        .b = @intFromFloat(@round(std.math.clamp(b, 0.0, 255.0))),
+        .a = @intFromFloat(@round(std.math.clamp(a, 0.0, 255.0))),
+    };
+}
+
+/// Apply a separable Gaussian blur to z2d's premultiplied RGBA pixels.
+/// Sampling beyond the surface uses transparent black, matching CSS filter
+/// edges when callers provide the standard three-sigma outset.
+pub fn gaussianBlurPixels(
+    allocator: std.mem.Allocator,
+    pixels: []z2d.pixel.RGBA,
+    width: usize,
+    height: usize,
+    sigma: f64,
+) !void {
+    const pixel_count = try std.math.mul(usize, width, height);
+    if (pixel_count != pixels.len) return error.InvalidBlurBuffer;
+    const radius = blurKernelRadius(sigma);
+    if (radius == 0 or pixel_count == 0) return;
+
+    const kernel_len = radius * 2 + 1;
+    const weights = try allocator.alloc(f64, kernel_len);
+    defer allocator.free(weights);
+    var weight_total: f64 = 0.0;
+    for (weights, 0..) |*weight, index| {
+        const distance: f64 = @floatFromInt(@as(isize, @intCast(index)) - @as(isize, @intCast(radius)));
+        weight.* = @exp(-(distance * distance) / (2.0 * sigma * sigma));
+        weight_total += weight.*;
+    }
+    for (weights) |*weight| weight.* /= weight_total;
+
+    const intermediate = try allocator.alloc(z2d.pixel.RGBA, pixel_count);
+    defer allocator.free(intermediate);
+
+    for (0..height) |y| {
+        for (0..width) |x| {
+            var r: f64 = 0.0;
+            var g: f64 = 0.0;
+            var b: f64 = 0.0;
+            var a: f64 = 0.0;
+            for (weights, 0..) |weight, index| {
+                const sample_x = @as(isize, @intCast(x)) + @as(isize, @intCast(index)) - @as(isize, @intCast(radius));
+                if (sample_x < 0 or sample_x >= @as(isize, @intCast(width))) continue;
+                const sample = pixels[y * width + @as(usize, @intCast(sample_x))];
+                r += @as(f64, @floatFromInt(sample.r)) * weight;
+                g += @as(f64, @floatFromInt(sample.g)) * weight;
+                b += @as(f64, @floatFromInt(sample.b)) * weight;
+                a += @as(f64, @floatFromInt(sample.a)) * weight;
+            }
+            intermediate[y * width + x] = rgbaFromWeightedSums(r, g, b, a);
+        }
+    }
+
+    for (0..height) |y| {
+        for (0..width) |x| {
+            var r: f64 = 0.0;
+            var g: f64 = 0.0;
+            var b: f64 = 0.0;
+            var a: f64 = 0.0;
+            for (weights, 0..) |weight, index| {
+                const sample_y = @as(isize, @intCast(y)) + @as(isize, @intCast(index)) - @as(isize, @intCast(radius));
+                if (sample_y < 0 or sample_y >= @as(isize, @intCast(height))) continue;
+                const sample = intermediate[@as(usize, @intCast(sample_y)) * width + x];
+                r += @as(f64, @floatFromInt(sample.r)) * weight;
+                g += @as(f64, @floatFromInt(sample.g)) * weight;
+                b += @as(f64, @floatFromInt(sample.b)) * weight;
+                a += @as(f64, @floatFromInt(sample.a)) * weight;
+            }
+            pixels[y * width + x] = rgbaFromWeightedSums(r, g, b, a);
+        }
+    }
+}
+
+test "Gaussian blur spreads premultiplied color without transparent halos" {
+    var pixels = [_]z2d.pixel.RGBA{.{ .r = 0, .g = 0, .b = 0, .a = 0 }} ** 49;
+    pixels[3 * 7 + 3] = .{ .r = 255, .g = 0, .b = 0, .a = 255 };
+    try gaussianBlurPixels(std.testing.allocator, &pixels, 7, 7, 1.0);
+
+    const center = pixels[3 * 7 + 3];
+    const neighbor = pixels[3 * 7 + 2];
+    const two_away = pixels[3 * 7 + 1];
+    try std.testing.expect(center.a < 255 and center.a > neighbor.a);
+    try std.testing.expect(neighbor.a > 0);
+    try std.testing.expect(two_away.a > 0);
+    for (pixels) |pixel| {
+        try std.testing.expectEqual(pixel.a, pixel.r);
+        try std.testing.expectEqual(@as(u8, 0), pixel.g);
+        try std.testing.expectEqual(@as(u8, 0), pixel.b);
+    }
+}
+
 fn glyphSourcePixel(
     pixel_mode: font.GlyphPixelMode,
     bitmap_pixel: []const u8,
@@ -648,6 +750,9 @@ pub const DisplayItem = union(enum) {
     blend: struct {
         opacity: f64,
         blend_mode: ?[]const u8,
+        /// CSS blur standard deviation in layout pixels. A positive value
+        /// filters the complete child subtree before outer clip/opacity work.
+        blur_radius: f64 = 0.0,
         children: []DisplayItem,
         node: ?*anyopaque = null, // Reference back to the DOM node that created this effect
         parent: ?*const DisplayItem = null, // Parent blend for walking up the tree
@@ -4529,32 +4634,22 @@ pub const Browser = struct {
                         bounds.bottom = @max(bounds.bottom, child_bounds.bottom);
                     }
 
-                    // Try to merge with the last layer if compatible
-                    const can_merge = if (self.composited_layers.items.len > 0) blk: {
-                        const last_layer = &self.composited_layers.items[self.composited_layers.items.len - 1];
-                        break :blk last_layer.canMerge(blend_item.opacity, blend_item.blend_mode);
-                    } else false;
-
-                    if (can_merge) {
-                        // Merge into existing layer
-                        const last_layer = &self.composited_layers.items[self.composited_layers.items.len - 1];
-                        try last_layer.add(self.allocator, flattened_items, bounds);
-                        flattened_items_owned = false;
-                    } else {
-                        // Create a new composited layer for this blend
-                        var layer = CompositedLayer.init(
-                            flattened_items,
-                            bounds,
-                            blend_item.opacity,
-                            blend_item.blend_mode,
-                            blend_item.node,
-                        );
-                        flattened_items_owned = false;
-                        var layer_owned = true;
-                        errdefer if (layer_owned) layer.deinit(self.allocator);
-                        try self.composited_layers.append(self.allocator, layer);
-                        layer_owned = false;
-                    }
+                    // Keep one layer per effect wrapper. Effect subtrees are
+                    // ordered groups (filter, then clip, then opacity/blend),
+                    // and merging neighboring groups would let a dst_in mask
+                    // or blur consume pixels belonging to another element.
+                    var layer = CompositedLayer.init(
+                        flattened_items,
+                        bounds,
+                        blend_item.opacity,
+                        blend_item.blend_mode,
+                        blend_item.node,
+                    );
+                    flattened_items_owned = false;
+                    var layer_owned = true;
+                    errdefer if (layer_owned) layer.deinit(self.allocator);
+                    try self.composited_layers.append(self.allocator, layer);
+                    layer_owned = false;
                 } else {
                     // No layer needed, recurse into children
                     for (blend_item.children) |child| {
@@ -4590,6 +4685,7 @@ pub const Browser = struct {
                     .blend = .{
                         .opacity = blend_item.opacity,
                         .blend_mode = mode_copy,
+                        .blur_radius = blend_item.blur_radius,
                         .children = children,
                         .node = blend_item.node,
                         .parent = null,
@@ -4687,7 +4783,25 @@ pub const Browser = struct {
         }
     }
 
-    /// Get the bounding rect of a display item
+    fn displayItemsBounds(self: *Browser, items: []const DisplayItem) ?Rect {
+        if (items.len == 0) return null;
+        var bounds = self.getDisplayItemBounds(items[0]);
+        for (items[1..]) |child| {
+            const child_bounds = self.getDisplayItemBounds(child);
+            bounds.left = @min(bounds.left, child_bounds.left);
+            bounds.top = @min(bounds.top, child_bounds.top);
+            bounds.right = @max(bounds.right, child_bounds.right);
+            bounds.bottom = @max(bounds.bottom, child_bounds.bottom);
+        }
+        return bounds;
+    }
+
+    fn blurOutset(self: *Browser, radius: f64) i32 {
+        const zoom = if (self.active_tab_zoom > 0) self.active_tab_zoom else 1.0;
+        return @intCast(blurKernelRadius(radius * @as(f64, zoom)));
+    }
+
+    /// Get the bounding rect of a display item in device/document coordinates.
     fn getDisplayItemBounds(self: *Browser, item: DisplayItem) Rect {
         return switch (item) {
             .glyph => |g| Rect{
@@ -4739,14 +4853,13 @@ pub const Browser = struct {
                         break :blk self.getDisplayItemBounds(mask_child);
                     }
                 }
-                var bounds = Rect{ .left = std.math.maxInt(i32), .top = std.math.maxInt(i32), .right = std.math.minInt(i32), .bottom = std.math.minInt(i32) };
-                for (b.children) |child| {
-                    const child_bounds = self.getDisplayItemBounds(child);
-                    bounds.left = @min(bounds.left, child_bounds.left);
-                    bounds.top = @min(bounds.top, child_bounds.top);
-                    bounds.right = @max(bounds.right, child_bounds.right);
-                    bounds.bottom = @max(bounds.bottom, child_bounds.bottom);
-                }
+                var bounds = self.displayItemsBounds(b.children) orelse Rect{
+                    .left = 0,
+                    .top = 0,
+                    .right = 0,
+                    .bottom = 0,
+                };
+                if (b.blur_radius > 0.0) bounds = bounds.outset(self.blurOutset(b.blur_radius));
                 break :blk bounds;
             },
             .draw_composited_layer => |dcl| dcl.layer.bounds,
@@ -5399,6 +5512,217 @@ pub const Browser = struct {
     }
 
     // Draw a display item using a specific z2d context
+    fn compositePremultipliedSurface(
+        self: *Browser,
+        context: *z2d.Context,
+        surface: *z2d.Surface,
+        destination_x: i32,
+        destination_y: i32,
+        opacity_value: f64,
+        operator: compositor.Operator,
+    ) !void {
+        _ = self;
+        const source = switch (surface.*) {
+            .image_surface_rgba => |*image_surface| image_surface,
+            else => return error.UnsupportedSurfaceType,
+        };
+        const destination = switch (context.surface.*) {
+            .image_surface_rgba => |*image_surface| image_surface,
+            else => return error.UnsupportedSurfaceType,
+        };
+        const opacity = std.math.clamp(opacity_value, 0.0, 1.0);
+        if (opacity <= 0.0) return;
+
+        const source_width: usize = @intCast(source.width);
+        const source_height: usize = @intCast(source.height);
+        const destination_width: usize = @intCast(destination.width);
+        const destination_height: i32 = destination.height;
+        for (0..source_height) |row| {
+            const y = destination_y + @as(i32, @intCast(row));
+            if (y < 0 or y >= destination_height) continue;
+            for (0..source_width) |column| {
+                const x = destination_x + @as(i32, @intCast(column));
+                if (x < 0 or x >= destination.width) continue;
+
+                var pixel = source.buf[row * source_width + column];
+                if (opacity < 1.0) {
+                    pixel.r = @intFromFloat(@round(@as(f64, @floatFromInt(pixel.r)) * opacity));
+                    pixel.g = @intFromFloat(@round(@as(f64, @floatFromInt(pixel.g)) * opacity));
+                    pixel.b = @intFromFloat(@round(@as(f64, @floatFromInt(pixel.b)) * opacity));
+                    pixel.a = @intFromFloat(@round(@as(f64, @floatFromInt(pixel.a)) * opacity));
+                }
+                const destination_index = @as(usize, @intCast(y)) * destination_width + @as(usize, @intCast(x));
+                destination.buf[destination_index] = compositor.runPixelT(
+                    z2d.pixel.RGBA,
+                    destination.buf[destination_index],
+                    z2d.pixel.RGBA,
+                    pixel,
+                    operator,
+                );
+            }
+        }
+    }
+
+    /// Render one element subtree to a transparent surface, blur its
+    /// premultiplied pixels, then composite that result as a single image.
+    fn drawBlurredChildren(
+        self: *Browser,
+        context: *z2d.Context,
+        children: []DisplayItem,
+        radius: f64,
+        opacity: f64,
+        blend_mode: ?[]const u8,
+        destination_x_offset: i32,
+        destination_y_offset: i32,
+        zoom: f32,
+    ) anyerror!void {
+        const content_bounds = self.displayItemsBounds(children) orelse return;
+        const sigma = radius * @as(f64, zoom);
+        const outset: i32 = @intCast(blurKernelRadius(sigma));
+        if (outset == 0) {
+            for (children) |child| {
+                try self.drawDisplayItemZ2dContextForLayer(
+                    context,
+                    child,
+                    -destination_x_offset,
+                    -destination_y_offset,
+                    zoom,
+                );
+            }
+            return;
+        }
+
+        const blur_bounds = content_bounds.outset(outset);
+        const width = blur_bounds.width();
+        const height = blur_bounds.height();
+        if (width <= 0 or height <= 0) return;
+
+        var surface = try z2d.Surface.init(.image_surface_rgba, self.allocator, width, height);
+        defer surface.deinit(self.allocator);
+        const pixels = switch (surface) {
+            .image_surface_rgba => |*image_surface| image_surface.buf,
+            else => return error.UnsupportedSurfaceType,
+        };
+        @memset(pixels, .{ .r = 0, .g = 0, .b = 0, .a = 0 });
+
+        var blur_context = z2d.Context.init(self.io, self.allocator, &surface);
+        defer blur_context.deinit();
+        for (children) |child| {
+            try self.drawDisplayItemZ2dContextForLayer(
+                &blur_context,
+                child,
+                blur_bounds.left,
+                blur_bounds.top,
+                zoom,
+            );
+        }
+        try gaussianBlurPixels(
+            self.allocator,
+            pixels,
+            @intCast(width),
+            @intCast(height),
+            sigma,
+        );
+
+        const operator = if (blend_mode) |mode| self.parseBlendMode(mode) else context.getOperator();
+        try self.compositePremultipliedSurface(
+            context,
+            &surface,
+            blur_bounds.left + destination_x_offset,
+            blur_bounds.top + destination_y_offset,
+            opacity,
+            operator,
+        );
+    }
+
+    /// Apply a display-list mask to every pixel already present in one
+    /// isolated layer. Doing this with the low-level compositor gives dst_in
+    /// its required unbounded semantics even when the mask path covers only
+    /// part of the temporary surface.
+    fn applyDisplayMaskForLayer(
+        self: *Browser,
+        context: *z2d.Context,
+        mask: DisplayItem,
+        layer_x: i32,
+        layer_y: i32,
+        zoom: f32,
+    ) anyerror!void {
+        const width = context.surface.getWidth();
+        const height = context.surface.getHeight();
+        if (width <= 0 or height <= 0) return;
+
+        var mask_surface = try z2d.Surface.init(.image_surface_rgba, self.allocator, width, height);
+        defer mask_surface.deinit(self.allocator);
+        const mask_pixels = switch (mask_surface) {
+            .image_surface_rgba => |*image_surface| image_surface.buf,
+            else => return error.UnsupportedSurfaceType,
+        };
+        @memset(mask_pixels, .{ .r = 0, .g = 0, .b = 0, .a = 0 });
+
+        if (mask == .rounded_rect) {
+            const rounded = mask.rounded_rect;
+            const left = self.scalePxWithZoom(rounded.x1, zoom) - layer_x;
+            const right = self.scalePxWithZoom(rounded.x2, zoom) - layer_x;
+            const top = self.scalePxWithZoom(rounded.y1, zoom) - layer_y;
+            const bottom = self.scalePxWithZoom(rounded.y2, zoom) - layer_y;
+            const radius = @min(
+                self.scalePxFWithZoom(rounded.radius, zoom),
+                @min(
+                    @as(f64, @floatFromInt(@max(0, right - left))) / 2.0,
+                    @as(f64, @floatFromInt(@max(0, bottom - top))) / 2.0,
+                ),
+            );
+            const width_usize: usize = @intCast(width);
+            const sample_offsets = [_]f64{ 0.25, 0.75 };
+            for (0..@as(usize, @intCast(height))) |row| {
+                for (0..width_usize) |column| {
+                    var covered: u8 = 0;
+                    for (sample_offsets) |sample_y| {
+                        for (sample_offsets) |sample_x| {
+                            const x = @as(f64, @floatFromInt(column)) + sample_x;
+                            const y = @as(f64, @floatFromInt(row)) + sample_y;
+                            if (x < @as(f64, @floatFromInt(left)) or x >= @as(f64, @floatFromInt(right)) or
+                                y < @as(f64, @floatFromInt(top)) or y >= @as(f64, @floatFromInt(bottom))) continue;
+                            const nearest_x = std.math.clamp(
+                                x,
+                                @as(f64, @floatFromInt(left)) + radius,
+                                @as(f64, @floatFromInt(right)) - radius,
+                            );
+                            const nearest_y = std.math.clamp(
+                                y,
+                                @as(f64, @floatFromInt(top)) + radius,
+                                @as(f64, @floatFromInt(bottom)) - radius,
+                            );
+                            const dx = x - nearest_x;
+                            const dy = y - nearest_y;
+                            if (radius <= 0.5 or dx * dx + dy * dy <= radius * radius) covered += 1;
+                        }
+                    }
+                    const alpha: u8 = @intCast((@as(u16, rounded.color.a) * covered + 2) / 4);
+                    mask_pixels[row * width_usize + column] = .{ .r = alpha, .g = alpha, .b = alpha, .a = alpha };
+                }
+            }
+        } else {
+            var mask_context = z2d.Context.init(self.io, self.allocator, &mask_surface);
+            defer mask_context.deinit();
+            try self.drawDisplayItemZ2dContextForLayer(&mask_context, mask, layer_x, layer_y, zoom);
+        }
+
+        const destination_pixels = switch (context.surface.*) {
+            .image_surface_rgba => |*image_surface| image_surface.buf,
+            else => return error.UnsupportedSurfaceType,
+        };
+        for (destination_pixels, mask_pixels) |*destination, source| {
+            destination.* = compositor.runPixelT(
+                z2d.pixel.RGBA,
+                destination.*,
+                z2d.pixel.RGBA,
+                source,
+                .dst_in,
+            );
+        }
+    }
+
     fn drawDisplayItemZ2dContext(self: *Browser, context: *z2d.Context, item: DisplayItem, scroll_offset: i32, zoom: f32) !void {
         switch (item) {
             .glyph => |glyph_item| {
@@ -5556,6 +5880,19 @@ pub const Browser = struct {
                 }
             },
             .blend => |blend_item| {
+                if (blend_item.blur_radius > 0.0) {
+                    try self.drawBlurredChildren(
+                        context,
+                        blend_item.children,
+                        blend_item.blur_radius,
+                        blend_item.opacity,
+                        blend_item.blend_mode,
+                        0,
+                        -scroll_offset,
+                        zoom,
+                    );
+                    return;
+                }
                 // For blend operations, only create a layer if we have opacity < 1 or a blend mode
                 const should_save_layer = blend_item.opacity < 1.0 or blend_item.blend_mode != null;
                 const is_dst_in = if (blend_item.blend_mode) |mode| std.mem.eql(u8, mode, "dst_in") else false;
@@ -5614,57 +5951,23 @@ pub const Browser = struct {
                 try dcl.layer.raster(self.allocator, self);
 
                 if (dcl.layer.surface) |*layer_surface| {
-                    const original_operator = context.getOperator();
-                    context.setOperator(.src_over);
-                    defer context.setOperator(original_operator);
-
                     // Draw the layer surface at its position with opacity.
                     const layer_y_i64 = @as(i64, dcl.layer.bounds.top) - @as(i64, scroll_offset);
                     const layer_x_i64 = @as(i64, dcl.layer.bounds.left);
                     const layer_y: i32 = @intCast(std.math.clamp(layer_y_i64, @as(i64, std.math.minInt(i32)), @as(i64, std.math.maxInt(i32))));
                     const layer_x: i32 = @intCast(std.math.clamp(layer_x_i64, @as(i64, std.math.minInt(i32)), @as(i64, std.math.maxInt(i32))));
-
-                    const layer_pixels = switch (layer_surface.*) {
-                        .image_surface_rgba => |*img_surface| img_surface.buf,
-                        else => return error.UnsupportedSurfaceType,
-                    };
-
-                    // Composite the layer onto the destination surface using per-pixel draws.
-                    const layer_width: usize = @intCast(layer_surface.getWidth());
-                    const layer_height: usize = @intCast(layer_surface.getHeight());
-
-                    for (0..layer_height) |row| {
-                        const y: i32 = @intCast(row);
-                        const dest_y = layer_y + y;
-                        if (dest_y < 0 or dest_y >= self.window_height) continue;
-
-                        for (0..layer_width) |col| {
-                            const x: i32 = @intCast(col);
-                            const dest_x = layer_x + x;
-                            if (dest_x < 0 or dest_x >= self.window_width) continue;
-
-                            const pixel_idx = row * layer_width + col;
-                            const pixel = layer_pixels[pixel_idx];
-
-                            // Apply layer opacity
-                            const alpha: f64 = @as(f64, @floatFromInt(pixel.a)) / 255.0 * dcl.layer.opacity;
-                            if (alpha > 0.01) {
-                                context.resetPath();
-                                context.setSource(.{ .opaque_pattern = .{ .pixel = .{ .rgba = .{
-                                    .r = pixel.r,
-                                    .g = pixel.g,
-                                    .b = pixel.b,
-                                    .a = @intFromFloat(alpha * 255.0),
-                                } } } });
-                                try context.moveTo(@floatFromInt(dest_x), @floatFromInt(dest_y));
-                                try context.lineTo(@floatFromInt(dest_x + 1), @floatFromInt(dest_y));
-                                try context.lineTo(@floatFromInt(dest_x + 1), @floatFromInt(dest_y + 1));
-                                try context.lineTo(@floatFromInt(dest_x), @floatFromInt(dest_y + 1));
-                                try context.closePath();
-                                try context.fill();
-                            }
-                        }
-                    }
+                    const operator = if (dcl.layer.blend_mode) |mode|
+                        self.parseBlendMode(mode)
+                    else
+                        .src_over;
+                    try self.compositePremultipliedSurface(
+                        context,
+                        layer_surface,
+                        layer_x,
+                        layer_y,
+                        dcl.layer.opacity,
+                        operator,
+                    );
                     // Draw debug border if enabled
                     if (self.debug_layer_borders) {
                         const border_y = layer_y;
@@ -5909,6 +6212,19 @@ pub const Browser = struct {
                 try context.stroke();
             },
             .blend => |blend_item| {
+                if (blend_item.blur_radius > 0.0) {
+                    try self.drawBlurredChildren(
+                        context,
+                        blend_item.children,
+                        blend_item.blur_radius,
+                        blend_item.opacity,
+                        blend_item.blend_mode,
+                        x_offset,
+                        -scroll_offset,
+                        zoom,
+                    );
+                    return;
+                }
                 // For blends, apply opacity and recurse into children with the transform applied
                 const should_apply_opacity = blend_item.opacity < 1.0 or blend_item.blend_mode != null;
                 const is_dst_in = if (blend_item.blend_mode) |mode| std.mem.eql(u8, mode, "dst_in") else false;
@@ -5959,45 +6275,20 @@ pub const Browser = struct {
                 // For composited layers, draw at transformed position
                 try dcl.layer.raster(self.allocator, self);
                 if (dcl.layer.surface) |*layer_surface| {
-                    const original_operator = context.getOperator();
-                    context.setOperator(.src_over);
-                    defer context.setOperator(original_operator);
-
                     const layer_y = dcl.layer.bounds.top - scroll_offset;
                     const layer_x = dcl.layer.bounds.left + x_offset;
-                    const layer_pixels = switch (layer_surface.*) {
-                        .image_surface_rgba => |*img| img.buf,
-                        else => return error.UnsupportedSurfaceType,
-                    };
-                    const layer_width: usize = @intCast(layer_surface.getWidth());
-                    const layer_height: usize = @intCast(layer_surface.getHeight());
-                    for (0..layer_height) |row| {
-                        const y: i32 = @intCast(row);
-                        const dest_y = layer_y + y;
-                        if (dest_y < 0 or dest_y >= self.window_height) continue;
-                        for (0..layer_width) |col| {
-                            const x: i32 = @intCast(col);
-                            const dest_x = layer_x + x;
-                            if (dest_x < 0 or dest_x >= self.window_width) continue;
-                            const pixel = layer_pixels[row * layer_width + col];
-                            const alpha: f64 = @as(f64, @floatFromInt(pixel.a)) / 255.0 * dcl.layer.opacity;
-                            if (alpha > 0.01) {
-                                context.resetPath();
-                                context.setSource(.{ .opaque_pattern = .{ .pixel = .{ .rgba = .{
-                                    .r = pixel.r,
-                                    .g = pixel.g,
-                                    .b = pixel.b,
-                                    .a = @intFromFloat(alpha * 255.0),
-                                } } } });
-                                try context.moveTo(@floatFromInt(dest_x), @floatFromInt(dest_y));
-                                try context.lineTo(@floatFromInt(dest_x + 1), @floatFromInt(dest_y));
-                                try context.lineTo(@floatFromInt(dest_x + 1), @floatFromInt(dest_y + 1));
-                                try context.lineTo(@floatFromInt(dest_x), @floatFromInt(dest_y + 1));
-                                try context.closePath();
-                                try context.fill();
-                            }
-                        }
-                    }
+                    const operator = if (dcl.layer.blend_mode) |mode|
+                        self.parseBlendMode(mode)
+                    else
+                        .src_over;
+                    try self.compositePremultipliedSurface(
+                        context,
+                        layer_surface,
+                        layer_x,
+                        layer_y,
+                        dcl.layer.opacity,
+                        operator,
+                    );
                 }
             },
             .transform => |t| {
@@ -6077,11 +6368,27 @@ pub const Browser = struct {
                 if (width > 1 and height > 1) {
                     context.resetPath();
                     context.setSource(.{ .opaque_pattern = .{ .pixel = .{ .rgba = rr.color.toZ2dRgba() } } });
-                    // Draw as regular rect (rounded rect requires more complex path)
-                    try context.moveTo(@floatFromInt(left), @floatFromInt(top));
-                    try context.lineTo(@floatFromInt(right), @floatFromInt(top));
-                    try context.lineTo(@floatFromInt(right), @floatFromInt(bottom));
-                    try context.lineTo(@floatFromInt(left), @floatFromInt(bottom));
+                    const max_radius = @min(
+                        @as(f64, @floatFromInt(width)) / 2.0,
+                        @as(f64, @floatFromInt(height)) / 2.0,
+                    );
+                    const radius = @min(self.scalePxFWithZoom(rr.radius, zoom), max_radius);
+                    const x1: f64 = @floatFromInt(left);
+                    const y1: f64 = @floatFromInt(top);
+                    const x2: f64 = @floatFromInt(right);
+                    const y2: f64 = @floatFromInt(bottom);
+                    if (radius > 0.5) {
+                        try context.moveTo(x1 + radius, y1);
+                        try context.arc(x1 + radius, y1 + radius, radius, -std.math.pi, -std.math.pi / 2.0);
+                        try context.arc(x2 - radius, y1 + radius, radius, -std.math.pi / 2.0, 0);
+                        try context.arc(x2 - radius, y2 - radius, radius, 0, std.math.pi / 2.0);
+                        try context.arc(x1 + radius, y2 - radius, radius, std.math.pi / 2.0, std.math.pi);
+                    } else {
+                        try context.moveTo(x1, y1);
+                        try context.lineTo(x2, y1);
+                        try context.lineTo(x2, y2);
+                        try context.lineTo(x1, y2);
+                    }
                     try context.closePath();
                     try context.fill();
                     context.resetPath();
@@ -6119,6 +6426,19 @@ pub const Browser = struct {
                 context.resetPath();
             },
             .blend => |blend_item| {
+                if (blend_item.blur_radius > 0.0) {
+                    try self.drawBlurredChildren(
+                        context,
+                        blend_item.children,
+                        blend_item.blur_radius,
+                        blend_item.opacity,
+                        blend_item.blend_mode,
+                        -layer_x,
+                        -layer_y,
+                        zoom,
+                    );
+                    return;
+                }
                 // Check if this is a dst_in clipping blend
                 const is_dst_in_clip = if (blend_item.blend_mode) |mode|
                     std.mem.eql(u8, mode, "dst_in")
@@ -6126,7 +6446,6 @@ pub const Browser = struct {
                     false;
 
                 if (is_dst_in_clip and blend_item.children.len > 0) {
-                    const original_operator = context.getOperator();
                     const content_end = blend_item.children.len - 1;
                     for (blend_item.children[0..content_end]) |child| {
                         if (blend_item.opacity < 1.0) {
@@ -6137,13 +6456,11 @@ pub const Browser = struct {
                             try self.drawDisplayItemZ2dContextForLayer(context, child, layer_x, layer_y, zoom);
                         }
                     }
-                    context.setOperator(self.parseBlendMode("dst_in"));
                     var mask_item = blend_item.children[content_end];
                     if (blend_item.opacity < 1.0) {
                         mask_item = self.applyOpacityToDisplayItem(mask_item, blend_item.opacity);
                     }
-                    try self.drawDisplayItemZ2dContextForLayer(context, mask_item, layer_x, layer_y, zoom);
-                    context.setOperator(original_operator);
+                    try self.applyDisplayMaskForLayer(context, mask_item, layer_x, layer_y, zoom);
                 } else {
                     // Apply opacity and recursively draw children in layer space
                     const should_apply_opacity = blend_item.opacity < 1.0 or blend_item.blend_mode != null;

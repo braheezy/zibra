@@ -1,0 +1,40 @@
+<!--
+How to verify:
+1. The first card is sharp and the second card has one soft blur around its
+   text, border, and both overlapping color blocks.
+2. The clipped card's blur stops at its rounded border; no haze escapes it.
+3. The translucent card has pale blur edges (opacity is applied after blur),
+   and the translated card remains blurred after moving to the right.
+4. `--dump-display-list` prints `filter blur(6px)` without pointer values.
+-->
+<style>
+  body { background-color: white; color: black; }
+  .card {
+    display: block;
+    width: 210px;
+    height: 72px;
+    background-color: #f2c94c;
+    border-radius: 12px;
+  }
+  .blurred { filter: blur(6px); }
+  .clipped {
+    filter: blur(8px);
+    overflow: clip;
+    border-radius: 18px;
+  }
+  .translucent { filter: blur(6px); opacity: 0.45; }
+  .translated { filter: blur(4px); transform: translate(35px, 0px); }
+  .blue { display: block; width: 70px; height: 24px; background-color: #276ef1; }
+  .red { display: block; width: 70px; height: 24px; background-color: #d7263d; transform: translate(45px, -12px); }
+</style>
+<h1>CSS blur filter</h1>
+<p>Sharp reference:</p>
+<div class="card">Sharp<div class="blue"></div><div class="red"></div></div>
+<p>Blurred as one subtree:</p>
+<div class="card blurred">Blurred<div class="blue"></div><div class="red"></div></div>
+<p>Blur, then rounded clipping:</p>
+<div class="card clipped">Clipped blur<div class="blue"></div><div class="red"></div></div>
+<p>Blur, then opacity:</p>
+<div class="card translucent">Translucent blur<div class="blue"></div><div class="red"></div></div>
+<p>Blur, then translation:</p>
+<div class="card translated">Translated blur<div class="blue"></div><div class="red"></div></div>

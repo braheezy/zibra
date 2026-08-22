@@ -86,6 +86,23 @@ test "display list hit testing inverts translations" {
     try std.testing.expect(DisplayItem.hitTest(&items, 5, 5, 1.0) == null);
 }
 
+test "blurred pixels do not expand the element hit target" {
+    var generator: u8 = 0;
+    var children = [_]DisplayItem{rect(10, 10, 20, 20, source(&generator, null))};
+    const items = [_]DisplayItem{.{ .blend = .{
+        .opacity = 1.0,
+        .blend_mode = null,
+        .blur_radius = 6.0,
+        .children = &children,
+        .needs_compositing = true,
+    } }};
+
+    try std.testing.expect(DisplayItem.hitTest(&items, 15, 15, 1.0) != null);
+    // This point can contain blur output, but CSS hit testing still uses the
+    // originating painted box rather than the filter's visual outset.
+    try std.testing.expect(DisplayItem.hitTest(&items, 7, 15, 1.0) == null);
+}
+
 test "device hit testing matches truncating raster edges at fractional zoom" {
     var generator: u8 = 0;
     const item_source = source(&generator, null);

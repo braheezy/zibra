@@ -144,6 +144,12 @@ before changing `root.zig`, `tab.zig`, `render/`, or browser task scheduling.
   updates to this retained list before committing them to the browser snapshot;
   recurse through transforms and reraster any ancestor layer that flattened the
   updated effect into its owned item tree.
+- CSS `filter: blur(<length>)` is an owning blend wrapper around the complete
+  element subtree. Raster it into premultiplied RGBA, blur that image, then
+  apply overflow clipping, group opacity/mix-blend, and finally translation.
+  Keep each effect wrapper in its own layer: neighboring filters and `dst_in`
+  masks are ordered groups and must never be merged. Blur expands visual layer
+  bounds but does not expand the DOM hit target.
 - Structural DOM mutation is a synchronous generation boundary, distinct from
   ordinary render invalidation. Before a child array moves or a child is
   destroyed, mark layout/render dirty, retire the frame's display and DOM-keyed

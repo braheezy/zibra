@@ -1295,6 +1295,7 @@ const CSS_PROPERTIES = [_]struct { name: []const u8, default_value: []const u8 }
     .{ .name = "opacity", .default_value = "1.0" },
     .{ .name = "transition", .default_value = "" },
     .{ .name = "transform", .default_value = "none" },
+    .{ .name = "filter", .default_value = "none" },
     .{ .name = "mix-blend-mode", .default_value = "" },
     .{ .name = "border-radius", .default_value = "0px" },
     .{ .name = "overflow", .default_value = "visible" },

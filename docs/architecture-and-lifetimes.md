@@ -418,7 +418,8 @@ The cached `Glyph` does not store the source grapheme slice, so transient input
 text is not retained as glyph metadata.
 
 Display-list container ownership is recursive: `.blend` and `.transform` own
-their child slices, and `.blend` owns its copied blend-mode string. See
+their child slices, and `.blend` owns its copied blend-mode string. A blend's
+copyable `blur_radius` marks a CSS filter wrapper without adding another owner. See
 `DisplayItem.freeList` in [`src/browser/root.zig`](../src/browser/root.zig).
 `BlockLayout.display_list` is a persistent paint cache and recursively owns
 any such containers stored in it. Painting a frame deep-clones cached items
@@ -484,6 +485,18 @@ tree; effects flattened into an ancestor or iframe layer update the layer-owned
 tree and mark its cached pixels for rerasterization.
 Layout-derived link and iframe bounds no longer decide click targets. Focus,
 accessibility, and fragment bounds retain their existing roles.
+
+CSS blur is represented by an inner composited blend around the element's
+complete painted subtree. Its premultiplied RGBA surface is convolved with a
+separable Gaussian kernel and outsets visual bounds by three standard
+deviations. The surrounding effect group preserves CSS paint order: blur,
+then overflow/border-radius clipping, then group opacity and mix blending, and
+translation last. Effect groups remain distinct composited layers because a
+blur or unbounded `dst_in` mask cannot safely consume neighboring pixels.
+Layer opacity scales all premultiplied channels together, and the layer's blend
+operator is applied only when the completed surface is placed. Hit testing
+continues through the original child commands, so the blur's visual haze does
+not enlarge interactive geometry.
 
 Basic text direction is resolved per inline block through the acyclic layout
 parent chain. The CLI `-rtl` flag supplies the fallback direction; the nearest

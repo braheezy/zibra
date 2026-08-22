@@ -90,6 +90,9 @@ or selector/rule lifetime.
 - `width` and `height` are non-inherited computed properties. Their default is
   `auto`; layout currently resolves only non-negative pixel lengths and keeps
   the borrowed computed-value slice in the style map.
+- `filter` is non-inherited and defaults to `none`. Layout currently accepts a
+  single non-negative `blur()` pixel length (or unitless zero); unsupported
+  filter functions and chains have no effect.
 - `display` is non-inherited and defaults to `inline`. HTML block defaults live
   in the user-agent stylesheet; layout reads the borrowed computed value.
 - Keep parser output deterministic: the `--dump-dom` golden test is the first
