@@ -16,6 +16,7 @@ comptime {
     _ = @import("tests/browser_resize.zig");
     _ = @import("tests/browser_scroll.zig");
     _ = @import("tests/browser_touch.zig");
+    _ = @import("tests/browser_timers.zig");
     _ = @import("tests/browser_dynamic_resources.zig");
     _ = @import("tests/browser_security.zig");
     _ = @import("tests/browser_cookies.zig");

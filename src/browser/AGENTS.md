@@ -21,6 +21,12 @@ before changing `root.zig`, `tab.zig`, `render/`, or browser task scheduling.
 - `tab.zig` owns frames, document generations, task serialization, and helper
   quiescence. Queued or detached work must carry a stable document identity,
   not a borrowed frame pointer.
+- A Tab also owns the native `setInterval` cancellation registry under its
+  interval mutex. Keys include window ID, document generation, and JavaScript
+  handle. Sleeping one-shot helpers poll this registry at most every 10ms;
+  `clearInterval`, navigation, frame teardown, and Tab shutdown remove the
+  applicable keys before document state can retire. JavaScript interval
+  callbacks and rescheduling still run only on the serialized Tab worker.
 - Each tab owns a sentinel-terminated copy of its root document title. Tab
   workers replace it under `Browser.lock`; only the interactive App/UI thread
   may pass it to the addressed native window, including after tab switches.

@@ -79,7 +79,8 @@ process main thread
           |
           | spawns accounted helper threads
           v
-    setTimeout thread(s), animation timer thread, async XHR thread(s)
+    setTimeout/setInterval helper thread(s), animation timer thread,
+    async XHR thread(s)
           |
           `---- enqueue completion Task values back onto the Tab worker
 ```
@@ -816,9 +817,18 @@ logical join point: helper teardown releases the reference as its final owner
 access, and `Tab.shutdown` waits for zero before document destruction. Helpers
 carry copied `DocumentHandle` values rather than `Frame` or `JsRenderContext`
 pointers.
-Long timers poll the tab shutdown flag and exit promptly. Async HTTP still has
-no request cancellation, so shutdown can safely wait but may wait for network
-I/O to finish.
+`setInterval` does not add a permanently looping helper. Its per-window
+JavaScript registry retains the callback and requested delay; each live
+delivery schedules exactly one new generation-stamped one-shot helper after
+the callback returns. A second, mutex-protected Tab registry keys active
+intervals by `(window_id, document_generation, handle)`. `clearInterval`
+removes both entries; sleeping helpers observe the native removal within 10ms,
+and already-queued deliveries find no JavaScript callback and become no-ops.
+Document replacement and frame teardown clear that document's keys, while Tab
+shutdown clears every key before joining helpers. One-shot timeout entries are
+removed before their callback runs. Long timer helpers poll the tab shutdown
+flag and exit promptly. Async HTTP still has no request cancellation, so
+shutdown can safely wait but may wait for network I/O to finish.
 
 ### Current locks
 

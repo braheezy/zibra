@@ -101,7 +101,13 @@ pub const SetTimeoutCallbackFn = *const fn (
     context: ?*anyopaque,
     handle: u32,
     delay_ms: u32,
+    is_interval: bool,
 ) anyerror!void;
+
+pub const ClearIntervalCallbackFn = *const fn (
+    context: ?*anyopaque,
+    handle: u32,
+) void;
 
 const SetTimeoutCallback = struct {
     function: ?SetTimeoutCallbackFn = null,
@@ -212,6 +218,10 @@ const WindowContext = struct {
     render_callback: RenderCallback,
     dom_mutation_callback: DomMutationCallback,
     set_timeout_callback: SetTimeoutCallback,
+    clear_interval_callback: struct {
+        function: ?ClearIntervalCallbackFn = null,
+        context: ?*anyopaque = null,
+    },
     post_message_callback: PostMessageCallback,
     xhr_callback: XhrCallback,
     cookie_callback: CookieCallback,
@@ -286,6 +296,7 @@ fn ensureWindow(self: *Js, window_id: u32) !void {
         .render_callback = .{},
         .dom_mutation_callback = .{},
         .set_timeout_callback = .{},
+        .clear_interval_callback = .{},
         .post_message_callback = .{},
         .xhr_callback = .{},
         .cookie_callback = .{},
@@ -587,21 +598,58 @@ pub fn evaluate(self: *Js, window_id: u32, code: []const u8) !Value {
         \\  delete WINDOW_NODE_LISTENERS[targetId];
         \\  delete WINDOW_MESSAGE_LISTENERS[targetId];
         \\  delete WINDOW_ONMESSAGE[targetId];
+        \\  delete WINDOW_TIMER_REQUESTS[targetId];
+        \\  delete WINDOW_NEXT_TIMER_HANDLE[targetId];
         \\};
         \\
-        \\var SET_TIMEOUT_REQUESTS = {};
-        \\var NEXT_TIMEOUT_HANDLE = 0;
+        \\var WINDOW_TIMER_REQUESTS = {};
+        \\var WINDOW_NEXT_TIMER_HANDLE = {};
+        \\
+        \\function __timerRequests() {
+        \\  var windowId = window.__id;
+        \\  if (!WINDOW_TIMER_REQUESTS[windowId]) WINDOW_TIMER_REQUESTS[windowId] = {};
+        \\  return WINDOW_TIMER_REQUESTS[windowId];
+        \\}
+        \\
+        \\function __scheduleTimer(callback, timeout, repeats) {
+        \\  var windowId = window.__id;
+        \\  var handle = WINDOW_NEXT_TIMER_HANDLE[windowId] || 0;
+        \\  WINDOW_NEXT_TIMER_HANDLE[windowId] = handle + 1;
+        \\  var delay = timeout || 0;
+        \\  __timerRequests()[handle] = {
+        \\    callback: callback,
+        \\    delay: delay,
+        \\    repeats: repeats
+        \\  };
+        \\  __native.setTimeout(handle, delay, repeats);
+        \\  return handle;
+        \\}
         \\
         \\globalThis.__runSetTimeout = function(handle) {
-        \\  var callback = SET_TIMEOUT_REQUESTS[handle];
-        \\  if (callback) callback();
+        \\  var requests = __timerRequests();
+        \\  var request = requests[handle];
+        \\  if (!request) return;
+        \\  if (!request.repeats) delete requests[handle];
+        \\  try {
+        \\    request.callback();
+        \\  } finally {
+        \\    if (request.repeats && requests[handle] === request) {
+        \\      __native.setTimeout(handle, request.delay, true);
+        \\    }
+        \\  }
         \\};
         \\
         \\globalThis.setTimeout = function(callback, timeout) {
-        \\  var handle = NEXT_TIMEOUT_HANDLE++;
-        \\  SET_TIMEOUT_REQUESTS[handle] = callback;
-        \\  __native.setTimeout(handle, timeout || 0);
-        \\  return handle;
+        \\  return __scheduleTimer(callback, timeout, false);
+        \\};
+        \\
+        \\globalThis.setInterval = function(callback, timeout) {
+        \\  return __scheduleTimer(callback, timeout, true);
+        \\};
+        \\
+        \\globalThis.clearInterval = function(handle) {
+        \\  delete __timerRequests()[handle];
+        \\  __native.clearInterval(handle);
         \\};
         \\
         \\var RAF_LISTENERS = [];
@@ -806,6 +854,7 @@ pub fn setNodes(self: *Js, window_id: u32, nodes: ?*Node) void {
         window.xhr_callback = .{};
         window.cookie_callback = .{};
         window.set_timeout_callback = .{};
+        window.clear_interval_callback = .{};
         window.post_message_callback = .{};
         window.animation_frame_callback = .{};
     } else {
@@ -859,6 +908,19 @@ pub fn setCookieCallbacks(
 pub fn setSetTimeoutCallback(self: *Js, window_id: u32, callback: ?SetTimeoutCallbackFn, context: ?*anyopaque) void {
     const window = self.setCurrentWindow(window_id) catch return;
     window.set_timeout_callback = .{
+        .function = callback,
+        .context = context,
+    };
+}
+
+pub fn setClearIntervalCallback(
+    self: *Js,
+    window_id: u32,
+    callback: ?ClearIntervalCallbackFn,
+    context: ?*anyopaque,
+) void {
+    const window = self.setCurrentWindow(window_id) catch return;
+    window.clear_interval_callback = .{
         .function = callback,
         .context = context,
     };
@@ -2572,6 +2634,26 @@ fn setupDocument(self: *Js, realm: *Realm) !void {
         },
     );
 
+    const clear_interval_fn = try kiesel.builtins.createBuiltinFunction(
+        &self.agent,
+        .{ .function = clearIntervalNative },
+        1,
+        "clearInterval",
+        .{
+            .realm = realm,
+            .additional_fields = self_ptr,
+        },
+    );
+
+    try native_obj.definePropertyDirect(
+        &self.agent,
+        PropertyKey.from("clearInterval"),
+        .{
+            .value_or_accessor = .{ .value = Value.from(&clear_interval_fn.object) },
+            .attributes = .builtin_default,
+        },
+    );
+
     const request_animation_fn = try kiesel.builtins.createBuiltinFunction(
         &self.agent,
         .{ .function = requestAnimationFrameNative },
@@ -3870,13 +3952,39 @@ fn setTimeoutNative(agent: *Agent, this_value: Value, arguments: kiesel.types.Ar
         }
     }
 
+    const is_interval = arguments.count() >= 3 and arguments.get(2).toBoolean();
+
     if (window.set_timeout_callback.function) |callback| {
         const callback_context = window.set_timeout_callback.context;
-        callback(callback_context, handle, delay_ms) catch |err| {
+        callback(callback_context, handle, delay_ms, is_interval) catch |err| {
             std.log.warn("Failed to schedule setTimeout callback: {}", .{err});
         };
     }
 
+    return .undefined;
+}
+
+fn clearIntervalNative(agent: *Agent, this_value: Value, arguments: kiesel.types.Arguments) Agent.Error!Value {
+    _ = this_value;
+
+    const function_obj = agent.activeFunctionObject();
+    const builtin_fn = function_obj.as(kiesel.builtins.BuiltinFunction);
+    const js_instance = builtin_fn.fields.additionalFieldsAs(Js);
+    const window_id = js_instance.current_window_id orelse return .undefined;
+    const window = js_instance.windows.getPtr(window_id) orelse return .undefined;
+
+    const handle_arg = arguments.get(0);
+    if (!handle_arg.isNumber()) return .undefined;
+    const raw_handle = handle_arg.asNumber().asFloat();
+    const max_handle = @as(f64, @floatFromInt(std.math.maxInt(u32)));
+    if (std.math.isNan(raw_handle) or raw_handle < 0 or raw_handle > max_handle) return .undefined;
+
+    if (window.clear_interval_callback.function) |callback| {
+        callback(
+            window.clear_interval_callback.context,
+            @intFromFloat(raw_handle),
+        );
+    }
     return .undefined;
 }
 

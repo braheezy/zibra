@@ -1,0 +1,118 @@
+<!--
+How to verify:
+1. Open this page and wait until the frame-status field starts with "DONE".
+2. The 16, 50, and 125ms rows must each report 24 samples with measured
+   average, minimum, and maximum callback spacing.
+3. Values need not exactly equal the requested delay: timer callbacks and the
+   deliberately expensive requestAnimationFrame style/layout/paint work share
+   the serialized tab worker. Short intervals should generally show the most
+   relative jitter and callbacks may be late, but they must never overlap.
+4. Once DONE appears, every value must remain stable. This proves each
+   clearInterval call stopped its repeating timer and the RAF stress loop.
+5. The page also creates and immediately clears a one-hour interval. A prompt
+   DONE state proves cancellation released its sleeping native helper.
+-->
+<!doctype html>
+<html>
+<head>
+  <title>setInterval cadence</title>
+  <style>
+    body { background-color: white; color: black; font-size: 16px; }
+    input { width: 650px; height: 26px; }
+    #stressArea { width: 650px; filter: blur(4px); }
+    .stress { height: 5px; background-color: orange; }
+  </style>
+</head>
+<body>
+  <h1>setInterval cadence under rendering load</h1>
+  <p>16ms interval: <input id="result16" value="collecting"></p>
+  <p>50ms interval: <input id="result50" value="collecting"></p>
+  <p>125ms interval: <input id="result125" value="collecting"></p>
+  <p>RAF status: <input id="frameStatus" value="running"></p>
+
+  <div id="stressArea">
+    <div class="stress"></div><div class="stress"></div>
+    <div class="stress"></div><div class="stress"></div>
+    <div class="stress"></div><div class="stress"></div>
+    <div class="stress"></div><div class="stress"></div>
+    <div class="stress"></div><div class="stress"></div>
+    <div class="stress"></div><div class="stress"></div>
+    <div class="stress"></div><div class="stress"></div>
+    <div class="stress"></div><div class="stress"></div>
+    <div class="stress"></div><div class="stress"></div>
+    <div class="stress"></div><div class="stress"></div>
+    <div class="stress"></div><div class="stress"></div>
+    <div class="stress"></div><div class="stress"></div>
+    <div class="stress"></div><div class="stress"></div>
+    <div class="stress"></div><div class="stress"></div>
+    <div class="stress"></div><div class="stress"></div>
+    <div class="stress"></div><div class="stress"></div>
+  </div>
+
+  <script>
+    var unfinishedIntervals = 3;
+    var renderedFrames = 0;
+    var report16 = '';
+    var report50 = '';
+    var report125 = '';
+    var canceledLongInterval = setInterval(function() {
+      console.log('FAIL: cleared one-hour interval fired');
+    }, 3600000);
+    clearInterval(canceledLongInterval);
+
+    function saveReport(delay, report) {
+      if (delay === 16) report16 = report;
+      if (delay === 50) report50 = report;
+      if (delay === 125) report125 = report;
+    }
+
+    function publishReports() {
+      result16.setAttribute('value', report16);
+      result50.setAttribute('value', report50);
+      result125.setAttribute('value', report125);
+      frameStatus.setAttribute('value', 'DONE frames=' + renderedFrames + ' (values must now stay stable)');
+    }
+
+    function runCadence(delay) {
+      var samples = [];
+      var previous = Date.now();
+      var timer = setInterval(function() {
+        var current = Date.now();
+        samples.push(current - previous);
+        previous = current;
+        if (samples.length === 24) {
+          clearInterval(timer);
+          var total = 0;
+          var minimum = samples[0];
+          var maximum = samples[0];
+          for (var i = 0; i < samples.length; i++) {
+            total = total + samples[i];
+            if (samples[i] < minimum) minimum = samples[i];
+            if (samples[i] > maximum) maximum = samples[i];
+          }
+          var average = total / samples.length;
+          var report = 'requested=' + delay + 'ms samples=24 avg=' +
+            average.toFixed(1) + 'ms min=' + minimum + 'ms max=' + maximum + 'ms';
+          saveReport(delay, report);
+          console.log(report);
+          unfinishedIntervals = unfinishedIntervals - 1;
+        }
+      }, delay);
+    }
+
+    function stressRenderingPipeline() {
+      renderedFrames = renderedFrames + 1;
+      if (unfinishedIntervals > 0) {
+        requestAnimationFrame(stressRenderingPipeline);
+      } else {
+        publishReports();
+      }
+    }
+
+    runCadence(16);
+    runCadence(50);
+    runCadence(125);
+    requestAnimationFrame(stressRenderingPipeline);
+  </script>
+</body>
+</html>

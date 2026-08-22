@@ -58,6 +58,15 @@ or Kiesel allocation/locking.
   pointer.
 - Preserve Kiesel's GC-root and `JsLock` assumptions. Do not add unlocked
   cross-thread host mutation without documenting and enforcing its owner.
+- Timer handles and callback registries are scoped by JavaScript window ID.
+  `setInterval` reuses the generation-stamped one-shot native timer boundary:
+  after a live callback completes, its JavaScript wrapper schedules exactly one
+  next delivery at the same delay. `clearInterval` removes both the JavaScript
+  callback entry and the Tab's native generation-stamped cancellation key;
+  sleeping helpers poll that key and already-queued deliveries become no-ops.
+  Reset both registries when installing a replacement document; timeout
+  callbacks are one-shot entries and must be removed before invocation. Keep
+  timer JavaScript serialized on the tab worker.
 - Attribute and inline-style mutation can affect `:has` matches. Dirty the
   changed element's style and its ancestor chain before requesting a render.
 - Exercise interactive behavior with a deterministic `tests/manual/` page that

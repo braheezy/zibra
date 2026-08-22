@@ -2998,6 +2998,11 @@ pub const Browser = struct {
             jsSetTimeoutCallback,
             @ptrCast(render_context),
         );
+        js_context.setClearIntervalCallback(
+            frame.window_id,
+            jsClearIntervalCallback,
+            @ptrCast(render_context),
+        );
         js_context.setPostMessageCallback(
             frame.window_id,
             jsPostMessageCallback,
@@ -3326,6 +3331,7 @@ pub const Browser = struct {
     }
 
     fn resetFrameForNavigation(self: *Browser, frame: *Frame) void {
+        frame.tab.clearIntervalsForDocument(frame.window_id, frame.document_generation);
         if (frame.js_context) |ctx| {
             ctx.setNodes(frame.window_id, null);
         }
@@ -4350,11 +4356,18 @@ pub const Browser = struct {
         js_context: *JsRenderContext,
         handle: u32,
         delay_ms: u32,
+        is_interval: bool,
     ) !void {
         if (tab.isShuttingDown() or js_context.js_context == null) return;
         const document = DocumentHandle{
             .window_id = js_context.window_id,
             .generation = js_context.currentGeneration(),
+        };
+        if (is_interval) {
+            try tab.ensureInterval(document.window_id, document.generation, handle);
+        }
+        errdefer if (is_interval) {
+            tab.clearInterval(document.window_id, document.generation, handle);
         };
 
         const thread_ctx = try SetTimeoutThreadContext.create(
@@ -4364,6 +4377,7 @@ pub const Browser = struct {
             document,
             handle,
             delay_ms,
+            is_interval,
         );
 
         tab.retainAsyncThread();
@@ -7550,6 +7564,7 @@ const SetTimeoutThreadContext = struct {
     document: DocumentHandle,
     handle: u32,
     delay_ms: u32,
+    is_interval: bool,
 
     fn create(
         allocator: std.mem.Allocator,
@@ -7558,6 +7573,7 @@ const SetTimeoutThreadContext = struct {
         document: DocumentHandle,
         handle: u32,
         delay_ms: u32,
+        is_interval: bool,
     ) !*SetTimeoutThreadContext {
         const ctx = try allocator.create(SetTimeoutThreadContext);
         ctx.* = .{
@@ -7567,6 +7583,7 @@ const SetTimeoutThreadContext = struct {
             .document = document,
             .handle = handle,
             .delay_ms = delay_ms,
+            .is_interval = is_interval,
         };
         return ctx;
     }
@@ -7590,11 +7607,28 @@ fn runSetTimeoutThread(ctx: *SetTimeoutThreadContext) void {
     var remaining_ns = @as(u64, ctx.delay_ms) * std.time.ns_per_ms;
     while (remaining_ns > 0) {
         if (tab.isShuttingDown()) return;
+        if (ctx.is_interval and !tab.intervalIsActive(
+            ctx.document.window_id,
+            ctx.document.generation,
+            ctx.handle,
+        )) return;
         const sleep_ns = @min(remaining_ns, 10 * std.time.ns_per_ms);
-        ctx.browser.io.sleep(.fromNanoseconds(@intCast(sleep_ns)), .awake) catch return;
+        ctx.browser.io.sleep(.fromNanoseconds(@intCast(sleep_ns)), .awake) catch {
+            if (ctx.is_interval) tab.clearInterval(
+                ctx.document.window_id,
+                ctx.document.generation,
+                ctx.handle,
+            );
+            return;
+        };
         remaining_ns -= sleep_ns;
     }
     if (tab.isShuttingDown()) return;
+    if (ctx.is_interval and !tab.intervalIsActive(
+        ctx.document.window_id,
+        ctx.document.generation,
+        ctx.handle,
+    )) return;
 
     const task_ctx = SetTimeoutTaskContext.create(
         ctx.browser.allocator,
@@ -7602,8 +7636,14 @@ fn runSetTimeoutThread(ctx: *SetTimeoutThreadContext) void {
         tab,
         ctx.document,
         ctx.handle,
+        ctx.is_interval,
     ) catch |err| {
         std.log.warn("Failed to allocate setTimeout task: {}", .{err});
+        if (ctx.is_interval) tab.clearInterval(
+            ctx.document.window_id,
+            ctx.document.generation,
+            ctx.handle,
+        );
         return;
     };
     errdefer task_ctx.destroy();
@@ -7617,6 +7657,11 @@ fn runSetTimeoutThread(ctx: *SetTimeoutThreadContext) void {
     tab.task_runner.schedule(task) catch |err| {
         std.log.warn("Failed to enqueue setTimeout task: {}", .{err});
         task_ctx.destroy();
+        if (ctx.is_interval) tab.clearInterval(
+            ctx.document.window_id,
+            ctx.document.generation,
+            ctx.handle,
+        );
     };
 }
 
@@ -7626,6 +7671,7 @@ const SetTimeoutTaskContext = struct {
     tab: *Tab,
     document: DocumentHandle,
     handle: u32,
+    is_interval: bool,
 
     fn create(
         allocator: std.mem.Allocator,
@@ -7633,6 +7679,7 @@ const SetTimeoutTaskContext = struct {
         tab: *Tab,
         document: DocumentHandle,
         handle: u32,
+        is_interval: bool,
     ) !*SetTimeoutTaskContext {
         const ctx = try allocator.create(SetTimeoutTaskContext);
         ctx.* = .{
@@ -7641,6 +7688,7 @@ const SetTimeoutTaskContext = struct {
             .tab = tab,
             .document = document,
             .handle = handle,
+            .is_interval = is_interval,
         };
         return ctx;
     }
@@ -7667,12 +7715,31 @@ const SetTimeoutTaskContext = struct {
     }
 
     fn run(self: *SetTimeoutTaskContext) !void {
-        const frame = self.document.resolve(self.tab) orelse return;
+        const frame = self.document.resolve(self.tab) orelse {
+            if (self.is_interval) self.tab.clearInterval(
+                self.document.window_id,
+                self.document.generation,
+                self.handle,
+            );
+            return;
+        };
         const trace_eval = self.browser.measure.begin("evaljs");
         defer if (trace_eval) self.browser.measure.end("evaljs");
-        const js_context = frame.js_context orelse return;
+        const js_context = frame.js_context orelse {
+            if (self.is_interval) self.tab.clearInterval(
+                self.document.window_id,
+                self.document.generation,
+                self.handle,
+            );
+            return;
+        };
         js_context.runTimeoutCallback(self.document.window_id, self.handle) catch |err| {
             std.log.warn("setTimeout callback failed: {}", .{err});
+            if (self.is_interval and !self.tab.intervalIsActive(
+                self.document.window_id,
+                self.document.generation,
+                self.handle,
+            )) return;
         };
     }
 };
@@ -8286,6 +8353,7 @@ fn jsSetTimeoutCallback(
     context: ?*anyopaque,
     handle: u32,
     delay_ms: u32,
+    is_interval: bool,
 ) anyerror!void {
     const ctx_ptr = context orelse return error.MissingJsContext;
     const raw_ctx: *align(1) JsRenderContext = @ptrCast(ctx_ptr);
@@ -8300,7 +8368,22 @@ fn jsSetTimeoutCallback(
     const raw_tab: *align(1) Tab = @ptrCast(tab_ptr);
     const tab: *Tab = @alignCast(raw_tab);
 
-    try browser.scheduleSetTimeoutTask(tab, ctx, handle, delay_ms);
+    try browser.scheduleSetTimeoutTask(tab, ctx, handle, delay_ms, is_interval);
+}
+
+fn jsClearIntervalCallback(
+    context: ?*anyopaque,
+    handle: u32,
+) void {
+    const ctx_ptr = context orelse return;
+    const raw_ctx: *align(1) JsRenderContext = @ptrCast(ctx_ptr);
+    const ctx: *JsRenderContext = @alignCast(raw_ctx);
+
+    const tab_ptr = ctx.tab_ptr orelse return;
+    const raw_tab: *align(1) Tab = @ptrCast(tab_ptr);
+    const tab: *Tab = @alignCast(raw_tab);
+
+    tab.clearInterval(ctx.window_id, ctx.currentGeneration(), handle);
 }
 
 fn jsRequestAnimationFrameCallback(

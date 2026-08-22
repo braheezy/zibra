@@ -148,6 +148,13 @@ and process-shared bookmark/visited state.
 drag cancellation, synthetic-mouse de-duplication, link cancellation, and
 touch activation of browser chrome on a touch-capable display.
 
+`tests/manual/set-interval-cadence.html` records min/average/max spacing for
+16, 50, and 125ms intervals while requestAnimationFrame repeatedly forces
+style, layout, and paint work. It must reach a stable DONE state after all
+three callbacks call `clearInterval`; timing variance is expected and visible.
+It also immediately clears a one-hour interval, so a completed windowless run
+proves cancellation releases the sleeping native helper promptly.
+
 Choose the narrowest check that covers the pipeline stage under change. A DOM
 or parser regression should normally add a DOM dump or unit fixture before a
 full screenshot fixture.

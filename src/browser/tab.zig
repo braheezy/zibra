@@ -145,6 +145,12 @@ pub const LiveSetting = enum {
     assertive,
 };
 
+const IntervalKey = struct {
+    window_id: u32,
+    document_generation: u64,
+    handle: u32,
+};
+
 pub const Frame = struct {
     allocator: std.mem.Allocator,
     tab: *Tab,
@@ -218,6 +224,12 @@ pub const Frame = struct {
     }
 
     pub fn deinit(self: *Frame) void {
+        // A zero generation has never hosted a live JavaScript document. This
+        // guard also keeps lightweight Frame-only tests from needing to
+        // initialize the Tab-owned interval registry.
+        if (self.document_generation != 0) {
+            self.tab.clearIntervalsForDocument(self.window_id, self.document_generation);
+        }
         if (self.js_context) |ctx| {
             ctx.setNodes(self.window_id, null);
         }
@@ -871,6 +883,11 @@ task_runner: TaskRunner,
 async_thread_refs: usize = 0,
 async_thread_mutex: sync.Mutex,
 async_thread_condition: sync.Condition,
+// Native cancellation registry for sleeping setInterval helpers. The key is a
+// complete document identity so reused per-window JavaScript handles cannot
+// cancel a timer from another frame or navigation generation.
+intervals: std.AutoHashMap(IntervalKey, void),
+interval_mutex: sync.Mutex,
 shutting_down: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
 // Separate dirty flags for render phases
 needs_style: bool = true,
@@ -915,6 +932,8 @@ pub fn init(allocator: std.mem.Allocator, tab_width: i32, tab_height: i32, measu
         .task_runner = TaskRunner.init(allocator, measure),
         .async_thread_mutex = .init(measure.io),
         .async_thread_condition = .init(measure.io),
+        .intervals = std.AutoHashMap(IntervalKey, void).init(allocator),
+        .interval_mutex = .init(measure.io),
         .visited_generation = 0,
         .activation_commit_requested = std.atomic.Value(bool).init(false),
         .composited_updates = std.ArrayList(CompositedUpdate).empty,
@@ -1009,6 +1028,9 @@ pub fn start(self: *Tab) !void {
 /// only after this boundary.
 pub fn shutdown(self: *Tab) void {
     self.shutting_down.store(true, .seq_cst);
+    self.interval_mutex.lock();
+    self.intervals.clearRetainingCapacity();
+    self.interval_mutex.unlock();
 
     // Joining the serialized worker first prevents an active task from
     // launching a new helper after the helper count has reached zero.
@@ -1027,6 +1049,7 @@ pub fn deinit(self: *Tab) void {
     }
     self.frames_by_id.deinit();
     self.parent_window_ids.deinit();
+    self.intervals.deinit();
 
     var js_it = self.js_contexts.iterator();
     while (js_it.next()) |entry| {
@@ -1146,6 +1169,10 @@ pub fn invalidateJsContext(self: *Tab) void {
     self.parent_window_ids.clearRetainingCapacity();
     var it = self.frames_by_id.valueIterator();
     while (it.next()) |frame_ptr| {
+        self.clearIntervalsForDocument(
+            frame_ptr.*.window_id,
+            frame_ptr.*.document_generation,
+        );
         frame_ptr.*.document_generation = 0;
         frame_ptr.*.js_render_context.setGeneration(0);
         frame_ptr.*.js_render_context.setPointers(null, null, null, 0);
@@ -1160,6 +1187,80 @@ pub fn retainAsyncThread(self: *Tab) void {
     self.async_thread_mutex.lock();
     self.async_thread_refs += 1;
     self.async_thread_mutex.unlock();
+}
+
+pub fn ensureInterval(
+    self: *Tab,
+    window_id: u32,
+    document_generation: u64,
+    handle: u32,
+) !void {
+    if (self.isShuttingDown()) return error.TabShuttingDown;
+    self.interval_mutex.lock();
+    defer self.interval_mutex.unlock();
+    if (self.isShuttingDown()) return error.TabShuttingDown;
+    try self.intervals.put(.{
+        .window_id = window_id,
+        .document_generation = document_generation,
+        .handle = handle,
+    }, {});
+}
+
+pub fn clearInterval(
+    self: *Tab,
+    window_id: u32,
+    document_generation: u64,
+    handle: u32,
+) void {
+    self.interval_mutex.lock();
+    defer self.interval_mutex.unlock();
+    _ = self.intervals.remove(.{
+        .window_id = window_id,
+        .document_generation = document_generation,
+        .handle = handle,
+    });
+}
+
+pub fn intervalIsActive(
+    self: *Tab,
+    window_id: u32,
+    document_generation: u64,
+    handle: u32,
+) bool {
+    self.interval_mutex.lock();
+    defer self.interval_mutex.unlock();
+    return self.intervals.contains(.{
+        .window_id = window_id,
+        .document_generation = document_generation,
+        .handle = handle,
+    });
+}
+
+pub fn clearIntervalsForDocument(
+    self: *Tab,
+    window_id: u32,
+    document_generation: u64,
+) void {
+    self.interval_mutex.lock();
+    defer self.interval_mutex.unlock();
+
+    while (true) {
+        var found: ?IntervalKey = null;
+        var it = self.intervals.keyIterator();
+        while (it.next()) |key| {
+            if (key.window_id == window_id and
+                key.document_generation == document_generation)
+            {
+                found = key.*;
+                break;
+            }
+        }
+        if (found) |key| {
+            _ = self.intervals.remove(key);
+        } else {
+            break;
+        }
+    }
 }
 
 pub fn releaseAsyncThread(self: *Tab) void {
