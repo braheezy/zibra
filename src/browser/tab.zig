@@ -1479,6 +1479,7 @@ fn replaceIframesInList(
                         .opacity = blend_item.opacity,
                         .blend_mode = mode_copy,
                         .blur_radius = blend_item.blur_radius,
+                        .hit_clip = blend_item.hit_clip,
                         .children = child_slice,
                         .node = blend_item.node,
                         .parent = null,

@@ -168,6 +168,14 @@ before changing `root.zig`, `tab.zig`, `render/`, or browser task scheduling.
   `stopPropagation`. `link_bounds` and `iframe_bounds` may support
   layout-derived accessibility/coordinate bookkeeping, but must not select a
   click target; keep focus, accessibility, and fragment bounds intact.
+- Rounded backgrounds are rounded hit targets, not their containing
+  rectangles: corner misses continue through reverse paint order to visible
+  content underneath. Keep an ordinary rounded element's complete paint group,
+  plus input and rich-button payloads, under non-painting rounded hit-clip
+  metadata so text, glyphs, and child commands cannot restore square click
+  corners. Inputs and rich-button outer boxes also emit the same rounded
+  primitive as ordinary block backgrounds. Preserve hit clips in retained-list
+  clones and translation walks, including at fractional zoom.
 - `scroll.zig` is the single source of truth for CSS scroll ranges and native
   scrollbar-thumb geometry. Clamping and drawing must use the same metrics.
 - Fragment targets are layout-derived document-space positions that borrow DOM

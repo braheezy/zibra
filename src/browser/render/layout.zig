@@ -123,6 +123,159 @@ fn parseCssPixelLength(value: []const u8) ?i32 {
     return @intFromFloat(pixels);
 }
 
+/// Parse the single-radius subset supported by paint and hit testing. Invalid,
+/// negative, and non-pixel radii fall back to a square box.
+fn parseCssPixelRadius(value: []const u8) f64 {
+    const trimmed = std.mem.trim(u8, value, " \t\r\n");
+    if (trimmed.len < 2 or !std.ascii.eqlIgnoreCase(trimmed[trimmed.len - 2 ..], "px")) return 0;
+
+    const number = std.mem.trim(u8, trimmed[0 .. trimmed.len - 2], " \t\r\n");
+    if (number.len == 0) return 0;
+    const radius = std.fmt.parseFloat(f64, number) catch return 0;
+    return if (std.math.isFinite(radius) and radius > 0) radius else 0;
+}
+
+fn appendBackgroundBox(
+    commands: *std.ArrayList(DisplayItem),
+    allocator: std.mem.Allocator,
+    x: i32,
+    y: i32,
+    width: i32,
+    height: i32,
+    radius: f64,
+    color: browser.Color,
+    source: ?browser.DisplayItemSource,
+) !void {
+    if (color.a == 0) return;
+    if (radius > 0) {
+        try commands.append(allocator, .{ .rounded_rect = .{
+            .x1 = x,
+            .y1 = y,
+            .x2 = x + width,
+            .y2 = y + height,
+            .radius = radius,
+            .color = color,
+            .source = source,
+        } });
+    } else {
+        try commands.append(allocator, .{ .rect = .{
+            .x1 = x,
+            .y1 = y,
+            .x2 = x + width,
+            .y2 = y + height,
+            .color = color,
+            .source = source,
+        } });
+    }
+}
+
+/// Wrap one control's complete painted payload in its rounded hit shape.
+/// Non-painting group metadata constrains glyph and descendant-command hits
+/// that would otherwise restore the square containing rectangle after the
+/// rounded background itself missed.
+fn appendRoundedControlGroup(
+    destination: *std.ArrayList(DisplayItem),
+    allocator: std.mem.Allocator,
+    items: *std.ArrayList(DisplayItem),
+    x: i32,
+    y: i32,
+    width: i32,
+    height: i32,
+    radius: f64,
+    source: ?browser.DisplayItemSource,
+) !void {
+    const children = try items.toOwnedSlice(allocator);
+    var children_owned = true;
+    errdefer if (children_owned) DisplayItem.freeList(allocator, children);
+
+    try destination.append(allocator, .{ .blend = .{
+        .opacity = 1.0,
+        .blend_mode = null,
+        .hit_clip = .{
+            .x1 = x,
+            .y1 = y,
+            .x2 = x + width,
+            .y2 = y + height,
+            .radius = radius,
+        },
+        .children = children,
+        .needs_compositing = false,
+        .source = source,
+    } });
+    children_owned = false;
+}
+
+test "control backgrounds preserve CSS border radius in hit geometry" {
+    try std.testing.expectEqual(@as(f64, 12.5), parseCssPixelRadius(" 12.5px "));
+    try std.testing.expectEqual(@as(f64, 0), parseCssPixelRadius("-4px"));
+    try std.testing.expectEqual(@as(f64, 0), parseCssPixelRadius("50%"));
+
+    var commands = std.ArrayList(DisplayItem).empty;
+    defer commands.deinit(std.testing.allocator);
+    var origin: u8 = 0;
+    try appendBackgroundBox(
+        &commands,
+        std.testing.allocator,
+        0,
+        0,
+        100,
+        40,
+        20,
+        .{ .r = 1, .g = 2, .b = 3, .a = 255 },
+        .{ .layout = @ptrCast(&origin), .node = null },
+    );
+
+    try std.testing.expect(commands.items[0] == .rounded_rect);
+    try std.testing.expect(DisplayItem.hitTestDevice(commands.items, 50, 20, 1.0) != null);
+    try std.testing.expect(DisplayItem.hitTestDevice(commands.items, 1, 1, 1.0) == null);
+
+    // A control's text/checkmark commands carry the same source and may cover
+    // the square corner. The group clip must still keep that corner inert.
+    var control_content = std.ArrayList(DisplayItem).empty;
+    defer {
+        DisplayItem.freeItems(std.testing.allocator, control_content.items);
+        control_content.deinit(std.testing.allocator);
+    }
+    try appendBackgroundBox(
+        &control_content,
+        std.testing.allocator,
+        0,
+        0,
+        100,
+        40,
+        0,
+        .{ .r = 1, .g = 2, .b = 3, .a = 255 },
+        .{ .layout = @ptrCast(&origin), .node = null },
+    );
+    var grouped = std.ArrayList(DisplayItem).empty;
+    defer {
+        DisplayItem.freeItems(std.testing.allocator, grouped.items);
+        grouped.deinit(std.testing.allocator);
+    }
+    try appendRoundedControlGroup(
+        &grouped,
+        std.testing.allocator,
+        &control_content,
+        0,
+        0,
+        100,
+        40,
+        20,
+        .{ .layout = @ptrCast(&origin), .node = null },
+    );
+    try std.testing.expect(grouped.items[0] == .blend);
+    try std.testing.expect(grouped.items[0].blend.hit_clip != null);
+    try std.testing.expect(grouped.items[0].blend.blend_mode == null);
+    try std.testing.expect(!grouped.items[0].blend.needs_compositing);
+    try std.testing.expect(DisplayItem.hitTestDevice(grouped.items, 50, 20, 1.0) != null);
+    try std.testing.expect(DisplayItem.hitTestDevice(grouped.items, 1, 1, 1.0) == null);
+
+    const cloned = try cloneDisplayListOwned(std.testing.allocator, grouped.items);
+    defer DisplayItem.freeList(std.testing.allocator, cloned);
+    try std.testing.expect(cloned[0].blend.hit_clip != null);
+    try std.testing.expect(DisplayItem.hitTestDevice(cloned, 1, 1, 1.0) == null);
+}
+
 fn drawCursor(
     commands: *std.ArrayList(DisplayItem),
     allocator: std.mem.Allocator,
@@ -2718,6 +2871,7 @@ const InputLayout = struct {
     font_family: FontFamily = .proportional,
     color: browser.Color = .{ .r = 0, .g = 0, .b = 0, .a = 255 },
     bgcolor: browser.Color = .{ .r = 173, .g = 216, .b = 230, .a = 255 }, // lightblue
+    border_radius: f64 = 0,
     text: []const u8 = "",
     is_focused: bool = false,
     is_checkbox: bool = false,
@@ -2752,6 +2906,9 @@ const InputLayout = struct {
                 if (parseColor(bg)) |col| {
                     self.bgcolor = col;
                 }
+            }
+            if (styleValue(style_map, "border-radius")) |radius| {
+                self.border_radius = parseCssPixelRadius(radius);
             }
         }
 
@@ -2802,23 +2959,28 @@ const InputLayout = struct {
         const width_value = self.embed.width.get().*;
         const height_value = self.embed.height.get().*;
         const ascent_value = self.embed.ascent.get().*;
-        const remapped_bg = engine.remapColor(self.bgcolor);
-        if (remapped_bg.a > 0) {
-            try commands.append(engine.allocator, DisplayItem{
-                .rect = .{
-                    .x1 = x,
-                    .y1 = y,
-                    .x2 = x + width_value,
-                    .y2 = y + height_value,
-                    .color = remapped_bg,
-                    .source = source,
-                },
-            });
+        var rounded_items = std.ArrayList(DisplayItem).empty;
+        defer {
+            DisplayItem.freeItems(engine.allocator, rounded_items.items);
+            rounded_items.deinit(engine.allocator);
         }
+        const target = if (self.border_radius > 0) &rounded_items else commands;
+        const remapped_bg = engine.remapColor(self.bgcolor);
+        try appendBackgroundBox(
+            target,
+            engine.allocator,
+            x,
+            y,
+            width_value,
+            height_value,
+            self.border_radius,
+            remapped_bg,
+            source,
+        );
 
         if (self.is_checkbox) {
             const ink = engine.remapColor(.{ .r = 48, .g = 48, .b = 48, .a = 255 });
-            try commands.append(engine.allocator, DisplayItem{
+            try target.append(engine.allocator, DisplayItem{
                 .outline = .{
                     .rect = .{
                         .left = x,
@@ -2836,7 +2998,7 @@ const InputLayout = struct {
                 const joint_x = x + @divTrunc(width_value, 2) - 1;
                 const joint_y = y + height_value - padding;
                 const thickness = @max(@divTrunc(height_value, 7), 1);
-                try commands.append(engine.allocator, DisplayItem{
+                try target.append(engine.allocator, DisplayItem{
                     .line = .{
                         .x1 = x + padding,
                         .y1 = y + @divTrunc(height_value, 2),
@@ -2847,7 +3009,7 @@ const InputLayout = struct {
                         .source = source,
                     },
                 });
-                try commands.append(engine.allocator, DisplayItem{
+                try target.append(engine.allocator, DisplayItem{
                     .line = .{
                         .x1 = joint_x,
                         .y1 = joint_y,
@@ -2858,6 +3020,19 @@ const InputLayout = struct {
                         .source = source,
                     },
                 });
+            }
+            if (self.border_radius > 0) {
+                try appendRoundedControlGroup(
+                    commands,
+                    engine.allocator,
+                    &rounded_items,
+                    x,
+                    y,
+                    width_value,
+                    height_value,
+                    self.border_radius,
+                    source,
+                );
             }
             return;
         }
@@ -2878,7 +3053,7 @@ const InputLayout = struct {
                     self.font_family,
                 );
 
-                try commands.append(engine.allocator, DisplayItem{
+                try target.append(engine.allocator, DisplayItem{
                     .glyph = .{
                         .x = text_x,
                         .y = baseline_y - engine.toLayoutPx(glyph.ascent),
@@ -2893,12 +3068,26 @@ const InputLayout = struct {
 
         if (self.is_focused) {
             try drawCursor(
-                commands,
+                target,
                 engine.allocator,
                 text_x,
                 y,
                 height_value,
                 engine.remapColor(.{ .r = 255, .g = 0, .b = 0, .a = 255 }),
+                source,
+            );
+        }
+
+        if (self.border_radius > 0) {
+            try appendRoundedControlGroup(
+                commands,
+                engine.allocator,
+                &rounded_items,
+                x,
+                y,
+                width_value,
+                height_value,
+                self.border_radius,
                 source,
             );
         }
@@ -2951,6 +3140,7 @@ const ButtonLayout = struct {
     root: ?*BlockLayout = null,
     commands: std.ArrayList(DisplayItem),
     bgcolor: browser.Color = .{ .r = 255, .g = 165, .b = 0, .a = 255 },
+    border_radius: f64 = 0,
     content_offset_x: i32 = button_padding,
     content_offset_y: i32 = button_padding,
     input_bounds: std.AutoHashMap(*Node, Bounds),
@@ -3018,6 +3208,9 @@ const ButtonLayout = struct {
         if (element.style) |*style_map| {
             if (styleValue(style_map, "background-color")) |background| {
                 if (parseColor(background)) |color| self.bgcolor = color;
+            }
+            if (styleValue(style_map, "border-radius")) |radius| {
+                self.border_radius = parseCssPixelRadius(radius);
             }
         }
 
@@ -3115,26 +3308,51 @@ const ButtonLayout = struct {
         const translate_y = y + self.content_offset_y;
         try self.mergeBounds(engine, translate_x, translate_y);
 
-        try destination.append(engine.allocator, .{ .rect = .{
-            .x1 = x,
-            .y1 = y,
-            .x2 = x + self.embed.width.get().*,
-            .y2 = y + self.embed.height.get().*,
-            .color = engine.remapColor(self.bgcolor),
-            .source = source,
-        } });
+        var rounded_items = std.ArrayList(DisplayItem).empty;
+        defer {
+            DisplayItem.freeItems(engine.allocator, rounded_items.items);
+            rounded_items.deinit(engine.allocator);
+        }
+        const target = if (self.border_radius > 0) &rounded_items else destination;
 
-        if (self.commands.items.len == 0) return;
-        const children = try self.commands.toOwnedSlice(engine.allocator);
-        var children_owned = true;
-        errdefer if (children_owned) DisplayItem.freeList(engine.allocator, children);
-        try destination.append(engine.allocator, .{ .transform = .{
-            .translate_x = translate_x,
-            .translate_y = translate_y,
-            .children = children,
-            .source = source,
-        } });
-        children_owned = false;
+        try appendBackgroundBox(
+            target,
+            engine.allocator,
+            x,
+            y,
+            self.embed.width.get().*,
+            self.embed.height.get().*,
+            self.border_radius,
+            engine.remapColor(self.bgcolor),
+            source,
+        );
+
+        if (self.commands.items.len > 0) {
+            const children = try self.commands.toOwnedSlice(engine.allocator);
+            var children_owned = true;
+            errdefer if (children_owned) DisplayItem.freeList(engine.allocator, children);
+            try target.append(engine.allocator, .{ .transform = .{
+                .translate_x = translate_x,
+                .translate_y = translate_y,
+                .children = children,
+                .source = source,
+            } });
+            children_owned = false;
+        }
+
+        if (self.border_radius > 0) {
+            try appendRoundedControlGroup(
+                destination,
+                engine.allocator,
+                &rounded_items,
+                x,
+                y,
+                self.embed.width.get().*,
+                self.embed.height.get().*,
+                self.border_radius,
+                source,
+            );
+        }
     }
 
     fn mergeBounds(self: *ButtonLayout, engine: *Layout, dx: i32, dy: i32) !void {
@@ -3342,6 +3560,7 @@ fn cloneDisplayItemOwned(
                 .opacity = blend.opacity,
                 .blend_mode = blend_mode,
                 .blur_radius = blend.blur_radius,
+                .hit_clip = blend.hit_clip,
                 .children = children,
                 .node = blend.node,
                 .parent = null,
@@ -5114,13 +5333,7 @@ fn addBackgroundIfNeeded(self: *Layout, block: *const BlockLayout) !void {
             if (color) |col| {
                 const remapped = self.remapColor(col);
                 // Parse border-radius if present
-                var radius: f64 = 0.0;
-                if (border_radius_str) |br_str| {
-                    if (std.mem.endsWith(u8, br_str, "px")) {
-                        const radius_str = br_str[0 .. br_str.len - 2];
-                        radius = std.fmt.parseFloat(f64, radius_str) catch 0.0;
-                    }
-                }
+                const radius = if (border_radius_str) |br_str| parseCssPixelRadius(br_str) else 0;
 
                 const block_width = block.width.get().*;
                 const block_x = block.x.get().*;
@@ -5293,6 +5506,8 @@ fn writeDisplayItemsDebug(writer: *std.Io.Writer, items: []const DisplayItem, in
             .blend => |blend| {
                 if (blend.blur_radius > 0.0) {
                     try writer.print("filter blur({d}px)\n", .{blend.blur_radius});
+                } else if (blend.hit_clip) |clip| {
+                    try writer.print("hit-clip rounded x1={d} y1={d} x2={d} y2={d} radius={d}\n", .{ clip.x1, clip.y1, clip.x2, clip.y2, clip.radius });
                 } else {
                     try writer.print("blend opacity={d} mode={s}\n", .{ blend.opacity, blend.blend_mode orelse "normal" });
                 }
@@ -5384,15 +5599,11 @@ fn applyPaintEffects(self: *Layout, block: *BlockLayout, commands: []DisplayItem
             if (styleValue(style_map, "filter")) |filter_str| {
                 blur_radius = parseBlurFilter(filter_str) orelse 0.0;
             }
+            if (styleValue(style_map, "border-radius")) |radius_str| {
+                border_radius = parseCssPixelRadius(radius_str);
+            }
             if (std.mem.eql(u8, styleValue(style_map, "overflow") orelse "visible", "clip")) {
                 should_clip = true;
-                if (styleValue(style_map, "border-radius")) |radius_str| {
-                    // Parse border-radius (e.g., "30px" -> 30.0)
-                    if (std.mem.endsWith(u8, radius_str, "px")) {
-                        const radius_value = radius_str[0 .. radius_str.len - 2];
-                        border_radius = std.fmt.parseFloat(f64, radius_value) catch 0.0;
-                    }
-                }
             }
             // Parse transform: translate(xpx, ypx)
             if (styleValue(style_map, "transform")) |transform_str| {
@@ -5489,7 +5700,7 @@ fn applyPaintEffects(self: *Layout, block: *BlockLayout, commands: []DisplayItem
     }
 
     // Only create a blend operation if we have effects to apply
-    if (opacity < 1.0 or final_blend_mode != null or blur_radius > 0.0) {
+    if (opacity < 1.0 or final_blend_mode != null or blur_radius > 0.0 or border_radius > 0.0) {
         const wrapped_commands = try self.allocator.alloc(DisplayItem, current_commands.len);
         @memcpy(wrapped_commands, current_commands);
 
@@ -5505,6 +5716,13 @@ fn applyPaintEffects(self: *Layout, block: *BlockLayout, commands: []DisplayItem
             .blend = .{
                 .opacity = opacity,
                 .blend_mode = final_blend_mode,
+                .hit_clip = if (border_radius > 0.0) .{
+                    .x1 = block.x.get().*,
+                    .y1 = block.y.get().*,
+                    .x2 = block.x.get().* + block.width.get().*,
+                    .y2 = block.y.get().* + block.height.get().*,
+                    .radius = border_radius,
+                } else null,
                 .children = wrapped_commands,
                 .node = node_ptr,
                 .needs_compositing = needs_compositing,
@@ -5600,13 +5818,7 @@ fn addBackgroundIfNeededToList(self: *Layout, commands: *std.ArrayList(DisplayIt
             if (color) |col| {
                 const remapped = self.remapColor(col);
                 // Parse border-radius if present
-                var radius: f64 = 0.0;
-                if (border_radius_str) |br_str| {
-                    if (std.mem.endsWith(u8, br_str, "px")) {
-                        const radius_str = br_str[0 .. br_str.len - 2];
-                        radius = std.fmt.parseFloat(f64, radius_str) catch 0.0;
-                    }
-                }
+                const radius = if (border_radius_str) |br_str| parseCssPixelRadius(br_str) else 0;
 
                 const block_width = block.width.get().*;
                 const block_x = block.x.get().*;

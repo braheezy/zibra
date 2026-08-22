@@ -463,7 +463,15 @@ a later button start out of this case by implicitly closing the active button.
 `DisplayItem.hitTestDevice` is a pure walk over the retained frame list. It
 visits items in reverse paint order, inverts translation transforms, treats
 `dst_in` masks as clipping operators rather than click targets, and checks
-primitive paint geometry. Native click tasks retain the exact device point and
+primitive paint geometry. A rounded rectangle uses its clamped corner circles,
+so a point inside its containing rectangle but outside a rounded corner misses
+that item and the walk may select painted content underneath. The complete
+paint group of an ordinary rounded element carries an owning blend's
+non-painting `hit_clip`; inputs and rich buttons preserve authored radii by
+emitting the same primitive and grouping their payload the same way. Thus text,
+control glyphs, and rich descendants cannot restore a rectangular hit region,
+and no composited visual mask is required. Native click
+tasks retain the exact device point and
 the committed zoom snapshot; CSS positions and translations use the same
 truncating scale rule as raster, while cached glyph widths/heights remain exact
 device bitmap dimensions. `Frame.click` normalizes the hit to its painted

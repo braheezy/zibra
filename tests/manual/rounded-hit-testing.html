@@ -1,0 +1,55 @@
+<!--
+How to verify:
+1. Click a few pixels inside each orange control's square corner. The counters
+   must stay at zero because those pixels are outside the rounded shape.
+2. Click the visibly orange center of each control. Only that control's counter
+   should increment.
+3. Repeat at a non-default page zoom; the painted edge and click edge must stay
+   aligned.
+-->
+<!doctype html>
+<html>
+<head>
+  <title>Rounded hit testing</title>
+  <style>
+    body { background-color: white; color: black; font-size: 18px; }
+    .rounded { width: 220px; height: 64px; background-color: orange; border-radius: 28px; }
+    button { width: 220px; height: 64px; background-color: orange; border-radius: 28px; }
+    input { width: 220px; height: 64px; background-color: orange; border-radius: 28px; }
+    #hitStatus { background-color: lightblue; }
+  </style>
+</head>
+<body>
+  <h1>Rounded hit testing</h1>
+  <p>Corner clicks do nothing; center clicks increment one counter.</p>
+  <p id="hitStatus">block=0, button=0, input=0</p>
+  <p>Rounded block:</p>
+  <div id="roundedBlock" class="rounded"></div>
+  <p>Rounded button:</p>
+  <p><button id="roundedButton"><b>rounded button</b></button></p>
+  <p>Rounded input:</p>
+  <p><input id="roundedInput" value=""></p>
+  <script>
+    var blockClicks = 0;
+    var buttonClicks = 0;
+    var inputClicks = 0;
+
+    function showCounts() {
+      hitStatus.innerHTML = 'block=' + blockClicks + ', button=' + buttonClicks + ', input=' + inputClicks;
+    }
+
+    roundedBlock.addEventListener('click', function() {
+      blockClicks = blockClicks + 1;
+      showCounts();
+    });
+    roundedButton.addEventListener('click', function() {
+      buttonClicks = buttonClicks + 1;
+      showCounts();
+    });
+    roundedInput.addEventListener('click', function() {
+      inputClicks = inputClicks + 1;
+      showCounts();
+    });
+  </script>
+</body>
+</html>

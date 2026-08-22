@@ -123,6 +123,10 @@ translation, rounded-clip, overlap, and iframe click routing. Only the visible
 topmost painted target should activate; its child and destination pages are
 support fixtures in the same directory.
 
+`tests/manual/rounded-hit-testing.html` isolates rounded-corner targeting for
+ordinary blocks, rich buttons, and text inputs. Corner clicks leave the visible
+counters unchanged while clicks in painted centers increment exactly one.
+
 `tests/manual/blur-filter.html` exercises subtree blur together with rounded
 overflow clipping, group opacity, and translation. Its display-list dump also
 keeps the filter wrapper's serialized contract pointer-free.

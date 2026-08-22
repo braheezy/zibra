@@ -69,6 +69,85 @@ test "display list hit testing chooses the topmost overlapping primitive" {
     try std.testing.expect(lower_only.source.layout == @as(*const anyopaque, @ptrCast(&lower_generator)));
 }
 
+test "rounded element corners fall through to painted content underneath" {
+    var lower_generator: u8 = 0;
+    var rounded_generator: u8 = 0;
+    const items = [_]DisplayItem{
+        rect(0, 0, 100, 60, source(&lower_generator, null)),
+        .{ .rounded_rect = .{
+            .x1 = 0,
+            .y1 = 0,
+            .x2 = 100,
+            .y2 = 60,
+            .radius = 24,
+            .color = test_color,
+            .source = source(&rounded_generator, null),
+        } },
+    };
+
+    const rounded_center = DisplayItem.hitTestDevice(&items, 50, 30, 1.0).?;
+    try std.testing.expect(rounded_center.source.layout == @as(*const anyopaque, @ptrCast(&rounded_generator)));
+
+    // The point is inside the rounded element's border box but outside its
+    // painted corner, so the rounded element must not become the click target.
+    const clipped_corner = DisplayItem.hitTestDevice(&items, 2, 2, 1.0).?;
+    try std.testing.expect(clipped_corner.source.layout == @as(*const anyopaque, @ptrCast(&lower_generator)));
+
+    // Fractional zoom uses the same device-space geometry as rasterization.
+    const scaled_corner = DisplayItem.hitTestDevice(&items, 2, 2, 1.25).?;
+    try std.testing.expect(scaled_corner.source.layout == @as(*const anyopaque, @ptrCast(&lower_generator)));
+
+    var translated_children = [_]DisplayItem{items[1]};
+    const translated = [_]DisplayItem{
+        items[0],
+        .{ .transform = .{
+            .translate_x = 10,
+            .translate_y = 10,
+            .children = &translated_children,
+        } },
+    };
+    const translated_center = DisplayItem.hitTestDevice(&translated, 74, 49, 1.25).?;
+    try std.testing.expect(translated_center.source.layout == @as(*const anyopaque, @ptrCast(&rounded_generator)));
+    const translated_corner = DisplayItem.hitTestDevice(&translated, 14, 14, 1.25).?;
+    try std.testing.expect(translated_corner.source.layout == @as(*const anyopaque, @ptrCast(&lower_generator)));
+}
+
+test "rounded element hit clip constrains descendant paint commands" {
+    var lower_generator: u8 = 0;
+    var rounded_generator: u8 = 0;
+    var rounded_children = [_]DisplayItem{
+        // Model text or another descendant whose primitive bounds extend into
+        // the containing rectangle's rounded-off corner.
+        rect(0, 0, 100, 60, source(&rounded_generator, null)),
+    };
+    const items = [_]DisplayItem{
+        rect(0, 0, 100, 60, source(&lower_generator, null)),
+        .{ .blend = .{
+            .opacity = 1.0,
+            .blend_mode = null,
+            .hit_clip = .{ .x1 = 0, .y1 = 0, .x2 = 100, .y2 = 60, .radius = 24 },
+            .children = &rounded_children,
+        } },
+    };
+
+    const center = DisplayItem.hitTestDevice(&items, 50, 30, 1.0).?;
+    try std.testing.expect(center.source.layout == @as(*const anyopaque, @ptrCast(&rounded_generator)));
+    const corner = DisplayItem.hitTestDevice(&items, 2, 2, 1.0).?;
+    try std.testing.expect(corner.source.layout == @as(*const anyopaque, @ptrCast(&lower_generator)));
+
+    var transformed_children = [_]DisplayItem{items[1]};
+    const transformed = [_]DisplayItem{
+        items[0],
+        .{ .transform = .{
+            .translate_x = 10,
+            .translate_y = 10,
+            .children = &transformed_children,
+        } },
+    };
+    const transformed_corner = DisplayItem.hitTestDevice(&transformed, 14, 14, 1.25).?;
+    try std.testing.expect(transformed_corner.source.layout == @as(*const anyopaque, @ptrCast(&lower_generator)));
+}
+
 test "display list hit testing inverts translations" {
     var generator: u8 = 0;
     var children = [_]DisplayItem{

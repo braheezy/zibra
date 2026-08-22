@@ -701,6 +701,14 @@ pub const DisplayItemSource = struct {
     }
 };
 
+pub const RoundedHitClip = struct {
+    x1: i32,
+    y1: i32,
+    x2: i32,
+    y2: i32,
+    radius: f64,
+};
+
 pub const DisplayItem = union(enum) {
     glyph: struct {
         x: i32,
@@ -753,6 +761,8 @@ pub const DisplayItem = union(enum) {
         /// CSS blur standard deviation in layout pixels. A positive value
         /// filters the complete child subtree before outer clip/opacity work.
         blur_radius: f64 = 0.0,
+        /// Optional non-painting clip for this group's click geometry.
+        hit_clip: ?RoundedHitClip = null,
         children: []DisplayItem,
         node: ?*anyopaque = null, // Reference back to the DOM node that created this effect
         parent: ?*const DisplayItem = null, // Parent blend for walking up the tree
@@ -871,6 +881,9 @@ pub const DisplayItem = union(enum) {
             switch (item.*) {
                 .blend => |blend_item| {
                     if (blend_item.opacity <= 0) continue;
+                    if (blend_item.hit_clip) |clip| {
+                        if (!pointInRoundedRect(x, y, clip, zoom)) continue;
+                    }
                     const is_dst_in = if (blend_item.blend_mode) |mode|
                         std.mem.eql(u8, mode, "dst_in")
                     else
@@ -920,6 +933,9 @@ pub const DisplayItem = union(enum) {
         return switch (item.*) {
             .blend => |blend_item| blk: {
                 if (blend_item.opacity <= 0) break :blk false;
+                if (blend_item.hit_clip) |clip| {
+                    if (!pointInRoundedRect(x, y, clip, zoom)) break :blk false;
+                }
                 const is_dst_in = if (blend_item.blend_mode) |mode|
                     std.mem.eql(u8, mode, "dst_in")
                 else
@@ -4686,6 +4702,7 @@ pub const Browser = struct {
                         .opacity = blend_item.opacity,
                         .blend_mode = mode_copy,
                         .blur_radius = blend_item.blur_radius,
+                        .hit_clip = blend_item.hit_clip,
                         .children = children,
                         .node = blend_item.node,
                         .parent = null,
@@ -5803,20 +5820,15 @@ pub const Browser = struct {
 
                         // Only draw rounded corners if radius is meaningful
                         if (radius > 0.5) {
-                            // Create rounded rectangle path using arcs
-                            // Top-left corner
                             try context.moveTo(x1 + radius, y1);
-                            try context.arc(x1 + radius, y1 + radius, radius, -std.math.pi, -std.math.pi / 2.0);
-
-                            // Top-right corner
+                            try context.lineTo(x2 - radius, y1);
                             try context.arc(x2 - radius, y1 + radius, radius, -std.math.pi / 2.0, 0);
-
-                            // Bottom-right corner
+                            try context.lineTo(x2, y2 - radius);
                             try context.arc(x2 - radius, y2 - radius, radius, 0, std.math.pi / 2.0);
-
-                            // Bottom-left corner
+                            try context.lineTo(x1 + radius, y2);
                             try context.arc(x1 + radius, y2 - radius, radius, std.math.pi / 2.0, std.math.pi);
-
+                            try context.lineTo(x1, y1 + radius);
+                            try context.arc(x1 + radius, y1 + radius, radius, -std.math.pi, -std.math.pi / 2.0);
                             try context.closePath();
                             try context.fill();
                         } else {
@@ -6157,21 +6169,39 @@ pub const Browser = struct {
                 const bottom = self.scalePxWithZoom(rr.y2, zoom) - scroll_offset;
                 const left = self.scalePxWithZoom(rr.x1, zoom) + x_offset;
                 const right = self.scalePxWithZoom(rr.x2, zoom) + x_offset;
-                if (bottom > 0 and top < self.window_height) {
-                    // Draw as a regular rect for simplicity in transformed context
+                const width = right - left;
+                const height = bottom - top;
+                if (width > 1 and height > 1 and bottom > 0 and top < self.window_height) {
                     context.resetPath();
-                    context.setSource(.{ .opaque_pattern = .{ .pixel = .{ .rgba = .{
-                        .r = rr.color.r,
-                        .g = rr.color.g,
-                        .b = rr.color.b,
-                        .a = rr.color.a,
-                    } } } });
-                    try context.moveTo(@floatFromInt(left), @floatFromInt(top));
-                    try context.lineTo(@floatFromInt(right), @floatFromInt(top));
-                    try context.lineTo(@floatFromInt(right), @floatFromInt(bottom));
-                    try context.lineTo(@floatFromInt(left), @floatFromInt(bottom));
+                    context.setSource(.{ .opaque_pattern = .{ .pixel = .{ .rgba = rr.color.toZ2dRgba() } } });
+                    const max_radius = @min(
+                        @as(f64, @floatFromInt(width)) / 2.0,
+                        @as(f64, @floatFromInt(height)) / 2.0,
+                    );
+                    const radius = @min(self.scalePxFWithZoom(rr.radius, zoom), max_radius);
+                    const x1: f64 = @floatFromInt(left);
+                    const y1: f64 = @floatFromInt(top);
+                    const x2: f64 = @floatFromInt(right);
+                    const y2: f64 = @floatFromInt(bottom);
+                    if (radius > 0.5) {
+                        try context.moveTo(x1 + radius, y1);
+                        try context.lineTo(x2 - radius, y1);
+                        try context.arc(x2 - radius, y1 + radius, radius, -std.math.pi / 2.0, 0);
+                        try context.lineTo(x2, y2 - radius);
+                        try context.arc(x2 - radius, y2 - radius, radius, 0, std.math.pi / 2.0);
+                        try context.lineTo(x1 + radius, y2);
+                        try context.arc(x1 + radius, y2 - radius, radius, std.math.pi / 2.0, std.math.pi);
+                        try context.lineTo(x1, y1 + radius);
+                        try context.arc(x1 + radius, y1 + radius, radius, -std.math.pi, -std.math.pi / 2.0);
+                    } else {
+                        try context.moveTo(x1, y1);
+                        try context.lineTo(x2, y1);
+                        try context.lineTo(x2, y2);
+                        try context.lineTo(x1, y2);
+                    }
                     try context.closePath();
                     try context.fill();
+                    context.resetPath();
                 }
             },
             .line => |l| {
@@ -6379,10 +6409,14 @@ pub const Browser = struct {
                     const y2: f64 = @floatFromInt(bottom);
                     if (radius > 0.5) {
                         try context.moveTo(x1 + radius, y1);
-                        try context.arc(x1 + radius, y1 + radius, radius, -std.math.pi, -std.math.pi / 2.0);
+                        try context.lineTo(x2 - radius, y1);
                         try context.arc(x2 - radius, y1 + radius, radius, -std.math.pi / 2.0, 0);
+                        try context.lineTo(x2, y2 - radius);
                         try context.arc(x2 - radius, y2 - radius, radius, 0, std.math.pi / 2.0);
+                        try context.lineTo(x1 + radius, y2);
                         try context.arc(x1 + radius, y2 - radius, radius, std.math.pi / 2.0, std.math.pi);
+                        try context.lineTo(x1, y1 + radius);
+                        try context.arc(x1 + radius, y1 + radius, radius, -std.math.pi, -std.math.pi / 2.0);
                     } else {
                         try context.moveTo(x1, y1);
                         try context.lineTo(x2, y1);
