@@ -66,6 +66,12 @@ fn nativeEvent(event_type: u32, window_id: u32) sdl2.Event {
             raw.wheel.windowID = window_id;
             raw.wheel.direction = sdl2.c.SDL_MOUSEWHEEL_NORMAL;
         },
+        sdl2.c.SDL_FINGERDOWN, sdl2.c.SDL_FINGERUP, sdl2.c.SDL_FINGERMOTION => {
+            raw.tfinger.type = event_type;
+            raw.tfinger.windowID = window_id;
+            raw.tfinger.touchId = 1;
+            raw.tfinger.fingerId = 2;
+        },
         else => unreachable,
     }
     return sdl2.Event.from(raw);
@@ -108,6 +114,13 @@ test "event routing extracts every mouse target" {
 
     try std.testing.expectEqual(@as(?u32, null), app.eventWindowId(.{ .unsupported = 0xffff }));
     try std.testing.expectEqual(@as(?u32, null), app.eventWindowId(nativeEvent(sdl2.c.SDL_MOUSEMOTION, 0)));
+}
+
+test "event routing extracts every touch target" {
+    try std.testing.expectEqual(@as(?u32, 51), app.eventWindowId(nativeEvent(sdl2.c.SDL_FINGERDOWN, 51)));
+    try std.testing.expectEqual(@as(?u32, 52), app.eventWindowId(nativeEvent(sdl2.c.SDL_FINGERMOTION, 52)));
+    try std.testing.expectEqual(@as(?u32, 53), app.eventWindowId(nativeEvent(sdl2.c.SDL_FINGERUP, 53)));
+    try std.testing.expectEqual(@as(?u32, null), app.eventWindowId(nativeEvent(sdl2.c.SDL_FINGERDOWN, 0)));
 }
 
 test "Ctrl+N accepts either control key and ignores ambient lock state" {

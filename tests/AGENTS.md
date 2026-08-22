@@ -144,6 +144,10 @@ keeps the filter wrapper's serialized contract pointer-free.
 creation, per-window tab/chrome/focus/scroll state, addressed close behavior,
 and process-shared bookmark/visited state.
 
+`tests/manual/touch-input.html` exercises single and simultaneous touch taps,
+drag cancellation, synthetic-mouse de-duplication, link cancellation, and
+touch activation of browser chrome on a touch-capable display.
+
 Choose the narrowest check that covers the pipeline stage under change. A DOM
 or parser regression should normally add a DOM dump or unit fixture before a
 full screenshot fixture.

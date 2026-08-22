@@ -82,6 +82,16 @@ before changing `root.zig`, `tab.zig`, `render/`, or browser task scheduling.
   accessibility focus, and triggers a repaint when a content cursor was
   removed. Address-bar transitions preserve tab-worker ownership by enqueueing
   that blur instead of mutating frame focus directly from the UI thread.
+- SDL finger coordinates are normalized; convert them against the addressed
+  Browser's current native-window dimensions before dispatch. Each Browser's
+  UI-thread-only touch tracker keys contacts by both touch-device and finger
+  identity, accepts a release as a primary click only while it remains within
+  the 10px tap slop, and clears unfinished contacts on focus loss. Keep a drag
+  canceled even if it returns to its start. SDL's synthetic touch-mouse and
+  mouse-touch mirror events must be ignored so one physical action cannot
+  activate twice. A completed tap reuses `Browser.handleClick`, preserving
+  chrome/page hit testing and the existing tab-worker task boundary without
+  retaining DOM or layout pointers.
 - Checkbox state is the presence of the DOM `checked` attribute, not a second
   widget-owned boolean. Primary or focused activation dispatches the cancelable
   click first, then toggles that attribute and repaints. Form encoding omits

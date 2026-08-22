@@ -22,6 +22,7 @@ pub fn eventWindowId(event: sdl2.Event) ?u32 {
         .mouse_motion => |motion_event| motion_event.window_id,
         .mouse_button_down, .mouse_button_up => |button_event| button_event.window_id,
         .mouse_wheel => |wheel_event| wheel_event.window_id,
+        .finger_down, .finger_up, .finger_motion => |finger_event| finger_event.windowID,
         .drop_file, .drop_text, .drop_begin, .drop_complete => |drop_event| drop_event.windowID,
         .user => |user_event| user_event.window_id,
         else => return null,

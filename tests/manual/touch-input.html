@@ -1,0 +1,64 @@
+<!--
+How to verify on a touch-capable display:
+1. Tap either colored target. Its counter must increment exactly once; a single
+   tap must never be followed by a duplicate synthetic-mouse click.
+2. Put a finger down on a target, drag well outside it, return, and release.
+   No counter should change because crossing the tap slop cancels the gesture.
+3. Touch both targets at the same time and release both. Each counter should
+   increment once, proving contacts are tracked independently.
+4. Tap the protected link. Its counter should increment without navigating.
+5. Tap the address bar and browser-chrome buttons; they should behave like
+   primary mouse clicks in the same native window.
+-->
+<!doctype html>
+<html>
+<head>
+  <title>Touch input</title>
+  <style>
+    body { background-color: white; color: black; font-size: 18px; }
+    button { width: 260px; height: 72px; }
+    #leftTarget { background-color: orange; }
+    #rightTarget { background-color: lightgreen; }
+    #status { background-color: lightblue; padding: 12px; }
+    #protectedLink { background-color: lightgreen; padding: 12px; }
+  </style>
+</head>
+<body>
+  <h1>Touch input</h1>
+  <p id="status">left=0, right=0, link=0</p>
+  <p>
+    <button id="leftTarget"><strong>left touch target</strong></button>
+  </p>
+  <p>
+    <button id="rightTarget"><strong>right touch target</strong></button>
+  </p>
+  <p>
+    <a id="protectedLink" href="data:text/html,<h1 style='color:red'>FAILED: touch followed the protected link</h1>">
+      protected touch link
+    </a>
+  </p>
+  <script>
+    var leftTouches = 0;
+    var rightTouches = 0;
+    var linkTouches = 0;
+
+    function showTouches() {
+      status.innerHTML = 'left=' + leftTouches + ', right=' + rightTouches + ', link=' + linkTouches;
+    }
+
+    leftTarget.addEventListener('click', function() {
+      leftTouches = leftTouches + 1;
+      showTouches();
+    });
+    rightTarget.addEventListener('click', function() {
+      rightTouches = rightTouches + 1;
+      showTouches();
+    });
+    protectedLink.addEventListener('click', function(event) {
+      linkTouches = linkTouches + 1;
+      event.preventDefault();
+      showTouches();
+    });
+  </script>
+</body>
+</html>

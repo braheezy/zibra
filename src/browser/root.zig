@@ -31,6 +31,7 @@ const HistoryDirection = tab_module.HistoryDirection;
 const HistoryNavigation = tab_module.HistoryNavigation;
 const BrowserSession = @import("session_state.zig").BrowserSession;
 const scroll_model = @import("scroll.zig");
+const touch_input = @import("touch.zig");
 const Chrome = @import("chrome.zig");
 const task_module = @import("../runtime/task.zig");
 const Task = task_module.Task;
@@ -1262,6 +1263,8 @@ pub const Browser = struct {
     tab_draw_list: std.ArrayList(DisplayItem),
     // Cached SDL texture for GPU-accelerated rendering
     cached_texture: ?sdl2.Texture = null,
+    // UI-thread-only active finger contacts for this native window.
+    touch_tracker: touch_input.Tracker,
     // Debug flag to visualize composited layer boundaries
     debug_layer_borders: bool = false,
     profiling_enabled: bool = false,
@@ -1475,6 +1478,7 @@ pub const Browser = struct {
             .measure = measure,
             .lock = .init(io),
             .cached_texture = cached_texture,
+            .touch_tracker = touch_input.Tracker.init(al),
             .composited_layers = std.ArrayList(CompositedLayer).empty,
             .tab_draw_list = std.ArrayList(DisplayItem).empty,
             .profiling_enabled = profiling_enabled,
@@ -2102,6 +2106,7 @@ pub const Browser = struct {
                 if (delta != 0) self.handleScroll(delta);
             },
             .mouse_button_down => |button_event| {
+                if (touch_input.isSyntheticMouse(button_event.mouse_instance_id)) return false;
                 switch (button_event.button) {
                     .left => try self.handleClick(button_event.x, button_event.y),
                     .middle => self.handleMiddleClick(button_event.x, button_event.y),
@@ -2109,7 +2114,45 @@ pub const Browser = struct {
                 }
             },
             .mouse_motion => |motion_event| {
+                if (touch_input.isSyntheticMouse(motion_event.mouse_instance_id)) return false;
                 try self.handleHover(motion_event.x, motion_event.y);
+            },
+            .finger_down => |finger_event| {
+                if (touch_input.isSyntheticTouch(finger_event.touchId)) return false;
+                self.touch_tracker.begin(
+                    finger_event.touchId,
+                    finger_event.fingerId,
+                    finger_event.x,
+                    finger_event.y,
+                    self.window_width,
+                    self.window_height,
+                ) catch |err| {
+                    std.log.warn("Failed to track touch contact: {}", .{err});
+                };
+            },
+            .finger_motion => |finger_event| {
+                if (touch_input.isSyntheticTouch(finger_event.touchId)) return false;
+                self.touch_tracker.motion(
+                    finger_event.touchId,
+                    finger_event.fingerId,
+                    finger_event.x,
+                    finger_event.y,
+                    self.window_width,
+                    self.window_height,
+                );
+            },
+            .finger_up => |finger_event| {
+                if (touch_input.isSyntheticTouch(finger_event.touchId)) return false;
+                if (self.touch_tracker.end(
+                    finger_event.touchId,
+                    finger_event.fingerId,
+                    finger_event.x,
+                    finger_event.y,
+                    self.window_width,
+                    self.window_height,
+                )) |point| {
+                    try self.handleClick(point.x, point.y);
+                }
             },
             .window => |window_event| {
                 try self.handleWindowEvent(window_event);
@@ -2122,6 +2165,7 @@ pub const Browser = struct {
     pub fn handleWindowEvent(self: *Browser, window_event: sdl2.WindowEvent) !void {
         const canvas = self.canvas orelse return;
         switch (window_event.type) {
+            .focus_lost => self.touch_tracker.clear(),
             .resized, .size_changed => |size| {
                 self.lock.lock();
                 const active_tab_height = self.active_tab_height;
@@ -6814,6 +6858,7 @@ pub const Browser = struct {
 
         for (self.pending_new_tabs.items) |*url| url.free(self.allocator);
         self.pending_new_tabs.deinit(self.allocator);
+        self.touch_tracker.deinit();
 
         if (self.owns_session) {
             self.session_state.deinit();

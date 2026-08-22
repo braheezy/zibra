@@ -129,6 +129,16 @@ so queued events for a stale ID cannot reach a retired Browser. An addressed
 close destroys only that entry; closing the final entry exits the process
 loop. SDL quit is ID-less and global. Escape also requests global quit, but it
 first routes through a live source Browser so stale Escape events are ignored.
+Raw finger events carry that same native window ID and remain routed to exactly
+one Browser. SDL reports their positions in normalized coordinates, so the
+receiving Browser converts them with its current native pixel dimensions and
+tracks each `(touchId, fingerId)` contact independently. Release within a 10px
+slop becomes the ordinary primary-click path; crossing the slop permanently
+cancels that gesture, and focus loss clears every unfinished contact. This
+tracker is UI-thread-only, owns no document pointers, and is destroyed with its
+Browser. SDL mouse events carrying the reserved touch-mouse device ID and
+finger events carrying the reserved mouse-touch device ID are ignored, so SDL's
+bidirectional compatibility streams cannot activate one physical action twice.
 
 Each `Browser` in [`src/browser/root.zig`](../src/browser/root.zig) owns:
 
@@ -471,8 +481,8 @@ paint group of an ordinary rounded element carries an owning blend's
 non-painting `hit_clip`; inputs and rich buttons preserve authored radii by
 emitting the same primitive and grouping their payload the same way. Thus text,
 control glyphs, and rich descendants cannot restore a rectangular hit region,
-and no composited visual mask is required. Native click
-tasks retain the exact device point and
+and no composited visual mask is required. Native mouse clicks and completed
+touch taps retain the exact device point and
 the committed zoom snapshot; CSS positions and translations use the same
 truncating scale rule as raster, while cached glyph widths/heights remain exact
 device bitmap dimensions. `Frame.click` normalizes the hit to its painted
