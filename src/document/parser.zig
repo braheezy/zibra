@@ -232,6 +232,12 @@ pub const Element = struct {
     // Browser-session annotation used only while painting link descendants.
     // It owns no URL or session storage.
     is_visited: bool = false,
+    // Persistent element-local scroll state. Layout refreshes the geometry,
+    // while input changes only scroll_y and requests a repaint.
+    scroll_container: bool = false,
+    scroll_y: i32 = 0,
+    scroll_client_height: i32 = 0,
+    scroll_content_height: i32 = 0,
     // Classic scripts are evaluated at most once for the lifetime of this
     // element, including when a detached node is later re-attached.
     script_started: bool = false,
@@ -315,6 +321,46 @@ pub const Element = struct {
     pub fn isInputType(self: *const Element, expected: []const u8) bool {
         if (!std.ascii.eqlIgnoreCase(self.tag, "input")) return false;
         return std.ascii.eqlIgnoreCase(self.inputType(), expected);
+    }
+
+    /// Publish the latest layout overflow for an `overflow: scroll` box and
+    /// preserve its offset across paint/layout passes, clamped to the new
+    /// range. Disabling scrolling resets all element-local scroll state.
+    pub fn setScrollGeometry(
+        self: *Element,
+        enabled: bool,
+        client_height: i32,
+        content_height: i32,
+    ) void {
+        if (!enabled) {
+            self.scroll_container = false;
+            self.scroll_y = 0;
+            self.scroll_client_height = 0;
+            self.scroll_content_height = 0;
+            return;
+        }
+
+        self.scroll_container = true;
+        self.scroll_client_height = @max(0, client_height);
+        self.scroll_content_height = @max(0, content_height);
+        self.scroll_y = @min(@max(0, self.scroll_y), self.maxScrollY());
+    }
+
+    pub fn maxScrollY(self: *const Element) i32 {
+        if (!self.scroll_container or self.scroll_content_height <= self.scroll_client_height) return 0;
+        return self.scroll_content_height - self.scroll_client_height;
+    }
+
+    /// Move within this element's current scroll range. Returns false at a
+    /// boundary so keyboard input can bubble to an enclosing scroll box.
+    pub fn scrollBy(self: *Element, delta: i32) bool {
+        if (!self.scroll_container or delta == 0) return false;
+        const maximum = self.maxScrollY();
+        const candidate = @as(i64, self.scroll_y) + @as(i64, delta);
+        const next: i32 = @intCast(std.math.clamp(candidate, 0, @as(i64, maximum)));
+        if (next == self.scroll_y) return false;
+        self.scroll_y = next;
+        return true;
     }
 
     /// Checkbox state lives in the DOM attribute map so layout, activation,

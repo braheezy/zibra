@@ -150,6 +150,13 @@ before changing `root.zig`, `tab.zig`, `render/`, or browser task scheduling.
   Keep each effect wrapper in its own layer: neighboring filters and `dst_in`
   masks are ordered groups and must never be merged. Blur expands visual layer
   bounds but does not expand the DOM hit target.
+- A fixed-height `overflow: scroll` block keeps its natural content height as
+  DOM-owned scroll geometry while layout exposes the fixed client height.
+  Paint keeps the box background stationary, translates its content by the
+  persistent element offset, then applies a square or rounded subtree clip.
+  Primary painted hits focus the innermost scroll container. Up/Down run on the
+  tab worker and climb enclosing containers at boundaries before delegating to
+  frame/root scrolling; this raw Node focus is retired with other DOM borrows.
 - Structural DOM mutation is a synchronous generation boundary, distinct from
   ordinary render invalidation. Before a child array moves or a child is
   destroyed, mark layout/render dirty, retire the frame's display and DOM-keyed
@@ -236,8 +243,10 @@ before changing `root.zig`, `tab.zig`, `render/`, or browser task scheduling.
   family selections. The user-agent stylesheet makes `code` monospace.
 - Block `width` and `height` support `auto` and non-negative pixel lengths.
   Resolve a fixed width before laying out descendants so it controls wrapping;
-  replace the content-derived height afterward, allowing visible overflow.
-  Synthesized anonymous blocks always retain their automatic dimensions.
+  replace the content-derived height afterward. Visible overflow remains the
+  default; `overflow: scroll` retains the content-derived height separately for
+  element-local clamping and clips paint to the fixed box. Synthesized
+  anonymous blocks always retain their automatic dimensions.
 - Block participation is driven by computed `display`, not a tag list in
   layout. The user-agent stylesheet owns HTML's block defaults; direct child
   display fields invalidate their parent's anonymous/block box grouping.

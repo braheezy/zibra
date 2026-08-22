@@ -238,8 +238,9 @@ standalone Browser in screenshot mode.
 - a frame-owned URL only when `current_url_owned` is true.
 
 The root frame normally borrows its URL from `Tab.history`; child frames may
-own their URL. `parent`, `tab`, `frame_element`, focus pointers, hit-test node
-pointers, `js_context`, and layout-related node pointers are borrowed.
+own their URL. `parent`, `tab`, `frame_element`, DOM focus and element-scroll
+focus pointers, hit-test node pointers, `js_context`, and layout-related node
+pointers are borrowed.
 
 Structural DOM mutation also marks the affected frame's resources dirty. On
 the serialized tab worker, after the JavaScript host call has completed and
@@ -497,9 +498,10 @@ accessibility, and fragment bounds retain their existing roles.
 CSS blur is represented by an inner composited blend around the element's
 complete painted subtree. Its premultiplied RGBA surface is convolved with a
 separable Gaussian kernel and outsets visual bounds by three standard
-deviations. The surrounding effect group preserves CSS paint order: blur,
-then overflow/border-radius clipping, then group opacity and mix blending, and
-translation last. Effect groups remain distinct composited layers because a
+deviations. An element scroll offset first translates only the content while
+leaving its background fixed. The surrounding effect group then preserves CSS
+paint order: blur, overflow/border-radius clipping, group opacity and mix
+blending, and CSS translation last. Effect groups remain distinct because a
 blur or unbounded `dst_in` mask cannot safely consume neighboring pixels.
 Layer opacity scales all premultiplied channels together, and the layer's blend
 operator is applied only when the completed surface is placed. Hit testing
@@ -557,6 +559,11 @@ pixel height replaces the content-derived height after descendant layout.
 `auto`, invalid values, and synthesized anonymous blocks retain the existing
 automatic algorithm. Content is not clipped by a fixed height unless the
 separate overflow behavior requests clipping.
+For fixed-height `overflow: scroll`, layout also publishes the natural content
+height and fixed client height into scalar state on the live `Element`,
+preserving and clamping its `scroll_y` across layout generations. Repaint reads
+that live scalar, translates only the box's content commands, and scopes them
+under a square or rounded clip; nested wrappers compose recursively.
 The non-inherited `display` computed value likewise remains a borrowed style
 slice. Layout treats `block` children as separate block boxes and groups other
 children into anonymous inline runs; the browser stylesheet, rather than Zig
@@ -730,6 +737,12 @@ Blur clears every frame-local focus and
 `is_focused` marker in the tab, resets accessibility focus, and requests paint
 when it removed a content cursor. The chrome path never mutates those DOM
 borrows directly.
+Primary content clicks also retain the innermost ancestor whose layout marked
+it as an element scroll container. Up/Down tasks mutate that element offset on
+the serialized tab worker, repaint without relayout, and try enclosing scroll
+containers when the focused one is at its boundary before falling back to the
+focused frame/root scroll model. Blur, navigation reset, and the synchronous
+structural-mutation boundary clear this borrowed scroll-focus pointer.
 Once Return is routed to page content, `Tab.enter` distinguishes text entry
 from generic activation: a focused text input dispatches `keydown`, finds its
 containing form, dispatches the cancelable `submit` event, collects the current

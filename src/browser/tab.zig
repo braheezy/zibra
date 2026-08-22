@@ -175,6 +175,9 @@ pub const Frame = struct {
     content_height: i32 = 0,
     scroll: i32 = 0,
     focus: ?*Node = null,
+    // The innermost clicked `overflow: scroll` element. This worker-owned DOM
+    // borrow is retired at the same structural-mutation boundary as focus.
+    scroll_focus: ?*Node = null,
     js_context: ?*js_module = null,
     js_render_context: JsRenderContext = .{},
     js_render_context_initialized: bool = false,
@@ -301,6 +304,11 @@ pub const Frame = struct {
                     .text => {},
                 }
                 self.focus = null;
+            }
+        }
+        if (self.scroll_focus) |scroll_node| {
+            if (isStrictDomDescendant(scroll_node, mutation_root)) {
+                self.scroll_focus = null;
             }
         }
         self.retireDisplayList();
@@ -572,6 +580,20 @@ pub const Frame = struct {
         return null;
     }
 
+    fn nearestScrollContainer(target: *Node) ?*Node {
+        var current: ?*Node = target;
+        while (current) |node| {
+            switch (node.*) {
+                .element => |element| {
+                    if (element.scroll_container) return node;
+                    current = element.parent;
+                },
+                .text => |text| current = text.parent,
+            }
+        }
+        return null;
+    }
+
     pub fn click(self: *Frame, b: *Browser, x: i32, y: i32, button: ClickButton) !bool {
         const zoom = self.tab.accessibility.zoom;
         return self.clickDevice(
@@ -615,6 +637,11 @@ pub const Frame = struct {
                 }
                 return true;
             }
+        }
+
+        if (button == .primary) {
+            self.scroll_focus = nearestScrollContainer(target);
+            self.tab.focused_frame = self;
         }
 
         if (button != .primary) {
@@ -2375,6 +2402,7 @@ pub fn enter(self: *Tab, b: *Browser) !bool {
 
 fn blurFrame(frame: *Frame) bool {
     var changed = false;
+    frame.scroll_focus = null;
     if (frame.focus) |focus_node| {
         switch (focus_node.*) {
             .element => |*e| {
@@ -2399,6 +2427,35 @@ pub fn blur(self: *Tab) bool {
     self.focused_frame = null;
     self.accessibility_focused = null;
     return changed;
+}
+
+/// Try the clicked scroll box first, then each enclosing scroll box. Returning
+/// false at a boundary lets the caller fall back to the frame/page scroller.
+pub fn scrollElementChain(scroll_start: ?*Node, delta: i32) bool {
+    var current = scroll_start;
+    while (current) |node| {
+        switch (node.*) {
+            .element => |*element| {
+                const parent = element.parent;
+                if (element.scrollBy(delta)) return true;
+                current = parent;
+            },
+            .text => |text| current = text.parent,
+        }
+    }
+    return false;
+}
+
+/// Arrow-key scroll entry point. Element offsets are tab-worker-owned and need
+/// only repaint; an exhausted element chain delegates to the existing frame
+/// scroll model (including iframe and root interest-region behavior).
+pub fn scrollFocused(self: *Tab, b: *Browser, delta: i32) void {
+    const frame = self.focused_frame orelse self.root_frame orelse return;
+    if (scrollElementChain(frame.scroll_focus, delta)) {
+        self.setNeedsPaint();
+        return;
+    }
+    b.handleScroll(delta);
 }
 
 // Handle keypress in focused input

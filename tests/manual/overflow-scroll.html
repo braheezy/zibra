@@ -1,0 +1,58 @@
+<!doctype html>
+<!--
+How to verify:
+1. The blue outer box is exactly 120px tall and no text paints outside it.
+2. Click a colored row in the green inner box, then press Down/Up. The inner
+   rows move first while both box backgrounds remain fixed.
+3. Continue Down at the inner bottom: the outer box starts moving. Continue at
+   both bottoms: the page itself scrolls. Reverse direction to test the same
+   innermost-to-outer behavior upward.
+4. Clicking an outer-only row focuses the outer scroller directly.
+-->
+<title>Overflow scroll regression</title>
+<style>
+  body { background-color: white; color: black; }
+  .instructions { background-color: #fff2b3; }
+  .outer {
+    width: 520px;
+    height: 120px;
+    overflow: scroll;
+    background-color: #dbeafe;
+    border-radius: 18px;
+  }
+  .inner {
+    width: 420px;
+    height: 64px;
+    overflow: scroll;
+    background-color: #dcfce7;
+    border-radius: 12px;
+  }
+  .blue { background-color: #bfdbfe; }
+  .green { background-color: #bbf7d0; }
+  .pink { background-color: #fbcfe8; }
+  .page-tail { height: 700px; background-color: #f3f4f6; }
+</style>
+<h1>Nested overflow scrolling</h1>
+<p class="instructions">Click a painted row, then use Up and Down.</p>
+<div class="outer">
+  <p class="blue">Outer row A — visible initially</p>
+  <div class="inner">
+    <p class="green">Inner row 1</p>
+    <p class="pink">Inner row 2</p>
+    <p class="green">Inner row 3</p>
+    <p class="pink">Inner row 4</p>
+    <p class="green">Inner row 5</p>
+    <p class="pink">Inner row 6 — inner bottom</p>
+  </div>
+  <p class="blue">Outer row B — appears as outer scrolling begins</p>
+  <p class="pink">Outer row C</p>
+  <p class="blue">Outer row D</p>
+  <p class="pink">Outer row E</p>
+  <p class="blue">Outer row F — outer bottom</p>
+</div>
+<p>Page fallback marker 1</p>
+<p>Page fallback marker 2</p>
+<p>Page fallback marker 3</p>
+<p>Page fallback marker 4</p>
+<p>Page fallback marker 5</p>
+<div class="page-tail">Tall page tail — the third Down at both element bottoms scrolls the page.</div>

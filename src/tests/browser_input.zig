@@ -229,17 +229,79 @@ test "tab blur clears focused elements across the frame tree" {
 
     root_input.element.is_focused = true;
     root.focus = root_input;
+    root.scroll_focus = root_input;
     child_input.element.is_focused = true;
     child.focus = child_input;
+    child.scroll_focus = child_input;
     tab.focused_frame = child;
 
     try std.testing.expect(tab.blur());
     try std.testing.expect(root.focus == null);
     try std.testing.expect(child.focus == null);
+    try std.testing.expect(root.scroll_focus == null);
+    try std.testing.expect(child.scroll_focus == null);
     try std.testing.expect(!root_input.element.is_focused);
     try std.testing.expect(!child_input.element.is_focused);
     try std.testing.expect(tab.focused_frame == null);
     try std.testing.expect(!tab.blur());
+}
+
+test "nested element scrolling clamps and bubbles at container boundaries" {
+    const allocator = std.testing.allocator;
+    var html_parser = try parser_module.HTMLParser.init(
+        allocator,
+        "<div id=outer><div id=inner><span>content</span></div></div>",
+    );
+    defer html_parser.deinit(allocator);
+    var root = try html_parser.parse();
+    defer root.deinit(allocator);
+    parser_module.fixParentPointers(&root, null);
+
+    var nodes = std.ArrayList(*parser_module.Node).empty;
+    defer nodes.deinit(allocator);
+    try parser_module.treeToList(allocator, &root, &nodes);
+
+    var outer: ?*parser_module.Node = null;
+    var inner: ?*parser_module.Node = null;
+    for (nodes.items) |node| switch (node.*) {
+        .element => |element| {
+            const attributes = element.attributes orelse continue;
+            const id = attributes.get("id") orelse continue;
+            if (std.mem.eql(u8, id, "outer")) outer = node;
+            if (std.mem.eql(u8, id, "inner")) inner = node;
+        },
+        .text => {},
+    };
+
+    const outer_node = outer orelse return error.TestOuterMissing;
+    const inner_node = inner orelse return error.TestInnerMissing;
+    outer_node.element.setScrollGeometry(true, 200, 600);
+    inner_node.element.setScrollGeometry(true, 100, 350);
+
+    try std.testing.expect(tab_module.scrollElementChain(inner_node, 100));
+    try std.testing.expectEqual(@as(i32, 100), inner_node.element.scroll_y);
+    try std.testing.expectEqual(@as(i32, 0), outer_node.element.scroll_y);
+
+    try std.testing.expect(inner_node.element.scrollBy(std.math.maxInt(i32)));
+    try std.testing.expectEqual(@as(i32, 250), inner_node.element.scroll_y);
+    // Once the innermost box reaches its bottom, the same direction bubbles
+    // to its enclosing scroll box.
+    try std.testing.expect(tab_module.scrollElementChain(inner_node, 100));
+    try std.testing.expectEqual(@as(i32, 250), inner_node.element.scroll_y);
+    try std.testing.expectEqual(@as(i32, 100), outer_node.element.scroll_y);
+
+    inner_node.element.scroll_y = 0;
+    try std.testing.expect(tab_module.scrollElementChain(inner_node, -100));
+    try std.testing.expectEqual(@as(i32, 0), outer_node.element.scroll_y);
+    try std.testing.expect(!tab_module.scrollElementChain(inner_node, -100));
+
+    // A new layout generation preserves but clamps the persistent offset.
+    inner_node.element.scroll_y = 200;
+    inner_node.element.setScrollGeometry(true, 100, 140);
+    try std.testing.expectEqual(@as(i32, 40), inner_node.element.scroll_y);
+    inner_node.element.setScrollGeometry(false, 0, 0);
+    try std.testing.expect(!inner_node.element.scroll_container);
+    try std.testing.expectEqual(@as(i32, 0), inner_node.element.scroll_y);
 }
 
 test "address input inserts at the cursor and backspace deletes before it" {

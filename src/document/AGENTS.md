@@ -90,6 +90,10 @@ or selector/rule lifetime.
 - `width` and `height` are non-inherited computed properties. Their default is
   `auto`; layout currently resolves only non-negative pixel lengths and keeps
   the borrowed computed-value slice in the style map.
+- Element-local overflow scroll offsets and client/content heights are scalar
+  DOM state. Layout republishes and clamps their geometry; input may change
+  only the offset between layouts. Structural mutation consumers must retire
+  any focused raw Node before its by-value child storage moves.
 - `filter` is non-inherited and defaults to `none`. Layout currently accepts a
   single non-negative `blur()` pixel length (or unitless zero); unsupported
   filter functions and chains have no effect.

@@ -4497,6 +4497,7 @@ const BlockLayout = struct {
                     if (element.style) |*style_map| {
                         if (style_map.getPtr("width")) |field| block.width.addDependency(field);
                         if (style_map.getPtr("height")) |field| block.height.addDependency(field);
+                        if (style_map.getPtr("overflow")) |field| block.height.addDependency(field);
                     }
                 },
                 .text => {},
@@ -4558,6 +4559,31 @@ const BlockLayout = struct {
                 null,
             .text => null,
         };
+    }
+
+    fn updateScrollGeometry(
+        self: *BlockLayout,
+        specified_height: ?i32,
+        natural_height: i32,
+    ) void {
+        const node_ptr = self.node_ptr orelse return;
+        switch (node_ptr.*) {
+            .element => |*element| {
+                const overflow = if (element.style) |*style_map|
+                    styleValue(style_map, "overflow") orelse "visible"
+                else
+                    "visible";
+                const normalized = std.mem.trim(u8, overflow, " \t\r\n");
+                const enabled = specified_height != null and
+                    std.ascii.eqlIgnoreCase(normalized, "scroll");
+                element.setScrollGeometry(
+                    enabled,
+                    specified_height orelse 0,
+                    natural_height,
+                );
+            },
+            .text => {},
+        }
     }
 
     fn initAnonymous(
@@ -4767,6 +4793,7 @@ const BlockLayout = struct {
         DisplayItem.freeItems(self.allocator, self.display_list.items);
         self.display_list.clearRetainingCapacity();
 
+        var natural_height: i32 = 0;
         if (is_block) {
             // Check if children are dirty and rebuild them if needed
             var children_dirty = false;
@@ -4830,6 +4857,7 @@ const BlockLayout = struct {
                 }
             }
             const auto_height = computed_height + tableOfContentsHeaderHeight(self.node);
+            natural_height = auto_height;
             self.height.set(specified_height orelse auto_height);
             self.zoom.set(1.0);
 
@@ -4849,11 +4877,14 @@ const BlockLayout = struct {
             self.children_epoch += 1;
             self.children_version.set(self.children_epoch);
 
+            natural_height = self.height.get().*;
             if (specified_height) |height| self.height.set(height);
 
             try recordContentEditableFocusBounds(engine, self);
             // Height is set by layoutInlineBlock - need to ensure it uses .set()
         }
+
+        self.updateScrollGeometry(specified_height, natural_height);
 
         // Clear descendant flags after layout pass
         self.has_dirty_descendants = false;
@@ -5424,6 +5455,7 @@ fn paintBlockTree(self: *Layout, block: *BlockLayout) !void {
 
     // Add the block's own background/borders
     try addBackgroundIfNeeded(self, block);
+    const content_start = commands.items.len;
     try appendTableOfContentsHeader(self, &commands, block);
 
     // Add the block's display items (from children like text, etc.)
@@ -5441,6 +5473,7 @@ fn paintBlockTree(self: *Layout, block: *BlockLayout) !void {
     }
 
     try appendContentEditableCursor(self, &commands, block);
+    try applyElementScroll(block, &commands, content_start);
 
     // Apply visual effects (opacity, etc.) to wrap the entire subtree
     const final_commands = try applyPaintEffects(self, block, commands.items);
@@ -5532,6 +5565,7 @@ fn paintBlockTreeRecursive(commands: *std.ArrayList(DisplayItem), self: *Layout,
 
     // Add background/borders for this block
     try addBackgroundIfNeededToList(self, &block_commands, block);
+    const content_start = block_commands.items.len;
     try appendTableOfContentsHeader(self, &block_commands, block);
 
     // Add display items (from text, etc.)
@@ -5549,6 +5583,7 @@ fn paintBlockTreeRecursive(commands: *std.ArrayList(DisplayItem), self: *Layout,
     }
 
     try appendContentEditableCursor(self, &block_commands, block);
+    try applyElementScroll(block, &block_commands, content_start);
 
     // Apply visual effects (opacity, transform, etc.) for this block
     const final_commands = try applyPaintEffects(self, block, block_commands.items);
@@ -5560,6 +5595,37 @@ fn paintBlockTreeRecursive(commands: *std.ArrayList(DisplayItem), self: *Layout,
     if (final_commands.len > 0) {
         self.allocator.free(final_commands);
     }
+}
+
+/// Keep the element's own background stationary while moving all of its
+/// painted content. The enclosing overflow clip is installed below by
+/// applyPaintEffects, so translated descendants cannot escape the box.
+fn applyElementScroll(
+    block: *BlockLayout,
+    commands: *std.ArrayList(DisplayItem),
+    content_start: usize,
+) !void {
+    const node_ptr = block.node_ptr orelse return;
+    const element = switch (node_ptr.*) {
+        .element => |*value| value,
+        .text => return,
+    };
+    if (!element.scroll_container or element.scroll_y <= 0) return;
+    if (content_start >= commands.items.len) return;
+
+    const children = try block.allocator.alloc(DisplayItem, commands.items.len - content_start);
+    @memcpy(children, commands.items[content_start..]);
+
+    // The list already had room for every moved child, so replacing the
+    // suffix by one transform cannot allocate after ownership is transferred.
+    commands.shrinkRetainingCapacity(content_start);
+    commands.appendAssumeCapacity(.{ .transform = .{
+        .translate_x = 0,
+        .translate_y = -element.scroll_y,
+        .children = children,
+        .node = opaqueElementForNode(block.node_ptr),
+        .source = displaySource(block, block.node_ptr),
+    } });
 }
 
 // Apply visual effects like opacity, blend modes, and clipping to a list of display commands
@@ -5602,7 +5668,18 @@ fn applyPaintEffects(self: *Layout, block: *BlockLayout, commands: []DisplayItem
             if (styleValue(style_map, "border-radius")) |radius_str| {
                 border_radius = parseCssPixelRadius(radius_str);
             }
-            if (std.mem.eql(u8, styleValue(style_map, "overflow") orelse "visible", "clip")) {
+            const overflow = std.mem.trim(
+                u8,
+                styleValue(style_map, "overflow") orelse "visible",
+                " \t\r\n",
+            );
+            const scroll_container = if (block.node_ptr) |node_ptr| switch (node_ptr.*) {
+                .element => |element| element.scroll_container,
+                .text => false,
+            } else false;
+            if (std.ascii.eqlIgnoreCase(overflow, "clip") or
+                (std.ascii.eqlIgnoreCase(overflow, "scroll") and scroll_container))
+            {
                 should_clip = true;
             }
             // Parse transform: translate(xpx, ypx)
@@ -5648,7 +5725,7 @@ fn applyPaintEffects(self: *Layout, block: *BlockLayout, commands: []DisplayItem
 
     // Clipping is applied to the filtered result, so blur pixels cannot escape
     // an overflow clip even though content outside the edge contributes.
-    if (should_clip and border_radius > 0) {
+    if (should_clip) {
         // Create a clipping mask using dst_in blend mode.
         // The mask is a white rounded rectangle that will clip the content.
         // Create the clipping blend that applies dst_in to mask the content
@@ -5660,8 +5737,8 @@ fn applyPaintEffects(self: *Layout, block: *BlockLayout, commands: []DisplayItem
         const block_y = block.y.get().*;
         const block_height = block.height.get().*;
         const clip_mask_commands = try self.allocator.alloc(DisplayItem, 1);
-        clip_mask_commands[0] = DisplayItem{
-            .rounded_rect = .{
+        clip_mask_commands[0] = if (border_radius > 0.0)
+            DisplayItem{ .rounded_rect = .{
                 .x1 = block_x,
                 .y1 = block_y,
                 .x2 = block_x + block_width,
@@ -5669,8 +5746,16 @@ fn applyPaintEffects(self: *Layout, block: *BlockLayout, commands: []DisplayItem
                 .radius = border_radius,
                 .color = browser.Color{ .r = 255, .g = 255, .b = 255, .a = 255 },
                 .source = displaySource(block, block.node_ptr),
-            },
-        };
+            } }
+        else
+            DisplayItem{ .rect = .{
+                .x1 = block_x,
+                .y1 = block_y,
+                .x2 = block_x + block_width,
+                .y2 = block_y + block_height,
+                .color = browser.Color{ .r = 255, .g = 255, .b = 255, .a = 255 },
+                .source = displaySource(block, block.node_ptr),
+            } };
 
         const clip_blend = DisplayItem{
             .blend = .{
@@ -5700,7 +5785,7 @@ fn applyPaintEffects(self: *Layout, block: *BlockLayout, commands: []DisplayItem
     }
 
     // Only create a blend operation if we have effects to apply
-    if (opacity < 1.0 or final_blend_mode != null or blur_radius > 0.0 or border_radius > 0.0) {
+    if (opacity < 1.0 or final_blend_mode != null or blur_radius > 0.0 or border_radius > 0.0 or should_clip) {
         const wrapped_commands = try self.allocator.alloc(DisplayItem, current_commands.len);
         @memcpy(wrapped_commands, current_commands);
 
@@ -5710,13 +5795,13 @@ fn applyPaintEffects(self: *Layout, block: *BlockLayout, commands: []DisplayItem
         // Determine if this blend needs compositing (does actual work)
         // Blur uses an inner blend so clipping can follow it; this outer group
         // keeps the ordered filter/clip sequence in one composited surface.
-        const needs_compositing = opacity < 1.0 or final_blend_mode != null or blur_radius > 0.0;
+        const needs_compositing = opacity < 1.0 or final_blend_mode != null or blur_radius > 0.0 or should_clip;
 
         const blend_item = DisplayItem{
             .blend = .{
                 .opacity = opacity,
                 .blend_mode = final_blend_mode,
-                .hit_clip = if (border_radius > 0.0) .{
+                .hit_clip = if (border_radius > 0.0 or should_clip) .{
                     .x1 = block.x.get().*,
                     .y1 = block.y.get().*,
                     .x2 = block.x.get().* + block.width.get().*,

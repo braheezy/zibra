@@ -132,6 +132,10 @@ for crossing and reversing over tab raster-cache boundaries. Scrolling and
 resizing must remain continuous while the cached surface stays bounded to four
 native window heights.
 
+`tests/manual/overflow-scroll.html` exercises fixed-height `overflow: scroll`
+boxes, click-to-focus arrow scrolling, clipping, and innermost-to-outer nested
+scroll fallback before the root page moves.
+
 `tests/manual/blur-filter.html` exercises subtree blur together with rounded
 overflow clipping, group opacity, and translation. Its display-list dump also
 keeps the filter wrapper's serialized contract pointer-free.

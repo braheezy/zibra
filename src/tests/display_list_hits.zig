@@ -230,6 +230,42 @@ test "one-child dst_in masks earlier siblings without becoming a target" {
     try std.testing.expect(DisplayItem.hitTest(&items, 2, 2, 1.0) == null);
 }
 
+test "scroll transforms remain clipped and hit-test through nested translation" {
+    var generator: u8 = 0;
+    var content = [_]DisplayItem{rect(0, 40, 100, 100, source(&generator, null))};
+    var mask_children = [_]DisplayItem{rect(0, 0, 100, 40, null)};
+    var scroll_group = [_]DisplayItem{
+        .{ .transform = .{
+            .translate_x = 0,
+            .translate_y = -30,
+            .children = &content,
+        } },
+        .{ .blend = .{
+            .opacity = 1.0,
+            .blend_mode = "dst_in",
+            .children = &mask_children,
+            .needs_compositing = true,
+        } },
+    };
+    var clipped = [_]DisplayItem{.{ .blend = .{
+        .opacity = 1.0,
+        .blend_mode = null,
+        .hit_clip = .{ .x1 = 0, .y1 = 0, .x2 = 100, .y2 = 40, .radius = 0 },
+        .children = &scroll_group,
+        .needs_compositing = true,
+    } }};
+    const items = [_]DisplayItem{.{ .transform = .{
+        .translate_x = 10,
+        .translate_y = 20,
+        .children = &clipped,
+    } }};
+
+    try std.testing.expect(DisplayItem.hitTestDevice(&items, 20, 35, 1.0) != null);
+    // The translated content continues below the 40px scroll port, but the
+    // outer hit clip and dst_in mask both reject that invisible portion.
+    try std.testing.expect(DisplayItem.hitTestDevice(&items, 20, 70, 1.0) == null);
+}
+
 test "composited opacity updates transformed retained and flattened layer lists" {
     var generator: u8 = 0;
     var opacity_owner: u8 = 0;
@@ -448,6 +484,8 @@ test "structural mutation retires a painted link before DOM removal" {
     const link = try findElement(&frame.current_node.?, "a");
     link.element.is_focused = true;
     frame.focus = link;
+    link.element.setScrollGeometry(true, 20, 80);
+    frame.scroll_focus = link;
 
     var current_url = try Url.init(allocator, "https://example.com/page.html");
     defer current_url.free(allocator);
@@ -482,6 +520,7 @@ test "structural mutation retires a painted link before DOM removal" {
     tab.prepareForDomMutation(&test_browser, &frame, body);
     try std.testing.expect(frame.display_list == null);
     try std.testing.expect(frame.focus == null);
+    try std.testing.expect(frame.scroll_focus == null);
     try std.testing.expectEqual(@as(usize, 0), frame.input_bounds.count());
     try std.testing.expectEqual(@as(usize, 0), frame.link_bounds.items.len);
     try std.testing.expectEqual(@as(usize, 0), frame.focus_bounds.items.len);
@@ -582,6 +621,59 @@ test "frame clicks use painted link fragments when link bounds are empty" {
     try std.testing.expect(try frame.click(&test_browser, 15, 25, .middle));
     try std.testing.expectEqual(@as(usize, 1), test_browser.pending_new_tabs.items.len);
     try std.testing.expectEqualStrings("/docs/next.html", test_browser.pending_new_tabs.items[0].path);
+}
+
+test "primary painted click focuses the innermost scroll container" {
+    const allocator = std.testing.allocator;
+    var html_parser = try parser.HTMLParser.init(
+        allocator,
+        "<body><div><div><span>painted child</span></div></div></body>",
+    );
+    defer html_parser.deinit(allocator);
+    var root = try html_parser.parse();
+    defer root.deinit(allocator);
+    parser.fixParentPointers(&root, null);
+
+    var divs = std.ArrayList(*Node).empty;
+    defer divs.deinit(allocator);
+    var all_nodes = std.ArrayList(*Node).empty;
+    defer all_nodes.deinit(allocator);
+    try parser.treeToList(allocator, &root, &all_nodes);
+    var painted: ?*Node = null;
+    for (all_nodes.items) |node| switch (node.*) {
+        .element => |element| {
+            if (std.ascii.eqlIgnoreCase(element.tag, "div")) try divs.append(allocator, node);
+            if (std.ascii.eqlIgnoreCase(element.tag, "span")) painted = node;
+        },
+        .text => {},
+    };
+    try std.testing.expectEqual(@as(usize, 2), divs.items.len);
+    const outer = divs.items[0];
+    const inner = divs.items[1];
+    const painted_node = painted orelse return error.TestPaintedNodeMissing;
+    outer.element.setScrollGeometry(true, 100, 300);
+    inner.element.setScrollGeometry(true, 50, 200);
+
+    var tab: tab_module.Tab = undefined;
+    initClickTab(&tab, allocator);
+    defer deinitClickTab(&tab);
+    var frame = tab_module.Frame.init(allocator, &tab, null, null);
+    defer frame.deinit();
+    tab.root_frame = &frame;
+
+    const generator = TestLayoutOrigin{ .node_ptr = painted_node };
+    const display_list = try allocator.alloc(DisplayItem, 1);
+    display_list[0] = rect(0, 0, 80, 30, sourceFromOrigin(&generator, painted_node));
+    frame.display_list = display_list;
+
+    var unused_browser: browser.Browser = undefined;
+    try std.testing.expect(try frame.clickDevice(&unused_browser, 10, 10, .primary, 1.0));
+    try std.testing.expect(frame.scroll_focus == inner);
+    try std.testing.expect(tab.focused_frame == &frame);
+
+    inner.element.setScrollGeometry(false, 0, 0);
+    try std.testing.expect(try frame.clickDevice(&unused_browser, 10, 10, .primary, 1.0));
+    try std.testing.expect(frame.scroll_focus == outer);
 }
 
 test "painted ordinary elements dispatch click events from target through ancestors" {

@@ -1686,7 +1686,11 @@ pub const Browser = struct {
                             self.needs_raster = true;
                         }
                     } else {
-                        active.setNeedsPaint();
+                        // We already hold Browser.lock here; publish the tab
+                        // paint bit directly instead of re-entering through
+                        // Tab.setNeedsPaint. The flags below schedule the same
+                        // animation after the lock is released.
+                        active.needs_paint = true;
                         self.needs_composite = true;
                         self.needs_raster = true;
                     }
@@ -2449,13 +2453,11 @@ pub const Browser = struct {
                 return;
             },
             .down => {
-                self.handleScroll(scroll_step);
-                try self.compositeRasterAndDraw();
+                if (self.activeTab()) |tab| self.scheduleTabScrollTask(tab, scroll_step);
                 return;
             },
             .up => {
-                self.handleScroll(-scroll_step);
-                try self.compositeRasterAndDraw();
+                if (self.activeTab()) |tab| self.scheduleTabScrollTask(tab, -scroll_step);
                 return;
             },
             else => {},
@@ -2629,6 +2631,23 @@ pub const Browser = struct {
         );
         tab.task_runner.schedule(task_instance) catch |err| {
             std.log.err("Failed to schedule backspace: {}", .{err});
+            ctx.destroy();
+            return;
+        };
+    }
+
+    fn scheduleTabScrollTask(self: *Browser, tab: *Tab, delta: i32) void {
+        const ctx = TabScrollTaskContext.create(self.allocator, self, tab, delta) catch |err| {
+            std.log.err("Failed to allocate tab scroll task: {}", .{err});
+            return;
+        };
+        const task_instance = Task.init(
+            ctx.toOpaque(),
+            TabScrollTaskContext.runOpaque,
+            TabScrollTaskContext.cleanupOpaque,
+        );
+        tab.task_runner.schedule(task_instance) catch |err| {
+            std.log.err("Failed to schedule tab scroll: {}", .{err});
             ctx.destroy();
             return;
         };
@@ -3332,6 +3351,7 @@ pub const Browser = struct {
         frame.content_height = 0;
         frame.scroll = 0;
         frame.focus = null;
+        frame.scroll_focus = null;
 
         frame.clearAllowedOrigins();
     }
@@ -7195,6 +7215,54 @@ const TabBackspaceTaskContext = struct {
 
     fn cleanupOpaque(context: *anyopaque) void {
         TabBackspaceTaskContext.fromOpaque(context).destroy();
+    }
+};
+
+const TabScrollTaskContext = struct {
+    allocator: std.mem.Allocator,
+    browser: *Browser,
+    tab: *Tab,
+    delta: i32,
+
+    fn create(
+        allocator: std.mem.Allocator,
+        browser: *Browser,
+        tab: *Tab,
+        delta: i32,
+    ) !*TabScrollTaskContext {
+        const ctx = try allocator.create(TabScrollTaskContext);
+        ctx.* = .{
+            .allocator = allocator,
+            .browser = browser,
+            .tab = tab,
+            .delta = delta,
+        };
+        return ctx;
+    }
+
+    fn destroy(self: *TabScrollTaskContext) void {
+        self.allocator.destroy(self);
+    }
+
+    fn run(self: *TabScrollTaskContext) !void {
+        self.tab.scrollFocused(self.browser, self.delta);
+    }
+
+    fn toOpaque(self: *TabScrollTaskContext) *anyopaque {
+        return @ptrCast(self);
+    }
+
+    fn fromOpaque(context: *anyopaque) *TabScrollTaskContext {
+        const raw: *align(1) TabScrollTaskContext = @ptrCast(context);
+        return @alignCast(raw);
+    }
+
+    fn runOpaque(context: *anyopaque) anyerror!void {
+        try TabScrollTaskContext.fromOpaque(context).run();
+    }
+
+    fn cleanupOpaque(context: *anyopaque) void {
+        TabScrollTaskContext.fromOpaque(context).destroy();
     }
 };
 
