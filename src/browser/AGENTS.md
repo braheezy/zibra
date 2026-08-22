@@ -67,6 +67,9 @@ before changing `root.zig`, `tab.zig`, `render/`, or browser task scheduling.
   for the raster worker, allowing the two threads to overlap. CSS animations
   must publish `needs_animation_frame`, just like JavaScript
   `requestAnimationFrame`, before attempting to schedule again.
+- CSS transition frames first normalize elapsed frame count, then apply the
+  Element-owned timing function before property interpolation. Easing changes
+  values only; it does not alter the absolute animation-frame scheduling path.
 - Browser task producers classify animation frames and native input as urgent,
   navigation and script discovery as normal, and timeout/interval/XHR/message
   callbacks as JavaScript-low. Do not infer priority from the trace label:

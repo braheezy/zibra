@@ -12,9 +12,12 @@ const zigimg = @import("zigimg");
 const ProtectedField = @import("../core/protected_field.zig").ProtectedField;
 const CSSParser = @import("css_parser.zig").CSSParser;
 const css_color = @import("color.zig");
+const easing = @import("easing.zig");
 
 pub const CssColor = css_color.Color;
 pub const parseCssColor = css_color.parse;
+pub const EasingFunction = easing.Function;
+pub const parseEasingFunction = easing.parse;
 
 /// Animation state for a numeric CSS property transition
 pub const NumericAnimation = struct {
@@ -22,20 +25,33 @@ pub const NumericAnimation = struct {
     end_value: f64,
     current_frame: u32,
     total_frames: u32,
+    easing_function: EasingFunction,
 
     pub fn init(start: f64, end: f64, frames: u32) NumericAnimation {
+        return initWithEasing(start, end, frames, .linear);
+    }
+
+    pub fn initWithEasing(
+        start: f64,
+        end: f64,
+        frames: u32,
+        easing_function: EasingFunction,
+    ) NumericAnimation {
         return .{
             .start_value = start,
             .end_value = end,
             .current_frame = 0,
             .total_frames = frames,
+            .easing_function = easing_function,
         };
     }
 
     /// Get the current interpolated value
     pub fn getValue(self: NumericAnimation) f64 {
         if (self.total_frames == 0) return self.end_value;
-        const t: f64 = @as(f64, @floatFromInt(self.current_frame)) / @as(f64, @floatFromInt(self.total_frames));
+        const progress: f64 = @as(f64, @floatFromInt(self.current_frame)) /
+            @as(f64, @floatFromInt(self.total_frames));
+        const t = self.easing_function.apply(progress);
         return self.start_value + (self.end_value - self.start_value) * t;
     }
 
@@ -60,31 +76,44 @@ pub const ColorAnimation = struct {
     end_value: CssColor,
     current_frame: u32,
     total_frames: u32,
+    easing_function: EasingFunction,
 
     pub fn init(start: CssColor, end: CssColor, frames: u32) ColorAnimation {
+        return initWithEasing(start, end, frames, .linear);
+    }
+
+    pub fn initWithEasing(
+        start: CssColor,
+        end: CssColor,
+        frames: u32,
+        easing_function: EasingFunction,
+    ) ColorAnimation {
         return .{
             .start_value = start,
             .end_value = end,
             .current_frame = 0,
             .total_frames = frames,
+            .easing_function = easing_function,
         };
     }
 
-    fn interpolateChannel(start: u8, end: u8, current_frame: u32, total_frames: u32) u8 {
-        if (total_frames == 0 or current_frame >= total_frames) return end;
-        const t = @as(f64, @floatFromInt(current_frame)) /
-            @as(f64, @floatFromInt(total_frames));
+    fn interpolateChannel(start: u8, end: u8, progress: f64) u8 {
         const start_float: f64 = @floatFromInt(start);
         const end_float: f64 = @floatFromInt(end);
-        return @intFromFloat(@round(start_float + (end_float - start_float) * t));
+        const interpolated = start_float + (end_float - start_float) * progress;
+        return @intFromFloat(@round(std.math.clamp(interpolated, 0.0, 255.0)));
     }
 
     pub fn getValue(self: ColorAnimation) CssColor {
+        if (self.total_frames == 0 or self.current_frame >= self.total_frames) return self.end_value;
+        const progress = @as(f64, @floatFromInt(self.current_frame)) /
+            @as(f64, @floatFromInt(self.total_frames));
+        const eased_progress = self.easing_function.apply(progress);
         return .{
-            .r = interpolateChannel(self.start_value.r, self.end_value.r, self.current_frame, self.total_frames),
-            .g = interpolateChannel(self.start_value.g, self.end_value.g, self.current_frame, self.total_frames),
-            .b = interpolateChannel(self.start_value.b, self.end_value.b, self.current_frame, self.total_frames),
-            .a = interpolateChannel(self.start_value.a, self.end_value.a, self.current_frame, self.total_frames),
+            .r = interpolateChannel(self.start_value.r, self.end_value.r, eased_progress),
+            .g = interpolateChannel(self.start_value.g, self.end_value.g, eased_progress),
+            .b = interpolateChannel(self.start_value.b, self.end_value.b, eased_progress),
+            .a = interpolateChannel(self.start_value.a, self.end_value.a, eased_progress),
         };
     }
 
@@ -131,6 +160,24 @@ test "color animation interpolates every channel" {
     _ = animation.advance();
     try std.testing.expect(animation.advance());
     try std.testing.expectEqual(CssColor{ .r = 255, .g = 0, .b = 100, .a = 255 }, animation.getValue());
+}
+
+test "numeric and color animations apply easing before interpolation" {
+    var numeric = NumericAnimation.initWithEasing(0.0, 100.0, 2, EasingFunction.ease);
+    _ = numeric.advance();
+    try std.testing.expectApproxEqAbs(80.2403, numeric.getValue(), 0.0001);
+
+    var color = ColorAnimation.initWithEasing(
+        .{ .r = 0, .g = 255, .b = 0, .a = 0 },
+        .{ .r = 255, .g = 0, .b = 0, .a = 255 },
+        2,
+        EasingFunction.ease,
+    );
+    _ = color.advance();
+    try std.testing.expectEqual(
+        CssColor{ .r = 205, .g = 50, .b = 0, .a = 205 },
+        color.getValue(),
+    );
 }
 
 // These tags can look like <tag /> and don't need a closing tag.

@@ -19,6 +19,7 @@ const CSSParser = @import("../document/css_parser.zig").CSSParser;
 const NumericAnimation = parser.NumericAnimation;
 const ColorAnimation = parser.ColorAnimation;
 const Animation = parser.Animation;
+const EasingFunction = parser.EasingFunction;
 
 const Js = @This();
 
@@ -44,34 +45,72 @@ fn parseInlineStyle(allocator: std.mem.Allocator, style_str: []const u8) !std.St
     return result;
 }
 
-/// Parse a transition value like "opacity 2s" into property name and frame count
-fn parseTransitionValue(value: []const u8) ?struct { property: []const u8, frames: u32 } {
-    var parts = std.mem.tokenizeAny(u8, value, " \t");
-    const property = parts.next() orelse return null;
-    const duration_str = parts.next() orelse return null;
+const TransitionValue = struct {
+    property: []const u8,
+    frames: u32,
+    easing_function: EasingFunction,
+};
 
-    var frames: u32 = 0;
+fn takeTransitionToken(remaining: *[]const u8) ?[]const u8 {
+    const trimmed = std.mem.trimStart(u8, remaining.*, " \t\n\r");
+    if (trimmed.len == 0) return null;
+    const end = std.mem.indexOfAny(u8, trimmed, " \t\n\r") orelse trimmed.len;
+    remaining.* = trimmed[end..];
+    return trimmed[0..end];
+}
+
+/// Parse `property duration [timing-function]`. CSS transitions default to
+/// `ease`, while an explicit supported keyword or cubic-bezier overrides it.
+fn parseTransitionValue(value: []const u8) ?TransitionValue {
+    var remaining = value;
+    const property = takeTransitionToken(&remaining) orelse return null;
+    const duration_str = takeTransitionToken(&remaining) orelse return null;
+
+    var duration_seconds: f64 = 0;
     if (std.mem.endsWith(u8, duration_str, "ms")) {
         const ms_str = duration_str[0 .. duration_str.len - 2];
         const ms = std.fmt.parseFloat(f64, ms_str) catch return null;
-        frames = @intFromFloat(ms / 1000.0 * @as(f64, FRAMES_PER_SECOND));
+        duration_seconds = ms / 1000.0;
     } else if (std.mem.endsWith(u8, duration_str, "s")) {
         const s_str = duration_str[0 .. duration_str.len - 1];
-        const s = std.fmt.parseFloat(f64, s_str) catch return null;
-        frames = @intFromFloat(s * @as(f64, FRAMES_PER_SECOND));
+        duration_seconds = std.fmt.parseFloat(f64, s_str) catch return null;
     } else {
         return null;
     }
 
-    return .{ .property = property, .frames = @max(1, frames) };
+    const frame_count = duration_seconds * @as(f64, FRAMES_PER_SECOND);
+    const max_frames: f64 = @floatFromInt(std.math.maxInt(u32));
+    if (!std.math.isFinite(frame_count) or frame_count < 0 or frame_count > max_frames) return null;
+    const frames: u32 = @intFromFloat(frame_count);
+
+    const timing_value = std.mem.trim(u8, remaining, " \t\n\r");
+    const easing_function = if (timing_value.len == 0)
+        EasingFunction.ease
+    else
+        parser.parseEasingFunction(timing_value) orelse return null;
+
+    return .{
+        .property = property,
+        .frames = @max(1, frames),
+        .easing_function = easing_function,
+    };
 }
 
 /// Start an opacity animation on an element
-fn startOpacityAnimation(allocator: std.mem.Allocator, elem: *parser.Element, start: f64, end: f64, frames: u32) !void {
+fn startOpacityAnimation(
+    allocator: std.mem.Allocator,
+    elem: *parser.Element,
+    start: f64,
+    end: f64,
+    frames: u32,
+    easing_function: EasingFunction,
+) !void {
     if (elem.animations == null) {
         elem.animations = std.StringHashMap(Animation).init(allocator);
     }
-    const animation = Animation{ .numeric = NumericAnimation.init(start, end, frames) };
+    const animation = Animation{
+        .numeric = NumericAnimation.initWithEasing(start, end, frames, easing_function),
+    };
     try elem.animations.?.put("opacity", animation);
 }
 
@@ -82,12 +121,37 @@ fn startBackgroundColorAnimation(
     start: parser.CssColor,
     end: parser.CssColor,
     frames: u32,
+    easing_function: EasingFunction,
 ) !void {
     if (elem.animations == null) {
         elem.animations = std.StringHashMap(Animation).init(allocator);
     }
-    const animation = Animation{ .color = ColorAnimation.init(start, end, frames) };
+    const animation = Animation{
+        .color = ColorAnimation.initWithEasing(start, end, frames, easing_function),
+    };
     try elem.animations.?.put("background-color", animation);
+}
+
+test "transition values default to ease and parse supported timing functions" {
+    const default_transition = parseTransitionValue("background-color 500ms").?;
+    try std.testing.expectEqualStrings("background-color", default_transition.property);
+    try std.testing.expectEqual(@as(u32, 30), default_transition.frames);
+    try std.testing.expectApproxEqAbs(
+        EasingFunction.ease.apply(0.5),
+        default_transition.easing_function.apply(0.5),
+        0.000001,
+    );
+
+    const linear = parseTransitionValue("opacity 2s linear").?;
+    try std.testing.expectEqual(@as(u32, 120), linear.frames);
+    try std.testing.expectApproxEqAbs(0.5, linear.easing_function.apply(0.5), 0.000001);
+
+    const explicit = parseTransitionValue(
+        "opacity 1s cubic-bezier(0.42, 0, 0.58, 1)",
+    ).?;
+    try std.testing.expectApproxEqAbs(0.5, explicit.easing_function.apply(0.5), 0.000001);
+    try std.testing.expect(parseTransitionValue("opacity 1s steps(2)") == null);
+    try std.testing.expect(parseTransitionValue("opacity -1s ease") == null);
 }
 
 fn currentAnimatedOpacity(elem: *const parser.Element) ?f64 {
@@ -2288,6 +2352,11 @@ test "native style_set starts a background-color transition from computed color"
                 color.end_value,
             );
             try std.testing.expectEqual(@as(u32, 30), color.total_frames);
+            try std.testing.expectApproxEqAbs(
+                parser.EasingFunction.ease.apply(0.5),
+                color.easing_function.apply(0.5),
+                0.000001,
+            );
         },
         .numeric => try std.testing.expect(false),
     }
@@ -3802,7 +3871,14 @@ fn styleSet(agent: *Agent, this_value: Value, arguments: kiesel.types.Arguments)
                                 const new_opacity = std.fmt.parseFloat(f64, new_op_str) catch null;
                                 if (new_opacity != null and old_opacity != null and old_opacity.? != new_opacity.?) {
                                     // Start animation from old to new value
-                                    startOpacityAnimation(js_instance.allocator, e, old_opacity.?, new_opacity.?, transition.frames) catch |err| {
+                                    startOpacityAnimation(
+                                        js_instance.allocator,
+                                        e,
+                                        old_opacity.?,
+                                        new_opacity.?,
+                                        transition.frames,
+                                        transition.easing_function,
+                                    ) catch |err| {
                                         std.log.warn("Failed to start opacity animation: {}", .{err});
                                     };
                                 }
@@ -3819,6 +3895,7 @@ fn styleSet(agent: *Agent, this_value: Value, arguments: kiesel.types.Arguments)
                                         old_background_color.?,
                                         new_color.?,
                                         transition.frames,
+                                        transition.easing_function,
                                     ) catch |err| {
                                         std.log.warn("Failed to start background-color animation: {}", .{err});
                                     };

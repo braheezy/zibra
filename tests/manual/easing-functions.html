@@ -1,0 +1,50 @@
+<!--
+How to verify:
+1. The four boxes animate from red to blue together on load; click Replay to run again.
+2. Halfway through, Linear is purple, Ease-in remains redder, and Default ease plus
+   Ease-out are bluer. Default ease changes fastest near the beginning but slows smoothly.
+3. All boxes finish at the same blue endpoint and the status changes to DONE.
+-->
+<!doctype html>
+<html>
+  <head>
+    <title>CSS easing functions</title>
+    <style>
+      body { background-color: white; color: black; font-size: 18px; }
+      div { background-color: red; color: white; width: 300px; height: 42px; margin: 8px; padding: 8px; }
+      button { margin: 12px 8px; }
+      p { background-color: lightgray; padding: 8px; }
+    </style>
+  </head>
+  <body>
+    <h1>CSS easing functions</h1>
+    <div>Default ease</div>
+    <div>Linear</div>
+    <div>Ease-in</div>
+    <div>Ease-out</div>
+    <button>Replay</button>
+    <p>READY</p>
+    <script>
+      var boxes = document.querySelectorAll('div');
+      var replay = document.querySelectorAll('button')[0];
+      var status = document.querySelectorAll('p')[0];
+
+      function run() {
+        status.innerHTML = 'ANIMATING';
+        for (var i = 0; i < boxes.length; i = i + 1) {
+          boxes[i].style = 'background-color: red; color: white; width: 300px; height: 42px; margin: 8px; padding: 8px';
+        }
+        requestAnimationFrame(function() {
+          boxes[0].style = 'background-color: blue; color: white; width: 300px; height: 42px; margin: 8px; padding: 8px; transition: background-color 2s';
+          boxes[1].style = 'background-color: blue; color: white; width: 300px; height: 42px; margin: 8px; padding: 8px; transition: background-color 2s linear';
+          boxes[2].style = 'background-color: blue; color: white; width: 300px; height: 42px; margin: 8px; padding: 8px; transition: background-color 2s ease-in';
+          boxes[3].style = 'background-color: blue; color: white; width: 300px; height: 42px; margin: 8px; padding: 8px; transition: background-color 2s ease-out';
+        });
+        setTimeout(function() { status.innerHTML = 'DONE'; }, 2300);
+      }
+
+      replay.addEventListener('click', run);
+      run();
+    </script>
+  </body>
+</html>

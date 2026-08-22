@@ -176,6 +176,10 @@ timeout must eventually complete, covering both priority and starvation.
 transition from translucent red through purple to opaque blue. The final DONE
 state is deterministic; the intermediate color change is verified visually.
 
+`tests/manual/easing-functions.html` compares default `ease`, `linear`,
+`ease-in`, and `ease-out` background-color transitions on one shared timeline.
+Their midpoint colors differ while their duration and final blue endpoint match.
+
 `tests/manual/threaded-loading.html` combines two external scripts and two
 same-specificity stylesheets. Run its adjacent threaded Python server to give
 each response equal latency: all four requests start together while the visible

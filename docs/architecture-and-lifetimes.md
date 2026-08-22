@@ -934,14 +934,17 @@ cost does not throttle another.
 CSS transition state is owned by its DOM Element and advanced only by the
 serialized Tab worker. The transition map is tagged by interpolation kind:
 opacity stores a numeric interpolation, while `background-color` stores RGBA
-endpoints and interpolates all four channels at the same frame position. Layout
-reads that current color directly from the Element-owned map, and each advance
-marks paint dirty so the display command and raster pixels are regenerated.
-Opacity remains eligible for the separate composited-update path and does not
-force paint. A replacement style captures its baseline from an active
-transition first, otherwise from `ProtectedField.lastValue`: this intentionally
-means the last published visual state even when a new style pass is pending,
-without treating the dirty field as newly computed.
+endpoints and interpolates all four channels at the same frame position. Each
+entry stores its timing function by value. Normalized frame progress is linear
+in scheduler time, then `easing.zig` maps it through CSS `ease` by default or a
+supported keyword/explicit cubic Bezier before the property interpolation.
+Layout reads that current color directly from the Element-owned map, and each
+advance marks paint dirty so the display command and raster pixels are
+regenerated. Opacity remains eligible for the separate composited-update path
+and does not force paint. A replacement style captures its baseline from an
+active transition first, otherwise from `ProtectedField.lastValue`: this
+intentionally means the last published visual state even when a new style pass
+is pending, without treating the dirty field as newly computed.
 
 When no follow-up frame is requested, or input/tab lifecycle forces a fresh
 generation, the deadline anchor is cleared while the same-document cost
