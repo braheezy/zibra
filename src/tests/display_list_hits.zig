@@ -841,6 +841,8 @@ test "activating a clean tab republishes its retained list and committed URL" {
     defer test_browser.tab_draw_list.deinit(allocator);
     test_browser.shutting_down = true; // Suppress timer threads; run the worker step directly.
     test_browser.animation_timer_active = false;
+    test_browser.animation_timer_generation = 0;
+    test_browser.animation_frame_deadline_ns = null;
     test_browser.needs_animation_frame = false;
     test_browser.needs_composite = false;
     test_browser.needs_raster = false;

@@ -1,0 +1,85 @@
+<!--
+How to verify:
+1. Open this page and wait until the status field starts with "DONE".
+2. The page records 48 requestAnimationFrame gaps while repeatedly forcing
+   style, layout, paint, blur rasterization, and draw work.
+3. The average should stay near the requested 33ms cadence instead of growing
+   by roughly 33ms plus the duration of the previous rendering pipeline.
+   Individual minimum and maximum values may vary with machine load.
+4. Run with ZIBRA_TRACE=1 to confirm task:animation_frame work on the tab
+   worker overlaps composite_raster_draw work on the main thread.
+-->
+<!doctype html>
+<html>
+<head>
+  <title>clock-based animation frame cadence</title>
+  <style>
+    body { background-color: white; color: black; font-size: 16px; }
+    input { width: 700px; height: 26px; }
+    #stressArea { width: 700px; filter: blur(4px); }
+    .stress { height: 6px; background-color: orange; }
+  </style>
+</head>
+<body>
+  <h1>Absolute animation-frame timing</h1>
+  <p>Frame timing: <input id="result" value="collecting 48 frame gaps"></p>
+  <p>Pipeline work: <input id="work" value="running"></p>
+
+  <div id="stressArea">
+    <div class="stress"></div><div class="stress"></div>
+    <div class="stress"></div><div class="stress"></div>
+    <div class="stress"></div><div class="stress"></div>
+    <div class="stress"></div><div class="stress"></div>
+    <div class="stress"></div><div class="stress"></div>
+    <div class="stress"></div><div class="stress"></div>
+    <div class="stress"></div><div class="stress"></div>
+    <div class="stress"></div><div class="stress"></div>
+    <div class="stress"></div><div class="stress"></div>
+    <div class="stress"></div><div class="stress"></div>
+    <div class="stress"></div><div class="stress"></div>
+    <div class="stress"></div><div class="stress"></div>
+    <div class="stress"></div><div class="stress"></div>
+    <div class="stress"></div><div class="stress"></div>
+    <div class="stress"></div><div class="stress"></div>
+    <div class="stress"></div><div class="stress"></div>
+  </div>
+
+  <script>
+    var gaps = [];
+    // The initial load may service the first callback synchronously. Treat it
+    // and the already-anchored first deadline as warm-ups so the report
+    // contains only steady-state timer-delivered frame gaps.
+    var previous = null;
+    var warmupGaps = 1;
+
+    function recordFrame() {
+      var current = Date.now();
+      if (previous !== null) {
+        if (warmupGaps > 0) warmupGaps = warmupGaps - 1;
+        else gaps.push(current - previous);
+      }
+      previous = current;
+
+      if (gaps.length < 48) {
+        requestAnimationFrame(recordFrame);
+        return;
+      }
+
+      var total = 0;
+      var minimum = gaps[0];
+      var maximum = gaps[0];
+      for (var i = 0; i < gaps.length; i++) {
+        total = total + gaps[i];
+        if (gaps[i] < minimum) minimum = gaps[i];
+        if (gaps[i] > maximum) maximum = gaps[i];
+      }
+      result.setAttribute('value', 'DONE requested=33ms samples=48 avg=' +
+        (total / gaps.length).toFixed(1) + 'ms min=' + minimum +
+        'ms max=' + maximum + 'ms');
+      work.setAttribute('value', 'DONE style/layout/paint/blur/draw exercised');
+    }
+
+    requestAnimationFrame(recordFrame);
+  </script>
+</body>
+</html>

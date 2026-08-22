@@ -697,7 +697,9 @@ creates an `about:blank` native window; allocation or renderer failure logs and
 leaves existing windows alive. Window-close events remove only their addressed
 entry, SDL quit is global, and Escape routed through any live Browser is the
 documented global shortcut. After event dispatch, the App broadcasts shared
-session generations and ticks composition/raster/draw for every window. In
+session generations and ticks every window. Each tick schedules requested
+tab-worker animation work before composition/raster/draw consumes the previous
+commit, so document rendering can overlap main-thread raster and draw. In
 screenshot mode a standalone Browser instead runs a windowless quiescence loop
 and exports the software root surface directly. Page workers never mutate the
 tab collection: a middle-click resolves its link target on the serialized tab
@@ -821,8 +823,23 @@ context is borrowed by that worker.
 detached OS threads. A Tab-level mutex, condition, and reference count provide a
 logical join point: helper teardown releases the reference as its final owner
 access, and `Tab.shutdown` waits for zero before document destruction. Helpers
-carry copied `DocumentHandle` values rather than `Frame` or `JsRenderContext`
-pointers.
+that target a document carry copied `DocumentHandle` values rather than
+`Frame` or `JsRenderContext` pointers. Animation helpers borrow their
+heap-stable Tab under that helper reference and pair it with the timer
+generation described below.
+
+Animation timers wait for an absolute timestamp on the monotonic `awake` clock.
+The first requested frame anchors a deadline 33ms in the future; a continuous
+chain advances by 33ms from the prior deadline rather than from the preceding
+frame's completion. If work finishes late, the next wait is immediately due;
+choosing a sustainable slower cadence belongs to the separate frame-estimator
+policy. When no follow-up frame is requested, or input/tab lifecycle forces a
+fresh generation, the deadline anchor is cleared. Detached timer helpers and
+their queued `task:animation_frame` values carry the Browser's generation and
+may finish only that generation. This lets reset paths supersede a helper
+without joining it and prevents stale wakeups from clearing or enqueueing work
+for a newer active tab. A timer-delivered commit carries the same generation;
+direct load/test commits deliberately do not consume a live timer generation.
 `setInterval` does not add a permanently looping helper. Its per-window
 JavaScript registry retains the callback and requested delay; each live
 delivery schedules exactly one new generation-stamped one-shot helper after

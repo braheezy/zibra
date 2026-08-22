@@ -1860,6 +1860,14 @@ pub fn render(self: *Tab, b: *Browser) !void {
 }
 
 pub fn runAnimationFrame(self: *Tab, scroll: i32) void {
+    self.runAnimationFrameForGeneration(scroll, null);
+}
+
+pub fn runAnimationFrameForGeneration(
+    self: *Tab,
+    scroll: i32,
+    animation_generation: ?u64,
+) void {
     const frame = self.root_frame orelse return;
     const activation_commit = self.activation_commit_requested.swap(false, .acq_rel);
     var frame_it = self.frames_by_id.valueIterator();
@@ -1886,6 +1894,7 @@ pub fn runAnimationFrame(self: *Tab, scroll: i32) void {
 
     // If animations are running, schedule the next frame
     if (animations_running) {
+        self.browser.setNeedsAnimationFrame(self);
         self.browser.scheduleAnimationFrame();
     }
 
@@ -1927,6 +1936,7 @@ pub fn runAnimationFrame(self: *Tab, scroll: i32) void {
             .zoom = self.accessibility.zoom,
             .prefers_dark = self.accessibility.prefers_dark,
             .composited_updates = self.composited_updates.items,
+            .animation_generation = animation_generation,
         };
         self.browser.commit(self, commit_data);
     }

@@ -27,6 +27,15 @@ before changing `root.zig`, `tab.zig`, `render/`, or browser task scheduling.
   `clearInterval`, navigation, frame teardown, and Tab shutdown remove the
   applicable keys before document state can retire. JavaScript interval
   callbacks and rescheduling still run only on the serialized Tab worker.
+- Animation frames use absolute monotonic `awake`-clock deadlines, not a new
+  relative 33ms sleep after each completed frame. A continuous chain advances
+  from its preceding deadline; an idle chain or forced reset starts from the
+  current clock. Every detached timer and queued animation task carries a
+  generation so superseded helpers cannot publish work or clear newer state.
+  The Browser UI tick starts requested tab-worker animation work before
+  consuming the preceding commit in composition/raster/draw, allowing the two
+  threads to overlap. CSS animations must publish `needs_animation_frame`, just
+  like JavaScript `requestAnimationFrame`, before attempting to schedule again.
 - Each tab owns a sentinel-terminated copy of its root document title. Tab
   workers replace it under `Browser.lock`; only the interactive App/UI thread
   may pass it to the addressed native window, including after tab switches.

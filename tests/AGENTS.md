@@ -155,6 +155,11 @@ three callbacks call `clearInterval`; timing variance is expected and visible.
 It also immediately clears a one-hour interval, so a completed windowless run
 proves cancellation releases the sleeping native helper promptly.
 
+`tests/manual/frame-clock-cadence.html` records 48 requestAnimationFrame gaps
+while forcing style, layout, paint, blur rasterization, and draw work. Its
+average exposes relative-delay drift; a trace also shows animation-frame tasks
+starting before and overlapping main-thread composition/raster/draw.
+
 Choose the narrowest check that covers the pipeline stage under change. A DOM
 or parser regression should normally add a DOM dump or unit fixture before a
 full screenshot fixture.

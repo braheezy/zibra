@@ -190,8 +190,29 @@ pub const h_offset = 13;
 pub const v_offset = 18;
 pub const scrollbar_width = 10;
 const scroll_step: i32 = 100;
-const refresh_rate_ns: u64 = 33_000_000; // ~30 FPS
+pub const animation_frame_interval_ns: i96 = 33_000_000; // ~30 FPS
 // *********************************************************
+
+pub const AnimationFrameTiming = struct {
+    deadline_ns: i96,
+    delay_ns: u64,
+};
+
+/// Advance the cadence from its prior absolute deadline, not from the time the
+/// previous frame happened to finish. A late frame therefore schedules the
+/// next deadline immediately instead of adding another full 33ms delay.
+pub fn nextAnimationFrameTiming(previous_deadline_ns: ?i96, now_ns: i96) AnimationFrameTiming {
+    const deadline_ns = if (previous_deadline_ns) |previous|
+        previous +| animation_frame_interval_ns
+    else
+        now_ns +| animation_frame_interval_ns;
+    const remaining_ns = deadline_ns -| now_ns;
+    const delay_ns: u64 = if (remaining_ns <= 0)
+        0
+    else
+        @intCast(@min(remaining_ns, @as(i96, std.math.maxInt(u64))));
+    return .{ .deadline_ns = deadline_ns, .delay_ns = delay_ns };
+}
 
 /// Convert SDL wheel units into Zibra's signed CSS-pixel scroll delta.
 /// SDL reports natural scrolling separately, so normalize that direction here.
@@ -1238,6 +1259,11 @@ pub const Browser = struct {
     // Focus tracking: null means nothing focused, "content" means page content
     focus: ?[]const u8 = null,
     animation_timer_active: bool = false,
+    // The generation invalidates a sleeping or queued frame after tab switches
+    // and other forced resets. The deadline anchors a continuous animation to
+    // the monotonic clock rather than to completion of the prior frame.
+    animation_timer_generation: u64 = 0,
+    animation_frame_deadline_ns: ?i96 = null,
     needs_composite: bool = true,
     needs_raster: bool = true,
     needs_draw: bool = true,
@@ -1700,7 +1726,7 @@ pub const Browser = struct {
                     }
                     self.needs_draw = true;
                     self.needs_animation_frame = true;
-                    self.animation_timer_active = false;
+                    self.invalidateAnimationTimerLocked();
                     should_schedule = true;
                 }
             }
@@ -1750,7 +1776,7 @@ pub const Browser = struct {
             self.needs_raster = true;
             self.needs_draw = true;
             self.needs_animation_frame = true;
-            self.animation_timer_active = false;
+            self.invalidateAnimationTimerLocked();
             should_schedule = true;
         }
         self.lock.unlock();
@@ -1977,8 +2003,10 @@ pub const Browser = struct {
             }
 
             if (!quit) {
-                try self.compositeRasterAndDraw();
+                // Launch tab/main-thread animation work before browser-thread
+                // raster and draw so both sides of the pipeline can overlap.
                 self.scheduleAnimationFrame();
+                try self.compositeRasterAndDraw();
 
                 if (!handled_event and self.isIdle()) {
                     // Yield briefly to avoid a busy loop when there's no work.
@@ -1994,8 +2022,10 @@ pub const Browser = struct {
         self.openPendingTabs();
         self.processPendingPostResubmission();
         self.applyWindowTitle();
-        try self.compositeRasterAndDraw();
+        // BrowserApp ticks every window on the UI thread. Start its tab worker
+        // first, then consume the previously committed frame while it runs.
         self.scheduleAnimationFrame();
+        try self.compositeRasterAndDraw();
         return self.isIdle();
     }
 
@@ -2026,6 +2056,7 @@ pub const Browser = struct {
         self.lock.lock();
         self.shutting_down = true;
         self.needs_animation_frame = false;
+        self.invalidateAnimationTimerLocked();
         self.pending_post_resubmission = null;
         self.lock.unlock();
     }
@@ -2318,7 +2349,7 @@ pub const Browser = struct {
                 }
                 self.lock.lock();
                 self.needs_animation_frame = true;
-                self.animation_timer_active = false;
+                self.invalidateAnimationTimerLocked();
                 self.lock.unlock();
                 self.scheduleAnimationFrame();
                 return;
@@ -4404,6 +4435,54 @@ pub const Browser = struct {
         thread.detach();
     }
 
+    fn advanceAnimationTimerGenerationLocked(self: *Browser) u64 {
+        self.animation_timer_generation +%= 1;
+        if (self.animation_timer_generation == 0) self.animation_timer_generation = 1;
+        return self.animation_timer_generation;
+    }
+
+    /// Invalidate an existing sleeping/queued frame without trying to stop its
+    /// detached helper. The captured generation makes that helper harmless.
+    fn invalidateAnimationTimerLocked(self: *Browser) void {
+        _ = self.advanceAnimationTimerGenerationLocked();
+        self.animation_timer_active = false;
+        self.animation_frame_deadline_ns = null;
+    }
+
+    fn animationTimerMatchesLocked(self: *const Browser, tab: *Tab, generation: u64) bool {
+        return self.animation_timer_active and
+            self.animation_timer_generation == generation and
+            self.activeTab() == tab;
+    }
+
+    /// Finish only the timer generation represented by an animation task or
+    /// commit. Preserve its absolute deadline while chaining another frame.
+    fn finishAnimationFrame(self: *Browser, tab: *Tab, generation: u64) bool {
+        self.lock.lock();
+        defer self.lock.unlock();
+        return self.finishAnimationFrameLocked(tab, generation);
+    }
+
+    fn finishAnimationFrameLocked(self: *Browser, tab: *Tab, generation: u64) bool {
+        if (!self.animationTimerMatchesLocked(tab, generation)) return false;
+
+        self.animation_timer_active = false;
+        const should_schedule = !self.shutting_down and self.needs_animation_frame;
+        if (!should_schedule) self.animation_frame_deadline_ns = null;
+        return should_schedule;
+    }
+
+    fn recoverAnimationFrameFailure(self: *Browser, tab: *Tab, generation: u64) void {
+        self.lock.lock();
+        defer self.lock.unlock();
+        if (!self.animationTimerMatchesLocked(tab, generation)) return;
+        self.animation_timer_active = false;
+        self.animation_frame_deadline_ns = null;
+        if (!self.shutting_down and !tab.isShuttingDown()) {
+            self.needs_animation_frame = true;
+        }
+    }
+
     pub fn scheduleAnimationFrame(self: *Browser) void {
         self.lock.lock();
         if (self.shutting_down or self.animation_timer_active or !self.needs_animation_frame or self.activeTab() == null) {
@@ -4411,17 +4490,23 @@ pub const Browser = struct {
             return;
         }
         const tab = self.activeTab().?;
+        const now_ns = std.Io.Clock.awake.now(self.io).nanoseconds;
+        const timing = nextAnimationFrameTiming(self.animation_frame_deadline_ns, now_ns);
+        const generation = self.advanceAnimationTimerGenerationLocked();
         self.animation_timer_active = true;
+        self.animation_frame_deadline_ns = timing.deadline_ns;
         self.needs_animation_frame = false;
         tab.retainAsyncThread();
         self.lock.unlock();
 
-        const ctx = AnimationTimerContext.create(self, tab) catch |err| {
+        const ctx = AnimationTimerContext.create(
+            self,
+            tab,
+            generation,
+            timing.deadline_ns,
+        ) catch |err| {
             std.log.warn("Failed to allocate animation timer context: {}", .{err});
-            self.lock.lock();
-            self.animation_timer_active = false;
-            self.needs_animation_frame = true;
-            self.lock.unlock();
+            self.recoverAnimationFrameFailure(tab, generation);
             tab.releaseAsyncThread();
             return;
         };
@@ -4429,10 +4514,7 @@ pub const Browser = struct {
         const thread = std.Thread.spawn(.{}, runAnimationTimerThread, .{ctx}) catch |err| {
             std.log.warn("Failed to spawn animation timer thread: {}", .{err});
             ctx.destroy();
-            self.lock.lock();
-            self.animation_timer_active = false;
-            self.needs_animation_frame = true;
-            self.lock.unlock();
+            self.recoverAnimationFrameFailure(tab, generation);
             tab.releaseAsyncThread();
             return;
         };
@@ -5339,8 +5421,10 @@ pub const Browser = struct {
             self.clearActiveTabUrlLocked();
         }
 
-        self.animation_timer_active = false;
-        const should_schedule_animation = self.needs_animation_frame;
+        const should_schedule_animation = if (data.animation_generation) |generation|
+            self.finishAnimationFrameLocked(tab, generation)
+        else
+            false;
 
         // Determine which phases need to run based on what changed
         if (has_display_list_change) {
@@ -6866,6 +6950,7 @@ pub const Browser = struct {
         self.lock.lock();
         self.shutting_down = true;
         self.needs_animation_frame = false;
+        self.invalidateAnimationTimerLocked();
         self.pending_post_resubmission = null;
         self.lock.unlock();
         for (self.tabs.items) |tab| tab.shutdown();
@@ -6942,6 +7027,9 @@ pub const CommitData = struct {
     zoom: f32,
     prefers_dark: bool,
     composited_updates: []const Tab.CompositedUpdate = &.{},
+    // Present only for timer-delivered animation work. Synchronous first-paint
+    // commits must not consume an unrelated pending timer generation.
+    animation_generation: ?u64 = null,
 };
 
 const LoadTaskContext = struct {
@@ -7760,10 +7848,22 @@ const SetTimeoutTaskContext = struct {
 const AnimationTimerContext = struct {
     browser: *Browser,
     tab: *Tab,
+    generation: u64,
+    deadline_ns: i96,
 
-    fn create(browser: *Browser, tab: *Tab) !*AnimationTimerContext {
+    fn create(
+        browser: *Browser,
+        tab: *Tab,
+        generation: u64,
+        deadline_ns: i96,
+    ) !*AnimationTimerContext {
         const ctx = try browser.allocator.create(AnimationTimerContext);
-        ctx.* = .{ .browser = browser, .tab = tab };
+        ctx.* = .{
+            .browser = browser,
+            .tab = tab,
+            .generation = generation,
+            .deadline_ns = deadline_ns,
+        };
         return ctx;
     }
 
@@ -7784,22 +7884,18 @@ fn runAnimationTimerThread(ctx: *AnimationTimerContext) void {
         std.log.warn("Failed to register animation timer thread: {}", .{err});
     };
 
-    browser.io.sleep(.fromNanoseconds(refresh_rate_ns), .awake) catch return;
-
-    browser.lock.lock();
-    // Check if browser is shutting down before accessing any resources
-    if (browser.shutting_down) {
-        browser.animation_timer_active = false;
-        browser.lock.unlock();
-        return;
-    }
-    const active_tab = browser.activeTab() orelse {
-        browser.animation_timer_active = false;
-        browser.lock.unlock();
+    const deadline = std.Io.Timestamp{ .nanoseconds = ctx.deadline_ns };
+    deadline.withClock(.awake).wait(browser.io) catch {
+        browser.recoverAnimationFrameFailure(tab, ctx.generation);
         return;
     };
-    if (active_tab != tab or tab.isShuttingDown()) {
-        browser.animation_timer_active = false;
+
+    browser.lock.lock();
+    // A tab switch or forced reset can supersede this detached helper without
+    // joining it. Only the captured generation may publish a render task.
+    if (!browser.animationTimerMatchesLocked(tab, ctx.generation) or
+        browser.shutting_down or tab.isShuttingDown())
+    {
         browser.lock.unlock();
         return;
     }
@@ -7811,11 +7907,10 @@ fn runAnimationTimerThread(ctx: *AnimationTimerContext) void {
         browser,
         tab,
         scroll,
+        ctx.generation,
     ) catch |err| {
         std.log.warn("Failed to allocate animation task: {}", .{err});
-        browser.lock.lock();
-        browser.animation_timer_active = false;
-        browser.lock.unlock();
+        browser.recoverAnimationFrameFailure(tab, ctx.generation);
         return;
     };
 
@@ -7829,9 +7924,7 @@ fn runAnimationTimerThread(ctx: *AnimationTimerContext) void {
     tab.task_runner.schedule(task) catch |err| {
         std.log.warn("Failed to schedule animation frame: {}", .{err});
         render_ctx.destroy();
-        browser.lock.lock();
-        browser.animation_timer_active = false;
-        browser.lock.unlock();
+        browser.recoverAnimationFrameFailure(tab, ctx.generation);
         return;
     };
 }
@@ -7841,12 +7934,14 @@ const AnimationRenderTaskContext = struct {
     browser: *Browser,
     tab: *Tab,
     scroll: i32,
+    generation: u64,
 
     fn create(
         allocator: std.mem.Allocator,
         browser: *Browser,
         tab: *Tab,
         scroll: i32,
+        generation: u64,
     ) !*AnimationRenderTaskContext {
         const ctx = try allocator.create(AnimationRenderTaskContext);
         ctx.* = .{
@@ -7854,6 +7949,7 @@ const AnimationRenderTaskContext = struct {
             .browser = browser,
             .tab = tab,
             .scroll = scroll,
+            .generation = generation,
         };
         return ctx;
     }
@@ -7880,17 +7976,18 @@ const AnimationRenderTaskContext = struct {
     }
 
     fn run(self: *AnimationRenderTaskContext) !void {
-        if (self.tab.isShuttingDown()) return;
-        self.tab.runAnimationFrame(self.scroll);
-
         self.browser.lock.lock();
-        const should_clear = self.browser.animation_timer_active;
-        const should_reschedule = self.browser.needs_animation_frame;
-        if (should_clear) {
-            self.browser.animation_timer_active = false;
-        }
+        const is_current = !self.browser.shutting_down and
+            !self.tab.isShuttingDown() and
+            self.browser.animationTimerMatchesLocked(self.tab, self.generation);
         self.browser.lock.unlock();
-        if (should_clear and should_reschedule) {
+
+        if (!is_current) return;
+        self.tab.runAnimationFrameForGeneration(self.scroll, self.generation);
+
+        // A commit normally consumes this generation. Frames with no visual
+        // commit still have to release it and possibly chain the next request.
+        if (self.browser.finishAnimationFrame(self.tab, self.generation)) {
             self.browser.scheduleAnimationFrame();
         }
     }
