@@ -240,6 +240,10 @@ before changing `root.zig`, `tab.zig`, `render/`, or browser task scheduling.
   Keep each effect wrapper in its own layer: neighboring filters and `dst_in`
   masks are ordered groups and must never be merged. Blur expands visual layer
   bounds but does not expand the DOM hit target.
+- CSS transition state advances only on the serialized Tab worker. Opacity
+  emits a composited update and can skip paint; `background-color` writes the
+  interpolated RGBA value in Element-owned animation state and marks paint
+  dirty on every frame because the rectangle command and raster pixels change.
 - A fixed-height `overflow: scroll` block keeps its natural content height as
   DOM-owned scroll geometry while layout exposes the fixed client height.
   Paint keeps the box background stationary, translates its content by the

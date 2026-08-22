@@ -11,6 +11,10 @@ const std = @import("std");
 const zigimg = @import("zigimg");
 const ProtectedField = @import("../core/protected_field.zig").ProtectedField;
 const CSSParser = @import("css_parser.zig").CSSParser;
+const css_color = @import("color.zig");
+
+pub const CssColor = css_color.Color;
+pub const parseCssColor = css_color.parse;
 
 /// Animation state for a numeric CSS property transition
 pub const NumericAnimation = struct {
@@ -48,6 +52,86 @@ pub const NumericAnimation = struct {
         return self.current_frame >= self.total_frames;
     }
 };
+
+/// Animation state for a CSS color transition. Every RGBA channel is
+/// interpolated independently over the same normalized frame position.
+pub const ColorAnimation = struct {
+    start_value: CssColor,
+    end_value: CssColor,
+    current_frame: u32,
+    total_frames: u32,
+
+    pub fn init(start: CssColor, end: CssColor, frames: u32) ColorAnimation {
+        return .{
+            .start_value = start,
+            .end_value = end,
+            .current_frame = 0,
+            .total_frames = frames,
+        };
+    }
+
+    fn interpolateChannel(start: u8, end: u8, current_frame: u32, total_frames: u32) u8 {
+        if (total_frames == 0 or current_frame >= total_frames) return end;
+        const t = @as(f64, @floatFromInt(current_frame)) /
+            @as(f64, @floatFromInt(total_frames));
+        const start_float: f64 = @floatFromInt(start);
+        const end_float: f64 = @floatFromInt(end);
+        return @intFromFloat(@round(start_float + (end_float - start_float) * t));
+    }
+
+    pub fn getValue(self: ColorAnimation) CssColor {
+        return .{
+            .r = interpolateChannel(self.start_value.r, self.end_value.r, self.current_frame, self.total_frames),
+            .g = interpolateChannel(self.start_value.g, self.end_value.g, self.current_frame, self.total_frames),
+            .b = interpolateChannel(self.start_value.b, self.end_value.b, self.current_frame, self.total_frames),
+            .a = interpolateChannel(self.start_value.a, self.end_value.a, self.current_frame, self.total_frames),
+        };
+    }
+
+    pub fn advance(self: *ColorAnimation) bool {
+        if (self.current_frame < self.total_frames) self.current_frame += 1;
+        return self.current_frame >= self.total_frames;
+    }
+
+    pub fn isComplete(self: ColorAnimation) bool {
+        return self.current_frame >= self.total_frames;
+    }
+};
+
+/// Property-specific transition state retained by one DOM element.
+pub const Animation = union(enum) {
+    numeric: NumericAnimation,
+    color: ColorAnimation,
+
+    pub fn advance(self: *Animation) bool {
+        return switch (self.*) {
+            .numeric => |*animation| animation.advance(),
+            .color => |*animation| animation.advance(),
+        };
+    }
+
+    pub fn isComplete(self: Animation) bool {
+        return switch (self) {
+            .numeric => |animation| animation.isComplete(),
+            .color => |animation| animation.isComplete(),
+        };
+    }
+};
+
+test "color animation interpolates every channel" {
+    var animation = ColorAnimation.init(
+        .{ .r = 0, .g = 100, .b = 200, .a = 0 },
+        .{ .r = 255, .g = 0, .b = 100, .a = 255 },
+        4,
+    );
+    try std.testing.expectEqual(CssColor{ .r = 0, .g = 100, .b = 200, .a = 0 }, animation.getValue());
+    _ = animation.advance();
+    _ = animation.advance();
+    try std.testing.expectEqual(CssColor{ .r = 128, .g = 50, .b = 150, .a = 128 }, animation.getValue());
+    _ = animation.advance();
+    try std.testing.expect(animation.advance());
+    try std.testing.expectEqual(CssColor{ .r = 255, .g = 0, .b = 100, .a = 255 }, animation.getValue());
+}
 
 // These tags can look like <tag /> and don't need a closing tag.
 // HTML has specific elements that are self-closing by definition
@@ -242,8 +326,8 @@ pub const Element = struct {
     // element, including when a detached node is later re-attached.
     script_started: bool = false,
     children_dirty: bool = true,
-    // Animation state for CSS transitions, keyed by property name (e.g., "opacity")
-    animations: ?std.StringHashMap(NumericAnimation) = null,
+    // Animation state for CSS transitions, keyed by property name.
+    animations: ?std.StringHashMap(Animation) = null,
     image_data: ?ImageData = null,
     opacity_anim_value: [32]u8 = undefined,
 

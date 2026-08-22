@@ -52,6 +52,7 @@ The source tree is organized by responsibility:
 | [`src/document/parser.zig`](../src/document/parser.zig) | HTML parser, DOM representation, style maps, images, and DOM tree utilities. |
 | [`src/document/inspection.zig`](../src/document/inspection.zig) | Browser-free fetch/decode/parse/style pipeline for document inspection commands. |
 | [`src/document/css_parser.zig`](../src/document/css_parser.zig) | CSS parsing and `CSSRule` ownership. |
+| [`src/document/color.zig`](../src/document/color.zig) | Shared parsing for paintable named and hexadecimal RGBA CSS colors. |
 | [`src/document/selector.zig`](../src/document/selector.zig) | Selector representation and matching. |
 | [`src/network/url.zig`](../src/network/url.zig) | Owning `Url`, URL resolution, schemes, HTTP requests, redirects, cookies, response bodies, and cache integration. |
 | [`src/network/cache.zig`](../src/network/cache.zig) | Browser-session HTTP response entries, expiry, and strict `Cache-Control` policy parsing. |
@@ -929,6 +930,18 @@ half-delta smoothing reacts quickly; downward eighth-delta smoothing prevents
 bucket oscillation and eventually restores 33ms when work becomes cheap.
 Successful root navigation and active-tab changes reset samples so one page's
 cost does not throttle another.
+
+CSS transition state is owned by its DOM Element and advanced only by the
+serialized Tab worker. The transition map is tagged by interpolation kind:
+opacity stores a numeric interpolation, while `background-color` stores RGBA
+endpoints and interpolates all four channels at the same frame position. Layout
+reads that current color directly from the Element-owned map, and each advance
+marks paint dirty so the display command and raster pixels are regenerated.
+Opacity remains eligible for the separate composited-update path and does not
+force paint. A replacement style captures its baseline from an active
+transition first, otherwise from `ProtectedField.lastValue`: this intentionally
+means the last published visual state even when a new style pass is pending,
+without treating the dirty field as newly computed.
 
 When no follow-up frame is requested, or input/tab lifecycle forces a fresh
 generation, the deadline anchor is cleared while the same-document cost

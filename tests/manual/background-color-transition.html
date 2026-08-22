@@ -1,0 +1,41 @@
+<!--
+How to verify:
+1. The animation starts on load; click Animate background to replay it.
+2. The box must move smoothly from translucent red through purple to opaque blue,
+   rather than jumping directly to blue.
+3. The status changes to DONE after the one-second transition.
+-->
+<!doctype html>
+<html>
+  <head>
+    <title>background-color transition</title>
+    <style>
+      body { background-color: white; color: black; font-size: 18px; }
+      .stage { background-color: black; width: 320px; padding: 12px; }
+      .box { background-color: #ff000040; width: 280px; height: 100px; }
+      button { margin: 14px 0; }
+      .status { background-color: lightgray; padding: 8px; }
+    </style>
+  </head>
+  <body>
+    <h1>Background color transition</h1>
+    <div class="stage"><div class="box">COLOR BOX</div></div>
+    <button>Animate background</button>
+    <p class="status">READY</p>
+    <script>
+      var box = document.querySelectorAll('div')[1];
+      var button = document.querySelectorAll('button')[0];
+      var status = document.querySelectorAll('p')[0];
+      function animateBackground() {
+        status.innerHTML = 'ANIMATING';
+        box.style = 'background-color: #ff000040; width: 280px; height: 100px';
+        requestAnimationFrame(function() {
+          box.style = 'background-color: #0000ffff; width: 280px; height: 100px; transition: background-color 1s';
+        });
+        setTimeout(function() { status.innerHTML = 'DONE'; }, 1200);
+      }
+      button.addEventListener('click', animateBackground);
+      animateBackground();
+    </script>
+  </body>
+</html>

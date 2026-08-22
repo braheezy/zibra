@@ -132,6 +132,13 @@ pub fn ProtectedField(comptime T: type) type {
             return &self.value;
         }
 
+        /// Return the last published value without requiring the field to be
+        /// clean or registering a dependency. This is a historical snapshot,
+        /// not permission to use a dirty field as current computed state.
+        pub fn lastValue(self: *const @This()) *const T {
+            return &self.value;
+        }
+
         pub fn set(self: *@This(), value: T) void {
             // Only notify dependents if the value actually changed (for comparable types)
             // Check type at comptime and decide whether to compare
@@ -175,4 +182,15 @@ test "clearInvalidations detaches subscribers before their lifetime ends" {
 
     source.set(3);
     try std.testing.expect(!subscriber.dirty);
+}
+
+test "last published value remains available while recomputation is pending" {
+    const Field = ProtectedField(i32);
+    var field = Field.init(std.testing.allocator, 4);
+    defer field.deinit();
+    field.set(9);
+    field.mark();
+
+    try std.testing.expect(field.dirty);
+    try std.testing.expectEqual(@as(i32, 9), field.lastValue().*);
 }

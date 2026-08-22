@@ -172,6 +172,10 @@ the Browser/UI thread.
 callbacks with 48 animation frames. Frame cadence remains visible while every
 timeout must eventually complete, covering both priority and starvation.
 
+`tests/manual/background-color-transition.html` exercises a one-second RGBA
+transition from translucent red through purple to opaque blue. The final DONE
+state is deterministic; the intermediate color change is verified visually.
+
 `tests/manual/threaded-loading.html` combines two external scripts and two
 same-specificity stylesheets. Run its adjacent threaded Python server to give
 each response equal latency: all four requests start together while the visible

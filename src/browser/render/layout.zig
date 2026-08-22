@@ -2901,10 +2901,14 @@ const InputLayout = struct {
             self.bgcolor = .{ .r = 255, .g = 255, .b = 255, .a = 255 };
         }
 
-        if (element.style) |*style_map| {
+        if (animatedBackgroundColor(element)) |color| {
+            self.bgcolor = color;
+        } else if (element.style) |*style_map| {
             if (styleValue(style_map, "background-color")) |bg| {
-                if (parseColor(bg)) |col| {
-                    self.bgcolor = col;
+                if (!std.ascii.eqlIgnoreCase(bg, "transparent")) {
+                    if (parseColor(bg)) |col| {
+                        self.bgcolor = col;
+                    }
                 }
             }
             if (styleValue(style_map, "border-radius")) |radius| {
@@ -3205,9 +3209,13 @@ const ButtonLayout = struct {
         element: parser.Element,
         parent_block: *BlockLayout,
     ) !void {
-        if (element.style) |*style_map| {
+        if (animatedBackgroundColor(element)) |color| {
+            self.bgcolor = color;
+        } else if (element.style) |*style_map| {
             if (styleValue(style_map, "background-color")) |background| {
-                if (parseColor(background)) |color| self.bgcolor = color;
+                if (!std.ascii.eqlIgnoreCase(background, "transparent")) {
+                    if (parseColor(background)) |color| self.bgcolor = color;
+                }
             }
             if (styleValue(style_map, "border-radius")) |radius| {
                 self.border_radius = parseCssPixelRadius(radius);
@@ -5269,57 +5277,39 @@ fn layoutInlineBlock(self: *Layout, block: *BlockLayout) !void {
 }
 
 fn parseColor(color_str: []const u8) ?browser.Color {
-    // Handle hex colors like #rrggbbaa (with alpha)
-    if (color_str.len == 9 and color_str[0] == '#') {
-        const r = std.fmt.parseInt(u8, color_str[1..3], 16) catch return null;
-        const g = std.fmt.parseInt(u8, color_str[3..5], 16) catch return null;
-        const b = std.fmt.parseInt(u8, color_str[5..7], 16) catch return null;
-        const a = std.fmt.parseInt(u8, color_str[7..9], 16) catch return null;
-        return browser.Color{ .r = r, .g = g, .b = b, .a = a };
-    }
-    // Handle hex colors like #rrggbb (opaque)
-    else if (color_str.len == 7 and color_str[0] == '#') {
-        const r = std.fmt.parseInt(u8, color_str[1..3], 16) catch return null;
-        const g = std.fmt.parseInt(u8, color_str[3..5], 16) catch return null;
-        const b = std.fmt.parseInt(u8, color_str[5..7], 16) catch return null;
-        return browser.Color{ .r = r, .g = g, .b = b, .a = 255 };
-    }
+    const color = parser.parseCssColor(color_str) orelse return null;
+    return .{ .r = color.r, .g = color.g, .b = color.b, .a = color.a };
+}
 
-    // Handle named colors
-    if (std.mem.eql(u8, color_str, "red")) {
-        return browser.Color{ .r = 255, .g = 0, .b = 0, .a = 255 };
-    } else if (std.mem.eql(u8, color_str, "green")) {
-        return browser.Color{ .r = 0, .g = 128, .b = 0, .a = 255 };
-    } else if (std.mem.eql(u8, color_str, "blue")) {
-        return browser.Color{ .r = 0, .g = 0, .b = 255, .a = 255 };
-    } else if (std.mem.eql(u8, color_str, "yellow")) {
-        return browser.Color{ .r = 255, .g = 255, .b = 0, .a = 255 };
-    } else if (std.mem.eql(u8, color_str, "gray") or std.mem.eql(u8, color_str, "grey")) {
-        return browser.Color{ .r = 128, .g = 128, .b = 128, .a = 255 };
-    } else if (std.mem.eql(u8, color_str, "lightgray") or std.mem.eql(u8, color_str, "lightgrey")) {
-        return browser.Color{ .r = 211, .g = 211, .b = 211, .a = 255 };
-    } else if (std.mem.eql(u8, color_str, "white")) {
-        return browser.Color{ .r = 255, .g = 255, .b = 255, .a = 255 };
-    } else if (std.mem.eql(u8, color_str, "black")) {
-        return browser.Color{ .r = 0, .g = 0, .b = 0, .a = 255 };
-    } else if (std.mem.eql(u8, color_str, "orange")) {
-        return browser.Color{ .r = 255, .g = 165, .b = 0, .a = 255 };
-    } else if (std.mem.eql(u8, color_str, "purple")) {
-        return browser.Color{ .r = 128, .g = 0, .b = 128, .a = 255 };
-    } else if (std.mem.eql(u8, color_str, "pink")) {
-        return browser.Color{ .r = 255, .g = 192, .b = 203, .a = 255 };
-    } else if (std.mem.eql(u8, color_str, "lightblue")) {
-        return browser.Color{ .r = 173, .g = 216, .b = 230, .a = 255 };
-    } else if (std.mem.eql(u8, color_str, "lightgreen")) {
-        return browser.Color{ .r = 144, .g = 238, .b = 144, .a = 255 };
-    } else if (std.mem.eql(u8, color_str, "cyan")) {
-        return browser.Color{ .r = 0, .g = 255, .b = 255, .a = 255 };
-    } else if (std.mem.eql(u8, color_str, "magenta")) {
-        return browser.Color{ .r = 255, .g = 0, .b = 255, .a = 255 };
-    } else if (std.mem.eql(u8, color_str, "orangered")) {
-        return browser.Color{ .r = 255, .g = 69, .b = 0, .a = 255 };
-    }
-    return null;
+fn animatedBackgroundColor(element: parser.Element) ?browser.Color {
+    const animations = element.animations orelse return null;
+    const animation = animations.get("background-color") orelse return null;
+    const color = switch (animation) {
+        .color => |value| value.getValue(),
+        .numeric => return null,
+    };
+    return .{ .r = color.r, .g = color.g, .b = color.b, .a = color.a };
+}
+
+test "layout reads the current background color animation value" {
+    const allocator = std.testing.allocator;
+    var element = try parser.Element.init(allocator, "div", null);
+    defer element.deinit(allocator);
+    element.animations = std.StringHashMap(parser.Animation).init(allocator);
+
+    var color = parser.ColorAnimation.init(
+        .{ .r = 255, .g = 0, .b = 0, .a = 0 },
+        .{ .r = 0, .g = 0, .b = 255, .a = 255 },
+        4,
+    );
+    _ = color.advance();
+    _ = color.advance();
+    try element.animations.?.put("background-color", .{ .color = color });
+
+    try std.testing.expectEqual(
+        browser.Color{ .r = 128, .g = 0, .b = 128, .a = 128 },
+        animatedBackgroundColor(element).?,
+    );
 }
 
 fn addBackgroundIfNeeded(self: *Layout, block: *const BlockLayout) !void {
@@ -5349,9 +5339,11 @@ fn addBackgroundIfNeeded(self: *Layout, block: *const BlockLayout) !void {
             // Determine the background color
             var color: ?browser.Color = null;
 
-            if (bgcolor_str) |bg| {
+            if (animatedBackgroundColor(e)) |animated| {
+                color = animated;
+            } else if (bgcolor_str) |bg| {
                 // Don't draw if explicitly transparent
-                if (std.mem.eql(u8, bg, "transparent")) {
+                if (std.ascii.eqlIgnoreCase(bg, "transparent")) {
                     return;
                 }
                 color = parseColor(bg);
@@ -5362,6 +5354,7 @@ fn addBackgroundIfNeeded(self: *Layout, block: *const BlockLayout) !void {
 
             // Draw the background rectangle if we have a color
             if (color) |col| {
+                if (col.a == 0) return;
                 const remapped = self.remapColor(col);
                 // Parse border-radius if present
                 const radius = if (border_radius_str) |br_str| parseCssPixelRadius(br_str) else 0;
@@ -5646,8 +5639,13 @@ fn applyPaintEffects(self: *Layout, block: *BlockLayout, commands: []DisplayItem
             // Check for active opacity animation first
             if (elem.animations) |animations| {
                 if (animations.get("opacity")) |anim| {
-                    opacity = anim.getValue();
-                    opacity = @max(0.0, @min(1.0, opacity)); // Clamp to valid range
+                    switch (anim) {
+                        .numeric => |numeric| {
+                            opacity = numeric.getValue();
+                            opacity = @max(0.0, @min(1.0, opacity)); // Clamp to valid range
+                        },
+                        .color => {},
+                    }
                 }
             }
             // Fall back to style value if no animation
@@ -5888,9 +5886,11 @@ fn addBackgroundIfNeededToList(self: *Layout, commands: *std.ArrayList(DisplayIt
             // Determine the background color
             var color: ?browser.Color = null;
 
-            if (bgcolor_str) |bg| {
+            if (animatedBackgroundColor(e)) |animated| {
+                color = animated;
+            } else if (bgcolor_str) |bg| {
                 // Don't draw if explicitly transparent
-                if (std.mem.eql(u8, bg, "transparent")) {
+                if (std.ascii.eqlIgnoreCase(bg, "transparent")) {
                     return;
                 }
                 color = parseColor(bg);
@@ -5901,6 +5901,7 @@ fn addBackgroundIfNeededToList(self: *Layout, commands: *std.ArrayList(DisplayIt
 
             // Draw the background rectangle if we have a color
             if (color) |col| {
+                if (col.a == 0) return;
                 const remapped = self.remapColor(col);
                 // Parse border-radius if present
                 const radius = if (border_radius_str) |br_str| parseCssPixelRadius(br_str) else 0;

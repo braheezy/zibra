@@ -69,5 +69,9 @@ or Kiesel allocation/locking.
   timer JavaScript serialized on the tab worker.
 - Attribute and inline-style mutation can affect `:has` matches. Dirty the
   changed element's style and its ancestor chain before requesting a render.
+- Inline `style` replacement detects supported transitions from the previous
+  computed value to the new declaration. Opacity creates a numeric transition;
+  `background-color` parses both endpoints into RGBA and creates a color
+  transition. Never retain slices from the temporary inline-style parse map.
 - Exercise interactive behavior with a deterministic `tests/manual/` page that
   reports success in-page.

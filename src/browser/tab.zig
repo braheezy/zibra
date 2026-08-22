@@ -1958,23 +1958,38 @@ fn advanceAnimations(self: *Tab, node: *parser.Node) bool {
                         _ = anim.advance();
                         any_running = true;
 
-                        // Record composited update for opacity animations
+                        // Opacity updates can remain on the compositor path.
                         if (std.mem.eql(u8, entry.key_ptr.*, "opacity")) {
-                            if (elem.style) |*style_map| {
-                                if (style_map.getPtr("opacity")) |field| {
-                                    const buf = std.fmt.bufPrint(&elem.opacity_anim_value, "{d:.3}", .{anim.getValue()}) catch null;
-                                    if (buf) |value| {
-                                        field.set(value);
+                            switch (anim.*) {
+                                .numeric => |numeric| {
+                                    const opacity = numeric.getValue();
+                                    if (elem.style) |*style_map| {
+                                        if (style_map.getPtr("opacity")) |field| {
+                                            const buf = std.fmt.bufPrint(&elem.opacity_anim_value, "{d:.3}", .{opacity}) catch null;
+                                            if (buf) |value| {
+                                                field.set(value);
+                                            }
+                                        }
                                     }
-                                }
+                                    const update = CompositedUpdate{
+                                        .node = @ptrCast(elem),
+                                        .opacity = opacity,
+                                    };
+                                    self.composited_updates.append(self.allocator, update) catch continue;
+                                    if (self.root_frame) |root_frame| {
+                                        applyRetainedCompositedOpacity(root_frame, update);
+                                    }
+                                },
+                                .color => {},
                             }
-                            const update = CompositedUpdate{
-                                .node = @ptrCast(elem),
-                                .opacity = anim.getValue(),
-                            };
-                            self.composited_updates.append(self.allocator, update) catch continue;
-                            if (self.root_frame) |root_frame| {
-                                applyRetainedCompositedOpacity(root_frame, update);
+                        } else if (std.mem.eql(u8, entry.key_ptr.*, "background-color")) {
+                            switch (anim.*) {
+                                // A background is part of the painted command,
+                                // so it cannot use opacity's composited-only
+                                // update path. Layout reads the current color
+                                // directly from this element-owned animation.
+                                .color => self.needs_paint = true,
+                                .numeric => {},
                             }
                         }
                     }

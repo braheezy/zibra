@@ -10,6 +10,10 @@ before changing dependency registration or destruction behavior.
   before its address becomes invalid. Supported structural DOM mutation uses a
   coarse pre-mutation clear of all style publishers and forces full style and
   layout recomputation; general per-edge unsubscription remains unresolved.
+- `ProtectedField.lastValue` is an explicit non-subscribing historical read.
+  It may be used while dirty only when the consumer needs the last published
+  state, such as the visual baseline for an interrupted CSS transition; it is
+  not a substitute for recomputation or a clean `get`.
 - Keep core primitives independent of Browser, SDL, Kiesel, and URL layers.
 - Changes here need direct unit coverage plus regression coverage in each
   consuming subsystem where the lifecycle can differ.

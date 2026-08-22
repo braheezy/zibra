@@ -17,6 +17,8 @@ const parser = @import("../document/parser.zig");
 const Node = parser.Node;
 const CSSParser = @import("../document/css_parser.zig").CSSParser;
 const NumericAnimation = parser.NumericAnimation;
+const ColorAnimation = parser.ColorAnimation;
+const Animation = parser.Animation;
 
 const Js = @This();
 
@@ -67,10 +69,43 @@ fn parseTransitionValue(value: []const u8) ?struct { property: []const u8, frame
 /// Start an opacity animation on an element
 fn startOpacityAnimation(allocator: std.mem.Allocator, elem: *parser.Element, start: f64, end: f64, frames: u32) !void {
     if (elem.animations == null) {
-        elem.animations = std.StringHashMap(NumericAnimation).init(allocator);
+        elem.animations = std.StringHashMap(Animation).init(allocator);
     }
-    const animation = NumericAnimation.init(start, end, frames);
+    const animation = Animation{ .numeric = NumericAnimation.init(start, end, frames) };
     try elem.animations.?.put("opacity", animation);
+}
+
+/// Start a background-color animation on an element.
+fn startBackgroundColorAnimation(
+    allocator: std.mem.Allocator,
+    elem: *parser.Element,
+    start: parser.CssColor,
+    end: parser.CssColor,
+    frames: u32,
+) !void {
+    if (elem.animations == null) {
+        elem.animations = std.StringHashMap(Animation).init(allocator);
+    }
+    const animation = Animation{ .color = ColorAnimation.init(start, end, frames) };
+    try elem.animations.?.put("background-color", animation);
+}
+
+fn currentAnimatedOpacity(elem: *const parser.Element) ?f64 {
+    const animations = elem.animations orelse return null;
+    const animation = animations.get("opacity") orelse return null;
+    return switch (animation) {
+        .numeric => |numeric| numeric.getValue(),
+        .color => null,
+    };
+}
+
+fn currentAnimatedBackgroundColor(elem: *const parser.Element) ?parser.CssColor {
+    const animations = elem.animations orelse return null;
+    const animation = animations.get("background-color") orelse return null;
+    return switch (animation) {
+        .color => |color| color.getValue(),
+        .numeric => null,
+    };
 }
 
 pub const RenderCallbackFn = *const fn (context: ?*anyopaque) anyerror!void;
@@ -2214,6 +2249,50 @@ test "native style_set updates element style attribute" {
     }
 }
 
+test "native style_set starts a background-color transition from computed color" {
+    const allocator = std.testing.allocator;
+    var html_parser = try parser.HTMLParser.init(
+        allocator,
+        "<div style=\"background-color: #ff000080\"></div>",
+    );
+    html_parser.use_implicit_tags = false;
+    defer html_parser.deinit(allocator);
+    var root = try html_parser.parse();
+    defer root.deinit(allocator);
+    parser.fixParentPointers(&root, null);
+    try parser.style(allocator, &root, &.{});
+
+    var environ = std.process.Environ.Map.init(allocator);
+    defer environ.deinit();
+    var js = try Js.init(allocator, std.testing.io, &environ);
+    defer js.deinit(allocator);
+    js.setNodes(0, &root);
+    defer js.setNodes(0, null);
+
+    const result = try js.evaluate(0,
+        \\var box = document.querySelectorAll('div')[0];
+        \\box.style = 'background-color: #0000ffff; transition: background-color 500ms';
+        \\true
+    );
+    try std.testing.expect(result.toBoolean());
+
+    const animation = root.element.animations.?.get("background-color").?;
+    switch (animation) {
+        .color => |color| {
+            try std.testing.expectEqual(
+                parser.CssColor{ .r = 255, .g = 0, .b = 0, .a = 128 },
+                color.start_value,
+            );
+            try std.testing.expectEqual(
+                parser.CssColor{ .r = 0, .g = 0, .b = 255, .a = 255 },
+                color.end_value,
+            );
+            try std.testing.expectEqual(@as(u32, 30), color.total_frames);
+        },
+        .numeric => try std.testing.expect(false),
+    }
+}
+
 const RenderTestContext = struct {
     called: *bool,
 };
@@ -3674,12 +3753,30 @@ fn styleSet(agent: *Agent, this_value: Value, arguments: kiesel.types.Arguments)
                 e.attributes = std.StringHashMap([]const u8).init(js_instance.allocator);
             }
 
-            // Get old opacity value for transition detection
-            var old_opacity: ?f64 = null;
+            // Capture current computed values before replacing the inline
+            // declaration. An interrupted transition therefore starts from
+            // its currently painted value rather than its original endpoint.
+            var old_opacity = currentAnimatedOpacity(e);
+            var old_background_color = currentAnimatedBackgroundColor(e);
             if (e.style) |*style_map| {
-                if (style_map.getPtr("opacity")) |field| {
-                    old_opacity = std.fmt.parseFloat(f64, field.get().*) catch null;
+                if (old_opacity == null) {
+                    if (style_map.getPtr("opacity")) |field| {
+                        old_opacity = std.fmt.parseFloat(f64, field.lastValue().*) catch null;
+                    }
                 }
+                if (old_background_color == null) {
+                    if (style_map.getPtr("background-color")) |field| {
+                        old_background_color = parser.parseCssColor(field.lastValue().*);
+                    }
+                }
+            }
+
+            // Replacing the complete inline style cancels transitions that
+            // are not explicitly restarted below. Capture their current
+            // values first so an interrupted replacement remains continuous.
+            if (e.animations) |*animations| {
+                _ = animations.remove("opacity");
+                _ = animations.remove("background-color");
             }
 
             const owned_style = try js_instance.allocator.dupe(u8, style_str);
@@ -3699,7 +3796,7 @@ fn styleSet(agent: *Agent, this_value: Value, arguments: kiesel.types.Arguments)
                 if (new_style.get("transition")) |transition_str| {
                     // Parse transition value (e.g., "opacity 2s")
                     if (parseTransitionValue(transition_str)) |transition| {
-                        if (std.mem.eql(u8, transition.property, "opacity")) {
+                        if (std.ascii.eqlIgnoreCase(transition.property, "opacity")) {
                             // Get new opacity value
                             if (new_style.get("opacity")) |new_op_str| {
                                 const new_opacity = std.fmt.parseFloat(f64, new_op_str) catch null;
@@ -3707,6 +3804,23 @@ fn styleSet(agent: *Agent, this_value: Value, arguments: kiesel.types.Arguments)
                                     // Start animation from old to new value
                                     startOpacityAnimation(js_instance.allocator, e, old_opacity.?, new_opacity.?, transition.frames) catch |err| {
                                         std.log.warn("Failed to start opacity animation: {}", .{err});
+                                    };
+                                }
+                            }
+                        } else if (std.ascii.eqlIgnoreCase(transition.property, "background-color")) {
+                            if (new_style.get("background-color")) |new_color_str| {
+                                const new_color = parser.parseCssColor(new_color_str);
+                                if (new_color != null and old_background_color != null and
+                                    !std.meta.eql(old_background_color.?, new_color.?))
+                                {
+                                    startBackgroundColorAnimation(
+                                        js_instance.allocator,
+                                        e,
+                                        old_background_color.?,
+                                        new_color.?,
+                                        transition.frames,
+                                    ) catch |err| {
+                                        std.log.warn("Failed to start background-color animation: {}", .{err});
                                     };
                                 }
                             }
