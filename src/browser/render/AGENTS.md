@@ -1,0 +1,26 @@
+# Browser rendering guide
+
+This directory owns layout, font resources, display-command structure,
+software effects, and worker-transfer snapshots. Read
+[`../../../docs/architecture-and-lifetimes.md`](../../../docs/architecture-and-lifetimes.md)
+before changing ownership or thread boundaries.
+
+- `layout.zig` builds layout trees and emits provenance-bearing display items.
+  Layout and frame-side command lists synchronously borrow DOM and image state.
+- `font.zig` owns SDL_ttf handles and cached RGBA glyph pixels. Display items
+  borrow those pixels until a raster snapshot copies them.
+- `display_list.zig` owns display-command types, recursive cleanup, painted hit
+  testing, and composited-layer data. Keep it independent of `Browser`, SDL,
+  and native-window lifecycle.
+- `effects.zig` contains pixel-only software effects. Keep its APIs explicit
+  about premultiplication, edge sampling, and temporary allocation.
+- `raster_snapshot.zig` is the thread-transfer boundary. Snapshots must deep
+  copy every resource-backed leaf, clear synchronous provenance, and reject
+  browser-owned layer pointers.
+
+Prefer adding a focused rendering module when a feature introduces a distinct
+data owner or pipeline phase. Do not move Browser orchestration into this
+directory merely to reduce a line count.
+
+Run `zig build`, `zig build test`, the dump-pipeline checks, and macOS
+`zig build test-screenshot` after rendering behavior or ownership changes.

@@ -26,6 +26,7 @@ architecture document.
 | CLI and isolated inspection modes      | `src/main.zig`        |
 | Interactive app and native windows     | `src/browser/app.zig` |
 | Per-window browser, tabs, chrome       | `src/browser/`        |
+| Display commands and software effects  | `src/browser/render/` |
 | DOM, HTML, CSS, selectors              | `src/document/`       |
 | Kiesel host integration                | `src/script/`         |
 | URLs, HTTP, cookies, caching, decoding | `src/network/`        |
@@ -41,6 +42,13 @@ architecture document.
 - Treat raw `*Node`, `*Frame`, and JavaScript callback pointers as synchronous
   borrows unless the lifecycle documentation explicitly gives them a stable
   identity or lifetime.
+- Keep source files cohesive as the codebase grows. There is no mechanical
+  line limit, but a file reaching several thousand lines is a signal to review
+  its responsibilities, and approaching 10,000 lines requires active
+  decomposition. Before adding another distinct responsibility to an
+  oversized file, extract a module around a real ownership or subsystem seam;
+  avoid arbitrary line-range splits, circular facade modules, and tiny files
+  that obscure rather than clarify the architecture.
 - Prefer isolated CLI diagnostics when debugging a pipeline stage:
   `--dump-dom` stops after HTML parsing; `--dump-style` stops after computed
   styles; `--dump-layout` stops after geometry; `--dump-display-list` stops

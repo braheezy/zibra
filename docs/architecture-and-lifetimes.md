@@ -34,12 +34,21 @@ The source tree is organized by responsibility:
 | --- | --- |
 | [`src/main.zig`](../src/main.zig) | Executable entry point, CLI parsing, process arena, isolated DOM/style/layout/display-list dumps, interactive `BrowserApp` construction, and standalone screenshot mode. |
 | [`src/browser/app.zig`](../src/browser/app.zig) | Process-wide interactive SDL event routing, heap-stable native-window registry, shared session/measurement ownership, generation broadcast, and addressed window shutdown. |
-| [`src/browser/root.zig`](../src/browser/root.zig) | Per-window `Browser`, navigation orchestration, fetch coordination, async host helpers, render commit, composition, raster, and draw; it also supports standalone headless construction. |
+| [`src/browser/root.zig`](../src/browser/root.zig) | Per-window `Browser`, navigation and fetch coordination, render commit, composition, raster, draw, and standalone headless construction; it re-exports compatibility types while delegating independent algorithms and task payloads to focused modules. |
 | [`src/browser/tab.zig`](../src/browser/tab.zig) | `Tab` and `Frame` ownership, task serialization, history, frame lookup, accessibility, focus, and per-document state. |
+| [`src/browser/tab_tasks.zig`](../src/browser/tab_tasks.zig) | Owned navigation, script, and tagged UI-action payloads transferred to a serialized Tab runner; instantiated with the Browser type without importing `root.zig`. |
+| [`src/browser/js_context.zig`](../src/browser/js_context.zig) | Stable generation-stamped synchronous host-callback identity embedded in each JavaScript-capable Frame. |
+| [`src/browser/script_tasks.zig`](../src/browser/script_tasks.zig) | Detached timer, animation, asynchronous XHR, cookie, and postMessage callback adapters and queued payload cleanup, instantiated without importing `root.zig`. |
 | [`src/browser/chrome.zig`](../src/browser/chrome.zig) | Browser-owned internal HTML chrome, its dedicated layout/font state, semantic actions, address editing, and retained display data. |
+| [`src/browser/navigation.zig`](../src/browser/navigation.zig) | Browser-generated navigation documents, certificate-warning HTML, and committed transport-security classification. |
+| [`src/browser/frame_timing.zig`](../src/browser/frame_timing.zig) | Smoothed two-stage frame-work estimates, cadence buckets, and absolute animation deadlines. |
+| [`src/browser/window_geometry.zig`](../src/browser/window_geometry.zig) | Pure native-window resize and bounded tab-surface geometry derivation. |
 | [`src/browser/session_state.zig`](../src/browser/session_state.zig) | Window-independent networking task runner, HTTP client/cookies/cache, visited/bookmarked URL state, generated bookmark HTML, and separate network-data/metadata synchronization. |
 | [`src/browser/render/layout.zig`](../src/browser/render/layout.zig) | Layout tree, invalidation dependencies, hit-test collection, paint, and image layout. |
 | [`src/browser/render/font.zig`](../src/browser/render/font.zig) | Font discovery, SDL_ttf handles, Unicode fallback selection, and owned RGBA glyph bitmaps. |
+| [`src/browser/render/display_list.zig`](../src/browser/render/display_list.zig) | Display-command and composited-layer data, recursive ownership cleanup, provenance, and painted hit testing without Browser or SDL dependencies. |
+| [`src/browser/render/effects.zig`](../src/browser/render/effects.zig) | Pixel-level software effects such as premultiplied-RGBA Gaussian blur. |
+| [`src/browser/render/raster_snapshot.zig`](../src/browser/render/raster_snapshot.zig) | Deep-owned, provenance-free display generations transferred to the raster worker. |
 | [`src/document/parser.zig`](../src/document/parser.zig) | HTML parser, DOM representation, style maps, images, and DOM tree utilities. |
 | [`src/document/inspection.zig`](../src/document/inspection.zig) | Browser-free fetch/decode/parse/style pipeline for document inspection commands. |
 | [`src/document/css_parser.zig`](../src/document/css_parser.zig) | CSS parsing and `CSSRule` ownership. |
@@ -473,8 +482,9 @@ text is not retained as glyph metadata.
 
 Display-list container ownership is recursive: `.blend` and `.transform` own
 their child slices, and `.blend` owns its copied blend-mode string. A blend's
-copyable `blur_radius` marks a CSS filter wrapper without adding another owner. See
-`DisplayItem.freeList` in [`src/browser/root.zig`](../src/browser/root.zig).
+copyable `blur_radius` marks a CSS filter wrapper without adding another owner.
+See `DisplayItem.freeList` in
+[`src/browser/render/display_list.zig`](../src/browser/render/display_list.zig).
 `BlockLayout.display_list` is a persistent paint cache and recursively owns
 any such containers stored in it. Painting a frame deep-clones cached items
 before wrapping them in effects or transferring the resulting snapshot; frame
@@ -896,14 +906,15 @@ context is borrowed by that worker.
 ### Detached helpers
 
 `Browser.scheduleSetTimeoutTask`, `scheduleAnimationFrame`, and
-`scheduleAsyncXhr` in [`src/browser/root.zig`](../src/browser/root.zig) spawn
-detached OS threads. A Tab-level mutex, condition, and reference count provide a
-logical join point: helper teardown releases the reference as its final owner
-access, and `Tab.shutdown` waits for zero before document destruction. Helpers
-that target a document carry copied `DocumentHandle` values rather than
-`Frame` or `JsRenderContext` pointers. Animation helpers borrow their
-heap-stable Tab under that helper reference and pair it with the timer
-generation described below.
+`scheduleAsyncXhr` initiate detached OS threads; their thread contexts,
+callbacks, and cleanup adapters live in
+[`src/browser/script_tasks.zig`](../src/browser/script_tasks.zig). A Tab-level
+mutex, condition, and reference count provide a logical join point: helper
+teardown releases the reference as its final owner access, and `Tab.shutdown`
+waits for zero before document destruction. Helpers that target a document
+carry copied `DocumentHandle` values rather than `Frame` or `JsRenderContext`
+pointers. Animation helpers borrow their heap-stable Tab under that helper
+reference and pair it with the timer generation described below.
 
 Animation timers wait for an absolute timestamp on the monotonic `awake` clock.
 The first requested frame anchors a deadline one estimated interval in the

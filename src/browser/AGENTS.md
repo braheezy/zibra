@@ -14,13 +14,39 @@ before changing `root.zig`, `tab.zig`, `render/`, or browser task scheduling.
   process-wide; Escape becomes process-wide only after routing through a live
   source window, so stale queued events are harmless.
 - `root.zig` owns one native window, that window's tabs/chrome/render state,
-  and browser-side snapshot shutdown order. Browser-side snapshot retirement
-  must precede document or tab destruction. Standalone screenshot construction
-  additionally owns SDL, text input when applicable, session, and measurement;
-  App-window construction borrows those four services explicitly.
+  navigation/render orchestration, and browser-side snapshot shutdown order.
+  It re-exports shared rendering types for compatibility but does not own their
+  implementation. Browser-side snapshot retirement must precede document or
+  tab destruction. Standalone screenshot construction additionally owns SDL,
+  text input when applicable, session, and measurement; App-window
+  construction borrows those four services explicitly.
+- `render/display_list.zig` owns display-command types, recursive container
+  cleanup, painted hit testing, and composited-layer data. It must remain free
+  of `Browser` and SDL dependencies. `render/effects.zig` owns pixel-level
+  software effects, and `render/raster_snapshot.zig` owns the deep-copy
+  boundary used to hand commands and copied leaf pixels to the raster worker.
+  Operations requiring per-window drawing state remain Browser methods.
+- `root.zig` remains an oversized legacy coordinator, so do not add another
+  standalone algorithm or data-owner there by default. The remaining natural
+  seams include fetch/resource coordination and the per-window presentation
+  worker; extract one only when its inputs, ownership, and shutdown order can
+  be expressed without a circular facade.
 - `tab.zig` owns frames, document generations, task serialization, and helper
   quiescence. Queued or detached work must carry a stable document identity,
   not a borrowed frame pointer.
+- `tab_tasks.zig` owns heap payloads transferred from Browser/UI work to the
+  serialized Tab runner. Its comptime Browser parameter avoids a root import
+  cycle. Simple input/history/resize work shares one tagged action adapter;
+  navigation and script payloads retain specialized URL/body ownership.
+- `js_context.zig` is the stable synchronous JavaScript host-callback identity
+  embedded in each Frame. `script_tasks.zig` owns detached timer, animation,
+  asynchronous XHR, cookie, and postMessage adapters plus their queued cleanup
+  payloads. It receives Browser and document-handle types at comptime to avoid
+  importing the per-window coordinator and creating an import cycle.
+- `navigation.zig` owns browser-generated certificate-warning documents and
+  transport-security classification. `frame_timing.zig` owns frame cadence
+  estimation and absolute deadlines. `window_geometry.zig` owns pure resize
+  derivation; SDL resource creation and installation remain in Browser.
 - A Tab also owns the native `setInterval` cancellation registry under its
   interval mutex. Keys include window ID, document generation, and JavaScript
   handle. Sleeping one-shot helpers poll this registry at most every 10ms;

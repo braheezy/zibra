@@ -14,6 +14,35 @@ const zigimg = @import("zigimg");
 
 const font = @import("render/font.zig");
 const Glyph = font.Glyph;
+const display_commands = @import("render/display_list.zig");
+pub const Color = display_commands.Color;
+pub const Rect = display_commands.Rect;
+pub const CompositedLayer = display_commands.CompositedLayer;
+pub const ImageDisplayItem = display_commands.ImageDisplayItem;
+pub const DisplayItemSource = display_commands.DisplayItemSource;
+pub const RoundedHitClip = display_commands.RoundedHitClip;
+pub const DisplayItem = display_commands.DisplayItem;
+const effects = @import("render/effects.zig");
+const blurKernelRadius = effects.blurKernelRadius;
+pub const gaussianBlurPixels = effects.gaussianBlurPixels;
+const raster_snapshot = @import("render/raster_snapshot.zig");
+pub const RasterSnapshot = raster_snapshot.RasterSnapshot;
+pub const rasterBlendNeedsIsolation = raster_snapshot.blendNeedsIsolation;
+const navigation = @import("navigation.zig");
+pub const NavigationDocument = navigation.NavigationDocument;
+pub const NavigationSecurity = navigation.NavigationSecurity;
+pub const navigationSecurity = navigation.security;
+pub const certificateWarningHtml = navigation.certificateWarningHtml;
+const frame_timing = @import("frame_timing.zig");
+pub const animation_frame_interval_ns = frame_timing.default_interval_ns;
+pub const animation_frame_headroom_ns = frame_timing.headroom_ns;
+pub const maximum_estimated_frame_work_ns = frame_timing.maximum_estimated_work_ns;
+pub const FrameTimeEstimator = frame_timing.Estimator;
+pub const AnimationFrameTiming = frame_timing.Timing;
+pub const nextAnimationFrameTiming = frame_timing.next;
+const window_geometry = @import("window_geometry.zig");
+pub const ResizeGeometry = window_geometry.ResizeGeometry;
+pub const resizeGeometry = window_geometry.resize;
 const url_module = @import("../network/url.zig");
 const Url = url_module.Url;
 const Layout = @import("render/layout.zig");
@@ -23,7 +52,10 @@ const Node = parser.Node;
 const ImageData = parser.ImageData;
 const CSSParser = @import("../document/css_parser.zig").CSSParser;
 const js_module = @import("../script/js.zig");
+pub const JsRenderContext = @import("js_context.zig").JsRenderContext;
+const script_tasks = @import("script_tasks.zig");
 const tab_module = @import("tab.zig");
+const tab_tasks = @import("tab_tasks.zig");
 const Tab = tab_module.Tab;
 const Frame = tab_module.Frame;
 const ClickButton = tab_module.ClickButton;
@@ -85,27 +117,6 @@ fn showPostResubmissionDialog(window: sdl2.Window) bool {
     }
     return button_id == 1;
 }
-
-/// A document-navigation response plus explicit ownership for its body and
-/// CSP header. Generated browser pages and fetched resources share this
-/// contract, so callers never infer ownership from the URL scheme.
-pub const NavigationDocument = struct {
-    response: url_module.HttpResponse,
-    owned_body: ?[]const u8,
-    certificate_error: bool = false,
-
-    pub fn deinit(self: *NavigationDocument, allocator: std.mem.Allocator) void {
-        if (self.response.csp_header) |header| allocator.free(header);
-        if (self.owned_body) |body| allocator.free(body);
-        self.* = undefined;
-    }
-};
-
-pub const NavigationSecurity = enum {
-    none,
-    secure,
-    certificate_error,
-};
 
 const DocumentResourceKind = enum {
     script,
@@ -267,63 +278,6 @@ const DocumentResourceBatch = struct {
     }
 };
 
-pub fn navigationSecurity(url: ?*const Url, certificate_error: bool) NavigationSecurity {
-    if (certificate_error) return .certificate_error;
-    const current = url orelse return .none;
-    return if (std.ascii.eqlIgnoreCase(current.scheme, "https")) .secure else .none;
-}
-
-fn appendWarningHtmlEscaped(
-    allocator: std.mem.Allocator,
-    output: *std.ArrayList(u8),
-    value: []const u8,
-) !void {
-    for (value) |byte| {
-        const replacement: ?[]const u8 = switch (byte) {
-            '&' => "&amp;",
-            '<' => "&lt;",
-            '>' => "&gt;",
-            '"' => "&quot;",
-            '\'' => "&apos;",
-            else => null,
-        };
-        if (replacement) |escaped| {
-            try output.appendSlice(allocator, escaped);
-        } else {
-            try output.append(allocator, byte);
-        }
-    }
-}
-
-/// Build a self-contained warning document without incorporating bytes from
-/// the untrusted peer. There is deliberately no proceed-anyway action.
-pub fn certificateWarningHtml(
-    allocator: std.mem.Allocator,
-    requested_url: *const Url,
-    certificate_error: anyerror,
-) ![]u8 {
-    const target = try requested_url.*.toOwnedString(allocator);
-    defer allocator.free(target);
-
-    var html = std.ArrayList(u8).empty;
-    errdefer html.deinit(allocator);
-    try html.appendSlice(
-        allocator,
-        "<html><head><title>Certificate error</title></head>" ++
-            "<body><h1>Certificate error</h1>" ++
-            "<p>Zibra could not verify the security certificate for <strong>",
-    );
-    try appendWarningHtmlEscaped(allocator, &html, target);
-    try html.appendSlice(
-        allocator,
-        "</strong>.</p><p>The connection was stopped before any page data was loaded.</p>" ++
-            "<p>Error: <code>",
-    );
-    try appendWarningHtmlEscaped(allocator, &html, @errorName(certificate_error));
-    try html.appendSlice(allocator, "</code></p></body></html>");
-    return html.toOwnedSlice(allocator);
-}
-
 fn createBrokenImage(allocator: std.mem.Allocator) !zigimg.Image {
     const width: usize = 16;
     const height: usize = 16;
@@ -352,101 +306,6 @@ pub const h_offset = 13;
 pub const v_offset = 18;
 pub const scrollbar_width = 10;
 const scroll_step: i32 = 100;
-pub const animation_frame_interval_ns: i96 = 33_000_000; // ~30 FPS
-pub const animation_frame_headroom_ns: u64 = 3_000_000;
-pub const maximum_estimated_frame_work_ns: u64 = 1_000_000_000;
-// *********************************************************
-
-/// Estimates the sustainable cadence of the two-stage frame pipeline. Tab
-/// work and browser-thread presentation overlap, so the slower smoothed stage
-/// determines the next interval. Upward changes react quickly to overload;
-/// downward changes recover gradually to avoid oscillating around a boundary.
-pub const FrameTimeEstimator = struct {
-    tab_work_ns: ?u64 = null,
-    browser_work_ns: ?u64 = null,
-
-    pub fn reset(self: *FrameTimeEstimator) void {
-        self.* = .{};
-    }
-
-    pub fn observeTabWork(self: *FrameTimeEstimator, duration_ns: i96) void {
-        updateEstimate(&self.tab_work_ns, duration_ns);
-    }
-
-    pub fn observeBrowserWork(self: *FrameTimeEstimator, duration_ns: i96) void {
-        updateEstimate(&self.browser_work_ns, duration_ns);
-    }
-
-    fn updateEstimate(slot: *?u64, duration_ns: i96) void {
-        const normalized: u64 = if (duration_ns <= 0)
-            0
-        else
-            @intCast(@min(duration_ns, @as(i96, maximum_estimated_frame_work_ns)));
-        const previous = slot.* orelse {
-            slot.* = normalized;
-            return;
-        };
-
-        if (normalized >= previous) {
-            // Half of an upward delta is enough to leave an overloaded cadence
-            // within a couple of frames without treating one spike as truth.
-            slot.* = previous +| @divTrunc(normalized - previous + 1, 2);
-        } else {
-            // Recover over several frames so neighboring cadence buckets do
-            // not alternate when work duration is close to their boundary.
-            slot.* = previous - @divTrunc(previous - normalized + 7, 8);
-        }
-    }
-
-    pub fn estimatedWorkNs(self: *const FrameTimeEstimator) u64 {
-        return @max(self.tab_work_ns orelse 0, self.browser_work_ns orelse 0);
-    }
-
-    /// Select the smallest 33ms cadence bucket with 3ms of idle headroom. The
-    /// one-second sample clamp also bounds the largest recommended interval.
-    pub fn intervalNs(self: *const FrameTimeEstimator) i96 {
-        const estimated_work = self.estimatedWorkNs();
-        if (estimated_work == 0) return animation_frame_interval_ns;
-
-        const base: u64 = @intCast(animation_frame_interval_ns);
-        const required = estimated_work +| animation_frame_headroom_ns;
-        const maximum_steps = @divTrunc(
-            maximum_estimated_frame_work_ns + animation_frame_headroom_ns + base - 1,
-            base,
-        );
-        const requested_steps = @divTrunc(required +| base - 1, base);
-        const steps = std.math.clamp(requested_steps, @as(u64, 1), maximum_steps);
-        return @intCast(steps * base);
-    }
-};
-
-pub const AnimationFrameTiming = struct {
-    deadline_ns: i96,
-    delay_ns: u64,
-};
-
-/// Advance the cadence from its prior absolute deadline, not from the time the
-/// previous frame happened to finish. `interval_ns` is supplied by the frame
-/// estimator, so an overloaded continuous chain advances at its sustainable
-/// cadence instead of repeatedly choosing an already-expired 33ms deadline.
-pub fn nextAnimationFrameTiming(
-    previous_deadline_ns: ?i96,
-    now_ns: i96,
-    interval_ns: i96,
-) AnimationFrameTiming {
-    std.debug.assert(interval_ns > 0);
-    const deadline_ns = if (previous_deadline_ns) |previous|
-        previous +| interval_ns
-    else
-        now_ns +| interval_ns;
-    const remaining_ns = deadline_ns -| now_ns;
-    const delay_ns: u64 = if (remaining_ns <= 0)
-        0
-    else
-        @intCast(@min(remaining_ns, @as(i96, std.math.maxInt(u64))));
-    return .{ .deadline_ns = deadline_ns, .delay_ns = delay_ns };
-}
-
 /// Convert SDL wheel units into Zibra's signed CSS-pixel scroll delta.
 /// SDL reports natural scrolling separately, so normalize that direction here.
 pub fn wheelScrollDelta(delta_y: i32, is_flipped: bool) i32 {
@@ -472,54 +331,12 @@ pub fn shouldRouteContentEditing(
     return frame_has_focus;
 }
 
-/// Native and content-surface dimensions derived from an SDL resize event.
-pub const ResizeGeometry = struct {
-    window_width: i32,
-    window_height: i32,
-    tab_viewport_height: i32,
-    tab_surface_height: ?i32,
-};
-
 const ResizeTargets = struct {
     root_surface: z2d.Surface,
     chrome_surface: z2d.Surface,
     tab_surface: ?z2d.Surface,
     cached_texture: sdl2.Texture,
 };
-
-/// Validate a native window size and derive the dependent tab target sizes.
-pub fn resizeGeometry(
-    window_width: i32,
-    window_height: i32,
-    chrome_height: i32,
-    content_height: i32,
-    zoom: f32,
-    has_tab_surface: bool,
-) ?ResizeGeometry {
-    if (window_width <= 0 or window_height <= 0) return null;
-
-    const viewport_delta = @as(i64, window_height) - @as(i64, chrome_height);
-    const viewport_height: i32 = @intCast(std.math.clamp(
-        viewport_delta,
-        0,
-        std.math.maxInt(i32),
-    ));
-    const scaled_content_height = scroll_model.scaleCssPx(content_height, zoom);
-
-    return .{
-        .window_width = window_width,
-        .window_height = window_height,
-        .tab_viewport_height = viewport_height,
-        .tab_surface_height = if (has_tab_surface)
-            scroll_model.interestSurfaceHeight(
-                scaled_content_height,
-                viewport_height,
-                window_height,
-            )
-        else
-            null,
-    };
-}
 
 const WindowPos = struct {
     x: c_int,
@@ -558,120 +375,6 @@ pub const AccessibilitySettings = struct {
     reduce_motion: bool = false,
     dark_palette: ?DarkPalette = null,
 };
-
-// Display items are the drawing commands emitted by layout.
-pub const Color = struct {
-    r: u8,
-    g: u8,
-    b: u8,
-    a: u8 = 255,
-
-    pub fn toZ2dRgba(self: Color) z2d.pixel.RGBA {
-        return .{ .r = self.r, .g = self.g, .b = self.b, .a = self.a };
-    }
-};
-
-const max_blur_kernel_radius: usize = 128;
-
-fn blurKernelRadius(sigma: f64) usize {
-    if (!std.math.isFinite(sigma) or sigma <= 0.0) return 0;
-    return @intFromFloat(@min(@ceil(sigma * 3.0), @as(f64, @floatFromInt(max_blur_kernel_radius))));
-}
-
-fn rgbaFromWeightedSums(r: f64, g: f64, b: f64, a: f64) z2d.pixel.RGBA {
-    return .{
-        .r = @intFromFloat(@round(std.math.clamp(r, 0.0, 255.0))),
-        .g = @intFromFloat(@round(std.math.clamp(g, 0.0, 255.0))),
-        .b = @intFromFloat(@round(std.math.clamp(b, 0.0, 255.0))),
-        .a = @intFromFloat(@round(std.math.clamp(a, 0.0, 255.0))),
-    };
-}
-
-/// Apply a separable Gaussian blur to z2d's premultiplied RGBA pixels.
-/// Sampling beyond the surface uses transparent black, matching CSS filter
-/// edges when callers provide the standard three-sigma outset.
-pub fn gaussianBlurPixels(
-    allocator: std.mem.Allocator,
-    pixels: []z2d.pixel.RGBA,
-    width: usize,
-    height: usize,
-    sigma: f64,
-) !void {
-    const pixel_count = try std.math.mul(usize, width, height);
-    if (pixel_count != pixels.len) return error.InvalidBlurBuffer;
-    const radius = blurKernelRadius(sigma);
-    if (radius == 0 or pixel_count == 0) return;
-
-    const kernel_len = radius * 2 + 1;
-    const weights = try allocator.alloc(f64, kernel_len);
-    defer allocator.free(weights);
-    var weight_total: f64 = 0.0;
-    for (weights, 0..) |*weight, index| {
-        const distance: f64 = @floatFromInt(@as(isize, @intCast(index)) - @as(isize, @intCast(radius)));
-        weight.* = @exp(-(distance * distance) / (2.0 * sigma * sigma));
-        weight_total += weight.*;
-    }
-    for (weights) |*weight| weight.* /= weight_total;
-
-    const intermediate = try allocator.alloc(z2d.pixel.RGBA, pixel_count);
-    defer allocator.free(intermediate);
-
-    for (0..height) |y| {
-        for (0..width) |x| {
-            var r: f64 = 0.0;
-            var g: f64 = 0.0;
-            var b: f64 = 0.0;
-            var a: f64 = 0.0;
-            for (weights, 0..) |weight, index| {
-                const sample_x = @as(isize, @intCast(x)) + @as(isize, @intCast(index)) - @as(isize, @intCast(radius));
-                if (sample_x < 0 or sample_x >= @as(isize, @intCast(width))) continue;
-                const sample = pixels[y * width + @as(usize, @intCast(sample_x))];
-                r += @as(f64, @floatFromInt(sample.r)) * weight;
-                g += @as(f64, @floatFromInt(sample.g)) * weight;
-                b += @as(f64, @floatFromInt(sample.b)) * weight;
-                a += @as(f64, @floatFromInt(sample.a)) * weight;
-            }
-            intermediate[y * width + x] = rgbaFromWeightedSums(r, g, b, a);
-        }
-    }
-
-    for (0..height) |y| {
-        for (0..width) |x| {
-            var r: f64 = 0.0;
-            var g: f64 = 0.0;
-            var b: f64 = 0.0;
-            var a: f64 = 0.0;
-            for (weights, 0..) |weight, index| {
-                const sample_y = @as(isize, @intCast(y)) + @as(isize, @intCast(index)) - @as(isize, @intCast(radius));
-                if (sample_y < 0 or sample_y >= @as(isize, @intCast(height))) continue;
-                const sample = intermediate[@as(usize, @intCast(sample_y)) * width + x];
-                r += @as(f64, @floatFromInt(sample.r)) * weight;
-                g += @as(f64, @floatFromInt(sample.g)) * weight;
-                b += @as(f64, @floatFromInt(sample.b)) * weight;
-                a += @as(f64, @floatFromInt(sample.a)) * weight;
-            }
-            pixels[y * width + x] = rgbaFromWeightedSums(r, g, b, a);
-        }
-    }
-}
-
-test "Gaussian blur spreads premultiplied color without transparent halos" {
-    var pixels = [_]z2d.pixel.RGBA{.{ .r = 0, .g = 0, .b = 0, .a = 0 }} ** 49;
-    pixels[3 * 7 + 3] = .{ .r = 255, .g = 0, .b = 0, .a = 255 };
-    try gaussianBlurPixels(std.testing.allocator, &pixels, 7, 7, 1.0);
-
-    const center = pixels[3 * 7 + 3];
-    const neighbor = pixels[3 * 7 + 2];
-    const two_away = pixels[3 * 7 + 1];
-    try std.testing.expect(center.a < 255 and center.a > neighbor.a);
-    try std.testing.expect(neighbor.a > 0);
-    try std.testing.expect(two_away.a > 0);
-    for (pixels) |pixel| {
-        try std.testing.expectEqual(pixel.a, pixel.r);
-        try std.testing.expectEqual(@as(u8, 0), pixel.g);
-        try std.testing.expectEqual(@as(u8, 0), pixel.b);
-    }
-}
 
 fn glyphSourcePixel(
     pixel_mode: font.GlyphPixelMode,
@@ -731,836 +434,10 @@ pub const DarkPalette = struct {
     control_text: Color = .{ .r = 230, .g = 230, .b = 230, .a = 255 },
 };
 
-// Rectangle helper for layout bounds
-pub const Rect = struct {
-    left: i32,
-    top: i32,
-    right: i32,
-    bottom: i32,
-
-    pub fn containsPoint(self: Rect, x: i32, y: i32) bool {
-        return x >= self.left and x < self.right and
-            y >= self.top and y < self.bottom;
-    }
-
-    pub fn width(self: Rect) i32 {
-        if (self.right <= self.left) return 0;
-        return self.right - self.left;
-    }
-
-    pub fn height(self: Rect) i32 {
-        if (self.bottom <= self.top) return 0;
-        return self.bottom - self.top;
-    }
-
-    /// Expand bounds by the given amount in all directions
-    pub fn outset(self: Rect, amount: i32) Rect {
-        return .{
-            .left = self.left - amount,
-            .top = self.top - amount,
-            .right = self.right + amount,
-            .bottom = self.bottom + amount,
-        };
-    }
-
-    /// Contract bounds by the given amount in all directions
-    pub fn inset(self: Rect, amount: i32) Rect {
-        return .{
-            .left = self.left + amount,
-            .top = self.top + amount,
-            .right = self.right - amount,
-            .bottom = self.bottom - amount,
-        };
-    }
-};
-
-/// A composited layer stores display items that can be rasterized once and reused.
-/// Layers are created for elements with visual effects like opacity or blend modes.
-pub const CompositedLayer = struct {
-    /// The display items to rasterize into this layer
-    display_items: []DisplayItem,
-    /// Cached raster surface (null until first rasterized)
-    surface: ?z2d.Surface = null,
-    /// Bounds of the layer in document coordinates (with 1px outset for edge artifacts)
-    bounds: Rect,
-    /// Whether this layer needs to be re-rasterized
-    needs_raster: bool = true,
-    /// Opacity to apply when compositing this layer
-    opacity: f64 = 1.0,
-    /// Blend mode to apply when compositing
-    blend_mode: ?[]const u8 = null,
-    /// DOM node pointer for identifying this layer across frames
-    node: ?*anyopaque = null,
-
-    pub fn init(display_items: []DisplayItem, bounds: Rect, opacity: f64, blend_mode: ?[]const u8, node: ?*anyopaque) CompositedLayer {
-        // Add 1px outset to avoid raster edge artifacts
-        return .{
-            .display_items = display_items,
-            .bounds = bounds.outset(1),
-            .opacity = opacity,
-            .blend_mode = blend_mode,
-            .node = node,
-        };
-    }
-
-    pub fn deinit(self: *CompositedLayer, allocator: std.mem.Allocator) void {
-        if (self.surface) |*surface| {
-            surface.deinit(allocator);
-            self.surface = null;
-        }
-        if (self.display_items.len > 0) {
-            DisplayItem.freeList(allocator, self.display_items);
-            self.display_items = &.{};
-        }
-    }
-
-    /// Apply an opacity animation to this layer. A layer whose own node is the
-    /// target can change its composite alpha without rerasterizing; a target
-    /// nested in flattened/iframe-owned display items requires new pixels.
-    pub fn applyCompositedOpacity(self: *CompositedLayer, node: *anyopaque, opacity: f64) bool {
-        if (self.node == node) {
-            self.opacity = opacity;
-            return false;
-        }
-        if (DisplayItem.applyCompositedOpacity(self.display_items, node, opacity)) {
-            self.needs_raster = true;
-            return true;
-        }
-        return false;
-    }
-
-    /// Check if another layer can be merged into this one.
-    /// Layers can merge if they have identical visual-effect ancestry (same opacity and blend_mode).
-    pub fn canMerge(self: *const CompositedLayer, other_opacity: f64, other_blend_mode: ?[]const u8) bool {
-        // Must have same opacity
-        if (self.opacity != other_opacity) return false;
-
-        // dst_in masks should never merge because they clip different content.
-        if (self.blend_mode) |mode| {
-            if (std.mem.eql(u8, mode, "dst_in")) return false;
-        }
-
-        // Must have same blend mode
-        if (self.blend_mode == null and other_blend_mode == null) return true;
-        if (self.blend_mode == null or other_blend_mode == null) return false;
-        return std.mem.eql(u8, self.blend_mode.?, other_blend_mode.?);
-    }
-
-    /// Add display items to this layer, expanding bounds as needed.
-    /// Returns true if items were added, false if incompatible.
-    pub fn add(self: *CompositedLayer, allocator: std.mem.Allocator, items: []DisplayItem, item_bounds: Rect) !void {
-        // Expand bounds to include new items (remove 1px outset, expand, re-add)
-        const inner_bounds = self.bounds.inset(1);
-        const new_bounds = Rect{
-            .left = @min(inner_bounds.left, item_bounds.left),
-            .top = @min(inner_bounds.top, item_bounds.top),
-            .right = @max(inner_bounds.right, item_bounds.right),
-            .bottom = @max(inner_bounds.bottom, item_bounds.bottom),
-        };
-
-        // Combine display items
-        const old_items = self.display_items;
-        const new_items = try allocator.alloc(DisplayItem, old_items.len + items.len);
-        @memcpy(new_items[0..old_items.len], old_items);
-        @memcpy(new_items[old_items.len..], items);
-
-        // Publish the expanded layer only after the fallible allocation. On
-        // failure, both the layer and the caller-owned incoming list remain
-        // unchanged.
-        self.display_items = new_items;
-        self.bounds = new_bounds.outset(1);
-        if (old_items.len > 0) {
-            allocator.free(old_items);
-        }
-        if (items.len > 0) {
-            allocator.free(items);
-        }
-
-        // Mark for re-rasterization since content changed
-        self.needs_raster = true;
-    }
-
-    /// Rasterize the layer's display items to its cached surface
-    pub fn raster(self: *CompositedLayer, allocator: std.mem.Allocator, browser: *Browser) anyerror!void {
-        if (!self.needs_raster and self.surface != null) return;
-
-        const layer_width: i32 = @max(1, self.bounds.width());
-        const layer_height: i32 = @max(1, self.bounds.height());
-
-        // Create or recreate surface if needed
-        if (self.surface) |*existing| {
-            if (existing.getWidth() != layer_width or existing.getHeight() != layer_height) {
-                existing.deinit(allocator);
-                self.surface = null;
-            }
-        }
-
-        if (self.surface == null) {
-            self.surface = try z2d.Surface.init(.image_surface_rgba, allocator, layer_width, layer_height);
-        }
-
-        var ctx = z2d.Context.init(browser.io, allocator, &self.surface.?);
-        defer ctx.deinit();
-
-        // Clear to transparent
-        ctx.setSource(.{ .opaque_pattern = .{ .pixel = .{ .rgba = .{ .r = 0, .g = 0, .b = 0, .a = 0 } } } });
-        try ctx.moveTo(0, 0);
-        try ctx.lineTo(@floatFromInt(layer_width), 0);
-        try ctx.lineTo(@floatFromInt(layer_width), @floatFromInt(layer_height));
-        try ctx.lineTo(0, @floatFromInt(layer_height));
-        try ctx.closePath();
-        try ctx.fill();
-
-        // Draw display items offset by layer bounds (absolute to local mapping)
-        // Items are stored in absolute coordinates, so we offset by bounds origin to draw in layer space
-        const zoom = if (browser.active_tab_zoom > 0) browser.active_tab_zoom else 1.0;
-        for (self.display_items) |item| {
-            try browser.drawDisplayItemZ2dContextForLayer(&ctx, item, self.bounds.left, self.bounds.top, zoom);
-        }
-
-        self.needs_raster = false;
-    }
-};
-
-pub const ImageDisplayItem = struct {
-    x1: i32,
-    y1: i32,
-    x2: i32,
-    y2: i32,
-    source_width: i32,
-    source_height: i32,
-    pixels: []const u8,
-    opacity: f64 = 1.0,
-    source: ?DisplayItemSource = null,
-};
-
-/// Synchronous-only provenance for an uncomposed frame display item. Both
-/// pointers borrow the frame's current layout/DOM generation and must be
-/// cleared before the item crosses the tab-to-browser commit boundary.
-pub const DisplayItemSource = struct {
-    layout: *const anyopaque,
-    node: ?*Node,
-    /// Typed by the layout emitter. This keeps the erased layout pointer
-    /// useful without making DisplayItem depend on every concrete layout type.
-    layout_node_resolver: ?*const fn (*const anyopaque, ?*Node) ?*Node = null,
-
-    /// Ask the generating layout object to validate the precise fragment node
-    /// (needed for anonymous inline blocks), or to provide its own DOM node.
-    pub fn originatingNode(self: DisplayItemSource) ?*Node {
-        return if (self.layout_node_resolver) |resolve|
-            resolve(self.layout, self.node)
-        else
-            self.node;
-    }
-};
-
-pub const RoundedHitClip = struct {
-    x1: i32,
-    y1: i32,
-    x2: i32,
-    y2: i32,
-    radius: f64,
-};
-
-pub const DisplayItem = union(enum) {
-    glyph: struct {
-        x: i32,
-        y: i32,
-        glyph: Glyph,
-        color: Color,
-        source: ?DisplayItemSource = null,
-    },
-    rect: struct {
-        x1: i32,
-        y1: i32,
-        x2: i32,
-        y2: i32,
-        color: Color,
-        source: ?DisplayItemSource = null,
-    },
-    image: ImageDisplayItem,
-    iframe: struct {
-        rect: Rect,
-        node: *Node,
-        source: ?DisplayItemSource = null,
-    },
-    rounded_rect: struct {
-        x1: i32,
-        y1: i32,
-        x2: i32,
-        y2: i32,
-        radius: f64,
-        color: Color,
-        source: ?DisplayItemSource = null,
-    },
-    line: struct {
-        x1: i32,
-        y1: i32,
-        x2: i32,
-        y2: i32,
-        color: Color,
-        thickness: i32,
-        source: ?DisplayItemSource = null,
-    },
-    outline: struct {
-        rect: Rect,
-        color: Color,
-        thickness: i32,
-        source: ?DisplayItemSource = null,
-    },
-    blend: struct {
-        opacity: f64,
-        blend_mode: ?[]const u8,
-        /// CSS blur standard deviation in layout pixels. A positive value
-        /// filters the complete child subtree before outer clip/opacity work.
-        blur_radius: f64 = 0.0,
-        /// Optional non-painting clip for this group's click geometry.
-        hit_clip: ?RoundedHitClip = null,
-        children: []DisplayItem,
-        node: ?*anyopaque = null, // Reference back to the DOM node that created this effect
-        parent: ?*const DisplayItem = null, // Parent blend for walking up the tree
-        needs_compositing: bool = false, // True if this blend or descendants require composited layers
-        source: ?DisplayItemSource = null,
-    },
-    /// Draw a pre-rasterized composited layer
-    draw_composited_layer: struct {
-        layer: *CompositedLayer,
-        source: ?DisplayItemSource = null,
-    },
-    /// Apply a 2D translation transform to children
-    transform: struct {
-        translate_x: i32,
-        translate_y: i32,
-        children: []DisplayItem,
-        node: ?*anyopaque = null,
-        source: ?DisplayItemSource = null,
-    },
-
-    pub const HitResult = struct {
-        item: *const DisplayItem,
-        source: DisplayItemSource,
-        /// Point in the hit primitive's local, unzoomed layout coordinates.
-        x: i32,
-        y: i32,
-        /// Exact point in the primitive's local device coordinates.
-        device_x: i32,
-        device_y: i32,
-    };
-
-    pub fn source(self: *const DisplayItem) ?DisplayItemSource {
-        return switch (self.*) {
-            inline else => |payload| payload.source,
-        };
-    }
-
-    /// Strip borrowed layout/DOM provenance before transferring a list to a
-    /// longer-lived browser render snapshot.
-    pub fn clearSources(items: []DisplayItem) void {
-        for (items) |*item| {
-            switch (item.*) {
-                .blend => |*blend_item| {
-                    blend_item.source = null;
-                    clearSources(blend_item.children);
-                },
-                .transform => |*transform_item| {
-                    transform_item.source = null;
-                    clearSources(transform_item.children);
-                },
-                inline else => |*payload| payload.source = null,
-            }
-        }
-    }
-
-    /// Keep the frame's authoritative hit list synchronized with compositor-
-    /// only opacity animation updates. The node identity is the live DOM
-    /// element pointer stored by the layout effect wrapper.
-    pub fn applyCompositedOpacity(items: []DisplayItem, node: *anyopaque, opacity: f64) bool {
-        var updated = false;
-        for (items) |*item| {
-            switch (item.*) {
-                .blend => |*blend_item| {
-                    if (blend_item.node == node) {
-                        blend_item.opacity = opacity;
-                        updated = true;
-                    }
-                    if (applyCompositedOpacity(blend_item.children, node, opacity)) updated = true;
-                },
-                .transform => |*transform_item| {
-                    if (applyCompositedOpacity(transform_item.children, node, opacity)) updated = true;
-                },
-                else => {},
-            }
-        }
-        return updated;
-    }
-
-    pub fn scaleLayoutPx(value: i32, zoom_value: f32) i32 {
-        const zoom = if (zoom_value > 0) zoom_value else 1.0;
-        if (zoom == 1.0) return value;
-        return @intFromFloat(@as(f32, @floatFromInt(value)) * zoom);
-    }
-
-    fn deviceToLayoutPx(value: i32, zoom_value: f32) i32 {
-        const zoom = if (zoom_value > 0) zoom_value else 1.0;
-        if (zoom == 1.0) return value;
-        return @intFromFloat(@as(f32, @floatFromInt(value)) / zoom);
-    }
-
-    /// Convenience entry point for tests and synchronous layout-coordinate
-    /// callers. Native input should retain its exact device coordinate and use
-    /// hitTestDevice so fractional zoom never loses an edge pixel.
-    pub fn hitTest(items: []const DisplayItem, x: i32, y: i32, zoom_value: f32) ?HitResult {
-        return hitTestDevice(
-            items,
-            scaleLayoutPx(x, zoom_value),
-            scaleLayoutPx(y, zoom_value),
-            zoom_value,
-        );
-    }
-
-    /// Return the topmost painted item carrying synchronous frame provenance.
-    /// CSS coordinates and translations use the same truncating scale rule as
-    /// raster; glyph w/h are already exact device bitmap dimensions.
-    pub fn hitTestDevice(items: []const DisplayItem, x: i32, y: i32, zoom_value: f32) ?HitResult {
-        const zoom = if (zoom_value > 0) zoom_value else 1.0;
-        return hitTestDeviceList(items, x, y, zoom);
-    }
-
-    fn hitTestDeviceList(items: []const DisplayItem, x: i32, y: i32, zoom: f32) ?HitResult {
-        var index = items.len;
-        while (index > 0) {
-            index -= 1;
-            const item = &items[index];
-            switch (item.*) {
-                .blend => |blend_item| {
-                    if (blend_item.opacity <= 0) continue;
-                    if (blend_item.hit_clip) |clip| {
-                        if (!pointInRoundedRect(x, y, clip, zoom)) continue;
-                    }
-                    const is_dst_in = if (blend_item.blend_mode) |mode|
-                        std.mem.eql(u8, mode, "dst_in")
-                    else
-                        false;
-                    if (is_dst_in) {
-                        if (blend_item.children.len == 1) {
-                            // Layout clipping is encoded as a one-child
-                            // dst_in mask following the sibling content it
-                            // clips. The mask is an operator, not a target.
-                            if (!containsPaintedPoint(&blend_item.children[0], x, y, zoom)) return null;
-                            continue;
-                        }
-                        if (blend_item.children.len < 2) continue;
-                        const mask = &blend_item.children[blend_item.children.len - 1];
-                        if (!containsPaintedPoint(mask, x, y, zoom)) continue;
-                        if (hitTestDeviceList(blend_item.children[0 .. blend_item.children.len - 1], x, y, zoom)) |hit| {
-                            return hit;
-                        }
-                        continue;
-                    }
-                    if (hitTestDeviceList(blend_item.children, x, y, zoom)) |hit| return hit;
-                },
-                .transform => |transform_item| {
-                    const local_x = x - scaleLayoutPx(transform_item.translate_x, zoom);
-                    const local_y = y - scaleLayoutPx(transform_item.translate_y, zoom);
-                    if (hitTestDeviceList(transform_item.children, local_x, local_y, zoom)) |hit| return hit;
-                },
-                else => {
-                    const item_source = item.source() orelse continue;
-                    if (containsPrimitivePoint(item, x, y, zoom)) {
-                        return .{
-                            .item = item,
-                            .source = item_source,
-                            .x = deviceToLayoutPx(x, zoom),
-                            .y = deviceToLayoutPx(y, zoom),
-                            .device_x = x,
-                            .device_y = y,
-                        };
-                    }
-                },
-            }
-        }
-        return null;
-    }
-
-    fn containsPaintedPoint(item: *const DisplayItem, x: i32, y: i32, zoom: f32) bool {
-        return switch (item.*) {
-            .blend => |blend_item| blk: {
-                if (blend_item.opacity <= 0) break :blk false;
-                if (blend_item.hit_clip) |clip| {
-                    if (!pointInRoundedRect(x, y, clip, zoom)) break :blk false;
-                }
-                const is_dst_in = if (blend_item.blend_mode) |mode|
-                    std.mem.eql(u8, mode, "dst_in")
-                else
-                    false;
-                if (is_dst_in) {
-                    if (blend_item.children.len == 1) {
-                        break :blk containsPaintedPoint(&blend_item.children[0], x, y, zoom);
-                    }
-                    if (blend_item.children.len < 2) break :blk false;
-                    const mask = &blend_item.children[blend_item.children.len - 1];
-                    if (!containsPaintedPoint(mask, x, y, zoom)) break :blk false;
-                    break :blk listContainsPaintedPoint(blend_item.children[0 .. blend_item.children.len - 1], x, y, zoom);
-                }
-                break :blk listContainsPaintedPoint(blend_item.children, x, y, zoom);
-            },
-            .transform => |transform_item| blk: {
-                const local_x = x - scaleLayoutPx(transform_item.translate_x, zoom);
-                const local_y = y - scaleLayoutPx(transform_item.translate_y, zoom);
-                break :blk listContainsPaintedPoint(transform_item.children, local_x, local_y, zoom);
-            },
-            else => containsPrimitivePoint(item, x, y, zoom),
-        };
-    }
-
-    fn listContainsPaintedPoint(items: []const DisplayItem, x: i32, y: i32, zoom: f32) bool {
-        var index = items.len;
-        while (index > 0) {
-            index -= 1;
-            const item = &items[index];
-            if (item.* == .blend) {
-                const blend_item = item.blend;
-                const is_dst_in = if (blend_item.blend_mode) |mode|
-                    std.mem.eql(u8, mode, "dst_in")
-                else
-                    false;
-                if (is_dst_in and blend_item.children.len == 1) {
-                    if (!containsPaintedPoint(&blend_item.children[0], x, y, zoom)) return false;
-                    continue;
-                }
-            }
-            if (containsPaintedPoint(item, x, y, zoom)) return true;
-        }
-        return false;
-    }
-
-    fn containsPrimitivePoint(item: *const DisplayItem, x: i32, y: i32, zoom: f32) bool {
-        return switch (item.*) {
-            .glyph => |glyph_item| glyph_item.color.a > 0 and pointInRect(
-                x,
-                y,
-                scaleLayoutPx(glyph_item.x, zoom),
-                scaleLayoutPx(glyph_item.y, zoom),
-                scaleLayoutPx(glyph_item.x, zoom) + glyph_item.glyph.w,
-                scaleLayoutPx(glyph_item.y, zoom) + glyph_item.glyph.h,
-            ),
-            .rect => |rect_item| rect_item.color.a > 0 and pointInScaledRect(x, y, rect_item.x1, rect_item.y1, rect_item.x2, rect_item.y2, zoom),
-            .image => |image_item| image_item.opacity > 0 and pointInScaledRect(x, y, image_item.x1, image_item.y1, image_item.x2, image_item.y2, zoom),
-            .iframe => |iframe_item| pointInScaledRect(x, y, iframe_item.rect.left, iframe_item.rect.top, iframe_item.rect.right, iframe_item.rect.bottom, zoom),
-            .rounded_rect => |rounded_item| rounded_item.color.a > 0 and pointInRoundedRect(x, y, rounded_item, zoom),
-            .line => |line_item| line_item.color.a > 0 and pointOnLine(x, y, line_item, zoom),
-            .outline => |outline_item| outline_item.color.a > 0 and pointOnOutline(x, y, outline_item, zoom),
-            .draw_composited_layer => |layer_item| pointInRect(
-                x,
-                y,
-                layer_item.layer.bounds.left,
-                layer_item.layer.bounds.top,
-                layer_item.layer.bounds.right,
-                layer_item.layer.bounds.bottom,
-            ),
-            .blend, .transform => false,
-        };
-    }
-
-    fn pointInScaledRect(x: i32, y: i32, x1: i32, y1: i32, x2: i32, y2: i32, zoom: f32) bool {
-        return pointInRect(
-            x,
-            y,
-            scaleLayoutPx(x1, zoom),
-            scaleLayoutPx(y1, zoom),
-            scaleLayoutPx(x2, zoom),
-            scaleLayoutPx(y2, zoom),
-        );
-    }
-
-    fn pointInRect(x: i32, y: i32, x1: i32, y1: i32, x2: i32, y2: i32) bool {
-        const left = @min(x1, x2);
-        const right = @max(x1, x2);
-        const top = @min(y1, y2);
-        const bottom = @max(y1, y2);
-        return x >= left and x < right and y >= top and y < bottom;
-    }
-
-    fn pointInRoundedRect(x: i32, y: i32, item: anytype, zoom: f32) bool {
-        const left = scaleLayoutPx(@min(item.x1, item.x2), zoom);
-        const right = scaleLayoutPx(@max(item.x1, item.x2), zoom);
-        const top = scaleLayoutPx(@min(item.y1, item.y2), zoom);
-        const bottom = scaleLayoutPx(@max(item.y1, item.y2), zoom);
-        if (!pointInRect(x, y, left, top, right, bottom)) return false;
-        const width: f64 = @floatFromInt(right - left);
-        const height: f64 = @floatFromInt(bottom - top);
-        const radius = @min(item.radius * @as(f64, zoom), @min(width / 2.0, height / 2.0));
-        if (radius <= 0.5) return true;
-        const x_float: f64 = @floatFromInt(x);
-        const y_float: f64 = @floatFromInt(y);
-        const left_float: f64 = @floatFromInt(left);
-        const right_float: f64 = @floatFromInt(right);
-        const top_float: f64 = @floatFromInt(top);
-        const bottom_float: f64 = @floatFromInt(bottom);
-        const center_x = if (x_float < left_float + radius) left_float + radius else if (x_float >= right_float - radius) right_float - radius else x_float;
-        const center_y = if (y_float < top_float + radius) top_float + radius else if (y_float >= bottom_float - radius) bottom_float - radius else y_float;
-        const dx = x_float - center_x;
-        const dy = y_float - center_y;
-        return dx * dx + dy * dy <= radius * radius;
-    }
-
-    fn pointOnLine(x: i32, y: i32, item: anytype, zoom: f32) bool {
-        const x1: f64 = @floatFromInt(scaleLayoutPx(item.x1, zoom));
-        const y1: f64 = @floatFromInt(scaleLayoutPx(item.y1, zoom));
-        const x2: f64 = @floatFromInt(scaleLayoutPx(item.x2, zoom));
-        const y2: f64 = @floatFromInt(scaleLayoutPx(item.y2, zoom));
-        const dx = x2 - x1;
-        const dy = y2 - y1;
-        const length_squared = dx * dx + dy * dy;
-        const x_float: f64 = @floatFromInt(x);
-        const y_float: f64 = @floatFromInt(y);
-        const t = if (length_squared == 0) 0.0 else std.math.clamp(((x_float - x1) * dx + (y_float - y1) * dy) / length_squared, 0.0, 1.0);
-        const nearest_x = x1 + t * dx;
-        const nearest_y = y1 + t * dy;
-        const half_width = @as(f64, @floatFromInt(@max(1, scaleLayoutPx(item.thickness, zoom)))) / 2.0;
-        const distance_x = x_float - nearest_x;
-        const distance_y = y_float - nearest_y;
-        return distance_x * distance_x + distance_y * distance_y <= half_width * half_width;
-    }
-
-    fn pointOnOutline(x: i32, y: i32, item: anytype, zoom: f32) bool {
-        const left = scaleLayoutPx(@min(item.rect.left, item.rect.right), zoom);
-        const right = scaleLayoutPx(@max(item.rect.left, item.rect.right), zoom);
-        const top = scaleLayoutPx(@min(item.rect.top, item.rect.bottom), zoom);
-        const bottom = scaleLayoutPx(@max(item.rect.top, item.rect.bottom), zoom);
-        const thickness = @max(1, scaleLayoutPx(item.thickness, zoom));
-        if (!pointInRect(x, y, left - thickness, top - thickness, right + thickness, bottom + thickness)) return false;
-        const inner_left = left + thickness;
-        const inner_right = right - thickness;
-        const inner_top = top + thickness;
-        const inner_bottom = bottom - thickness;
-        return inner_left >= inner_right or inner_top >= inner_bottom or
-            !pointInRect(x, y, inner_left, inner_top, inner_right, inner_bottom);
-    }
-
-    // Set parent pointers recursively on a display list
-    // This should be called after the display list is constructed
-    pub fn setParentPointers(items: []DisplayItem, parent: ?*const DisplayItem) void {
-        for (items) |*item| {
-            switch (item.*) {
-                .blend => |*b| {
-                    b.parent = parent;
-                    // Recursively set parent pointers on children
-                    setParentPointers(b.children, item);
-                },
-                else => {}, // Leaf nodes don't have parent pointers
-            }
-        }
-    }
-
-    pub fn freeList(allocator: std.mem.Allocator, items: []DisplayItem) void {
-        for (items) |item| {
-            freeItem(allocator, item);
-        }
-        allocator.free(items);
-    }
-
-    pub fn freeItems(allocator: std.mem.Allocator, items: []DisplayItem) void {
-        for (items) |item| {
-            freeItem(allocator, item);
-        }
-    }
-
-    fn freeItem(allocator: std.mem.Allocator, item: DisplayItem) void {
-        switch (item) {
-            .blend => |b| {
-                if (b.blend_mode) |mode| {
-                    allocator.free(mode);
-                }
-                freeList(allocator, b.children);
-            },
-            .transform => |t| {
-                freeList(allocator, t.children);
-            },
-            else => {},
-        }
-    }
-};
-
-pub const JsRenderContext = struct {
-    browser_ptr: ?*anyopaque = null,
-    tab_ptr: ?*anyopaque = null,
-    js_context: ?*js_module = null,
-    window_id: u32 = 0,
-    generation: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
-
-    pub fn setPointers(
-        self: *JsRenderContext,
-        browser_ptr: ?*anyopaque,
-        tab_ptr: ?*anyopaque,
-        js_context: ?*js_module,
-        window_id: u32,
-    ) void {
-        self.browser_ptr = browser_ptr;
-        self.tab_ptr = tab_ptr;
-        self.js_context = js_context;
-        self.window_id = window_id;
-    }
-
-    pub fn setGeneration(self: *JsRenderContext, generation: u64) void {
-        self.generation.store(generation, .seq_cst);
-    }
-
-    pub fn currentGeneration(self: *const JsRenderContext) u64 {
-        return self.generation.load(.seq_cst);
-    }
-
-    pub fn matchesGeneration(self: *const JsRenderContext, expected: u64) bool {
-        return self.currentGeneration() == expected;
-    }
-};
-
-/// Copyable identity for one installed document. Detached helpers carry this
-/// value instead of borrowing a Frame or its synchronous JS callback context.
-const DocumentHandle = struct {
-    window_id: u32,
-    generation: u64,
-
-    fn fromFrame(frame: *const Frame) DocumentHandle {
-        return .{
-            .window_id = frame.window_id,
-            .generation = frame.document_generation,
-        };
-    }
-
-    /// Resolve only on the serialized tab worker.
-    fn resolve(self: DocumentHandle, tab: *Tab) ?*Frame {
-        const frame = tab.frameForWindowId(self.window_id) orelse return null;
-        if (frame.document_generation != self.generation) return null;
-        return frame;
-    }
-};
-
 const PendingPostResubmission = struct {
     tab: *Tab,
     target: usize,
     history_generation: u64,
-};
-
-/// One self-contained display-list generation handed to the raster worker.
-/// Structural containers, blend-mode strings, glyph bitmaps, and image pixels
-/// are all independently owned; no document, layout, font-cache, or chrome
-/// generation has to remain alive while the worker consumes it.
-pub const RasterSnapshot = struct {
-    const CloneError = std.mem.Allocator.Error || error{CompositedLayerCannotCrossRasterBoundary};
-
-    allocator: std.mem.Allocator,
-    items: []DisplayItem,
-    pixel_buffers: std.ArrayList([]u8) = .empty,
-
-    pub fn clone(allocator: std.mem.Allocator, items: []const DisplayItem) CloneError!RasterSnapshot {
-        var snapshot = RasterSnapshot{
-            .allocator = allocator,
-            .items = &.{},
-        };
-        errdefer snapshot.deinit();
-        snapshot.items = try snapshot.cloneList(items);
-        return snapshot;
-    }
-
-    fn clonePixelBuffer(self: *RasterSnapshot, source: []const u8) CloneError![]u8 {
-        const copy = try self.allocator.dupe(u8, source);
-        errdefer self.allocator.free(copy);
-        try self.pixel_buffers.append(self.allocator, copy);
-        return copy;
-    }
-
-    fn cloneList(self: *RasterSnapshot, items: []const DisplayItem) CloneError![]DisplayItem {
-        const copy = try self.allocator.alloc(DisplayItem, items.len);
-        var initialized: usize = 0;
-        errdefer {
-            DisplayItem.freeItems(self.allocator, copy[0..initialized]);
-            self.allocator.free(copy);
-        }
-        for (items, 0..) |item, index| {
-            copy[index] = try self.cloneItem(item);
-            initialized = index + 1;
-        }
-        return copy;
-    }
-
-    fn cloneItem(self: *RasterSnapshot, item: DisplayItem) CloneError!DisplayItem {
-        return switch (item) {
-            .glyph => |glyph_item| blk: {
-                var copy = glyph_item;
-                copy.source = null;
-                if (glyph_item.glyph.pixels) |pixels| {
-                    copy.glyph.pixels = try self.clonePixelBuffer(pixels);
-                }
-                break :blk .{ .glyph = copy };
-            },
-            .image => |image_item| blk: {
-                var copy = image_item;
-                copy.source = null;
-                copy.pixels = try self.clonePixelBuffer(image_item.pixels);
-                break :blk .{ .image = copy };
-            },
-            .blend => |blend_item| blk: {
-                const children = try self.cloneList(blend_item.children);
-                errdefer DisplayItem.freeList(self.allocator, children);
-                const mode_copy = if (blend_item.blend_mode) |mode|
-                    try self.allocator.dupe(u8, mode)
-                else
-                    null;
-                break :blk .{ .blend = .{
-                    .opacity = blend_item.opacity,
-                    .blend_mode = mode_copy,
-                    .blur_radius = blend_item.blur_radius,
-                    .hit_clip = blend_item.hit_clip,
-                    .children = children,
-                    .node = null,
-                    .parent = null,
-                    .needs_compositing = blend_item.needs_compositing,
-                    .source = null,
-                } };
-            },
-            .transform => |transform_item| .{ .transform = .{
-                .translate_x = transform_item.translate_x,
-                .translate_y = transform_item.translate_y,
-                .children = try self.cloneList(transform_item.children),
-                .node = null,
-                .source = null,
-            } },
-            .draw_composited_layer => error.CompositedLayerCannotCrossRasterBoundary,
-            .rect => |payload| blk: {
-                var copy = payload;
-                copy.source = null;
-                break :blk .{ .rect = copy };
-            },
-            .iframe => |payload| blk: {
-                var copy = payload;
-                copy.source = null;
-                break :blk .{ .iframe = copy };
-            },
-            .rounded_rect => |payload| blk: {
-                var copy = payload;
-                copy.source = null;
-                break :blk .{ .rounded_rect = copy };
-            },
-            .line => |payload| blk: {
-                var copy = payload;
-                copy.source = null;
-                break :blk .{ .line = copy };
-            },
-            .outline => |payload| blk: {
-                var copy = payload;
-                copy.source = null;
-                break :blk .{ .outline = copy };
-            },
-        };
-    }
-
-    pub fn deinit(self: *RasterSnapshot) void {
-        if (self.items.len > 0) DisplayItem.freeList(self.allocator, self.items);
-        self.items = &.{};
-        for (self.pixel_buffers.items) |pixels| self.allocator.free(pixels);
-        self.pixel_buffers.deinit(self.allocator);
-    }
 };
 
 const RasterResult = struct {
@@ -1612,21 +489,6 @@ const RasterTaskContext = struct {
         allocator.destroy(self);
     }
 };
-
-/// A one-child dst_in command is a list-level mask for already-painted
-/// siblings inside its enclosing isolated group. Every other compositing
-/// boundary receives its own temporary surface on the raster worker.
-pub fn rasterBlendNeedsIsolation(
-    needs_compositing: bool,
-    blend_mode: ?[]const u8,
-    child_count: usize,
-) bool {
-    if (!needs_compositing) return false;
-    if (blend_mode) |mode| {
-        if (std.mem.eql(u8, mode, "dst_in") and child_count == 1) return false;
-    }
-    return true;
-}
 
 // Browser manages the window and tabs
 pub const Browser = struct {
@@ -3121,80 +1983,48 @@ pub const Browser = struct {
         }
     }
 
-    fn scheduleTabClickTask(self: *Browser, tab: *Tab, x: i32, y: i32, button: ClickButton, zoom: f32) void {
-        const ctx = TabClickTaskContext.create(self.allocator, self, tab, x, y, button, zoom) catch |err| {
-            std.log.err("Failed to allocate tab click task: {}", .{err});
+    fn scheduleTabAction(
+        self: *Browser,
+        tab: *Tab,
+        action: TabActionTaskContext.Action,
+        label: []const u8,
+    ) void {
+        const ctx = TabActionTaskContext.create(self.allocator, self, tab, action) catch |err| {
+            std.log.err("Failed to allocate {s}: {}", .{ label, err });
             return;
         };
         const task_instance = Task.init(
             .user_input,
-            "task:click",
+            label,
             ctx.toOpaque(),
-            TabClickTaskContext.runOpaque,
-            TabClickTaskContext.cleanupOpaque,
+            TabActionTaskContext.runOpaque,
+            TabActionTaskContext.cleanupOpaque,
         );
         tab.task_runner.schedule(task_instance) catch |err| {
-            std.log.err("Failed to schedule tab click: {}", .{err});
+            std.log.err("Failed to schedule {s}: {}", .{ label, err });
             ctx.destroy();
-            return;
         };
+    }
+
+    fn scheduleTabClickTask(self: *Browser, tab: *Tab, x: i32, y: i32, button: ClickButton, zoom: f32) void {
+        self.scheduleTabAction(tab, .{ .click = .{
+            .x = x,
+            .y = y,
+            .button = button,
+            .zoom = zoom,
+        } }, "task:click");
     }
 
     fn scheduleTabKeypressTask(self: *Browser, tab: *Tab, char: u8) void {
-        const ctx = TabKeypressTaskContext.create(self.allocator, self, tab, char) catch |err| {
-            std.log.err("Failed to allocate keypress task: {}", .{err});
-            return;
-        };
-        const task_instance = Task.init(
-            .user_input,
-            "task:keypress",
-            ctx.toOpaque(),
-            TabKeypressTaskContext.runOpaque,
-            TabKeypressTaskContext.cleanupOpaque,
-        );
-        tab.task_runner.schedule(task_instance) catch |err| {
-            std.log.err("Failed to schedule keypress: {}", .{err});
-            ctx.destroy();
-            return;
-        };
+        self.scheduleTabAction(tab, .{ .keypress = char }, "task:keypress");
     }
 
     fn scheduleTabBackspaceTask(self: *Browser, tab: *Tab) void {
-        const ctx = TabBackspaceTaskContext.create(self.allocator, self, tab) catch |err| {
-            std.log.err("Failed to allocate backspace task: {}", .{err});
-            return;
-        };
-        const task_instance = Task.init(
-            .user_input,
-            "task:backspace",
-            ctx.toOpaque(),
-            TabBackspaceTaskContext.runOpaque,
-            TabBackspaceTaskContext.cleanupOpaque,
-        );
-        tab.task_runner.schedule(task_instance) catch |err| {
-            std.log.err("Failed to schedule backspace: {}", .{err});
-            ctx.destroy();
-            return;
-        };
+        self.scheduleTabAction(tab, .backspace, "task:backspace");
     }
 
     fn scheduleTabScrollTask(self: *Browser, tab: *Tab, delta: i32) void {
-        const ctx = TabScrollTaskContext.create(self.allocator, self, tab, delta) catch |err| {
-            std.log.err("Failed to allocate tab scroll task: {}", .{err});
-            return;
-        };
-        const task_instance = Task.init(
-            .user_input,
-            "task:scroll",
-            ctx.toOpaque(),
-            TabScrollTaskContext.runOpaque,
-            TabScrollTaskContext.cleanupOpaque,
-        );
-        tab.task_runner.schedule(task_instance) catch |err| {
-            std.log.err("Failed to schedule tab scroll: {}", .{err});
-            ctx.destroy();
-            return;
-        };
+        self.scheduleTabAction(tab, .{ .scroll = delta }, "task:scroll");
     }
 
     pub fn scheduleTabHistoryTraversal(
@@ -3202,56 +2032,25 @@ pub const Browser = struct {
         tab: *Tab,
         direction: HistoryDirection,
     ) void {
-        const ctx = TabHistoryTaskContext.create(
-            self.allocator,
-            self,
+        self.scheduleTabAction(
             tab,
-            .{ .direction = direction },
-        ) catch |err| {
-            std.log.err("Failed to allocate history traversal task: {}", .{err});
-            return;
-        };
-        const task_instance = Task.init(
-            .user_input,
+            .{ .history = .{ .direction = direction } },
             "task:history_traversal",
-            ctx.toOpaque(),
-            TabHistoryTaskContext.runOpaque,
-            TabHistoryTaskContext.cleanupOpaque,
         );
-        tab.task_runner.schedule(task_instance) catch |err| {
-            std.log.err("Failed to schedule history traversal: {}", .{err});
-            ctx.destroy();
-            return;
-        };
     }
 
     fn scheduleConfirmedPostResubmission(
         self: *Browser,
         request: PendingPostResubmission,
     ) void {
-        const ctx = TabHistoryTaskContext.create(
-            self.allocator,
-            self,
+        self.scheduleTabAction(
             request.tab,
-            .{ .resubmit = .{
+            .{ .history = .{ .resubmit = .{
                 .target = request.target,
                 .history_generation = request.history_generation,
-            } },
-        ) catch |err| {
-            std.log.err("Failed to allocate POST resubmission task: {}", .{err});
-            return;
-        };
-        const task_instance = Task.init(
-            .user_input,
+            } } },
             "task:post_resubmission",
-            ctx.toOpaque(),
-            TabHistoryTaskContext.runOpaque,
-            TabHistoryTaskContext.cleanupOpaque,
         );
-        request.tab.task_runner.schedule(task_instance) catch |err| {
-            std.log.err("Failed to schedule POST resubmission: {}", .{err});
-            ctx.destroy();
-        };
     }
 
     /// Called only by the serialized tab worker. The UI thread validates that
@@ -3274,22 +2073,7 @@ pub const Browser = struct {
     }
 
     fn scheduleTabBlurTask(self: *Browser, tab: *Tab) void {
-        const ctx = TabBlurTaskContext.create(self.allocator, self, tab) catch |err| {
-            std.log.err("Failed to allocate tab blur task: {}", .{err});
-            return;
-        };
-        const task_instance = Task.init(
-            .user_input,
-            "task:blur",
-            ctx.toOpaque(),
-            TabBlurTaskContext.runOpaque,
-            TabBlurTaskContext.cleanupOpaque,
-        );
-        tab.task_runner.schedule(task_instance) catch |err| {
-            std.log.err("Failed to schedule tab blur: {}", .{err});
-            ctx.destroy();
-            return;
-        };
+        self.scheduleTabAction(tab, .blur, "task:blur");
     }
 
     fn scheduleTabResizeTask(
@@ -3299,29 +2083,15 @@ pub const Browser = struct {
         height: i32,
         generation: u64,
     ) void {
-        const ctx = TabResizeTaskContext.create(
-            self.allocator,
-            self,
+        self.scheduleTabAction(
             tab,
-            width,
-            height,
-            generation,
-        ) catch |err| {
-            std.log.err("Failed to allocate tab resize task: {}", .{err});
-            return;
-        };
-        const task_instance = Task.init(
-            .user_input,
+            .{ .resize = .{
+                .width = width,
+                .height = height,
+                .generation = generation,
+            } },
             "task:resize",
-            ctx.toOpaque(),
-            TabResizeTaskContext.runOpaque,
-            TabResizeTaskContext.cleanupOpaque,
         );
-        tab.task_runner.schedule(task_instance) catch |err| {
-            std.log.err("Failed to schedule tab resize: {}", .{err});
-            ctx.destroy();
-            return;
-        };
     }
 
     // Update the scroll offset
@@ -3370,7 +2140,7 @@ pub const Browser = struct {
         );
     }
 
-    fn fetchBodyForXhr(
+    pub fn fetchBodyForXhr(
         self: *Browser,
         url: Url,
         referrer: ?Url,
@@ -5057,7 +3827,7 @@ pub const Browser = struct {
         try tab.task_runner.schedule(task_instance);
     }
 
-    fn scheduleSetTimeoutTask(
+    pub fn scheduleSetTimeoutTask(
         self: *Browser,
         tab: *Tab,
         js_context: *JsRenderContext,
@@ -5113,7 +3883,7 @@ pub const Browser = struct {
         self.animation_frame_deadline_ns = null;
     }
 
-    fn observeAnimationFrameTabWork(
+    pub fn observeAnimationFrameTabWork(
         self: *Browser,
         tab: *Tab,
         generation: u64,
@@ -5128,7 +3898,7 @@ pub const Browser = struct {
         }
     }
 
-    fn animationTimerMatchesLocked(self: *const Browser, tab: *Tab, generation: u64) bool {
+    pub fn animationTimerMatchesLocked(self: *const Browser, tab: *Tab, generation: u64) bool {
         return self.animation_timer_active and
             self.animation_timer_generation == generation and
             self.activeTab() == tab;
@@ -5136,7 +3906,7 @@ pub const Browser = struct {
 
     /// Finish only the timer generation represented by an animation task or
     /// commit. Preserve its absolute deadline while chaining another frame.
-    fn finishAnimationFrame(self: *Browser, tab: *Tab, generation: u64) bool {
+    pub fn finishAnimationFrame(self: *Browser, tab: *Tab, generation: u64) bool {
         self.lock.lock();
         defer self.lock.unlock();
         return self.finishAnimationFrameLocked(tab, generation);
@@ -5151,7 +3921,7 @@ pub const Browser = struct {
         return should_schedule;
     }
 
-    fn recoverAnimationFrameFailure(self: *Browser, tab: *Tab, generation: u64) void {
+    pub fn recoverAnimationFrameFailure(self: *Browser, tab: *Tab, generation: u64) void {
         self.lock.lock();
         defer self.lock.unlock();
         if (!self.animationTimerMatchesLocked(tab, generation)) return;
@@ -5207,7 +3977,7 @@ pub const Browser = struct {
         thread.detach();
     }
 
-    fn scheduleAsyncXhr(
+    pub fn scheduleAsyncXhr(
         self: *Browser,
         tab: *Tab,
         js_context: *JsRenderContext,
@@ -6479,6 +5249,57 @@ pub const Browser = struct {
         if (needs_layer_raster) self.needs_raster = true;
     }
 
+    /// Rasterize one retained composited layer. The layer module owns command
+    /// state; this operation stays here because it needs Browser drawing and
+    /// zoom state.
+    fn rasterCompositedLayer(self: *Browser, layer: *CompositedLayer) !void {
+        if (!layer.needs_raster and layer.surface != null) return;
+
+        const layer_width: i32 = @max(1, layer.bounds.width());
+        const layer_height: i32 = @max(1, layer.bounds.height());
+        if (layer.surface) |*existing| {
+            if (existing.getWidth() != layer_width or existing.getHeight() != layer_height) {
+                existing.deinit(self.allocator);
+                layer.surface = null;
+            }
+        }
+        if (layer.surface == null) {
+            layer.surface = try z2d.Surface.init(
+                .image_surface_rgba,
+                self.allocator,
+                layer_width,
+                layer_height,
+            );
+        }
+
+        var context = z2d.Context.init(self.io, self.allocator, &layer.surface.?);
+        defer context.deinit();
+        context.setSource(.{ .opaque_pattern = .{ .pixel = .{ .rgba = .{
+            .r = 0,
+            .g = 0,
+            .b = 0,
+            .a = 0,
+        } } } });
+        try context.moveTo(0, 0);
+        try context.lineTo(@floatFromInt(layer_width), 0);
+        try context.lineTo(@floatFromInt(layer_width), @floatFromInt(layer_height));
+        try context.lineTo(0, @floatFromInt(layer_height));
+        try context.closePath();
+        try context.fill();
+
+        const zoom = if (self.active_tab_zoom > 0) self.active_tab_zoom else 1.0;
+        for (layer.display_items) |item| {
+            try self.drawDisplayItemZ2dContextForLayer(
+                &context,
+                item,
+                layer.bounds.left,
+                layer.bounds.top,
+                zoom,
+            );
+        }
+        layer.needs_raster = false;
+    }
+
     /// Publish an optimistic address-bar URL by copying it while the caller
     /// still owns the Url. The public writer synchronizes with commit, chrome
     /// paint, and bookmark toggles.
@@ -7296,7 +6117,7 @@ pub const Browser = struct {
             },
             .draw_composited_layer => |dcl| {
                 // Ensure the layer is rasterized
-                try dcl.layer.raster(self.allocator, self);
+                try self.rasterCompositedLayer(dcl.layer);
 
                 if (dcl.layer.surface) |*layer_surface| {
                     // Draw the layer surface at its position with opacity.
@@ -7639,7 +6460,7 @@ pub const Browser = struct {
             },
             .draw_composited_layer => |dcl| {
                 // For composited layers, draw at transformed position
-                try dcl.layer.raster(self.allocator, self);
+                try self.rasterCompositedLayer(dcl.layer);
                 if (dcl.layer.surface) |*layer_surface| {
                     const layer_y = dcl.layer.bounds.top - scroll_offset;
                     const layer_x = dcl.layer.bounds.left + x_offset;
@@ -8097,6 +6918,29 @@ pub const Browser = struct {
     }
 };
 
+const BrowserTaskContexts = tab_tasks.Contexts(Browser);
+const DocumentHandle = BrowserTaskContexts.DocumentHandle;
+const LoadTaskContext = BrowserTaskContexts.LoadTaskContext;
+const FrameLoadTaskContext = BrowserTaskContexts.FrameLoadTaskContext;
+const TabActionTaskContext = BrowserTaskContexts.TabActionTaskContext;
+const ScriptTaskContext = BrowserTaskContexts.ScriptTaskContext;
+const BrowserScriptTaskContexts = script_tasks.Contexts(Browser, DocumentHandle);
+const SetTimeoutThreadContext = BrowserScriptTaskContexts.SetTimeoutThreadContext;
+const runSetTimeoutThread = BrowserScriptTaskContexts.runSetTimeoutThread;
+const AnimationTimerContext = BrowserScriptTaskContexts.AnimationTimerContext;
+const runAnimationTimerThread = BrowserScriptTaskContexts.runAnimationTimerThread;
+const XhrThreadContext = BrowserScriptTaskContexts.XhrThreadContext;
+const runXhrThread = BrowserScriptTaskContexts.runXhrThread;
+const jsRenderCallback = BrowserScriptTaskContexts.jsRenderCallback;
+const jsDomMutationCallback = BrowserScriptTaskContexts.jsDomMutationCallback;
+const jsCookieGetCallback = BrowserScriptTaskContexts.jsCookieGetCallback;
+const jsCookieSetCallback = BrowserScriptTaskContexts.jsCookieSetCallback;
+const jsXhrCallback = BrowserScriptTaskContexts.jsXhrCallback;
+const jsSetTimeoutCallback = BrowserScriptTaskContexts.jsSetTimeoutCallback;
+const jsClearIntervalCallback = BrowserScriptTaskContexts.jsClearIntervalCallback;
+const jsRequestAnimationFrameCallback = BrowserScriptTaskContexts.jsRequestAnimationFrameCallback;
+const jsPostMessageCallback = BrowserScriptTaskContexts.jsPostMessageCallback;
+
 pub const CommitData = struct {
     url: ?*Url,
     certificate_error: bool = false,
@@ -8109,1649 +6953,4 @@ pub const CommitData = struct {
     // Present only for timer-delivered animation work. Synchronous first-paint
     // commits must not consume an unrelated pending timer generation.
     animation_generation: ?u64 = null,
-};
-
-const LoadTaskContext = struct {
-    allocator: std.mem.Allocator,
-    browser: *Browser,
-    tab: *Tab,
-    url: ?*Url,
-    payload: ?[]const u8,
-
-    fn create(
-        allocator: std.mem.Allocator,
-        browser: *Browser,
-        tab: *Tab,
-        url: *Url,
-        payload: ?[]const u8,
-    ) !*LoadTaskContext {
-        const ctx = try allocator.create(LoadTaskContext);
-        ctx.* = .{
-            .allocator = allocator,
-            .browser = browser,
-            .tab = tab,
-            .url = url,
-            .payload = payload,
-        };
-        return ctx;
-    }
-
-    fn destroy(self: *LoadTaskContext) void {
-        self.consumePayload();
-        if (self.url) |url_ptr| {
-            url_ptr.*.free(self.allocator);
-            self.allocator.destroy(url_ptr);
-        }
-        self.allocator.destroy(self);
-    }
-
-    fn consumePayload(self: *LoadTaskContext) void {
-        if (self.payload) |payload| {
-            self.allocator.free(payload);
-            self.payload = null;
-        }
-    }
-
-    fn run(self: *LoadTaskContext) !void {
-        defer self.consumePayload();
-        try self.browser.loadInTab(self.tab, self.url.?, self.payload, .push);
-        self.url = null;
-    }
-
-    fn toOpaque(self: *LoadTaskContext) *anyopaque {
-        return @ptrCast(self);
-    }
-
-    fn fromOpaque(context: *anyopaque) *LoadTaskContext {
-        const raw: *align(1) LoadTaskContext = @ptrCast(context);
-        return @alignCast(raw);
-    }
-
-    fn runOpaque(context: *anyopaque) anyerror!void {
-        try LoadTaskContext.fromOpaque(context).run();
-    }
-
-    fn cleanupOpaque(context: *anyopaque) void {
-        LoadTaskContext.fromOpaque(context).destroy();
-    }
-};
-
-const FrameLoadTaskContext = struct {
-    allocator: std.mem.Allocator,
-    browser: *Browser,
-    tab: *Tab,
-    document: DocumentHandle,
-    url: ?*Url,
-    payload: ?[]const u8,
-
-    fn create(
-        allocator: std.mem.Allocator,
-        browser: *Browser,
-        frame: *Frame,
-        url: *Url,
-        payload: ?[]const u8,
-    ) !*FrameLoadTaskContext {
-        const ctx = try allocator.create(FrameLoadTaskContext);
-        ctx.* = .{
-            .allocator = allocator,
-            .browser = browser,
-            .tab = frame.tab,
-            .document = DocumentHandle.fromFrame(frame),
-            .url = url,
-            .payload = payload,
-        };
-        return ctx;
-    }
-
-    fn destroy(self: *FrameLoadTaskContext) void {
-        self.consumePayload();
-        if (self.url) |url_ptr| {
-            url_ptr.*.free(self.allocator);
-            self.allocator.destroy(url_ptr);
-        }
-        self.allocator.destroy(self);
-    }
-
-    fn consumePayload(self: *FrameLoadTaskContext) void {
-        if (self.payload) |payload| {
-            self.allocator.free(payload);
-            self.payload = null;
-        }
-    }
-
-    fn run(self: *FrameLoadTaskContext) !void {
-        defer self.consumePayload();
-        const frame = self.document.resolve(self.tab) orelse return;
-        try self.browser.loadInFrame(frame, self.url.?, self.payload);
-    }
-
-    fn toOpaque(self: *FrameLoadTaskContext) *anyopaque {
-        return @ptrCast(self);
-    }
-
-    fn fromOpaque(context: *anyopaque) *FrameLoadTaskContext {
-        const raw: *align(1) FrameLoadTaskContext = @ptrCast(context);
-        return @alignCast(raw);
-    }
-
-    fn runOpaque(context: *anyopaque) anyerror!void {
-        try FrameLoadTaskContext.fromOpaque(context).run();
-    }
-
-    fn cleanupOpaque(context: *anyopaque) void {
-        FrameLoadTaskContext.fromOpaque(context).destroy();
-    }
-};
-
-const TabClickTaskContext = struct {
-    allocator: std.mem.Allocator,
-    browser: *Browser,
-    tab: *Tab,
-    x: i32,
-    y: i32,
-    button: ClickButton,
-    zoom: f32,
-
-    fn create(
-        allocator: std.mem.Allocator,
-        browser: *Browser,
-        tab: *Tab,
-        x: i32,
-        y: i32,
-        button: ClickButton,
-        zoom: f32,
-    ) !*TabClickTaskContext {
-        const ctx = try allocator.create(TabClickTaskContext);
-        ctx.* = .{
-            .allocator = allocator,
-            .browser = browser,
-            .tab = tab,
-            .x = x,
-            .y = y,
-            .button = button,
-            .zoom = zoom,
-        };
-        return ctx;
-    }
-
-    fn destroy(self: *TabClickTaskContext) void {
-        self.allocator.destroy(self);
-    }
-
-    fn run(self: *TabClickTaskContext) !void {
-        try self.tab.clickDevice(self.browser, self.x, self.y, self.button, self.zoom);
-    }
-
-    fn toOpaque(self: *TabClickTaskContext) *anyopaque {
-        return @ptrCast(self);
-    }
-
-    fn fromOpaque(context: *anyopaque) *TabClickTaskContext {
-        const raw: *align(1) TabClickTaskContext = @ptrCast(context);
-        return @alignCast(raw);
-    }
-
-    fn runOpaque(context: *anyopaque) anyerror!void {
-        try TabClickTaskContext.fromOpaque(context).run();
-    }
-
-    fn cleanupOpaque(context: *anyopaque) void {
-        TabClickTaskContext.fromOpaque(context).destroy();
-    }
-};
-
-const TabKeypressTaskContext = struct {
-    allocator: std.mem.Allocator,
-    browser: *Browser,
-    tab: *Tab,
-    char: u8,
-
-    fn create(
-        allocator: std.mem.Allocator,
-        browser: *Browser,
-        tab: *Tab,
-        char: u8,
-    ) !*TabKeypressTaskContext {
-        const ctx = try allocator.create(TabKeypressTaskContext);
-        ctx.* = .{
-            .allocator = allocator,
-            .browser = browser,
-            .tab = tab,
-            .char = char,
-        };
-        return ctx;
-    }
-
-    fn destroy(self: *TabKeypressTaskContext) void {
-        self.allocator.destroy(self);
-    }
-
-    fn run(self: *TabKeypressTaskContext) !void {
-        try self.tab.keypress(self.browser, self.char);
-    }
-
-    fn toOpaque(self: *TabKeypressTaskContext) *anyopaque {
-        return @ptrCast(self);
-    }
-
-    fn fromOpaque(context: *anyopaque) *TabKeypressTaskContext {
-        const raw: *align(1) TabKeypressTaskContext = @ptrCast(context);
-        return @alignCast(raw);
-    }
-
-    fn runOpaque(context: *anyopaque) anyerror!void {
-        try TabKeypressTaskContext.fromOpaque(context).run();
-    }
-
-    fn cleanupOpaque(context: *anyopaque) void {
-        TabKeypressTaskContext.fromOpaque(context).destroy();
-    }
-};
-
-const TabHistoryTaskContext = struct {
-    const Request = union(enum) {
-        direction: HistoryDirection,
-        resubmit: struct {
-            target: usize,
-            history_generation: u64,
-        },
-    };
-
-    allocator: std.mem.Allocator,
-    browser: *Browser,
-    tab: *Tab,
-    request: Request,
-
-    fn create(
-        allocator: std.mem.Allocator,
-        browser: *Browser,
-        tab: *Tab,
-        request: Request,
-    ) !*TabHistoryTaskContext {
-        const ctx = try allocator.create(TabHistoryTaskContext);
-        ctx.* = .{
-            .allocator = allocator,
-            .browser = browser,
-            .tab = tab,
-            .request = request,
-        };
-        return ctx;
-    }
-
-    fn destroy(self: *TabHistoryTaskContext) void {
-        self.allocator.destroy(self);
-    }
-
-    fn run(self: *TabHistoryTaskContext) !void {
-        switch (self.request) {
-            .direction => |direction| try self.tab.traverseHistory(self.browser, direction),
-            .resubmit => |request| try self.tab.resubmitHistoryEntry(
-                self.browser,
-                request.target,
-                request.history_generation,
-            ),
-        }
-    }
-
-    fn toOpaque(self: *TabHistoryTaskContext) *anyopaque {
-        return @ptrCast(self);
-    }
-
-    fn fromOpaque(context: *anyopaque) *TabHistoryTaskContext {
-        const raw: *align(1) TabHistoryTaskContext = @ptrCast(context);
-        return @alignCast(raw);
-    }
-
-    fn runOpaque(context: *anyopaque) anyerror!void {
-        try TabHistoryTaskContext.fromOpaque(context).run();
-    }
-
-    fn cleanupOpaque(context: *anyopaque) void {
-        TabHistoryTaskContext.fromOpaque(context).destroy();
-    }
-};
-
-const TabBackspaceTaskContext = struct {
-    allocator: std.mem.Allocator,
-    browser: *Browser,
-    tab: *Tab,
-
-    fn create(
-        allocator: std.mem.Allocator,
-        browser: *Browser,
-        tab: *Tab,
-    ) !*TabBackspaceTaskContext {
-        const ctx = try allocator.create(TabBackspaceTaskContext);
-        ctx.* = .{
-            .allocator = allocator,
-            .browser = browser,
-            .tab = tab,
-        };
-        return ctx;
-    }
-
-    fn destroy(self: *TabBackspaceTaskContext) void {
-        self.allocator.destroy(self);
-    }
-
-    fn run(self: *TabBackspaceTaskContext) !void {
-        try self.tab.backspace(self.browser);
-    }
-
-    fn toOpaque(self: *TabBackspaceTaskContext) *anyopaque {
-        return @ptrCast(self);
-    }
-
-    fn fromOpaque(context: *anyopaque) *TabBackspaceTaskContext {
-        const raw: *align(1) TabBackspaceTaskContext = @ptrCast(context);
-        return @alignCast(raw);
-    }
-
-    fn runOpaque(context: *anyopaque) anyerror!void {
-        try TabBackspaceTaskContext.fromOpaque(context).run();
-    }
-
-    fn cleanupOpaque(context: *anyopaque) void {
-        TabBackspaceTaskContext.fromOpaque(context).destroy();
-    }
-};
-
-const TabScrollTaskContext = struct {
-    allocator: std.mem.Allocator,
-    browser: *Browser,
-    tab: *Tab,
-    delta: i32,
-
-    fn create(
-        allocator: std.mem.Allocator,
-        browser: *Browser,
-        tab: *Tab,
-        delta: i32,
-    ) !*TabScrollTaskContext {
-        const ctx = try allocator.create(TabScrollTaskContext);
-        ctx.* = .{
-            .allocator = allocator,
-            .browser = browser,
-            .tab = tab,
-            .delta = delta,
-        };
-        return ctx;
-    }
-
-    fn destroy(self: *TabScrollTaskContext) void {
-        self.allocator.destroy(self);
-    }
-
-    fn run(self: *TabScrollTaskContext) !void {
-        self.tab.scrollFocused(self.browser, self.delta);
-    }
-
-    fn toOpaque(self: *TabScrollTaskContext) *anyopaque {
-        return @ptrCast(self);
-    }
-
-    fn fromOpaque(context: *anyopaque) *TabScrollTaskContext {
-        const raw: *align(1) TabScrollTaskContext = @ptrCast(context);
-        return @alignCast(raw);
-    }
-
-    fn runOpaque(context: *anyopaque) anyerror!void {
-        try TabScrollTaskContext.fromOpaque(context).run();
-    }
-
-    fn cleanupOpaque(context: *anyopaque) void {
-        TabScrollTaskContext.fromOpaque(context).destroy();
-    }
-};
-
-const TabBlurTaskContext = struct {
-    allocator: std.mem.Allocator,
-    browser: *Browser,
-    tab: *Tab,
-
-    fn create(
-        allocator: std.mem.Allocator,
-        browser: *Browser,
-        tab: *Tab,
-    ) !*TabBlurTaskContext {
-        const ctx = try allocator.create(TabBlurTaskContext);
-        ctx.* = .{
-            .allocator = allocator,
-            .browser = browser,
-            .tab = tab,
-        };
-        return ctx;
-    }
-
-    fn destroy(self: *TabBlurTaskContext) void {
-        self.allocator.destroy(self);
-    }
-
-    fn run(self: *TabBlurTaskContext) !void {
-        if (self.tab.blur()) {
-            self.tab.updateAccessibilityFocus(self.browser);
-            self.tab.setNeedsRender();
-        }
-    }
-
-    fn toOpaque(self: *TabBlurTaskContext) *anyopaque {
-        return @ptrCast(self);
-    }
-
-    fn fromOpaque(context: *anyopaque) *TabBlurTaskContext {
-        const raw: *align(1) TabBlurTaskContext = @ptrCast(context);
-        return @alignCast(raw);
-    }
-
-    fn runOpaque(context: *anyopaque) anyerror!void {
-        try TabBlurTaskContext.fromOpaque(context).run();
-    }
-
-    fn cleanupOpaque(context: *anyopaque) void {
-        TabBlurTaskContext.fromOpaque(context).destroy();
-    }
-};
-
-const TabResizeTaskContext = struct {
-    allocator: std.mem.Allocator,
-    browser: *Browser,
-    tab: *Tab,
-    width: i32,
-    height: i32,
-    generation: u64,
-
-    fn create(
-        allocator: std.mem.Allocator,
-        browser: *Browser,
-        tab: *Tab,
-        width: i32,
-        height: i32,
-        generation: u64,
-    ) !*TabResizeTaskContext {
-        const ctx = try allocator.create(TabResizeTaskContext);
-        ctx.* = .{
-            .allocator = allocator,
-            .browser = browser,
-            .tab = tab,
-            .width = width,
-            .height = height,
-            .generation = generation,
-        };
-        return ctx;
-    }
-
-    fn destroy(self: *TabResizeTaskContext) void {
-        self.allocator.destroy(self);
-    }
-
-    fn run(self: *TabResizeTaskContext) void {
-        if (self.tab.isShuttingDown()) return;
-        if (self.generation != self.browser.resize_generation.load(.seq_cst)) return;
-
-        self.tab.resizeViewport(self.width, self.height);
-        self.browser.setNeedsAnimationFrame(self.tab);
-        self.browser.scheduleAnimationFrame();
-    }
-
-    fn toOpaque(self: *TabResizeTaskContext) *anyopaque {
-        return @ptrCast(self);
-    }
-
-    fn fromOpaque(context: *anyopaque) *TabResizeTaskContext {
-        const raw: *align(1) TabResizeTaskContext = @ptrCast(context);
-        return @alignCast(raw);
-    }
-
-    fn runOpaque(context: *anyopaque) anyerror!void {
-        TabResizeTaskContext.fromOpaque(context).run();
-    }
-
-    fn cleanupOpaque(context: *anyopaque) void {
-        TabResizeTaskContext.fromOpaque(context).destroy();
-    }
-};
-
-const ScriptTaskContext = struct {
-    allocator: std.mem.Allocator,
-    browser: *Browser,
-    tab: *Tab,
-    document: DocumentHandle,
-    script_label: []const u8,
-    script_url: Url,
-    script_body: []const u8,
-
-    fn create(
-        allocator: std.mem.Allocator,
-        browser: *Browser,
-        tab: *Tab,
-        document: DocumentHandle,
-        script_label: []const u8,
-        script_url: Url,
-        script_body: []const u8,
-    ) !*ScriptTaskContext {
-        const ctx = try allocator.create(ScriptTaskContext);
-        ctx.* = .{
-            .allocator = allocator,
-            .browser = browser,
-            .tab = tab,
-            .document = document,
-            .script_label = script_label,
-            .script_url = script_url,
-            .script_body = script_body,
-        };
-        return ctx;
-    }
-
-    fn destroy(self: *ScriptTaskContext) void {
-        self.script_url.free(self.allocator);
-        self.allocator.free(self.script_body);
-        self.allocator.free(self.script_label);
-        self.allocator.destroy(self);
-    }
-
-    fn toOpaque(self: *ScriptTaskContext) *anyopaque {
-        return @ptrCast(self);
-    }
-
-    fn fromOpaque(context: *anyopaque) *ScriptTaskContext {
-        const raw: *align(1) ScriptTaskContext = @ptrCast(context);
-        return @alignCast(raw);
-    }
-
-    fn runOpaque(context: *anyopaque) anyerror!void {
-        try ScriptTaskContext.fromOpaque(context).run();
-    }
-
-    fn cleanupOpaque(context: *anyopaque) void {
-        ScriptTaskContext.fromOpaque(context).destroy();
-    }
-
-    fn run(self: *ScriptTaskContext) !void {
-        const frame = self.document.resolve(self.tab) orelse return;
-        const js_context = frame.js_context orelse return;
-
-        std.log.info("Executing script for window_id={d}", .{self.document.window_id});
-        std.log.info("========== Executing script ==========", .{});
-        const trace_eval = self.browser.measure.begin("evaljs");
-        defer if (trace_eval) self.browser.measure.end("evaljs");
-        const result = js_context.evaluate(self.document.window_id, self.script_body) catch |err| {
-            std.log.err("Script {s} crashed: {}", .{ self.script_label, err });
-            return;
-        };
-
-        var result_buf: [4096]u8 = undefined;
-        const result_str = js_module.formatValue(result, &result_buf) catch |err| {
-            std.log.err("Failed to format script result: {}", .{err});
-            return;
-        };
-
-        std.log.info("Script result: {s}", .{result_str});
-        std.log.info("======================================", .{});
-
-        if (!std.mem.eql(u8, result_str, "undefined")) {
-            self.injectResult(result_str) catch |err| {
-                std.log.warn("Failed to inject script result: {}", .{err});
-            };
-        }
-    }
-
-    fn injectResult(self: *ScriptTaskContext, result_str: []const u8) anyerror!void {
-        const frame = self.document.resolve(self.tab) orelse return;
-        if (frame.current_node == null) return;
-
-        const allocator = self.browser.allocator;
-        const result_text = try allocator.alloc(u8, result_str.len);
-        @memcpy(result_text, result_str);
-
-        var node_list = std.ArrayList(*Node).empty;
-        defer node_list.deinit(allocator);
-
-        try parser.treeToList(allocator, &frame.current_node.?, &node_list);
-
-        var body_node: ?*Node = null;
-        for (node_list.items) |node_ptr| {
-            switch (node_ptr.*) {
-                .element => |e| {
-                    if (std.mem.eql(u8, e.tag, "body")) {
-                        body_node = node_ptr;
-                        break;
-                    }
-                },
-                .text => {},
-            }
-        }
-
-        if (body_node) |body_elem| {
-            const text_node = Node{ .text = .{
-                .text = result_text,
-                .parent = body_elem,
-            } };
-            try body_elem.appendChild(allocator, text_node);
-            try self.tab.dynamic_texts.append(allocator, result_text);
-            parser.fixParentPointers(&frame.current_node.?, null);
-            try self.tab.render(self.browser);
-        } else {
-            allocator.free(result_text);
-        }
-    }
-};
-
-const SetTimeoutThreadContext = struct {
-    allocator: std.mem.Allocator,
-    browser: *Browser,
-    tab: *Tab,
-    document: DocumentHandle,
-    handle: u32,
-    delay_ms: u32,
-    is_interval: bool,
-
-    fn create(
-        allocator: std.mem.Allocator,
-        browser: *Browser,
-        tab: *Tab,
-        document: DocumentHandle,
-        handle: u32,
-        delay_ms: u32,
-        is_interval: bool,
-    ) !*SetTimeoutThreadContext {
-        const ctx = try allocator.create(SetTimeoutThreadContext);
-        ctx.* = .{
-            .allocator = allocator,
-            .browser = browser,
-            .tab = tab,
-            .document = document,
-            .handle = handle,
-            .delay_ms = delay_ms,
-            .is_interval = is_interval,
-        };
-        return ctx;
-    }
-
-    fn destroy(self: *SetTimeoutThreadContext) void {
-        self.allocator.destroy(self);
-    }
-};
-
-fn runSetTimeoutThread(ctx: *SetTimeoutThreadContext) void {
-    const tab = ctx.tab;
-    defer {
-        ctx.destroy();
-        tab.releaseAsyncThread();
-    }
-
-    _ = ctx.browser.measure.registerThread("SetTimeout thread") catch |err| {
-        std.log.warn("Failed to register setTimeout thread: {}", .{err});
-    };
-
-    var remaining_ns = @as(u64, ctx.delay_ms) * std.time.ns_per_ms;
-    while (remaining_ns > 0) {
-        if (tab.isShuttingDown()) return;
-        if (ctx.is_interval and !tab.intervalIsActive(
-            ctx.document.window_id,
-            ctx.document.generation,
-            ctx.handle,
-        )) return;
-        const sleep_ns = @min(remaining_ns, 10 * std.time.ns_per_ms);
-        ctx.browser.io.sleep(.fromNanoseconds(@intCast(sleep_ns)), .awake) catch {
-            if (ctx.is_interval) tab.clearInterval(
-                ctx.document.window_id,
-                ctx.document.generation,
-                ctx.handle,
-            );
-            return;
-        };
-        remaining_ns -= sleep_ns;
-    }
-    if (tab.isShuttingDown()) return;
-    if (ctx.is_interval and !tab.intervalIsActive(
-        ctx.document.window_id,
-        ctx.document.generation,
-        ctx.handle,
-    )) return;
-
-    const task_ctx = SetTimeoutTaskContext.create(
-        ctx.browser.allocator,
-        ctx.browser,
-        tab,
-        ctx.document,
-        ctx.handle,
-        ctx.is_interval,
-    ) catch |err| {
-        std.log.warn("Failed to allocate setTimeout task: {}", .{err});
-        if (ctx.is_interval) tab.clearInterval(
-            ctx.document.window_id,
-            ctx.document.generation,
-            ctx.handle,
-        );
-        return;
-    };
-    errdefer task_ctx.destroy();
-
-    const task = Task.init(
-        .javascript,
-        if (ctx.is_interval) "task:interval" else "task:timeout",
-        task_ctx.toOpaque(),
-        SetTimeoutTaskContext.runOpaque,
-        SetTimeoutTaskContext.cleanupOpaque,
-    );
-
-    tab.task_runner.schedule(task) catch |err| {
-        std.log.warn("Failed to enqueue setTimeout task: {}", .{err});
-        task_ctx.destroy();
-        if (ctx.is_interval) tab.clearInterval(
-            ctx.document.window_id,
-            ctx.document.generation,
-            ctx.handle,
-        );
-    };
-}
-
-const SetTimeoutTaskContext = struct {
-    allocator: std.mem.Allocator,
-    browser: *Browser,
-    tab: *Tab,
-    document: DocumentHandle,
-    handle: u32,
-    is_interval: bool,
-
-    fn create(
-        allocator: std.mem.Allocator,
-        browser: *Browser,
-        tab: *Tab,
-        document: DocumentHandle,
-        handle: u32,
-        is_interval: bool,
-    ) !*SetTimeoutTaskContext {
-        const ctx = try allocator.create(SetTimeoutTaskContext);
-        ctx.* = .{
-            .allocator = allocator,
-            .browser = browser,
-            .tab = tab,
-            .document = document,
-            .handle = handle,
-            .is_interval = is_interval,
-        };
-        return ctx;
-    }
-
-    fn destroy(self: *SetTimeoutTaskContext) void {
-        self.allocator.destroy(self);
-    }
-
-    fn toOpaque(self: *SetTimeoutTaskContext) *anyopaque {
-        return @ptrCast(self);
-    }
-
-    fn fromOpaque(context: *anyopaque) *SetTimeoutTaskContext {
-        const raw: *align(1) SetTimeoutTaskContext = @ptrCast(context);
-        return @alignCast(raw);
-    }
-
-    fn runOpaque(context: *anyopaque) anyerror!void {
-        try SetTimeoutTaskContext.fromOpaque(context).run();
-    }
-
-    fn cleanupOpaque(context: *anyopaque) void {
-        SetTimeoutTaskContext.fromOpaque(context).destroy();
-    }
-
-    fn run(self: *SetTimeoutTaskContext) !void {
-        const frame = self.document.resolve(self.tab) orelse {
-            if (self.is_interval) self.tab.clearInterval(
-                self.document.window_id,
-                self.document.generation,
-                self.handle,
-            );
-            return;
-        };
-        const trace_eval = self.browser.measure.begin("evaljs");
-        defer if (trace_eval) self.browser.measure.end("evaljs");
-        const js_context = frame.js_context orelse {
-            if (self.is_interval) self.tab.clearInterval(
-                self.document.window_id,
-                self.document.generation,
-                self.handle,
-            );
-            return;
-        };
-        js_context.runTimeoutCallback(self.document.window_id, self.handle) catch |err| {
-            std.log.warn("setTimeout callback failed: {}", .{err});
-            if (self.is_interval and !self.tab.intervalIsActive(
-                self.document.window_id,
-                self.document.generation,
-                self.handle,
-            )) return;
-        };
-    }
-};
-
-const AnimationTimerContext = struct {
-    browser: *Browser,
-    tab: *Tab,
-    generation: u64,
-    deadline_ns: i96,
-
-    fn create(
-        browser: *Browser,
-        tab: *Tab,
-        generation: u64,
-        deadline_ns: i96,
-    ) !*AnimationTimerContext {
-        const ctx = try browser.allocator.create(AnimationTimerContext);
-        ctx.* = .{
-            .browser = browser,
-            .tab = tab,
-            .generation = generation,
-            .deadline_ns = deadline_ns,
-        };
-        return ctx;
-    }
-
-    fn destroy(self: *AnimationTimerContext) void {
-        self.browser.allocator.destroy(self);
-    }
-};
-
-fn runAnimationTimerThread(ctx: *AnimationTimerContext) void {
-    const browser = ctx.browser;
-    const tab = ctx.tab;
-    defer {
-        ctx.destroy();
-        tab.releaseAsyncThread();
-    }
-
-    _ = browser.measure.registerThread("Animation timer thread") catch |err| {
-        std.log.warn("Failed to register animation timer thread: {}", .{err});
-    };
-
-    const deadline = std.Io.Timestamp{ .nanoseconds = ctx.deadline_ns };
-    deadline.withClock(.awake).wait(browser.io) catch {
-        browser.recoverAnimationFrameFailure(tab, ctx.generation);
-        return;
-    };
-
-    browser.lock.lock();
-    // A tab switch or forced reset can supersede this detached helper without
-    // joining it. Only the captured generation may publish a render task.
-    if (!browser.animationTimerMatchesLocked(tab, ctx.generation) or
-        browser.shutting_down or tab.isShuttingDown())
-    {
-        browser.lock.unlock();
-        return;
-    }
-    const scroll = browser.active_tab_scroll;
-    browser.lock.unlock();
-
-    const render_ctx = AnimationRenderTaskContext.create(
-        browser.allocator,
-        browser,
-        tab,
-        scroll,
-        ctx.generation,
-    ) catch |err| {
-        std.log.warn("Failed to allocate animation task: {}", .{err});
-        browser.recoverAnimationFrameFailure(tab, ctx.generation);
-        return;
-    };
-
-    const task = Task.init(
-        .rendering,
-        "task:animation_frame",
-        render_ctx.toOpaque(),
-        AnimationRenderTaskContext.runOpaque,
-        AnimationRenderTaskContext.cleanupOpaque,
-    );
-
-    tab.task_runner.schedule(task) catch |err| {
-        std.log.warn("Failed to schedule animation frame: {}", .{err});
-        render_ctx.destroy();
-        browser.recoverAnimationFrameFailure(tab, ctx.generation);
-        return;
-    };
-}
-
-const AnimationRenderTaskContext = struct {
-    allocator: std.mem.Allocator,
-    browser: *Browser,
-    tab: *Tab,
-    scroll: i32,
-    generation: u64,
-
-    fn create(
-        allocator: std.mem.Allocator,
-        browser: *Browser,
-        tab: *Tab,
-        scroll: i32,
-        generation: u64,
-    ) !*AnimationRenderTaskContext {
-        const ctx = try allocator.create(AnimationRenderTaskContext);
-        ctx.* = .{
-            .allocator = allocator,
-            .browser = browser,
-            .tab = tab,
-            .scroll = scroll,
-            .generation = generation,
-        };
-        return ctx;
-    }
-
-    fn destroy(self: *AnimationRenderTaskContext) void {
-        self.allocator.destroy(self);
-    }
-
-    fn toOpaque(self: *AnimationRenderTaskContext) *anyopaque {
-        return @ptrCast(self);
-    }
-
-    fn fromOpaque(context: *anyopaque) *AnimationRenderTaskContext {
-        const raw: *align(1) AnimationRenderTaskContext = @ptrCast(context);
-        return @alignCast(raw);
-    }
-
-    fn runOpaque(context: *anyopaque) anyerror!void {
-        try AnimationRenderTaskContext.fromOpaque(context).run();
-    }
-
-    fn cleanupOpaque(context: *anyopaque) void {
-        AnimationRenderTaskContext.fromOpaque(context).destroy();
-    }
-
-    fn run(self: *AnimationRenderTaskContext) !void {
-        self.browser.lock.lock();
-        const is_current = !self.browser.shutting_down and
-            !self.tab.isShuttingDown() and
-            self.browser.animationTimerMatchesLocked(self.tab, self.generation);
-        self.browser.lock.unlock();
-
-        if (!is_current) return;
-        const started_ns = std.Io.Clock.awake.now(self.browser.io).nanoseconds;
-        self.tab.runAnimationFrameForGeneration(self.scroll, self.generation);
-        const duration_ns = std.Io.Clock.awake.now(self.browser.io).nanoseconds - started_ns;
-        self.browser.observeAnimationFrameTabWork(
-            self.tab,
-            self.generation,
-            duration_ns,
-        );
-
-        // A commit normally consumes this generation. Frames with no visual
-        // commit still have to release it and possibly chain the next request.
-        if (self.browser.finishAnimationFrame(self.tab, self.generation)) {
-            self.browser.scheduleAnimationFrame();
-        }
-    }
-};
-
-const XhrThreadContext = struct {
-    allocator: std.mem.Allocator,
-    browser: *Browser,
-    tab: *Tab,
-    document: DocumentHandle,
-    resolved_url: Url,
-    referrer: ?Url,
-    referrer_policy: url_module.ReferrerPolicy,
-    payload: ?[]const u8,
-    handle: u32,
-
-    fn create(
-        allocator: std.mem.Allocator,
-        browser: *Browser,
-        tab: *Tab,
-        document: DocumentHandle,
-        resolved_url: Url,
-        referrer: ?Url,
-        referrer_policy: url_module.ReferrerPolicy,
-        payload: ?[]const u8,
-        handle: u32,
-    ) !*XhrThreadContext {
-        const ctx = try allocator.create(XhrThreadContext);
-        errdefer allocator.destroy(ctx);
-
-        const payload_copy = if (payload) |body| blk: {
-            const copy = try allocator.alloc(u8, body.len);
-            @memcpy(copy, body);
-            break :blk copy;
-        } else null;
-        ctx.* = .{
-            .allocator = allocator,
-            .browser = browser,
-            .tab = tab,
-            .document = document,
-            .resolved_url = resolved_url,
-            .referrer = referrer,
-            .referrer_policy = referrer_policy,
-            .payload = payload_copy,
-            .handle = handle,
-        };
-
-        return ctx;
-    }
-
-    fn destroy(self: *XhrThreadContext) void {
-        if (self.payload) |body| {
-            self.allocator.free(body);
-        }
-        self.resolved_url.free(self.allocator);
-        if (self.referrer) |referrer| referrer.free(self.allocator);
-        self.allocator.destroy(self);
-    }
-};
-
-fn ownedXhrRequestOrigin(
-    allocator: std.mem.Allocator,
-    resolved_url: Url,
-    referrer: ?Url,
-) !?[]u8 {
-    const source = referrer orelse return null;
-    if (source.sameOrigin(resolved_url)) return null;
-    return try source.toOwnedOrigin(allocator);
-}
-
-fn freeRawXhrBody(allocator: std.mem.Allocator, url: Url, body: []const u8) void {
-    if (!std.mem.eql(u8, url.scheme, "about") and
-        !std.mem.eql(u8, url.scheme, "data"))
-    {
-        allocator.free(body);
-    }
-}
-
-fn runXhrThread(ctx: *XhrThreadContext) void {
-    const tab = ctx.tab;
-    defer {
-        ctx.destroy();
-        tab.releaseAsyncThread();
-    }
-
-    _ = ctx.browser.measure.registerThread("XHR thread") catch |err| {
-        std.log.warn("Failed to register XHR thread: {}", .{err});
-    };
-
-    const request_origin = ownedXhrRequestOrigin(
-        ctx.allocator,
-        ctx.resolved_url,
-        ctx.referrer,
-    ) catch |err| {
-        std.log.warn("Failed to serialize async XHR origin: {}", .{err});
-        return;
-    };
-    defer if (request_origin) |origin| ctx.allocator.free(origin);
-
-    const response_result = ctx.browser.fetchBodyForXhr(
-        ctx.resolved_url,
-        ctx.referrer,
-        ctx.payload,
-        request_origin,
-        ctx.referrer_policy,
-    ) catch |err| {
-        std.log.warn("Async XHR failed: {}", .{err});
-        return;
-    };
-    defer if (response_result.csp_header) |hdr| ctx.allocator.free(hdr);
-    defer if (response_result.access_control_allow_origin) |hdr| ctx.allocator.free(hdr);
-
-    if (!url_module.corsAllowsResponse(
-        request_origin,
-        response_result.access_control_allow_origin,
-    )) {
-        freeRawXhrBody(ctx.allocator, ctx.resolved_url, response_result.body);
-        std.log.warn("Discarded cross-origin XHR response without matching Access-Control-Allow-Origin", .{});
-        return;
-    }
-
-    var response_body = response_result.body;
-    var should_free_response = true;
-    var response_allocator: ?std.mem.Allocator = ctx.allocator;
-
-    if (std.mem.eql(u8, ctx.resolved_url.scheme, "about")) {
-        should_free_response = false;
-        response_allocator = null;
-    } else if (std.mem.eql(u8, ctx.resolved_url.scheme, "data")) {
-        const copy = ctx.allocator.alloc(u8, response_body.len) catch {
-            std.log.warn("Failed to copy async XHR data body", .{});
-            return;
-        };
-        @memcpy(copy, response_body);
-        response_body = copy;
-        response_allocator = ctx.allocator;
-    }
-
-    const decoded_body = decodeUtf8Replace(ctx.allocator, response_body) catch |err| {
-        std.log.warn("Failed to decode XHR body: {}", .{err});
-        if (should_free_response) {
-            if (response_allocator) |alloc| {
-                alloc.free(response_body);
-            } else {
-                ctx.allocator.free(response_body);
-            }
-        }
-        return;
-    };
-
-    if (should_free_response) {
-        if (response_allocator) |alloc| {
-            alloc.free(response_body);
-        } else {
-            ctx.allocator.free(response_body);
-        }
-    }
-
-    const task_ctx = XhrOnloadTaskContext.create(
-        ctx.allocator,
-        ctx.browser,
-        tab,
-        ctx.document,
-        ctx.handle,
-        decoded_body,
-        ctx.allocator,
-        true,
-    ) catch |err| {
-        std.log.warn("Failed to enqueue XHR onload task: {}", .{err});
-        ctx.allocator.free(decoded_body);
-        return;
-    };
-
-    const task = Task.init(
-        .javascript,
-        "task:xhr_onload",
-        task_ctx.toOpaque(),
-        XhrOnloadTaskContext.runOpaque,
-        XhrOnloadTaskContext.cleanupOpaque,
-    );
-
-    tab.task_runner.schedule(task) catch |err| {
-        std.log.warn("Failed to schedule XHR onload task: {}", .{err});
-        task_ctx.destroy();
-    };
-}
-
-const XhrOnloadTaskContext = struct {
-    allocator: std.mem.Allocator,
-    browser: *Browser,
-    tab: *Tab,
-    document: DocumentHandle,
-    handle: u32,
-    body: []const u8,
-    body_allocator: ?std.mem.Allocator,
-    should_free_body: bool,
-
-    fn create(
-        allocator: std.mem.Allocator,
-        browser: *Browser,
-        tab: *Tab,
-        document: DocumentHandle,
-        handle: u32,
-        body: []const u8,
-        body_allocator: ?std.mem.Allocator,
-        should_free_body: bool,
-    ) !*XhrOnloadTaskContext {
-        const ctx = try allocator.create(XhrOnloadTaskContext);
-        ctx.* = .{
-            .allocator = allocator,
-            .browser = browser,
-            .tab = tab,
-            .document = document,
-            .handle = handle,
-            .body = body,
-            .body_allocator = body_allocator,
-            .should_free_body = should_free_body,
-        };
-        return ctx;
-    }
-
-    fn destroy(self: *XhrOnloadTaskContext) void {
-        if (self.should_free_body) {
-            if (self.body_allocator) |alloc| {
-                alloc.free(self.body);
-            } else {
-                self.allocator.free(self.body);
-            }
-        }
-        self.allocator.destroy(self);
-    }
-
-    fn toOpaque(self: *XhrOnloadTaskContext) *anyopaque {
-        return @ptrCast(self);
-    }
-
-    fn fromOpaque(context: *anyopaque) *XhrOnloadTaskContext {
-        const raw: *align(1) XhrOnloadTaskContext = @ptrCast(context);
-        return @alignCast(raw);
-    }
-
-    fn runOpaque(context: *anyopaque) anyerror!void {
-        try XhrOnloadTaskContext.fromOpaque(context).run();
-    }
-
-    fn cleanupOpaque(context: *anyopaque) void {
-        XhrOnloadTaskContext.fromOpaque(context).destroy();
-    }
-
-    fn run(self: *XhrOnloadTaskContext) !void {
-        const frame = self.document.resolve(self.tab) orelse return;
-        const js_context = frame.js_context orelse return;
-        js_context.runXhrOnload(self.document.window_id, self.handle, self.body) catch |err| {
-            std.log.warn("XHR onload callback failed: {}", .{err});
-        };
-    }
-};
-
-fn jsRenderCallback(context: ?*anyopaque) anyerror!void {
-    const ctx_ptr = context orelse return;
-    const raw_ctx: *align(1) JsRenderContext = @ptrCast(ctx_ptr);
-    const ctx: *JsRenderContext = @alignCast(raw_ctx);
-
-    const browser_ptr = ctx.browser_ptr orelse return;
-    const tab_ptr = ctx.tab_ptr orelse return;
-
-    const raw_browser: *align(1) Browser = @ptrCast(browser_ptr);
-    const browser: *Browser = @alignCast(raw_browser);
-
-    const raw_tab: *align(1) Tab = @ptrCast(tab_ptr);
-    const tab: *Tab = @alignCast(raw_tab);
-
-    // Mark render work; let the main loop drive rendering to avoid re-entrancy.
-    _ = browser;
-    tab.setNeedsRender();
-}
-
-fn jsDomMutationCallback(context: ?*anyopaque, mutation_root: *parser.Node) void {
-    const ctx_ptr = context orelse return;
-    const raw_ctx: *align(1) JsRenderContext = @ptrCast(ctx_ptr);
-    const ctx: *JsRenderContext = @alignCast(raw_ctx);
-
-    const browser_ptr = ctx.browser_ptr orelse return;
-    const tab_ptr = ctx.tab_ptr orelse return;
-    const raw_browser: *align(1) Browser = @ptrCast(browser_ptr);
-    const browser: *Browser = @alignCast(raw_browser);
-    const raw_tab: *align(1) Tab = @ptrCast(tab_ptr);
-    const tab: *Tab = @alignCast(raw_tab);
-
-    const frame = tab.frameForWindowId(ctx.window_id) orelse return;
-    if (frame.document_generation == 0 or
-        !ctx.matchesGeneration(frame.document_generation)) return;
-
-    tab.prepareForDomMutation(browser, frame, mutation_root);
-}
-
-fn jsCookieGetCallback(context: ?*anyopaque) anyerror!js_module.CookieResult {
-    const ctx_ptr = context orelse return error.MissingJsContext;
-    const raw_ctx: *align(1) JsRenderContext = @ptrCast(ctx_ptr);
-    const ctx: *JsRenderContext = @alignCast(raw_ctx);
-    const browser_ptr = ctx.browser_ptr orelse return error.MissingJsContext;
-    const tab_ptr = ctx.tab_ptr orelse return error.MissingJsContext;
-    const raw_browser: *align(1) Browser = @ptrCast(browser_ptr);
-    const browser: *Browser = @alignCast(raw_browser);
-    const raw_tab: *align(1) Tab = @ptrCast(tab_ptr);
-    const tab: *Tab = @alignCast(raw_tab);
-    const frame = tab.frameForWindowId(ctx.window_id) orelse return error.MissingJsContext;
-    if (frame.document_generation == 0 or
-        !ctx.matchesGeneration(frame.document_generation)) return error.StaleDocument;
-    const current_url = frame.current_url orelse return .{ .data = "" };
-    const host = current_url.host orelse return .{ .data = "" };
-
-    const data = try browser.session_state.readCookieForScript(browser.allocator, host);
-    return .{
-        .data = data,
-        .allocator = browser.allocator,
-        .should_free = true,
-    };
-}
-
-fn jsCookieSetCallback(context: ?*anyopaque, value: []const u8) anyerror!void {
-    const ctx_ptr = context orelse return error.MissingJsContext;
-    const raw_ctx: *align(1) JsRenderContext = @ptrCast(ctx_ptr);
-    const ctx: *JsRenderContext = @alignCast(raw_ctx);
-    const browser_ptr = ctx.browser_ptr orelse return error.MissingJsContext;
-    const tab_ptr = ctx.tab_ptr orelse return error.MissingJsContext;
-    const raw_browser: *align(1) Browser = @ptrCast(browser_ptr);
-    const browser: *Browser = @alignCast(raw_browser);
-    const raw_tab: *align(1) Tab = @ptrCast(tab_ptr);
-    const tab: *Tab = @alignCast(raw_tab);
-    const frame = tab.frameForWindowId(ctx.window_id) orelse return error.MissingJsContext;
-    if (frame.document_generation == 0 or
-        !ctx.matchesGeneration(frame.document_generation)) return error.StaleDocument;
-    const current_url = frame.current_url orelse return;
-    const host = current_url.host orelse return;
-    _ = try browser.session_state.writeCookieFromScript(host, value);
-}
-
-fn jsXhrCallback(
-    context: ?*anyopaque,
-    _: []const u8,
-    url_str: []const u8,
-    body: ?[]const u8,
-    is_async: bool,
-    handle: u32,
-) anyerror!js_module.XhrResult {
-    const ctx_ptr = context orelse return error.MissingJsContext;
-    const raw_ctx: *align(1) JsRenderContext = @ptrCast(ctx_ptr);
-    const ctx: *JsRenderContext = @alignCast(raw_ctx);
-
-    const browser_ptr = ctx.browser_ptr orelse return error.MissingJsContext;
-    const tab_ptr = ctx.tab_ptr orelse return error.MissingJsContext;
-
-    const raw_browser: *align(1) Browser = @ptrCast(browser_ptr);
-    const browser: *Browser = @alignCast(raw_browser);
-
-    const raw_tab: *align(1) Tab = @ptrCast(tab_ptr);
-    const tab: *Tab = @alignCast(raw_tab);
-    const frame = tab.frameForWindowId(ctx.window_id) orelse return error.MissingJsContext;
-
-    const allocator = browser.allocator;
-    var resolved_url: Url = undefined;
-    if (frame.current_url) |current_ptr| {
-        resolved_url = current_ptr.*.resolve(allocator, url_str) catch |err| blk: {
-            std.log.warn("Failed to resolve XHR URL {s} relative to page: {}", .{ url_str, err });
-            break :blk try Url.init(allocator, url_str);
-        };
-    } else {
-        resolved_url = try Url.init(allocator, url_str);
-    }
-
-    defer resolved_url.free(allocator);
-
-    if (!frame.allowedRequest(resolved_url, frame.current_url)) {
-        const target_host = resolved_url.host orelse "";
-        std.log.warn(
-            "Blocked XHR to {s}://{s}:{d} due to CSP",
-            .{ resolved_url.scheme, target_host, resolved_url.port },
-        );
-        return error.CspViolation;
-    }
-
-    var current_url_value: ?Url = null;
-    if (frame.current_url) |cur_ptr| {
-        current_url_value = cur_ptr.*;
-    }
-
-    if (is_async) {
-        try browser.scheduleAsyncXhr(
-            tab,
-            ctx,
-            resolved_url,
-            current_url_value,
-            frame.referrer_policy,
-            body,
-            handle,
-        );
-        return .{ .data = "", .allocator = null, .should_free = false };
-    }
-
-    const request_origin = try ownedXhrRequestOrigin(allocator, resolved_url, current_url_value);
-    defer if (request_origin) |origin| allocator.free(origin);
-
-    const response = try browser.fetchBodyForXhr(
-        resolved_url,
-        current_url_value,
-        body,
-        request_origin,
-        frame.referrer_policy,
-    );
-    defer if (response.csp_header) |hdr| allocator.free(hdr);
-    defer if (response.access_control_allow_origin) |hdr| allocator.free(hdr);
-
-    if (!url_module.corsAllowsResponse(request_origin, response.access_control_allow_origin)) {
-        freeRawXhrBody(allocator, resolved_url, response.body);
-        return error.CrossOriginBlocked;
-    }
-
-    var response_body = response.body;
-
-    var should_free_response = true;
-    var response_allocator: ?std.mem.Allocator = allocator;
-
-    if (std.mem.eql(u8, resolved_url.scheme, "data")) {
-        const copy = try allocator.alloc(u8, response_body.len);
-        @memcpy(copy, response_body);
-        response_body = copy;
-    } else if (std.mem.eql(u8, resolved_url.scheme, "about")) {
-        should_free_response = false;
-        response_allocator = null;
-    }
-
-    const decoded_body = decodeUtf8Replace(allocator, response_body) catch |err| {
-        if (should_free_response) {
-            if (response_allocator) |alloc| {
-                alloc.free(response_body);
-            } else {
-                allocator.free(response_body);
-            }
-        }
-        return err;
-    };
-
-    if (should_free_response) {
-        if (response_allocator) |alloc| {
-            alloc.free(response_body);
-        } else {
-            allocator.free(response_body);
-        }
-    }
-
-    return .{
-        .data = decoded_body,
-        .allocator = allocator,
-        .should_free = true,
-    };
-}
-
-fn jsSetTimeoutCallback(
-    context: ?*anyopaque,
-    handle: u32,
-    delay_ms: u32,
-    is_interval: bool,
-) anyerror!void {
-    const ctx_ptr = context orelse return error.MissingJsContext;
-    const raw_ctx: *align(1) JsRenderContext = @ptrCast(ctx_ptr);
-    const ctx: *JsRenderContext = @alignCast(raw_ctx);
-
-    const browser_ptr = ctx.browser_ptr orelse return error.MissingJsContext;
-    const tab_ptr = ctx.tab_ptr orelse return error.MissingJsContext;
-
-    const raw_browser: *align(1) Browser = @ptrCast(browser_ptr);
-    const browser: *Browser = @alignCast(raw_browser);
-
-    const raw_tab: *align(1) Tab = @ptrCast(tab_ptr);
-    const tab: *Tab = @alignCast(raw_tab);
-
-    try browser.scheduleSetTimeoutTask(tab, ctx, handle, delay_ms, is_interval);
-}
-
-fn jsClearIntervalCallback(
-    context: ?*anyopaque,
-    handle: u32,
-) void {
-    const ctx_ptr = context orelse return;
-    const raw_ctx: *align(1) JsRenderContext = @ptrCast(ctx_ptr);
-    const ctx: *JsRenderContext = @alignCast(raw_ctx);
-
-    const tab_ptr = ctx.tab_ptr orelse return;
-    const raw_tab: *align(1) Tab = @ptrCast(tab_ptr);
-    const tab: *Tab = @alignCast(raw_tab);
-
-    tab.clearInterval(ctx.window_id, ctx.currentGeneration(), handle);
-}
-
-fn jsRequestAnimationFrameCallback(
-    context: ?*anyopaque,
-) anyerror!void {
-    const ctx_ptr = context orelse return error.MissingJsContext;
-    const raw_ctx: *align(1) JsRenderContext = @ptrCast(ctx_ptr);
-    const ctx: *JsRenderContext = @alignCast(raw_ctx);
-
-    const tab_ptr = ctx.tab_ptr orelse return error.MissingJsContext;
-
-    const raw_tab: *align(1) Tab = @ptrCast(tab_ptr);
-    const tab: *Tab = @alignCast(raw_tab);
-
-    tab.setNeedsRender();
-}
-
-fn originStringForUrl(allocator: std.mem.Allocator, url: Url) ![]u8 {
-    if (std.mem.eql(u8, url.scheme, "file")) {
-        return allocator.dupe(u8, "file://");
-    }
-    if (std.mem.eql(u8, url.scheme, "about") or std.mem.eql(u8, url.scheme, "data")) {
-        return std.fmt.allocPrint(allocator, "{s}:", .{url.scheme});
-    }
-    const host = url.host orelse "";
-    return std.fmt.allocPrint(allocator, "{s}://{s}:{d}", .{ url.scheme, host, url.port });
-}
-
-fn normalizeOrigin(allocator: std.mem.Allocator, origin: []const u8) ![]const u8 {
-    const trimmed = std.mem.trim(u8, origin, " \t\r\n");
-    const lower = try allocator.alloc(u8, trimmed.len);
-    for (trimmed, 0..) |ch, idx| {
-        lower[idx] = std.ascii.toLower(ch);
-    }
-    return lower;
-}
-
-fn jsPostMessageCallback(
-    context: ?*anyopaque,
-    source_window_id: u32,
-    target_window_id: u32,
-    target_origin: []const u8,
-    message: []const u8,
-) anyerror!void {
-    const ctx_ptr = context orelse return error.MissingJsContext;
-    const raw_ctx: *align(1) JsRenderContext = @ptrCast(ctx_ptr);
-    const ctx: *JsRenderContext = @alignCast(raw_ctx);
-
-    const browser_ptr = ctx.browser_ptr orelse return error.MissingJsContext;
-    const tab_ptr = ctx.tab_ptr orelse return error.MissingJsContext;
-
-    const raw_browser: *align(1) Browser = @ptrCast(browser_ptr);
-    const browser: *Browser = @alignCast(raw_browser);
-
-    const raw_tab: *align(1) Tab = @ptrCast(tab_ptr);
-    const tab: *Tab = @alignCast(raw_tab);
-
-    const source_frame = tab.frameForWindowId(source_window_id) orelse return;
-    const target_frame = tab.frameForWindowId(target_window_id) orelse return;
-
-    const allocator = browser.allocator;
-
-    var source_origin = try allocator.dupe(u8, "null");
-    defer allocator.free(source_origin);
-    if (source_frame.current_url) |url_ptr| {
-        allocator.free(source_origin);
-        source_origin = try originStringForUrl(allocator, url_ptr.*);
-    }
-
-    if (!std.mem.eql(u8, target_origin, "*")) {
-        var target_origin_actual = try allocator.dupe(u8, "null");
-        defer allocator.free(target_origin_actual);
-        if (target_frame.current_url) |url_ptr| {
-            allocator.free(target_origin_actual);
-            target_origin_actual = try originStringForUrl(allocator, url_ptr.*);
-        }
-
-        const target_origin_norm = try normalizeOrigin(allocator, target_origin);
-        defer allocator.free(target_origin_norm);
-        const actual_origin_norm = try normalizeOrigin(allocator, target_origin_actual);
-        defer allocator.free(actual_origin_norm);
-
-        if (!std.mem.eql(u8, target_origin_norm, actual_origin_norm)) {
-            std.log.warn("Blocked postMessage due to target origin mismatch", .{});
-            return;
-        }
-    }
-
-    const task_ctx = try PostMessageTaskContext.create(
-        allocator,
-        browser,
-        tab,
-        DocumentHandle.fromFrame(target_frame),
-        source_window_id,
-        message,
-        source_origin,
-    );
-    const task = Task.init(
-        .javascript,
-        "task:post_message",
-        task_ctx.toOpaque(),
-        PostMessageTaskContext.runOpaque,
-        PostMessageTaskContext.cleanupOpaque,
-    );
-    tab.task_runner.schedule(task) catch |err| {
-        std.log.warn("Failed to schedule postMessage task: {}", .{err});
-        task_ctx.destroy();
-    };
-}
-
-const PostMessageTaskContext = struct {
-    allocator: std.mem.Allocator,
-    browser: *Browser,
-    tab: *Tab,
-    target_document: DocumentHandle,
-    source_window_id: u32,
-    message: []const u8,
-    origin: []const u8,
-
-    fn create(
-        allocator: std.mem.Allocator,
-        browser: *Browser,
-        tab: *Tab,
-        target_document: DocumentHandle,
-        source_window_id: u32,
-        message: []const u8,
-        origin: []const u8,
-    ) !*PostMessageTaskContext {
-        const ctx = try allocator.create(PostMessageTaskContext);
-        const message_copy = try allocator.dupe(u8, message);
-        errdefer allocator.free(message_copy);
-        const origin_copy = try allocator.dupe(u8, origin);
-        errdefer allocator.free(origin_copy);
-        ctx.* = .{
-            .allocator = allocator,
-            .browser = browser,
-            .tab = tab,
-            .target_document = target_document,
-            .source_window_id = source_window_id,
-            .message = message_copy,
-            .origin = origin_copy,
-        };
-        return ctx;
-    }
-
-    fn destroy(self: *PostMessageTaskContext) void {
-        self.allocator.free(self.message);
-        self.allocator.free(self.origin);
-        self.allocator.destroy(self);
-    }
-
-    fn toOpaque(self: *PostMessageTaskContext) *anyopaque {
-        return @ptrCast(self);
-    }
-
-    fn fromOpaque(context: *anyopaque) *PostMessageTaskContext {
-        const raw: *align(1) PostMessageTaskContext = @ptrCast(context);
-        return @alignCast(raw);
-    }
-
-    fn runOpaque(context: *anyopaque) anyerror!void {
-        try PostMessageTaskContext.fromOpaque(context).run();
-    }
-
-    fn cleanupOpaque(context: *anyopaque) void {
-        PostMessageTaskContext.fromOpaque(context).destroy();
-    }
-
-    fn run(self: *PostMessageTaskContext) !void {
-        const target_frame = self.target_document.resolve(self.tab) orelse return;
-        const target_context = target_frame.js_context orelse return;
-        target_context.dispatchPostMessage(
-            self.target_document.window_id,
-            self.message,
-            self.origin,
-            self.source_window_id,
-        ) catch |err| {
-            std.log.warn("Failed to dispatch postMessage: {}", .{err});
-            return;
-        };
-        // Ensure postMessage-driven DOM updates paint without waiting for input.
-        self.tab.setNeedsRender();
-        const scroll = if (self.tab.root_frame) |root| root.scroll else 0;
-        self.tab.runAnimationFrame(scroll);
-    }
 };
