@@ -48,6 +48,7 @@ The source tree is organized by responsibility:
 | [`src/network/cache.zig`](../src/network/cache.zig) | Browser-session HTTP response entries, expiry, and strict `Cache-Control` policy parsing. |
 | [`src/script/js.zig`](../src/script/js.zig) | Kiesel host integration, realms/windows, DOM handles, JavaScript evaluation, events, timers, XHR, and host callbacks. |
 | [`src/runtime/task.zig`](../src/runtime/task.zig) | Per-tab serialized task worker and opaque task-context cleanup. |
+| [`src/runtime/thread_batch.zig`](../src/runtime/thread_batch.zig) | Synchronous start-all/join-all thread batches with caller-owned job/result slots. |
 | [`src/runtime/sync.zig`](../src/runtime/sync.zig) | Runtime synchronization wrappers. |
 | [`src/runtime/measure_time.zig`](../src/runtime/measure_time.zig) | Cross-thread measurement and profiling state. |
 | [`src/core/protected_field.zig`](../src/core/protected_field.zig) | Reactive dirty/invalidation fields used by style and layout. |
@@ -178,8 +179,10 @@ change independently of page screenshot goldens.
 
 `BrowserSession` owns the shared `std.http.Client`, cookie jar, decoded HTTP
 response cache, and canonical serialized strings for visited and bookmarked
-URLs. A dedicated network mutex serializes transport/cookie/cache access; its
-metadata mutex protects both URL sets independently of every `Browser.lock`.
+URLs. Zig opens client connections thread-safely. A dedicated network mutex
+stabilizes cookie/cache lookup, copying, eviction, and mutation, but does not
+cover a complete transport round trip; its metadata mutex protects both URL
+sets independently of every `Browser.lock`.
 The tutorial jar owns one host key, cookie value, retained parameter string,
 derived SameSite/HttpOnly flags, and an optional absolute Unix expiration per
 site. HTTP Set-Cookie and JavaScript assignments use the same transactional
@@ -262,6 +265,17 @@ while evaluated code remains in the document realm. Author stylesheets are
 rebuilt as a staged rules-plus-source-buffer generation from the current DOM,
 which both loads inserted `<style>`/`<link>` elements and retires rules from
 detached links without leaving property slices pointing at freed CSS text.
+
+Root documents, child documents, and those mutation rescans discover every
+external classic script and linked stylesheet into one fixed batch. Each slot
+owns a resolved resource URL and independent referrer URL before its worker
+starts, and retains its response until the tab worker consumes it. The batch
+starts every available request before joining any thread; native spawn failure
+falls back to a synchronous fetch for that slot. After the complete join, the
+worker walks the DOM again, queueing scripts and parsing stylesheets in source
+order. Thus network completion cannot reorder classic-script execution or the
+CSS cascade, and navigation/shutdown cannot retire the Browser, Frame, or URLs
+while a batch thread still borrows them.
 
 Each tab records the visited generation represented by its display list. A new
 session visit requests an animation frame; render compares generations before
@@ -622,8 +636,11 @@ behavior. Entries with `max-age` use the monotonic awake clock; `no-store`,
 malformed directives, and unknown directives bypass storage. Responses without
 `Cache-Control` remain cached for the current browser session, matching the
 exercise's simplified model.
-`BrowserSession.network_lock` serializes its HTTP client, cookie jar, and cache
-across tabs and native windows without nesting the visited/bookmark mutex.
+`BrowserSession.network_lock` serializes only cookie/cache access across tabs
+and native windows without nesting the visited/bookmark mutex. Cache-hit
+responses and Cookie request headers are copied while locked, so the shared
+maps may change safely while independent `std.http.Client` requests are in
+flight.
 
 Every document Frame stores the Referrer-Policy parsed from its response.
 Navigation, images, iframes, scripts, stylesheets, and XHR pass both that policy
@@ -874,10 +891,11 @@ shutdown can safely wait but may wait for network I/O to finish.
   for a matching, verified HTTPS document, never for optimistic navigation
   text or a certificate-warning document.
 - `TaskRunner.mutex` and its condition protect the task queue and worker flags.
-- `BrowserSession.network_lock` serializes the shared HTTP client, cookie jar,
-  and response cache across every window around fetches and synchronous
-  `document.cookie` callbacks. A callback never retains a jar slice after
-  releasing this lock.
+- `BrowserSession.network_lock` serializes shared cookie-jar and response-cache
+  access across every window, plus synchronous `document.cookie` callbacks;
+  it deliberately does not serialize the HTTP round trip. Requests own copied
+  Cookie header values, cache hits own response copies, and callbacks retain no
+  jar slice after releasing the lock.
 - `BrowserSession.lock` protects owned session URL sets. Its visited generation
   is published atomically so render can detect stale link annotations without
   reading the map outside that lock. Chrome bookmark lookup holds

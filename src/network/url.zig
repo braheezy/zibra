@@ -9,6 +9,7 @@ const std = @import("std");
 
 const ada = @import("ada");
 const cache_module = @import("cache.zig");
+const Mutex = @import("../runtime/sync.zig").Mutex;
 
 pub const CacheControl = cache_module.CacheControl;
 pub const HttpCache = cache_module.HttpCache;
@@ -745,7 +746,7 @@ pub const Url = struct {
         referrer: ?Url,
         payload: ?[]const u8,
     ) !HttpResponse {
-        return fetchBodyInternal(allocator, io, http_client, cookie_jar, cache, url, referrer, payload, null, null, .default);
+        return fetchBodyInternal(allocator, io, http_client, cookie_jar, cache, null, url, referrer, payload, null, null, .default);
     }
 
     /// Fetch with the source document's policy controlling only the outbound
@@ -762,7 +763,25 @@ pub const Url = struct {
         payload: ?[]const u8,
         referrer_policy: ReferrerPolicy,
     ) !HttpResponse {
-        return fetchBodyInternal(allocator, io, http_client, cookie_jar, cache, url, referrer, payload, null, null, referrer_policy);
+        return fetchBodyInternal(allocator, io, http_client, cookie_jar, cache, null, url, referrer, payload, null, null, referrer_policy);
+    }
+
+    /// Browser-session variant which serializes only shared cookie/cache map
+    /// access. `std.http.Client` opens connections thread-safely, so callers
+    /// may execute independent requests concurrently through one client.
+    pub fn fetchBodyWithReferrerPolicySynchronized(
+        allocator: std.mem.Allocator,
+        io: std.Io,
+        http_client: *std.http.Client,
+        cookie_jar: *std.StringHashMap(CookieEntry),
+        cache: ?*HttpCache,
+        network_lock: *Mutex,
+        url: Url,
+        referrer: ?Url,
+        payload: ?[]const u8,
+        referrer_policy: ReferrerPolicy,
+    ) !HttpResponse {
+        return fetchBodyInternal(allocator, io, http_client, cookie_jar, cache, network_lock, url, referrer, payload, null, null, referrer_policy);
     }
 
     /// Fetch an XHR while attaching the caller's serialized origin. CORS
@@ -793,6 +812,35 @@ pub const Url = struct {
         );
     }
 
+    pub fn fetchBodyWithOriginAndReferrerPolicySynchronized(
+        allocator: std.mem.Allocator,
+        io: std.Io,
+        http_client: *std.http.Client,
+        cookie_jar: *std.StringHashMap(CookieEntry),
+        cache: ?*HttpCache,
+        network_lock: *Mutex,
+        url: Url,
+        referrer: ?Url,
+        payload: ?[]const u8,
+        request_origin: []const u8,
+        referrer_policy: ReferrerPolicy,
+    ) !HttpResponse {
+        return fetchBodyInternal(
+            allocator,
+            io,
+            http_client,
+            cookie_jar,
+            cache,
+            network_lock,
+            url,
+            referrer,
+            payload,
+            null,
+            request_origin,
+            referrer_policy,
+        );
+    }
+
     pub fn fetchBodyWithOriginAndReferrerPolicy(
         allocator: std.mem.Allocator,
         io: std.Io,
@@ -811,6 +859,7 @@ pub const Url = struct {
             http_client,
             cookie_jar,
             cache,
+            null,
             url,
             referrer,
             payload,
@@ -860,7 +909,24 @@ pub const Url = struct {
         referrer_policy: ReferrerPolicy,
     ) !HttpResponse {
         final_url.* = null;
-        return fetchBodyInternal(allocator, io, http_client, cookie_jar, cache, url, referrer, payload, final_url, null, referrer_policy);
+        return fetchBodyInternal(allocator, io, http_client, cookie_jar, cache, null, url, referrer, payload, final_url, null, referrer_policy);
+    }
+
+    pub fn fetchBodyWithFinalUrlAndReferrerPolicySynchronized(
+        allocator: std.mem.Allocator,
+        io: std.Io,
+        http_client: *std.http.Client,
+        cookie_jar: *std.StringHashMap(CookieEntry),
+        cache: ?*HttpCache,
+        network_lock: *Mutex,
+        url: Url,
+        referrer: ?Url,
+        payload: ?[]const u8,
+        final_url: *?Url,
+        referrer_policy: ReferrerPolicy,
+    ) !HttpResponse {
+        final_url.* = null;
+        return fetchBodyInternal(allocator, io, http_client, cookie_jar, cache, network_lock, url, referrer, payload, final_url, null, referrer_policy);
     }
 
     /// Zig's HTTP client maps TLS handshake-init failures, including
@@ -877,6 +943,7 @@ pub const Url = struct {
         http_client: *std.http.Client,
         cookie_jar: *std.StringHashMap(CookieEntry),
         cache: ?*HttpCache,
+        network_lock: ?*Mutex,
         url: Url,
         referrer: ?Url,
         payload: ?[]const u8,
@@ -901,35 +968,42 @@ pub const Url = struct {
         const cache_key = if (std.mem.indexOfScalar(u8, href, '#')) |fragment_index| href[0..fragment_index] else href;
 
         if (use_cache) {
-            const lookup_time_ns = std.Io.Clock.awake.now(io).nanoseconds;
-            if (cache.?.lookup(cache_key, lookup_time_ns)) |entry| {
-                var cached_final_url: ?Url = null;
-                errdefer if (cached_final_url) |resolved| resolved.free(allocator);
-                if (final_url != null) {
-                    if (entry.final_url) |final_url_text| {
-                        cached_final_url = try Url.init(allocator, final_url_text);
-                        cached_final_url.?.view_source = url.view_source;
-                        try inheritFragment(allocator, url, &cached_final_url.?);
+            const cached_response: ?HttpResponse = cache_lookup: {
+                if (network_lock) |lock| lock.lock();
+                defer if (network_lock) |lock| lock.unlock();
+
+                const lookup_time_ns = std.Io.Clock.awake.now(io).nanoseconds;
+                if (cache.?.lookup(cache_key, lookup_time_ns)) |entry| {
+                    var cached_final_url: ?Url = null;
+                    errdefer if (cached_final_url) |resolved| resolved.free(allocator);
+                    if (final_url != null) {
+                        if (entry.final_url) |final_url_text| {
+                            cached_final_url = try Url.init(allocator, final_url_text);
+                            cached_final_url.?.view_source = url.view_source;
+                            try inheritFragment(allocator, url, &cached_final_url.?);
+                        }
                     }
-                }
 
-                const body = try allocator.dupe(u8, entry.body);
-                errdefer allocator.free(body);
-                const csp_header = if (entry.csp_header) |header| try allocator.dupe(u8, header) else null;
-                errdefer if (csp_header) |header| allocator.free(header);
+                    const body = try allocator.dupe(u8, entry.body);
+                    errdefer allocator.free(body);
+                    const csp_header = if (entry.csp_header) |header| try allocator.dupe(u8, header) else null;
+                    errdefer if (csp_header) |header| allocator.free(header);
 
-                if (final_url) |output| {
-                    output.* = cached_final_url;
-                    cached_final_url = null;
+                    if (final_url) |output| {
+                        output.* = cached_final_url;
+                        cached_final_url = null;
+                    }
+                    break :cache_lookup .{
+                        .body = body,
+                        .csp_header = csp_header,
+                        .status = .ok,
+                        .cache_control = entry.policy,
+                        .referrer_policy = entry.referrer_policy,
+                    };
                 }
-                return .{
-                    .body = body,
-                    .csp_header = csp_header,
-                    .status = .ok,
-                    .cache_control = entry.policy,
-                    .referrer_policy = entry.referrer_policy,
-                };
-            }
+                break :cache_lookup null;
+            };
+            if (cached_response) |response| return response;
         }
 
         var fetched_final_url: ?Url = null;
@@ -939,6 +1013,7 @@ pub const Url = struct {
             allocator,
             http_client,
             cookie_jar,
+            network_lock,
             referrer,
             payload,
             final_url_output,
@@ -948,6 +1023,7 @@ pub const Url = struct {
 
         if (use_cache and response.status == .ok and response.cache_control.isCacheable()) {
             const final_url_text = if (fetched_final_url) |resolved| resolved.ada_url.getHref() else null;
+            if (network_lock) |lock| lock.lock();
             cache.?.store(
                 cache_key,
                 response.body,
@@ -959,6 +1035,7 @@ pub const Url = struct {
             ) catch |err| {
                 std.log.warn("Failed to cache {s}: {}", .{ cache_key, err });
             };
+            if (network_lock) |lock| lock.unlock();
         }
 
         if (final_url) |output| {
@@ -974,6 +1051,7 @@ pub const Url = struct {
         al: std.mem.Allocator,
         http_client: *std.http.Client,
         cookie_jar: *std.StringHashMap(CookieEntry),
+        network_lock: ?*Mutex,
         referrer: ?Url,
         payload: ?[]const u8,
         final_url: ?*?Url,
@@ -1025,15 +1103,23 @@ pub const Url = struct {
             });
         }
 
+        var cookie_header_value: ?[]u8 = null;
+        defer if (cookie_header_value) |value| al.free(value);
         if (self.host) |host_slice| {
-            if (cookieForRequest(
-                al,
-                cookie_jar,
-                host_slice,
-                method,
-                referrer,
-                std.Io.Clock.real.now(http_client.io).toSeconds(),
-            )) |cookie_value| {
+            cookie_header_value = cookie_snapshot: {
+                if (network_lock) |lock| lock.lock();
+                defer if (network_lock) |lock| lock.unlock();
+                const value = cookieForRequest(
+                    al,
+                    cookie_jar,
+                    host_slice,
+                    method,
+                    referrer,
+                    std.Io.Clock.real.now(http_client.io).toSeconds(),
+                ) orelse break :cookie_snapshot null;
+                break :cookie_snapshot try al.dupe(u8, value);
+            };
+            if (cookie_header_value) |cookie_value| {
                 try extra_headers.append(al, .{
                     .name = "Cookie",
                     .value = cookie_value,
@@ -1118,14 +1204,18 @@ pub const Url = struct {
                 var header_it = response.head.iterateHeaders();
                 while (header_it.next()) |header| {
                     if (std.ascii.eqlIgnoreCase(header.name, "set-cookie")) {
-                        _ = try applySetCookie(
-                            al,
-                            cookie_jar,
-                            cookie_host,
-                            header.value,
-                            .http,
-                            std.Io.Clock.real.now(http_client.io).toSeconds(),
-                        );
+                        _ = set_cookie: {
+                            if (network_lock) |lock| lock.lock();
+                            defer if (network_lock) |lock| lock.unlock();
+                            break :set_cookie try applySetCookie(
+                                al,
+                                cookie_jar,
+                                cookie_host,
+                                header.value,
+                                .http,
+                                std.Io.Clock.real.now(http_client.io).toSeconds(),
+                            );
+                        };
                     } else if (std.ascii.eqlIgnoreCase(header.name, "content-security-policy")) {
                         if (csp_header) |existing| {
                             al.free(existing);

@@ -164,6 +164,12 @@ starting before and overlapping main-thread composition/raster/draw.
 callbacks with 48 animation frames. Frame cadence remains visible while every
 timeout must eventually complete, covering both priority and starvation.
 
+`tests/manual/threaded-loading.html` combines two external scripts and two
+same-specificity stylesheets. Run its adjacent threaded Python server to give
+each response equal latency: all four requests start together while the visible
+script result and final green style prove that consumption remains in DOM
+source order.
+
 Choose the narrowest check that covers the pipeline stage under change. A DOM
 or parser regression should normally add a DOM dump or unit fixture before a
 full screenshot fixture.

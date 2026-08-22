@@ -26,4 +26,5 @@ comptime {
     _ = @import("tests/parser.zig");
     _ = @import("network/url.zig");
     _ = @import("runtime/task.zig");
+    _ = @import("runtime/thread_batch.zig");
 }

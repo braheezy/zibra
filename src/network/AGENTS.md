@@ -41,8 +41,11 @@ before changing URL or response ownership.
 - Cache hits must preserve the normal fetch ownership contract by returning
   caller-owned body and header copies, and must reproduce response metadata
   such as Referrer-Policy. Interactive cache, cookie, and HTTP client state
-  belongs to the shared `BrowserSession` and is protected by its dedicated
-  network mutex; standalone screenshot browsers own their session.
+  belongs to the shared `BrowserSession`; standalone screenshot browsers own
+  their session. Zig's client opens connections thread-safely. The session's
+  network mutex protects cookie/cache lookup, copying, eviction, and mutation,
+  but must not cover the complete round trip or parallel subresources become
+  serialized. Copy a Cookie header while locked before giving it to a request.
 - Referer generation borrows the source URL only for the synchronous request,
   omits its fragment, and applies the source document's `no-referrer` or
   `same-origin` policy. Policy suppression must not erase the request context:

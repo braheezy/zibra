@@ -36,6 +36,7 @@ const Chrome = @import("chrome.zig");
 const task_module = @import("../runtime/task.zig");
 const Task = task_module.Task;
 const MeasureTime = @import("../runtime/measure_time.zig").MeasureTime;
+const thread_batch = @import("../runtime/thread_batch.zig");
 
 // Default browser stylesheet - defines default styling for HTML elements
 const DEFAULT_STYLE_SHEET = @embedFile("browser.css");
@@ -103,6 +104,81 @@ pub const NavigationSecurity = enum {
     none,
     secure,
     certificate_error,
+};
+
+const DocumentResourceKind = enum {
+    script,
+    stylesheet,
+};
+
+/// One external script or stylesheet fetch. The DOM node is only an identity
+/// used after every worker has joined; workers borrow the heap-stable Browser
+/// and own independent URL/referrer values plus their response.
+const DocumentResourceFetch = struct {
+    browser: *Browser,
+    node: *Node,
+    kind: DocumentResourceKind,
+    resource_url: Url,
+    referrer_url: Url,
+    referrer_policy: url_module.ReferrerPolicy,
+    response: ?url_module.HttpResponse = null,
+    fetch_error: ?anyerror = null,
+
+    fn runOpaque(raw: *anyopaque) void {
+        const self: *@This() = @ptrCast(@alignCast(raw));
+        self.response = self.browser.fetchBodyWithReferrerPolicy(
+            self.resource_url,
+            self.referrer_url,
+            null,
+            self.referrer_policy,
+        ) catch |err| {
+            self.fetch_error = err;
+            return;
+        };
+    }
+
+    fn deinit(self: *@This(), allocator: std.mem.Allocator) void {
+        if (self.response) |response| {
+            const body_owned = !std.mem.eql(u8, self.resource_url.scheme, "data") and
+                !std.mem.eql(u8, self.resource_url.scheme, "about");
+            if (body_owned) allocator.free(response.body);
+            if (response.csp_header) |header| allocator.free(header);
+            if (response.access_control_allow_origin) |header| allocator.free(header);
+        }
+        self.resource_url.free(allocator);
+        self.referrer_url.free(allocator);
+        self.* = undefined;
+    }
+};
+
+const DocumentResourceBatch = struct {
+    allocator: std.mem.Allocator,
+    fetches: std.ArrayList(DocumentResourceFetch) = .empty,
+    jobs: std.ArrayList(thread_batch.Job) = .empty,
+
+    fn deinit(self: *@This()) void {
+        for (self.fetches.items) |*fetch| fetch.deinit(self.allocator);
+        self.fetches.deinit(self.allocator);
+        self.jobs.deinit(self.allocator);
+    }
+
+    fn runAndJoin(self: *@This()) !void {
+        try self.jobs.ensureTotalCapacity(self.allocator, self.fetches.items.len);
+        for (self.fetches.items) |*fetch| {
+            self.jobs.appendAssumeCapacity(.{
+                .context = fetch,
+                .run_fn = DocumentResourceFetch.runOpaque,
+            });
+        }
+        thread_batch.runAndJoin(self.jobs.items);
+    }
+
+    fn find(self: *@This(), node: *Node, kind: DocumentResourceKind) ?*DocumentResourceFetch {
+        for (self.fetches.items) |*fetch| {
+            if (fetch.node == node and fetch.kind == kind) return fetch;
+        }
+        return null;
+    }
 };
 
 pub fn navigationSecurity(url: ?*const Url, certificate_error: bool) NavigationSecurity {
@@ -2875,15 +2951,13 @@ pub const Browser = struct {
         payload: ?[]const u8,
         referrer_policy: url_module.ReferrerPolicy,
     ) !url_module.HttpResponse {
-        self.session_state.network_lock.lock();
-        defer self.session_state.network_lock.unlock();
-
-        return url_module.Url.fetchBodyWithReferrerPolicy(
+        return url_module.Url.fetchBodyWithReferrerPolicySynchronized(
             self.allocator,
             self.io,
             &self.session_state.http_client,
             &self.session_state.cookie_jar,
             &self.session_state.http_cache,
+            &self.session_state.network_lock,
             url,
             referrer,
             payload,
@@ -2899,15 +2973,13 @@ pub const Browser = struct {
         request_origin: []const u8,
         referrer_policy: url_module.ReferrerPolicy,
     ) !url_module.HttpResponse {
-        self.session_state.network_lock.lock();
-        defer self.session_state.network_lock.unlock();
-
-        return url_module.Url.fetchBodyWithOriginAndReferrerPolicy(
+        return url_module.Url.fetchBodyWithOriginAndReferrerPolicySynchronized(
             self.allocator,
             self.io,
             &self.session_state.http_client,
             &self.session_state.cookie_jar,
             &self.session_state.http_cache,
+            &self.session_state.network_lock,
             url,
             referrer,
             payload,
@@ -2924,15 +2996,13 @@ pub const Browser = struct {
         final_url: *?Url,
         referrer_policy: url_module.ReferrerPolicy,
     ) !url_module.HttpResponse {
-        self.session_state.network_lock.lock();
-        defer self.session_state.network_lock.unlock();
-
-        return url_module.Url.fetchBodyWithFinalUrlAndReferrerPolicy(
+        return url_module.Url.fetchBodyWithFinalUrlAndReferrerPolicySynchronized(
             self.allocator,
             self.io,
             &self.session_state.http_client,
             &self.session_state.cookie_jar,
             &self.session_state.http_cache,
+            &self.session_state.network_lock,
             url,
             referrer,
             payload,
@@ -3221,6 +3291,9 @@ pub const Browser = struct {
             defer node_list.deinit(self.allocator);
             try parser.treeToList(self.allocator, &frame.current_node.?, &node_list);
 
+            var resources = try self.fetchDocumentResources(frame, url, node_list.items);
+            defer resources.deinit();
+
             // Download and decode <img> elements before layout/paint.
             self.loadImages(frame, url, node_list.items) catch |err| {
                 std.log.warn("Failed to load images: {}", .{err});
@@ -3228,7 +3301,13 @@ pub const Browser = struct {
 
             // Queue scripts in document order and mark their element identity
             // so later resource rescans do not evaluate them again.
-            _ = self.scheduleDocumentScripts(tab, frame, url, node_list.items);
+            _ = self.scheduleDocumentScripts(
+                tab,
+                frame,
+                url,
+                node_list.items,
+                &resources,
+            );
 
             // Create and load iframe subdocuments after scheduling parent scripts.
             self.loadIframes(frame, url, node_list.items) catch |err| {
@@ -3270,8 +3349,8 @@ pub const Browser = struct {
 
             try self.appendDocumentStylesheets(
                 frame,
-                url,
                 node_list.items,
+                &resources,
                 &new_css_texts,
                 &all_rules,
             );
@@ -3577,11 +3656,20 @@ pub const Browser = struct {
         defer node_list.deinit(self.allocator);
         try parser.treeToList(self.allocator, &frame.current_node.?, &node_list);
 
+        var resources = try self.fetchDocumentResources(frame, url, node_list.items);
+        defer resources.deinit();
+
         self.loadImages(frame, url, node_list.items) catch |err| {
             std.log.warn("Failed to load iframe images: {}", .{err});
         };
 
-        _ = self.scheduleDocumentScripts(frame.tab, frame, url, node_list.items);
+        _ = self.scheduleDocumentScripts(
+            frame.tab,
+            frame,
+            url,
+            node_list.items,
+            &resources,
+        );
 
         // Load nested iframes in this frame.
         self.loadIframes(frame, url, node_list.items) catch |err| {
@@ -3611,8 +3699,8 @@ pub const Browser = struct {
 
         try self.appendDocumentStylesheets(
             frame,
-            url,
             node_list.items,
+            &resources,
             &new_css_texts,
             &all_rules,
         );
@@ -3958,11 +4046,20 @@ pub const Browser = struct {
         defer node_list.deinit(self.allocator);
         try parser.treeToList(self.allocator, &frame.current_node.?, &node_list);
 
+        var resources = try self.fetchDocumentResources(frame, frame_url_ptr, node_list.items);
+        defer resources.deinit();
+
         self.loadImages(frame, frame_url_ptr, node_list.items) catch |err| {
             std.log.warn("Failed to load iframe images: {}", .{err});
         };
 
-        _ = self.scheduleDocumentScripts(parent.tab, frame, frame_url_ptr, node_list.items);
+        _ = self.scheduleDocumentScripts(
+            parent.tab,
+            frame,
+            frame_url_ptr,
+            node_list.items,
+            &resources,
+        );
 
         var new_css_texts = std.ArrayList([]const u8).empty;
         defer {
@@ -3987,8 +4084,8 @@ pub const Browser = struct {
 
         try self.appendDocumentStylesheets(
             frame,
-            frame_url_ptr,
             node_list.items,
+            &resources,
             &new_css_texts,
             &all_rules,
         );
@@ -4012,45 +4109,101 @@ pub const Browser = struct {
         try parent.children.append(parent.allocator, frame);
     }
 
+    /// Resolve every external classic script and linked stylesheet before
+    /// starting any request. The finished fetch array remains in DOM discovery
+    /// order, even though its workers may complete in any order.
+    fn fetchDocumentResources(
+        self: *Browser,
+        frame: *Frame,
+        page_url: *Url,
+        nodes: []*Node,
+    ) !DocumentResourceBatch {
+        var batch = DocumentResourceBatch{ .allocator = self.allocator };
+        errdefer batch.deinit();
+
+        for (nodes) |node| {
+            const element = switch (node.*) {
+                .element => |*value| value,
+                .text => continue,
+            };
+
+            var kind: DocumentResourceKind = undefined;
+            var reference: []const u8 = undefined;
+            if (std.mem.eql(u8, element.tag, "script") and
+                !element.script_started and frame.js_render_context_initialized)
+            {
+                const attrs = element.attributes orelse continue;
+                reference = attrs.get("src") orelse continue;
+                kind = .script;
+            } else if (std.mem.eql(u8, element.tag, "link")) {
+                const attrs = element.attributes orelse continue;
+                const rel = attrs.get("rel") orelse continue;
+                if (!std.mem.eql(u8, rel, "stylesheet")) continue;
+                reference = attrs.get("href") orelse continue;
+                kind = .stylesheet;
+            } else {
+                continue;
+            }
+
+            var resource_url = page_url.*.resolve(self.allocator, reference) catch |err| {
+                std.log.warn("Failed to resolve {s} resource URL {s}: {}", .{ @tagName(kind), reference, err });
+                continue;
+            };
+            var resource_url_owned = true;
+            defer if (resource_url_owned) resource_url.free(self.allocator);
+
+            if (!frame.allowedRequest(resource_url, page_url)) {
+                std.log.warn("Blocked {s} {s} due to CSP", .{ @tagName(kind), reference });
+                continue;
+            }
+
+            var referrer_url = try page_url.*.clone(self.allocator);
+            var referrer_url_owned = true;
+            defer if (referrer_url_owned) referrer_url.free(self.allocator);
+
+            try batch.fetches.append(self.allocator, .{
+                .browser = self,
+                .node = node,
+                .kind = kind,
+                .resource_url = resource_url,
+                .referrer_url = referrer_url,
+                .referrer_policy = frame.referrer_policy,
+            });
+            resource_url_owned = false;
+            referrer_url_owned = false;
+        }
+
+        try batch.runAndJoin();
+        return batch;
+    }
+
     fn scheduleScriptTask(
         self: *Browser,
         tab: *Tab,
         frame: *Frame,
-        page_url: *Url,
         src: []const u8,
+        fetch: ?*DocumentResourceFetch,
     ) !void {
         if (!frame.js_render_context_initialized) return;
         std.log.info("Loading script: {s}", .{src});
+
+        const completed = fetch orelse return;
+        if (completed.fetch_error) |err| {
+            std.log.warn("Failed to load script {s}: {}", .{ src, err });
+            return;
+        }
+        const script_response = completed.response orelse return;
 
         const src_copy = try self.allocator.alloc(u8, src.len);
         @memcpy(src_copy, src);
         var src_copy_owned = false;
         defer if (!src_copy_owned) self.allocator.free(src_copy);
 
-        var script_url = try page_url.*.resolve(self.allocator, src);
+        var script_url = try completed.resource_url.clone(self.allocator);
         var url_owned = true;
         defer if (url_owned) script_url.free(self.allocator);
 
-        if (!frame.allowedRequest(script_url, page_url)) {
-            std.log.warn("Blocked script {s} due to CSP", .{src});
-            return;
-        }
-
-        const script_response = self.fetchBodyWithReferrerPolicy(
-            script_url,
-            page_url.*,
-            null,
-            frame.referrer_policy,
-        ) catch |err| {
-            std.log.warn("Failed to load script {s}: {}", .{ src, err });
-            return;
-        };
-        defer if (script_response.csp_header) |hdr| self.allocator.free(hdr);
-
-        const script_raw = script_response.body;
-        const raw_owned = !std.mem.eql(u8, script_url.scheme, "data") and !std.mem.eql(u8, script_url.scheme, "about");
-        defer if (raw_owned) self.allocator.free(script_raw);
-        const body_copy = try decodeUtf8Replace(self.allocator, script_raw);
+        const body_copy = try decodeUtf8Replace(self.allocator, script_response.body);
         var body_copy_owned = false;
         defer if (!body_copy_owned) self.allocator.free(body_copy);
 
@@ -4114,6 +4267,7 @@ pub const Browser = struct {
         frame: *Frame,
         page_url: *Url,
         nodes: []*Node,
+        resources: *DocumentResourceBatch,
     ) bool {
         var all_started = true;
         for (nodes) |node| {
@@ -4125,7 +4279,12 @@ pub const Browser = struct {
 
             if (element.attributes) |attrs| {
                 if (attrs.get("src")) |src| {
-                    self.scheduleScriptTask(tab, frame, page_url, src) catch |err| {
+                    self.scheduleScriptTask(
+                        tab,
+                        frame,
+                        src,
+                        resources.find(node, .script),
+                    ) catch |err| {
                         std.log.warn("Failed to schedule script {s}: {}", .{ src, err });
                         all_started = false;
                         continue;
@@ -4155,8 +4314,8 @@ pub const Browser = struct {
     fn replaceFrameStylesheets(
         self: *Browser,
         frame: *Frame,
-        page_url: *Url,
         nodes: []*Node,
+        resources: *DocumentResourceBatch,
     ) !void {
         var new_css_texts = std.ArrayList([]const u8).empty;
         defer {
@@ -4177,8 +4336,8 @@ pub const Browser = struct {
         }
         try self.appendDocumentStylesheets(
             frame,
-            page_url,
             nodes,
+            resources,
             &new_css_texts,
             &new_rules,
         );
@@ -4226,8 +4385,17 @@ pub const Browser = struct {
         defer nodes.deinit(self.allocator);
         try parser.treeToList(self.allocator, root, &nodes);
 
-        const scripts_started = self.scheduleDocumentScripts(frame.tab, frame, page_url, nodes.items);
-        try self.replaceFrameStylesheets(frame, page_url, nodes.items);
+        var resources = try self.fetchDocumentResources(frame, page_url, nodes.items);
+        defer resources.deinit();
+
+        const scripts_started = self.scheduleDocumentScripts(
+            frame.tab,
+            frame,
+            page_url,
+            nodes.items,
+            &resources,
+        );
+        try self.replaceFrameStylesheets(frame, nodes.items, &resources);
         if (!scripts_started) frame.resources_dirty = true;
     }
 
@@ -4268,8 +4436,8 @@ pub const Browser = struct {
     fn appendDocumentStylesheets(
         self: *Browser,
         frame: *Frame,
-        page_url: *Url,
         nodes: []*Node,
+        resources: *DocumentResourceBatch,
         css_texts: *std.ArrayList([]const u8),
         rules: *std.ArrayList(CSSParser.CSSRule),
     ) !void {
@@ -4304,34 +4472,14 @@ pub const Browser = struct {
             if (!std.mem.eql(u8, rel, "stylesheet")) continue;
 
             std.log.info("Loading stylesheet: {s}", .{href});
-            const stylesheet_url = page_url.*.resolve(self.allocator, href) catch |err| {
-                std.log.warn("Failed to resolve stylesheet URL {s}: {}", .{ href, err });
-                continue;
-            };
-            defer stylesheet_url.free(self.allocator);
-
-            if (!frame.allowedRequest(stylesheet_url, page_url)) {
-                std.log.warn("Blocked stylesheet {s} due to CSP", .{href});
-                continue;
-            }
-
-            const css_response = self.fetchBodyWithReferrerPolicy(
-                stylesheet_url,
-                page_url.*,
-                null,
-                frame.referrer_policy,
-            ) catch |err| {
+            const completed = resources.find(node, .stylesheet) orelse continue;
+            if (completed.fetch_error) |err| {
                 std.log.warn("Failed to load stylesheet {s}: {}", .{ href, err });
                 continue;
-            };
-            defer if (css_response.csp_header) |header| self.allocator.free(header);
+            }
+            const css_response = completed.response orelse continue;
 
-            const css_raw = css_response.body;
-            const raw_owned = !std.mem.eql(u8, stylesheet_url.scheme, "data") and
-                !std.mem.eql(u8, stylesheet_url.scheme, "about");
-            defer if (raw_owned) self.allocator.free(css_raw);
-
-            const css_text = try decodeUtf8Replace(self.allocator, css_raw);
+            const css_text = try decodeUtf8Replace(self.allocator, css_response.body);
             var css_text_owned = true;
             defer if (css_text_owned) self.allocator.free(css_text);
 

@@ -150,6 +150,12 @@ before changing `root.zig`, `tab.zig`, `render/`, or browser task scheduling.
 - A frame's `css_texts` owns decoded linked stylesheets and copied `<style>`
   text in DOM order. Its author rules borrow those buffers; rebuild and retire
   the text and rules as one generation for root documents and iframes.
+- External classic scripts and linked stylesheets are first discovered into a
+  fixed caller-owned batch. Each entry owns its resolved URL, referrer, and
+  eventual response; all network workers join synchronously before any entry
+  or document generation can retire. Completion order is irrelevant: scripts
+  are queued and styles are parsed by walking the DOM in source order after the
+  join. Root loads, child-frame loads, and mutation rescans share this path.
 - Attached structural DOM mutation marks that frame's document resources
   dirty. Before the next style pass, the tab worker queues newly attached
   scripts once and rebuilds the complete author-sheet generation from the

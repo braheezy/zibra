@@ -22,6 +22,10 @@ before changing queues, thread lifetime, shutdown, or helper accounting.
   priority.
 - `TaskRunner.shutdown` is a quiescence boundary: it rejects/cleans pending
   work and joins the worker. Do not reintroduce detached workers.
+- `thread_batch.zig` is a synchronous join boundary for caller-owned job/result
+  slots. Construct the complete slice before starting it; every native thread
+  must be joined before return, and a spawn failure must retain correct
+  synchronous behavior.
 - Browser/Tab owners must remain alive until every worker and accounted helper
   that can borrow them has stopped.
 - Add focused concurrency tests that force the ordering being changed; do not

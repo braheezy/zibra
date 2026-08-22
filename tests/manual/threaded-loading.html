@@ -1,0 +1,33 @@
+<!--
+How to verify:
+1. Run `python3 tests/manual/threaded-loading-server.py` from the repository
+   root, then open http://127.0.0.1:8000/threaded-loading.html in Zibra.
+2. Load this page. The four requests should begin together, so completion is
+   close to 750ms rather than 3 seconds.
+3. The status box must be green and the terminal must print
+   "THREAD ORDER PASS: AB". This proves scripts execute in source order and
+   the later stylesheet still wins.
+-->
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <title>Threaded resource loading</title>
+  <link rel="stylesheet" href="threaded-loading-a.css">
+  <link rel="stylesheet" href="threaded-loading-b.css">
+  <script src="threaded-loading-a.js"></script>
+  <script src="threaded-loading-b.js"></script>
+</head>
+<body>
+  <h1>Threaded resource loading</h1>
+  <p id="status">Later stylesheet wins when this status box is green.</p>
+  <script>
+    if (window.threadedOrder == "AB") {
+      console.log("THREAD ORDER PASS: " + window.threadedOrder);
+    } else {
+      console.log("THREAD ORDER FAIL: " + window.threadedOrder);
+    }
+    undefined;
+  </script>
+</body>
+</html>

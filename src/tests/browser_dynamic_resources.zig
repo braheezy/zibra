@@ -93,6 +93,53 @@ test "resource refresh adds and removes live linked stylesheet generations" {
     try std.testing.expectEqual(@as(usize, 0), frame.css_texts.items.len);
 }
 
+test "parallel stylesheet fetches are applied in DOM source order" {
+    const allocator = std.testing.allocator;
+
+    var session = BrowserSession.init(allocator, std.testing.io);
+    defer session.deinit();
+
+    var tab: tab_module.Tab = undefined;
+    tab.allocator = allocator;
+    tab.accessibility = .{};
+    tab.frames_by_id = std.AutoHashMap(u32, *tab_module.Frame).init(allocator);
+    defer tab.frames_by_id.deinit();
+    tab.parent_window_ids = std.AutoHashMap(u32, u32).init(allocator);
+    defer tab.parent_window_ids.deinit();
+
+    var frame = tab_module.Frame.init(allocator, &tab, null, null);
+    defer frame.deinit();
+
+    var html_parser = try parser.HTMLParser.init(
+        allocator,
+        "<html><head>" ++
+            "<link rel=stylesheet href=\"data:text/css,p%7Bcolor%3Ared%7D\">" ++
+            "<link rel=stylesheet href=\"data:text/css,p%7Bcolor%3Agreen%7D\">" ++
+            "</head><body><p>ordered</p></body></html>",
+    );
+    defer html_parser.deinit(allocator);
+    frame.current_node = try html_parser.parse();
+    parser.fixParentPointers(&frame.current_node.?, null);
+
+    var page_url = try Url.init(allocator, "https://example.test/page.html");
+    defer page_url.free(allocator);
+    frame.current_url = &page_url;
+
+    var test_browser: browser.Browser = undefined;
+    test_browser.allocator = allocator;
+    test_browser.io = std.testing.io;
+    test_browser.session_state = &session;
+    test_browser.default_style_sheet_rules = &.{};
+
+    frame.resources_dirty = true;
+    try test_browser.refreshFrameResources(&frame);
+
+    try std.testing.expectEqual(@as(usize, 2), frame.css_texts.items.len);
+    try std.testing.expectEqual(@as(usize, 2), frame.rules.items.len);
+    try std.testing.expectEqualStrings("red", frame.rules.items[0].properties.get("color").?.value);
+    try std.testing.expectEqualStrings("green", frame.rules.items[1].properties.get("color").?.value);
+}
+
 test "script execution identity survives detach and reattachment" {
     const allocator = std.testing.allocator;
     var html_parser = try parser.HTMLParser.init(
