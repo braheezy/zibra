@@ -1,0 +1,29 @@
+<!-- How to verify:
+1. Click the input in the white panel. Its focus ring has a thin black center
+   bordered by a thicker white stroke; the black portion remains visible.
+2. Click the input in the black panel. The same ring appears, and its white
+   outer portion remains visible against the dark surroundings.
+3. Press Tab to move between controls. Exactly one two-tone ring follows focus.
+-->
+<!doctype html>
+<html>
+  <head>
+    <title>High-contrast focus rings</title>
+    <style>
+      body { background-color: #777777; color: black; font-size: 18px; }
+      .panel { display: block; width: 440px; height: 110px; margin-top: 20px; }
+      .light { background-color: white; color: black; }
+      .dark { background-color: black; color: white; }
+      input { margin-top: 36px; margin-left: 24px; width: 260px; }
+      .dark input { background-color: black; color: white; }
+    </style>
+  </head>
+  <body>
+    <div class="panel light">
+      <input value="Focus on white">
+    </div>
+    <div class="panel dark">
+      <input value="Focus on black">
+    </div>
+  </body>
+</html>

@@ -15,6 +15,7 @@ const zigimg = @import("zigimg");
 const font = @import("render/font.zig");
 const Glyph = font.Glyph;
 const display_commands = @import("render/display_list.zig");
+const focus_ring = @import("render/focus_ring.zig");
 pub const Color = display_commands.Color;
 pub const Rect = display_commands.Rect;
 pub const CompositedLayer = display_commands.CompositedLayer;
@@ -4249,14 +4250,19 @@ pub const Browser = struct {
 
         var focus_items = std.ArrayList(DisplayItem).empty;
         defer focus_items.deinit(self.allocator);
-        const focus_color = Color{ .r = 0x3b, .g = 0x82, .b = 0xf6, .a = 0xff };
         const highlight_color = Color{ .r = 0xf5, .g = 0x9e, .b = 0x0b, .a = 0xff };
 
         if (frame.focus) |focus_node| {
             for (self.layout_engine.focus_bounds.items) |entry| {
                 if (entry.node == focus_node) {
-                    self.appendOutline(&focus_items, focus_color, entry.bounds) catch |err| {
-                        std.log.warn("Failed to append focus outline: {}", .{err});
+                    const rect = focus_ring.rectAround(
+                        entry.bounds.x,
+                        entry.bounds.y,
+                        entry.bounds.width,
+                        entry.bounds.height,
+                    );
+                    focus_ring.appendHighContrast(&focus_items, self.allocator, rect) catch |err| {
+                        std.log.warn("Failed to append focus ring: {}", .{err});
                     };
                 }
             }
@@ -4266,7 +4272,19 @@ pub const Browser = struct {
             if (highlight_node.dom_node) |dom| {
                 for (self.layout_engine.focus_bounds.items) |entry| {
                     if (entry.node == dom) {
-                        self.appendOutline(&focus_items, highlight_color, entry.bounds) catch |err| {
+                        const rect = focus_ring.rectAround(
+                            entry.bounds.x,
+                            entry.bounds.y,
+                            entry.bounds.width,
+                            entry.bounds.height,
+                        );
+                        focus_ring.appendOutline(
+                            &focus_items,
+                            self.allocator,
+                            rect,
+                            highlight_color,
+                            1,
+                        ) catch |err| {
                             std.log.warn("Failed to append highlight outline: {}", .{err});
                         };
                     }
@@ -4313,54 +4331,6 @@ pub const Browser = struct {
         std.log.debug("Compositing complete: {} layers created", .{self.composited_layers.items.len});
 
         return true;
-    }
-
-    fn appendOutline(self: *Browser, items: *std.ArrayList(DisplayItem), color: Color, bounds: Layout.Bounds) !void {
-        const padding: i32 = 2;
-        const left = bounds.x - padding;
-        const top = bounds.y - padding;
-        const right = bounds.x + bounds.width + padding;
-        const bottom = bounds.y + bounds.height + padding;
-        try items.append(self.allocator, .{
-            .line = .{
-                .x1 = left,
-                .y1 = top,
-                .x2 = right,
-                .y2 = top,
-                .color = color,
-                .thickness = 1,
-            },
-        });
-        try items.append(self.allocator, .{
-            .line = .{
-                .x1 = right,
-                .y1 = top,
-                .x2 = right,
-                .y2 = bottom,
-                .color = color,
-                .thickness = 1,
-            },
-        });
-        try items.append(self.allocator, .{
-            .line = .{
-                .x1 = right,
-                .y1 = bottom,
-                .x2 = left,
-                .y2 = bottom,
-                .color = color,
-                .thickness = 1,
-            },
-        });
-        try items.append(self.allocator, .{
-            .line = .{
-                .x1 = left,
-                .y1 = bottom,
-                .x2 = left,
-                .y2 = top,
-                .color = color,
-                .thickness = 1,
-            },
-        });
     }
 
     /// Recursively process a display item for compositing

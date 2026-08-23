@@ -179,6 +179,10 @@ before changing `root.zig`, `tab.zig`, `render/`, or browser task scheduling.
   accessibility focus, and triggers a repaint when a content cursor was
   removed. Address-bar transitions preserve tab-worker ownership by enqueueing
   that blur instead of mutating frame focus directly from the UI thread.
+- Page focus indicators paint after document content as two coincident outline
+  commands: a 4px white stroke below a 2px black stroke. This two-tone ring
+  must follow every focused-element bounds entry and remain distinct from the
+  amber accessibility highlight.
 - SDL finger coordinates are normalized; convert them against the addressed
   Browser's current native-window dimensions before dispatch. Each Browser's
   UI-thread-only touch tracker keys contacts by both touch-device and finger

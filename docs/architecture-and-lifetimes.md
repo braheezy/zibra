@@ -47,6 +47,7 @@ The source tree is organized by responsibility:
 | [`src/browser/render/layout.zig`](../src/browser/render/layout.zig) | Layout tree, invalidation dependencies, hit-test collection, paint, and image layout. |
 | [`src/browser/render/font.zig`](../src/browser/render/font.zig) | Font discovery, SDL_ttf handles, Unicode fallback selection, and owned RGBA glyph bitmaps. |
 | [`src/browser/render/display_list.zig`](../src/browser/render/display_list.zig) | Display-command and composited-layer data, recursive ownership cleanup, provenance, and painted hit testing without Browser or SDL dependencies. |
+| [`src/browser/render/focus_ring.zig`](../src/browser/render/focus_ring.zig) | Pointer-free high-contrast focus-ring and accessibility-outline command generation. |
 | [`src/browser/render/effects.zig`](../src/browser/render/effects.zig) | Pixel-level software effects such as premultiplied-RGBA Gaussian blur. |
 | [`src/browser/render/raster_snapshot.zig`](../src/browser/render/raster_snapshot.zig) | Deep-owned, provenance-free display generations transferred to the raster worker. |
 | [`src/browser/render/compositor_cache.zig`](../src/browser/render/compositor_cache.zig) | Raster-worker-owned ordered planes, surface-or-short-command backing, and pointer-free opacity/translation updates used by draw-only animation and scrolling. |
@@ -1302,6 +1303,14 @@ stable-node representation so reuse of an array address cannot silently
 retarget an old JavaScript wrapper.
 
 ## Accessibility contract
+
+Focused page elements append their indicator after document paint using the
+layout generation's focus bounds. `render/focus_ring.zig` reserves and emits a
+4px white outline followed by a coincident 2px black outline around the padded
+bounds. The black center remains visible on light content and the exposed white
+edge remains visible on dark content. Both commands are pointer-free and move
+with the frame display-list generation; the amber accessibility highlight is a
+separate single outline and does not replace either focus stroke.
 
 `Tab.buildAccessibilityTree` in
 [`src/browser/tab.zig`](../src/browser/tab.zig) now moves the prior generation's
