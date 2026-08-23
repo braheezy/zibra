@@ -198,6 +198,11 @@ into a later-painted static card. The later blue card must remain above the
 mover throughout every cycle, proving animated transforms establish a
 conservative compositor-plane merge barrier while frames remain draw-only.
 
+`tests/manual/sparse-composited-layers.html` separates compatible static paint
+chunks by roughly 1800px around a composited effect. Raster-worker inspection
+must show separate tightly cropped surfaces instead of one sparse page-height
+plane, while both endpoints remain visually correct when scrolling.
+
 `tests/manual/threaded-loading.html` combines two external scripts and two
 same-specificity stylesheets. Run its adjacent threaded Python server to give
 each response equal latency: all four requests start together while the visible

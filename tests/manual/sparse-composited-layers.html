@@ -1,0 +1,31 @@
+<!--
+How to verify:
+1. Open this page and scroll from the green TOP CHUNK to the blue BOTTOM CHUNK.
+2. Both chunks and the translucent orange compositor plane must paint normally.
+3. The top and bottom chunks are deliberately about 1800px apart. Inspecting
+   raster-worker planes should show separate tightly cropped static surfaces;
+   they must not become one mostly transparent, page-height allocation.
+4. Scrolling within the interest region remains draw-only after the first raster.
+-->
+<!doctype html>
+<html>
+  <head>
+    <title>Avoid sparse composited layers</title>
+    <style>
+      body { background-color: white; color: black; font-family: sans-serif; }
+      .chunk { width: 700px; height: 40px; padding: 8px; color: black; }
+      .top { background-color: lightgreen; }
+      .composited { width: 120px; height: 40px; background-color: orange; opacity: 0.8; }
+      .spacer { height: 1700px; }
+      .bottom { background-color: lightblue; }
+    </style>
+  </head>
+  <body>
+    <h1>Sparse layer allocation</h1>
+    <p>The distant colored chunks should use separate cropped surfaces.</p>
+    <div class="chunk top">TOP CHUNK</div>
+    <div class="composited">COMPOSITOR PLANE</div>
+    <div class="spacer"></div>
+    <div class="chunk bottom">BOTTOM CHUNK</div>
+  </body>
+</html>

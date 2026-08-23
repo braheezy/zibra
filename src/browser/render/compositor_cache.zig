@@ -11,6 +11,24 @@ const display = @import("display_list.zig");
 
 const Rect = display.Rect;
 
+/// A merged RGBA plane may use at most four MiB of pixel storage. Individual
+/// paint chunks can exceed this when unavoidable; the limit only prevents a
+/// merge from manufacturing a large, mostly transparent bounding surface.
+pub const maximum_merged_surface_area_pixels: u64 = 1024 * 1024;
+
+pub fn mergeFitsSurfaceArea(first: Rect, second: Rect) bool {
+    const combined = first.unionWith(second);
+    const width: u64 = @intCast(@max(
+        @as(i64, combined.right) - @as(i64, combined.left),
+        0,
+    ));
+    const height: u64 = @intCast(@max(
+        @as(i64, combined.bottom) - @as(i64, combined.top),
+        0,
+    ));
+    return width * height <= maximum_merged_surface_area_pixels;
+}
+
 pub const Update = struct {
     id: usize,
     value: union(enum) {
@@ -79,32 +97,35 @@ pub const Cache = struct {
         }
     }
 
-    /// Find the earliest static plane that `paint_bounds` can join without
-    /// changing paint order. A static stratum may move ahead of intervening
-    /// dynamic planes only when it cannot overlap them. Active transforms are
-    /// permanent barriers because their future positions are not represented
-    /// by their current bounds.
+    /// Find a static plane that `paint_bounds` can join without changing paint
+    /// order or creating an excessively sparse surface. A static stratum may
+    /// move ahead of intervening planes only when it cannot overlap them.
+    /// Active transforms are permanent barriers because their future
+    /// positions are not represented by their current bounds.
     pub fn staticMergeTarget(
         self: *const Cache,
         paint_bounds: Rect,
         zoom: f32,
     ) ?usize {
-        var candidate: ?usize = null;
         var index = self.planes.items.len;
         while (index > 0) {
             index -= 1;
             const plane = &self.planes.items[index];
             if (plane.compositor_id == null) {
-                candidate = index;
+                const existing_bounds = plane.paint_bounds orelse plane.bounds;
+                if (mergeFitsSurfaceArea(existing_bounds, paint_bounds)) return index;
+                // A later chunk cannot cross overlapping pixels in a plane it
+                // cannot join, or their relative paint order would reverse.
+                if (existing_bounds.overlaps(paint_bounds)) return null;
                 continue;
             }
             if (plane.assume_overlap_after or
                 plane.currentPaintBounds(zoom).overlaps(paint_bounds))
             {
-                return candidate;
+                return null;
             }
         }
-        return candidate;
+        return null;
     }
 
     pub fn draw(
@@ -274,4 +295,37 @@ test "fixed transform permits current-bounds static plane merging" {
         .{ .left = 35, .top = 0, .right = 45, .bottom = 10 },
         1.0,
     ) == null);
+}
+
+test "far-apart chunks do not create a sparse merged surface" {
+    try std.testing.expect(mergeFitsSurfaceArea(
+        .{ .left = 0, .top = 0, .right = 512, .bottom = 1024 },
+        .{ .left = 512, .top = 0, .right = 1024, .bottom = 1024 },
+    ));
+    try std.testing.expect(!mergeFitsSurfaceArea(
+        .{ .left = 0, .top = 0, .right = 512, .bottom = 1024 },
+        .{ .left = 512, .top = 0, .right = 1025, .bottom = 1024 },
+    ));
+
+    const allocator = std.testing.allocator;
+    var cache = Cache{};
+    defer cache.deinit(allocator);
+
+    var surface = try z2d.Surface.init(.image_surface_rgba, allocator, 1, 1);
+    var surface_owned = true;
+    errdefer if (surface_owned) surface.deinit(allocator);
+    const top = Rect{ .left = 0, .top = 0, .right = 700, .bottom = 40 };
+    try cache.planes.append(allocator, .{
+        .surface = surface,
+        .bounds = top,
+        .paint_bounds = top,
+    });
+    surface_owned = false;
+
+    const nearby = Rect{ .left = 0, .top = 50, .right = 700, .bottom = 90 };
+    try std.testing.expectEqual(@as(?usize, 0), cache.staticMergeTarget(nearby, 1.0));
+
+    const far = Rect{ .left = 0, .top = 2000, .right = 700, .bottom = 2040 };
+    try std.testing.expect(!mergeFitsSurfaceArea(top, far));
+    try std.testing.expect(cache.staticMergeTarget(far, 1.0) == null);
 }

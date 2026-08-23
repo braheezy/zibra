@@ -95,13 +95,15 @@ before changing `root.zig`, `tab.zig`, `render/`, or browser task scheduling.
   font caches, z2d surfaces, SDL handles, or shared measurement retire.
   When a committed page has top-level composited opacity or translation
   effects, the worker retains ordered transparent planes instead of one
-  assembled tab bitmap. Static strata stay bounded to the interest region;
-  animated planes retain their own raster and accept pointer-free numeric
-  updates. Stable dynamic planes use tight current bounds for overlap-safe
-  backward merging of later static paint. An actively animated transform is a
-  permanent merge barrier for that raster generation, so later content cannot
-  move beneath it when translation creates overlap. Unsupported nesting or
-  masking falls back to a full raster rather than losing an update.
+  assembled tab bitmap. Static strata are tightly cropped within the interest
+  region; nearby paint can expand them, but a merge whose bounding surface
+  would exceed one megapixel starts a new plane instead. Animated planes retain
+  their own raster and accept pointer-free numeric updates. Stable dynamic
+  planes use tight current bounds for overlap-safe backward merging of later
+  static paint. An actively animated transform is a permanent merge barrier
+  for that raster generation, so later content cannot move beneath it when
+  translation creates overlap. Unsupported nesting or masking falls back to a
+  full raster rather than losing an update.
 - Each tab owns a sentinel-terminated copy of its root document title. Tab
   workers replace it under `Browser.lock`; only the interactive App/UI thread
   may pass it to the addressed native window, including after tab switches.

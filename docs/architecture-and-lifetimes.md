@@ -590,14 +590,19 @@ scroll-back headroom where page bounds permit. Without separable effects,
 raster translates page commands by that region's page-space start and publishes
 the coordinates only after all fallible drawing succeeds. With top-level
 composited opacity or translation effects, static strata are transparent
-interest-region surfaces and each animated subtree is rasterized once into its
-own plane. Static strata may merge backward across stable dynamic planes when
-their tight painted bounds are disjoint. An active transform instead enters
-assume-overlap mode for the raster generation: every later stratum stays after
-that plane even when its initial bounds are disjoint, because a later scalar
-translation can make them overlap. This conservative barrier preserves CSS
-paint order without repeating overlap testing, compositing, or raster on every
-animation frame. Later pointer-free scalar updates change plane
+surfaces cropped to their painted intersection with the interest region, and
+each animated subtree is rasterized once into its own plane. Static strata may
+merge backward across stable dynamic planes when their tight painted bounds are
+disjoint. A merge is rejected when its union would exceed 1,048,576 device
+pixels (about four MiB of RGBA storage), preventing far-apart chunks from
+creating a mostly transparent allocation; an intrinsically larger single chunk
+is still rasterized. Surface expansion is transactional, so allocation or draw
+failure leaves the prior plane generation intact. An active transform instead
+enters assume-overlap mode for the raster generation: every later stratum stays
+after that plane even when its initial bounds are disjoint, because a later
+scalar translation can make them overlap. This conservative barrier preserves
+CSS paint order without repeating overlap testing, compositing, or raster on
+every animation frame. Later pointer-free scalar updates change plane
 opacity/translation; the worker assembles those planes beneath chrome without
 rerastering their pixels. Complex masks or unsupported nesting deliberately
 use the assembled surface fallback.

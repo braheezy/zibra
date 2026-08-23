@@ -4966,23 +4966,98 @@ pub const Browser = struct {
         items: []const DisplayItem,
     ) !void {
         if (items.len == 0) return;
-        const paint_bounds = self.displayItemsBounds(items, task.zoom) orelse return;
-        if (self.worker_compositor_cache.staticMergeTarget(paint_bounds, task.zoom)) |index| {
-            const plane = &self.worker_compositor_cache.planes.items[index];
-            try self.drawItemsIntoWorkerPlane(task, &plane.surface, plane.bounds, items, null);
-            plane.paint_bounds = if (plane.paint_bounds) |existing|
-                existing.unionWith(paint_bounds)
-            else
-                paint_bounds;
-            return;
+
+        // Consecutive static commands are one paint stratum, but they need
+        // not share one allocation. Split before a union would exceed the
+        // sparse-surface budget; nearby glyphs and boxes remain batched.
+        var group_start: usize = 0;
+        var group_bounds: ?Rect = null;
+        for (items, 0..) |item, index| {
+            const item_bounds = self.getDisplayItemBounds(item, task.zoom);
+            if (item_bounds.right <= item_bounds.left or item_bounds.bottom <= item_bounds.top) continue;
+            if (group_bounds) |existing| {
+                if (!compositor_cache.mergeFitsSurfaceArea(existing, item_bounds)) {
+                    try self.appendWorkerStaticChunk(
+                        task,
+                        items[group_start..index],
+                        existing,
+                    );
+                    group_start = index;
+                    group_bounds = item_bounds;
+                } else {
+                    group_bounds = existing.unionWith(item_bounds);
+                }
+            } else {
+                group_start = index;
+                group_bounds = item_bounds;
+            }
         }
-        const bounds = Rect{
+        if (group_bounds) |bounds| {
+            try self.appendWorkerStaticChunk(task, items[group_start..], bounds);
+        }
+    }
+
+    fn appendWorkerStaticChunk(
+        self: *Browser,
+        task: *const RasterTaskContext,
+        items: []const DisplayItem,
+        unbounded_paint_bounds: Rect,
+    ) !void {
+        const interest_bounds = Rect{
             .left = 0,
             .top = task.interest_region.start_px,
             .right = task.window_width,
             .bottom = task.interest_region.endPx(),
         };
-        try self.appendWorkerPlane(task, items, bounds, paint_bounds, null, null);
+        // Keep a one-device-pixel raster gutter for stroked/antialiased edges;
+        // the final viewport intersection still bounds total page memory.
+        const paint_bounds = unbounded_paint_bounds.outset(1).intersection(interest_bounds) orelse return;
+        if (self.worker_compositor_cache.staticMergeTarget(paint_bounds, task.zoom)) |index| {
+            const plane = &self.worker_compositor_cache.planes.items[index];
+            try self.mergeWorkerStaticPlane(task, plane, items, paint_bounds);
+            return;
+        }
+        try self.appendWorkerPlane(task, items, paint_bounds, paint_bounds, null, null);
+    }
+
+    fn mergeWorkerStaticPlane(
+        self: *Browser,
+        task: *const RasterTaskContext,
+        plane: *compositor_cache.Plane,
+        items: []const DisplayItem,
+        paint_bounds: Rect,
+    ) !void {
+        const combined_bounds = plane.bounds.unionWith(paint_bounds);
+        if (std.meta.eql(combined_bounds, plane.bounds)) {
+            try self.drawItemsIntoWorkerPlane(task, &plane.surface, plane.bounds, items, null);
+            plane.paint_bounds = combined_bounds;
+            return;
+        }
+
+        var replacement = try z2d.Surface.init(
+            .image_surface_rgba,
+            task.allocator,
+            combined_bounds.width(),
+            combined_bounds.height(),
+        );
+        var replacement_owned = true;
+        errdefer if (replacement_owned) replacement.deinit(task.allocator);
+        @memset(try imageSurfacePixels(&replacement), .{ .r = 0, .g = 0, .b = 0, .a = 0 });
+        z2d.Surface.composite(
+            &replacement,
+            &plane.surface,
+            .src_over,
+            plane.bounds.left - combined_bounds.left,
+            plane.bounds.top - combined_bounds.top,
+            .{},
+        );
+        try self.drawItemsIntoWorkerPlane(task, &replacement, combined_bounds, items, null);
+
+        plane.surface.deinit(task.allocator);
+        plane.surface = replacement;
+        plane.bounds = combined_bounds;
+        plane.paint_bounds = combined_bounds;
+        replacement_owned = false;
     }
 
     fn appendWorkerDynamicPlane(

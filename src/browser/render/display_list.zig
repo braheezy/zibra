@@ -74,6 +74,16 @@ pub const Rect = struct {
         };
     }
 
+    pub fn intersection(self: Rect, other: Rect) ?Rect {
+        const result = Rect{
+            .left = @max(self.left, other.left),
+            .top = @max(self.top, other.top),
+            .right = @min(self.right, other.right),
+            .bottom = @min(self.bottom, other.bottom),
+        };
+        return if (result.width() > 0 and result.height() > 0) result else null;
+    }
+
     pub fn translated(self: Rect, x: i32, y: i32) Rect {
         return .{
             .left = self.left + x,
