@@ -6,6 +6,7 @@ const Chrome = @import("../browser/chrome.zig");
 const BrowserSession = @import("../browser/session_state.zig").BrowserSession;
 const tab_module = @import("../browser/tab.zig");
 const parser_module = @import("../document/parser.zig");
+const Js = @import("../script/js.zig");
 const Url = @import("../network/url.zig").Url;
 
 fn initTestChrome(allocator: std.mem.Allocator) Chrome {
@@ -169,6 +170,7 @@ test "tab blur clears focused elements across the frame tree" {
     tab.root_frame = null;
     tab.focused_frame = null;
     tab.accessibility_focused = null;
+    tab.next_window_id = 1;
     tab.frames_by_id = std.AutoHashMap(u32, *tab_module.Frame).init(allocator);
     defer tab.frames_by_id.deinit();
     tab.parent_window_ids = std.AutoHashMap(u32, u32).init(allocator);
@@ -244,6 +246,75 @@ test "tab blur clears focused elements across the frame tree" {
     try std.testing.expect(!child_input.element.is_focused);
     try std.testing.expect(tab.focused_frame == null);
     try std.testing.expect(!tab.blur());
+}
+
+test "tab blur dispatches a non-bubbling DOM blur event" {
+    const allocator = std.testing.allocator;
+    var html_parser = try parser_module.HTMLParser.init(
+        allocator,
+        "<main><section><input id=entry></section></main>",
+    );
+    html_parser.use_implicit_tags = false;
+    defer html_parser.deinit(allocator);
+
+    var tab: tab_module.Tab = undefined;
+    tab.allocator = allocator;
+    tab.root_frame = null;
+    tab.focused_frame = null;
+    tab.accessibility_focused = null;
+    tab.next_window_id = 1;
+    tab.frames_by_id = std.AutoHashMap(u32, *tab_module.Frame).init(allocator);
+    defer tab.frames_by_id.deinit();
+    tab.parent_window_ids = std.AutoHashMap(u32, u32).init(allocator);
+    defer tab.parent_window_ids.deinit();
+
+    var frame = tab_module.Frame.init(allocator, &tab, null, null);
+    defer frame.deinit();
+    tab.registerFrame(&frame);
+    tab.root_frame = &frame;
+    tab.focused_frame = &frame;
+    frame.current_node = try html_parser.parse();
+    parser_module.fixParentPointers(&frame.current_node.?, null);
+
+    var nodes = std.ArrayList(*parser_module.Node).empty;
+    defer nodes.deinit(allocator);
+    try parser_module.treeToList(allocator, &frame.current_node.?, &nodes);
+    var input: ?*parser_module.Node = null;
+    for (nodes.items) |node| {
+        if (node.* == .element and std.ascii.eqlIgnoreCase(node.element.tag, "input")) {
+            input = node;
+            break;
+        }
+    }
+    const entry = input orelse return error.TestInputMissing;
+    entry.element.is_focused = true;
+    frame.focus = entry;
+
+    var environ = std.process.Environ.Map.init(allocator);
+    defer environ.deinit();
+    var js = try Js.init(allocator, std.testing.io, &environ);
+    defer js.deinit(allocator);
+    js.setNodes(frame.window_id, &frame.current_node.?);
+    frame.js_context = js;
+    defer frame.js_context = null;
+
+    _ = try js.evaluate(frame.window_id,
+        \\var blurLog = [];
+        \\var entry = document.querySelectorAll('input')[0];
+        \\var parentNode = document.querySelectorAll('section')[0];
+        \\entry.addEventListener('blur', function(event) {
+        \\  blurLog.push('entry:' + event.bubbles);
+        \\});
+        \\parentNode.addEventListener('blur', function() { blurLog.push('parent'); });
+    );
+
+    try std.testing.expect(tab.blur());
+    try std.testing.expect(frame.focus == null);
+    const result = try js.evaluate(
+        frame.window_id,
+        "blurLog.join(',') === 'entry:false'",
+    );
+    try std.testing.expect(result.toBoolean());
 }
 
 test "nested element scrolling clamps and bubbles at container boundaries" {

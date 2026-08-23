@@ -52,6 +52,7 @@ The source tree is organized by responsibility:
 | [`src/browser/render/raster_snapshot.zig`](../src/browser/render/raster_snapshot.zig) | Deep-owned, provenance-free display generations transferred to the raster worker. |
 | [`src/browser/render/compositor_cache.zig`](../src/browser/render/compositor_cache.zig) | Raster-worker-owned ordered planes, surface-or-short-command backing, and pointer-free opacity/translation updates used by draw-only animation and scrolling. |
 | [`src/document/parser.zig`](../src/document/parser.zig) | HTML parser, DOM representation, style maps, images, and DOM tree utilities. |
+| [`src/document/focus.zig`](../src/document/focus.zig) | Shared intrinsic programmatic and sequential HTML focusability rules. |
 | [`src/document/inspection.zig`](../src/document/inspection.zig) | Browser-free fetch/decode/parse/style pipeline for document inspection commands. |
 | [`src/document/css_parser.zig`](../src/document/css_parser.zig) | CSS parsing and `CSSRule` ownership. |
 | [`src/document/color.zig`](../src/document/color.zig) | Shared parsing for paintable named and hexadecimal RGBA CSS colors. |
@@ -351,6 +352,22 @@ document-space CSS pixels. Layout collects block targets directly and inline
 targets from positioned line content, including an insertion point for empty
 inline targets. A frame copies that ephemeral layout-engine collection with its
 other hit-test data, then releases it before either layout or DOM teardown.
+
+DOM focus is also a synchronous, generation-bound operation. JavaScript
+`Node.focus()` crosses the host boundary with a numeric handle rather than a
+raw Node pointer. The tab worker first completes pending style/layout/paint,
+then requires the target to appear in that frame generation's focus-bounds
+snapshot before reading its position or scrolling it into view. It clears the
+old focus state before dispatching target-only blur events, re-renders and
+re-resolves the handle after listeners may mutate the DOM, and only then
+installs focus and dispatches the target-only focus event. Focus/blur listener
+dispatch never retains a raw Node across another listener: the blur pass
+snapshots handles for every old focused frame before JavaScript runs. Because
+the native focus callback is entered while the JavaScript mutex is already
+held, its handle and event operations use callback-only lock-aware entry points;
+ordinary lock-taking DOM APIs would deadlock there. Page focus intent crosses
+back to the UI thread as stable Tab identity so Chrome's private DOM/layout is
+mutated only by the native-window tick.
 
 ### DOM and source buffers
 

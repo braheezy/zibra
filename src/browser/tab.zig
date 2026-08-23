@@ -8,6 +8,7 @@ const std = @import("std");
 const browser_mod = @import("root.zig");
 const url_module = @import("../network/url.zig");
 const parser = @import("../document/parser.zig");
+const dom_focus = @import("../document/focus.zig");
 const Layout = @import("render/layout.zig");
 const CSSParser = @import("../document/css_parser.zig");
 const task = @import("../runtime/task.zig");
@@ -47,6 +48,14 @@ fn isStrictDomDescendant(node: *Node, ancestor: *Node) bool {
 pub const ClickButton = enum {
     primary,
     middle,
+};
+
+/// JavaScript event helpers normally acquire the Js mutex. A synchronous
+/// native host callback already runs under that mutex and must use the
+/// callback-only entry points instead.
+const JsEventAccess = enum {
+    acquire_lock,
+    native_callback,
 };
 
 pub const HistoryDirection = enum {
@@ -525,8 +534,46 @@ pub const Frame = struct {
     }
 
     pub fn dispatchEvent(self: *Frame, event_type: []const u8, node: *Node) bool {
+        return self.dispatchEventWithBubbles(event_type, node, true);
+    }
+
+    pub fn dispatchEventWithBubbles(
+        self: *Frame,
+        event_type: []const u8,
+        node: *Node,
+        bubbles: bool,
+    ) bool {
+        return self.dispatchEventWithAccess(
+            event_type,
+            node,
+            bubbles,
+            .acquire_lock,
+        );
+    }
+
+    fn dispatchEventWithAccess(
+        self: *Frame,
+        event_type: []const u8,
+        node: *Node,
+        bubbles: bool,
+        access: JsEventAccess,
+    ) bool {
         const ctx = self.js_context orelse return true;
-        return ctx.dispatchEvent(self.window_id, event_type, node) catch |err| blk: {
+        const result = switch (access) {
+            .acquire_lock => ctx.dispatchEventWithBubbles(
+                self.window_id,
+                event_type,
+                node,
+                bubbles,
+            ),
+            .native_callback => ctx.dispatchEventWithBubblesFromNativeCallback(
+                self.window_id,
+                event_type,
+                node,
+                bubbles,
+            ),
+        };
+        return result catch |err| blk: {
             std.log.warn("Failed to dispatch {s} event: {}", .{ event_type, err });
             break :blk true;
         };
@@ -720,24 +767,14 @@ pub const Frame = struct {
                 } else if (element.attributes) |*attributes| {
                     try attributes.put("value", "");
                 }
-                element.is_focused = true;
-                parser.dirtyStyleForElement(element);
-                self.focus = live_node;
-                self.tab.focused_frame = self;
-                self.tab.updateAccessibilityFocus(b);
-                self.tab.setNeedsRender();
+                _ = try self.tab.focusElement(b, self, live_node);
             },
             .button => {
                 _ = try self.tab.submitForm(b, self, live_node);
                 self.tab.focused_frame = self;
             },
             .contenteditable => {
-                element.is_focused = true;
-                parser.dirtyStyleForElement(element);
-                self.focus = live_node;
-                self.tab.focused_frame = self;
-                self.tab.updateAccessibilityFocus(b);
-                self.tab.setNeedsRender();
+                _ = try self.tab.focusElement(b, self, live_node);
             },
         }
         return true;
@@ -2666,36 +2703,6 @@ fn submitFormData(
 }
 
 // Cycle focus to the next input element (for Tab key)
-fn isTabIndexFocusable(element: *const parser.Element) bool {
-    if (element.attributes) |attrs| {
-        if (attrs.get("tabindex")) |raw| {
-            const trimmed = std.mem.trim(u8, raw, " \t\r\n");
-            if (trimmed.len == 0) return true;
-            const idx = std.fmt.parseInt(i32, trimmed, 10) catch return true;
-            return idx >= 0;
-        }
-    }
-    return false;
-}
-
-fn isElementFocusable(element: *const parser.Element) bool {
-    if (element.isHiddenInput()) return false;
-    if (std.mem.eql(u8, element.tag, "input") or std.mem.eql(u8, element.tag, "button")) {
-        return true;
-    }
-    if (element.attributes) |attrs| {
-        if (attrs.get("contenteditable") != null) {
-            return true;
-        }
-    }
-    if (std.mem.eql(u8, element.tag, "a")) {
-        if (element.attributes) |attrs| {
-            return attrs.get("href") != null or isTabIndexFocusable(element);
-        }
-    }
-    return isTabIndexFocusable(element);
-}
-
 test "hidden inputs are skipped by focus while password inputs remain editable" {
     const allocator = std.testing.allocator;
     var hidden = try parser.Element.init(allocator, "input type=HiDdEn tabindex=0", null);
@@ -2704,9 +2711,9 @@ test "hidden inputs are skipped by focus while password inputs remain editable" 
     defer password.deinit(allocator);
 
     try std.testing.expect(hidden.isHiddenInput());
-    try std.testing.expect(!isElementFocusable(&hidden));
+    try std.testing.expect(!dom_focus.isSequentiallyFocusable(&hidden));
     try std.testing.expect(password.isPasswordInput());
-    try std.testing.expect(isElementFocusable(&password));
+    try std.testing.expect(dom_focus.isSequentiallyFocusable(&password));
     try std.testing.expect(isTextEntryInput(&password));
 }
 
@@ -2722,13 +2729,224 @@ fn collectFocusableElements(self: *Tab, frame: *Frame, out: *std.ArrayList(*Node
     for (node_list.items) |node_ptr| {
         switch (node_ptr.*) {
             .element => |e| {
-                if (isElementFocusable(&e)) {
+                if (dom_focus.isSequentiallyFocusable(&e)) {
                     try out.append(self.allocator, node_ptr);
                 }
             },
             else => {},
         }
     }
+}
+
+fn focusBoundsForNode(frame: *const Frame, node: *Node) ?Bounds {
+    for (frame.focus_bounds.items) |entry| {
+        if (entry.node == node) return entry.bounds;
+    }
+    return null;
+}
+
+fn captureNodeHandleWithAccess(
+    ctx: *js_module,
+    window_id: u32,
+    node: *Node,
+    access: JsEventAccess,
+) !u32 {
+    return switch (access) {
+        .acquire_lock => ctx.captureNodeHandle(window_id, node),
+        .native_callback => ctx.captureNodeHandleFromNativeCallback(window_id, node),
+    };
+}
+
+fn resolveAttachedNodeWithAccess(
+    ctx: *js_module,
+    window_id: u32,
+    handle: u32,
+    access: JsEventAccess,
+) ?*Node {
+    return switch (access) {
+        .acquire_lock => ctx.resolveAttachedNode(window_id, handle),
+        .native_callback => ctx.resolveAttachedNodeFromNativeCallback(window_id, handle),
+    };
+}
+
+fn focusScrollTarget(self: *const Tab, frame: *const Frame, bounds: Bounds) i32 {
+    const zoom = if (self.accessibility.zoom > 0) self.accessibility.zoom else 1.0;
+    const viewport_device = if (frame.viewport_height > 0)
+        frame.viewport_height
+    else
+        self.tab_height;
+    const viewport_css_float = @as(f64, @floatFromInt(@max(viewport_device, 1))) /
+        @as(f64, zoom);
+    const viewport_css: i32 = @max(1, @as(i32, @intFromFloat(@ceil(viewport_css_float))));
+    const top = bounds.y;
+    const bottom = bounds.y +| bounds.height;
+    const current_bottom = frame.scroll +| viewport_css;
+
+    var requested = frame.scroll;
+    if (bounds.height >= viewport_css) {
+        if (top < frame.scroll or bottom > current_bottom) requested = top;
+    } else if (top < frame.scroll) {
+        requested = top;
+    } else if (bottom > current_bottom) {
+        requested = bottom -| viewport_css;
+    }
+    return self.clampScrollForFrame(frame, requested);
+}
+
+test "focus scrolling reveals an element using CSS coordinates at zoom" {
+    var tab: Tab = undefined;
+    tab.accessibility = .{ .zoom = 2.0, .dark_palette = .{} };
+    tab.tab_height = 200;
+    var frame: Frame = undefined;
+    frame.viewport_height = 200;
+    frame.content_height = 1000;
+    frame.scroll = 0;
+
+    try std.testing.expectEqual(@as(i32, 240), focusScrollTarget(
+        &tab,
+        &frame,
+        .{ .x = 0, .y = 300, .width = 100, .height = 40 },
+    ));
+
+    frame.scroll = 300;
+    try std.testing.expectEqual(@as(i32, 50), focusScrollTarget(
+        &tab,
+        &frame,
+        .{ .x = 0, .y = 50, .width = 100, .height = 20 },
+    ));
+}
+
+fn installFocusedElement(
+    self: *Tab,
+    b: *Browser,
+    frame: *Frame,
+    node: *Node,
+    access: JsEventAccess,
+) bool {
+    const element = switch (node.*) {
+        .element => |*value| value,
+        .text => return false,
+    };
+    if (!dom_focus.isProgrammaticallyFocusable(element)) return false;
+    if (frame.focus == node and self.focused_frame == frame) {
+        b.requestContentFocus(self);
+        return false;
+    }
+
+    element.is_focused = true;
+    parser.dirtyStyleForElement(element);
+    frame.focus = node;
+    self.focused_frame = frame;
+    self.updateAccessibilityFocus(b);
+    b.requestContentFocus(self);
+    self.setNeedsRender();
+
+    // DOM focus/blur do not bubble. State is installed before dispatch so a
+    // listener observes the new focus and a structural mutation can retire it
+    // through the normal synchronous mutation boundary.
+    _ = frame.dispatchEventWithAccess("focus", node, false, access);
+    return true;
+}
+
+/// Move ordinary browser focus to a known attached element. Capturing a JS
+/// handle before blur makes click/keyboard focus robust when a blur listener
+/// relocates or removes the intended target.
+pub fn focusElement(self: *Tab, b: *Browser, frame: *Frame, node: *Node) !bool {
+    const element = switch (node.*) {
+        .element => |*value| value,
+        .text => return false,
+    };
+    if (!dom_focus.isProgrammaticallyFocusable(element)) return false;
+    if (frame.focus == node and self.focused_frame == frame) {
+        b.requestContentFocus(self);
+        return false;
+    }
+
+    const handle = if (frame.js_context) |ctx|
+        try ctx.captureNodeHandle(frame.window_id, node)
+    else
+        null;
+    const changed = self.blur();
+    if (changed) self.setNeedsRender();
+
+    const live_node = if (handle) |stable_handle| blk: {
+        const ctx = frame.js_context orelse return false;
+        break :blk ctx.resolveAttachedNode(frame.window_id, stable_handle) orelse return false;
+    } else node;
+    return installFocusedElement(self, b, frame, live_node, .acquire_lock);
+}
+
+/// Synchronous HTMLElement.focus() implementation. JavaScript can dirty style
+/// or layout and call focus in the same task, so render before consulting the
+/// focus-bounds snapshot. Blur listeners can mutate again, requiring a second
+/// generation check and layout synchronization before the final position read.
+pub fn focusElementFromScript(
+    self: *Tab,
+    b: *Browser,
+    window_id: u32,
+    generation: u64,
+    handle: u32,
+) !bool {
+    var frame = self.frameForWindowId(window_id) orelse return false;
+    if (frame.document_generation != generation) return false;
+    var ctx = frame.js_context orelse return false;
+    var target = resolveAttachedNodeWithAccess(
+        ctx,
+        window_id,
+        handle,
+        .native_callback,
+    ) orelse return false;
+    const initial_element = switch (target.*) {
+        .element => |*value| value,
+        .text => return false,
+    };
+    if (!dom_focus.isProgrammaticallyFocusable(initial_element)) return false;
+
+    try self.render(b);
+    frame = self.frameForWindowId(window_id) orelse return false;
+    if (frame.document_generation != generation) return false;
+    ctx = frame.js_context orelse return false;
+    target = resolveAttachedNodeWithAccess(
+        ctx,
+        window_id,
+        handle,
+        .native_callback,
+    ) orelse return false;
+    var bounds = focusBoundsForNode(frame, target) orelse return false;
+
+    if (frame.focus != target or self.focused_frame != frame) {
+        const blurred = self.blurWithAccess(.native_callback);
+        if (blurred) self.setNeedsRender();
+
+        // A blur listener may change style, structure, or even the document.
+        // Re-render and recover both Frame and Node through stable identities.
+        try self.render(b);
+        frame = self.frameForWindowId(window_id) orelse return false;
+        if (frame.document_generation != generation) return false;
+        ctx = frame.js_context orelse return false;
+        target = resolveAttachedNodeWithAccess(
+            ctx,
+            window_id,
+            handle,
+            .native_callback,
+        ) orelse return false;
+        const live_element = switch (target.*) {
+            .element => |*value| value,
+            .text => return false,
+        };
+        if (!dom_focus.isProgrammaticallyFocusable(live_element)) return false;
+        bounds = focusBoundsForNode(frame, target) orelse return false;
+    }
+
+    const target_scroll = focusScrollTarget(self, frame, bounds);
+    if (target_scroll != frame.scroll) {
+        frame.scroll_animation = null;
+        frame.scroll = target_scroll;
+        self.scroll_changed_in_tab = true;
+        self.setNeedsRender();
+    }
+
+    return installFocusedElement(self, b, frame, target, .native_callback);
 }
 
 pub fn cycleFocus(self: *Tab, b: *Browser, reverse: bool) !void {
@@ -2748,8 +2966,6 @@ pub fn cycleFocus(self: *Tab, b: *Browser, reverse: bool) !void {
         }
     }
 
-    _ = self.blur();
-
     const next_index = if (found_index) |i| blk: {
         if (reverse) {
             break :blk if (i == 0) focusables.items.len - 1 else i - 1;
@@ -2757,22 +2973,7 @@ pub fn cycleFocus(self: *Tab, b: *Browser, reverse: bool) !void {
         break :blk (i + 1) % focusables.items.len;
     } else if (reverse) focusables.items.len - 1 else 0;
 
-    const to_focus = focusables.items[next_index];
-    switch (to_focus.*) {
-        .element => |*e| {
-            e.is_focused = true;
-            parser.dirtyStyleForElement(e);
-        },
-        else => {},
-    }
-    frame.focus = to_focus;
-    self.focused_frame = frame;
-    self.updateAccessibilityFocus(b);
-    b.lock.lock();
-    b.focus = "content";
-    b.lock.unlock();
-
-    self.setNeedsRender();
+    _ = try self.focusElement(b, frame, focusables.items[next_index]);
 }
 
 pub fn activateFocusedElement(self: *Tab, b: *Browser) !void {
@@ -2891,10 +3092,37 @@ pub fn enter(self: *Tab, b: *Browser) !bool {
     return false;
 }
 
-fn blurFrame(frame: *Frame) bool {
+const PendingBlurEvent = struct {
+    window_id: u32,
+    generation: u64,
+    handle: u32,
+};
+
+fn clearFrameFocus(
+    frame: *Frame,
+    allocator: std.mem.Allocator,
+    events: *std.ArrayList(PendingBlurEvent),
+    access: JsEventAccess,
+) bool {
     var changed = false;
     frame.scroll_focus = null;
     if (frame.focus) |focus_node| {
+        if (frame.js_context) |ctx| {
+            if (captureNodeHandleWithAccess(
+                ctx,
+                frame.window_id,
+                focus_node,
+                access,
+            )) |handle| {
+                events.append(allocator, .{
+                    .window_id = frame.window_id,
+                    .generation = frame.document_generation,
+                    .handle = handle,
+                }) catch |err| {
+                    std.log.warn("Failed to retain blur event target: {}", .{err});
+                };
+            } else |_| {}
+        }
         switch (focus_node.*) {
             .element => |*e| {
                 e.is_focused = false;
@@ -2906,7 +3134,7 @@ fn blurFrame(frame: *Frame) bool {
         changed = true;
     }
     for (frame.children.items) |child| {
-        if (blurFrame(child)) changed = true;
+        if (clearFrameFocus(child, allocator, events, access)) changed = true;
     }
     return changed;
 }
@@ -2914,9 +3142,35 @@ fn blurFrame(frame: *Frame) bool {
 /// Remove every DOM focus in this tab before another focus owner is selected.
 /// Returns whether a focused element changed and therefore needs repainting.
 pub fn blur(self: *Tab) bool {
-    const changed = if (self.root_frame) |root| blurFrame(root) else false;
+    return self.blurWithAccess(.acquire_lock);
+}
+
+fn blurWithAccess(self: *Tab, access: JsEventAccess) bool {
+    var events = std.ArrayList(PendingBlurEvent).empty;
+    defer events.deinit(self.allocator);
+    const changed = if (self.root_frame) |root|
+        clearFrameFocus(root, self.allocator, &events, access)
+    else
+        false;
+
+    // Clear the complete old focus generation before invoking JavaScript.
+    // A blur listener may synchronously call focus(); that new state must not
+    // be erased when this outer transition finishes walking child frames.
     self.focused_frame = null;
     self.accessibility_focused = null;
+
+    for (events.items) |event| {
+        const frame = self.frameForWindowId(event.window_id) orelse continue;
+        if (event.generation != 0 and frame.document_generation != event.generation) continue;
+        const ctx = frame.js_context orelse continue;
+        const live_node = resolveAttachedNodeWithAccess(
+            ctx,
+            event.window_id,
+            event.handle,
+            access,
+        ) orelse continue;
+        _ = frame.dispatchEventWithAccess("blur", live_node, false, access);
+    }
     return changed;
 }
 
@@ -3643,23 +3897,13 @@ fn commandClick(self: *Tab, query: []const u8) void {
     if (self.findAccessibilityByName(root, query)) |node| {
         self.accessibility_highlight = node;
         if (node.dom_node) |dom| {
-            _ = self.blur();
-            self.focused_frame = frame;
-            frame.focus = dom;
-            if (frame.focus) |focus_node| {
-                switch (focus_node.*) {
-                    .element => |*e| {
-                        e.is_focused = true;
-                        parser.dirtyStyleForElement(e);
-                    },
-                    else => {},
-                }
-            }
-            self.updateAccessibilityFocus(self.browser);
+            _ = self.focusElement(self.browser, frame, dom) catch |err| {
+                std.log.warn("Failed to focus voice-command target: {}", .{err});
+                return;
+            };
             self.activateFocusedElement(self.browser) catch |err| {
                 std.log.warn("Failed to activate element: {}", .{err});
             };
-            self.setNeedsRender();
         }
     } else {
         std.log.info("voice command: no match for '{s}'", .{query});

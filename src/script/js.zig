@@ -14,6 +14,7 @@ const Script = kiesel.language.Script;
 const Realm = kiesel.execution.Realm;
 const Value = kiesel.types.Value;
 const parser = @import("../document/parser.zig");
+const dom_focus = @import("../document/focus.zig");
 const Node = parser.Node;
 const CSSParser = @import("../document/css_parser.zig").CSSParser;
 const NumericAnimation = parser.NumericAnimation;
@@ -286,6 +287,16 @@ const RenderCallback = struct {
     context: ?*anyopaque = null,
 };
 
+/// Runs synchronously for an attached, intrinsically focusable element. The
+/// numeric handle remains the stable identity if blur listeners relocate DOM
+/// children before the browser installs the new focus.
+pub const FocusCallbackFn = *const fn (context: ?*anyopaque, handle: u32) anyerror!void;
+
+const FocusCallback = struct {
+    function: ?FocusCallbackFn = null,
+    context: ?*anyopaque = null,
+};
+
 /// Runs synchronously before JavaScript changes DOM child storage. Browser
 /// embedders use this boundary to retire every snapshot that borrows the
 /// current DOM generation before any node can move or be destroyed.
@@ -422,6 +433,7 @@ const WindowContext = struct {
     named_globals_synced: bool,
     pending_messages: std.ArrayList(PendingMessage),
     render_callback: RenderCallback,
+    focus_callback: FocusCallback,
     dom_mutation_callback: DomMutationCallback,
     set_timeout_callback: SetTimeoutCallback,
     clear_interval_callback: struct {
@@ -500,6 +512,7 @@ fn ensureWindow(self: *Js, window_id: u32) !void {
         .named_globals_synced = false,
         .pending_messages = std.ArrayList(PendingMessage).empty,
         .render_callback = .{},
+        .focus_callback = .{},
         .dom_mutation_callback = .{},
         .set_timeout_callback = .{},
         .clear_interval_callback = .{},
@@ -674,6 +687,7 @@ pub fn evaluate(self: *Js, window_id: u32, code: []const u8) !Value {
         \\
         \\function Event(type) {
         \\  this.type = type;
+        \\  this.bubbles = false;
         \\  this.do_default = true;
         \\  this.defaultPrevented = false;
         \\  this.propagation_stopped = false;
@@ -708,7 +722,7 @@ pub fn evaluate(self: *Js, window_id: u32, code: []const u8) !Value {
         \\
         \\Node.prototype.dispatchEvent = function(evt) {
         \\  var event = typeof evt === "string" ? new Event(evt) : evt;
-        \\  var path = __native.eventPath(this.handle);
+        \\  var path = event.bubbles ? __native.eventPath(this.handle) : [this.handle];
         \\  var listeners = listenersForWindow(window.__id);
         \\  event.propagation_stopped = false;
         \\  event.target = path.length ? new Node(path[0]) : this;
@@ -760,6 +774,10 @@ pub fn evaluate(self: *Js, window_id: u32, code: []const u8) !Value {
         \\  return child;
         \\};
         \\
+        \\Node.prototype.focus = function() {
+        \\  __native.focus(this.handle);
+        \\};
+        \\
         \\// Snapshot the immediate element children as wrapped Node objects.
         \\Object.defineProperty(Node.prototype, "children", {
         \\  get: function() {
@@ -792,8 +810,10 @@ pub fn evaluate(self: *Js, window_id: u32, code: []const u8) !Value {
         \\  }
         \\});
         \\
-        \\__native.dispatchEvent = function(handle, type) {
-        \\  return new Node(handle).dispatchEvent(new Event(type));
+        \\__native.dispatchEvent = function(handle, type, bubbles) {
+        \\  var event = new Event(type);
+        \\  event.bubbles = !!bubbles;
+        \\  return new Node(handle).dispatchEvent(event);
         \\};
         \\
         \\globalThis.Event = Event;
@@ -1056,6 +1076,7 @@ pub fn setNodes(self: *Js, window_id: u32, nodes: ?*Node) void {
     window.next_handle = 0;
     if (nodes == null) {
         window.render_callback = .{};
+        window.focus_callback = .{};
         window.dom_mutation_callback = .{};
         window.xhr_callback = .{};
         window.cookie_callback = .{};
@@ -1075,6 +1096,14 @@ pub fn setNodes(self: *Js, window_id: u32, nodes: ?*Node) void {
 pub fn setRenderCallback(self: *Js, window_id: u32, callback: ?RenderCallbackFn, context: ?*anyopaque) void {
     const window = self.setCurrentWindow(window_id) catch return;
     window.render_callback = .{
+        .function = callback,
+        .context = context,
+    };
+}
+
+pub fn setFocusCallback(self: *Js, window_id: u32, callback: ?FocusCallbackFn, context: ?*anyopaque) void {
+    const window = self.setCurrentWindow(window_id) catch return;
+    window.focus_callback = .{
         .function = callback,
         .context = context,
     };
@@ -1533,10 +1562,62 @@ fn markElementLayoutDirty(e: *parser.Element) void {
 /// Dispatch an event to the JavaScript environment for the given node
 /// Returns true if the default action should proceed.
 pub fn dispatchEvent(self: *Js, window_id: u32, event_type: []const u8, node: *Node) !bool {
+    return self.dispatchEventWithBubbles(window_id, event_type, node, true);
+}
+
+/// Dispatch a browser-generated DOM event. Click/key/form events bubble;
+/// focus and blur use this seam with `bubbles=false`, matching their DOM
+/// semantics while retaining the same stable-handle event machinery.
+pub fn dispatchEventWithBubbles(
+    self: *Js,
+    window_id: u32,
+    event_type: []const u8,
+    node: *Node,
+    bubbles: bool,
+) !bool {
     self.lock.lock();
     defer self.lock.unlock();
+    return self.dispatchEventWithBubblesLocked(
+        window_id,
+        event_type,
+        node,
+        bubbles,
+        true,
+    );
+}
+
+/// Dispatch while a native JavaScript host callback is already running under
+/// this Js instance's lock. Calling the ordinary public dispatcher from that
+/// boundary would recursively acquire the non-recursive mutex and deadlock.
+/// The current realm was installed by the outer JavaScript entry point, so a
+/// callback may only dispatch into that same window.
+pub fn dispatchEventWithBubblesFromNativeCallback(
+    self: *Js,
+    window_id: u32,
+    event_type: []const u8,
+    node: *Node,
+    bubbles: bool,
+) !bool {
+    if (self.current_window_id != window_id) return error.InactiveJavaScriptWindow;
+    return self.dispatchEventWithBubblesLocked(
+        window_id,
+        event_type,
+        node,
+        bubbles,
+        false,
+    );
+}
+
+fn dispatchEventWithBubblesLocked(
+    self: *Js,
+    window_id: u32,
+    event_type: []const u8,
+    node: *Node,
+    bubbles: bool,
+    activate_window: bool,
+) !bool {
     const window = try self.setCurrentWindow(window_id);
-    try self.setActiveWindow(window_id, window);
+    if (activate_window) try self.setActiveWindow(window_id, window);
     if (window.current_nodes == null) return true;
 
     const handle = try self.getHandle(window, node);
@@ -1554,7 +1635,12 @@ pub fn dispatchEvent(self: *Js, window_id: u32, event_type: []const u8, node: *N
 
     if (!dispatch_value.isCallable()) return true;
 
-    const result = try dispatch_value.call(&self.agent, .undefined, &.{ handle_value, type_js_value });
+    const bubbles_value = Value.from(bubbles);
+    const result = try dispatch_value.call(
+        &self.agent,
+        .undefined,
+        &.{ handle_value, type_js_value, bubbles_value },
+    );
     const do_default = result.toBoolean();
     return do_default;
 }
@@ -1565,6 +1651,17 @@ pub fn dispatchEvent(self: *Js, window_id: u32, event_type: []const u8, node: *N
 pub fn captureNodeHandle(self: *Js, window_id: u32, node: *Node) !u32 {
     self.lock.lock();
     defer self.lock.unlock();
+    return self.captureNodeHandleLocked(window_id, node);
+}
+
+/// Capture a handle from a native callback invoked by this Js instance. The
+/// caller is the current JavaScript execution thread and already owns `lock`.
+pub fn captureNodeHandleFromNativeCallback(self: *Js, window_id: u32, node: *Node) !u32 {
+    if (self.current_window_id != window_id) return error.InactiveJavaScriptWindow;
+    return self.captureNodeHandleLocked(window_id, node);
+}
+
+fn captureNodeHandleLocked(self: *Js, window_id: u32, node: *Node) !u32 {
     const window = try self.setCurrentWindow(window_id);
     if (!isAttachedToCurrentDocument(window, node)) return error.DetachedNode;
     return self.getHandle(window, node);
@@ -1576,6 +1673,17 @@ pub fn captureNodeHandle(self: *Js, window_id: u32, node: *Node) !u32 {
 pub fn resolveAttachedNode(self: *Js, window_id: u32, handle: u32) ?*Node {
     self.lock.lock();
     defer self.lock.unlock();
+    return self.resolveAttachedNodeLocked(window_id, handle);
+}
+
+/// Resolve a handle from the current native callback without recursively
+/// acquiring `lock`. This API is invalid outside the synchronous callback.
+pub fn resolveAttachedNodeFromNativeCallback(self: *Js, window_id: u32, handle: u32) ?*Node {
+    if (self.current_window_id != window_id) return null;
+    return self.resolveAttachedNodeLocked(window_id, handle);
+}
+
+fn resolveAttachedNodeLocked(self: *Js, window_id: u32, handle: u32) ?*Node {
     const window = self.windows.getPtr(window_id) orelse return null;
     const node = self.getNode(window, handle) orelse return null;
     return if (isAttachedToCurrentDocument(window, node)) node else null;
@@ -1785,6 +1893,126 @@ fn findTestElementById(root: *Node, id: []const u8) !*Node {
         }
     }
     return error.MissingTestElement;
+}
+
+const FocusCallbackTestContext = struct {
+    js: *Js,
+    handles: [4]u32 = undefined,
+    count: usize = 0,
+
+    fn callback(context: ?*anyopaque, handle: u32) anyerror!void {
+        const raw = context orelse return;
+        const unaligned: *align(1) FocusCallbackTestContext = @ptrCast(raw);
+        const self: *FocusCallbackTestContext = @alignCast(unaligned);
+        if (self.count < self.handles.len) self.handles[self.count] = handle;
+        self.count += 1;
+
+        // The production callback resolves the stable handle and dispatches
+        // focus/blur while evaluate() already owns the Js mutex. Exercise the
+        // callback-only path so a recursive lock regression hangs this test.
+        const node = self.js.resolveAttachedNodeFromNativeCallback(0, handle) orelse return;
+        _ = try self.js.dispatchEventWithBubblesFromNativeCallback(
+            0,
+            "focus",
+            node,
+            false,
+        );
+    }
+};
+
+test "Node focus calls the host only for attached focusable elements" {
+    const allocator = std.testing.allocator;
+    const html =
+        "<main>" ++
+        "<input id=entry>" ++
+        "<div id=plain></div>" ++
+        "<div id=programmatic tabindex=-1></div>" ++
+        "<input id=hidden type=hidden>" ++
+        "<button id=disabled disabled>disabled</button>" ++
+        "</main>";
+
+    var html_parser = try parser.HTMLParser.init(allocator, html);
+    html_parser.use_implicit_tags = false;
+    defer html_parser.deinit(allocator);
+    var root = try html_parser.parse();
+    defer root.deinit(allocator);
+    parser.fixParentPointers(&root, null);
+
+    var environ = std.process.Environ.Map.init(allocator);
+    defer environ.deinit();
+    var js = try Js.init(allocator, std.testing.io, &environ);
+    defer js.deinit(allocator);
+    js.setNodes(0, &root);
+    defer js.setNodes(0, null);
+
+    var focus_context = FocusCallbackTestContext{ .js = js };
+    js.setFocusCallback(0, FocusCallbackTestContext.callback, &focus_context);
+    const result = try js.evaluate(0,
+        \\var entry = document.querySelectorAll('input')[0];
+        \\var hidden = document.querySelectorAll('input')[1];
+        \\var plain = document.querySelectorAll('div')[0];
+        \\var programmatic = document.querySelectorAll('div')[1];
+        \\var disabled = document.querySelectorAll('button')[0];
+        \\var detached = document.createElement('input');
+        \\var focusDeliveries = 0;
+        \\entry.addEventListener('focus', function() { focusDeliveries += 1; });
+        \\var entryResult = entry.focus();
+        \\plain.focus();
+        \\programmatic.focus();
+        \\hidden.focus();
+        \\disabled.focus();
+        \\detached.focus();
+        \\document.querySelectorAll('main')[0].appendChild(detached);
+        \\detached.focus();
+        \\entryResult === undefined && focusDeliveries === 1
+    );
+    try std.testing.expect(result.toBoolean());
+    try std.testing.expectEqual(@as(usize, 3), focus_context.count);
+    try std.testing.expect(focus_context.handles[0] != focus_context.handles[1]);
+    try std.testing.expect(focus_context.handles[1] != focus_context.handles[2]);
+}
+
+test "browser focus and blur events stay on their target" {
+    const allocator = std.testing.allocator;
+    var html_parser = try parser.HTMLParser.init(
+        allocator,
+        "<main><section><input id=target></section></main>",
+    );
+    html_parser.use_implicit_tags = false;
+    defer html_parser.deinit(allocator);
+    var root = try html_parser.parse();
+    defer root.deinit(allocator);
+    parser.fixParentPointers(&root, null);
+    const target = try findTestElementById(&root, "target");
+
+    var environ = std.process.Environ.Map.init(allocator);
+    defer environ.deinit();
+    var js = try Js.init(allocator, std.testing.io, &environ);
+    defer js.deinit(allocator);
+    js.setNodes(0, &root);
+    defer js.setNodes(0, null);
+
+    _ = try js.evaluate(0,
+        \\var focusLog = [];
+        \\var target = document.querySelectorAll('input')[0];
+        \\var parentNode = document.querySelectorAll('section')[0];
+        \\target.addEventListener('focus', function(event) {
+        \\  focusLog.push('target-focus:' + event.bubbles);
+        \\});
+        \\target.addEventListener('blur', function(event) {
+        \\  focusLog.push('target-blur:' + event.bubbles);
+        \\});
+        \\parentNode.addEventListener('focus', function() { focusLog.push('parent-focus'); });
+        \\parentNode.addEventListener('blur', function() { focusLog.push('parent-blur'); });
+    );
+
+    try std.testing.expect(try js.dispatchEventWithBubbles(0, "focus", target, false));
+    try std.testing.expect(try js.dispatchEventWithBubbles(0, "blur", target, false));
+    const result = try js.evaluate(
+        0,
+        "focusLog.join(',') === 'target-focus:false,target-blur:false'",
+    );
+    try std.testing.expect(result.toBoolean());
 }
 
 test "DOM events bubble with stable targets propagation control and cancellation" {
@@ -2729,6 +2957,26 @@ fn setupDocument(self: *Js, realm: *Realm) !void {
         },
     );
 
+    const focus_fn = try kiesel.builtins.createBuiltinFunction(
+        &self.agent,
+        .{ .function = focusNode },
+        1,
+        "focus",
+        .{
+            .realm = realm,
+            .additional_fields = self_ptr,
+        },
+    );
+
+    try native_obj.definePropertyDirect(
+        &self.agent,
+        PropertyKey.from("focus"),
+        .{
+            .value_or_accessor = .{ .value = Value.from(&focus_fn.object) },
+            .attributes = .builtin_default,
+        },
+    );
+
     const create_element_fn = try kiesel.builtins.createBuiltinFunction(
         &self.agent,
         .{ .function = createElement },
@@ -3398,6 +3646,40 @@ fn getEventPath(agent: *Agent, this_value: Value, arguments: kiesel.types.Argume
     }
 
     return Value.from(&result.object);
+}
+
+/// __native.focus implementation. Detached, text, hidden, disabled, and
+/// otherwise non-focusable nodes are silent no-ops, matching HTMLElement's
+/// focus contract. Layout-dependent visibility is checked by the browser
+/// callback after it synchronously brings style/layout up to date.
+fn focusNode(agent: *Agent, this_value: Value, arguments: kiesel.types.Arguments) Agent.Error!Value {
+    const function_obj = agent.activeFunctionObject();
+    const builtin_fn = function_obj.as(kiesel.builtins.BuiltinFunction);
+    const js_instance = builtin_fn.fields.additionalFieldsAs(Js);
+    const window_id = js_instance.current_window_id orelse return .undefined;
+    const window = js_instance.windows.getPtr(window_id) orelse return .undefined;
+    _ = this_value;
+
+    const handle_arg = arguments.get(0);
+    if (!handle_arg.isNumber()) return .undefined;
+    const raw_handle = handle_arg.asNumber().asFloat();
+    const max_handle = @as(f64, @floatFromInt(std.math.maxInt(u32)));
+    if (std.math.isNan(raw_handle) or raw_handle < 0 or raw_handle > max_handle) return .undefined;
+    const handle: u32 = @intFromFloat(raw_handle);
+    const node = js_instance.getNode(window, handle) orelse return .undefined;
+    if (!isAttachedToCurrentDocument(window, node)) return .undefined;
+    const element = switch (node.*) {
+        .element => |*value| value,
+        .text => return .undefined,
+    };
+    if (!dom_focus.isProgrammaticallyFocusable(element)) return .undefined;
+
+    if (window.focus_callback.function) |callback| {
+        callback(window.focus_callback.context, handle) catch |err| {
+            std.log.warn("Failed to focus DOM element: {}", .{err});
+        };
+    }
+    return .undefined;
 }
 
 fn isValidCreatedTagName(tag: []const u8) bool {

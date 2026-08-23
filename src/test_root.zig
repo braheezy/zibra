@@ -10,6 +10,7 @@ comptime {
     _ = @import("browser/render/compositor_cache.zig");
     _ = @import("browser/render/raster_snapshot.zig");
     _ = @import("browser/render/layout.zig");
+    _ = @import("document/focus.zig");
     _ = @import("script/js.zig");
     _ = @import("tests/browser_input.zig");
     _ = @import("tests/browser_history.zig");

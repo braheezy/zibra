@@ -546,6 +546,10 @@ pub const Browser = struct {
     chrome: Chrome = undefined,
     // Focus tracking: null means nothing focused, "content" means page content
     focus: ?[]const u8 = null,
+    // Tab workers cannot mutate Chrome's UI-thread-owned DOM/layout. A
+    // JavaScript focus() request publishes stable tab identity here; the next
+    // UI tick blurs chrome only if that tab is still active.
+    pending_content_focus_tab: ?*Tab = null,
     animation_timer_active: bool = false,
     // The generation invalidates a sleeping or queued frame after tab switches
     // and other forced resets. The deadline anchors a continuous animation to
@@ -873,6 +877,33 @@ pub const Browser = struct {
         return self.activeTab() == tab;
     }
 
+    /// Publish page focus from the serialized tab worker without touching the
+    /// UI-thread-owned Chrome object. Key routing can observe `focus`
+    /// immediately; the native-window tick removes any address-bar cursor.
+    pub fn requestContentFocus(self: *Browser, tab: *Tab) void {
+        self.lock.lock();
+        defer self.lock.unlock();
+        if (self.shutting_down or self.activeTab() != tab) return;
+        self.focus = "content";
+        self.pending_content_focus_tab = tab;
+        self.needs_draw = true;
+    }
+
+    fn applyPendingContentFocus(self: *Browser) void {
+        self.lock.lock();
+        const requested_tab = self.pending_content_focus_tab;
+        self.pending_content_focus_tab = null;
+        const should_apply = if (requested_tab) |tab|
+            !self.shutting_down and self.activeTab() == tab
+        else
+            false;
+        self.lock.unlock();
+
+        if (!should_apply) return;
+        self.chrome.blur();
+        self.setNeedsRasterDraw();
+    }
+
     pub fn windowId(self: *const Browser) !u32 {
         const window = self.window orelse return error.BrowserHasNoNativeWindow;
         return window.getID();
@@ -1096,6 +1127,7 @@ pub const Browser = struct {
         }
         if (found_idx) |idx| {
             self.active_tab_index = idx;
+            self.pending_content_focus_tab = null;
             if (self.pending_post_resubmission) |pending| {
                 if (pending.tab != tab) self.pending_post_resubmission = null;
             }
@@ -1336,6 +1368,7 @@ pub const Browser = struct {
         self.scheduleAnimationFrame();
 
         while (!quit) {
+            self.applyPendingContentFocus();
             self.openPendingTabs();
             self.processPendingPostResubmission();
             self.applyWindowTitle();
@@ -1377,6 +1410,7 @@ pub const Browser = struct {
     /// Perform one nonblocking iteration of one native window. BrowserApp is
     /// responsible for SDL polling and calls this for every registered window.
     pub fn tick(self: *Browser) !bool {
+        self.applyPendingContentFocus();
         self.openPendingTabs();
         self.processPendingPostResubmission();
         self.applyWindowTitle();
@@ -1416,6 +1450,7 @@ pub const Browser = struct {
         self.needs_animation_frame = false;
         self.invalidateAnimationTimerLocked();
         self.pending_post_resubmission = null;
+        self.pending_content_focus_tab = null;
         self.lock.unlock();
     }
 
@@ -1834,6 +1869,7 @@ pub const Browser = struct {
                 }
                 if (should_clear_focus) {
                     self.focus = null;
+                    self.pending_content_focus_tab = null;
                 }
                 self.lock.unlock();
                 if (should_clear_focus) {
@@ -1914,6 +1950,7 @@ pub const Browser = struct {
 
             self.lock.lock();
             self.focus = null;
+            self.pending_content_focus_tab = null;
             self.lock.unlock();
             var chrome_changed = try self.chrome.click(self, screen_x, screen_y);
             if (!chrome_changed) {
@@ -2393,6 +2430,7 @@ pub const Browser = struct {
         frame.js_render_context_initialized = true;
         js_context.setNodes(frame.window_id, &frame.current_node.?);
         js_context.setRenderCallback(frame.window_id, jsRenderCallback, @ptrCast(render_context));
+        js_context.setFocusCallback(frame.window_id, jsFocusCallback, @ptrCast(render_context));
         js_context.setDomMutationCallback(
             frame.window_id,
             jsDomMutationCallback,
@@ -7700,6 +7738,7 @@ const runAnimationTimerThread = BrowserScriptTaskContexts.runAnimationTimerThrea
 const XhrThreadContext = BrowserScriptTaskContexts.XhrThreadContext;
 const runXhrThread = BrowserScriptTaskContexts.runXhrThread;
 const jsRenderCallback = BrowserScriptTaskContexts.jsRenderCallback;
+const jsFocusCallback = BrowserScriptTaskContexts.jsFocusCallback;
 const jsDomMutationCallback = BrowserScriptTaskContexts.jsDomMutationCallback;
 const jsCookieGetCallback = BrowserScriptTaskContexts.jsCookieGetCallback;
 const jsCookieSetCallback = BrowserScriptTaskContexts.jsCookieSetCallback;

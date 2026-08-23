@@ -179,6 +179,13 @@ before changing `root.zig`, `tab.zig`, `render/`, or browser task scheduling.
   accessibility focus, and triggers a repaint when a content cursor was
   removed. Address-bar transitions preserve tab-worker ownership by enqueueing
   that blur instead of mutating frame focus directly from the UI thread.
+- JavaScript `Node.focus()` runs synchronously on the serialized tab worker.
+  It forces pending style/layout work before consulting the frame's focus
+  bounds, rejects focusable-but-unlaid-out targets, scrolls the refreshed
+  bounds into the frame viewport, and re-resolves the numeric node handle
+  after blur listeners. Focus and blur events do not bubble. A worker publishes
+  content-focus intent by stable Tab identity; only the UI tick may blur the
+  chrome-owned address input.
 - Page focus indicators paint after document content as two coincident outline
   commands: a 4px white stroke below a 2px black stroke. This two-tone ring
   must follow every focused-element bounds entry and remain distinct from the

@@ -68,6 +68,11 @@ or selector/rule lifetime.
   `Element.inputType` view. Hidden and password inputs keep their real `value`
   attribute in the DOM: layout suppresses hidden controls and masks password
   paint without replacing or duplicating that submission value.
+- `focus.zig` is the canonical HTML focusability policy shared by layout,
+  keyboard traversal, and JavaScript. Programmatic focus accepts an explicit
+  negative `tabindex`, while sequential focus rejects it; hidden inputs,
+  disabled controls, and `contenteditable=false` are rejected by both. Layout
+  visibility remains a separate, current-generation bounds check.
 - A `button` start tag implicitly closes an active button even through
   intervening flow descendants, so malformed nested-button source produces
   sibling controls. Other descendants, including non-conforming interactive

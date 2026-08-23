@@ -46,6 +46,14 @@ or Kiesel allocation/locking.
   update `currentTarget` for each node, keep `target` fixed, let
   `stopPropagation` finish the current node's listeners before stopping, and
   keep propagation control independent from `preventDefault`.
+- `Node.focus()` first applies the shared intrinsic focusability rule, then
+  synchronously transfers only the stable numeric handle through the current
+  generation's focus callback. The Tab must re-resolve that handle after blur
+  listeners and layout work. This callback runs while `Js.lock` is already
+  held; handle resolution and focus/blur dispatch must use the explicit native-
+  callback helpers instead of recursively acquiring the mutex. Browser-
+  generated focus and blur events are target-only; click, key, and form events
+  continue to bubble.
 - Structural JavaScript mutation also clears current style-field subscriber
   maps while every endpoint is alive; the mandatory full style/layout render
   rebuilds dependencies after mutation.

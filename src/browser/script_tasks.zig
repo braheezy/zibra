@@ -632,6 +632,29 @@ pub fn Contexts(comptime Browser: type, comptime DocumentHandle: type) type {
             tab.setNeedsRender();
         }
 
+        pub fn jsFocusCallback(context: ?*anyopaque, handle: u32) anyerror!void {
+            const ctx_ptr = context orelse return;
+            const raw_ctx: *align(1) JsRenderContext = @ptrCast(ctx_ptr);
+            const ctx: *JsRenderContext = @alignCast(raw_ctx);
+
+            const browser_ptr = ctx.browser_ptr orelse return;
+            const tab_ptr = ctx.tab_ptr orelse return;
+            const raw_browser: *align(1) Browser = @ptrCast(browser_ptr);
+            const browser: *Browser = @alignCast(raw_browser);
+            const raw_tab: *align(1) Tab = @ptrCast(tab_ptr);
+            const tab: *Tab = @alignCast(raw_tab);
+
+            const frame = tab.frameForWindowId(ctx.window_id) orelse return;
+            const generation = frame.document_generation;
+            if (generation == 0 or !ctx.matchesGeneration(generation)) return;
+            _ = try tab.focusElementFromScript(
+                browser,
+                ctx.window_id,
+                generation,
+                handle,
+            );
+        }
+
         pub fn jsDomMutationCallback(context: ?*anyopaque, mutation_root: *parser.Node) void {
             const ctx_ptr = context orelse return;
             const raw_ctx: *align(1) JsRenderContext = @ptrCast(ctx_ptr);

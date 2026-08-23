@@ -51,6 +51,10 @@ input styling.
 black panels. The same 4px-white/2px-black two-tone ring must remain visible on
 both backgrounds and follow keyboard focus without leaving a stale ring.
 
+`tests/manual/focus-method-events.html` verifies script focusability,
+target-only focus/blur event order, synchronous layout before focus scrolling,
+and address-bar blur when JavaScript returns focus to page content.
+
 `tests/manual/checkboxes.html` verifies checked and unchecked painting, click
 toggles, omission of unchecked controls, explicit values, and the default
 checked value `on` through a localhost GET submission.

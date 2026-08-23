@@ -13,6 +13,9 @@ before changing ownership or thread boundaries.
   descending. Inline-mode blocks retain an exact painted-command leaf fallback
   until they gain persistent line/text children. Do not reconstruct an
   absolute rectangle for every descendant.
+  Focus-bound collection uses `document/focus.zig`'s programmatic policy so
+  script-focusable negative-tabindex targets receive geometry even though
+  sequential keyboard traversal skips them.
   Immediate layout children paint through a retained stable index permutation
   keyed by effective z-index and DOM index. Only positioned blocks receive a
   nonzero signed z-index; lines and static/invalid blocks stay at zero. Recurse

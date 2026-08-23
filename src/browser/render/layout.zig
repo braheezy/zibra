@@ -9,6 +9,7 @@ const font = @import("font.zig");
 const browser = @import("../root.zig");
 const grapheme = @import("grapheme");
 const parser = @import("../../document/parser.zig");
+const dom_focus = @import("../../document/focus.zig");
 const ProtectedField = @import("../../core/protected_field.zig").ProtectedField;
 const DisplayItem = browser.DisplayItem;
 const Node = parser.Node;
@@ -2598,42 +2599,12 @@ fn recordFragmentTargets(self: *Layout, node_ptr: *Node, y: i32) !void {
     }
 }
 
-fn isTabIndexFocusable(element: *const parser.Element) bool {
-    if (element.attributes) |attrs| {
-        if (attrs.get("tabindex")) |raw| {
-            const trimmed = std.mem.trim(u8, raw, " \t\r\n");
-            if (trimmed.len == 0) return true;
-            const idx = std.fmt.parseInt(i32, trimmed, 10) catch return true;
-            return idx >= 0;
-        }
-    }
-    return false;
-}
-
-fn isElementFocusable(element: *const parser.Element) bool {
-    if (element.isHiddenInput()) return false;
-    if (std.mem.eql(u8, element.tag, "input") or std.mem.eql(u8, element.tag, "button")) {
-        return true;
-    }
-    if (element.attributes) |attrs| {
-        if (attrs.get("contenteditable") != null) {
-            return true;
-        }
-    }
-    if (std.mem.eql(u8, element.tag, "a")) {
-        if (element.attributes) |attrs| {
-            return attrs.get("href") != null or isTabIndexFocusable(element);
-        }
-    }
-    return isTabIndexFocusable(element);
-}
-
 fn findFocusableNode(node_ptr: *Node) ?*Node {
     var current: ?*Node = node_ptr;
     while (current) |ptr| {
         switch (ptr.*) {
             .element => |*el| {
-                if (isElementFocusable(el)) return ptr;
+                if (dom_focus.isProgrammaticallyFocusable(el)) return ptr;
                 current = el.parent;
             },
             .text => |*txt| {

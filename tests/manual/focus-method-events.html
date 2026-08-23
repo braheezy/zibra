@@ -1,0 +1,75 @@
+<!--
+How to verify:
+1. Load this page and press "Run focus sequence".
+2. The page must scroll the green "script target" input into view even though
+   the same click first makes the blue spacer much taller.
+3. The visible log must end in PASS. It should contain target-only focus/blur
+   events in this order: first focus, first blur, target focus, target blur,
+   last focus. No parent focus/blur event or plain-div focus may appear.
+4. Press "Arm delayed focus", immediately click in the address bar, and wait.
+   The address-bar cursor must disappear when the timeout focuses page content;
+   only one cursor is visible.
+-->
+<!doctype html>
+<meta charset="utf-8">
+<title>Focus method and events</title>
+<style>
+  body { font-family: sans-serif; margin: 16px; }
+  button, input { font-size: 16px; padding: 6px; }
+  #status { position: fixed; top: 72px; right: 12px; width: 320px;
+            padding: 10px; background: white; border: 2px solid black; z-index: 5; }
+  #spacer { height: 80px; background: #dbeafe; margin: 12px 0; }
+  #target { background: #dcfce7; }
+</style>
+
+<h1>JavaScript focus() + events</h1>
+<p><button id="run">Run focus sequence</button>
+   <button id="arm">Arm delayed focus</button></p>
+<p><input id="first" value="first input"></p>
+<div id="plain">This plain div is not focusable.</div>
+<div id="spacer">This spacer grows before focus() reads target geometry.</div>
+<section id="eventParent">
+  <p><input id="target" value="script target"></p>
+  <p><input id="last" value="last input"></p>
+</section>
+<pre id="status">Ready</pre>
+
+<script>
+var log = [];
+function record(label) { log.push(label); }
+
+first.addEventListener('focus', function() { record('first focus'); });
+first.addEventListener('blur', function() { record('first blur'); });
+target.addEventListener('focus', function(event) {
+  record('target focus bubbles=' + event.bubbles);
+});
+target.addEventListener('blur', function(event) {
+  record('target blur bubbles=' + event.bubbles);
+});
+last.addEventListener('focus', function() { record('last focus'); });
+eventParent.addEventListener('focus', function() { record('BAD parent focus'); });
+eventParent.addEventListener('blur', function() { record('BAD parent blur'); });
+plain.addEventListener('focus', function() { record('BAD plain focus'); });
+
+run.addEventListener('click', function() {
+  log = [];
+  first.focus();
+  spacer.style = 'height: 1400px; background-color: #dbeafe;';
+  target.focus();
+  plain.focus();
+  last.focus();
+
+  var expected = 'first focus,first blur,target focus bubbles=false,' +
+      'target blur bubbles=false,last focus';
+  var actual = log.join(',');
+  status.innerHTML = (actual === expected ? 'PASS\n' : 'FAIL\n') + actual;
+});
+
+arm.addEventListener('click', function() {
+  status.innerHTML = 'Click the address bar now; target focus runs in 1500ms.';
+  setTimeout(function() {
+    target.focus();
+    status.innerHTML = 'Delayed focus fired. Only the page cursor should remain.';
+  }, 1500);
+});
+</script>

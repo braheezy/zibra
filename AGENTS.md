@@ -28,6 +28,7 @@ architecture document.
 | Per-window browser, tabs, chrome       | `src/browser/`        |
 | Display commands and software effects  | `src/browser/render/` |
 | DOM, HTML, CSS, selectors              | `src/document/`       |
+| Shared DOM focusability rules          | `src/document/focus.zig` |
 | Kiesel host integration                | `src/script/`         |
 | URLs, HTTP, cookies, caching, decoding | `src/network/`        |
 | Tasking and synchronization            | `src/runtime/`        |
