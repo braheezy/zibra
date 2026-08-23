@@ -1,20 +1,62 @@
 //! Raster-worker-owned page planes for draw-only property updates.
 //!
-//! Each plane owns immutable raster pixels. Animation and scrolling mutate
-//! only scalar placement/alpha state, then composite those cached pixels into
-//! the next root surface without replaying paint commands.
+//! Each plane owns either immutable raster pixels or a tiny worker-safe display
+//! list. Animation and scrolling mutate only scalar placement/alpha state;
+//! tiny lists are replayed during draw while larger lists composite cached
+//! pixels into the next root surface.
 
 const std = @import("std");
 const z2d = @import("z2d");
 const compositor = z2d.compositor;
 const display = @import("display_list.zig");
+const RasterSnapshot = @import("raster_snapshot.zig").RasterSnapshot;
 
 const Rect = display.Rect;
+const DisplayItem = display.DisplayItem;
 
 /// A merged RGBA plane may use at most four MiB of pixel storage. Individual
 /// paint chunks can exceed this when unavoidable; the limit only prevents a
 /// merge from manufacturing a large, mostly transparent bounding surface.
 pub const maximum_merged_surface_area_pixels: u64 = 1024 * 1024;
+pub const maximum_direct_paint_commands: usize = 3;
+
+const DirectPaintInfo = struct {
+    count: usize = 0,
+    grouped_opacity: bool = false,
+};
+
+fn collectDirectPaintInfo(items: []const DisplayItem, info: *DirectPaintInfo) bool {
+    for (items) |item| {
+        switch (item) {
+            .rect, .rounded_rect, .line, .outline => {
+                info.count += 1;
+                if (info.count > maximum_direct_paint_commands) return false;
+            },
+            .transform => |transform| {
+                if (!collectDirectPaintInfo(transform.children, info)) return false;
+            },
+            .blend => |blend| {
+                if (blend.blend_mode != null or blend.blur_radius > 0.0) return false;
+                if (blend.opacity < 1.0 or blend.compositor_id != null) {
+                    info.grouped_opacity = true;
+                }
+                if (!collectDirectPaintInfo(blend.children, info)) return false;
+            },
+            .glyph, .image, .iframe, .draw_composited_layer => return false,
+        }
+    }
+    return true;
+}
+
+/// Tiny command trees are cheaper to replay than to retain as RGBA textures.
+/// Text, images, masks, filters, and multi-command opacity groups stay
+/// rasterized because their per-frame cost or group semantics are nontrivial.
+pub fn canDrawDirectly(items: []const DisplayItem) bool {
+    var info = DirectPaintInfo{};
+    if (!collectDirectPaintInfo(items, &info)) return false;
+    if (info.count == 0 or info.count > maximum_direct_paint_commands) return false;
+    return !info.grouped_opacity or info.count == 1;
+}
 
 pub fn mergeFitsSurfaceArea(first: Rect, second: Rect) bool {
     const combined = first.unionWith(second);
@@ -38,7 +80,11 @@ pub const Update = struct {
 };
 
 pub const Plane = struct {
-    surface: z2d.Surface,
+    /// Exactly one backing is installed in every live cache plane. Surfaces
+    /// retain expensive raster results; tiny direct snapshots retain owned,
+    /// pointer-free commands for replay during software draw.
+    surface: ?z2d.Surface = null,
+    direct_commands: ?RasterSnapshot = null,
     /// Surface placement. Static planes cover the interest region, while a
     /// dynamic plane is tightly cropped around its untransformed pixels.
     bounds: Rect,
@@ -54,7 +100,10 @@ pub const Plane = struct {
     assume_overlap_after: bool = false,
 
     pub fn deinit(self: *Plane, allocator: std.mem.Allocator) void {
-        self.surface.deinit(allocator);
+        if (self.surface) |*surface| surface.deinit(allocator);
+        self.surface = null;
+        if (self.direct_commands) |*commands| commands.deinit();
+        self.direct_commands = null;
     }
 
     fn currentPaintBounds(self: *const Plane, zoom: f32) Rect {
@@ -135,17 +184,21 @@ pub const Cache = struct {
         scroll_device: i32,
         zoom: f32,
     ) void {
+        // Browser orchestration interleaves direct command replay with these
+        // surface planes. This helper remains the surface-only path used by
+        // low-level cache tests.
         if (!self.valid) return;
         for (self.planes.items) |*plane| {
+            const surface = if (plane.surface) |*value| value else continue;
             const x = plane.bounds.left + display.DisplayItem.scaleLayoutPx(plane.translate_x, zoom);
             const y = chrome_bottom + plane.bounds.top - scroll_device +
                 display.DisplayItem.scaleLayoutPx(plane.translate_y, zoom);
-            compositeWithOpacity(destination, &plane.surface, x, y, plane.opacity);
+            compositeWithOpacity(destination, surface, x, y, plane.opacity);
         }
     }
 };
 
-fn compositeWithOpacity(
+pub fn compositeWithOpacity(
     destination: *z2d.Surface,
     source: *const z2d.Surface,
     x: i32,
@@ -174,6 +227,107 @@ fn compositeWithOpacity(
         },
         .{ .operator = .src_over },
     }, .{});
+}
+
+fn directTestRect(x: i32) DisplayItem {
+    return .{ .rect = .{
+        .x1 = x,
+        .y1 = 0,
+        .x2 = x + 10,
+        .y2 = 10,
+        .color = .{ .r = 20, .g = 40, .b = 60 },
+    } };
+}
+
+test "short simple display lists bypass raster surfaces" {
+    const one = [_]DisplayItem{directTestRect(0)};
+    const three = [_]DisplayItem{
+        directTestRect(0),
+        directTestRect(10),
+        directTestRect(20),
+    };
+    const four = [_]DisplayItem{
+        directTestRect(0),
+        directTestRect(10),
+        directTestRect(20),
+        directTestRect(30),
+    };
+
+    try std.testing.expect(canDrawDirectly(&one));
+    try std.testing.expect(canDrawDirectly(&three));
+    try std.testing.expect(!canDrawDirectly(&four));
+    try std.testing.expect(!canDrawDirectly(&.{}));
+}
+
+test "direct display lists reject expensive commands and unsafe opacity groups" {
+    var transformed_children = [_]DisplayItem{directTestRect(0)};
+    const transformed = [_]DisplayItem{.{ .transform = .{
+        .translate_x = 8,
+        .translate_y = 4,
+        .children = &transformed_children,
+        .composited = true,
+        .compositor_id = 9,
+    } }};
+    try std.testing.expect(canDrawDirectly(&transformed));
+
+    var one_opacity_child = [_]DisplayItem{directTestRect(0)};
+    const one_opacity_group = [_]DisplayItem{.{ .blend = .{
+        .opacity = 0.5,
+        .blend_mode = null,
+        .children = &one_opacity_child,
+        .needs_compositing = true,
+        .compositor_id = 9,
+    } }};
+    try std.testing.expect(canDrawDirectly(&one_opacity_group));
+
+    var two_opacity_children = [_]DisplayItem{ directTestRect(0), directTestRect(5) };
+    const two_opacity_group = [_]DisplayItem{.{ .blend = .{
+        .opacity = 0.5,
+        .blend_mode = null,
+        .children = &two_opacity_children,
+        .needs_compositing = true,
+        .compositor_id = 9,
+    } }};
+    try std.testing.expect(!canDrawDirectly(&two_opacity_group));
+
+    var blurred_children = [_]DisplayItem{directTestRect(0)};
+    const blurred = [_]DisplayItem{.{ .blend = .{
+        .opacity = 1.0,
+        .blend_mode = null,
+        .blur_radius = 3.0,
+        .children = &blurred_children,
+    } }};
+    try std.testing.expect(!canDrawDirectly(&blurred));
+
+    var blended_children = [_]DisplayItem{directTestRect(0)};
+    const blended = [_]DisplayItem{.{ .blend = .{
+        .opacity = 1.0,
+        .blend_mode = "multiply",
+        .children = &blended_children,
+    } }};
+    try std.testing.expect(!canDrawDirectly(&blended));
+
+    const image = [_]DisplayItem{.{ .image = .{
+        .x1 = 0,
+        .y1 = 0,
+        .x2 = 1,
+        .y2 = 1,
+        .source_width = 1,
+        .source_height = 1,
+        .pixels = &.{ 0, 0, 0, 0 },
+    } }};
+    try std.testing.expect(!canDrawDirectly(&image));
+}
+
+test "surface-less plane owns and releases its direct command snapshot" {
+    const items = [_]DisplayItem{directTestRect(0)};
+    var plane = Plane{
+        .direct_commands = try RasterSnapshot.clone(std.testing.allocator, &items),
+        .bounds = .{ .left = 0, .top = 0, .right = 10, .bottom = 10 },
+    };
+    plane.deinit(std.testing.allocator);
+    try std.testing.expect(plane.surface == null);
+    try std.testing.expect(plane.direct_commands == null);
 }
 
 test "cached planes update transform and opacity without replacing pixels" {

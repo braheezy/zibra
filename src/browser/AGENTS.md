@@ -98,7 +98,12 @@ before changing `root.zig`, `tab.zig`, `render/`, or browser task scheduling.
   assembled tab bitmap. Static strata are tightly cropped within the interest
   region; nearby paint can expand them, but a merge whose bounding surface
   would exceed one megapixel starts a new plane instead. Animated planes retain
-  their own raster and accept pointer-free numeric updates. Stable dynamic
+  either their own raster or, for at most three cheap primitive commands, an
+  independently owned pointer-free command snapshot. Short planes skip raster
+  and replay those commands during draw with the plane's current opacity and
+  translation; glyphs, images, filters, blend modes, and unsafe opacity groups
+  stay surface-backed. A static merge that stops being eligible promotes the
+  plane transactionally to a surface. Stable dynamic
   planes use tight current bounds for overlap-safe backward merging of later
   static paint. An actively animated transform is a permanent merge barrier
   for that raster generation, so later content cannot move beneath it when

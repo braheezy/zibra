@@ -1,0 +1,48 @@
+<!--
+How to verify:
+1. The empty orange block moves right and fades without flashing, ghosting, or
+   changing hue. Its compositor plane contains one solid-color command and is
+   replayed directly during draw instead of retaining a raster surface.
+2. The labeled blue block performs the same animation and remains visually
+   correct. Its text glyphs make it ineligible for direct replay, so it keeps a
+   raster surface.
+3. Press Up/Down while both blocks animate. Scrolling within the interest
+   region and later animation frames remain draw-only after the initial raster.
+4. Unit coverage checks the three-command threshold, expensive-command
+   fallback, opacity-group safety, worker ownership, and transformed pixels.
+-->
+<!doctype html>
+<html>
+  <head>
+    <title>Short composited display lists</title>
+    <style>
+      body { background-color: white; color: black; font-family: sans-serif; }
+      .direct {
+        width: 180px;
+        height: 70px;
+        background-color: orange;
+        animation: 2s infinite alternate move-and-fade;
+      }
+      .complex {
+        width: 180px;
+        height: 70px;
+        background-color: lightblue;
+        color: black;
+        animation: 2s infinite alternate move-and-fade;
+      }
+      .spacer { height: 700px; }
+      @keyframes move-and-fade {
+        from { transform: translate(0px, 0px); opacity: 1; }
+        to { transform: translate(300px, 0px); opacity: 0.35; }
+      }
+    </style>
+  </head>
+  <body>
+    <h1>Surface-free short planes</h1>
+    <p>The first moving block is intentionally empty; the second contains text.</p>
+    <div class="direct"></div>
+    <div class="complex">TEXT KEEPS THIS RASTERIZED</div>
+    <div class="spacer"></div>
+    <p>SCROLL TARGET</p>
+  </body>
+</html>

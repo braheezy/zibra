@@ -23,12 +23,19 @@ before changing ownership or thread boundaries.
   browser-owned layer pointers. Numeric compositor IDs may cross this boundary;
   raw DOM/layout pointers may not.
 - `compositor_cache.zig` owns ordered raster-worker planes and applies only
-  scalar opacity/translation updates before draw. Static strata may merge
+  scalar opacity/translation updates before draw. A live plane owns exactly
+  one backing: an RGBA surface, or an independent `RasterSnapshot` containing
+  at most three cheap rect/rounded-rect/line/outline commands. Direct planes do
+  no raster work and replay during draw; text, images, filters, blend modes,
+  and unsafe multi-command opacity groups retain surfaces. Static strata may
+  merge
   backward across stable dynamic planes only when their tight painted bounds
   do not overlap. Static surfaces are cropped to the interest region and their
   painted bounds; stop a merge before its union exceeds the fixed one-megapixel
   allocation budget, while allowing an intrinsically larger individual paint
-  chunk. An active transform is an assume-overlap barrier: later paint must
+  chunk. Merging may keep a direct plane direct or transactionally promote it
+  to a surface when it crosses the threshold. An active transform is an
+  assume-overlap barrier: later paint must
   remain after it even when the current rectangles are disjoint, because a
   future compositor update can create overlap. Plane pixels never return to
   the DOM/tab thread, and fallback decisions remain Browser orchestration.

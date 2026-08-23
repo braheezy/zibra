@@ -4776,13 +4776,7 @@ pub const Browser = struct {
         @memset(try imageSurfacePixels(&root), .{ .r = 255, .g = 255, .b = 255, .a = 255 });
 
         if (self.worker_compositor_cache.valid) {
-            const scroll_px = scroll_model.scaleCssPx(task.scroll, task.zoom);
-            self.worker_compositor_cache.draw(
-                &root,
-                task.chrome_bottom,
-                scroll_px,
-                task.zoom,
-            );
+            try self.drawWorkerCompositorCache(task, &root);
         } else if (self.worker_tab_surface) |*tab_surface| {
             const scroll_px = scroll_model.scaleCssPx(task.scroll, task.zoom);
             const destination_y_i64 = @as(i64, task.chrome_bottom) +
@@ -5028,8 +5022,66 @@ pub const Browser = struct {
         paint_bounds: Rect,
     ) !void {
         const combined_bounds = plane.bounds.unionWith(paint_bounds);
+        if (plane.direct_commands) |*old_commands| {
+            const borrowed_commands = try task.allocator.alloc(
+                DisplayItem,
+                old_commands.items.len + items.len,
+            );
+            defer task.allocator.free(borrowed_commands);
+            @memcpy(borrowed_commands[0..old_commands.items.len], old_commands.items);
+            @memcpy(borrowed_commands[old_commands.items.len..], items);
+
+            if (compositor_cache.canDrawDirectly(borrowed_commands)) {
+                const combined_commands = try RasterSnapshot.clone(
+                    task.allocator,
+                    borrowed_commands,
+                );
+                old_commands.deinit();
+                plane.direct_commands = combined_commands;
+                plane.bounds = combined_bounds;
+                plane.paint_bounds = combined_bounds;
+                return;
+            }
+
+            var replacement = try z2d.Surface.init(
+                .image_surface_rgba,
+                task.allocator,
+                @max(combined_bounds.width(), 1),
+                @max(combined_bounds.height(), 1),
+            );
+            var replacement_owned = true;
+            errdefer if (replacement_owned) replacement.deinit(task.allocator);
+            @memset(try imageSurfacePixels(&replacement), .{ .r = 0, .g = 0, .b = 0, .a = 0 });
+            try self.drawItemsIntoWorkerPlane(
+                task,
+                &replacement,
+                combined_bounds,
+                old_commands.items,
+                null,
+            );
+            try self.drawItemsIntoWorkerPlane(
+                task,
+                &replacement,
+                combined_bounds,
+                items,
+                null,
+            );
+
+            old_commands.deinit();
+            plane.direct_commands = null;
+            plane.surface = replacement;
+            plane.bounds = combined_bounds;
+            plane.paint_bounds = combined_bounds;
+            replacement_owned = false;
+            return;
+        }
+
+        const old_surface = if (plane.surface) |*surface|
+            surface
+        else
+            return error.InvalidWorkerPlaneState;
         if (std.meta.eql(combined_bounds, plane.bounds)) {
-            try self.drawItemsIntoWorkerPlane(task, &plane.surface, plane.bounds, items, null);
+            try self.drawItemsIntoWorkerPlane(task, old_surface, plane.bounds, items, null);
             plane.paint_bounds = combined_bounds;
             return;
         }
@@ -5045,7 +5097,7 @@ pub const Browser = struct {
         @memset(try imageSurfacePixels(&replacement), .{ .r = 0, .g = 0, .b = 0, .a = 0 });
         z2d.Surface.composite(
             &replacement,
-            &plane.surface,
+            old_surface,
             .src_over,
             plane.bounds.left - combined_bounds.left,
             plane.bounds.top - combined_bounds.top,
@@ -5053,7 +5105,7 @@ pub const Browser = struct {
         );
         try self.drawItemsIntoWorkerPlane(task, &replacement, combined_bounds, items, null);
 
-        plane.surface.deinit(task.allocator);
+        old_surface.deinit(task.allocator);
         plane.surface = replacement;
         plane.bounds = combined_bounds;
         plane.paint_bounds = combined_bounds;
@@ -5085,6 +5137,24 @@ pub const Browser = struct {
         spec: ?WorkerPlaneSpec,
         compositor_id: ?usize,
     ) !void {
+        if (compositor_cache.canDrawDirectly(items)) {
+            var commands = try RasterSnapshot.clone(task.allocator, items);
+            var commands_owned = true;
+            errdefer if (commands_owned) commands.deinit();
+            try self.worker_compositor_cache.planes.append(task.allocator, .{
+                .direct_commands = commands,
+                .bounds = bounds,
+                .paint_bounds = paint_bounds,
+                .compositor_id = compositor_id,
+                .opacity = if (spec) |value| value.opacity else 1.0,
+                .translate_x = if (spec) |value| value.translate_x else 0,
+                .translate_y = if (spec) |value| value.translate_y else 0,
+                .assume_overlap_after = if (spec) |value| value.assume_overlap_after else false,
+            });
+            commands_owned = false;
+            return;
+        }
+
         const width = @max(bounds.width(), 1);
         const height = @max(bounds.height(), 1);
         var surface = try z2d.Surface.init(.image_surface_rgba, task.allocator, width, height);
@@ -5103,6 +5173,151 @@ pub const Browser = struct {
             .assume_overlap_after = if (spec) |value| value.assume_overlap_after else false,
         });
         surface_owned = false;
+    }
+
+    fn drawWorkerCompositorCache(
+        self: *Browser,
+        task: *const RasterTaskContext,
+        root: *z2d.Surface,
+    ) !void {
+        const scroll_device = scroll_model.scaleCssPx(task.scroll, task.zoom);
+        var context = z2d.Context.init(self.io, task.allocator, root);
+        defer context.deinit();
+
+        for (self.worker_compositor_cache.planes.items) |*plane| {
+            const translated_x = DisplayItem.scaleLayoutPx(plane.translate_x, task.zoom);
+            const translated_y = DisplayItem.scaleLayoutPx(plane.translate_y, task.zoom);
+            if (plane.surface) |*surface| {
+                compositor_cache.compositeWithOpacity(
+                    root,
+                    surface,
+                    plane.bounds.left + translated_x,
+                    task.chrome_bottom + plane.bounds.top - scroll_device + translated_y,
+                    plane.opacity,
+                );
+                continue;
+            }
+
+            const commands = if (plane.direct_commands) |*value|
+                value
+            else
+                return error.InvalidWorkerPlaneState;
+            const scroll_offset_i64 = @as(i64, scroll_device) -
+                @as(i64, task.chrome_bottom) - @as(i64, translated_y);
+            const scroll_offset: i32 = @intCast(std.math.clamp(
+                scroll_offset_i64,
+                @as(i64, std.math.minInt(i32)),
+                @as(i64, std.math.maxInt(i32)),
+            ));
+            for (commands.items) |item| {
+                try self.drawWorkerDirectItem(
+                    &context,
+                    item,
+                    plane.compositor_id,
+                    plane.opacity,
+                    scroll_offset,
+                    translated_x,
+                    task.zoom,
+                );
+            }
+        }
+    }
+
+    fn drawWorkerDirectItem(
+        self: *Browser,
+        context: *z2d.Context,
+        item: DisplayItem,
+        plane_compositor_id: ?usize,
+        inherited_opacity: f64,
+        scroll_offset: i32,
+        x_offset: i32,
+        zoom: f32,
+    ) !void {
+        switch (item) {
+            .transform => |transform| {
+                const is_plane_transform = if (plane_compositor_id) |id|
+                    transform.composited and transform.compositor_id == id
+                else
+                    false;
+                const child_scroll = if (is_plane_transform)
+                    scroll_offset
+                else
+                    scroll_offset - DisplayItem.scaleLayoutPx(transform.translate_y, zoom);
+                const child_x = if (is_plane_transform)
+                    x_offset
+                else
+                    x_offset + DisplayItem.scaleLayoutPx(transform.translate_x, zoom);
+                for (transform.children) |child| {
+                    try self.drawWorkerDirectItem(
+                        context,
+                        child,
+                        plane_compositor_id,
+                        inherited_opacity,
+                        child_scroll,
+                        child_x,
+                        zoom,
+                    );
+                }
+            },
+            .blend => |blend| {
+                const is_plane_blend = if (plane_compositor_id) |id|
+                    blend.compositor_id == id
+                else
+                    false;
+                const child_opacity = if (is_plane_blend)
+                    inherited_opacity
+                else
+                    inherited_opacity * blend.opacity;
+                for (blend.children) |child| {
+                    try self.drawWorkerDirectItem(
+                        context,
+                        child,
+                        plane_compositor_id,
+                        child_opacity,
+                        scroll_offset,
+                        x_offset,
+                        zoom,
+                    );
+                }
+            },
+            .rect, .rounded_rect, .line, .outline => {
+                const opacity = std.math.clamp(inherited_opacity, 0.0, 1.0);
+                var modified = self.applyOpacityToDisplayItem(item, opacity);
+                premultiplyDirectCommandColor(&modified);
+                try self.drawDisplayItemZ2dContextWithTransform(
+                    context,
+                    modified,
+                    scroll_offset,
+                    x_offset,
+                    zoom,
+                );
+            },
+            else => return error.UnsupportedDirectDisplayItem,
+        }
+    }
+
+    fn premultiplyDirectCommandColor(item: *DisplayItem) void {
+        const color = switch (item.*) {
+            .rect => |payload| payload.color,
+            .rounded_rect => |payload| payload.color,
+            .line => |payload| payload.color,
+            .outline => |payload| payload.color,
+            else => return,
+        };
+        const premultiplied = color.toZ2dRgba().multiply();
+        const replacement = Color{
+            .r = premultiplied.r,
+            .g = premultiplied.g,
+            .b = premultiplied.b,
+            .a = premultiplied.a,
+        };
+        switch (item.*) {
+            .rect => |*payload| payload.color = replacement,
+            .rounded_rect => |*payload| payload.color = replacement,
+            .line => |*payload| payload.color = replacement,
+            .outline => |*payload| payload.color = replacement,
+            else => unreachable,
+        }
     }
 
     fn drawItemsIntoWorkerPlane(
@@ -7430,6 +7645,68 @@ test "worker compositor cache accepts representable planes and rejects nested ef
         } },
     };
     try std.testing.expect(!Browser.workerCacheSupportsCompositorId(&masked, plane_id));
+}
+
+test "direct worker commands preserve plane transform and opacity at draw time" {
+    const allocator = std.testing.allocator;
+    var surface = try z2d.Surface.init(.image_surface_rgba, allocator, 8, 8);
+    defer surface.deinit(allocator);
+    const pixels = switch (surface) {
+        .image_surface_rgba => |*image_surface| image_surface.buf,
+        else => unreachable,
+    };
+    @memset(pixels, .{ .r = 255, .g = 255, .b = 255, .a = 255 });
+
+    var rect_children = [_]DisplayItem{.{ .rect = .{
+        .x1 = 1,
+        .y1 = 1,
+        .x2 = 4,
+        .y2 = 4,
+        .color = .{ .r = 255, .g = 0, .b = 0 },
+    } }};
+    const compositor_id: usize = 41;
+    var blend_children = [_]DisplayItem{.{ .blend = .{
+        .opacity = 0.25,
+        .blend_mode = null,
+        .children = &rect_children,
+        .needs_compositing = true,
+        .compositor_id = compositor_id,
+    } }};
+    const item = DisplayItem{ .transform = .{
+        .translate_x = 2,
+        .translate_y = 1,
+        .children = &blend_children,
+        .composited = true,
+        .compositor_id = compositor_id,
+    } };
+
+    var context = z2d.Context.init(std.testing.io, allocator, &surface);
+    defer context.deinit();
+    var browser: Browser = undefined;
+    // The plane's current scalars replace the stale values retained inside
+    // the command tree. scroll=-1 and x=2 place the rectangle at (3, 2).
+    try browser.drawWorkerDirectItem(
+        &context,
+        item,
+        compositor_id,
+        0.5,
+        -1,
+        2,
+        1.0,
+    );
+
+    const width: usize = 8;
+    const untouched = pixels[1 * width + 1];
+    const painted = pixels[2 * width + 3];
+    try std.testing.expectEqual(z2d.pixel.RGBA{
+        .r = 255,
+        .g = 255,
+        .b = 255,
+        .a = 255,
+    }, untouched);
+    try std.testing.expectEqual(@as(u8, 255), painted.r);
+    try std.testing.expect(painted.g >= 126 and painted.g <= 129);
+    try std.testing.expect(painted.b >= 126 and painted.b <= 129);
 }
 
 const BrowserTaskContexts = tab_tasks.Contexts(Browser);

@@ -49,7 +49,7 @@ The source tree is organized by responsibility:
 | [`src/browser/render/display_list.zig`](../src/browser/render/display_list.zig) | Display-command and composited-layer data, recursive ownership cleanup, provenance, and painted hit testing without Browser or SDL dependencies. |
 | [`src/browser/render/effects.zig`](../src/browser/render/effects.zig) | Pixel-level software effects such as premultiplied-RGBA Gaussian blur. |
 | [`src/browser/render/raster_snapshot.zig`](../src/browser/render/raster_snapshot.zig) | Deep-owned, provenance-free display generations transferred to the raster worker. |
-| [`src/browser/render/compositor_cache.zig`](../src/browser/render/compositor_cache.zig) | Raster-worker-owned ordered planes and pointer-free opacity/translation updates used by draw-only animation and scrolling. |
+| [`src/browser/render/compositor_cache.zig`](../src/browser/render/compositor_cache.zig) | Raster-worker-owned ordered planes, surface-or-short-command backing, and pointer-free opacity/translation updates used by draw-only animation and scrolling. |
 | [`src/document/parser.zig`](../src/document/parser.zig) | HTML parser, DOM representation, style maps, images, and DOM tree utilities. |
 | [`src/document/inspection.zig`](../src/document/inspection.zig) | Browser-free fetch/decode/parse/style pipeline for document inspection commands. |
 | [`src/document/css_parser.zig`](../src/document/css_parser.zig) | CSS parsing and `CSSRule` ownership. |
@@ -589,23 +589,31 @@ region no taller than four native window heights, with one viewport of
 scroll-back headroom where page bounds permit. Without separable effects,
 raster translates page commands by that region's page-space start and publishes
 the coordinates only after all fallible drawing succeeds. With top-level
-composited opacity or translation effects, static strata are transparent
-surfaces cropped to their painted intersection with the interest region, and
-each animated subtree is rasterized once into its own plane. Static strata may
+composited opacity or translation effects, static strata become ordered planes
+cropped to their painted intersection with the interest region, and each
+animated subtree gets its own plane. A plane with at most three cheap
+rect/rounded-rect/line/outline leaves owns a separate pointer-free
+`RasterSnapshot` instead of an RGBA surface. Its raster phase is a no-op; final
+draw replays those commands in plane order with the current scalar opacity and
+translation. Glyphs, images, blur, blend modes, and multi-command grouped
+opacity remain surface-backed because replay would be expensive or would
+change group semantics. Static strata may
 merge backward across stable dynamic planes when their tight painted bounds are
 disjoint. A merge is rejected when its union would exceed 1,048,576 device
 pixels (about four MiB of RGBA storage), preventing far-apart chunks from
 creating a mostly transparent allocation; an intrinsically larger single chunk
-is still rasterized. Surface expansion is transactional, so allocation or draw
-failure leaves the prior plane generation intact. An active transform instead
+is still rasterized. A short-plane merge either installs another independently
+owned short snapshot or transactionally promotes the combined commands to a
+surface. Surface expansion and promotion leave the prior plane generation
+intact on allocation or draw failure. An active transform instead
 enters assume-overlap mode for the raster generation: every later stratum stays
 after that plane even when its initial bounds are disjoint, because a later
 scalar translation can make them overlap. This conservative barrier preserves
 CSS paint order without repeating overlap testing, compositing, or raster on
 every animation frame. Later pointer-free scalar updates change plane
-opacity/translation; the worker assembles those planes beneath chrome without
-rerastering their pixels. Complex masks or unsupported nesting deliberately
-use the assembled surface fallback.
+opacity/translation; the worker assembles surface planes and replays short
+planes beneath chrome without rerastering their pixels. Complex masks or
+unsupported nesting deliberately use the assembled surface fallback.
 
 Final software draw moves cached page pixels by `region_start - root_scroll`
 beneath chrome. z2d has no public `clipRect`, so final composition slices source

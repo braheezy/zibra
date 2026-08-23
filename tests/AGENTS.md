@@ -203,6 +203,10 @@ chunks by roughly 1800px around a composited effect. Raster-worker inspection
 must show separate tightly cropped surfaces instead of one sparse page-height
 plane, while both endpoints remain visually correct when scrolling.
 
+`tests/manual/short-composited-layers.html` compares a surface-free animated
+solid-color plane with a glyph-bearing surface-backed plane. Both must preserve
+opacity, translation, paint order, and draw-only scrolling without ghosting.
+
 `tests/manual/threaded-loading.html` combines two external scripts and two
 same-specificity stylesheets. Run its adjacent threaded Python server to give
 each response equal latency: all four requests start together while the visible
