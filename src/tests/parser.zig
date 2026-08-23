@@ -1351,6 +1351,35 @@ test "display defaults to inline and browser rules define block elements" {
     );
 }
 
+test "position and z-index are computed non-inherited properties" {
+    const allocator = std.testing.allocator;
+    const html =
+        "<div style=\"z-index: 99\">" ++
+        "<span style=\"position: relative; z-index: -4\">nested</span>" ++
+        "<p>default</p></div>";
+
+    var html_parser = try HTMLParser.init(allocator, html);
+    html_parser.use_implicit_tags = false;
+    defer html_parser.deinit(allocator);
+    var root = try html_parser.parse();
+    defer root.deinit(allocator);
+
+    try document_parser.style(allocator, &root, &.{});
+    const positioned = &root.element.children.items[0].element;
+    const defaulted = &root.element.children.items[1].element;
+
+    try std.testing.expectEqualStrings("static", root.element.style.?.getPtr("position").?.get().*);
+    try std.testing.expectEqualStrings("99", root.element.style.?.getPtr("z-index").?.get().*);
+    try std.testing.expectEqualStrings("relative", positioned.style.?.getPtr("position").?.get().*);
+    try std.testing.expectEqualStrings("-4", positioned.style.?.getPtr("z-index").?.get().*);
+    try std.testing.expectEqualStrings("static", defaulted.style.?.getPtr("position").?.get().*);
+    try std.testing.expectEqualStrings("0", defaulted.style.?.getPtr("z-index").?.get().*);
+    try std.testing.expectEqualStrings(
+        "0",
+        positioned.children.items[0].text.style.?.getPtr("z-index").?.get().*,
+    );
+}
+
 test "nested button start tags implicitly close the outer button" {
     const allocator = std.testing.allocator;
     const html =

@@ -132,6 +132,10 @@ through nested translations, reverse-order overlapping siblings, and clipped
 element scrolling. Its visible counters distinguish the visual target from an
 element's old untransformed or unscrolled box.
 
+`tests/manual/z-index.html` exercises positioned signed z-index ordering,
+stable DOM-order ties, the static-position gate, and recursive nested sibling
+stacking. Visible counters verify that reverse hit testing follows paint order.
+
 `tests/manual/interest-region.html` is a deliberately long, color-banded page
 for crossing and reversing over tab raster-cache boundaries. Scrolling and
 resizing must remain continuous while the cached surface stays bounded to four

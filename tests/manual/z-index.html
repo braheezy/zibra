@@ -1,0 +1,75 @@
+<!--
+How to verify:
+1. In the first overlap, click the orange/gray intersection and then exposed
+   gray. The earlier orange z=5 box wins the intersection; gray still receives
+   its exposed click.
+2. In the static-gate overlap, the earlier green positioned z=1 box wins over
+   the later gray static z=999 box. Static elements ignore z-index.
+3. In the nested overlap, the earlier purple nested z=8 child wins over its
+   later gray z=1 sibling. Each click increments exactly the named counter.
+-->
+<!doctype html>
+<html>
+<head>
+  <title>Z-index paint and hit order</title>
+  <style>
+    body { background-color: white; color: black; font-size: 18px; }
+    .status { background-color: lightblue; }
+    .box { width: 250px; height: 72px; }
+    .highEarlier { position: relative; z-index: 5; background-color: orange; }
+    .lowLater { position: relative; z-index: 1; background-color: gray; transform: translate(55px, -54px); }
+    .positionedEarlier { position: relative; z-index: 1; background-color: lightgreen; }
+    .staticLater { z-index: 999; background-color: gray; transform: translate(55px, -54px); }
+    .nestedParent { width: 300px; height: 130px; background-color: lightblue; }
+    .nestedHigh { position: relative; z-index: 8; width: 210px; height: 65px; background-color: purple; color: white; }
+    .nestedLow { position: relative; z-index: 1; width: 180px; height: 55px; background-color: gray; transform: translate(45px, -48px); }
+  </style>
+</head>
+<body>
+  <h1>Z-index paint and hit order</h1>
+  <p id="status" class="status">high=0, low=0, positioned=0, static=0, nestedHigh=0, nestedLow=0</p>
+
+  <h2>Earlier high z-index beats later low z-index</h2>
+  <div id="high" class="box highEarlier">earlier orange z=5</div>
+  <div id="low" class="box lowLater">later gray z=1</div>
+
+  <h2>Static ignores z-index</h2>
+  <div id="positioned" class="box positionedEarlier">earlier green positioned z=1</div>
+  <div id="staticBox" class="box staticLater">later gray static z=999 (ignored)</div>
+
+  <h2>Nested sibling z-index</h2>
+  <div class="nestedParent">
+    <div id="nestedHigh" class="nestedHigh">earlier purple nested z=8</div>
+    <div id="nestedLow" class="nestedLow">later gray nested z=1</div>
+  </div>
+
+  <script>
+    var highClicks = 0;
+    var lowClicks = 0;
+    var positionedClicks = 0;
+    var staticClicks = 0;
+    var nestedHighClicks = 0;
+    var nestedLowClicks = 0;
+
+    function showCounts() {
+      status.innerHTML = 'high=' + highClicks + ', low=' + lowClicks +
+        ', positioned=' + positionedClicks + ', static=' + staticClicks +
+        ', nestedHigh=' + nestedHighClicks + ', nestedLow=' + nestedLowClicks;
+    }
+    high.addEventListener('click', function() { highClicks = highClicks + 1; showCounts(); });
+    low.addEventListener('click', function() { lowClicks = lowClicks + 1; showCounts(); });
+    positioned.addEventListener('click', function() { positionedClicks = positionedClicks + 1; showCounts(); });
+    staticBox.addEventListener('click', function() { staticClicks = staticClicks + 1; showCounts(); });
+    nestedHigh.addEventListener('click', function(event) {
+      nestedHighClicks = nestedHighClicks + 1;
+      event.stopPropagation();
+      showCounts();
+    });
+    nestedLow.addEventListener('click', function(event) {
+      nestedLowClicks = nestedLowClicks + 1;
+      event.stopPropagation();
+      showCounts();
+    });
+  </script>
+</body>
+</html>

@@ -1853,6 +1853,26 @@ fn blockHitScrollY(block: *const BlockLayout) i32 {
     return if (element.scroll_container) @max(element.scroll_y, 0) else 0;
 }
 
+/// The exercise's simplified stacking model honors signed integer z-index
+/// only for positioned elements. Invalid values and static elements stay in
+/// the default zero layer.
+fn blockPaintZIndex(block: *const BlockLayout) i32 {
+    const element = liveBlockElement(block) orelse return 0;
+    const styles = if (element.style) |*value| value else return 0;
+    const position = std.mem.trim(
+        u8,
+        styleValue(styles, "position") orelse "static",
+        " \t\r\n",
+    );
+    if (std.ascii.eqlIgnoreCase(position, "static")) return 0;
+    const z_index = std.mem.trim(
+        u8,
+        styleValue(styles, "z-index") orelse "0",
+        " \t\r\n",
+    );
+    return std.fmt.parseInt(i32, z_index, 10) catch 0;
+}
+
 fn applyNodeStyles(self: *Layout, element: parser.Element, _: *std.ArrayList(LineItem)) !void {
     // Save current style state including transform offsets
     const snapshot = StyleSnapshot{
@@ -3419,8 +3439,9 @@ const ButtonLayout = struct {
         for (root.display_list.items) |item| {
             try appendClonedDisplayItem(self.embed.allocator, &self.commands, item);
         }
-        for (root.children.items) |child| {
-            switch (child) {
+        try root.refreshPaintOrder();
+        for (root.paint_order.items) |document_index| {
+            switch (root.children.items[document_index]) {
                 .block => |block| try paintBlockTreeRecursive(&self.commands, engine, block),
                 .line => |line| try line.paintToList(&self.commands, engine),
             }
@@ -4663,6 +4684,26 @@ const LayoutChild = union(enum) {
     }
 };
 
+const LayoutChildPaintKey = struct {
+    z_index: i32,
+    document_index: usize,
+};
+
+fn layoutChildPaintKey(child: LayoutChild, document_index: usize) LayoutChildPaintKey {
+    return .{
+        .z_index = switch (child) {
+            .block => |block| blockPaintZIndex(block),
+            .line => 0,
+        },
+        .document_index = document_index,
+    };
+}
+
+fn paintKeyBefore(left: LayoutChildPaintKey, right: LayoutChildPaintKey) bool {
+    if (left.z_index != right.z_index) return left.z_index < right.z_index;
+    return left.document_index < right.document_index;
+}
+
 const BlockLayout = struct {
     allocator: std.mem.Allocator,
     node: Node,
@@ -4688,6 +4729,9 @@ const BlockLayout = struct {
     children_version: ProtectedField(u64),
 
     children: std.ArrayList(LayoutChild),
+    /// DOM-index permutation captured at the last paint. Retaining it keeps
+    /// structural hit queries aligned with that exact display generation.
+    paint_order: std.ArrayList(usize),
     display_list: std.ArrayList(DisplayItem),
     cursor_x: i32 = 0,
     has_dirty_descendants: bool = false,
@@ -4721,6 +4765,7 @@ const BlockLayout = struct {
             .width = ProtectedField(i32).init(allocator, 0),
             .height = ProtectedField(i32).init(allocator, 0),
             .children = std.ArrayList(LayoutChild).empty,
+            .paint_order = std.ArrayList(usize).empty,
             .display_list = std.ArrayList(DisplayItem).empty,
             .embedded_box = null,
             .rich_button_root = false,
@@ -4888,6 +4933,7 @@ const BlockLayout = struct {
             child.deinit(self.allocator);
         }
         self.children.deinit(self.allocator);
+        self.paint_order.deinit(self.allocator);
         if (self.inline_nodes) |nodes| self.allocator.free(nodes);
         DisplayItem.freeItems(self.allocator, self.display_list.items);
         self.display_list.deinit(self.allocator);
@@ -4951,6 +4997,22 @@ const BlockLayout = struct {
 
     fn appendChild(self: *BlockLayout, child: LayoutChild) !void {
         try self.children.append(self.allocator, child);
+    }
+
+    fn refreshPaintOrder(self: *BlockLayout) !void {
+        try self.paint_order.ensureTotalCapacity(self.allocator, self.children.items.len);
+        self.paint_order.clearRetainingCapacity();
+        for (0..self.children.items.len) |document_index| {
+            self.paint_order.appendAssumeCapacity(document_index);
+        }
+        std.mem.sort(usize, self.paint_order.items, self.children.items, struct {
+            fn lessThan(children: []const LayoutChild, left: usize, right: usize) bool {
+                return paintKeyBefore(
+                    layoutChildPaintKey(children[left], left),
+                    layoutChildPaintKey(children[right], right),
+                );
+            }
+        }.lessThan);
     }
 
     // Create a new line for inline content
@@ -5236,10 +5298,21 @@ const BlockLayout = struct {
         // local point back into the unscrolled content space before descending.
         const content_point = addHitOffset(local, 0, blockHitScrollY(self));
         const origin = HitPoint{ .x = self.x.get().*, .y = self.y.get().* };
-        var index = self.children.items.len;
-        while (index > 0) {
-            index -= 1;
-            if (self.children.items[index].hitTest(content_point, origin)) |hit| return hit;
+        if (self.paint_order.items.len == self.children.items.len) {
+            var order_index = self.paint_order.items.len;
+            while (order_index > 0) {
+                order_index -= 1;
+                const document_index = self.paint_order.items[order_index];
+                if (self.children.items[document_index].hitTest(content_point, origin)) |hit| return hit;
+            }
+        } else {
+            // Before the first paint there is no committed stack snapshot.
+            // DOM reverse order is the zero-layer fallback.
+            var document_index = self.children.items.len;
+            while (document_index > 0) {
+                document_index -= 1;
+                if (self.children.items[document_index].hitTest(content_point, origin)) |hit| return hit;
+            }
         }
 
         // Inline-mode blocks still use the legacy inline formatter and do not
@@ -5462,6 +5535,134 @@ test "layout hit testing localizes line and text children" {
     try std.testing.expect(hit.node == &span_node);
     try std.testing.expectEqual(@as(i32, 5), hit.local_x);
     try std.testing.expectEqual(@as(i32, 3), hit.local_y);
+}
+
+test "z-index paint order is positioned stable and recursive" {
+    const allocator = std.testing.allocator;
+
+    var root_node = Node{ .element = try parser.Element.init(allocator, "html", null) };
+    defer root_node.deinit(allocator);
+    var high_first_node = Node{ .element = try parser.Element.init(allocator, "div", null) };
+    defer high_first_node.deinit(allocator);
+    try setTestStyleValue(allocator, &high_first_node, "position", "relative");
+    try setTestStyleValue(allocator, &high_first_node, "z-index", "5");
+    var static_high_node = Node{ .element = try parser.Element.init(allocator, "div", null) };
+    defer static_high_node.deinit(allocator);
+    try setTestStyleValue(allocator, &static_high_node, "z-index", "999");
+    var negative_node = Node{ .element = try parser.Element.init(allocator, "div", null) };
+    defer negative_node.deinit(allocator);
+    try setTestStyleValue(allocator, &negative_node, "position", "relative");
+    try setTestStyleValue(allocator, &negative_node, "z-index", "-2");
+    var high_later_node = Node{ .element = try parser.Element.init(allocator, "div", null) };
+    defer high_later_node.deinit(allocator);
+    try setTestStyleValue(allocator, &high_later_node, "position", "absolute");
+    try setTestStyleValue(allocator, &high_later_node, "z-index", "5");
+    var nested_high_node = Node{ .element = try parser.Element.init(allocator, "button", null) };
+    defer nested_high_node.deinit(allocator);
+    try setTestStyleValue(allocator, &nested_high_node, "position", "relative");
+    try setTestStyleValue(allocator, &nested_high_node, "z-index", "8");
+    var nested_later_node = Node{ .element = try parser.Element.init(allocator, "button", null) };
+    defer nested_later_node.deinit(allocator);
+    try setTestStyleValue(allocator, &nested_later_node, "position", "relative");
+    try setTestStyleValue(allocator, &nested_later_node, "z-index", "1");
+
+    const document = try DocumentLayout.init(allocator, &root_node);
+    defer {
+        document.deinit();
+        allocator.destroy(document);
+    }
+    setTestLayoutBox(document, 10, 20, 500, 500);
+    const root = try BlockLayout.init(allocator, root_node, &root_node, document, null, null);
+    try document.children.append(allocator, root);
+    setTestLayoutBox(root, 10, 20, 400, 400);
+
+    const high_first = try BlockLayout.init(
+        allocator,
+        high_first_node,
+        &high_first_node,
+        document,
+        root,
+        null,
+    );
+    try root.children.append(allocator, .{ .block = high_first });
+    const static_high = try BlockLayout.init(
+        allocator,
+        static_high_node,
+        &static_high_node,
+        document,
+        root,
+        high_first,
+    );
+    try root.children.append(allocator, .{ .block = static_high });
+    const negative = try BlockLayout.init(
+        allocator,
+        negative_node,
+        &negative_node,
+        document,
+        root,
+        static_high,
+    );
+    try root.children.append(allocator, .{ .block = negative });
+    const high_later = try BlockLayout.init(
+        allocator,
+        high_later_node,
+        &high_later_node,
+        document,
+        root,
+        negative,
+    );
+    try root.children.append(allocator, .{ .block = high_later });
+
+    try root.refreshPaintOrder();
+    const expected_forward = [_]*Node{
+        &negative_node,
+        &static_high_node,
+        &high_first_node,
+        &high_later_node,
+    };
+    for (root.paint_order.items, expected_forward) |document_index, expected_node| {
+        try std.testing.expect(root.children.items[document_index].block.node_ptr.? == expected_node);
+    }
+
+    setTestLayoutBox(high_first, 30, 50, 100, 100);
+    setTestLayoutBox(static_high, 30, 50, 100, 100);
+    setTestLayoutBox(negative, 30, 50, 100, 100);
+    setTestLayoutBox(high_later, 30, 50, 100, 100);
+    try std.testing.expect(document.hitTest(35, 55).?.node == &high_later_node);
+
+    const nested_high = try BlockLayout.init(
+        allocator,
+        nested_high_node,
+        &nested_high_node,
+        document,
+        high_first,
+        null,
+    );
+    try high_first.children.append(allocator, .{ .block = nested_high });
+    const nested_later = try BlockLayout.init(
+        allocator,
+        nested_later_node,
+        &nested_later_node,
+        document,
+        high_first,
+        nested_high,
+    );
+    try high_first.children.append(allocator, .{ .block = nested_later });
+
+    try high_first.refreshPaintOrder();
+    try std.testing.expect(
+        high_first.children.items[high_first.paint_order.items[0]].block.node_ptr.? == &nested_later_node,
+    );
+    try std.testing.expect(
+        high_first.children.items[high_first.paint_order.items[1]].block.node_ptr.? == &nested_high_node,
+    );
+
+    setTestLayoutBox(static_high, 250, 250, 20, 20);
+    setTestLayoutBox(negative, 250, 250, 20, 20);
+    setTestLayoutBox(high_later, 250, 250, 20, 20);
+    setTestLayoutBox(nested_high, 40, 60, 30, 30);
+    setTestLayoutBox(nested_later, 40, 60, 30, 30);
+    try std.testing.expect(document.hitTest(45, 65).?.node == &nested_high_node);
 }
 
 test "block display provenance rejects fragments outside its DOM origin" {
@@ -5953,9 +6154,11 @@ fn paintBlockTree(self: *Layout, block: *BlockLayout) !void {
     }
     try appendListMarker(self, &commands, block);
 
-    // Recursively paint children
-    for (block.children.items) |child| {
-        switch (child) {
+    // Recursively paint children in stable ascending stack order. Layout and
+    // DOM storage remain untouched; reverse hit testing uses the same keys.
+    try block.refreshPaintOrder();
+    for (block.paint_order.items) |document_index| {
+        switch (block.children.items[document_index]) {
             .block => |b| try paintBlockTreeRecursive(&commands, self, b),
             .line => |l| try l.paintToList(&commands, self),
         }
@@ -6067,9 +6270,11 @@ fn paintBlockTreeRecursive(commands: *std.ArrayList(DisplayItem), self: *Layout,
     }
     try appendListMarker(self, &block_commands, block);
 
-    // Recursively paint children - collect their commands
-    for (block.children.items) |child| {
-        switch (child) {
+    // Recursively paint children - collect their commands in stable stack
+    // order without mutating their geometry/DOM order.
+    try block.refreshPaintOrder();
+    for (block.paint_order.items) |document_index| {
+        switch (block.children.items[document_index]) {
             .block => |b| try paintBlockTreeRecursive(&block_commands, self, b),
             .line => |l| try l.paintToList(&block_commands, self),
         }

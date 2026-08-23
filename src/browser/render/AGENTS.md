@@ -13,6 +13,12 @@ before changing ownership or thread boundaries.
   descending. Inline-mode blocks retain an exact painted-command leaf fallback
   until they gain persistent line/text children. Do not reconstruct an
   absolute rectangle for every descendant.
+  Immediate layout children paint through a retained stable index permutation
+  keyed by effective z-index and DOM index. Only positioned blocks receive a
+  nonzero signed z-index; lines and static/invalid blocks stay at zero. Recurse
+  with the same rule for nested stacking, and use its reverse order for layout
+  hit queries so visual and interaction order cannot diverge. Refresh the
+  permutation at paint and retain it with that display generation.
   Active width/height transitions override their computed pixel endpoints here;
   every frame relayouts descendants so line wrapping follows animated width.
   Document/block/line `in_layout` guards suppress only reentrant owner-wide

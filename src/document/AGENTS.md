@@ -117,6 +117,9 @@ or selector/rule lifetime.
   filter functions and chains have no effect.
 - `display` is non-inherited and defaults to `inline`. HTML block defaults live
   in the user-agent stylesheet; layout reads the borrowed computed value.
+- `position` and `z-index` are non-inherited and default to `static` and `0`.
+  The layout painter accepts signed integer z-index values only when position
+  is non-static; invalid values retain the zero paint layer.
 - Keep parser output deterministic: the `--dump-dom` golden test is the first
   inspection contract for this pipeline stage.
 

@@ -302,7 +302,9 @@ before changing `root.zig`, `tab.zig`, `render/`, or browser task scheduling.
   apply element scroll at the owning block, and visit later siblings first
   instead of rebuilding per-object absolute rectangles. Keep this query on the
   serialized tab worker; UI-thread accessibility continues to consume its
-  committed bounds snapshot. A primary hit
+  committed bounds snapshot. Positioned siblings use signed z-index followed
+  by DOM index for both paint and reverse hit order; static elements remain in
+  layer zero even when they declare z-index. A primary hit
   dispatches one click at the painted element and bubbles through its
   snapshotted DOM ancestry, even when no native control owns a default action;
   iframe events stay inside the child document. Resolve link/input/button

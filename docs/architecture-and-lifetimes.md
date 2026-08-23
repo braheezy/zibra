@@ -583,6 +583,19 @@ continues to consume its committed root-relative bounds snapshot rather than
 borrowing a concurrently rebuilt layout graph. Neither hit-test path rebuilds
 every descendant's absolute bounds.
 
+Block painting preserves layout and DOM storage order but visits immediate
+children through a retained stable permutation of their DOM indices. A non-static
+positioned block receives its parsed signed integer `z-index`; static blocks,
+lines, missing values, and invalid values use zero. Ascending `(z-index, DOM
+index)` order drives paint, and the exact reverse drives structural hit testing,
+so ties retain source order and the visual topmost child is queried first. The
+permutation refreshes at paint and stays with that retained layout/display
+generation; input never sorts or allocates. Each child subtree applies the
+same rule recursively. The subtree remains grouped
+under its parent's transform, opacity, blur, clip, and scroll wrappers, making
+nested z-index local to that parent rather than detaching commands from their
+effect and lifetime owners.
+
 Layout-derived link and iframe bounds no longer decide click targets. Focus,
 accessibility, and fragment bounds retain their existing roles.
 
