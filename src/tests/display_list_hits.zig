@@ -303,6 +303,152 @@ test "composited opacity updates transformed retained and flattened layer lists"
     try std.testing.expectEqual(@as(f64, 0.0), transformed_children[0].blend.opacity);
 }
 
+test "composited transform updates only the CSS transform wrapper" {
+    var owner: u8 = 0;
+    var primitive = [_]DisplayItem{rect(0, 0, 20, 20, null)};
+    var css_transform = [_]DisplayItem{.{ .transform = .{
+        .translate_x = 0,
+        .translate_y = 0,
+        .children = &primitive,
+        .node = @ptrCast(&owner),
+        .composited = true,
+    } }};
+    var items = [_]DisplayItem{.{ .transform = .{
+        .translate_x = 0,
+        .translate_y = -30,
+        .children = &css_transform,
+        .node = @ptrCast(&owner),
+    } }};
+
+    try std.testing.expect(DisplayItem.applyCompositedTransform(
+        &items,
+        @ptrCast(&owner),
+        80,
+        25,
+    ));
+    try std.testing.expectEqual(@as(i32, -30), items[0].transform.translate_y);
+    try std.testing.expectEqual(@as(i32, 80), items[0].transform.children[0].transform.translate_x);
+    try std.testing.expectEqual(@as(i32, 25), items[0].transform.children[0].transform.translate_y);
+}
+
+test "simultaneous transform and opacity commit is draw-only" {
+    const allocator = std.testing.allocator;
+    var owner: u8 = 0;
+    const primitive = try allocator.alloc(DisplayItem, 1);
+    primitive[0] = rect(0, 0, 20, 20, null);
+    const opacity_group = try allocator.alloc(DisplayItem, 1);
+    opacity_group[0] = .{ .blend = .{
+        .opacity = 1.0,
+        .blend_mode = null,
+        .children = primitive,
+        .node = @ptrCast(&owner),
+        .needs_compositing = true,
+        .compositor_id = @intFromPtr(&owner),
+    } };
+    const display_list = try allocator.alloc(DisplayItem, 1);
+    display_list[0] = .{ .transform = .{
+        .translate_x = 0,
+        .translate_y = 0,
+        .children = opacity_group,
+        .node = @ptrCast(&owner),
+        .composited = true,
+        .compositor_id = @intFromPtr(&owner),
+    } };
+    defer DisplayItem.freeList(allocator, display_list);
+
+    var tab: tab_module.Tab = undefined;
+    var test_browser: browser.Browser = undefined;
+    test_browser.allocator = allocator;
+    test_browser.io = std.testing.io;
+    test_browser.lock = .init(std.testing.io);
+    test_browser.tabs = .empty;
+    defer test_browser.tabs.deinit(allocator);
+    try test_browser.tabs.append(allocator, &tab);
+    test_browser.active_tab_index = 0;
+    test_browser.active_tab_display_list = display_list;
+    test_browser.pending_composited_updates = .empty;
+    defer test_browser.pending_composited_updates.deinit(allocator);
+    test_browser.active_tab_url = null;
+    test_browser.active_tab_committed_url = null;
+    test_browser.active_tab_committed_security = .none;
+    test_browser.active_tab_scroll = 0;
+    test_browser.active_tab_height = 100;
+    test_browser.active_tab_zoom = 1.0;
+    test_browser.active_tab_prefers_dark = false;
+    test_browser.needs_composite = false;
+    test_browser.needs_raster = false;
+    test_browser.needs_draw = false;
+
+    const updates = [_]tab_module.CompositedUpdate{
+        .{ .node = @ptrCast(&owner), .value = .{ .transform = .{ .x = 70, .y = 15 } } },
+        .{ .node = @ptrCast(&owner), .value = .{ .opacity = 0.4 } },
+    };
+    test_browser.commit(&tab, .{
+        .url = null,
+        .display_list = null,
+        .scroll = null,
+        .height = 100,
+        .zoom = 1.0,
+        .prefers_dark = false,
+        .composited_updates = &updates,
+    });
+
+    // Prevent the manual ownership defer above from racing Browser ownership;
+    // this minimal test Browser is not deinitialized.
+    test_browser.active_tab_display_list = null;
+    try std.testing.expect(!test_browser.needs_composite);
+    try std.testing.expect(!test_browser.needs_raster);
+    try std.testing.expect(test_browser.needs_draw);
+    try std.testing.expectEqual(@as(usize, 2), test_browser.pending_composited_updates.items.len);
+    try std.testing.expectEqual(@as(i32, 70), display_list[0].transform.translate_x);
+    try std.testing.expectEqual(@as(i32, 15), display_list[0].transform.translate_y);
+    try std.testing.expectApproxEqAbs(@as(f64, 0.4), display_list[0].transform.children[0].blend.opacity, 0.000001);
+}
+
+test "root scrolling inside the interest region is draw-only" {
+    const allocator = std.testing.allocator;
+    var tab: tab_module.Tab = undefined;
+    var frame: tab_module.Frame = undefined;
+    frame.scroll = 0;
+    frame.content_height = 5000;
+    frame.viewport_height = 534;
+    tab.root_frame = &frame;
+    tab.focused_frame = null;
+    tab.tab_height = 534;
+    tab.accessibility.zoom = 1.0;
+
+    var test_browser: browser.Browser = undefined;
+    test_browser.allocator = allocator;
+    test_browser.io = std.testing.io;
+    test_browser.lock = .init(std.testing.io);
+    test_browser.tabs = .empty;
+    defer test_browser.tabs.deinit(allocator);
+    try test_browser.tabs.append(allocator, &tab);
+    test_browser.active_tab_index = 0;
+    test_browser.active_tab_scroll = 0;
+    test_browser.active_tab_height = 5000;
+    test_browser.active_tab_zoom = 1.0;
+    test_browser.window_height = 600;
+    test_browser.chrome.bottom = 66;
+    test_browser.tab_interest_region = .{ .start_px = 0, .height_px = 2400 };
+    test_browser.tab_interest_region_valid = true;
+    test_browser.needs_composite = false;
+    test_browser.needs_raster = false;
+    test_browser.needs_draw = false;
+    test_browser.needs_animation_frame = false;
+    test_browser.animation_timer_active = false;
+    test_browser.animation_timer_generation = 0;
+    test_browser.animation_frame_deadline_ns = null;
+    test_browser.shutting_down = true;
+
+    test_browser.handleScroll(100);
+    try std.testing.expectEqual(@as(i32, 100), frame.scroll);
+    try std.testing.expectEqual(@as(i32, 100), test_browser.active_tab_scroll);
+    try std.testing.expect(!test_browser.needs_composite);
+    try std.testing.expect(!test_browser.needs_raster);
+    try std.testing.expect(test_browser.needs_draw);
+}
+
 test "layout origin validates the fragment used for activation" {
     var expected_node: Node = undefined;
     var foreign_node: Node = undefined;
@@ -413,6 +559,7 @@ fn initMutationBrowser(
     result.active_tab_display_list = null;
     result.composited_layers = .empty;
     result.tab_draw_list = .empty;
+    result.pending_composited_updates = .empty;
     result.shutting_down = true;
     result.needs_composite = false;
     result.needs_raster = false;
@@ -427,6 +574,7 @@ fn deinitMutationBrowser(test_browser: *browser.Browser) void {
     test_browser.composited_layers.deinit(test_browser.allocator);
     DisplayItem.freeItems(test_browser.allocator, test_browser.tab_draw_list.items);
     test_browser.tab_draw_list.deinit(test_browser.allocator);
+    test_browser.pending_composited_updates.deinit(test_browser.allocator);
     deinitQueueBrowser(test_browser);
 }
 
@@ -839,6 +987,8 @@ test "activating a clean tab republishes its retained list and committed URL" {
     defer test_browser.composited_layers.deinit(allocator);
     test_browser.tab_draw_list = .empty;
     defer test_browser.tab_draw_list.deinit(allocator);
+    test_browser.pending_composited_updates = .empty;
+    defer test_browser.pending_composited_updates.deinit(allocator);
     test_browser.shutting_down = true; // Suppress timer threads; run the worker step directly.
     test_browser.animation_timer_active = false;
     test_browser.animation_timer_generation = 0;

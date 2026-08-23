@@ -1,0 +1,60 @@
+<!--
+How to verify:
+1. The orange card moves right while fading, with both effects running together.
+2. Press Down/Up while it animates. Scrolling and animation must remain smooth and
+   must not flash, leave a copy behind, or reveal the card at its old position.
+3. In an interactive ZIBRA_TRACE=1 run, the initial page build has
+   render:raster_and_draw; animation frames and scrolls inside the interest region
+   have render:draw_only and no later render:raster_and_draw span. The status
+   eventually changes to DONE.
+-->
+<!doctype html>
+<html>
+  <head>
+    <title>Composited transform and opacity</title>
+    <style>
+      body { background-color: white; color: black; font-size: 18px; }
+      .card { display: block; background-color: orange; color: black; width: 240px; height: 90px; padding: 12px; opacity: 1; transform: translate(0px, 0px); }
+      .spacer { display: block; background-color: lightgray; width: 180px; }
+      .status { background-color: lightblue; padding: 8px; }
+      button { margin: 12px 0; }
+    </style>
+  </head>
+  <body>
+    <h1>Composited animation</h1>
+    <div class="card">MOVE + FADE</div>
+    <button>Replay</button>
+    <p class="status">READY</p>
+    <div class="spacer">
+      SCROLL AREA 01<br>SCROLL AREA 02<br>SCROLL AREA 03<br>SCROLL AREA 04<br>
+      SCROLL AREA 05<br>SCROLL AREA 06<br>SCROLL AREA 07<br>SCROLL AREA 08<br>
+      SCROLL AREA 09<br>SCROLL AREA 10<br>SCROLL AREA 11<br>SCROLL AREA 12<br>
+      SCROLL AREA 13<br>SCROLL AREA 14<br>SCROLL AREA 15<br>SCROLL AREA 16<br>
+      SCROLL AREA 17<br>SCROLL AREA 18<br>SCROLL AREA 19<br>SCROLL AREA 20<br>
+      SCROLL AREA 21<br>SCROLL AREA 22<br>SCROLL AREA 23<br>SCROLL AREA 24<br>
+      SCROLL AREA 25<br>SCROLL AREA 26<br>SCROLL AREA 27<br>SCROLL AREA 28<br>
+      SCROLL AREA 29<br>SCROLL AREA 30<br>SCROLL AREA 31<br>SCROLL AREA 32<br>
+      SCROLL AREA 33<br>SCROLL AREA 34<br>SCROLL AREA 35<br>SCROLL AREA 36<br>
+      SCROLL AREA 37<br>SCROLL AREA 38<br>SCROLL AREA 39<br>SCROLL AREA 40<br>
+    </div>
+    <p>END OF PAGE</p>
+    <script>
+      var divs = document.querySelectorAll('div');
+      var card = divs[0];
+      var replay = document.querySelectorAll('button')[0];
+      var status = document.querySelectorAll('p')[0];
+
+      function run() {
+        status.innerHTML = 'ANIMATING - TRY UP / DOWN';
+        card.style = 'display: block; background-color: orange; color: black; width: 240px; height: 90px; padding: 12px; opacity: 1; transform: translate(0px, 0px)';
+        requestAnimationFrame(function() {
+          card.style = 'display: block; background-color: orange; color: black; width: 240px; height: 90px; padding: 12px; opacity: 0.25; transform: translate(360px, 40px); transition: transform 2s ease-in-out, opacity 2s linear';
+        });
+        setTimeout(function() { status.innerHTML = 'DONE'; }, 2300);
+      }
+
+      replay.addEventListener('click', run);
+      run();
+    </script>
+  </body>
+</html>

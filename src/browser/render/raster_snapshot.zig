@@ -91,6 +91,7 @@ pub const RasterSnapshot = struct {
                     .node = null,
                     .parent = null,
                     .needs_compositing = blend_item.needs_compositing,
+                    .compositor_id = blend_item.compositor_id,
                     .source = null,
                 } };
             },
@@ -99,6 +100,8 @@ pub const RasterSnapshot = struct {
                 .translate_y = transform_item.translate_y,
                 .children = try self.cloneList(transform_item.children),
                 .node = null,
+                .composited = transform_item.composited,
+                .compositor_id = transform_item.compositor_id,
                 .source = null,
             } },
             .draw_composited_layer => error.CompositedLayerCannotCrossRasterBoundary,

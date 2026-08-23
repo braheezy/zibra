@@ -13,11 +13,14 @@ const ProtectedField = @import("../core/protected_field.zig").ProtectedField;
 const CSSParser = @import("css_parser.zig").CSSParser;
 const css_color = @import("color.zig");
 const easing = @import("easing.zig");
+const css_transform = @import("transform.zig");
 
 pub const CssColor = css_color.Color;
 pub const parseCssColor = css_color.parse;
 pub const EasingFunction = easing.Function;
 pub const parseEasingFunction = easing.parse;
+pub const Translation = css_transform.Translation;
+pub const parseTranslate = css_transform.parse;
 
 /// Animation state for a numeric CSS property transition
 pub const NumericAnimation = struct {
@@ -127,15 +130,62 @@ pub const ColorAnimation = struct {
     }
 };
 
+/// Animation state for the supported translate transform. Both axes share
+/// one eased frame position and remain floating point until paint/compositing.
+pub const TransformAnimation = struct {
+    start_value: Translation,
+    end_value: Translation,
+    current_frame: u32,
+    total_frames: u32,
+    easing_function: EasingFunction,
+
+    pub fn initWithEasing(
+        start: Translation,
+        end: Translation,
+        frames: u32,
+        easing_function: EasingFunction,
+    ) TransformAnimation {
+        return .{
+            .start_value = start,
+            .end_value = end,
+            .current_frame = 0,
+            .total_frames = frames,
+            .easing_function = easing_function,
+        };
+    }
+
+    pub fn getValue(self: TransformAnimation) Translation {
+        if (self.total_frames == 0 or self.current_frame >= self.total_frames) return self.end_value;
+        const progress = @as(f64, @floatFromInt(self.current_frame)) /
+            @as(f64, @floatFromInt(self.total_frames));
+        const eased = self.easing_function.apply(progress);
+        return .{
+            .x = self.start_value.x + (self.end_value.x - self.start_value.x) * eased,
+            .y = self.start_value.y + (self.end_value.y - self.start_value.y) * eased,
+        };
+    }
+
+    pub fn advance(self: *TransformAnimation) bool {
+        if (self.current_frame < self.total_frames) self.current_frame += 1;
+        return self.current_frame >= self.total_frames;
+    }
+
+    pub fn isComplete(self: TransformAnimation) bool {
+        return self.current_frame >= self.total_frames;
+    }
+};
+
 /// Property-specific transition state retained by one DOM element.
 pub const Animation = union(enum) {
     numeric: NumericAnimation,
     color: ColorAnimation,
+    transform: TransformAnimation,
 
     pub fn advance(self: *Animation) bool {
         return switch (self.*) {
             .numeric => |*animation| animation.advance(),
             .color => |*animation| animation.advance(),
+            .transform => |*animation| animation.advance(),
         };
     }
 
@@ -143,6 +193,7 @@ pub const Animation = union(enum) {
         return switch (self) {
             .numeric => |animation| animation.isComplete(),
             .color => |animation| animation.isComplete(),
+            .transform => |animation| animation.isComplete(),
         };
     }
 };
@@ -178,6 +229,21 @@ test "numeric and color animations apply easing before interpolation" {
         CssColor{ .r = 205, .g = 50, .b = 0, .a = 205 },
         color.getValue(),
     );
+}
+
+test "transform animation eases both translation axes" {
+    var animation = TransformAnimation.initWithEasing(
+        .{ .x = 0, .y = 100 },
+        .{ .x = 100, .y = 0 },
+        2,
+        EasingFunction.ease,
+    );
+    _ = animation.advance();
+    const midpoint = animation.getValue();
+    try std.testing.expectApproxEqAbs(80.2403, midpoint.x, 0.0001);
+    try std.testing.expectApproxEqAbs(19.7597, midpoint.y, 0.0001);
+    try std.testing.expectEqual(@as(i32, 80), midpoint.layoutPixels().x);
+    try std.testing.expectEqual(@as(i32, 20), midpoint.layoutPixels().y);
 }
 
 // These tags can look like <tag /> and don't need a closing tag.

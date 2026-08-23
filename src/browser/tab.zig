@@ -116,10 +116,14 @@ pub const HistoryTraversalTarget = struct {
     method: HistoryMethod,
 };
 
-/// Represents a composited visual effect update (e.g., opacity change during animation)
+/// Represents one property update that can be applied to an already-rastered
+/// effect plane.
 pub const CompositedUpdate = struct {
     node: *anyopaque, // Pointer to the element that owns this effect
-    opacity: f64, // New opacity value
+    value: union(enum) {
+        opacity: f64,
+        transform: struct { x: i32, y: i32 },
+    },
 };
 
 pub const AccessibilityNode = struct {
@@ -1612,6 +1616,7 @@ fn replaceIframesInList(
                         .node = blend_item.node,
                         .parent = null,
                         .needs_compositing = blend_item.needs_compositing,
+                        .compositor_id = blend_item.compositor_id,
                         .source = null,
                     },
                 });
@@ -1634,6 +1639,8 @@ fn replaceIframesInList(
                         .translate_y = transform_item.translate_y,
                         .children = child_slice,
                         .node = transform_item.node,
+                        .composited = transform_item.composited,
+                        .compositor_id = transform_item.compositor_id,
                         .source = null,
                     },
                 });
@@ -1973,14 +1980,14 @@ fn advanceAnimations(self: *Tab, node: *parser.Node) bool {
                                     }
                                     const update = CompositedUpdate{
                                         .node = @ptrCast(elem),
-                                        .opacity = opacity,
+                                        .value = .{ .opacity = opacity },
                                     };
                                     self.composited_updates.append(self.allocator, update) catch continue;
                                     if (self.root_frame) |root_frame| {
-                                        applyRetainedCompositedOpacity(root_frame, update);
+                                        applyRetainedCompositedUpdate(root_frame, update);
                                     }
                                 },
-                                .color => {},
+                                .color, .transform => {},
                             }
                         } else if (std.mem.eql(u8, entry.key_ptr.*, "background-color")) {
                             switch (anim.*) {
@@ -1989,7 +1996,22 @@ fn advanceAnimations(self: *Tab, node: *parser.Node) bool {
                                 // update path. Layout reads the current color
                                 // directly from this element-owned animation.
                                 .color => self.needs_paint = true,
-                                .numeric => {},
+                                .numeric, .transform => {},
+                            }
+                        } else if (std.mem.eql(u8, entry.key_ptr.*, "transform")) {
+                            switch (anim.*) {
+                                .transform => |transform| {
+                                    const pixels = transform.getValue().layoutPixels();
+                                    const update = CompositedUpdate{
+                                        .node = @ptrCast(elem),
+                                        .value = .{ .transform = .{ .x = pixels.x, .y = pixels.y } },
+                                    };
+                                    self.composited_updates.append(self.allocator, update) catch continue;
+                                    if (self.root_frame) |root_frame| {
+                                        applyRetainedCompositedUpdate(root_frame, update);
+                                    }
+                                },
+                                .numeric, .color => {},
                             }
                         }
                     }
@@ -2009,11 +2031,23 @@ fn advanceAnimations(self: *Tab, node: *parser.Node) bool {
     return any_running;
 }
 
-fn applyRetainedCompositedOpacity(frame: *Frame, update: CompositedUpdate) void {
+fn applyRetainedCompositedUpdate(frame: *Frame, update: CompositedUpdate) void {
     if (frame.display_list) |items| {
-        _ = DisplayItem.applyCompositedOpacity(items, update.node, update.opacity);
+        switch (update.value) {
+            .opacity => |opacity| {
+                _ = DisplayItem.applyCompositedOpacity(items, update.node, opacity);
+            },
+            .transform => |transform| {
+                _ = DisplayItem.applyCompositedTransform(
+                    items,
+                    update.node,
+                    transform.x,
+                    transform.y,
+                );
+            },
+        }
     }
-    for (frame.children.items) |child| applyRetainedCompositedOpacity(child, update);
+    for (frame.children.items) |child| applyRetainedCompositedUpdate(child, update);
 }
 
 // Handle click on tab content

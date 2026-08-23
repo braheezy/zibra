@@ -16,7 +16,11 @@ before changing ownership or thread boundaries.
   about premultiplication, edge sampling, and temporary allocation.
 - `raster_snapshot.zig` is the thread-transfer boundary. Snapshots must deep
   copy every resource-backed leaf, clear synchronous provenance, and reject
-  browser-owned layer pointers.
+  browser-owned layer pointers. Numeric compositor IDs may cross this boundary;
+  raw DOM/layout pointers may not.
+- `compositor_cache.zig` owns ordered raster-worker planes and applies only
+  scalar opacity/translation updates before draw. Plane pixels never return to
+  the DOM/tab thread, and fallback decisions remain Browser orchestration.
 
 Prefer adding a focused rendering module when a feature introduces a distinct
 data owner or pipeline phase. Do not move Browser orchestration into this

@@ -18,6 +18,7 @@ const Node = parser.Node;
 const CSSParser = @import("../document/css_parser.zig").CSSParser;
 const NumericAnimation = parser.NumericAnimation;
 const ColorAnimation = parser.ColorAnimation;
+const TransformAnimation = parser.TransformAnimation;
 const Animation = parser.Animation;
 const EasingFunction = parser.EasingFunction;
 
@@ -96,6 +97,37 @@ fn parseTransitionValue(value: []const u8) ?TransitionValue {
     };
 }
 
+const TransitionListIterator = struct {
+    remaining: []const u8,
+
+    fn init(value: []const u8) TransitionListIterator {
+        return .{ .remaining = value };
+    }
+
+    /// Split only top-level commas so cubic-bezier arguments remain one
+    /// timing function.
+    fn next(self: *TransitionListIterator) ?[]const u8 {
+        self.remaining = std.mem.trim(u8, self.remaining, " \t\n\r,");
+        if (self.remaining.len == 0) return null;
+        var depth: usize = 0;
+        for (self.remaining, 0..) |char, index| {
+            switch (char) {
+                '(' => depth += 1,
+                ')' => depth -|= 1,
+                ',' => if (depth == 0) {
+                    const result = self.remaining[0..index];
+                    self.remaining = self.remaining[index + 1 ..];
+                    return std.mem.trim(u8, result, " \t\n\r");
+                },
+                else => {},
+            }
+        }
+        const result = self.remaining;
+        self.remaining = &.{};
+        return std.mem.trim(u8, result, " \t\n\r");
+    }
+};
+
 /// Start an opacity animation on an element
 fn startOpacityAnimation(
     allocator: std.mem.Allocator,
@@ -132,6 +164,28 @@ fn startBackgroundColorAnimation(
     try elem.animations.?.put("background-color", animation);
 }
 
+fn startTransformAnimation(
+    allocator: std.mem.Allocator,
+    elem: *parser.Element,
+    start: parser.Translation,
+    end: parser.Translation,
+    frames: u32,
+    easing_function: EasingFunction,
+) !void {
+    if (elem.animations == null) {
+        elem.animations = std.StringHashMap(Animation).init(allocator);
+    }
+    const animation = Animation{
+        .transform = TransformAnimation.initWithEasing(
+            start,
+            end,
+            frames,
+            easing_function,
+        ),
+    };
+    try elem.animations.?.put("transform", animation);
+}
+
 test "transition values default to ease and parse supported timing functions" {
     const default_transition = parseTransitionValue("background-color 500ms").?;
     try std.testing.expectEqualStrings("background-color", default_transition.property);
@@ -154,12 +208,25 @@ test "transition values default to ease and parse supported timing functions" {
     try std.testing.expect(parseTransitionValue("opacity -1s ease") == null);
 }
 
+test "transition list keeps cubic-bezier commas and simultaneous properties" {
+    var iterator = TransitionListIterator.init(
+        "transform 1s cubic-bezier(0.25, 0.1, 0.25, 1), opacity 1s linear",
+    );
+    const transform = parseTransitionValue(iterator.next().?).?;
+    try std.testing.expectEqualStrings("transform", transform.property);
+    try std.testing.expectApproxEqAbs(EasingFunction.ease.apply(0.5), transform.easing_function.apply(0.5), 0.000001);
+    const opacity = parseTransitionValue(iterator.next().?).?;
+    try std.testing.expectEqualStrings("opacity", opacity.property);
+    try std.testing.expectApproxEqAbs(0.5, opacity.easing_function.apply(0.5), 0.000001);
+    try std.testing.expect(iterator.next() == null);
+}
+
 fn currentAnimatedOpacity(elem: *const parser.Element) ?f64 {
     const animations = elem.animations orelse return null;
     const animation = animations.get("opacity") orelse return null;
     return switch (animation) {
         .numeric => |numeric| numeric.getValue(),
-        .color => null,
+        .color, .transform => null,
     };
 }
 
@@ -168,7 +235,16 @@ fn currentAnimatedBackgroundColor(elem: *const parser.Element) ?parser.CssColor 
     const animation = animations.get("background-color") orelse return null;
     return switch (animation) {
         .color => |color| color.getValue(),
-        .numeric => null,
+        .numeric, .transform => null,
+    };
+}
+
+fn currentAnimatedTransform(elem: *const parser.Element) ?parser.Translation {
+    const animations = elem.animations orelse return null;
+    const animation = animations.get("transform") orelse return null;
+    return switch (animation) {
+        .transform => |transform| transform.getValue(),
+        .numeric, .color => null,
     };
 }
 
@@ -2358,7 +2434,57 @@ test "native style_set starts a background-color transition from computed color"
                 0.000001,
             );
         },
-        .numeric => try std.testing.expect(false),
+        .numeric, .transform => try std.testing.expect(false),
+    }
+}
+
+test "native style_set starts simultaneous transform and opacity transitions" {
+    const allocator = std.testing.allocator;
+    var html_parser = try parser.HTMLParser.init(
+        allocator,
+        "<div style=\"opacity: 1; transform: translate(0px, 0px)\"></div>",
+    );
+    html_parser.use_implicit_tags = false;
+    defer html_parser.deinit(allocator);
+    var root = try html_parser.parse();
+    defer root.deinit(allocator);
+    parser.fixParentPointers(&root, null);
+    try parser.style(allocator, &root, &.{});
+
+    var environ = std.process.Environ.Map.init(allocator);
+    defer environ.deinit();
+    var js = try Js.init(allocator, std.testing.io, &environ);
+    defer js.deinit(allocator);
+    js.setNodes(0, &root);
+    defer js.setNodes(0, null);
+
+    const result = try js.evaluate(0,
+        \\var box = document.querySelectorAll('div')[0];
+        \\box.style = 'opacity: 0.25; transform: translate(120px, 30px); transition: transform 1s ease-out, opacity 1s linear';
+        \\true
+    );
+    try std.testing.expect(result.toBoolean());
+
+    const animations = root.element.animations.?;
+    switch (animations.get("opacity").?) {
+        .numeric => |opacity| {
+            try std.testing.expectEqual(@as(f64, 1.0), opacity.start_value);
+            try std.testing.expectEqual(@as(f64, 0.25), opacity.end_value);
+            try std.testing.expectApproxEqAbs(0.5, opacity.easing_function.apply(0.5), 0.000001);
+        },
+        .color, .transform => try std.testing.expect(false),
+    }
+    switch (animations.get("transform").?) {
+        .transform => |transform| {
+            try std.testing.expectEqual(parser.Translation{ .x = 0, .y = 0 }, transform.start_value);
+            try std.testing.expectEqual(parser.Translation{ .x = 120, .y = 30 }, transform.end_value);
+            try std.testing.expectApproxEqAbs(
+                parser.EasingFunction.ease_out.apply(0.5),
+                transform.easing_function.apply(0.5),
+                0.000001,
+            );
+        },
+        .numeric, .color => try std.testing.expect(false),
     }
 }
 
@@ -3827,6 +3953,7 @@ fn styleSet(agent: *Agent, this_value: Value, arguments: kiesel.types.Arguments)
             // its currently painted value rather than its original endpoint.
             var old_opacity = currentAnimatedOpacity(e);
             var old_background_color = currentAnimatedBackgroundColor(e);
+            var old_transform = currentAnimatedTransform(e);
             if (e.style) |*style_map| {
                 if (old_opacity == null) {
                     if (style_map.getPtr("opacity")) |field| {
@@ -3838,6 +3965,11 @@ fn styleSet(agent: *Agent, this_value: Value, arguments: kiesel.types.Arguments)
                         old_background_color = parser.parseCssColor(field.lastValue().*);
                     }
                 }
+                if (old_transform == null) {
+                    if (style_map.getPtr("transform")) |field| {
+                        old_transform = parser.parseTranslate(field.lastValue().*);
+                    }
+                }
             }
 
             // Replacing the complete inline style cancels transitions that
@@ -3846,6 +3978,7 @@ fn styleSet(agent: *Agent, this_value: Value, arguments: kiesel.types.Arguments)
             if (e.animations) |*animations| {
                 _ = animations.remove("opacity");
                 _ = animations.remove("background-color");
+                _ = animations.remove("transform");
             }
 
             const owned_style = try js_instance.allocator.dupe(u8, style_str);
@@ -3863,8 +3996,9 @@ fn styleSet(agent: *Agent, this_value: Value, arguments: kiesel.types.Arguments)
 
                 // Check for transition definition
                 if (new_style.get("transition")) |transition_str| {
-                    // Parse transition value (e.g., "opacity 2s")
-                    if (parseTransitionValue(transition_str)) |transition| {
+                    var transitions = TransitionListIterator.init(transition_str);
+                    while (transitions.next()) |transition_part| {
+                        const transition = parseTransitionValue(transition_part) orelse continue;
                         if (std.ascii.eqlIgnoreCase(transition.property, "opacity")) {
                             // Get new opacity value
                             if (new_style.get("opacity")) |new_op_str| {
@@ -3898,6 +4032,24 @@ fn styleSet(agent: *Agent, this_value: Value, arguments: kiesel.types.Arguments)
                                         transition.easing_function,
                                     ) catch |err| {
                                         std.log.warn("Failed to start background-color animation: {}", .{err});
+                                    };
+                                }
+                            }
+                        } else if (std.ascii.eqlIgnoreCase(transition.property, "transform")) {
+                            if (new_style.get("transform")) |new_transform_str| {
+                                const new_transform = parser.parseTranslate(new_transform_str);
+                                if (new_transform != null and old_transform != null and
+                                    !old_transform.?.eql(new_transform.?))
+                                {
+                                    startTransformAnimation(
+                                        js_instance.allocator,
+                                        e,
+                                        old_transform.?,
+                                        new_transform.?,
+                                        transition.frames,
+                                        transition.easing_function,
+                                    ) catch |err| {
+                                        std.log.warn("Failed to start transform animation: {}", .{err});
                                     };
                                 }
                             }

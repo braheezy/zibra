@@ -365,41 +365,8 @@ fn opaqueElementForNode(node_ptr: ?*Node) ?*anyopaque {
 /// Parse a translate transform value like "translate(10px, 20px)" into x and y offsets
 /// Returns null if parsing fails
 fn parseTranslate(value: []const u8) ?struct { x: i32, y: i32 } {
-    // Look for "translate(" prefix
-    const prefix = "translate(";
-    if (!std.mem.startsWith(u8, value, prefix)) return null;
-
-    // Find the closing paren
-    const start = prefix.len;
-    const end = std.mem.indexOf(u8, value[start..], ")") orelse return null;
-    const args = value[start .. start + end];
-
-    // Split on comma
-    var parts = std.mem.tokenizeAny(u8, args, ", \t");
-    const x_str = parts.next() orelse return null;
-    const y_str = parts.next() orelse "0px"; // Default y to 0 if not specified
-
-    // Parse x value (e.g., "10px")
-    var x: i32 = 0;
-    if (std.mem.endsWith(u8, x_str, "px")) {
-        const num_str = x_str[0 .. x_str.len - 2];
-        x = std.fmt.parseInt(i32, num_str, 10) catch return null;
-    } else {
-        // Try parsing as plain number
-        x = std.fmt.parseInt(i32, x_str, 10) catch return null;
-    }
-
-    // Parse y value (e.g., "20px")
-    var y: i32 = 0;
-    if (std.mem.endsWith(u8, y_str, "px")) {
-        const num_str = y_str[0 .. y_str.len - 2];
-        y = std.fmt.parseInt(i32, num_str, 10) catch return null;
-    } else {
-        // Try parsing as plain number
-        y = std.fmt.parseInt(i32, y_str, 10) catch return null;
-    }
-
-    return .{ .x = x, .y = y };
+    const pixels = (parser.parseTranslate(value) orelse return null).layoutPixels();
+    return .{ .x = pixels.x, .y = pixels.y };
 }
 
 /// Parse the supported CSS filter syntax. Zibra intentionally implements one
@@ -3573,6 +3540,7 @@ fn cloneDisplayItemOwned(
                 .node = blend.node,
                 .parent = null,
                 .needs_compositing = blend.needs_compositing,
+                .compositor_id = blend.compositor_id,
                 .source = blend.source,
             } };
         },
@@ -3581,6 +3549,8 @@ fn cloneDisplayItemOwned(
             .translate_y = transform.translate_y,
             .children = try cloneDisplayListOwned(allocator, transform.children),
             .node = transform.node,
+            .composited = transform.composited,
+            .compositor_id = transform.compositor_id,
             .source = transform.source,
         } },
         else => item,
@@ -5286,7 +5256,7 @@ fn animatedBackgroundColor(element: parser.Element) ?browser.Color {
     const animation = animations.get("background-color") orelse return null;
     const color = switch (animation) {
         .color => |value| value.getValue(),
-        .numeric => return null,
+        .numeric, .transform => return null,
     };
     return .{ .r = color.r, .g = color.g, .b = color.b, .a = color.a };
 }
@@ -5644,7 +5614,7 @@ fn applyPaintEffects(self: *Layout, block: *BlockLayout, commands: []DisplayItem
                             opacity = numeric.getValue();
                             opacity = @max(0.0, @min(1.0, opacity)); // Clamp to valid range
                         },
-                        .color => {},
+                        .color, .transform => {},
                     }
                 }
             }
@@ -5680,12 +5650,30 @@ fn applyPaintEffects(self: *Layout, block: *BlockLayout, commands: []DisplayItem
             {
                 should_clip = true;
             }
-            // Parse transform: translate(xpx, ypx)
-            if (styleValue(style_map, "transform")) |transform_str| {
-                if (parseTranslate(transform_str)) |translate| {
-                    transform_x = translate.x;
-                    transform_y = translate.y;
-                    has_transform = true;
+            // An active translate animation overrides the computed endpoint.
+            // Keep even a zero-valued animated transform wrapped so subsequent
+            // frames can update only this compositor node.
+            var animated_transform: ?parser.Translation = null;
+            if (elem.animations) |animations| {
+                if (animations.get("transform")) |animation| {
+                    animated_transform = switch (animation) {
+                        .transform => |value| value.getValue(),
+                        .numeric, .color => null,
+                    };
+                }
+            }
+            if (animated_transform) |translation| {
+                const pixels = translation.layoutPixels();
+                transform_x = pixels.x;
+                transform_y = pixels.y;
+                has_transform = true;
+            } else if (styleValue(style_map, "transform")) |transform_str| {
+                if (!std.ascii.eqlIgnoreCase(std.mem.trim(u8, transform_str, " \t\r\n"), "none")) {
+                    if (parseTranslate(transform_str)) |translate| {
+                        transform_x = translate.x;
+                        transform_y = translate.y;
+                        has_transform = true;
+                    }
                 }
             }
         }
@@ -5809,6 +5797,7 @@ fn applyPaintEffects(self: *Layout, block: *BlockLayout, commands: []DisplayItem
                 .children = wrapped_commands,
                 .node = node_ptr,
                 .needs_compositing = needs_compositing,
+                .compositor_id = if (node_ptr) |ptr| @intFromPtr(ptr) else null,
                 .source = displaySource(block, block.node_ptr),
             },
         };
@@ -5824,6 +5813,8 @@ fn applyPaintEffects(self: *Layout, block: *BlockLayout, commands: []DisplayItem
                     .translate_y = transform_y,
                     .children = result,
                     .node = node_ptr,
+                    .composited = true,
+                    .compositor_id = if (node_ptr) |ptr| @intFromPtr(ptr) else null,
                     .source = displaySource(block, block.node_ptr),
                 },
             };
@@ -5846,6 +5837,8 @@ fn applyPaintEffects(self: *Layout, block: *BlockLayout, commands: []DisplayItem
                     .translate_y = transform_y,
                     .children = wrapped_for_transform,
                     .node = node_ptr,
+                    .composited = true,
+                    .compositor_id = if (node_ptr) |ptr| @intFromPtr(ptr) else null,
                     .source = displaySource(block, block.node_ptr),
                 },
             };

@@ -49,10 +49,13 @@ The source tree is organized by responsibility:
 | [`src/browser/render/display_list.zig`](../src/browser/render/display_list.zig) | Display-command and composited-layer data, recursive ownership cleanup, provenance, and painted hit testing without Browser or SDL dependencies. |
 | [`src/browser/render/effects.zig`](../src/browser/render/effects.zig) | Pixel-level software effects such as premultiplied-RGBA Gaussian blur. |
 | [`src/browser/render/raster_snapshot.zig`](../src/browser/render/raster_snapshot.zig) | Deep-owned, provenance-free display generations transferred to the raster worker. |
+| [`src/browser/render/compositor_cache.zig`](../src/browser/render/compositor_cache.zig) | Raster-worker-owned ordered planes and pointer-free opacity/translation updates used by draw-only animation and scrolling. |
 | [`src/document/parser.zig`](../src/document/parser.zig) | HTML parser, DOM representation, style maps, images, and DOM tree utilities. |
 | [`src/document/inspection.zig`](../src/document/inspection.zig) | Browser-free fetch/decode/parse/style pipeline for document inspection commands. |
 | [`src/document/css_parser.zig`](../src/document/css_parser.zig) | CSS parsing and `CSSRule` ownership. |
 | [`src/document/color.zig`](../src/document/color.zig) | Shared parsing for paintable named and hexadecimal RGBA CSS colors. |
+| [`src/document/easing.zig`](../src/document/easing.zig) | Owned CSS timing functions and cubic-Bezier evaluation. |
+| [`src/document/transform.zig`](../src/document/transform.zig) | Shared parsing and interpolation-ready representation for supported CSS translations. |
 | [`src/document/selector.zig`](../src/document/selector.zig) | Selector representation and matching. |
 | [`src/network/url.zig`](../src/network/url.zig) | Owning `Url`, URL resolution, schemes, HTTP requests, redirects, cookies, response bodies, and cache integration. |
 | [`src/network/cache.zig`](../src/network/cache.zig) | Browser-session HTTP response entries, expiry, and strict `Cache-Control` policy parsing. |
@@ -550,12 +553,13 @@ document before performing anchor, input, button, or contenteditable behavior.
 Thus structural listener mutation cannot leave the default-action path holding
 a relocated raw Node pointer. `stopPropagation` controls only ancestor
 delivery, while `preventDefault` cancels that resolved browser action.
-Compositor-only opacity
-animation updates also mutate the retained effect wrapper before the same
-update is committed, so invisible content stops participating in hit testing.
-The browser applies that update recursively through transforms in its committed
-tree; effects flattened into an ancestor or iframe layer update the layer-owned
-tree and mark its cached pixels for rerasterization.
+Compositor-only opacity and translation animation updates also mutate the
+retained effect wrapper before the same update is committed, so hit testing
+tracks the visible animated position and opacity. The committed command tree
+uses the DOM address only as a UI/tab-thread lookup key. Raster snapshots clear
+that borrow and retain a numeric compositor ID; no DOM pointer crosses to the
+raster worker. Effects that cannot be represented as a top-level retained plane
+fall back to a full raster.
 Layout-derived link and iframe bounds no longer decide click targets. Focus,
 accessibility, and fragment bounds retain their existing roles.
 
@@ -572,21 +576,27 @@ operator is applied only when the completed surface is placed. Hit testing
 continues through the original child commands, so the blur's visual haze does
 not enlarge interactive geometry.
 
-The per-window worker-owned tab surface is a bounded raster cache rather than a
-full-page bitmap. `scroll.zig` chooses a device-pixel interest region no taller than four
-native window heights, with one viewport of scroll-back headroom where page
-bounds permit. Raster translates page commands by that region's page-space
-start and publishes the coordinates only after all fallible drawing succeeds.
-Final software draw moves the cached surface by `region_start - root_scroll` beneath
-chrome. z2d has no public `clipRect`, so final composition slices source and
-destination pixel rows to the content viewport, providing the same hard clip
-as the book's Skia operation. A root scroll whose complete viewport remains in
-the published region queues a draw-only worker job without cloning commands.
-Crossing an edge rerasterizes a new region,
-while display-list replacement, resize, zoom, content-height change, and
-structural retirement invalidate the cache. Compositor-only visual updates
-also reraster the bounded surface because it owns the assembled page pixels,
-even when an underlying layer can reuse its private raster.
+The per-window raster worker keeps either one bounded assembled tab surface or
+an ordered compositor-plane cache. `scroll.zig` chooses a device-pixel interest
+region no taller than four native window heights, with one viewport of
+scroll-back headroom where page bounds permit. Without separable effects,
+raster translates page commands by that region's page-space start and publishes
+the coordinates only after all fallible drawing succeeds. With top-level
+composited opacity or translation effects, static strata are transparent
+interest-region surfaces and each animated subtree is rasterized once into its
+own plane. Later pointer-free scalar updates change plane opacity/translation;
+the worker assembles those planes beneath chrome without rerastering their
+pixels. Complex masks or unsupported nesting deliberately use the assembled
+surface fallback.
+
+Final software draw moves cached page pixels by `region_start - root_scroll`
+beneath chrome. z2d has no public `clipRect`, so final composition slices source
+and destination pixel rows to the content viewport, providing the same hard
+clip as the book's Skia operation. A root scroll whose complete viewport
+remains in the published region queues a draw-only worker job without cloning
+commands or invalidating compositor planes. Crossing an edge rerasterizes a new
+region, while display-list replacement, resize, zoom, content-height change,
+and structural retirement invalidate the cache.
 
 Basic text direction is resolved per inline block through the acyclic layout
 parent chain. The CLI `-rtl` flag supplies the fallback direction; the nearest
@@ -769,14 +779,17 @@ creating and activating tabs in the same native window.
 
 The UI thread rebuilds Chrome, then holds `Browser.lock` only while cloning the
 chrome and committed page command trees. `RasterSnapshot` owns every recursive
-container and blend-mode string and copies each borrowed font glyph bitmap and
-image byte buffer. The queued job therefore contains no layout, DOM,
-FontManager, ImageData, or chrome-generation borrow. Tab commits, structural
-mutation, navigation, scrolling, and input may continue while it runs. A newer
-dirty commit or a window/tab mismatch causes the completed result to be
-discarded; otherwise the UI thread swaps in the owned z2d root surface. The
-job queue, snapshots, caches, and surfaces use the thread-safe SMP allocator;
-Browser records the current root surface's allocator when ownership transfers.
+container and blend-mode string, copies each borrowed font glyph bitmap and
+image byte buffer, and converts composited DOM identity to a scalar numeric ID.
+The queued job therefore contains no layout, DOM, FontManager, ImageData, or
+chrome-generation borrow. Full-raster jobs may rebuild the worker-owned ordered
+plane cache; draw-only jobs carry only scroll geometry and opacity/translation
+updates for those planes. Tab commits, structural mutation, navigation,
+scrolling, and input may continue while either runs. A newer dirty commit or a
+window/tab mismatch causes the completed result to be discarded; otherwise the
+UI thread swaps in the owned z2d root surface. The job queue, snapshots, caches,
+and surfaces use the thread-safe SMP allocator; Browser records the current
+root surface's allocator when ownership transfers.
 The worker never calls SDL. Texture lock/upload, renderer copy, `present`, native
 window/title/dialog operations, event polling, and resize-time texture
 creation/destruction remain on the Browser/UI thread. Input callbacks only
@@ -933,18 +946,20 @@ cost does not throttle another.
 
 CSS transition state is owned by its DOM Element and advanced only by the
 serialized Tab worker. The transition map is tagged by interpolation kind:
-opacity stores a numeric interpolation, while `background-color` stores RGBA
-endpoints and interpolates all four channels at the same frame position. Each
-entry stores its timing function by value. Normalized frame progress is linear
-in scheduler time, then `easing.zig` maps it through CSS `ease` by default or a
-supported keyword/explicit cubic Bezier before the property interpolation.
-Layout reads that current color directly from the Element-owned map, and each
-advance marks paint dirty so the display command and raster pixels are
-regenerated. Opacity remains eligible for the separate composited-update path
-and does not force paint. A replacement style captures its baseline from an
-active transition first, otherwise from `ProtectedField.lastValue`: this
-intentionally means the last published visual state even when a new style pass
-is pending, without treating the dirty field as newly computed.
+opacity stores a numeric interpolation, `background-color` stores RGBA
+endpoints, and `transform` stores the two axes of a parsed `translate(...)`.
+Each entry stores its timing function by value. Normalized frame progress is
+linear in scheduler time, then `easing.zig` maps it through CSS `ease` by
+default or a supported keyword/explicit cubic Bezier before property
+interpolation. Layout reads current color directly from the Element-owned map,
+and each color advance marks paint dirty so display commands and raster pixels
+are regenerated. Opacity and translation instead emit compositor updates; a
+simultaneous pair for one element shares its numeric compositor ID and updates
+one retained plane without paint or raster. A replacement style captures its
+baseline from an active transition first, otherwise from
+`ProtectedField.lastValue`: this intentionally means the last published visual
+state even when a new style pass is pending, without treating the dirty field
+as newly computed.
 
 When no follow-up frame is requested, or input/tab lifecycle forces a fresh
 generation, the deadline anchor is cleared while the same-document cost

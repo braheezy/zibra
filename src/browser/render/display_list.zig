@@ -246,6 +246,7 @@ pub const DisplayItem = union(enum) {
         node: ?*anyopaque = null,
         parent: ?*const DisplayItem = null,
         needs_compositing: bool = false,
+        compositor_id: ?usize = null,
         source: ?DisplayItemSource = null,
     },
     draw_composited_layer: struct {
@@ -257,6 +258,8 @@ pub const DisplayItem = union(enum) {
         translate_y: i32,
         children: []DisplayItem,
         node: ?*anyopaque = null,
+        composited: bool = false,
+        compositor_id: ?usize = null,
         source: ?DisplayItemSource = null,
     },
 
@@ -308,6 +311,42 @@ pub const DisplayItem = union(enum) {
                 },
                 .transform => |*transform_item| {
                     if (applyCompositedOpacity(transform_item.children, node, opacity)) updated = true;
+                },
+                else => {},
+            }
+        }
+        return updated;
+    }
+
+    pub fn applyCompositedTransform(
+        items: []DisplayItem,
+        node: *anyopaque,
+        translate_x: i32,
+        translate_y: i32,
+    ) bool {
+        var updated = false;
+        for (items) |*item| {
+            switch (item.*) {
+                .blend => |*blend_item| {
+                    if (applyCompositedTransform(
+                        blend_item.children,
+                        node,
+                        translate_x,
+                        translate_y,
+                    )) updated = true;
+                },
+                .transform => |*transform_item| {
+                    if (transform_item.composited and transform_item.node == node) {
+                        transform_item.translate_x = translate_x;
+                        transform_item.translate_y = translate_y;
+                        updated = true;
+                    }
+                    if (applyCompositedTransform(
+                        transform_item.children,
+                        node,
+                        translate_x,
+                        translate_y,
+                    )) updated = true;
                 },
                 else => {},
             }

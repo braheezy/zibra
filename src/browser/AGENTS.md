@@ -23,9 +23,11 @@ before changing `root.zig`, `tab.zig`, `render/`, or browser task scheduling.
 - `render/display_list.zig` owns display-command types, recursive container
   cleanup, painted hit testing, and composited-layer data. It must remain free
   of `Browser` and SDL dependencies. `render/effects.zig` owns pixel-level
-  software effects, and `render/raster_snapshot.zig` owns the deep-copy
-  boundary used to hand commands and copied leaf pixels to the raster worker.
-  Operations requiring per-window drawing state remain Browser methods.
+  software effects, `render/raster_snapshot.zig` owns the deep-copy boundary
+  used to hand commands and copied leaf pixels to the raster worker, and
+  `render/compositor_cache.zig` owns worker-thread planes and scalar opacity /
+  translation updates. Operations requiring per-window drawing state remain
+  Browser methods.
 - `root.zig` remains an oversized legacy coordinator, so do not add another
   standalone algorithm or data-owner there by default. The remaining natural
   seams include fetch/resource coordination and the per-window presentation
@@ -70,6 +72,9 @@ before changing `root.zig`, `tab.zig`, `render/`, or browser task scheduling.
 - CSS transition frames first normalize elapsed frame count, then apply the
   Element-owned timing function before property interpolation. Easing changes
   values only; it does not alter the absolute animation-frame scheduling path.
+  Opacity and `translate(...)` transform transitions publish compositor
+  updates; simultaneous values for one element must share a stable numeric
+  compositor ID and remain draw-only after their initial raster.
 - Browser task producers classify animation frames and native input as urgent,
   navigation and script discovery as normal, and timeout/interval/XHR/message
   callbacks as JavaScript-low. Do not infer priority from the trace label:
@@ -88,6 +93,12 @@ before changing `root.zig`, `tab.zig`, `render/`, or browser task scheduling.
   window texture, copies it to the renderer, and presents it. Input handlers
   only publish dirty work and return. Shutdown joins this runner before tabs,
   font caches, z2d surfaces, SDL handles, or shared measurement retire.
+  When a committed page has top-level composited opacity or translation
+  effects, the worker retains ordered transparent planes instead of one
+  assembled tab bitmap. Static strata stay bounded to the interest region;
+  animated planes retain their own raster and accept pointer-free numeric
+  updates. Unsupported nesting or masking falls back to a full raster rather
+  than losing an update.
 - Each tab owns a sentinel-terminated copy of its root document title. Tab
   workers replace it under `Browser.lock`; only the interactive App/UI thread
   may pass it to the addressed native window, including after tab switches.
@@ -233,20 +244,22 @@ before changing `root.zig`, `tab.zig`, `render/`, or browser task scheduling.
   list, clears all source metadata, and transfers only that copy to
   `Browser.commit`; clean-tab activation must republish the same way. Source
   activation must consult the typed layout-origin resolver and validate any
-  inline fragment node against that origin. Apply compositor-only opacity
-  updates to this retained list before committing them to the browser snapshot;
-  recurse through transforms and reraster any ancestor layer that flattened the
-  updated effect into its owned item tree.
+  inline fragment node against that origin. Apply compositor-only opacity and
+  translation updates to this retained list before committing them to the
+  browser snapshot. The raster worker accepts only numeric compositor IDs, not
+  those DOM pointers; unsupported/flattened effect trees request a safe full
+  raster.
 - CSS `filter: blur(<length>)` is an owning blend wrapper around the complete
   element subtree. Raster it into premultiplied RGBA, blur that image, then
   apply overflow clipping, group opacity/mix-blend, and finally translation.
   Keep each effect wrapper in its own layer: neighboring filters and `dst_in`
   masks are ordered groups and must never be merged. Blur expands visual layer
   bounds but does not expand the DOM hit target.
-- CSS transition state advances only on the serialized Tab worker. Opacity
-  emits a composited update and can skip paint; `background-color` writes the
-  interpolated RGBA value in Element-owned animation state and marks paint
-  dirty on every frame because the rectangle command and raster pixels change.
+- CSS transition state advances only on the serialized Tab worker. Opacity and
+  `translate(...)` transforms emit composited scalar updates and can skip
+  paint; `background-color` writes the interpolated RGBA value in Element-owned
+  animation state and marks paint dirty on every frame because the rectangle
+  command and raster pixels change.
 - A fixed-height `overflow: scroll` block keeps its natural content height as
   DOM-owned scroll geometry while layout exposes the fixed client height.
   Paint keeps the box background stationary, translates its content by the

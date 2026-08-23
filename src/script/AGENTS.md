@@ -72,9 +72,12 @@ or Kiesel allocation/locking.
 - Inline `style` replacement detects supported transitions from the previous
   computed value to the new declaration. Opacity creates a numeric transition;
   `background-color` parses both endpoints into RGBA and creates a color
-  transition. An omitted timing function means CSS `ease`; `linear`, `ease-in`,
-  `ease-out`, `ease-in-out`, and valid explicit `cubic-bezier(...)` values are
-  retained by value with the animation. Never retain slices from the temporary
-  inline-style parse map.
+  transition; `transform` accepts `none` and `translate(...)` and interpolates
+  both axes. Split comma-separated transition lists only at top level so the
+  commas inside `cubic-bezier(...)` remain part of one timing function. An
+  omitted timing function means CSS `ease`; `linear`, `ease-in`, `ease-out`,
+  `ease-in-out`, and valid explicit `cubic-bezier(...)` values are retained by
+  value with the animation. Never retain slices from the temporary inline-style
+  parse map.
 - Exercise interactive behavior with a deterministic `tests/manual/` page that
   reports success in-page.

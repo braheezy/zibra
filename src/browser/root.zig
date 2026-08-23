@@ -28,6 +28,9 @@ pub const gaussianBlurPixels = effects.gaussianBlurPixels;
 const raster_snapshot = @import("render/raster_snapshot.zig");
 pub const RasterSnapshot = raster_snapshot.RasterSnapshot;
 pub const rasterBlendNeedsIsolation = raster_snapshot.blendNeedsIsolation;
+const compositor_cache = @import("render/compositor_cache.zig");
+const CompositorCache = compositor_cache.Cache;
+const CompositorUpdate = compositor_cache.Update;
 const navigation = @import("navigation.zig");
 pub const NavigationDocument = navigation.NavigationDocument;
 pub const NavigationSecurity = navigation.NavigationSecurity;
@@ -461,6 +464,7 @@ const RasterTaskContext = struct {
     browser: *Browser,
     page: ?RasterSnapshot,
     chrome: ?RasterSnapshot,
+    composited_updates: []CompositorUpdate,
     raster: bool,
     window_width: i32,
     window_height: i32,
@@ -485,6 +489,7 @@ const RasterTaskContext = struct {
         if (!self.ran) self.browser.cancelRasterTask(self.sample_animation_work);
         if (self.page) |*page| page.deinit();
         if (self.chrome) |*chrome| chrome.deinit();
+        if (self.composited_updates.len > 0) self.allocator.free(self.composited_updates);
         const allocator = self.allocator;
         allocator.destroy(self);
     }
@@ -575,6 +580,7 @@ pub const Browser = struct {
     // teardown reads or destroys them.
     worker_chrome_surface: ?z2d.Surface = null,
     worker_tab_surface: ?z2d.Surface = null,
+    worker_compositor_cache: CompositorCache = .{},
     worker_interest_region: scroll_model.InterestRegion = .{ .start_px = 0, .height_px = 0 },
     worker_interest_region_valid: bool = false,
     // Optimistic address-bar text may lead a pending load. Bookmark state uses
@@ -587,6 +593,7 @@ pub const Browser = struct {
     active_tab_zoom: f32 = 1.0,
     active_tab_prefers_dark: bool = false,
     active_tab_display_list: ?[]DisplayItem = null,
+    pending_composited_updates: std.ArrayList(CompositorUpdate),
     // Composited layers for caching rasterized content
     composited_layers: std.ArrayList(CompositedLayer),
     // Draw list created from composite phase
@@ -817,6 +824,7 @@ pub const Browser = struct {
             .touch_tracker = touch_input.Tracker.init(al),
             .composited_layers = std.ArrayList(CompositedLayer).empty,
             .tab_draw_list = std.ArrayList(DisplayItem).empty,
+            .pending_composited_updates = std.ArrayList(CompositorUpdate).empty,
             .profiling_enabled = profiling_enabled,
         };
 
@@ -1130,6 +1138,7 @@ pub const Browser = struct {
     /// Caller must hold `self.lock`.
     fn retireActiveRenderStateLocked(self: *Browser) void {
         self.invalidateInterestRegion();
+        self.pending_composited_updates.clearRetainingCapacity();
         if (self.tab_draw_list.items.len > 0) {
             DisplayItem.freeItems(self.allocator, self.tab_draw_list.items);
             self.tab_draw_list.items.len = 0;
@@ -4373,6 +4382,7 @@ pub const Browser = struct {
                         .node = blend_item.node,
                         .parent = null,
                         .needs_compositing = blend_item.needs_compositing,
+                        .compositor_id = blend_item.compositor_id,
                         .source = blend_item.source,
                     },
                 };
@@ -4385,6 +4395,8 @@ pub const Browser = struct {
                         .translate_y = transform_item.translate_y,
                         .children = children,
                         .node = transform_item.node,
+                        .composited = transform_item.composited,
+                        .compositor_id = transform_item.compositor_id,
                         .source = transform_item.source,
                     },
                 };
@@ -4452,6 +4464,8 @@ pub const Browser = struct {
                                 .translate_y = transform_item.translate_y,
                                 .children = children_copy,
                                 .node = transform_item.node,
+                                .composited = transform_item.composited,
+                                .compositor_id = transform_item.compositor_id,
                                 .source = transform_item.source,
                             },
                         });
@@ -4634,6 +4648,8 @@ pub const Browser = struct {
                             .translate_y = transform_item.translate_y,
                             .children = children_copy,
                             .node = transform_item.node,
+                            .composited = transform_item.composited,
+                            .compositor_id = transform_item.compositor_id,
                             .source = transform_item.source,
                         },
                     });
@@ -4662,12 +4678,14 @@ pub const Browser = struct {
             return error.InvalidRasterDimensions;
         }
         if (task.raster) try self.rasterWorkerCaches(task);
+        self.worker_compositor_cache.apply(task.composited_updates);
         const chrome_surface = if (self.worker_chrome_surface) |*surface|
             surface
         else
             return error.MissingChromeRasterCache;
         if (task.active_tab != null and
-            (self.worker_tab_surface == null or !self.worker_interest_region_valid))
+            (self.worker_tab_surface == null and !self.worker_compositor_cache.valid or
+                !self.worker_interest_region_valid))
         {
             return error.MissingTabRasterCache;
         }
@@ -4681,7 +4699,15 @@ pub const Browser = struct {
         errdefer root.deinit(task.allocator);
         @memset(try imageSurfacePixels(&root), .{ .r = 255, .g = 255, .b = 255, .a = 255 });
 
-        if (self.worker_tab_surface) |*tab_surface| {
+        if (self.worker_compositor_cache.valid) {
+            const scroll_px = scroll_model.scaleCssPx(task.scroll, task.zoom);
+            self.worker_compositor_cache.draw(
+                &root,
+                task.chrome_bottom,
+                scroll_px,
+                task.zoom,
+            );
+        } else if (self.worker_tab_surface) |*tab_surface| {
             const scroll_px = scroll_model.scaleCssPx(task.scroll, task.zoom);
             const destination_y_i64 = @as(i64, task.chrome_bottom) +
                 @as(i64, self.worker_interest_region.start_px) - @as(i64, scroll_px);
@@ -4734,25 +4760,33 @@ pub const Browser = struct {
         var tab_owned = false;
         errdefer if (tab_owned) if (tab_surface) |*surface| surface.deinit(task.allocator);
         if (task.page) |page| {
-            tab_surface = try z2d.Surface.init(
-                .image_surface_rgba,
-                task.allocator,
-                task.window_width,
-                @max(task.interest_region.height_px, 1),
+            const built_compositor_cache = try self.buildWorkerCompositorCache(
+                task,
+                page.items,
             );
-            tab_owned = true;
-            @memset(try imageSurfacePixels(&tab_surface.?), .{ .r = 255, .g = 255, .b = 255, .a = 255 });
-            var tab_context = z2d.Context.init(self.io, task.allocator, &tab_surface.?);
-            defer tab_context.deinit();
-            for (page.items) |item| {
-                try self.drawDisplayItemZ2dContextForLayer(
-                    &tab_context,
-                    item,
-                    0,
-                    task.interest_region.start_px,
-                    task.zoom,
+            if (!built_compositor_cache) {
+                tab_surface = try z2d.Surface.init(
+                    .image_surface_rgba,
+                    task.allocator,
+                    task.window_width,
+                    @max(task.interest_region.height_px, 1),
                 );
+                tab_owned = true;
+                @memset(try imageSurfacePixels(&tab_surface.?), .{ .r = 255, .g = 255, .b = 255, .a = 255 });
+                var tab_context = z2d.Context.init(self.io, task.allocator, &tab_surface.?);
+                defer tab_context.deinit();
+                for (page.items) |item| {
+                    try self.drawDisplayItemZ2dContextForLayer(
+                        &tab_context,
+                        item,
+                        0,
+                        task.interest_region.start_px,
+                        task.zoom,
+                    );
+                }
             }
+        } else {
+            self.worker_compositor_cache.clear(task.allocator);
         }
 
         if (self.worker_chrome_surface) |*old| old.deinit(task.allocator);
@@ -4763,6 +4797,216 @@ pub const Browser = struct {
         tab_owned = false;
         self.worker_interest_region = task.interest_region;
         self.worker_interest_region_valid = task.page != null;
+    }
+
+    const WorkerPlaneSpec = struct {
+        compositor_id: usize,
+        opacity: f64,
+        translate_x: i32,
+        translate_y: i32,
+    };
+
+    fn workerPlaneSpec(item: DisplayItem) ?WorkerPlaneSpec {
+        return switch (item) {
+            .transform => |transform| if (transform.composited and transform.compositor_id != null) blk: {
+                var opacity: f64 = 1.0;
+                for (transform.children) |child| {
+                    if (child == .blend and child.blend.compositor_id == transform.compositor_id) {
+                        opacity = child.blend.opacity;
+                        break;
+                    }
+                }
+                break :blk .{
+                    .compositor_id = transform.compositor_id.?,
+                    .opacity = opacity,
+                    .translate_x = transform.translate_x,
+                    .translate_y = transform.translate_y,
+                };
+            } else null,
+            .blend => |blend| if (blend.needs_compositing and blend.compositor_id != null)
+                .{
+                    .compositor_id = blend.compositor_id.?,
+                    .opacity = blend.opacity,
+                    .translate_x = 0,
+                    .translate_y = 0,
+                }
+            else
+                null,
+            else => null,
+        };
+    }
+
+    fn workerCacheCanSplit(items: []const DisplayItem) bool {
+        var found_plane = false;
+        for (items) |item| {
+            if (workerPlaneSpec(item) != null) {
+                found_plane = true;
+                continue;
+            }
+            if (item == .blend and item.blend.blend_mode != null) return false;
+        }
+        return found_plane;
+    }
+
+    fn workerCacheSupportsCompositorId(items: []const DisplayItem, compositor_id: usize) bool {
+        if (!workerCacheCanSplit(items)) return false;
+        for (items) |item| {
+            const spec = workerPlaneSpec(item) orelse continue;
+            if (spec.compositor_id == compositor_id) return true;
+        }
+        return false;
+    }
+
+    fn buildWorkerCompositorCache(
+        self: *Browser,
+        task: *const RasterTaskContext,
+        items: []const DisplayItem,
+    ) !bool {
+        self.worker_compositor_cache.clear(task.allocator);
+        if (!workerCacheCanSplit(items)) return false;
+
+        var static_start: usize = 0;
+        for (items, 0..) |item, index| {
+            const spec = workerPlaneSpec(item) orelse continue;
+            if (static_start < index) {
+                try self.appendWorkerStaticPlane(task, items[static_start..index]);
+            }
+            try self.appendWorkerDynamicPlane(task, item, spec);
+            static_start = index + 1;
+        }
+        if (static_start < items.len) {
+            try self.appendWorkerStaticPlane(task, items[static_start..]);
+        }
+        self.worker_compositor_cache.valid = true;
+        return true;
+    }
+
+    fn appendWorkerStaticPlane(
+        self: *Browser,
+        task: *const RasterTaskContext,
+        items: []const DisplayItem,
+    ) !void {
+        if (items.len == 0) return;
+        const bounds = Rect{
+            .left = 0,
+            .top = task.interest_region.start_px,
+            .right = task.window_width,
+            .bottom = task.interest_region.endPx(),
+        };
+        try self.appendWorkerPlane(task, items, bounds, null, null);
+    }
+
+    fn appendWorkerDynamicPlane(
+        self: *Browser,
+        task: *const RasterTaskContext,
+        item: DisplayItem,
+        spec: WorkerPlaneSpec,
+    ) !void {
+        var bounds = self.getDisplayItemBounds(item, task.zoom);
+        bounds = .{
+            .left = bounds.left - DisplayItem.scaleLayoutPx(spec.translate_x, task.zoom),
+            .top = bounds.top - DisplayItem.scaleLayoutPx(spec.translate_y, task.zoom),
+            .right = bounds.right - DisplayItem.scaleLayoutPx(spec.translate_x, task.zoom),
+            .bottom = bounds.bottom - DisplayItem.scaleLayoutPx(spec.translate_y, task.zoom),
+        };
+        try self.appendWorkerPlane(task, &.{item}, bounds, spec, spec.compositor_id);
+    }
+
+    fn appendWorkerPlane(
+        self: *Browser,
+        task: *const RasterTaskContext,
+        items: []const DisplayItem,
+        bounds: Rect,
+        spec: ?WorkerPlaneSpec,
+        compositor_id: ?usize,
+    ) !void {
+        const width = @max(bounds.width(), 1);
+        const height = @max(bounds.height(), 1);
+        var surface = try z2d.Surface.init(.image_surface_rgba, task.allocator, width, height);
+        var surface_owned = true;
+        errdefer if (surface_owned) surface.deinit(task.allocator);
+        @memset(try imageSurfacePixels(&surface), .{ .r = 0, .g = 0, .b = 0, .a = 0 });
+        var context = z2d.Context.init(self.io, task.allocator, &surface);
+        defer context.deinit();
+        for (items) |item| {
+            if (spec) |plane_spec| {
+                try self.drawWorkerCompositedSource(
+                    &context,
+                    item,
+                    plane_spec.compositor_id,
+                    bounds.left,
+                    bounds.top,
+                    task.zoom,
+                );
+            } else {
+                try self.drawDisplayItemZ2dContextForLayer(
+                    &context,
+                    item,
+                    bounds.left,
+                    bounds.top,
+                    task.zoom,
+                );
+            }
+        }
+        try self.worker_compositor_cache.planes.append(task.allocator, .{
+            .surface = surface,
+            .bounds = bounds,
+            .compositor_id = compositor_id,
+            .opacity = if (spec) |value| value.opacity else 1.0,
+            .translate_x = if (spec) |value| value.translate_x else 0,
+            .translate_y = if (spec) |value| value.translate_y else 0,
+        });
+        surface_owned = false;
+    }
+
+    fn drawWorkerCompositedSource(
+        self: *Browser,
+        context: *z2d.Context,
+        item: DisplayItem,
+        compositor_id: usize,
+        layer_x: i32,
+        layer_y: i32,
+        zoom: f32,
+    ) !void {
+        switch (item) {
+            .transform => |transform| {
+                if (transform.composited and transform.compositor_id == compositor_id) {
+                    for (transform.children) |child| {
+                        try self.drawWorkerCompositedSource(
+                            context,
+                            child,
+                            compositor_id,
+                            layer_x,
+                            layer_y,
+                            zoom,
+                        );
+                    }
+                    return;
+                }
+            },
+            .blend => |blend| {
+                if (blend.compositor_id == compositor_id) {
+                    var opaque_blend = item;
+                    opaque_blend.blend.opacity = 1.0;
+                    try self.drawDisplayItemZ2dContextForLayer(
+                        context,
+                        opaque_blend,
+                        layer_x,
+                        layer_y,
+                        zoom,
+                    );
+                    return;
+                }
+            },
+            else => {},
+        }
+        try self.drawDisplayItemZ2dContextForLayer(
+            context,
+            item,
+            layer_x,
+            layer_y,
+            zoom,
+        );
     }
 
     fn copyRasterRows(
@@ -4981,12 +5225,27 @@ pub const Browser = struct {
             };
         }
 
+        const composited_updates: []CompositorUpdate = if (self.pending_composited_updates.items.len > 0) blk: {
+            const copy = raster_allocator.alloc(
+                CompositorUpdate,
+                self.pending_composited_updates.items.len,
+            ) catch |err| {
+                self.lock.unlock();
+                return err;
+            };
+            @memcpy(copy, self.pending_composited_updates.items);
+            break :blk copy;
+        } else @constCast(&.{});
+        var composited_updates_owned = composited_updates.len > 0;
+        errdefer if (composited_updates_owned) raster_allocator.free(composited_updates);
+
         const zoom = self.activeZoom();
         context.* = .{
             .allocator = raster_allocator,
             .browser = self,
             .page = page_snapshot,
             .chrome = chrome_snapshot,
+            .composited_updates = composited_updates,
             .raster = raster,
             .window_width = self.window_width,
             .window_height = self.window_height,
@@ -5004,6 +5263,8 @@ pub const Browser = struct {
         };
         page_snapshot = null;
         chrome_snapshot = null;
+        composited_updates_owned = false;
+        self.pending_composited_updates.clearRetainingCapacity();
         context_owned = false;
 
         self.animation_frame_present_pending = false;
@@ -5029,6 +5290,9 @@ pub const Browser = struct {
 
     fn runRasterTask(self: *Browser, task: *RasterTaskContext) !void {
         errdefer self.cancelRasterTask(task.sample_animation_work);
+        const trace_name = if (task.raster) "render:raster_and_draw" else "render:draw_only";
+        const tracing = self.measure.begin(trace_name);
+        defer if (tracing) self.measure.end(trace_name);
         const start_ns = std.Io.Clock.awake.now(self.io).nanoseconds;
         var surface = try self.renderRasterSnapshot(task);
         var surface_owned = true;
@@ -5206,12 +5470,13 @@ pub const Browser = struct {
             self.needs_raster = true;
             self.needs_draw = true;
         } else if (data.composited_updates.len > 0) {
-            // The bounded tab surface caches the fully assembled page region,
-            // so compositor-only changes must be copied into that cache again.
+            var compositor_only = true;
             for (data.composited_updates) |update| {
-                self.applyCompositedUpdate(update);
+                if (!self.applyCompositedUpdate(update)) compositor_only = false;
             }
-            self.needs_raster = true;
+            if (!compositor_only) {
+                self.needs_raster = true;
+            }
             self.needs_draw = true;
         }
 
@@ -5235,18 +5500,45 @@ pub const Browser = struct {
     }
 
     /// Apply a composited update to the matching layer
-    fn applyCompositedUpdate(self: *Browser, update: Tab.CompositedUpdate) void {
-        // Keep the committed source tree current even when the effect is below
-        // a transform; a later recomposite must see the animated value.
-        if (self.active_tab_display_list) |display_list| {
-            _ = DisplayItem.applyCompositedOpacity(display_list, update.node, update.opacity);
+    fn applyCompositedUpdate(self: *Browser, update: Tab.CompositedUpdate) bool {
+        const compositor_id = @intFromPtr(update.node);
+
+        // Keep the committed source tree current; a later cache rebuild must
+        // start from the last composited value rather than the CSS endpoint.
+        const display_list = self.active_tab_display_list orelse return false;
+        {
+            switch (update.value) {
+                .opacity => |opacity| {
+                    _ = DisplayItem.applyCompositedOpacity(display_list, update.node, opacity);
+                },
+                .transform => |transform| {
+                    _ = DisplayItem.applyCompositedTransform(
+                        display_list,
+                        update.node,
+                        transform.x,
+                        transform.y,
+                    );
+                },
+            }
         }
 
-        var needs_layer_raster = false;
-        for (self.composited_layers.items) |*layer| {
-            if (layer.applyCompositedOpacity(update.node, update.opacity)) needs_layer_raster = true;
-        }
-        if (needs_layer_raster) self.needs_raster = true;
+        // Draw-only updates are valid only for a top-level effect represented
+        // by the worker's retained plane cache. Nested/unsupported effects
+        // fall back to raster so an update is never silently dropped.
+        if (!workerCacheSupportsCompositorId(display_list, compositor_id)) return false;
+
+        const worker_update = CompositorUpdate{
+            .id = compositor_id,
+            .value = switch (update.value) {
+                .opacity => |opacity| .{ .opacity = opacity },
+                .transform => |transform| .{ .transform = .{
+                    .x = transform.x,
+                    .y = transform.y,
+                } },
+            },
+        };
+        self.pending_composited_updates.append(self.allocator, worker_update) catch return false;
+        return true;
     }
 
     /// Rasterize one retained composited layer. The layer module owns command
@@ -6851,6 +7143,7 @@ pub const Browser = struct {
         self.worker_chrome_surface = null;
         if (self.worker_tab_surface) |*surface| surface.deinit(self.raster_allocator);
         self.worker_tab_surface = null;
+        self.worker_compositor_cache.deinit(self.raster_allocator);
         self.worker_interest_region_valid = false;
 
         for (self.tabs.items) |tab| tab.shutdown();
@@ -6885,6 +7178,7 @@ pub const Browser = struct {
 
         self.composited_layers.deinit(self.allocator);
         self.tab_draw_list.deinit(self.allocator);
+        self.pending_composited_updates.deinit(self.allocator);
 
         self.chrome.deinit();
 
@@ -6917,6 +7211,46 @@ pub const Browser = struct {
         if (self.owns_sdl) sdl2.quit();
     }
 };
+
+test "worker compositor cache accepts representable planes and rejects nested effects" {
+    var leaf = [_]DisplayItem{.{ .rect = .{
+        .x1 = 0,
+        .y1 = 0,
+        .x2 = 10,
+        .y2 = 10,
+        .color = .{ .r = 255, .g = 0, .b = 0 },
+    } }};
+    const plane_id: usize = 17;
+    const plane = DisplayItem{ .transform = .{
+        .translate_x = 0,
+        .translate_y = 0,
+        .children = &leaf,
+        .composited = true,
+        .compositor_id = plane_id,
+    } };
+
+    var top_level = [_]DisplayItem{plane};
+    try std.testing.expect(Browser.workerCacheSupportsCompositorId(&top_level, plane_id));
+
+    var nested_children = [_]DisplayItem{plane};
+    var nested = [_]DisplayItem{.{ .blend = .{
+        .opacity = 1.0,
+        .blend_mode = null,
+        .children = &nested_children,
+    } }};
+    try std.testing.expect(!Browser.workerCacheSupportsCompositorId(&nested, plane_id));
+
+    var mask_children = [_]DisplayItem{leaf[0]};
+    var masked = [_]DisplayItem{
+        plane,
+        .{ .blend = .{
+            .opacity = 1.0,
+            .blend_mode = "dst_in",
+            .children = &mask_children,
+        } },
+    };
+    try std.testing.expect(!Browser.workerCacheSupportsCompositorId(&masked, plane_id));
+}
 
 const BrowserTaskContexts = tab_tasks.Contexts(Browser);
 const DocumentHandle = BrowserTaskContexts.DocumentHandle;
