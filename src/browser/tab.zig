@@ -1987,7 +1987,7 @@ fn advanceAnimations(self: *Tab, node: *parser.Node) bool {
                                         applyRetainedCompositedUpdate(root_frame, update);
                                     }
                                 },
-                                .color, .transform => {},
+                                .pixel, .color, .transform => {},
                             }
                         } else if (std.mem.eql(u8, entry.key_ptr.*, "background-color")) {
                             switch (anim.*) {
@@ -1996,7 +1996,7 @@ fn advanceAnimations(self: *Tab, node: *parser.Node) bool {
                                 // update path. Layout reads the current color
                                 // directly from this element-owned animation.
                                 .color => self.needs_paint = true,
-                                .numeric, .transform => {},
+                                .numeric, .pixel, .transform => {},
                             }
                         } else if (std.mem.eql(u8, entry.key_ptr.*, "transform")) {
                             switch (anim.*) {
@@ -2011,7 +2011,21 @@ fn advanceAnimations(self: *Tab, node: *parser.Node) bool {
                                         applyRetainedCompositedUpdate(root_frame, update);
                                     }
                                 },
-                                .numeric, .color => {},
+                                .numeric, .pixel, .color => {},
+                            }
+                        } else if (std.mem.eql(u8, entry.key_ptr.*, "width") or
+                            std.mem.eql(u8, entry.key_ptr.*, "height"))
+                        {
+                            switch (anim.*) {
+                                .pixel => {
+                                    // Dimension animations change both block
+                                    // geometry and descendant line wrapping.
+                                    self.needs_layout = true;
+                                    if (elem.layout_ptr) |layout_ptr| {
+                                        if (elem.layout_mark) |mark| mark(layout_ptr);
+                                    }
+                                },
+                                .numeric, .color, .transform => {},
                             }
                         }
                     }
@@ -2029,6 +2043,38 @@ fn advanceAnimations(self: *Tab, node: *parser.Node) bool {
     }
 
     return any_running;
+}
+
+test "pixel dimension animation requests layout and produces px values" {
+    const allocator = std.testing.allocator;
+    var html_parser = try parser.HTMLParser.init(
+        allocator,
+        "<div style=\"width: 100px; height: 40px\"></div>",
+    );
+    html_parser.use_implicit_tags = false;
+    defer html_parser.deinit(allocator);
+    var root = try html_parser.parse();
+    defer root.deinit(allocator);
+    parser.fixParentPointers(&root, null);
+    try parser.style(allocator, &root, &.{});
+
+    root.element.animations = std.StringHashMap(parser.Animation).init(allocator);
+    try root.element.animations.?.put("width", .{ .pixel = parser.PixelAnimation.initWithEasing(100, 200, 2, .linear) });
+    try root.element.animations.?.put("height", .{ .pixel = parser.PixelAnimation.initWithEasing(40, 80, 2, .linear) });
+
+    var tab: Tab = undefined;
+    tab.allocator = allocator;
+    tab.root_frame = null;
+    tab.composited_updates = .empty;
+    defer tab.composited_updates.deinit(allocator);
+    tab.needs_layout = false;
+
+    try std.testing.expect(tab.advanceAnimations(&root));
+    try std.testing.expect(tab.needs_layout);
+    var width_buffer: [32]u8 = undefined;
+    var height_buffer: [32]u8 = undefined;
+    try std.testing.expectEqualStrings("150.000px", try root.element.animations.?.get("width").?.pixel.formatValue(&width_buffer));
+    try std.testing.expectEqualStrings("60.000px", try root.element.animations.?.get("height").?.pixel.formatValue(&height_buffer));
 }
 
 fn applyRetainedCompositedUpdate(frame: *Frame, update: CompositedUpdate) void {

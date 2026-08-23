@@ -55,6 +55,7 @@ The source tree is organized by responsibility:
 | [`src/document/css_parser.zig`](../src/document/css_parser.zig) | CSS parsing and `CSSRule` ownership. |
 | [`src/document/color.zig`](../src/document/color.zig) | Shared parsing for paintable named and hexadecimal RGBA CSS colors. |
 | [`src/document/easing.zig`](../src/document/easing.zig) | Owned CSS timing functions and cubic-Bezier evaluation. |
+| [`src/document/length.zig`](../src/document/length.zig) | Shared parsing, layout conversion, and serialization for supported non-negative CSS pixel lengths. |
 | [`src/document/transform.zig`](../src/document/transform.zig) | Shared parsing and interpolation-ready representation for supported CSS translations. |
 | [`src/document/selector.zig`](../src/document/selector.zig) | Selector representation and matching. |
 | [`src/network/url.zig`](../src/network/url.zig) | Owning `Url`, URL resolution, schemes, HTTP requests, redirects, cookies, response bodies, and cache integration. |
@@ -462,6 +463,12 @@ Inherited style fields establish these edges between parent and child DOM
 styles in [`src/document/parser.zig`](../src/document/parser.zig). Layout fields
 establish similar edges between document, parent, previous sibling, and child
 layout objects in [`src/browser/render/layout.zig`](../src/browser/render/layout.zig).
+During an active incremental layout traversal, child metrics can notify the
+parent aggregate that is already being recomputed. Document, block, and line
+owners suppress that reentrant owner-wide callback while their `in_layout`
+guard is set; the individual aggregate remains dirty until the same traversal
+publishes its final value. This keeps stable parent x/width fields readable by
+later siblings without dropping an external invalidation.
 The synthetic default-parent style used at the root is ephemeral to one style
 pass: root fields read its defaults directly and never register dependency edges
 to it.
@@ -947,13 +954,15 @@ cost does not throttle another.
 CSS transition state is owned by its DOM Element and advanced only by the
 serialized Tab worker. The transition map is tagged by interpolation kind:
 opacity stores a numeric interpolation, `background-color` stores RGBA
-endpoints, and `transform` stores the two axes of a parsed `translate(...)`.
-Each entry stores its timing function by value. Normalized frame progress is
-linear in scheduler time, then `easing.zig` maps it through CSS `ease` by
-default or a supported keyword/explicit cubic Bezier before property
-interpolation. Layout reads current color directly from the Element-owned map,
-and each color advance marks paint dirty so display commands and raster pixels
-are regenerated. Opacity and translation instead emit compositor updates; a
+endpoints, width/height wrap numeric interpolation in a pixel-length variant,
+and `transform` stores the two axes of a parsed `translate(...)`. Each entry
+stores its timing function by value. Normalized frame progress is linear in
+scheduler time, then `easing.zig` maps it through CSS `ease` by default or a
+supported keyword/explicit cubic Bezier before property interpolation. Layout
+reads current color and dimensions directly from the Element-owned map. Color
+advances mark paint dirty; every width/height advance can serialize a stable
+`px` value and marks the element's layout owner dirty so geometry and line
+breaks are regenerated. Opacity and translation instead emit compositor updates; a
 simultaneous pair for one element shares its numeric compositor ID and updates
 one retained plane without paint or raster. A replacement style captures its
 baseline from an active transition first, otherwise from

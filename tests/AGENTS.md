@@ -185,6 +185,10 @@ Their midpoint colors differ while their duration and final blue endpoint match.
 initial build rasterizes once; later animation frames and root scrolls that stay
 inside the interest region are draw-only and leave no ghost image.
 
+`tests/manual/width-height-animations.html` animates both block dimensions.
+The panel grows in both axes while its text continuously reflows onto fewer
+lines, proving width frames enter layout rather than only repainting a box.
+
 `tests/manual/threaded-loading.html` combines two external scripts and two
 same-specificity stylesheets. Run its adjacent threaded Python server to give
 each response equal latency: all four requests start together while the visible

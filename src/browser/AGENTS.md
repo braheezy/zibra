@@ -257,9 +257,10 @@ before changing `root.zig`, `tab.zig`, `render/`, or browser task scheduling.
   bounds but does not expand the DOM hit target.
 - CSS transition state advances only on the serialized Tab worker. Opacity and
   `translate(...)` transforms emit composited scalar updates and can skip
-  paint; `background-color` writes the interpolated RGBA value in Element-owned
-  animation state and marks paint dirty on every frame because the rectangle
-  command and raster pixels change.
+  paint; `background-color` marks paint dirty; width/height retain a
+  pixel-serializing animation value and mark the element's layout owner dirty
+  on every frame so block geometry, descendant line wrapping, paint, and raster
+  are regenerated.
 - A fixed-height `overflow: scroll` block keeps its natural content height as
   DOM-owned scroll geometry while layout exposes the fixed client height.
   Paint keeps the box background stationary, translates its content by the

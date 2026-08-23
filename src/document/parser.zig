@@ -14,6 +14,7 @@ const CSSParser = @import("css_parser.zig").CSSParser;
 const css_color = @import("color.zig");
 const easing = @import("easing.zig");
 const css_transform = @import("transform.zig");
+const css_length = @import("length.zig");
 
 pub const CssColor = css_color.Color;
 pub const parseCssColor = css_color.parse;
@@ -21,6 +22,8 @@ pub const EasingFunction = easing.Function;
 pub const parseEasingFunction = easing.parse;
 pub const Translation = css_transform.Translation;
 pub const parseTranslate = css_transform.parse;
+pub const parsePixelLength = css_length.parsePixel;
+pub const pixelLengthToLayoutPixels = css_length.toLayoutPixels;
 
 /// Animation state for a numeric CSS property transition
 pub const NumericAnimation = struct {
@@ -69,6 +72,51 @@ pub const NumericAnimation = struct {
     /// Check if animation is complete
     pub fn isComplete(self: NumericAnimation) bool {
         return self.current_frame >= self.total_frames;
+    }
+};
+
+/// Numeric interpolation whose CSS representation is a non-negative pixel
+/// length. Width and height use this variant so values can retain the `px`
+/// suffix expected by layout.
+pub const PixelAnimation = struct {
+    numeric: NumericAnimation,
+
+    pub fn initWithEasing(
+        start: f64,
+        end: f64,
+        frames: u32,
+        easing_function: EasingFunction,
+    ) PixelAnimation {
+        return .{ .numeric = NumericAnimation.initWithEasing(
+            start,
+            end,
+            frames,
+            easing_function,
+        ) };
+    }
+
+    pub fn parse(value: []const u8) ?f64 {
+        return css_length.parsePixel(value);
+    }
+
+    pub fn getValue(self: PixelAnimation) f64 {
+        return self.numeric.getValue();
+    }
+
+    pub fn layoutPixels(self: PixelAnimation) i32 {
+        return css_length.toLayoutPixels(self.getValue());
+    }
+
+    pub fn formatValue(self: PixelAnimation, buffer: []u8) ![]const u8 {
+        return css_length.formatPixel(buffer, self.getValue());
+    }
+
+    pub fn advance(self: *PixelAnimation) bool {
+        return self.numeric.advance();
+    }
+
+    pub fn isComplete(self: PixelAnimation) bool {
+        return self.numeric.isComplete();
     }
 };
 
@@ -178,12 +226,14 @@ pub const TransformAnimation = struct {
 /// Property-specific transition state retained by one DOM element.
 pub const Animation = union(enum) {
     numeric: NumericAnimation,
+    pixel: PixelAnimation,
     color: ColorAnimation,
     transform: TransformAnimation,
 
     pub fn advance(self: *Animation) bool {
         return switch (self.*) {
             .numeric => |*animation| animation.advance(),
+            .pixel => |*animation| animation.advance(),
             .color => |*animation| animation.advance(),
             .transform => |*animation| animation.advance(),
         };
@@ -192,6 +242,7 @@ pub const Animation = union(enum) {
     pub fn isComplete(self: Animation) bool {
         return switch (self) {
             .numeric => |animation| animation.isComplete(),
+            .pixel => |animation| animation.isComplete(),
             .color => |animation| animation.isComplete(),
             .transform => |animation| animation.isComplete(),
         };
@@ -229,6 +280,15 @@ test "numeric and color animations apply easing before interpolation" {
         CssColor{ .r = 205, .g = 50, .b = 0, .a = 205 },
         color.getValue(),
     );
+}
+
+test "pixel animation retains units and produces layout values" {
+    var animation = PixelAnimation.initWithEasing(100, 200, 2, .linear);
+    _ = animation.advance();
+    try std.testing.expectApproxEqAbs(@as(f64, 150), animation.getValue(), 0.000001);
+    try std.testing.expectEqual(@as(i32, 150), animation.layoutPixels());
+    var buffer: [32]u8 = undefined;
+    try std.testing.expectEqualStrings("150.000px", try animation.formatValue(&buffer));
 }
 
 test "transform animation eases both translation axes" {

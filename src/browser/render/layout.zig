@@ -111,16 +111,26 @@ fn contentBoundsForNode(node: Node, parent_x: i32, parent_width: i32) ContentBou
 /// Parse the subset of CSS lengths supported by block dimensions. `auto`,
 /// unsupported units, negative lengths, and invalid values use auto layout.
 fn parseCssPixelLength(value: []const u8) ?i32 {
-    const trimmed = std.mem.trim(u8, value, " \t\r\n");
-    if (std.ascii.eqlIgnoreCase(trimmed, "auto")) return null;
-    if (trimmed.len < 2 or !std.ascii.eqlIgnoreCase(trimmed[trimmed.len - 2 ..], "px")) return null;
+    const pixels = parser.parsePixelLength(value) orelse return null;
+    return parser.pixelLengthToLayoutPixels(pixels);
+}
 
-    const number = std.mem.trim(u8, trimmed[0 .. trimmed.len - 2], " \t\r\n");
-    if (number.len == 0) return null;
-    const pixels = std.fmt.parseFloat(f64, number) catch return null;
-    const max_i32_float: f64 = @floatFromInt(std.math.maxInt(i32));
-    if (!std.math.isFinite(pixels) or pixels < 0 or pixels > max_i32_float) return null;
-    return @intFromFloat(pixels);
+fn animatedPixelDimension(element: *const parser.Element, property: []const u8) ?i32 {
+    const animations = element.animations orelse return null;
+    const animation = animations.get(property) orelse return null;
+    return switch (animation) {
+        .pixel => |pixel| pixel.layoutPixels(),
+        .numeric, .color, .transform => null,
+    };
+}
+
+fn resolvedPixelDimension(
+    element: *const parser.Element,
+    style_map: *const parser.StyleMap,
+    property: []const u8,
+) ?i32 {
+    return animatedPixelDimension(element, property) orelse
+        if (styleValue(style_map, property)) |value| parseCssPixelLength(value) else null;
 }
 
 /// Parse the single-radius subset supported by paint and hit testing. Invalid,
@@ -1070,6 +1080,34 @@ test "block dimensions accept non-negative pixel lengths" {
     try std.testing.expectEqual(@as(?i32, null), parseCssPixelLength("-1px"));
     try std.testing.expectEqual(@as(?i32, null), parseCssPixelLength("NaNpx"));
     try std.testing.expectEqual(@as(?i32, null), parseCssPixelLength("999999999999px"));
+}
+
+test "animated width changes the word wrapping threshold" {
+    var animation = parser.PixelAnimation.initWithEasing(100, 200, 2, .linear);
+    try std.testing.expect(wordNeedsNewLine(70, 50, animation.layoutPixels()));
+    _ = animation.advance();
+    _ = animation.advance();
+    try std.testing.expect(!wordNeedsNewLine(70, 50, animation.layoutPixels()));
+}
+
+test "active layout suppresses reentrant owner-wide invalidation" {
+    const allocator = std.testing.allocator;
+    var block: BlockLayout = undefined;
+    block.in_layout = true;
+    block.x = ProtectedField(i32).init(allocator, 10);
+    defer block.x.deinit();
+    block.width = ProtectedField(i32).init(allocator, 100);
+    defer block.width.deinit();
+    block.x.set(10);
+    block.width.set(100);
+    block.width.setOwner(&block, BlockLayout.markOpaque);
+
+    // A child metric may dirty the parent's aggregate while that parent is
+    // already recomputing. Only that aggregate stays dirty; the owner callback
+    // must not redirty x/width before the next sibling reads them.
+    block.width.mark();
+    try std.testing.expect(block.width.dirty);
+    try std.testing.expect(!block.x.dirty);
 }
 
 test "table of contents navigation reserves a header row" {
@@ -2906,12 +2944,10 @@ const InputLayout = struct {
         var height_value = natural_height;
         if (!self.is_checkbox) {
             if (element.style) |*style_map| {
-                if (styleValue(style_map, "width")) |width| {
-                    if (parseCssPixelLength(width)) |pixels| width_value = @max(pixels, 1);
-                }
-                if (styleValue(style_map, "height")) |height| {
-                    if (parseCssPixelLength(height)) |pixels| height_value = @max(pixels, natural_height);
-                }
+                if (resolvedPixelDimension(&element, style_map, "width")) |pixels|
+                    width_value = @max(pixels, 1);
+                if (resolvedPixelDimension(&element, style_map, "height")) |pixels|
+                    height_value = @max(pixels, natural_height);
             }
         }
         self.embed.setupDependencies(engine.inline_block, if (element.style) |*map| map else null);
@@ -3195,12 +3231,10 @@ const ButtonLayout = struct {
         var requested_width = INPUT_WIDTH_PX;
         var requested_height: ?i32 = null;
         if (element.style) |*style_map| {
-            if (styleValue(style_map, "width")) |width| {
-                if (parseCssPixelLength(width)) |pixels| requested_width = @max(pixels, 1);
-            }
-            if (styleValue(style_map, "height")) |height| {
-                if (parseCssPixelLength(height)) |pixels| requested_height = @max(pixels, 1);
-            }
+            if (resolvedPixelDimension(&element, style_map, "width")) |pixels|
+                requested_width = @max(pixels, 1);
+            if (resolvedPixelDimension(&element, style_map, "height")) |pixels|
+                requested_height = @max(pixels, 1);
         }
         const content_width = @max(requested_width - 2 * button_padding, 1);
         const root = try BlockLayout.initRichButton(
@@ -3993,9 +4027,11 @@ const LineLayout = struct {
     children: std.ArrayList(*TextLayout),
     has_dirty_descendants: bool = false,
     initialized_fields: bool = false,
+    in_layout: bool = false,
 
     fn markOpaque(ptr: *anyopaque) void {
         const self: *LineLayout = @ptrCast(@alignCast(ptr));
+        if (self.in_layout) return;
         self.mark();
     }
 
@@ -4066,6 +4102,8 @@ const LineLayout = struct {
     fn layout(self: *LineLayout, engine: *Layout) !void {
         // Skip layout if nothing is dirty
         if (!self.layoutNeeded()) return;
+        self.in_layout = true;
+        defer self.in_layout = false;
 
         if (!self.initialized_fields) {
             var ascent_deps = std.ArrayList(*ProtectedField(i32)).empty;
@@ -4221,9 +4259,11 @@ pub const DocumentLayout = struct {
     children: std.ArrayList(*BlockLayout),
 
     has_dirty_descendants: bool = false,
+    in_layout: bool = false,
 
     fn markOpaque(ptr: *anyopaque) void {
         const self: *DocumentLayout = @ptrCast(@alignCast(ptr));
+        if (self.in_layout) return;
         self.mark();
     }
 
@@ -4279,6 +4319,8 @@ pub const DocumentLayout = struct {
 
     pub fn layout(self: *DocumentLayout, engine: *Layout) !void {
         if (!self.layoutNeeded()) return;
+        self.in_layout = true;
+        defer self.in_layout = false;
 
         // Compute dimensions
         const x_value = h_offset;
@@ -4404,9 +4446,11 @@ const BlockLayout = struct {
     display_list: std.ArrayList(DisplayItem),
     cursor_x: i32 = 0,
     has_dirty_descendants: bool = false,
+    in_layout: bool = false,
 
     fn markOpaque(ptr: *anyopaque) void {
         const self: *BlockLayout = @ptrCast(@alignCast(ptr));
+        if (self.in_layout) return;
         self.mark();
     }
 
@@ -4528,13 +4572,11 @@ const BlockLayout = struct {
         if (self.inline_nodes != null) return null;
         const node_ptr = self.node_ptr orelse return null;
         return switch (node_ptr.*) {
-            .element => |*element| if (element.style) |*style_map|
-                if (styleValueRead(style_map, property, target)) |value|
-                    parseCssPixelLength(value)
-                else
-                    null
-            else
-                null,
+            .element => |*element| if (element.style) |*style_map| blk: {
+                const computed = styleValueRead(style_map, property, target) orelse break :blk null;
+                break :blk animatedPixelDimension(element, property) orelse
+                    parseCssPixelLength(computed);
+            } else null,
             .text => null,
         };
     }
@@ -4701,7 +4743,7 @@ const BlockLayout = struct {
         const line = self.children.items[self.children.items.len - 1].line;
 
         // Check if we need to wrap to a new line
-        if (self.cursor_x + width > self.width and self.cursor_x > 0) {
+        if (wordNeedsNewLine(self.cursor_x, width, self.width)) {
             try self.newLine();
         }
 
@@ -4720,6 +4762,8 @@ const BlockLayout = struct {
     fn layout(self: *BlockLayout, engine: *Layout) !void {
         // Skip layout if nothing is dirty
         if (!self.layoutNeeded()) return;
+        self.in_layout = true;
+        defer self.in_layout = false;
 
         if (self.node_ptr) |ptr| {
             self.node = ptr.*;
@@ -4937,6 +4981,10 @@ const BlockLayout = struct {
         }
     }
 };
+
+fn wordNeedsNewLine(cursor_x: i32, word_width: i32, line_width: i32) bool {
+    return cursor_x > 0 and cursor_x +| word_width > line_width;
+}
 
 test "block display provenance rejects fragments outside its DOM origin" {
     const allocator = std.testing.allocator;
@@ -5256,7 +5304,7 @@ fn animatedBackgroundColor(element: parser.Element) ?browser.Color {
     const animation = animations.get("background-color") orelse return null;
     const color = switch (animation) {
         .color => |value| value.getValue(),
-        .numeric, .transform => return null,
+        .numeric, .pixel, .transform => return null,
     };
     return .{ .r = color.r, .g = color.g, .b = color.b, .a = color.a };
 }
@@ -5614,7 +5662,7 @@ fn applyPaintEffects(self: *Layout, block: *BlockLayout, commands: []DisplayItem
                             opacity = numeric.getValue();
                             opacity = @max(0.0, @min(1.0, opacity)); // Clamp to valid range
                         },
-                        .color, .transform => {},
+                        .pixel, .color, .transform => {},
                     }
                 }
             }
@@ -5658,7 +5706,7 @@ fn applyPaintEffects(self: *Layout, block: *BlockLayout, commands: []DisplayItem
                 if (animations.get("transform")) |animation| {
                     animated_transform = switch (animation) {
                         .transform => |value| value.getValue(),
-                        .numeric, .color => null,
+                        .numeric, .pixel, .color => null,
                     };
                 }
             }

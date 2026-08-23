@@ -17,6 +17,7 @@ const parser = @import("../document/parser.zig");
 const Node = parser.Node;
 const CSSParser = @import("../document/css_parser.zig").CSSParser;
 const NumericAnimation = parser.NumericAnimation;
+const PixelAnimation = parser.PixelAnimation;
 const ColorAnimation = parser.ColorAnimation;
 const TransformAnimation = parser.TransformAnimation;
 const Animation = parser.Animation;
@@ -186,6 +187,27 @@ fn startTransformAnimation(
     try elem.animations.?.put("transform", animation);
 }
 
+fn startPixelAnimation(
+    allocator: std.mem.Allocator,
+    elem: *parser.Element,
+    property: []const u8,
+    start: f64,
+    end: f64,
+    frames: u32,
+    easing_function: EasingFunction,
+) !void {
+    if (elem.animations == null) {
+        elem.animations = std.StringHashMap(Animation).init(allocator);
+    }
+    const animation = Animation{ .pixel = PixelAnimation.initWithEasing(
+        start,
+        end,
+        frames,
+        easing_function,
+    ) };
+    try elem.animations.?.put(property, animation);
+}
+
 test "transition values default to ease and parse supported timing functions" {
     const default_transition = parseTransitionValue("background-color 500ms").?;
     try std.testing.expectEqualStrings("background-color", default_transition.property);
@@ -226,7 +248,7 @@ fn currentAnimatedOpacity(elem: *const parser.Element) ?f64 {
     const animation = animations.get("opacity") orelse return null;
     return switch (animation) {
         .numeric => |numeric| numeric.getValue(),
-        .color, .transform => null,
+        .pixel, .color, .transform => null,
     };
 }
 
@@ -235,7 +257,7 @@ fn currentAnimatedBackgroundColor(elem: *const parser.Element) ?parser.CssColor 
     const animation = animations.get("background-color") orelse return null;
     return switch (animation) {
         .color => |color| color.getValue(),
-        .numeric, .transform => null,
+        .numeric, .pixel, .transform => null,
     };
 }
 
@@ -244,7 +266,16 @@ fn currentAnimatedTransform(elem: *const parser.Element) ?parser.Translation {
     const animation = animations.get("transform") orelse return null;
     return switch (animation) {
         .transform => |transform| transform.getValue(),
-        .numeric, .color => null,
+        .numeric, .pixel, .color => null,
+    };
+}
+
+fn currentAnimatedPixel(elem: *const parser.Element, property: []const u8) ?f64 {
+    const animations = elem.animations orelse return null;
+    const animation = animations.get(property) orelse return null;
+    return switch (animation) {
+        .pixel => |pixel| pixel.getValue(),
+        .numeric, .color, .transform => null,
     };
 }
 
@@ -2434,7 +2465,7 @@ test "native style_set starts a background-color transition from computed color"
                 0.000001,
             );
         },
-        .numeric, .transform => try std.testing.expect(false),
+        .numeric, .pixel, .transform => try std.testing.expect(false),
     }
 }
 
@@ -2472,7 +2503,7 @@ test "native style_set starts simultaneous transform and opacity transitions" {
             try std.testing.expectEqual(@as(f64, 0.25), opacity.end_value);
             try std.testing.expectApproxEqAbs(0.5, opacity.easing_function.apply(0.5), 0.000001);
         },
-        .color, .transform => try std.testing.expect(false),
+        .pixel, .color, .transform => try std.testing.expect(false),
     }
     switch (animations.get("transform").?) {
         .transform => |transform| {
@@ -2484,7 +2515,58 @@ test "native style_set starts simultaneous transform and opacity transitions" {
                 0.000001,
             );
         },
-        .numeric, .color => try std.testing.expect(false),
+        .numeric, .pixel, .color => try std.testing.expect(false),
+    }
+}
+
+test "native style_set starts width and height pixel transitions" {
+    const allocator = std.testing.allocator;
+    var html_parser = try parser.HTMLParser.init(
+        allocator,
+        "<div style=\"width: 120px; height: 40px\"></div>",
+    );
+    html_parser.use_implicit_tags = false;
+    defer html_parser.deinit(allocator);
+    var root = try html_parser.parse();
+    defer root.deinit(allocator);
+    parser.fixParentPointers(&root, null);
+    try parser.style(allocator, &root, &.{});
+
+    var environ = std.process.Environ.Map.init(allocator);
+    defer environ.deinit();
+    var js = try Js.init(allocator, std.testing.io, &environ);
+    defer js.deinit(allocator);
+    js.setNodes(0, &root);
+    defer js.setNodes(0, null);
+
+    const result = try js.evaluate(0,
+        \\var box = document.querySelectorAll('div')[0];
+        \\box.style = 'width: 360px; height: 100px; transition: width 1s linear, height 2s ease-in';
+        \\true
+    );
+    try std.testing.expect(result.toBoolean());
+
+    const animations = root.element.animations.?;
+    switch (animations.get("width").?) {
+        .pixel => |width| {
+            try std.testing.expectEqual(@as(f64, 120), width.numeric.start_value);
+            try std.testing.expectEqual(@as(f64, 360), width.numeric.end_value);
+            try std.testing.expectEqual(@as(u32, 60), width.numeric.total_frames);
+        },
+        .numeric, .color, .transform => try std.testing.expect(false),
+    }
+    switch (animations.get("height").?) {
+        .pixel => |height| {
+            try std.testing.expectEqual(@as(f64, 40), height.numeric.start_value);
+            try std.testing.expectEqual(@as(f64, 100), height.numeric.end_value);
+            try std.testing.expectEqual(@as(u32, 120), height.numeric.total_frames);
+            try std.testing.expectApproxEqAbs(
+                parser.EasingFunction.ease_in.apply(0.5),
+                height.numeric.easing_function.apply(0.5),
+                0.000001,
+            );
+        },
+        .numeric, .color, .transform => try std.testing.expect(false),
     }
 }
 
@@ -3954,6 +4036,8 @@ fn styleSet(agent: *Agent, this_value: Value, arguments: kiesel.types.Arguments)
             var old_opacity = currentAnimatedOpacity(e);
             var old_background_color = currentAnimatedBackgroundColor(e);
             var old_transform = currentAnimatedTransform(e);
+            var old_width = currentAnimatedPixel(e, "width");
+            var old_height = currentAnimatedPixel(e, "height");
             if (e.style) |*style_map| {
                 if (old_opacity == null) {
                     if (style_map.getPtr("opacity")) |field| {
@@ -3970,6 +4054,16 @@ fn styleSet(agent: *Agent, this_value: Value, arguments: kiesel.types.Arguments)
                         old_transform = parser.parseTranslate(field.lastValue().*);
                     }
                 }
+                if (old_width == null) {
+                    if (style_map.getPtr("width")) |field| {
+                        old_width = PixelAnimation.parse(field.lastValue().*);
+                    }
+                }
+                if (old_height == null) {
+                    if (style_map.getPtr("height")) |field| {
+                        old_height = PixelAnimation.parse(field.lastValue().*);
+                    }
+                }
             }
 
             // Replacing the complete inline style cancels transitions that
@@ -3979,6 +4073,8 @@ fn styleSet(agent: *Agent, this_value: Value, arguments: kiesel.types.Arguments)
                 _ = animations.remove("opacity");
                 _ = animations.remove("background-color");
                 _ = animations.remove("transform");
+                _ = animations.remove("width");
+                _ = animations.remove("height");
             }
 
             const owned_style = try js_instance.allocator.dupe(u8, style_str);
@@ -4050,6 +4146,35 @@ fn styleSet(agent: *Agent, this_value: Value, arguments: kiesel.types.Arguments)
                                         transition.easing_function,
                                     ) catch |err| {
                                         std.log.warn("Failed to start transform animation: {}", .{err});
+                                    };
+                                }
+                            }
+                        } else if (std.ascii.eqlIgnoreCase(transition.property, "width") or
+                            std.ascii.eqlIgnoreCase(transition.property, "height"))
+                        {
+                            const property: []const u8 = if (std.ascii.eqlIgnoreCase(
+                                transition.property,
+                                "width",
+                            )) "width" else "height";
+                            const old_value = if (std.mem.eql(u8, property, "width"))
+                                old_width
+                            else
+                                old_height;
+                            if (new_style.get(property)) |new_value_str| {
+                                const new_value = PixelAnimation.parse(new_value_str);
+                                if (new_value != null and old_value != null and
+                                    old_value.? != new_value.?)
+                                {
+                                    startPixelAnimation(
+                                        js_instance.allocator,
+                                        e,
+                                        property,
+                                        old_value.?,
+                                        new_value.?,
+                                        transition.frames,
+                                        transition.easing_function,
+                                    ) catch |err| {
+                                        std.log.warn("Failed to start {s} animation: {}", .{ property, err });
                                     };
                                 }
                             }

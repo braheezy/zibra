@@ -92,11 +92,13 @@ or selector/rule lifetime.
   the borrowed computed-value slice in the style map.
 - Each Element owns a property-keyed tagged transition map. Numeric entries
   currently drive opacity, color entries interpolate RGBA channels together,
-  and transform entries interpolate both axes of a parsed `translate(...)`.
-  All store their timing function and apply it to normalized frame progress
-  before interpolation. `easing.zig` owns the timing-function parser and cubic
-  Bezier solver. Opacity's computed style string borrows a fixed buffer embedded
-  in that same Element; layout reads animated colors directly from the tagged map.
+  pixel entries preserve the `px` unit for width/height, and transform entries
+  interpolate both axes of a parsed `translate(...)`. All store their timing
+  function and apply it to normalized frame progress before interpolation.
+  `length.zig` owns the supported non-negative pixel grammar; `easing.zig` owns
+  the timing-function parser and cubic Bezier solver. Opacity's computed-style
+  string borrows a fixed buffer embedded in that same Element; layout reads
+  animated colors and dimensions directly from the tagged map.
 - Element-local overflow scroll offsets and client/content heights are scalar
   DOM state. Layout republishes and clamps their geometry; input may change
   only the offset between layouts. Structural mutation consumers must retire

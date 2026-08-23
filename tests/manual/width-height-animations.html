@@ -1,0 +1,42 @@
+<!--
+How to verify:
+1. The blue panel grows wider and taller for two seconds, then reports DONE.
+2. The sentence starts on several lines and continuously reflows onto fewer
+   lines as the width grows; it must not jump immediately to the final wrapping.
+3. Replay repeats both dimensions together without leaving stale backgrounds.
+-->
+<!doctype html>
+<html>
+  <head>
+    <title>Width and height transitions</title>
+    <style>
+      body { background-color: white; color: black; font-size: 18px; }
+      .panel { display: block; width: 220px; height: 100px; padding: 10px; background-color: lightblue; }
+      .status { background-color: lightgray; padding: 6px; }
+      button { margin: 10px 0; }
+    </style>
+  </head>
+  <body>
+    <h1>Layout-inducing transitions</h1>
+    <div class="panel">WIDTH ANIMATION CHANGES THESE LINE BREAKS WHILE THE BLUE BOX ALSO GROWS TALLER.</div>
+    <button>Replay</button>
+    <p class="status">READY</p>
+    <script>
+      var panel = document.querySelectorAll('div')[0];
+      var replay = document.querySelectorAll('button')[0];
+      var status = document.querySelectorAll('p')[0];
+
+      function run() {
+        status.innerHTML = 'ANIMATING';
+        panel.style = 'display: block; width: 220px; height: 100px; padding: 10px; background-color: lightblue';
+        requestAnimationFrame(function() {
+          panel.style = 'display: block; width: 560px; height: 180px; padding: 10px; background-color: lightblue; transition: width 2s ease-in-out, height 2s linear';
+        });
+        setTimeout(function() { status.innerHTML = 'DONE'; }, 2300);
+      }
+
+      replay.addEventListener('click', run);
+      run();
+    </script>
+  </body>
+</html>

@@ -7,6 +7,10 @@ before changing ownership or thread boundaries.
 
 - `layout.zig` builds layout trees and emits provenance-bearing display items.
   Layout and frame-side command lists synchronously borrow DOM and image state.
+  Active width/height transitions override their computed pixel endpoints here;
+  every frame relayouts descendants so line wrapping follows animated width.
+  Document/block/line `in_layout` guards suppress only reentrant owner-wide
+  invalidation caused by child metrics during that same serialized traversal.
 - `font.zig` owns SDL_ttf handles and cached RGBA glyph pixels. Display items
   borrow those pixels until a raster snapshot copies them.
 - `display_list.zig` owns display-command types, recursive cleanup, painted hit
