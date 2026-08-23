@@ -178,6 +178,7 @@ pub fn Contexts(comptime Browser: type) type {
                 keypress: u8,
                 backspace,
                 scroll: i32,
+                immediate_scroll: i32,
                 blur,
                 history: union(enum) {
                     direction: HistoryDirection,
@@ -230,6 +231,7 @@ pub fn Contexts(comptime Browser: type) type {
                     .keypress => |char| try self.tab.keypress(self.browser, char),
                     .backspace => try self.tab.backspace(self.browser),
                     .scroll => |delta| self.tab.scrollFocused(self.browser, delta),
+                    .immediate_scroll => |delta| self.tab.scrollImmediate(self.browser, delta),
                     .blur => if (self.tab.blur()) {
                         self.tab.updateAccessibilityFocus(self.browser);
                         self.tab.setNeedsRender();

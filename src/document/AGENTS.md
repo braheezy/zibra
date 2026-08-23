@@ -120,6 +120,9 @@ or selector/rule lifetime.
 - `position` and `z-index` are non-inherited and default to `static` and `0`.
   The layout painter accepts signed integer z-index values only when position
   is non-static; invalid values retain the zero paint layer.
+- `scroll-behavior` is non-inherited and defaults to `auto`. The tab worker
+  reads the authored body element's computed value when an arrow-key viewport
+  scroll begins; descendants do not opt the viewport into smooth scrolling.
 - Keep parser output deterministic: the `--dump-dom` golden test is the first
   inspection contract for this pipeline stage.
 

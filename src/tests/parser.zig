@@ -1380,6 +1380,30 @@ test "position and z-index are computed non-inherited properties" {
     );
 }
 
+test "scroll behavior is computed and does not inherit" {
+    const allocator = std.testing.allocator;
+    const html =
+        "<body style=\"scroll-behavior: smooth\">" ++
+        "<main><p>content</p></main></body>";
+
+    var html_parser = try HTMLParser.init(allocator, html);
+    html_parser.use_implicit_tags = false;
+    defer html_parser.deinit(allocator);
+    var root = try html_parser.parse();
+    defer root.deinit(allocator);
+
+    try document_parser.style(allocator, &root, &.{});
+    const main = &root.element.children.items[0].element;
+    try std.testing.expectEqualStrings(
+        "smooth",
+        root.element.style.?.getPtr("scroll-behavior").?.get().*,
+    );
+    try std.testing.expectEqualStrings(
+        "auto",
+        main.style.?.getPtr("scroll-behavior").?.get().*,
+    );
+}
+
 test "nested button start tags implicitly close the outer button" {
     const allocator = std.testing.allocator;
     const html =

@@ -1,0 +1,37 @@
+<!--
+How to verify:
+1. Press Down once. The viewport and scrollbar thumb should ease toward the
+   next 100px position over several frames instead of jumping immediately.
+2. Press Down rapidly several times. The pending destination should accumulate
+   each key press without snapping backward; Up should smoothly retarget in the
+   opposite direction.
+3. Mouse-wheel scrolling remains immediate. Set the body declaration below to
+   `auto` and arrow-key scrolling should also become immediate.
+4. Enable reduced-motion accessibility and reload: arrow-key scrolling should
+   be immediate even though the page requests smooth behavior.
+-->
+<!doctype html>
+<html>
+<head>
+  <title>Animated body scrolling</title>
+  <style>
+    body { scroll-behavior: smooth; background-color: white; color: black; font-size: 20px; }
+    .instructions { background-color: lightblue; height: 120px; }
+    .orange { background-color: orange; height: 260px; }
+    .green { background-color: lightgreen; height: 260px; }
+    .purple { background-color: purple; color: white; height: 260px; }
+    .gray { background-color: lightgray; height: 260px; }
+  </style>
+</head>
+<body>
+  <h1>Animated body scrolling</h1>
+  <div class="instructions">Press Down and watch each numbered band glide past.</div>
+  <div class="orange">Band 1 — orange</div>
+  <div class="green">Band 2 — green</div>
+  <div class="purple">Band 3 — purple</div>
+  <div class="gray">Band 4 — gray</div>
+  <div class="orange">Band 5 — orange</div>
+  <div class="green">Band 6 — green</div>
+  <p>END — Up should animate back toward the top.</p>
+</body>
+</html>

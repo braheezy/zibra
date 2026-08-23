@@ -136,6 +136,11 @@ element's old untransformed or unscrolled box.
 stable DOM-order ties, the static-position gate, and recursive nested sibling
 stacking. Visible counters verify that reverse hit testing follows paint order.
 
+`tests/manual/animated-scroll.html` exercises body `scroll-behavior`, smooth
+Up/Down motion, repeated-key retargeting, the immediate `auto`/wheel path, and
+the reduced-motion override. `tests/manual/composited-animations.html` also
+combines smooth scrolling with simultaneous opacity/transform animation.
+
 `tests/manual/interest-region.html` is a deliberately long, color-banded page
 for crossing and reversing over tab raster-cache boundaries. Scrolling and
 resizing must remain continuous while the cached surface stays bounded to four

@@ -863,6 +863,15 @@ pub const Browser = struct {
         return null;
     }
 
+    /// Input tasks retain their originating tab. Validate it under the
+    /// per-window lock so an event queued just before a tab switch cannot
+    /// scroll whichever tab happens to be active when that task finally runs.
+    pub fn tabIsActive(self: *Browser, tab: *Tab) bool {
+        self.lock.lock();
+        defer self.lock.unlock();
+        return self.activeTab() == tab;
+    }
+
     pub fn windowId(self: *const Browser) !u32 {
         const window = self.window orelse return error.BrowserHasNoNativeWindow;
         return window.getID();
@@ -1019,9 +1028,23 @@ pub const Browser = struct {
     }
 
     pub fn handleScroll(self: *Browser, delta: i32) void {
+        self.handleScrollForExpectedTab(null, delta);
+    }
+
+    pub fn handleScrollForTab(self: *Browser, tab: *Tab, delta: i32) void {
+        self.handleScrollForExpectedTab(tab, delta);
+    }
+
+    fn handleScrollForExpectedTab(self: *Browser, expected_tab: ?*Tab, delta: i32) void {
         var should_schedule = false;
         self.lock.lock();
         const tab = self.activeTab();
+        if (expected_tab) |expected| {
+            if (tab != expected) {
+                self.lock.unlock();
+                return;
+            }
+        }
         if (tab) |active| {
             const target_frame = active.focused_frame orelse active.root_frame;
             if (target_frame) |frame| {
@@ -1472,7 +1495,9 @@ pub const Browser = struct {
             },
             .mouse_wheel => |wheel_event| {
                 const delta = wheelScrollDelta(wheel_event.delta_y, wheel_event.direction == .flipped);
-                if (delta != 0) self.handleScroll(delta);
+                if (delta != 0) {
+                    if (self.activeTab()) |tab| self.scheduleTabImmediateScrollTask(tab, delta);
+                }
             },
             .mouse_button_down => |button_event| {
                 if (touch_input.isSyntheticMouse(button_event.mouse_instance_id)) return false;
@@ -2034,6 +2059,10 @@ pub const Browser = struct {
 
     fn scheduleTabScrollTask(self: *Browser, tab: *Tab, delta: i32) void {
         self.scheduleTabAction(tab, .{ .scroll = delta }, "task:scroll");
+    }
+
+    fn scheduleTabImmediateScrollTask(self: *Browser, tab: *Tab, delta: i32) void {
+        self.scheduleTabAction(tab, .{ .immediate_scroll = delta }, "task:scroll_immediate");
     }
 
     pub fn scheduleTabHistoryTraversal(

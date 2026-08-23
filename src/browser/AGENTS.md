@@ -329,6 +329,16 @@ before changing `root.zig`, `tab.zig`, `render/`, or browser task scheduling.
   while crossing either edge requests a new raster around the viewport.
   Resize, zoom, display-list retirement, and document geometry changes
   invalidate the region before any cached pixels can be reused.
+- `scroll.zig` also owns the allocation-free, clock-based `ScrollAnimation`
+  value. Up/Down on a page whose authored body computes
+  `scroll-behavior: smooth` starts or retargets that value on the serialized
+  tab worker; repeated keys accumulate against its pending destination. Each
+  root step commits only the scalar offset, preserving draw-only scrolling
+  inside the interest region. Focused overflow boxes, wheel/voice input,
+  `auto`, and reduced-motion mode remain immediate and cancel a pending frame
+  animation. Every queued scroll validates its originating tab under
+  `Browser.lock` before touching state. Child-frame smooth scrolls currently
+  recompose their iframe.
 - Fragment targets are layout-derived document-space positions that borrow DOM
   node identity. A `Frame` copies them with its other hit-test data and retires
   them before layout or DOM. Full navigation applies the fragment after layout;

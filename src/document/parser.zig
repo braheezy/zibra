@@ -1688,6 +1688,7 @@ const CSS_PROPERTIES = [_]struct { name: []const u8, default_value: []const u8 }
     .{ .name = "display", .default_value = "inline" },
     .{ .name = "position", .default_value = "static" },
     .{ .name = "z-index", .default_value = "0" },
+    .{ .name = "scroll-behavior", .default_value = "auto" },
     .{ .name = "width", .default_value = "auto" },
     .{ .name = "height", .default_value = "auto" },
 };

@@ -653,6 +653,20 @@ commands or invalidating compositor planes. Crossing an edge rerasterizes a new
 region, while display-list replacement, resize, zoom, content-height change,
 and structural retirement invalidate the cache.
 
+Viewport smooth scrolling is a separate, allocation-free animation owned by
+the target `Frame`. On serialized Up/Down input, the tab samples the authored
+body's non-inherited computed `scroll-behavior`; `smooth` creates or retargets a
+250ms clock-based ease-out interpolation, while `auto` and reduced-motion mode
+use the immediate path. Repeated keys accumulate from the pending destination
+but restart interpolation from the currently displayed offset, avoiding jumps.
+The tab advances every live frame's value alongside CSS/JavaScript animation
+callbacks. A root step commits only the scalar scroll offset, so the Browser
+can reuse its interest-region surface and draw without raster until an edge is
+crossed. Child iframe placement is encoded in the composed command tree and
+therefore repaints during its smooth scroll. Direct wheel/voice or focused
+overflow scrolling cancels a pending viewport interpolation; navigation and
+fragment jumps retire it with, or explicitly clear it from, the Frame.
+
 Basic text direction is resolved per inline block through the acyclic layout
 parent chain. The CLI `-rtl` flag supplies the fallback direction; the nearest
 block ancestor with `dir=rtl` or `dir=ltr` overrides it. Glyphs are measured and

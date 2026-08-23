@@ -184,6 +184,10 @@ pub const Frame = struct {
     display_list: ?[]DisplayItem = null,
     content_height: i32 = 0,
     scroll: i32 = 0,
+    // Worker-owned viewport animation. Root-frame steps commit only a new
+    // scalar scroll offset; child-frame steps currently require recomposition
+    // because iframe placement is encoded in the composed command tree.
+    scroll_animation: ?scroll_model.ScrollAnimation = null,
     focus: ?*Node = null,
     // The innermost clicked `overflow: scroll` element. This worker-owned DOM
     // borrow is retired at the same structural-mutation boundary as focus.
@@ -422,6 +426,7 @@ pub const Frame = struct {
 
     pub fn scrollToFragment(self: *Frame, fragment: []const u8) bool {
         const target_scroll = self.scrollOffsetForFragment(fragment) orelse return false;
+        self.scroll_animation = null;
         self.scroll = target_scroll;
         self.tab.scroll_changed_in_tab = true;
         return true;
@@ -1907,6 +1912,9 @@ pub fn runAnimationFrameForGeneration(
         frame.scroll = scroll;
     }
 
+    const now_ns = std.Io.Clock.awake.now(self.browser.io).nanoseconds;
+    const scroll_animations_running = self.advanceScrollAnimations(now_ns);
+
     // Clear previous frame's composited updates
     self.composited_updates.items.len = 0;
 
@@ -1917,7 +1925,7 @@ pub fn runAnimationFrameForGeneration(
     }
 
     // If animations are running, schedule the next frame
-    if (animations_running) {
+    if (animations_running or scroll_animations_running) {
         self.browser.setNeedsAnimationFrame(self);
         self.browser.scheduleAnimationFrame();
     }
@@ -1947,7 +1955,12 @@ pub fn runAnimationFrameForGeneration(
         null;
 
     // Only commit if we have something to send
-    if (needs_full_render or has_composited_updates or activation_commit) {
+    if (animationFrameHasCommit(
+        needs_full_render,
+        has_composited_updates,
+        activation_commit,
+        commit_scroll,
+    )) {
         const composed_list = if (needs_full_render or activation_commit)
             self.composeDisplayList(frame) catch |err| blk: {
                 std.log.warn("Failed to compose retained display list: {}", .{err});
@@ -1973,6 +1986,56 @@ pub fn runAnimationFrameForGeneration(
         self.browser.commit(self, commit_data);
     }
     self.scroll_changed_in_tab = false;
+}
+
+/// A root scroll is itself a visual commit even when layout, paint, and the
+/// compositor command tree are unchanged.
+pub fn animationFrameHasCommit(
+    needs_full_render: bool,
+    has_composited_updates: bool,
+    activation_commit: bool,
+    commit_scroll: ?i32,
+) bool {
+    return needs_full_render or has_composited_updates or activation_commit or commit_scroll != null;
+}
+
+fn advanceScrollAnimations(self: *Tab, now_ns: i96) bool {
+    var any_running = false;
+    var frame_it = self.frames_by_id.valueIterator();
+    while (frame_it.next()) |frame_ptr| {
+        const target_frame = frame_ptr.*;
+        const animation = target_frame.scroll_animation orelse continue;
+        const step = animation.sample(now_ns);
+        const next_scroll = self.clampScrollForFrame(target_frame, step.scroll);
+        if (next_scroll != target_frame.scroll) {
+            target_frame.scroll = next_scroll;
+            if (target_frame == self.root_frame) {
+                self.scroll_changed_in_tab = true;
+            } else {
+                // Child-frame scroll is part of iframe composition rather
+                // than Browser's root-scroll scalar.
+                self.needs_paint = true;
+            }
+        }
+
+        const target_scroll = self.clampScrollForFrame(
+            target_frame,
+            animation.target_scroll,
+        );
+        const target_was_clamped = target_scroll != animation.target_scroll;
+        if (step.complete or (target_was_clamped and next_scroll == target_scroll)) {
+            target_frame.scroll = target_scroll;
+            target_frame.scroll_animation = null;
+            if (target_frame == self.root_frame) {
+                self.scroll_changed_in_tab = true;
+            } else {
+                self.needs_paint = true;
+            }
+        } else {
+            any_running = true;
+        }
+    }
+    return any_running;
 }
 
 fn hasActiveAnimations(node: *const parser.Node) bool {
@@ -2874,16 +2937,82 @@ pub fn scrollElementChain(scroll_start: ?*Node, delta: i32) bool {
     return false;
 }
 
+fn findBodyElement(node: *Node) ?*parser.Element {
+    return switch (node.*) {
+        .text => null,
+        .element => |*element| blk: {
+            // Zibra's permissive parser can retain an explicit authored
+            // document below its implicit html/body wrapper. Prefer the
+            // descendant body so an authored inline declaration wins over
+            // that synthetic viewport container.
+            for (element.children.items) |*child| {
+                if (findBodyElement(child)) |body| break :blk body;
+            }
+            break :blk if (std.ascii.eqlIgnoreCase(element.tag, "body")) element else null;
+        },
+    };
+}
+
+/// The exercise deliberately uses the body element as the viewport's style
+/// source. `scroll-behavior` is non-inherited, so descendants cannot enable it
+/// accidentally.
+pub fn documentScrollBehavior(root: *Node) scroll_model.Behavior {
+    const body = findBodyElement(root) orelse return .auto;
+    const styles = if (body.style) |*map| map else return .auto;
+    const field = styles.getPtr("scroll-behavior") orelse return .auto;
+    return scroll_model.parseBehavior(field.get().*);
+}
+
+fn frameScrollBehavior(frame: *Frame) scroll_model.Behavior {
+    const root = if (frame.current_node) |*node| node else return .auto;
+    return documentScrollBehavior(root);
+}
+
 /// Arrow-key scroll entry point. Element offsets are tab-worker-owned and need
 /// only repaint; an exhausted element chain delegates to the existing frame
 /// scroll model (including iframe and root interest-region behavior).
 pub fn scrollFocused(self: *Tab, b: *Browser, delta: i32) void {
+    if (!b.tabIsActive(self)) return;
     const frame = self.focused_frame orelse self.root_frame orelse return;
     if (scrollElementChain(frame.scroll_focus, delta)) {
+        frame.scroll_animation = null;
         self.setNeedsPaint();
         return;
     }
-    b.handleScroll(delta);
+
+    if (!self.accessibility.reduce_motion and frameScrollBehavior(frame) == .smooth) {
+        const base_scroll = if (frame.scroll_animation) |animation|
+            animation.target_scroll
+        else
+            frame.scroll;
+        const target_scroll = self.clampScrollForFrame(frame, base_scroll +| delta);
+        if (frame.scroll_animation) |animation| {
+            if (animation.target_scroll == target_scroll) return;
+        } else if (target_scroll == frame.scroll) {
+            return;
+        }
+
+        frame.scroll_animation = scroll_model.ScrollAnimation.init(
+            frame.scroll,
+            target_scroll,
+            std.Io.Clock.awake.now(b.io).nanoseconds,
+        );
+        b.setNeedsAnimationFrame(self);
+        b.scheduleAnimationFrame();
+        return;
+    }
+
+    self.scrollImmediate(b, delta);
+}
+
+/// Serialized immediate scrolling for `auto`, wheel, voice, and accessibility
+/// input. Keeping cancellation on the tab worker prevents the optional clock
+/// animation from being read or torn across threads.
+pub fn scrollImmediate(self: *Tab, b: *Browser, delta: i32) void {
+    if (!b.tabIsActive(self)) return;
+    const frame = self.focused_frame orelse self.root_frame orelse return;
+    frame.scroll_animation = null;
+    b.handleScrollForTab(self, delta);
 }
 
 // Handle keypress in focused input
@@ -3490,11 +3619,11 @@ pub fn handleVoiceCommand(self: *Tab, b: *Browser, command: []const u8) void {
         return;
     }
     if (std.mem.eql(u8, command, "scroll down")) {
-        b.handleScroll(100);
+        self.scrollImmediate(b, 100);
         return;
     }
     if (std.mem.eql(u8, command, "scroll up")) {
-        b.handleScroll(-100);
+        self.scrollImmediate(b, -100);
         return;
     }
 

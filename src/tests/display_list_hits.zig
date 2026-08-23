@@ -441,6 +441,11 @@ test "root scrolling inside the interest region is draw-only" {
     test_browser.animation_frame_deadline_ns = null;
     test_browser.shutting_down = true;
 
+    var stale_tab: tab_module.Tab = undefined;
+    test_browser.handleScrollForTab(&stale_tab, 100);
+    try std.testing.expectEqual(@as(i32, 0), frame.scroll);
+    try std.testing.expectEqual(@as(i32, 0), test_browser.active_tab_scroll);
+
     test_browser.handleScroll(100);
     try std.testing.expectEqual(@as(i32, 100), frame.scroll);
     try std.testing.expectEqual(@as(i32, 100), test_browser.active_tab_scroll);

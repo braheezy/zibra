@@ -1,9 +1,75 @@
-//! Pure scroll-range and scrollbar-thumb geometry.
+//! Pure scroll behavior, animation, range, and scrollbar-thumb geometry.
 //!
 //! Document and scroll values use CSS pixels. Viewport and thumb values use
 //! native window pixels, with zoom providing the conversion between them.
 
 const std = @import("std");
+
+pub const Behavior = enum {
+    auto,
+    smooth,
+};
+
+/// Only the two values used by the chapter exercise affect viewport input.
+/// Unknown values retain the CSS initial behavior instead of accidentally
+/// enabling animation.
+pub fn parseBehavior(value: []const u8) Behavior {
+    const normalized = std.mem.trim(u8, value, " \t\r\n");
+    return if (std.ascii.eqlIgnoreCase(normalized, "smooth")) .smooth else .auto;
+}
+
+pub const smooth_scroll_duration_ns: i96 = 250_000_000;
+
+pub const AnimationStep = struct {
+    scroll: i32,
+    complete: bool,
+};
+
+/// One clock-based viewport scroll. The user-agent curve is deliberately an
+/// ease-out cubic: CSS leaves the exact smooth-scroll timing function to the
+/// browser, and deceleration makes keyboard scrolling settle naturally.
+pub const ScrollAnimation = struct {
+    start_scroll: i32,
+    target_scroll: i32,
+    start_time_ns: i96,
+    duration_ns: i96 = smooth_scroll_duration_ns,
+
+    pub fn init(start_scroll: i32, target_scroll: i32, start_time_ns: i96) ScrollAnimation {
+        return .{
+            .start_scroll = start_scroll,
+            .target_scroll = target_scroll,
+            .start_time_ns = start_time_ns,
+        };
+    }
+
+    pub fn sample(self: ScrollAnimation, now_ns: i96) AnimationStep {
+        if (self.start_scroll == self.target_scroll or self.duration_ns <= 0) {
+            return .{ .scroll = self.target_scroll, .complete = true };
+        }
+
+        const elapsed_ns = std.math.clamp(
+            now_ns -| self.start_time_ns,
+            @as(i96, 0),
+            self.duration_ns,
+        );
+        if (elapsed_ns >= self.duration_ns) {
+            return .{ .scroll = self.target_scroll, .complete = true };
+        }
+
+        const progress = @as(f64, @floatFromInt(elapsed_ns)) /
+            @as(f64, @floatFromInt(self.duration_ns));
+        const remaining = 1.0 - progress;
+        const eased = 1.0 - remaining * remaining * remaining;
+        const delta = @as(f64, @floatFromInt(
+            @as(i64, self.target_scroll) - @as(i64, self.start_scroll),
+        ));
+        const interpolated = @as(f64, @floatFromInt(self.start_scroll)) + delta * eased;
+        return .{
+            .scroll = @intFromFloat(std.math.round(interpolated)),
+            .complete = false,
+        };
+    }
+};
 
 /// The tab raster cache is deliberately bounded independently of document
 /// height. Values in this model are native/device pixels, not CSS pixels.
