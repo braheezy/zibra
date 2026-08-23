@@ -6776,6 +6776,10 @@ pub const Browser = struct {
                     );
                     return;
                 }
+                if (item.fuseCompositedLayerDraw()) |layer_draw| {
+                    try self.drawDisplayItemZ2dContext(context, layer_draw, scroll_offset, zoom);
+                    return;
+                }
                 // For blend operations, only create a layer if we have opacity < 1 or a blend mode
                 const should_save_layer = blend_item.opacity < 1.0 or blend_item.blend_mode != null;
                 const is_dst_in = if (blend_item.blend_mode) |mode| std.mem.eql(u8, mode, "dst_in") else false;
@@ -6830,6 +6834,8 @@ pub const Browser = struct {
                 }
             },
             .draw_composited_layer => |dcl| {
+                const draw_opacity = std.math.clamp(dcl.layer.opacity * dcl.opacity, 0.0, 1.0);
+                if (draw_opacity <= 0.0) return;
                 // Ensure the layer is rasterized
                 try self.rasterCompositedLayer(dcl.layer);
 
@@ -6848,7 +6854,7 @@ pub const Browser = struct {
                         layer_surface,
                         layer_x,
                         layer_y,
-                        dcl.layer.opacity,
+                        draw_opacity,
                         operator,
                     );
                     // Draw debug border if enabled
@@ -7126,6 +7132,16 @@ pub const Browser = struct {
                     );
                     return;
                 }
+                if (item.fuseCompositedLayerDraw()) |layer_draw| {
+                    try self.drawDisplayItemZ2dContextWithTransform(
+                        context,
+                        layer_draw,
+                        scroll_offset,
+                        x_offset,
+                        zoom,
+                    );
+                    return;
+                }
                 // For blends, apply opacity and recurse into children with the transform applied
                 const should_apply_opacity = blend_item.opacity < 1.0 or blend_item.blend_mode != null;
                 const is_dst_in = if (blend_item.blend_mode) |mode| std.mem.eql(u8, mode, "dst_in") else false;
@@ -7173,6 +7189,8 @@ pub const Browser = struct {
                 }
             },
             .draw_composited_layer => |dcl| {
+                const draw_opacity = std.math.clamp(dcl.layer.opacity * dcl.opacity, 0.0, 1.0);
+                if (draw_opacity <= 0.0) return;
                 // For composited layers, draw at transformed position
                 try self.rasterCompositedLayer(dcl.layer);
                 if (dcl.layer.surface) |*layer_surface| {
@@ -7187,7 +7205,7 @@ pub const Browser = struct {
                         layer_surface,
                         layer_x,
                         layer_y,
-                        dcl.layer.opacity,
+                        draw_opacity,
                         operator,
                     );
                 }
@@ -7463,48 +7481,8 @@ pub const Browser = struct {
 
     // Apply opacity to a display item's colors
     fn applyOpacityToDisplayItem(self: *Browser, item: DisplayItem, opacity: f64) DisplayItem {
-        _ = self; // Used for context
-        var result = item;
-
-        switch (result) {
-            .glyph => |*glyph_item| {
-                glyph_item.color.a = @as(u8, @intFromFloat(@round(@as(f64, @floatFromInt(glyph_item.color.a)) * opacity)));
-            },
-            .rect => |*rect_item| {
-                rect_item.color.a = @as(u8, @intFromFloat(@round(@as(f64, @floatFromInt(rect_item.color.a)) * opacity)));
-            },
-            .image => |*image_item| {
-                image_item.opacity *= opacity;
-            },
-            .iframe => {
-                // Iframe placeholders are expanded during display list composition.
-            },
-            .rounded_rect => |*rounded_item| {
-                rounded_item.color.a = @as(u8, @intFromFloat(@round(@as(f64, @floatFromInt(rounded_item.color.a)) * opacity)));
-            },
-            .line => |*line_item| {
-                line_item.color.a = @as(u8, @intFromFloat(@round(@as(f64, @floatFromInt(line_item.color.a)) * opacity)));
-            },
-            .outline => |*outline_item| {
-                outline_item.color.a = @as(u8, @intFromFloat(@round(@as(f64, @floatFromInt(outline_item.color.a)) * opacity)));
-            },
-            .blend => |*blend_item| {
-                // For nested blend operations with blend modes (like dst_in for clipping),
-                // do NOT multiply opacity - the mask needs full opacity to work correctly
-                if (blend_item.blend_mode == null) {
-                    blend_item.opacity *= opacity;
-                }
-                // Blends with modes (clipping masks) keep their original opacity
-            },
-            .draw_composited_layer => {
-                // Composited layers handle their own opacity
-            },
-            .transform => {
-                // Transform items don't have direct color, opacity applied to children
-            },
-        }
-
-        return result;
+        _ = self;
+        return item.withOpacity(opacity);
     }
 
     fn drawScrollbarZ2d(self: *Browser) !void {

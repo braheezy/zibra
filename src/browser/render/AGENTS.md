@@ -26,8 +26,11 @@ before changing ownership or thread boundaries.
 - `font.zig` owns SDL_ttf handles and cached RGBA glyph pixels. Display items
   borrow those pixels until a raster snapshot copies them.
 - `display_list.zig` owns display-command types, recursive cleanup, painted hit
-  testing, and composited-layer data. Keep it independent of `Browser`, SDL,
-  and native-window lifecycle.
+  testing, and composited-layer data. A `DrawCompositedLayer` carries a
+  draw-local opacity multiplier separately from the layer's live compositor
+  opacity; opacity-only paint ancestors multiply that scalar so the cached
+  surface is sampled once during its final draw. Keep this module independent
+  of `Browser`, SDL, and native-window lifecycle.
 - `effects.zig` contains pixel-only software effects. Keep its APIs explicit
   about premultiplication, edge sampling, and temporary allocation.
 - `raster_snapshot.zig` is the thread-transfer boundary. Snapshots must deep

@@ -94,3 +94,58 @@ test "raster isolation preserves list-level masks inside their parent group" {
     try std.testing.expect(browser.rasterBlendNeedsIsolation(true, null, 1));
     try std.testing.expect(browser.rasterBlendNeedsIsolation(true, "multiply", 1));
 }
+
+test "opacity-only ancestor folds into composited layer draw scalar" {
+    var layer = browser.CompositedLayer{
+        .display_items = &.{},
+        .bounds = .{ .left = 0, .top = 0, .right = 20, .bottom = 20 },
+        .opacity = 0.8,
+    };
+    var blend_children = [_]DisplayItem{.{ .draw_composited_layer = .{ .layer = &layer } }};
+    const blend = DisplayItem{ .blend = .{
+        .opacity = 0.5,
+        .blend_mode = null,
+        .children = &blend_children,
+    } };
+
+    const fused = blend.fuseCompositedLayerDraw().?;
+
+    try std.testing.expect(fused == .draw_composited_layer);
+    try std.testing.expectEqual(
+        @as(*browser.CompositedLayer, &layer),
+        fused.draw_composited_layer.layer,
+    );
+    try std.testing.expectApproxEqAbs(
+        @as(f64, 0.5),
+        fused.draw_composited_layer.opacity,
+        0.0001,
+    );
+    try std.testing.expectApproxEqAbs(@as(f64, 0.8), layer.opacity, 0.0001);
+    try std.testing.expectApproxEqAbs(
+        @as(f64, 0.4),
+        layer.opacity * fused.draw_composited_layer.opacity,
+        0.0001,
+    );
+
+    var second_layer = layer;
+    var multiple_children = [_]DisplayItem{
+        blend_children[0],
+        .{ .draw_composited_layer = .{ .layer = &second_layer } },
+    };
+    const overlapping_group = DisplayItem{ .blend = .{
+        .opacity = 0.5,
+        .blend_mode = null,
+        .children = &multiple_children,
+    } };
+    try std.testing.expect(overlapping_group.fuseCompositedLayerDraw() == null);
+
+    var blended_group = blend;
+    blended_group.blend.blend_mode = "multiply";
+    try std.testing.expect(blended_group.fuseCompositedLayerDraw() == null);
+    var filtered_group = blend;
+    filtered_group.blend.blur_radius = 3.0;
+    try std.testing.expect(filtered_group.fuseCompositedLayerDraw() == null);
+    var opaque_group = blend;
+    opaque_group.blend.opacity = 1.0;
+    try std.testing.expect(opaque_group.fuseCompositedLayerDraw() == null);
+}

@@ -1,0 +1,44 @@
+<!-- How to verify:
+1. The moving red square remains the same pale red as the reference square.
+2. It moves without flashing darker, leaving a ghost, or changing the reference.
+3. The parent contributes 0.5 opacity and the child contributes 0.8, so the
+   cached child layer is drawn once at an effective opacity of 0.4.
+-->
+<!doctype html>
+<html>
+  <head>
+    <title>Opacity plus composited-layer draw</title>
+    <style>
+      body { background-color: white; color: black; font-size: 18px; }
+      .label { margin-top: 14px; }
+      .reference {
+        width: 100px;
+        height: 70px;
+        background-color: #ff9999;
+      }
+      .ancestor {
+        width: 420px;
+        height: 90px;
+        background-color: white;
+        opacity: 0.5;
+      }
+      .cached-child {
+        width: 100px;
+        height: 70px;
+        background-color: red;
+        opacity: 0.8;
+        animation: slide 2s ease-in-out infinite alternate;
+      }
+      @keyframes slide {
+        from { transform: translate(0px, 0px); }
+        to { transform: translate(280px, 0px); }
+      }
+    </style>
+  </head>
+  <body>
+    <div class="label">Reference: precomputed 40% red</div>
+    <div class="reference"></div>
+    <div class="label">0.5 ancestor containing a 0.8 composited child</div>
+    <div class="ancestor"><div class="cached-child"></div></div>
+  </body>
+</html>

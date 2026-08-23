@@ -108,7 +108,10 @@ before changing `root.zig`, `tab.zig`, `render/`, or browser task scheduling.
   static paint. An actively animated transform is a permanent merge barrier
   for that raster generation, so later content cannot move beneath it when
   translation creates overlap. Unsupported nesting or masking falls back to a
-  full raster rather than losing an update.
+  full raster rather than losing an update. When an opacity-only `Blend` draws
+  one retained composited layer, fold its alpha into the draw command and
+  multiply it with the layer's live opacity at final composition; never copy
+  the cached surface merely to apply that ancestor alpha.
 - Each tab owns a sentinel-terminated copy of its root document title. Tab
   workers replace it under `Browser.lock`; only the interactive App/UI thread
   may pass it to the addressed native window, including after tab switches.

@@ -221,6 +221,11 @@ plane, while both endpoints remain visually correct when scrolling.
 solid-color plane with a glyph-bearing surface-backed plane. Both must preserve
 opacity, translation, paint order, and draw-only scrolling without ghosting.
 
+`tests/manual/opacity-plus-draw.html` compares nested 0.5 and 0.8 opacity on an
+animated composited child with a precomputed 40% red reference. The child must
+keep the same color while moving, proving ancestor alpha is folded into its
+single cached-surface draw without a temporary copy or stale animation state.
+
 `tests/manual/threaded-loading.html` combines two external scripts and two
 same-specificity stylesheets. Run its adjacent threaded Python server to give
 each response equal latency: all four requests start together while the visible

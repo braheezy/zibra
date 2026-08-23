@@ -284,6 +284,11 @@ pub const DisplayItem = union(enum) {
     },
     draw_composited_layer: struct {
         layer: *CompositedLayer,
+        /// Alpha contributed by paint-command ancestors. Keep it separate
+        /// from `layer.opacity`, which is live compositor state shared by
+        /// every draw of the cached layer. A surrounding opacity-only Blend
+        /// can therefore fold into this command without copying the surface.
+        opacity: f64 = 1.0,
         source: ?DisplayItemSource = null,
     },
     transform: struct {
@@ -312,6 +317,62 @@ pub const DisplayItem = union(enum) {
         return switch (self.*) {
             inline else => |payload| payload.source,
         };
+    }
+
+    /// Return a non-owning command copy with `opacity_value` distributed into
+    /// its paint alpha. Grouped cached-layer draws are handled by
+    /// `fuseCompositedLayerDraw` so overlapping siblings keep group semantics.
+    pub fn withOpacity(self: DisplayItem, opacity_value: f64) DisplayItem {
+        const opacity = std.math.clamp(opacity_value, 0.0, 1.0);
+        var result = self;
+        switch (result) {
+            .glyph => |*glyph_item| {
+                glyph_item.color.a = scaleAlpha(glyph_item.color.a, opacity);
+            },
+            .rect => |*rect_item| {
+                rect_item.color.a = scaleAlpha(rect_item.color.a, opacity);
+            },
+            .image => |*image_item| {
+                image_item.opacity *= opacity;
+            },
+            .iframe => {},
+            .rounded_rect => |*rounded_item| {
+                rounded_item.color.a = scaleAlpha(rounded_item.color.a, opacity);
+            },
+            .line => |*line_item| {
+                line_item.color.a = scaleAlpha(line_item.color.a, opacity);
+            },
+            .outline => |*outline_item| {
+                outline_item.color.a = scaleAlpha(outline_item.color.a, opacity);
+            },
+            .blend => |*blend_item| {
+                // A blend mode (especially dst_in) describes group semantics;
+                // changing that wrapper's alpha would also change its mask.
+                if (blend_item.blend_mode == null) blend_item.opacity *= opacity;
+            },
+            .draw_composited_layer => {},
+            .transform => {},
+        }
+        return result;
+    }
+
+    /// Fold an opacity-only Blend containing exactly one cached-layer draw
+    /// into that draw command. This is the safe structural case: distributing
+    /// group alpha across multiple overlapping children would change output.
+    pub fn fuseCompositedLayerDraw(self: DisplayItem) ?DisplayItem {
+        if (self != .blend) return null;
+        const blend_item = self.blend;
+        if (blend_item.blend_mode != null or blend_item.blur_radius > 0.0) return null;
+        if (blend_item.opacity >= 1.0 or blend_item.children.len != 1) return null;
+        if (blend_item.children[0] != .draw_composited_layer) return null;
+
+        var result = blend_item.children[0];
+        result.draw_composited_layer.opacity *= std.math.clamp(blend_item.opacity, 0.0, 1.0);
+        return result;
+    }
+
+    fn scaleAlpha(alpha: u8, opacity: f64) u8 {
+        return @intFromFloat(@round(@as(f64, @floatFromInt(alpha)) * opacity));
     }
 
     pub fn clearSources(items: []DisplayItem) void {

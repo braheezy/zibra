@@ -612,6 +612,15 @@ operator is applied only when the completed surface is placed. Hit testing
 continues through the original child commands, so the blur's visual haze does
 not enlarge interactive geometry.
 
+A `DrawCompositedLayer` command borrows its retained layer and stores a
+draw-local opacity multiplier independently of the layer's live compositor
+opacity. An opacity-only `Blend` around that single draw folds its alpha into
+the command copy; final placement multiplies both scalars while reading the
+cached premultiplied pixels once. The layer surface and its shared animation
+state are not mutated. Masks, filters, blend operators, and multi-command group
+opacity keep their isolation boundary because distributing opacity across
+those children would change output.
+
 The per-window raster worker keeps either one bounded assembled tab surface or
 an ordered compositor-plane cache. `scroll.zig` chooses a device-pixel interest
 region no taller than four native window heights, with one viewport of
