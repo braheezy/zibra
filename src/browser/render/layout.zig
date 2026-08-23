@@ -711,6 +711,89 @@ pub const Bounds = struct {
     height: i32,
 };
 
+/// A layout-tree hit carries coordinates local to the object that supplied
+/// the DOM node. Worker-owned callers can reuse it for clicking or other point
+/// queries without reconstructing an absolute rectangle per object.
+pub const LayoutHitResult = struct {
+    node: *Node,
+    local_x: i32,
+    local_y: i32,
+};
+
+const HitPoint = struct {
+    x: i32,
+    y: i32,
+};
+
+fn subtractHitOffset(point: HitPoint, x: i32, y: i32) HitPoint {
+    return .{
+        .x = @intCast(std.math.clamp(
+            @as(i64, point.x) - @as(i64, x),
+            @as(i64, std.math.minInt(i32)),
+            @as(i64, std.math.maxInt(i32)),
+        )),
+        .y = @intCast(std.math.clamp(
+            @as(i64, point.y) - @as(i64, y),
+            @as(i64, std.math.minInt(i32)),
+            @as(i64, std.math.maxInt(i32)),
+        )),
+    };
+}
+
+fn addHitOffset(point: HitPoint, x: i32, y: i32) HitPoint {
+    return .{
+        .x = @intCast(std.math.clamp(
+            @as(i64, point.x) + @as(i64, x),
+            @as(i64, std.math.minInt(i32)),
+            @as(i64, std.math.maxInt(i32)),
+        )),
+        .y = @intCast(std.math.clamp(
+            @as(i64, point.y) + @as(i64, y),
+            @as(i64, std.math.minInt(i32)),
+            @as(i64, std.math.maxInt(i32)),
+        )),
+    };
+}
+
+fn relativeHitOffset(child: i32, parent: i32) i32 {
+    return @intCast(std.math.clamp(
+        @as(i64, child) - @as(i64, parent),
+        @as(i64, std.math.minInt(i32)),
+        @as(i64, std.math.maxInt(i32)),
+    ));
+}
+
+fn pointInLocalBox(point: HitPoint, width: i32, height: i32) bool {
+    return width > 0 and height > 0 and
+        point.x >= 0 and point.x < width and
+        point.y >= 0 and point.y < height;
+}
+
+fn pointInLocalRoundedBox(point: HitPoint, width: i32, height: i32, radius_value: f64) bool {
+    if (!pointInLocalBox(point, width, height)) return false;
+    const radius = @min(
+        @max(radius_value, 0.0),
+        @min(
+            @as(f64, @floatFromInt(width)) / 2.0,
+            @as(f64, @floatFromInt(height)) / 2.0,
+        ),
+    );
+    if (radius <= 0.0) return true;
+
+    const px: f64 = @floatFromInt(point.x);
+    const py: f64 = @floatFromInt(point.y);
+    const right: f64 = @floatFromInt(width);
+    const bottom: f64 = @floatFromInt(height);
+    if (px >= radius and px < right - radius) return true;
+    if (py >= radius and py < bottom - radius) return true;
+
+    const center_x = if (px < radius) radius else right - radius;
+    const center_y = if (py < radius) radius else bottom - radius;
+    const dx = px - center_x;
+    const dy = py - center_y;
+    return dx * dx + dy * dy <= radius * radius;
+}
+
 const LinkBoundEntry = struct {
     node: *Node,
     bounds: Bounds,
@@ -1019,17 +1102,24 @@ test "pre elements preserve text without automatic wrapping" {
     try std.testing.expect(!shouldAutomaticallyWrap(false, 95, 10, 100, false));
 }
 
-fn setTestDisplay(allocator: std.mem.Allocator, node: *Node, value: []const u8) !void {
+fn setTestStyleValue(
+    allocator: std.mem.Allocator,
+    node: *Node,
+    property: []const u8,
+    value: []const u8,
+) !void {
     std.debug.assert(node.* == .element);
-    var styles = parser.StyleMap.init(allocator);
-    errdefer styles.deinit();
-    var field = ProtectedField([]const u8).init(allocator, "inline");
+    if (node.element.style == null) node.element.style = parser.StyleMap.init(allocator);
+    var field = ProtectedField([]const u8).init(allocator, value);
     field.set(value);
-    styles.put("display", field) catch |err| {
+    node.element.style.?.put(property, field) catch |err| {
         field.deinit();
         return err;
     };
-    node.element.style = styles;
+}
+
+fn setTestDisplay(allocator: std.mem.Allocator, node: *Node, value: []const u8) !void {
+    return setTestStyleValue(allocator, node, "display", value);
 }
 
 test "computed display classifies block children" {
@@ -1687,6 +1777,80 @@ fn styleValueRead(style_map: *const parser.StyleMap, property: []const u8, notif
         return field.read(notify).*;
     }
     return null;
+}
+
+fn liveBlockElement(block: *const BlockLayout) ?*const parser.Element {
+    const node = block.node_ptr orelse return null;
+    return switch (node.*) {
+        .element => |*element| element,
+        .text => null,
+    };
+}
+
+/// Resolve the visual translation from the live DOM element. Composited
+/// transform animations can advance without rebuilding the layout tree, so a
+/// point query must not rely on the node snapshot captured by BlockLayout.
+fn blockHitTranslation(block: *const BlockLayout) HitPoint {
+    const element = liveBlockElement(block) orelse return .{ .x = 0, .y = 0 };
+    if (element.animations) |animations| {
+        if (animations.get("transform")) |animation| {
+            switch (animation) {
+                .transform => |value| {
+                    const pixels = value.getValue().layoutPixels();
+                    return .{ .x = pixels.x, .y = pixels.y };
+                },
+                .numeric, .pixel, .color => {},
+            }
+        }
+    }
+    const styles = if (element.style) |*value| value else return .{ .x = 0, .y = 0 };
+    const value = styleValue(styles, "transform") orelse return .{ .x = 0, .y = 0 };
+    return if (parseTranslate(value)) |translation|
+        .{ .x = translation.x, .y = translation.y }
+    else
+        .{ .x = 0, .y = 0 };
+}
+
+fn blockHitOpacity(block: *const BlockLayout) f64 {
+    const element = liveBlockElement(block) orelse return 1.0;
+    if (element.animations) |animations| {
+        if (animations.get("opacity")) |animation| {
+            switch (animation) {
+                .numeric => |value| return std.math.clamp(value.getValue(), 0.0, 1.0),
+                .pixel, .color, .transform => {},
+            }
+        }
+    }
+    const styles = if (element.style) |*value| value else return 1.0;
+    const value = styleValue(styles, "opacity") orelse return 1.0;
+    return std.math.clamp(std.fmt.parseFloat(f64, value) catch 1.0, 0.0, 1.0);
+}
+
+const BlockHitClip = struct {
+    enabled: bool,
+    radius: f64,
+};
+
+fn blockHitClip(block: *const BlockLayout) BlockHitClip {
+    const element = liveBlockElement(block) orelse return .{ .enabled = false, .radius = 0.0 };
+    const styles = if (element.style) |*value| value else return .{ .enabled = false, .radius = 0.0 };
+    const radius = if (styleValue(styles, "border-radius")) |value|
+        parseCssPixelRadius(value)
+    else
+        0.0;
+    const overflow = std.mem.trim(
+        u8,
+        styleValue(styles, "overflow") orelse "visible",
+        " \t\r\n",
+    );
+    const clips_overflow = std.ascii.eqlIgnoreCase(overflow, "clip") or
+        (std.ascii.eqlIgnoreCase(overflow, "scroll") and element.scroll_container);
+    return .{ .enabled = radius > 0.0 or clips_overflow, .radius = radius };
+}
+
+fn blockHitScrollY(block: *const BlockLayout) i32 {
+    const element = liveBlockElement(block) orelse return 0;
+    return if (element.scroll_container) @max(element.scroll_y, 0) else 0;
 }
 
 fn applyNodeStyles(self: *Layout, element: parser.Element, _: *std.ArrayList(LineItem)) !void {
@@ -3991,6 +4155,24 @@ const TextLayout = struct {
         });
     }
 
+    fn hitTest(
+        self: *const TextLayout,
+        parent_point: HitPoint,
+        parent_origin: HitPoint,
+    ) ?LayoutHitResult {
+        const local = subtractHitOffset(
+            parent_point,
+            relativeHitOffset(self.x.get().*, parent_origin.x),
+            relativeHitOffset(self.y.get().*, parent_origin.y),
+        );
+        if (!pointInLocalBox(local, self.width.get().*, self.height.get().*)) return null;
+        return .{
+            .node = self.node_ptr orelse return null,
+            .local_x = local.x,
+            .local_y = local.y,
+        };
+    }
+
     fn layoutNeeded(self: *const TextLayout) bool {
         if (self.zoom.dirty) return true;
         if (self.x.dirty) return true;
@@ -4204,6 +4386,25 @@ const LineLayout = struct {
         }
     }
 
+    fn hitTest(
+        self: *const LineLayout,
+        parent_point: HitPoint,
+        parent_origin: HitPoint,
+    ) ?LayoutHitResult {
+        const local = subtractHitOffset(
+            parent_point,
+            relativeHitOffset(self.x.get().*, parent_origin.x),
+            relativeHitOffset(self.y.get().*, parent_origin.y),
+        );
+        var index = self.children.items.len;
+        const origin = HitPoint{ .x = self.x.get().*, .y = self.y.get().* };
+        while (index > 0) {
+            index -= 1;
+            if (self.children.items[index].hitTest(local, origin)) |hit| return hit;
+        }
+        return null;
+    }
+
     fn layoutNeeded(self: *const LineLayout) bool {
         if (self.zoom.dirty) return true;
         if (self.x.dirty) return true;
@@ -4380,6 +4581,38 @@ pub const DocumentLayout = struct {
         return false;
     }
 
+    /// Walk the layout tree back-to-front while carrying a point expressed in
+    /// the current object's local coordinate space. Each child subtracts only
+    /// its offset from its parent; transforms and element scrolling are
+    /// inverted at the object that owns them.
+    pub fn hitTest(self: *const DocumentLayout, x: i32, y: i32) ?LayoutHitResult {
+        const local = subtractHitOffset(
+            .{ .x = x, .y = y },
+            self.x.get().*,
+            self.y.get().*,
+        );
+        const origin = HitPoint{ .x = self.x.get().*, .y = self.y.get().* };
+        var index = self.children.items.len;
+        while (index > 0) {
+            index -= 1;
+            if (self.children.items[index].hitTest(local, origin)) |hit| return hit;
+        }
+        if (!pointInLocalBox(local, self.width.get().*, self.height.get().*)) return null;
+        return .{ .node = self.node_ptr, .local_x = local.x, .local_y = local.y };
+    }
+
+    pub fn hitTestDevice(
+        self: *const DocumentLayout,
+        device_x: i32,
+        device_y: i32,
+        zoom_value: f32,
+    ) ?LayoutHitResult {
+        return self.hitTest(
+            DisplayItem.deviceToLayoutPx(device_x, zoom_value),
+            DisplayItem.deviceToLayoutPx(device_y, zoom_value),
+        );
+    }
+
     pub fn mark(self: *DocumentLayout) void {
         // Mark all layout properties as dirty
         self.x.markNoOwner();
@@ -4416,6 +4649,17 @@ const LayoutChild = union(enum) {
                 allocator.destroy(l);
             },
         }
+    }
+
+    fn hitTest(
+        self: LayoutChild,
+        parent_point: HitPoint,
+        parent_origin: HitPoint,
+    ) ?LayoutHitResult {
+        return switch (self) {
+            .block => |block| block.hitTest(parent_point, parent_origin),
+            .line => |line| line.hitTest(parent_point, parent_origin),
+        };
     }
 };
 
@@ -4968,6 +5212,62 @@ const BlockLayout = struct {
         return false;
     }
 
+    fn hitTest(
+        self: *const BlockLayout,
+        parent_point: HitPoint,
+        parent_origin: HitPoint,
+    ) ?LayoutHitResult {
+        if (blockHitOpacity(self) <= 0.0) return null;
+
+        var local = subtractHitOffset(
+            parent_point,
+            relativeHitOffset(self.x.get().*, parent_origin.x),
+            relativeHitOffset(self.y.get().*, parent_origin.y),
+        );
+        const translation = blockHitTranslation(self);
+        local = subtractHitOffset(local, translation.x, translation.y);
+
+        const width = self.width.get().*;
+        const height = self.height.get().*;
+        const clip = blockHitClip(self);
+        if (clip.enabled and !pointInLocalRoundedBox(local, width, height, clip.radius)) return null;
+
+        // Scroll moves the contents but not the element's own box. Convert the
+        // local point back into the unscrolled content space before descending.
+        const content_point = addHitOffset(local, 0, blockHitScrollY(self));
+        const origin = HitPoint{ .x = self.x.get().*, .y = self.y.get().* };
+        var index = self.children.items.len;
+        while (index > 0) {
+            index -= 1;
+            if (self.children.items[index].hitTest(content_point, origin)) |hit| return hit;
+        }
+
+        // Inline-mode blocks still use the legacy inline formatter and do not
+        // retain LineLayout/TextLayout children. Their local leaf query uses
+        // the cached paint commands, preserving fragment gaps, controls, and
+        // rich-button descendants until that TODO is removed.
+        if (self.display_list.items.len > 0) {
+            const absolute_content_point = addHitOffset(content_point, self.x.get().*, self.y.get().*);
+            if (DisplayItem.hitTest(
+                self.display_list.items,
+                absolute_content_point.x,
+                absolute_content_point.y,
+                1.0,
+            )) |paint_hit| {
+                if (paint_hit.source.originatingNode()) |node| {
+                    return .{ .node = node, .local_x = local.x, .local_y = local.y };
+                }
+            }
+        }
+
+        if (!pointInLocalRoundedBox(local, width, height, clip.radius)) return null;
+        return .{
+            .node = self.node_ptr orelse return null,
+            .local_x = local.x,
+            .local_y = local.y,
+        };
+    }
+
     fn shouldPaint(self: *const BlockLayout) bool {
         // Anonymous blocks may use an input or button as their representative
         // node, but their display list contains the replaced control itself.
@@ -4985,6 +5285,183 @@ const BlockLayout = struct {
 
 fn wordNeedsNewLine(cursor_x: i32, word_width: i32, line_width: i32) bool {
     return cursor_x > 0 and cursor_x +| word_width > line_width;
+}
+
+fn setTestLayoutBox(layout_object: anytype, x: i32, y: i32, width: i32, height: i32) void {
+    layout_object.x.set(x);
+    layout_object.y.set(y);
+    layout_object.width.set(width);
+    layout_object.height.set(height);
+}
+
+test "layout hit testing localizes nested transforms and reverses sibling order" {
+    const allocator = std.testing.allocator;
+
+    var root_node = Node{ .element = try parser.Element.init(allocator, "html", null) };
+    defer root_node.deinit(allocator);
+    var transformed_node = Node{ .element = try parser.Element.init(allocator, "div", null) };
+    defer transformed_node.deinit(allocator);
+    try setTestStyleValue(allocator, &transformed_node, "transform", "translate(100px, 30px)");
+    var nested_node = Node{ .element = try parser.Element.init(allocator, "button", null) };
+    defer nested_node.deinit(allocator);
+    var later_node = Node{ .element = try parser.Element.init(allocator, "a", null) };
+    defer later_node.deinit(allocator);
+
+    const document = try DocumentLayout.init(allocator, &root_node);
+    defer {
+        document.deinit();
+        allocator.destroy(document);
+    }
+    setTestLayoutBox(document, 10, 20, 500, 500);
+
+    const root = try BlockLayout.init(allocator, root_node, &root_node, document, null, null);
+    try document.children.append(allocator, root);
+    setTestLayoutBox(root, 10, 20, 400, 400);
+
+    const transformed = try BlockLayout.init(
+        allocator,
+        transformed_node,
+        &transformed_node,
+        document,
+        root,
+        null,
+    );
+    try root.children.append(allocator, .{ .block = transformed });
+    setTestLayoutBox(transformed, 30, 50, 80, 60);
+
+    const nested = try BlockLayout.init(
+        allocator,
+        nested_node,
+        &nested_node,
+        document,
+        transformed,
+        null,
+    );
+    try transformed.children.append(allocator, .{ .block = nested });
+    setTestLayoutBox(nested, 40, 60, 20, 20);
+
+    const later = try BlockLayout.init(
+        allocator,
+        later_node,
+        &later_node,
+        document,
+        root,
+        transformed,
+    );
+    try root.children.append(allocator, .{ .block = later });
+    setTestLayoutBox(later, 250, 250, 20, 20);
+
+    const nested_hit = document.hitTest(145, 95).?;
+    try std.testing.expect(nested_hit.node == &nested_node);
+    try std.testing.expectEqual(@as(i32, 5), nested_hit.local_x);
+    try std.testing.expectEqual(@as(i32, 5), nested_hit.local_y);
+
+    const old_location = document.hitTest(45, 65).?;
+    try std.testing.expect(old_location.node == &root_node);
+
+    // Point queries read the live computed transform rather than the stale
+    // BlockLayout node snapshot, matching compositor-only movement.
+    transformed_node.element.style.?.getPtr("transform").?.set("translate(120px, 40px)");
+    const moved_hit = document.hitTest(165, 105).?;
+    try std.testing.expect(moved_hit.node == &nested_node);
+    try std.testing.expectEqual(@as(i32, 5), moved_hit.local_x);
+    try std.testing.expectEqual(@as(i32, 5), moved_hit.local_y);
+
+    // Later paint-order siblings win once their local box overlaps the
+    // transformed descendant's visual position.
+    setTestLayoutBox(later, 160, 100, 20, 20);
+    const overlap_hit = document.hitTest(165, 105).?;
+    try std.testing.expect(overlap_hit.node == &later_node);
+}
+
+test "layout hit testing localizes nested overflow scrolling" {
+    const allocator = std.testing.allocator;
+
+    var root_node = Node{ .element = try parser.Element.init(allocator, "html", null) };
+    defer root_node.deinit(allocator);
+    var scroll_node = Node{ .element = try parser.Element.init(allocator, "section", null) };
+    defer scroll_node.deinit(allocator);
+    try setTestStyleValue(allocator, &scroll_node, "overflow", "scroll");
+    scroll_node.element.setScrollGeometry(true, 50, 120);
+    try std.testing.expect(scroll_node.element.scrollBy(40));
+    var child_node = Node{ .element = try parser.Element.init(allocator, "button", null) };
+    defer child_node.deinit(allocator);
+
+    const document = try DocumentLayout.init(allocator, &root_node);
+    defer {
+        document.deinit();
+        allocator.destroy(document);
+    }
+    setTestLayoutBox(document, 10, 20, 500, 500);
+
+    const root = try BlockLayout.init(allocator, root_node, &root_node, document, null, null);
+    try document.children.append(allocator, root);
+    setTestLayoutBox(root, 10, 20, 400, 400);
+
+    const scroll = try BlockLayout.init(
+        allocator,
+        scroll_node,
+        &scroll_node,
+        document,
+        root,
+        null,
+    );
+    try root.children.append(allocator, .{ .block = scroll });
+    setTestLayoutBox(scroll, 30, 50, 100, 50);
+
+    const child = try BlockLayout.init(
+        allocator,
+        child_node,
+        &child_node,
+        document,
+        scroll,
+        null,
+    );
+    try scroll.children.append(allocator, .{ .block = child });
+    setTestLayoutBox(child, 30, 110, 30, 20);
+
+    const scrolled_hit = document.hitTest(35, 75).?;
+    try std.testing.expect(scrolled_hit.node == &child_node);
+    try std.testing.expectEqual(@as(i32, 5), scrolled_hit.local_x);
+    try std.testing.expectEqual(@as(i32, 5), scrolled_hit.local_y);
+
+    // The child's old unscrolled location lies outside the scrollport and
+    // therefore falls through to the enclosing document block.
+    const clipped_hit = document.hitTest(35, 115).?;
+    try std.testing.expect(clipped_hit.node == &root_node);
+}
+
+test "layout hit testing localizes line and text children" {
+    const allocator = std.testing.allocator;
+
+    var root_node = Node{ .element = try parser.Element.init(allocator, "html", null) };
+    defer root_node.deinit(allocator);
+    var span_node = Node{ .element = try parser.Element.init(allocator, "span", null) };
+    defer span_node.deinit(allocator);
+
+    const document = try DocumentLayout.init(allocator, &root_node);
+    defer {
+        document.deinit();
+        allocator.destroy(document);
+    }
+    setTestLayoutBox(document, 10, 20, 500, 500);
+
+    const root = try BlockLayout.init(allocator, root_node, &root_node, document, null, null);
+    try document.children.append(allocator, root);
+    setTestLayoutBox(root, 10, 20, 400, 400);
+
+    const line = try LineLayout.init(allocator, root_node, root, null);
+    try root.children.append(allocator, .{ .line = line });
+    setTestLayoutBox(line, 20, 30, 200, 20);
+
+    const text = try TextLayout.init(allocator, span_node, &span_node, "word", line, null);
+    try line.children.append(allocator, text);
+    setTestLayoutBox(text, 40, 32, 25, 15);
+
+    const hit = document.hitTest(45, 35).?;
+    try std.testing.expect(hit.node == &span_node);
+    try std.testing.expectEqual(@as(i32, 5), hit.local_x);
+    try std.testing.expectEqual(@as(i32, 3), hit.local_y);
 }
 
 test "block display provenance rejects fragments outside its DOM origin" {

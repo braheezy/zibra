@@ -641,7 +641,13 @@ pub const Frame = struct {
     ) !bool {
         const items = self.display_list orelse return false;
         const hit = DisplayItem.hitTestDevice(items, device_x, device_y, zoom) orelse return false;
-        const target = clickTarget(hit.source.originatingNode() orelse return false) orelse return false;
+        const layout_hit = if (self.document_layout) |document|
+            document.hitTestDevice(device_x, device_y, zoom)
+        else
+            null;
+        const hit_node = hit.source.originatingNode() orelse
+            if (layout_hit) |result| result.node else return false;
+        const target = clickTarget(hit_node) orelse return false;
         const action = findClickAction(target, button);
 
         if (action) |candidate| {

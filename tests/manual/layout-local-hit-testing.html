@@ -1,0 +1,79 @@
+<!--
+How to verify:
+1. Click the green nested target after both of its translations. Only the
+   nested counter should increment; its old, untransformed location does not.
+2. In the overlap sample, click the gray overlap and then the exposed orange
+   area. The later gray sibling wins the overlap; the exposed orange area still
+   reaches the earlier sibling.
+3. Click the blue scrollport, press Down several times, and click the purple
+   target after it moves into view. The scroll counter increments once. Content
+   outside the blue clip must never activate.
+-->
+<!doctype html>
+<html>
+<head>
+  <title>Layout-local hit testing</title>
+  <style>
+    body { background-color: white; color: black; font-size: 18px; }
+    .status { background-color: lightblue; }
+    .translatedOuter { width: 300px; height: 90px; background-color: lightblue; transform: translate(70px, 10px); }
+    .translatedInner { width: 190px; height: 45px; background-color: lightgreen; transform: translate(35px, 20px); }
+    .under { width: 240px; height: 70px; background-color: orange; }
+    .over { width: 140px; height: 45px; background-color: gray; transform: translate(45px, -58px); }
+    .scrollport { width: 260px; height: 85px; overflow: scroll; background-color: lightblue; }
+    .spacer { height: 100px; }
+    .scrollTarget { width: 190px; height: 42px; background-color: purple; color: white; }
+  </style>
+</head>
+<body>
+  <h1>Layout-local hit testing</h1>
+  <p id="status" class="status">nested=0, under=0, over=0, scroll=0</p>
+
+  <h2>Nested transforms</h2>
+  <div id="translatedOuter" class="translatedOuter">
+    translated outer
+    <div id="translatedInner" class="translatedInner">nested target</div>
+  </div>
+
+  <h2>Reverse sibling order</h2>
+  <div id="under" class="under">earlier orange target</div>
+  <div id="over" class="over">later gray target</div>
+
+  <h2>Local scrolling and clipping</h2>
+  <div id="scrollport" class="scrollport">
+    blue scrollport
+    <div id="spacer" class="spacer"></div>
+    <div id="scrollTarget" class="scrollTarget">scrolled target</div>
+  </div>
+
+  <script>
+    var nestedClicks = 0;
+    var underClicks = 0;
+    var overClicks = 0;
+    var scrollClicks = 0;
+
+    function updateStatus() {
+      status.innerHTML = 'nested=' + nestedClicks + ', under=' + underClicks +
+        ', over=' + overClicks + ', scroll=' + scrollClicks;
+    }
+
+    translatedInner.addEventListener('click', function(event) {
+      nestedClicks = nestedClicks + 1;
+      event.stopPropagation();
+      updateStatus();
+    });
+    under.addEventListener('click', function() {
+      underClicks = underClicks + 1;
+      updateStatus();
+    });
+    over.addEventListener('click', function() {
+      overClicks = overClicks + 1;
+      updateStatus();
+    });
+    scrollTarget.addEventListener('click', function() {
+      scrollClicks = scrollClicks + 1;
+      updateStatus();
+    });
+  </script>
+</body>
+</html>

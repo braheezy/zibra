@@ -295,6 +295,14 @@ before changing `root.zig`, `tab.zig`, `render/`, or browser task scheduling.
   before any fallible mutation step. Preserve focus when the mutation root
   itself survives; clear it only for a removed descendant.
 - Content clicks walk the retained list in reverse paint order. A primary hit
+  also runs the retained layout tree's parent-local point query; painted
+  provenance remains authoritative for fragment gaps, glyph geometry, rounded
+  corners, and rich controls, while the layout result provides provenance when
+  a synthetic wrapper has none. Layout descent must invert live translations,
+  apply element scroll at the owning block, and visit later siblings first
+  instead of rebuilding per-object absolute rectangles. Keep this query on the
+  serialized tab worker; UI-thread accessibility continues to consume its
+  committed bounds snapshot. A primary hit
   dispatches one click at the painted element and bubbles through its
   snapshotted DOM ancestry, even when no native control owns a default action;
   iframe events stay inside the child document. Resolve link/input/button

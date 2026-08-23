@@ -567,6 +567,22 @@ uses the DOM address only as a UI/tab-thread lookup key. Raster snapshots clear
 that borrow and retain a numeric compositor ID; no DOM pointer crosses to the
 raster worker. Effects that cannot be represented as a top-level retained plane
 fall back to a full raster.
+
+`DocumentLayout.hitTest` is the complementary structural point query. The
+document converts the page point to its own coordinates once; block, line, and
+text objects then subtract only their offset from the parent. Blocks invert
+their live CSS translation, add their live element scroll before entering
+content, apply rounded/overflow clips locally, and visit children in reverse
+paint order. Inline-mode blocks do not yet retain line/text objects, so they use
+their provenance-bearing cached paint commands as an exact local leaf. Content
+clicks still require a painted-command hit—preserving fragment gaps, glyph
+bitmap geometry, rich controls, and masks—but always perform the layout query
+and use it when painted provenance cannot resolve an originating node.
+Run this layout query only on the serialized tab worker; UI-thread accessibility
+continues to consume its committed root-relative bounds snapshot rather than
+borrowing a concurrently rebuilt layout graph. Neither hit-test path rebuilds
+every descendant's absolute bounds.
+
 Layout-derived link and iframe bounds no longer decide click targets. Focus,
 accessibility, and fragment bounds retain their existing roles.
 

@@ -127,6 +127,11 @@ support fixtures in the same directory.
 ordinary blocks, rich buttons, and text inputs. Corner clicks leave the visible
 counters unchanged while clicks in painted centers increment exactly one.
 
+`tests/manual/layout-local-hit-testing.html` exercises parent-local traversal
+through nested translations, reverse-order overlapping siblings, and clipped
+element scrolling. Its visible counters distinguish the visual target from an
+element's old untransformed or unscrolled box.
+
 `tests/manual/interest-region.html` is a deliberately long, color-banded page
 for crossing and reversing over tab raster-cache boundaries. Scrolling and
 resizing must remain continuous while the cached surface stays bounded to four

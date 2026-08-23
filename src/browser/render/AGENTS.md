@@ -7,6 +7,12 @@ before changing ownership or thread boundaries.
 
 - `layout.zig` builds layout trees and emits provenance-bearing display items.
   Layout and frame-side command lists synchronously borrow DOM and image state.
+  Point queries walk document/block/line/text objects in reverse order and
+  carry parent-local coordinates: each object subtracts its own offset and
+  live translation, while scroll containers add their live scroll before
+  descending. Inline-mode blocks retain an exact painted-command leaf fallback
+  until they gain persistent line/text children. Do not reconstruct an
+  absolute rectangle for every descendant.
   Active width/height transitions override their computed pixel endpoints here;
   every frame relayouts descendants so line wrapping follows animated width.
   Document/block/line `in_layout` guards suppress only reentrant owner-wide

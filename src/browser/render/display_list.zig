@@ -396,7 +396,7 @@ pub const DisplayItem = union(enum) {
         return @intFromFloat(@as(f32, @floatFromInt(value)) * zoom);
     }
 
-    fn deviceToLayoutPx(value: i32, zoom_value: f32) i32 {
+    pub fn deviceToLayoutPx(value: i32, zoom_value: f32) i32 {
         const zoom = if (zoom_value > 0) zoom_value else 1.0;
         if (zoom == 1.0) return value;
         return @intFromFloat(@as(f32, @floatFromInt(value)) / zoom);
