@@ -591,10 +591,16 @@ raster translates page commands by that region's page-space start and publishes
 the coordinates only after all fallible drawing succeeds. With top-level
 composited opacity or translation effects, static strata are transparent
 interest-region surfaces and each animated subtree is rasterized once into its
-own plane. Later pointer-free scalar updates change plane opacity/translation;
-the worker assembles those planes beneath chrome without rerastering their
-pixels. Complex masks or unsupported nesting deliberately use the assembled
-surface fallback.
+own plane. Static strata may merge backward across stable dynamic planes when
+their tight painted bounds are disjoint. An active transform instead enters
+assume-overlap mode for the raster generation: every later stratum stays after
+that plane even when its initial bounds are disjoint, because a later scalar
+translation can make them overlap. This conservative barrier preserves CSS
+paint order without repeating overlap testing, compositing, or raster on every
+animation frame. Later pointer-free scalar updates change plane
+opacity/translation; the worker assembles those planes beneath chrome without
+rerastering their pixels. Complex masks or unsupported nesting deliberately
+use the assembled surface fallback.
 
 Final software draw moves cached page pixels by `region_start - root_scroll`
 beneath chrome. z2d has no public `clipRect`, so final composition slices source

@@ -4469,6 +4469,7 @@ pub const Browser = struct {
                         .children = children,
                         .node = transform_item.node,
                         .composited = transform_item.composited,
+                        .animation_active = transform_item.animation_active,
                         .compositor_id = transform_item.compositor_id,
                         .source = transform_item.source,
                     },
@@ -4538,6 +4539,7 @@ pub const Browser = struct {
                                 .children = children_copy,
                                 .node = transform_item.node,
                                 .composited = transform_item.composited,
+                                .animation_active = transform_item.animation_active,
                                 .compositor_id = transform_item.compositor_id,
                                 .source = transform_item.source,
                             },
@@ -4722,6 +4724,7 @@ pub const Browser = struct {
                             .children = children_copy,
                             .node = transform_item.node,
                             .composited = transform_item.composited,
+                            .animation_active = transform_item.animation_active,
                             .compositor_id = transform_item.compositor_id,
                             .source = transform_item.source,
                         },
@@ -4877,6 +4880,7 @@ pub const Browser = struct {
         opacity: f64,
         translate_x: i32,
         translate_y: i32,
+        assume_overlap_after: bool,
     };
 
     fn workerPlaneSpec(item: DisplayItem) ?WorkerPlaneSpec {
@@ -4894,6 +4898,7 @@ pub const Browser = struct {
                     .opacity = opacity,
                     .translate_x = transform.translate_x,
                     .translate_y = transform.translate_y,
+                    .assume_overlap_after = transform.animation_active,
                 };
             } else null,
             .blend => |blend| if (blend.needs_compositing and blend.compositor_id != null)
@@ -4902,6 +4907,7 @@ pub const Browser = struct {
                     .opacity = blend.opacity,
                     .translate_x = 0,
                     .translate_y = 0,
+                    .assume_overlap_after = false,
                 }
             else
                 null,
@@ -4960,13 +4966,23 @@ pub const Browser = struct {
         items: []const DisplayItem,
     ) !void {
         if (items.len == 0) return;
+        const paint_bounds = self.displayItemsBounds(items, task.zoom) orelse return;
+        if (self.worker_compositor_cache.staticMergeTarget(paint_bounds, task.zoom)) |index| {
+            const plane = &self.worker_compositor_cache.planes.items[index];
+            try self.drawItemsIntoWorkerPlane(task, &plane.surface, plane.bounds, items, null);
+            plane.paint_bounds = if (plane.paint_bounds) |existing|
+                existing.unionWith(paint_bounds)
+            else
+                paint_bounds;
+            return;
+        }
         const bounds = Rect{
             .left = 0,
             .top = task.interest_region.start_px,
             .right = task.window_width,
             .bottom = task.interest_region.endPx(),
         };
-        try self.appendWorkerPlane(task, items, bounds, null, null);
+        try self.appendWorkerPlane(task, items, bounds, paint_bounds, null, null);
     }
 
     fn appendWorkerDynamicPlane(
@@ -4982,7 +4998,7 @@ pub const Browser = struct {
             .right = bounds.right - DisplayItem.scaleLayoutPx(spec.translate_x, task.zoom),
             .bottom = bounds.bottom - DisplayItem.scaleLayoutPx(spec.translate_y, task.zoom),
         };
-        try self.appendWorkerPlane(task, &.{item}, bounds, spec, spec.compositor_id);
+        try self.appendWorkerPlane(task, &.{item}, bounds, bounds, spec, spec.compositor_id);
     }
 
     fn appendWorkerPlane(
@@ -4990,6 +5006,7 @@ pub const Browser = struct {
         task: *const RasterTaskContext,
         items: []const DisplayItem,
         bounds: Rect,
+        paint_bounds: Rect,
         spec: ?WorkerPlaneSpec,
         compositor_id: ?usize,
     ) !void {
@@ -4999,7 +5016,29 @@ pub const Browser = struct {
         var surface_owned = true;
         errdefer if (surface_owned) surface.deinit(task.allocator);
         @memset(try imageSurfacePixels(&surface), .{ .r = 0, .g = 0, .b = 0, .a = 0 });
-        var context = z2d.Context.init(self.io, task.allocator, &surface);
+        try self.drawItemsIntoWorkerPlane(task, &surface, bounds, items, spec);
+        try self.worker_compositor_cache.planes.append(task.allocator, .{
+            .surface = surface,
+            .bounds = bounds,
+            .paint_bounds = paint_bounds,
+            .compositor_id = compositor_id,
+            .opacity = if (spec) |value| value.opacity else 1.0,
+            .translate_x = if (spec) |value| value.translate_x else 0,
+            .translate_y = if (spec) |value| value.translate_y else 0,
+            .assume_overlap_after = if (spec) |value| value.assume_overlap_after else false,
+        });
+        surface_owned = false;
+    }
+
+    fn drawItemsIntoWorkerPlane(
+        self: *Browser,
+        task: *const RasterTaskContext,
+        surface: *z2d.Surface,
+        bounds: Rect,
+        items: []const DisplayItem,
+        spec: ?WorkerPlaneSpec,
+    ) !void {
+        var context = z2d.Context.init(self.io, task.allocator, surface);
         defer context.deinit();
         for (items) |item| {
             if (spec) |plane_spec| {
@@ -5021,15 +5060,6 @@ pub const Browser = struct {
                 );
             }
         }
-        try self.worker_compositor_cache.planes.append(task.allocator, .{
-            .surface = surface,
-            .bounds = bounds,
-            .compositor_id = compositor_id,
-            .opacity = if (spec) |value| value.opacity else 1.0,
-            .translate_x = if (spec) |value| value.translate_x else 0,
-            .translate_y = if (spec) |value| value.translate_y else 0,
-        });
-        surface_owned = false;
     }
 
     fn drawWorkerCompositedSource(
@@ -7299,11 +7329,13 @@ test "worker compositor cache accepts representable planes and rejects nested ef
         .translate_y = 0,
         .children = &leaf,
         .composited = true,
+        .animation_active = true,
         .compositor_id = plane_id,
     } };
 
     var top_level = [_]DisplayItem{plane};
     try std.testing.expect(Browser.workerCacheSupportsCompositorId(&top_level, plane_id));
+    try std.testing.expect(Browser.workerPlaneSpec(plane).?.assume_overlap_after);
 
     var nested_children = [_]DisplayItem{plane};
     var nested = [_]DisplayItem{.{ .blend = .{

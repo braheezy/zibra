@@ -21,14 +21,31 @@ pub const Update = struct {
 
 pub const Plane = struct {
     surface: z2d.Surface,
+    /// Surface placement. Static planes cover the interest region, while a
+    /// dynamic plane is tightly cropped around its untransformed pixels.
     bounds: Rect,
+    /// Tight bounds of pixels painted into this plane, before its scalar
+    /// compositor translation. Static planes use this for overlap testing.
+    paint_bounds: ?Rect = null,
     compositor_id: ?usize = null,
     opacity: f64 = 1.0,
     translate_x: i32 = 0,
     translate_y: i32 = 0,
+    /// An active transform may enter another plane's current bounds later.
+    /// No subsequently painted static content may move ahead of this plane.
+    assume_overlap_after: bool = false,
 
     pub fn deinit(self: *Plane, allocator: std.mem.Allocator) void {
         self.surface.deinit(allocator);
+    }
+
+    fn currentPaintBounds(self: *const Plane, zoom: f32) Rect {
+        const pixels = self.paint_bounds orelse self.bounds;
+        if (self.compositor_id == null) return pixels;
+        return pixels.translated(
+            display.DisplayItem.scaleLayoutPx(self.translate_x, zoom),
+            display.DisplayItem.scaleLayoutPx(self.translate_y, zoom),
+        );
     }
 };
 
@@ -60,6 +77,34 @@ pub const Cache = struct {
                 }
             }
         }
+    }
+
+    /// Find the earliest static plane that `paint_bounds` can join without
+    /// changing paint order. A static stratum may move ahead of intervening
+    /// dynamic planes only when it cannot overlap them. Active transforms are
+    /// permanent barriers because their future positions are not represented
+    /// by their current bounds.
+    pub fn staticMergeTarget(
+        self: *const Cache,
+        paint_bounds: Rect,
+        zoom: f32,
+    ) ?usize {
+        var candidate: ?usize = null;
+        var index = self.planes.items.len;
+        while (index > 0) {
+            index -= 1;
+            const plane = &self.planes.items[index];
+            if (plane.compositor_id == null) {
+                candidate = index;
+                continue;
+            }
+            if (plane.assume_overlap_after or
+                plane.currentPaintBounds(zoom).overlaps(paint_bounds))
+            {
+                return candidate;
+            }
+        }
+        return candidate;
     }
 
     pub fn draw(
@@ -145,4 +190,88 @@ test "cached planes update transform and opacity without replacing pixels" {
     try std.testing.expect(@abs(@as(i16, pixels[1].g) - 127) <= 1);
     try std.testing.expect(@abs(@as(i16, pixels[1].b) - 127) <= 1);
     try std.testing.expectEqual(@as(u8, 255), pixels[1].r);
+}
+
+test "animated transform is a permanent overlap barrier for later paint" {
+    const allocator = std.testing.allocator;
+    var cache = Cache{};
+    defer cache.deinit(allocator);
+
+    var before = try z2d.Surface.init(.image_surface_rgba, allocator, 1, 1);
+    var before_owned = true;
+    errdefer if (before_owned) before.deinit(allocator);
+    try cache.planes.append(allocator, .{
+        .surface = before,
+        .bounds = .{ .left = 0, .top = 0, .right = 100, .bottom = 100 },
+        .paint_bounds = .{ .left = 0, .top = 0, .right = 20, .bottom = 20 },
+    });
+    before_owned = false;
+
+    var moving = try z2d.Surface.init(.image_surface_rgba, allocator, 1, 1);
+    var moving_owned = true;
+    errdefer if (moving_owned) moving.deinit(allocator);
+    try cache.planes.append(allocator, .{
+        .surface = moving,
+        .bounds = .{ .left = 30, .top = 0, .right = 40, .bottom = 10 },
+        .paint_bounds = .{ .left = 30, .top = 0, .right = 40, .bottom = 10 },
+        .compositor_id = 7,
+        .assume_overlap_after = true,
+    });
+    moving_owned = false;
+
+    // The later item is currently far from the moving plane. A current-bounds
+    // test alone would merge it into plane 0 and place it underneath once the
+    // transform reaches x=80. Assume-overlap mode keeps it after the mover.
+    const later = Rect{ .left = 80, .top = 0, .right = 90, .bottom = 10 };
+    try std.testing.expect(cache.staticMergeTarget(later, 1.0) == null);
+
+    var after = try z2d.Surface.init(.image_surface_rgba, allocator, 1, 1);
+    var after_owned = true;
+    errdefer if (after_owned) after.deinit(allocator);
+    try cache.planes.append(allocator, .{
+        .surface = after,
+        .bounds = .{ .left = 0, .top = 0, .right = 100, .bottom = 100 },
+        .paint_bounds = later,
+    });
+    after_owned = false;
+    try std.testing.expectEqual(@as(?usize, 2), cache.staticMergeTarget(
+        .{ .left = 92, .top = 0, .right = 98, .bottom = 10 },
+        1.0,
+    ));
+}
+
+test "fixed transform permits current-bounds static plane merging" {
+    const allocator = std.testing.allocator;
+    var cache = Cache{};
+    defer cache.deinit(allocator);
+
+    var before = try z2d.Surface.init(.image_surface_rgba, allocator, 1, 1);
+    var before_owned = true;
+    errdefer if (before_owned) before.deinit(allocator);
+    try cache.planes.append(allocator, .{
+        .surface = before,
+        .bounds = .{ .left = 0, .top = 0, .right = 100, .bottom = 100 },
+        .paint_bounds = .{ .left = 0, .top = 0, .right = 20, .bottom = 20 },
+    });
+    before_owned = false;
+
+    var fixed = try z2d.Surface.init(.image_surface_rgba, allocator, 1, 1);
+    var fixed_owned = true;
+    errdefer if (fixed_owned) fixed.deinit(allocator);
+    try cache.planes.append(allocator, .{
+        .surface = fixed,
+        .bounds = .{ .left = 30, .top = 0, .right = 40, .bottom = 10 },
+        .paint_bounds = .{ .left = 30, .top = 0, .right = 40, .bottom = 10 },
+        .compositor_id = 8,
+    });
+    fixed_owned = false;
+
+    try std.testing.expectEqual(@as(?usize, 0), cache.staticMergeTarget(
+        .{ .left = 80, .top = 0, .right = 90, .bottom = 10 },
+        1.0,
+    ));
+    try std.testing.expect(cache.staticMergeTarget(
+        .{ .left = 35, .top = 0, .right = 45, .bottom = 10 },
+        1.0,
+    ) == null);
 }

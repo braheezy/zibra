@@ -3584,6 +3584,7 @@ fn cloneDisplayItemOwned(
             .children = try cloneDisplayListOwned(allocator, transform.children),
             .node = transform.node,
             .composited = transform.composited,
+            .animation_active = transform.animation_active,
             .compositor_id = transform.compositor_id,
             .source = transform.source,
         } },
@@ -5558,7 +5559,11 @@ fn writeDisplayItemsDebug(writer: *std.Io.Writer, items: []const DisplayItem, in
                 try writeDisplayItemsDebug(writer, blend.children, indent + 2);
             },
             .transform => |transform| {
-                try writer.print("transform x={d} y={d}\n", .{ transform.translate_x, transform.translate_y });
+                if (transform.animation_active) {
+                    try writer.print("transform x={d} y={d} animation-active=true\n", .{ transform.translate_x, transform.translate_y });
+                } else {
+                    try writer.print("transform x={d} y={d}\n", .{ transform.translate_x, transform.translate_y });
+                }
                 try writeDisplayItemsDebug(writer, transform.children, indent + 2);
             },
             .draw_composited_layer => try writer.writeAll("composited-layer\n"),
@@ -5650,6 +5655,7 @@ fn applyPaintEffects(self: *Layout, block: *BlockLayout, commands: []DisplayItem
     var transform_x: i32 = 0;
     var transform_y: i32 = 0;
     var has_transform = false;
+    var has_animated_transform = false;
     var has_animated_opacity = false;
 
     if (block.node == .element) {
@@ -5706,6 +5712,11 @@ fn applyPaintEffects(self: *Layout, block: *BlockLayout, commands: []DisplayItem
             var animated_transform: ?parser.Translation = null;
             if (elem.animations) |animations| {
                 if (animations.get("transform")) |animation| {
+                    const css_track_will_continue = if (elem.css_animation) |state|
+                        !state.finished and state.contains("transform")
+                    else
+                        false;
+                    has_animated_transform = !animation.isComplete() or css_track_will_continue;
                     animated_transform = switch (animation) {
                         .transform => |value| value.getValue(),
                         .numeric, .pixel, .color => null,
@@ -5864,6 +5875,7 @@ fn applyPaintEffects(self: *Layout, block: *BlockLayout, commands: []DisplayItem
                     .children = result,
                     .node = node_ptr,
                     .composited = true,
+                    .animation_active = has_animated_transform,
                     .compositor_id = if (node_ptr) |ptr| @intFromPtr(ptr) else null,
                     .source = displaySource(block, block.node_ptr),
                 },
@@ -5888,6 +5900,7 @@ fn applyPaintEffects(self: *Layout, block: *BlockLayout, commands: []DisplayItem
                     .children = wrapped_for_transform,
                     .node = node_ptr,
                     .composited = true,
+                    .animation_active = has_animated_transform,
                     .compositor_id = if (node_ptr) |ptr| @intFromPtr(ptr) else null,
                     .source = displaySource(block, block.node_ptr),
                 },

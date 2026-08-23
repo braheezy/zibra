@@ -37,6 +37,7 @@ test "raster snapshot owns nested glyph and image pixels" {
         .translate_y = 9,
         .children = &nested,
         .node = @ptrFromInt(3),
+        .animation_active = true,
     } }};
 
     var snapshot = try RasterSnapshot.clone(std.testing.allocator, &items);
@@ -48,6 +49,7 @@ test "raster snapshot owns nested glyph and image pixels" {
     const transform = snapshot.items[0].transform;
     try std.testing.expectEqual(@as(?*anyopaque, null), transform.node);
     try std.testing.expectEqual(@as(?browser.DisplayItemSource, null), transform.source);
+    try std.testing.expect(transform.animation_active);
     try std.testing.expectEqual(@as(u8, 1), transform.children[0].glyph.glyph.pixels.?[0]);
     try std.testing.expectEqual(@as(u8, 10), transform.children[1].image.pixels[0]);
     try std.testing.expectEqual(@as(?browser.DisplayItemSource, null), transform.children[0].glyph.source);

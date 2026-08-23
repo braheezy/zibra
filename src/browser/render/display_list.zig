@@ -59,6 +59,29 @@ pub const Rect = struct {
             .bottom = self.bottom - amount,
         };
     }
+
+    pub fn overlaps(self: Rect, other: Rect) bool {
+        return self.left < other.right and other.left < self.right and
+            self.top < other.bottom and other.top < self.bottom;
+    }
+
+    pub fn unionWith(self: Rect, other: Rect) Rect {
+        return .{
+            .left = @min(self.left, other.left),
+            .top = @min(self.top, other.top),
+            .right = @max(self.right, other.right),
+            .bottom = @max(self.bottom, other.bottom),
+        };
+    }
+
+    pub fn translated(self: Rect, x: i32, y: i32) Rect {
+        return .{
+            .left = self.left + x,
+            .top = self.top + y,
+            .right = self.right + x,
+            .bottom = self.bottom + y,
+        };
+    }
 };
 
 /// A composited layer owns the display items and optional cached surface used
@@ -259,6 +282,9 @@ pub const DisplayItem = union(enum) {
         children: []DisplayItem,
         node: ?*anyopaque = null,
         composited: bool = false,
+        /// Active transforms can move after overlap testing. They therefore
+        /// establish a conservative paint-order barrier in the raster cache.
+        animation_active: bool = false,
         compositor_id: ?usize = null,
         source: ?DisplayItemSource = null,
     },

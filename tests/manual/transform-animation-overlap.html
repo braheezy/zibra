@@ -1,0 +1,44 @@
+<!--
+How to verify:
+1. Leave this page visible for several animation cycles.
+2. The orange MOVING card travels down across the blue ALWAYS ON TOP card.
+3. Wherever they overlap, the blue card must stay in front of the orange card.
+4. The animation must remain smooth and leave no stale or reordered pixels.
+5. With ZIBRA_TRACE=1, frames after the initial raster remain draw-only.
+-->
+<!doctype html>
+<html>
+  <head>
+    <title>Animated transform overlap testing</title>
+    <style>
+      body { background-color: white; color: black; font-family: sans-serif; }
+      .moving {
+        background-color: orange;
+        color: black;
+        width: 360px;
+        height: 70px;
+        padding: 10px;
+        animation: 2s infinite alternate cross-layer;
+      }
+      .gap { height: 30px; }
+      .top {
+        background-color: lightblue;
+        color: black;
+        width: 360px;
+        height: 70px;
+        padding: 10px;
+      }
+      @keyframes cross-layer {
+        from { transform: translate(0px, 0px); }
+        to { transform: translate(0px, 100px); }
+      }
+    </style>
+  </head>
+  <body>
+    <h1>Transform overlap barrier</h1>
+    <p>The blue card is painted later and must stay above the moving card.</p>
+    <div class="moving">MOVING ORANGE CARD</div>
+    <div class="gap"></div>
+    <div class="top">ALWAYS ON TOP</div>
+  </body>
+</html>

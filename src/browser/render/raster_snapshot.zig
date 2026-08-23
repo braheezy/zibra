@@ -101,6 +101,7 @@ pub const RasterSnapshot = struct {
                 .children = try self.cloneList(transform_item.children),
                 .node = null,
                 .composited = transform_item.composited,
+                .animation_active = transform_item.animation_active,
                 .compositor_id = transform_item.compositor_id,
                 .source = null,
             } },

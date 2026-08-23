@@ -193,6 +193,11 @@ lines, proving width frames enter layout rather than only repainting a box.
 Its infinite alternate opacity animation stays composited, while the matching
 width animation repeatedly changes line wrapping and therefore relayouts.
 
+`tests/manual/transform-animation-overlap.html` moves an animated transform
+into a later-painted static card. The later blue card must remain above the
+mover throughout every cycle, proving animated transforms establish a
+conservative compositor-plane merge barrier while frames remain draw-only.
+
 `tests/manual/threaded-loading.html` combines two external scripts and two
 same-specificity stylesheets. Run its adjacent threaded Python server to give
 each response equal latency: all four requests start together while the visible

@@ -1650,6 +1650,7 @@ fn replaceIframesInList(
                         .children = child_slice,
                         .node = transform_item.node,
                         .composited = transform_item.composited,
+                        .animation_active = transform_item.animation_active,
                         .compositor_id = transform_item.compositor_id,
                         .source = null,
                     },

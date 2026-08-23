@@ -23,8 +23,13 @@ before changing ownership or thread boundaries.
   browser-owned layer pointers. Numeric compositor IDs may cross this boundary;
   raw DOM/layout pointers may not.
 - `compositor_cache.zig` owns ordered raster-worker planes and applies only
-  scalar opacity/translation updates before draw. Plane pixels never return to
-  the DOM/tab thread, and fallback decisions remain Browser orchestration.
+  scalar opacity/translation updates before draw. Static strata may merge
+  backward across stable dynamic planes only when their tight painted bounds
+  do not overlap. An active transform is an assume-overlap barrier: later
+  paint must remain after it even when the current rectangles are disjoint,
+  because a future compositor update can create overlap. Plane pixels never
+  return to the DOM/tab thread, and fallback decisions remain Browser
+  orchestration.
 
 Prefer adding a focused rendering module when a feature introduces a distinct
 data owner or pipeline phase. Do not move Browser orchestration into this

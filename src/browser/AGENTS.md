@@ -97,8 +97,11 @@ before changing `root.zig`, `tab.zig`, `render/`, or browser task scheduling.
   effects, the worker retains ordered transparent planes instead of one
   assembled tab bitmap. Static strata stay bounded to the interest region;
   animated planes retain their own raster and accept pointer-free numeric
-  updates. Unsupported nesting or masking falls back to a full raster rather
-  than losing an update.
+  updates. Stable dynamic planes use tight current bounds for overlap-safe
+  backward merging of later static paint. An actively animated transform is a
+  permanent merge barrier for that raster generation, so later content cannot
+  move beneath it when translation creates overlap. Unsupported nesting or
+  masking falls back to a full raster rather than losing an update.
 - Each tab owns a sentinel-terminated copy of its root document title. Tab
   workers replace it under `Browser.lock`; only the interactive App/UI thread
   may pass it to the addressed native window, including after tab switches.
