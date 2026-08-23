@@ -31,8 +31,9 @@ or selector/rule lifetime.
 - A detached retained subtree keeps its style maps but dirties every field and
   clears layout back-pointers. When it is reparented, inherited style reads
   register the current parent dependency before using a frozen field.
-- CSS rules own selector/map allocations while their property slices borrow the
-  stylesheet. Move and retire rules with their source text as one generation.
+- CSS rules and `@keyframes` own their selector/frame/map containers while
+  names and property slices borrow the stylesheet. Move and retire both parsed
+  products with their source text as one generation.
 - Concatenated tag/class selectors own a source-ordered `SelectorSequence` of
   atomic selectors, all of which must match the same element. Sequence
   specificity is the sum of its members.
@@ -99,6 +100,14 @@ or selector/rule lifetime.
   the timing-function parser and cubic Bezier solver. Opacity's computed-style
   string borrows a fixed buffer embedded in that same Element; layout reads
   animated colors and dimensions directly from the tagged map.
+- `css_animation.zig` parses the supported single-animation shorthand: named
+  duration, shared easing functions, integer/infinite iterations, and
+  normal/alternate direction. An Element's `CssAnimationState` identifies the
+  entries in the interpolation map that came from its named `@keyframes` rule;
+  typed endpoints own no stylesheet slices. Preserve endpoint frames and
+  mirror the timing function when reversing alternate cycles, and restore the
+  underlying computed property after a finite animation without overwriting
+  that property during playback.
 - Element-local overflow scroll offsets and client/content heights are scalar
   DOM state. Layout republishes and clamps their geometry; input may change
   only the offset between layouts. Structural mutation consumers must retire

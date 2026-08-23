@@ -4070,11 +4070,12 @@ fn styleSet(agent: *Agent, this_value: Value, arguments: kiesel.types.Arguments)
             // are not explicitly restarted below. Capture their current
             // values first so an interrupted replacement remains continuous.
             if (e.animations) |*animations| {
-                _ = animations.remove("opacity");
-                _ = animations.remove("background-color");
-                _ = animations.remove("transform");
-                _ = animations.remove("width");
-                _ = animations.remove("height");
+                for (parser.css_animation_properties) |property| {
+                    if (e.css_animation) |state| {
+                        if (!state.finished and state.contains(property)) continue;
+                    }
+                    _ = animations.remove(property);
+                }
             }
 
             const owned_style = try js_instance.allocator.dupe(u8, style_str);
@@ -4095,6 +4096,14 @@ fn styleSet(agent: *Agent, this_value: Value, arguments: kiesel.types.Arguments)
                     var transitions = TransitionListIterator.init(transition_str);
                     while (transitions.next()) |transition_part| {
                         const transition = parseTransitionValue(transition_part) orelse continue;
+                        const canonical_property: ?[]const u8 = for (parser.css_animation_properties) |property| {
+                            if (std.ascii.eqlIgnoreCase(transition.property, property)) break property;
+                        } else null;
+                        if (canonical_property) |property| {
+                            if (e.css_animation) |state| {
+                                if (!state.finished and state.contains(property)) continue;
+                            }
+                        }
                         if (std.ascii.eqlIgnoreCase(transition.property, "opacity")) {
                             // Get new opacity value
                             if (new_style.get("opacity")) |new_op_str| {

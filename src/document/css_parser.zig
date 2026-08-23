@@ -37,6 +37,37 @@ pub const Declaration = struct {
 
 pub const DeclarationMap = std.StringHashMap(Declaration);
 
+/// One declaration block within an `@keyframes` rule. Selectors are normalized
+/// to a 0...1 offset; declaration values borrow the stylesheet buffer.
+pub const Keyframe = struct {
+    offset: f64,
+    properties: DeclarationMap,
+
+    pub fn deinit(self: *Keyframe) void {
+        self.properties.deinit();
+    }
+};
+
+/// A named keyframe rule. The name and declaration values borrow the
+/// stylesheet; the frame slice and declaration maps are owned.
+pub const KeyframesRule = struct {
+    name: []const u8,
+    frames: []Keyframe,
+
+    pub fn deinit(self: *KeyframesRule, allocator: std.mem.Allocator) void {
+        for (self.frames) |*frame| frame.deinit();
+        allocator.free(self.frames);
+    }
+
+    pub fn frameAt(self: *const KeyframesRule, offset: f64) ?*const Keyframe {
+        var result: ?*const Keyframe = null;
+        for (self.frames) |*frame| {
+            if (frame.offset == offset) result = frame;
+        }
+        return result;
+    }
+};
+
 string: []const u8,
 pos: usize,
 prefers_dark: bool,
@@ -279,6 +310,85 @@ fn findMatchingBrace(self: *CSSParser, start: usize) ?usize {
     return null;
 }
 
+fn parseKeyframeOffset(raw: []const u8) ?f64 {
+    const token = std.mem.trim(u8, raw, " \t\r\n");
+    if (std.ascii.eqlIgnoreCase(token, "from")) return 0;
+    if (std.ascii.eqlIgnoreCase(token, "to")) return 1;
+    if (!std.mem.endsWith(u8, token, "%")) return null;
+    const percentage = std.fmt.parseFloat(f64, token[0 .. token.len - 1]) catch return null;
+    if (!std.math.isFinite(percentage) or percentage < 0 or percentage > 100) return null;
+    return percentage / 100.0;
+}
+
+fn cloneDeclarationMap(allocator: std.mem.Allocator, source: *const DeclarationMap) !DeclarationMap {
+    var result = DeclarationMap.init(allocator);
+    errdefer result.deinit();
+    try result.ensureUnusedCapacity(source.count());
+    var iterator = source.iterator();
+    while (iterator.next()) |entry| {
+        result.putAssumeCapacity(entry.key_ptr.*, entry.value_ptr.*);
+    }
+    return result;
+}
+
+fn parseKeyframesRule(self: *CSSParser, allocator: std.mem.Allocator) !KeyframesRule {
+    self.pos += "@keyframes".len;
+    self.whitespace();
+    const name = try self.word();
+    self.whitespace();
+    try self.literal('{');
+    self.whitespace();
+
+    var frames = std.ArrayList(Keyframe).empty;
+    errdefer {
+        for (frames.items) |*frame| frame.deinit();
+        frames.deinit(allocator);
+    }
+
+    while (self.pos < self.string.len and self.string[self.pos] != '}') {
+        const selector_start = self.pos;
+        const brace = std.mem.indexOfScalarPos(u8, self.string, self.pos, '{') orelse
+            return error.InvalidKeyframes;
+        const selector_text = self.string[selector_start..brace];
+        self.pos = brace + 1;
+        self.whitespace();
+
+        var declarations = try self.body(allocator);
+        var declarations_owned = true;
+        defer if (declarations_owned) declarations.deinit();
+        try self.literal('}');
+        self.whitespace();
+
+        var selectors = std.mem.splitScalar(u8, selector_text, ',');
+        var accepted: usize = 0;
+        while (selectors.next()) |selector_text_part| {
+            const offset = parseKeyframeOffset(selector_text_part) orelse continue;
+            const properties = if (accepted == 0)
+                declarations
+            else
+                try cloneDeclarationMap(allocator, &declarations);
+            if (accepted == 0) declarations_owned = false;
+            var frame = Keyframe{ .offset = offset, .properties = properties };
+            frames.append(allocator, frame) catch |err| {
+                frame.deinit();
+                return err;
+            };
+            accepted += 1;
+        }
+    }
+    try self.literal('}');
+    if (frames.items.len == 0) return error.InvalidKeyframes;
+    return .{ .name = name, .frames = try frames.toOwnedSlice(allocator) };
+}
+
+fn startsWithKeyframesRule(self: *const CSSParser) bool {
+    const keyword = "@keyframes";
+    if (self.string.len - self.pos < keyword.len) return false;
+    if (!std.ascii.eqlIgnoreCase(self.string[self.pos .. self.pos + keyword.len], keyword)) return false;
+    const next = self.pos + keyword.len;
+    return next == self.string.len or std.ascii.isWhitespace(self.string[next]);
+}
+
 fn prefersColorSchemeMatch(self: *CSSParser, allocator: std.mem.Allocator, prelude: []const u8) ?bool {
     const lower = std.ascii.allocLowerString(allocator, prelude) catch return null;
     defer allocator.free(lower);
@@ -437,8 +547,29 @@ pub const CSSRule = struct {
     }
 };
 
-/// Parse a full CSS file into a list of rules
+/// Parse a full CSS file into a list of selector rules, discarding keyframes.
+/// Browser document loading uses `parseWithKeyframes` to retain both products.
 pub fn parse(self: *CSSParser, allocator: std.mem.Allocator) ![]CSSRule {
+    var keyframes = std.ArrayList(KeyframesRule).empty;
+    defer {
+        for (keyframes.items) |*rule| rule.deinit(allocator);
+        keyframes.deinit(allocator);
+    }
+    return self.parseWithKeyframes(allocator, &keyframes);
+}
+
+/// Parse selector rules and append named keyframes to caller-owned storage.
+/// Both products borrow the same stylesheet input buffer.
+pub fn parseWithKeyframes(
+    self: *CSSParser,
+    allocator: std.mem.Allocator,
+    keyframes: *std.ArrayList(KeyframesRule),
+) ![]CSSRule {
+    const keyframes_start = keyframes.items.len;
+    errdefer {
+        for (keyframes.items[keyframes_start..]) |*rule| rule.deinit(allocator);
+        keyframes.shrinkRetainingCapacity(keyframes_start);
+    }
     var rules = std.ArrayList(CSSRule).empty;
     errdefer {
         for (rules.items) |*rule| {
@@ -452,6 +583,19 @@ pub fn parse(self: *CSSParser, allocator: std.mem.Allocator) ![]CSSRule {
         if (self.pos >= self.string.len) break;
 
         if (self.string[self.pos] == '@') {
+            if (self.startsWithKeyframesRule()) {
+                const brace_idx = std.mem.indexOfScalarPos(u8, self.string, self.pos, '{') orelse break;
+                const block_end = self.findMatchingBrace(brace_idx) orelse break;
+                var keyframes_rule = self.parseKeyframesRule(allocator) catch {
+                    self.pos = block_end + 1;
+                    continue;
+                };
+                keyframes.append(allocator, keyframes_rule) catch |err| {
+                    keyframes_rule.deinit(allocator);
+                    return err;
+                };
+                continue;
+            }
             if (std.mem.startsWith(u8, self.string[self.pos..], "@media")) {
                 const prelude_start = self.pos + "@media".len;
                 const brace_idx = std.mem.indexOfPos(u8, self.string, prelude_start, "{") orelse break;
@@ -467,7 +611,7 @@ pub fn parse(self: *CSSParser, allocator: std.mem.Allocator) ![]CSSRule {
                         );
                         defer media_parser.deinit(allocator);
 
-                        const media_rules = try media_parser.parse(allocator);
+                        const media_rules = try media_parser.parseWithKeyframes(allocator, keyframes);
                         var media_rules_transferred = false;
                         defer {
                             if (!media_rules_transferred) {
@@ -588,4 +732,41 @@ pub fn parse(self: *CSSParser, allocator: std.mem.Allocator) ![]CSSRule {
     }
 
     return rules.toOwnedSlice(allocator);
+}
+
+test "keyframes parse beside selector rules and normalize offsets" {
+    const allocator = std.testing.allocator;
+    const css =
+        "@KEYFRAMES pulse {" ++
+        " from { opacity: 0.1; width: 100px; }" ++
+        " 50%, 75% { opacity: 0.5; }" ++
+        " to { opacity: 0.9; width: 300px; }" ++
+        "}" ++
+        "div { animation: 2s infinite alternate pulse; }";
+
+    var parser = try CSSParser.init(allocator, css, false);
+    defer parser.deinit(allocator);
+    var keyframes = std.ArrayList(KeyframesRule).empty;
+    defer {
+        for (keyframes.items) |*rule| rule.deinit(allocator);
+        keyframes.deinit(allocator);
+    }
+    const rules = try parser.parseWithKeyframes(allocator, &keyframes);
+    defer {
+        for (rules) |*rule| rule.deinit(allocator);
+        allocator.free(rules);
+    }
+
+    try std.testing.expectEqual(@as(usize, 1), rules.len);
+    try std.testing.expectEqualStrings(
+        "2s infinite alternate pulse",
+        rules[0].properties.get("animation").?.value,
+    );
+    try std.testing.expectEqual(@as(usize, 1), keyframes.items.len);
+    const pulse = &keyframes.items[0];
+    try std.testing.expectEqualStrings("pulse", pulse.name);
+    try std.testing.expectEqual(@as(usize, 4), pulse.frames.len);
+    try std.testing.expectEqualStrings("0.1", pulse.frameAt(0).?.properties.get("opacity").?.value);
+    try std.testing.expectEqualStrings("0.5", pulse.frameAt(0.5).?.properties.get("opacity").?.value);
+    try std.testing.expectEqualStrings("0.9", pulse.frameAt(1).?.properties.get("opacity").?.value);
 }

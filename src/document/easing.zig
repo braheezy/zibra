@@ -76,6 +76,20 @@ pub const Function = union(enum) {
             .cubic_bezier => |curve| curve.apply(progress),
         };
     }
+
+    /// Reverse a timing function for `animation-direction: alternate`.
+    /// Mirroring both axes makes f_rev(t) = 1 - f(1 - t).
+    pub fn reversed(self: Function) Function {
+        return switch (self) {
+            .linear => .linear,
+            .cubic_bezier => |curve| .{ .cubic_bezier = .{
+                .x1 = 1.0 - curve.x2,
+                .y1 = 1.0 - curve.y2,
+                .x2 = 1.0 - curve.x1,
+                .y2 = 1.0 - curve.y1,
+            } },
+        };
+    }
 };
 
 /// Parse the supported CSS timing-function keywords and explicit
@@ -127,6 +141,11 @@ test "CSS timing functions map normalized progress" {
     try std.testing.expectApproxEqAbs(0.5, Function.ease_in_out.apply(0.5), 0.000001);
     try std.testing.expectEqual(@as(f64, 0.0), Function.ease.apply(0.0));
     try std.testing.expectEqual(@as(f64, 1.0), Function.ease.apply(1.0));
+    try std.testing.expectApproxEqAbs(
+        Function.ease_out.apply(0.5),
+        Function.ease_in.reversed().apply(0.5),
+        0.000001,
+    );
 }
 
 test "explicit cubic-bezier parsing validates control points" {

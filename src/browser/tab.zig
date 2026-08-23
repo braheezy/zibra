@@ -193,6 +193,7 @@ pub const Frame = struct {
     js_render_context_initialized: bool = false,
     document_generation: u64 = 0,
     rules: std.ArrayList(CSSParser.CSSRule),
+    keyframes: std.ArrayList(CSSParser.KeyframesRule),
     default_rules_count: usize = 0,
     // Owned linked and inline author stylesheet buffers in DOM order. Owned
     // rules borrow their property strings from these allocations.
@@ -216,6 +217,7 @@ pub const Frame = struct {
             .parent = parent,
             .frame_element = frame_element,
             .rules = std.ArrayList(CSSParser.CSSRule).empty,
+            .keyframes = std.ArrayList(CSSParser.KeyframesRule).empty,
             .css_texts = std.ArrayList([]const u8).empty,
             .children = std.ArrayList(*Frame).empty,
             .input_bounds = std.AutoHashMap(*Node, Bounds).init(allocator),
@@ -283,6 +285,9 @@ pub const Frame = struct {
         }
         self.rules.deinit(self.allocator);
 
+        for (self.keyframes.items) |*rule| rule.deinit(self.allocator);
+        self.keyframes.deinit(self.allocator);
+
         for (self.css_texts.items) |css_text| {
             self.allocator.free(css_text);
         }
@@ -344,7 +349,12 @@ pub const Frame = struct {
             try browser.annotateVisitedLinks(&self.current_node.?, base_url);
         }
         if (needs_style) {
-            try parser.style(browser.allocator, &self.current_node.?, self.rules.items);
+            try parser.styleWithKeyframes(
+                browser.allocator,
+                &self.current_node.?,
+                self.rules.items,
+                self.keyframes.items,
+            );
         }
         if (needs_layout or needs_paint) {
             try browser.layoutTabNodes(self, needs_paint);
@@ -1914,6 +1924,14 @@ pub fn runAnimationFrameForGeneration(
         self.render(self.browser) catch |err| {
             std.log.warn("Animation frame render failed: {}", .{err});
         };
+        // Style recomputation can instantiate a CSS keyframe animation after
+        // the advance phase above. Arm its first follow-up frame here.
+        if (!animations_running and frame.current_node != null and
+            hasActiveAnimations(&frame.current_node.?))
+        {
+            self.browser.setNeedsAnimationFrame(self);
+            self.browser.scheduleAnimationFrame();
+        }
     }
 
     const commit_scroll: ?i32 = if (activation_commit or self.scroll_changed_in_tab)
@@ -1950,98 +1968,181 @@ pub fn runAnimationFrameForGeneration(
     self.scroll_changed_in_tab = false;
 }
 
-/// Advance all animations in the node tree, returns true if any animations are still running
+fn hasActiveAnimations(node: *const parser.Node) bool {
+    return switch (node.*) {
+        .text => false,
+        .element => |*element| blk: {
+            if (element.css_animation) |state| {
+                if (!state.finished) break :blk true;
+            }
+            if (element.animations) |animations| {
+                var iterator = animations.iterator();
+                while (iterator.next()) |entry| {
+                    if (!entry.value_ptr.isComplete()) break :blk true;
+                }
+            }
+            for (element.children.items) |*child| {
+                if (hasActiveAnimations(child)) break :blk true;
+            }
+            break :blk false;
+        },
+    };
+}
+
+fn publishAnimationValue(
+    self: *Tab,
+    elem: *parser.Element,
+    property: []const u8,
+    anim: *parser.Animation,
+    css_keyframe_animation: bool,
+) void {
+    if (std.mem.eql(u8, property, "opacity")) {
+        switch (anim.*) {
+            .numeric => |numeric| {
+                const opacity = numeric.getValue();
+                // Transition values historically publish through the
+                // computed style's Element-owned buffer. A keyframe animation
+                // must leave the underlying computed value untouched so it
+                // can be restored when a finite animation ends.
+                if (!css_keyframe_animation) {
+                    if (elem.style) |*style_map| {
+                        if (style_map.getPtr("opacity")) |field| {
+                            const buf = std.fmt.bufPrint(
+                                &elem.opacity_anim_value,
+                                "{d:.3}",
+                                .{opacity},
+                            ) catch null;
+                            if (buf) |value| field.set(value);
+                        }
+                    }
+                }
+                const update = CompositedUpdate{
+                    .node = @ptrCast(elem),
+                    .value = .{ .opacity = opacity },
+                };
+                self.composited_updates.append(self.allocator, update) catch return;
+                if (self.root_frame) |root_frame| applyRetainedCompositedUpdate(root_frame, update);
+            },
+            .pixel, .color, .transform => {},
+        }
+    } else if (std.mem.eql(u8, property, "background-color")) {
+        switch (anim.*) {
+            .color => self.needs_paint = true,
+            .numeric, .pixel, .transform => {},
+        }
+    } else if (std.mem.eql(u8, property, "transform")) {
+        switch (anim.*) {
+            .transform => |transform| {
+                const pixels = transform.getValue().layoutPixels();
+                const update = CompositedUpdate{
+                    .node = @ptrCast(elem),
+                    .value = .{ .transform = .{ .x = pixels.x, .y = pixels.y } },
+                };
+                self.composited_updates.append(self.allocator, update) catch return;
+                if (self.root_frame) |root_frame| applyRetainedCompositedUpdate(root_frame, update);
+            },
+            .numeric, .pixel, .color => {},
+        }
+    } else if (std.mem.eql(u8, property, "width") or std.mem.eql(u8, property, "height")) {
+        switch (anim.*) {
+            .pixel => {
+                self.needs_layout = true;
+                if (elem.layout_ptr) |layout_ptr| {
+                    if (elem.layout_mark) |mark| mark(layout_ptr);
+                }
+            },
+            .numeric, .color, .transform => {},
+        }
+    }
+}
+
+fn restartCssAnimation(self: *Tab, elem: *parser.Element, state: *parser.CssAnimationState) void {
+    state.completed_iterations += 1;
+    state.restart_pending = false;
+    const should_reverse = state.direction == .alternate;
+    if (elem.animations) |*animations| {
+        for (parser.css_animation_properties) |property| {
+            if (!state.contains(property)) continue;
+            if (animations.getPtr(property)) |animation| {
+                if (should_reverse) animation.reverse();
+                animation.reset();
+                self.publishAnimationValue(elem, property, animation, true);
+            }
+        }
+    }
+}
+
+fn invalidateRemovedCssAnimation(self: *Tab, elem: *parser.Element, property_mask: u8) void {
+    for (parser.css_animation_properties) |property| {
+        if ((property_mask & parser.cssAnimationPropertyBit(property)) == 0) continue;
+        if (std.mem.eql(u8, property, "width") or std.mem.eql(u8, property, "height")) {
+            self.needs_layout = true;
+            if (elem.layout_ptr) |layout_ptr| {
+                if (elem.layout_mark) |mark| mark(layout_ptr);
+            }
+        } else {
+            self.needs_paint = true;
+        }
+    }
+}
+
+/// Advance transitions and named keyframe animations in the node tree.
 fn advanceAnimations(self: *Tab, node: *parser.Node) bool {
     var any_running = false;
 
     switch (node.*) {
         .element => |*elem| {
-            // Advance animations on this element
+            var skip_css_tracks = false;
+            if (elem.css_animation) |*state| {
+                if (state.restart_pending) {
+                    if (state.hasAnotherIteration()) {
+                        self.restartCssAnimation(elem, state);
+                        any_running = true;
+                    } else {
+                        const property_mask = state.property_mask;
+                        parser.finishCssAnimationTracks(elem);
+                        self.invalidateRemovedCssAnimation(elem, property_mask);
+                    }
+                    skip_css_tracks = true;
+                }
+            }
+
             if (elem.animations) |*animations| {
+                const css_animation_active = if (elem.css_animation) |state| !state.finished else false;
+                var css_tracks_complete = css_animation_active;
                 var it = animations.iterator();
                 while (it.next()) |entry| {
+                    const is_css_track = if (elem.css_animation) |state|
+                        !state.finished and state.contains(entry.key_ptr.*)
+                    else
+                        false;
+                    if (is_css_track and skip_css_tracks) continue;
+
                     const anim = entry.value_ptr;
                     if (!anim.isComplete()) {
                         _ = anim.advance();
                         any_running = true;
+                        self.publishAnimationValue(elem, entry.key_ptr.*, anim, is_css_track);
+                    }
+                    if (is_css_track and !anim.isComplete()) css_tracks_complete = false;
+                }
 
-                        // Opacity updates can remain on the compositor path.
-                        if (std.mem.eql(u8, entry.key_ptr.*, "opacity")) {
-                            switch (anim.*) {
-                                .numeric => |numeric| {
-                                    const opacity = numeric.getValue();
-                                    if (elem.style) |*style_map| {
-                                        if (style_map.getPtr("opacity")) |field| {
-                                            const buf = std.fmt.bufPrint(&elem.opacity_anim_value, "{d:.3}", .{opacity}) catch null;
-                                            if (buf) |value| {
-                                                field.set(value);
-                                            }
-                                        }
-                                    }
-                                    const update = CompositedUpdate{
-                                        .node = @ptrCast(elem),
-                                        .value = .{ .opacity = opacity },
-                                    };
-                                    self.composited_updates.append(self.allocator, update) catch continue;
-                                    if (self.root_frame) |root_frame| {
-                                        applyRetainedCompositedUpdate(root_frame, update);
-                                    }
-                                },
-                                .pixel, .color, .transform => {},
-                            }
-                        } else if (std.mem.eql(u8, entry.key_ptr.*, "background-color")) {
-                            switch (anim.*) {
-                                // A background is part of the painted command,
-                                // so it cannot use opacity's composited-only
-                                // update path. Layout reads the current color
-                                // directly from this element-owned animation.
-                                .color => self.needs_paint = true,
-                                .numeric, .pixel, .transform => {},
-                            }
-                        } else if (std.mem.eql(u8, entry.key_ptr.*, "transform")) {
-                            switch (anim.*) {
-                                .transform => |transform| {
-                                    const pixels = transform.getValue().layoutPixels();
-                                    const update = CompositedUpdate{
-                                        .node = @ptrCast(elem),
-                                        .value = .{ .transform = .{ .x = pixels.x, .y = pixels.y } },
-                                    };
-                                    self.composited_updates.append(self.allocator, update) catch continue;
-                                    if (self.root_frame) |root_frame| {
-                                        applyRetainedCompositedUpdate(root_frame, update);
-                                    }
-                                },
-                                .numeric, .pixel, .color => {},
-                            }
-                        } else if (std.mem.eql(u8, entry.key_ptr.*, "width") or
-                            std.mem.eql(u8, entry.key_ptr.*, "height"))
-                        {
-                            switch (anim.*) {
-                                .pixel => {
-                                    // Dimension animations change both block
-                                    // geometry and descendant line wrapping.
-                                    self.needs_layout = true;
-                                    if (elem.layout_ptr) |layout_ptr| {
-                                        if (elem.layout_mark) |mark| mark(layout_ptr);
-                                    }
-                                },
-                                .numeric, .color, .transform => {},
-                            }
-                        }
+                if (!skip_css_tracks and css_animation_active and css_tracks_complete) {
+                    if (elem.css_animation) |*state| {
+                        state.restart_pending = true;
+                        // Preserve the terminal endpoint for this render, then
+                        // schedule one more frame to restart or restore style.
+                        any_running = true;
                     }
                 }
             }
 
-            // Recurse into children
             for (elem.children.items) |*child| {
-                if (self.advanceAnimations(child)) {
-                    any_running = true;
-                }
+                if (self.advanceAnimations(child)) any_running = true;
             }
         },
         .text => {},
     }
-
     return any_running;
 }
 
@@ -2075,6 +2176,120 @@ test "pixel dimension animation requests layout and produces px values" {
     var height_buffer: [32]u8 = undefined;
     try std.testing.expectEqualStrings("150.000px", try root.element.animations.?.get("width").?.pixel.formatValue(&width_buffer));
     try std.testing.expectEqualStrings("60.000px", try root.element.animations.?.get("height").?.pixel.formatValue(&height_buffer));
+}
+
+test "alternate keyframe cycles preserve endpoints and relayout dimensions" {
+    const allocator = std.testing.allocator;
+    var root = parser.Node{ .element = try parser.Element.init(allocator, "div", null) };
+    defer root.deinit(allocator);
+    try parser.style(allocator, &root, &.{});
+
+    root.element.animations = std.StringHashMap(parser.Animation).init(allocator);
+    try root.element.animations.?.put("opacity", .{ .numeric = parser.NumericAnimation.initWithEasing(
+        0,
+        1,
+        2,
+        .linear,
+    ) });
+    try root.element.animations.?.put("width", .{ .pixel = parser.PixelAnimation.initWithEasing(
+        100,
+        200,
+        2,
+        .linear,
+    ) });
+    root.element.css_animation = .{
+        .signature = 1,
+        .property_mask = parser.cssAnimationPropertyBit("opacity") |
+            parser.cssAnimationPropertyBit("width"),
+        .iterations = null,
+        .direction = .alternate,
+    };
+
+    var tab: Tab = undefined;
+    tab.allocator = allocator;
+    tab.root_frame = null;
+    tab.composited_updates = .empty;
+    defer tab.composited_updates.deinit(allocator);
+    tab.needs_layout = false;
+    tab.needs_paint = false;
+
+    try std.testing.expect(tab.advanceAnimations(&root));
+    try std.testing.expectApproxEqAbs(
+        @as(f64, 0.5),
+        root.element.animations.?.get("opacity").?.numeric.getValue(),
+        0.000001,
+    );
+    try std.testing.expectApproxEqAbs(
+        @as(f64, 150),
+        root.element.animations.?.get("width").?.pixel.getValue(),
+        0.000001,
+    );
+    try std.testing.expect(tab.needs_layout);
+
+    try std.testing.expect(tab.advanceAnimations(&root));
+    try std.testing.expect(root.element.css_animation.?.restart_pending);
+    try std.testing.expectApproxEqAbs(
+        @as(f64, 1),
+        root.element.animations.?.get("opacity").?.numeric.getValue(),
+        0.000001,
+    );
+
+    try std.testing.expect(tab.advanceAnimations(&root));
+    try std.testing.expectEqual(@as(u32, 1), root.element.css_animation.?.completed_iterations);
+    try std.testing.expectApproxEqAbs(
+        @as(f64, 1),
+        root.element.animations.?.get("opacity").?.numeric.getValue(),
+        0.000001,
+    );
+    try std.testing.expectApproxEqAbs(
+        @as(f64, 200),
+        root.element.animations.?.get("width").?.pixel.getValue(),
+        0.000001,
+    );
+
+    try std.testing.expect(tab.advanceAnimations(&root));
+    try std.testing.expect(tab.advanceAnimations(&root));
+    try std.testing.expectApproxEqAbs(
+        @as(f64, 0),
+        root.element.animations.?.get("opacity").?.numeric.getValue(),
+        0.000001,
+    );
+}
+
+test "finite keyframe animation restores its underlying property" {
+    const allocator = std.testing.allocator;
+    var root = parser.Node{ .element = try parser.Element.init(allocator, "div", null) };
+    defer root.deinit(allocator);
+    try parser.style(allocator, &root, &.{});
+
+    root.element.animations = std.StringHashMap(parser.Animation).init(allocator);
+    try root.element.animations.?.put("width", .{ .pixel = parser.PixelAnimation.initWithEasing(
+        100,
+        200,
+        1,
+        .linear,
+    ) });
+    root.element.css_animation = .{
+        .signature = 2,
+        .property_mask = parser.cssAnimationPropertyBit("width"),
+        .iterations = 1,
+        .direction = .normal,
+    };
+
+    var tab: Tab = undefined;
+    tab.allocator = allocator;
+    tab.root_frame = null;
+    tab.composited_updates = .empty;
+    defer tab.composited_updates.deinit(allocator);
+    tab.needs_layout = false;
+    tab.needs_paint = false;
+
+    try std.testing.expect(tab.advanceAnimations(&root));
+    try std.testing.expect(root.element.css_animation.?.restart_pending);
+    try std.testing.expect(!tab.advanceAnimations(&root));
+    try std.testing.expect(root.element.css_animation.?.finished);
+    try std.testing.expect(root.element.animations.?.get("width") == null);
+    try std.testing.expect(tab.needs_layout);
 }
 
 fn applyRetainedCompositedUpdate(frame: *Frame, update: CompositedUpdate) void {

@@ -2599,6 +2599,7 @@ pub const Browser = struct {
             }
 
             var all_rules = std.ArrayList(CSSParser.CSSRule).empty;
+            var all_keyframes = std.ArrayList(CSSParser.KeyframesRule).empty;
 
             // Track how many default rules we have so we don't double-free them
             const default_rules_count = self.default_style_sheet_rules.len;
@@ -2610,6 +2611,8 @@ pub const Browser = struct {
                     }
                 }
                 all_rules.deinit(self.allocator);
+                for (all_keyframes.items) |*rule| rule.deinit(self.allocator);
+                all_keyframes.deinit(self.allocator);
             }
 
             // Start with default browser stylesheet rules (shallow copy, browser still owns them)
@@ -2623,6 +2626,7 @@ pub const Browser = struct {
                 &resources,
                 &new_css_texts,
                 &all_rules,
+                &all_keyframes,
             );
 
             // Sort rules by cascade priority (more specific selectors override less specific)
@@ -2640,6 +2644,8 @@ pub const Browser = struct {
                 }
             }
             frame.rules.deinit(self.allocator);
+            for (frame.keyframes.items) |*rule| rule.deinit(self.allocator);
+            frame.keyframes.deinit(self.allocator);
 
             for (frame.css_texts.items) |old_css_text| {
                 self.allocator.free(old_css_text);
@@ -2649,11 +2655,18 @@ pub const Browser = struct {
             frame.default_rules_count = default_rules_count;
             frame.rules = all_rules;
             all_rules = .empty;
+            frame.keyframes = all_keyframes;
+            all_keyframes = .empty;
             frame.css_texts = new_css_texts;
             new_css_texts = .empty;
 
             // Apply all stylesheet rules and inline styles (sorted by cascade order)
-            try parser.style(self.allocator, &frame.current_node.?, frame.rules.items);
+            try parser.styleWithKeyframes(
+                self.allocator,
+                &frame.current_node.?,
+                frame.rules.items,
+                frame.keyframes.items,
+            );
 
             // Layout using the HTML node tree
             try self.layoutTabNodes(frame, true);
@@ -2777,6 +2790,9 @@ pub const Browser = struct {
         }
         frame.rules.clearRetainingCapacity();
         frame.default_rules_count = 0;
+
+        for (frame.keyframes.items) |*rule| rule.deinit(self.allocator);
+        frame.keyframes.clearRetainingCapacity();
 
         for (frame.css_texts.items) |css_text| {
             self.allocator.free(css_text);
@@ -2954,6 +2970,7 @@ pub const Browser = struct {
         }
 
         var all_rules = std.ArrayList(CSSParser.CSSRule).empty;
+        var all_keyframes = std.ArrayList(CSSParser.KeyframesRule).empty;
         const default_rules_count = self.default_style_sheet_rules.len;
         defer {
             for (all_rules.items) |*rule| {
@@ -2962,6 +2979,8 @@ pub const Browser = struct {
                 }
             }
             all_rules.deinit(self.allocator);
+            for (all_keyframes.items) |*rule| rule.deinit(self.allocator);
+            all_keyframes.deinit(self.allocator);
         }
 
         for (self.default_style_sheet_rules) |rule| {
@@ -2974,6 +2993,7 @@ pub const Browser = struct {
             &resources,
             &new_css_texts,
             &all_rules,
+            &all_keyframes,
         );
 
         std.mem.sort(CSSParser.CSSRule, all_rules.items, {}, struct {
@@ -2986,14 +3006,23 @@ pub const Browser = struct {
         // buffers. Replace both generations together so rules never outlive
         // the stylesheet text they borrow.
         frame.rules.deinit(self.allocator);
+        for (frame.keyframes.items) |*rule| rule.deinit(self.allocator);
+        frame.keyframes.deinit(self.allocator);
         frame.css_texts.deinit(self.allocator);
         frame.default_rules_count = default_rules_count;
         frame.rules = all_rules;
         all_rules = .empty;
+        frame.keyframes = all_keyframes;
+        all_keyframes = .empty;
         frame.css_texts = new_css_texts;
         new_css_texts = .empty;
 
-        try parser.style(self.allocator, &frame.current_node.?, frame.rules.items);
+        try parser.styleWithKeyframes(
+            self.allocator,
+            &frame.current_node.?,
+            frame.rules.items,
+            frame.keyframes.items,
+        );
         try self.layoutTabNodes(frame, true);
         if (url.*.fragment()) |fragment| {
             _ = frame.scrollToFragment(fragment);
@@ -3339,6 +3368,7 @@ pub const Browser = struct {
         }
 
         var all_rules = std.ArrayList(CSSParser.CSSRule).empty;
+        var all_keyframes = std.ArrayList(CSSParser.KeyframesRule).empty;
         const default_rules_count = self.default_style_sheet_rules.len;
         defer {
             for (all_rules.items) |*rule| {
@@ -3347,6 +3377,8 @@ pub const Browser = struct {
                 }
             }
             all_rules.deinit(self.allocator);
+            for (all_keyframes.items) |*rule| rule.deinit(self.allocator);
+            all_keyframes.deinit(self.allocator);
         }
 
         for (self.default_style_sheet_rules) |rule| {
@@ -3359,6 +3391,7 @@ pub const Browser = struct {
             &resources,
             &new_css_texts,
             &all_rules,
+            &all_keyframes,
         );
 
         std.mem.sort(CSSParser.CSSRule, all_rules.items, {}, struct {
@@ -3368,14 +3401,23 @@ pub const Browser = struct {
         }.lessThan);
 
         frame.rules.deinit(self.allocator);
+        for (frame.keyframes.items) |*rule| rule.deinit(self.allocator);
+        frame.keyframes.deinit(self.allocator);
         frame.css_texts.deinit(self.allocator);
         frame.default_rules_count = default_rules_count;
         frame.rules = all_rules;
         all_rules = .empty;
+        frame.keyframes = all_keyframes;
+        all_keyframes = .empty;
         frame.css_texts = new_css_texts;
         new_css_texts = .empty;
 
-        try parser.style(self.allocator, &frame.current_node.?, frame.rules.items);
+        try parser.styleWithKeyframes(
+            self.allocator,
+            &frame.current_node.?,
+            frame.rules.items,
+            frame.keyframes.items,
+        );
         try self.layoutTabNodes(frame, true);
         try parent.children.append(parent.allocator, frame);
     }
@@ -3607,11 +3649,14 @@ pub const Browser = struct {
         }
 
         var new_rules = std.ArrayList(CSSParser.CSSRule).empty;
+        var new_keyframes = std.ArrayList(CSSParser.KeyframesRule).empty;
         defer {
             for (new_rules.items) |*rule| {
                 if (rule.owned) rule.deinit(self.allocator);
             }
             new_rules.deinit(self.allocator);
+            for (new_keyframes.items) |*rule| rule.deinit(self.allocator);
+            new_keyframes.deinit(self.allocator);
         }
 
         for (self.default_style_sheet_rules) |rule| {
@@ -3623,6 +3668,7 @@ pub const Browser = struct {
             resources,
             &new_css_texts,
             &new_rules,
+            &new_keyframes,
         );
 
         std.mem.sort(CSSParser.CSSRule, new_rules.items, {}, struct {
@@ -3637,12 +3683,16 @@ pub const Browser = struct {
             if (rule.owned) rule.deinit(self.allocator);
         }
         frame.rules.deinit(self.allocator);
+        for (frame.keyframes.items) |*rule| rule.deinit(self.allocator);
+        frame.keyframes.deinit(self.allocator);
         for (frame.css_texts.items) |css_text| self.allocator.free(css_text);
         frame.css_texts.deinit(self.allocator);
 
         frame.default_rules_count = self.default_style_sheet_rules.len;
         frame.rules = new_rules;
         new_rules = .empty;
+        frame.keyframes = new_keyframes;
+        new_keyframes = .empty;
         frame.css_texts = new_css_texts;
         new_css_texts = .empty;
     }
@@ -3691,11 +3741,21 @@ pub const Browser = struct {
         prefers_dark: bool,
         css_texts: *std.ArrayList([]const u8),
         rules: *std.ArrayList(CSSParser.CSSRule),
+        keyframes: *std.ArrayList(CSSParser.KeyframesRule),
     ) !void {
         var css_parser = try CSSParser.init(self.allocator, css_text, prefers_dark);
         defer css_parser.deinit(self.allocator);
 
-        const parsed_rules = try css_parser.parse(self.allocator);
+        var parsed_keyframes = std.ArrayList(CSSParser.KeyframesRule).empty;
+        var parsed_keyframes_owned = true;
+        defer {
+            if (parsed_keyframes_owned) {
+                for (parsed_keyframes.items) |*rule| rule.deinit(self.allocator);
+            }
+            parsed_keyframes.deinit(self.allocator);
+        }
+
+        const parsed_rules = try css_parser.parseWithKeyframes(self.allocator, &parsed_keyframes);
         var parsed_rules_owned = true;
         defer {
             if (parsed_rules_owned) {
@@ -3708,9 +3768,12 @@ pub const Browser = struct {
         // generation. Every parsed rule borrows from css_text.
         try css_texts.ensureUnusedCapacity(self.allocator, 1);
         try rules.ensureUnusedCapacity(self.allocator, parsed_rules.len);
+        try keyframes.ensureUnusedCapacity(self.allocator, parsed_keyframes.items.len);
         css_texts.appendAssumeCapacity(css_text);
         for (parsed_rules) |rule| rules.appendAssumeCapacity(rule);
+        for (parsed_keyframes.items) |rule| keyframes.appendAssumeCapacity(rule);
         parsed_rules_owned = false;
+        parsed_keyframes_owned = false;
     }
 
     /// Load author stylesheets in DOM order. Inline `<style>` text is copied
@@ -3723,6 +3786,7 @@ pub const Browser = struct {
         resources: *DocumentResourceBatch,
         css_texts: *std.ArrayList([]const u8),
         rules: *std.ArrayList(CSSParser.CSSRule),
+        keyframes: *std.ArrayList(CSSParser.KeyframesRule),
     ) !void {
         for (nodes) |node| {
             const element = switch (node.*) {
@@ -3740,6 +3804,7 @@ pub const Browser = struct {
                     frame.tab.accessibility.prefers_dark,
                     css_texts,
                     rules,
+                    keyframes,
                 ) catch |err| {
                     std.log.warn("Failed to parse inline stylesheet: {}", .{err});
                     continue;
@@ -3771,6 +3836,7 @@ pub const Browser = struct {
                 frame.tab.accessibility.prefers_dark,
                 css_texts,
                 rules,
+                keyframes,
             ) catch |err| {
                 std.log.warn("Failed to parse stylesheet {s}: {}", .{ href, err });
                 continue;
@@ -4044,11 +4110,14 @@ pub const Browser = struct {
         const default_rules_count = self.default_style_sheet_rules.len;
 
         var new_rules = std.ArrayList(CSSParser.CSSRule).empty;
+        var new_keyframes = std.ArrayList(CSSParser.KeyframesRule).empty;
         defer {
             for (new_rules.items) |*rule| {
                 if (rule.owned) rule.deinit(self.allocator);
             }
             new_rules.deinit(self.allocator);
+            for (new_keyframes.items) |*rule| rule.deinit(self.allocator);
+            new_keyframes.deinit(self.allocator);
         }
 
         for (self.default_style_sheet_rules) |rule| {
@@ -4059,7 +4128,7 @@ pub const Browser = struct {
             var css_parser = try CSSParser.init(self.allocator, css_text, tab.accessibility.prefers_dark);
             defer css_parser.deinit(self.allocator);
 
-            const parsed_rules = css_parser.parse(self.allocator) catch |err| {
+            const parsed_rules = css_parser.parseWithKeyframes(self.allocator, &new_keyframes) catch |err| {
                 std.log.warn("Failed to parse stylesheet on rebuild: {}", .{err});
                 continue;
             };
@@ -4088,8 +4157,12 @@ pub const Browser = struct {
             if (rule.owned) rule.deinit(self.allocator);
         }
         frame.rules.deinit(self.allocator);
+        for (frame.keyframes.items) |*rule| rule.deinit(self.allocator);
+        frame.keyframes.deinit(self.allocator);
         frame.rules = new_rules;
         new_rules = .empty;
+        frame.keyframes = new_keyframes;
+        new_keyframes = .empty;
         frame.default_rules_count = default_rules_count;
     }
 

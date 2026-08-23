@@ -1250,6 +1250,66 @@ test "width and height are computed without inheriting" {
     );
 }
 
+test "computed animation starts typed keyframe tracks without restarting on restyle" {
+    const allocator = std.testing.allocator;
+    const css =
+        "div { animation: 2s infinite alternate demo; width: 220px; }" ++
+        "@keyframes demo {" ++
+        " from { opacity: 0.2; width: 100px; background-color: red; }" ++
+        " to { opacity: 0.8; width: 300px; background-color: blue; }" ++
+        "}";
+
+    var html_parser = try HTMLParser.init(allocator, "<div>animated words wrap here</div>");
+    html_parser.use_implicit_tags = false;
+    defer html_parser.deinit(allocator);
+    var root = try html_parser.parse();
+    defer root.deinit(allocator);
+
+    var css_parser = try CSSParser.init(allocator, css, false);
+    defer css_parser.deinit(allocator);
+    var keyframes = std.ArrayList(CSSParser.KeyframesRule).empty;
+    defer {
+        for (keyframes.items) |*rule| rule.deinit(allocator);
+        keyframes.deinit(allocator);
+    }
+    const rules = try css_parser.parseWithKeyframes(allocator, &keyframes);
+    defer {
+        for (rules) |*rule| rule.deinit(allocator);
+        allocator.free(rules);
+    }
+
+    try document_parser.styleWithKeyframes(allocator, &root, rules, keyframes.items);
+    try std.testing.expectEqualStrings(
+        "2s infinite alternate demo",
+        root.element.style.?.getPtr("animation").?.get().*,
+    );
+    const state = root.element.css_animation.?;
+    try std.testing.expect(state.contains("opacity"));
+    try std.testing.expect(state.contains("background-color"));
+    try std.testing.expect(state.contains("width"));
+    try std.testing.expect(!state.contains("height"));
+    try std.testing.expectApproxEqAbs(
+        @as(f64, 100),
+        root.element.animations.?.get("width").?.pixel.getValue(),
+        0.000001,
+    );
+
+    _ = root.element.animations.?.getPtr("width").?.advance();
+    const current_frame = root.element.animations.?.get("width").?.pixel.numeric.current_frame;
+    document_parser.dirtyStyleForElement(&root.element);
+    try document_parser.styleWithKeyframes(allocator, &root, rules, keyframes.items);
+    try std.testing.expectEqual(
+        current_frame,
+        root.element.animations.?.get("width").?.pixel.numeric.current_frame,
+    );
+
+    document_parser.finishCssAnimationTracks(&root.element);
+    document_parser.dirtyStyleForElement(&root.element);
+    try document_parser.styleWithKeyframes(allocator, &root, rules, keyframes.items);
+    try std.testing.expect(root.element.css_animation.?.finished);
+    try std.testing.expect(root.element.animations.?.get("width") == null);
+}
+
 test "display defaults to inline and browser rules define block elements" {
     const allocator = std.testing.allocator;
     const html =

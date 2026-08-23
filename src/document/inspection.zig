@@ -17,6 +17,7 @@ pub const Page = struct {
     body: []u8,
     root: parser.Node,
     rules: std.ArrayList(CSSParser.CSSRule),
+    keyframes: std.ArrayList(CSSParser.KeyframesRule),
     css_texts: std.ArrayList([]u8),
 
     pub fn load(init: std.process.Init, allocator: std.mem.Allocator, source_url: ?Url) !Page {
@@ -36,6 +37,7 @@ pub const Page = struct {
             .body = body,
             .root = root,
             .rules = std.ArrayList(CSSParser.CSSRule).empty,
+            .keyframes = std.ArrayList(CSSParser.KeyframesRule).empty,
             .css_texts = std.ArrayList([]u8).empty,
         };
         errdefer page.deinit();
@@ -52,13 +54,20 @@ pub const Page = struct {
                 return a.cascadePriority() < b.cascadePriority();
             }
         }.lessThan);
-        try parser.style(allocator, &page.root, page.rules.items);
+        try parser.styleWithKeyframes(
+            allocator,
+            &page.root,
+            page.rules.items,
+            page.keyframes.items,
+        );
         return page;
     }
 
     pub fn deinit(self: *Page) void {
         for (self.rules.items) |*rule| rule.deinit(self.allocator);
         self.rules.deinit(self.allocator);
+        for (self.keyframes.items) |*rule| rule.deinit(self.allocator);
+        self.keyframes.deinit(self.allocator);
         for (self.css_texts.items) |text| self.allocator.free(text);
         self.css_texts.deinit(self.allocator);
         self.root.deinit(self.allocator);
@@ -75,7 +84,15 @@ pub const Page = struct {
     fn appendRules(self: *Page, stylesheet: []const u8, keep_text: bool) !void {
         var css_parser = try CSSParser.init(self.allocator, stylesheet, false);
         defer css_parser.deinit(self.allocator);
-        const rules = try css_parser.parse(self.allocator);
+        var keyframes = std.ArrayList(CSSParser.KeyframesRule).empty;
+        var keyframes_owned = true;
+        defer {
+            if (keyframes_owned) {
+                for (keyframes.items) |*rule| rule.deinit(self.allocator);
+            }
+            keyframes.deinit(self.allocator);
+        }
+        const rules = try css_parser.parseWithKeyframes(self.allocator, &keyframes);
         var rules_owned = true;
         defer if (rules_owned) {
             for (rules) |*rule| rule.deinit(self.allocator);
@@ -87,12 +104,15 @@ pub const Page = struct {
         // the ownership transfer.
         if (keep_text) try self.css_texts.ensureUnusedCapacity(self.allocator, 1);
         try self.rules.ensureUnusedCapacity(self.allocator, rules.len);
+        try self.keyframes.ensureUnusedCapacity(self.allocator, keyframes.items.len);
         if (keep_text) {
             // `stylesheet` is an owned allocation supplied by the caller.
             self.css_texts.appendAssumeCapacity(@constCast(stylesheet));
         }
         for (rules) |rule| self.rules.appendAssumeCapacity(rule);
+        for (keyframes.items) |rule| self.keyframes.appendAssumeCapacity(rule);
         rules_owned = false;
+        keyframes_owned = false;
         self.allocator.free(rules);
     }
 

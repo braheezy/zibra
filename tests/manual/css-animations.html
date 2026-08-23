@@ -1,0 +1,39 @@
+<!--
+How to verify:
+1. Open this page and leave it visible for at least four seconds.
+2. The first blue card must continuously fade out and back in without flashing
+   or causing a full page reraster on every frame.
+3. The second card must continuously narrow and widen. Its sentence must wrap
+   onto more lines while narrow and unwrap while wide, proving relayout occurs.
+4. Both animations must reverse smoothly at their endpoints and keep running.
+-->
+<style>
+  body { font-family: sans-serif; }
+  .card {
+    background-color: lightblue;
+    margin: 12px;
+    padding: 12px;
+  }
+  .fade {
+    opacity: 0.999;
+    animation: 2s infinite alternate fade;
+  }
+  .narrow {
+    width: 400px;
+    animation: 2s infinite alternate narrow;
+  }
+  @keyframes fade {
+    from { opacity: 0.999; }
+    to { opacity: 0.1; }
+  }
+  @keyframes narrow {
+    from { width: 400px; }
+    to { width: 180px; }
+  }
+</style>
+<h1>CSS keyframe animations</h1>
+<div class="card fade">This card fades using only CSS.</div>
+<div class="card narrow">
+  This sentence changes line breaks as its keyframed width becomes narrow and
+  then wide again.
+</div>

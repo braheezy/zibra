@@ -285,8 +285,8 @@ standalone Browser in screenshot mode.
 - the document's decoded HTML source;
 - the root DOM `Node` value;
 - document layout and the frame-side display list;
-- owned CSS rules and their source buffers, including decoded linked sheets
-  and copied `<style>` text retained in DOM order;
+- owned CSS rules and keyframe containers plus their source buffers, including
+  decoded linked sheets and copied `<style>` text retained in DOM order;
 - hit-test collections, fragment target positions, and allowed-origin strings;
 - a frame-owned URL only when `current_url_owned` is true.
 
@@ -301,7 +301,7 @@ before the next style pass, the browser scans the final attached tree. Newly
 attached classic scripts are copied into queued tasks and their DOM elements
 record that evaluation has started; this identity moves with remove/re-attach,
 while evaluated code remains in the document realm. Author stylesheets are
-rebuilt as a staged rules-plus-source-buffer generation from the current DOM,
+rebuilt as a staged rules-plus-keyframes-plus-source-buffer generation from the current DOM,
 which both loads inserted `<style>`/`<link>` elements and retires rules from
 detached links without leaving property slices pointing at freed CSS text.
 
@@ -970,6 +970,18 @@ baseline from an active transition first, otherwise from
 state even when a new style pass is pending, without treating the dirty field
 as newly computed.
 
+Named CSS animations retain a second Element-local cycle descriptor but reuse
+the tagged property interpolation map. `@keyframes` names and declarations
+borrow frame-owned stylesheet buffers only while rules are installed; starting
+an animation parses supported `from`/`to` values into typed scalar/color/pixel/
+translation endpoints, so playback owns no CSS text borrow. The descriptor
+identifies its map entries, iteration count, and normal/alternate direction.
+The Tab worker preserves terminal frames across cycle boundaries, reverses
+alternate endpoints and their timing curves, and removes finite-animation
+entries before restoring the underlying computed style. Property invalidation remains identical to
+transitions, including compositor-only opacity/translation and layout-inducing
+width/height.
+
 When no follow-up frame is requested, or input/tab lifecycle forces a fresh
 generation, the deadline anchor is cleared while the same-document cost
 estimate remains useful. Detached timer helpers and their queued
@@ -1049,7 +1061,7 @@ lock across parsing, layout, JavaScript, and rendering.
 6. allocates and registers a new root `Frame`;
 7. installs the response's Referrer-Policy before subresource discovery and
    transfers the decoded body to the frame as backing storage for the DOM;
-8. stages stylesheet source buffers and parsed rules together;
+8. stages stylesheet source buffers, parsed rules, and keyframes together;
 9. assigns a unique document generation, parses scripts, builds layout/paint
    state, and commits browser-visible data;
 10. applies any final-URL fragment to the completed layout and clamps the frame
@@ -1068,7 +1080,7 @@ Child-frame navigation reuses a `Frame` allocation.
 `Browser.resetFrameForNavigation` first clears JS node roots and render-context
 pointers, then retires provenance-bearing display state before destroying
 children, layout, the old DOM, owned
-rules, stylesheet text, and finally decoded HTML and URL backing. The fetch
+rules and keyframes, stylesheet text, and finally decoded HTML and URL backing. The fetch
 happens through the same owned `NavigationDocument` helper before reset so the
 referrer and its copied policy remain valid, and browser-side render
 state is retired under `Browser.lock` before reset frees document resources.
@@ -1079,12 +1091,13 @@ before recording the visit or installing the child.
 
 ### Stylesheet generation transfer
 
-Root and child navigation build `new_css_texts` and `all_rules` as one staged
-generation. Error cleanup owns both staging collections until success. Only
-after parsing and sorting succeed does the code replace `frame.css_texts` and
-`frame.rules`. Rules and the source slices they borrow therefore cross the
-ownership boundary together. Accessibility-driven stylesheet rebuilding also
-constructs a complete replacement rule generation before retiring the old one;
+Root and child navigation build `new_css_texts`, `all_rules`, and keyframes as
+one staged generation. Error cleanup owns every staging collection until
+success. Only after parsing and sorting succeed does the code replace
+`frame.css_texts`, `frame.rules`, and `frame.keyframes`. Rules, keyframes, and
+the source slices they borrow therefore cross the ownership boundary together.
+Accessibility-driven stylesheet rebuilding also constructs a complete
+replacement generation before retiring the old one;
 see `loadInTab`, `loadInFrame`, `loadIframe`, and `rebuildTabStyleRules`.
 
 ### Required navigation invariant

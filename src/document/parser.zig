@@ -15,6 +15,7 @@ const css_color = @import("color.zig");
 const easing = @import("easing.zig");
 const css_transform = @import("transform.zig");
 const css_length = @import("length.zig");
+const css_animation = @import("css_animation.zig");
 
 pub const CssColor = css_color.Color;
 pub const parseCssColor = css_color.parse;
@@ -247,6 +248,79 @@ pub const Animation = union(enum) {
             .transform => |animation| animation.isComplete(),
         };
     }
+
+    pub fn reset(self: *Animation) void {
+        switch (self.*) {
+            .numeric => |*animation| animation.current_frame = 0,
+            .pixel => |*animation| animation.numeric.current_frame = 0,
+            .color => |*animation| animation.current_frame = 0,
+            .transform => |*animation| animation.current_frame = 0,
+        }
+    }
+
+    pub fn reverse(self: *Animation) void {
+        switch (self.*) {
+            .numeric => |*animation| {
+                std.mem.swap(f64, &animation.start_value, &animation.end_value);
+                animation.easing_function = animation.easing_function.reversed();
+            },
+            .pixel => |*animation| {
+                std.mem.swap(
+                    f64,
+                    &animation.numeric.start_value,
+                    &animation.numeric.end_value,
+                );
+                animation.numeric.easing_function = animation.numeric.easing_function.reversed();
+            },
+            .color => |*animation| {
+                std.mem.swap(CssColor, &animation.start_value, &animation.end_value);
+                animation.easing_function = animation.easing_function.reversed();
+            },
+            .transform => |*animation| {
+                std.mem.swap(
+                    Translation,
+                    &animation.start_value,
+                    &animation.end_value,
+                );
+                animation.easing_function = animation.easing_function.reversed();
+            },
+        }
+    }
+};
+
+pub const CssAnimationState = struct {
+    signature: u64,
+    property_mask: u8,
+    iterations: ?u32,
+    completed_iterations: u32 = 0,
+    direction: css_animation.Direction,
+    restart_pending: bool = false,
+    finished: bool = false,
+
+    pub fn contains(self: CssAnimationState, property: []const u8) bool {
+        return (self.property_mask & cssAnimationPropertyBit(property)) != 0;
+    }
+
+    pub fn hasAnotherIteration(self: CssAnimationState) bool {
+        return self.iterations == null or self.completed_iterations + 1 < self.iterations.?;
+    }
+};
+
+pub fn cssAnimationPropertyBit(property: []const u8) u8 {
+    if (std.mem.eql(u8, property, "opacity")) return 1 << 0;
+    if (std.mem.eql(u8, property, "background-color")) return 1 << 1;
+    if (std.mem.eql(u8, property, "transform")) return 1 << 2;
+    if (std.mem.eql(u8, property, "width")) return 1 << 3;
+    if (std.mem.eql(u8, property, "height")) return 1 << 4;
+    return 0;
+}
+
+pub const css_animation_properties = [_][]const u8{
+    "opacity",
+    "background-color",
+    "transform",
+    "width",
+    "height",
 };
 
 test "color animation interpolates every channel" {
@@ -499,8 +573,11 @@ pub const Element = struct {
     // element, including when a detached node is later re-attached.
     script_started: bool = false,
     children_dirty: bool = true,
-    // Animation state for CSS transitions, keyed by property name.
+    // Property interpolation state shared by transitions and the currently
+    // selected named keyframe animation. CssAnimationState identifies which
+    // entries belong to the latter so CSS animations override transitions.
     animations: ?std.StringHashMap(Animation) = null,
+    css_animation: ?CssAnimationState = null,
     image_data: ?ImageData = null,
     opacity_anim_value: [32]u8 = undefined,
 
@@ -516,6 +593,7 @@ pub const Element = struct {
             .is_visited = false,
             .script_started = false,
             .animations = null,
+            .css_animation = null,
             .image_data = null,
         };
         errdefer e.deinit(allocator);
@@ -1597,6 +1675,7 @@ const CSS_PROPERTIES = [_]struct { name: []const u8, default_value: []const u8 }
     .{ .name = "color", .default_value = "inherit" },
     .{ .name = "opacity", .default_value = "1.0" },
     .{ .name = "transition", .default_value = "" },
+    .{ .name = "animation", .default_value = "none" },
     .{ .name = "transform", .default_value = "none" },
     .{ .name = "filter", .default_value = "none" },
     .{ .name = "mix-blend-mode", .default_value = "" },
@@ -1725,6 +1804,182 @@ fn cssDefaultFor(property: []const u8) []const u8 {
     return "";
 }
 
+fn keyframesNamed(
+    keyframes: []const CSSParser.KeyframesRule,
+    name: []const u8,
+) ?*const CSSParser.KeyframesRule {
+    var index = keyframes.len;
+    while (index > 0) {
+        index -= 1;
+        if (std.mem.eql(u8, keyframes[index].name, name)) return &keyframes[index];
+    }
+    return null;
+}
+
+fn keyframeAnimationForProperty(
+    property: []const u8,
+    start_value: []const u8,
+    end_value: []const u8,
+    spec: css_animation.Spec,
+) ?Animation {
+    if (std.mem.eql(u8, property, "opacity")) {
+        const start = std.fmt.parseFloat(f64, start_value) catch return null;
+        const end = std.fmt.parseFloat(f64, end_value) catch return null;
+        if (!std.math.isFinite(start) or !std.math.isFinite(end)) return null;
+        return .{ .numeric = NumericAnimation.initWithEasing(
+            start,
+            end,
+            spec.frames,
+            spec.easing_function,
+        ) };
+    }
+    if (std.mem.eql(u8, property, "background-color")) {
+        const start = parseCssColor(start_value) orelse return null;
+        const end = parseCssColor(end_value) orelse return null;
+        return .{ .color = ColorAnimation.initWithEasing(
+            start,
+            end,
+            spec.frames,
+            spec.easing_function,
+        ) };
+    }
+    if (std.mem.eql(u8, property, "transform")) {
+        const start = if (std.ascii.eqlIgnoreCase(std.mem.trim(u8, start_value, " \t\r\n"), "none"))
+            Translation{ .x = 0, .y = 0 }
+        else
+            parseTranslate(start_value) orelse return null;
+        const end = if (std.ascii.eqlIgnoreCase(std.mem.trim(u8, end_value, " \t\r\n"), "none"))
+            Translation{ .x = 0, .y = 0 }
+        else
+            parseTranslate(end_value) orelse return null;
+        return .{ .transform = TransformAnimation.initWithEasing(
+            start,
+            end,
+            spec.frames,
+            spec.easing_function,
+        ) };
+    }
+    if (std.mem.eql(u8, property, "width") or std.mem.eql(u8, property, "height")) {
+        const start = parsePixelLength(start_value) orelse return null;
+        const end = parsePixelLength(end_value) orelse return null;
+        return .{ .pixel = PixelAnimation.initWithEasing(
+            start,
+            end,
+            spec.frames,
+            spec.easing_function,
+        ) };
+    }
+    return null;
+}
+
+fn cssAnimationSignature(
+    raw_animation: []const u8,
+    start: *const CSSParser.Keyframe,
+    end: *const CSSParser.Keyframe,
+) u64 {
+    var signature = std.hash.Wyhash.hash(0, std.mem.trim(u8, raw_animation, " \t\r\n"));
+    for (css_animation_properties) |property| {
+        const start_declaration = start.properties.get(property) orelse continue;
+        const end_declaration = end.properties.get(property) orelse continue;
+        signature = std.hash.Wyhash.hash(signature, property);
+        signature = std.hash.Wyhash.hash(signature, start_declaration.value);
+        signature = std.hash.Wyhash.hash(signature, end_declaration.value);
+    }
+    return signature;
+}
+
+fn cssAnimationTracksPresent(element: *const Element, state: CssAnimationState) bool {
+    if (state.finished) return true;
+    const animations = element.animations orelse return false;
+    for (css_animation_properties) |property| {
+        if (state.contains(property) and !animations.contains(property)) return false;
+    }
+    return true;
+}
+
+pub fn removeCssAnimationTracks(element: *Element) void {
+    const state = element.css_animation orelse return;
+    if (element.animations) |*animations| {
+        for (css_animation_properties) |property| {
+            if (state.contains(property)) _ = animations.remove(property);
+        }
+    }
+    element.css_animation = null;
+}
+
+pub fn finishCssAnimationTracks(element: *Element) void {
+    const state = element.css_animation orelse return;
+    if (element.animations) |*animations| {
+        for (css_animation_properties) |property| {
+            if (state.contains(property)) _ = animations.remove(property);
+        }
+    }
+    element.css_animation.?.restart_pending = false;
+    element.css_animation.?.finished = true;
+}
+
+fn syncCssAnimation(
+    allocator: std.mem.Allocator,
+    element: *Element,
+    raw_animation: []const u8,
+    keyframes: []const CSSParser.KeyframesRule,
+) !void {
+    const spec = css_animation.parse(raw_animation) orelse {
+        removeCssAnimationTracks(element);
+        return;
+    };
+    const rule = keyframesNamed(keyframes, spec.name) orelse {
+        removeCssAnimationTracks(element);
+        return;
+    };
+    const start = rule.frameAt(0) orelse {
+        removeCssAnimationTracks(element);
+        return;
+    };
+    const end = rule.frameAt(1) orelse {
+        removeCssAnimationTracks(element);
+        return;
+    };
+
+    const signature = cssAnimationSignature(raw_animation, start, end);
+    if (element.css_animation) |state| {
+        if (state.signature == signature and cssAnimationTracksPresent(element, state)) return;
+    }
+
+    var tracks = [_]?Animation{ null, null, null, null, null };
+    var property_mask: u8 = 0;
+    for (css_animation_properties, 0..) |property, index| {
+        const start_declaration = start.properties.get(property) orelse continue;
+        const end_declaration = end.properties.get(property) orelse continue;
+        tracks[index] = keyframeAnimationForProperty(
+            property,
+            start_declaration.value,
+            end_declaration.value,
+            spec,
+        ) orelse continue;
+        property_mask |= cssAnimationPropertyBit(property);
+    }
+    if (property_mask == 0) {
+        removeCssAnimationTracks(element);
+        return;
+    }
+
+    if (element.animations == null) {
+        element.animations = std.StringHashMap(Animation).init(allocator);
+    }
+    try element.animations.?.ensureUnusedCapacity(css_animation_properties.len);
+    removeCssAnimationTracks(element);
+    for (css_animation_properties, 0..) |property, index| {
+        if (tracks[index]) |track| element.animations.?.putAssumeCapacity(property, track);
+    }
+    element.css_animation = .{
+        .signature = signature,
+        .property_mask = property_mask,
+        .iterations = spec.iterations,
+        .direction = spec.direction,
+    };
+}
+
 fn resolveFontFamilyKeyword(value: []const u8, inherited_value: []const u8) []const u8 {
     const keyword = std.mem.trim(u8, value, " \t\r\n");
     if (std.ascii.eqlIgnoreCase(keyword, "inherit") or
@@ -1755,6 +2010,15 @@ fn getDefaultParentStyle(allocator: std.mem.Allocator) !StyleMap {
 // Parse inline styles from the style attribute and apply CSS rules to the node tree
 // This function recurses through the HTML tree to process all elements
 pub fn style(allocator: std.mem.Allocator, node: *Node, rules: []const CSSParser.CSSRule) !void {
+    return styleWithKeyframes(allocator, node, rules, &.{});
+}
+
+pub fn styleWithKeyframes(
+    allocator: std.mem.Allocator,
+    node: *Node,
+    rules: []const CSSParser.CSSRule,
+    keyframes: []const CSSParser.KeyframesRule,
+) !void {
     var has_cache = CSSParser.HasMatchCache.init(allocator);
     defer has_cache.deinit();
     for (rules) |rule| try rule.selector.populateHasMatches(&has_cache, node);
@@ -1766,6 +2030,7 @@ pub fn style(allocator: std.mem.Allocator, node: *Node, rules: []const CSSParser
         allocator,
         node,
         rules,
+        keyframes,
         &default_parent,
         empty_ancestors,
         .{ .has_cache = &has_cache },
@@ -1810,6 +2075,7 @@ fn styleWithParent(
     allocator: std.mem.Allocator,
     node: *Node,
     rules: []const CSSParser.CSSRule,
+    keyframes: []const CSSParser.KeyframesRule,
     parent_style: *StyleMap,
     ancestor_chain: []const *Node,
     match_context: CSSParser.MatchContext,
@@ -1984,6 +2250,12 @@ fn styleWithParent(
                         field.set(value);
                     }
                 }
+                try syncCssAnimation(
+                    allocator,
+                    e,
+                    new_style.get("animation") orelse "none",
+                    keyframes,
+                );
             }
 
             // Finally, recursively process all children with this element's computed style
@@ -2003,6 +2275,7 @@ fn styleWithParent(
                     allocator,
                     child,
                     rules,
+                    keyframes,
                     style_map,
                     new_ancestors,
                     match_context,

@@ -5650,6 +5650,7 @@ fn applyPaintEffects(self: *Layout, block: *BlockLayout, commands: []DisplayItem
     var transform_x: i32 = 0;
     var transform_y: i32 = 0;
     var has_transform = false;
+    var has_animated_opacity = false;
 
     if (block.node == .element) {
         const elem = block.node.element;
@@ -5661,13 +5662,14 @@ fn applyPaintEffects(self: *Layout, block: *BlockLayout, commands: []DisplayItem
                         .numeric => |numeric| {
                             opacity = numeric.getValue();
                             opacity = @max(0.0, @min(1.0, opacity)); // Clamp to valid range
+                            has_animated_opacity = true;
                         },
                         .pixel, .color, .transform => {},
                     }
                 }
             }
             // Fall back to style value if no animation
-            if (opacity == 1.0) {
+            if (!has_animated_opacity) {
                 if (styleValue(style_map, "opacity")) |op_str| {
                     opacity = std.fmt.parseFloat(f64, op_str) catch 1.0;
                     opacity = @max(0.0, @min(1.0, opacity)); // Clamp to valid range
@@ -5819,7 +5821,7 @@ fn applyPaintEffects(self: *Layout, block: *BlockLayout, commands: []DisplayItem
     }
 
     // Only create a blend operation if we have effects to apply
-    if (opacity < 1.0 or final_blend_mode != null or blur_radius > 0.0 or border_radius > 0.0 or should_clip) {
+    if (has_animated_opacity or opacity < 1.0 or final_blend_mode != null or blur_radius > 0.0 or border_radius > 0.0 or should_clip) {
         const wrapped_commands = try self.allocator.alloc(DisplayItem, current_commands.len);
         @memcpy(wrapped_commands, current_commands);
 
@@ -5829,7 +5831,7 @@ fn applyPaintEffects(self: *Layout, block: *BlockLayout, commands: []DisplayItem
         // Determine if this blend needs compositing (does actual work)
         // Blur uses an inner blend so clipping can follow it; this outer group
         // keeps the ordered filter/clip sequence in one composited surface.
-        const needs_compositing = opacity < 1.0 or final_blend_mode != null or blur_radius > 0.0 or should_clip;
+        const needs_compositing = has_animated_opacity or opacity < 1.0 or final_blend_mode != null or blur_radius > 0.0 or should_clip;
 
         const blend_item = DisplayItem{
             .blend = .{

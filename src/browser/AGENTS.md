@@ -213,8 +213,9 @@ before changing `root.zig`, `tab.zig`, `render/`, or browser task scheduling.
   URL on entry, including failure paths. These queued tabs stay grouped in the
   requesting native window; only Ctrl+N creates another native window.
 - A frame's `css_texts` owns decoded linked stylesheets and copied `<style>`
-  text in DOM order. Its author rules borrow those buffers; rebuild and retire
-  the text and rules as one generation for root documents and iframes.
+  text in DOM order. Its author rules and named keyframes borrow those buffers;
+  rebuild and retire text, rules, and keyframes as one generation for root
+  documents and iframes.
 - External classic scripts and linked stylesheets are first discovered into a
   fixed caller-owned batch. The tab submits that complete batch as one task to
   the session networking runner. Each entry owns its resolved URL, referrer,
@@ -261,6 +262,12 @@ before changing `root.zig`, `tab.zig`, `render/`, or browser task scheduling.
   pixel-serializing animation value and mark the element's layout owner dirty
   on every frame so block geometry, descendant line wrapping, paint, and raster
   are regenerated.
+- Named CSS keyframe animations use that same property-specific interpolation
+  and invalidation path plus an Element-owned cycle controller. `alternate`
+  cycles hold each terminal endpoint for one render before reversing; opacity
+  and translation remain compositor-only, while width/height continue to
+  relayout. Any style pass that creates a keyframe animation after the advance
+  phase must publish another browser animation-frame request.
 - A fixed-height `overflow: scroll` block keeps its natural content height as
   DOM-owned scroll geometry while layout exposes the fixed client height.
   Paint keeps the box background stationary, translates its content by the
