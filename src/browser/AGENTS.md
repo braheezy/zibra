@@ -176,6 +176,11 @@ before changing `root.zig`, `tab.zig`, `render/`, or browser task scheduling.
   also clears pending speech. Accessibility-tree rebuilds remap the reading /
   highlight pointers through their DOM nodes before retiring the prior tree.
   The F4 key and the `read page` voice command each advance once.
+- F6 toggles the active Tab's forced-colors setting. The change invalidates
+  conditional stylesheet rules plus style, layout, and paint; every frame then
+  receives the same `(forced-colors: active)` media environment. Page paint
+  uses the renderer's semantic four-color palette, while images and color
+  glyph bitmaps remain content rather than author CSS colors.
 - Address-bar editing uses a byte insertion point in the inclusive range
   `0..address_bar.items.len`. SDL admits only printable ASCII into this buffer,
   so Left, Right, insertion, and Backspace operate on bytes; focus, blur, and a

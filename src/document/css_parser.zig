@@ -29,6 +29,7 @@ pub const HasMatchCache = selector_mod.HasMatchCache;
 /// media features are then recognized but inactive.
 pub const MediaEnvironment = struct {
     prefers_dark: bool = false,
+    forced_colors: bool = false,
     viewport_width_css: ?f64 = null,
 };
 
@@ -462,6 +463,12 @@ fn mediaFeatureMatches(self: *const CSSParser, raw_feature: []const u8) ?bool {
     if (std.ascii.eqlIgnoreCase(name, "prefers-color-scheme")) {
         if (std.ascii.eqlIgnoreCase(media_value, "dark")) return self.media.prefers_dark;
         if (std.ascii.eqlIgnoreCase(media_value, "light")) return !self.media.prefers_dark;
+        return null;
+    }
+
+    if (std.ascii.eqlIgnoreCase(name, "forced-colors")) {
+        if (std.ascii.eqlIgnoreCase(media_value, "active")) return self.media.forced_colors;
+        if (std.ascii.eqlIgnoreCase(media_value, "none")) return !self.media.forced_colors;
         return null;
     }
 
@@ -1003,4 +1010,39 @@ test "width and color media features compose and reject unsupported lengths" {
         allocator.free(light_rules);
     }
     try std.testing.expectEqual(@as(usize, 0), light_rules.len);
+}
+
+test "forced-colors media feature selects active and none rules" {
+    const allocator = std.testing.allocator;
+    const css =
+        "@media (forced-colors: active) { p { color: red; } }" ++
+        "@media (forced-colors: none) { p { background-color: blue; } }" ++
+        "@media (forced-colors: invalid) { p { width: 1px; } }";
+
+    var active_parser = try CSSParser.initWithMedia(
+        allocator,
+        css,
+        .{ .forced_colors = true },
+    );
+    defer active_parser.deinit(allocator);
+    const active_rules = try active_parser.parse(allocator);
+    defer {
+        for (active_rules) |*rule| rule.deinit(allocator);
+        allocator.free(active_rules);
+    }
+    try std.testing.expectEqual(@as(usize, 1), active_rules.len);
+    try std.testing.expectEqualStrings("red", active_rules[0].properties.get("color").?.value);
+
+    var normal_parser = try CSSParser.initWithMedia(allocator, css, .{});
+    defer normal_parser.deinit(allocator);
+    const normal_rules = try normal_parser.parse(allocator);
+    defer {
+        for (normal_rules) |*rule| rule.deinit(allocator);
+        allocator.free(normal_rules);
+    }
+    try std.testing.expectEqual(@as(usize, 1), normal_rules.len);
+    try std.testing.expectEqualStrings(
+        "blue",
+        normal_rules[0].properties.get("background-color").?.value,
+    );
 }

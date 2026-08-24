@@ -6,6 +6,7 @@
 
 const std = @import("std");
 const font = @import("font.zig");
+const forced_colors = @import("forced_colors.zig");
 const browser = @import("../root.zig");
 const grapheme = @import("grapheme");
 const parser = @import("../../document/parser.zig");
@@ -592,7 +593,7 @@ const IframeLayout = struct {
     ) !void {
         const width_value = self.embed.width.get().*;
         const height_value = self.embed.height.get().*;
-        const bg = engine.remapColor(self.bgcolor);
+        const bg = engine.remapColor(self.bgcolor, .background);
         if (bg.a > 0) {
             try commands.append(engine.allocator, DisplayItem{
                 .rect = .{
@@ -606,7 +607,7 @@ const IframeLayout = struct {
             });
         }
 
-        const border = engine.remapColor(self.border_color);
+        const border = engine.remapColor(self.border_color, .border);
         if (border.a > 0) {
             try commands.append(engine.allocator, DisplayItem{
                 .outline = .{
@@ -684,6 +685,22 @@ pub fn nodeIsInVisitedLink(node_ptr: ?*const Node) bool {
 
 pub fn textColorForNode(node_ptr: ?*const Node, normal_color: browser.Color) browser.Color {
     return if (nodeIsInVisitedLink(node_ptr)) visited_link_color else normal_color;
+}
+
+fn textColorRoleForNode(node_ptr: ?*const Node) forced_colors.Role {
+    var current = node_ptr;
+    while (current) |node| {
+        switch (node.*) {
+            .element => |*element| {
+                if (std.mem.eql(u8, element.tag, "a")) {
+                    return if (element.is_visited) .visited_link else .link;
+                }
+                current = element.parent;
+            },
+            .text => |*text_node| current = text_node.parent,
+        }
+    }
+    return .text;
 }
 
 const SoftHyphenBreak = struct {
@@ -1433,8 +1450,14 @@ pub fn resolveColorScheme(self: *const Layout, value: []const u8) bool {
     return false;
 }
 
-fn remapColor(self: *const Layout, color: browser.Color) browser.Color {
-    if (!self.color_scheme_dark or color.a == 0) return color;
+fn remapColor(
+    self: *const Layout,
+    color: browser.Color,
+    role: forced_colors.Role,
+) browser.Color {
+    if (color.a == 0) return color;
+    if (self.accessibility.forced_colors) return forced_colors.map(color, role, true);
+    if (!self.color_scheme_dark) return color;
 
     if (self.accessibility.dark_palette) |palette| {
         if (color.r == 0 and color.g == 0 and color.b == 0) {
@@ -1463,6 +1486,71 @@ fn remapColor(self: *const Layout, color: browser.Color) browser.Color {
         .b = clamp_channel(255 - color.b),
         .a = color.a,
     };
+}
+
+fn remapTextColor(
+    self: *const Layout,
+    node_ptr: ?*const Node,
+    normal_color: browser.Color,
+) browser.Color {
+    return self.remapColor(
+        textColorForNode(node_ptr, normal_color),
+        textColorRoleForNode(node_ptr),
+    );
+}
+
+test "forced-color text roles distinguish ordinary and visited link descendants" {
+    const allocator = std.testing.allocator;
+    var html_parser = try parser.HTMLParser.init(
+        allocator,
+        "<a id=fresh>fresh</a><a id=seen>seen</a>",
+    );
+    defer html_parser.deinit(allocator);
+    var root = try html_parser.parse();
+    defer root.deinit(allocator);
+    parser.fixParentPointers(&root, null);
+
+    var nodes = std.ArrayList(*Node).empty;
+    defer nodes.deinit(allocator);
+    try parser.treeToList(allocator, &root, &nodes);
+
+    var fresh_text: ?*Node = null;
+    var seen_text: ?*Node = null;
+    for (nodes.items) |node| switch (node.*) {
+        .element => |*element| {
+            if (!std.ascii.eqlIgnoreCase(element.tag, "a")) continue;
+            const id = if (element.attributes) |attributes|
+                attributes.get("id") orelse continue
+            else
+                continue;
+            if (element.children.items.len == 0) continue;
+            if (std.mem.eql(u8, id, "fresh")) {
+                fresh_text = &element.children.items[0];
+            } else if (std.mem.eql(u8, id, "seen")) {
+                element.is_visited = true;
+                seen_text = &element.children.items[0];
+            }
+        },
+        .text => {},
+    };
+
+    var engine: Layout = undefined;
+    engine.accessibility = .{ .forced_colors = true };
+    engine.color_scheme_dark = false;
+    const author_color = browser.Color{ .r = 119, .g = 120, .b = 121, .a = 255 };
+
+    try std.testing.expectEqual(
+        forced_colors.text,
+        engine.remapTextColor(null, author_color),
+    );
+    try std.testing.expectEqual(
+        forced_colors.link,
+        engine.remapTextColor(fresh_text.?, author_color),
+    );
+    try std.testing.expectEqual(
+        forced_colors.accent,
+        engine.remapTextColor(seen_text.?, author_color),
+    );
 }
 
 pub fn init(
@@ -2034,7 +2122,7 @@ fn recordSoftHyphenBreak(
             .node_ptr = node_ptr,
             .payload = .{ .glyph = .{
                 .glyph = hyphen,
-                .color = self.remapColor(self.text_color),
+                .color = self.remapTextColor(node_ptr, self.text_color),
             } },
         },
     });
@@ -2238,10 +2326,7 @@ fn flushLine(self: *Layout, line_buffer: *std.ArrayList(LineItem)) !void {
                         .x = item.x,
                         .y = final_y,
                         .glyph = glyph_payload.glyph,
-                        .color = if (nodeIsInVisitedLink(item.node_ptr))
-                            self.remapColor(visited_link_color)
-                        else
-                            glyph_payload.color,
+                        .color = glyph_payload.color,
                         .source = source,
                     },
                 });
@@ -2480,7 +2565,7 @@ fn processGrapheme(
         .payload = .{
             .glyph = .{
                 .glyph = glyph,
-                .color = self.remapColor(self.text_color),
+                .color = self.remapTextColor(node_ptr, self.text_color),
             },
         },
     });
@@ -3194,7 +3279,7 @@ const InputLayout = struct {
             rounded_items.deinit(engine.allocator);
         }
         const target = if (self.border_radius > 0) &rounded_items else commands;
-        const remapped_bg = engine.remapColor(self.bgcolor);
+        const remapped_bg = engine.remapColor(self.bgcolor, .control_background);
         try appendBackgroundBox(
             target,
             engine.allocator,
@@ -3207,8 +3292,25 @@ const InputLayout = struct {
             source,
         );
 
+        if (engine.accessibility.forced_colors and !self.is_checkbox) {
+            try target.append(engine.allocator, .{ .outline = .{
+                .rect = .{
+                    .left = x,
+                    .top = y,
+                    .right = x + width_value,
+                    .bottom = y + height_value,
+                },
+                .color = forced_colors.text,
+                .thickness = 1,
+                .source = source,
+            } });
+        }
+
         if (self.is_checkbox) {
-            const ink = engine.remapColor(.{ .r = 48, .g = 48, .b = 48, .a = 255 });
+            const ink = engine.remapColor(
+                .{ .r = 48, .g = 48, .b = 48, .a = 255 },
+                .control_text,
+            );
             try target.append(engine.allocator, DisplayItem{
                 .outline = .{
                     .rect = .{
@@ -3287,7 +3389,7 @@ const InputLayout = struct {
                         .x = text_x,
                         .y = baseline_y - engine.toLayoutPx(glyph.ascent),
                         .glyph = glyph,
-                        .color = engine.remapColor(self.color),
+                        .color = engine.remapColor(self.color, .control_text),
                         .source = source,
                     },
                 });
@@ -3302,7 +3404,10 @@ const InputLayout = struct {
                 text_x,
                 y,
                 height_value,
-                engine.remapColor(.{ .r = 255, .g = 0, .b = 0, .a = 255 }),
+                engine.remapColor(
+                    .{ .r = 255, .g = 0, .b = 0, .a = 255 },
+                    .accent,
+                ),
                 source,
             );
         }
@@ -3555,9 +3660,23 @@ const ButtonLayout = struct {
             self.embed.width.get().*,
             self.embed.height.get().*,
             self.border_radius,
-            engine.remapColor(self.bgcolor),
+            engine.remapColor(self.bgcolor, .control_background),
             source,
         );
+
+        if (engine.accessibility.forced_colors) {
+            try target.append(engine.allocator, .{ .outline = .{
+                .rect = .{
+                    .left = x,
+                    .top = y,
+                    .right = x + self.embed.width.get().*,
+                    .bottom = y + self.embed.height.get().*,
+                },
+                .color = forced_colors.text,
+                .thickness = 1,
+                .source = source,
+            } });
+        }
 
         if (self.commands.items.len > 0) {
             const children = try self.commands.toOwnedSlice(engine.allocator);
@@ -4208,7 +4327,7 @@ const TextLayout = struct {
                 .x = self.x.get().*,
                 .y = self.y.get().*,
                 .glyph = glyph,
-                .color = engine.remapColor(textColorForNode(&self.node, self.color)),
+                .color = engine.remapTextColor(&self.node, self.color),
                 .source = displaySource(self, self.node_ptr),
             },
         });
@@ -5783,7 +5902,10 @@ fn appendContentEditableCursor(self: *Layout, commands: *std.ArrayList(DisplayIt
     if (element.attributes == null) return;
     if (element.attributes.?.get("contenteditable") == null) return;
 
-    const cursor_color = self.remapColor(.{ .r = 255, .g = 0, .b = 0, .a = 255 });
+    const cursor_color = self.remapColor(
+        .{ .r = 255, .g = 0, .b = 0, .a = 255 },
+        .accent,
+    );
     const source = displaySource(block, block.node_ptr);
     if (findLastTextLayout(block)) |text| {
         const cursor_x = text.x.get().* + text.width.get().*;
@@ -5823,7 +5945,7 @@ fn appendListMarker(self: *Layout, commands: *std.ArrayList(DisplayItem), block:
         .y1 = marker_y,
         .x2 = marker_x + list_marker_size,
         .y2 = marker_y + list_marker_size,
-        .color = self.remapColor(color),
+        .color = self.remapColor(color, .text),
         .source = displaySource(block, block.node_ptr),
     } });
 }
@@ -5838,7 +5960,10 @@ fn appendTableOfContentsHeader(self: *Layout, commands: *std.ArrayList(DisplayIt
     const x = block.x.get().*;
     const y = block.y.get().*;
     const width = block.width.get().*;
-    const background = self.remapColor(.{ .r = 211, .g = 211, .b = 211, .a = 255 });
+    const background = self.remapColor(
+        .{ .r = 211, .g = 211, .b = 211, .a = 255 },
+        .background,
+    );
     try commands.append(self.allocator, .{ .rect = .{
         .x1 = x,
         .y1 = y,
@@ -5859,7 +5984,10 @@ fn appendTableOfContentsHeader(self: *Layout, commands: *std.ArrayList(DisplayIt
         .x = x + 4,
         .y = y + 3,
         .glyph = glyph,
-        .color = self.remapColor(.{ .r = 0, .g = 0, .b = 0, .a = 255 }),
+        .color = self.remapColor(
+            .{ .r = 0, .g = 0, .b = 0, .a = 255 },
+            .text,
+        ),
         .source = displaySource(block, block.node_ptr),
     } });
 }
@@ -6164,7 +6292,7 @@ fn addBackgroundIfNeeded(self: *Layout, block: *const BlockLayout) !void {
             // Draw the background rectangle if we have a color
             if (color) |col| {
                 if (col.a == 0) return;
-                const remapped = self.remapColor(col);
+                const remapped = self.remapColor(col, .background);
                 // Parse border-radius if present
                 const radius = if (border_radius_str) |br_str| parseCssPixelRadius(br_str) else 0;
 
@@ -6214,9 +6342,11 @@ pub fn paintDocument(self: *Layout, document: *DocumentLayout) ![]DisplayItem {
     self.display_list.clearRetainingCapacity();
     const content_height = documentScrollHeight(document.height.get().*);
 
-    if (self.document_color_scheme_dark) {
+    if (self.accessibility.forced_colors or self.document_color_scheme_dark) {
         const width = self.layoutWindowWidth();
-        const bg_color = if (self.accessibility.dark_palette) |palette|
+        const bg_color = if (self.accessibility.forced_colors)
+            forced_colors.canvas
+        else if (self.accessibility.dark_palette) |palette|
             palette.background
         else
             browser.Color{ .r = 18, .g = 18, .b = 18, .a = 255 };
@@ -6224,7 +6354,7 @@ pub fn paintDocument(self: *Layout, document: *DocumentLayout) ![]DisplayItem {
             .x1 = 0,
             .y1 = 0,
             .x2 = width,
-            .y2 = content_height,
+            .y2 = @max(content_height, self.toLayoutPx(self.window_height)),
             .color = bg_color,
             .source = displaySource(document, document.node_ptr),
         } };
@@ -6752,7 +6882,7 @@ fn addBackgroundIfNeededToList(self: *Layout, commands: *std.ArrayList(DisplayIt
             // Draw the background rectangle if we have a color
             if (color) |col| {
                 if (col.a == 0) return;
-                const remapped = self.remapColor(col);
+                const remapped = self.remapColor(col, .background);
                 // Parse border-radius if present
                 const radius = if (border_radius_str) |br_str| parseCssPixelRadius(br_str) else 0;
 

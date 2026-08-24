@@ -73,6 +73,10 @@ cancels speech that has not started.
 `max-width` query using page zoom and native resize; the visible text and panel
 change from red to green while the query is active.
 
+`tests/manual/forced-colors.html` toggles F6 across deliberately low-contrast
+author paint, semantic link/control states, and the `forced-colors` media
+feature. Active CSS paint must use only the black/white/cyan/yellow palette.
+
 `tests/manual/checkboxes.html` verifies checked and unchecked painting, click
 toggles, omission of unchecked controls, explicit values, and the default
 checked value `on` through a localhost GET submission.

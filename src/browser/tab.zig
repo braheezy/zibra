@@ -6,6 +6,7 @@
 
 const std = @import("std");
 const browser_mod = @import("root.zig");
+const forced_colors = @import("render/forced_colors.zig");
 const url_module = @import("../network/url.zig");
 const parser = @import("../document/parser.zig");
 const dom_focus = @import("../document/focus.zig");
@@ -1022,11 +1023,12 @@ pub fn init(allocator: std.mem.Allocator, tab_width: i32, tab_height: i32, measu
 
 pub fn logAccessibilitySettings(self: *const Tab, reason: []const u8) void {
     std.log.info(
-        "Accessibility settings ({s}): zoom={d:.2} prefers_dark={} reduce_motion={} screen_reader={}",
+        "Accessibility settings ({s}): zoom={d:.2} prefers_dark={} forced_colors={} reduce_motion={} screen_reader={}",
         .{
             reason,
             self.accessibility.zoom,
             self.accessibility.prefers_dark,
+            self.accessibility.forced_colors,
             self.accessibility.reduce_motion,
             self.accessibility.screen_reader,
         },
@@ -1068,6 +1070,22 @@ pub fn viewportWidthInCssPixels(device_width: i32, zoom_value: f32) f64 {
 pub fn mediaEnvironmentChanged(self: *Tab) void {
     self.media_environment_dirty = true;
     self.setNeedsRender();
+}
+
+fn updateForcedColorsState(self: *Tab, enabled: bool) bool {
+    if (self.accessibility.forced_colors == enabled) return false;
+    self.accessibility.forced_colors = enabled;
+    self.media_environment_dirty = true;
+    self.needs_style = true;
+    self.needs_layout = true;
+    self.needs_paint = true;
+    return true;
+}
+
+pub fn setForcedColors(self: *Tab, enabled: bool) void {
+    if (!self.updateForcedColorsState(enabled)) return;
+    self.browser.setNeedsAnimationFrame(self);
+    self.browser.scheduleAnimationFrame();
 }
 
 fn markFrameLayoutDirty(frame: *Frame) void {
@@ -1140,6 +1158,26 @@ test "zoom changes CSS viewport width and invalidates media rules" {
 
     tab.media_environment_dirty = false;
     try std.testing.expect(!tab.updateZoomState(2.0));
+    try std.testing.expect(!tab.media_environment_dirty);
+}
+
+test "forced colors changes invalidate media rules and the complete render pipeline" {
+    var tab: Tab = undefined;
+    tab.accessibility = .{};
+    tab.needs_style = false;
+    tab.needs_layout = false;
+    tab.needs_paint = false;
+    tab.media_environment_dirty = false;
+
+    try std.testing.expect(tab.updateForcedColorsState(true));
+    try std.testing.expect(tab.accessibility.forced_colors);
+    try std.testing.expect(tab.media_environment_dirty);
+    try std.testing.expect(tab.needs_style);
+    try std.testing.expect(tab.needs_layout);
+    try std.testing.expect(tab.needs_paint);
+
+    tab.media_environment_dirty = false;
+    try std.testing.expect(!tab.updateForcedColorsState(true));
     try std.testing.expect(!tab.media_environment_dirty);
 }
 
@@ -1784,8 +1822,16 @@ fn appendIframeContent(
     iframe_item: DisplayItem,
     out: *std.ArrayList(DisplayItem),
 ) IframeComposeError!void {
-    const border_color = browser_mod.Color{ .r = 0x33, .g = 0x33, .b = 0x33, .a = 0xff };
-    const bg_color = browser_mod.Color{ .r = 0xf2, .g = 0xf2, .b = 0xf2, .a = 0xff };
+    const border_color = forced_colors.map(
+        .{ .r = 0x33, .g = 0x33, .b = 0x33, .a = 0xff },
+        .border,
+        self.accessibility.forced_colors,
+    );
+    const bg_color = forced_colors.map(
+        .{ .r = 0xf2, .g = 0xf2, .b = 0xf2, .a = 0xff },
+        .background,
+        self.accessibility.forced_colors,
+    );
 
     const iframe_data = iframe_item.iframe;
     try out.append(self.allocator, .{

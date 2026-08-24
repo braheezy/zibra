@@ -44,6 +44,11 @@ before changing ownership or thread boundaries.
   followed by a 2px black outline; reserve both commands before appending
   either so OOM cannot publish a half-ring. Accessibility highlighting remains
   a separate requested-color outline.
+- `forced_colors.zig` owns the fixed semantic high-contrast palette. Layout
+  assigns paint roles before author colors are replaced, so backgrounds,
+  ordinary text, link states, controls, borders, and cursors cannot collapse
+  into an author-selected low-contrast pair. Transparent paint remains
+  transparent; image pixels and color emoji are content and are not recolored.
 - `effects.zig` contains pixel-only software effects. Keep its APIs explicit
   about premultiplication, edge sampling, and temporary allocation.
 - `raster_snapshot.zig` is the thread-transfer boundary. Snapshots must deep

@@ -49,6 +49,7 @@ The source tree is organized by responsibility:
 | [`src/browser/render/font.zig`](../src/browser/render/font.zig) | Font discovery, SDL_ttf handles, Unicode fallback selection, and owned RGBA glyph bitmaps. |
 | [`src/browser/render/display_list.zig`](../src/browser/render/display_list.zig) | Display-command and composited-layer data, recursive ownership cleanup, provenance, and painted hit testing without Browser or SDL dependencies. |
 | [`src/browser/render/focus_ring.zig`](../src/browser/render/focus_ring.zig) | Pointer-free high-contrast focus-ring and accessibility-outline command generation. |
+| [`src/browser/render/forced_colors.zig`](../src/browser/render/forced_colors.zig) | Semantic four-color accessibility palette and author-color replacement. |
 | [`src/browser/render/effects.zig`](../src/browser/render/effects.zig) | Pixel-level software effects such as premultiplied-RGBA Gaussian blur. |
 | [`src/browser/render/raster_snapshot.zig`](../src/browser/render/raster_snapshot.zig) | Deep-owned, provenance-free display generations transferred to the raster worker. |
 | [`src/browser/render/compositor_cache.zig`](../src/browser/render/compositor_cache.zig) | Raster-worker-owned ordered planes, surface-or-short-command backing, and pointer-free opacity/translation updates used by draw-only animation and scrolling. |
@@ -1193,12 +1194,12 @@ success. Only after parsing and sorting succeed does the code replace
 the source slices they borrow therefore cross the ownership boundary together.
 Media-environment rebuilding also constructs a complete replacement generation
 before retiring the old one; it runs on the serialized tab render path after
-zoom, viewport width, or color-scheme preference changes. Root media width is
-the native tab width divided by zoom, while an iframe's published viewport is
-already in CSS pixels. Every successfully replaced frame dirties its complete
-computed-style subtree before style runs, so rules that became inactive reset
-to the cascade beneath them. See `loadInTab`, `loadInFrame`, `loadIframe`, and
-`rebuildFrameStyleRules`.
+zoom, viewport width, color-scheme preference, or forced-colors changes. Root
+media width is the native tab width divided by zoom, while an iframe's
+published viewport is already in CSS pixels. Every successfully replaced frame
+dirties its complete computed-style subtree before style runs, so rules that
+became inactive reset to the cascade beneath them. See `loadInTab`,
+`loadInFrame`, `loadIframe`, and `rebuildFrameStyleRules`.
 
 ### Required navigation invariant
 
@@ -1331,6 +1332,16 @@ stable-node representation so reuse of an array address cannot silently
 retarget an old JavaScript wrapper.
 
 ## Accessibility contract
+
+F6 changes the active Tab's forced-colors mode and schedules a complete media,
+style, layout, and paint refresh. The same setting is supplied to every frame's
+`(forced-colors: active)` query. During paint, layout classifies author CSS
+colors by semantic role and `render/forced_colors.zig` replaces their RGB
+channels with black canvas/control backgrounds, white text/borders, cyan links,
+or yellow visited/accent paint while retaining nonzero author alpha.
+The root document always emits a black canvas in this mode. Raster snapshots
+therefore contain only the small system palette for CSS paint; decoded images
+and color glyph bitmaps remain unmodified content.
 
 Focused page elements append their indicator after document paint using the
 layout generation's focus bounds. `render/focus_ring.zig` reserves and emits a

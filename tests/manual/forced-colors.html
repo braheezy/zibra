@@ -1,0 +1,50 @@
+<!--
+How to verify:
+1. Load this page normally: it intentionally uses several low-contrast author
+   colors, and the line below says that forced colors are inactive.
+2. Press F6. The page canvas becomes black; ordinary text and control text are
+   white, the unvisited link is cyan, and cursors/visited links are yellow.
+   No authored red, green, blue, gray, or pink paint remains.
+3. The media-query status changes to "forced-colors: active". Focus the input
+   and toggle the checkbox to confirm controls and their indicators stay clear.
+4. Follow the link, go Back, and confirm it is yellow. Press F6 again to restore
+   the original colors and the "forced-colors: none" status.
+-->
+<!doctype html>
+<style>
+  body {
+    color: #777777;
+    background-color: #fff4fa;
+    font-size: 20px;
+  }
+
+  .panel {
+    color: #607060;
+    background-color: #718071;
+    padding: 18px;
+  }
+
+  .accent {
+    color: red;
+    background-color: #ffcccc;
+  }
+
+  input { background-color: #add8e6; color: #000080; }
+  button { background-color: #add8e6; color: #000080; }
+  .active { display: none; }
+
+  @media (forced-colors: active) {
+    .normal { display: none; }
+    .active { display: block; }
+  }
+</style>
+<h1>High-contrast forced colors</h1>
+<p class="normal">forced-colors: none</p>
+<p class="active">forced-colors: active</p>
+<div class="panel">
+  Deliberately low-contrast ordinary text.
+  <p class="accent">Author red and pink must be replaced.</p>
+  <a href="about:blank">Visit this link, then go Back</a>
+  <p><input value="editable text"> <input type="checkbox" checked></p>
+  <button><b>Rich button text</b></button>
+</div>

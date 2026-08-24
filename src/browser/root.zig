@@ -16,6 +16,7 @@ const font = @import("render/font.zig");
 const Glyph = font.Glyph;
 const display_commands = @import("render/display_list.zig");
 const focus_ring = @import("render/focus_ring.zig");
+const forced_colors = @import("render/forced_colors.zig");
 pub const Color = display_commands.Color;
 pub const Rect = display_commands.Rect;
 pub const CompositedLayer = display_commands.CompositedLayer;
@@ -375,6 +376,7 @@ fn windowPositionForFocusedDisplay() ?WindowPos {
 pub const AccessibilitySettings = struct {
     zoom: f32 = 1.0,
     prefers_dark: bool = false,
+    forced_colors: bool = false,
     screen_reader: bool = false,
     reduce_motion: bool = false,
     dark_palette: ?DarkPalette = null,
@@ -1779,6 +1781,13 @@ pub const Browser = struct {
             },
             .f5 => {
                 self.handleVoiceCommand();
+                return;
+            },
+            .f6 => {
+                if (self.activeTab()) |tab| {
+                    tab.setForcedColors(!tab.accessibility.forced_colors);
+                    tab.logAccessibilitySettings("toggle forced_colors");
+                }
                 return;
             },
             .tab => {
@@ -3811,6 +3820,7 @@ pub const Browser = struct {
             );
         return .{
             .prefers_dark = frame.tab.accessibility.prefers_dark,
+            .forced_colors = frame.tab.accessibility.forced_colors,
             .viewport_width_css = viewport_width_css,
         };
     }
@@ -4308,7 +4318,10 @@ pub const Browser = struct {
 
         var focus_items = std.ArrayList(DisplayItem).empty;
         defer focus_items.deinit(self.allocator);
-        const highlight_color = Color{ .r = 0xf5, .g = 0x9e, .b = 0x0b, .a = 0xff };
+        const highlight_color = if (frame.tab.accessibility.forced_colors)
+            forced_colors.accent
+        else
+            Color{ .r = 0xf5, .g = 0x9e, .b = 0x0b, .a = 0xff };
 
         if (frame.focus) |focus_node| {
             for (self.layout_engine.focus_bounds.items) |entry| {

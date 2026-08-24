@@ -37,8 +37,10 @@ or selector/rule lifetime.
 - Conditional stylesheet parsing receives an explicit media environment.
   `max-width` compares its non-negative pixel limit against the viewport width
   in CSS pixels, inclusively; parser-only consumers without a viewport keep
-  width queries inactive. Retain stylesheet text so a browsing context can
-  rebuild the filtered rule/keyframe generation when that environment changes.
+  width queries inactive. `forced-colors` accepts only `active` and `none` and
+  follows the browsing context's accessibility setting. Retain stylesheet text
+  so a browsing context can rebuild the filtered rule/keyframe generation when
+  that environment changes.
 - Concatenated tag/class selectors own a source-ordered `SelectorSequence` of
   atomic selectors, all of which must match the same element. Sequence
   specificity is the sum of its members.
