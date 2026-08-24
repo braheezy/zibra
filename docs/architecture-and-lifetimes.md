@@ -1185,9 +1185,14 @@ one staged generation. Error cleanup owns every staging collection until
 success. Only after parsing and sorting succeed does the code replace
 `frame.css_texts`, `frame.rules`, and `frame.keyframes`. Rules, keyframes, and
 the source slices they borrow therefore cross the ownership boundary together.
-Accessibility-driven stylesheet rebuilding also constructs a complete
-replacement generation before retiring the old one;
-see `loadInTab`, `loadInFrame`, `loadIframe`, and `rebuildTabStyleRules`.
+Media-environment rebuilding also constructs a complete replacement generation
+before retiring the old one; it runs on the serialized tab render path after
+zoom, viewport width, or color-scheme preference changes. Root media width is
+the native tab width divided by zoom, while an iframe's published viewport is
+already in CSS pixels. Every successfully replaced frame dirties its complete
+computed-style subtree before style runs, so rules that became inactive reset
+to the cascade beneath them. See `loadInTab`, `loadInFrame`, `loadIframe`, and
+`rebuildFrameStyleRules`.
 
 ### Required navigation invariant
 
@@ -1470,7 +1475,7 @@ reintroduced:
    buffers and parsed rules are staged, cleaned up on error, and moved into
    `Frame` together. Rule rebuilding also preserves the prior generation until
    its replacement is complete. See the `new_css_texts`/`all_rules`
-   transactions and `rebuildTabStyleRules`.
+   transactions and `rebuildFrameStyleRules`.
 8. **Accessibility diff backing:** the previous accessibility strings stay
    alive through the old/new tree diff. See `previous_strings` in
    `Tab.buildAccessibilityTree`.

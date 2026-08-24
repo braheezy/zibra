@@ -34,6 +34,11 @@ or selector/rule lifetime.
 - CSS rules and `@keyframes` own their selector/frame/map containers while
   names and property slices borrow the stylesheet. Move and retire both parsed
   products with their source text as one generation.
+- Conditional stylesheet parsing receives an explicit media environment.
+  `max-width` compares its non-negative pixel limit against the viewport width
+  in CSS pixels, inclusively; parser-only consumers without a viewport keep
+  width queries inactive. Retain stylesheet text so a browsing context can
+  rebuild the filtered rule/keyframe generation when that environment changes.
 - Concatenated tag/class selectors own a source-ordered `SelectorSequence` of
   atomic selectors, all of which must match the same element. Sequence
   specificity is the sum of its members.

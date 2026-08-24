@@ -1,0 +1,30 @@
+<!--
+How to verify:
+1. Open this page in the default 800px-wide window. The text is red.
+2. Press + repeatedly until page zoom reaches 1.6 or higher. At 1.6, the
+   viewport is exactly 500 CSS pixels wide and the text turns green.
+3. Press - until the zoom drops below 1.6; the text turns red again. Resizing
+   the native window across the same CSS-width boundary has the same effect.
+-->
+<!doctype html>
+<style>
+  body {
+    font: 24px sans-serif;
+    color: red;
+    background-color: white;
+  }
+
+  .sample {
+    padding: 24px;
+    background-color: #ffe8e8;
+  }
+
+  @media screen and (max-width: 500px) {
+    body { color: green; }
+    .sample { background-color: #e5ffe5; }
+  }
+</style>
+<h1>Width media query</h1>
+<p class="sample">
+  This text is green when the viewport is at most 500 CSS pixels wide.
+</p>

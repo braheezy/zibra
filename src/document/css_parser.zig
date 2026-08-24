@@ -24,6 +24,14 @@ pub const INLINE_STYLE_PRIORITY: u32 = 1_000;
 pub const MatchContext = selector_mod.MatchContext;
 pub const HasMatchCache = selector_mod.HasMatchCache;
 
+/// Values supplied by the browsing context while parsing conditional rules.
+/// A null width is used by parser-only consumers that have no viewport; width
+/// media features are then recognized but inactive.
+pub const MediaEnvironment = struct {
+    prefers_dark: bool = false,
+    viewport_width_css: ?f64 = null,
+};
+
 /// One parsed property value. The value borrows the stylesheet or inline-style
 /// buffer; `important` is declaration-local cascade metadata.
 pub const Declaration = struct {
@@ -70,14 +78,22 @@ pub const KeyframesRule = struct {
 
 string: []const u8,
 pos: usize,
-prefers_dark: bool,
+media: MediaEnvironment,
 
 pub fn init(allocator: std.mem.Allocator, string: []const u8, prefers_dark: bool) !*CSSParser {
+    return initWithMedia(allocator, string, .{ .prefers_dark = prefers_dark });
+}
+
+pub fn initWithMedia(
+    allocator: std.mem.Allocator,
+    string: []const u8,
+    media: MediaEnvironment,
+) !*CSSParser {
     const parser = try allocator.create(CSSParser);
     parser.* = CSSParser{
         .string = string,
         .pos = 0,
-        .prefers_dark = prefers_dark,
+        .media = media,
     };
     return parser;
 }
@@ -389,19 +405,155 @@ fn startsWithKeyframesRule(self: *const CSSParser) bool {
     return next == self.string.len or std.ascii.isWhitespace(self.string[next]);
 }
 
-fn prefersColorSchemeMatch(self: *CSSParser, allocator: std.mem.Allocator, prelude: []const u8) ?bool {
-    const lower = std.ascii.allocLowerString(allocator, prelude) catch return null;
-    defer allocator.free(lower);
+fn mediaIdentifierChar(char: u8) bool {
+    return std.ascii.isAlphanumeric(char) or char == '-' or char == '_';
+}
 
-    if (std.mem.indexOf(u8, lower, "prefers-color-scheme") == null) return null;
+fn skipMediaWhitespace(text: []const u8, cursor: *usize) void {
+    while (cursor.* < text.len and std.ascii.isWhitespace(text[cursor.*])) {
+        cursor.* += 1;
+    }
+}
 
-    const has_dark = std.mem.indexOf(u8, lower, "dark") != null;
-    const has_light = std.mem.indexOf(u8, lower, "light") != null;
+fn consumeMediaKeyword(text: []const u8, cursor: *usize, keyword: []const u8) bool {
+    if (text.len - cursor.* < keyword.len) return false;
+    if (!std.ascii.eqlIgnoreCase(text[cursor.* .. cursor.* + keyword.len], keyword)) return false;
+    const end = cursor.* + keyword.len;
+    if (end < text.len and mediaIdentifierChar(text[end])) return false;
+    cursor.* = end;
+    return true;
+}
 
-    if (has_dark and has_light) return self.prefers_dark;
-    if (has_dark) return self.prefers_dark;
-    if (has_light) return !self.prefers_dark;
+fn mediaIdentifier(text: []const u8, cursor: *usize) ?[]const u8 {
+    const start = cursor.*;
+    while (cursor.* < text.len and mediaIdentifierChar(text[cursor.*])) {
+        cursor.* += 1;
+    }
+    if (cursor.* == start) return null;
+    return text[start..cursor.*];
+}
+
+fn parseMediaPixelLength(raw_value: []const u8) ?f64 {
+    const value_text = std.mem.trim(u8, raw_value, " \t\r\n");
+    if (value_text.len == 0) return null;
+
+    const number_text = if (std.ascii.eqlIgnoreCase(value_text, "0"))
+        value_text
+    else blk: {
+        if (value_text.len <= 2 or
+            !std.ascii.eqlIgnoreCase(value_text[value_text.len - 2 ..], "px"))
+        {
+            return null;
+        }
+        break :blk std.mem.trim(u8, value_text[0 .. value_text.len - 2], " \t\r\n");
+    };
+    if (number_text.len == 0) return null;
+    const parsed_length = std.fmt.parseFloat(f64, number_text) catch return null;
+    if (!std.math.isFinite(parsed_length) or parsed_length < 0) return null;
+    return parsed_length;
+}
+
+fn mediaFeatureMatches(self: *const CSSParser, raw_feature: []const u8) ?bool {
+    const feature = std.mem.trim(u8, raw_feature, " \t\r\n");
+    const colon = std.mem.indexOfScalar(u8, feature, ':') orelse return null;
+    const name = std.mem.trim(u8, feature[0..colon], " \t\r\n");
+    const media_value = std.mem.trim(u8, feature[colon + 1 ..], " \t\r\n");
+
+    if (std.ascii.eqlIgnoreCase(name, "prefers-color-scheme")) {
+        if (std.ascii.eqlIgnoreCase(media_value, "dark")) return self.media.prefers_dark;
+        if (std.ascii.eqlIgnoreCase(media_value, "light")) return !self.media.prefers_dark;
+        return null;
+    }
+
+    if (std.ascii.eqlIgnoreCase(name, "max-width")) {
+        const limit = parseMediaPixelLength(media_value) orelse return null;
+        const viewport_width = self.media.viewport_width_css orelse return false;
+        return viewport_width <= limit;
+    }
+
     return null;
+}
+
+fn singleMediaQueryMatches(self: *const CSSParser, raw_query: []const u8) bool {
+    const query = std.mem.trim(u8, raw_query, " \t\r\n");
+    if (query.len == 0) return false;
+
+    var cursor: usize = 0;
+    var negate = false;
+    var matches = true;
+    var saw_condition = false;
+
+    if (consumeMediaKeyword(query, &cursor, "only")) skipMediaWhitespace(query, &cursor);
+    if (consumeMediaKeyword(query, &cursor, "not")) {
+        negate = true;
+        skipMediaWhitespace(query, &cursor);
+    }
+
+    // A media type is optional when the query begins with a parenthesized
+    // feature. Zibra is a screen user agent, so `screen` and `all` match.
+    if (cursor < query.len and query[cursor] != '(') {
+        const media_type = mediaIdentifier(query, &cursor) orelse return false;
+        if (std.ascii.eqlIgnoreCase(media_type, "screen") or
+            std.ascii.eqlIgnoreCase(media_type, "all"))
+        {
+            matches = true;
+        } else if (std.ascii.eqlIgnoreCase(media_type, "print")) {
+            matches = false;
+        } else {
+            return false;
+        }
+        skipMediaWhitespace(query, &cursor);
+        if (cursor == query.len) return if (negate) !matches else matches;
+        if (!consumeMediaKeyword(query, &cursor, "and")) return false;
+        skipMediaWhitespace(query, &cursor);
+    }
+
+    while (cursor < query.len) {
+        if (query[cursor] != '(') return false;
+        const feature_start = cursor + 1;
+        const close = std.mem.indexOfScalarPos(u8, query, feature_start, ')') orelse return false;
+        if (std.mem.indexOfScalar(u8, query[feature_start..close], '(') != null) return false;
+        const feature_matches = self.mediaFeatureMatches(query[feature_start..close]) orelse return false;
+        matches = matches and feature_matches;
+        saw_condition = true;
+        cursor = close + 1;
+        skipMediaWhitespace(query, &cursor);
+        if (cursor == query.len) break;
+        if (!consumeMediaKeyword(query, &cursor, "and")) return false;
+        skipMediaWhitespace(query, &cursor);
+    }
+
+    if (!saw_condition) return false;
+    return if (negate) !matches else matches;
+}
+
+fn mediaQueryMatches(self: *const CSSParser, prelude: []const u8) bool {
+    var depth: usize = 0;
+    var query_start: usize = 0;
+    for (prelude, 0..) |char, index| {
+        switch (char) {
+            '(' => depth += 1,
+            ')' => {
+                if (depth == 0) return false;
+                depth -= 1;
+            },
+            ',' => if (depth == 0) {
+                if (self.singleMediaQueryMatches(prelude[query_start..index])) return true;
+                query_start = index + 1;
+            },
+            else => {},
+        }
+    }
+    if (depth != 0) return false;
+    return self.singleMediaQueryMatches(prelude[query_start..]);
+}
+
+fn startsWithMediaRule(self: *const CSSParser) bool {
+    const keyword = "@media";
+    if (self.string.len - self.pos < keyword.len) return false;
+    if (!std.ascii.eqlIgnoreCase(self.string[self.pos .. self.pos + keyword.len], keyword)) return false;
+    const next = self.pos + keyword.len;
+    return next == self.string.len or std.ascii.isWhitespace(self.string[next]) or self.string[next] == '(';
 }
 
 /// Parse a tag/class selector, `:has(...)` relational selector, or a
@@ -596,38 +748,36 @@ pub fn parseWithKeyframes(
                 };
                 continue;
             }
-            if (std.mem.startsWith(u8, self.string[self.pos..], "@media")) {
+            if (self.startsWithMediaRule()) {
                 const prelude_start = self.pos + "@media".len;
                 const brace_idx = std.mem.indexOfPos(u8, self.string, prelude_start, "{") orelse break;
                 const prelude = self.string[prelude_start..brace_idx];
                 const block_end = self.findMatchingBrace(brace_idx) orelse break;
 
-                if (self.prefersColorSchemeMatch(allocator, prelude)) |matches| {
-                    if (matches) {
-                        var media_parser = try CSSParser.init(
-                            allocator,
-                            self.string[brace_idx + 1 .. block_end],
-                            self.prefers_dark,
-                        );
-                        defer media_parser.deinit(allocator);
+                if (self.mediaQueryMatches(prelude)) {
+                    var media_parser = try CSSParser.initWithMedia(
+                        allocator,
+                        self.string[brace_idx + 1 .. block_end],
+                        self.media,
+                    );
+                    defer media_parser.deinit(allocator);
 
-                        const media_rules = try media_parser.parseWithKeyframes(allocator, keyframes);
-                        var media_rules_transferred = false;
-                        defer {
-                            if (!media_rules_transferred) {
-                                for (media_rules) |*rule| {
-                                    rule.deinit(allocator);
-                                }
+                    const media_rules = try media_parser.parseWithKeyframes(allocator, keyframes);
+                    var media_rules_transferred = false;
+                    defer {
+                        if (!media_rules_transferred) {
+                            for (media_rules) |*rule| {
+                                rule.deinit(allocator);
                             }
-                            allocator.free(media_rules);
                         }
-
-                        try rules.ensureUnusedCapacity(allocator, media_rules.len);
-                        for (media_rules) |rule| {
-                            rules.appendAssumeCapacity(rule);
-                        }
-                        media_rules_transferred = true;
+                        allocator.free(media_rules);
                     }
+
+                    try rules.ensureUnusedCapacity(allocator, media_rules.len);
+                    for (media_rules) |rule| {
+                        rules.appendAssumeCapacity(rule);
+                    }
+                    media_rules_transferred = true;
                 }
 
                 self.pos = block_end + 1;
@@ -769,4 +919,88 @@ test "keyframes parse beside selector rules and normalize offsets" {
     try std.testing.expectEqualStrings("0.1", pulse.frameAt(0).?.properties.get("opacity").?.value);
     try std.testing.expectEqualStrings("0.5", pulse.frameAt(0.5).?.properties.get("opacity").?.value);
     try std.testing.expectEqualStrings("0.9", pulse.frameAt(1).?.properties.get("opacity").?.value);
+}
+
+test "max-width media queries use CSS viewport pixels and inclusive bounds" {
+    const allocator = std.testing.allocator;
+    const css =
+        "p { color: red; }" ++
+        "@MEDIA screen and (MAX-WIDTH: 600PX) { p { color: green; } }" ++
+        "@media print, (max-width: 500px) { p { background-color: blue; } }";
+
+    var wide_parser = try CSSParser.initWithMedia(
+        allocator,
+        css,
+        .{ .viewport_width_css = 601 },
+    );
+    defer wide_parser.deinit(allocator);
+    const wide_rules = try wide_parser.parse(allocator);
+    defer {
+        for (wide_rules) |*rule| rule.deinit(allocator);
+        allocator.free(wide_rules);
+    }
+    try std.testing.expectEqual(@as(usize, 1), wide_rules.len);
+
+    var boundary_parser = try CSSParser.initWithMedia(
+        allocator,
+        css,
+        .{ .viewport_width_css = 600 },
+    );
+    defer boundary_parser.deinit(allocator);
+    const boundary_rules = try boundary_parser.parse(allocator);
+    defer {
+        for (boundary_rules) |*rule| rule.deinit(allocator);
+        allocator.free(boundary_rules);
+    }
+    try std.testing.expectEqual(@as(usize, 2), boundary_rules.len);
+    try std.testing.expectEqualStrings("green", boundary_rules[1].properties.get("color").?.value);
+
+    var narrow_parser = try CSSParser.initWithMedia(
+        allocator,
+        css,
+        .{ .viewport_width_css = 500 },
+    );
+    defer narrow_parser.deinit(allocator);
+    const narrow_rules = try narrow_parser.parse(allocator);
+    defer {
+        for (narrow_rules) |*rule| rule.deinit(allocator);
+        allocator.free(narrow_rules);
+    }
+    try std.testing.expectEqual(@as(usize, 3), narrow_rules.len);
+    try std.testing.expectEqualStrings("blue", narrow_rules[2].properties.get("background-color").?.value);
+}
+
+test "width and color media features compose and reject unsupported lengths" {
+    const allocator = std.testing.allocator;
+    const css =
+        "@media (max-width: 640px) and (prefers-color-scheme: dark) { p { color: green; } }" ++
+        "@media (max-width: 40em) { p { color: purple; } }" ++
+        "@media (min-width: 1px) { p { color: orange; } }";
+
+    var matching_parser = try CSSParser.initWithMedia(
+        allocator,
+        css,
+        .{ .prefers_dark = true, .viewport_width_css = 640 },
+    );
+    defer matching_parser.deinit(allocator);
+    const matching_rules = try matching_parser.parse(allocator);
+    defer {
+        for (matching_rules) |*rule| rule.deinit(allocator);
+        allocator.free(matching_rules);
+    }
+    try std.testing.expectEqual(@as(usize, 1), matching_rules.len);
+    try std.testing.expectEqualStrings("green", matching_rules[0].properties.get("color").?.value);
+
+    var light_parser = try CSSParser.initWithMedia(
+        allocator,
+        css,
+        .{ .prefers_dark = false, .viewport_width_css = 400 },
+    );
+    defer light_parser.deinit(allocator);
+    const light_rules = try light_parser.parse(allocator);
+    defer {
+        for (light_rules) |*rule| rule.deinit(allocator);
+        allocator.free(light_rules);
+    }
+    try std.testing.expectEqual(@as(usize, 0), light_rules.len);
 }

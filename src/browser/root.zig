@@ -1740,10 +1740,7 @@ pub const Browser = struct {
             .f1 => {
                 if (self.activeTab()) |tab| {
                     tab.accessibility.prefers_dark = !tab.accessibility.prefers_dark;
-                    self.rebuildTabStyleRules(tab) catch |err| {
-                        std.log.warn("Failed to rebuild styles for prefers-color-scheme: {}", .{err});
-                    };
-                    tab.setNeedsRender();
+                    tab.mediaEnvironmentChanged();
                     self.active_tab_prefers_dark = tab.accessibility.prefers_dark;
                     tab.logAccessibilitySettings("toggle prefers_dark");
                 }
@@ -3803,15 +3800,29 @@ pub const Browser = struct {
     /// Parse one owned document stylesheet into staged frame storage. The
     /// caller retains ownership of `css_text` on error and transfers it to
     /// `css_texts` only after this function succeeds.
+    fn frameMediaEnvironment(frame: *const Frame) CSSParser.MediaEnvironment {
+        const viewport_width_css = if (frame.parent != null and frame.viewport_width > 0)
+            @as(f64, @floatFromInt(frame.viewport_width))
+        else
+            tab_module.viewportWidthInCssPixels(
+                frame.tab.tab_width,
+                frame.tab.accessibility.zoom,
+            );
+        return .{
+            .prefers_dark = frame.tab.accessibility.prefers_dark,
+            .viewport_width_css = viewport_width_css,
+        };
+    }
+
     fn appendDocumentStylesheetRules(
         self: *Browser,
         css_text: []const u8,
-        prefers_dark: bool,
+        media: CSSParser.MediaEnvironment,
         css_texts: *std.ArrayList([]const u8),
         rules: *std.ArrayList(CSSParser.CSSRule),
         keyframes: *std.ArrayList(CSSParser.KeyframesRule),
     ) !void {
-        var css_parser = try CSSParser.init(self.allocator, css_text, prefers_dark);
+        var css_parser = try CSSParser.initWithMedia(self.allocator, css_text, media);
         defer css_parser.deinit(self.allocator);
 
         var parsed_keyframes = std.ArrayList(CSSParser.KeyframesRule).empty;
@@ -3869,7 +3880,7 @@ pub const Browser = struct {
 
                 self.appendDocumentStylesheetRules(
                     css_text,
-                    frame.tab.accessibility.prefers_dark,
+                    frameMediaEnvironment(frame),
                     css_texts,
                     rules,
                     keyframes,
@@ -3901,7 +3912,7 @@ pub const Browser = struct {
 
             self.appendDocumentStylesheetRules(
                 css_text,
-                frame.tab.accessibility.prefers_dark,
+                frameMediaEnvironment(frame),
                 css_texts,
                 rules,
                 keyframes,
@@ -4173,8 +4184,11 @@ pub const Browser = struct {
         thread.detach();
     }
 
-    fn rebuildTabStyleRules(self: *Browser, tab: *Tab) !void {
-        const frame = tab.root_frame orelse return;
+    /// Reparse one frame's retained author stylesheets under its current media
+    /// environment. The replacement is staged before the old rule generation
+    /// retires; computed style is then dirtied so newly active/inactive rules
+    /// participate in the next style pass.
+    pub fn rebuildFrameStyleRules(self: *Browser, frame: *Frame) !void {
         const default_rules_count = self.default_style_sheet_rules.len;
 
         var new_rules = std.ArrayList(CSSParser.CSSRule).empty;
@@ -4193,7 +4207,11 @@ pub const Browser = struct {
         }
 
         for (frame.css_texts.items) |css_text| {
-            var css_parser = try CSSParser.init(self.allocator, css_text, tab.accessibility.prefers_dark);
+            var css_parser = try CSSParser.initWithMedia(
+                self.allocator,
+                css_text,
+                frameMediaEnvironment(frame),
+            );
             defer css_parser.deinit(self.allocator);
 
             const parsed_rules = css_parser.parseWithKeyframes(self.allocator, &new_keyframes) catch |err| {
@@ -4232,6 +4250,7 @@ pub const Browser = struct {
         frame.keyframes = new_keyframes;
         new_keyframes = .empty;
         frame.default_rules_count = default_rules_count;
+        if (frame.current_node) |*root| parser.dirtyStyleSubtree(root);
     }
 
     // Layout a tab's HTML nodes with the tree-based layout

@@ -75,6 +75,11 @@ before changing `root.zig`, `tab.zig`, `render/`, or browser task scheduling.
   Opacity and `translate(...)` transform transitions publish compositor
   updates; simultaneous values for one element must share a stable numeric
   compositor ID and remain draw-only after their initial raster.
+- Zoom and native-width changes invalidate the tab's media environment as well
+  as layout. On the serialized render path, every frame reparses its retained
+  author sheets using its current CSS-pixel viewport width, dirties the DOM
+  style subtree, and only then runs style/layout/paint. Child-frame widths are
+  already CSS geometry; root widths divide native pixels by page zoom.
 - Browser task producers classify animation frames and native input as urgent,
   navigation and script discovery as normal, and timeout/interval/XHR/message
   callbacks as JavaScript-low. Do not infer priority from the trace label:

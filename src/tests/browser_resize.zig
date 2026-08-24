@@ -6,6 +6,8 @@ const Chrome = @import("../browser/chrome.zig");
 const tab_module = @import("../browser/tab.zig");
 const Layout = @import("../browser/render/layout.zig");
 const ProtectedField = @import("../core/protected_field.zig").ProtectedField;
+const CSSParser = @import("../document/css_parser.zig").CSSParser;
+const document_parser = @import("../document/parser.zig");
 
 fn createCleanDocument(allocator: std.mem.Allocator) !*Layout.DocumentLayout {
     const document = try allocator.create(Layout.DocumentLayout);
@@ -80,6 +82,57 @@ test "scroll clamping follows the resized visible viewport" {
     try std.testing.expectEqual(@as(i32, 700), tab_module.clampScrollOffset(900, 1000, 600, 2.0));
 }
 
+test "page zoom crosses a max-width media query in CSS pixels" {
+    const allocator = std.testing.allocator;
+    const css =
+        "p { color: red; }" ++
+        "@media (max-width: 500px) { p { color: green; } }";
+
+    var normal_parser = try CSSParser.initWithMedia(
+        allocator,
+        css,
+        .{ .viewport_width_css = tab_module.viewportWidthInCssPixels(800, 1.0) },
+    );
+    defer normal_parser.deinit(allocator);
+    const normal_rules = try normal_parser.parse(allocator);
+    defer {
+        for (normal_rules) |*rule| rule.deinit(allocator);
+        allocator.free(normal_rules);
+    }
+    try std.testing.expectEqual(@as(usize, 1), normal_rules.len);
+
+    var zoomed_parser = try CSSParser.initWithMedia(
+        allocator,
+        css,
+        .{ .viewport_width_css = tab_module.viewportWidthInCssPixels(800, 2.0) },
+    );
+    defer zoomed_parser.deinit(allocator);
+    const zoomed_rules = try zoomed_parser.parse(allocator);
+    defer {
+        for (zoomed_rules) |*rule| rule.deinit(allocator);
+        allocator.free(zoomed_rules);
+    }
+    try std.testing.expectEqual(@as(usize, 2), zoomed_rules.len);
+    try std.testing.expectEqualStrings("green", zoomed_rules[1].properties.get("color").?.value);
+
+    var html_parser = try document_parser.HTMLParser.init(allocator, "<p>responsive</p>");
+    html_parser.use_implicit_tags = false;
+    defer html_parser.deinit(allocator);
+    var root = try html_parser.parse();
+    defer root.deinit(allocator);
+
+    try document_parser.style(allocator, &root, normal_rules);
+    try std.testing.expectEqualStrings("red", root.element.style.?.getPtr("color").?.get().*);
+
+    document_parser.dirtyStyleSubtree(&root);
+    try document_parser.style(allocator, &root, zoomed_rules);
+    try std.testing.expectEqualStrings("green", root.element.style.?.getPtr("color").?.get().*);
+
+    document_parser.dirtyStyleSubtree(&root);
+    try document_parser.style(allocator, &root, normal_rules);
+    try std.testing.expectEqualStrings("red", root.element.style.?.getPtr("color").?.get().*);
+}
+
 test "tab resize updates root viewport and invalidates layout" {
     const allocator = std.testing.allocator;
 
@@ -91,6 +144,7 @@ test "tab resize updates root viewport and invalidates layout" {
     tab.needs_style = false;
     tab.needs_layout = false;
     tab.needs_paint = false;
+    tab.media_environment_dirty = false;
     tab.scroll_changed_in_tab = false;
     tab.frames_by_id = std.AutoHashMap(u32, *tab_module.Frame).init(allocator);
     defer tab.frames_by_id.deinit();
@@ -134,7 +188,8 @@ test "tab resize updates root viewport and invalidates layout" {
     try std.testing.expectEqual(@as(i32, 150), child.viewport_height);
     try std.testing.expect(tab.needs_layout);
     try std.testing.expect(tab.needs_paint);
-    try std.testing.expect(!tab.needs_style);
+    try std.testing.expect(tab.needs_style);
     try std.testing.expectEqual(@as(i32, 200), frame.scroll);
     try std.testing.expect(tab.scroll_changed_in_tab);
+    try std.testing.expect(tab.media_environment_dirty);
 }

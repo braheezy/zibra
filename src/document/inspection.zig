@@ -11,6 +11,7 @@ const Url = url_module.Url;
 
 const default_html = @embedFile("../assets/default.html");
 const default_style_sheet = @embedFile("../browser/browser.css");
+const inspection_viewport_width_css: f64 = 800;
 
 pub const Page = struct {
     allocator: std.mem.Allocator,
@@ -82,7 +83,11 @@ pub const Page = struct {
     }
 
     fn appendRules(self: *Page, stylesheet: []const u8, keep_text: bool) !void {
-        var css_parser = try CSSParser.init(self.allocator, stylesheet, false);
+        var css_parser = try CSSParser.initWithMedia(
+            self.allocator,
+            stylesheet,
+            .{ .viewport_width_css = inspection_viewport_width_css },
+        );
         defer css_parser.deinit(self.allocator);
         var keyframes = std.ArrayList(CSSParser.KeyframesRule).empty;
         var keyframes_owned = true;

@@ -955,6 +955,8 @@ shutting_down: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
 needs_style: bool = true,
 needs_layout: bool = true,
 needs_paint: bool = true,
+// Author rules were filtered under an older color/viewport media environment.
+media_environment_dirty: bool = false,
 // Browser-session visited generation reflected by the current display list.
 visited_generation: u64 = 0,
 // Cross-thread activation request. Browser.setActiveTab publishes it, and the
@@ -999,6 +1001,7 @@ pub fn init(allocator: std.mem.Allocator, tab_width: i32, tab_height: i32, measu
         .intervals = std.AutoHashMap(IntervalKey, void).init(allocator),
         .interval_mutex = .init(measure.io),
         .visited_generation = 0,
+        .media_environment_dirty = false,
         .activation_commit_requested = std.atomic.Value(bool).init(false),
         .composited_updates = std.ArrayList(CompositedUpdate).empty,
         .accessibility_root = null,
@@ -1027,8 +1030,14 @@ pub fn logAccessibilitySettings(self: *const Tab, reason: []const u8) void {
 }
 
 pub fn setZoom(self: *Tab, zoom: f32) void {
+    if (!self.updateZoomState(zoom)) return;
+    self.browser.setNeedsAnimationFrame(self);
+    self.browser.scheduleAnimationFrame();
+}
+
+fn updateZoomState(self: *Tab, zoom: f32) bool {
     const clamped = std.math.clamp(zoom, 0.5, 3.0);
-    if (self.accessibility.zoom == clamped) return;
+    if (self.accessibility.zoom == clamped) return false;
     self.accessibility.zoom = clamped;
 
     // Mark all frame layouts as dirty for layout recalculation
@@ -1036,6 +1045,24 @@ pub fn setZoom(self: *Tab, zoom: f32) void {
         markFrameLayoutDirty(frame);
     }
 
+    self.media_environment_dirty = true;
+    self.needs_style = true;
+    self.needs_layout = true;
+    self.needs_paint = true;
+    return true;
+}
+
+/// Convert a native viewport width to the CSS-pixel width used by media
+/// queries. Zoom enlarges each CSS pixel, so fewer of them fit in the same
+/// device-space viewport.
+pub fn viewportWidthInCssPixels(device_width: i32, zoom_value: f32) f64 {
+    const safe_width = @max(device_width, 1);
+    const safe_zoom = if (std.math.isFinite(zoom_value) and zoom_value > 0) zoom_value else 1.0;
+    return @as(f64, @floatFromInt(safe_width)) / @as(f64, safe_zoom);
+}
+
+pub fn mediaEnvironmentChanged(self: *Tab) void {
+    self.media_environment_dirty = true;
     self.setNeedsRender();
 }
 
@@ -1060,7 +1087,9 @@ fn invalidateFrameTreeForViewportResize(frame: *Frame) void {
 /// Apply a native viewport change on the tab worker. The next animation frame
 /// performs layout and paint using the new root-frame dimensions.
 pub fn resizeViewport(self: *Tab, width: i32, height: i32) void {
-    self.tab_width = @max(width, 1);
+    const new_width = @max(width, 1);
+    const width_changed = self.tab_width != new_width;
+    self.tab_width = new_width;
     self.tab_height = @max(height, 0);
 
     if (self.root_frame) |frame| {
@@ -1075,12 +1104,39 @@ pub fn resizeViewport(self: *Tab, width: i32, height: i32) void {
         }
     }
 
+    if (width_changed) {
+        self.media_environment_dirty = true;
+        self.needs_style = true;
+    }
     self.needs_layout = true;
     self.needs_paint = true;
 }
 
 pub fn adjustZoom(self: *Tab, delta: f32) void {
     self.setZoom(self.accessibility.zoom + delta);
+}
+
+test "zoom changes CSS viewport width and invalidates media rules" {
+    var tab: Tab = undefined;
+    tab.accessibility = .{ .zoom = 1.0, .dark_palette = .{} };
+    tab.root_frame = null;
+    tab.needs_style = false;
+    tab.needs_layout = false;
+    tab.needs_paint = false;
+    tab.media_environment_dirty = false;
+
+    try std.testing.expectEqual(@as(f64, 800), viewportWidthInCssPixels(800, 1.0));
+    try std.testing.expectEqual(@as(f64, 400), viewportWidthInCssPixels(800, 2.0));
+    try std.testing.expect(tab.updateZoomState(2.0));
+    try std.testing.expectEqual(@as(f32, 2.0), tab.accessibility.zoom);
+    try std.testing.expect(tab.media_environment_dirty);
+    try std.testing.expect(tab.needs_style);
+    try std.testing.expect(tab.needs_layout);
+    try std.testing.expect(tab.needs_paint);
+
+    tab.media_environment_dirty = false;
+    try std.testing.expect(!tab.updateZoomState(2.0));
+    try std.testing.expect(!tab.media_environment_dirty);
 }
 
 /// Start the task runner thread. Must be called after the Tab is in its final memory location.
@@ -1745,8 +1801,12 @@ fn appendIframeContent(
         return;
     }
 
-    child_frame.?.viewport_width = iframe_data.rect.right - iframe_data.rect.left;
-    child_frame.?.viewport_height = iframe_data.rect.bottom - iframe_data.rect.top;
+    const child_width = iframe_data.rect.right - iframe_data.rect.left;
+    const child_height = iframe_data.rect.bottom - iframe_data.rect.top;
+    const child_width_changed = child_frame.?.viewport_width != child_width;
+    child_frame.?.viewport_width = child_width;
+    child_frame.?.viewport_height = child_height;
+    if (child_width_changed) self.mediaEnvironmentChanged();
 
     const child_list = child_frame.?.display_list.?;
 
@@ -1861,8 +1921,18 @@ pub fn render(self: *Tab, b: *Browser) !void {
     var resource_frames = std.ArrayList(*Frame).empty;
     defer resource_frames.deinit(self.allocator);
     try self.collectFramesPostOrder(frame, &resource_frames);
+    const rebuild_media_rules = self.media_environment_dirty;
+    if (rebuild_media_rules) self.media_environment_dirty = false;
+    errdefer {
+        if (rebuild_media_rules) self.media_environment_dirty = true;
+    }
     for (resource_frames.items) |resource_frame| {
         try b.refreshFrameResources(resource_frame);
+    }
+    if (rebuild_media_rules) {
+        for (resource_frames.items) |resource_frame| {
+            try b.rebuildFrameStyleRules(resource_frame);
+        }
     }
 
     b.layout_engine.accessibility = self.accessibility;
