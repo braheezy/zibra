@@ -971,8 +971,10 @@ accessibility_focused: ?*AccessibilityNode = null,
 accessibility_hovered: ?*AccessibilityNode = null,
 // Pending polite announcements
 accessibility_polite_queue: std.ArrayList(*AccessibilityNode),
-// Highlighted accessibility node for voice commands
+// Persistent highlighted accessibility node for voice and reading interaction
 accessibility_highlight: ?*AccessibilityNode = null,
+// Current node in the incremental screen-reader reading traversal.
+accessibility_reading: ?*AccessibilityNode = null,
 // Owned strings for accessibility names/labels
 accessibility_strings: std.ArrayList([]const u8),
 
@@ -1004,6 +1006,7 @@ pub fn init(allocator: std.mem.Allocator, tab_width: i32, tab_height: i32, measu
         .accessibility_hovered = null,
         .accessibility_polite_queue = std.ArrayList(*AccessibilityNode).empty,
         .accessibility_highlight = null,
+        .accessibility_reading = null,
         .accessibility_strings = std.ArrayList([]const u8).empty,
         .frames_by_id = std.AutoHashMap(u32, *Frame).init(allocator),
         .parent_window_ids = std.AutoHashMap(u32, u32).init(allocator),
@@ -3407,6 +3410,14 @@ pub fn backspace(self: *Tab, b: *Browser) !void {
 
 pub fn buildAccessibilityTree(self: *Tab) !void {
     const previous_root = self.accessibility_root;
+    const previous_reading_dom = if (self.accessibility_reading) |node|
+        node.dom_node
+    else
+        null;
+    const previous_highlight_dom = if (self.accessibility_highlight) |node|
+        node.dom_node
+    else
+        null;
     self.accessibility_root = null;
 
     var previous_strings = self.accessibility_strings;
@@ -3470,6 +3481,14 @@ pub fn buildAccessibilityTree(self: *Tab) !void {
     const root = try self.createAccessibilityNode("document", root_name, root_bounds, null, root_children);
     self.accessibility_root = root;
     self.accessibility_focused = self.findAccessibilityNodeForDom(self.accessibility_root, frame.focus);
+    self.accessibility_reading = self.findAccessibilityNodeForDom(
+        self.accessibility_root,
+        previous_reading_dom,
+    );
+    self.accessibility_highlight = self.findAccessibilityNodeForDom(
+        self.accessibility_root,
+        previous_highlight_dom,
+    );
     self.accessibility_hovered = null;
 
     if (previous_root) |old_root| {
@@ -3840,24 +3859,109 @@ fn flushPoliteAnnouncements(self: *Tab) void {
     self.accessibility_polite_queue.clearRetainingCapacity();
 }
 
-pub fn readAccessibilityDocument(self: *Tab) void {
+/// Advance the screen-reader reading cursor by one accessibility-tree node.
+/// The node remains highlighted until the next advance, so a repaint can show
+/// the same element that was just spoken. Once the traversal reaches the end,
+/// the next advance clears the reading highlight and the following advance
+/// starts over at the document root.
+pub fn advanceAccessibility(self: *Tab) void {
     if (!self.accessibility.screen_reader) return;
     const root = self.accessibility_root orelse return;
-    self.readAccessibilityNode(root);
+
+    const next = if (self.accessibility_reading) |current| blk: {
+        break :blk nextAccessibilityNode(root, current);
+    } else if (root.dom_node == null and root.children.items.len > 0) root.children.items[0] else root;
+
+    if (next) |node| {
+        self.accessibility_reading = node;
+        self.accessibility_highlight = node;
+        self.speakAccessibilityNode(node, "document");
+    } else {
+        self.accessibility_reading = null;
+        self.accessibility_highlight = null;
+    }
+    self.setNeedsPaint();
 }
 
-fn readAccessibilityNode(self: *Tab, node: *AccessibilityNode) void {
-    self.speakAccessibilityNode(node, "document");
-    for (node.children.items) |child| {
-        self.readAccessibilityNode(child);
+/// Compatibility entry point for callers that used the old whole-document
+/// reader. Reading is intentionally incremental now: one call advances one
+/// node, allowing the corresponding highlight to be painted between calls.
+pub fn readAccessibilityDocument(self: *Tab) void {
+    self.advanceAccessibility();
+}
+
+fn nextAccessibilityNode(root: *AccessibilityNode, current: *AccessibilityNode) ?*AccessibilityNode {
+    var seen = false;
+    return nextAccessibilityNodeAfter(root, current, &seen);
+}
+
+fn nextAccessibilityNodeAfter(
+    node: *AccessibilityNode,
+    current: *AccessibilityNode,
+    seen: *bool,
+) ?*AccessibilityNode {
+    if (seen.*) return node;
+    if (node == current) {
+        seen.* = true;
+        if (node.children.items.len > 0) return node.children.items[0];
+        return null;
     }
+    for (node.children.items) |child| {
+        if (nextAccessibilityNodeAfter(child, current, seen)) |next| return next;
+    }
+    return null;
+}
+
+test "accessibility reading traversal advances in preorder" {
+    const allocator = std.testing.allocator;
+    var root = AccessibilityNode{
+        .role = "document",
+        .name = "document",
+        .bounds = .{ .x = 0, .y = 0, .width = 1, .height = 1 },
+        .children = std.ArrayList(*AccessibilityNode).empty,
+        .dom_node = null,
+    };
+    var first = AccessibilityNode{
+        .role = "heading",
+        .name = "First",
+        .bounds = .{ .x = 0, .y = 0, .width = 1, .height = 1 },
+        .children = std.ArrayList(*AccessibilityNode).empty,
+        .dom_node = null,
+    };
+    var nested = AccessibilityNode{
+        .role = "paragraph",
+        .name = "Nested",
+        .bounds = .{ .x = 0, .y = 0, .width = 1, .height = 1 },
+        .children = std.ArrayList(*AccessibilityNode).empty,
+        .dom_node = null,
+    };
+    var last = AccessibilityNode{
+        .role = "link",
+        .name = "Last",
+        .bounds = .{ .x = 0, .y = 0, .width = 1, .height = 1 },
+        .children = std.ArrayList(*AccessibilityNode).empty,
+        .dom_node = null,
+    };
+    defer root.children.deinit(allocator);
+    defer first.children.deinit(allocator);
+    defer nested.children.deinit(allocator);
+    defer last.children.deinit(allocator);
+
+    try root.children.append(allocator, &first);
+    try root.children.append(allocator, &last);
+    try first.children.append(allocator, &nested);
+
+    try std.testing.expectEqual(&first, nextAccessibilityNode(&root, &root));
+    try std.testing.expectEqual(&nested, nextAccessibilityNode(&root, &first));
+    try std.testing.expectEqual(&last, nextAccessibilityNode(&root, &nested));
+    try std.testing.expect(nextAccessibilityNode(&root, &last) == null);
 }
 
 pub fn handleVoiceCommand(self: *Tab, b: *Browser, command: []const u8) void {
     if (self.accessibility_root == null) return;
 
     if (std.mem.eql(u8, command, "read page")) {
-        self.readAccessibilityDocument();
+        self.advanceAccessibility();
         return;
     }
     if (std.mem.eql(u8, command, "focus next")) {
@@ -3977,6 +4081,7 @@ fn clearAccessibilityTree(self: *Tab) void {
     self.accessibility_hovered = null;
     self.accessibility_polite_queue.clearRetainingCapacity();
     self.accessibility_highlight = null;
+    self.accessibility_reading = null;
 }
 
 // Percent-encode a string for use in form data (application/x-www-form-urlencoded)

@@ -1775,7 +1775,7 @@ pub const Browser = struct {
             },
             .f4 => {
                 if (self.activeTab()) |tab| {
-                    tab.readAccessibilityDocument();
+                    tab.advanceAccessibility();
                 }
                 return;
             },
@@ -4308,7 +4308,7 @@ pub const Browser = struct {
 
         if (frame.tab.accessibility_highlight) |highlight_node| {
             if (highlight_node.dom_node) |dom| {
-                for (self.layout_engine.focus_bounds.items) |entry| {
+                for (self.layout_engine.accessibility_bounds.items) |entry| {
                     if (entry.node == dom) {
                         const rect = focus_ring.rectAround(
                             entry.bounds.x,

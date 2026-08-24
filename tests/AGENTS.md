@@ -55,6 +55,10 @@ both backgrounds and follow keyboard focus without leaving a stale ring.
 target-only focus/blur event order, synchronous layout before focus scrolling,
 and address-bar blur when JavaScript returns focus to page content.
 
+`tests/manual/accessibility-read-highlight.html` verifies that F3 enables the
+screen-reader mode and each F4/read-page step speaks and highlights the same
+accessibility node, including non-focusable content.
+
 `tests/manual/checkboxes.html` verifies checked and unchecked painting, click
 toggles, omission of unchecked controls, explicit values, and the default
 checked value `on` through a localhost GET submission.

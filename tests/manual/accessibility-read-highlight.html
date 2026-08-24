@@ -1,0 +1,26 @@
+<!--
+How to verify:
+1. Load this page, press F3 to enable the screen-reader accessibility mode.
+2. Press F4 repeatedly. Each press should speak one node and draw an amber
+   outline around that same heading, paragraph, link, or button.
+3. The first reading step starts at the first page element (not the synthetic
+   document root). At the end, one extra F4 clears the outline and the next
+   F4 starts the reading pass again.
+-->
+<!doctype html>
+<meta charset="utf-8">
+<title>Accessibility reading highlight</title>
+<style>
+  body { font-family: sans-serif; margin: 24px; }
+  .panel { border: 2px solid #334155; padding: 16px; width: 560px; }
+  a { color: #075985; }
+  button { font-size: 16px; padding: 6px 10px; }
+</style>
+
+<h1>Reading highlight demo</h1>
+<div class="panel">
+  <p>The current accessibility node is highlighted while it is spoken.</p>
+  <p>Reading includes ordinary content as well as interactive controls.</p>
+  <p><a href="https://browser.engineering/">Browser Engineering</a></p>
+  <p><button>Continue reading</button></p>
+</div>

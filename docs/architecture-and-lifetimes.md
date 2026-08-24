@@ -1340,6 +1340,14 @@ cross-thread snapshot: main-thread hover and voice paths can still read or
 mutate accessibility state while the tab worker rebuilds it. That broader
 thread-ownership contract remains unresolved.
 
+Document reading is incremental: `Tab.advanceAccessibility` walks one
+preorder accessibility node per F4/read-page request, speaks that node, and
+stores it as the amber highlight target so the next paint displays exactly
+what was announced. The synthetic document root is not the first visual
+target. Because accessibility trees are rebuilt after layout, the reading and
+highlight pointers are remapped through their borrowed DOM nodes while the
+replacement tree is alive; if a node was removed, the cursor is cleared.
+
 ## SDL and graphics contract
 
 `BrowserApp.init` initializes SDL video, holds one process-level SDL_ttf
