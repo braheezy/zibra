@@ -34,11 +34,16 @@ before changing ownership or thread boundaries.
   opacity; opacity-only paint ancestors multiply that scalar so the cached
   surface is sampled once during its final draw. Keep this module independent
   of `Browser`, SDL, and native-window lifecycle.
-- `focus_ring.zig` generates pointer-free focus-indicator commands. The page
-  focus ring is one padded rectangle painted as a 4px white outline followed
-  by a 2px black outline; reserve both commands before appending either so OOM
-  cannot publish a half-ring. Accessibility highlighting remains a separate
-  requested-color outline.
+- `layout.zig` resolves every painted inline fragment to its nearest focusable
+  DOM ancestor and unions those fragments once per visual line. Nested inline
+  descendants therefore share their ancestor's wrapped focus geometry. After
+  child layout, a block-displayed focusable element replaces only its own line
+  fragments with one block box; independently focusable descendants remain.
+- `focus_ring.zig` generates pointer-free focus-indicator commands. Each
+  published focus rectangle is padded and painted as a 4px white outline
+  followed by a 2px black outline; reserve both commands before appending
+  either so OOM cannot publish a half-ring. Accessibility highlighting remains
+  a separate requested-color outline.
 - `effects.zig` contains pixel-only software effects. Keep its APIs explicit
   about premultiplication, edge sampling, and temporary allocation.
 - `raster_snapshot.zig` is the thread-transfer boundary. Snapshots must deep

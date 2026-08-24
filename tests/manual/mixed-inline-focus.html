@@ -1,0 +1,25 @@
+<!--
+How to verify:
+1. The mixed inline link receives focus on load. Its two-tone focus ring covers
+   plain, bold, and italic descendants as one fragment per wrapped line.
+2. Click the block below. It receives one rectangular ring around the complete
+   block, not separate rings around "many", "bold", and "lines".
+3. Resize or zoom until the link wraps differently; its fragment rings continue
+   to follow every painted line without becoming one large bounding rectangle.
+-->
+<!doctype html>
+<style>
+  body { font: 20px sans-serif; }
+  .narrow { width: 230px; }
+  a { background-color: #dbeafe; }
+  .block-target {
+    width: 230px;
+    background-color: #fef3c7;
+  }
+</style>
+<p class="narrow">
+  <a id="mixed" href="#done">plain <b>bold nested</b> and <i>italic</i> link text</a>
+</p>
+<div id="block" class="block-target" tabindex="2">many<br><b>bold</b><br>lines</div>
+<p id="done">Focus geometry complete.</p>
+<script>mixed.focus()</script>

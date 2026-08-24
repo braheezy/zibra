@@ -51,6 +51,11 @@ input styling.
 black panels. The same 4px-white/2px-black two-tone ring must remain visible on
 both backgrounds and follow keyboard focus without leaving a stale ring.
 
+`tests/manual/mixed-inline-focus.html` checks focus geometry rather than ring
+color: nested inline descendants merge into one rectangle per wrapped line,
+while a multiline block with `tabindex` receives one rectangle around the
+whole block.
+
 `tests/manual/focus-method-events.html` verifies script focusability,
 target-only focus/blur event order, synchronous layout before focus scrolling,
 and address-bar blur when JavaScript returns focus to page content.

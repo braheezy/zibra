@@ -199,9 +199,11 @@ before changing `root.zig`, `tab.zig`, `render/`, or browser task scheduling.
   content-focus intent by stable Tab identity; only the UI tick may blur the
   chrome-owned address input.
 - Page focus indicators paint after document content as two coincident outline
-  commands: a 4px white stroke below a 2px black stroke. This two-tone ring
-  must follow every focused-element bounds entry and remain distinct from the
-  amber accessibility highlight.
+  commands: a 4px white stroke below a 2px black stroke. Mixed inline content
+  publishes one bounds entry per wrapped visual line, including fragments from
+  nested inline descendants; a block-displayed focus target publishes only its
+  complete block box. The ring must follow every resulting bounds entry and
+  remain distinct from the amber accessibility highlight.
 - SDL finger coordinates are normalized; convert them against the addressed
   Browser's current native-window dimensions before dispatch. Each Browser's
   UI-thread-only touch tracker keys contacts by both touch-device and finger

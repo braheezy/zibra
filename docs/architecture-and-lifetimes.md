@@ -1334,6 +1334,15 @@ edge remains visible on dark content. Both commands are pointer-free and move
 with the frame display-list generation; the amber accessibility highlight is a
 separate single outline and does not replace either focus stroke.
 
+Inline focus geometry is collected from painted fragments, not merely from the
+DOM node that directly owns each glyph. Every fragment climbs to its nearest
+focusable ancestor, so nested inline descendants are unioned into one bounds
+entry per visual line and wrapped inlines retain multiple rectangles. Once a
+focusable block has laid out its descendants, it transactionally replaces all
+of its own fragment entries with the block box while leaving independently
+focusable descendant entries intact. This prevents multiline block targets
+from acquiring a separate ring around every line.
+
 `Tab.buildAccessibilityTree` in
 [`src/browser/tab.zig`](../src/browser/tab.zig) now moves the prior generation's
 string list to `previous_strings`. The previous tree and strings remain alive

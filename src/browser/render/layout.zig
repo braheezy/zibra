@@ -2208,46 +2208,20 @@ fn flushLine(self: *Layout, line_buffer: *std.ArrayList(LineItem)) !void {
                 try self.recordLinkBounds(ptr, bounds_x, line_bounds_y, item.width, line_box_height);
                 try self.recordFragmentTargets(ptr, line_bounds_y);
                 if (findFocusableNode(ptr)) |focus_node| {
-                    const right = bounds_x + item.width;
-                    const bottom = bounds_y + item.height;
-                    if (focus_map.getPtr(focus_node)) |existing| {
-                        const existing_right = existing.x + existing.width;
-                        const existing_bottom = existing.y + existing.height;
-                        if (bounds_x < existing.x) existing.x = bounds_x;
-                        if (bounds_y < existing.y) existing.y = bounds_y;
-                        const new_right = if (right > existing_right) right else existing_right;
-                        const new_bottom = if (bottom > existing_bottom) bottom else existing_bottom;
-                        existing.width = new_right - existing.x;
-                        existing.height = new_bottom - existing.y;
-                    } else {
-                        try focus_map.put(focus_node, .{
-                            .x = bounds_x,
-                            .y = bounds_y,
-                            .width = item.width,
-                            .height = item.height,
-                        });
-                    }
+                    try includeBounds(&focus_map, focus_node, .{
+                        .x = bounds_x,
+                        .y = bounds_y,
+                        .width = item.width,
+                        .height = item.height,
+                    });
                 }
                 if (findAccessibleNode(ptr)) |accessible_node| {
-                    const right = bounds_x + item.width;
-                    const bottom = bounds_y + item.height;
-                    if (accessibility_map.getPtr(accessible_node)) |existing| {
-                        const existing_right = existing.x + existing.width;
-                        const existing_bottom = existing.y + existing.height;
-                        if (bounds_x < existing.x) existing.x = bounds_x;
-                        if (bounds_y < existing.y) existing.y = bounds_y;
-                        const new_right = if (right > existing_right) right else existing_right;
-                        const new_bottom = if (bottom > existing_bottom) bottom else existing_bottom;
-                        existing.width = new_right - existing.x;
-                        existing.height = new_bottom - existing.y;
-                    } else {
-                        try accessibility_map.put(accessible_node, .{
-                            .x = bounds_x,
-                            .y = bounds_y,
-                            .width = item.width,
-                            .height = item.height,
-                        });
-                    }
+                    try includeBounds(&accessibility_map, accessible_node, .{
+                        .x = bounds_x,
+                        .y = bounds_y,
+                        .width = item.width,
+                        .height = item.height,
+                    });
                 }
             }
         }
@@ -2613,6 +2587,99 @@ fn findFocusableNode(node_ptr: *Node) ?*Node {
         }
     }
     return null;
+}
+
+fn includeBounds(
+    map: *std.AutoHashMap(*Node, Bounds),
+    node: *Node,
+    bounds: Bounds,
+) !void {
+    const right = bounds.x + bounds.width;
+    const bottom = bounds.y + bounds.height;
+    if (map.getPtr(node)) |existing| {
+        const existing_right = existing.x + existing.width;
+        const existing_bottom = existing.y + existing.height;
+        if (bounds.x < existing.x) existing.x = bounds.x;
+        if (bounds.y < existing.y) existing.y = bounds.y;
+        existing.width = @max(right, existing_right) - existing.x;
+        existing.height = @max(bottom, existing_bottom) - existing.y;
+        return;
+    }
+    try map.put(node, bounds);
+}
+
+test "nested inline focus fragments resolve to one target per visual line" {
+    const allocator = std.testing.allocator;
+    var html_parser = try parser.HTMLParser.init(
+        allocator,
+        "<a href='/next'>a <b>bold</b> link</a>",
+    );
+    defer html_parser.deinit(allocator);
+    html_parser.use_implicit_tags = false;
+    var root = try html_parser.parse();
+    defer root.deinit(allocator);
+    parser.fixParentPointers(&root, null);
+
+    var nodes = std.ArrayList(*Node).empty;
+    defer nodes.deinit(allocator);
+    try parser.treeToList(allocator, &root, &nodes);
+
+    var anchor: ?*Node = null;
+    var text_nodes = std.ArrayList(*Node).empty;
+    defer text_nodes.deinit(allocator);
+    for (nodes.items) |node| switch (node.*) {
+        .element => |element| {
+            if (std.ascii.eqlIgnoreCase(element.tag, "a")) anchor = node;
+        },
+        .text => try text_nodes.append(allocator, node),
+    };
+
+    try std.testing.expect(anchor != null);
+    try std.testing.expectEqual(@as(usize, 3), text_nodes.items.len);
+    for (text_nodes.items) |text_node| {
+        try std.testing.expect(findFocusableNode(text_node) == anchor.?);
+    }
+
+    var first_line = std.AutoHashMap(*Node, Bounds).init(allocator);
+    defer first_line.deinit();
+    try includeBounds(&first_line, findFocusableNode(text_nodes.items[0]).?, .{
+        .x = 10,
+        .y = 20,
+        .width = 20,
+        .height = 10,
+    });
+    try includeBounds(&first_line, findFocusableNode(text_nodes.items[1]).?, .{
+        .x = 30,
+        .y = 18,
+        .width = 15,
+        .height = 14,
+    });
+    try includeBounds(&first_line, findFocusableNode(text_nodes.items[2]).?, .{
+        .x = 45,
+        .y = 20,
+        .width = 25,
+        .height = 10,
+    });
+    try std.testing.expectEqual(@as(usize, 1), first_line.count());
+    const first_bounds = first_line.get(anchor.?).?;
+    try std.testing.expectEqual(@as(i32, 10), first_bounds.x);
+    try std.testing.expectEqual(@as(i32, 18), first_bounds.y);
+    try std.testing.expectEqual(@as(i32, 60), first_bounds.width);
+    try std.testing.expectEqual(@as(i32, 14), first_bounds.height);
+
+    // flushLine uses a fresh map for each line, so wrapping deliberately keeps
+    // another fragment instead of making one tall bounding rectangle.
+    var second_line = std.AutoHashMap(*Node, Bounds).init(allocator);
+    defer second_line.deinit();
+    try includeBounds(&second_line, anchor.?, .{
+        .x = 10,
+        .y = 40,
+        .width = 18,
+        .height = 10,
+    });
+    const second_bounds = second_line.get(anchor.?).?;
+    try std.testing.expectEqual(@as(i32, 40), second_bounds.y);
+    try std.testing.expectEqual(@as(i32, 18), second_bounds.width);
 }
 
 fn isPresentationalTag(tag: []const u8) bool {
@@ -5160,8 +5227,6 @@ const BlockLayout = struct {
             natural_height = auto_height;
             self.height.set(specified_height orelse auto_height);
             self.zoom.set(1.0);
-
-            try recordContentEditableFocusBounds(engine, self);
         } else {
             // Inline layout mode - use the old approach for now
             // TODO: Refactor to populate LineLayout and TextLayout objects
@@ -5180,9 +5245,10 @@ const BlockLayout = struct {
             natural_height = self.height.get().*;
             if (specified_height) |height| self.height.set(height);
 
-            try recordContentEditableFocusBounds(engine, self);
             // Height is set by layoutInlineBlock - need to ensure it uses .set()
         }
+
+        try recordElementFocusBounds(engine, self);
 
         self.updateScrollGeometry(specified_height, natural_height);
 
@@ -5798,12 +5864,61 @@ fn appendTableOfContentsHeader(self: *Layout, commands: *std.ArrayList(DisplayIt
     } });
 }
 
-fn recordContentEditableFocusBounds(self: *Layout, block: *const BlockLayout) !void {
-    if (block.node != .element) return;
-    const element = block.node.element;
-    if (element.attributes == null) return;
-    if (element.attributes.?.get("contenteditable") == null) return;
+fn elementUsesBlockFocusBox(element: *const parser.Element) bool {
+    const style_map = if (element.style) |*styles| styles else return false;
+    const display = styleValue(style_map, "display") orelse return false;
+    return isBlockDisplay(display);
+}
+
+fn hasFocusBoundsForNode(entries: []const FocusBoundEntry, node: *Node) bool {
+    for (entries) |entry| {
+        if (entry.node == node) return true;
+    }
+    return false;
+}
+
+/// Replace every inline fragment for `node` with one block-level box while
+/// preserving entries for independently focusable descendants. Capacity is
+/// reserved before compaction so an allocation failure leaves the old
+/// generation intact.
+fn replaceFocusBoundsForNode(
+    allocator: std.mem.Allocator,
+    entries: *std.ArrayList(FocusBoundEntry),
+    node: *Node,
+    bounds: Bounds,
+) !void {
+    try entries.ensureUnusedCapacity(allocator, 1);
+
+    var write_index: usize = 0;
+    for (entries.items) |entry| {
+        if (entry.node == node) continue;
+        entries.items[write_index] = entry;
+        write_index += 1;
+    }
+    entries.items.len = write_index;
+    entries.appendAssumeCapacity(.{ .node = node, .bounds = bounds });
+}
+
+fn recordElementFocusBounds(self: *Layout, block: *const BlockLayout) !void {
     const node_ptr = block.node_ptr orelse return;
+    const element = switch (node_ptr.*) {
+        .element => |*value| value,
+        .text => return,
+    };
+    if (!dom_focus.isProgrammaticallyFocusable(element)) return;
+
+    const use_block_box = elementUsesBlockFocusBox(element);
+    if (!use_block_box and hasFocusBoundsForNode(self.focus_bounds.items, node_ptr)) return;
+
+    // Non-empty inline elements already received fragment bounds while each
+    // visual line was flushed. Keep those separate instead of surrounding all
+    // wrapped lines with one large rectangle. The fallback below preserves the
+    // prior empty-contenteditable focus target without affecting ordinary
+    // empty inline elements.
+    if (!use_block_box) {
+        const attributes = element.attributes orelse return;
+        if (attributes.get("contenteditable") == null) return;
+    }
 
     var height = block.height.get().*;
     if (height <= 0) {
@@ -5817,33 +5932,59 @@ fn recordContentEditableFocusBounds(self: *Layout, block: *const BlockLayout) !v
         height = self.toLayoutPx(glyph.ascent + glyph.descent);
     }
 
-    const block_bounds = Bounds{
+    const bounds = Bounds{
         .x = block.x.get().*,
         .y = block.y.get().*,
         .width = block.width.get().*,
         .height = height,
     };
 
-    for (self.focus_bounds.items) |*entry| {
-        if (entry.node == node_ptr) {
-            const entry_right = entry.bounds.x + entry.bounds.width;
-            const entry_bottom = entry.bounds.y + entry.bounds.height;
-            const block_right = block_bounds.x + block_bounds.width;
-            const block_bottom = block_bounds.y + block_bounds.height;
-            if (block_bounds.x < entry.bounds.x) entry.bounds.x = block_bounds.x;
-            if (block_bounds.y < entry.bounds.y) entry.bounds.y = block_bounds.y;
-            const new_right = if (block_right > entry_right) block_right else entry_right;
-            const new_bottom = if (block_bottom > entry_bottom) block_bottom else entry_bottom;
-            entry.bounds.width = new_right - entry.bounds.x;
-            entry.bounds.height = new_bottom - entry.bounds.y;
-            return;
-        }
+    if (use_block_box) {
+        try replaceFocusBoundsForNode(self.allocator, &self.focus_bounds, node_ptr, bounds);
+    } else {
+        try self.focus_bounds.append(self.allocator, .{ .node = node_ptr, .bounds = bounds });
     }
+}
 
-    try self.focus_bounds.append(self.allocator, .{
-        .node = node_ptr,
-        .bounds = block_bounds,
+test "block focus boxes replace line fragments without hiding descendants" {
+    const allocator = std.testing.allocator;
+    var block_node = Node{ .element = try parser.Element.init(allocator, "div tabindex=2", null) };
+    defer block_node.deinit(allocator);
+    try setTestDisplay(allocator, &block_node, "block");
+    try std.testing.expect(dom_focus.isProgrammaticallyFocusable(&block_node.element));
+    try std.testing.expect(elementUsesBlockFocusBox(&block_node.element));
+
+    var inline_node = Node{ .element = try parser.Element.init(allocator, "a href=/next", null) };
+    defer inline_node.deinit(allocator);
+    try setTestDisplay(allocator, &inline_node, "inline");
+    try std.testing.expect(!elementUsesBlockFocusBox(&inline_node.element));
+
+    var entries = std.ArrayList(FocusBoundEntry).empty;
+    defer entries.deinit(allocator);
+    try entries.append(allocator, .{
+        .node = &block_node,
+        .bounds = .{ .x = 12, .y = 20, .width = 40, .height = 12 },
     });
+    try entries.append(allocator, .{
+        .node = &inline_node,
+        .bounds = .{ .x = 30, .y = 34, .width = 24, .height = 12 },
+    });
+    try entries.append(allocator, .{
+        .node = &block_node,
+        .bounds = .{ .x = 12, .y = 48, .width = 36, .height = 12 },
+    });
+
+    const block_bounds = Bounds{ .x = 8, .y = 16, .width = 200, .height = 72 };
+    try replaceFocusBoundsForNode(allocator, &entries, &block_node, block_bounds);
+
+    try std.testing.expectEqual(@as(usize, 2), entries.items.len);
+    try std.testing.expect(entries.items[0].node == &inline_node);
+    try std.testing.expectEqual(@as(i32, 30), entries.items[0].bounds.x);
+    try std.testing.expect(entries.items[1].node == &block_node);
+    try std.testing.expectEqual(block_bounds.x, entries.items[1].bounds.x);
+    try std.testing.expectEqual(block_bounds.y, entries.items[1].bounds.y);
+    try std.testing.expectEqual(block_bounds.width, entries.items[1].bounds.width);
+    try std.testing.expectEqual(block_bounds.height, entries.items[1].bounds.height);
 }
 
 fn layoutInlineBlock(self: *Layout, block: *BlockLayout) !void {
