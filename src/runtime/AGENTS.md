@@ -24,7 +24,10 @@ before changing queues, thread lifetime, shutdown, or helper accounting.
   work and joins the worker. Do not reintroduce detached workers.
 - `TaskRunner.initNamed` borrows a stable worker label for native thread naming
   and trace registration. BrowserSession uses one heap-stable runner named
-  `Networking thread`; it must stop before the shared `MeasureTime` it borrows.
+  `Networking thread`; each Tab also owns a runner named `Accessibility thread`
+  whose tasks own complete speech text. Both must stop before the shared
+  `MeasureTime` they borrow. Stop the Tab's serialized producer before its
+  accessibility runner so no new utterance can race speaker shutdown.
 - `thread_batch.zig` is a synchronous join boundary for caller-owned job/result
   slots. Construct the complete slice before starting it; every native thread
   must be joined before return, and a spawn failure must retain correct

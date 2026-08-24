@@ -165,12 +165,17 @@ before changing `root.zig`, `tab.zig`, `render/`, or browser task scheduling.
   boundary so changing its implementation does not shift document screenshots
   or viewport calculations.
 - Screen-reader document reading is incremental. `Tab.advanceAccessibility`
-  advances one preorder accessibility-tree node, speaks it, stores the current
-  node as the persistent amber highlight, and schedules paint; the synthetic
-  document root is skipped for the first visual step. Accessibility-tree
-  rebuilds remap the reading/highlight pointers through their DOM nodes before
-  retiring the prior tree. The F4 key and the `read page` voice command each
-  advance once.
+  advances one preorder accessibility-tree node, queues it for speech, stores
+  the current node as the persistent amber highlight, and schedules paint; the
+  synthetic document root is skipped for the first visual step. Every Tab owns
+  one named accessibility worker. Queueing flattens role/name/value into owned
+  bytes, so no speech payload retains a DOM, accessibility-tree, or Tab pointer.
+  The serialized Tab worker stops first during shutdown; the accessibility
+  worker then cancels pending utterances and joins an active backend call before
+  tree strings and shared measurement retire. Turning the screen reader off
+  also clears pending speech. Accessibility-tree rebuilds remap the reading /
+  highlight pointers through their DOM nodes before retiring the prior tree.
+  The F4 key and the `read page` voice command each advance once.
 - Address-bar editing uses a byte insertion point in the inclusive range
   `0..address_bar.items.len`. SDL admits only printable ASCII into this buffer,
   so Left, Right, insertion, and Backspace operate on bytes; focus, blur, and a

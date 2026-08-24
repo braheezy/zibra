@@ -36,6 +36,7 @@ The source tree is organized by responsibility:
 | [`src/browser/app.zig`](../src/browser/app.zig) | Process-wide interactive SDL event routing, heap-stable native-window registry, shared session/measurement ownership, generation broadcast, and addressed window shutdown. |
 | [`src/browser/root.zig`](../src/browser/root.zig) | Per-window `Browser`, navigation and fetch coordination, render commit, composition, raster, draw, and standalone headless construction; it re-exports compatibility types while delegating independent algorithms and task payloads to focused modules. |
 | [`src/browser/tab.zig`](../src/browser/tab.zig) | `Tab` and `Frame` ownership, task serialization, history, frame lookup, accessibility, focus, and per-document state. |
+| [`src/browser/accessibility_speech.zig`](../src/browser/accessibility_speech.zig) | Per-tab owned speech snapshots, the named accessibility runner, backend dispatch, cancellation, and join boundary. |
 | [`src/browser/tab_tasks.zig`](../src/browser/tab_tasks.zig) | Owned navigation, script, and tagged UI-action payloads transferred to a serialized Tab runner; instantiated with the Browser type without importing `root.zig`. |
 | [`src/browser/js_context.zig`](../src/browser/js_context.zig) | Stable generation-stamped synchronous host-callback identity embedded in each JavaScript-capable Frame. |
 | [`src/browser/script_tasks.zig`](../src/browser/script_tasks.zig) | Detached timer, animation, asynchronous XHR, cookie, and postMessage callback adapters and queued payload cleanup, instantiated without importing `root.zig`. |
@@ -96,9 +97,13 @@ process main thread
           v
   one TaskRunner worker per Tab
     navigation, parsing, DOM, style, layout, paint, JavaScript host work
-          |
-          | synchronous fetch bridge submits borrowed request inputs
-          v
+    |
+    |-- owned role/name/value snapshot; no page pointer crosses
+    |     `--> one Accessibility thread per Tab
+    |            serialized speech backend calls
+    |
+    | synchronous fetch bridge submits borrowed request inputs
+    v
     shared BrowserSession Networking thread
       navigation, image, iframe, XHR, script/style batch dispatch
           |
@@ -271,13 +276,14 @@ borrows from every window have ended.
 - one Kiesel `Js` context per origin key;
 - frame-ID maps plus tab-wide and per-document generation counters;
 - the `TaskRunner` and accounting for detached helper threads;
+- one named accessibility runner whose queued tasks own complete utterances;
 - dynamic text allocations;
 - the accessibility tree and its backing strings;
 - per-tab dirty flags and composited updates.
 
-`Tab` borrows its `Browser` and the heap-stable `MeasureTime` used by its
-`TaskRunner`. That measurement owner is BrowserApp in interactive mode and the
-standalone Browser in screenshot mode.
+`Tab` borrows its `Browser` and the heap-stable `MeasureTime` used by both of
+its named runners. That measurement owner is BrowserApp in interactive mode
+and the standalone Browser in screenshot mode.
 
 ### Frame
 
@@ -1354,13 +1360,21 @@ cross-thread snapshot: main-thread hover and voice paths can still read or
 mutate accessibility state while the tab worker rebuilds it. That broader
 thread-ownership contract remains unresolved.
 
-Document reading is incremental: `Tab.advanceAccessibility` walks one
-preorder accessibility node per F4/read-page request, speaks that node, and
+Document reading is incremental: `Tab.advanceAccessibility` walks one preorder
+accessibility node per F4/read-page request, queues that node's speech, and
 stores it as the amber highlight target so the next paint displays exactly
-what was announced. The synthetic document root is not the first visual
-target. Because accessibility trees are rebuilt after layout, the reading and
-highlight pointers are remapped through their borrowed DOM nodes while the
-replacement tree is alive; if a node was removed, the cursor is cleared.
+what was announced. Queueing synchronously flattens reason, role, name, and any
+non-password input value into independently owned bytes. The per-Tab
+`Accessibility thread` therefore blocks only itself inside the speech backend
+and its queued payload never retains a Tab, DOM node, accessibility node, or
+tree-string slice. The thread itself borrows its heap-stable Tab's embedded
+runner field until `shutdown` joins it.
+Requests are serialized in queue order. Disabling the screen reader clears
+requests that have not begun; an active call remains owned until shutdown joins
+it. The synthetic document root is not the first visual target. Because
+accessibility trees are rebuilt after layout, the reading and highlight
+pointers are remapped through their borrowed DOM nodes while the replacement
+tree is alive; if a node was removed, the cursor is cleared.
 
 ## SDL and graphics contract
 
@@ -1430,7 +1444,8 @@ The enforced SDL contract is:
 1. publish shutdown and reject new browser/tab/JS work;
 2. stop/join each Browser's raster runner and release any completed surface;
 3. wake long timer helpers, interrupt JavaScript running on each tab worker,
-   and stop/join the workers;
+   stop/join those serialized workers, then cancel/join each Tab's
+   accessibility runner after its final speech producer is gone;
 4. wait for accounted helpers, whose completion tasks are rejected and cleaned
    by the stopped runner;
 5. retire browser render snapshots, then destroy tabs, frames, DOM, and JS;

@@ -64,6 +64,11 @@ and address-bar blur when JavaScript returns focus to page content.
 screen-reader mode and each F4/read-page step speaks and highlights the same
 accessibility node, including non-focusable content.
 
+`tests/manual/threaded-accessibility.html` keeps animation and input visible
+while a deliberately long node is spoken. It checks that speech does not block
+UI work, copied utterances remain ordered, and disabling the screen reader
+cancels speech that has not started.
+
 `tests/manual/max-width-media.html` crosses an inclusive 500-CSS-pixel
 `max-width` query using page zoom and native resize; the visible text and panel
 change from red to green while the query is active.

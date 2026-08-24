@@ -1762,6 +1762,7 @@ pub const Browser = struct {
             .f3 => {
                 if (self.activeTab()) |tab| {
                     tab.accessibility.screen_reader = !tab.accessibility.screen_reader;
+                    if (!tab.accessibility.screen_reader) tab.clearAccessibilitySpeech();
                     tab.setNeedsRender();
                     tab.logAccessibilitySettings("toggle screen_reader");
                     if (tab.accessibility.screen_reader) {

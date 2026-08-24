@@ -1,0 +1,37 @@
+<!--
+How to verify:
+1. Press F3 to enable the screen reader, then press F4 to begin reading.
+2. While an utterance is still being spoken, type in the text box, move the
+   pointer between elements, and scroll. Input, highlighting, and the pulsing
+   square remain responsive because speech is not running on the UI thread.
+3. Press F4 several times quickly. Complete utterances are spoken in request
+   order, without reading corrupted text after later highlights appear.
+4. Press F3 again while several utterances are queued. Pending speech is
+   canceled; an utterance that already started is allowed to finish safely.
+-->
+<!doctype html>
+<meta charset="utf-8">
+<title>Threaded accessibility speech</title>
+<style>
+  @keyframes pulse {
+    from { opacity: 0.25; transform: translate(0px, 0px); }
+    to { opacity: 1; transform: translate(80px, 0px); }
+  }
+  body { font-family: sans-serif; width: 560px; }
+  .pulse {
+    width: 40px;
+    height: 40px;
+    background-color: #2563eb;
+    animation: pulse 2s linear 3 alternate;
+  }
+  .spacer { height: 700px; }
+</style>
+
+<h1>Threaded screen-reader demonstration</h1>
+<p aria-label="This deliberately long announcement gives the accessibility speech backend time to remain active while browser input and rendering continue on their own threads.">
+  Long accessibility announcement.
+</p>
+<label>Type while speech runs <input value="responsive"></label>
+<div class="pulse" aria-label="animated blue square"></div>
+<div class="spacer"></div>
+<p>Scroll target at the end of the document.</p>

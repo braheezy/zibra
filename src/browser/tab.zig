@@ -14,6 +14,7 @@ const CSSParser = @import("../document/css_parser.zig");
 const task = @import("../runtime/task.zig");
 const sync = @import("../runtime/sync.zig");
 const scroll_model = @import("scroll.zig");
+const AccessibilitySpeech = @import("accessibility_speech.zig").Worker;
 const MeasureTime = @import("../runtime/measure_time.zig").MeasureTime;
 const js_module = @import("../script/js.zig");
 
@@ -942,6 +943,8 @@ parent_window_ids: std.AutoHashMap(u32, u32),
 next_window_id: u32 = 1,
 // Pending asynchronous work for this tab
 task_runner: TaskRunner,
+// Serialized speech owns copied utterances and never borrows this Tab's tree.
+accessibility_speech: AccessibilitySpeech,
 async_thread_refs: usize = 0,
 async_thread_mutex: sync.Mutex,
 async_thread_condition: sync.Condition,
@@ -996,6 +999,7 @@ pub fn init(allocator: std.mem.Allocator, tab_width: i32, tab_height: i32, measu
         .dynamic_texts = std.ArrayList([]const u8).empty,
         .js_contexts = std.StringHashMap(*js_module).init(allocator),
         .task_runner = TaskRunner.init(allocator, measure),
+        .accessibility_speech = AccessibilitySpeech.init(std.heap.smp_allocator, measure),
         .async_thread_mutex = .init(measure.io),
         .async_thread_condition = .init(measure.io),
         .intervals = std.AutoHashMap(IntervalKey, void).init(allocator),
@@ -1139,9 +1143,11 @@ test "zoom changes CSS viewport width and invalidates media rules" {
     try std.testing.expect(!tab.media_environment_dirty);
 }
 
-/// Start the task runner thread. Must be called after the Tab is in its final memory location.
+/// Start both embedded runner threads after the Tab reaches its final address.
 pub fn start(self: *Tab) !void {
     try self.task_runner.start();
+    errdefer self.task_runner.shutdown();
+    try self.accessibility_speech.start();
 }
 
 /// Stop every producer of tab work and wait until no worker/helper can borrow
@@ -1154,8 +1160,9 @@ pub fn shutdown(self: *Tab) void {
     self.interval_mutex.unlock();
 
     // Joining the serialized worker first prevents an active task from
-    // launching a new helper after the helper count has reached zero.
+    // launching a new helper or speech request after its producer boundary.
     self.task_runner.shutdown();
+    self.accessibility_speech.shutdown();
     self.waitForAsyncThreads();
     self.invalidateJsContext();
 }
@@ -1201,6 +1208,7 @@ pub fn deinit(self: *Tab) void {
     self.history.deinit(self.allocator);
 
     self.task_runner.deinit();
+    self.accessibility_speech.deinit();
     self.accessibility_polite_queue.deinit(self.allocator);
 }
 
@@ -1392,10 +1400,11 @@ pub fn releaseAsyncThread(self: *Tab) void {
     self.async_thread_mutex.unlock();
 }
 
-/// Return whether the serialized worker and all detached helpers are idle.
+/// Return whether both serialized workers and all detached helpers are idle.
 /// Screenshot mode uses this to keep shared SDL_ttf state single-threaded.
 pub fn isQuiescent(self: *Tab) bool {
     if (!self.task_runner.isIdle()) return false;
+    if (!self.accessibility_speech.isIdle()) return false;
     self.async_thread_mutex.lock();
     defer self.async_thread_mutex.unlock();
     return self.async_thread_refs == 0;
@@ -3834,8 +3843,6 @@ pub fn updateAccessibilityHover(self: *Tab, node: ?*AccessibilityNode) void {
 }
 
 fn speakAccessibilityNode(self: *Tab, node: *AccessibilityNode, reason: []const u8) void {
-    _ = self;
-    var value_buf: [128]u8 = undefined;
     var value_text: []const u8 = "";
     if (node.dom_node) |dom| {
         switch (dom.*) {
@@ -3854,21 +3861,18 @@ fn speakAccessibilityNode(self: *Tab, node: *AccessibilityNode, reason: []const 
         }
     }
 
-    if (value_text.len > 0) {
-        const formatted = std.fmt.bufPrint(&value_buf, "{s} {s} value {s}", .{
-            node.role,
-            node.name,
-            value_text,
-        }) catch return;
-        std.log.info("screen reader {s}: {s}", .{ reason, formatted });
-        return;
-    }
+    self.accessibility_speech.enqueue(
+        reason,
+        node.role,
+        node.name,
+        value_text,
+    ) catch |err| {
+        std.log.warn("Failed to queue accessibility speech: {}", .{err});
+    };
+}
 
-    if (node.name.len > 0) {
-        std.log.info("screen reader {s}: {s} {s}", .{ reason, node.role, node.name });
-    } else {
-        std.log.info("screen reader {s}: {s}", .{ reason, node.role });
-    }
+pub fn clearAccessibilitySpeech(self: *Tab) void {
+    self.accessibility_speech.clear();
 }
 
 fn findLiveSetting(node: *AccessibilityNode) ?LiveSetting {
