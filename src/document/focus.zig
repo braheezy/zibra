@@ -7,6 +7,15 @@
 const std = @import("std");
 const parser = @import("parser.zig");
 
+/// Input provenance retained by a Tab for subsequent synchronous focus()
+/// calls. Keyboard-like focus always needs an indicator; pointer focus keeps
+/// it only for controls where the caret/control state would otherwise be easy
+/// to lose, such as inputs and editable regions.
+pub const Modality = enum {
+    keyboard,
+    pointer,
+};
+
 fn explicitTabIndex(element: *const parser.Element) ?i32 {
     const attrs = element.attributes orelse return null;
     const raw = attrs.get("tabindex") orelse return null;
@@ -61,6 +70,28 @@ pub fn isSequentiallyFocusable(element: *const parser.Element) bool {
     return explicitTabIndex(element).? >= 0;
 }
 
+/// Decide the focus-visible state to install for a newly focused element.
+/// Hidden and disabled controls are rejected even if a caller bypasses the
+/// normal focusability check.
+pub fn indicatorVisibleFor(
+    element: *const parser.Element,
+    modality: Modality,
+) bool {
+    if (!isProgrammaticallyFocusable(element)) return false;
+    if (modality == .keyboard) return true;
+
+    // Pointer-focused text controls still need a visible editing affordance.
+    // The exercise explicitly applies this to every visible input; retaining
+    // it for contenteditable matches the same caret-oriented heuristic.
+    return std.ascii.eqlIgnoreCase(element.tag, "input") or
+        isContentEditable(element);
+}
+
+/// The state predicate shared by selector matching and native ring paint.
+pub fn hasVisibleFocus(element: *const parser.Element) bool {
+    return element.is_focused and element.is_focus_visible;
+}
+
 test "programmatic focus includes negative tabindex while sequential focus does not" {
     const allocator = std.testing.allocator;
     var programmatic = try parser.Element.init(allocator, "div tabindex=-1", null);
@@ -105,4 +136,34 @@ test "native links and editable elements follow HTML focus rules" {
     try std.testing.expect(!isProgrammaticallyFocusable(&plain_link));
     try std.testing.expect(isProgrammaticallyFocusable(&editable));
     try std.testing.expect(!isProgrammaticallyFocusable(&false_editable));
+}
+
+test "focus-visible heuristic distinguishes pointer controls from keyboard focus" {
+    const allocator = std.testing.allocator;
+    var link = try parser.Element.init(allocator, "a href=/next", null);
+    defer link.deinit(allocator);
+    var button = try parser.Element.init(allocator, "button", null);
+    defer button.deinit(allocator);
+    var input = try parser.Element.init(allocator, "input", null);
+    defer input.deinit(allocator);
+    var editable = try parser.Element.init(allocator, "div contenteditable", null);
+    defer editable.deinit(allocator);
+    var hidden = try parser.Element.init(allocator, "input type=hidden", null);
+    defer hidden.deinit(allocator);
+
+    try std.testing.expect(!indicatorVisibleFor(&link, .pointer));
+    try std.testing.expect(!indicatorVisibleFor(&button, .pointer));
+    try std.testing.expect(indicatorVisibleFor(&input, .pointer));
+    try std.testing.expect(indicatorVisibleFor(&editable, .pointer));
+    try std.testing.expect(!indicatorVisibleFor(&hidden, .pointer));
+
+    try std.testing.expect(indicatorVisibleFor(&link, .keyboard));
+    try std.testing.expect(indicatorVisibleFor(&button, .keyboard));
+    try std.testing.expect(indicatorVisibleFor(&input, .keyboard));
+    try std.testing.expect(!indicatorVisibleFor(&hidden, .keyboard));
+
+    input.is_focused = true;
+    try std.testing.expect(!hasVisibleFocus(&input));
+    input.is_focus_visible = true;
+    try std.testing.expect(hasVisibleFocus(&input));
 }

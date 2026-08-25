@@ -52,6 +52,7 @@ const url_module = @import("../network/url.zig");
 const Url = url_module.Url;
 const Layout = @import("render/layout.zig");
 const parser = @import("../document/parser.zig");
+const dom_focus = @import("../document/focus.zig");
 const HTMLParser = parser.HTMLParser;
 const Node = parser.Node;
 const ImageData = parser.ImageData;
@@ -4324,17 +4325,23 @@ pub const Browser = struct {
             Color{ .r = 0xf5, .g = 0x9e, .b = 0x0b, .a = 0xff };
 
         if (frame.focus) |focus_node| {
-            for (self.layout_engine.focus_bounds.items) |entry| {
-                if (entry.node == focus_node) {
-                    const rect = focus_ring.rectAround(
-                        entry.bounds.x,
-                        entry.bounds.y,
-                        entry.bounds.width,
-                        entry.bounds.height,
-                    );
-                    focus_ring.appendHighContrast(&focus_items, self.allocator, rect) catch |err| {
-                        std.log.warn("Failed to append focus ring: {}", .{err});
-                    };
+            const focus_is_visible = switch (focus_node.*) {
+                .element => |*element| dom_focus.hasVisibleFocus(element),
+                .text => false,
+            };
+            if (focus_is_visible) {
+                for (self.layout_engine.focus_bounds.items) |entry| {
+                    if (entry.node == focus_node) {
+                        const rect = focus_ring.rectAround(
+                            entry.bounds.x,
+                            entry.bounds.y,
+                            entry.bounds.width,
+                            entry.bounds.height,
+                        );
+                        focus_ring.appendHighContrast(&focus_items, self.allocator, rect) catch |err| {
+                            std.log.warn("Failed to append focus ring: {}", .{err});
+                        };
+                    }
                 }
             }
         }

@@ -1343,13 +1343,26 @@ The root document always emits a black canvas in this mode. Raster snapshots
 therefore contain only the small system palette for CSS paint; decoded images
 and color glyph bitmaps remain unmodified content.
 
-Focused page elements append their indicator after document paint using the
-layout generation's focus bounds. `render/focus_ring.zig` reserves and emits a
-4px white outline followed by a coincident 2px black outline around the padded
-bounds. The black center remains visible on light content and the exposed white
-edge remains visible on dark content. Both commands are pointer-free and move
-with the frame display-list generation; the amber accessibility highlight is a
-separate single outline and does not replace either focus stroke.
+Focused page elements retain both `Element.is_focused` and a focus-visible bit
+chosen from the Tab's current input modality. Primary clicks record pointer
+modality before JavaScript dispatch; links and buttons receive focus without a
+ring, while visible inputs and contenteditable controls keep one. Keyboard
+editing, activation, scrolling, or traversal promotes the current focus and
+all subsequently focused controls to focus-visible. Synchronous `focus()`
+inherits that modality. Blur and DOM-retirement boundaries clear both bits,
+and every transition dirties style so `:focus-visible` rematches in the same
+generation consumed by native paint.
+
+When that focus-visible bit is set, page paint appends the indicator after
+document content using the layout generation's focus bounds.
+`render/focus_ring.zig` reserves and emits a 4px white outline followed by a
+coincident 2px black outline around the padded bounds. The black center remains
+visible on light content and the exposed white edge remains visible on dark
+content. Both commands are pointer-free and move with the frame display-list
+generation; the amber accessibility highlight is a separate single outline
+and does not replace either focus stroke. Layout still records every
+programmatically focusable target because JavaScript focus needs geometry even
+when pointer modality suppresses the eventual ring.
 
 Inline focus geometry is collected from painted fragments, not merely from the
 DOM node that directly owns each glyph. Every fragment climbs to its nearest

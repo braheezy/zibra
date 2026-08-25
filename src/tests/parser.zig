@@ -887,6 +887,85 @@ test "selector sequences require every member and sum priorities" {
     try std.testing.expectError(error.InvalidSelector, invalid_parser.selector(allocator));
 }
 
+test ":focus-visible matches the installed focus heuristic and recomputes styles" {
+    const allocator = std.testing.allocator;
+    const html =
+        "<main><button class=widget>Outside-form button</button>" ++
+        "<input value=editable></main>";
+    const css =
+        ".widget { color: blue; }" ++
+        "button.widget:focus-visible { color: green; }" ++
+        "main :focus-visible { background-color: lightgray; }" ++
+        "input:focus-visible { font-weight: bold; }";
+
+    var html_parser = try HTMLParser.init(allocator, html);
+    html_parser.use_implicit_tags = false;
+    defer html_parser.deinit(allocator);
+    var root = try html_parser.parse();
+    defer root.deinit(allocator);
+    document_parser.fixParentPointers(&root, null);
+
+    var css_parser = try CSSParser.init(allocator, css, false);
+    defer css_parser.deinit(allocator);
+    const rules = try css_parser.parse(allocator);
+    defer {
+        for (rules) |*rule| rule.deinit(allocator);
+        allocator.free(rules);
+    }
+
+    try std.testing.expectEqual(@as(usize, 4), rules.len);
+    switch (rules[1].selector) {
+        .sequence => |sequence| {
+            try std.testing.expectEqual(@as(usize, 3), sequence.selectors.items.len);
+        },
+        else => return error.TestExpectedSelectorSequence,
+    }
+    // button (1) + .widget (10) + :focus-visible (10)
+    try std.testing.expectEqual(@as(u32, 21), rules[1].cascadePriority());
+
+    try document_parser.style(allocator, &root, rules);
+    const button = &root.element.children.items[0].element;
+    const input = &root.element.children.items[1].element;
+    try std.testing.expectEqualStrings("blue", button.style.?.getPtr("color").?.get().*);
+    try std.testing.expectEqualStrings(
+        "transparent",
+        button.style.?.getPtr("background-color").?.get().*,
+    );
+
+    // Focus alone is insufficient when pointer modality suppressed the ring.
+    button.is_focused = true;
+    button.is_focus_visible = false;
+    document_parser.dirtyStyleForElement(button);
+    try document_parser.style(allocator, &root, rules);
+    try std.testing.expectEqualStrings("blue", button.style.?.getPtr("color").?.get().*);
+
+    button.is_focus_visible = true;
+    document_parser.dirtyStyleForElement(button);
+    try document_parser.style(allocator, &root, rules);
+    try std.testing.expectEqualStrings("green", button.style.?.getPtr("color").?.get().*);
+    try std.testing.expectEqualStrings(
+        "lightgray",
+        button.style.?.getPtr("background-color").?.get().*,
+    );
+
+    button.is_focused = false;
+    button.is_focus_visible = false;
+    input.is_focused = true;
+    input.is_focus_visible = true;
+    document_parser.dirtyStyleForElement(button);
+    document_parser.dirtyStyleForElement(input);
+    try document_parser.style(allocator, &root, rules);
+    try std.testing.expectEqualStrings("bold", input.style.?.getPtr("font-weight").?.get().*);
+    try std.testing.expectEqualStrings(
+        "lightgray",
+        input.style.?.getPtr("background-color").?.get().*,
+    );
+
+    var unsupported_parser = try CSSParser.init(allocator, "button:hover", false);
+    defer unsupported_parser.deinit(allocator);
+    try std.testing.expectError(error.InvalidSelector, unsupported_parser.selector(allocator));
+}
+
 test "descendant selectors are flat and match ordered ancestor chains" {
     const allocator = std.testing.allocator;
     const html =

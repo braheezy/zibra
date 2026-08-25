@@ -44,6 +44,11 @@ or selector/rule lifetime.
 - Concatenated tag/class selectors own a source-ordered `SelectorSequence` of
   atomic selectors, all of which must match the same element. Sequence
   specificity is the sum of its members.
+- `:focus-visible` is a dynamic class-specificity selector and may stand alone
+  or join a tag/class sequence. It matches only when both `Element.is_focused`
+  and the Tab-installed `Element.is_focus_visible` heuristic snapshot are set.
+  Focus transitions must dirty the element before styling so selector queries,
+  author rules, and the native focus ring observe the same generation.
 - Descendant selectors own a flat, source-ordered list of simple selectors.
   Matching callers must pass ancestors from the document root through the
   immediate parent so matching remains one O(n + d) backward walk.

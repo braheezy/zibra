@@ -560,6 +560,10 @@ pub const Element = struct {
     // Track strings we've allocated (like resolved percentage font sizes) so we can free them
     owned_strings: ?std.ArrayList([]const u8) = null,
     is_focused: bool = false,
+    // Snapshot of the user-agent focus-visible heuristic for this focus
+    // generation. Native focus-ring paint and `:focus-visible` both consume
+    // this bit so author styling cannot drift from the browser indicator.
+    is_focus_visible: bool = false,
     // Browser-session annotation used only while painting link descendants.
     // It owns no URL or session storage.
     is_visited: bool = false,
@@ -590,6 +594,7 @@ pub const Element = struct {
             .children = std.ArrayList(Node).empty,
             .owned_strings = null,
             .is_focused = false,
+            .is_focus_visible = false,
             .is_visited = false,
             .script_started = false,
             .animations = null,

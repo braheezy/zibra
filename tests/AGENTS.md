@@ -51,6 +51,11 @@ input styling.
 black panels. The same 4px-white/2px-black two-tone ring must remain visible on
 both backgrounds and follow keyboard focus without leaving a stale ring.
 
+`tests/manual/focus-visible.html` distinguishes modality from DOM focus: a
+clicked outside-form button has no native or author focus-visible indicator,
+keyboard-focused links/buttons have both, and a clicked or tabbed input keeps
+both. Its colored author rules also verify dynamic `:focus-visible` matching.
+
 `tests/manual/mixed-inline-focus.html` checks focus geometry rather than ring
 color: nested inline descendants merge into one rectangle per wrapped line,
 while a multiline block with `tabindex` receives one rectangle around the

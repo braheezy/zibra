@@ -544,6 +544,7 @@ fn initClickTab(tab: *tab_module.Tab, allocator: std.mem.Allocator) void {
     tab.accessibility = .{};
     tab.root_frame = null;
     tab.focused_frame = null;
+    tab.focus_modality = .keyboard;
     tab.frames_by_id = std.AutoHashMap(u32, *tab_module.Frame).init(allocator);
     tab.parent_window_ids = std.AutoHashMap(u32, u32).init(allocator);
 }
@@ -636,6 +637,7 @@ test "structural mutation retires a painted link before DOM removal" {
     const body = try findElement(&frame.current_node.?, "body");
     const link = try findElement(&frame.current_node.?, "a");
     link.element.is_focused = true;
+    link.element.is_focus_visible = true;
     frame.focus = link;
     link.element.setScrollGeometry(true, 20, 80);
     frame.scroll_focus = link;
@@ -673,6 +675,7 @@ test "structural mutation retires a painted link before DOM removal" {
     tab.prepareForDomMutation(&test_browser, &frame, body);
     try std.testing.expect(frame.display_list == null);
     try std.testing.expect(frame.focus == null);
+    try std.testing.expect(!link.element.is_focus_visible);
     try std.testing.expect(frame.scroll_focus == null);
     try std.testing.expectEqual(@as(usize, 0), frame.input_bounds.count());
     try std.testing.expectEqual(@as(usize, 0), frame.link_bounds.items.len);
@@ -827,6 +830,69 @@ test "primary painted click focuses the innermost scroll container" {
     inner.element.setScrollGeometry(false, 0, 0);
     try std.testing.expect(try frame.clickDevice(&unused_browser, 10, 10, .primary, 1.0));
     try std.testing.expect(frame.scroll_focus == outer);
+}
+
+test "pointer and keyboard focus share the focus-visible heuristic" {
+    const allocator = std.testing.allocator;
+    var html_parser = try parser.HTMLParser.init(
+        allocator,
+        "<main><button><strong>Outside form</strong></button><input value=edit>" ++
+            "<a href=#target>Link</a><div id=target>Target</div></main>",
+    );
+    html_parser.use_implicit_tags = false;
+    defer html_parser.deinit(allocator);
+
+    var session = BrowserSession.init(allocator, std.testing.io);
+    defer session.deinit();
+    var test_browser: browser.Browser = undefined;
+    initMutationBrowser(&test_browser, allocator, &session);
+    defer deinitMutationBrowser(&test_browser);
+
+    var tab: tab_module.Tab = undefined;
+    initMutationTab(&tab, allocator, &test_browser);
+    defer deinitMutationTab(&tab);
+    try test_browser.tabs.append(allocator, &tab);
+    test_browser.active_tab_index = 0;
+
+    var frame = tab_module.Frame.init(allocator, &tab, null, null);
+    defer frame.deinit();
+    tab.root_frame = &frame;
+    frame.current_node = try html_parser.parse();
+    parser.fixParentPointers(&frame.current_node.?, null);
+    const button = try findElement(&frame.current_node.?, "button");
+    const button_text = try findElement(&frame.current_node.?, "strong");
+    const input = try findElement(&frame.current_node.?, "input");
+    const link = try findElement(&frame.current_node.?, "a");
+
+    const button_origin = TestLayoutOrigin{ .node_ptr = button_text };
+    const input_origin = TestLayoutOrigin{ .node_ptr = input };
+    const display_list = try allocator.alloc(DisplayItem, 2);
+    display_list[0] = rect(0, 0, 80, 30, sourceFromOrigin(&button_origin, button_text));
+    display_list[1] = rect(100, 0, 180, 30, sourceFromOrigin(&input_origin, input));
+    frame.display_list = display_list;
+
+    // A pointer-focused button receives DOM focus but suppresses both the
+    // native ring and `:focus-visible` state.
+    try tab.clickDevice(&test_browser, 10, 10, .primary, 1.0);
+    try std.testing.expect(frame.focus == button);
+    try std.testing.expect(button.element.is_focused);
+    try std.testing.expect(!button.element.is_focus_visible);
+
+    // Reverse Tab wraps to the link and promotes keyboard focus visibility.
+    try tab.cycleFocus(&test_browser, true);
+    try std.testing.expect(frame.focus == link);
+    try std.testing.expect(link.element.is_focused);
+    try std.testing.expect(link.element.is_focus_visible);
+    try std.testing.expect(!button.element.is_focused);
+    try std.testing.expect(!button.element.is_focus_visible);
+
+    // Inputs retain a visible indicator even when pointer-focused.
+    try tab.clickDevice(&test_browser, 110, 10, .primary, 1.0);
+    try std.testing.expect(frame.focus == input);
+    try std.testing.expect(input.element.is_focused);
+    try std.testing.expect(input.element.is_focus_visible);
+    try std.testing.expect(!link.element.is_focused);
+    try std.testing.expect(!link.element.is_focus_visible);
 }
 
 test "painted ordinary elements dispatch click events from target through ancestors" {

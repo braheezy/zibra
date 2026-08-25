@@ -335,6 +335,7 @@ pub const Frame = struct {
                 switch (focus_node.*) {
                     .element => |*element| {
                         element.is_focused = false;
+                        element.is_focus_visible = false;
                         parser.dirtyStyleForElement(element);
                     },
                     .text => {},
@@ -674,6 +675,23 @@ pub const Frame = struct {
         return null;
     }
 
+    /// Focus a primary-click target, then recover it through a stable script
+    /// handle because the resulting focus listener may mutate the DOM before
+    /// link navigation or form submission continues.
+    fn focusPrimaryClickTarget(self: *Frame, b: *Browser, target: *Node) !?*Node {
+        const handle = if (self.js_context) |ctx|
+            try ctx.captureNodeHandle(self.window_id, target)
+        else
+            null;
+
+        _ = try self.tab.focusElement(b, self, target);
+        if (handle) |stable_handle| {
+            const ctx = self.js_context orelse return null;
+            return ctx.resolveAttachedNode(self.window_id, stable_handle);
+        }
+        return target;
+    }
+
     pub fn click(self: *Frame, b: *Browser, x: i32, y: i32, button: ClickButton) !bool {
         const zoom = self.tab.accessibility.zoom;
         return self.clickDevice(
@@ -755,13 +773,17 @@ pub const Frame = struct {
         switch (candidate.kind) {
             .iframe => unreachable,
             .link => {
-                if (element.attributes) |attributes| {
+                const focused_node = try self.focusPrimaryClickTarget(b, live_node) orelse return true;
+                const focused_element = switch (focused_node.*) {
+                    .element => |*value| value,
+                    .text => return true,
+                };
+                if (focused_element.attributes) |attributes| {
                     if (attributes.get("href")) |href| {
                         std.log.info("Link click in window_id={d}: {s}", .{ self.window_id, href });
                         try self.followLink(b, href, button);
                     }
                 }
-                self.tab.focused_frame = self;
             },
             .input => {
                 if (element.isCheckbox()) {
@@ -772,8 +794,8 @@ pub const Frame = struct {
                 _ = try self.tab.focusElement(b, self, live_node);
             },
             .button => {
-                _ = try self.tab.submitForm(b, self, live_node);
-                self.tab.focused_frame = self;
+                const focused_node = try self.focusPrimaryClickTarget(b, live_node) orelse return true;
+                _ = try self.tab.submitForm(b, self, focused_node);
             },
             .contenteditable => {
                 _ = try self.tab.focusElement(b, self, live_node);
@@ -939,6 +961,9 @@ js_generation: u64 = 0,
 // Root frame for this tab
 root_frame: ?*Frame = null,
 focused_frame: ?*Frame = null,
+// Modality inherited by synchronous JavaScript focus() calls. The focused
+// Element stores the resulting visibility bit for selectors and paint.
+focus_modality: dom_focus.Modality = .keyboard,
 frames_by_id: std.AutoHashMap(u32, *Frame),
 parent_window_ids: std.AutoHashMap(u32, u32),
 next_window_id: u32 = 1,
@@ -997,6 +1022,7 @@ pub fn init(allocator: std.mem.Allocator, tab_width: i32, tab_height: i32, measu
         .history_can_go_forward = std.atomic.Value(bool).init(false),
         .history_generation = 0,
         .title = null,
+        .focus_modality = .keyboard,
         .dynamic_texts = std.ArrayList([]const u8).empty,
         .js_contexts = std.StringHashMap(*js_module).init(allocator),
         .task_runner = TaskRunner.init(allocator, measure),
@@ -1696,6 +1722,7 @@ fn refreshFocusState(self: *Tab) !void {
                 switch (focus_node.*) {
                     .element => |*e| {
                         e.is_focused = false;
+                        e.is_focus_visible = false;
                         parser.dirtyStyleForElement(e);
                     },
                     else => {},
@@ -2569,6 +2596,9 @@ pub fn clickDevice(
     const frame = self.root_frame orelse return;
 
     if (button == .primary) {
+        // Record pointer modality before click/focus listeners run so a
+        // synchronous JavaScript focus() observes the initiating input.
+        self.focus_modality = .pointer;
         const focus_changed = self.blur();
         self.focused_frame = frame;
         if (focus_changed) self.setNeedsRender();
@@ -2962,6 +2992,7 @@ fn installFocusedElement(
     }
 
     element.is_focused = true;
+    element.is_focus_visible = dom_focus.indicatorVisibleFor(element, self.focus_modality);
     parser.dirtyStyleForElement(element);
     frame.focus = node;
     self.focused_frame = frame;
@@ -2974,6 +3005,48 @@ fn installFocusedElement(
     // through the normal synchronous mutation boundary.
     _ = frame.dispatchEventWithAccess("focus", node, false, access);
     return true;
+}
+
+/// Keyboard input promotes an already pointer-focused non-text control into
+/// focus-visible state. This matters when Tab cycles back to the same sole
+/// control and when Space/Return is the first keyboard action after a click.
+fn promoteFocusedIndicatorForKeyboard(self: *Tab) bool {
+    self.focus_modality = .keyboard;
+    const frame = self.focused_frame orelse return false;
+    const node = frame.focus orelse return false;
+    const element = switch (node.*) {
+        .element => |*value| value,
+        .text => return false,
+    };
+    if (!element.is_focused or element.is_focus_visible) return false;
+    if (!dom_focus.indicatorVisibleFor(element, .keyboard)) return false;
+
+    element.is_focus_visible = true;
+    parser.dirtyStyleForElement(element);
+    return true;
+}
+
+fn noteKeyboardInteraction(self: *Tab) void {
+    if (self.promoteFocusedIndicatorForKeyboard()) self.setNeedsRender();
+}
+
+test "keyboard interaction promotes an existing pointer focus" {
+    const allocator = std.testing.allocator;
+    var button = Node{ .element = try parser.Element.init(allocator, "button", null) };
+    defer button.deinit(allocator);
+    button.element.is_focused = true;
+    button.element.is_focus_visible = false;
+
+    var frame: Frame = undefined;
+    frame.focus = &button;
+    var tab: Tab = undefined;
+    tab.focused_frame = &frame;
+    tab.focus_modality = .pointer;
+
+    try std.testing.expect(tab.promoteFocusedIndicatorForKeyboard());
+    try std.testing.expectEqual(dom_focus.Modality.keyboard, tab.focus_modality);
+    try std.testing.expect(button.element.is_focus_visible);
+    try std.testing.expect(!tab.promoteFocusedIndicatorForKeyboard());
 }
 
 /// Move ordinary browser focus to a known attached element. Capturing a JS
@@ -3078,6 +3151,7 @@ pub fn focusElementFromScript(
 }
 
 pub fn cycleFocus(self: *Tab, b: *Browser, reverse: bool) !void {
+    self.noteKeyboardInteraction();
     const frame = self.focused_frame orelse self.root_frame orelse return;
     var focusables = std.ArrayList(*Node).empty;
     defer focusables.deinit(self.allocator);
@@ -3105,6 +3179,7 @@ pub fn cycleFocus(self: *Tab, b: *Browser, reverse: bool) !void {
 }
 
 pub fn activateFocusedElement(self: *Tab, b: *Browser) !void {
+    self.noteKeyboardInteraction();
     const frame = self.focused_frame orelse self.root_frame orelse return;
     if (frame.focus == null) return;
     const node_ptr = frame.focus.?;
@@ -3197,6 +3272,7 @@ fn isTextEntryInput(element: *const parser.Element) bool {
 /// buttons, links, and other focused elements keep the existing activation
 /// behavior shared with accessibility and voice-command input.
 pub fn enter(self: *Tab, b: *Browser) !bool {
+    self.noteKeyboardInteraction();
     const frame = self.focused_frame orelse self.root_frame orelse return false;
     const focus_node = frame.focus orelse return false;
 
@@ -3254,6 +3330,7 @@ fn clearFrameFocus(
         switch (focus_node.*) {
             .element => |*e| {
                 e.is_focused = false;
+                e.is_focus_visible = false;
                 parser.dirtyStyleForElement(e);
             },
             else => {},
@@ -3355,6 +3432,7 @@ fn frameScrollBehavior(frame: *Frame) scroll_model.Behavior {
 /// scroll model (including iframe and root interest-region behavior).
 pub fn scrollFocused(self: *Tab, b: *Browser, delta: i32) void {
     if (!b.tabIsActive(self)) return;
+    self.noteKeyboardInteraction();
     const frame = self.focused_frame orelse self.root_frame orelse return;
     if (scrollElementChain(frame.scroll_focus, delta)) {
         frame.scroll_animation = null;
@@ -3399,6 +3477,7 @@ pub fn scrollImmediate(self: *Tab, b: *Browser, delta: i32) void {
 
 // Handle keypress in focused input
 pub fn keypress(self: *Tab, b: *Browser, char: u8) !void {
+    self.noteKeyboardInteraction();
     const frame = self.focused_frame orelse self.root_frame orelse return;
     if (frame.focus) |focus_node| {
         const live_focus_node = frame.dispatchEventForDefault(
@@ -3504,6 +3583,7 @@ pub fn keypress(self: *Tab, b: *Browser, char: u8) !void {
 
 // Handle backspace in focused input
 pub fn backspace(self: *Tab, b: *Browser) !void {
+    self.noteKeyboardInteraction();
     _ = b;
     const frame = self.focused_frame orelse self.root_frame orelse return;
     if (frame.focus) |focus_node| {
@@ -4121,6 +4201,7 @@ fn commandClick(self: *Tab, query: []const u8) void {
     if (self.findAccessibilityByName(root, query)) |node| {
         self.accessibility_highlight = node;
         if (node.dom_node) |dom| {
+            self.noteKeyboardInteraction();
             _ = self.focusElement(self.browser, frame, dom) catch |err| {
                 std.log.warn("Failed to focus voice-command target: {}", .{err});
                 return;

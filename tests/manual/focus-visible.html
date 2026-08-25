@@ -1,0 +1,43 @@
+<!--
+Verify focus modality and :focus-visible:
+1. Click the outside-form button. It receives focus, but neither the two-tone
+   native ring nor the lime :focus-visible style should appear.
+2. Press Shift-Tab from that button to wrap to the link. The link should gain
+   both the white/black native ring and the lime author style.
+3. Click the text input. It should keep the native ring and gain the cyan
+   :focus-visible style even though focus came from the pointer.
+4. Tab through all three controls. Every keyboard-focused control should show
+   its native ring and its matching author style, with no stale ring left on
+   the previous control.
+-->
+<!doctype html>
+<html>
+<head>
+  <title>Focus-visible modality</title>
+  <style>
+    body { font-family: sans-serif; margin: 28px; }
+    p { width: 620px; }
+    .control {
+      display: inline-block;
+      margin: 18px;
+      padding: 14px;
+      background-color: lightgray;
+      color: black;
+    }
+    button:focus-visible { background-color: lime; }
+    a:focus-visible { background-color: lime; }
+    input:focus-visible { background-color: cyan; }
+  </style>
+</head>
+<body>
+  <h1>Focus-visible modality</h1>
+  <p>
+    Pointer focus hides redundant rings on buttons and links. Keyboard focus
+    shows them, while an input shows its ring for either modality.
+  </p>
+  <button class="control" id="outside">Outside-form button</button>
+  <input class="control" id="entry" value="Click or tab here">
+  <a class="control" href="#target">Focusable link</a>
+  <div id="target">Fragment target</div>
+</body>
+</html>

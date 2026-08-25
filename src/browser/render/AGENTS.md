@@ -42,8 +42,11 @@ before changing ownership or thread boundaries.
 - `focus_ring.zig` generates pointer-free focus-indicator commands. Each
   published focus rectangle is padded and painted as a 4px white outline
   followed by a 2px black outline; reserve both commands before appending
-  either so OOM cannot publish a half-ring. Accessibility highlighting remains
-  a separate requested-color outline.
+  either so OOM cannot publish a half-ring. Layout continues to publish
+  geometry for every programmatically focusable element because script focus
+  needs it; root paint gates only the native indicator on the focused
+  element's `is_focus_visible` snapshot. Accessibility highlighting remains a
+  separate requested-color outline.
 - `forced_colors.zig` owns the fixed semantic high-contrast palette. Layout
   assigns paint roles before author colors are replaced, so backgrounds,
   ordinary text, link states, controls, borders, and cursors cannot collapse

@@ -201,19 +201,29 @@ before changing `root.zig`, `tab.zig`, `render/`, or browser task scheduling.
   accessibility focus, and triggers a repaint when a content cursor was
   removed. Address-bar transitions preserve tab-worker ownership by enqueueing
   that blur instead of mutating frame focus directly from the UI thread.
+- A Tab retains the latest pointer/keyboard focus modality. Primary page clicks
+  publish pointer modality before event listeners run; keyboard editing,
+  activation, scrolling, and focus traversal publish keyboard modality and
+  promote an existing pointer focus. A focus transition snapshots the result
+  in `Element.is_focus_visible`: pointer-focused links/buttons suppress the
+  indicator, visible inputs and contenteditable targets retain it, and every
+  keyboard-focused target shows it. Clicked links and buttons are focused
+  before their default action continues, then recovered through a stable JS
+  handle because the focus listener may structurally mutate the target.
 - JavaScript `Node.focus()` runs synchronously on the serialized tab worker.
   It forces pending style/layout work before consulting the frame's focus
   bounds, rejects focusable-but-unlaid-out targets, scrolls the refreshed
-  bounds into the frame viewport, and re-resolves the numeric node handle
-  after blur listeners. Focus and blur events do not bubble. A worker publishes
-  content-focus intent by stable Tab identity; only the UI tick may blur the
-  chrome-owned address input.
+  bounds into the frame viewport, inherits the Tab's current modality, and
+  re-resolves the numeric node handle after blur listeners. Focus and blur
+  events do not bubble. A worker publishes content-focus intent by stable Tab
+  identity; only the UI tick may blur the chrome-owned address input.
 - Page focus indicators paint after document content as two coincident outline
   commands: a 4px white stroke below a 2px black stroke. Mixed inline content
   publishes one bounds entry per wrapped visual line, including fragments from
   nested inline descendants; a block-displayed focus target publishes only its
-  complete block box. The ring must follow every resulting bounds entry and
-  remain distinct from the amber accessibility highlight.
+  complete block box. Paint consumes the same `is_focus_visible` state as the
+  CSS pseudo-class, follows every resulting bounds entry only when that state
+  is active, and remains distinct from the amber accessibility highlight.
 - SDL finger coordinates are normalized; convert them against the addressed
   Browser's current native-window dimensions before dispatch. Each Browser's
   UI-thread-only touch tracker keys contacts by both touch-device and finger

@@ -11,6 +11,7 @@ const Node = parser.Node;
 pub const Selector = union(enum) {
     tag: TagSelector,
     class: ClassSelector,
+    focus_visible: FocusVisibleSelector,
     sequence: SelectorSequence,
     has: HasSelector,
     descendant: DescendantSelector,
@@ -30,6 +31,7 @@ pub const Selector = union(enum) {
         return switch (self) {
             .tag => |t| t.matches(node),
             .class => |c| c.matches(node),
+            .focus_visible => |focus_visible| focus_visible.matches(node),
             .sequence => |s| s.matches(node),
             .has => |h| h.matches(node, context),
             .descendant => |d| d.matches(node, ancestor_chain, context),
@@ -54,6 +56,7 @@ pub const Selector = union(enum) {
         switch (self.*) {
             .tag => |*t| t.deinit(allocator),
             .class => |*c| c.deinit(allocator),
+            .focus_visible => {},
             .sequence => |*s| s.deinit(allocator),
             .has => |*h| h.deinit(allocator),
             .descendant => |*d| d.deinit(allocator),
@@ -66,6 +69,7 @@ pub const Selector = union(enum) {
         return switch (self) {
             .tag => |t| t.priority(),
             .class => |c| c.priority(),
+            .focus_visible => |focus_visible| focus_visible.priority(),
             .sequence => |s| s.priority(),
             .has => |h| h.priority(),
             .descendant => |d| d.priority(),
@@ -78,6 +82,7 @@ pub const Selector = union(enum) {
 pub const SimpleSelector = union(enum) {
     tag: TagSelector,
     class: ClassSelector,
+    focus_visible: FocusVisibleSelector,
     sequence: SelectorSequence,
     has: HasSelector,
 
@@ -85,6 +90,7 @@ pub const SimpleSelector = union(enum) {
         return switch (self) {
             .tag => |tag| .{ .tag = tag },
             .class => |class| .{ .class = class },
+            .focus_visible => |focus_visible| .{ .focus_visible = focus_visible },
             .sequence => |sequence| .{ .sequence = sequence },
             .has => |has| .{ .has = has },
         };
@@ -94,6 +100,7 @@ pub const SimpleSelector = union(enum) {
         return switch (self) {
             .tag => |tag| tag.matches(node),
             .class => |class| class.matches(node),
+            .focus_visible => |focus_visible| focus_visible.matches(node),
             .sequence => |sequence| sequence.matches(node),
             .has => |has| has.matches(node, context),
         };
@@ -114,6 +121,7 @@ pub const SimpleSelector = union(enum) {
         switch (self.*) {
             .tag => |*tag| tag.deinit(allocator),
             .class => |*class| class.deinit(allocator),
+            .focus_visible => {},
             .sequence => |*sequence| sequence.deinit(allocator),
             .has => |*has| has.deinit(allocator),
         }
@@ -123,6 +131,7 @@ pub const SimpleSelector = union(enum) {
         return switch (self) {
             .tag => |tag| tag.priority(),
             .class => |class| class.priority(),
+            .focus_visible => |focus_visible| focus_visible.priority(),
             .sequence => |sequence| sequence.priority(),
             .has => |has| has.priority(),
         };
@@ -161,6 +170,24 @@ pub const ClassSelector = struct {
     }
 };
 
+/// The dynamic `:focus-visible` pseudo-class. The Tab installs both focus
+/// bits as one serialized DOM transition, and style invalidation rematches
+/// this selector before the next paint.
+pub const FocusVisibleSelector = struct {
+    fn matches(self: FocusVisibleSelector, node: *Node) bool {
+        _ = self;
+        return switch (node.*) {
+            .element => |element| element.is_focused and element.is_focus_visible,
+            .text => false,
+        };
+    }
+
+    fn priority(self: FocusVisibleSelector) u32 {
+        _ = self;
+        return 10;
+    }
+};
+
 /// Tag selector - matches elements by tag name (e.g., "p", "div", "ul")
 pub const TagSelector = struct {
     tag: []const u8,
@@ -190,15 +217,18 @@ pub const TagSelector = struct {
 };
 
 /// One atomic member of a selector sequence. A sequence matches only when all
-/// of its tag and class members match the same element.
+/// of its tag, class, and supported pseudo-class members match the same
+/// element.
 pub const SequenceSelector = union(enum) {
     tag: TagSelector,
     class: ClassSelector,
+    focus_visible: FocusVisibleSelector,
 
     pub fn intoSimpleSelector(self: SequenceSelector) SimpleSelector {
         return switch (self) {
             .tag => |tag| .{ .tag = tag },
             .class => |class| .{ .class = class },
+            .focus_visible => |focus_visible| .{ .focus_visible = focus_visible },
         };
     }
 
@@ -206,6 +236,7 @@ pub const SequenceSelector = union(enum) {
         return switch (self) {
             .tag => |tag| tag.matches(node),
             .class => |class| class.matches(node),
+            .focus_visible => |focus_visible| focus_visible.matches(node),
         };
     }
 
@@ -213,6 +244,7 @@ pub const SequenceSelector = union(enum) {
         switch (self.*) {
             .tag => |*tag| tag.deinit(allocator),
             .class => |*class| class.deinit(allocator),
+            .focus_visible => {},
         }
     }
 
@@ -220,11 +252,13 @@ pub const SequenceSelector = union(enum) {
         return switch (self) {
             .tag => |tag| tag.priority(),
             .class => |class| class.priority(),
+            .focus_visible => |focus_visible| focus_visible.priority(),
         };
     }
 };
 
-/// Concatenated tag/class selectors, such as `span.announce.urgent`.
+/// Concatenated compound selectors, such as
+/// `span.announce.urgent:focus-visible`.
 pub const SelectorSequence = struct {
     selectors: std.ArrayList(SequenceSelector),
 

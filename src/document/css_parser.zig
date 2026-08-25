@@ -12,6 +12,7 @@ const Selector = selector_mod.Selector;
 const SimpleSelector = selector_mod.SimpleSelector;
 const TagSelector = selector_mod.TagSelector;
 const ClassSelector = selector_mod.ClassSelector;
+const FocusVisibleSelector = selector_mod.FocusVisibleSelector;
 const SequenceSelector = selector_mod.SequenceSelector;
 const SelectorSequence = selector_mod.SelectorSequence;
 const HasSelector = selector_mod.HasSelector;
@@ -563,9 +564,9 @@ fn startsWithMediaRule(self: *const CSSParser) bool {
     return next == self.string.len or std.ascii.isWhitespace(self.string[next]) or self.string[next] == '(';
 }
 
-/// Parse a tag/class selector, `:has(...)` relational selector, or a
-/// whitespace-separated descendant selector. ID, attribute, and other
-/// combinator selectors are not yet supported.
+/// Parse a tag/class/`:focus-visible` selector, `:has(...)` relational
+/// selector, or a whitespace-separated descendant selector. ID, attribute,
+/// and other combinator selectors are not yet supported.
 pub fn selector(self: *CSSParser, allocator: std.mem.Allocator) !Selector {
     var selectors = std.ArrayList(SimpleSelector).empty;
     errdefer {
@@ -604,7 +605,7 @@ pub fn selector(self: *CSSParser, allocator: std.mem.Allocator) !Selector {
 
 /// Parse a selector anchored to the current element and optionally constrained
 /// by a matching strict descendant. Zibra's current selector subset accepts a
-/// tag/class sequence on each side of `:has`.
+/// tag/class/focus-visible sequence on each side of `:has`.
 fn relationalSelector(self: *CSSParser, allocator: std.mem.Allocator) !SimpleSelector {
     var ancestor = try self.simpleSelector(allocator);
     errdefer ancestor.deinit(allocator);
@@ -626,44 +627,68 @@ fn relationalSelector(self: *CSSParser, allocator: std.mem.Allocator) !SimpleSel
 }
 
 fn simpleSelector(self: *CSSParser, allocator: std.mem.Allocator) !SimpleSelector {
-    const raw = try self.word();
-    if (std.mem.indexOfAny(u8, raw, "#%") != null) return error.InvalidSelector;
-
     var selectors = std.ArrayList(SequenceSelector).empty;
     errdefer {
         for (selectors.items) |*part| part.deinit(allocator);
         selectors.deinit(allocator);
     }
 
-    var cursor: usize = 0;
-    if (raw[0] != '.') {
-        const tag_end = std.mem.indexOfScalar(u8, raw, '.') orelse raw.len;
-        const lower_tag = try std.ascii.allocLowerString(allocator, raw[0..tag_end]);
+    if (self.pos < self.string.len and self.string[self.pos] != ':') {
+        const raw = try self.word();
+        if (std.mem.indexOfAny(u8, raw, "#%") != null) return error.InvalidSelector;
+
+        var cursor: usize = 0;
+        if (raw[0] != '.') {
+            const tag_end = std.mem.indexOfScalar(u8, raw, '.') orelse raw.len;
+            const lower_tag = try std.ascii.allocLowerString(allocator, raw[0..tag_end]);
+            try appendSequenceSelector(
+                allocator,
+                &selectors,
+                .{ .tag = TagSelector.init(lower_tag) },
+            );
+            cursor = tag_end;
+        }
+
+        while (cursor < raw.len) {
+            if (raw[cursor] != '.') return error.InvalidSelector;
+            const class_start = cursor + 1;
+            if (class_start >= raw.len) return error.InvalidSelector;
+
+            const remaining = raw[class_start..];
+            const class_len = std.mem.indexOfScalar(u8, remaining, '.') orelse remaining.len;
+            if (class_len == 0) return error.InvalidSelector;
+
+            try appendSequenceSelector(
+                allocator,
+                &selectors,
+                .{ .class = ClassSelector.init(try allocator.dupe(u8, remaining[0..class_len])) },
+            );
+            cursor = class_start + class_len;
+        }
+    }
+
+    // Consume the dynamic pseudo when it is part of this compound selector.
+    // Leave any other colon untouched so relationalSelector can recognize
+    // `:has(...)` or report the existing unsupported-pseudo error.
+    while (self.pos < self.string.len and self.string[self.pos] == ':') {
+        const pseudo_start = self.pos;
+        self.pos += 1;
+        const pseudo_class = self.word() catch {
+            self.pos = pseudo_start;
+            break;
+        };
+        if (!std.ascii.eqlIgnoreCase(pseudo_class, "focus-visible")) {
+            self.pos = pseudo_start;
+            break;
+        }
         try appendSequenceSelector(
             allocator,
             &selectors,
-            .{ .tag = TagSelector.init(lower_tag) },
+            .{ .focus_visible = FocusVisibleSelector{} },
         );
-        cursor = tag_end;
     }
 
-    while (cursor < raw.len) {
-        if (raw[cursor] != '.') return error.InvalidSelector;
-        const class_start = cursor + 1;
-        if (class_start >= raw.len) return error.InvalidSelector;
-
-        const remaining = raw[class_start..];
-        const class_len = std.mem.indexOfScalar(u8, remaining, '.') orelse remaining.len;
-        if (class_len == 0) return error.InvalidSelector;
-
-        try appendSequenceSelector(
-            allocator,
-            &selectors,
-            .{ .class = ClassSelector.init(try allocator.dupe(u8, remaining[0..class_len])) },
-        );
-        cursor = class_start + class_len;
-    }
-
+    if (selectors.items.len == 0) return error.InvalidSelector;
     if (selectors.items.len == 1) {
         const part = selectors.items[0];
         selectors.deinit(allocator);

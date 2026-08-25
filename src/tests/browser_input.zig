@@ -45,6 +45,7 @@ fn enterOnFirstInput(html: []const u8) !bool {
             .element => |*element| {
                 if (std.ascii.eqlIgnoreCase(element.tag, "input")) {
                     element.is_focused = true;
+                    element.is_focus_visible = true;
                     frame.focus = node;
                     break;
                 }
@@ -230,9 +231,11 @@ test "tab blur clears focused elements across the frame tree" {
     };
 
     root_input.element.is_focused = true;
+    root_input.element.is_focus_visible = true;
     root.focus = root_input;
     root.scroll_focus = root_input;
     child_input.element.is_focused = true;
+    child_input.element.is_focus_visible = true;
     child.focus = child_input;
     child.scroll_focus = child_input;
     tab.focused_frame = child;
@@ -243,7 +246,9 @@ test "tab blur clears focused elements across the frame tree" {
     try std.testing.expect(root.scroll_focus == null);
     try std.testing.expect(child.scroll_focus == null);
     try std.testing.expect(!root_input.element.is_focused);
+    try std.testing.expect(!root_input.element.is_focus_visible);
     try std.testing.expect(!child_input.element.is_focused);
+    try std.testing.expect(!child_input.element.is_focus_visible);
     try std.testing.expect(tab.focused_frame == null);
     try std.testing.expect(!tab.blur());
 }
@@ -288,6 +293,7 @@ test "tab blur dispatches a non-bubbling DOM blur event" {
     }
     const entry = input orelse return error.TestInputMissing;
     entry.element.is_focused = true;
+    entry.element.is_focus_visible = true;
     frame.focus = entry;
 
     var environ = std.process.Environ.Map.init(allocator);
@@ -310,6 +316,7 @@ test "tab blur dispatches a non-bubbling DOM blur event" {
 
     try std.testing.expect(tab.blur());
     try std.testing.expect(frame.focus == null);
+    try std.testing.expect(!entry.element.is_focus_visible);
     const result = try js.evaluate(
         frame.window_id,
         "blurLog.join(',') === 'entry:false'",
