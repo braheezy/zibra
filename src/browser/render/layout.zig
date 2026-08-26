@@ -26,6 +26,8 @@ const list_marker_size = 6;
 const list_marker_top_offset = 7;
 const toc_header_height = 24;
 const button_padding = 4;
+const min_effective_zoom: f32 = 0.01;
+const max_effective_zoom: f32 = 1024.0;
 
 const ContentBounds = struct {
     x: i32,
@@ -86,24 +88,108 @@ fn isTableOfContentsElement(element: *const parser.Element) bool {
     return std.mem.eql(u8, attributes.get("id") orelse return false, "toc");
 }
 
-fn tableOfContentsHeaderHeight(node: Node) i32 {
+/// Parse the standardized number/percentage grammar for `zoom`. Invalid,
+/// negative, and zero values use the initial factor of one; zero's behavior is
+/// the CSS compatibility rule rather than a hidden subtree.
+fn parseCssZoom(value: []const u8) f32 {
+    const trimmed = std.mem.trim(u8, value, " \t\r\n");
+    if (trimmed.len == 0 or
+        std.ascii.eqlIgnoreCase(trimmed, "normal") or
+        std.ascii.eqlIgnoreCase(trimmed, "reset"))
+    {
+        return 1.0;
+    }
+
+    const percentage = std.mem.endsWith(u8, trimmed, "%");
+    const number = if (percentage)
+        std.mem.trim(u8, trimmed[0 .. trimmed.len - 1], " \t\r\n")
+    else
+        trimmed;
+    const parsed = std.fmt.parseFloat(f32, number) catch return 1.0;
+    if (!std.math.isFinite(parsed) or parsed <= 0.0) return 1.0;
+    return if (percentage) parsed / 100.0 else parsed;
+}
+
+/// Compute the authored effective zoom at `node` from live computed styles.
+/// Frame code uses this before child layout so iframe documents inherit the
+/// same factor as the containing replaced element.
+pub fn effectiveCssZoomForNode(node: *const Node) f32 {
+    var result: f32 = 1.0;
+    var current: ?*const Node = node;
+    while (current) |candidate| {
+        current = switch (candidate.*) {
+            .element => |*element| next: {
+                if (element.style) |*styles| {
+                    if (styleValue(styles, "zoom")) |value| {
+                        result = combinedEffectiveZoom(result, parseCssZoom(value));
+                    }
+                }
+                break :next element.parent;
+            },
+            .text => |*text| text.parent,
+        };
+    }
+    return result;
+}
+
+fn combinedEffectiveZoom(parent_zoom: f32, local_zoom: f32) f32 {
+    const parent = if (std.math.isFinite(parent_zoom) and parent_zoom > 0.0) parent_zoom else 1.0;
+    const local = if (std.math.isFinite(local_zoom) and local_zoom > 0.0) local_zoom else 1.0;
+    return std.math.clamp(parent * local, min_effective_zoom, max_effective_zoom);
+}
+
+/// Convert an authored CSS-pixel length into the page's layout coordinate
+/// space. Accessibility zoom is applied later by raster, while the ratio here
+/// bakes only subtree zoom into geometry. Signed values support translations.
+fn scaleCssPixel(value: i32, effective_zoom: f32, page_zoom: f32) i32 {
+    const page = if (std.math.isFinite(page_zoom) and page_zoom > 0.0) page_zoom else 1.0;
+    const effective = if (std.math.isFinite(effective_zoom) and effective_zoom > 0.0)
+        effective_zoom
+    else
+        page;
+    const scaled = @as(f64, @floatFromInt(value)) *
+        (@as(f64, effective) / @as(f64, page));
+    return @intFromFloat(std.math.clamp(
+        scaled,
+        @as(f64, @floatFromInt(std.math.minInt(i32))),
+        @as(f64, @floatFromInt(std.math.maxInt(i32))),
+    ));
+}
+
+pub fn scaleCssPixelByFactor(value: i32, factor: f32) i32 {
+    return scaleCssPixel(value, factor, 1.0);
+}
+
+fn scaleCssFloat(value: f64, effective_zoom: f32, page_zoom: f32) f64 {
+    const page = if (std.math.isFinite(page_zoom) and page_zoom > 0.0) page_zoom else 1.0;
+    const effective = if (std.math.isFinite(effective_zoom) and effective_zoom > 0.0)
+        effective_zoom
+    else
+        page;
+    return value * (@as(f64, effective) / @as(f64, page));
+}
+
+fn tableOfContentsHeaderHeight(node: Node, effective_zoom: f32, page_zoom: f32) i32 {
     return switch (node) {
-        .element => |element| if (isTableOfContentsElement(&element)) toc_header_height else 0,
+        .element => |element| if (isTableOfContentsElement(&element))
+            scaleCssPixel(toc_header_height, effective_zoom, page_zoom)
+        else
+            0,
         .text => 0,
     };
 }
 
-fn listItemContentBounds(parent_x: i32, parent_width: i32) ContentBounds {
+fn listItemContentBounds(parent_x: i32, parent_width: i32, indent: i32) ContentBounds {
     return .{
-        .x = parent_x + list_item_indent,
-        .width = @max(parent_width - list_item_indent, 0),
+        .x = parent_x + indent,
+        .width = @max(parent_width - indent, 0),
     };
 }
 
-fn contentBoundsForNode(node: Node, parent_x: i32, parent_width: i32) ContentBounds {
+fn contentBoundsForNode(node: Node, parent_x: i32, parent_width: i32, indent: i32) ContentBounds {
     switch (node) {
         .element => |element| {
-            if (isListItemElement(&element)) return listItemContentBounds(parent_x, parent_width);
+            if (isListItemElement(&element)) return listItemContentBounds(parent_x, parent_width, indent);
         },
         .text => {},
     }
@@ -445,23 +531,16 @@ const EmbedLayout = struct {
         self.descent.deinit();
     }
 
-    fn setupDependencies(self: *EmbedLayout, parent_block: ?*BlockLayout, style_map: ?*const parser.StyleMap) void {
+    /// Inline embed records are destroyed as soon as their completed line is
+    /// painted. Keep their dependency graph entirely self-contained: a
+    /// persistent BlockLayout is responsible for subscribing to DOM styles.
+    fn setupDependencies(self: *EmbedLayout) void {
         if (self.deps_initialized) return;
         self.deps_initialized = true;
 
-        if (parent_block) |parent| {
-            self.zoom.addDependency(&parent.zoom);
-        }
         self.zoom.freezeDependencies();
 
         self.font_stub.addDependency(&self.zoom);
-        if (style_map) |map| {
-            const map_mut = @constCast(map);
-            if (map_mut.getPtr("font-weight")) |field| self.font_stub.addDependency(field);
-            if (map_mut.getPtr("font-style")) |field| self.font_stub.addDependency(field);
-            if (map_mut.getPtr("font-size")) |field| self.font_stub.addDependency(field);
-            if (map_mut.getPtr("font-family")) |field| self.font_stub.addDependency(field);
-        }
         self.font_stub.freezeDependencies();
 
         self.width.addDependency(&self.zoom);
@@ -544,7 +623,9 @@ const ImageLayout = struct {
             .source_height = src_height,
             .opacity = 1.0,
         };
-        layout.embed.setupDependencies(parent_block, style_map);
+        _ = parent_block;
+        _ = style_map;
+        layout.embed.setupDependencies();
         layout.embed.setMetrics(layout_width, layout_height, layout_height, 0, zoom_value, 0);
         return layout;
     }
@@ -559,6 +640,7 @@ const IframeLayout = struct {
     bgcolor: browser.Color,
     border_color: browser.Color,
     border_thickness: i32 = 1,
+    css_zoom: f32 = 1.0,
 
     fn init(
         allocator: std.mem.Allocator,
@@ -567,14 +649,18 @@ const IframeLayout = struct {
         parent_block: ?*BlockLayout,
         style_map: ?*const parser.StyleMap,
         zoom_value: f32,
+        page_zoom: f32,
     ) IframeLayout {
         var layout = IframeLayout{
             .embed = EmbedLayout.init(allocator),
             .bgcolor = .{ .r = 0xf2, .g = 0xf2, .b = 0xf2, .a = 0xff },
             .border_color = .{ .r = 0x33, .g = 0x33, .b = 0x33, .a = 0xff },
-            .border_thickness = 1,
+            .border_thickness = @max(scaleCssPixel(1, zoom_value, page_zoom), 1),
+            .css_zoom = zoom_value / page_zoom,
         };
-        layout.embed.setupDependencies(parent_block, style_map);
+        _ = parent_block;
+        _ = style_map;
+        layout.embed.setupDependencies();
         layout.embed.setMetrics(layout_width, layout_height, layout_height, 0, zoom_value, 0);
         return layout;
     }
@@ -1172,7 +1258,7 @@ test "list items reserve room for square markers" {
     defer item.deinit(allocator);
     try std.testing.expect(isListItemElement(&item.element));
 
-    const bounds = listItemContentBounds(13, 100);
+    const bounds = listItemContentBounds(13, 100, list_item_indent);
     try std.testing.expectEqual(@as(i32, 37), bounds.x);
     try std.testing.expectEqual(@as(i32, 76), bounds.width);
 }
@@ -1188,6 +1274,124 @@ test "block dimensions accept non-negative pixel lengths" {
     try std.testing.expectEqual(@as(?i32, null), parseCssPixelLength("-1px"));
     try std.testing.expectEqual(@as(?i32, null), parseCssPixelLength("NaNpx"));
     try std.testing.expectEqual(@as(?i32, null), parseCssPixelLength("999999999999px"));
+}
+
+test "CSS zoom parses numbers and percentages and composes nested lengths" {
+    try std.testing.expectEqual(@as(f32, 1.5), parseCssZoom("1.5"));
+    try std.testing.expectEqual(@as(f32, 1.75), parseCssZoom(" 175% "));
+    try std.testing.expectEqual(@as(f32, 1.0), parseCssZoom("0"));
+    try std.testing.expectEqual(@as(f32, 1.0), parseCssZoom("0%"));
+    try std.testing.expectEqual(@as(f32, 1.0), parseCssZoom("-2"));
+    try std.testing.expectEqual(@as(f32, 1.0), parseCssZoom("bogus"));
+
+    const accessibility_zoom: f32 = 1.25;
+    const outer = combinedEffectiveZoom(accessibility_zoom, parseCssZoom("200%"));
+    const inner = combinedEffectiveZoom(outer, parseCssZoom("1.5"));
+    try std.testing.expectEqual(@as(f32, 2.5), outer);
+    try std.testing.expectEqual(@as(f32, 3.75), inner);
+    try std.testing.expectEqual(@as(i32, 60), scaleCssPixel(20, inner, accessibility_zoom));
+    try std.testing.expectEqual(@as(i32, -30), scaleCssPixel(-10, inner, accessibility_zoom));
+}
+
+test "effective CSS zoom follows ancestors and invalidates block layout" {
+    const allocator = std.testing.allocator;
+    var outer = Node{ .element = try parser.Element.init(allocator, "div", null) };
+    defer outer.deinit(allocator);
+    try setTestStyleValue(allocator, &outer, "zoom", "2");
+
+    var middle = Node{ .element = try parser.Element.init(allocator, "section", &outer) };
+    defer middle.deinit(allocator);
+    try setTestStyleValue(allocator, &middle, "zoom", "150%");
+
+    var leaf = Node{ .element = try parser.Element.init(allocator, "span", &middle) };
+    defer leaf.deinit(allocator);
+    try std.testing.expectEqual(@as(f32, 3.0), effectiveCssZoomForNode(&leaf));
+
+    const document = try DocumentLayout.init(allocator, &outer);
+    defer {
+        document.deinit();
+        allocator.destroy(document);
+    }
+    const block = try BlockLayout.init(allocator, middle, &middle, document, null, null);
+    try document.children.append(allocator, block);
+    block.zoom.set(1.0);
+    middle.element.style.?.getPtr("zoom").?.set("175%");
+    try std.testing.expect(block.zoom.dirty);
+}
+
+test "temporary rich-button dependencies target the persistent containing block" {
+    const allocator = std.testing.allocator;
+
+    var document_node = Node{ .element = try parser.Element.init(allocator, "html", null) };
+    defer document_node.deinit(allocator);
+    const document = try DocumentLayout.init(allocator, &document_node);
+    defer {
+        document.deinit();
+        allocator.destroy(document);
+    }
+
+    const parent = try BlockLayout.init(
+        allocator,
+        document_node,
+        &document_node,
+        document,
+        null,
+        null,
+    );
+    try document.children.append(allocator, parent);
+    parent.zoom.set(1.0);
+    parent.height.set(0);
+
+    var button = Node{ .element = try parser.Element.init(allocator, "button", null) };
+    defer button.deinit(allocator);
+    try setTestStyleValue(allocator, &button, "zoom", "2");
+
+    var child = Node{ .element = try parser.Element.init(allocator, "div", &button) };
+    var child_owned = true;
+    errdefer if (child_owned) child.deinit(allocator);
+    try setTestStyleValue(allocator, &child, "display", "block");
+    try setTestStyleValue(allocator, &child, "zoom", "150%");
+    try button.element.children.append(allocator, child);
+    child_owned = false;
+    parser.fixParentPointers(&button, null);
+
+    const temporary = try BlockLayout.initRichButton(
+        allocator,
+        &button,
+        document,
+        parent,
+        200,
+        2.0,
+    );
+    var temporary_owned = true;
+    errdefer if (temporary_owned) {
+        temporary.deinit();
+        allocator.destroy(temporary);
+    };
+    try temporary.appendBlockChildren(button.element.children.items);
+
+    try std.testing.expect(!temporary.persistent_dependencies);
+    try std.testing.expect(!temporary.children.items[0].block.persistent_dependencies);
+    try std.testing.expectEqual(
+        @as(usize, 1),
+        button.element.style.?.getPtr("zoom").?.invalidations.count(),
+    );
+    try std.testing.expectEqual(
+        @as(usize, 1),
+        button.element.children.items[0].element.style.?.getPtr("display").?.invalidations.count(),
+    );
+    try std.testing.expectEqual(@as(usize, 0), parent.zoom.invalidations.count());
+
+    temporary.deinit();
+    allocator.destroy(temporary);
+    temporary_owned = false;
+
+    // These writes must not call through a retired temporary BlockLayout.
+    button.element.style.?.getPtr("zoom").?.set("175%");
+    button.element.children.items[0].element.style.?.getPtr("display").?.set("inline");
+    button.element.children.items[0].element.style.?.getPtr("zoom").?.set("125%");
+    parent.zoom.set(1.25);
+    try std.testing.expect(parent.height.dirty);
 }
 
 test "animated width changes the word wrapping threshold" {
@@ -1223,11 +1427,11 @@ test "table of contents navigation reserves a header row" {
     var toc = Node{ .element = try parser.Element.init(allocator, "nav id=toc", null) };
     defer toc.deinit(allocator);
     try std.testing.expect(isTableOfContentsElement(&toc.element));
-    try std.testing.expectEqual(toc_header_height, tableOfContentsHeaderHeight(toc));
+    try std.testing.expectEqual(toc_header_height, tableOfContentsHeaderHeight(toc, 1.0, 1.0));
 
     var ordinary_nav = Node{ .element = try parser.Element.init(allocator, "nav id=links", null) };
     defer ordinary_nav.deinit(allocator);
-    try std.testing.expectEqual(@as(i32, 0), tableOfContentsHeaderHeight(ordinary_nav));
+    try std.testing.expectEqual(@as(i32, 0), tableOfContentsHeaderHeight(ordinary_nav, 2.0, 1.0));
 }
 
 test "anonymous blocks group only consecutive inline siblings" {
@@ -1265,6 +1469,12 @@ window_height: i32,
 default_direction: TextDirection = .left_to_right,
 line_direction: TextDirection = .left_to_right,
 accessibility: browser.AccessibilitySettings = .{},
+// Total device-pixel scale for the inline subtree currently being measured:
+// accessibility zoom multiplied by every applicable authored `zoom` value.
+effective_zoom: f32 = 1.0,
+// Zoom inherited across a nested browsing-context boundary. Root documents
+// use one; iframe documents receive the containing iframe's effective factor.
+frame_css_zoom: f32 = 1.0,
 color_scheme_dark: bool = false,
 document_color_scheme_dark: bool = false,
 default_font_size: i32 = 16,
@@ -1336,6 +1546,7 @@ const InlineSnapshot = struct {
     current_font_category: FontCategory,
     text_color: browser.Color,
     line_direction: TextDirection,
+    effective_zoom: f32,
 };
 
 fn snapshotInlineState(self: *const Layout) InlineSnapshot {
@@ -1356,6 +1567,7 @@ fn snapshotInlineState(self: *const Layout) InlineSnapshot {
         .current_font_category = self.current_font_category,
         .text_color = self.text_color,
         .line_direction = self.line_direction,
+        .effective_zoom = self.effective_zoom,
     };
 }
 
@@ -1376,6 +1588,7 @@ fn restoreInlineState(self: *Layout, snapshot: InlineSnapshot) void {
     self.current_font_category = snapshot.current_font_category;
     self.text_color = snapshot.text_color;
     self.line_direction = snapshot.line_direction;
+    self.effective_zoom = snapshot.effective_zoom;
 }
 
 fn zoom(self: *const Layout) f32 {
@@ -1394,8 +1607,28 @@ fn toDevicePx(self: *const Layout, layout_px: i32) i32 {
     return @intFromFloat(@as(f32, @floatFromInt(layout_px)) * z);
 }
 
+fn effectiveZoom(self: *const Layout) f32 {
+    return if (std.math.isFinite(self.effective_zoom) and self.effective_zoom > 0.0)
+        self.effective_zoom
+    else
+        self.zoom();
+}
+
+fn scaleActiveCssPixel(self: *const Layout, css_px: i32) i32 {
+    return scaleCssPixel(css_px, self.effectiveZoom(), self.zoom());
+}
+
+fn scaleActiveCssFloat(self: *const Layout, css_px: f64) f64 {
+    return scaleCssFloat(css_px, self.effectiveZoom(), self.zoom());
+}
+
 fn scaledFontSize(self: *const Layout, css_size: i32) i32 {
-    const scaled = self.toDevicePx(css_size);
+    const scaled = scaleCssPixel(css_size, self.effectiveZoom(), 1.0);
+    return if (scaled < 1) 1 else scaled;
+}
+
+fn scaledFontSizeForZoom(_: *const Layout, css_size: i32, effective_zoom: f32) i32 {
+    const scaled = scaleCssPixel(css_size, effective_zoom, 1.0);
     return if (scaled < 1) 1 else scaled;
 }
 
@@ -1648,7 +1881,7 @@ fn recurseNode(self: *Layout, node: Node, node_ptr: ?*Node, line_buffer: *std.Ar
                 if (node_ptr) |ptr| try self.recordFragmentTargets(ptr, self.cursor_y);
             }
             // Apply CSS styles before processing this element
-            try self.applyNodeStyles(e, line_buffer);
+            try self.applyNodeStyles(e, line_buffer, true);
 
             // DOM recursion replaces the old opening/closing-tag token stream.
             // Scope semantic text state to this subtree so nested styles retain
@@ -1759,11 +1992,11 @@ fn handleImageElement(self: *Layout, node: Node, node_ptr: ?*Node, line_buffer: 
 
     const image_data = element.image_data;
     const intrinsic_width: i32 = if (image_data) |data|
-        self.toLayoutPx(@intCast(data.image.width))
+        self.scaleActiveCssPixel(self.toLayoutPx(@intCast(data.image.width)))
     else
         0;
     const intrinsic_height: i32 = if (image_data) |data|
-        self.toLayoutPx(@intCast(data.image.height))
+        self.scaleActiveCssPixel(self.toLayoutPx(@intCast(data.image.height)))
     else
         0;
 
@@ -1771,17 +2004,17 @@ fn handleImageElement(self: *Layout, node: Node, node_ptr: ?*Node, line_buffer: 
     var layout_height: i32 = 0;
 
     if (width_attr != null and height_attr != null) {
-        layout_width = width_attr.?;
-        layout_height = height_attr.?;
+        layout_width = self.scaleActiveCssPixel(width_attr.?);
+        layout_height = self.scaleActiveCssPixel(height_attr.?);
     } else if (width_attr != null) {
-        layout_width = width_attr.?;
+        layout_width = self.scaleActiveCssPixel(width_attr.?);
         if (intrinsic_width > 0 and intrinsic_height > 0) {
             layout_height = @divTrunc(layout_width * intrinsic_height, intrinsic_width);
         } else {
             layout_height = layout_width;
         }
     } else if (height_attr != null) {
-        layout_height = height_attr.?;
+        layout_height = self.scaleActiveCssPixel(height_attr.?);
         if (intrinsic_width > 0 and intrinsic_height > 0) {
             layout_width = @divTrunc(layout_height * intrinsic_width, intrinsic_height);
         } else {
@@ -1798,7 +2031,7 @@ fn handleImageElement(self: *Layout, node: Node, node_ptr: ?*Node, line_buffer: 
         if (node.element.style) |*map| break :blk map;
         break :blk null;
     } else null;
-    var image_layout = ImageLayout.init(self.allocator, layout_width, layout_height, image_data, self.inline_block, style_map, self.zoom());
+    var image_layout = ImageLayout.init(self.allocator, layout_width, layout_height, image_data, self.inline_block, style_map, self.effectiveZoom());
     try image_layout.embed.appendInline(self, line_buffer, node_ptr, .{
         .image = image_layout,
     });
@@ -1822,13 +2055,13 @@ fn handleIframeElement(self: *Layout, node: Node, node_ptr: ?*Node, line_buffer:
         }
     }
 
-    var layout_width: i32 = 300;
-    var layout_height: i32 = 150;
+    var layout_width: i32 = self.scaleActiveCssPixel(300);
+    var layout_height: i32 = self.scaleActiveCssPixel(150);
     if (width_attr != null) {
-        layout_width = width_attr.?;
+        layout_width = self.scaleActiveCssPixel(width_attr.?);
     }
     if (height_attr != null) {
-        layout_height = height_attr.?;
+        layout_height = self.scaleActiveCssPixel(height_attr.?);
     }
 
     if (layout_width <= 0 or layout_height <= 0) return;
@@ -1837,7 +2070,15 @@ fn handleIframeElement(self: *Layout, node: Node, node_ptr: ?*Node, line_buffer:
         if (node.element.style) |*map| break :blk map;
         break :blk null;
     } else null;
-    var iframe_layout = IframeLayout.init(self.allocator, layout_width, layout_height, self.inline_block, style_map, self.zoom());
+    var iframe_layout = IframeLayout.init(
+        self.allocator,
+        layout_width,
+        layout_height,
+        self.inline_block,
+        style_map,
+        self.effectiveZoom(),
+        self.zoom(),
+    );
     try iframe_layout.embed.appendInline(self, line_buffer, node_ptr, .{
         .iframe = iframe_layout,
     });
@@ -1852,6 +2093,7 @@ const StyleSnapshot = struct {
     transform_offset_x: i32,
     transform_offset_y: i32,
     color_scheme_dark: bool,
+    effective_zoom: f32,
 };
 
 fn styleValue(style_map: *const parser.StyleMap, property: []const u8) ?[]const u8 {
@@ -1868,12 +2110,28 @@ fn styleValueRead(style_map: *const parser.StyleMap, property: []const u8, notif
     return null;
 }
 
+fn registerStyleDependencies(
+    style_map: *const parser.StyleMap,
+    target: *ProtectedField(i32),
+) void {
+    var iterator = @constCast(style_map).iterator();
+    while (iterator.next()) |entry| target.addDependency(entry.value_ptr);
+}
+
 fn liveBlockElement(block: *const BlockLayout) ?*const parser.Element {
     const node = block.node_ptr orelse return null;
     return switch (node.*) {
         .element => |*element| element,
         .text => null,
     };
+}
+
+fn scaleBlockCssPixel(block: *const BlockLayout, value: i32) i32 {
+    return scaleCssPixel(value, block.zoom.get().*, block.document.page_zoom);
+}
+
+fn scaleBlockCssFloat(block: *const BlockLayout, value: f64) f64 {
+    return scaleCssFloat(value, block.zoom.get().*, block.document.page_zoom);
 }
 
 /// Resolve the visual translation from the live DOM element. Composited
@@ -1886,7 +2144,10 @@ fn blockHitTranslation(block: *const BlockLayout) HitPoint {
             switch (animation) {
                 .transform => |value| {
                     const pixels = value.getValue().layoutPixels();
-                    return .{ .x = pixels.x, .y = pixels.y };
+                    return .{
+                        .x = scaleBlockCssPixel(block, pixels.x),
+                        .y = scaleBlockCssPixel(block, pixels.y),
+                    };
                 },
                 .numeric, .pixel, .color => {},
             }
@@ -1895,7 +2156,10 @@ fn blockHitTranslation(block: *const BlockLayout) HitPoint {
     const styles = if (element.style) |*value| value else return .{ .x = 0, .y = 0 };
     const value = styleValue(styles, "transform") orelse return .{ .x = 0, .y = 0 };
     return if (parseTranslate(value)) |translation|
-        .{ .x = translation.x, .y = translation.y }
+        .{
+            .x = scaleBlockCssPixel(block, translation.x),
+            .y = scaleBlockCssPixel(block, translation.y),
+        }
     else
         .{ .x = 0, .y = 0 };
 }
@@ -1924,7 +2188,7 @@ fn blockHitClip(block: *const BlockLayout) BlockHitClip {
     const element = liveBlockElement(block) orelse return .{ .enabled = false, .radius = 0.0 };
     const styles = if (element.style) |*value| value else return .{ .enabled = false, .radius = 0.0 };
     const radius = if (styleValue(styles, "border-radius")) |value|
-        parseCssPixelRadius(value)
+        scaleBlockCssFloat(block, parseCssPixelRadius(value))
     else
         0.0;
     const overflow = std.mem.trim(
@@ -1962,7 +2226,12 @@ fn blockPaintZIndex(block: *const BlockLayout) i32 {
     return std.fmt.parseInt(i32, z_index, 10) catch 0;
 }
 
-fn applyNodeStyles(self: *Layout, element: parser.Element, _: *std.ArrayList(LineItem)) !void {
+fn applyNodeStyles(
+    self: *Layout,
+    element: parser.Element,
+    _: *std.ArrayList(LineItem),
+    apply_zoom: bool,
+) !void {
     // Save current style state including transform offsets
     const snapshot = StyleSnapshot{
         .is_bold = self.is_bold,
@@ -1973,11 +2242,39 @@ fn applyNodeStyles(self: *Layout, element: parser.Element, _: *std.ArrayList(Lin
         .transform_offset_x = self.transform_offset_x,
         .transform_offset_y = self.transform_offset_y,
         .color_scheme_dark = self.color_scheme_dark,
+        .effective_zoom = self.effective_zoom,
     };
     try self.style_stack.append(self.allocator, snapshot);
 
     if (element.style) |*style_map| {
-        const notify_target = if (self.inline_block) |blk| &blk.height else null;
+        const notify_target = if (self.inline_block) |blk|
+            if (blk.persistent_dependencies)
+                &blk.height
+            else
+                blk.temporary_dependency_target
+        else
+            null;
+        if (self.inline_block) |blk| {
+            if (!blk.persistent_dependencies) {
+                if (notify_target) |target| registerStyleDependencies(style_map, target);
+            }
+        }
+        // `zoom` is not inherited as a computed property, but its used value
+        // multiplies every descendant length. DOM-backed BlockLayouts already
+        // folded their own zoom into block.zoom; inline descendants do it here.
+        if (apply_zoom) {
+            const zoom_value = if (notify_target) |target|
+                styleValueRead(style_map, "zoom", target)
+            else
+                styleValue(style_map, "zoom");
+            if (zoom_value) |zoom_str| {
+                self.effective_zoom = combinedEffectiveZoom(
+                    self.effectiveZoom(),
+                    parseCssZoom(zoom_str),
+                );
+            }
+        }
+
         // Apply the inherited font family before measuring any descendant
         // glyphs. Unsupported named faces resolve through the CSS fallback
         // list to Zibra's proportional system face.
@@ -2032,8 +2329,8 @@ fn applyNodeStyles(self: *Layout, element: parser.Element, _: *std.ArrayList(Lin
         // Apply transform to cumulative offset for hit testing
         if (styleValue(style_map, "transform")) |transform_str| {
             if (parseTranslate(transform_str)) |translate| {
-                self.transform_offset_x += translate.x;
-                self.transform_offset_y += translate.y;
+                self.transform_offset_x += self.scaleActiveCssPixel(translate.x);
+                self.transform_offset_y += self.scaleActiveCssPixel(translate.y);
             }
         }
 
@@ -2058,6 +2355,7 @@ fn restoreNodeStyles(self: *Layout, _: *std.ArrayList(LineItem)) !void {
         self.transform_offset_x = snapshot.transform_offset_x;
         self.transform_offset_y = snapshot.transform_offset_y;
         self.color_scheme_dark = snapshot.color_scheme_dark;
+        self.effective_zoom = snapshot.effective_zoom;
     }
 }
 
@@ -2369,6 +2667,7 @@ fn flushLine(self: *Layout, line_buffer: *std.ArrayList(LineItem)) !void {
                                 .bottom = bounds_y + item.height,
                             },
                             .node = ptr,
+                            .css_zoom = iframe_payload.css_zoom,
                             .source = source,
                         },
                     });
@@ -2879,11 +3178,11 @@ fn breakParagraph(self: *Layout, line_buffer: *std.ArrayList(LineItem)) !void {
     const initial_y = self.cursor_y;
     try self.flushLine(line_buffer);
 
-    const gap = paragraphGap(self.size);
+    const gap = @max(self.scaleActiveCssPixel(paragraphGap(self.size)), 1);
     if (self.cursor_y == initial_y) {
         // Preserve an empty source line even though flushLine has no glyph
         // metrics from which to derive its normal advance.
-        self.cursor_y += @max(self.size, 1);
+        self.cursor_y += @max(self.scaleActiveCssPixel(self.size), 1);
     }
     self.cursor_y += gap;
     self.cursor_x = self.line_left;
@@ -3224,7 +3523,7 @@ const InputLayout = struct {
                 }
             }
             if (styleValue(style_map, "border-radius")) |radius| {
-                self.border_radius = parseCssPixelRadius(radius);
+                self.border_radius = engine.scaleActiveCssFloat(parseCssPixelRadius(radius));
             }
         }
 
@@ -3247,18 +3546,18 @@ const InputLayout = struct {
         const ascent_value = engine.toLayoutPx(glyph.ascent);
         const descent_value = engine.toLayoutPx(glyph.descent);
         const natural_height = ascent_value + descent_value;
-        var width_value = if (self.is_checkbox) natural_height else INPUT_WIDTH_PX;
+        var width_value = if (self.is_checkbox) natural_height else engine.scaleActiveCssPixel(INPUT_WIDTH_PX);
         var height_value = natural_height;
         if (!self.is_checkbox) {
             if (element.style) |*style_map| {
                 if (resolvedPixelDimension(&element, style_map, "width")) |pixels|
-                    width_value = @max(pixels, 1);
+                    width_value = @max(engine.scaleActiveCssPixel(pixels), 1);
                 if (resolvedPixelDimension(&element, style_map, "height")) |pixels|
-                    height_value = @max(pixels, natural_height);
+                    height_value = @max(engine.scaleActiveCssPixel(pixels), natural_height);
             }
         }
-        self.embed.setupDependencies(engine.inline_block, if (element.style) |*map| map else null);
-        self.embed.setMetrics(width_value, height_value, ascent_value, descent_value, engine.zoom(), self.font_size);
+        self.embed.setupDependencies();
+        self.embed.setMetrics(width_value, height_value, ascent_value, descent_value, engine.effectiveZoom(), self.font_size);
         self.is_focused = element.is_focused;
     }
 
@@ -3301,7 +3600,7 @@ const InputLayout = struct {
                     .bottom = y + height_value,
                 },
                 .color = forced_colors.text,
-                .thickness = 1,
+                .thickness = @max(scaleCssPixel(1, self.embed.zoom.get().*, engine.zoom()), 1),
                 .source = source,
             } });
         }
@@ -3320,7 +3619,7 @@ const InputLayout = struct {
                         .bottom = y + height_value,
                     },
                     .color = ink,
-                    .thickness = 1,
+                    .thickness = @max(scaleCssPixel(1, self.embed.zoom.get().*, engine.zoom()), 1),
                     .source = source,
                 },
             });
@@ -3368,7 +3667,7 @@ const InputLayout = struct {
             return;
         }
 
-        var text_x = x + 2;
+        var text_x = x + scaleCssPixel(2, self.embed.zoom.get().*, engine.zoom());
         const baseline_y = y + ascent_value;
         if (self.text.len > 0) {
             var g_iter = grapheme.iterator(self.text);
@@ -3548,28 +3847,30 @@ const ButtonLayout = struct {
                 }
             }
             if (styleValue(style_map, "border-radius")) |radius| {
-                self.border_radius = parseCssPixelRadius(radius);
+                self.border_radius = engine.scaleActiveCssFloat(parseCssPixelRadius(radius));
             }
         }
 
         // Preserve the former 200px control width while allowing chrome and
         // authored pages to size a control explicitly. Oversized descendants
         // still expand the final outer box below instead of spilling out.
-        var requested_width = INPUT_WIDTH_PX;
+        const padding = @max(engine.scaleActiveCssPixel(button_padding), 1);
+        var requested_width = engine.scaleActiveCssPixel(INPUT_WIDTH_PX);
         var requested_height: ?i32 = null;
         if (element.style) |*style_map| {
             if (resolvedPixelDimension(&element, style_map, "width")) |pixels|
-                requested_width = @max(pixels, 1);
+                requested_width = @max(engine.scaleActiveCssPixel(pixels), 1);
             if (resolvedPixelDimension(&element, style_map, "height")) |pixels|
-                requested_height = @max(pixels, 1);
+                requested_height = @max(engine.scaleActiveCssPixel(pixels), 1);
         }
-        const content_width = @max(requested_width - 2 * button_padding, 1);
+        const content_width = @max(requested_width - 2 * padding, 1);
         const root = try BlockLayout.initRichButton(
             self.embed.allocator,
             button_node,
             parent_block.document,
             parent_block,
             content_width,
+            engine.effectiveZoom(),
         );
         self.root = root;
 
@@ -3611,7 +3912,7 @@ const ButtonLayout = struct {
                 root.height.get().*,
                 @max(
                     minimum_content_height,
-                    if (requested_height) |height| @max(height - 2 * button_padding, 1) else 1,
+                    if (requested_height) |height| @max(height - 2 * padding, 1) else 1,
                 ),
             ),
         };
@@ -3619,16 +3920,16 @@ const ButtonLayout = struct {
             content_bounds = unionRects(content_bounds, paint_bounds);
         }
 
-        const box_metrics = buttonBoxMetrics(content_bounds);
+        const box_metrics = buttonBoxMetrics(content_bounds, padding);
         self.content_offset_x = box_metrics.content_offset_x;
         self.content_offset_y = box_metrics.content_offset_y;
-        self.embed.setupDependencies(parent_block, if (element.style) |*map| map else null);
+        self.embed.setupDependencies();
         self.embed.setMetrics(
             box_metrics.width,
             box_metrics.height,
             box_metrics.height,
             0,
-            engine.zoom(),
+            engine.effectiveZoom(),
             engine.size,
         );
     }
@@ -3673,7 +3974,7 @@ const ButtonLayout = struct {
                     .bottom = y + self.embed.height.get().*,
                 },
                 .color = forced_colors.text,
-                .thickness = 1,
+                .thickness = @max(scaleCssPixel(1, self.embed.zoom.get().*, engine.zoom()), 1),
                 .source = source,
             } });
         }
@@ -3759,12 +4060,12 @@ const ButtonBoxMetrics = struct {
     content_offset_y: i32,
 };
 
-fn buttonBoxMetrics(content_bounds: browser.Rect) ButtonBoxMetrics {
+fn buttonBoxMetrics(content_bounds: browser.Rect, padding: i32) ButtonBoxMetrics {
     return .{
-        .width = content_bounds.width() + 2 * button_padding,
-        .height = content_bounds.height() + 2 * button_padding,
-        .content_offset_x = button_padding - content_bounds.left,
-        .content_offset_y = button_padding - content_bounds.top,
+        .width = content_bounds.width() + 2 * padding,
+        .height = content_bounds.height() + 2 * padding,
+        .content_offset_x = padding - content_bounds.left,
+        .content_offset_y = padding - content_bounds.top,
     };
 }
 
@@ -3774,7 +4075,7 @@ test "rich button box encloses tall oversized and negative-offset content" {
         .top = -3,
         .right = 240,
         .bottom = 117,
-    });
+    }, button_padding);
     try std.testing.expectEqual(@as(i32, 260), metrics.width);
     try std.testing.expectEqual(@as(i32, 128), metrics.height);
     try std.testing.expectEqual(@as(i32, 16), metrics.content_offset_x);
@@ -4091,6 +4392,18 @@ const TextLayout = struct {
         self.mark();
     }
 
+    fn addStyleDependencies(text: *TextLayout, style_map: ?*parser.StyleMap) void {
+        const map = style_map orelse return;
+        for ([_][]const u8{ "font-weight", "font-style", "font-size", "font-family" }) |property| {
+            if (map.getPtr(property)) |field| {
+                text.width.addDependency(field);
+                text.height.addDependency(field);
+                text.ascent.addDependency(field);
+                text.descent.addDependency(field);
+            }
+        }
+    }
+
     fn init(
         allocator: std.mem.Allocator,
         node: Node,
@@ -4145,64 +4458,10 @@ const TextLayout = struct {
         text.ascent.addDependency(&text.zoom);
         text.descent.addDependency(&text.zoom);
 
-        switch (text.node) {
-            .text => |*t| {
-                if (t.style) |*style_map| {
-                    if (style_map.getPtr("font-weight")) |field| {
-                        text.width.addDependency(field);
-                        text.height.addDependency(field);
-                        text.ascent.addDependency(field);
-                        text.descent.addDependency(field);
-                    }
-                    if (style_map.getPtr("font-style")) |field| {
-                        text.width.addDependency(field);
-                        text.height.addDependency(field);
-                        text.ascent.addDependency(field);
-                        text.descent.addDependency(field);
-                    }
-                    if (style_map.getPtr("font-size")) |field| {
-                        text.width.addDependency(field);
-                        text.height.addDependency(field);
-                        text.ascent.addDependency(field);
-                        text.descent.addDependency(field);
-                    }
-                    if (style_map.getPtr("font-family")) |field| {
-                        text.width.addDependency(field);
-                        text.height.addDependency(field);
-                        text.ascent.addDependency(field);
-                        text.descent.addDependency(field);
-                    }
-                }
-            },
-            .element => |*e| {
-                if (e.style) |*style_map| {
-                    if (style_map.getPtr("font-weight")) |field| {
-                        text.width.addDependency(field);
-                        text.height.addDependency(field);
-                        text.ascent.addDependency(field);
-                        text.descent.addDependency(field);
-                    }
-                    if (style_map.getPtr("font-style")) |field| {
-                        text.width.addDependency(field);
-                        text.height.addDependency(field);
-                        text.ascent.addDependency(field);
-                        text.descent.addDependency(field);
-                    }
-                    if (style_map.getPtr("font-size")) |field| {
-                        text.width.addDependency(field);
-                        text.height.addDependency(field);
-                        text.ascent.addDependency(field);
-                        text.descent.addDependency(field);
-                    }
-                    if (style_map.getPtr("font-family")) |field| {
-                        text.width.addDependency(field);
-                        text.height.addDependency(field);
-                        text.ascent.addDependency(field);
-                        text.descent.addDependency(field);
-                    }
-                }
-            },
-        }
+        if (parent.parent.persistent_dependencies) switch (text.node) {
+            .text => |*t| addStyleDependencies(text, if (t.style) |*style_map| style_map else null),
+            .element => |*e| addStyleDependencies(text, if (e.style) |*style_map| style_map else null),
+        };
         text.width.freezeDependencies();
         text.height.freezeDependencies();
         text.ascent.freezeDependencies();
@@ -4296,7 +4555,7 @@ const TextLayout = struct {
         self.ascent.set(ascent_value);
         self.descent.set(descent_value);
         self.x.set(x_value);
-        self.zoom.set(1.0);
+        self.zoom.set(self.parent.zoom.read(&self.zoom).*);
         // y position is computed by LineLayout after baseline is determined
 
         // Clear descendant flags after layout pass
@@ -4542,7 +4801,7 @@ const LineLayout = struct {
         self.ascent.set(max_ascent);
         self.descent.set(max_descent);
         self.height.set(height_value);
-        self.zoom.set(1.0);
+        self.zoom.set(self.parent.zoom.read(&self.zoom).*);
 
         // Clear descendant flags after layout pass
         self.has_dirty_descendants = false;
@@ -4630,6 +4889,7 @@ pub const DocumentLayout = struct {
     allocator: std.mem.Allocator,
     node: Node,
     node_ptr: *Node,
+    page_zoom: f32 = 1.0,
 
     zoom: ProtectedField(f32),
     x: ProtectedField(i32),
@@ -4653,6 +4913,7 @@ pub const DocumentLayout = struct {
             .allocator = allocator,
             .node = node.*,
             .node_ptr = node,
+            .page_zoom = 1.0,
             .zoom = ProtectedField(f32).init(allocator, 1.0),
             .children = std.ArrayList(*BlockLayout).empty,
             .x = ProtectedField(i32).init(allocator, h_offset),
@@ -4703,10 +4964,12 @@ pub const DocumentLayout = struct {
         defer self.in_layout = false;
 
         // Compute dimensions
-        const x_value = h_offset;
-        const y_value = v_offset;
-        const width_value = engine.layoutWindowWidth() - engine.layoutScrollbarWidth() - (2 * h_offset);
-        const zoom_value = engine.zoom();
+        const zoom_value = combinedEffectiveZoom(engine.zoom(), engine.frame_css_zoom);
+        self.page_zoom = engine.zoom();
+        const x_value = scaleCssPixel(h_offset, zoom_value, engine.zoom());
+        const y_value = scaleCssPixel(v_offset, zoom_value, engine.zoom());
+        const width_value = engine.layoutWindowWidth() - engine.layoutScrollbarWidth() - (2 * x_value);
+        engine.effective_zoom = zoom_value;
 
         // Set x, y, width, zoom BEFORE child layout so children can read them
         self.x.set(x_value);
@@ -4875,6 +5138,15 @@ const BlockLayout = struct {
     // commands are later translated into the surrounding inline line box.
     embedded_box: ?EmbeddedBlockBox = null,
     rich_button_root: bool = false,
+    effective_zoom_override: ?f32 = null,
+    /// False for rich-button layout trees, which are destroyed after their
+    /// paint commands are rebased into the persistent surrounding block.
+    /// ProtectedField has no unsubscribe operation, so those temporary trees
+    /// must never register callbacks with longer-lived DOM/layout fields.
+    persistent_dependencies: bool = true,
+    /// Rich-button descendants route every DOM-style invalidation to this
+    /// persistent containing-block field instead of their temporary fields.
+    temporary_dependency_target: ?*ProtectedField(i32) = null,
 
     // ProtectedField-wrapped layout properties
     zoom: ProtectedField(f32),
@@ -4908,6 +5180,26 @@ const BlockLayout = struct {
         parent_block: ?*BlockLayout,
         previous: ?*BlockLayout,
     ) !*BlockLayout {
+        return initWithDependencyTracking(
+            allocator,
+            node,
+            node_ptr,
+            document,
+            parent_block,
+            previous,
+            if (parent_block) |parent| parent.persistent_dependencies else true,
+        );
+    }
+
+    fn initWithDependencyTracking(
+        allocator: std.mem.Allocator,
+        node: Node,
+        node_ptr: ?*Node,
+        document: *DocumentLayout,
+        parent_block: ?*BlockLayout,
+        previous: ?*BlockLayout,
+        persistent_dependencies: bool,
+    ) !*BlockLayout {
         const block = try allocator.create(BlockLayout);
         block.* = BlockLayout{
             .allocator = allocator,
@@ -4926,6 +5218,12 @@ const BlockLayout = struct {
             .display_list = std.ArrayList(DisplayItem).empty,
             .embedded_box = null,
             .rich_button_root = false,
+            .effective_zoom_override = null,
+            .persistent_dependencies = persistent_dependencies,
+            .temporary_dependency_target = if (!persistent_dependencies and parent_block != null)
+                parent_block.?.temporary_dependency_target
+            else
+                null,
             .children_epoch = 0,
             .children_version = ProtectedField(u64).init(allocator, 0),
         };
@@ -4936,40 +5234,56 @@ const BlockLayout = struct {
         block.height.setOwner(block, markOpaque);
         block.children_version.setOwner(block, markOpaque);
 
-        if (parent_block) |parent| {
-            block.zoom.addDependency(&parent.zoom);
-            block.x.addDependency(&parent.x);
-            block.width.addDependency(&parent.width);
-            if (previous) |prev| {
-                block.y.addDependency(&prev.y);
-                block.y.addDependency(&prev.height);
-            } else {
-                block.y.addDependency(&parent.y);
+        if (!persistent_dependencies) {
+            if (block.temporary_dependency_target) |target| {
+                if (node_ptr) |ptr| switch (ptr.*) {
+                    .element => |*element| {
+                        if (element.style) |*style_map| registerStyleDependencies(style_map, target);
+                    },
+                    .text => {},
+                };
             }
-        } else {
-            block.zoom.addDependency(&document.zoom);
-            block.x.addDependency(&document.x);
-            block.width.addDependency(&document.width);
-            if (previous) |prev| {
-                block.y.addDependency(&prev.y);
-                block.y.addDependency(&prev.height);
+        }
+
+        if (persistent_dependencies) {
+            if (parent_block) |parent| {
+                block.zoom.addDependency(&parent.zoom);
+                block.x.addDependency(&parent.x);
+                block.width.addDependency(&parent.width);
+                if (previous) |prev| {
+                    block.y.addDependency(&prev.y);
+                    block.y.addDependency(&prev.height);
+                } else {
+                    block.y.addDependency(&parent.y);
+                }
             } else {
-                block.y.addDependency(&document.y);
+                block.zoom.addDependency(&document.zoom);
+                block.x.addDependency(&document.x);
+                block.width.addDependency(&document.width);
+                if (previous) |prev| {
+                    block.y.addDependency(&prev.y);
+                    block.y.addDependency(&prev.height);
+                } else {
+                    block.y.addDependency(&document.y);
+                }
             }
         }
 
         // Real DOM-backed blocks react to changes in their specified
         // dimensions. Anonymous blocks intentionally keep their auto size.
-        if (node_ptr) |ptr| {
-            switch (ptr.*) {
-                .element => |*element| {
-                    if (element.style) |*style_map| {
-                        if (style_map.getPtr("width")) |field| block.width.addDependency(field);
-                        if (style_map.getPtr("height")) |field| block.height.addDependency(field);
-                        if (style_map.getPtr("overflow")) |field| block.height.addDependency(field);
-                    }
-                },
-                .text => {},
+        if (persistent_dependencies) {
+            if (node_ptr) |ptr| {
+                switch (ptr.*) {
+                    .element => |*element| {
+                        if (element.style) |*style_map| {
+                            if (style_map.getPtr("zoom")) |field| block.zoom.addDependency(field);
+                            if (style_map.getPtr("width")) |field| block.width.addDependency(field);
+                            if (style_map.getPtr("height")) |field| block.height.addDependency(field);
+                            if (style_map.getPtr("overflow")) |field| block.height.addDependency(field);
+                        }
+                    },
+                    .text => {},
+                }
             }
         }
         block.zoom.freezeDependencies();
@@ -4997,17 +5311,29 @@ const BlockLayout = struct {
         document: *DocumentLayout,
         parent_block: *BlockLayout,
         content_width: i32,
+        effective_zoom: f32,
     ) !*BlockLayout {
-        const block = try BlockLayout.init(
+        const block = try BlockLayout.initWithDependencyTracking(
             allocator,
             node_ptr.*,
             node_ptr,
             document,
             parent_block,
             null,
+            false,
         );
         block.embedded_box = .{ .x = 0, .y = 0, .width = content_width };
         block.rich_button_root = true;
+        block.effective_zoom_override = effective_zoom;
+        block.temporary_dependency_target = &parent_block.height;
+        switch (node_ptr.*) {
+            .element => |*element| {
+                if (element.style) |*style_map| {
+                    registerStyleDependencies(style_map, &parent_block.height);
+                }
+            },
+            .text => {},
+        }
         return block;
     }
 
@@ -5020,7 +5346,14 @@ const BlockLayout = struct {
         const node_ptr = self.node_ptr orelse return null;
         return switch (node_ptr.*) {
             .element => |*element| if (element.style) |*style_map| blk: {
-                const computed = styleValueRead(style_map, property, target) orelse break :blk null;
+                const dependency_target = if (self.persistent_dependencies)
+                    target
+                else
+                    self.temporary_dependency_target;
+                const computed = (if (dependency_target) |notify|
+                    styleValueRead(style_map, property, notify)
+                else
+                    styleValue(style_map, property)) orelse break :blk null;
                 break :blk animatedPixelDimension(element, property) orelse
                     parseCssPixelLength(computed);
             } else null,
@@ -5145,7 +5478,10 @@ const BlockLayout = struct {
                 // Otherwise, mixed content stays inline unless the element is
                 // empty, matching the book's simplified layout algorithm.
                 for (e.children.items) |child| {
-                    if (isContainerNode(child, &self.children_version)) return true;
+                    if (isContainerNode(
+                        child,
+                        if (self.persistent_dependencies) &self.children_version else null,
+                    )) return true;
                 }
                 return e.children.items.len == 0;
             },
@@ -5233,28 +5569,89 @@ const BlockLayout = struct {
             self.node = ptr.*;
         }
 
+        // This subtree is rebuilt and destroyed inside one surrounding line
+        // layout. Its live DOM styles must invalidate the persistent outer
+        // block, never a ProtectedField owned by this temporary tree.
+        if (!self.persistent_dependencies) {
+            if (self.temporary_dependency_target) |target| switch (self.node) {
+                .element => |*element| {
+                    if (element.style) |*style_map| registerStyleDependencies(style_map, target);
+                },
+                .text => {},
+            };
+        }
+
         // Compute position and dimensions
         // Use .read() to register invalidation dependencies on parent/document/previous fields
-        const parent_x = if (self.parent_block) |pb| pb.x.read(&self.x).* else self.document.x.read(&self.x).*;
-        const parent_width = if (self.parent_block) |pb| pb.width.read(&self.width).* else self.document.width.read(&self.width).*;
-        const prev_y = if (self.previous) |prev|
-            prev.y.read(&self.y).* + prev.height.read(&self.y).*
-        else if (self.parent_block) |pb|
-            pb.y.read(&self.y).* + tableOfContentsHeaderHeight(pb.node)
+        const parent_zoom = if (self.parent_block) |pb|
+            if (self.persistent_dependencies) pb.zoom.read(&self.zoom).* else pb.zoom.get().*
+        else if (self.persistent_dependencies)
+            self.document.zoom.read(&self.zoom).*
         else
-            self.document.y.read(&self.y).*;
+            self.document.zoom.get().*;
+        const local_zoom = if (self.inline_nodes == null and self.node_ptr != null) local: {
+            const element = switch (self.node_ptr.?.*) {
+                .element => |*value| value,
+                .text => break :local 1.0,
+            };
+            const styles = if (element.style) |*value| value else break :local 1.0;
+            break :local parseCssZoom(styleValue(styles, "zoom") orelse "1");
+        } else 1.0;
+        const zoom_value = self.effective_zoom_override orelse
+            combinedEffectiveZoom(parent_zoom, local_zoom);
+        self.zoom.set(zoom_value);
+
+        const parent_x = if (self.parent_block) |pb|
+            if (self.persistent_dependencies) pb.x.read(&self.x).* else pb.x.get().*
+        else if (self.persistent_dependencies)
+            self.document.x.read(&self.x).*
+        else
+            self.document.x.get().*;
+        const parent_width = if (self.parent_block) |pb|
+            if (self.persistent_dependencies) pb.width.read(&self.width).* else pb.width.get().*
+        else if (self.persistent_dependencies)
+            self.document.width.read(&self.width).*
+        else
+            self.document.width.get().*;
+        const prev_y = if (self.previous) |prev|
+            if (self.persistent_dependencies)
+                prev.y.read(&self.y).* + prev.height.read(&self.y).*
+            else
+                prev.y.get().* + prev.height.get().*
+        else if (self.parent_block) |pb|
+            (if (self.persistent_dependencies) pb.y.read(&self.y).* else pb.y.get().*) +
+                tableOfContentsHeaderHeight(
+                    pb.node,
+                    pb.zoom.get().*,
+                    engine.zoom(),
+                )
+        else if (self.persistent_dependencies)
+            self.document.y.read(&self.y).*
+        else
+            self.document.y.get().*;
 
         // Set x, y, width early so children can read them
         const content_bounds = if (self.embedded_box) |embedded|
             ContentBounds{ .x = embedded.x, .width = embedded.width }
         else
-            contentBoundsForNode(self.node, parent_x, parent_width);
+            contentBoundsForNode(
+                self.node,
+                parent_x,
+                parent_width,
+                scaleCssPixel(list_item_indent, zoom_value, engine.zoom()),
+            );
         const specified_width = if (self.embedded_box == null)
-            self.specifiedPixelDimension("width", &self.width)
+            if (self.specifiedPixelDimension("width", &self.width)) |width|
+                scaleCssPixel(width, zoom_value, engine.zoom())
+            else
+                null
         else
             null;
         const specified_height = if (self.embedded_box == null)
-            self.specifiedPixelDimension("height", &self.height)
+            if (self.specifiedPixelDimension("height", &self.height)) |height|
+                scaleCssPixel(height, zoom_value, engine.zoom())
+            else
+                null
         else
             null;
         self.x.set(content_bounds.x);
@@ -5342,10 +5739,13 @@ const BlockLayout = struct {
                     },
                 }
             }
-            const auto_height = computed_height + tableOfContentsHeaderHeight(self.node);
+            const auto_height = computed_height + tableOfContentsHeaderHeight(
+                self.node,
+                zoom_value,
+                engine.zoom(),
+            );
             natural_height = auto_height;
             self.height.set(specified_height orelse auto_height);
-            self.zoom.set(1.0);
         } else {
             // Inline layout mode - use the old approach for now
             // TODO: Refactor to populate LineLayout and TextLayout objects
@@ -5384,8 +5784,10 @@ const BlockLayout = struct {
             // anonymous block, normal inline recursion preserves the h6's
             // style while continuing straight into the paragraph text.
             if (isRunInHeadingNode(nodes[index]) and
-                index + 1 < nodes.len and isContainerNode(nodes[index + 1], &self.children_version))
-            {
+                index + 1 < nodes.len and isContainerNode(
+                nodes[index + 1],
+                if (self.persistent_dependencies) &self.children_version else null,
+            )) {
                 const run_in_nodes = try self.allocator.alloc(*Node, 2);
                 errdefer self.allocator.free(run_in_nodes);
                 run_in_nodes[0] = &nodes[index];
@@ -5397,7 +5799,10 @@ const BlockLayout = struct {
                 continue;
             }
 
-            if (isContainerNode(nodes[index], &self.children_version)) {
+            if (isContainerNode(
+                nodes[index],
+                if (self.persistent_dependencies) &self.children_version else null,
+            )) {
                 const child_node = &nodes[index];
                 const child = try BlockLayout.init(self.allocator, child_node.*, child_node, self.document, self, previous);
                 try self.children.append(self.allocator, .{ .block = child });
@@ -5407,7 +5812,10 @@ const BlockLayout = struct {
             }
 
             const start = index;
-            while (index < nodes.len and !isContainerNode(nodes[index], &self.children_version)) : (index += 1) {}
+            while (index < nodes.len and !isContainerNode(
+                nodes[index],
+                if (self.persistent_dependencies) &self.children_version else null,
+            )) : (index += 1) {}
             const inline_nodes = try self.allocator.alloc(*Node, index - start);
             errdefer self.allocator.free(inline_nodes);
             for (nodes[start..index], 0..) |*node, output_index| {
@@ -5517,6 +5925,7 @@ fn wordNeedsNewLine(cursor_x: i32, word_width: i32, line_width: i32) bool {
 }
 
 fn setTestLayoutBox(layout_object: anytype, x: i32, y: i32, width: i32, height: i32) void {
+    layout_object.zoom.set(1.0);
     layout_object.x.set(x);
     layout_object.y.set(y);
     layout_object.width.set(width);
@@ -5919,7 +6328,7 @@ fn appendContentEditableCursor(self: *Layout, commands: *std.ArrayList(DisplayIt
         "X",
         .Normal,
         .Roman,
-        self.default_font_size,
+        self.scaledFontSizeForZoom(self.default_font_size, block.zoom.get().*),
         .proportional,
     );
     const cursor_height = self.toLayoutPx(glyph.ascent + glyph.descent);
@@ -5933,8 +6342,11 @@ fn appendListMarker(self: *Layout, commands: *std.ArrayList(DisplayItem), block:
     };
     if (!isListItemElement(element) or block.height.get().* <= 0) return;
 
-    const marker_x = block.x.get().* - list_item_indent + (list_item_indent - list_marker_size) / 2;
-    const marker_y = block.y.get().* + @min(list_marker_top_offset, @max(block.height.get().* - list_marker_size, 0));
+    const indent = scaleBlockCssPixel(block, list_item_indent);
+    const marker_size = @max(scaleBlockCssPixel(block, list_marker_size), 1);
+    const marker_top = scaleBlockCssPixel(block, list_marker_top_offset);
+    const marker_x = block.x.get().* - indent + @divTrunc(indent - marker_size, 2);
+    const marker_y = block.y.get().* + @min(marker_top, @max(block.height.get().* - marker_size, 0));
     const color = if (element.style) |*style_map|
         if (styleValue(style_map, "color")) |value| parseColor(value) orelse browser.Color{ .r = 0, .g = 0, .b = 0, .a = 255 } else browser.Color{ .r = 0, .g = 0, .b = 0, .a = 255 }
     else
@@ -5943,8 +6355,8 @@ fn appendListMarker(self: *Layout, commands: *std.ArrayList(DisplayItem), block:
     try commands.append(self.allocator, .{ .rect = .{
         .x1 = marker_x,
         .y1 = marker_y,
-        .x2 = marker_x + list_marker_size,
-        .y2 = marker_y + list_marker_size,
+        .x2 = marker_x + marker_size,
+        .y2 = marker_y + marker_size,
         .color = self.remapColor(color, .text),
         .source = displaySource(block, block.node_ptr),
     } });
@@ -5960,6 +6372,11 @@ fn appendTableOfContentsHeader(self: *Layout, commands: *std.ArrayList(DisplayIt
     const x = block.x.get().*;
     const y = block.y.get().*;
     const width = block.width.get().*;
+    const header_height = tableOfContentsHeaderHeight(
+        block.node,
+        block.zoom.get().*,
+        block.document.page_zoom,
+    );
     const background = self.remapColor(
         .{ .r = 211, .g = 211, .b = 211, .a = 255 },
         .background,
@@ -5968,7 +6385,7 @@ fn appendTableOfContentsHeader(self: *Layout, commands: *std.ArrayList(DisplayIt
         .x1 = x,
         .y1 = y,
         .x2 = x + width,
-        .y2 = y + toc_header_height,
+        .y2 = y + header_height,
         .color = background,
         .source = displaySource(block, block.node_ptr),
     } });
@@ -5977,12 +6394,12 @@ fn appendTableOfContentsHeader(self: *Layout, commands: *std.ArrayList(DisplayIt
         "Table of Contents",
         .Normal,
         .Roman,
-        self.scaledFontSize(self.default_font_size),
+        self.scaledFontSizeForZoom(self.default_font_size, block.zoom.get().*),
         .proportional,
     );
     try commands.append(self.allocator, .{ .glyph = .{
-        .x = x + 4,
-        .y = y + 3,
+        .x = x + scaleBlockCssPixel(block, 4),
+        .y = y + scaleBlockCssPixel(block, 3),
         .glyph = glyph,
         .color = self.remapColor(
             .{ .r = 0, .g = 0, .b = 0, .a = 255 },
@@ -6054,7 +6471,7 @@ fn recordElementFocusBounds(self: *Layout, block: *const BlockLayout) !void {
             "X",
             .Normal,
             .Roman,
-            self.default_font_size,
+            self.scaledFontSizeForZoom(self.default_font_size, block.zoom.get().*),
             .proportional,
         );
         height = self.toLayoutPx(glyph.ascent + glyph.descent);
@@ -6125,6 +6542,7 @@ fn layoutInlineBlock(self: *Layout, block: *BlockLayout) !void {
         self.inline_block = previous_inline_block;
     }
     self.inline_block = block;
+    self.effective_zoom = block.zoom.get().*;
     self.resetSoftHyphenWord();
 
     self.line_left = block.x.get().*;
@@ -6157,8 +6575,12 @@ fn layoutInlineBlock(self: *Layout, block: *BlockLayout) !void {
             switch (parent.node) {
                 .element => |element| {
                     if (element.style) |*style_map| {
-                        if (styleValueRead(style_map, "font-family", &block.height)) |family_value| {
-                            self.font_family = font.familyFromCss(family_value);
+                        const family_value = if (block.persistent_dependencies)
+                            styleValueRead(style_map, "font-family", &block.height)
+                        else
+                            styleValue(style_map, "font-family");
+                        if (family_value) |value| {
+                            self.font_family = font.familyFromCss(value);
                         }
                     }
                 },
@@ -6182,7 +6604,7 @@ fn layoutInlineBlock(self: *Layout, block: *BlockLayout) !void {
         },
         .element => |e| {
             // Apply CSS styles for this block element
-            try self.applyNodeStyles(e, &line_buffer);
+            try self.applyNodeStyles(e, &line_buffer, false);
 
             // Handle br tag for line breaks
             if (std.mem.eql(u8, e.tag, "br")) {
@@ -6210,7 +6632,6 @@ fn layoutInlineBlock(self: *Layout, block: *BlockLayout) !void {
     try self.flushLine(&line_buffer);
     const computed_height = self.cursor_y - block.y.get().*;
     block.height.set(if (computed_height < 0) 0 else computed_height);
-    block.zoom.set(1.0);
 }
 
 fn parseColor(color_str: []const u8) ?browser.Color {
@@ -6294,7 +6715,10 @@ fn addBackgroundIfNeeded(self: *Layout, block: *const BlockLayout) !void {
                 if (col.a == 0) return;
                 const remapped = self.remapColor(col, .background);
                 // Parse border-radius if present
-                const radius = if (border_radius_str) |br_str| parseCssPixelRadius(br_str) else 0;
+                const radius = if (border_radius_str) |br_str|
+                    scaleBlockCssFloat(block, parseCssPixelRadius(br_str))
+                else
+                    0;
 
                 const block_width = block.width.get().*;
                 const block_x = block.x.get().*;
@@ -6611,10 +7035,10 @@ fn applyPaintEffects(self: *Layout, block: *BlockLayout, commands: []DisplayItem
                 }
             }
             if (styleValue(style_map, "filter")) |filter_str| {
-                blur_radius = parseBlurFilter(filter_str) orelse 0.0;
+                blur_radius = scaleBlockCssFloat(block, parseBlurFilter(filter_str) orelse 0.0);
             }
             if (styleValue(style_map, "border-radius")) |radius_str| {
-                border_radius = parseCssPixelRadius(radius_str);
+                border_radius = scaleBlockCssFloat(block, parseCssPixelRadius(radius_str));
             }
             const overflow = std.mem.trim(
                 u8,
@@ -6649,14 +7073,14 @@ fn applyPaintEffects(self: *Layout, block: *BlockLayout, commands: []DisplayItem
             }
             if (animated_transform) |translation| {
                 const pixels = translation.layoutPixels();
-                transform_x = pixels.x;
-                transform_y = pixels.y;
+                transform_x = scaleBlockCssPixel(block, pixels.x);
+                transform_y = scaleBlockCssPixel(block, pixels.y);
                 has_transform = true;
             } else if (styleValue(style_map, "transform")) |transform_str| {
                 if (!std.ascii.eqlIgnoreCase(std.mem.trim(u8, transform_str, " \t\r\n"), "none")) {
                     if (parseTranslate(transform_str)) |translate| {
-                        transform_x = translate.x;
-                        transform_y = translate.y;
+                        transform_x = scaleBlockCssPixel(block, translate.x);
+                        transform_y = scaleBlockCssPixel(block, translate.y);
                         has_transform = true;
                     }
                 }
@@ -6884,7 +7308,10 @@ fn addBackgroundIfNeededToList(self: *Layout, commands: *std.ArrayList(DisplayIt
                 if (col.a == 0) return;
                 const remapped = self.remapColor(col, .background);
                 // Parse border-radius if present
-                const radius = if (border_radius_str) |br_str| parseCssPixelRadius(br_str) else 0;
+                const radius = if (border_radius_str) |br_str|
+                    scaleBlockCssFloat(block, parseCssPixelRadius(br_str))
+                else
+                    0;
 
                 const block_width = block.width.get().*;
                 const block_x = block.x.get().*;

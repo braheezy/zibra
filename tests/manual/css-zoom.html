@@ -1,0 +1,32 @@
+<!--
+How to verify:
+1. Open this page at the browser's default accessibility zoom.
+2. The blue control group is authored with zoom: 2. Its text, 120x40 green
+   box, 80x20 input, rounded corners, and 120x40 iframe should all be twice
+   the size of the matching unzoomed CSS lengths.
+3. "Nested 3x" is inside an additional zoom: 150% subtree and should be three
+   times the baseline text size. The gray sibling below stays unzoomed.
+4. Click the enlarged input/link and the nested iframe link; hit targets and
+   focus rings must match the painted geometry. Ctrl-+ should multiply the
+   whole result without changing the relative 1x/2x/3x ratios.
+-->
+<!doctype html>
+<style>
+  body { font-size: 16px; }
+  .zoomed { zoom: 2; background-color: lightblue; }
+  .fixed { display: block; width: 120px; height: 40px;
+           background-color: green; border-radius: 8px; }
+  .nested { zoom: 150%; }
+  input { width: 80px; height: 20px; border-radius: 4px; }
+  iframe { display: inline; }
+  .plain { display: block; width: 120px; height: 40px;
+           background-color: lightgray; }
+</style>
+<div>Baseline 1x</div>
+<section class="zoomed">
+  <div class="fixed">Fixed 2x</div>
+  <div class="nested"><a href="#target">Nested 3x</a></div>
+  <input value="control">
+  <iframe src="css-zoom-frame.html" width="120" height="40"></iframe>
+</section>
+<div class="plain" id="target">Unzoomed sibling</div>

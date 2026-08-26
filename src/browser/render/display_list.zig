@@ -244,6 +244,10 @@ pub const DisplayItem = union(enum) {
     iframe: struct {
         rect: Rect,
         node: *Node,
+        /// Authored zoom inherited by the nested browsing context. Geometry
+        /// is already scaled; this factor makes the child document's own CSS
+        /// lengths and natural sizes use the same effective zoom.
+        css_zoom: f32 = 1.0,
         source: ?DisplayItemSource = null,
     },
     rounded_rect: struct {

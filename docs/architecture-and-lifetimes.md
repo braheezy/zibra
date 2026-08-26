@@ -360,6 +360,25 @@ targets from positioned line content, including an insertion point for empty
 inline targets. A frame copies that ephemeral layout-engine collection with its
 other hit-test data, then releases it before either layout or DOM teardown.
 
+Layout keeps accessibility zoom and authored CSS `zoom` as related but
+distinct factors. Display-list coordinates remain page-layout coordinates:
+fixed CSS lengths, font metrics, natural replaced-element sizes, translations,
+radii, and filters have the cumulative authored subtree factor baked into
+them, while raster applies the tab's accessibility factor once to the complete
+list. Auto widths are already expressed by their containing block and are not
+multiplied. A BlockLayout's protected zoom field stores the total factor so a
+computed-style change invalidates descendant geometry and paint/hit effects
+read the same generation.
+
+An iframe placeholder carries its numeric authored effective zoom alongside
+its already-scaled rectangle. The child Frame stores that factor independently
+of DOM provenance; after parent style, Tab updates it before the post-order
+layout pass and rescales the prior viewport by the factor delta. Child layout
+uses the scaled viewport coordinate space, while conditional CSS divides by
+the inherited factor to recover the iframe's unscaled CSS-pixel media width.
+The numeric factor may cross composition boundaries; it does not extend any
+DOM or layout-object lifetime.
+
 DOM focus is also a synchronous, generation-bound operation. JavaScript
 `Node.focus()` crosses the host boundary with a numeric handle rather than a
 raw Node pointer. The tab worker first completes pending style/layout/paint,
@@ -559,6 +578,12 @@ spilling into following content. Descendant paint provenance remains precise:
 an embedded link or input is activated before the ancestor button, while an
 uncovered button pixel activates the button itself. HTML parser recovery keeps
 a later button start out of this case by implicitly closing the active button.
+Because `ProtectedField` cannot unsubscribe, no field owned by this temporary
+tree or a short-lived inline embed record registers with a DOM style or the
+persistent containing block. The temporary records copy current values, while
+their DOM style sources register the containing BlockLayout's height directly
+as the stable invalidation target. That persistent owner rebuilds the records
+when any descendant style changes.
 
 `DisplayItem.hitTestDevice` is a pure walk over the retained frame list. It
 visits items in reverse paint order, inverts translation transforms, treats
@@ -1195,8 +1220,9 @@ the source slices they borrow therefore cross the ownership boundary together.
 Media-environment rebuilding also constructs a complete replacement generation
 before retiring the old one; it runs on the serialized tab render path after
 zoom, viewport width, color-scheme preference, or forced-colors changes. Root
-media width is the native tab width divided by zoom, while an iframe's
-published viewport is already in CSS pixels. Every successfully replaced frame
+media width is the native tab width divided by accessibility zoom. An iframe's
+published viewport is in authored-zoom-scaled layout pixels, so media matching
+divides it by the Frame's inherited authored factor. Every successfully replaced frame
 dirties its complete computed-style subtree before style runs, so rules that
 became inactive reset to the cascade beneath them. See `loadInTab`,
 `loadInFrame`, `loadIframe`, and `rebuildFrameStyleRules`.

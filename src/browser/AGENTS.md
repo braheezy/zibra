@@ -36,6 +36,11 @@ before changing `root.zig`, `tab.zig`, `render/`, or browser task scheduling.
 - `tab.zig` owns frames, document generations, task serialization, and helper
   quiescence. Queued or detached work must carry a stable document identity,
   not a borrowed frame pointer.
+  Each child Frame also stores the numeric authored zoom inherited at its
+  iframe boundary. Recompute it from the styled containing-node ancestry
+  before child layout, rescale the already-published viewport by the factor
+  delta, and schedule a media/style follow-up because iframe media queries use
+  the unscaled CSS width. Root Frames always start at one.
 - `tab_tasks.zig` owns heap payloads transferred from Browser/UI work to the
   serialized Tab runner. Its comptime Browser parameter avoids a root import
   cycle. Simple input/history/resize work shares one tagged action adapter;

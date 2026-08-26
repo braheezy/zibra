@@ -24,6 +24,18 @@ before changing ownership or thread boundaries.
   permutation at paint and retain it with that display generation.
   Active width/height transitions override their computed pixel endpoints here;
   every frame relayouts descendants so line wrapping follows animated width.
+  Authored `zoom` is layout-inducing and multiplicative. Each block retains
+  its total effective zoom (accessibility zoom times frame/DOM zoom), while
+  fixed CSS lengths and natural replaced-element sizes bake only the authored
+  ratio into page-layout coordinates. Font raster size uses the total factor;
+  the later display-list raster pass still applies accessibility zoom exactly
+  once. Keep auto widths unscaled, propagate inline zoom through the scoped
+  style stack, and scale paint/hit effects from the generating block so
+  geometry, focus bounds, and clicks cannot diverge.
+  Inline embed records and rich-button block trees retire after one line is
+  painted. They may copy the current effective zoom, but no `ProtectedField`
+  they own may subscribe to a persistent block or DOM style. Route descendant
+  DOM-style invalidations directly to the containing persistent block instead.
   Document/block/line `in_layout` guards suppress only reentrant owner-wide
   invalidation caused by child metrics during that same serialized traversal.
 - `font.zig` owns SDL_ttf handles and cached RGBA glyph pixels. Display items
@@ -34,6 +46,9 @@ before changing ownership or thread boundaries.
   opacity; opacity-only paint ancestors multiply that scalar so the cached
   surface is sampled once during its final draw. Keep this module independent
   of `Browser`, SDL, and native-window lifecycle.
+  Iframe placeholders additionally publish the containing element's authored
+  effective zoom; Tab transfers that scalar to the child Frame before its next
+  layout. It is plain numeric state, not DOM/layout provenance.
 - `layout.zig` resolves every painted inline fragment to its nearest focusable
   DOM ancestor and unions those fragments once per visual line. Nested inline
   descendants therefore share their ancestor's wrapped focus geometry. After

@@ -108,6 +108,11 @@ or selector/rule lifetime.
 - `width` and `height` are non-inherited computed properties. Their default is
   `auto`; layout currently resolves only non-negative pixel lengths and keeps
   the borrowed computed-value slice in the style map.
+- `zoom` is non-inherited and defaults to `1`. Layout accepts positive numbers
+  and percentages, treats zero as one for web compatibility, and multiplies
+  used fixed lengths through the ancestor chain. Invalid/negative values fall
+  back to one in this simplified value-validation model; auto and percentage
+  dimensions remain unaffected.
 - Each Element owns a property-keyed tagged transition map. Numeric entries
   currently drive opacity, color entries interpolate RGBA channels together,
   pixel entries preserve the `px` unit for width/height, and transform entries

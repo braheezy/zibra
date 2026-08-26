@@ -78,6 +78,11 @@ cancels speech that has not started.
 `max-width` query using page zoom and native resize; the visible text and panel
 change from red to green while the query is active.
 
+`tests/manual/css-zoom.html` and its child-frame fixture compare unzoomed,
+2x, and nested 3x subtrees. Fixed boxes, fonts, controls, rounded geometry,
+iframe contents, focus, and clicks must share the same authored scale, which
+then composes multiplicatively with the browser's accessibility zoom.
+
 `tests/manual/forced-colors.html` toggles F6 across deliberately low-contrast
 author paint, semantic link/control states, and the `forced-colors` media
 feature. Active CSS paint must use only the black/white/cyan/yellow palette.

@@ -1329,6 +1329,31 @@ test "width and height are computed without inheriting" {
     );
 }
 
+test "zoom is computed per element without inheriting" {
+    const allocator = std.testing.allocator;
+    const html = "<div style=\"zoom: 175%\"><p>child</p></div>";
+
+    var html_parser = try HTMLParser.init(allocator, html);
+    html_parser.use_implicit_tags = false;
+    defer html_parser.deinit(allocator);
+    var root = try html_parser.parse();
+    defer root.deinit(allocator);
+
+    const rules = &[_]CSSParser.CSSRule{};
+    try document_parser.style(allocator, &root, rules);
+
+    try std.testing.expectEqualStrings(
+        "175%",
+        root.element.style.?.getPtr("zoom").?.get().*,
+    );
+    const child = &root.element.children.items[0].element;
+    try std.testing.expectEqualStrings("1", child.style.?.getPtr("zoom").?.get().*);
+    try std.testing.expectEqualStrings(
+        "1",
+        child.children.items[0].text.style.?.getPtr("zoom").?.get().*,
+    );
+}
+
 test "computed animation starts typed keyframe tracks without restarting on restyle" {
     const allocator = std.testing.allocator;
     const css =

@@ -179,6 +179,9 @@ pub const Frame = struct {
     fragment_targets: std.ArrayList(Layout.FragmentTarget),
     viewport_width: i32 = 0,
     viewport_height: i32 = 0,
+    /// Authored zoom inherited from the containing iframe. Root frames stay
+    /// at one; descendant document layout multiplies this with its own DOM.
+    inherited_css_zoom: f32 = 1.0,
     window_id: u32 = 0,
     current_url: ?*Url = null,
     current_url_owned: bool = false,
@@ -1123,6 +1126,47 @@ fn markFrameLayoutDirty(frame: *Frame) void {
     }
 }
 
+fn cssZoomFactorsDiffer(left: f32, right: f32) bool {
+    const magnitude = @max(@max(@abs(left), @abs(right)), 1.0);
+    return @abs(left - right) > magnitude * 0.00001;
+}
+
+fn refreshInheritedFrameZoom(frame: *Frame) bool {
+    var changed = false;
+    for (frame.children.items) |child| {
+        const local_zoom = if (child.frame_element) |element|
+            Layout.effectiveCssZoomForNode(element)
+        else
+            1.0;
+        const inherited = std.math.clamp(
+            frame.inherited_css_zoom * local_zoom,
+            @as(f32, 0.01),
+            @as(f32, 1024.0),
+        );
+        if (cssZoomFactorsDiffer(child.inherited_css_zoom, inherited)) {
+            const old_zoom = child.inherited_css_zoom;
+            const scale_from = if (old_zoom > 0.0) old_zoom else 1.0;
+            child.inherited_css_zoom = inherited;
+            if (child.viewport_width > 0) {
+                child.viewport_width = Layout.scaleCssPixelByFactor(
+                    child.viewport_width,
+                    inherited / scale_from,
+                );
+            }
+            if (child.viewport_height > 0) {
+                child.viewport_height = Layout.scaleCssPixelByFactor(
+                    child.viewport_height,
+                    inherited / scale_from,
+                );
+            }
+            markFrameLayoutDirty(child);
+            changed = true;
+        }
+        changed = refreshInheritedFrameZoom(child) or changed;
+    }
+    return changed;
+}
+
 fn invalidateFrameTreeForViewportResize(frame: *Frame) void {
     if (frame.document_layout) |doc| {
         doc.mark();
@@ -1185,6 +1229,12 @@ test "zoom changes CSS viewport width and invalidates media rules" {
     tab.media_environment_dirty = false;
     try std.testing.expect(!tab.updateZoomState(2.0));
     try std.testing.expect(!tab.media_environment_dirty);
+}
+
+test "iframe CSS zoom comparison ignores floating-point round trips" {
+    try std.testing.expect(!cssZoomFactorsDiffer(1.5, 1.500001));
+    try std.testing.expect(!cssZoomFactorsDiffer(3.0, 3.00001));
+    try std.testing.expect(cssZoomFactorsDiffer(1.5, 1.6));
 }
 
 test "forced colors changes invalidate media rules and the complete render pipeline" {
@@ -1885,6 +1935,13 @@ fn appendIframeContent(
 
     const child_width = iframe_data.rect.right - iframe_data.rect.left;
     const child_height = iframe_data.rect.bottom - iframe_data.rect.top;
+    if (cssZoomFactorsDiffer(child_frame.?.inherited_css_zoom, iframe_data.css_zoom)) {
+        child_frame.?.inherited_css_zoom = iframe_data.css_zoom;
+        markFrameLayoutDirty(child_frame.?);
+        self.needs_layout = true;
+        self.browser.setNeedsAnimationFrame(self);
+        self.browser.scheduleAnimationFrame();
+    }
     const child_width_changed = child_frame.?.viewport_width != child_width;
     child_frame.?.viewport_width = child_width;
     child_frame.?.viewport_height = child_height;
@@ -2045,6 +2102,12 @@ pub fn render(self: *Tab, b: *Browser) !void {
             self.needs_paint = true;
         }
         const layout_start = if (profiling) std.Io.Clock.awake.now(b.io).nanoseconds else 0;
+        if (refreshInheritedFrameZoom(frame)) {
+            // Child media widths are unscaled CSS pixels, so a changed frame
+            // factor needs one follow-up style generation as well as this
+            // frame's immediate corrected layout.
+            self.mediaEnvironmentChanged();
+        }
         var frames = std.ArrayList(*Frame).empty;
         defer frames.deinit(self.allocator);
         try self.collectFramesPostOrder(frame, &frames);

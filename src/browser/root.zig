@@ -3357,6 +3357,11 @@ pub const Browser = struct {
 
         const frame = try parent.allocator.create(Frame);
         frame.* = Frame.init(parent.allocator, parent.tab, parent, iframe_node);
+        frame.inherited_css_zoom = std.math.clamp(
+            parent.inherited_css_zoom * Layout.effectiveCssZoomForNode(iframe_node),
+            @as(f32, 0.01),
+            @as(f32, 1024.0),
+        );
         frame.certificate_error = document.certificate_error;
         frame.referrer_policy = response.referrer_policy;
         errdefer {
@@ -3365,8 +3370,14 @@ pub const Browser = struct {
         }
         parent.tab.registerFrame(frame);
         if (iframeViewportFromNode(iframe_node)) |viewport| {
-            frame.viewport_width = viewport.width;
-            frame.viewport_height = viewport.height;
+            frame.viewport_width = Layout.scaleCssPixelByFactor(
+                viewport.width,
+                frame.inherited_css_zoom,
+            );
+            frame.viewport_height = Layout.scaleCssPixelByFactor(
+                viewport.height,
+                frame.inherited_css_zoom,
+            );
         }
 
         const frame_url_ptr = try parent.allocator.create(Url);
@@ -3813,7 +3824,8 @@ pub const Browser = struct {
     /// `css_texts` only after this function succeeds.
     fn frameMediaEnvironment(frame: *const Frame) CSSParser.MediaEnvironment {
         const viewport_width_css = if (frame.parent != null and frame.viewport_width > 0)
-            @as(f64, @floatFromInt(frame.viewport_width))
+            @as(f64, @floatFromInt(frame.viewport_width)) /
+                @as(f64, if (frame.inherited_css_zoom > 0.0) frame.inherited_css_zoom else 1.0)
         else
             tab_module.viewportWidthInCssPixels(
                 frame.tab.tab_width,
@@ -4274,10 +4286,13 @@ pub const Browser = struct {
         self.layout_engine.accessibility = frame.tab.accessibility;
         const saved_window_width = self.layout_engine.window_width;
         const saved_window_height = self.layout_engine.window_height;
+        const saved_frame_css_zoom = self.layout_engine.frame_css_zoom;
         defer {
             self.layout_engine.window_width = saved_window_width;
             self.layout_engine.window_height = saved_window_height;
+            self.layout_engine.frame_css_zoom = saved_frame_css_zoom;
         }
+        self.layout_engine.frame_css_zoom = frame.inherited_css_zoom;
         if (frame.parent != null and frame.viewport_width > 0) {
             self.layout_engine.window_width = self.scalePxWithZoom(frame.viewport_width, frame.tab.accessibility.zoom);
         } else {
