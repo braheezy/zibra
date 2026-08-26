@@ -49,6 +49,9 @@ before changing ownership or thread boundaries.
   Iframe placeholders additionally publish the containing element's authored
   effective zoom; Tab transfers that scalar to the child Frame before its next
   layout. It is plain numeric state, not DOM/layout provenance.
+  Image commands normally sample the complete borrowed bitmap. Their optional
+  half-open source-pixel rectangle exists for CSS backgrounds cropped at the
+  element border box and must survive every clone/snapshot boundary.
   Canvas commands are the exception to ordinary image borrowing: every paint
   owns an immutable straight-alpha RGBA snapshot copied from the live
   premultiplied z2d surface. Deep-clone that buffer at every command-tree owner
@@ -74,7 +77,15 @@ before changing ownership or thread boundaries.
   assigns paint roles before author colors are replaced, so backgrounds,
   ordinary text, link states, controls, borders, and cursors cannot collapse
   into an author-selected low-contrast pair. Transparent paint remains
-  transparent; image pixels and color emoji are content and are not recolored.
+  transparent; content images and color emoji are not recolored, while
+  decorative CSS background images are suppressed.
+- Element backgrounds paint in color, image, content order inside the same
+  effect subtree so scrolling, opacity, transforms, overflow, and rounded
+  clipping remain coherent. The supported non-repeating image is anchored at
+  the top-left and accepts intrinsic `auto`, one/two px or percentage sizes,
+  `contain`, and `cover`; oversized output source-crops instead of spilling.
+  Inputs and rich buttons resolve their image from live provenance at paint
+  time rather than retaining another decoded-pixel borrow in layout state.
 - `effects.zig` contains pixel-only software effects. Keep its APIs explicit
   about premultiplication, edge sampling, and temporary allocation.
 - `raster_snapshot.zig` is the thread-transfer boundary. Snapshots must deep

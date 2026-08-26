@@ -32,6 +32,7 @@ const raster_snapshot = @import("render/raster_snapshot.zig");
 pub const RasterSnapshot = raster_snapshot.RasterSnapshot;
 pub const rasterBlendNeedsIsolation = raster_snapshot.blendNeedsIsolation;
 const compositor_cache = @import("render/compositor_cache.zig");
+const background_images = @import("background_images.zig");
 const CompositorCache = compositor_cache.Cache;
 const CompositorUpdate = compositor_cache.Update;
 const navigation = @import("navigation.zig");
@@ -77,6 +78,86 @@ const Task = task_module.Task;
 const TaskRunner = task_module.TaskRunner;
 const MeasureTime = @import("../runtime/measure_time.zig").MeasureTime;
 const thread_batch = @import("../runtime/thread_batch.zig");
+
+const BackgroundImageLoadContext = struct {
+    browser: *Browser,
+    frame: *Frame,
+};
+
+const BackgroundImageLoadCallbacks = struct {
+    pub fn allowed(context: *BackgroundImageLoadContext, target: Url, base: *const Url) bool {
+        return context.frame.allowedRequest(target, base);
+    }
+
+    pub fn fetch(
+        context: *BackgroundImageLoadContext,
+        target: Url,
+        referrer: Url,
+        policy: url_module.ReferrerPolicy,
+    ) !url_module.HttpResponse {
+        return context.browser.fetchBodyWithReferrerPolicy(target, referrer, null, policy);
+    }
+
+    pub fn retire(context: *BackgroundImageLoadContext) void {
+        context.browser.retireRenderStateForTab(context.frame.tab);
+        context.frame.retireDisplayList();
+    }
+};
+
+const RasterImageSource = struct {
+    left: i32,
+    top: i32,
+    width: i32,
+    height: i32,
+};
+
+fn rasterImageSource(image_item: anytype) RasterImageSource {
+    var left: i32 = 0;
+    var top: i32 = 0;
+    var right = image_item.source_width;
+    var bottom = image_item.source_height;
+    if (comptime @hasField(@TypeOf(image_item), "source_rect")) {
+        if (image_item.source_rect) |crop| {
+            left = std.math.clamp(crop.left, 0, image_item.source_width);
+            top = std.math.clamp(crop.top, 0, image_item.source_height);
+            right = std.math.clamp(crop.right, left, image_item.source_width);
+            bottom = std.math.clamp(crop.bottom, top, image_item.source_height);
+        }
+    }
+    return .{ .left = left, .top = top, .width = right - left, .height = bottom - top };
+}
+
+fn mapImageSourceCoordinate(
+    destination: i32,
+    destination_start: i32,
+    destination_size: i32,
+    source_start: i32,
+    source_size: i32,
+) i32 {
+    const offset = @as(i64, destination) - @as(i64, destination_start);
+    const scaled = @divTrunc(offset * @as(i64, source_size), @as(i64, destination_size));
+    return source_start + @as(i32, @intCast(scaled));
+}
+
+test "raster image sampling honors a clipped background source rectangle" {
+    const pixels = [_]u8{0} ** (4 * 2 * 4);
+    const item = ImageDisplayItem{
+        .x1 = 0,
+        .y1 = 0,
+        .x2 = 120,
+        .y2 = 120,
+        .source_width = 4,
+        .source_height = 2,
+        .pixels = &pixels,
+        .source_rect = .{ .left = 0, .top = 0, .right = 2, .bottom = 2 },
+    };
+    try std.testing.expectEqual(
+        RasterImageSource{ .left = 0, .top = 0, .width = 2, .height = 2 },
+        rasterImageSource(item),
+    );
+    try std.testing.expectEqual(@as(i32, 0), mapImageSourceCoordinate(0, 0, 120, 0, 2));
+    try std.testing.expectEqual(@as(i32, 1), mapImageSourceCoordinate(119, 0, 120, 0, 2));
+}
 
 // Default browser stylesheet - defines default styling for HTML elements
 const DEFAULT_STYLE_SHEET = @embedFile("browser.css");
@@ -2744,6 +2825,7 @@ pub const Browser = struct {
                 frame.rules.items,
                 frame.keyframes.items,
             );
+            try self.loadUsedBackgroundImages(frame, url);
 
             // Layout using the HTML node tree
             try self.layoutTabNodes(frame, true);
@@ -3100,6 +3182,7 @@ pub const Browser = struct {
             frame.rules.items,
             frame.keyframes.items,
         );
+        try self.loadUsedBackgroundImages(frame, url);
         try self.layoutTabNodes(frame, true);
         if (url.*.fragment()) |fragment| {
             _ = frame.scrollToFragment(fragment);
@@ -3107,6 +3190,23 @@ pub const Browser = struct {
 
         frame.tab.setNeedsRender();
         frame.tab.runAnimationFrame(frame.scroll);
+    }
+
+    /// CSS background URLs are resolved only after cascade/media evaluation,
+    /// unlike eager `<img>` discovery. This prevents unmatched or overridden
+    /// declarations from causing network work.
+    pub fn loadUsedBackgroundImages(self: *Browser, frame: *Frame, page_url: *Url) !void {
+        const root = if (frame.current_node) |*node| node else return;
+        var context = BackgroundImageLoadContext{ .browser = self, .frame = frame };
+        try background_images.loadUsed(
+            self.allocator,
+            root,
+            page_url,
+            frame.referrer_policy,
+            !frame.tab.accessibility.forced_colors,
+            &context,
+            BackgroundImageLoadCallbacks,
+        );
     }
 
     fn loadImages(self: *Browser, frame: *Frame, page_url: *Url, nodes: []*Node) !void {
@@ -3506,6 +3606,7 @@ pub const Browser = struct {
             frame.rules.items,
             frame.keyframes.items,
         );
+        try self.loadUsedBackgroundImages(frame, frame_url_ptr);
         try self.layoutTabNodes(frame, true);
         try parent.children.append(parent.allocator, frame);
     }
@@ -6351,6 +6452,8 @@ pub const Browser = struct {
 
         const src_w = image_item.source_width;
         const src_h = image_item.source_height;
+        const source = rasterImageSource(image_item);
+        if (source.width <= 0 or source.height <= 0) return;
         const pixels = image_item.pixels;
 
         switch (context.surface.*) {
@@ -6360,14 +6463,26 @@ pub const Browser = struct {
 
                 var y = start_y;
                 while (y < end_y) : (y += 1) {
-                    const src_y = @divTrunc((y - dest_top) * src_h, dest_height);
+                    const src_y = mapImageSourceCoordinate(
+                        y,
+                        dest_top,
+                        dest_height,
+                        source.top,
+                        source.height,
+                    );
                     if (src_y < 0 or src_y >= src_h) continue;
 
                     const row_base = @as(usize, @intCast(y)) * @as(usize, @intCast(surface_width));
 
                     var x = start_x;
                     while (x < end_x) : (x += 1) {
-                        const src_x = @divTrunc((x - dest_left) * src_w, dest_width);
+                        const src_x = mapImageSourceCoordinate(
+                            x,
+                            dest_left,
+                            dest_width,
+                            source.left,
+                            source.width,
+                        );
                         if (src_x < 0 or src_x >= src_w) continue;
 
                         const src_idx = (@as(usize, @intCast(src_y)) * @as(usize, @intCast(src_w)) + @as(usize, @intCast(src_x))) * 4;
@@ -6407,12 +6522,24 @@ pub const Browser = struct {
 
         var y = start_y;
         while (y < end_y) : (y += 1) {
-            const src_y = @divTrunc((y - dest_top) * src_h, dest_height);
+            const src_y = mapImageSourceCoordinate(
+                y,
+                dest_top,
+                dest_height,
+                source.top,
+                source.height,
+            );
             if (src_y < 0 or src_y >= src_h) continue;
 
             var x = start_x;
             while (x < end_x) : (x += 1) {
-                const src_x = @divTrunc((x - dest_left) * src_w, dest_width);
+                const src_x = mapImageSourceCoordinate(
+                    x,
+                    dest_left,
+                    dest_width,
+                    source.left,
+                    source.width,
+                );
                 if (src_x < 0 or src_x >= src_w) continue;
 
                 const src_idx = (@as(usize, @intCast(src_y)) * @as(usize, @intCast(src_w)) + @as(usize, @intCast(src_x))) * 4;

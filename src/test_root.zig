@@ -11,6 +11,7 @@ comptime {
     _ = @import("browser/render/raster_snapshot.zig");
     _ = @import("browser/render/layout.zig");
     _ = @import("document/canvas.zig");
+    _ = @import("document/background_image.zig");
     _ = @import("document/focus.zig");
     _ = @import("script/js.zig");
     _ = @import("tests/browser_input.zig");
@@ -27,6 +28,7 @@ comptime {
     _ = @import("tests/browser_frame_timing.zig");
     _ = @import("tests/browser_raster_worker.zig");
     _ = @import("tests/browser_canvas.zig");
+    _ = @import("tests/browser_background_images.zig");
     _ = @import("tests/browser_dynamic_resources.zig");
     _ = @import("tests/browser_networking.zig");
     _ = @import("tests/browser_security.zig");

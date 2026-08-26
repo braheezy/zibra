@@ -56,6 +56,11 @@ before changing URL or response ownership.
   omits its fragment, and applies the source document's `no-referrer` or
   `same-origin` policy. Policy suppression must not erase the request context:
   SameSite cookie checks still receive the unsuppressed source URL.
+- A computed CSS background URL is an ordinary image subresource: resolve it
+  strictly against the containing document, apply that Frame's CSP and
+  Referrer-Policy, and preserve the same HTTP/file versus data/about body
+  ownership split as `<img>`. Discovery belongs after cascade, outside the URL
+  layer, so an unused declaration never reaches transport.
 - Cross-origin XHR uses the explicit Origin-bearing fetch path. That path
   bypasses the ordinary response cache, still selects target-host cookies, and
   returns an owned `access_control_allow_origin` header for the XHR policy

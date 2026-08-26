@@ -1,0 +1,43 @@
+<!doctype html>
+<!--
+How to verify:
+1. Open this file in Zibra. All four cards should show the colored PPM image
+   behind readable text; the pale background color should fill uncovered area.
+2. "Explicit" paints an 80x48 image at its top-left. "Percent" stretches to
+   the whole card. "Contain" preserves the 2:1 aspect ratio and leaves space
+   to its right. "Cover" fills the rounded square and crops its right half.
+3. The rounded Cover card must not spill image pixels into its corners.
+4. The button and text input should use the same image behind their content.
+5. No warning/request for should-not-load.ppm should appear: that declaration
+   matches no element and must never enter resource loading.
+-->
+<style>
+  body { font-family: sans-serif; background-color: #f8fafc; }
+  #does-not-exist { background-image: url(should-not-load.ppm); }
+  .grid { display: block; width: 520px; }
+  .card {
+    display: block;
+    width: 220px;
+    height: 80px;
+    margin: 8px;
+    color: white;
+    background-color: #cbd5e1;
+    background-image: url(background-image-pattern.ppm);
+  }
+  .explicit { background-size: 80px 48px; }
+  .percent { background-size: 100% 100%; }
+  .contain { background-size: contain; }
+  .cover { width: 80px; background-size: cover; border-radius: 22px; }
+  .control { width: 220px; height: 56px; color: white;
+    background-image: url(background-image-pattern.ppm);
+    background-size: 100% 100%; }
+</style>
+<h1>CSS background images</h1>
+<div class=grid>
+  <div class="card explicit">Explicit 80px × 48px</div>
+  <div class="card percent">Percentage sizing</div>
+  <div class="card contain">Contain</div>
+  <div class="card cover">Cover + rounded clip</div>
+  <button class=control><b>Rich button background</b></button>
+  <input class=control value="Input background">
+</div>

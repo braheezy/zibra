@@ -198,6 +198,9 @@ pub const ImageDisplayItem = struct {
     source_width: i32,
     source_height: i32,
     pixels: []const u8,
+    /// Optional half-open source-pixel crop. Ordinary `<img>` commands use the
+    /// complete bitmap; oversized CSS backgrounds crop at their border box.
+    source_rect: ?Rect = null,
     opacity: f64 = 1.0,
     source: ?DisplayItemSource = null,
 };

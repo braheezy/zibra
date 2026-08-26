@@ -184,8 +184,9 @@ before changing `root.zig`, `tab.zig`, `render/`, or browser task scheduling.
 - F6 toggles the active Tab's forced-colors setting. The change invalidates
   conditional stylesheet rules plus style, layout, and paint; every frame then
   receives the same `(forced-colors: active)` media environment. Page paint
-  uses the renderer's semantic four-color palette, while images and color
-  glyph bitmaps remain content rather than author CSS colors.
+  uses the renderer's semantic four-color palette, while content images and
+  color glyph bitmaps remain content rather than author CSS colors. Decorative
+  CSS background images are suppressed.
 - Address-bar editing uses a byte insertion point in the inclusive range
   `0..address_bar.items.len`. SDL admits only printable ASCII into this buffer,
   so Left, Right, insertion, and Backspace operate on bytes; focus, blur, and a
@@ -287,6 +288,16 @@ before changing `root.zig`, `tab.zig`, `render/`, or browser task scheduling.
   is irrelevant: scripts are queued and styles are parsed by walking the DOM
   in source order after the join. Root loads, child-frame loads, and mutation
   rescans share this path.
+- CSS backgrounds use the separate post-cascade loader in
+  `background_images.zig`. Run it after every initial or dynamic style pass for
+  root and child frames, not during eager DOM resource discovery: unmatched,
+  overridden, `display:none`, hidden-input, `none`, and unsupported image
+  values must cause no fetch. Forced-colors disables and releases decorative
+  background resources at this same boundary. Resolve selected URLs against the document,
+  enforce the frame CSP and Referrer-Policy, deduplicate one pass, and retain
+  blocked/broken attempt identities without a placeholder. Before replacing
+  Element-owned decoded pixels, retire both active Browser render state under
+  its lock and the frame list that borrows them.
 - Attached structural DOM mutation marks that frame's document resources
   dirty. Before the next style pass, the tab worker queues newly attached
   scripts once and rebuilds the complete author-sheet generation from the

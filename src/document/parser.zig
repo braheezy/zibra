@@ -593,6 +593,10 @@ pub const Element = struct {
     animations: ?std.StringHashMap(Animation) = null,
     css_animation: ?CssAnimationState = null,
     image_data: ?ImageData = null,
+    // Installed only after computed style selects a supported url(...)
+    // background. The source key records failed/blocked attempts too, so an
+    // unchanged style does not refetch on every render.
+    background_image: ?BackgroundImageData = null,
     // Heap-stable because z2d.Context borrows its embedded Surface. Element
     // values may relocate when DOM child arrays grow, but this pointee does
     // not move until the element is destroyed.
@@ -614,6 +618,7 @@ pub const Element = struct {
             .animations = null,
             .css_animation = null,
             .image_data = null,
+            .background_image = null,
             .canvas = null,
         };
         errdefer e.deinit(allocator);
@@ -655,6 +660,10 @@ pub const Element = struct {
 
         if (self.image_data) |*image_data| {
             image_data.deinit(allocator);
+        }
+
+        if (self.background_image) |*background_image| {
+            background_image.deinit(allocator);
         }
 
         if (self.canvas) |canvas| {
@@ -877,6 +886,16 @@ pub const ImageData = struct {
         if (self.encoded_bytes) |bytes| {
             allocator.free(bytes);
         }
+    }
+};
+
+pub const BackgroundImageData = struct {
+    source: []u8,
+    data: ?ImageData = null,
+
+    pub fn deinit(self: *BackgroundImageData, allocator: std.mem.Allocator) void {
+        if (self.data) |*data| data.deinit(allocator);
+        allocator.free(self.source);
     }
 };
 
@@ -1725,6 +1744,8 @@ const CSS_PROPERTIES = [_]struct { name: []const u8, default_value: []const u8 }
     .{ .name = "overflow", .default_value = "visible" },
     .{ .name = "outline", .default_value = "none" },
     .{ .name = "background-color", .default_value = "transparent" },
+    .{ .name = "background-image", .default_value = "none" },
+    .{ .name = "background-size", .default_value = "auto" },
     .{ .name = "image-rendering", .default_value = "auto" },
     .{ .name = "color-scheme", .default_value = "light dark" },
     .{ .name = "display", .default_value = "inline" },

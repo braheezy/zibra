@@ -283,3 +283,8 @@ dimensions, retained 2D context identity, rectangles, paths, arcs, transforms,
 alpha, clearing, and a non-fatal unsupported drawImage call. Unit coverage owns
 the 300x150 defaults, same-size dimension reset, lazy-context repaint, and
 display/raster snapshot boundaries.
+
+`tests/manual/background-images.html` uses a local ASCII PPM to compare
+explicit, percentage, contain, cover, and rounded-crop geometry. Its unmatched
+broken URL is also a manual assertion that post-cascade discovery performs no
+unused fetch; `browser_background_images.zig` provides the deterministic count.

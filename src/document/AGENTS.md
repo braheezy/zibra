@@ -85,6 +85,12 @@ or selector/rule lifetime.
   borrows the embedded Surface. Width/height content attributes select the
   bitmap dimensions (300x150 defaults) and a resize clears native drawing
   state; DOM child-array relocation moves only the owning pointer.
+- `background_image.zig` parses the supported single-image `url(...)` and
+  background-size grammar independently of networking and paint. After final
+  computed style selects a URL, the Element owns both an attempted-source copy
+  and optional decoded `ImageData`; blocked/broken attempts deliberately keep
+  the source key so an unchanged restyle does not fetch forever. Structural
+  removal releases that resource with the rest of the Element.
 - `focus.zig` is the canonical HTML focusability policy shared by layout,
   keyboard traversal, and JavaScript. Programmatic focus accepts an explicit
   negative `tabindex`, while sequential focus rejects it; hidden inputs,
@@ -106,6 +112,9 @@ or selector/rule lifetime.
   `!important` metadata. Preserve importance through shorthand expansion and
   compare cascade priority per property: selector priority plus 10,000 for
   important declarations, with later declarations winning exact ties.
+- Declaration value scanning stops only at top-level semicolons/braces;
+  preserve quotes, escapes, and parenthesis depth so `url(data:...;...)` and
+  other supported CSS functions remain one borrowed value.
 - Keep the computed-style property table and inherited-property defaults in
   sync. A computed `font-family` borrows either its declaration or inherited
   parent slice; rendering resolves the supported family/fallback list without
@@ -113,6 +122,10 @@ or selector/rule lifetime.
 - `width` and `height` are non-inherited computed properties. Their default is
   `auto`; layout currently resolves only non-negative pixel lengths and keeps
   the borrowed computed-value slice in the style map.
+- `background-image` and `background-size` are non-inherited and default to
+  `none` and `auto`. Their declaration values remain borrowed computed-style
+  slices; only a finally selected supported URL receives an independent
+  Element-owned resource identity.
 - `zoom` is non-inherited and defaults to `1`. Layout accepts positive numbers
   and percentages, treats zero as one for web compatibility, and multiplies
   used fixed lengths through the ancestor chain. Invalid/negative values fall

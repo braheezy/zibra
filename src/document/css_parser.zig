@@ -133,13 +133,32 @@ fn literal(self: *CSSParser, lit: u8) !void {
     self.pos += 1;
 }
 
-/// Read a CSS value until `;` or `}`, trimming trailing whitespace
+/// Read a CSS value until a top-level `;` or `}`. Quoted strings and function
+/// parentheses may contain either byte; this is required for data URLs in
+/// `url(...)` and also keeps other supported function values intact.
 fn value(self: *CSSParser) ![]const u8 {
     const start = self.pos;
+    var parentheses: usize = 0;
+    var quote: ?u8 = null;
+    var escaped = false;
     while (self.pos < self.string.len) {
         const c = self.string[self.pos];
-        if (c == ';' or c == '}') {
-            break;
+        if (quote) |delimiter| {
+            if (escaped) {
+                escaped = false;
+            } else if (c == '\\') {
+                escaped = true;
+            } else if (c == delimiter) {
+                quote = null;
+            }
+        } else switch (c) {
+            '\'', '"' => quote = c,
+            '(' => parentheses += 1,
+            ')' => if (parentheses > 0) {
+                parentheses -= 1;
+            },
+            ';', '}' => if (parentheses == 0) break,
+            else => {},
         }
         self.pos += 1;
     }
@@ -1070,4 +1089,28 @@ test "forced-colors media feature selects active and none rules" {
         "blue",
         normal_rules[0].properties.get("background-color").?.value,
     );
+}
+
+test "declaration values retain semicolons inside URL functions" {
+    const allocator = std.testing.allocator;
+    const css =
+        "div { background-image: url(data:image/png;base64,AAAA); " ++
+        "background-size: 50% 25%; color: red; }";
+    var parser = try CSSParser.init(allocator, css, false);
+    defer parser.deinit(allocator);
+    const rules = try parser.parse(allocator);
+    defer {
+        for (rules) |*rule| rule.deinit(allocator);
+        allocator.free(rules);
+    }
+    try std.testing.expectEqual(@as(usize, 1), rules.len);
+    try std.testing.expectEqualStrings(
+        "url(data:image/png;base64,AAAA)",
+        rules[0].properties.get("background-image").?.value,
+    );
+    try std.testing.expectEqualStrings(
+        "50% 25%",
+        rules[0].properties.get("background-size").?.value,
+    );
+    try std.testing.expectEqualStrings("red", rules[0].properties.get("color").?.value);
 }

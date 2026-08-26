@@ -54,6 +54,7 @@ The source tree is organized by responsibility:
 | [`src/browser/render/raster_snapshot.zig`](../src/browser/render/raster_snapshot.zig) | Deep-owned, provenance-free display generations transferred to the raster worker. |
 | [`src/browser/render/compositor_cache.zig`](../src/browser/render/compositor_cache.zig) | Raster-worker-owned ordered planes, surface-or-short-command backing, and pointer-free opacity/translation updates used by draw-only animation and scrolling. |
 | [`src/document/parser.zig`](../src/document/parser.zig) | HTML parser, DOM representation, style maps, image/canvas owners, and DOM tree utilities. |
+| [`src/document/background_image.zig`](../src/document/background_image.zig) | Pure CSS background URL/size parsing and used-size resolution. |
 | [`src/document/canvas.zig`](../src/document/canvas.zig) | Heap-stable z2d canvas backing stores, 2D command dispatch, state, resizing, and straight-alpha snapshots. |
 | [`src/document/focus.zig`](../src/document/focus.zig) | Shared intrinsic programmatic and sequential HTML focusability rules. |
 | [`src/document/inspection.zig`](../src/document/inspection.zig) | Browser-free fetch/decode/parse/style pipeline for document inspection commands. |
@@ -315,6 +316,18 @@ rebuilt as a staged rules-plus-keyframes-plus-source-buffer generation from the 
 which both loads inserted `<style>`/`<link>` elements and retires rules from
 detached links without leaving property slices pointing at freed CSS text.
 
+CSS background images intentionally follow a later resource boundary. After
+each initial or dynamic computed-style pass, `background_images.zig` walks the
+final styled DOM and fetches only supported URLs actually selected on visible
+elements. Each Element owns an attempted-source copy plus optional decoded
+image data; identical computed URLs are stable across restyles, and one pass
+deduplicates transport/decode work. Replacing that data first retires active
+Browser render state under `Browser.lock` and the frame-side list, because both
+may borrow its RGBA bytes. CSP and the document's Referrer-Policy are applied
+before fetching; blocked and failed resources remain transparent. Forced-colors
+treats decorative backgrounds as unused, avoiding a fetch for a newly loaded
+document and releasing an earlier resource after its render borrowers retire.
+
 Root documents, child documents, and those mutation rescans discover every
 external classic script and linked stylesheet into one fixed batch. Each slot
 owns a resolved resource URL and independent referrer URL before work starts,
@@ -535,6 +548,15 @@ borrows its cached pixel slice; it does not transfer ownership. Its
 `pixel_mode` distinguishes a tintable alpha mask from a native-color bitmap.
 The cached `Glyph` does not store the source grapheme slice, so transient input
 text is not retained as glyph metadata.
+
+CSS background paint borrows the same Element-owned decoded-image shape but
+does not retain another pointer in block or control layout state. Paint reads
+the live resource, emits color then image before content, and scopes all three
+under the element's effects. `background-size` resolves intrinsic `auto`, px,
+percentage, contain, and cover geometry in authored layout space. The image
+command's optional half-open source rectangle crops oversized output at the
+right/bottom border; raster snapshots copy the underlying complete bitmap and
+preserve that numeric crop.
 
 An Element lazily owns a heap-stable canvas pointee when JavaScript first calls
 `getContext("2d")`. z2d Context retains the address of the Surface inside that
@@ -839,8 +861,9 @@ maps may change safely while independent `std.http.Client` requests are in
 flight.
 
 Every document Frame stores the Referrer-Policy parsed from its response.
-Navigation, images, iframes, scripts, stylesheets, and XHR pass both that policy
-and the source URL into the network layer. Referer generation omits fragments;
+Navigation, element and CSS-background images, iframes, scripts, stylesheets,
+and XHR pass both that policy and the source URL into the network layer.
+Referer generation omits fragments;
 `no-referrer` suppresses it for every destination and `same-origin` suppresses
 it when scheme, host, or port differs. The source URL remains a separate
 synchronous request-context borrow even when the header is suppressed, because
@@ -1286,6 +1309,9 @@ The composition/clone boundary separates container ownership and prevents the
 browser snapshot from retaining layout/DOM hit-test provenance. It still
 borrows image bytes, glyph resources, composited layers, and the existing
 effect-node identities, so it is not an independent resource snapshot.
+Changing a computed CSS background therefore retires this browser-side state
+before freeing the old Element-owned pixels, then commits the replacement
+generation normally.
 Selecting a clean tab publishes an atomic activation request to its serialized
 worker. That worker composes the retained lists and commits the frame's scroll
 and current URL even when no style/layout/paint dirty flag is set, avoiding a
@@ -1384,8 +1410,9 @@ colors by semantic role and `render/forced_colors.zig` replaces their RGB
 channels with black canvas/control backgrounds, white text/borders, cyan links,
 or yellow visited/accent paint while retaining nonzero author alpha.
 The root document always emits a black canvas in this mode. Raster snapshots
-therefore contain only the small system palette for CSS paint; decoded images
-and color glyph bitmaps remain unmodified content.
+therefore contain only the small system palette for CSS paint; decoded content
+images and color glyph bitmaps remain unmodified, while decorative CSS
+background images are omitted.
 
 Focused page elements retain both `Element.is_focused` and a focus-visible bit
 chosen from the Tab's current input modality. Primary clicks record pointer

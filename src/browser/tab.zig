@@ -374,6 +374,9 @@ pub const Frame = struct {
                 self.rules.items,
                 self.keyframes.items,
             );
+            if (self.current_url) |page_url| {
+                try browser.loadUsedBackgroundImages(self, page_url);
+            }
         }
         if (needs_layout or needs_paint) {
             try browser.layoutTabNodes(self, needs_paint);

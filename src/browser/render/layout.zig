@@ -10,6 +10,7 @@ const forced_colors = @import("forced_colors.zig");
 const browser = @import("../root.zig");
 const grapheme = @import("grapheme");
 const parser = @import("../../document/parser.zig");
+const background_image = @import("../../document/background_image.zig");
 const dom_focus = @import("../../document/focus.zig");
 const ProtectedField = @import("../../core/protected_field.zig").ProtectedField;
 const DisplayItem = browser.DisplayItem;
@@ -265,6 +266,126 @@ fn appendBackgroundBox(
             .source = source,
         } });
     }
+}
+
+const BackgroundImagePaint = struct {
+    pixels: []const u8,
+    source_width: i32,
+    source_height: i32,
+    size: background_image.Size,
+};
+
+fn backgroundImagePaint(element: *const parser.Element) ?BackgroundImagePaint {
+    const installed = element.background_image orelse return null;
+    const data = installed.data orelse return null;
+    const styles = if (element.style) |*styles| styles else return null;
+    const size = if (styleValue(styles, "background-size")) |value|
+        background_image.parseSize(value) orelse background_image.Size.automatic()
+    else
+        background_image.Size.automatic();
+    return .{
+        .pixels = data.image.rawBytes(),
+        .source_width = @intCast(data.image.width),
+        .source_height = @intCast(data.image.height),
+        .size = size,
+    };
+}
+
+fn backgroundImagePaintForSource(source: ?browser.DisplayItemSource) ?BackgroundImagePaint {
+    const node = (source orelse return null).node orelse return null;
+    return switch (node.*) {
+        .element => |*element| backgroundImagePaint(element),
+        .text => null,
+    };
+}
+
+fn croppedSourceExtent(clipped: i32, desired: i32, source: i32) i32 {
+    if (clipped >= desired) return source;
+    const scaled = @as(f64, @floatFromInt(clipped)) *
+        @as(f64, @floatFromInt(source)) /
+        @as(f64, @floatFromInt(desired));
+    return std.math.clamp(@as(i32, @intFromFloat(@ceil(scaled))), 1, source);
+}
+
+/// Paint one non-repeating image anchored at the background-position default
+/// (top left). The supported background-size subset can make it smaller than
+/// the box; a larger image is source-cropped at the right/bottom border.
+fn appendBackgroundImageBox(
+    commands: *std.ArrayList(DisplayItem),
+    allocator: std.mem.Allocator,
+    paint: BackgroundImagePaint,
+    x: i32,
+    y: i32,
+    width: i32,
+    height: i32,
+    css_scale: f64,
+    source: ?browser.DisplayItemSource,
+) !void {
+    const resolved = background_image.resolveSize(
+        paint.size,
+        width,
+        height,
+        paint.source_width,
+        paint.source_height,
+        css_scale,
+    );
+    if (resolved.width <= 0 or resolved.height <= 0) return;
+
+    const clipped_width = @min(width, resolved.width);
+    const clipped_height = @min(height, resolved.height);
+    if (clipped_width <= 0 or clipped_height <= 0) return;
+    const is_cropped = clipped_width != resolved.width or clipped_height != resolved.height;
+    const source_rect: ?browser.Rect = if (is_cropped) .{
+        .left = 0,
+        .top = 0,
+        .right = croppedSourceExtent(clipped_width, resolved.width, paint.source_width),
+        .bottom = croppedSourceExtent(clipped_height, resolved.height, paint.source_height),
+    } else null;
+
+    try commands.append(allocator, .{ .image = .{
+        .x1 = x,
+        .y1 = y,
+        .x2 = x + clipped_width,
+        .y2 = y + clipped_height,
+        .source_width = paint.source_width,
+        .source_height = paint.source_height,
+        .pixels = paint.pixels,
+        .source_rect = source_rect,
+        .source = source,
+    } });
+}
+
+test "background image paint resolves size and crops oversized cover geometry" {
+    const allocator = std.testing.allocator;
+    const pixels = [_]u8{
+        255, 0,   0, 255,
+        0,   255, 0, 255,
+    };
+    var commands = std.ArrayList(DisplayItem).empty;
+    defer commands.deinit(allocator);
+
+    try appendBackgroundImageBox(
+        &commands,
+        allocator,
+        .{
+            .pixels = &pixels,
+            .source_width = 2,
+            .source_height = 1,
+            .size = .cover,
+        },
+        10,
+        20,
+        100,
+        100,
+        1.0,
+        null,
+    );
+
+    try std.testing.expectEqual(@as(usize, 1), commands.items.len);
+    const image = commands.items[0].image;
+    try std.testing.expectEqual(@as(i32, 10), image.x1);
+    try std.testing.expectEqual(@as(i32, 110), image.x2);
+    try std.testing.expectEqual(browser.Rect{ .left = 0, .top = 0, .right = 1, .bottom = 1 }, image.source_rect.?);
 }
 
 /// Wrap one control's complete painted payload in its rounded hit shape.
@@ -3683,6 +3804,21 @@ const InputLayout = struct {
             remapped_bg,
             source,
         );
+        if (!engine.accessibility.forced_colors) {
+            if (backgroundImagePaintForSource(source)) |paint| {
+                try appendBackgroundImageBox(
+                    target,
+                    engine.allocator,
+                    paint,
+                    x,
+                    y,
+                    width_value,
+                    height_value,
+                    scaleCssFloat(1.0, self.embed.zoom.get().*, engine.zoom()),
+                    source,
+                );
+            }
+        }
 
         if (engine.accessibility.forced_colors and !self.is_checkbox) {
             try target.append(engine.allocator, .{ .outline = .{
@@ -4057,6 +4193,21 @@ const ButtonLayout = struct {
             engine.remapColor(self.bgcolor, .control_background),
             source,
         );
+        if (!engine.accessibility.forced_colors) {
+            if (backgroundImagePaintForSource(source)) |paint| {
+                try appendBackgroundImageBox(
+                    target,
+                    engine.allocator,
+                    paint,
+                    x,
+                    y,
+                    self.embed.width.get().*,
+                    self.embed.height.get().*,
+                    scaleCssFloat(1.0, self.embed.zoom.get().*, engine.zoom()),
+                    source,
+                );
+            }
+        }
 
         if (engine.accessibility.forced_colors) {
             try target.append(engine.allocator, .{ .outline = .{
@@ -6791,90 +6942,6 @@ test "layout reads the current background color animation value" {
     );
 }
 
-fn addBackgroundIfNeeded(self: *Layout, block: *const BlockLayout) !void {
-    // Skip painting if shouldPaint returns false
-    if (!block.shouldPaint()) return;
-    // Anonymous inline-run blocks copy their first node only as a layout
-    // representative; that node's background belongs to its own inline
-    // payload, not to the full-width anonymous wrapper.
-    if (block.inline_nodes != null) return;
-
-    switch (block.node) {
-        .element => |e| {
-            if (block.height.get().* <= 0) return;
-
-            // Check for background-color in the style attribute
-            const bgcolor_str = if (e.style) |*style_map|
-                styleValue(style_map, "background-color")
-            else
-                null;
-
-            // Check for border-radius
-            const border_radius_str = if (e.style) |*style_map|
-                styleValue(style_map, "border-radius")
-            else
-                null;
-
-            // Determine the background color
-            var color: ?browser.Color = null;
-
-            if (animatedBackgroundColor(e)) |animated| {
-                color = animated;
-            } else if (bgcolor_str) |bg| {
-                // Don't draw if explicitly transparent
-                if (std.ascii.eqlIgnoreCase(bg, "transparent")) {
-                    return;
-                }
-                color = parseColor(bg);
-            } else if (std.mem.eql(u8, e.tag, "pre")) {
-                // Default gray background for pre tags if no style specified
-                color = browser.Color{ .r = 230, .g = 230, .b = 230, .a = 255 };
-            }
-
-            // Draw the background rectangle if we have a color
-            if (color) |col| {
-                if (col.a == 0) return;
-                const remapped = self.remapColor(col, .background);
-                // Parse border-radius if present
-                const radius = if (border_radius_str) |br_str|
-                    scaleBlockCssFloat(block, parseCssPixelRadius(br_str))
-                else
-                    0;
-
-                const block_width = block.width.get().*;
-                const block_x = block.x.get().*;
-                const block_y = block.y.get().*;
-                const block_height = block.height.get().*;
-                if (radius > 0.0) {
-                    // Use rounded rectangle
-                    const rounded_rect = DisplayItem{ .rounded_rect = .{
-                        .x1 = block_x,
-                        .y1 = block_y,
-                        .x2 = block_x + block_width,
-                        .y2 = block_y + block_height,
-                        .radius = radius,
-                        .color = remapped,
-                        .source = displaySource(block, block.node_ptr),
-                    } };
-                    try self.display_list.append(self.allocator, rounded_rect);
-                } else {
-                    // Use regular rectangle
-                    const rect = DisplayItem{ .rect = .{
-                        .x1 = block_x,
-                        .y1 = block_y,
-                        .x2 = block_x + block_width,
-                        .y2 = block_y + block_height,
-                        .color = remapped,
-                        .source = displaySource(block, block.node_ptr),
-                    } };
-                    try self.display_list.append(self.allocator, rect);
-                }
-            }
-        },
-        else => {},
-    }
-}
-
 pub fn buildDocument(self: *Layout, root: *Node) !*DocumentLayout {
     self.color_scheme_dark = self.resolveColorScheme("light dark");
     self.document_color_scheme_dark = self.color_scheme_dark;
@@ -6931,7 +6998,7 @@ fn paintBlockTree(self: *Layout, block: *BlockLayout) !void {
     defer commands.deinit(self.allocator);
 
     // Add the block's own background/borders
-    try addBackgroundIfNeeded(self, block);
+    try addBackgroundIfNeededToList(self, &commands, block);
     const content_start = commands.items.len;
     try appendTableOfContentsHeader(self, &commands, block);
 
@@ -7387,84 +7454,69 @@ fn applyPaintEffects(self: *Layout, block: *BlockLayout, commands: []DisplayItem
     }
 }
 
-// Add background/borders to a specific command list instead of the global display list
+// Add an element's color and image backgrounds to a command list. Keeping both
+// in the subtree means opacity, transforms, scrolling, and rounded clips apply
+// to backgrounds and content in the same order.
 fn addBackgroundIfNeededToList(self: *Layout, commands: *std.ArrayList(DisplayItem), block: *const BlockLayout) !void {
-    // Skip painting if shouldPaint returns false
     if (!block.shouldPaint()) return;
+    // Anonymous inline-run blocks copy their first node only as a layout
+    // representative; that node's background belongs to its inline payload,
+    // not to the full-width wrapper.
     if (block.inline_nodes != null) return;
+    const element = liveBlockElement(block) orelse return;
+    const block_width = block.width.get().*;
+    const block_height = block.height.get().*;
+    if (block_width <= 0 or block_height <= 0) return;
+    const block_x = block.x.get().*;
+    const block_y = block.y.get().*;
+    const source = displaySource(block, block.node_ptr);
 
-    switch (block.node) {
-        .element => |e| {
-            if (block.height.get().* <= 0) return;
+    const styles = if (element.style) |*style_map| style_map else null;
+    const bgcolor_str = if (styles) |style_map| styleValue(style_map, "background-color") else null;
+    const border_radius_str = if (styles) |style_map| styleValue(style_map, "border-radius") else null;
 
-            // Check for background-color in the style attribute
-            const bgcolor_str = if (e.style) |*style_map|
-                styleValue(style_map, "background-color")
-            else
-                null;
+    var color: ?browser.Color = null;
+    if (animatedBackgroundColor(element.*)) |animated| {
+        color = animated;
+    } else if (bgcolor_str) |bg| {
+        if (!std.ascii.eqlIgnoreCase(bg, "transparent")) color = parseColor(bg);
+    } else if (std.mem.eql(u8, element.tag, "pre")) {
+        color = .{ .r = 230, .g = 230, .b = 230, .a = 255 };
+    }
 
-            // Check for border-radius
-            const border_radius_str = if (e.style) |*style_map|
-                styleValue(style_map, "border-radius")
-            else
-                null;
+    if (color) |value| {
+        const radius = if (border_radius_str) |radius|
+            scaleBlockCssFloat(block, parseCssPixelRadius(radius))
+        else
+            0;
+        try appendBackgroundBox(
+            commands,
+            self.allocator,
+            block_x,
+            block_y,
+            block_width,
+            block_height,
+            radius,
+            self.remapColor(value, .background),
+            source,
+        );
+    }
 
-            // Determine the background color
-            var color: ?browser.Color = null;
-
-            if (animatedBackgroundColor(e)) |animated| {
-                color = animated;
-            } else if (bgcolor_str) |bg| {
-                // Don't draw if explicitly transparent
-                if (std.ascii.eqlIgnoreCase(bg, "transparent")) {
-                    return;
-                }
-                color = parseColor(bg);
-            } else if (std.mem.eql(u8, e.tag, "pre")) {
-                // Default gray background for pre tags if no style specified
-                color = browser.Color{ .r = 230, .g = 230, .b = 230, .a = 255 };
-            }
-
-            // Draw the background rectangle if we have a color
-            if (color) |col| {
-                if (col.a == 0) return;
-                const remapped = self.remapColor(col, .background);
-                // Parse border-radius if present
-                const radius = if (border_radius_str) |br_str|
-                    scaleBlockCssFloat(block, parseCssPixelRadius(br_str))
-                else
-                    0;
-
-                const block_width = block.width.get().*;
-                const block_x = block.x.get().*;
-                const block_y = block.y.get().*;
-                const block_height = block.height.get().*;
-                if (radius > 0.0) {
-                    // Use rounded rectangle
-                    const rounded_rect = DisplayItem{ .rounded_rect = .{
-                        .x1 = block_x,
-                        .y1 = block_y,
-                        .x2 = block_x + block_width,
-                        .y2 = block_y + block_height,
-                        .radius = radius,
-                        .color = remapped,
-                        .source = displaySource(block, block.node_ptr),
-                    } };
-                    try commands.append(self.allocator, rounded_rect);
-                } else {
-                    // Use regular rectangle
-                    const rect = DisplayItem{ .rect = .{
-                        .x1 = block_x,
-                        .y1 = block_y,
-                        .x2 = block_x + block_width,
-                        .y2 = block_y + block_height,
-                        .color = remapped,
-                        .source = displaySource(block, block.node_ptr),
-                    } };
-                    try commands.append(self.allocator, rect);
-                }
-            }
-        },
-        else => {},
+    // Forced-colors preserves content images but suppresses decorative author
+    // backgrounds so the semantic high-contrast palette remains legible.
+    if (!self.accessibility.forced_colors) {
+        if (backgroundImagePaint(element)) |paint| {
+            try appendBackgroundImageBox(
+                commands,
+                self.allocator,
+                paint,
+                block_x,
+                block_y,
+                block_width,
+                block_height,
+                scaleBlockCssFloat(block, 1.0),
+                source,
+            );
+        }
     }
 }
