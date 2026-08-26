@@ -21,6 +21,7 @@ pub const Color = display_commands.Color;
 pub const Rect = display_commands.Rect;
 pub const CompositedLayer = display_commands.CompositedLayer;
 pub const ImageDisplayItem = display_commands.ImageDisplayItem;
+pub const CanvasDisplayItem = display_commands.CanvasDisplayItem;
 pub const DisplayItemSource = display_commands.DisplayItemSource;
 pub const RoundedHitClip = display_commands.RoundedHitClip;
 pub const DisplayItem = display_commands.DisplayItem;
@@ -4529,6 +4530,12 @@ pub const Browser = struct {
 
     fn cloneDisplayItem(self: *Browser, item: DisplayItem) CloneError!DisplayItem {
         switch (item) {
+            .canvas => |canvas_item| {
+                var copy = canvas_item;
+                copy.pixels = try self.allocator.dupe(u8, canvas_item.pixels);
+                copy.owns_pixels = true;
+                return .{ .canvas = copy };
+            },
             .blend => |blend_item| {
                 const children = try self.cloneDisplayItemList(blend_item.children);
                 errdefer DisplayItem.freeList(self.allocator, children);
@@ -4640,8 +4647,16 @@ pub const Browser = struct {
                     }
                 },
                 else => {
-                    // Primitive items are added directly
-                    try result.append(self.allocator, item);
+                    // Mutable-canvas snapshots own their bytes; all other
+                    // primitive payloads borrow immutable resource data.
+                    const primitive = try self.cloneDisplayItem(item);
+                    var primitive_owned = true;
+                    errdefer if (primitive_owned) {
+                        var primitive_items = [_]DisplayItem{primitive};
+                        DisplayItem.freeItems(self.allocator, &primitive_items);
+                    };
+                    try result.append(self.allocator, primitive);
+                    primitive_owned = false;
                 },
             }
         }
@@ -4685,6 +4700,12 @@ pub const Browser = struct {
                 .top = self.scalePxWithZoom(img.y1, zoom),
                 .right = self.scalePxWithZoom(img.x2, zoom),
                 .bottom = self.scalePxWithZoom(img.y2, zoom),
+            },
+            .canvas => |canvas| Rect{
+                .left = self.scalePxWithZoom(canvas.x1, zoom),
+                .top = self.scalePxWithZoom(canvas.y1, zoom),
+                .right = self.scalePxWithZoom(canvas.x2, zoom),
+                .bottom = self.scalePxWithZoom(canvas.y2, zoom),
             },
             .iframe => |iframe_item| Rect{
                 .left = self.scalePxWithZoom(iframe_item.rect.left, zoom),
@@ -4826,7 +4847,14 @@ pub const Browser = struct {
             },
             else => {
                 // Primitive items go directly to the draw list
-                try self.tab_draw_list.append(self.allocator, item);
+                const primitive = try self.cloneDisplayItem(item);
+                var primitive_owned = true;
+                errdefer if (primitive_owned) {
+                    var primitive_items = [_]DisplayItem{primitive};
+                    DisplayItem.freeItems(self.allocator, &primitive_items);
+                };
+                try self.tab_draw_list.append(self.allocator, primitive);
+                primitive_owned = false;
             },
         }
     }
@@ -6290,7 +6318,7 @@ pub const Browser = struct {
     fn drawImageNearest(
         self: *Browser,
         context: *z2d.Context,
-        image_item: ImageDisplayItem,
+        image_item: anytype,
         dest_left: i32,
         dest_top: i32,
         dest_right: i32,
@@ -6303,6 +6331,11 @@ pub const Browser = struct {
         const dest_height = dest_bottom - dest_top;
         if (dest_width <= 0 or dest_height <= 0) return;
         if (image_item.source_width <= 0 or image_item.source_height <= 0) return;
+        if (!display_commands.rgbaPixelBufferComplete(
+            image_item.source_width,
+            image_item.source_height,
+            image_item.pixels,
+        )) return;
 
         var start_x = dest_left;
         if (start_x < 0) start_x = 0;
@@ -6727,6 +6760,22 @@ pub const Browser = struct {
                     surface_height,
                 );
             },
+            .canvas => |canvas_item| {
+                const left = self.scalePxWithZoom(canvas_item.x1, zoom);
+                const right = self.scalePxWithZoom(canvas_item.x2, zoom);
+                const top = self.scalePxWithZoom(canvas_item.y1, zoom) - scroll_offset;
+                const bottom = self.scalePxWithZoom(canvas_item.y2, zoom) - scroll_offset;
+                try self.drawImageNearest(
+                    context,
+                    canvas_item,
+                    left,
+                    top,
+                    right,
+                    bottom,
+                    context.surface.getWidth(),
+                    context.surface.getHeight(),
+                );
+            },
             .iframe => {
                 // Iframe placeholders are expanded during display list composition.
             },
@@ -7101,6 +7150,22 @@ pub const Browser = struct {
                     surface_height,
                 );
             },
+            .canvas => |canvas_item| {
+                const top = self.scalePxWithZoom(canvas_item.y1, zoom) - scroll_offset;
+                const bottom = self.scalePxWithZoom(canvas_item.y2, zoom) - scroll_offset;
+                const left = self.scalePxWithZoom(canvas_item.x1, zoom) + x_offset;
+                const right = self.scalePxWithZoom(canvas_item.x2, zoom) + x_offset;
+                try self.drawImageNearest(
+                    context,
+                    canvas_item,
+                    left,
+                    top,
+                    right,
+                    bottom,
+                    context.surface.getWidth(),
+                    context.surface.getHeight(),
+                );
+            },
             .iframe => {
                 // Iframe placeholders are expanded during display list composition.
             },
@@ -7334,6 +7399,22 @@ pub const Browser = struct {
                     bottom,
                     surface_width,
                     surface_height,
+                );
+            },
+            .canvas => |canvas_item| {
+                const left = self.scalePxWithZoom(canvas_item.x1, zoom) - layer_x;
+                const right = self.scalePxWithZoom(canvas_item.x2, zoom) - layer_x;
+                const top = self.scalePxWithZoom(canvas_item.y1, zoom) - layer_y;
+                const bottom = self.scalePxWithZoom(canvas_item.y2, zoom) - layer_y;
+                try self.drawImageNearest(
+                    context,
+                    canvas_item,
+                    left,
+                    top,
+                    right,
+                    bottom,
+                    context.surface.getWidth(),
+                    context.surface.getHeight(),
                 );
             },
             .iframe => {

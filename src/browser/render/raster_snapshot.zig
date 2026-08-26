@@ -75,6 +75,13 @@ pub const RasterSnapshot = struct {
                 copy.pixels = try self.clonePixelBuffer(image_item.pixels);
                 break :blk .{ .image = copy };
             },
+            .canvas => |canvas_item| blk: {
+                var copy = canvas_item;
+                copy.source = null;
+                copy.pixels = try self.allocator.dupe(u8, canvas_item.pixels);
+                copy.owns_pixels = true;
+                break :blk .{ .canvas = copy };
+            },
             .blend => |blend_item| blk: {
                 const children = try self.cloneList(blend_item.children);
                 errdefer DisplayItem.freeList(self.allocator, children);

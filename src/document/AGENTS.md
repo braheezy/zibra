@@ -80,6 +80,11 @@ or selector/rule lifetime.
   `Element.inputType` view. Hidden and password inputs keep their real `value`
   attribute in the DOM: layout suppresses hidden controls and masks password
   paint without replacing or duplicating that submission value.
+- `Element.canvas` owns a heap-stable `document/canvas.zig` backing object only
+  after `getContext("2d")`. The pointee may not move because its z2d Context
+  borrows the embedded Surface. Width/height content attributes select the
+  bitmap dimensions (300x150 defaults) and a resize clears native drawing
+  state; DOM child-array relocation moves only the owning pointer.
 - `focus.zig` is the canonical HTML focusability policy shared by layout,
   keyboard traversal, and JavaScript. Programmatic focus accepts an explicit
   negative `tabindex`, while sequential focus rejects it; hidden inputs,

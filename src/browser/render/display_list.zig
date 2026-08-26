@@ -202,6 +202,39 @@ pub const ImageDisplayItem = struct {
     source: ?DisplayItemSource = null,
 };
 
+/// Validate an RGBA byte buffer before raster code indexes it. A canvas that
+/// has never had `getContext("2d")` called deliberately has no backing
+/// surface, so an empty buffer with non-zero layout dimensions is a normal
+/// transparent state rather than a raster invariant violation.
+pub fn rgbaPixelBufferComplete(
+    source_width: i32,
+    source_height: i32,
+    pixels: []const u8,
+) bool {
+    if (source_width <= 0 or source_height <= 0) return false;
+    const width: usize = @intCast(source_width);
+    const height: usize = @intCast(source_height);
+    const pixel_count = std.math.mul(usize, width, height) catch return false;
+    const byte_count = std.math.mul(usize, pixel_count, 4) catch return false;
+    return pixels.len >= byte_count;
+}
+
+/// Immutable RGBA snapshot of a live DOM canvas. Unlike decoded image bytes,
+/// these pixels are owned by the display command because the backing canvas
+/// remains mutable after paint.
+pub const CanvasDisplayItem = struct {
+    x1: i32,
+    y1: i32,
+    x2: i32,
+    y2: i32,
+    source_width: i32,
+    source_height: i32,
+    pixels: []u8,
+    owns_pixels: bool = false,
+    opacity: f64 = 1.0,
+    source: ?DisplayItemSource = null,
+};
+
 /// Synchronous-only provenance for an uncomposed frame display item.
 pub const DisplayItemSource = struct {
     layout: *const anyopaque,
@@ -241,6 +274,7 @@ pub const DisplayItem = union(enum) {
         source: ?DisplayItemSource = null,
     },
     image: ImageDisplayItem,
+    canvas: CanvasDisplayItem,
     iframe: struct {
         rect: Rect,
         node: *Node,
@@ -338,6 +372,9 @@ pub const DisplayItem = union(enum) {
             },
             .image => |*image_item| {
                 image_item.opacity *= opacity;
+            },
+            .canvas => |*canvas_item| {
+                canvas_item.opacity *= opacity;
             },
             .iframe => {},
             .rounded_rect => |*rounded_item| {
@@ -652,6 +689,15 @@ pub const DisplayItem = union(enum) {
                 image_item.y2,
                 zoom,
             ),
+            .canvas => |canvas_item| canvas_item.opacity > 0 and pointInScaledRect(
+                x,
+                y,
+                canvas_item.x1,
+                canvas_item.y1,
+                canvas_item.x2,
+                canvas_item.y2,
+                zoom,
+            ),
             .iframe => |iframe_item| pointInScaledRect(
                 x,
                 y,
@@ -818,7 +864,15 @@ pub const DisplayItem = union(enum) {
                 freeList(allocator, blend_item.children);
             },
             .transform => |transform_item| freeList(allocator, transform_item.children),
+            .canvas => |canvas_item| if (canvas_item.owns_pixels) allocator.free(canvas_item.pixels),
             else => {},
         }
     }
 };
+
+test "RGBA raster buffers reject lazy and truncated canvas snapshots" {
+    try std.testing.expect(!rgbaPixelBufferComplete(300, 150, &.{}));
+    try std.testing.expect(!rgbaPixelBufferComplete(2, 2, &([_]u8{0} ** 15)));
+    try std.testing.expect(rgbaPixelBufferComplete(2, 2, &([_]u8{0} ** 16)));
+    try std.testing.expect(!rgbaPixelBufferComplete(0, 2, &.{}));
+}

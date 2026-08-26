@@ -35,6 +35,14 @@ or Kiesel allocation/locking.
   allocator before temporary callback storage is freed, because ASCII String
   construction may retain the supplied bytes. Callback invalidation follows
   the same document-generation boundary as XHR and DOM callbacks.
+- Canvas wrappers are scoped by JavaScript window and cached by stable Node
+  handle so repeated `getContext("2d")` calls return one object. Drawing stays
+  serialized on the tab worker; pixel-changing commands request paint, while
+  path/state-only commands do not. A z2d-missing method must return native
+  `error.NotImplemented`, which the host consumes as a non-fatal `undefined`
+  result so later page script still runs. Assigning either canvas dimension
+  resets native pixels/path/transforms and the cached wrapper's paint state,
+  including when the assigned size equals the current size.
 - XHR same-origin/CORS policy belongs to the browser callback, not the
   JavaScript shim. A synchronous denied response surfaces as the existing
   cross-origin exception; asynchronous denial intentionally has no `onload`

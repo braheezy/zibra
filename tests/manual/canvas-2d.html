@@ -1,0 +1,65 @@
+<!doctype html>
+<!--
+How to verify:
+  zig build run -- tests/manual/canvas-2d.html
+  zig build run -- --dump-layout tests/manual/canvas-2d.html
+  zig build run -- --dump-display-list tests/manual/canvas-2d.html
+
+The canvas occupies a 360x180 inline replaced-element box. It should show a
+navy field, translucent red and green blocks, a cleared white window, a yellow
+outlined triangle, a cyan circle, and a rotated orange block. The small green
+square in the lower-right proves execution continued after the intentional
+drawImage NotImplemented stub. Text after the canvas must remain below it.
+-->
+<title>Canvas 2D</title>
+<style>
+  body { font-family: sans-serif; }
+  h1 { color: navy; }
+  canvas { background-color: white; }
+</style>
+<h1>CanvasRenderingContext2D</h1>
+<p>Supported z2d-backed commands:</p>
+<canvas id="demo" width="360" height="180">Canvas fallback text</canvas>
+<p id="status">DONE: the canvas above is an atomic 360 by 180 element.</p>
+<script>
+var canvas = document.querySelectorAll('canvas')[0];
+var context = canvas.getContext('2d');
+
+context.fillStyle = '#101a40';
+context.fillRect(0, 0, canvas.width, canvas.height);
+
+context.globalAlpha = 0.75;
+context.fillStyle = 'red';
+context.fillRect(18, 18, 95, 58);
+context.fillStyle = 'green';
+context.fillRect(76, 45, 105, 64);
+context.globalAlpha = 1;
+context.clearRect(100, 62, 38, 28);
+
+context.beginPath();
+context.moveTo(210, 22);
+context.lineTo(276, 104);
+context.lineTo(164, 104);
+context.closePath();
+context.strokeStyle = 'yellow';
+context.lineWidth = 6;
+context.stroke();
+
+context.beginPath();
+context.arc(305, 54, 28, 0, Math.PI * 2, false);
+context.closePath();
+context.fillStyle = 'cyan';
+context.fill();
+
+context.save();
+context.translate(245, 140);
+context.rotate(-0.25);
+context.fillStyle = 'orange';
+context.fillRect(-38, -13, 76, 26);
+context.restore();
+
+// Not backed by z2d yet; it must be a non-fatal native stub.
+context.drawImage(null, 0, 0);
+context.fillStyle = 'green';
+context.fillRect(338, 158, 14, 14);
+</script>

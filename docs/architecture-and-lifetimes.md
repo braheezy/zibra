@@ -45,7 +45,7 @@ The source tree is organized by responsibility:
 | [`src/browser/frame_timing.zig`](../src/browser/frame_timing.zig) | Smoothed two-stage frame-work estimates, cadence buckets, and absolute animation deadlines. |
 | [`src/browser/window_geometry.zig`](../src/browser/window_geometry.zig) | Pure native-window resize and bounded tab-surface geometry derivation. |
 | [`src/browser/session_state.zig`](../src/browser/session_state.zig) | Window-independent networking task runner, HTTP client/cookies/cache, visited/bookmarked URL state, generated bookmark HTML, and separate network-data/metadata synchronization. |
-| [`src/browser/render/layout.zig`](../src/browser/render/layout.zig) | Layout tree, invalidation dependencies, hit-test collection, paint, and image layout. |
+| [`src/browser/render/layout.zig`](../src/browser/render/layout.zig) | Layout tree, invalidation dependencies, hit-test collection, paint, and replaced-element layout. |
 | [`src/browser/render/font.zig`](../src/browser/render/font.zig) | Font discovery, SDL_ttf handles, Unicode fallback selection, and owned RGBA glyph bitmaps. |
 | [`src/browser/render/display_list.zig`](../src/browser/render/display_list.zig) | Display-command and composited-layer data, recursive ownership cleanup, provenance, and painted hit testing without Browser or SDL dependencies. |
 | [`src/browser/render/focus_ring.zig`](../src/browser/render/focus_ring.zig) | Pointer-free high-contrast focus-ring and accessibility-outline command generation. |
@@ -53,7 +53,8 @@ The source tree is organized by responsibility:
 | [`src/browser/render/effects.zig`](../src/browser/render/effects.zig) | Pixel-level software effects such as premultiplied-RGBA Gaussian blur. |
 | [`src/browser/render/raster_snapshot.zig`](../src/browser/render/raster_snapshot.zig) | Deep-owned, provenance-free display generations transferred to the raster worker. |
 | [`src/browser/render/compositor_cache.zig`](../src/browser/render/compositor_cache.zig) | Raster-worker-owned ordered planes, surface-or-short-command backing, and pointer-free opacity/translation updates used by draw-only animation and scrolling. |
-| [`src/document/parser.zig`](../src/document/parser.zig) | HTML parser, DOM representation, style maps, images, and DOM tree utilities. |
+| [`src/document/parser.zig`](../src/document/parser.zig) | HTML parser, DOM representation, style maps, image/canvas owners, and DOM tree utilities. |
+| [`src/document/canvas.zig`](../src/document/canvas.zig) | Heap-stable z2d canvas backing stores, 2D command dispatch, state, resizing, and straight-alpha snapshots. |
 | [`src/document/focus.zig`](../src/document/focus.zig) | Shared intrinsic programmatic and sequential HTML focusability rules. |
 | [`src/document/inspection.zig`](../src/document/inspection.zig) | Browser-free fetch/decode/parse/style pipeline for document inspection commands. |
 | [`src/document/css_parser.zig`](../src/document/css_parser.zig) | CSS parsing and `CSSRule` ownership. |
@@ -146,7 +147,7 @@ but no lock or owner-thread rule covers the complete mutable graph.
 | Zibra collections | `Browser`, `Tab`, `Frame`, DOM, layout, rules, tasks, and snapshots generally retain the caller allocator and provide explicit teardown paths. | The explicit lifetime remains authoritative even when production allocation behavior masks a bad free order. |
 | Raster worker | Raster task queues, snapshots, copied leaf pixels, z2d temporaries/caches, and completed surfaces use `std.heap.smp_allocator`; `root_surface_allocator` follows a transferred result into UI ownership. | The process arena is not used concurrently by the raster worker, and every transferred surface must be released through the allocator that created it. |
 | SDL and SDL_ttf | BrowserApp owns interactive SDL/text input, each Browser owns its native window/renderer/texture, and each `FontManager.deinit` frees cached RGBA glyph bitmaps, closes fonts, and releases its paired SDL_ttf reference. The App holds an extra refcounted SDL_ttf guard until all windows close. | Native handles require deterministic release and an explicit thread-affinity rule. |
-| z2d and zigimg | `Browser` owns long-lived z2d surfaces/contexts. `ImageData` owns a `zigimg.Image` and, when present, its encoded byte buffer; see [`src/document/parser.zig`](../src/document/parser.zig). | Layout and display items borrow pixel slices from these owners. The source image must outlive every borrower. |
+| z2d and zigimg | `Browser` owns long-lived presentation surfaces/contexts. Each initialized canvas element owns a heap-stable z2d Surface/Context pair; `ImageData` owns a `zigimg.Image` and, when present, its encoded byte buffer. | Image display items borrow decoded slices. Canvas paint instead copies and owns immutable pixels because scripts may mutate its live z2d surface after commit. |
 
 ## Ownership topology
 
@@ -535,6 +536,21 @@ borrows its cached pixel slice; it does not transfer ownership. Its
 The cached `Glyph` does not store the source grapheme slice, so transient input
 text is not retained as glyph metadata.
 
+An Element lazily owns a heap-stable canvas pointee when JavaScript first calls
+`getContext("2d")`. z2d Context retains the address of the Surface inside that
+pointee, so DOM child-array moves transfer the pointer but never copy the
+backing object. Canvas width/height attributes select unzoomed bitmap pixels
+with 300x150 defaults; layout applies authored/accessibility zoom only to the
+replaced-element box. Assigning either dimension resets pixels and drawing
+state even when the numeric size is unchanged. Canvas drawing is serialized
+with JavaScript and layout on the tab worker. A cached layout command can
+predate lazy context allocation, so each provenance-backed paint clone resolves
+the current Element backing and converts its live premultiplied z2d pixels into
+one independently owned straight-alpha `.canvas` command. Subsequent script
+drawing therefore cannot race or rewrite a committed/browser-worker generation;
+a context-free canvas uses an empty, transparent snapshot that raster accepts
+without indexing.
+
 Display-list container ownership is recursive: `.blend` and `.transform` own
 their child slices, and `.blend` owns its copied blend-mode string. A blend's
 copyable `blur_radius` marks a CSS filter wrapper without adding another owner.
@@ -549,6 +565,8 @@ before replacing the cache.
 Primitive entries are not self-contained:
 
 - `.image.pixels` borrows decoded image memory;
+- `.canvas.pixels` owns an immutable allocation and every deep command clone
+  owns its own copy;
 - `.glyph.glyph` borrows a `FontManager` pixel resource;
 - `.iframe.node`, `.blend.node`, and `.transform.node` borrow DOM identity;
 - composited-layer entries borrow layer allocations.

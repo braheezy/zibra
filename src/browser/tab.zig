@@ -1888,6 +1888,17 @@ fn replaceIframesInList(
                 });
                 child_slice_owned = false;
             },
+            .canvas => |canvas_item| {
+                const pixels = try self.allocator.dupe(u8, canvas_item.pixels);
+                var pixels_owned = true;
+                errdefer if (pixels_owned) self.allocator.free(pixels);
+                var copy = canvas_item;
+                copy.pixels = pixels;
+                copy.owns_pixels = true;
+                copy.source = null;
+                try out.append(self.allocator, .{ .canvas = copy });
+                pixels_owned = false;
+            },
             else => try out.append(self.allocator, item),
         }
     }

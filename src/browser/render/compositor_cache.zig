@@ -42,7 +42,7 @@ fn collectDirectPaintInfo(items: []const DisplayItem, info: *DirectPaintInfo) bo
                 }
                 if (!collectDirectPaintInfo(blend.children, info)) return false;
             },
-            .glyph, .image, .iframe, .draw_composited_layer => return false,
+            .glyph, .image, .canvas, .iframe, .draw_composited_layer => return false,
         }
     }
     return true;

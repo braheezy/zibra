@@ -277,3 +277,9 @@ still overlap.
 Choose the narrowest check that covers the pipeline stage under change. A DOM
 or parser regression should normally add a DOM dump or unit fixture before a
 full screenshot fixture.
+
+`tests/manual/canvas-2d.html` exercises atomic canvas layout with explicit
+dimensions, retained 2D context identity, rectangles, paths, arcs, transforms,
+alpha, clearing, and a non-fatal unsupported drawImage call. Unit coverage owns
+the 300x150 defaults, same-size dimension reset, lazy-context repaint, and
+display/raster snapshot boundaries.

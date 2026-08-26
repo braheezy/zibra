@@ -49,6 +49,14 @@ before changing ownership or thread boundaries.
   Iframe placeholders additionally publish the containing element's authored
   effective zoom; Tab transfers that scalar to the child Frame before its next
   layout. It is plain numeric state, not DOM/layout provenance.
+  Canvas commands are the exception to ordinary image borrowing: every paint
+  owns an immutable straight-alpha RGBA snapshot copied from the live
+  premultiplied z2d surface. Deep-clone that buffer at every command-tree owner
+  boundary and free it recursively; raster snapshots must never observe the
+  mutable DOM backing store. A cached layout command can predate lazy
+  `getContext("2d")` allocation, so provenance-backed layout clones refresh its
+  pixels from the live element on paint. An empty snapshot is a valid
+  transparent canvas, and raster must validate byte length before indexing.
 - `layout.zig` resolves every painted inline fragment to its nearest focusable
   DOM ancestor and unions those fragments once per visual line. Nested inline
   descendants therefore share their ancestor's wrapped focus geometry. After

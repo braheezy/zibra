@@ -449,6 +449,7 @@ const WindowContext = struct {
 platform: Agent.Platform,
 agent: Agent,
 allocator: std.mem.Allocator,
+io: std.Io,
 storage_allocator: std.mem.Allocator,
 windows: std.AutoHashMap(u32, WindowContext),
 parent_window_ids: std.AutoHashMap(u32, u32),
@@ -481,6 +482,7 @@ pub fn init(
     errdefer self.agent.deinit();
 
     self.allocator = allocator;
+    self.io = io;
     self.storage_allocator = storage_allocator;
     self.windows = std.AutoHashMap(u32, WindowContext).init(allocator);
     self.parent_window_ids = std.AutoHashMap(u32, u32).init(allocator);
@@ -748,7 +750,9 @@ pub fn evaluate(self: *Js, window_id: u32, code: []const u8) !Value {
         \\// Add setAttribute method to Node prototype
         \\Node.prototype.setAttribute = function(name, value) {
         \\  var text = value == null ? "" : value.toString();
-        \\  __native.setAttribute(this.handle, name, text);
+        \\  if (__native.setAttribute(this.handle, name, text)) {
+        \\    resetCanvasContextState(this.handle);
+        \\  }
         \\};
         \\
         \\Object.defineProperty(Node.prototype, "id", {
@@ -777,6 +781,108 @@ pub fn evaluate(self: *Js, window_id: u32, code: []const u8) !Value {
         \\Node.prototype.focus = function() {
         \\  __native.focus(this.handle);
         \\};
+        \\
+        \\var WINDOW_CANVAS_CONTEXTS = {};
+        \\
+        \\function canvasContextsForWindow() {
+        \\  var windowId = window.__id;
+        \\  if (!WINDOW_CANVAS_CONTEXTS[windowId]) WINDOW_CANVAS_CONTEXTS[windowId] = {};
+        \\  return WINDOW_CANVAS_CONTEXTS[windowId];
+        \\}
+        \\
+        \\function resetCanvasContextState(handle) {
+        \\  var context = canvasContextsForWindow()[handle];
+        \\  if (!context) return;
+        \\  context.fillStyle = '#000000';
+        \\  context.strokeStyle = '#000000';
+        \\  context.lineWidth = 1;
+        \\  context.globalAlpha = 1;
+        \\  context.__stateStack = [];
+        \\}
+        \\
+        \\function CanvasRenderingContext2D(handle) {
+        \\  this.__canvasHandle = handle;
+        \\  this.canvas = new Node(handle);
+        \\  this.fillStyle = '#000000';
+        \\  this.strokeStyle = '#000000';
+        \\  this.lineWidth = 1;
+        \\  this.globalAlpha = 1;
+        \\  this.__stateStack = [];
+        \\}
+        \\
+        \\CanvasRenderingContext2D.prototype.__command = function(name, args, flag) {
+        \\  function numberAt(index) {
+        \\    return index < args.length ? Number(args[index]) : 0;
+        \\  }
+        \\  return __native.canvasCommand(
+        \\    this.__canvasHandle,
+        \\    name,
+        \\    this.fillStyle == null ? '' : this.fillStyle.toString(),
+        \\    this.strokeStyle == null ? '' : this.strokeStyle.toString(),
+        \\    Number(this.lineWidth),
+        \\    Number(this.globalAlpha),
+        \\    !!flag,
+        \\    numberAt(0), numberAt(1), numberAt(2),
+        \\    numberAt(3), numberAt(4), numberAt(5)
+        \\  );
+        \\};
+        \\
+        \\CanvasRenderingContext2D.prototype.fillRect = function(x, y, width, height) { this.__command('fillRect', arguments, false); };
+        \\CanvasRenderingContext2D.prototype.strokeRect = function(x, y, width, height) { this.__command('strokeRect', arguments, false); };
+        \\CanvasRenderingContext2D.prototype.clearRect = function(x, y, width, height) { this.__command('clearRect', arguments, false); };
+        \\CanvasRenderingContext2D.prototype.beginPath = function() { this.__command('beginPath', arguments, false); };
+        \\CanvasRenderingContext2D.prototype.moveTo = function(x, y) { this.__command('moveTo', arguments, false); };
+        \\CanvasRenderingContext2D.prototype.lineTo = function(x, y) { this.__command('lineTo', arguments, false); };
+        \\CanvasRenderingContext2D.prototype.rect = function(x, y, width, height) { this.__command('rect', arguments, false); };
+        \\CanvasRenderingContext2D.prototype.closePath = function() { this.__command('closePath', arguments, false); };
+        \\CanvasRenderingContext2D.prototype.bezierCurveTo = function(cp1x, cp1y, cp2x, cp2y, x, y) { this.__command('bezierCurveTo', arguments, false); };
+        \\CanvasRenderingContext2D.prototype.arc = function(x, y, radius, startAngle, endAngle, counterclockwise) { this.__command('arc', arguments, !!counterclockwise); };
+        \\CanvasRenderingContext2D.prototype.fill = function() { this.__command('fill', arguments, false); };
+        \\CanvasRenderingContext2D.prototype.stroke = function() { this.__command('stroke', arguments, false); };
+        \\CanvasRenderingContext2D.prototype.translate = function(x, y) { this.__command('translate', arguments, false); };
+        \\CanvasRenderingContext2D.prototype.rotate = function(angle) { this.__command('rotate', arguments, false); };
+        \\CanvasRenderingContext2D.prototype.scale = function(x, y) { this.__command('scale', arguments, false); };
+        \\CanvasRenderingContext2D.prototype.setTransform = function(a, b, c, d, e, f) { this.__command('setTransform', arguments, false); };
+        \\CanvasRenderingContext2D.prototype.resetTransform = function() { this.__command('resetTransform', arguments, false); };
+        \\CanvasRenderingContext2D.prototype.save = function() {
+        \\  this.__command('save', arguments, false);
+        \\  this.__stateStack.push([this.fillStyle, this.strokeStyle, this.lineWidth, this.globalAlpha]);
+        \\};
+        \\CanvasRenderingContext2D.prototype.restore = function() {
+        \\  this.__command('restore', arguments, false);
+        \\  var state = this.__stateStack.pop();
+        \\  if (state) {
+        \\    this.fillStyle = state[0]; this.strokeStyle = state[1];
+        \\    this.lineWidth = state[2]; this.globalAlpha = state[3];
+        \\  }
+        \\};
+        \\
+        \\// These methods deliberately reach a native error.NotImplemented
+        \\// stub. The host consumes that error and returns undefined so one
+        \\// unsupported operation does not terminate the page's script.
+        \\CanvasRenderingContext2D.prototype.quadraticCurveTo = function() { this.__command('quadraticCurveTo', arguments, false); };
+        \\CanvasRenderingContext2D.prototype.drawImage = function() { this.__command('drawImage', arguments, false); };
+        \\CanvasRenderingContext2D.prototype.fillText = function() { this.__command('fillText', arguments, false); };
+        \\CanvasRenderingContext2D.prototype.strokeText = function() { this.__command('strokeText', arguments, false); };
+        \\CanvasRenderingContext2D.prototype.clip = function() { this.__command('clip', arguments, false); };
+        \\CanvasRenderingContext2D.prototype.measureText = function() { return this.__command('measureText', arguments, false); };
+        \\
+        \\Node.prototype.getContext = function(type) {
+        \\  var kind = type == null ? '' : type.toString();
+        \\  if (!__native.canvasGetContext(this.handle, kind)) return null;
+        \\  var contexts = canvasContextsForWindow();
+        \\  if (!contexts[this.handle]) contexts[this.handle] = new CanvasRenderingContext2D(this.handle);
+        \\  return contexts[this.handle];
+        \\};
+        \\
+        \\Object.defineProperty(Node.prototype, 'width', {
+        \\  get: function() { return __native.canvasDimension(this.handle, 'width'); },
+        \\  set: function(value) { this.setAttribute('width', Number(value).toString()); }
+        \\});
+        \\Object.defineProperty(Node.prototype, 'height', {
+        \\  get: function() { return __native.canvasDimension(this.handle, 'height'); },
+        \\  set: function(value) { this.setAttribute('height', Number(value).toString()); }
+        \\});
         \\
         \\// Snapshot the immediate element children as wrapped Node objects.
         \\Object.defineProperty(Node.prototype, "children", {
@@ -818,6 +924,7 @@ pub fn evaluate(self: *Js, window_id: u32, code: []const u8) !Value {
         \\
         \\globalThis.Event = Event;
         \\globalThis.XMLHttpRequest = XMLHttpRequest;
+        \\globalThis.CanvasRenderingContext2D = CanvasRenderingContext2D;
         \\
         \\globalThis.__resetEventListeners = function(windowId) {
         \\  var targetId = (windowId === undefined || windowId === null) ? window.__id : windowId;
@@ -826,6 +933,7 @@ pub fn evaluate(self: *Js, window_id: u32, code: []const u8) !Value {
         \\  delete WINDOW_ONMESSAGE[targetId];
         \\  delete WINDOW_TIMER_REQUESTS[targetId];
         \\  delete WINDOW_NEXT_TIMER_HANDLE[targetId];
+        \\  delete WINDOW_CANVAS_CONTEXTS[targetId];
         \\};
         \\
         \\var WINDOW_TIMER_REQUESTS = {};
@@ -3075,6 +3183,63 @@ fn setupDocument(self: *Js, realm: *Realm) !void {
         },
     );
 
+    const canvas_get_context_fn = try kiesel.builtins.createBuiltinFunction(
+        &self.agent,
+        .{ .function = canvasGetContext },
+        2,
+        "canvasGetContext",
+        .{
+            .realm = realm,
+            .additional_fields = self_ptr,
+        },
+    );
+    try native_obj.definePropertyDirect(
+        &self.agent,
+        PropertyKey.from("canvasGetContext"),
+        .{
+            .value_or_accessor = .{ .value = Value.from(&canvas_get_context_fn.object) },
+            .attributes = .builtin_default,
+        },
+    );
+
+    const canvas_dimension_fn = try kiesel.builtins.createBuiltinFunction(
+        &self.agent,
+        .{ .function = canvasDimension },
+        2,
+        "canvasDimension",
+        .{
+            .realm = realm,
+            .additional_fields = self_ptr,
+        },
+    );
+    try native_obj.definePropertyDirect(
+        &self.agent,
+        PropertyKey.from("canvasDimension"),
+        .{
+            .value_or_accessor = .{ .value = Value.from(&canvas_dimension_fn.object) },
+            .attributes = .builtin_default,
+        },
+    );
+
+    const canvas_command_fn = try kiesel.builtins.createBuiltinFunction(
+        &self.agent,
+        .{ .function = canvasCommand },
+        13,
+        "canvasCommand",
+        .{
+            .realm = realm,
+            .additional_fields = self_ptr,
+        },
+    );
+    try native_obj.definePropertyDirect(
+        &self.agent,
+        PropertyKey.from("canvasCommand"),
+        .{
+            .value_or_accessor = .{ .value = Value.from(&canvas_command_fn.object) },
+            .attributes = .builtin_default,
+        },
+    );
+
     // Create innerHTML function with self pointer
     const inner_html_fn = try kiesel.builtins.createBuiltinFunction(
         &self.agent,
@@ -3915,6 +4080,180 @@ fn removeChild(agent: *Agent, this_value: Value, arguments: kiesel.types.Argumen
     return .undefined;
 }
 
+fn canvasElementForHandle(window: *WindowContext, handle: u32) ?*parser.Element {
+    const node = window.handle_to_node.get(handle) orelse return null;
+    if (node.* != .element) return null;
+    if (!std.ascii.eqlIgnoreCase(node.element.tag, "canvas")) return null;
+    return &node.element;
+}
+
+fn ensureCanvasBacking(
+    agent: *Agent,
+    js_instance: *Js,
+    element: *parser.Element,
+) Agent.Error!*parser.Canvas {
+    const dimensions = element.canvasDimensions();
+    if (element.canvas == null) {
+        element.canvas = parser.Canvas.create(
+            js_instance.allocator,
+            js_instance.io,
+            dimensions.width,
+            dimensions.height,
+        ) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            else => return agent.throwException(
+                .internal_error,
+                "Could not allocate canvas backing store",
+                .{},
+            ),
+        };
+    } else {
+        element.canvas.?.resize(dimensions.width, dimensions.height) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            else => return agent.throwException(
+                .internal_error,
+                "Could not resize canvas backing store",
+                .{},
+            ),
+        };
+    }
+    return element.canvas.?;
+}
+
+/// Allocate (or return) the one 2D backing store for a canvas element. The JS
+/// runtime owns wrapper identity; this native seam owns only z2d state.
+fn canvasGetContext(agent: *Agent, this_value: Value, arguments: kiesel.types.Arguments) Agent.Error!Value {
+    _ = this_value;
+    const function_obj = agent.activeFunctionObject();
+    const builtin_fn = function_obj.as(kiesel.builtins.BuiltinFunction);
+    const js_instance = builtin_fn.fields.additionalFieldsAs(Js);
+    const window_id = js_instance.current_window_id orelse return .null;
+    const window = js_instance.windows.getPtr(window_id) orelse return .null;
+
+    const handle_arg = arguments.get(0);
+    const type_arg = arguments.get(1);
+    if (!handle_arg.isNumber() or !type_arg.isString()) return Value.from(@as(f64, 0));
+    const raw_handle = handle_arg.asNumber().asFloat();
+    if (!std.math.isFinite(raw_handle) or raw_handle < 0 or raw_handle > std.math.maxInt(u32)) {
+        return Value.from(@as(f64, 0));
+    }
+    const context_type = try type_arg.asString().toUtf8(js_instance.allocator);
+    defer js_instance.allocator.free(context_type);
+    if (!std.mem.eql(u8, context_type, "2d")) return Value.from(@as(f64, 0));
+
+    const element = canvasElementForHandle(window, @intFromFloat(raw_handle)) orelse
+        return Value.from(@as(f64, 0));
+    _ = try ensureCanvasBacking(agent, js_instance, element);
+    return Value.from(@as(f64, 1));
+}
+
+/// Width/height IDL-like properties use canvas defaults while retaining a
+/// useful numeric reflection for other replaced elements.
+fn canvasDimension(agent: *Agent, this_value: Value, arguments: kiesel.types.Arguments) Agent.Error!Value {
+    _ = this_value;
+    const function_obj = agent.activeFunctionObject();
+    const builtin_fn = function_obj.as(kiesel.builtins.BuiltinFunction);
+    const js_instance = builtin_fn.fields.additionalFieldsAs(Js);
+    const window_id = js_instance.current_window_id orelse return Value.from(@as(f64, 0));
+    const window = js_instance.windows.getPtr(window_id) orelse return Value.from(@as(f64, 0));
+    const handle_arg = arguments.get(0);
+    const name_arg = arguments.get(1);
+    if (!handle_arg.isNumber() or !name_arg.isString()) return Value.from(@as(f64, 0));
+
+    const raw_handle = handle_arg.asNumber().asFloat();
+    if (!std.math.isFinite(raw_handle) or raw_handle < 0 or raw_handle > std.math.maxInt(u32)) {
+        return Value.from(@as(f64, 0));
+    }
+    const node = window.handle_to_node.get(@intFromFloat(raw_handle)) orelse
+        return Value.from(@as(f64, 0));
+    if (node.* != .element) return Value.from(@as(f64, 0));
+    const name = try name_arg.asString().toUtf8(js_instance.allocator);
+    defer js_instance.allocator.free(name);
+    const is_width = std.mem.eql(u8, name, "width");
+    const is_height = std.mem.eql(u8, name, "height");
+    if (!is_width and !is_height) return Value.from(@as(f64, 0));
+
+    if (std.ascii.eqlIgnoreCase(node.element.tag, "canvas")) {
+        const dimensions = node.element.canvasDimensions();
+        return Value.from(@as(f64, @floatFromInt(if (is_width) dimensions.width else dimensions.height)));
+    }
+    const attributes = node.element.attributes orelse return Value.from(@as(f64, 0));
+    const raw = attributes.get(name) orelse return Value.from(@as(f64, 0));
+    const value = std.fmt.parseFloat(f64, raw) catch 0;
+    return Value.from(value);
+}
+
+/// Dispatch one CanvasRenderingContext2D call. Unsupported z2d operations and
+/// invalid drawing state are non-fatal stubs; allocation failures still
+/// propagate through Kiesel normally.
+fn canvasCommand(agent: *Agent, this_value: Value, arguments: kiesel.types.Arguments) Agent.Error!Value {
+    _ = this_value;
+    const function_obj = agent.activeFunctionObject();
+    const builtin_fn = function_obj.as(kiesel.builtins.BuiltinFunction);
+    const js_instance = builtin_fn.fields.additionalFieldsAs(Js);
+    const window_id = js_instance.current_window_id orelse return .undefined;
+    const window = js_instance.windows.getPtr(window_id) orelse return .undefined;
+
+    const handle_arg = arguments.get(0);
+    const name_arg = arguments.get(1);
+    const fill_arg = arguments.get(2);
+    const stroke_arg = arguments.get(3);
+    if (!handle_arg.isNumber() or !name_arg.isString() or
+        !fill_arg.isString() or !stroke_arg.isString()) return .undefined;
+    const raw_handle = handle_arg.asNumber().asFloat();
+    if (!std.math.isFinite(raw_handle) or raw_handle < 0 or raw_handle > std.math.maxInt(u32)) {
+        return .undefined;
+    }
+    const element = canvasElementForHandle(window, @intFromFloat(raw_handle)) orelse return .undefined;
+    const canvas = try ensureCanvasBacking(agent, js_instance, element);
+
+    const name = try name_arg.asString().toUtf8(js_instance.allocator);
+    defer js_instance.allocator.free(name);
+    const fill_style = try fill_arg.asString().toUtf8(js_instance.allocator);
+    defer js_instance.allocator.free(fill_style);
+    const stroke_style = try stroke_arg.asString().toUtf8(js_instance.allocator);
+    defer js_instance.allocator.free(stroke_style);
+
+    const line_width_arg = arguments.get(4);
+    const global_alpha_arg = arguments.get(5);
+    if (!line_width_arg.isNumber() or !global_alpha_arg.isNumber()) return .undefined;
+    const line_width = line_width_arg.asNumber().asFloat();
+    const global_alpha = global_alpha_arg.asNumber().asFloat();
+    if (!std.math.isFinite(line_width) or !std.math.isFinite(global_alpha)) return .undefined;
+
+    var values = [_]f64{0} ** 6;
+    for (0..values.len) |index| {
+        const value_arg = arguments.get(7 + index);
+        if (!value_arg.isNumber()) return .undefined;
+        values[index] = value_arg.asNumber().asFloat();
+        if (!std.math.isFinite(values[index])) return .undefined;
+    }
+
+    const result = canvas.command(
+        name,
+        values,
+        arguments.get(6).toBoolean(),
+        .{
+            .fill_style = fill_style,
+            .stroke_style = stroke_style,
+            .line_width = line_width,
+            .global_alpha = global_alpha,
+        },
+    ) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        error.NotImplemented => {
+            std.log.debug("CanvasRenderingContext2D.{s} is not implemented", .{name});
+            return .undefined;
+        },
+        else => {
+            std.log.warn("CanvasRenderingContext2D.{s} ignored: {}", .{ name, err });
+            return .undefined;
+        },
+    };
+    if (result == .pixels_changed) js_instance.requestRender();
+    return .undefined;
+}
+
 /// __native.setAttribute implementation
 fn setAttribute(agent: *Agent, this_value: Value, arguments: kiesel.types.Arguments) Agent.Error!Value {
     const function_obj = agent.activeFunctionObject();
@@ -4003,11 +4342,29 @@ fn setAttribute(agent: *Agent, this_value: Value, arguments: kiesel.types.Argume
             e.attributes.?.putAssumeCapacity(owned_name, owned_value);
             parser.dirtyStyleForElement(e);
 
-            if ((std.mem.eql(u8, e.tag, "img") or std.mem.eql(u8, e.tag, "iframe")) and
+            const canvas_dimension = std.ascii.eqlIgnoreCase(e.tag, "canvas") and
+                (std.ascii.eqlIgnoreCase(attr_name, "width") or
+                    std.ascii.eqlIgnoreCase(attr_name, "height"));
+            if ((std.mem.eql(u8, e.tag, "img") or
+                std.mem.eql(u8, e.tag, "iframe") or
+                std.mem.eql(u8, e.tag, "canvas")) and
                 (std.mem.eql(u8, attr_name, "width") or std.mem.eql(u8, attr_name, "height")))
             {
                 e.children_dirty = true;
                 markElementLayoutDirty(e);
+            }
+            if (canvas_dimension) {
+                if (e.canvas) |canvas| {
+                    const dimensions = e.canvasDimensions();
+                    canvas.reset(dimensions.width, dimensions.height) catch |err| switch (err) {
+                        error.OutOfMemory => return error.OutOfMemory,
+                        else => return agent.throwException(
+                            .internal_error,
+                            "Could not reset canvas backing store",
+                            .{},
+                        ),
+                    };
+                }
             }
 
             // Attribute ownership and dirty state are already committed. A
@@ -4017,7 +4374,7 @@ fn setAttribute(agent: *Agent, this_value: Value, arguments: kiesel.types.Argume
             if (refresh_id_globals) {
                 try js_instance.syncNamedIdGlobals(window_id, window);
             }
-            return .undefined;
+            return Value.from(canvas_dimension);
         },
         .text => {
             return agent.throwException(

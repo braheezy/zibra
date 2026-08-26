@@ -635,6 +635,40 @@ const ImageLayout = struct {
     }
 };
 
+const CanvasLayout = struct {
+    embed: EmbedLayout,
+    /// The backing object is allocated lazily by getContext("2d"), after the
+    /// initial layout may already exist. Borrow the owning element so repaint
+    /// observes a backing store created without requiring a geometry rebuild.
+    element: *parser.Element,
+    source_width: i32,
+    source_height: i32,
+
+    fn init(
+        allocator: std.mem.Allocator,
+        layout_width: i32,
+        layout_height: i32,
+        source_width: i32,
+        source_height: i32,
+        element: *parser.Element,
+        zoom_value: f32,
+    ) CanvasLayout {
+        var layout = CanvasLayout{
+            .embed = EmbedLayout.init(allocator),
+            .element = element,
+            .source_width = source_width,
+            .source_height = source_height,
+        };
+        layout.embed.setupDependencies();
+        layout.embed.setMetrics(layout_width, layout_height, layout_height, 0, zoom_value, 0);
+        return layout;
+    }
+
+    fn deinit(self: *CanvasLayout) void {
+        self.embed.deinit();
+    }
+};
+
 const IframeLayout = struct {
     embed: EmbedLayout,
     bgcolor: browser.Color,
@@ -720,6 +754,7 @@ const LineItemPayload = union(enum) {
     input: InputLayout,
     button: ButtonLayout,
     image: ImageLayout,
+    canvas: CanvasLayout,
     iframe: IframeLayout,
 
     fn deinit(self: *LineItemPayload) void {
@@ -728,6 +763,7 @@ const LineItemPayload = union(enum) {
             .input => |*input_payload| input_payload.deinit(),
             .button => |*button_payload| button_payload.deinit(),
             .image => |*image_payload| image_payload.deinit(),
+            .canvas => |*canvas_payload| canvas_payload.deinit(),
             .iframe => |*iframe_payload| iframe_payload.deinit(),
         }
     }
@@ -1907,6 +1943,8 @@ fn recurseNode(self: *Layout, node: Node, node_ptr: ?*Node, line_buffer: *std.Ar
                 try self.handleButtonElement(node, node_ptr, line_buffer);
             } else if (std.mem.eql(u8, e.tag, "img")) {
                 try self.handleImageElement(node, node_ptr, line_buffer);
+            } else if (std.ascii.eqlIgnoreCase(e.tag, "canvas")) {
+                try self.handleCanvasElement(node_ptr, line_buffer);
             } else if (std.ascii.eqlIgnoreCase(e.tag, "iframe")) {
                 try self.handleIframeElement(node, node_ptr, line_buffer);
             } else {
@@ -2081,6 +2119,37 @@ fn handleIframeElement(self: *Layout, node: Node, node_ptr: ?*Node, line_buffer:
     );
     try iframe_layout.embed.appendInline(self, line_buffer, node_ptr, .{
         .iframe = iframe_layout,
+    });
+}
+
+fn handleCanvasElement(
+    self: *Layout,
+    node_ptr: ?*Node,
+    line_buffer: *std.ArrayList(LineItem),
+) !void {
+    const canvas_node = node_ptr orelse return;
+    if (canvas_node.* != .element) return;
+    const element = &canvas_node.element;
+    self.resetSoftHyphenWord();
+
+    const dimensions = element.canvasDimensions();
+    if (element.canvas) |canvas| try canvas.resize(dimensions.width, dimensions.height);
+
+    const layout_width = self.scaleActiveCssPixel(dimensions.width);
+    const layout_height = self.scaleActiveCssPixel(dimensions.height);
+    if (layout_width <= 0 or layout_height <= 0) return;
+
+    var canvas_layout = CanvasLayout.init(
+        self.allocator,
+        layout_width,
+        layout_height,
+        dimensions.width,
+        dimensions.height,
+        element,
+        self.effectiveZoom(),
+    );
+    try canvas_layout.embed.appendInline(self, line_buffer, canvas_node, .{
+        .canvas = canvas_layout,
     });
 }
 
@@ -2529,6 +2598,7 @@ fn flushLine(self: *Layout, line_buffer: *std.ArrayList(LineItem)) !void {
             .input => false,
             .button => false,
             .image => false,
+            .canvas => false,
             .iframe => false,
         };
         if (is_superscript) {
@@ -2567,6 +2637,7 @@ fn flushLine(self: *Layout, line_buffer: *std.ArrayList(LineItem)) !void {
             .input => false,
             .button => false,
             .image => false,
+            .canvas => false,
             .iframe => false,
         };
         if (is_superscript) {
@@ -2655,6 +2726,28 @@ fn flushLine(self: *Layout, line_buffer: *std.ArrayList(LineItem)) !void {
                         .source = source,
                     },
                 });
+            },
+            .canvas => |canvas_payload| {
+                const pixels = if (canvas_payload.element.canvas) |canvas|
+                    try canvas.snapshot(self.allocator)
+                else
+                    try self.allocator.alloc(u8, 0);
+                var pixels_owned = true;
+                errdefer if (pixels_owned) self.allocator.free(pixels);
+                try self.current_display_target.append(self.allocator, DisplayItem{
+                    .canvas = .{
+                        .x1 = item.x,
+                        .y1 = final_y,
+                        .x2 = item.x + item.width,
+                        .y2 = final_y + item.height,
+                        .source_width = canvas_payload.source_width,
+                        .source_height = canvas_payload.source_height,
+                        .pixels = pixels,
+                        .owns_pixels = true,
+                        .source = source,
+                    },
+                });
+                pixels_owned = false;
             },
             .iframe => |iframe_payload| {
                 if (item.node_ptr) |ptr| {
@@ -4109,6 +4202,12 @@ fn displayListLayoutBounds(
                 .right = translate_x + @max(image.x1, image.x2),
                 .bottom = translate_y + @max(image.y1, image.y2),
             },
+            .canvas => |canvas| .{
+                .left = translate_x + @min(canvas.x1, canvas.x2),
+                .top = translate_y + @min(canvas.y1, canvas.y2),
+                .right = translate_x + @max(canvas.x1, canvas.x2),
+                .bottom = translate_y + @max(canvas.y1, canvas.y2),
+            },
             .iframe => |iframe| .{
                 .left = translate_x + iframe.rect.left,
                 .top = translate_y + iframe.rect.top,
@@ -4198,6 +4297,22 @@ fn cloneDisplayItemOwned(
     item: DisplayItem,
 ) DisplayListCloneError!DisplayItem {
     return switch (item) {
+        .canvas => |canvas| blk: {
+            var copy = canvas;
+            copy.pixels = pixels: {
+                const source = canvas.source orelse break :pixels try allocator.dupe(u8, canvas.pixels);
+                const node = source.originatingNode() orelse break :pixels try allocator.dupe(u8, canvas.pixels);
+                if (node.* != .element or
+                    !std.ascii.eqlIgnoreCase(node.element.tag, "canvas"))
+                {
+                    break :pixels try allocator.dupe(u8, canvas.pixels);
+                }
+                const backing = node.element.canvas orelse break :pixels try allocator.dupe(u8, canvas.pixels);
+                break :pixels try backing.snapshot(allocator);
+            };
+            copy.owns_pixels = true;
+            break :blk .{ .canvas = copy };
+        },
         .blend => |blend| blk: {
             const children = try cloneDisplayListOwned(allocator, blend.children);
             var children_owned = true;
@@ -5469,7 +5584,9 @@ const BlockLayout = struct {
                 // rich button's temporary root is the contained exception.
                 if (std.ascii.eqlIgnoreCase(e.tag, "input") or
                     (std.ascii.eqlIgnoreCase(e.tag, "button") and !self.rich_button_root) or
-                    std.ascii.eqlIgnoreCase(e.tag, "img") or std.ascii.eqlIgnoreCase(e.tag, "iframe"))
+                    std.ascii.eqlIgnoreCase(e.tag, "img") or
+                    std.ascii.eqlIgnoreCase(e.tag, "canvas") or
+                    std.ascii.eqlIgnoreCase(e.tag, "iframe"))
                 {
                     return false;
                 }
@@ -5666,7 +5783,9 @@ const BlockLayout = struct {
             const tag = self.node.element.tag;
             if (std.ascii.eqlIgnoreCase(tag, "input") or
                 (std.ascii.eqlIgnoreCase(tag, "button") and !self.rich_button_root) or
-                std.ascii.eqlIgnoreCase(tag, "img") or std.ascii.eqlIgnoreCase(tag, "iframe"))
+                std.ascii.eqlIgnoreCase(tag, "img") or
+                std.ascii.eqlIgnoreCase(tag, "canvas") or
+                std.ascii.eqlIgnoreCase(tag, "iframe"))
             {
                 is_block = false;
             }
@@ -6617,6 +6736,8 @@ fn layoutInlineBlock(self: *Layout, block: *BlockLayout) !void {
                 try self.handleButtonElement(block.node, block.node_ptr, &line_buffer);
             } else if (std.ascii.eqlIgnoreCase(e.tag, "img")) {
                 try self.handleImageElement(block.node, block.node_ptr, &line_buffer);
+            } else if (std.ascii.eqlIgnoreCase(e.tag, "canvas")) {
+                try self.handleCanvasElement(block.node_ptr, &line_buffer);
             } else if (std.ascii.eqlIgnoreCase(e.tag, "iframe")) {
                 try self.handleIframeElement(block.node, block.node_ptr, &line_buffer);
             } else {
@@ -6890,6 +7011,7 @@ fn writeDisplayItemsDebug(writer: *std.Io.Writer, items: []const DisplayItem, in
             .glyph => |glyph| try writer.print("glyph x={d} y={d} width={d} height={d} color=#{x:0>2}{x:0>2}{x:0>2}{x:0>2}\n", .{ glyph.x, glyph.y, glyph.glyph.w, glyph.glyph.h, glyph.color.r, glyph.color.g, glyph.color.b, glyph.color.a }),
             .rect => |rect| try writer.print("rect x1={d} y1={d} x2={d} y2={d} color=#{x:0>2}{x:0>2}{x:0>2}{x:0>2}\n", .{ rect.x1, rect.y1, rect.x2, rect.y2, rect.color.r, rect.color.g, rect.color.b, rect.color.a }),
             .image => |image| try writer.print("image x1={d} y1={d} x2={d} y2={d} source_width={d} source_height={d} opacity={d}\n", .{ image.x1, image.y1, image.x2, image.y2, image.source_width, image.source_height, image.opacity }),
+            .canvas => |canvas| try writer.print("canvas x1={d} y1={d} x2={d} y2={d} source_width={d} source_height={d} opacity={d}\n", .{ canvas.x1, canvas.y1, canvas.x2, canvas.y2, canvas.source_width, canvas.source_height, canvas.opacity }),
             .iframe => |iframe| try writer.print("iframe left={d} top={d} right={d} bottom={d}\n", .{ iframe.rect.left, iframe.rect.top, iframe.rect.right, iframe.rect.bottom }),
             .rounded_rect => |rect| try writer.print("rounded-rect x1={d} y1={d} x2={d} y2={d} radius={d} color=#{x:0>2}{x:0>2}{x:0>2}{x:0>2}\n", .{ rect.x1, rect.y1, rect.x2, rect.y2, rect.radius, rect.color.r, rect.color.g, rect.color.b, rect.color.a }),
             .line => |line| try writer.print("line x1={d} y1={d} x2={d} y2={d} thickness={d} color=#{x:0>2}{x:0>2}{x:0>2}{x:0>2}\n", .{ line.x1, line.y1, line.x2, line.y2, line.thickness, line.color.r, line.color.g, line.color.b, line.color.a }),

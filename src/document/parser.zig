@@ -16,8 +16,10 @@ const easing = @import("easing.zig");
 const css_transform = @import("transform.zig");
 const css_length = @import("length.zig");
 const css_animation = @import("css_animation.zig");
+const canvas_module = @import("canvas.zig");
 
 pub const CssColor = css_color.Color;
+pub const Canvas = canvas_module.Canvas;
 pub const parseCssColor = css_color.parse;
 pub const EasingFunction = easing.Function;
 pub const parseEasingFunction = easing.parse;
@@ -427,6 +429,14 @@ const raw_text_elements = [_][]const u8{
 
 pub const StyleMap = std.StringHashMap(ProtectedField([]const u8));
 
+fn parseCanvasDimension(raw: []const u8) ?i32 {
+    const text = std.mem.trim(u8, raw, " \t\r\n");
+    if (text.len == 0 or text[0] == '-') return null;
+    const value = std.fmt.parseInt(u32, text, 10) catch return null;
+    if (value > std.math.maxInt(i32)) return null;
+    return @intCast(value);
+}
+
 pub const CharacterReference = struct {
     codepoint: u21,
     len: usize,
@@ -583,6 +593,10 @@ pub const Element = struct {
     animations: ?std.StringHashMap(Animation) = null,
     css_animation: ?CssAnimationState = null,
     image_data: ?ImageData = null,
+    // Heap-stable because z2d.Context borrows its embedded Surface. Element
+    // values may relocate when DOM child arrays grow, but this pointee does
+    // not move until the element is destroyed.
+    canvas: ?*Canvas = null,
     opacity_anim_value: [32]u8 = undefined,
 
     pub fn init(allocator: std.mem.Allocator, tag: []const u8, parent: ?*Node) !Element {
@@ -600,6 +614,7 @@ pub const Element = struct {
             .animations = null,
             .css_animation = null,
             .image_data = null,
+            .canvas = null,
         };
         errdefer e.deinit(allocator);
 
@@ -640,6 +655,11 @@ pub const Element = struct {
 
         if (self.image_data) |*image_data| {
             image_data.deinit(allocator);
+        }
+
+        if (self.canvas) |canvas| {
+            canvas.destroy();
+            self.canvas = null;
         }
 
         // Free animations map
@@ -721,6 +741,23 @@ pub const Element = struct {
         if (!self.isCheckbox()) return false;
         const attributes = self.attributes orelse return false;
         return attributes.get("checked") != null;
+    }
+
+    /// HTML canvas bitmap dimensions come from non-negative integer content
+    /// attributes, independently of CSS/page zoom. Invalid values use the
+    /// platform defaults.
+    pub fn canvasDimensions(self: *const Element) struct { width: i32, height: i32 } {
+        var width = canvas_module.default_width;
+        var height = canvas_module.default_height;
+        if (self.attributes) |attributes| {
+            if (attributes.get("width")) |raw| {
+                width = parseCanvasDimension(raw) orelse canvas_module.default_width;
+            }
+            if (attributes.get("height")) |raw| {
+                height = parseCanvasDimension(raw) orelse canvas_module.default_height;
+            }
+        }
+        return .{ .width = width, .height = height };
     }
 
     /// Toggle a checkbox's boolean `checked` attribute and return its new
