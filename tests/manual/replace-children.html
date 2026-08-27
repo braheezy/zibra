@@ -15,18 +15,18 @@ How to verify:
 <style>
   body { font-family: sans-serif; }
   button { margin-right: 8px; padding: 6px; }
-  #target { border: 4px solid navy; padding: 8px; margin-top: 12px; }
-  #saved-card { background-color: lightyellow; padding: 12px; }
+  .target-box { border: 4px solid navy; padding: 8px; margin-top: 12px; }
+  .saved-card { background-color: lightyellow; padding: 12px; }
   iframe { width: 280px; height: 90px; display: block; margin-top: 8px; }
-  #after { background-color: lightgreen; padding: 10px; }
+  .after { background-color: lightgreen; padding: 10px; }
 </style>
 
 <h1>Zero-argument replaceChildren()</h1>
-<button id="empty-button">Empty children</button>
-<button id="restore-button">Restore saved card</button>
+<button class="empty-button">Empty children</button>
+<button class="restore-button">Restore saved card</button>
 
-<div id="target">
-  <section id="saved-card">
+<div class="target-box">
+  <section class="saved-card">
     <b>Saved card</b>
     <p>This subtree should be reattachable after the box is emptied.</p>
     <a href="#after">Focusable link</a>
@@ -35,18 +35,18 @@ How to verify:
   <iframe src="script-iframe-a.html"></iframe>
 </div>
 
-<p id="after">PASS after emptying: this green paragraph moved upward.</p>
+<p class="after" id="after">PASS after emptying: this green paragraph moved upward.</p>
 
 <script>
-  var target = document.querySelectorAll('#target')[0];
-  var savedCard = document.querySelectorAll('#saved-card')[0];
+  var target = document.querySelectorAll('.target-box')[0];
+  var savedCard = document.querySelectorAll('.saved-card')[0];
 
-  document.querySelectorAll('#empty-button')[0].addEventListener('click', function() {
+  document.querySelectorAll('.empty-button')[0].addEventListener('click', function() {
     var result = target.replaceChildren();
     console.log('replaceChildren returned undefined:', result === undefined);
   });
 
-  document.querySelectorAll('#restore-button')[0].addEventListener('click', function() {
+  document.querySelectorAll('.restore-button')[0].addEventListener('click', function() {
     if (target.children.length === 0) target.appendChild(savedCard);
   });
 </script>

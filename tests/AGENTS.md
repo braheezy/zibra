@@ -39,6 +39,11 @@ insertion at the address cursor, and Backspace deletion before it.
 dispatches the containing form's submit event, while an input outside a form
 does not submit.
 
+`tests/manual/replace-children.html` covers the emptying form of
+`replaceChildren`, while `tests/manual/replace-children-transfer.html` moves
+children from two attached parents plus a detached subtree into one target and
+checks order, identity, source collapse, and iframe rebinding.
+
 `tests/manual/form-get.html` and its target fixture verify over a localhost
 server that GET submission puts encoded controls in the URL query and sends no
 POST body.

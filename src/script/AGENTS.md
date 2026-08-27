@@ -20,11 +20,17 @@ or Kiesel allocation/locking.
 - `removeChild` performs the inverse transfer: it accepts only a direct child,
   moves that subtree into a heap-stable window-owned detached root, preserves
   subtree handles, and rebinds siblings shifted in the attached child array.
-- Zero-argument `replaceChildren` empties an Element in one mutation
-  transaction. Removed subtrees with published handles move to heap-stable
-  detached ownership so saved Nodes remain reattachable; unobserved subtrees
-  are reclaimed. An already-empty target is a no-op, and the argument-bearing
-  transfer form remains explicitly unsupported.
+- `replaceChildren` runs as one staged mutation transaction. With no arguments
+  it empties the Element; with Element arguments it extracts attached or
+  detached roots, processes nested source parents deepest-first, and installs
+  the roots in argument order. Repeated roots follow the DOM fragment rule and
+  keep only their last occurrence. Removed subtrees with published handles move
+  to heap-stable detached ownership so saved Nodes remain reattachable;
+  unobserved subtrees are reclaimed. Validate every handle and cycle before
+  entering invalidation, and re-resolve a destination shifted by source removal
+  through its stable handle before installing the final child array. Use the
+  nearest common ancestor of attached source/destination parents as the one
+  invalidation root so focused or scroll-focused source nodes cannot dangle.
 - Element IDs are exposed as named globals for only the active window. The
   first duplicate ID in document order wins; empty IDs and names colliding
   with existing globals are skipped. Refresh the per-window registry whenever

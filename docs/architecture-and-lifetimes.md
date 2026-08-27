@@ -545,7 +545,18 @@ sibling. Zero-argument `replaceChildren` stages stable owners for each removed
 direct-child subtree that has any published JavaScript handle, enters the seam
 once, and atomically empties the target. Those observable subtrees remain
 detached and reattachable; subtrees without handles are reclaimed. An empty
-target does not open a mutation generation. Each detached subtree keeps its
+target does not open a mutation generation. Argument-bearing `replaceChildren`
+stages transfer boxes, replacement/source arrays, and detached owners before
+invalidation; then it processes affected parents deepest-first, preserving
+nested arguments and every relocated handle before installing the final array.
+Repeated arguments retain only their last occurrence, matching the temporary
+DOM-fragment ordering rule. One mutation boundary uses the nearest common
+ancestor of every attached destination/source parent, retiring focus and scroll
+borrows that could otherwise point at relocated source nodes; a detached target
+still retires the installed document when it extracts attached children. The
+target is re-resolved by its scalar handle
+before final installation because removing an earlier sibling can relocate the
+target itself. Each detached subtree keeps its
 owning DOM resources and handles, but clears layout back-pointers and dirties
 retained style fields. Reattachment
 registers inherited-style dependencies against the current parent before a
@@ -1518,10 +1529,15 @@ Current enforced behavior includes:
   a heap-stable `WindowContext` owner, preserves its handles, rebinds shifted
   sibling handles, and returns the same root eligible for either insertion
   method;
-- zero-argument `Node.replaceChildren` removes every direct child in one
-  synchronous mutation boundary. Handle-reachable subtrees become detached
-  roots and remain eligible for insertion; unobserved subtrees are destroyed,
-  while the not-yet-implemented argument-bearing form throws a `TypeError`;
+- `Node.replaceChildren` removes every direct child in one synchronous
+  mutation boundary. Element arguments may come from attached parents or from
+  the window's detached-root set; they are transferred in DOM-fragment order,
+  including nested arguments and last-occurrence handling for repeats. Source
+  sibling handles and a relocated destination handle are rebound as part of
+  the same transaction. Handle-reachable replaced subtrees become detached
+  roots and remain eligible for insertion, while unobserved subtrees are
+  destroyed. String-to-Text argument conversion is outside Zibra's current API
+  subset and non-Element arguments throw before mutation;
 - `innerHTML` calls `removeHandlesForSubtree` for every removed child before
   destroying it, so descendant JavaScript handles are removed with the old
   subtree;
@@ -1781,7 +1797,7 @@ reintroduced:
    Kiesel host contexts remain locally owned until insertion into the tab map,
    so allocation or map-insertion failure cannot strand either owner.
 14. **Structural DOM snapshot retirement:** `innerHTML`, detached-root
-   `appendChild`/`insertBefore`, `removeChild`, zero-argument
+   `appendChild`/`insertBefore`, `removeChild`, both emptying and transferring
    `replaceChildren`, and the native first contenteditable child append mark
    layout/render work and synchronously retire frame/browser DOM-derived
    snapshots before a child can move or be destroyed. Browser-side

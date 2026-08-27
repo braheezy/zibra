@@ -1,0 +1,69 @@
+<!--
+How to verify:
+1. Load this page. It starts with a yellow card and a live child iframe in two
+   blue source boxes, plus an old gray child in the dashed target.
+2. Click "Transfer children". The two blue boxes must retain only their
+   "stays here" lines. The target must contain, in order, the yellow card, a
+   newly created green card, and the still-live iframe; the gray child is gone.
+3. The status line must turn green. Tab through the moved input and iframe to
+   confirm their subtrees and browsing-context bindings survived the move.
+-->
+<!doctype html>
+<meta charset="utf-8">
+<title>replaceChildren element transfer</title>
+<style>
+  body { font-family: sans-serif; }
+  button { padding: 7px; }
+  .source { background-color: lightblue; margin: 8px 0; padding: 8px; }
+  .target { border: 3px dashed navy; margin-top: 12px; padding: 8px; }
+  .moving-card { background-color: lightyellow; padding: 8px; }
+  .created-card { background-color: lightgreen; padding: 8px; }
+  .old-child { background-color: lightgray; padding: 8px; }
+  iframe { display: block; height: 90px; width: 280px; }
+  .status-line { color: red; }
+  .status-line.pass { color: green; }
+</style>
+
+<h1>Multi-argument replaceChildren()</h1>
+<button class="transfer-button">Transfer children</button>
+
+<div class="source source-a">
+  <section class="moving-card">Yellow card <input value="moved input"></section>
+  <p>Source A stays here</p>
+</div>
+<div class="source source-b">
+  <iframe src="script-iframe-a.html"></iframe>
+  <p>Source B stays here</p>
+</div>
+
+<div class="target"><p class="old-child">This old child must disappear.</p></div>
+<p class="status-line">PASS: transferred children kept their order and identity.</p>
+
+<script>
+  var target = document.querySelectorAll('.target')[0];
+  var sourceA = document.querySelectorAll('.source-a')[0];
+  var sourceB = document.querySelectorAll('.source-b')[0];
+  var movingCard = document.querySelectorAll('.moving-card')[0];
+  var movingFrame = document.querySelectorAll('iframe')[0];
+  var status = document.querySelectorAll('.status-line')[0];
+
+  var createdCard = document.createElement('section');
+  createdCard.setAttribute('class', 'created-card');
+  var createdChild = document.createElement('b');
+  createdCard.appendChild(createdChild);
+
+  document.querySelectorAll('.transfer-button')[0].addEventListener('click', function() {
+    var cardHandle = movingCard.handle;
+    var frameHandle = movingFrame.handle;
+    target.replaceChildren(movingCard, createdCard, movingFrame);
+
+    var children = target.children;
+    var passed = children.length === 3 &&
+      children[0].handle === cardHandle &&
+      children[1].handle === createdCard.handle &&
+      children[2].handle === frameHandle &&
+      createdCard.children[0].handle === createdChild.handle &&
+      sourceA.children.length === 1 && sourceB.children.length === 1;
+    if (passed) status.setAttribute('class', 'status-line pass');
+  });
+</script>

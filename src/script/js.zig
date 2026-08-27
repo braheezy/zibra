@@ -795,10 +795,12 @@ pub fn evaluate(self: *Js, window_id: u32, code: []const u8) !Value {
         \\};
         \\
         \\Node.prototype.replaceChildren = function() {
-        \\  if (arguments.length !== 0) {
-        \\    throw new TypeError("replaceChildren currently supports no arguments");
+        \\  var nativeArguments = [this.handle];
+        \\  for (var index = 0; index < arguments.length; index++) {
+        \\    var child = arguments[index];
+        \\    nativeArguments.push(child && typeof child.handle === "number" ? child.handle : undefined);
         \\  }
-        \\  __native.replaceChildren(this.handle);
+        \\  __native.replaceChildren.apply(__native, nativeArguments);
         \\};
         \\
         \\Node.prototype.focus = function() {
@@ -1779,6 +1781,353 @@ fn emptyElementChildren(
         // The pre-mutation callback already publishes a replacement frame;
         // keep the ordinary render callback observable even if rebuilding ID
         // globals subsequently runs out of memory.
+        self.requestRender();
+        try self.syncNamedIdGlobals(window_id, window);
+    }
+}
+
+const ReplacementArgument = struct {
+    handle: u32,
+    source_parent: ?*Node,
+    source_index: ?usize,
+    transfer: *Node,
+    transfer_allocated: bool,
+    has_value: bool,
+};
+
+const ReplacementParent = struct {
+    node: *Node,
+    depth: usize,
+    is_target: bool,
+    bindings: std.ArrayList(DirectChildHandle),
+    remaining: std.ArrayList(Node),
+};
+
+const RemovedTargetChild = struct {
+    old_index: usize,
+    stable_ptr: *Node,
+    consumed: bool = false,
+};
+
+fn nodeDepth(node: *Node) usize {
+    var depth: usize = 0;
+    var current = nodeParent(node);
+    while (current) |parent| {
+        depth += 1;
+        current = nodeParent(parent);
+    }
+    return depth;
+}
+
+fn nearestCommonAncestor(first: *Node, second: *Node) *Node {
+    var candidate: ?*Node = first;
+    while (candidate) |node| {
+        if (isInclusiveAncestor(node, second)) return node;
+        candidate = nodeParent(node);
+    }
+    unreachable;
+}
+
+fn replacementArgumentAt(
+    arguments: []const ReplacementArgument,
+    parent: *Node,
+    child_index: usize,
+) ?usize {
+    for (arguments, 0..) |argument, index| {
+        if (argument.source_parent == parent and argument.source_index == child_index) return index;
+    }
+    return null;
+}
+
+fn directChildHandle(bindings: []const DirectChildHandle, child_index: usize) ?u32 {
+    for (bindings) |binding| {
+        if (binding.old_index == child_index) return binding.handle;
+    }
+    return null;
+}
+
+fn selectedChildrenBefore(
+    arguments: []const ReplacementArgument,
+    parent: *Node,
+    child_index: usize,
+) usize {
+    var count: usize = 0;
+    for (arguments) |argument| {
+        if (argument.source_parent == parent and argument.source_index.? < child_index) count += 1;
+    }
+    return count;
+}
+
+fn addReplacementParent(
+    self: *Js,
+    window: *WindowContext,
+    parents: *std.ArrayList(ReplacementParent),
+    node: *Node,
+    is_target: bool,
+) !void {
+    for (parents.items) |*parent| {
+        if (parent.node != node) continue;
+        parent.is_target = parent.is_target or is_target;
+        return;
+    }
+
+    var bindings = try self.snapshotDirectChildHandles(window, node);
+    errdefer bindings.deinit(self.allocator);
+    try parents.append(self.allocator, .{
+        .node = node,
+        .depth = nodeDepth(node),
+        .is_target = is_target,
+        .bindings = bindings,
+        .remaining = std.ArrayList(Node).empty,
+    });
+}
+
+/// Replace an Element's children with existing Element roots in one ownership
+/// transaction. Every fallible allocation precedes DOM invalidation. Affected
+/// parents are processed deepest-first so moving a by-value ancestor cannot
+/// invalidate a descendant parent that still needs mutation.
+fn transferElementChildren(
+    self: *Js,
+    window_id: u32,
+    window: *WindowContext,
+    target: *Node,
+    argument_nodes: []const *Node,
+) !void {
+    std.debug.assert(argument_nodes.len > 0);
+    const target_handle = window.node_to_handle.get(target).?;
+
+    var arguments = std.ArrayList(ReplacementArgument).empty;
+    defer arguments.deinit(self.allocator);
+    try arguments.ensureTotalCapacity(self.allocator, argument_nodes.len);
+    var transfer_boxes_owned = true;
+    defer if (transfer_boxes_owned) {
+        for (arguments.items) |argument| {
+            if (argument.transfer_allocated) self.allocator.destroy(argument.transfer);
+        }
+    };
+
+    // `convert nodes into a node` appends arguments to a temporary fragment.
+    // Repeating a node therefore keeps only its last occurrence.
+    for (argument_nodes, 0..) |node, index| {
+        var appears_later = false;
+        for (argument_nodes[index + 1 ..]) |later| {
+            if (later == node) {
+                appears_later = true;
+                break;
+            }
+        }
+        if (appears_later) continue;
+
+        const is_detached = window.detached_nodes.contains(node);
+        const source_parent = if (is_detached) null else nodeParent(node);
+        const source_index = if (source_parent) |parent|
+            directChildIndex(parent, node)
+        else
+            null;
+        const transfer = if (is_detached) node else try self.allocator.create(Node);
+        arguments.appendAssumeCapacity(.{
+            .handle = window.node_to_handle.get(node).?,
+            .source_parent = source_parent,
+            .source_index = source_index,
+            .transfer = transfer,
+            .transfer_allocated = !is_detached,
+            .has_value = is_detached,
+        });
+    }
+
+    var mutation_started = false;
+
+    var parents = std.ArrayList(ReplacementParent).empty;
+    defer {
+        for (parents.items) |*parent| {
+            parent.bindings.deinit(self.allocator);
+            parent.remaining.deinit(self.allocator);
+        }
+        parents.deinit(self.allocator);
+    }
+    try self.addReplacementParent(window, &parents, target, true);
+    for (arguments.items) |argument| {
+        if (argument.source_parent) |parent| {
+            try self.addReplacementParent(window, &parents, parent, false);
+        }
+    }
+
+    for (parents.items) |*parent| {
+        if (parent.is_target) continue;
+        var selected_count: usize = 0;
+        for (arguments.items) |argument| {
+            if (argument.source_parent == parent.node) selected_count += 1;
+        }
+        try parent.remaining.ensureTotalCapacity(
+            self.allocator,
+            parent.node.element.children.items.len - selected_count,
+        );
+    }
+
+    // Post-order mutation keeps every stored parent pointer valid until its
+    // own child array has been rebuilt.
+    var sort_index: usize = 1;
+    while (sort_index < parents.items.len) : (sort_index += 1) {
+        var cursor = sort_index;
+        while (cursor > 0 and parents.items[cursor - 1].depth < parents.items[cursor].depth) {
+            std.mem.swap(ReplacementParent, &parents.items[cursor - 1], &parents.items[cursor]);
+            cursor -= 1;
+        }
+    }
+
+    var removed_target_children = std.ArrayList(RemovedTargetChild).empty;
+    defer {
+        for (removed_target_children.items) |removed| {
+            if (!removed.consumed) self.allocator.destroy(removed.stable_ptr);
+        }
+        removed_target_children.deinit(self.allocator);
+    }
+    const target_child_count = target.element.children.items.len;
+    try removed_target_children.ensureTotalCapacity(self.allocator, target_child_count);
+    for (target.element.children.items, 0..) |_, child_index| {
+        if (replacementArgumentAt(arguments.items, target, child_index) != null) continue;
+        const stable_ptr = try self.allocator.create(Node);
+        removed_target_children.appendAssumeCapacity(.{
+            .old_index = child_index,
+            .stable_ptr = stable_ptr,
+        });
+    }
+    const detached_capacity = std.math.cast(u32, removed_target_children.items.len) orelse
+        return error.OutOfMemory;
+    try window.detached_nodes.ensureUnusedCapacity(detached_capacity);
+
+    var replacement = std.ArrayList(Node).empty;
+    defer replacement.deinit(self.allocator);
+    try replacement.ensureTotalCapacity(self.allocator, arguments.items.len);
+
+    const target_was_attached = isAttachedToCurrentDocument(window, target);
+    var document_mutation_root: ?*Node = if (target_was_attached) target else null;
+    for (arguments.items) |argument| {
+        const parent = argument.source_parent orelse continue;
+        if (!isAttachedToCurrentDocument(window, parent)) continue;
+        document_mutation_root = if (document_mutation_root) |root|
+            nearestCommonAncestor(root, parent)
+        else
+            parent;
+    }
+    const mutates_document = document_mutation_root != null;
+
+    if (mutates_document) try self.clearNamedIdGlobals(window_id, window);
+    errdefer if (mutates_document and !mutation_started) {
+        self.syncNamedIdGlobals(window_id, window) catch {};
+    };
+
+    for (parents.items) |parent| {
+        const element = &parent.node.element;
+        element.children_dirty = true;
+        parser.dirtyStyleForElement(element);
+        markElementLayoutDirty(element);
+    }
+    if (document_mutation_root) |mutation_root| self.prepareDomMutation(mutation_root);
+    mutation_started = true;
+
+    for (parents.items) |*parent_state| {
+        const parent = parent_state.node;
+        const parent_parent = nodeParent(parent);
+        const element = &parent.element;
+
+        for (parent_state.bindings.items) |binding| {
+            _ = window.node_to_handle.remove(binding.old_ptr);
+        }
+
+        var removed_slot_index: usize = 0;
+        for (element.children.items, 0..) |*child, child_index| {
+            if (replacementArgumentAt(arguments.items, parent, child_index)) |argument_index| {
+                const argument = &arguments.items[argument_index];
+                std.debug.assert(!argument.has_value);
+                argument.transfer.* = child.*;
+                argument.has_value = true;
+                window.node_to_handle.putAssumeCapacity(argument.transfer, argument.handle);
+                window.handle_to_node.putAssumeCapacity(argument.handle, argument.transfer);
+                parser.fixParentPointers(argument.transfer, null);
+                clearDetachedLayoutPointers(argument.transfer);
+                parser.dirtyStyleSubtree(argument.transfer);
+                continue;
+            }
+
+            if (parent_state.is_target) {
+                const removed = &removed_target_children.items[removed_slot_index];
+                removed_slot_index += 1;
+                std.debug.assert(removed.old_index == child_index);
+                const root_handle = directChildHandle(parent_state.bindings.items, child_index);
+                const retain = root_handle != null or subtreeHasPublishedHandle(window, child);
+                if (retain) {
+                    removed.stable_ptr.* = child.*;
+                    if (root_handle) |handle| {
+                        window.node_to_handle.putAssumeCapacity(removed.stable_ptr, handle);
+                        window.handle_to_node.putAssumeCapacity(handle, removed.stable_ptr);
+                    }
+                    parser.fixParentPointers(removed.stable_ptr, null);
+                    clearDetachedLayoutPointers(removed.stable_ptr);
+                    parser.dirtyStyleSubtree(removed.stable_ptr);
+                    window.detached_nodes.putAssumeCapacity(removed.stable_ptr, {});
+                    removed.consumed = true;
+                } else {
+                    self.removeHandlesForSubtree(window, child);
+                    child.deinit(self.allocator);
+                    self.allocator.destroy(removed.stable_ptr);
+                    removed.consumed = true;
+                }
+                continue;
+            }
+
+            parent_state.remaining.appendAssumeCapacity(child.*);
+        }
+
+        element.children.deinit(self.allocator);
+        if (parent_state.is_target) {
+            element.children = std.ArrayList(Node).empty;
+            std.debug.assert(removed_slot_index == removed_target_children.items.len);
+        } else {
+            element.children = parent_state.remaining;
+            parent_state.remaining = std.ArrayList(Node).empty;
+            for (parent_state.bindings.items) |binding| {
+                if (replacementArgumentAt(arguments.items, parent, binding.old_index) != null) continue;
+                const new_index = binding.old_index - selectedChildrenBefore(
+                    arguments.items,
+                    parent,
+                    binding.old_index,
+                );
+                const new_ptr = &element.children.items[new_index];
+                window.node_to_handle.putAssumeCapacity(new_ptr, binding.handle);
+                window.handle_to_node.putAssumeCapacity(binding.handle, new_ptr);
+            }
+        }
+        parser.fixParentPointers(parent, parent_parent);
+    }
+
+    const installed_target = window.handle_to_node.get(target_handle).?;
+    std.debug.assert(installed_target.* == .element);
+    for (arguments.items) |*argument| {
+        std.debug.assert(argument.has_value);
+        clearDetachedLayoutPointers(argument.transfer);
+        parser.dirtyStyleSubtree(argument.transfer);
+        _ = window.node_to_handle.remove(argument.transfer);
+        _ = window.detached_nodes.remove(argument.transfer);
+        replacement.appendAssumeCapacity(argument.transfer.*);
+        self.allocator.destroy(argument.transfer);
+
+        const installed = &replacement.items[replacement.items.len - 1];
+        window.node_to_handle.putAssumeCapacity(installed, argument.handle);
+        window.handle_to_node.putAssumeCapacity(argument.handle, installed);
+    }
+    transfer_boxes_owned = false;
+
+    installed_target.element.children = replacement;
+    replacement = std.ArrayList(Node).empty;
+    parser.fixParentPointers(installed_target, nodeParent(installed_target));
+
+    if (mutates_document) {
+        const completion_root = if (target_was_attached)
+            installed_target
+        else
+            window.current_nodes.?;
+        self.completeDomMutation(completion_root);
         self.requestRender();
         try self.syncNamedIdGlobals(window_id, window);
     }
@@ -2826,11 +3175,8 @@ test "replaceChildren empties once, invalidates relational style, and detaches l
         \\var savedNested = savedArticle.children[0];
         \\var savedSibling = oldChildren[1];
         \\var emptyResult = targetNode.replaceChildren();
-        \\var rejected = false;
-        \\try { targetNode.replaceChildren(document.createElement('b')); }
-        \\catch (error) { rejected = true; }
         \\var noopResult = targetNode.replaceChildren();
-        \\emptyResult === undefined && noopResult === undefined && rejected &&
+        \\emptyResult === undefined && noopResult === undefined &&
         \\  targetNode.children.length === 0 && targetNode.innerHTML === '' &&
         \\  typeof removed === 'undefined' && typeof nested === 'undefined' &&
         \\  savedArticle.getAttribute('id') === 'removed' &&
@@ -2862,6 +3208,269 @@ test "replaceChildren empties once, invalidates relational style, and detaches l
     try std.testing.expect(reattached.toBoolean());
     try std.testing.expectEqual(@as(usize, 2), mutation_context.count);
     try std.testing.expectEqual(@as(usize, 2), mutation_context.complete_count);
+}
+
+test "replaceChildren transfers attached and detached elements in argument order" {
+    const allocator = std.testing.allocator;
+    const html =
+        "<main>" ++
+        "<section class=target><i id=old><b id=old-nested></b></i></section>" ++
+        "<div class=source-a><article id=moving-a><strong id=nested></strong></article><u id=stay-a></u></div>" ++
+        "<div class=source-b><button id=moving-b></button><em id=stay-b></em></div>" ++
+        "<aside></aside>" ++
+        "</main>";
+    const css =
+        "section.target:has(article) { color: blue; }" ++
+        "section.target { color: black; }" ++
+        "div.source-a:has(article) { color: red; }" ++
+        "div.source-a { color: green; }";
+
+    var html_parser = try parser.HTMLParser.init(allocator, html);
+    html_parser.use_implicit_tags = false;
+    defer html_parser.deinit(allocator);
+    var root = try html_parser.parse();
+    defer root.deinit(allocator);
+    parser.fixParentPointers(&root, null);
+
+    var css_parser = try CSSParser.init(allocator, css, false);
+    defer css_parser.deinit(allocator);
+    const rules = try css_parser.parse(allocator);
+    defer {
+        for (rules) |*rule| rule.deinit(allocator);
+        allocator.free(rules);
+    }
+    try parser.style(allocator, &root, rules);
+    const target_element = &root.element.children.items[0].element;
+    const source_a_element = &root.element.children.items[1].element;
+    try std.testing.expectEqualStrings("black", target_element.style.?.getPtr("color").?.get().*);
+    try std.testing.expectEqualStrings("red", source_a_element.style.?.getPtr("color").?.get().*);
+
+    var environ = std.process.Environ.Map.init(allocator);
+    defer environ.deinit();
+    var js = try Js.init(allocator, std.testing.io, &environ);
+    defer js.deinit(allocator);
+    js.setNodes(0, &root);
+    defer js.setNodes(0, null);
+
+    var mutation_context = DomMutationTestContext{};
+    js.setDomMutationCallback(0, DomMutationTestContext.callback, &mutation_context);
+    js.setDomMutationCompleteCallback(
+        0,
+        DomMutationTestContext.completeCallback,
+        &mutation_context,
+    );
+
+    const result = try js.evaluate(0,
+        \\var targetNode = document.querySelectorAll('section')[0];
+        \\var sourceA = document.querySelectorAll('.source-a')[0];
+        \\var sourceB = document.querySelectorAll('.source-b')[0];
+        \\var articleNode = document.querySelectorAll('article')[0];
+        \\var nestedNode = articleNode.children[0];
+        \\var buttonNode = document.querySelectorAll('button')[0];
+        \\var stayA = sourceA.children[1];
+        \\var stayB = sourceB.children[1];
+        \\var oldNode = targetNode.children[0];
+        \\var oldNested = oldNode.children[0];
+        \\var detachedNode = document.createElement('small');
+        \\detachedNode.id = 'created';
+        \\var detachedNested = document.createElement('span');
+        \\detachedNested.id = 'created-nested';
+        \\detachedNode.appendChild(detachedNested);
+        \\var replaceResult = targetNode.replaceChildren(buttonNode, detachedNode, articleNode);
+        \\var children = targetNode.children;
+        \\replaceResult === undefined && children.length === 3 &&
+        \\  children[0].handle === buttonNode.handle &&
+        \\  children[1].handle === detachedNode.handle &&
+        \\  children[2].handle === articleNode.handle &&
+        \\  articleNode.children[0].handle === nestedNode.handle &&
+        \\  detachedNode.children[0].handle === detachedNested.handle &&
+        \\  sourceA.children.length === 1 && sourceA.children[0].handle === stayA.handle &&
+        \\  sourceB.children.length === 1 && sourceB.children[0].handle === stayB.handle &&
+        \\  document.querySelectorAll('i').length === 0 &&
+        \\  typeof old === 'undefined' && created.handle === detachedNode.handle &&
+        \\  oldNode.children[0].handle === oldNested.handle
+    );
+    try std.testing.expect(result.toBoolean());
+    try std.testing.expectEqual(@as(usize, 1), mutation_context.count);
+    // The target and both source parents are siblings, so the common-ancestor
+    // invalidation boundary is the four-child <main> root.
+    try std.testing.expectEqual(@as(usize, 4), mutation_context.prepared_child_count);
+    try std.testing.expectEqual(@as(usize, 1), mutation_context.complete_count);
+    try std.testing.expectEqual(@as(usize, 3), mutation_context.completed_child_count);
+    try std.testing.expectEqual(@as(usize, 1), js.windows.getPtr(0).?.detached_nodes.count());
+
+    try parser.style(allocator, &root, rules);
+    try std.testing.expectEqualStrings("blue", target_element.style.?.getPtr("color").?.get().*);
+    try std.testing.expectEqualStrings("green", source_a_element.style.?.getPtr("color").?.get().*);
+
+    const reattached = try js.evaluate(0,
+        \\var parking = document.querySelectorAll('aside')[0];
+        \\parking.appendChild(oldNode) === oldNode &&
+        \\  parking.children[0].handle === oldNode.handle &&
+        \\  oldNode.children[0].handle === oldNested.handle
+    );
+    try std.testing.expect(reattached.toBoolean());
+    try std.testing.expectEqual(@as(usize, 0), js.windows.getPtr(0).?.detached_nodes.count());
+    try std.testing.expectEqual(@as(usize, 2), mutation_context.count);
+    try std.testing.expectEqual(@as(usize, 2), mutation_context.complete_count);
+}
+
+test "replaceChildren handles nested and repeated elements and validates before mutation" {
+    const allocator = std.testing.allocator;
+    var html_parser = try parser.HTMLParser.init(
+        allocator,
+        "<main><section><article><strong></strong><em></em></article><i></i></section></main>",
+    );
+    html_parser.use_implicit_tags = false;
+    defer html_parser.deinit(allocator);
+    var root = try html_parser.parse();
+    defer root.deinit(allocator);
+    parser.fixParentPointers(&root, null);
+
+    var environ = std.process.Environ.Map.init(allocator);
+    defer environ.deinit();
+    var js = try Js.init(allocator, std.testing.io, &environ);
+    defer js.deinit(allocator);
+    js.setNodes(0, &root);
+    defer js.setNodes(0, null);
+
+    var mutation_context = DomMutationTestContext{};
+    js.setDomMutationCallback(0, DomMutationTestContext.callback, &mutation_context);
+    js.setDomMutationCompleteCallback(
+        0,
+        DomMutationTestContext.completeCallback,
+        &mutation_context,
+    );
+
+    const result = try js.evaluate(0,
+        \\var mainNode = document.querySelectorAll('main')[0];
+        \\var targetNode = document.querySelectorAll('section')[0];
+        \\var outerNode = document.querySelectorAll('article')[0];
+        \\var innerNode = document.querySelectorAll('strong')[0];
+        \\var tailNode = document.querySelectorAll('em')[0];
+        \\var discardedNode = document.querySelectorAll('i')[0];
+        \\var cycleRejected = false;
+        \\var valueRejected = false;
+        \\var zeroRejected = false;
+        \\try { targetNode.replaceChildren(mainNode); } catch (error) { cycleRejected = true; }
+        \\try { targetNode.replaceChildren(42); } catch (error) { valueRejected = true; }
+        \\try { targetNode.replaceChildren(0); } catch (error) { zeroRejected = true; }
+        \\var unchanged = targetNode.children.length === 2 &&
+        \\  targetNode.children[0].handle === outerNode.handle &&
+        \\  targetNode.children[1].handle === discardedNode.handle;
+        \\var replaceResult = targetNode.replaceChildren(outerNode, innerNode, outerNode);
+        \\var children = targetNode.children;
+        \\cycleRejected && valueRejected && zeroRejected && unchanged && replaceResult === undefined &&
+        \\  children.length === 2 && children[0].handle === innerNode.handle &&
+        \\  children[1].handle === outerNode.handle && outerNode.children.length === 1 &&
+        \\  outerNode.children[0].handle === tailNode.handle &&
+        \\  document.querySelectorAll('strong').length === 1 &&
+        \\  document.querySelectorAll('article').length === 1
+    );
+    try std.testing.expect(result.toBoolean());
+    try std.testing.expectEqual(@as(usize, 1), mutation_context.count);
+    try std.testing.expectEqual(@as(usize, 1), mutation_context.complete_count);
+    try std.testing.expectEqual(@as(usize, 2), mutation_context.completed_child_count);
+}
+
+test "replaceChildren into a detached target invalidates attached source parents" {
+    const allocator = std.testing.allocator;
+    var html_parser = try parser.HTMLParser.init(
+        allocator,
+        "<main><section><b></b><i></i></section><aside></aside></main>",
+    );
+    html_parser.use_implicit_tags = false;
+    defer html_parser.deinit(allocator);
+    var root = try html_parser.parse();
+    defer root.deinit(allocator);
+    parser.fixParentPointers(&root, null);
+
+    var environ = std.process.Environ.Map.init(allocator);
+    defer environ.deinit();
+    var js = try Js.init(allocator, std.testing.io, &environ);
+    defer js.deinit(allocator);
+    js.setNodes(0, &root);
+    defer js.setNodes(0, null);
+
+    var mutation_context = DomMutationTestContext{};
+    js.setDomMutationCallback(0, DomMutationTestContext.callback, &mutation_context);
+    js.setDomMutationCompleteCallback(
+        0,
+        DomMutationTestContext.completeCallback,
+        &mutation_context,
+    );
+
+    const detached_result = try js.evaluate(0,
+        \\var sourceNode = document.querySelectorAll('section')[0];
+        \\var destinationNode = document.querySelectorAll('aside')[0];
+        \\var firstNode = sourceNode.children[0];
+        \\var secondNode = sourceNode.children[1];
+        \\var detachedTarget = document.createElement('div');
+        \\detachedTarget.replaceChildren(firstNode, secondNode);
+        \\sourceNode.children.length === 0 && detachedTarget.children.length === 2 &&
+        \\  detachedTarget.children[0].handle === firstNode.handle &&
+        \\  detachedTarget.children[1].handle === secondNode.handle &&
+        \\  document.querySelectorAll('b').length === 0
+    );
+    try std.testing.expect(detached_result.toBoolean());
+    try std.testing.expectEqual(@as(usize, 1), mutation_context.count);
+    try std.testing.expectEqual(@as(usize, 1), mutation_context.complete_count);
+
+    const mounted_result = try js.evaluate(0,
+        \\destinationNode.appendChild(detachedTarget);
+        \\destinationNode.children[0].handle === detachedTarget.handle &&
+        \\  document.querySelectorAll('b')[0].handle === firstNode.handle &&
+        \\  document.querySelectorAll('i')[0].handle === secondNode.handle
+    );
+    try std.testing.expect(mounted_result.toBoolean());
+    try std.testing.expectEqual(@as(usize, 2), mutation_context.count);
+    try std.testing.expectEqual(@as(usize, 2), mutation_context.complete_count);
+}
+
+test "replaceChildren re-resolves a target shifted by source removal" {
+    const allocator = std.testing.allocator;
+    var html_parser = try parser.HTMLParser.init(
+        allocator,
+        "<main><div><b></b><section><i></i></section></div></main>",
+    );
+    html_parser.use_implicit_tags = false;
+    defer html_parser.deinit(allocator);
+    var root = try html_parser.parse();
+    defer root.deinit(allocator);
+    parser.fixParentPointers(&root, null);
+
+    var environ = std.process.Environ.Map.init(allocator);
+    defer environ.deinit();
+    var js = try Js.init(allocator, std.testing.io, &environ);
+    defer js.deinit(allocator);
+    js.setNodes(0, &root);
+    defer js.setNodes(0, null);
+
+    var mutation_context = DomMutationTestContext{};
+    js.setDomMutationCallback(0, DomMutationTestContext.callback, &mutation_context);
+    js.setDomMutationCompleteCallback(
+        0,
+        DomMutationTestContext.completeCallback,
+        &mutation_context,
+    );
+
+    const result = try js.evaluate(0,
+        \\var sourceNode = document.querySelectorAll('div')[0];
+        \\var movingNode = sourceNode.children[0];
+        \\var targetNode = sourceNode.children[1];
+        \\var oldNode = targetNode.children[0];
+        \\var targetHandle = targetNode.handle;
+        \\targetNode.replaceChildren(movingNode);
+        \\sourceNode.children.length === 1 &&
+        \\  sourceNode.children[0].handle === targetHandle &&
+        \\  targetNode.handle === targetHandle && targetNode.children.length === 1 &&
+        \\  targetNode.children[0].handle === movingNode.handle &&
+        \\  oldNode.getAttribute('missing') === null
+    );
+    try std.testing.expect(result.toBoolean());
+    try std.testing.expectEqual(@as(usize, 1), mutation_context.count);
+    try std.testing.expectEqual(@as(usize, 1), mutation_context.complete_count);
+    try std.testing.expectEqual(@as(usize, 1), mutation_context.completed_child_count);
 }
 
 test "createElement appendChild and insertBefore preserve handles and order" {
@@ -4439,9 +5048,9 @@ fn removeChild(agent: *Agent, this_value: Value, arguments: kiesel.types.Argumen
     return .undefined;
 }
 
-/// __native.replaceChildren implementation for the zero-argument exercise.
-/// The JavaScript wrapper rejects arguments until the transfer form of the API
-/// is implemented, leaving this host boundary responsible only for emptying.
+/// __native.replaceChildren implementation. The first argument is the receiver
+/// handle and each remaining argument is an Element handle supplied by the
+/// variadic JavaScript wrapper.
 fn replaceChildren(agent: *Agent, this_value: Value, arguments: kiesel.types.Arguments) Agent.Error!Value {
     const function_obj = agent.activeFunctionObject();
     const builtin_fn = function_obj.as(kiesel.builtins.BuiltinFunction);
@@ -4472,7 +5081,46 @@ fn replaceChildren(agent: *Agent, this_value: Value, arguments: kiesel.types.Arg
         return agent.throwException(.type_error, "Text nodes do not support replaceChildren", .{});
     }
 
-    try js_instance.emptyElementChildren(window_id, window, node);
+    if (arguments.count() == 1) {
+        try js_instance.emptyElementChildren(window_id, window, node);
+        return .undefined;
+    }
+
+    var child_nodes = std.ArrayList(*Node).empty;
+    defer child_nodes.deinit(js_instance.allocator);
+    try child_nodes.ensureTotalCapacity(js_instance.allocator, arguments.count() - 1);
+    var argument_index: usize = 1;
+    while (argument_index < arguments.count()) : (argument_index += 1) {
+        const child_arg = arguments.get(argument_index);
+        if (!child_arg.isNumber()) {
+            return agent.throwException(.type_error, "replaceChildren arguments must be Elements", .{});
+        }
+        const child_handle: u32 = @intFromFloat(child_arg.asNumber().asFloat());
+        const child = js_instance.getNode(window, child_handle) orelse return agent.throwException(
+            .internal_error,
+            "Invalid replacement child handle",
+            .{},
+        );
+        if (child.* != .element) {
+            return agent.throwException(.type_error, "replaceChildren arguments must be Elements", .{});
+        }
+        if (isInclusiveAncestor(child, node)) {
+            return agent.throwException(.type_error, "replaceChildren would create a cycle", .{});
+        }
+        if (!window.detached_nodes.contains(child)) {
+            const parent = nodeParent(child) orelse return agent.throwException(
+                .type_error,
+                "replaceChildren cannot transfer a document root",
+                .{},
+            );
+            if (directChildIndex(parent, child) == null) {
+                return agent.throwException(.internal_error, "Replacement child has an invalid parent", .{});
+            }
+        }
+        child_nodes.appendAssumeCapacity(child);
+    }
+
+    try js_instance.transferElementChildren(window_id, window, node, child_nodes.items);
     return .undefined;
 }
 
