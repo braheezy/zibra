@@ -18,6 +18,7 @@ const scroll_model = @import("scroll.zig");
 const AccessibilitySpeech = @import("accessibility_speech.zig").Worker;
 const MeasureTime = @import("../runtime/measure_time.zig").MeasureTime;
 const js_module = @import("../script/js.zig");
+const ProtectedField = @import("../core/protected_field.zig").ProtectedField;
 
 const Url = url_module.Url;
 const Browser = browser_mod.Browser;
@@ -242,7 +243,11 @@ pub const Frame = struct {
     referrer_policy: url_module.ReferrerPolicy = .default,
     current_html_source: ?[]const u8 = null,
     current_node: ?Node = null,
-    document_layout: ?*Layout.DocumentLayout = null,
+    /// A dirty document means computed style has not been republished for the
+    /// current DOM/rule generation. Layout consumers may use `get()` only
+    /// after the style phase clears this boundary; teardown deliberately uses
+    /// `lastValue()` to retire the previous owning layout pointer.
+    document: ProtectedField(?*Layout.DocumentLayout),
     display_list: ?[]DisplayItem = null,
     content_height: i32 = 0,
     scroll: i32 = 0,
@@ -294,7 +299,55 @@ pub const Frame = struct {
             .focus_bounds = std.ArrayList(FrameBoundEntry).empty,
             .accessibility_bounds = std.ArrayList(FrameBoundEntry).empty,
             .fragment_targets = std.ArrayList(Layout.FragmentTarget).empty,
+            .document = ProtectedField(?*Layout.DocumentLayout).init(allocator, null),
         };
+    }
+
+    pub fn styleNeeded(self: *const Frame) bool {
+        return self.document.dirty;
+    }
+
+    /// Read the current layout generation. Calling this while style is dirty
+    /// is a phase violation and is intentionally rejected by ProtectedField.
+    pub fn documentLayout(self: *const Frame) ?*Layout.DocumentLayout {
+        return self.document.get().*;
+    }
+
+    /// Install an already-computed layout generation and publish a clean
+    /// document phase. Tests and Browser.layoutTabNodes use this ownership
+    /// transfer rather than writing the pointer directly.
+    pub fn setDocumentLayout(self: *Frame, document: ?*Layout.DocumentLayout) void {
+        self.document.set(document);
+    }
+
+    /// Mark style stale without discarding the last layout generation. A
+    /// successful style pass republishes that same owning pointer; resulting
+    /// style-field notifications decide whether its geometry is also dirty.
+    pub fn markDocumentStyleDirty(self: *Frame) void {
+        self.document.mark();
+    }
+
+    /// Destroy the last retained layout while its DOM dependencies are still
+    /// alive. The field is left clean and null; callers that require a new
+    /// style pass must mark it after retirement.
+    pub fn destroyDocumentLayout(self: *Frame) void {
+        if (self.document.lastValue().*) |document| {
+            document.deinit();
+            self.allocator.destroy(document);
+        }
+        self.document.set(null);
+    }
+
+    pub fn layoutNeeded(self: *const Frame) bool {
+        if (self.current_node == null or self.document.dirty) return false;
+        const document = self.document.get().* orelse return true;
+        return document.layoutNeeded();
+    }
+
+    /// Finish a style pass performed by a navigation path before it enters
+    /// Browser.layoutTabNodes directly.
+    pub fn publishStyledDocument(self: *Frame) void {
+        self.document.set(self.document.lastValue().*);
     }
 
     /// Width queries in a nested browsing context use that iframe's own CSS
@@ -380,11 +433,8 @@ pub const Frame = struct {
         }
         self.children.deinit(self.allocator);
 
-        if (self.document_layout) |doc| {
-            doc.deinit();
-            self.allocator.destroy(doc);
-            self.document_layout = null;
-        }
+        self.destroyDocumentLayout();
+        self.document.deinit();
 
         if (self.current_node) |*node| {
             node.deinit(self.allocator);
@@ -461,27 +511,29 @@ pub const Frame = struct {
         self.fragment_targets.clearRetainingCapacity();
     }
 
-    pub fn render(self: *Frame, browser: *Browser, needs_style: bool, needs_layout: bool, needs_paint: bool) !void {
-        if (self.current_node == null) return;
+    pub fn annotateVisited(self: *Frame, browser: *Browser) !void {
+        const root = if (self.current_node) |*node| node else return;
         if (self.current_url) |base_url| {
-            // Re-annotate before any requested paint so DOM mutations and
-            // session visits made since the initial parse are reflected.
-            try browser.annotateVisitedLinks(&self.current_node.?, base_url);
+            try browser.annotateVisitedLinks(root, base_url);
         }
-        if (needs_style) {
-            try parser.styleWithKeyframes(
-                browser.allocator,
-                &self.current_node.?,
-                self.rules.items,
-                self.keyframes.items,
-            );
-            if (self.current_url) |page_url| {
-                try browser.loadUsedBackgroundImages(self, page_url);
-            }
+    }
+
+    pub fn renderStyle(self: *Frame, browser: *Browser) !void {
+        if (!self.document.dirty) return;
+        const root = if (self.current_node) |*node| node else {
+            self.publishStyledDocument();
+            return;
+        };
+        try parser.styleWithKeyframes(
+            browser.allocator,
+            root,
+            self.rules.items,
+            self.keyframes.items,
+        );
+        if (self.current_url) |page_url| {
+            try browser.loadUsedBackgroundImages(self, page_url);
         }
-        if (needs_layout or needs_paint) {
-            try browser.layoutTabNodes(self, needs_paint);
-        }
+        self.publishStyledDocument();
     }
 
     pub fn updateHitTestBounds(self: *Frame, engine: *Layout) !void {
@@ -838,8 +890,14 @@ pub const Frame = struct {
     ) !bool {
         const items = self.display_list orelse return false;
         const hit = DisplayItem.hitTestDevice(items, device_x, device_y, zoom) orelse return false;
-        const layout_hit = if (self.document_layout) |document|
-            document.hitTestDevice(device_x, device_y, zoom)
+        const layout_hit = if (!self.document.dirty)
+            if (self.document.get().*) |document|
+                if (!document.layoutNeeded())
+                    document.hitTestDevice(device_x, device_y, zoom)
+                else
+                    null
+            else
+                null
         else
             null;
         const hit_node = hit.source.originatingNode() orelse
@@ -1180,9 +1238,8 @@ async_thread_condition: sync.Condition,
 intervals: std.AutoHashMap(IntervalKey, void),
 interval_mutex: sync.Mutex,
 shutting_down: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
-// Separate dirty flags for render phases
-needs_style: bool = true,
-needs_layout: bool = true,
+// Paint is the only coarse render flag. Style readiness is protected by each
+// Frame.document, while layout dirtiness lives in the retained layout graph.
 needs_paint: bool = true,
 // Author rules were filtered under an older color/viewport media environment.
 media_environment_dirty: bool = false,
@@ -1275,11 +1332,10 @@ fn updateZoomState(self: *Tab, zoom: f32) bool {
     // Mark all frame layouts as dirty for layout recalculation
     if (self.root_frame) |frame| {
         markFrameLayoutDirty(frame);
+        markFrameStyleDirty(frame);
     }
 
     self.media_environment_dirty = true;
-    self.needs_style = true;
-    self.needs_layout = true;
     self.needs_paint = true;
     return true;
 }
@@ -1302,8 +1358,7 @@ fn updateForcedColorsState(self: *Tab, enabled: bool) bool {
     if (self.accessibility.forced_colors == enabled) return false;
     self.accessibility.forced_colors = enabled;
     self.media_environment_dirty = true;
-    self.needs_style = true;
-    self.needs_layout = true;
+    if (self.root_frame) |frame| markFrameStyleDirty(frame);
     self.needs_paint = true;
     return true;
 }
@@ -1315,12 +1370,33 @@ pub fn setForcedColors(self: *Tab, enabled: bool) void {
 }
 
 fn markFrameLayoutDirty(frame: *Frame) void {
-    if (frame.document_layout) |doc| {
+    if (frame.document.lastValue().*) |doc| {
         doc.mark();
     }
     for (frame.children.items) |child| {
         markFrameLayoutDirty(child);
     }
+}
+
+fn markFrameStyleDirty(frame: *Frame) void {
+    frame.markDocumentStyleDirty();
+    for (frame.children.items) |child| markFrameStyleDirty(child);
+}
+
+fn frameTreeNeedsStyle(frame: *const Frame) bool {
+    if (frame.styleNeeded()) return true;
+    for (frame.children.items) |child| {
+        if (frameTreeNeedsStyle(child)) return true;
+    }
+    return false;
+}
+
+fn frameTreeNeedsLayout(frame: *const Frame) bool {
+    if (frame.layoutNeeded()) return true;
+    for (frame.children.items) |child| {
+        if (frameTreeNeedsLayout(child)) return true;
+    }
+    return false;
 }
 
 fn cssZoomFactorsDiffer(left: f32, right: f32) bool {
@@ -1365,7 +1441,7 @@ fn refreshInheritedFrameZoom(frame: *Frame) bool {
 }
 
 fn invalidateFrameTreeForViewportResize(frame: *Frame) void {
-    if (frame.document_layout) |doc| {
+    if (frame.document.lastValue().*) |doc| {
         doc.mark();
     }
     for (frame.children.items) |child| {
@@ -1395,9 +1471,8 @@ pub fn resizeViewport(self: *Tab, width: i32, height: i32) void {
 
     if (width_changed) {
         self.media_environment_dirty = true;
-        self.needs_style = true;
+        if (self.root_frame) |frame| markFrameStyleDirty(frame);
     }
-    self.needs_layout = true;
     self.needs_paint = true;
 }
 
@@ -1409,8 +1484,6 @@ test "zoom changes CSS viewport width and invalidates media rules" {
     var tab: Tab = undefined;
     tab.accessibility = .{ .zoom = 1.0, .dark_palette = .{} };
     tab.root_frame = null;
-    tab.needs_style = false;
-    tab.needs_layout = false;
     tab.needs_paint = false;
     tab.media_environment_dirty = false;
 
@@ -1419,9 +1492,8 @@ test "zoom changes CSS viewport width and invalidates media rules" {
     try std.testing.expect(tab.updateZoomState(2.0));
     try std.testing.expectEqual(@as(f32, 2.0), tab.accessibility.zoom);
     try std.testing.expect(tab.media_environment_dirty);
-    try std.testing.expect(tab.needs_style);
-    try std.testing.expect(tab.needs_layout);
     try std.testing.expect(tab.needs_paint);
+    try std.testing.expect(tab.renderPhasesNeeded());
 
     tab.media_environment_dirty = false;
     try std.testing.expect(!tab.updateZoomState(2.0));
@@ -1437,17 +1509,15 @@ test "iframe CSS zoom comparison ignores floating-point round trips" {
 test "forced colors changes invalidate media rules and the complete render pipeline" {
     var tab: Tab = undefined;
     tab.accessibility = .{};
-    tab.needs_style = false;
-    tab.needs_layout = false;
+    tab.root_frame = null;
     tab.needs_paint = false;
     tab.media_environment_dirty = false;
 
     try std.testing.expect(tab.updateForcedColorsState(true));
     try std.testing.expect(tab.accessibility.forced_colors);
     try std.testing.expect(tab.media_environment_dirty);
-    try std.testing.expect(tab.needs_style);
-    try std.testing.expect(tab.needs_layout);
     try std.testing.expect(tab.needs_paint);
+    try std.testing.expect(tab.renderPhasesNeeded());
 
     tab.media_environment_dirty = false;
     try std.testing.expect(!tab.updateForcedColorsState(true));
@@ -2119,8 +2189,7 @@ fn loadHistoryEntry(
 }
 
 pub fn setNeedsRender(self: *Tab) void {
-    self.needs_style = true;
-    self.needs_layout = true;
+    if (self.root_frame) |frame| markFrameStyleDirty(frame);
     self.needs_paint = true;
     self.browser.setNeedsAnimationFrame(self);
     self.browser.scheduleAnimationFrame();
@@ -2133,10 +2202,9 @@ pub fn setNeedsRender(self: *Tab) void {
 pub fn prepareForDomMutation(self: *Tab, b: *Browser, frame: *Frame, mutation_root: *Node) void {
     std.debug.assert(frame.tab == self);
 
-    self.needs_style = true;
-    self.needs_layout = true;
     self.needs_paint = true;
     frame.resources_dirty = true;
+    frame.markDocumentStyleDirty();
 
     frame.retireDomMutationBorrows(mutation_root);
     self.composited_updates.clearRetainingCapacity();
@@ -2147,11 +2215,8 @@ pub fn prepareForDomMutation(self: *Tab, b: *Browser, frame: *Frame, mutation_ro
     // subscriptions and Node addresses inside the retained tree. Once every
     // display consumer is retired, destroy this frame's complete layout while
     // the old DOM is still alive; the next full render builds a fresh graph.
-    if (frame.document_layout) |doc| {
-        doc.deinit();
-        self.allocator.destroy(doc);
-        frame.document_layout = null;
-    }
+    frame.destroyDocumentLayout();
+    frame.markDocumentStyleDirty();
     // Descendant frames own independent DOM/layout trees but still need dirty
     // propagation when an ancestor iframe element changes.
     markFrameLayoutDirty(frame);
@@ -2387,7 +2452,6 @@ fn appendIframeContent(
     if (cssZoomFactorsDiffer(child_frame.?.inherited_css_zoom, iframe_data.css_zoom)) {
         child_frame.?.inherited_css_zoom = iframe_data.css_zoom;
         markFrameLayoutDirty(child_frame.?);
-        self.needs_layout = true;
         self.browser.setNeedsAnimationFrame(self);
         self.browser.scheduleAnimationFrame();
     }
@@ -2398,7 +2462,6 @@ fn appendIframeContent(
     } else if (viewport_change.height_changed) {
         // Height is not a supported media feature yet, but child layout and
         // scroll geometry still consume the containing viewport.
-        self.needs_layout = true;
         self.needs_paint = true;
         self.browser.setNeedsAnimationFrame(self);
         self.browser.scheduleAnimationFrame();
@@ -2473,7 +2536,13 @@ pub fn visitedLinksNeedRefresh(self: *const Tab, session_generation: u64) bool {
 pub fn animationFrameNeedsFullRender(self: *Tab, b: *Browser) bool {
     const visited_generation = b.session_state.currentVisitedGeneration();
     if (self.visitedLinksNeedRefresh(visited_generation)) self.needs_paint = true;
-    return self.needs_style or self.needs_layout or self.needs_paint;
+    return self.renderPhasesNeeded();
+}
+
+pub fn renderPhasesNeeded(self: *const Tab) bool {
+    if (self.needs_paint) return true;
+    const frame = self.root_frame orelse return false;
+    return frameTreeNeedsStyle(frame) or frameTreeNeedsLayout(frame);
 }
 
 pub fn requestActivationCommit(self: *Tab) void {
@@ -2484,8 +2553,7 @@ pub fn render(self: *Tab, b: *Browser) !void {
     const visited_generation = b.session_state.currentVisitedGeneration();
     if (self.visitedLinksNeedRefresh(visited_generation)) self.needs_paint = true;
 
-    // Check if any render phase is needed
-    if (!self.needs_style and !self.needs_layout and !self.needs_paint) return;
+    if (!self.renderPhasesNeeded()) return;
 
     const profiling = b.profiling_enabled;
     const render_start = if (profiling) std.Io.Clock.awake.now(b.io).nanoseconds else 0;
@@ -2496,18 +2564,25 @@ pub fn render(self: *Tab, b: *Browser) !void {
     defer if (trace_render) b.measure.end("render");
 
     const frame = self.root_frame orelse {
-        self.needs_style = false;
-        self.needs_layout = false;
         self.needs_paint = false;
         self.visited_generation = visited_generation;
         return;
     };
     if (frame.current_node == null) {
-        self.needs_style = false;
-        self.needs_layout = false;
+        if (frame.styleNeeded()) frame.publishStyledDocument();
         self.needs_paint = false;
         self.visited_generation = visited_generation;
         return;
+    }
+
+    // Consume inherited iframe zoom from the preceding computed-style
+    // generation before deciding which width-dependent media rules to parse.
+    // A zoom change painted during this pass is detected by composition and
+    // schedules the following protected generation.
+    if (refreshInheritedFrameZoom(frame)) {
+        self.media_environment_dirty = true;
+        markFrameStyleDirty(frame);
+        self.needs_paint = true;
     }
 
     // JavaScript structural mutations are complete by the time their
@@ -2531,46 +2606,41 @@ pub fn render(self: *Tab, b: *Browser) !void {
         }
     }
 
-    b.layout_engine.accessibility = self.accessibility;
-    try self.refreshFocusState();
+    var frames = std.ArrayList(*Frame).empty;
+    defer frames.deinit(self.allocator);
+    try self.collectFramesPostOrder(frame, &frames);
+    for (frames.items) |child_frame| try child_frame.annotateVisited(b);
 
-    // Style phase
-    if (self.needs_style) {
-        self.needs_style = false;
-        errdefer self.needs_style = true;
+    b.layout_engine.accessibility = self.accessibility;
+
+    // Frame.document protects the style/layout boundary. A dirty document is
+    // republished only after its complete style and background-resource pass
+    // succeeds; layout cannot read through this phase while it remains dirty.
+    if (frameTreeNeedsStyle(frame)) {
+        try self.refreshFocusState();
         const style_start = if (profiling) std.Io.Clock.awake.now(b.io).nanoseconds else 0;
-        var frames = std.ArrayList(*Frame).empty;
-        defer frames.deinit(self.allocator);
-        try self.collectFramesPostOrder(frame, &frames);
         for (frames.items) |child_frame| {
-            try child_frame.render(b, true, false, false);
+            try child_frame.renderStyle(b);
         }
         if (profiling) {
             style_ns = @intCast(std.Io.Clock.awake.now(b.io).nanoseconds - style_start);
         }
     }
 
-    // Layout phase (also does paint since they're combined in layoutTabNodes)
-    if (self.needs_layout or self.needs_paint) {
-        self.needs_layout = false;
+    // Geometry dirtiness comes from the retained layout dependency graph.
+    // Paint remains independently forceable for colors, focus, and visited
+    // state without manufacturing a layout invalidation.
+    const force_paint = self.needs_paint;
+    if (frameTreeNeedsLayout(frame) or force_paint) {
         self.needs_paint = false;
-        errdefer {
-            self.needs_layout = true;
-            self.needs_paint = true;
-        }
+        errdefer self.needs_paint = true;
         const layout_start = if (profiling) std.Io.Clock.awake.now(b.io).nanoseconds else 0;
-        if (refreshInheritedFrameZoom(frame)) {
-            // Child media widths are unscaled CSS pixels, so a changed frame
-            // factor needs one follow-up style generation as well as this
-            // frame's immediate corrected layout.
-            self.mediaEnvironmentChanged();
-        }
-        var frames = std.ArrayList(*Frame).empty;
-        defer frames.deinit(self.allocator);
-        try self.collectFramesPostOrder(frame, &frames);
         frame.viewport_height = self.tab_height;
         for (frames.items) |child_frame| {
-            try child_frame.render(b, false, true, true);
+            if (child_frame.current_node == null) continue;
+            if (child_frame.layoutNeeded() or force_paint) {
+                try b.layoutTabNodes(child_frame, force_paint);
+            }
         }
         // Layout publishes the document-space positions used for lazy-image
         // selection. Loading here deliberately schedules one follow-up layout:
@@ -2788,6 +2858,18 @@ fn hasActiveAnimations(node: *const parser.Node) bool {
     };
 }
 
+fn markAnimationLayout(self: *Tab, elem: *parser.Element) void {
+    if (elem.layout_ptr) |layout_ptr| {
+        if (elem.layout_mark) |mark| {
+            mark(layout_ptr);
+            return;
+        }
+    }
+    // A newly created animation can advance before its first layout has
+    // attached an element-local owner.
+    if (self.root_frame) |root_frame| markFrameLayoutDirty(root_frame);
+}
+
 fn publishAnimationValue(
     self: *Tab,
     elem: *parser.Element,
@@ -2826,7 +2908,10 @@ fn publishAnimationValue(
         }
     } else if (std.mem.eql(u8, property, "background-color")) {
         switch (anim.*) {
-            .color => self.needs_paint = true,
+            .color => {
+                self.needs_paint = true;
+                markAnimationLayout(self, elem);
+            },
             .numeric, .pixel, .transform => {},
         }
     } else if (std.mem.eql(u8, property, "transform")) {
@@ -2844,12 +2929,7 @@ fn publishAnimationValue(
         }
     } else if (std.mem.eql(u8, property, "width") or std.mem.eql(u8, property, "height")) {
         switch (anim.*) {
-            .pixel => {
-                self.needs_layout = true;
-                if (elem.layout_ptr) |layout_ptr| {
-                    if (elem.layout_mark) |mark| mark(layout_ptr);
-                }
-            },
+            .pixel => markAnimationLayout(self, elem),
             .numeric, .color, .transform => {},
         }
     }
@@ -2874,11 +2954,12 @@ fn restartCssAnimation(self: *Tab, elem: *parser.Element, state: *parser.CssAnim
 fn invalidateRemovedCssAnimation(self: *Tab, elem: *parser.Element, property_mask: u8) void {
     for (parser.css_animation_properties) |property| {
         if ((property_mask & parser.cssAnimationPropertyBit(property)) == 0) continue;
-        if (std.mem.eql(u8, property, "width") or std.mem.eql(u8, property, "height")) {
-            self.needs_layout = true;
-            if (elem.layout_ptr) |layout_ptr| {
-                if (elem.layout_mark) |mark| mark(layout_ptr);
-            }
+        if (std.mem.eql(u8, property, "background-color") or
+            std.mem.eql(u8, property, "width") or
+            std.mem.eql(u8, property, "height"))
+        {
+            markAnimationLayout(self, elem);
+            if (std.mem.eql(u8, property, "background-color")) self.needs_paint = true;
         } else {
             self.needs_paint = true;
         }
@@ -2945,6 +3026,124 @@ fn advanceAnimations(self: *Tab, node: *parser.Node) bool {
     return any_running;
 }
 
+fn createCleanPhaseTestDocument(
+    allocator: std.mem.Allocator,
+    node: *Node,
+) !*Layout.DocumentLayout {
+    const document = try allocator.create(Layout.DocumentLayout);
+    document.* = .{
+        .allocator = allocator,
+        .node = node.*,
+        .node_ptr = node,
+        .zoom = ProtectedField(f32).init(allocator, 1.0),
+        .x = ProtectedField(i32).init(allocator, 0),
+        .y = ProtectedField(i32).init(allocator, 0),
+        .width = ProtectedField(i32).init(allocator, 0),
+        .height = ProtectedField(i32).init(allocator, 0),
+        .children = .empty,
+    };
+    document.zoom.set(1.0);
+    document.x.set(0);
+    document.y.set(0);
+    document.width.set(0);
+    document.height.set(0);
+    return document;
+}
+
+fn initAnimationPhaseTest(
+    tab: *Tab,
+    frame: *Frame,
+    allocator: std.mem.Allocator,
+) !void {
+    tab.allocator = allocator;
+    tab.root_frame = frame;
+    tab.needs_paint = false;
+    tab.composited_updates = .empty;
+    tab.frames_by_id = std.AutoHashMap(u32, *Frame).init(allocator);
+    tab.parent_window_ids = std.AutoHashMap(u32, u32).init(allocator);
+    var frame_initialized = false;
+    errdefer {
+        if (frame_initialized) frame.deinit();
+        tab.frames_by_id.deinit();
+        tab.parent_window_ids.deinit();
+        tab.composited_updates.deinit(allocator);
+    }
+
+    frame.* = Frame.init(allocator, tab, null, null);
+    frame_initialized = true;
+    frame.current_node = .{ .element = try parser.Element.init(allocator, "html", null) };
+    frame.setDocumentLayout(try createCleanPhaseTestDocument(
+        allocator,
+        &frame.current_node.?,
+    ));
+}
+
+fn deinitAnimationPhaseTest(tab: *Tab, frame: *Frame) void {
+    frame.deinit();
+    tab.frames_by_id.deinit();
+    tab.parent_window_ids.deinit();
+    tab.composited_updates.deinit(tab.allocator);
+}
+
+test "opacity and transform animations stay compositor-only" {
+    const allocator = std.testing.allocator;
+    var root = parser.Node{ .element = try parser.Element.init(allocator, "div", null) };
+    defer root.deinit(allocator);
+    try parser.style(allocator, &root, &.{});
+
+    root.element.animations = std.StringHashMap(parser.Animation).init(allocator);
+    try root.element.animations.?.put("opacity", .{ .numeric = parser.NumericAnimation.initWithEasing(
+        0,
+        1,
+        2,
+        .linear,
+    ) });
+    try root.element.animations.?.put("transform", .{ .transform = parser.TransformAnimation.initWithEasing(
+        .{ .x = 0, .y = 0 },
+        .{ .x = 20, .y = 30 },
+        2,
+        .linear,
+    ) });
+
+    var tab: Tab = undefined;
+    var frame: Frame = undefined;
+    try initAnimationPhaseTest(&tab, &frame, allocator);
+    defer deinitAnimationPhaseTest(&tab, &frame);
+
+    try std.testing.expect(tab.advanceAnimations(&root));
+    try std.testing.expectEqual(@as(usize, 2), tab.composited_updates.items.len);
+    try std.testing.expect(!frame.styleNeeded());
+    try std.testing.expect(!frame.documentLayout().?.layoutNeeded());
+    try std.testing.expect(!tab.needs_paint);
+    try std.testing.expect(!tab.renderPhasesNeeded());
+}
+
+test "background color animation requests layout and paint" {
+    const allocator = std.testing.allocator;
+    var root = parser.Node{ .element = try parser.Element.init(allocator, "div", null) };
+    defer root.deinit(allocator);
+    try parser.style(allocator, &root, &.{});
+
+    root.element.animations = std.StringHashMap(parser.Animation).init(allocator);
+    try root.element.animations.?.put("background-color", .{ .color = parser.ColorAnimation.initWithEasing(
+        .{ .r = 255, .g = 0, .b = 0, .a = 255 },
+        .{ .r = 0, .g = 0, .b = 255, .a = 255 },
+        2,
+        .linear,
+    ) });
+
+    var tab: Tab = undefined;
+    var frame: Frame = undefined;
+    try initAnimationPhaseTest(&tab, &frame, allocator);
+    defer deinitAnimationPhaseTest(&tab, &frame);
+
+    try std.testing.expect(tab.advanceAnimations(&root));
+    try std.testing.expect(!frame.styleNeeded());
+    try std.testing.expect(frame.documentLayout().?.layoutNeeded());
+    try std.testing.expect(tab.needs_paint);
+    try std.testing.expect(tab.renderPhasesNeeded());
+}
+
 test "pixel dimension animation requests layout and produces px values" {
     const allocator = std.testing.allocator;
     var html_parser = try parser.HTMLParser.init(
@@ -2963,14 +3162,14 @@ test "pixel dimension animation requests layout and produces px values" {
     try root.element.animations.?.put("height", .{ .pixel = parser.PixelAnimation.initWithEasing(40, 80, 2, .linear) });
 
     var tab: Tab = undefined;
-    tab.allocator = allocator;
-    tab.root_frame = null;
-    tab.composited_updates = .empty;
-    defer tab.composited_updates.deinit(allocator);
-    tab.needs_layout = false;
+    var frame: Frame = undefined;
+    try initAnimationPhaseTest(&tab, &frame, allocator);
+    defer deinitAnimationPhaseTest(&tab, &frame);
 
     try std.testing.expect(tab.advanceAnimations(&root));
-    try std.testing.expect(tab.needs_layout);
+    try std.testing.expect(!frame.styleNeeded());
+    try std.testing.expect(frame.documentLayout().?.layoutNeeded());
+    try std.testing.expect(tab.renderPhasesNeeded());
     var width_buffer: [32]u8 = undefined;
     var height_buffer: [32]u8 = undefined;
     try std.testing.expectEqualStrings("150.000px", try root.element.animations.?.get("width").?.pixel.formatValue(&width_buffer));
@@ -3005,12 +3204,9 @@ test "alternate keyframe cycles preserve endpoints and relayout dimensions" {
     };
 
     var tab: Tab = undefined;
-    tab.allocator = allocator;
-    tab.root_frame = null;
-    tab.composited_updates = .empty;
-    defer tab.composited_updates.deinit(allocator);
-    tab.needs_layout = false;
-    tab.needs_paint = false;
+    var frame: Frame = undefined;
+    try initAnimationPhaseTest(&tab, &frame, allocator);
+    defer deinitAnimationPhaseTest(&tab, &frame);
 
     try std.testing.expect(tab.advanceAnimations(&root));
     try std.testing.expectApproxEqAbs(
@@ -3023,7 +3219,7 @@ test "alternate keyframe cycles preserve endpoints and relayout dimensions" {
         root.element.animations.?.get("width").?.pixel.getValue(),
         0.000001,
     );
-    try std.testing.expect(tab.needs_layout);
+    try std.testing.expect(frame.documentLayout().?.layoutNeeded());
 
     try std.testing.expect(tab.advanceAnimations(&root));
     try std.testing.expect(root.element.css_animation.?.restart_pending);
@@ -3076,19 +3272,16 @@ test "finite keyframe animation restores its underlying property" {
     };
 
     var tab: Tab = undefined;
-    tab.allocator = allocator;
-    tab.root_frame = null;
-    tab.composited_updates = .empty;
-    defer tab.composited_updates.deinit(allocator);
-    tab.needs_layout = false;
-    tab.needs_paint = false;
+    var frame: Frame = undefined;
+    try initAnimationPhaseTest(&tab, &frame, allocator);
+    defer deinitAnimationPhaseTest(&tab, &frame);
 
     try std.testing.expect(tab.advanceAnimations(&root));
     try std.testing.expect(root.element.css_animation.?.restart_pending);
     try std.testing.expect(!tab.advanceAnimations(&root));
     try std.testing.expect(root.element.css_animation.?.finished);
     try std.testing.expect(root.element.animations.?.get("width") == null);
-    try std.testing.expect(tab.needs_layout);
+    try std.testing.expect(frame.documentLayout().?.layoutNeeded());
 }
 
 fn applyRetainedCompositedUpdate(frame: *Frame, update: CompositedUpdate) void {

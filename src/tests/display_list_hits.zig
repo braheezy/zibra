@@ -587,8 +587,6 @@ fn deinitMutationBrowser(test_browser: *browser.Browser) void {
 fn initMutationTab(tab: *tab_module.Tab, allocator: std.mem.Allocator, test_browser: *browser.Browser) void {
     initClickTab(tab, allocator);
     tab.browser = test_browser;
-    tab.needs_style = false;
-    tab.needs_layout = false;
     tab.needs_paint = false;
     tab.composited_updates = .empty;
     tab.accessibility_root = null;
@@ -624,6 +622,7 @@ test "structural mutation retires a painted link before DOM removal" {
 
     var frame = tab_module.Frame.init(allocator, &tab, null, null);
     defer frame.deinit();
+    frame.publishStyledDocument();
     tab.root_frame = &frame;
     tab.focused_frame = &frame;
 
@@ -681,7 +680,9 @@ test "structural mutation retires a painted link before DOM removal" {
     try std.testing.expectEqual(@as(usize, 0), frame.link_bounds.items.len);
     try std.testing.expectEqual(@as(usize, 0), frame.focus_bounds.items.len);
     try std.testing.expect(test_browser.active_tab_display_list == null);
-    try std.testing.expect(tab.needs_style and tab.needs_layout and tab.needs_paint);
+    try std.testing.expect(frame.styleNeeded());
+    try std.testing.expect(tab.needs_paint);
+    try std.testing.expect(tab.renderPhasesNeeded());
     try std.testing.expect(frame.resources_dirty);
     try std.testing.expect(test_browser.needs_animation_frame);
 
@@ -1073,8 +1074,6 @@ test "activating a clean tab republishes its retained list and committed URL" {
     initClickTab(&tab, allocator);
     defer deinitClickTab(&tab);
     tab.browser = &test_browser;
-    tab.needs_style = false;
-    tab.needs_layout = false;
     tab.needs_paint = false;
     tab.visited_generation = session.currentVisitedGeneration();
     tab.activation_commit_requested = std.atomic.Value(bool).init(false);
@@ -1086,6 +1085,7 @@ test "activating a clean tab republishes its retained list and committed URL" {
     defer frame.deinit();
     tab.root_frame = &frame;
     frame.scroll = 37;
+    frame.publishStyledDocument();
     frame.content_height = 900;
     var current_url = try Url.init(allocator, "https://example.com/clean");
     defer current_url.free(allocator);

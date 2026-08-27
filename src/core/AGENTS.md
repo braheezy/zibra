@@ -14,6 +14,10 @@ before changing dependency registration or destruction behavior.
   It may be used while dirty only when the consumer needs the last published
   state, such as the visual baseline for an interrupted CSS transition; it is
   not a substitute for recomputation or a clean `get`.
+- `Frame.document` uses field dirtiness as a phase guard as well as an
+  invalidation signal. Its owning layout pointer may be read with `lastValue`
+  only for ordered retirement; style must republish the field before layout or
+  hit testing uses `get`.
 - Keep core primitives independent of Browser, SDL, Kiesel, and URL layers.
 - Changes here need direct unit coverage plus regression coverage in each
   consuming subsystem where the lifecycle can differ.

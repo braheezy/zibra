@@ -36,6 +36,13 @@ before changing `root.zig`, `tab.zig`, `render/`, or browser task scheduling.
 - `tab.zig` owns frames, document generations, task serialization, and helper
   quiescence. Queued or detached work must carry a stable document identity,
   not a borrowed frame pointer.
+  Each Frame owns its layout pointer through a `ProtectedField` named
+  `document`. A dirty field is the style-phase boundary: only teardown may
+  inspect its last published pointer, while layout and hit testing must wait
+  for a successful style pass to republish it clean. Do not reintroduce
+  tab-wide `needs_style` or `needs_layout` flags. The retained
+  `DocumentLayout.layoutNeeded()` graph is the sole geometry dirty source;
+  `Tab.needs_paint` remains independent for paint-only changes.
   Each child Frame also stores the numeric authored zoom inherited at its
   iframe boundary. Recompute it from the styled containing-node ancestry
   before child layout, rescale the already-published viewport by the factor
@@ -377,10 +384,13 @@ before changing `root.zig`, `tab.zig`, `render/`, or browser task scheduling.
   bounds but does not expand the DOM hit target.
 - CSS transition state advances only on the serialized Tab worker. Opacity and
   `translate(...)` transforms emit composited scalar updates and can skip
-  paint; `background-color` marks paint dirty; width/height retain a
-  pixel-serializing animation value and mark the element's layout owner dirty
-  on every frame so block geometry, descendant line wrapping, paint, and raster
-  are regenerated.
+  paint; every other supported animated property conservatively marks the
+  element's layout owner dirty. Width/height retain a pixel-serializing value
+  so block geometry and descendant line wrapping follow each frame, while
+  background color also keeps the explicit paint request. The animation dirty
+  gate must derive those full renders from `DocumentLayout.layoutNeeded()`;
+  opacity and transform must leave both the Frame document and layout graph
+  clean.
 - Named CSS keyframe animations use that same property-specific interpolation
   and invalidation path plus an Element-owned cycle controller. `alternate`
   cycles hold each terminal endpoint for one render before reversing; opacity
@@ -396,11 +406,12 @@ before changing `root.zig`, `tab.zig`, `render/`, or browser task scheduling.
   frame/root scrolling; this raw Node focus is retired with other DOM borrows.
 - Structural DOM mutation is a synchronous generation boundary, distinct from
   ordinary render invalidation. Before a child array moves or a child is
-  destroyed, mark layout/render dirty, retire the frame's display and DOM-keyed
+  destroyed, mark the Frame document dirty, retire the frame's display and DOM-keyed
   interaction state, clear tab accessibility/composited borrows, and retire
   active Browser draw/layer/display state under `Browser.lock`. Then destroy
-  the mutating frame's complete layout dependency graph while the old DOM is
-  still alive; the next full render rebuilds it. Schedule the replacement paint
+  the mutating frame's complete layout dependency graph through its last
+  published document value while the old DOM is still alive; the next style
+  pass republishes a clean null document and layout rebuilds it. Schedule the replacement paint
   before any fallible mutation step. Preserve focus when the mutation root
   itself survives; clear it only for a removed descendant. After the child
   storage and parent pointers are final, run the paired completion callback

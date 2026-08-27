@@ -289,7 +289,9 @@ borrows from every window have ended.
 - one named accessibility runner whose queued tasks own complete utterances;
 - dynamic text allocations;
 - the accessibility tree and its backing strings;
-- per-tab dirty flags and composited updates.
+- one paint dirty bit and composited updates. Style readiness belongs to each
+  Frame's protected document field, and layout readiness belongs to each
+  retained `DocumentLayout` graph.
 
 `Tab` borrows its `Browser` and the heap-stable `MeasureTime` used by both of
 its named runners. That measurement owner is BrowserApp in interactive mode
@@ -302,7 +304,9 @@ and the standalone Browser in screenshot mode.
 - child `Frame` allocations;
 - the document's decoded HTML source;
 - the root DOM `Node` value;
-- document layout and the frame-side display list;
+- a `ProtectedField(?*DocumentLayout)` named `document` and the frame-side
+  display list. The field owns the optional layout pointer; its dirty bit is
+  also the style/layout phase boundary;
 - owned CSS rules and keyframe containers plus their source buffers, including
   decoded linked sheets and copied `<style>` text retained in DOM order;
 - hit-test collections, image visibility boxes, fragment target positions, and
@@ -603,6 +607,18 @@ target pointer and callback in the dependency's `invalidations` map.
 that field from maps in its dependencies. See `addDependency`,
 `addInvalidation`, `notify`, and `deinit` in
 [`src/core/protected_field.zig`](../src/core/protected_field.zig).
+
+Each Frame's owning `document` field adds a coarse phase guard above that
+fine-grained graph. Marking it dirty requests style and makes ordinary `get`
+reads of the layout pointer invalid. A successful style/background-resource
+pass republishes the same optional pointer clean; only then may
+`DocumentLayout.layoutNeeded()` decide whether geometry runs. Teardown and
+structural mutation use `lastValue` solely to destroy the prior layout while
+its DOM dependencies are alive, publish null, and leave the replacement style
+generation dirty. There are no tab-wide `needs_style` or `needs_layout` bits.
+Paint remains independently dirty for focus/visited and non-animation color
+changes, while opacity and translation animations bypass every full render
+phase.
 
 Supported structural DOM mutation uses a coarse lifetime boundary:
 `clearStyleInvalidations` drops every raw subscriber from every installed DOM
@@ -1236,10 +1252,11 @@ and `transform` stores the two axes of a parsed `translate(...)`. Each entry
 stores its timing function by value. Normalized frame progress is linear in
 scheduler time, then `easing.zig` maps it through CSS `ease` by default or a
 supported keyword/explicit cubic Bezier before property interpolation. Layout
-reads current color and dimensions directly from the Element-owned map. Color
-advances mark paint dirty; every width/height advance can serialize a stable
-`px` value and marks the element's layout owner dirty so geometry and line
-breaks are regenerated. Opacity and translation instead emit compositor updates; a
+reads current color and dimensions directly from the Element-owned map. Every
+supported property except opacity and transform conservatively marks the
+element's layout owner dirty; color also marks paint explicitly, while each
+width/height advance serializes a stable `px` value so geometry and line breaks
+are regenerated. Opacity and translation instead emit compositor updates; a
 simultaneous pair for one element shares its numeric compositor ID and updates
 one retained plane without paint or raster. A replacement style captures its
 baseline from an active transition first, otherwise from
@@ -1444,7 +1461,8 @@ before freeing the old Element-owned pixels, then commits the replacement
 generation normally.
 Selecting a clean tab publishes an atomic activation request to its serialized
 worker. That worker composes the retained lists and commits the frame's scroll
-and current URL even when no style/layout/paint dirty flag is set, avoiding a
+and current URL even when every Frame document and layout graph is clean and
+the tab has no paint request, avoiding a
 blank render or empty chrome URL after switching tabs.
 
 The unresolved render contract must choose one of these models:

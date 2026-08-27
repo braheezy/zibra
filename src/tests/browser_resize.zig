@@ -153,7 +153,7 @@ test "iframe width queries follow parent-published viewport changes" {
     child.viewport_width = 300;
     child.viewport_height = 150;
     child.inherited_css_zoom = 1.0;
-    child.document_layout = try createCleanDocument(allocator);
+    child.setDocumentLayout(try createCleanDocument(allocator));
 
     const css =
         "p { color: red; }" ++
@@ -186,7 +186,7 @@ test "iframe width queries follow parent-published viewport changes" {
     const change = child.updateViewportFromParent(420, 180);
     try std.testing.expect(change.width_changed);
     try std.testing.expect(change.height_changed);
-    try std.testing.expect(child.document_layout.?.layoutNeeded());
+    try std.testing.expect(child.documentLayout().?.layoutNeeded());
     try std.testing.expectEqual(@as(f64, 420), child.mediaViewportWidthCssPixels());
 
     var resized_parser = try CSSParser.initWithMedia(
@@ -220,8 +220,6 @@ test "tab resize updates root viewport and invalidates layout" {
     tab.tab_height = 520;
     tab.accessibility = .{};
     tab.root_frame = null;
-    tab.needs_style = false;
-    tab.needs_layout = false;
     tab.needs_paint = false;
     tab.media_environment_dirty = false;
     tab.scroll_changed_in_tab = false;
@@ -239,7 +237,7 @@ test "tab resize updates root viewport and invalidates layout" {
     frame.scroll = 500;
 
     const document = try createCleanDocument(allocator);
-    frame.document_layout = document;
+    frame.setDocumentLayout(document);
     try std.testing.expect(!document.layoutNeeded());
 
     const child = try allocator.create(tab_module.Frame);
@@ -252,7 +250,7 @@ test "tab resize updates root viewport and invalidates layout" {
     child.viewport_width = 300;
     child.viewport_height = 150;
     const child_document = try createCleanDocument(allocator);
-    child.document_layout = child_document;
+    child.setDocumentLayout(child_document);
     try std.testing.expect(!child_document.layoutNeeded());
 
     tab.resizeViewport(420, 700);
@@ -265,9 +263,10 @@ test "tab resize updates root viewport and invalidates layout" {
     try std.testing.expect(child_document.layoutNeeded());
     try std.testing.expectEqual(@as(i32, 300), child.viewport_width);
     try std.testing.expectEqual(@as(i32, 150), child.viewport_height);
-    try std.testing.expect(tab.needs_layout);
     try std.testing.expect(tab.needs_paint);
-    try std.testing.expect(tab.needs_style);
+    try std.testing.expect(frame.styleNeeded());
+    try std.testing.expect(child.styleNeeded());
+    try std.testing.expect(tab.renderPhasesNeeded());
     try std.testing.expectEqual(@as(i32, 200), frame.scroll);
     try std.testing.expect(tab.scroll_changed_in_tab);
     try std.testing.expect(tab.media_environment_dirty);

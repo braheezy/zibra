@@ -156,6 +156,11 @@ same Node object under a different parent with a visible in-page result.
 operation, exposes layout collapse and iframe teardown, verifies removed
 controls leave keyboard focus order, and reattaches one saved child subtree.
 
+`tests/manual/protected-layout-phases.html` runs compositor-only opacity and
+translation beside background-color and width animations that conservatively
+dirty layout. The visible motion/color/reflow checks are paired with unit
+coverage that asserts which protected render phase becomes dirty.
+
 `tests/manual/id-globals.html` verifies source and dynamically added element
 IDs as JavaScript globals, including `innerHTML`, rename, detach, reattach, and
 non-identifier access through `window[...]`.

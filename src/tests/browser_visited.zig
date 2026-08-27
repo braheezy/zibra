@@ -197,8 +197,7 @@ test "visited anchors are annotated and override descendant text at paint" {
 
     var source_tab: Tab = undefined;
     source_tab.visited_generation = source_generation;
-    source_tab.needs_style = false;
-    source_tab.needs_layout = false;
+    source_tab.root_frame = null;
     source_tab.needs_paint = false;
     try std.testing.expect(source_tab.animationFrameNeedsFullRender(&test_browser));
     try std.testing.expect(source_tab.needs_paint);

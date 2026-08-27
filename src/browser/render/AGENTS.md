@@ -6,6 +6,11 @@ software effects, and worker-transfer snapshots. Read
 before changing ownership or thread boundaries.
 
 - `layout.zig` builds layout trees and emits provenance-bearing display items.
+  A Frame reaches this module through a clean `Frame.document`
+  `ProtectedField`. After style is republished, `DocumentLayout.layoutNeeded()`
+  and its descendant invalidation graph alone determine whether geometry runs;
+  paint-only work may reuse a clean layout, and compositor-only work must not
+  enter this module at all.
   Layout and frame-side command lists synchronously borrow DOM and image state.
   Point queries walk document/block/line/text objects in reverse order and
   carry parent-local coordinates: each object subtracts its own offset and

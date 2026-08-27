@@ -1,0 +1,51 @@
+<!--
+How to verify:
+1. The blue box should slide and fade smoothly without changing surrounding layout.
+2. The square swatch should animate between red and green without changing size.
+3. The bordered paragraph should repeatedly change width and visibly rewrap.
+The unit suite additionally verifies that only opacity/transform stay
+compositor-only; background-color and width both enter layout.
+-->
+<!doctype html>
+<style>
+  body { font-family: sans-serif; margin: 24px; }
+  .stage { height: 80px; }
+  .phase-compositor {
+    width: 90px;
+    height: 42px;
+    color: white;
+    background-color: #2563eb;
+    animation: composite-motion 1.6s linear infinite alternate;
+  }
+  .phase-paint-only {
+    width: 72px;
+    height: 72px;
+    animation: color-only 1.6s linear infinite alternate;
+  }
+  .phase-layout-animation {
+    width: 150px;
+    border: 2px solid black;
+    animation: width-reflow 1.6s linear infinite alternate;
+  }
+  @keyframes composite-motion {
+    from { opacity: 1; transform: translate(0px, 0px); }
+    to { opacity: 0.35; transform: translate(180px, 0px); }
+  }
+  @keyframes color-only {
+    from { background-color: #dc2626; }
+    to { background-color: #16a34a; }
+  }
+  @keyframes width-reflow {
+    from { width: 150px; }
+    to { width: 360px; }
+  }
+</style>
+<h1>Protected layout phases</h1>
+<p>Opacity and transform:</p>
+<div class="stage"><div class="phase-compositor">composited</div></div>
+<p>Background color:</p>
+<div class="phase-paint-only"></div>
+<p>Width and line wrapping:</p>
+<div class="phase-layout-animation">
+  This sentence should alternate between several short lines and fewer long lines.
+</div>

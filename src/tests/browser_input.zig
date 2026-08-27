@@ -341,8 +341,6 @@ test "Tab traversal crosses nested frames in both directions" {
     tab.focus_modality = .keyboard;
     tab.accessibility_root = null;
     tab.accessibility_focused = null;
-    tab.needs_style = false;
-    tab.needs_layout = false;
     tab.needs_paint = false;
     tab.next_window_id = 1;
     tab.frames_by_id = std.AutoHashMap(u32, *tab_module.Frame).init(allocator);

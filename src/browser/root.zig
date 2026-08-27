@@ -2701,11 +2701,7 @@ pub const Browser = struct {
                 DisplayItem.freeList(self.allocator, items);
             }
 
-            if (frame.document_layout) |doc| {
-                doc.deinit();
-                self.allocator.destroy(doc);
-                frame.document_layout = null;
-            }
+            frame.destroyDocumentLayout();
 
             if (frame.current_node) |node| {
                 var n = node;
@@ -2868,6 +2864,7 @@ pub const Browser = struct {
                 frame.keyframes.items,
             );
             try self.loadUsedBackgroundImages(frame, url);
+            frame.publishStyledDocument();
 
             // Layout using the HTML node tree
             try self.layoutTabNodes(frame, true);
@@ -2888,7 +2885,7 @@ pub const Browser = struct {
         self.updateTabTitle(tab, document_title);
         document_title = null;
         self.resetFrameTimeEstimatorForTab(tab);
-        tab.setNeedsRender();
+        tab.setNeedsPaint();
         // Render and commit immediately to ensure first paint even if animation scheduling stalls.
         tab.runAnimationFrame(frame.scroll);
     }
@@ -2988,11 +2985,8 @@ pub const Browser = struct {
         }
         frame.children.clearRetainingCapacity();
 
-        if (frame.document_layout) |doc| {
-            doc.deinit();
-            self.allocator.destroy(doc);
-            frame.document_layout = null;
-        }
+        frame.destroyDocumentLayout();
+        frame.markDocumentStyleDirty();
 
         if (frame.current_node) |*node| {
             node.deinit(self.allocator);
@@ -3252,6 +3246,7 @@ pub const Browser = struct {
             frame.keyframes.items,
         );
         try self.loadUsedBackgroundImages(frame, url);
+        frame.publishStyledDocument();
         try self.layoutTabNodes(frame, true);
         if (url.*.fragment()) |fragment| {
             _ = frame.scrollToFragment(fragment);
@@ -3261,7 +3256,7 @@ pub const Browser = struct {
             frame.tab.commitPreparedHistoryNavigation(prepared);
         }
 
-        frame.tab.setNeedsRender();
+        frame.tab.setNeedsPaint();
         frame.tab.runAnimationFrame(frame.scroll);
     }
 
@@ -3347,8 +3342,7 @@ pub const Browser = struct {
             // A batch may have installed earlier candidates before a later
             // allocation fails. Conservatively reflow so those owned pixels
             // are never left invisible behind an otherwise-clean frame.
-            if (frame.document_layout) |document| document.mark();
-            frame.tab.needs_layout = true;
+            if (frame.document.lastValue().*) |document| document.mark();
             frame.tab.needs_paint = true;
             self.setNeedsAnimationFrame(frame.tab);
             self.scheduleAnimationFrame();
@@ -3368,8 +3362,7 @@ pub const Browser = struct {
         );
         if (loaded == 0) return false;
 
-        if (frame.document_layout) |document| document.mark();
-        frame.tab.needs_layout = true;
+        if (frame.document.lastValue().*) |document| document.mark();
         frame.tab.needs_paint = true;
         self.setNeedsAnimationFrame(frame.tab);
         self.scheduleAnimationFrame();
@@ -3697,6 +3690,7 @@ pub const Browser = struct {
             frame.keyframes.items,
         );
         try self.loadUsedBackgroundImages(frame, frame_url_ptr);
+        frame.publishStyledDocument();
         try self.layoutTabNodes(frame, true);
         std.debug.assert(insert_index <= parent.children.items.len);
         parent.children.insertAssumeCapacity(insert_index, frame);
@@ -4502,13 +4496,13 @@ pub const Browser = struct {
         self.layout_engine.document_color_scheme_dark = scheme_dark;
 
         var did_layout = false;
-        if (frame.document_layout == null) {
+        if (frame.documentLayout() == null) {
             // Create and layout the document tree the first time
-            frame.document_layout = try self.layout_engine.buildDocument(&frame.current_node.?);
+            frame.setDocumentLayout(try self.layout_engine.buildDocument(&frame.current_node.?));
             did_layout = true;
         } else {
             // Layout on subsequent frames - only if needed
-            const doc = frame.document_layout.?;
+            const doc = frame.documentLayout().?;
             if (doc.layoutNeeded()) {
                 // doc.layout can destroy/rebuild BlockLayout descendants.
                 // Retire their borrowed provenance before entering it.
@@ -4521,7 +4515,7 @@ pub const Browser = struct {
         if (did_layout or force_paint) {
             // Paint the document to produce draw commands
             frame.retireDisplayList();
-            frame.display_list = try self.layout_engine.paintDocument(frame.document_layout.?);
+            frame.display_list = try self.layout_engine.paintDocument(frame.documentLayout().?);
             try frame.updateHitTestBounds(self.layout_engine);
         }
 
