@@ -172,6 +172,10 @@ pub const Frame = struct {
     parent: ?*Frame,
     frame_element: ?*Node,
     input_bounds: std.AutoHashMap(*Node, Bounds),
+    /// Last laid-out document-space boxes for `<img>` nodes. Unloaded images
+    /// without authored dimensions retain a one-pixel position anchor so a
+    /// scroll can still bring them into the lazy preload region.
+    image_bounds: std.AutoHashMap(*Node, Bounds),
     link_bounds: std.ArrayList(FrameBoundEntry),
     iframe_bounds: std.ArrayList(FrameBoundEntry),
     focus_bounds: std.ArrayList(FrameBoundEntry),
@@ -239,6 +243,7 @@ pub const Frame = struct {
             .css_texts = std.ArrayList([]const u8).empty,
             .children = std.ArrayList(*Frame).empty,
             .input_bounds = std.AutoHashMap(*Node, Bounds).init(allocator),
+            .image_bounds = std.AutoHashMap(*Node, Bounds).init(allocator),
             .link_bounds = std.ArrayList(FrameBoundEntry).empty,
             .iframe_bounds = std.ArrayList(FrameBoundEntry).empty,
             .focus_bounds = std.ArrayList(FrameBoundEntry).empty,
@@ -269,6 +274,7 @@ pub const Frame = struct {
         self.retireDisplayList();
 
         self.input_bounds.deinit();
+        self.image_bounds.deinit();
         self.link_bounds.deinit(self.allocator);
         self.iframe_bounds.deinit(self.allocator);
         self.focus_bounds.deinit(self.allocator);
@@ -353,6 +359,7 @@ pub const Frame = struct {
         }
         self.retireDisplayList();
         self.input_bounds.clearRetainingCapacity();
+        self.image_bounds.clearRetainingCapacity();
         self.link_bounds.clearRetainingCapacity();
         self.iframe_bounds.clearRetainingCapacity();
         self.focus_bounds.clearRetainingCapacity();
@@ -388,6 +395,12 @@ pub const Frame = struct {
         var input_it = engine.input_bounds.iterator();
         while (input_it.next()) |entry| {
             try self.input_bounds.put(entry.key_ptr.*, entry.value_ptr.*);
+        }
+
+        self.image_bounds.clearRetainingCapacity();
+        var image_it = engine.image_bounds.iterator();
+        while (image_it.next()) |entry| {
+            try self.image_bounds.put(entry.key_ptr.*, entry.value_ptr.*);
         }
 
         self.link_bounds.clearRetainingCapacity();
@@ -2125,13 +2138,19 @@ pub fn render(self: *Tab, b: *Browser) !void {
         var frames = std.ArrayList(*Frame).empty;
         defer frames.deinit(self.allocator);
         try self.collectFramesPostOrder(frame, &frames);
+        frame.viewport_height = self.tab_height;
         for (frames.items) |child_frame| {
             try child_frame.render(b, false, true, true);
+        }
+        // Layout publishes the document-space positions used for lazy-image
+        // selection. Loading here deliberately schedules one follow-up layout:
+        // decoded intrinsic dimensions may change line breaks and page height.
+        for (frames.items) |child_frame| {
+            _ = try b.loadLazyImagesNearViewport(child_frame);
         }
         if (profiling) {
             layout_ns = @intCast(std.Io.Clock.awake.now(b.io).nanoseconds - layout_start);
         }
-        frame.viewport_height = self.tab_height;
         const clamped_scroll = self.clampScrollForFrame(frame, frame.scroll);
         if (clamped_scroll != frame.scroll) {
             self.scroll_changed_in_tab = true;
@@ -2197,6 +2216,17 @@ pub fn runAnimationFrameForGeneration(
     if (animations_running or scroll_animations_running) {
         self.browser.setNeedsAnimationFrame(self);
         self.browser.scheduleAnimationFrame();
+    }
+
+    // Root scrolling can otherwise remain a compositor-only update. Consult
+    // retained image positions before the dirty gate so entering a preload
+    // region turns this same frame into the required layout/paint pass.
+    var lazy_frame_it = self.frames_by_id.valueIterator();
+    while (lazy_frame_it.next()) |frame_ptr| {
+        _ = self.browser.loadLazyImagesNearViewport(frame_ptr.*) catch |err| {
+            std.log.warn("Lazy image load failed: {}", .{err});
+            continue;
+        };
     }
 
     // Only run full render if there are non-composited changes

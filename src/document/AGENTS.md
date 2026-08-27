@@ -95,6 +95,11 @@ or selector/rule lifetime.
   centered destination plus fractional source-crop geometry without depending
   on layout, networking, or raster state. Preserve fractional crop edges: an
   integer crop visibly distorts small images with a mismatched aspect ratio.
+- `Element.image_data == null` means an HTML image has not reached a terminal
+  load state. The browser treats only an ASCII case-insensitive
+  `loading=lazy` as deferred; missing, invalid, and `eager` values load during
+  resource discovery. Success and broken-image fallback both install owned
+  `ImageData`, preventing repeated fetches on later animation frames.
 - `focus.zig` is the canonical HTML focusability policy shared by layout,
   keyboard traversal, and JavaScript. Programmatic focus accepts an explicit
   negative `tabindex`, while sequential focus rejects it; hidden inputs,

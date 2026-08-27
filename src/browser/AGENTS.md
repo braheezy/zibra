@@ -54,6 +54,12 @@ before changing `root.zig`, `tab.zig`, `render/`, or browser task scheduling.
   transport-security classification. `frame_timing.zig` owns frame cadence
   estimation and absolute deadlines. `window_geometry.zig` owns pure resize
   derivation; SDL resource creation and installation remain in Browser.
+- `image_loader.zig` owns HTML-image eager/lazy selection, per-batch URL
+  deduplication, fetch/decode, and stable broken-image fallback. Frames copy
+  image-node bounds from layout; lazy selection uses each frame's scroll and a
+  one-CSS-pixel-viewport preload margin after accessibility zoom conversion. A
+  newly decoded image always schedules layout and paint because its natural
+  dimensions may change geometry.
 - A Tab also owns the native `setInterval` cancellation registry under its
   interval mutex. Keys include window ID, document generation, and JavaScript
   handle. Sleeping one-shot helpers poll this registry at most every 10ms;

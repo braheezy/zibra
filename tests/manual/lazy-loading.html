@@ -1,0 +1,29 @@
+<!doctype html>
+<!--
+How to verify:
+1. From the repository root run `python3 -m http.server 8000`, then open
+   http://127.0.0.1:8000/tests/manual/lazy-loading.html in Zibra.
+2. On the first screen both compact images are painted. The server log should
+   contain requests ending in `?eager` and `?near`, but no `?far` request.
+3. Scroll down. Shortly before the "intrinsic lazy image" heading is visible,
+   exactly one `?far` request should appear. The large image then occupies its
+   natural 800x600 size and pushes the green AFTER marker downward.
+4. Scroll away and back. No image should be requested a second time, and the
+   post-load layout must remain stable.
+-->
+<style>
+  body { font-family: sans-serif; background-color: #f8fafc; color: #17233b; }
+  h1, h2, p, .marker { display: block; }
+  img { background-color: #dbeafe; }
+  .compact { width: 160px; height: 80px; }
+  .spacer { display: block; height: 1500px; background-color: #e2e8f0; }
+  .marker { height: 48px; background-color: #86efac; color: #14532d; }
+</style>
+<h1>Lazy image loading</h1>
+<p>Both images below should paint on the initial viewport.</p>
+<img class=compact src="background-image-pattern.ppm?eager">
+<img class=compact loading=lazy src="background-image-pattern.ppm?near">
+<div class=spacer>Scroll toward the bottom; the far image is not fetched yet.</div>
+<h2 id=far>Intrinsic lazy image</h2>
+<img loading=lazy src="../golden/native-screenshot.macos.png?far">
+<div class=marker>AFTER: loading the image must move this marker below it.</div>

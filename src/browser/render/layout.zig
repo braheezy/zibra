@@ -1767,6 +1767,9 @@ soft_hyphen_word_has_content: bool = false,
 
 // Map of input element nodes to their bounding boxes for hit testing
 input_bounds: std.AutoHashMap(*Node, Bounds),
+// Document-space boxes/anchors for HTML images. Frames retain a copy after
+// layout so lazy loading can select nearby images without borrowing layouts.
+image_bounds: std.AutoHashMap(*Node, Bounds),
 // Collected bounds for anchor elements
 link_bounds: std.ArrayList(LinkBoundEntry),
 // Collected bounds for iframe elements
@@ -2094,6 +2097,7 @@ pub fn init(
         .word_cache = std.AutoHashMap(u64, WordCache).init(allocator),
         .soft_hyphen_breaks = std.ArrayList(SoftHyphenBreak).empty,
         .input_bounds = std.AutoHashMap(*Node, Bounds).init(allocator),
+        .image_bounds = std.AutoHashMap(*Node, Bounds).init(allocator),
         .link_bounds = std.ArrayList(LinkBoundEntry).empty,
         .iframe_bounds = std.ArrayList(IframeBoundEntry).empty,
         .focus_bounds = std.ArrayList(FocusBoundEntry).empty,
@@ -2121,6 +2125,7 @@ pub fn deinit(self: *Layout) void {
     self.soft_hyphen_breaks.deinit(self.allocator);
 
     self.input_bounds.deinit();
+    self.image_bounds.deinit();
     self.link_bounds.deinit(self.allocator);
     self.iframe_bounds.deinit(self.allocator);
     self.focus_bounds.deinit(self.allocator);
@@ -2298,7 +2303,6 @@ fn handleImageElement(self: *Layout, node: Node, node_ptr: ?*Node, line_buffer: 
         self.scaleActiveCssPixel(@intCast(data.image.height))
     else
         0;
-
     var layout_width: i32 = 0;
     var layout_height: i32 = 0;
 
@@ -2324,7 +2328,22 @@ fn handleImageElement(self: *Layout, node: Node, node_ptr: ?*Node, line_buffer: 
         layout_height = intrinsic_height;
     }
 
-    if (layout_width <= 0 or layout_height <= 0) return;
+    if (layout_width <= 0 or layout_height <= 0) {
+        // An intrinsic-only lazy image has no dimensions until decode, but it
+        // still needs a stable position at which scrolling can discover it.
+        // The one-pixel anchor is visibility metadata, not occupied layout.
+        if (self.collect_hit_test_bounds) {
+            if (node_ptr) |ptr| {
+                try self.image_bounds.put(ptr, .{
+                    .x = self.cursor_x + self.transform_offset_x,
+                    .y = self.cursor_y + self.transform_offset_y,
+                    .width = 1,
+                    .height = 1,
+                });
+            }
+        }
+        return;
+    }
 
     var image_layout = ImageLayout.init(
         self.allocator,
@@ -2923,6 +2942,14 @@ fn flushLine(self: *Layout, line_buffer: *std.ArrayList(LineItem)) !void {
             if (self.collect_hit_test_bounds) {
                 if (item.payload == .input) {
                     try self.input_bounds.put(ptr, .{
+                        .x = bounds_x,
+                        .y = bounds_y,
+                        .width = item.width,
+                        .height = item.height,
+                    });
+                }
+                if (item.payload == .image) {
+                    try self.image_bounds.put(ptr, .{
                         .x = bounds_x,
                         .y = bounds_y,
                         .width = item.width,
@@ -4148,6 +4175,7 @@ const ButtonLayout = struct {
     content_offset_x: i32 = button_padding,
     content_offset_y: i32 = button_padding,
     input_bounds: std.AutoHashMap(*Node, Bounds),
+    image_bounds: std.AutoHashMap(*Node, Bounds),
     link_bounds: std.ArrayList(LinkBoundEntry),
     iframe_bounds: std.ArrayList(IframeBoundEntry),
     focus_bounds: std.ArrayList(FocusBoundEntry),
@@ -4159,6 +4187,7 @@ const ButtonLayout = struct {
             .embed = EmbedLayout.init(allocator),
             .commands = std.ArrayList(DisplayItem).empty,
             .input_bounds = std.AutoHashMap(*Node, Bounds).init(allocator),
+            .image_bounds = std.AutoHashMap(*Node, Bounds).init(allocator),
             .link_bounds = std.ArrayList(LinkBoundEntry).empty,
             .iframe_bounds = std.ArrayList(IframeBoundEntry).empty,
             .focus_bounds = std.ArrayList(FocusBoundEntry).empty,
@@ -4177,6 +4206,7 @@ const ButtonLayout = struct {
             self.root = null;
         }
         self.input_bounds.deinit();
+        self.image_bounds.deinit();
         self.link_bounds.deinit(allocator);
         self.iframe_bounds.deinit(allocator);
         self.focus_bounds.deinit(allocator);
@@ -4187,6 +4217,7 @@ const ButtonLayout = struct {
 
     fn swapCollectors(self: *ButtonLayout, engine: *Layout) void {
         std.mem.swap(@TypeOf(self.input_bounds), &self.input_bounds, &engine.input_bounds);
+        std.mem.swap(@TypeOf(self.image_bounds), &self.image_bounds, &engine.image_bounds);
         std.mem.swap(@TypeOf(self.link_bounds), &self.link_bounds, &engine.link_bounds);
         std.mem.swap(@TypeOf(self.iframe_bounds), &self.iframe_bounds, &engine.iframe_bounds);
         std.mem.swap(@TypeOf(self.focus_bounds), &self.focus_bounds, &engine.focus_bounds);
@@ -4397,6 +4428,10 @@ const ButtonLayout = struct {
         var input_iterator = self.input_bounds.iterator();
         while (input_iterator.next()) |entry| {
             try engine.input_bounds.put(entry.key_ptr.*, offsetBounds(entry.value_ptr.*, dx, dy));
+        }
+        var image_iterator = self.image_bounds.iterator();
+        while (image_iterator.next()) |entry| {
+            try engine.image_bounds.put(entry.key_ptr.*, offsetBounds(entry.value_ptr.*, dx, dy));
         }
         for (self.link_bounds.items) |entry| try engine.link_bounds.append(engine.allocator, .{
             .node = entry.node,
@@ -5287,6 +5322,11 @@ const LineLayout = struct {
         block_parent.document.has_dirty_descendants = true;
     }
 
+    fn markSubtree(self: *LineLayout) void {
+        self.mark();
+        for (self.children.items) |child| child.mark();
+    }
+
     fn shouldPaint(self: *const LineLayout) bool {
         _ = self;
         return true;
@@ -5386,6 +5426,7 @@ pub const DocumentLayout = struct {
         self.zoom.set(zoom_value);
 
         engine.input_bounds.clearRetainingCapacity();
+        engine.image_bounds.clearRetainingCapacity();
         engine.link_bounds.clearRetainingCapacity();
         engine.iframe_bounds.clearRetainingCapacity();
         engine.focus_bounds.clearRetainingCapacity();
@@ -5472,7 +5513,7 @@ pub const DocumentLayout = struct {
         self.has_dirty_descendants = true;
         // Also mark all children so they re-layout
         for (self.children.items) |child| {
-            child.mark();
+            child.markSubtree();
         }
     }
 
@@ -5866,6 +5907,14 @@ const BlockLayout = struct {
             if (self.document.has_dirty_descendants) return;
             self.document.has_dirty_descendants = true;
         }
+    }
+
+    fn markSubtree(self: *BlockLayout) void {
+        self.mark();
+        for (self.children.items) |child| switch (child) {
+            .block => |block| block.markSubtree(),
+            .line => |line| line.markSubtree(),
+        };
     }
 
     fn isBlockContainer(self: *BlockLayout) bool {

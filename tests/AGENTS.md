@@ -292,3 +292,7 @@ unused fetch; `browser_background_images.zig` provides the deterministic count.
 `tests/manual/object-fit.html` puts the same wide diagnostic PPM into fixed
 replaced-element boxes. It distinguishes stretched `fill`, centered letterbox
 `contain`, and centered fractional `cover` cropping without pixel spill.
+
+`tests/manual/lazy-loading.html` distinguishes eager, near-viewport lazy, and
+far lazy requests using HTTP-log query suffixes. Its far intrinsic-size image
+must reflow the green marker after decode and remain stable without refetching.

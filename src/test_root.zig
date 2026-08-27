@@ -30,6 +30,7 @@ comptime {
     _ = @import("tests/browser_raster_worker.zig");
     _ = @import("tests/browser_canvas.zig");
     _ = @import("tests/browser_background_images.zig");
+    _ = @import("tests/browser_lazy_images.zig");
     _ = @import("tests/browser_dynamic_resources.zig");
     _ = @import("tests/browser_networking.zig");
     _ = @import("tests/browser_security.zig");

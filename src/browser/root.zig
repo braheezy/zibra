@@ -10,7 +10,6 @@ const Mutex = @import("../runtime/sync.zig").Mutex;
 const sdl2 = @import("sdl");
 const z2d = @import("z2d");
 const compositor = z2d.compositor;
-const zigimg = @import("zigimg");
 
 const font = @import("render/font.zig");
 const Glyph = font.Glyph;
@@ -34,6 +33,7 @@ pub const RasterSnapshot = raster_snapshot.RasterSnapshot;
 pub const rasterBlendNeedsIsolation = raster_snapshot.blendNeedsIsolation;
 const compositor_cache = @import("render/compositor_cache.zig");
 const background_images = @import("background_images.zig");
+const image_loader = @import("image_loader.zig");
 const CompositorCache = compositor_cache.Cache;
 const CompositorUpdate = compositor_cache.Update;
 const navigation = @import("navigation.zig");
@@ -58,7 +58,6 @@ const parser = @import("../document/parser.zig");
 const dom_focus = @import("../document/focus.zig");
 const HTMLParser = parser.HTMLParser;
 const Node = parser.Node;
-const ImageData = parser.ImageData;
 const CSSParser = @import("../document/css_parser.zig").CSSParser;
 const js_module = @import("../script/js.zig");
 pub const JsRenderContext = @import("js_context.zig").JsRenderContext;
@@ -102,6 +101,26 @@ const BackgroundImageLoadCallbacks = struct {
     pub fn retire(context: *BackgroundImageLoadContext) void {
         context.browser.retireRenderStateForTab(context.frame.tab);
         context.frame.retireDisplayList();
+    }
+};
+
+const ImageLoadContext = struct {
+    browser: *Browser,
+    frame: *Frame,
+};
+
+const ImageLoadCallbacks = struct {
+    pub fn allowed(context: *ImageLoadContext, target: Url, base: *const Url) bool {
+        return context.frame.allowedRequest(target, base);
+    }
+
+    pub fn fetch(
+        context: *ImageLoadContext,
+        target: Url,
+        referrer: Url,
+        policy: url_module.ReferrerPolicy,
+    ) !url_module.HttpResponse {
+        return context.browser.fetchBodyWithReferrerPolicy(target, referrer, null, policy);
     }
 };
 
@@ -380,30 +399,6 @@ const DocumentResourceBatch = struct {
     }
 };
 
-fn createBrokenImage(allocator: std.mem.Allocator) !zigimg.Image {
-    const width: usize = 16;
-    const height: usize = 16;
-    const pixel_count = width * height;
-    var pixels = try allocator.alloc(u8, pixel_count * 4);
-    errdefer allocator.free(pixels);
-
-    var idx: usize = 0;
-    for (0..height) |y| {
-        for (0..width) |x| {
-            const is_cross = x == y or x + y == width - 1;
-            const r: u8 = if (is_cross) 0xCC else 0xEE;
-            const g: u8 = if (is_cross) 0x33 else 0xEE;
-            const b: u8 = if (is_cross) 0x33 else 0xEE;
-            pixels[idx] = r;
-            pixels[idx + 1] = g;
-            pixels[idx + 2] = b;
-            pixels[idx + 3] = 0xFF;
-            idx += 4;
-        }
-    }
-
-    return zigimg.Image.fromRawPixelsOwned(width, height, pixels, .rgba32);
-}
 pub const h_offset = 13;
 pub const v_offset = 18;
 pub const scrollbar_width = 10;
@@ -2736,7 +2731,8 @@ pub const Browser = struct {
             var resources = try self.fetchDocumentResources(frame, url, node_list.items);
             defer resources.deinit();
 
-            // Download and decode <img> elements before layout/paint.
+            // Download eager <img> elements before layout/paint. Lazy images
+            // need the first layout generation to publish their positions.
             self.loadImages(frame, url, node_list.items) catch |err| {
                 std.log.warn("Failed to load images: {}", .{err});
             };
@@ -2933,6 +2929,7 @@ pub const Browser = struct {
         frame.retireDisplayList();
 
         frame.input_bounds.clearRetainingCapacity();
+        frame.image_bounds.clearRetainingCapacity();
         frame.link_bounds.clearRetainingCapacity();
         frame.iframe_bounds.clearRetainingCapacity();
         frame.focus_bounds.clearRetainingCapacity();
@@ -3224,140 +3221,97 @@ pub const Browser = struct {
     }
 
     fn loadImages(self: *Browser, frame: *Frame, page_url: *Url, nodes: []*Node) !void {
-        const ImageCacheEntry = struct {
-            width: usize,
-            height: usize,
-            pixels: []const u8,
-        };
-
-        var image_cache = std.StringHashMap(ImageCacheEntry).init(self.allocator);
-        defer {
-            var it = image_cache.iterator();
-            while (it.next()) |entry| {
-                self.allocator.free(entry.key_ptr.*);
-                self.allocator.free(entry.value_ptr.pixels);
-            }
-            image_cache.deinit();
-        }
-
+        var candidates = std.ArrayList(image_loader.Candidate).empty;
+        defer candidates.deinit(self.allocator);
         for (nodes) |node| {
             switch (node.*) {
                 .element => |*element| {
-                    if (!std.mem.eql(u8, element.tag, "img")) continue;
-                    const attrs = element.attributes orelse continue;
-                    const src = attrs.get("src") orelse continue;
-                    if (src.len == 0) continue;
-
-                    var image_url = page_url.*.resolve(self.allocator, src) catch |err| {
-                        std.log.warn("Failed to resolve image URL {s}: {}", .{ src, err });
-                        if (element.image_data) |*existing| {
-                            existing.deinit(self.allocator);
-                        }
-                        const broken = try createBrokenImage(self.allocator);
-                        element.image_data = ImageData{
-                            .encoded_bytes = null,
-                            .image = broken,
-                        };
-                        continue;
-                    };
-                    defer image_url.free(self.allocator);
-
-                    if (!frame.allowedRequest(image_url, page_url)) {
-                        std.log.warn("Blocked image {s} due to CSP", .{src});
-                        continue;
+                    if (std.ascii.eqlIgnoreCase(element.tag, "img")) {
+                        try candidates.append(self.allocator, .{ .element = element });
                     }
-
-                    const cache_key = try self.allocator.dupe(u8, image_url.path);
-                    if (image_cache.get(cache_key)) |entry| {
-                        self.allocator.free(cache_key);
-                        const pixels_copy = try self.allocator.dupe(u8, entry.pixels);
-                        const image = try zigimg.Image.fromRawPixelsOwned(entry.width, entry.height, pixels_copy, .rgba32);
-                        if (element.image_data) |*existing| {
-                            existing.deinit(self.allocator);
-                        }
-                        element.image_data = ImageData{
-                            .encoded_bytes = null,
-                            .image = image,
-                        };
-                        continue;
-                    }
-
-                    const image_response = self.fetchBodyWithReferrerPolicy(
-                        image_url,
-                        page_url.*,
-                        null,
-                        frame.referrer_policy,
-                    ) catch |err| {
-                        std.log.warn("Failed to load image {s}: {}", .{ src, err });
-                        self.allocator.free(cache_key);
-                        if (element.image_data) |*existing| {
-                            existing.deinit(self.allocator);
-                        }
-                        const broken = try createBrokenImage(self.allocator);
-                        element.image_data = ImageData{
-                            .encoded_bytes = null,
-                            .image = broken,
-                        };
-                        continue;
-                    };
-                    defer if (image_response.csp_header) |hdr| self.allocator.free(hdr);
-
-                    var encoded_bytes = image_response.body;
-                    if (std.mem.eql(u8, image_url.scheme, "data") or std.mem.eql(u8, image_url.scheme, "about")) {
-                        const copy = try self.allocator.alloc(u8, encoded_bytes.len);
-                        @memcpy(copy, encoded_bytes);
-                        encoded_bytes = copy;
-                    }
-
-                    var image = zigimg.Image.fromMemory(self.allocator, encoded_bytes) catch |err| {
-                        std.log.warn("Failed to decode image {s}: {}", .{ src, err });
-                        self.allocator.free(encoded_bytes);
-                        self.allocator.free(cache_key);
-                        if (element.image_data) |*existing| {
-                            existing.deinit(self.allocator);
-                        }
-                        const broken = try createBrokenImage(self.allocator);
-                        element.image_data = ImageData{
-                            .encoded_bytes = null,
-                            .image = broken,
-                        };
-                        continue;
-                    };
-
-                    image.convert(self.allocator, .rgba32) catch |err| {
-                        std.log.warn("Failed to convert image {s} to RGBA: {}", .{ src, err });
-                        image.deinit(self.allocator);
-                        self.allocator.free(encoded_bytes);
-                        self.allocator.free(cache_key);
-                        if (element.image_data) |*existing| {
-                            existing.deinit(self.allocator);
-                        }
-                        const broken = try createBrokenImage(self.allocator);
-                        element.image_data = ImageData{
-                            .encoded_bytes = null,
-                            .image = broken,
-                        };
-                        continue;
-                    };
-
-                    const cached_pixels = try self.allocator.dupe(u8, image.rawBytes());
-                    try image_cache.put(cache_key, .{
-                        .width = image.width,
-                        .height = image.height,
-                        .pixels = cached_pixels,
-                    });
-
-                    if (element.image_data) |*existing| {
-                        existing.deinit(self.allocator);
-                    }
-                    element.image_data = ImageData{
-                        .encoded_bytes = encoded_bytes,
-                        .image = image,
-                    };
                 },
                 .text => {},
             }
         }
+
+        var context = ImageLoadContext{ .browser = self, .frame = frame };
+        _ = try image_loader.loadCandidates(
+            self.allocator,
+            candidates.items,
+            .eager,
+            page_url,
+            frame.referrer_policy,
+            &context,
+            ImageLoadCallbacks,
+        );
+    }
+
+    /// Load lazy `<img>` elements whose most recently laid-out box is within
+    /// one viewport of this frame's visible region. A successful load dirties
+    /// layout because intrinsic dimensions can change from zero to the decoded
+    /// image size.
+    pub fn loadLazyImagesNearViewport(self: *Browser, frame: *Frame) !bool {
+        const page_url = frame.current_url orelse return false;
+        if (frame.image_bounds.count() == 0) return false;
+
+        var candidates = std.ArrayList(image_loader.Candidate).empty;
+        defer candidates.deinit(self.allocator);
+        try candidates.ensureTotalCapacity(self.allocator, frame.image_bounds.count());
+
+        var iterator = frame.image_bounds.iterator();
+        while (iterator.next()) |entry| {
+            const element = switch (entry.key_ptr.*.*) {
+                .element => |*element| element,
+                .text => continue,
+            };
+            const bounds = entry.value_ptr.*;
+            candidates.appendAssumeCapacity(.{
+                .element = element,
+                .bounds = .{
+                    .x = bounds.x,
+                    .y = bounds.y,
+                    .width = bounds.width,
+                    .height = bounds.height,
+                },
+            });
+        }
+
+        const viewport_height = @max(scroll_model.viewportHeightCss(
+            frame.viewport_height,
+            frame.tab.accessibility.zoom,
+        ), 1);
+        var context = ImageLoadContext{ .browser = self, .frame = frame };
+        errdefer {
+            // A batch may have installed earlier candidates before a later
+            // allocation fails. Conservatively reflow so those owned pixels
+            // are never left invisible behind an otherwise-clean frame.
+            if (frame.document_layout) |document| document.mark();
+            frame.tab.needs_layout = true;
+            frame.tab.needs_paint = true;
+            self.setNeedsAnimationFrame(frame.tab);
+            self.scheduleAnimationFrame();
+        }
+        const loaded = try image_loader.loadCandidates(
+            self.allocator,
+            candidates.items,
+            .{ .lazy_near = .{
+                .scroll = frame.scroll,
+                .height = viewport_height,
+                .preload_margin = viewport_height,
+            } },
+            page_url,
+            frame.referrer_policy,
+            &context,
+            ImageLoadCallbacks,
+        );
+        if (loaded == 0) return false;
+
+        if (frame.document_layout) |document| document.mark();
+        frame.tab.needs_layout = true;
+        frame.tab.needs_paint = true;
+        self.setNeedsAnimationFrame(frame.tab);
+        self.scheduleAnimationFrame();
+        return true;
     }
 
     fn loadIframes(self: *Browser, parent: *Frame, page_url: *Url, nodes: []*Node) !void {
@@ -3920,6 +3874,11 @@ pub const Browser = struct {
         var nodes = std.ArrayList(*Node).empty;
         defer nodes.deinit(self.allocator);
         try parser.treeToList(self.allocator, root, &nodes);
+
+        // Newly attached eager images load with the same semantics as images
+        // found during navigation. Lazy images wait for the post-layout
+        // visibility pass, which needs their actual document-space bounds.
+        try self.loadImages(frame, page_url, nodes.items);
 
         var resources = try self.fetchDocumentResources(frame, page_url, nodes.items);
         defer resources.deinit();

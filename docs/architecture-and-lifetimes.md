@@ -42,6 +42,7 @@ The source tree is organized by responsibility:
 | [`src/browser/script_tasks.zig`](../src/browser/script_tasks.zig) | Detached timer, animation, asynchronous XHR, cookie, and postMessage callback adapters and queued payload cleanup, instantiated without importing `root.zig`. |
 | [`src/browser/chrome.zig`](../src/browser/chrome.zig) | Browser-owned internal HTML chrome, its dedicated layout/font state, semantic actions, address editing, and retained display data. |
 | [`src/browser/navigation.zig`](../src/browser/navigation.zig) | Browser-generated navigation documents, certificate-warning HTML, and committed transport-security classification. |
+| [`src/browser/image_loader.zig`](../src/browser/image_loader.zig) | Eager/lazy HTML-image selection, URL resolution, fetch/decode ownership, batch deduplication, and broken-image fallback. |
 | [`src/browser/frame_timing.zig`](../src/browser/frame_timing.zig) | Smoothed two-stage frame-work estimates, cadence buckets, and absolute animation deadlines. |
 | [`src/browser/window_geometry.zig`](../src/browser/window_geometry.zig) | Pure native-window resize and bounded tab-surface geometry derivation. |
 | [`src/browser/session_state.zig`](../src/browser/session_state.zig) | Window-independent networking task runner, HTTP client/cookies/cache, visited/bookmarked URL state, generated bookmark HTML, and separate network-data/metadata synchronization. |
@@ -299,7 +300,8 @@ and the standalone Browser in screenshot mode.
 - document layout and the frame-side display list;
 - owned CSS rules and keyframe containers plus their source buffers, including
   decoded linked sheets and copied `<style>` text retained in DOM order;
-- hit-test collections, fragment target positions, and allowed-origin strings;
+- hit-test collections, image visibility boxes, fragment target positions, and
+  allowed-origin strings;
 - a frame-owned URL only when `current_url_owned` is true.
 
 The root frame normally borrows its URL from `Tab.history`; child frames may
@@ -328,6 +330,23 @@ may borrow its RGBA bytes. CSP and the document's Referrer-Policy are applied
 before fetching; blocked and failed resources remain transparent. Forced-colors
 treats decorative backgrounds as unused, avoiding a fetch for a newly loaded
 document and releasing an earlier resource after its render borrowers retire.
+
+HTML image discovery has a separate two-stage boundary. Missing, invalid, and
+explicit `loading=eager` values load before initial layout; only an ASCII
+case-insensitive `loading=lazy` defers the request. Layout publishes an
+image-node box for every `<img>` and a one-pixel position anchor for an
+unloaded intrinsic-only image, which still occupies zero line space. The Frame
+copies those DOM-keyed coordinates out of the shared Layout engine. After
+layout and before every animation-frame dirty gate, the serialized Tab worker
+selects lazy boxes within one frame viewport above or below the visible range
+in CSS pixels (after accessibility zoom conversion) and synchronously bridges
+their request through the session networking runner.
+This pre-gate check is required because root scrolling can otherwise remain a
+draw-only update. A decoded or stable broken image installs Element-owned
+pixels, marks the complete `DocumentLayout` subtree, and schedules a follow-up
+layout/paint so natural dimensions, line wrapping, page height, and iframe composition are
+republished. DOM mutation retires the image-box map with the other raw-Node
+indexes before child storage can move.
 
 Root documents, child documents, and those mutation rescans discover every
 external classic script and linked stylesheet into one fixed batch. Each slot
@@ -393,7 +412,9 @@ fractional boundary matters for low-resolution images and is copied unchanged
 through display-list and raster-snapshot owners. Paint/compositor bounds use
 the visible destination, while the synchronous display item retains the full
 element box for hit testing; source provenance is still cleared at the worker
-snapshot boundary.
+snapshot boundary. Authored width and height therefore reserve their box before
+a lazy request completes; without either dimension the pre-load box is zero
+space, and the post-decode layout uses the natural bitmap size.
 
 An iframe placeholder carries its numeric authored effective zoom alongside
 its already-scaled rectangle. The child Frame stores that factor independently

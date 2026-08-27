@@ -94,6 +94,11 @@ before changing ownership or thread boundaries.
   using the initial centered object position. Layout emits only the visible
   destination and an exact source crop, while hit testing uses the complete
   element box. CSS pixel width/height override the matching HTML attributes.
+  Every image also publishes document-space bounds for Frame-owned lazy-load
+  selection. An unloaded intrinsic-only image publishes a one-pixel position
+  anchor but occupies no line space; after decode, dirtying the complete
+  `DocumentLayout` subtree replaces that anchor with its natural box and
+  reflows following content, including through implicit HTML wrapper blocks.
 - `effects.zig` contains pixel-only software effects. Keep its APIs explicit
   about premultiplication, edge sampling, and temporary allocation.
 - `raster_snapshot.zig` is the thread-transfer boundary. Snapshots must deep
