@@ -11,6 +11,7 @@ const browser = @import("../root.zig");
 const grapheme = @import("grapheme");
 const parser = @import("../../document/parser.zig");
 const background_image = @import("../../document/background_image.zig");
+const object_fit = @import("../../document/object_fit.zig");
 const dom_focus = @import("../../document/focus.zig");
 const ProtectedField = @import("../../core/protected_field.zig").ProtectedField;
 const DisplayItem = browser.DisplayItem;
@@ -299,12 +300,11 @@ fn backgroundImagePaintForSource(source: ?browser.DisplayItemSource) ?Background
     };
 }
 
-fn croppedSourceExtent(clipped: i32, desired: i32, source: i32) i32 {
-    if (clipped >= desired) return source;
-    const scaled = @as(f64, @floatFromInt(clipped)) *
+fn croppedSourceExtent(clipped: i32, desired: i32, source: i32) f64 {
+    if (clipped >= desired) return @floatFromInt(source);
+    return @as(f64, @floatFromInt(clipped)) *
         @as(f64, @floatFromInt(source)) /
         @as(f64, @floatFromInt(desired));
-    return std.math.clamp(@as(i32, @intFromFloat(@ceil(scaled))), 1, source);
 }
 
 /// Paint one non-repeating image anchored at the background-position default
@@ -335,7 +335,7 @@ fn appendBackgroundImageBox(
     const clipped_height = @min(height, resolved.height);
     if (clipped_width <= 0 or clipped_height <= 0) return;
     const is_cropped = clipped_width != resolved.width or clipped_height != resolved.height;
-    const source_rect: ?browser.Rect = if (is_cropped) .{
+    const source_rect: ?browser.ImageSourceRect = if (is_cropped) .{
         .left = 0,
         .top = 0,
         .right = croppedSourceExtent(clipped_width, resolved.width, paint.source_width),
@@ -385,7 +385,10 @@ test "background image paint resolves size and crops oversized cover geometry" {
     const image = commands.items[0].image;
     try std.testing.expectEqual(@as(i32, 10), image.x1);
     try std.testing.expectEqual(@as(i32, 110), image.x2);
-    try std.testing.expectEqual(browser.Rect{ .left = 0, .top = 0, .right = 1, .bottom = 1 }, image.source_rect.?);
+    try std.testing.expectEqual(
+        browser.ImageSourceRect{ .left = 0, .top = 0, .right = 1, .bottom = 1 },
+        image.source_rect.?,
+    );
 }
 
 /// Wrap one control's complete painted payload in its rounded hit shape.
@@ -723,12 +726,17 @@ const ImageLayout = struct {
     pixels: []const u8,
     source_width: i32,
     source_height: i32,
+    natural_width: i32,
+    natural_height: i32,
+    fit: object_fit.Mode,
     opacity: f64 = 1.0,
 
     fn init(
         allocator: std.mem.Allocator,
         layout_width: i32,
         layout_height: i32,
+        natural_width: i32,
+        natural_height: i32,
         image_data: ?parser.ImageData,
         parent_block: ?*BlockLayout,
         style_map: ?*const parser.StyleMap,
@@ -742,19 +750,114 @@ const ImageLayout = struct {
             .pixels = if (image_data) |data| data.image.rawBytes() else empty_pixels,
             .source_width = src_width,
             .source_height = src_height,
+            .natural_width = natural_width,
+            .natural_height = natural_height,
+            .fit = if (style_map) |styles|
+                if (styleValue(styles, "object-fit")) |value|
+                    object_fit.parse(value) orelse .fill
+                else
+                    .fill
+            else
+                .fill,
             .opacity = 1.0,
         };
         _ = parent_block;
-        _ = style_map;
         layout.embed.setupDependencies();
         layout.embed.setMetrics(layout_width, layout_height, layout_height, 0, zoom_value, 0);
         return layout;
+    }
+
+    fn displayItem(
+        self: *const ImageLayout,
+        box_x: i32,
+        box_y: i32,
+        box_width: i32,
+        box_height: i32,
+        source: ?browser.DisplayItemSource,
+    ) browser.ImageDisplayItem {
+        const geometry = object_fit.resolve(
+            self.fit,
+            box_width,
+            box_height,
+            self.natural_width,
+            self.natural_height,
+            self.source_width,
+            self.source_height,
+        ) orelse object_fit.Geometry{
+            .destination = .{ .left = 0, .top = 0, .right = box_width, .bottom = box_height },
+            .source = null,
+        };
+        const source_rect: ?browser.ImageSourceRect = if (geometry.source) |crop| .{
+            .left = crop.left,
+            .top = crop.top,
+            .right = crop.right,
+            .bottom = crop.bottom,
+        } else null;
+        return .{
+            .x1 = box_x +| geometry.destination.left,
+            .y1 = box_y +| geometry.destination.top,
+            .x2 = box_x +| geometry.destination.right,
+            .y2 = box_y +| geometry.destination.bottom,
+            .source_width = self.source_width,
+            .source_height = self.source_height,
+            .pixels = self.pixels,
+            .source_rect = source_rect,
+            .hit_rect = .{
+                .left = box_x,
+                .top = box_y,
+                .right = box_x +| box_width,
+                .bottom = box_y +| box_height,
+            },
+            .opacity = self.opacity,
+            .source = source,
+        };
     }
 
     fn deinit(self: *ImageLayout) void {
         self.embed.deinit();
     }
 };
+
+test "object-fit separates fitted image paint from the replaced element hit box" {
+    const allocator = std.testing.allocator;
+    var image = ImageLayout.init(
+        allocator,
+        100,
+        100,
+        200,
+        100,
+        null,
+        null,
+        null,
+        1.0,
+    );
+    defer image.deinit();
+    image.source_width = 200;
+    image.source_height = 100;
+
+    image.fit = .contain;
+    const contained = image.displayItem(10, 20, 100, 100, null);
+    try std.testing.expectEqual(@as(i32, 10), contained.x1);
+    try std.testing.expectEqual(@as(i32, 45), contained.y1);
+    try std.testing.expectEqual(@as(i32, 110), contained.x2);
+    try std.testing.expectEqual(@as(i32, 95), contained.y2);
+    try std.testing.expect(contained.source_rect == null);
+    try std.testing.expectEqual(
+        browser.Rect{ .left = 10, .top = 20, .right = 110, .bottom = 120 },
+        contained.hit_rect.?,
+    );
+
+    image.fit = .cover;
+    const covered = image.displayItem(10, 20, 100, 100, null);
+    try std.testing.expectEqual(@as(i32, 10), covered.x1);
+    try std.testing.expectEqual(@as(i32, 20), covered.y1);
+    try std.testing.expectEqual(@as(i32, 110), covered.x2);
+    try std.testing.expectEqual(@as(i32, 120), covered.y2);
+    try std.testing.expectEqual(
+        browser.ImageSourceRect{ .left = 50, .top = 0, .right = 150, .bottom = 100 },
+        covered.source_rect.?,
+    );
+}
 
 const CanvasLayout = struct {
     embed: EmbedLayout,
@@ -1832,6 +1935,19 @@ fn parseLengthAttribute(value: []const u8) ?i32 {
     return std.fmt.parseInt(i32, value, 10) catch null;
 }
 
+fn preserveAspectDimension(fixed: i32, numerator: i32, denominator: i32) i32 {
+    if (denominator <= 0) return 0;
+    const result = @divTrunc(
+        @as(i64, fixed) * @as(i64, numerator),
+        @as(i64, denominator),
+    );
+    return @intCast(std.math.clamp(
+        result,
+        @as(i64, std.math.minInt(i32)),
+        @as(i64, std.math.maxInt(i32)),
+    ));
+}
+
 pub fn resolveColorScheme(self: *const Layout, value: []const u8) bool {
     const support = parseColorSchemeValue(value);
     if (!support.light and !support.dark) return self.accessibility.prefers_dark;
@@ -2138,6 +2254,11 @@ fn handleImageElement(self: *Layout, node: Node, node_ptr: ?*Node, line_buffer: 
     };
     self.resetSoftHyphenWord();
 
+    const style_map = if (node == .element) blk: {
+        if (node.element.style) |*map| break :blk map;
+        break :blk null;
+    } else null;
+
     var width_attr: ?i32 = null;
     var height_attr: ?i32 = null;
     if (element.attributes) |attrs| {
@@ -2149,33 +2270,52 @@ fn handleImageElement(self: *Layout, node: Node, node_ptr: ?*Node, line_buffer: 
         }
     }
 
+    const css_width = if (style_map) |styles|
+        if (resolvedPixelDimension(&element, styles, "width")) |width|
+            self.scaleActiveCssPixel(width)
+        else
+            null
+    else
+        null;
+    const css_height = if (style_map) |styles|
+        if (resolvedPixelDimension(&element, styles, "height")) |height|
+            self.scaleActiveCssPixel(height)
+        else
+            null
+    else
+        null;
+    const specified_width = css_width orelse
+        if (width_attr) |width| self.scaleActiveCssPixel(width) else null;
+    const specified_height = css_height orelse
+        if (height_attr) |height| self.scaleActiveCssPixel(height) else null;
+
     const image_data = element.image_data;
     const intrinsic_width: i32 = if (image_data) |data|
-        self.scaleActiveCssPixel(self.toLayoutPx(@intCast(data.image.width)))
+        self.scaleActiveCssPixel(@intCast(data.image.width))
     else
         0;
     const intrinsic_height: i32 = if (image_data) |data|
-        self.scaleActiveCssPixel(self.toLayoutPx(@intCast(data.image.height)))
+        self.scaleActiveCssPixel(@intCast(data.image.height))
     else
         0;
 
     var layout_width: i32 = 0;
     var layout_height: i32 = 0;
 
-    if (width_attr != null and height_attr != null) {
-        layout_width = self.scaleActiveCssPixel(width_attr.?);
-        layout_height = self.scaleActiveCssPixel(height_attr.?);
-    } else if (width_attr != null) {
-        layout_width = self.scaleActiveCssPixel(width_attr.?);
+    if (specified_width != null and specified_height != null) {
+        layout_width = specified_width.?;
+        layout_height = specified_height.?;
+    } else if (specified_width != null) {
+        layout_width = specified_width.?;
         if (intrinsic_width > 0 and intrinsic_height > 0) {
-            layout_height = @divTrunc(layout_width * intrinsic_height, intrinsic_width);
+            layout_height = preserveAspectDimension(layout_width, intrinsic_height, intrinsic_width);
         } else {
             layout_height = layout_width;
         }
-    } else if (height_attr != null) {
-        layout_height = self.scaleActiveCssPixel(height_attr.?);
+    } else if (specified_height != null) {
+        layout_height = specified_height.?;
         if (intrinsic_width > 0 and intrinsic_height > 0) {
-            layout_width = @divTrunc(layout_height * intrinsic_width, intrinsic_height);
+            layout_width = preserveAspectDimension(layout_height, intrinsic_width, intrinsic_height);
         } else {
             layout_width = layout_height;
         }
@@ -2186,11 +2326,17 @@ fn handleImageElement(self: *Layout, node: Node, node_ptr: ?*Node, line_buffer: 
 
     if (layout_width <= 0 or layout_height <= 0) return;
 
-    const style_map = if (node == .element) blk: {
-        if (node.element.style) |*map| break :blk map;
-        break :blk null;
-    } else null;
-    var image_layout = ImageLayout.init(self.allocator, layout_width, layout_height, image_data, self.inline_block, style_map, self.effectiveZoom());
+    var image_layout = ImageLayout.init(
+        self.allocator,
+        layout_width,
+        layout_height,
+        intrinsic_width,
+        intrinsic_height,
+        image_data,
+        self.inline_block,
+        style_map,
+        self.effectiveZoom(),
+    );
     try image_layout.embed.appendInline(self, line_buffer, node_ptr, .{
         .image = image_layout,
     });
@@ -2835,17 +2981,13 @@ fn flushLine(self: *Layout, line_buffer: *std.ArrayList(LineItem)) !void {
             },
             .image => |image_payload| {
                 try self.current_display_target.append(self.allocator, DisplayItem{
-                    .image = .{
-                        .x1 = item.x,
-                        .y1 = final_y,
-                        .x2 = item.x + item.width,
-                        .y2 = final_y + item.height,
-                        .source_width = image_payload.source_width,
-                        .source_height = image_payload.source_height,
-                        .pixels = image_payload.pixels,
-                        .opacity = image_payload.opacity,
-                        .source = source,
-                    },
+                    .image = image_payload.displayItem(
+                        item.x,
+                        final_y,
+                        item.width,
+                        item.height,
+                        source,
+                    ),
                 });
             },
             .canvas => |canvas_payload| {

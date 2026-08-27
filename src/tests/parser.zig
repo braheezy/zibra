@@ -1329,6 +1329,29 @@ test "width and height are computed without inheriting" {
     );
 }
 
+test "object-fit is computed per element and defaults to fill" {
+    const allocator = std.testing.allocator;
+    const html = "<div style='object-fit: cover'><img id=child></div>";
+
+    var html_parser = try HTMLParser.init(allocator, html);
+    html_parser.use_implicit_tags = false;
+    defer html_parser.deinit(allocator);
+    var root = try html_parser.parse();
+    defer root.deinit(allocator);
+
+    const rules = &[_]CSSParser.CSSRule{};
+    try document_parser.style(allocator, &root, rules);
+
+    try std.testing.expectEqualStrings(
+        "cover",
+        root.element.style.?.getPtr("object-fit").?.get().*,
+    );
+    try std.testing.expectEqualStrings(
+        "fill",
+        root.element.children.items[0].element.style.?.getPtr("object-fit").?.get().*,
+    );
+}
+
 test "zoom is computed per element without inheriting" {
     const allocator = std.testing.allocator;
     const html = "<div style=\"zoom: 175%\"><p>child</p></div>";

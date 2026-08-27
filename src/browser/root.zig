@@ -21,6 +21,7 @@ pub const Color = display_commands.Color;
 pub const Rect = display_commands.Rect;
 pub const CompositedLayer = display_commands.CompositedLayer;
 pub const ImageDisplayItem = display_commands.ImageDisplayItem;
+pub const ImageSourceRect = display_commands.ImageSourceRect;
 pub const CanvasDisplayItem = display_commands.CanvasDisplayItem;
 pub const DisplayItemSource = display_commands.DisplayItemSource;
 pub const RoundedHitClip = display_commands.RoundedHitClip;
@@ -105,23 +106,25 @@ const BackgroundImageLoadCallbacks = struct {
 };
 
 const RasterImageSource = struct {
-    left: i32,
-    top: i32,
-    width: i32,
-    height: i32,
+    left: f64,
+    top: f64,
+    width: f64,
+    height: f64,
 };
 
 fn rasterImageSource(image_item: anytype) RasterImageSource {
-    var left: i32 = 0;
-    var top: i32 = 0;
-    var right = image_item.source_width;
-    var bottom = image_item.source_height;
+    var left: f64 = 0;
+    var top: f64 = 0;
+    var right: f64 = @floatFromInt(image_item.source_width);
+    var bottom: f64 = @floatFromInt(image_item.source_height);
     if (comptime @hasField(@TypeOf(image_item), "source_rect")) {
         if (image_item.source_rect) |crop| {
-            left = std.math.clamp(crop.left, 0, image_item.source_width);
-            top = std.math.clamp(crop.top, 0, image_item.source_height);
-            right = std.math.clamp(crop.right, left, image_item.source_width);
-            bottom = std.math.clamp(crop.bottom, top, image_item.source_height);
+            const source_width: f64 = @floatFromInt(image_item.source_width);
+            const source_height: f64 = @floatFromInt(image_item.source_height);
+            left = std.math.clamp(crop.left, 0, source_width);
+            top = std.math.clamp(crop.top, 0, source_height);
+            right = std.math.clamp(crop.right, left, source_width);
+            bottom = std.math.clamp(crop.bottom, top, source_height);
         }
     }
     return .{ .left = left, .top = top, .width = right - left, .height = bottom - top };
@@ -131,12 +134,21 @@ fn mapImageSourceCoordinate(
     destination: i32,
     destination_start: i32,
     destination_size: i32,
-    source_start: i32,
-    source_size: i32,
+    source_start: f64,
+    source_size: f64,
 ) i32 {
-    const offset = @as(i64, destination) - @as(i64, destination_start);
-    const scaled = @divTrunc(offset * @as(i64, source_size), @as(i64, destination_size));
-    return source_start + @as(i32, @intCast(scaled));
+    if (destination_size <= 0 or source_size <= 0 or
+        !std.math.isFinite(source_start) or !std.math.isFinite(source_size)) return -1;
+    const offset: f64 = @floatFromInt(
+        @as(i64, destination) - @as(i64, destination_start),
+    );
+    const mapped = source_start + offset * source_size /
+        @as(f64, @floatFromInt(destination_size));
+    return @intFromFloat(@floor(std.math.clamp(
+        mapped,
+        @as(f64, @floatFromInt(std.math.minInt(i32))),
+        @as(f64, @floatFromInt(std.math.maxInt(i32))),
+    )));
 }
 
 test "raster image sampling honors a clipped background source rectangle" {
@@ -157,6 +169,8 @@ test "raster image sampling honors a clipped background source rectangle" {
     );
     try std.testing.expectEqual(@as(i32, 0), mapImageSourceCoordinate(0, 0, 120, 0, 2));
     try std.testing.expectEqual(@as(i32, 1), mapImageSourceCoordinate(119, 0, 120, 0, 2));
+    try std.testing.expectEqual(@as(i32, 0), mapImageSourceCoordinate(0, 0, 160, 0.4, 3.2));
+    try std.testing.expectEqual(@as(i32, 3), mapImageSourceCoordinate(159, 0, 160, 0.4, 3.2));
 }
 
 // Default browser stylesheet - defines default styling for HTML elements

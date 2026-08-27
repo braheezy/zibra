@@ -55,6 +55,7 @@ The source tree is organized by responsibility:
 | [`src/browser/render/compositor_cache.zig`](../src/browser/render/compositor_cache.zig) | Raster-worker-owned ordered planes, surface-or-short-command backing, and pointer-free opacity/translation updates used by draw-only animation and scrolling. |
 | [`src/document/parser.zig`](../src/document/parser.zig) | HTML parser, DOM representation, style maps, image/canvas owners, and DOM tree utilities. |
 | [`src/document/background_image.zig`](../src/document/background_image.zig) | Pure CSS background URL/size parsing and used-size resolution. |
+| [`src/document/object_fit.zig`](../src/document/object_fit.zig) | Pure parsing and centered destination/source-crop geometry for replaced images. |
 | [`src/document/canvas.zig`](../src/document/canvas.zig) | Heap-stable z2d canvas backing stores, 2D command dispatch, state, resizing, and straight-alpha snapshots. |
 | [`src/document/focus.zig`](../src/document/focus.zig) | Shared intrinsic programmatic and sequential HTML focusability rules. |
 | [`src/document/inspection.zig`](../src/document/inspection.zig) | Browser-free fetch/decode/parse/style pipeline for document inspection commands. |
@@ -383,6 +384,16 @@ list. Auto widths are already expressed by their containing block and are not
 multiplied. A BlockLayout's protected zoom field stores the total factor so a
 computed-style change invalidates descendant geometry and paint/hit effects
 read the same generation.
+
+Replaced `<img>` elements retain a CSS/attribute-selected element box separately
+from decoded bitmap geometry. `object-fit` resolves a centered visible
+destination for `fill`, `contain`, `cover`, `none`, or `scale-down`, then emits
+an optional fractional source-pixel crop where content crosses the box. The
+fractional boundary matters for low-resolution images and is copied unchanged
+through display-list and raster-snapshot owners. Paint/compositor bounds use
+the visible destination, while the synchronous display item retains the full
+element box for hit testing; source provenance is still cleared at the worker
+snapshot boundary.
 
 An iframe placeholder carries its numeric authored effective zoom alongside
 its already-scaled rectangle. The child Frame stores that factor independently

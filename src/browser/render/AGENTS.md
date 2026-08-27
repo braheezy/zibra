@@ -50,8 +50,11 @@ before changing ownership or thread boundaries.
   effective zoom; Tab transfers that scalar to the child Frame before its next
   layout. It is plain numeric state, not DOM/layout provenance.
   Image commands normally sample the complete borrowed bitmap. Their optional
-  half-open source-pixel rectangle exists for CSS backgrounds cropped at the
-  element border box and must survive every clone/snapshot boundary.
+  half-open, fractional source-pixel rectangle supports CSS backgrounds and
+  fitted `<img>` content cropped at the element box and must survive every
+  clone/snapshot boundary. A fitted image may also retain a separate element
+  hit rectangle, so transparent `contain` letterbox space still targets the
+  replaced element without enlarging paint/compositor bounds.
   Canvas commands are the exception to ordinary image borrowing: every paint
   owns an immutable straight-alpha RGBA snapshot copied from the live
   premultiplied z2d surface. Deep-clone that buffer at every command-tree owner
@@ -86,6 +89,11 @@ before changing ownership or thread boundaries.
   `contain`, and `cover`; oversized output source-crops instead of spilling.
   Inputs and rich buttons resolve their image from live provenance at paint
   time rather than retaining another decoded-pixel borrow in layout state.
+- Replaced `<img>` layout keeps its element box independent from its bitmap.
+  `object-fit` supports `fill`, `contain`, `cover`, `none`, and `scale-down`
+  using the initial centered object position. Layout emits only the visible
+  destination and an exact source crop, while hit testing uses the complete
+  element box. CSS pixel width/height override the matching HTML attributes.
 - `effects.zig` contains pixel-only software effects. Keep its APIs explicit
   about premultiplication, edge sampling, and temporary allocation.
 - `raster_snapshot.zig` is the thread-transfer boundary. Snapshots must deep

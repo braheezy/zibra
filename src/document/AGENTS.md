@@ -91,6 +91,10 @@ or selector/rule lifetime.
   and optional decoded `ImageData`; blocked/broken attempts deliberately keep
   the source key so an unchanged restyle does not fetch forever. Structural
   removal releases that resource with the rest of the Element.
+- `object_fit.zig` parses the five basic replaced-image fit modes and resolves
+  centered destination plus fractional source-crop geometry without depending
+  on layout, networking, or raster state. Preserve fractional crop edges: an
+  integer crop visibly distorts small images with a mismatched aspect ratio.
 - `focus.zig` is the canonical HTML focusability policy shared by layout,
   keyboard traversal, and JavaScript. Programmatic focus accepts an explicit
   negative `tabindex`, while sequential focus rejects it; hidden inputs,
@@ -121,11 +125,15 @@ or selector/rule lifetime.
   retaining a new borrowed value.
 - `width` and `height` are non-inherited computed properties. Their default is
   `auto`; layout currently resolves only non-negative pixel lengths and keeps
-  the borrowed computed-value slice in the style map.
+  the borrowed computed-value slice in the style map. Replaced images use a
+  supported CSS dimension before the corresponding HTML width/height fallback.
 - `background-image` and `background-size` are non-inherited and default to
   `none` and `auto`. Their declaration values remain borrowed computed-style
   slices; only a finally selected supported URL receives an independent
   Element-owned resource identity.
+- `object-fit` is non-inherited and defaults to `fill`. The supported modes are
+  `fill`, `contain`, `cover`, `none`, and `scale-down`; invalid values fall
+  back to `fill` in the layout value-validation subset.
 - `zoom` is non-inherited and defaults to `1`. Layout accepts positive numbers
   and percentages, treats zero as one for web compatibility, and multiplies
   used fixed lengths through the ancestor chain. Invalid/negative values fall

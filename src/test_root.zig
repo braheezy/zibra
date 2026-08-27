@@ -12,6 +12,7 @@ comptime {
     _ = @import("browser/render/layout.zig");
     _ = @import("document/canvas.zig");
     _ = @import("document/background_image.zig");
+    _ = @import("document/object_fit.zig");
     _ = @import("document/focus.zig");
     _ = @import("script/js.zig");
     _ = @import("tests/browser_input.zig");

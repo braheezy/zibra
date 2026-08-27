@@ -94,6 +94,15 @@ pub const Rect = struct {
     }
 };
 
+/// Half-open source-image coordinates. Fractional edges preserve aspect ratio
+/// when a low-resolution bitmap is cropped into a differently shaped box.
+pub const ImageSourceRect = struct {
+    left: f64,
+    top: f64,
+    right: f64,
+    bottom: f64,
+};
+
 /// A composited layer owns the display items and optional cached surface used
 /// for one effect group. Raster execution remains a Browser responsibility.
 pub const CompositedLayer = struct {
@@ -191,6 +200,8 @@ pub const CompositedLayer = struct {
 };
 
 pub const ImageDisplayItem = struct {
+    /// Visible bitmap destination. For fitted `<img>` content this may be
+    /// smaller than its element box; `hit_rect` retains the replaced box.
     x1: i32,
     y1: i32,
     x2: i32,
@@ -198,9 +209,12 @@ pub const ImageDisplayItem = struct {
     source_width: i32,
     source_height: i32,
     pixels: []const u8,
-    /// Optional half-open source-pixel crop. Ordinary `<img>` commands use the
-    /// complete bitmap; oversized CSS backgrounds crop at their border box.
-    source_rect: ?Rect = null,
+    /// Optional half-open source-pixel crop. CSS backgrounds and fitted
+    /// `<img>` content use this when their bitmap is clipped by the box.
+    source_rect: ?ImageSourceRect = null,
+    /// Optional element box used for hit testing independently of the visible
+    /// bitmap destination. This keeps contain/none letterbox space targetable.
+    hit_rect: ?Rect = null,
     opacity: f64 = 1.0,
     source: ?DisplayItemSource = null,
 };
@@ -683,15 +697,23 @@ pub const DisplayItem = union(enum) {
                 rect_item.y2,
                 zoom,
             ),
-            .image => |image_item| image_item.opacity > 0 and pointInScaledRect(
-                x,
-                y,
-                image_item.x1,
-                image_item.y1,
-                image_item.x2,
-                image_item.y2,
-                zoom,
-            ),
+            .image => |image_item| image: {
+                const bounds = image_item.hit_rect orelse Rect{
+                    .left = image_item.x1,
+                    .top = image_item.y1,
+                    .right = image_item.x2,
+                    .bottom = image_item.y2,
+                };
+                break :image image_item.opacity > 0 and pointInScaledRect(
+                    x,
+                    y,
+                    bounds.left,
+                    bounds.top,
+                    bounds.right,
+                    bounds.bottom,
+                    zoom,
+                );
+            },
             .canvas => |canvas_item| canvas_item.opacity > 0 and pointInScaledRect(
                 x,
                 y,
@@ -878,4 +900,23 @@ test "RGBA raster buffers reject lazy and truncated canvas snapshots" {
     try std.testing.expect(!rgbaPixelBufferComplete(2, 2, &([_]u8{0} ** 15)));
     try std.testing.expect(rgbaPixelBufferComplete(2, 2, &([_]u8{0} ** 16)));
     try std.testing.expect(!rgbaPixelBufferComplete(0, 2, &.{}));
+}
+
+test "fitted image hit testing uses its complete replaced element box" {
+    var layout_marker: u8 = 0;
+    const items = [_]DisplayItem{.{ .image = .{
+        .x1 = 0,
+        .y1 = 25,
+        .x2 = 100,
+        .y2 = 75,
+        .source_width = 200,
+        .source_height = 100,
+        .pixels = &.{},
+        .hit_rect = .{ .left = 0, .top = 0, .right = 100, .bottom = 100 },
+        .source = .{ .layout = &layout_marker, .node = null },
+    } }};
+
+    try std.testing.expect(DisplayItem.hitTest(items[0..], 50, 5, 1.0) != null);
+    try std.testing.expect(DisplayItem.hitTest(items[0..], 50, 95, 1.0) != null);
+    try std.testing.expect(DisplayItem.hitTest(items[0..], 100, 50, 1.0) == null);
 }

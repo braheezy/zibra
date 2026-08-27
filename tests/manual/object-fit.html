@@ -1,0 +1,38 @@
+<!--
+How to verify:
+1. Open this file in Zibra. Every image element has the same 160x100 box.
+2. Fill must stretch the whole four-color image to that box.
+3. Contain must preserve the 2:1 aspect ratio, centered with equal dark bands
+   above and below it.
+4. Cover must fill the box without distortion and crop equal portions from the
+   left and right edges. No image pixels may spill outside its dark frame.
+-->
+<style>
+  body { background-color: #f1f5f9; color: #0f172a; }
+  .row { display: block; width: 560px; }
+  .card {
+    display: block;
+    width: 190px;
+    background-color: white;
+  }
+  .frame {
+    display: block;
+    width: 160px;
+    height: 100px;
+    background-color: #334155;
+    overflow: hidden;
+  }
+  img {
+    width: 160px;
+    height: 100px;
+  }
+  .fill { object-fit: fill; }
+  .contain { object-fit: contain; }
+  .cover { object-fit: cover; }
+</style>
+<h1>object-fit</h1>
+<div class=row>
+  <div class=card><b>fill</b><div class=frame><img class=fill src=background-image-pattern.ppm></div></div>
+  <div class=card><b>contain</b><div class=frame><img class=contain src=background-image-pattern.ppm></div></div>
+  <div class=card><b>cover</b><div class=frame><img class=cover src=background-image-pattern.ppm></div></div>
+</div>

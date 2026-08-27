@@ -288,3 +288,7 @@ display/raster snapshot boundaries.
 explicit, percentage, contain, cover, and rounded-crop geometry. Its unmatched
 broken URL is also a manual assertion that post-cascade discovery performs no
 unused fetch; `browser_background_images.zig` provides the deterministic count.
+
+`tests/manual/object-fit.html` puts the same wide diagnostic PPM into fixed
+replaced-element boxes. It distinguishes stretched `fill`, centered letterbox
+`contain`, and centered fractional `cover` cropping without pixel spill.
