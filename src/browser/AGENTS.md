@@ -73,8 +73,9 @@ before changing `root.zig`, `tab.zig`, `render/`, or browser task scheduling.
   geometry.
 - `render/replaced_sizing.zig` resolves unscaled image and iframe dimensions
   from computed CSS, HTML attributes, natural image size, and `aspect-ratio`.
-  Parent layout and initial iframe viewport setup share this resolver; layout
-  applies authored zoom only after both axes have been derived. A lazy image's
+  Relative CSS dimensions receive explicit font-size and containing-block
+  bases. Parent layout and initial iframe viewport setup share this resolver;
+  layout applies authored zoom only after both axes have been derived. A lazy image's
   `auto <ratio>` value reserves the fallback ratio until decoded pixels provide
   the natural one. Without pixels or a usable ratio, only explicitly authored
   image axes are retained; an unspecified axis is zero.
@@ -342,7 +343,13 @@ before changing `root.zig`, `tab.zig`, `render/`, or browser task scheduling.
   live DOM, so inserted `<style>`/`<link>` nodes participate and detached links
   stop participating. Script source tasks own their copies after queueing;
   removing a script never rolls back code and reattaching that same element
-  never evaluates it again.
+  never evaluates it again. Each attached iframe Element also carries the
+  numeric window ID of its live child Frame. The synchronous post-mutation
+  boundary validates those IDs, rebinds surviving `frame_element` pointers in
+  DOM order, and destroys contexts whose Elements disappeared. The deferred
+  resource pass then loads only marker-free new iframes through the ordinary
+  CSP/referrer/document pipeline; do not start network work while Kiesel is in
+  the mutation callback.
 - `render/layout.zig` and `render/font.zig` borrow DOM/image state and own
   layout/font resources. `FontManager` owns canonical RGBA glyph bitmaps;
   display-list `Glyph` values borrow those bytes, and `pixel_mode` tells paint
@@ -395,7 +402,10 @@ before changing `root.zig`, `tab.zig`, `render/`, or browser task scheduling.
   the mutating frame's complete layout dependency graph while the old DOM is
   still alive; the next full render rebuilds it. Schedule the replacement paint
   before any fallible mutation step. Preserve focus when the mutation root
-  itself survives; clear it only for a removed descendant.
+  itself survives; clear it only for a removed descendant. After the child
+  storage and parent pointers are final, run the paired completion callback
+  synchronously so moved iframe identities are rebound and removed child-frame
+  workers/callbacks are quiesced before JavaScript resumes.
 - Content clicks walk the retained list in reverse paint order. A primary hit
   also runs the retained layout tree's parent-local point query; painted
   provenance remains authoritative for fragment gaps, glyph geometry, rounded

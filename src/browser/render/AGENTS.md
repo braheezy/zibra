@@ -92,7 +92,8 @@ before changing ownership or thread boundaries.
 - Replaced `<img>` layout keeps its element box independent from its bitmap.
   `replaced_sizing.zig` is the shared unscaled-CSS-pixel resolver for image and
   iframe width, height, and `aspect-ratio`; both layout and initial child-frame
-  viewport setup must use it. The supported ratio grammar is
+  viewport setup must use it. Its relative dimensions receive explicit
+  font-size and containing-block bases. The supported ratio grammar is
   `auto || <positive-number> [ / <positive-number> ]`. An explicit ratio
   supplies only a missing axis, while `auto <ratio>` uses that ratio before an
   image loads and switches to its natural ratio afterward.

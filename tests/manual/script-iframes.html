@@ -1,0 +1,45 @@
+<!--
+How to verify:
+1. On load, a green "script-added iframe A" document appears below and the
+   status says A is ready; the iframe exists only because innerHTML added it.
+2. Click "Replace with B". A disappears, a blue B document loads in the same
+   position, and the status changes to B without duplicating either frame.
+3. Click "Remove". The child document disappears completely. Tab traversal
+   must no longer enter its input, and messages from the removed window must
+   not change the status.
+4. Click "Add A". A fresh green child context loads and becomes focusable.
+-->
+<!doctype html>
+<style>
+  body { font-family: sans-serif; }
+  button { margin-right: 8px; padding: 6px; }
+  #mount { margin-top: 12px; min-height: 20px; }
+  iframe { width: 420px; height: 150px; }
+  #status { font-weight: bold; }
+</style>
+<h1>Script iframe lifecycle</h1>
+<button id=addA>Add A</button>
+<button id=replaceB>Replace with B</button>
+<button id=removeFrame>Remove</button>
+<p id=status>waiting for iframe A</p>
+<div id=mount></div>
+<script>
+  function install(name) {
+    mount.innerHTML = '<iframe src="script-iframe-' + name + '.html"></iframe>';
+    status.innerHTML = 'loading iframe ' + name.toUpperCase();
+  }
+
+  window.addEventListener('message', function(event) {
+    if (event.data === 'iframe-a-ready') status.innerHTML = 'iframe A ready';
+    if (event.data === 'iframe-b-ready') status.innerHTML = 'iframe B ready';
+  });
+
+  addA.addEventListener('click', function() { install('a'); });
+  replaceB.addEventListener('click', function() { install('b'); });
+  removeFrame.addEventListener('click', function() {
+    mount.innerHTML = '';
+    status.innerHTML = 'iframe removed';
+  });
+
+  install('a');
+</script>

@@ -1,0 +1,8 @@
+<!doctype html>
+<style>
+  body { margin: 0; padding: 16px; background: #b7f5bd; font-family: sans-serif; }
+</style>
+<h2>script-added iframe A</h2>
+<p>This green document was loaded after its iframe entered the live DOM.</p>
+<input value="A focus stop">
+<script>window.parent.postMessage('iframe-a-ready', '*');</script>

@@ -264,9 +264,10 @@ pub const Frame = struct {
     // Owned linked and inline author stylesheet buffers in DOM order. Owned
     // rules borrow their property strings from these allocations.
     css_texts: std.ArrayList([]const u8),
-    // Structural DOM mutation can add scripts/stylesheets or remove linked
-    // stylesheets. The next worker-side render rebuilds resources from the
-    // final attached DOM generation.
+    // Structural DOM mutation can add scripts/stylesheets/iframes or remove
+    // linked stylesheets and iframe contexts. The next worker-side render
+    // rebuilds deferred resources from the final attached DOM generation;
+    // iframe removal itself completes synchronously at the mutation boundary.
     resources_dirty: bool = false,
     allowed_origins: ?std.ArrayList([]const u8) = null,
     children: std.ArrayList(*Frame),
@@ -934,6 +935,81 @@ pub const Frame = struct {
             if (child.findFrameByElement(node)) |hit| return hit;
         }
         return null;
+    }
+
+    fn childFrameIndexForWindow(
+        self: *Frame,
+        window_id: u32,
+        first_unbound: usize,
+    ) ?usize {
+        const registered = self.tab.frameForWindowId(window_id) orelse return null;
+        if (registered.parent != self) return null;
+        for (self.children.items[first_unbound..], first_unbound..) |child, index| {
+            if (child == registered) return index;
+        }
+        return null;
+    }
+
+    fn bindAttachedIframeNodes(self: *Frame, node: *Node, bound_count: *usize) void {
+        const element = switch (node.*) {
+            .element => |*value| value,
+            .text => return,
+        };
+
+        if (std.mem.eql(u8, element.tag, "iframe")) {
+            if (element.iframe_window_id) |window_id| {
+                if (self.childFrameIndexForWindow(window_id, bound_count.*)) |index| {
+                    if (index != bound_count.*) {
+                        std.mem.swap(
+                            *Frame,
+                            &self.children.items[index],
+                            &self.children.items[bound_count.*],
+                        );
+                    }
+                    const child = self.children.items[bound_count.*];
+                    child.frame_element = node;
+                    bound_count.* += 1;
+                } else {
+                    // Detached iframes retain their scalar marker so that the
+                    // Node can move without touching a dead Frame. Validate it
+                    // on every attachment and clear it when that context is no
+                    // longer registered beneath this parent.
+                    element.iframe_window_id = null;
+                }
+            }
+        }
+
+        for (element.children.items) |*child| {
+            self.bindAttachedIframeNodes(child, bound_count);
+        }
+    }
+
+    fn containsFrame(ancestor: *Frame, candidate: *Frame) bool {
+        var current: ?*Frame = candidate;
+        while (current) |frame| : (current = frame.parent) {
+            if (frame == ancestor) return true;
+        }
+        return false;
+    }
+
+    /// Rebind child browsing contexts after DOM child arrays move and destroy
+    /// contexts whose iframe element is no longer attached. The Element's
+    /// numeric window marker moves by value with the DOM node; no stale
+    /// frame_element pointer is dereferenced during this pass.
+    pub fn reconcileAttachedChildFrames(self: *Frame) void {
+        var bound_count: usize = 0;
+        if (self.current_node) |*root| {
+            self.bindAttachedIframeNodes(root, &bound_count);
+        }
+
+        while (self.children.items.len > bound_count) {
+            const removed = self.children.pop().?;
+            if (self.tab.focused_frame) |focused| {
+                if (containsFrame(removed, focused)) self.tab.focused_frame = self;
+            }
+            removed.deinit();
+            self.allocator.destroy(removed);
+        }
     }
 
     pub fn clearAllowedOrigins(self: *Frame) void {
@@ -2082,6 +2158,16 @@ pub fn prepareForDomMutation(self: *Tab, b: *Browser, frame: *Frame, mutation_ro
 
     b.setNeedsAnimationFrame(self);
     b.scheduleAnimationFrame();
+}
+
+/// Synchronous post-mutation half of the structural boundary. Parent pointers
+/// and JavaScript node handles have already been repaired, so stable iframe
+/// window IDs can rebind surviving Frame pointers. Removed child contexts are
+/// quiesced here, before JavaScript can enqueue work against them; network
+/// loading for marker-free new iframes remains deferred to resource refresh.
+pub fn completeDomMutation(self: *Tab, frame: *Frame) void {
+    std.debug.assert(frame.tab == self);
+    frame.reconcileAttachedChildFrames();
 }
 
 pub fn setNeedsPaint(self: *Tab) void {

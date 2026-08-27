@@ -1,0 +1,8 @@
+<!doctype html>
+<style>
+  body { margin: 0; padding: 16px; background: #b8d9ff; font-family: sans-serif; }
+</style>
+<h2>script-added iframe B</h2>
+<p>This blue replacement has a distinct browsing context.</p>
+<input value="B focus stop">
+<script>window.parent.postMessage('iframe-b-ready', '*');</script>

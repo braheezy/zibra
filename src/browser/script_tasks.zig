@@ -725,6 +725,25 @@ pub fn Contexts(comptime Browser: type, comptime DocumentHandle: type) type {
             tab.prepareForDomMutation(browser, frame, mutation_root);
         }
 
+        pub fn jsDomMutationCompleteCallback(
+            context: ?*anyopaque,
+            _: *parser.Node,
+        ) void {
+            const ctx_ptr = context orelse return;
+            const raw_ctx: *align(1) JsRenderContext = @ptrCast(ctx_ptr);
+            const ctx: *JsRenderContext = @alignCast(raw_ctx);
+
+            const tab_ptr = ctx.tab_ptr orelse return;
+            const raw_tab: *align(1) Tab = @ptrCast(tab_ptr);
+            const tab: *Tab = @alignCast(raw_tab);
+
+            const frame = tab.frameForWindowId(ctx.window_id) orelse return;
+            if (frame.document_generation == 0 or
+                !ctx.matchesGeneration(frame.document_generation)) return;
+
+            tab.completeDomMutation(frame);
+        }
+
         pub fn jsCookieGetCallback(context: ?*anyopaque) anyerror!js_module.CookieResult {
             const ctx_ptr = context orelse return error.MissingJsContext;
             const raw_ctx: *align(1) JsRenderContext = @ptrCast(ctx_ptr);

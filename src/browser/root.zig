@@ -2558,6 +2558,11 @@ pub const Browser = struct {
             jsDomMutationCallback,
             @ptrCast(render_context),
         );
+        js_context.setDomMutationCompleteCallback(
+            frame.window_id,
+            jsDomMutationCompleteCallback,
+            @ptrCast(render_context),
+        );
         js_context.setXhrCallback(frame.window_id, jsXhrCallback, @ptrCast(render_context));
         js_context.setCookieCallbacks(
             frame.window_id,
@@ -3358,20 +3363,60 @@ pub const Browser = struct {
         return true;
     }
 
-    fn loadIframes(self: *Browser, parent: *Frame, page_url: *Url, nodes: []*Node) !void {
+    fn loadIframes(
+        self: *Browser,
+        parent: *Frame,
+        page_url: *Url,
+        nodes: []*Node,
+    ) anyerror!void {
+        // A completed structural mutation may have moved surviving iframe
+        // Elements or detached old ones. Rebind by their scalar window IDs and
+        // retire missing contexts before discovering marker-free additions.
+        parent.reconcileAttachedChildFrames();
+
+        var missing_count: usize = 0;
         for (nodes) |node| {
-            switch (node.*) {
-                .element => |*element| {
-                    if (!std.mem.eql(u8, element.tag, "iframe")) continue;
-                    const attrs = element.attributes orelse continue;
-                    const src = attrs.get("src") orelse continue;
-                    if (src.len == 0) continue;
-                    self.loadIframe(parent, node, page_url, src) catch |err| {
-                        std.log.warn("Failed to load iframe {s}: {}", .{ src, err });
-                    };
-                },
-                .text => {},
+            const element = switch (node.*) {
+                .element => |*value| value,
+                .text => continue,
+            };
+            if (!std.mem.eql(u8, element.tag, "iframe") or
+                element.iframe_window_id != null) continue;
+            const attrs = element.attributes orelse continue;
+            const src = attrs.get("src") orelse continue;
+            if (src.len != 0) missing_count += 1;
+        }
+        try parent.children.ensureUnusedCapacity(parent.allocator, missing_count);
+
+        var child_index: usize = 0;
+        for (nodes) |node| {
+            const element = switch (node.*) {
+                .element => |*value| value,
+                .text => continue,
+            };
+            if (!std.mem.eql(u8, element.tag, "iframe")) continue;
+
+            if (element.iframe_window_id) |window_id| {
+                if (child_index < parent.children.items.len and
+                    parent.children.items[child_index].window_id == window_id)
+                {
+                    child_index += 1;
+                    continue;
+                }
+                // The reconciliation pass normally rules this out. Treat a
+                // stale/corrupt marker as a fresh attachment instead of
+                // silently binding the wrong browsing context.
+                element.iframe_window_id = null;
+                try parent.children.ensureUnusedCapacity(parent.allocator, 1);
             }
+
+            const attrs = element.attributes orelse continue;
+            const src = attrs.get("src") orelse continue;
+            if (src.len == 0) continue;
+            if (self.loadIframe(parent, node, page_url, src, child_index) catch |err| load: {
+                std.log.warn("Failed to load iframe {s}: {}", .{ src, err });
+                break :load null;
+            }) |_| child_index += 1;
         }
     }
 
@@ -3411,14 +3456,21 @@ pub const Browser = struct {
             iframeRedirectAllowed(parent, page_url, final_destination);
     }
 
-    fn loadIframe(self: *Browser, parent: *Frame, iframe_node: *Node, page_url: *Url, src: []const u8) !void {
+    fn loadIframe(
+        self: *Browser,
+        parent: *Frame,
+        iframe_node: *Node,
+        page_url: *Url,
+        src: []const u8,
+        insert_index: usize,
+    ) !?*Frame {
         var iframe_url = try page_url.*.resolveForNavigation(self.allocator, src);
         var url_owned = true;
         defer if (url_owned) iframe_url.free(self.allocator);
 
         if (!iframeNavigationAllowed(parent, page_url, &iframe_url, null)) {
             std.log.warn("Blocked iframe {s} due to CSP", .{src});
-            return;
+            return null;
         }
 
         var final_url: ?Url = null;
@@ -3525,6 +3577,13 @@ pub const Browser = struct {
             &resources,
         );
 
+        // A newly created child document may itself contain nested iframes.
+        // Load them before publishing this Frame into its parent's ordered
+        // child list; all allocations remain owned by `frame` on failure.
+        self.loadIframes(frame, frame_url_ptr, node_list.items) catch |err| {
+            std.log.warn("Failed to load nested iframe subdocuments: {}", .{err});
+        };
+
         var new_css_texts = std.ArrayList([]const u8).empty;
         defer {
             for (new_css_texts.items) |css_text| self.allocator.free(css_text);
@@ -3584,7 +3643,10 @@ pub const Browser = struct {
         );
         try self.loadUsedBackgroundImages(frame, frame_url_ptr);
         try self.layoutTabNodes(frame, true);
-        try parent.children.append(parent.allocator, frame);
+        std.debug.assert(insert_index <= parent.children.items.len);
+        parent.children.insertAssumeCapacity(insert_index, frame);
+        iframe_node.element.iframe_window_id = frame.window_id;
+        return frame;
     }
 
     /// Resolve every external classic script and linked stylesheet before
@@ -3899,6 +3961,7 @@ pub const Browser = struct {
             &resources,
         );
         try self.replaceFrameStylesheets(frame, nodes.items, &resources);
+        try self.loadIframes(frame, page_url, nodes.items);
         if (!scripts_started) frame.resources_dirty = true;
     }
 
@@ -7981,6 +8044,7 @@ const runXhrThread = BrowserScriptTaskContexts.runXhrThread;
 const jsRenderCallback = BrowserScriptTaskContexts.jsRenderCallback;
 const jsFocusCallback = BrowserScriptTaskContexts.jsFocusCallback;
 const jsDomMutationCallback = BrowserScriptTaskContexts.jsDomMutationCallback;
+const jsDomMutationCompleteCallback = BrowserScriptTaskContexts.jsDomMutationCompleteCallback;
 const jsCookieGetCallback = BrowserScriptTaskContexts.jsCookieGetCallback;
 const jsCookieSetCallback = BrowserScriptTaskContexts.jsCookieSetCallback;
 const jsXhrCallback = BrowserScriptTaskContexts.jsXhrCallback;

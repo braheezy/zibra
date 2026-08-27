@@ -307,6 +307,20 @@ const DomMutationCallback = struct {
     context: ?*anyopaque = null,
 };
 
+/// Runs synchronously after an attached structural mutation has installed its
+/// final child storage and repaired parent pointers. Browser embedders use it
+/// to rebind or retire native objects whose stable scalar identity moved with
+/// a DOM Element; it must not start network work while Kiesel is active.
+pub const DomMutationCompleteCallbackFn = *const fn (
+    context: ?*anyopaque,
+    mutation_root: *Node,
+) void;
+
+const DomMutationCompleteCallback = struct {
+    function: ?DomMutationCompleteCallbackFn = null,
+    context: ?*anyopaque = null,
+};
+
 pub const AnimationFrameCallbackFn = *const fn (context: ?*anyopaque) anyerror!void;
 
 const AnimationFrameCallback = struct {
@@ -435,6 +449,7 @@ const WindowContext = struct {
     render_callback: RenderCallback,
     focus_callback: FocusCallback,
     dom_mutation_callback: DomMutationCallback,
+    dom_mutation_complete_callback: DomMutationCompleteCallback,
     set_timeout_callback: SetTimeoutCallback,
     clear_interval_callback: struct {
         function: ?ClearIntervalCallbackFn = null,
@@ -516,6 +531,7 @@ fn ensureWindow(self: *Js, window_id: u32) !void {
         .render_callback = .{},
         .focus_callback = .{},
         .dom_mutation_callback = .{},
+        .dom_mutation_complete_callback = .{},
         .set_timeout_callback = .{},
         .clear_interval_callback = .{},
         .post_message_callback = .{},
@@ -1186,6 +1202,7 @@ pub fn setNodes(self: *Js, window_id: u32, nodes: ?*Node) void {
         window.render_callback = .{};
         window.focus_callback = .{};
         window.dom_mutation_callback = .{};
+        window.dom_mutation_complete_callback = .{};
         window.xhr_callback = .{};
         window.cookie_callback = .{};
         window.set_timeout_callback = .{};
@@ -1220,6 +1237,19 @@ pub fn setFocusCallback(self: *Js, window_id: u32, callback: ?FocusCallbackFn, c
 pub fn setDomMutationCallback(self: *Js, window_id: u32, callback: ?DomMutationCallbackFn, context: ?*anyopaque) void {
     const window = self.setCurrentWindow(window_id) catch return;
     window.dom_mutation_callback = .{
+        .function = callback,
+        .context = context,
+    };
+}
+
+pub fn setDomMutationCompleteCallback(
+    self: *Js,
+    window_id: u32,
+    callback: ?DomMutationCompleteCallbackFn,
+    context: ?*anyopaque,
+) void {
+    const window = self.setCurrentWindow(window_id) catch return;
+    window.dom_mutation_complete_callback = .{
         .function = callback,
         .context = context,
     };
@@ -1544,6 +1574,7 @@ fn insertDetachedChild(
     parser.fixParentPointers(parent, parent_parent);
 
     if (parent_is_attached) {
+        self.completeDomMutation(parent);
         try self.syncNamedIdGlobals(window_id, window);
         self.requestRender();
     }
@@ -1618,6 +1649,7 @@ fn detachChild(
     parser.dirtyStyleSubtree(detached);
 
     if (parent_is_attached) {
+        self.completeDomMutation(parent);
         try self.syncNamedIdGlobals(window_id, window);
         self.requestRender();
     }
@@ -1656,6 +1688,19 @@ fn prepareDomMutation(self: *Js, mutation_root: *Node) void {
     if (window.current_nodes) |root| parser.clearStyleInvalidations(root);
     if (window.dom_mutation_callback.function) |callback| {
         callback(window.dom_mutation_callback.context, mutation_root);
+    }
+}
+
+fn completeDomMutation(self: *Js, mutation_root: *Node) void {
+    const window_id = self.current_window_id orelse return;
+    const window = self.windows.getPtr(window_id) orelse return;
+    if (window.dom_mutation_complete_callback.function) |callback| {
+        // Retiring a same-origin child Frame clears that child's window in the
+        // shared Js host and temporarily changes current_window_id. The native
+        // DOM call and the remainder of its script still belong to the
+        // mutating parent window, so restore it before returning to Kiesel.
+        defer self.current_window_id = window_id;
+        callback(window.dom_mutation_complete_callback.context, mutation_root);
     }
 }
 
@@ -2530,6 +2575,10 @@ test "innerHTML and outerHTML serialize the live DOM" {
 
 const DomMutationTestContext = struct {
     count: usize = 0,
+    complete_count: usize = 0,
+    completed_child_count: usize = 0,
+    js_to_switch: ?*Js = null,
+    window_to_clear: ?u32 = null,
 
     fn callback(context: ?*anyopaque, _: *Node) void {
         const raw = context orelse return;
@@ -2537,7 +2586,71 @@ const DomMutationTestContext = struct {
         const self: *DomMutationTestContext = @alignCast(unaligned);
         self.count += 1;
     }
+
+    fn completeCallback(context: ?*anyopaque, mutation_root: *Node) void {
+        const raw = context orelse return;
+        const unaligned: *align(1) DomMutationTestContext = @ptrCast(raw);
+        const self: *DomMutationTestContext = @alignCast(unaligned);
+        self.complete_count += 1;
+        self.completed_child_count = switch (mutation_root.*) {
+            .element => |element| element.children.items.len,
+            .text => 0,
+        };
+        if (self.js_to_switch) |js| {
+            if (self.window_to_clear) |window_id| js.setNodes(window_id, null);
+        }
+    }
 };
+
+test "innerHTML completion callback observes installed child generation" {
+    const allocator = std.testing.allocator;
+    var html_parser = try parser.HTMLParser.init(
+        allocator,
+        "<main><section id=target><i></i></section></main>",
+    );
+    html_parser.use_implicit_tags = false;
+    defer html_parser.deinit(allocator);
+    var root = try html_parser.parse();
+    defer root.deinit(allocator);
+    parser.fixParentPointers(&root, null);
+
+    var environ = std.process.Environ.Map.init(allocator);
+    defer environ.deinit();
+    var js = try Js.init(allocator, std.testing.io, &environ);
+    defer js.deinit(allocator);
+
+    var child_parser = try parser.HTMLParser.init(allocator, "<p>child</p>");
+    child_parser.use_implicit_tags = false;
+    defer child_parser.deinit(allocator);
+    var child_root = try child_parser.parse();
+    defer child_root.deinit(allocator);
+    parser.fixParentPointers(&child_root, null);
+    js.setNodes(1, &child_root);
+    js.setNodes(0, &root);
+    defer js.setNodes(0, null);
+
+    var mutation_context = DomMutationTestContext{
+        .js_to_switch = js,
+        .window_to_clear = 1,
+    };
+    js.setDomMutationCallback(0, DomMutationTestContext.callback, &mutation_context);
+    js.setDomMutationCompleteCallback(
+        0,
+        DomMutationTestContext.completeCallback,
+        &mutation_context,
+    );
+
+    const result = try js.evaluate(0,
+        \\var target = document.querySelectorAll('section')[0];
+        \\target.innerHTML = '<iframe src="child.html"></iframe><span></span>';
+        \\target.children.length === 2
+    );
+    try std.testing.expect(result.toBoolean());
+    try std.testing.expectEqual(@as(usize, 1), mutation_context.count);
+    try std.testing.expectEqual(@as(usize, 1), mutation_context.complete_count);
+    try std.testing.expectEqual(@as(usize, 2), mutation_context.completed_child_count);
+    try std.testing.expectEqual(@as(?u32, 0), js.current_window_id);
+}
 
 test "createElement appendChild and insertBefore preserve handles and order" {
     const allocator = std.testing.allocator;
@@ -2560,6 +2673,11 @@ test "createElement appendChild and insertBefore preserve handles and order" {
 
     var mutation_context = DomMutationTestContext{};
     js.setDomMutationCallback(0, DomMutationTestContext.callback, &mutation_context);
+    js.setDomMutationCompleteCallback(
+        0,
+        DomMutationTestContext.completeCallback,
+        &mutation_context,
+    );
 
     const result = try js.evaluate(0,
         \\var target = document.querySelectorAll('section')[0];
@@ -2593,6 +2711,7 @@ test "createElement appendChild and insertBefore preserve handles and order" {
     // Building the article subtree while detached does not invalidate the
     // installed document; its three later insertions do.
     try std.testing.expectEqual(@as(usize, 3), mutation_context.count);
+    try std.testing.expectEqual(@as(usize, 3), mutation_context.complete_count);
 }
 
 test "removeChild detaches a subtree and preserves handles across reattachment" {
@@ -2631,6 +2750,11 @@ test "removeChild detaches a subtree and preserves handles across reattachment" 
 
     var mutation_context = DomMutationTestContext{};
     js.setDomMutationCallback(0, DomMutationTestContext.callback, &mutation_context);
+    js.setDomMutationCompleteCallback(
+        0,
+        DomMutationTestContext.completeCallback,
+        &mutation_context,
+    );
 
     const detached_result = try js.evaluate(0,
         \\var source = document.querySelectorAll('section')[0];
@@ -2655,6 +2779,7 @@ test "removeChild detaches a subtree and preserves handles across reattachment" 
     try std.testing.expect(detached_result.toBoolean());
     try std.testing.expectEqual(@as(usize, 1), js.windows.getPtr(0).?.detached_nodes.count());
     try std.testing.expectEqual(@as(usize, 1), mutation_context.count);
+    try std.testing.expectEqual(@as(usize, 1), mutation_context.complete_count);
 
     const reattached_result = try js.evaluate(0,
         \\moving.setAttribute('id', 'moved');
@@ -2670,6 +2795,7 @@ test "removeChild detaches a subtree and preserves handles across reattachment" 
     try std.testing.expect(reattached_result.toBoolean());
     try std.testing.expectEqual(@as(usize, 0), js.windows.getPtr(0).?.detached_nodes.count());
     try std.testing.expectEqual(@as(usize, 2), mutation_context.count);
+    try std.testing.expectEqual(@as(usize, 2), mutation_context.complete_count);
 
     // Reparenting a previously styled subtree must recompute both selector
     // matches and inherited descendant values against the new parent chain.
@@ -4601,6 +4727,7 @@ fn innerHTML(agent: *Agent, this_value: Value, arguments: kiesel.types.Arguments
             parser.fixParentPointers(node, e.parent);
 
             if (is_attached) {
+                js_instance.completeDomMutation(node);
                 try js_instance.syncNamedIdGlobals(window_id, window);
             }
             js_instance.requestRender();

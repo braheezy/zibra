@@ -64,7 +64,7 @@ The source tree is organized by responsibility:
 | [`src/document/css_parser.zig`](../src/document/css_parser.zig) | CSS parsing and `CSSRule` ownership. |
 | [`src/document/color.zig`](../src/document/color.zig) | Shared parsing for paintable named and hexadecimal RGBA CSS colors. |
 | [`src/document/easing.zig`](../src/document/easing.zig) | Owned CSS timing functions and cubic-Bezier evaluation. |
-| [`src/document/length.zig`](../src/document/length.zig) | Shared parsing, layout conversion, and serialization for supported non-negative CSS pixel lengths. |
+| [`src/document/length.zig`](../src/document/length.zig) | Shared parsing, context-based CSS-pixel resolution, layout conversion, and serialization for supported non-negative `px`, `em`, and percentage lengths. |
 | [`src/document/transform.zig`](../src/document/transform.zig) | Shared parsing and interpolation-ready representation for supported CSS translations. |
 | [`src/document/selector.zig`](../src/document/selector.zig) | Selector representation and matching. |
 | [`src/network/url.zig`](../src/network/url.zig) | Owning `Url`, URL resolution, schemes, HTTP requests, redirects, cookies, response bodies, and cache integration. |
@@ -321,6 +321,12 @@ while evaluated code remains in the document realm. Author stylesheets are
 rebuilt as a staged rules-plus-keyframes-plus-source-buffer generation from the current DOM,
 which both loads inserted `<style>`/`<link>` elements and retires rules from
 detached links without leaving property slices pointing at freed CSS text.
+Iframe browsing contexts use a split boundary: the synchronous mutation
+completion pass validates Element-carried numeric window IDs, rebinds surviving
+Frame pointers in final DOM order, and deinitializes contexts whose Elements
+disappeared. Marker-free attached iframes are fetched only by the later resource
+scan, after the host call has returned, through the same CSP, Referrer-Policy,
+document-generation, and nested-frame loader used at navigation time.
 
 CSS background images intentionally follow a later resource boundary. After
 each initial or dynamic computed-style pass, `background_images.zig` walks the
@@ -535,7 +541,14 @@ the full replacement render constructs a fresh dependency graph. Dirty flags
 and an animation-frame request are published before the mutation proceeds, so
 allocation failure still rebuilds the retired state. A focused mutation root
 survives; focus is cleared only when the focused node is a strict descendant
-that the replacement removes.
+that the replacement removes. After the mutation has installed its final child
+array, repaired parent pointers, and rebound JavaScript handles, a paired
+completion callback runs before JavaScript resumes. Each iframe Element's
+numeric window ID moves with the by-value Node, allowing that pass to repair the
+Frame's raw `frame_element` borrow without dereferencing its old address.
+Unmatched child Frames are unregistered and recursively destroyed immediately;
+if a same-origin child shared the current Js host, the host restores the
+mutating parent window after clearing the child realm's native bindings.
 
 ### CSS rules and invalidation fields
 
@@ -1344,7 +1357,14 @@ before recording the visit or installing the child. Initial iframe discovery
 is part of its containing document's state and does not append history. A later
 child navigation prepares a path/request/prior-subtree action before reset and
 commits it only after the new child document is ready; history replay uses the
-same loader without appending another action.
+same loader without appending another action. Script-created iframe Elements
+start without a browsing-context marker and enter the initial child-frame
+loader during their owning Frame's deferred resource refresh. Successful load
+sets the Element's window ID only after the heap-stable Frame is registered and
+inserted at its DOM-order child index. Script removal is the inverse: mutation
+completion rebinds every surviving marker, moves those Frame pointers into
+final DOM order, and deinitializes every unmatched context before another task
+can resolve its document handle.
 
 ### Stylesheet generation transfer
 
@@ -1476,7 +1496,10 @@ Current enforced behavior includes:
   subtrees disappear immediately while retaining handles for reattachment;
 - structural `innerHTML` invokes its dedicated synchronous DOM-mutation host
   callback before old child storage retires; ordinary render callbacks remain
-  a separate, non-destructive invalidation path;
+  a separate, non-destructive invalidation path. A distinct completion callback
+  runs after the final child storage and handle repair, allowing iframe Frame
+  bindings to be reconciled without retaining the old Node address or starting
+  network work inside Kiesel;
 - `JsRenderContext` connects a frame window to Browser/Tab/Js host pointers and
   carries a generation number while it is synchronously registered with
   Kiesel;
@@ -1733,6 +1756,15 @@ reintroduced:
    obsolete layout pointers. See `prepareDomMutation`,
    `Tab.prepareForDomMutation`, and
    `Frame.retireDomMutationBorrows`.
+15. **Script-mutated iframe ownership:** iframe Elements retain only a numeric
+   child-window marker across Node-array relocation. The synchronous mutation
+   completion pass validates that marker against the Tab registry, repairs
+   surviving Frame element pointers/order, and recursively deinitializes
+   removed contexts before JavaScript resumes. The deferred resource scan loads
+   marker-free additions through the normal iframe navigation pipeline, so no
+   network call re-enters the active host mutation. See
+   `Element.iframe_window_id`, `Frame.reconcileAttachedChildFrames`, and
+   `Browser.loadIframes`.
 
 ## Confirmed unresolved lifetime risks
 
