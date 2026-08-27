@@ -566,6 +566,10 @@ const RasterTaskContext = struct {
     window_height: i32,
     chrome_bottom: i32,
     active_tab: ?*Tab,
+    // An active tab may exist before its first document commit. Keep that
+    // state distinct from draw-only tasks, whose page snapshot is omitted
+    // because the worker cache should already be populated.
+    active_tab_has_content: bool,
     scroll: i32,
     document_height: i32,
     zoom: f32,
@@ -590,6 +594,24 @@ const RasterTaskContext = struct {
         allocator.destroy(self);
     }
 };
+
+fn missingTabRasterCache(
+    has_active_tab: bool,
+    active_tab_has_content: bool,
+    has_tab_surface: bool,
+    compositor_cache_valid: bool,
+    interest_region_valid: bool,
+) bool {
+    return has_active_tab and active_tab_has_content and
+        ((!has_tab_surface and !compositor_cache_valid) or !interest_region_valid);
+}
+
+test "an uncommitted active tab does not require a raster cache" {
+    try std.testing.expect(!missingTabRasterCache(true, false, false, false, false));
+    try std.testing.expect(missingTabRasterCache(true, true, false, false, false));
+    try std.testing.expect(!missingTabRasterCache(true, true, true, false, true));
+    try std.testing.expect(!missingTabRasterCache(true, true, false, true, true));
+}
 
 // Browser manages the window and tabs
 pub const Browser = struct {
@@ -2614,12 +2636,16 @@ pub const Browser = struct {
         // History owns an independent replay copy of a POST body. Complete
         // those allocations before retiring the old document so an OOM leaves
         // both the current page and history untouched.
-        var prepared_history = try tab.prepareHistoryNavigation(
-            url,
-            payload,
-            history_navigation,
-        );
-        defer prepared_history.deinit(tab.allocator);
+        var prepared_history: ?tab_module.PreparedHistoryNavigation = null;
+        defer if (prepared_history) |*prepared| prepared.deinit(tab.allocator);
+        if (history_navigation == .push) {
+            prepared_history = try tab.prepareHistoryNavigation(
+                tab.root_frame,
+                url,
+                payload,
+                true,
+            );
+        }
 
         tab.task_runner.clear();
         tab.invalidateJsContext();
@@ -2846,12 +2872,14 @@ pub const Browser = struct {
             _ = frame.scrollToFragment(fragment);
         }
 
-        // Commit history only after the new document is ready. Ordinary
-        // navigation truncates a forward branch; traversal replaces the
-        // canonical target with the final URL after redirects.
-        tab.commitPreparedHistoryNavigation(&prepared_history);
+        // Commit history only after the new document is ready. Replay owns
+        // the installed URL through the Frame but leaves the action log
+        // untouched until the complete joint state has been reconstructed.
+        if (prepared_history) |*prepared| {
+            tab.commitPreparedHistoryNavigation(prepared);
+        }
         frame.current_url = url;
-        frame.current_url_owned = false;
+        frame.current_url_owned = true;
         self.updateTabTitle(tab, document_title);
         document_title = null;
         self.resetFrameTimeEstimatorForTab(tab);
@@ -2915,6 +2943,18 @@ pub const Browser = struct {
     }
 
     fn resetFrameForNavigation(self: *Browser, frame: *Frame) void {
+        if (frame.tab.focused_frame) |focused| {
+            var focus_owner: ?*Frame = focused;
+            while (focus_owner) |candidate| : (focus_owner = candidate.parent) {
+                if (candidate == frame) {
+                    // Descendant Frames are about to be destroyed. Retain at
+                    // most the stable navigation target as a focus group; its
+                    // element focus is cleared below.
+                    frame.tab.focused_frame = frame;
+                    break;
+                }
+            }
+        }
         frame.tab.clearIntervalsForDocument(frame.window_id, frame.document_generation);
         if (frame.js_context) |ctx| {
             ctx.setNodes(frame.window_id, null);
@@ -2999,6 +3039,7 @@ pub const Browser = struct {
         frame: *Frame,
         url: *Url,
         payload: ?[]const u8,
+        history_navigation: HistoryNavigation,
     ) !void {
         std.log.info("Loading iframe: {s}", .{url.*.path});
 
@@ -3057,6 +3098,17 @@ pub const Browser = struct {
             return err;
         };
         defer if (frame_url_owned) frame_url.*.free(self.allocator);
+
+        var prepared_history: ?tab_module.PreparedHistoryNavigation = null;
+        defer if (prepared_history) |*prepared| prepared.deinit(frame.tab.allocator);
+        if (history_navigation == .push) {
+            prepared_history = try frame.tab.prepareHistoryNavigation(
+                frame,
+                url,
+                payload,
+                true,
+            );
+        }
 
         // The old child-frame URL owns the storage borrowed by referrer_value.
         // Keep the old document generation alive through fetch/decode, then
@@ -3185,6 +3237,10 @@ pub const Browser = struct {
         try self.layoutTabNodes(frame, true);
         if (url.*.fragment()) |fragment| {
             _ = frame.scrollToFragment(fragment);
+        }
+
+        if (prepared_history) |*prepared| {
+            frame.tab.commitPreparedHistoryNavigation(prepared);
         }
 
         frame.tab.setNeedsRender();
@@ -4897,10 +4953,13 @@ pub const Browser = struct {
             surface
         else
             return error.MissingChromeRasterCache;
-        if (task.active_tab != null and
-            (self.worker_tab_surface == null and !self.worker_compositor_cache.valid or
-                !self.worker_interest_region_valid))
-        {
+        if (missingTabRasterCache(
+            task.active_tab != null,
+            task.active_tab_has_content,
+            self.worker_tab_surface != null,
+            self.worker_compositor_cache.valid,
+            self.worker_interest_region_valid,
+        )) {
             return error.MissingTabRasterCache;
         }
 
@@ -5771,6 +5830,7 @@ pub const Browser = struct {
         errdefer if (composited_updates_owned) raster_allocator.free(composited_updates);
 
         const zoom = self.activeZoom();
+        const active_tab_has_content = self.active_tab_display_list != null;
         context.* = .{
             .allocator = raster_allocator,
             .browser = self,
@@ -5782,6 +5842,7 @@ pub const Browser = struct {
             .window_height = self.window_height,
             .chrome_bottom = self.chrome.bottom,
             .active_tab = self.activeTab(),
+            .active_tab_has_content = active_tab_has_content,
             .scroll = self.active_tab_scroll,
             .document_height = self.active_tab_height,
             .zoom = zoom,

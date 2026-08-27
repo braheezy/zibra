@@ -276,7 +276,8 @@ borrows from every window have ended.
 
 `Tab` in [`src/browser/tab.zig`](../src/browser/tab.zig) owns:
 
-- indexed URL history entries and the current-entry index;
+- indexed joint root/iframe history actions, their prior-subtree snapshots,
+  and the current-entry index;
 - a sentinel-terminated copy of the current root document's title;
 - one root `Frame`, which recursively owns child frames;
 - one Kiesel `Js` context per origin key;
@@ -303,12 +304,13 @@ and the standalone Browser in screenshot mode.
   decoded linked sheets and copied `<style>` text retained in DOM order;
 - hit-test collections, image visibility boxes, fragment target positions, and
   allowed-origin strings;
-- a frame-owned URL only when `current_url_owned` is true.
+- its current URL whenever `current_url_owned` is true; every installed root
+  and child document now uses this independent owner.
 
-The root frame normally borrows its URL from `Tab.history`; child frames may
-own their URL. `parent`, `tab`, `frame_element`, DOM focus and element-scroll
-focus pointers, hit-test node pointers, `js_context`, and layout-related node
-pointers are borrowed.
+History entries own separate replay URL/body copies, so truncating a Forward
+branch cannot invalidate the currently installed root URL. `parent`, `tab`,
+`frame_element`, DOM focus and element-scroll focus pointers, hit-test node
+pointers, `js_context`, and layout-related node pointers are borrowed.
 
 Structural DOM mutation also marks the affected frame's resources dirty. On
 the serialized tab worker, after the JavaScript host call has completed and
@@ -377,15 +379,25 @@ stale. A middle-click records the target before transferring its owning URL to
 the pending-tab queue, so the still-visible source document can repaint at
 once; stale background documents refresh when activated.
 
-History is mutated only by the serialized tab worker. Ordinary successful
-navigation removes and releases entries after the current index before
-appending the new URL. Back and Forward retain the list, clone the target URL
-for loading, and update the index only after the replacement document is
-ready; a failed traversal therefore leaves both the prior document's history
-position and every canonical history URL owned. Chrome does not read the
-history collection concurrently. It reads acquire/release atomic availability
-flags and schedules a traversal task, which revalidates the requested move on
-the worker.
+History is mutated only by the serialized tab worker. Each successful root,
+iframe, or same-document fragment navigation appends one joint-history action.
+The entry owns the resulting request, a child-index path from the root Frame,
+whether the action replaced a document, and a recursive URL/request snapshot
+of the target subtree immediately before the action. Preparing that entry
+clones all URLs, POST bodies, paths, and subtree containers before any current
+document is retired. Frame paths, rather than `*Frame` values, remain valid
+across a replay that creates new Frame allocations.
+
+Ordinary navigation removes and releases actions after the current index
+before appending. Back applies the current action's owned prior state; Forward
+applies the next action's resulting request. Thus sibling iframe actions are
+undone independently and a replaced parent iframe can recreate the precise
+nested-frame state it destroyed. Root and iframe URLs installed during replay
+remain Frame-owned and independent of history. The index advances only after
+the full target/subtree operation succeeds. Chrome does not read the history
+collection concurrently: it reads acquire/release atomic availability flags
+and schedules a traversal task, which revalidates the requested adjacent move
+and generation on the worker.
 
 `Frame.deinit` destroys display/layout state before DOM and destroys DOM before
 the decoded HTML source. That order is required because layout borrows DOM and
@@ -772,8 +784,11 @@ an ordered compositor-plane cache. `scroll.zig` chooses a device-pixel interest
 region no taller than four native window heights, with one viewport of
 scroll-back headroom where page bounds permit. Without separable effects,
 raster translates page commands by that region's page-space start and publishes
-the coordinates only after all fallible drawing succeeds. With top-level
-composited opacity or translation effects, static strata become ordered planes
+the coordinates only after all fallible drawing succeeds. Before the first
+document commit, an active tab may have no display list; that state renders as
+blank content after the worker clears its tab cache. Cache validity is required
+only when a task represents committed tab content. With top-level composited
+opacity or translation effects, static strata become ordered planes
 cropped to their painted intersection with the interest region, and each
 animated subtree gets its own plane. A plane with at most three cheap
 rect/rounded-rect/line/outline leaves owns a separate pointer-free
@@ -965,12 +980,13 @@ parsing supplies the normal empty document structure.
 
 Top-level HTTP navigation uses `fetchBodyWithFinalUrl` to receive an owned URL
 for the final redirect destination. `loadInTab` moves that value into the
-existing navigation URL pointer before parsing subresources or committing
-history, so the frame, relative URLs, history, and chrome all use the final
-destination without adding URL ownership to ordinary subresource responses.
-For a Back or Forward traversal, that final URL replaces the canonical entry at
-the destination index; this keeps redirected traversal and subsequent history
-moves consistent.
+existing navigation URL pointer before parsing subresources or preparing
+history, so the installed frame, the independently cloned history request,
+relative URLs, and chrome all use the final destination without adding URL
+ownership to ordinary subresource responses. A replay clones the retained
+request and lets the installed Frame own any newly resolved final destination;
+the immutable action remains a safe future replay source even if redirect
+policy changes between traversals.
 
 `view-source:` now replaces the wrapper Ada URL with the parsed inner Ada URL
 before exposing the inner component slices. That inner URL is the one released
@@ -1029,21 +1045,25 @@ it dirty.
 Chrome's Back and Forward handlers read only atomic availability snapshots and
 enqueue a history task. The worker computes the target again before loading,
 so a click based on a stale disabled/enabled snapshot is harmless.
-History entries are heap-stable owners of a URL, an explicit GET/POST method,
-and an independent POST-body copy. A navigation prepares the entry, body copy,
-and list capacity before retiring the current document, then transfers both the
-URL and prepared entry only after the replacement document is ready. Replacing
-or truncating entries frees their URL and POST bytes together.
+History entries are heap-stable owners of a URL, explicit GET/POST method,
+independent POST-body and frame-path copies, and the recursive request snapshot
+from before the navigation. A navigation prepares the full entry and list
+capacity before retiring the current document, then appends it only after the
+replacement document is ready. Truncating entries recursively frees their
+resulting request and prior-subtree snapshot.
 
-A GET history target is cloned and replayed directly on the tab worker. A POST
-target does not change the index or document; instead the worker publishes a
-tab pointer, target index, and history generation under `Browser.lock`. The
-interactive SDL thread consumes that request and displays a native modal
-confirmation without holding the lock. Cancel schedules nothing. Resubmit
-queues a task back to the originating tab, which validates the generation,
-copies the retained body for the load, and commits the new index only after the
-POST succeeds. Tab switches, shutdown, stale generations, dialog failures, and
-headless operation all cancel rather than replaying state-changing data.
+A GET traversal is replayed directly on the tab worker. Back restores the
+current entry's prior target subtree; Forward reapplies the next entry's
+resulting request. If that exact operation needs a POST—possibly in a nested
+subtree restored with its parent—the worker publishes a tab pointer, target
+index, and history generation under `Browser.lock`. The interactive SDL thread
+consumes that request and displays one native modal confirmation without
+holding the lock. Cancel schedules nothing. Resubmit queues a task back to the
+originating tab, which validates the adjacent target and generation and moves
+the index only after every required request succeeds. Same-document history
+actions never prompt or resend their retained POST metadata. Tab switches,
+shutdown, stale generations, dialog failures, and headless operation all
+cancel rather than replaying state-changing data.
 Address-bar submission is the sole URL-or-search policy boundary. Chrome trims
 the input, preserves explicit schemes and obvious bare hosts, and otherwise
 constructs a Google query using `+` for whitespace and percent escapes for
@@ -1106,10 +1126,13 @@ Accessibility naming and speech never copy that password value.
 Space continues to use only focused-element activation, and a text input outside
 a form does nothing.
 Primary same-document fragment links stay on the tab worker: they resolve the
-new URL, append it to indexed root history (or replace an iframe-owned URL),
-apply the clamped layout target, and request a paint commit. The existing DOM,
-JavaScript state, form controls, and document generation remain intact. Middle
-click still transfers the resolved URL to a new tab instead.
+new URL, append a non-document-replacing joint-history action for either the
+root or iframe path, replace that Frame's independently owned current URL,
+apply the clamped layout target, and request a paint commit. Back/Forward
+reapply only the URL/scroll action and never resend retained POST metadata. The
+existing DOM, JavaScript state, form controls, descendants, and document
+generation remain intact. Middle click still transfers the resolved URL to a
+new tab instead.
 
 Window resizing preserves that ownership boundary. The main thread allocates a
 complete replacement generation of the root/chrome/bounded-tab z2d surfaces
@@ -1294,8 +1317,10 @@ lock across parsing, layout, JavaScript, and rendering.
    state, and commits browser-visible data;
 10. applies any final-URL fragment to the completed layout and clamps the frame
    scroll range;
-11. commits the final URL by appending it to indexed history, or by replacing a
-   successfully traversed entry and moving the current index.
+11. on an ordinary navigation, appends the prepared root action and its prior
+   frame-tree snapshot; on replay, leaves the immutable action log alone while
+   the new root Frame owns the cloned request URL. The traversal coordinator
+   moves the shared index only after any nested snapshot restoration finishes.
 
 `Tab.invalidateJsContext` in [`src/browser/tab.zig`](../src/browser/tab.zig)
 zeros every current frame's document generation, clears its embedded
@@ -1315,7 +1340,11 @@ state is retired under `Browser.lock` before reset frees document resources.
 Installing the replacement assigns a fresh per-document generation. Initial
 iframe loads and later navigation within an existing child frame check both the
 requested and final redirect destinations against the parent document's CSP
-before recording the visit or installing the child.
+before recording the visit or installing the child. Initial iframe discovery
+is part of its containing document's state and does not append history. A later
+child navigation prepares a path/request/prior-subtree action before reset and
+commits it only after the new child document is ready; history replay uses the
+same loader without appending another action.
 
 ### Stylesheet generation transfer
 

@@ -1,0 +1,26 @@
+<!--
+How to verify:
+1. In Frame A click A0 -> A1, then inside A1 click Nested C0 -> C1.
+2. In Frame A click A1 -> A2, then in Frame B click B0 -> B1.
+3. Back must show B0 while A stays A2. Back again must restore A1 together
+   with Nested C1. Back again changes only Nested C1 to C0; Back once more
+   restores A0. The top-level page must never navigate during these steps.
+4. Forward must reproduce those four changes in the opposite order. After one
+   Back, following a different link must discard the old Forward branch.
+-->
+<!doctype html>
+<html>
+<head>
+  <title>Iframe joint history</title>
+  <style>
+    body { font-family: sans-serif; padding: 16px; }
+    iframe { width: 520px; height: 270px; margin: 10px; border: 3px solid #555; }
+  </style>
+</head>
+<body>
+  <h1>Top-level page: must stay loaded</h1>
+  <p>Use the links inside both frames, then the browser Back and Forward buttons.</p>
+  <iframe title="Frame A" src="iframe-history-a0.html"></iframe>
+  <iframe title="Frame B" src="iframe-history-b0.html"></iframe>
+</body>
+</html>

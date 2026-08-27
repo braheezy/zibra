@@ -65,9 +65,9 @@ pub const HistoryDirection = enum {
     forward,
 };
 
-pub const HistoryNavigation = union(enum) {
+pub const HistoryNavigation = enum {
     push,
-    traverse: usize,
+    replay,
 };
 
 pub const HistoryMethod = enum {
@@ -75,48 +75,92 @@ pub const HistoryMethod = enum {
     post,
 };
 
-/// One replayable root-navigation entry. The heap-stable URL is also borrowed
-/// by the installed root Frame; the optional POST bytes are an independent
-/// copy retained until this history entry is destroyed or replaced.
+/// Owned request state for one frame subtree immediately before a navigation.
+/// Back traversal restores this tree after reloading its root request; child
+/// indexes are implicit in `children` order and therefore survive Frame moves.
+pub const FrameHistorySnapshot = struct {
+    url: *Url,
+    method: HistoryMethod,
+    post_body: ?[]u8,
+    children: std.ArrayList(*FrameHistorySnapshot),
+
+    pub fn deinit(self: *FrameHistorySnapshot, allocator: std.mem.Allocator) void {
+        for (self.children.items) |child| child.deinit(allocator);
+        self.children.deinit(allocator);
+        if (self.post_body) |body| allocator.free(body);
+        self.url.*.free(allocator);
+        allocator.destroy(self.url);
+        allocator.destroy(self);
+    }
+
+    fn containsPost(self: *const FrameHistorySnapshot) bool {
+        if (self.method == .post) return true;
+        for (self.children.items) |child| {
+            if (child.containsPost()) return true;
+        }
+        return false;
+    }
+};
+
+/// One replayable navigation in the tab-wide joint session history. Frame
+/// identity is stored as child indexes from the root rather than a `*Frame`,
+/// because every document-replacing replay creates fresh frame allocations.
 pub const HistoryEntry = struct {
     url: *Url,
     method: HistoryMethod,
     post_body: ?[]u8,
+    target_path: []usize,
+    replaces_document: bool,
+    previous: ?*FrameHistorySnapshot,
 
     fn prepare(
         allocator: std.mem.Allocator,
-        url: *Url,
+        url: *const Url,
         payload: ?[]const u8,
+        target_path: []const usize,
+        replaces_document: bool,
+        previous: ?*FrameHistorySnapshot,
     ) !*HistoryEntry {
         const entry = try allocator.create(HistoryEntry);
         errdefer allocator.destroy(entry);
+
+        const url_ptr = try allocator.create(Url);
+        errdefer allocator.destroy(url_ptr);
+        url_ptr.* = try url.*.clone(allocator);
+        errdefer url_ptr.*.free(allocator);
+
         const body_copy = if (payload) |body| try allocator.dupe(u8, body) else null;
+        errdefer if (body_copy) |body| allocator.free(body);
+        const path_copy = try allocator.dupe(usize, target_path);
         entry.* = .{
-            .url = url,
+            .url = url_ptr,
             .method = if (payload == null) .get else .post,
             .post_body = body_copy,
+            .target_path = path_copy,
+            .replaces_document = replaces_document,
+            .previous = previous,
         };
         return entry;
     }
 
     pub fn deinit(self: *HistoryEntry, allocator: std.mem.Allocator) void {
         if (self.post_body) |body| allocator.free(body);
+        if (self.previous) |snapshot| snapshot.deinit(allocator);
+        allocator.free(self.target_path);
         self.url.*.free(allocator);
         allocator.destroy(self.url);
         allocator.destroy(self);
     }
 };
 
-/// A history mutation whose allocations have succeeded but whose URL remains
-/// caller-owned until `commitPreparedHistoryNavigation` transfers the entry.
+/// A history mutation whose URL, body, and frame path have all been copied
+/// before the caller retires the currently installed document.
 pub const PreparedHistoryNavigation = struct {
     entry: ?*HistoryEntry,
-    navigation: HistoryNavigation,
 
     pub fn deinit(self: *PreparedHistoryNavigation, allocator: std.mem.Allocator) void {
         const entry = self.entry orelse return;
-        if (entry.post_body) |body| allocator.free(body);
-        allocator.destroy(entry);
+        entry.deinit(allocator);
         self.entry = null;
     }
 };
@@ -512,9 +556,17 @@ pub const Frame = struct {
         return true;
     }
 
-    fn navigateSameDocumentFragment(self: *Frame, b: *Browser, resolved_url: Url) !void {
-        const fragment = resolved_url.fragment() orelse unreachable;
-        const target_scroll = self.scrollOffsetForFragment(fragment);
+    fn navigateSameDocumentHistory(
+        self: *Frame,
+        b: *Browser,
+        resolved_url: Url,
+        history_navigation: HistoryNavigation,
+    ) !void {
+        const fragment = resolved_url.fragment();
+        const target_scroll: ?i32 = if (fragment) |value|
+            self.scrollOffsetForFragment(value)
+        else
+            0;
 
         // Same-document fragment navigations do not pass through loadInTab,
         // but they still create a visited URL entry.
@@ -526,30 +578,34 @@ pub const Frame = struct {
         };
         url_ptr.* = resolved_url;
         var url_owned = true;
-        errdefer if (url_owned) {
+        defer if (url_owned) {
             url_ptr.*.free(self.allocator);
             self.allocator.destroy(url_ptr);
         };
 
-        if (self.parent == null) {
-            const current_payload = if (self.tab.history_index) |index|
-                self.tab.history.items[index].post_body
-            else
-                null;
-            try self.tab.commitHistoryNavigation(url_ptr, current_payload, .push);
-            url_owned = false;
-            self.current_url = url_ptr;
-            self.current_url_owned = false;
-        } else {
-            if (self.current_url_owned) {
-                if (self.current_url) |old_url| {
-                    old_url.*.free(self.allocator);
-                    self.allocator.destroy(old_url);
-                }
+        var prepared_history: ?PreparedHistoryNavigation = null;
+        defer if (prepared_history) |*prepared| prepared.deinit(self.allocator);
+        if (history_navigation == .push) {
+            const current_payload = try self.tab.currentHistoryPayloadForFrame(self);
+            prepared_history = try self.tab.prepareHistoryNavigation(
+                self,
+                url_ptr,
+                current_payload,
+                false,
+            );
+        }
+
+        if (self.current_url_owned) {
+            if (self.current_url) |old_url| {
+                old_url.*.free(self.allocator);
+                self.allocator.destroy(old_url);
             }
-            self.current_url = url_ptr;
-            self.current_url_owned = true;
-            url_owned = false;
+        }
+        self.current_url = url_ptr;
+        self.current_url_owned = true;
+        url_owned = false;
+        if (prepared_history) |*prepared| {
+            self.tab.commitPreparedHistoryNavigation(prepared);
         }
 
         if (target_scroll) |scroll| {
@@ -574,7 +630,7 @@ pub const Frame = struct {
         }
 
         if (current_url_ptr.*.sameDocument(resolved_url) and resolved_url.fragment() != null) {
-            try self.navigateSameDocumentFragment(b, resolved_url);
+            try self.navigateSameDocumentHistory(b, resolved_url, .push);
             return;
         }
 
@@ -1006,7 +1062,7 @@ accessibility: AccessibilitySettings = .{},
 // Available height for tab content (window height minus chrome height)
 tab_width: i32 = 0,
 tab_height: i32 = 0,
-// Replayable root-navigation history (owns HistoryEntry and Url pointers).
+// Replayable joint root/iframe history with owned requests and prior subtrees.
 history: std.ArrayList(*HistoryEntry),
 // Index of the currently displayed history entry. Forward entries remain
 // owned until a successful ordinary navigation replaces that branch.
@@ -1618,25 +1674,128 @@ fn updateHistoryAvailability(self: *Tab) void {
     );
 }
 
-/// Reserve every fallible allocation for a history mutation before a caller
-/// retires the currently installed document. The URL remains caller-owned
-/// until the prepared value is committed.
+/// Return an owned child-index path from the root browsing context. Raw Frame
+/// pointers cannot enter history because root and parent-frame navigation
+/// destroys those allocations before a later traversal.
+pub fn historyFramePath(self: *const Tab, target: *const Frame) ![]usize {
+    var reversed = std.ArrayList(usize).empty;
+    defer reversed.deinit(self.allocator);
+
+    var current = target;
+    while (current.parent) |parent| {
+        var child_index: ?usize = null;
+        for (parent.children.items, 0..) |child, i| {
+            if (child == current) {
+                child_index = i;
+                break;
+            }
+        }
+        try reversed.append(self.allocator, child_index orelse return error.DetachedHistoryFrame);
+        current = parent;
+    }
+    if (self.root_frame == null or self.root_frame.? != current) {
+        return error.DetachedHistoryFrame;
+    }
+
+    const path = try self.allocator.alloc(usize, reversed.items.len);
+    for (reversed.items, 0..) |index, i| {
+        path[path.len - i - 1] = index;
+    }
+    return path;
+}
+
+fn captureFrameHistorySnapshot(self: *Tab, frame: *Frame) !*FrameHistorySnapshot {
+    const current_url = frame.current_url orelse return error.HistoryFrameMissingUrl;
+    const payload = try self.currentHistoryPayloadForFrame(frame);
+
+    var cloned_url = try current_url.*.clone(self.allocator);
+    var cloned_url_owned = true;
+    errdefer if (cloned_url_owned) cloned_url.free(self.allocator);
+
+    const url_ptr = try self.allocator.create(Url);
+    var url_ptr_owned = true;
+    errdefer if (url_ptr_owned) self.allocator.destroy(url_ptr);
+    url_ptr.* = cloned_url;
+    cloned_url_owned = false;
+    var url_contents_owned = true;
+    errdefer if (url_contents_owned) url_ptr.*.free(self.allocator);
+
+    const body_copy = if (payload) |body| try self.allocator.dupe(u8, body) else null;
+    var body_owned = body_copy != null;
+    errdefer if (body_owned) self.allocator.free(body_copy.?);
+
+    const snapshot = try self.allocator.create(FrameHistorySnapshot);
+    var snapshot_allocation_owned = true;
+    errdefer if (snapshot_allocation_owned) self.allocator.destroy(snapshot);
+    snapshot.* = .{
+        .url = url_ptr,
+        .method = if (payload == null) .get else .post,
+        .post_body = body_copy,
+        .children = .empty,
+    };
+    url_ptr_owned = false;
+    url_contents_owned = false;
+    body_owned = false;
+    snapshot_allocation_owned = false;
+    errdefer snapshot.deinit(self.allocator);
+
+    try snapshot.children.ensureTotalCapacity(self.allocator, frame.children.items.len);
+    for (frame.children.items) |child_frame| {
+        const child = try self.captureFrameHistorySnapshot(child_frame);
+        snapshot.children.appendAssumeCapacity(child);
+    }
+    return snapshot;
+}
+
+fn prepareHistoryNavigationForPath(
+    self: *Tab,
+    url: *const Url,
+    payload: ?[]const u8,
+    target_path: []const usize,
+    replaces_document: bool,
+    previous: ?*FrameHistorySnapshot,
+) !PreparedHistoryNavigation {
+    try self.history.ensureUnusedCapacity(self.allocator, 1);
+    return .{ .entry = try HistoryEntry.prepare(
+        self.allocator,
+        url,
+        payload,
+        target_path,
+        replaces_document,
+        previous,
+    ) };
+}
+
+/// Reserve and copy every fallible part of a history mutation before a caller
+/// retires the currently installed document. A null target is valid only for
+/// the initial root navigation, whose path is empty.
 pub fn prepareHistoryNavigation(
     self: *Tab,
-    url: *Url,
+    target: ?*Frame,
+    url: *const Url,
     payload: ?[]const u8,
-    navigation: HistoryNavigation,
+    replaces_document: bool,
 ) !PreparedHistoryNavigation {
-    switch (navigation) {
-        .push => try self.history.ensureUnusedCapacity(self.allocator, 1),
-        .traverse => |target| {
-            if (target >= self.history.items.len) return error.InvalidHistoryTarget;
-        },
-    }
-    return .{
-        .entry = try HistoryEntry.prepare(self.allocator, url, payload),
-        .navigation = navigation,
-    };
+    const path = if (target) |frame|
+        try self.historyFramePath(frame)
+    else
+        try self.allocator.alloc(usize, 0);
+    defer self.allocator.free(path);
+    const previous = if (target) |frame|
+        try self.captureFrameHistorySnapshot(frame)
+    else
+        null;
+    var previous_owned = previous != null;
+    errdefer if (previous_owned) previous.?.deinit(self.allocator);
+    const prepared = try self.prepareHistoryNavigationForPath(
+        url,
+        payload,
+        path,
+        replaces_document,
+        previous,
+    );
+    previous_owned = false;
+    return prepared;
 }
 
 /// Transfer a fully prepared entry into history without allocation.
@@ -1645,41 +1804,52 @@ pub fn commitPreparedHistoryNavigation(
     prepared: *PreparedHistoryNavigation,
 ) void {
     const entry = prepared.entry orelse return;
-    switch (prepared.navigation) {
-        .push => {
-            const retained_len = if (self.history_index) |index| index + 1 else 0;
-            while (self.history.items.len > retained_len) {
-                const stale = self.history.pop().?;
-                stale.deinit(self.allocator);
-            }
-            self.history.appendAssumeCapacity(entry);
-            self.history_index = self.history.items.len - 1;
-        },
-        .traverse => |target| {
-            std.debug.assert(target < self.history.items.len);
-            const replaced = self.history.items[target];
-            self.history.items[target] = entry;
-            replaced.deinit(self.allocator);
-            self.history_index = target;
-        },
+    const retained_len = if (self.history_index) |index| index + 1 else 0;
+    while (self.history.items.len > retained_len) {
+        const stale = self.history.pop().?;
+        stale.deinit(self.allocator);
     }
+    self.history.appendAssumeCapacity(entry);
+    self.history_index = self.history.items.len - 1;
     prepared.entry = null;
     self.history_generation +%= 1;
     if (self.history_generation == 0) self.history_generation = 1;
     self.updateHistoryAvailability();
 }
 
-/// Commit `url` as the canonical owner for a successful root navigation.
-/// Ownership transfers only on success.
-pub fn commitHistoryNavigation(
+/// Testable/direct entry point for recording a completed navigation whose
+/// target path is already known. History owns independent URL, body, and path
+/// copies; the caller retains every argument.
+pub fn commitHistoryNavigationForPath(
     self: *Tab,
-    url: *Url,
+    url: *const Url,
     payload: ?[]const u8,
-    navigation: HistoryNavigation,
+    target_path: []const usize,
+    replaces_document: bool,
 ) !void {
-    var prepared = try self.prepareHistoryNavigation(url, payload, navigation);
+    var prepared = try self.prepareHistoryNavigationForPath(
+        url,
+        payload,
+        target_path,
+        replaces_document,
+        null,
+    );
     defer prepared.deinit(self.allocator);
     self.commitPreparedHistoryNavigation(&prepared);
+}
+
+fn pathEquals(left: []const usize, right: []const usize) bool {
+    return std.mem.eql(usize, left, right);
+}
+
+fn pathIsPrefix(prefix: []const usize, path: []const usize) bool {
+    return prefix.len <= path.len and std.mem.eql(usize, prefix, path[0..prefix.len]);
+}
+
+fn isAdjacentHistoryTarget(self: *const Tab, target: usize) bool {
+    const current = self.history_index orelse return false;
+    return (current > 0 and target == current - 1) or
+        (current + 1 < self.history.items.len and target == current + 1);
 }
 
 pub fn historyTraversalTarget(
@@ -1691,10 +1861,19 @@ pub fn historyTraversalTarget(
         .back => if (current > 0) current - 1 else null,
         .forward => if (current + 1 < self.history.items.len) current + 1 else null,
     } orelse return null;
+    const action = self.history.items[if (direction == .back) current else index];
+    const method: HistoryMethod = if (!action.replaces_document)
+        .get
+    else if (direction == .forward)
+        action.method
+    else if (action.previous) |snapshot|
+        if (snapshot.containsPost()) .post else .get
+    else
+        self.history.items[index].method;
     return .{
         .index = index,
         .generation = self.history_generation,
-        .method = self.history.items[index].method,
+        .method = method,
     };
 }
 
@@ -1720,9 +1899,118 @@ pub fn resubmitHistoryEntry(
     target: usize,
     generation: u64,
 ) !void {
-    if (generation != self.history_generation or target >= self.history.items.len) return;
-    if (self.history.items[target].method != .post) return;
+    if (generation != self.history_generation or !self.isAdjacentHistoryTarget(target)) return;
+    const current = self.history_index orelse return;
+    const direction: HistoryDirection = if (target < current) .back else .forward;
+    const planned = self.historyTraversalTarget(direction) orelse return;
+    if (planned.index != target or planned.method != .post) return;
     try self.loadHistoryEntry(b, target, generation);
+}
+
+fn frameAtHistoryPath(self: *Tab, path: []const usize) ?*Frame {
+    var frame = self.root_frame orelse return null;
+    for (path) |child_index| {
+        if (child_index >= frame.children.items.len) return null;
+        frame = frame.children.items[child_index];
+    }
+    return frame;
+}
+
+/// Resolve the request body that produced a frame's current document. An
+/// ancestor replacement resets every descendant to its authored initial GET,
+/// so an older exact-path POST must not leak through that boundary.
+fn currentHistoryPayloadForFrame(self: *Tab, frame: *Frame) !?[]const u8 {
+    const current_index = self.history_index orelse return null;
+    const path = try self.historyFramePath(frame);
+    defer self.allocator.free(path);
+
+    var cursor = current_index + 1;
+    while (cursor > 0) {
+        cursor -= 1;
+        const entry = self.history.items[cursor];
+        if (pathEquals(entry.target_path, path)) return entry.post_body;
+        if (entry.replaces_document and pathIsPrefix(entry.target_path, path)) return null;
+    }
+    return null;
+}
+
+fn replayHistoryRequest(
+    self: *Tab,
+    b: *Browser,
+    frame: *Frame,
+    url: *const Url,
+    payload: ?[]const u8,
+) !*Frame {
+    if (frame.parent == null) {
+        const cloned_url = try url.*.clone(self.allocator);
+        const url_ptr = self.allocator.create(Url) catch |err| {
+            cloned_url.free(self.allocator);
+            return err;
+        };
+        url_ptr.* = cloned_url;
+        var url_owned = true;
+        defer if (url_owned) {
+            url_ptr.*.free(self.allocator);
+            self.allocator.destroy(url_ptr);
+        };
+
+        try b.loadInTab(self, url_ptr, payload, .replay);
+        url_owned = false;
+        return self.root_frame orelse error.HistoryRootFrameMissing;
+    }
+
+    var cloned_url = try url.*.clone(self.allocator);
+    defer cloned_url.free(self.allocator);
+    try b.loadInFrame(frame, &cloned_url, payload, .replay);
+    return frame;
+}
+
+fn replaySameDocumentHistoryRequest(
+    self: *Tab,
+    b: *Browser,
+    frame: *Frame,
+    url: *const Url,
+) !void {
+    const cloned_url = try url.*.clone(self.allocator);
+    try frame.navigateSameDocumentHistory(b, cloned_url, .replay);
+}
+
+fn restoreFrameHistorySnapshot(
+    self: *Tab,
+    b: *Browser,
+    frame: *Frame,
+    snapshot: *const FrameHistorySnapshot,
+) !void {
+    const live_frame = try self.replayHistoryRequest(
+        b,
+        frame,
+        snapshot.url,
+        snapshot.post_body,
+    );
+    for (snapshot.children.items, 0..) |child_snapshot, child_index| {
+        if (child_index >= live_frame.children.items.len) {
+            return error.HistoryFramePathMissing;
+        }
+        try self.restoreFrameHistorySnapshot(
+            b,
+            live_frame.children.items[child_index],
+            child_snapshot,
+        );
+    }
+}
+
+/// Publish a successfully reconstructed adjacent history state. Keeping this
+/// mutation separate from network/document replay makes the old index remain
+/// authoritative until every root and child-frame action has completed.
+pub fn finishHistoryTraversal(self: *Tab, target: usize, generation: u64) bool {
+    if (generation != self.history_generation or !self.isAdjacentHistoryTarget(target)) {
+        return false;
+    }
+    self.history_index = target;
+    self.history_generation +%= 1;
+    if (self.history_generation == 0) self.history_generation = 1;
+    self.updateHistoryAvailability();
+    return true;
 }
 
 fn loadHistoryEntry(
@@ -1731,28 +2019,27 @@ fn loadHistoryEntry(
     target: usize,
     generation: u64,
 ) !void {
-    if (generation != self.history_generation or target >= self.history.items.len) return;
-    const entry = self.history.items[target];
-    const cloned_url = try entry.url.*.clone(self.allocator);
-    const url_ptr = self.allocator.create(Url) catch |err| {
-        cloned_url.free(self.allocator);
-        return err;
-    };
-    url_ptr.* = cloned_url;
-    var url_owned = true;
-    defer if (url_owned) {
-        url_ptr.*.free(self.allocator);
-        self.allocator.destroy(url_ptr);
-    };
+    if (generation != self.history_generation or !self.isAdjacentHistoryTarget(target)) return;
+    const current = self.history_index orelse return;
+    const is_back = target < current;
+    const entry = self.history.items[if (is_back) current else target];
+    const frame = self.frameAtHistoryPath(entry.target_path) orelse
+        return error.HistoryFramePathMissing;
 
-    const payload_copy = if (entry.post_body) |body|
-        try self.allocator.dupe(u8, body)
-    else
-        null;
-    defer if (payload_copy) |body| self.allocator.free(body);
+    if (is_back) {
+        const previous = entry.previous orelse return error.HistorySnapshotMissing;
+        if (entry.replaces_document) {
+            try self.restoreFrameHistorySnapshot(b, frame, previous);
+        } else {
+            try self.replaySameDocumentHistoryRequest(b, frame, previous.url);
+        }
+    } else if (entry.replaces_document) {
+        _ = try self.replayHistoryRequest(b, frame, entry.url, entry.post_body);
+    } else {
+        try self.replaySameDocumentHistoryRequest(b, frame, entry.url);
+    }
 
-    try b.loadInTab(self, url_ptr, payload_copy, .{ .traverse = target });
-    url_owned = false;
+    _ = self.finishHistoryTraversal(target, generation);
 }
 
 pub fn setNeedsRender(self: *Tab) void {

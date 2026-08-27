@@ -173,6 +173,11 @@ link retires its rules without undoing already-evaluated JavaScript.
 POST login to verify that Back to a POST target asks before replaying, Cancel
 does not navigate, and Resubmit sends the retained body again.
 
+`tests/manual/iframe-history.html` and its sibling/nested frame fixtures verify
+joint Back/Forward chronology. Navigating two sibling frames must undo only the
+most recent frame, while restoring a replaced parent frame must also restore
+the nested-frame state that existed immediately before that replacement.
+
 `tests/manual/display-list-hit-testing.html` exercises painted-fragment,
 translation, rounded-clip, overlap, and iframe click routing. Only the visible
 topmost painted target should activate; its child and destination pages are

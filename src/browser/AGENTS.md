@@ -129,6 +129,10 @@ before changing `root.zig`, `tab.zig`, `render/`, or browser task scheduling.
   window texture, copies it to the renderer, and presents it. Input handlers
   only publish dirty work and return. Shutdown joins this runner before tabs,
   font caches, z2d surfaces, SDL handles, or shared measurement retire.
+  An active tab without a committed display list is a valid blank-content
+  state: raster clears the worker tab cache and does not require a tab cache
+  until committed content exists. Draw-only tasks for committed content still
+  require a valid worker cache.
   When a committed page has top-level composited opacity or translation
   effects, the worker retains ordered transparent planes instead of one
   assembled tab bitmap. Static strata are tightly cropped within the interest
@@ -290,18 +294,20 @@ before changing `root.zig`, `tab.zig`, `render/`, or browser task scheduling.
   Persistent block paint caches recursively own nested display containers;
   every frame paint deep-clones cached items before effects or snapshots take
   ownership, so retiring one frame never poisons a later paint-only pass.
-- Each tab owns an indexed root-navigation history. Every heap-stable entry
-  owns its URL, request method, and an independent POST-body copy when present;
-  prepare all entry allocations before retiring the current document.
-  Successful ordinary navigation truncates entries after the current index
-  before appending; Back and Forward retain the list and move the index only
-  after the replacement document loads. History entries and the index are
-  tab-worker state. Chrome reads only the atomic back/forward availability
-  flags and schedules traversal back onto that worker. GET targets replay
-  immediately. A POST target publishes a generation-stamped request under
-  `Browser.lock`; the UI thread asks through a native modal dialog, cancellation
-  leaves history untouched, and confirmation schedules a body-copying replay
-  only if the target generation is still current.
+- Each tab owns an indexed joint session history for its root and iframe tree.
+  Every entry independently owns the resulting URL/request, an index path from
+  the root Frame, the document-replacement bit, and an owned snapshot of the
+  target subtree immediately before navigation. Never retain a `*Frame` in
+  history: replay can destroy and recreate the complete subtree. Prepare the
+  path, URL/body copies, recursive prior snapshot, and list capacity before
+  retiring a document. Successful navigation truncates entries after the
+  current index before appending. Back restores the current action's prior
+  subtree; Forward reapplies the next action, so interleaved sibling-frame
+  navigation leaves unrelated frames untouched. Move the index only after the
+  complete restore succeeds. Chrome reads only atomic availability flags and
+  schedules traversal on the tab worker. A replay that actually needs one or
+  more POST requests uses the existing generation-stamped native confirmation;
+  same-document fragment traversal never prompts because it sends no request.
 - Tab workers must not create tabs or mutate browser chrome collections.
   Cross-thread new-tab requests transfer an owning `Url` through
   `Browser.pending_new_tabs`; the browser thread drains that queue.

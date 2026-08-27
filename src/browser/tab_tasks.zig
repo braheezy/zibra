@@ -146,7 +146,7 @@ pub fn Contexts(comptime Browser: type) type {
             fn run(self: *@This()) !void {
                 defer self.consumePayload();
                 const frame = self.document.resolve(self.tab) orelse return;
-                try self.browser.loadInFrame(frame, self.url.?, self.payload);
+                try self.browser.loadInFrame(frame, self.url.?, self.payload, .push);
             }
 
             pub fn toOpaque(self: *@This()) *anyopaque {
