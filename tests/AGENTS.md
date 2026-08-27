@@ -300,3 +300,8 @@ must reflow the green marker after decode and remain stable without refetching.
 `tests/manual/aspect-ratio.html` covers width-derived and height-derived iframe
 boxes, an explicit image ratio, and an `auto <ratio>` lazy-image fallback that
 switches to the decoded natural ratio without a second request.
+
+`tests/manual/image-placeholders.html` covers zero- and one-axis unloaded image
+placeholders, post-decode reflow, and broken-image fallback visibility for
+missing, empty, and meaningful `alt` values. Serve it over HTTP so the missing
+resources reach a terminal decode failure and the lazy request is visible.

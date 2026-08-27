@@ -55,17 +55,21 @@ before changing `root.zig`, `tab.zig`, `render/`, or browser task scheduling.
   estimation and absolute deadlines. `window_geometry.zig` owns pure resize
   derivation; SDL resource creation and installation remain in Browser.
 - `image_loader.zig` owns HTML-image eager/lazy selection, per-batch URL
-  deduplication, fetch/decode, and stable broken-image fallback. Frames copy
-  image-node bounds from layout; lazy selection uses each frame's scroll and a
-  one-CSS-pixel-viewport preload margin after accessibility zoom conversion. A
-  newly decoded image always schedules layout and paint because its natural
-  dimensions may change geometry.
+  deduplication, fetch/decode, and stable broken-image fallback. A terminal
+  fallback is tagged separately from decoded content so layout paints its red-X
+  pixels only for a non-empty `alt`; missing and empty alternate text suppress
+  the icon without causing another request. Frames copy image-node bounds from
+  layout; lazy selection uses each frame's scroll and a one-CSS-pixel-viewport
+  preload margin after accessibility zoom conversion. A newly decoded image
+  always schedules layout and paint because its natural dimensions may change
+  geometry.
 - `render/replaced_sizing.zig` resolves unscaled image and iframe dimensions
   from computed CSS, HTML attributes, natural image size, and `aspect-ratio`.
   Parent layout and initial iframe viewport setup share this resolver; layout
   applies authored zoom only after both axes have been derived. A lazy image's
   `auto <ratio>` value reserves the fallback ratio until decoded pixels provide
-  the natural one.
+  the natural one. Without pixels or a usable ratio, only explicitly authored
+  image axes are retained; an unspecified axis is zero.
 - A Tab also owns the native `setInterval` cancellation registry under its
   interval mutex. Keys include window ID, document generation, and JavaScript
   handle. Sleeping one-shot helpers poll this registry at most every 10ms;

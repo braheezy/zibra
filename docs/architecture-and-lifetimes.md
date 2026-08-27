@@ -336,8 +336,11 @@ HTML image discovery has a separate two-stage boundary. Missing, invalid, and
 explicit `loading=eager` values load before initial layout; only an ASCII
 case-insensitive `loading=lazy` defers the request. Layout publishes an
 image-node box for every `<img>` and a one-pixel position anchor for an
-unloaded intrinsic-only image, which still occupies zero line space. The Frame
-copies those DOM-keyed coordinates out of the shared Layout engine. After
+unloaded intrinsic-only image, which still occupies zero line space. Before
+pixels arrive, an explicitly authored width or height is retained independently
+and participates in inline flow; an unspecified axis remains zero unless a
+preferred aspect ratio derives it. The Frame copies those DOM-keyed coordinates
+out of the shared Layout engine. After
 layout and before every animation-frame dirty gate, the serialized Tab worker
 selects lazy boxes within one frame viewport above or below the visible range
 in CSS pixels (after accessibility zoom conversion) and synchronously bridges
@@ -345,9 +348,13 @@ their request through the session networking runner.
 This pre-gate check is required because root scrolling can otherwise remain a
 draw-only update. A decoded or stable broken image installs Element-owned
 pixels, marks the complete `DocumentLayout` subtree, and schedules a follow-up
-layout/paint so natural dimensions, line wrapping, page height, and iframe composition are
-republished. DOM mutation retires the image-box map with the other raw-Node
-indexes before child storage can move.
+layout/paint so natural dimensions, line wrapping, page height, and iframe
+composition are republished. Broken resources retain a terminal 16x16 fallback
+and an `is_broken` tag so they are not retried; layout exposes those pixels and
+their intrinsic size only when the current `alt` attribute is non-empty.
+Missing or empty `alt` suppresses the icon while retaining any authored box.
+DOM mutation retires the image-box map with the other raw-Node indexes before
+child storage can move.
 
 Root documents, child documents, and those mutation rescans discover every
 external classic script and linked stylesheet into one fixed batch. Each slot
@@ -411,7 +418,9 @@ replaced-size resolver: supported CSS pixel dimensions override their matching
 HTML attributes, two specified axes win over `aspect-ratio`, and a preferred
 ratio derives only the missing axis. `auto <ratio>` gives an unloaded lazy
 image a stable fallback ratio, then switches to its natural ratio once decoded;
-plain `auto` retains the existing natural-image and 300x150 iframe defaults.
+plain `auto` retains natural-image and 300x150 iframe defaults after those
+resources exist. An unloaded image has a zero used value for every unspecified
+axis, rather than inventing a square intrinsic box.
 Authored subtree zoom is applied only after both axes are resolved, and the
 same iframe result seeds its child Frame viewport before later parent paint
 republishes exact placeholder geometry. `object-fit` then resolves a centered
@@ -423,8 +432,9 @@ bounds use the visible destination, while the synchronous display item retains
 the full element box for hit testing; source provenance is still cleared at
 the worker snapshot boundary. Authored dimensions therefore reserve their box
 before a lazy request completes; one dimension plus a usable aspect ratio
-reserves both axes. Without either dimension the pre-load box is zero space,
-and the post-decode layout uses the natural bitmap size.
+reserves both axes. One dimension without a usable ratio reserves just that
+axis, and without either dimension the pre-load box is zero space. Post-decode
+layout uses the natural bitmap ratio and size.
 
 An iframe placeholder carries its numeric authored effective zoom alongside
 its already-scaled rectangle. The child Frame stores that factor independently

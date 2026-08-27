@@ -1,6 +1,7 @@
 //! Lazy HTML-image selection and pre/post-decode layout regressions.
 
 const std = @import("std");
+const browser = @import("../browser/root.zig");
 const image_loader = @import("../browser/image_loader.zig");
 const Layout = @import("../browser/render/layout.zig");
 const document = @import("../document/parser.zig");
@@ -51,6 +52,29 @@ fn findNodeById(node: *document.Node, id: []const u8) ?*document.Node {
     };
 }
 
+fn findImageDisplayItem(
+    items: []const browser.DisplayItem,
+    node: *document.Node,
+) ?*const browser.ImageDisplayItem {
+    for (items) |*item| switch (item.*) {
+        .image => |*image| {
+            const source = image.source orelse continue;
+            if (source.node == node) return image;
+        },
+        .blend => |blend| {
+            if (findImageDisplayItem(blend.children, node)) |found| return found;
+        },
+        .transform => |transform| {
+            if (findImageDisplayItem(transform.children, node)) |found| return found;
+        },
+        .draw_composited_layer => |draw| {
+            if (findImageDisplayItem(draw.layer.display_items, node)) |found| return found;
+        },
+        else => {},
+    };
+    return null;
+}
+
 test "failed lazy image installs one stable broken-image result" {
     const allocator = std.testing.allocator;
     var image = try document.Element.init(allocator, "img loading=lazy src=missing.ppm", null);
@@ -77,6 +101,7 @@ test "failed lazy image installs one stable broken-image result" {
         &context,
         TestCallbacks,
     ));
+    try std.testing.expect(image.image_data.?.is_broken);
     try std.testing.expectEqual(@as(usize, 16), image.image_data.?.image.width);
     try std.testing.expectEqual(@as(usize, 16), image.image_data.?.image.height);
     try std.testing.expectEqual(@as(usize, 0), try image_loader.loadCandidates(
@@ -89,6 +114,115 @@ test "failed lazy image installs one stable broken-image result" {
         TestCallbacks,
     ));
     try std.testing.expectEqual(@as(usize, 1), context.fetch_count);
+}
+
+test "unloaded and decorative broken images preserve only authored placeholder axes" {
+    const allocator = std.testing.allocator;
+    var html_parser = try document.HTMLParser.init(
+        allocator,
+        "<main>" ++
+            "<img id=none loading=lazy src=none.ppm>" ++
+            "<br><img id=wide loading=lazy src=wide.ppm width=80>" ++
+            "<br><img id=tall loading=lazy src=tall.ppm height=45>" ++
+            "<br><img id=empty-alt loading=lazy src=empty.ppm width=32 height=20 alt=''>" ++
+            "<br><img id=described loading=lazy src=described.ppm alt='Missing portrait'>" ++
+            "</main>",
+    );
+    defer html_parser.deinit(allocator);
+    var root = try html_parser.parse();
+    defer root.deinit(allocator);
+    document.fixParentPointers(&root, null);
+    try document.style(allocator, &root, &.{});
+
+    const none = findNodeById(&root, "none").?;
+    const wide = findNodeById(&root, "wide").?;
+    const tall = findNodeById(&root, "tall").?;
+    const empty_alt = findNodeById(&root, "empty-alt").?;
+    const described = findNodeById(&root, "described").?;
+
+    var environ = std.process.Environ.Map.init(allocator);
+    defer environ.deinit();
+    try environ.put("HOME", "/tmp");
+    const layout = try Layout.init(allocator, std.testing.io, &environ, 800, 600, false);
+    defer layout.deinit();
+    const laid_out = try layout.buildDocument(&root);
+    defer {
+        laid_out.deinit();
+        allocator.destroy(laid_out);
+    }
+
+    const expected_nodes = [_]struct {
+        node: *document.Node,
+        width: i32,
+        height: i32,
+    }{
+        .{ .node = none, .width = 1, .height = 1 },
+        .{ .node = wide, .width = 80, .height = 0 },
+        .{ .node = tall, .width = 0, .height = 45 },
+        .{ .node = empty_alt, .width = 32, .height = 20 },
+        .{ .node = described, .width = 1, .height = 1 },
+    };
+    for (expected_nodes) |expected| {
+        const bounds = layout.image_bounds.get(expected.node).?;
+        try std.testing.expectEqual(expected.width, bounds.width);
+        try std.testing.expectEqual(expected.height, bounds.height);
+    }
+
+    const before = try layout.paintDocument(laid_out);
+    defer browser.DisplayItem.freeList(allocator, before);
+    try std.testing.expect(findImageDisplayItem(before, none) == null);
+    try std.testing.expectEqual(@as(usize, 0), findImageDisplayItem(before, wide).?.pixels.len);
+    try std.testing.expectEqual(@as(usize, 0), findImageDisplayItem(before, tall).?.pixels.len);
+    try std.testing.expectEqual(@as(usize, 0), findImageDisplayItem(before, empty_alt).?.pixels.len);
+    try std.testing.expect(findImageDisplayItem(before, described) == null);
+
+    var page_url = try Url.init(allocator, "https://example.test/page.html");
+    defer page_url.free(allocator);
+    var context = TestContext{ .allocator = allocator, .fail_fetch = true };
+    var candidates: [expected_nodes.len]image_loader.Candidate = undefined;
+    for (expected_nodes, 0..) |expected, index| {
+        const bounds = layout.image_bounds.get(expected.node).?;
+        candidates[index] = .{
+            .element = &expected.node.element,
+            .bounds = .{
+                .x = bounds.x,
+                .y = bounds.y,
+                .width = bounds.width,
+                .height = bounds.height,
+            },
+        };
+    }
+    try std.testing.expectEqual(@as(usize, expected_nodes.len), try image_loader.loadCandidates(
+        allocator,
+        &candidates,
+        .{ .lazy_near = .{ .scroll = 0, .height = 600, .preload_margin = 600 } },
+        &page_url,
+        .default,
+        &context,
+        TestCallbacks,
+    ));
+
+    laid_out.mark();
+    try laid_out.layout(layout);
+    for (expected_nodes[0 .. expected_nodes.len - 1]) |expected| {
+        const bounds = layout.image_bounds.get(expected.node).?;
+        try std.testing.expectEqual(expected.width, bounds.width);
+        try std.testing.expectEqual(expected.height, bounds.height);
+    }
+    const described_bounds = layout.image_bounds.get(described).?;
+    try std.testing.expectEqual(@as(i32, 16), described_bounds.width);
+    try std.testing.expectEqual(@as(i32, 16), described_bounds.height);
+
+    const after = try layout.paintDocument(laid_out);
+    defer browser.DisplayItem.freeList(allocator, after);
+    try std.testing.expect(findImageDisplayItem(after, none) == null);
+    try std.testing.expectEqual(@as(usize, 0), findImageDisplayItem(after, wide).?.pixels.len);
+    try std.testing.expectEqual(@as(usize, 0), findImageDisplayItem(after, tall).?.pixels.len);
+    try std.testing.expectEqual(@as(usize, 0), findImageDisplayItem(after, empty_alt).?.pixels.len);
+    const described_image = findImageDisplayItem(after, described).?;
+    try std.testing.expectEqual(@as(i32, 16), described_image.source_width);
+    try std.testing.expectEqual(@as(i32, 16), described_image.source_height);
+    try std.testing.expectEqual(@as(usize, 16 * 16 * 4), described_image.pixels.len);
 }
 
 test "eager and lazy image batches fetch only their selected candidates" {

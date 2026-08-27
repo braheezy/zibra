@@ -1,0 +1,54 @@
+<!doctype html>
+<!--
+How to verify:
+1. From the repository root run `python3 -m http.server 8000`, then open
+   http://127.0.0.1:8000/tests/manual/image-placeholders.html in Zibra.
+2. Under "Broken fallbacks", only the image with meaningful alt text shows a
+   16x16 red X. The missing-alt and empty-alt rows show no broken-image icon.
+3. The width-only row leaves a wide horizontal gap without making the line
+   taller. The height-only row makes a tall blank line without a horizontal
+   gap. The two-axis row reserves a wide, tall blank rectangle; none shows an
+   icon because its alt value is empty or absent.
+4. Reload, then scroll toward "Lazy one-axis placeholder". Before its request,
+   the image reserves 160px of width but zero height. Once `?placeholder`
+   appears in the server log, the decoded 2:1 image becomes 160x80 and pushes
+   the green AFTER marker downward. It must not fetch a second time.
+-->
+<style>
+  body { font-family: sans-serif; background-color: #f8fafc; color: #17233b; }
+  h1, h2, p, .row, .spacer, .marker { display: block; }
+  .row { background-color: #dbeafe; margin-bottom: 8px; }
+  .before { color: #7f1d1d; }
+  .after { color: #14532d; }
+  .spacer { height: 1400px; background-color: #e2e8f0; }
+  .marker { height: 40px; background-color: #86efac; color: #14532d; }
+</style>
+<h1>Image placeholders</h1>
+<h2>Broken fallbacks</h2>
+<div class=row>
+  Meaningful alt: <img src=missing-described.ppm alt="Important missing portrait"> AFTER
+</div>
+<div class=row>
+  Missing alt: <img src=missing-no-alt.ppm> AFTER (no icon)
+</div>
+<div class=row>
+  Empty alt: <img src=missing-empty-alt.ppm alt=""> AFTER (no icon)
+</div>
+
+<h2>Authored placeholder axes</h2>
+<div class=row>
+  <span class=before>BEFORE</span><img src=missing-wide.ppm width=96><span class=after>AFTER</span>
+</div>
+<div class=row>
+  <span class=before>BEFORE</span><img src=missing-tall.ppm height=48><span class=after>AFTER</span>
+</div>
+<div class=row>
+  <span class=before>BEFORE</span><img src=missing-box.ppm width=96 height=48 alt=""><span class=after>AFTER</span>
+</div>
+
+<div class=spacer>Scroll toward the lazy one-axis placeholder.</div>
+<h2 id=lazy-placeholder>Lazy one-axis placeholder</h2>
+<div class=row>
+  <span class=before>BEFORE</span><img loading=lazy width=160 src="background-image-pattern.ppm?placeholder"><span class=after>AFTER</span>
+</div>
+<div class=marker>AFTER: decoding the image moves this marker downward.</div>

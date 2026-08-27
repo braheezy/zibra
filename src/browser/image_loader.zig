@@ -91,7 +91,17 @@ fn brokenImage(allocator: std.mem.Allocator) !parser.ImageData {
     return .{
         .encoded_bytes = null,
         .image = try zigimg.Image.fromRawPixelsOwned(width, height, pixels, .rgba32),
+        .is_broken = true,
     };
+}
+
+/// Broken fallback pixels are visual only when alternate text says the image
+/// carries content. Missing and explicitly empty alt values suppress the icon.
+pub fn shouldShowBrokenImage(element: *const parser.Element) bool {
+    const data = element.image_data orelse return false;
+    if (!data.is_broken) return false;
+    const attributes = element.attributes orelse return false;
+    return (attributes.get("alt") orelse return false).len > 0;
 }
 
 fn cloneCachedImage(allocator: std.mem.Allocator, entry: CacheEntry) !parser.ImageData {
@@ -235,4 +245,22 @@ test "lazy image selection is case-insensitive and uses a viewport margin" {
     try std.testing.expect(isNearViewport(.{ .x = 0, .y = 400, .width = 10, .height = 1 }, viewport));
     try std.testing.expect(isNearViewport(.{ .x = 0, .y = 2200, .width = 10, .height = 1 }, viewport));
     try std.testing.expect(!isNearViewport(.{ .x = 0, .y = 2202, .width = 10, .height = 1 }, viewport));
+}
+
+test "broken image visibility requires non-empty alternate text" {
+    const allocator = std.testing.allocator;
+    var missing = try parser.Element.init(allocator, "img", null);
+    defer missing.deinit(allocator);
+    var empty = try parser.Element.init(allocator, "img alt=''", null);
+    defer empty.deinit(allocator);
+    var described = try parser.Element.init(allocator, "img alt='Missing portrait'", null);
+    defer described.deinit(allocator);
+
+    missing.image_data = try brokenImage(allocator);
+    empty.image_data = try brokenImage(allocator);
+    described.image_data = try brokenImage(allocator);
+
+    try std.testing.expect(!shouldShowBrokenImage(&missing));
+    try std.testing.expect(!shouldShowBrokenImage(&empty));
+    try std.testing.expect(shouldShowBrokenImage(&described));
 }

@@ -100,6 +100,9 @@ or selector/rule lifetime.
   `loading=lazy` as deferred; missing, invalid, and `eager` values load during
   resource discovery. Success and broken-image fallback both install owned
   `ImageData`, preventing repeated fetches on later animation frames.
+  `ImageData.is_broken` distinguishes synthetic fallback pixels from decoded
+  content without changing ownership; layout consumes that status together
+  with the element's live `alt` attribute.
 - `focus.zig` is the canonical HTML focusability policy shared by layout,
   keyboard traversal, and JavaScript. Programmatic focus accepts an explicit
   negative `tabindex`, while sequential focus rejects it; hidden inputs,

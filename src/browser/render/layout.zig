@@ -8,6 +8,7 @@ const std = @import("std");
 const font = @import("font.zig");
 const forced_colors = @import("forced_colors.zig");
 const browser = @import("../root.zig");
+const image_loader = @import("../image_loader.zig");
 const grapheme = @import("grapheme");
 const parser = @import("../../document/parser.zig");
 const background_image = @import("../../document/background_image.zig");
@@ -698,9 +699,36 @@ const EmbedLayout = struct {
         node_ptr: ?*Node,
         payload: LineItemPayload,
     ) !void {
+        return self.appendInlineWithPolicy(engine, line_buffer, node_ptr, payload, false);
+    }
+
+    /// Unloaded images can reserve just one authored axis. Retaining that
+    /// degenerate inline item makes width affect line flow and height affect
+    /// line height without inventing a natural size for the missing axis.
+    fn appendImagePlaceholder(
+        self: *const EmbedLayout,
+        engine: *Layout,
+        line_buffer: *std.ArrayList(LineItem),
+        node_ptr: ?*Node,
+        payload: LineItemPayload,
+    ) !void {
+        return self.appendInlineWithPolicy(engine, line_buffer, node_ptr, payload, true);
+    }
+
+    fn appendInlineWithPolicy(
+        self: *const EmbedLayout,
+        engine: *Layout,
+        line_buffer: *std.ArrayList(LineItem),
+        node_ptr: ?*Node,
+        payload: LineItemPayload,
+        allow_single_zero_axis: bool,
+    ) !void {
         const width_value = self.width.get().*;
         const height_value = self.height.get().*;
-        if (width_value <= 0 or height_value <= 0) return;
+        if (width_value < 0 or height_value < 0) return;
+        if (allow_single_zero_axis) {
+            if (width_value == 0 and height_value == 0) return;
+        } else if (width_value == 0 or height_value == 0) return;
 
         if (engine.cursor_x + width_value > engine.line_right) {
             try engine.flushLine(line_buffer);
@@ -2244,7 +2272,11 @@ fn handleImageElement(self: *Layout, node: Node, node_ptr: ?*Node, line_buffer: 
     } else null;
     if (style_map) |styles| registerReplacedSizeDependencies(self, styles);
 
-    const image_data = element.image_data;
+    const loaded_data = element.image_data;
+    const image_data: ?parser.ImageData = if (loaded_data) |data|
+        if (!data.is_broken or image_loader.shouldShowBrokenImage(&element)) data else null
+    else
+        null;
     const intrinsic_size: ?replaced_sizing.Size = if (image_data) |data| .{
         .width = @intCast(data.image.width),
         .height = @intCast(data.image.height),
@@ -2255,10 +2287,12 @@ fn handleImageElement(self: *Layout, node: Node, node_ptr: ?*Node, line_buffer: 
     const intrinsic_width = self.scaleActiveCssPixel(if (intrinsic_size) |size| size.width else 0);
     const intrinsic_height = self.scaleActiveCssPixel(if (intrinsic_size) |size| size.height else 0);
 
-    if (layout_width <= 0 or layout_height <= 0) {
-        // An intrinsic-only lazy image has no dimensions until decode, but it
-        // still needs a stable position at which scrolling can discover it.
-        // The one-pixel anchor is visibility metadata, not occupied layout.
+    if (layout_width < 0 or layout_height < 0 or
+        (layout_width == 0 and layout_height == 0))
+    {
+        // An intrinsic-only unloaded image has no dimensions, but it still
+        // needs a stable position at which scrolling can discover it. The
+        // one-pixel anchor is visibility metadata, not occupied layout.
         if (self.collect_hit_test_bounds) {
             if (node_ptr) |ptr| {
                 try self.image_bounds.put(ptr, .{
@@ -2283,7 +2317,7 @@ fn handleImageElement(self: *Layout, node: Node, node_ptr: ?*Node, line_buffer: 
         style_map,
         self.effectiveZoom(),
     );
-    try image_layout.embed.appendInline(self, line_buffer, node_ptr, .{
+    try image_layout.embed.appendImagePlaceholder(self, line_buffer, node_ptr, .{
         .image = image_layout,
     });
 }

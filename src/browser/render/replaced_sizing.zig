@@ -161,8 +161,9 @@ fn scaledDimension(fixed: i32, factor: f64) i32 {
 
 /// Resolve a replaced element in unscaled CSS pixels. A CSS ratio supplies
 /// the missing axis only; two authored axes remain authoritative. Images use
-/// their natural ratio for `auto`, while iframes retain their 300x150 default
-/// on an axis for which no ratio was supplied.
+/// their natural ratio for `auto`; before pixels arrive, an unspecified image
+/// axis stays zero unless a CSS ratio can derive it. Iframes retain their
+/// 300x150 default on an axis for which no ratio was supplied.
 pub fn resolve(
     kind: Kind,
     specified: SpecifiedSize,
@@ -180,7 +181,7 @@ pub fn resolve(
             .height = if (ratio) |resolved|
                 scaledDimension(width, 1.0 / resolved)
             else switch (kind) {
-                .image => width,
+                .image => 0,
                 .iframe => 150,
             },
         };
@@ -190,7 +191,7 @@ pub fn resolve(
             .width = if (ratio) |resolved|
                 scaledDimension(height, resolved)
             else switch (kind) {
-                .image => height,
+                .image => 0,
                 .iframe => 300,
             },
             .height = height,
@@ -275,5 +276,24 @@ test "image sizing switches auto ratio from fallback to intrinsic after load" {
     try std.testing.expectEqual(
         Size{ .width = 160, .height = 90 },
         resolve(.image, .{ .height = 90 }, null, parseAspectRatio("16 / 9").?),
+    );
+}
+
+test "unloaded images retain only explicitly specified axes" {
+    try std.testing.expectEqual(
+        Size{ .width = 80, .height = 0 },
+        resolve(.image, .{ .width = 80 }, null, .auto),
+    );
+    try std.testing.expectEqual(
+        Size{ .width = 0, .height = 45 },
+        resolve(.image, .{ .height = 45 }, null, .auto),
+    );
+    try std.testing.expectEqual(
+        Size{ .width = 80, .height = 45 },
+        resolve(.image, .{ .width = 80, .height = 45 }, null, .auto),
+    );
+    try std.testing.expectEqual(
+        Size{ .width = 0, .height = 0 },
+        resolve(.image, .{}, null, .auto),
     );
 }

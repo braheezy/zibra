@@ -880,6 +880,10 @@ pub const Element = struct {
 pub const ImageData = struct {
     encoded_bytes: ?[]const u8,
     image: zigimg.Image,
+    // A terminal decode/fetch failure owns synthetic fallback pixels just like
+    // a decoded image. Keep the distinction so layout can apply HTML's alt
+    // policy without retrying the failed request.
+    is_broken: bool = false,
 
     pub fn deinit(self: *ImageData, allocator: std.mem.Allocator) void {
         self.image.deinit(allocator);
