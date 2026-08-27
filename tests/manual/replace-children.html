@@ -1,0 +1,52 @@
+<!--
+How to verify:
+1. Load this page and focus the text input or the link inside the bordered box.
+2. Click "Empty children". The tall contents and child iframe must disappear,
+   the bordered box must collapse, and the green paragraph must move upward.
+3. Press Tab several times. Focus must not return to the removed input, link,
+   or iframe.
+4. Click "Restore saved card". Only the first yellow card must return; this
+   proves its JavaScript Node remained detached and reattachable. The old iframe
+   must not return or keep running.
+-->
+<!doctype html>
+<meta charset="utf-8">
+<title>replaceChildren invalidation</title>
+<style>
+  body { font-family: sans-serif; }
+  button { margin-right: 8px; padding: 6px; }
+  #target { border: 4px solid navy; padding: 8px; margin-top: 12px; }
+  #saved-card { background-color: lightyellow; padding: 12px; }
+  iframe { width: 280px; height: 90px; display: block; margin-top: 8px; }
+  #after { background-color: lightgreen; padding: 10px; }
+</style>
+
+<h1>Zero-argument replaceChildren()</h1>
+<button id="empty-button">Empty children</button>
+<button id="restore-button">Restore saved card</button>
+
+<div id="target">
+  <section id="saved-card">
+    <b>Saved card</b>
+    <p>This subtree should be reattachable after the box is emptied.</p>
+    <a href="#after">Focusable link</a>
+  </section>
+  <input value="removed input">
+  <iframe src="script-iframe-a.html"></iframe>
+</div>
+
+<p id="after">PASS after emptying: this green paragraph moved upward.</p>
+
+<script>
+  var target = document.querySelectorAll('#target')[0];
+  var savedCard = document.querySelectorAll('#saved-card')[0];
+
+  document.querySelectorAll('#empty-button')[0].addEventListener('click', function() {
+    var result = target.replaceChildren();
+    console.log('replaceChildren returned undefined:', result === undefined);
+  });
+
+  document.querySelectorAll('#restore-button')[0].addEventListener('click', function() {
+    if (target.children.length === 0) target.appendChild(savedCard);
+  });
+</script>

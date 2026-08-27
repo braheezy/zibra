@@ -537,8 +537,13 @@ invalidation seam, reserve capacity, and then transfer the new owner into the
 by-value child array while rebinding every relocated handle. `removeChild`
 preallocates the inverse heap-stable owner, enters the seam, moves the direct
 child out of attached storage, and rebinds the removed root plus every shifted
-sibling. The detached subtree keeps its owning DOM resources and handles, but
-clears layout back-pointers and dirties retained style fields. Reattachment
+sibling. Zero-argument `replaceChildren` stages stable owners for each removed
+direct-child subtree that has any published JavaScript handle, enters the seam
+once, and atomically empties the target. Those observable subtrees remain
+detached and reattachable; subtrees without handles are reclaimed. An empty
+target does not open a mutation generation. Each detached subtree keeps its
+owning DOM resources and handles, but clears layout back-pointers and dirties
+retained style fields. Reattachment
 registers inherited-style dependencies against the current parent before a
 frozen dependency read. That seam retires the frame display list and DOM-keyed
 bounds, clears the accessibility tree and
@@ -1495,10 +1500,15 @@ Current enforced behavior includes:
   a heap-stable `WindowContext` owner, preserves its handles, rebinds shifted
   sibling handles, and returns the same root eligible for either insertion
   method;
+- zero-argument `Node.replaceChildren` removes every direct child in one
+  synchronous mutation boundary. Handle-reachable subtrees become detached
+  roots and remain eligible for insertion; unobserved subtrees are destroyed,
+  while the not-yet-implemented argument-bearing form throws a `TypeError`;
 - `innerHTML` calls `removeHandlesForSubtree` for every removed child before
   destroying it, so descendant JavaScript handles are removed with the old
   subtree;
-- attached `innerHTML`, `appendChild`, `insertBefore`, `removeChild`, and `id`
+- attached `innerHTML`, `appendChild`, `insertBefore`, `removeChild`,
+  `replaceChildren`, and `id`
   attribute changes clear named globals before mutation and republish them
   afterward. Detached elements remain absent until insertion, and detached
   subtrees disappear immediately while retaining handles for reattachment;
@@ -1753,10 +1763,11 @@ reintroduced:
    Kiesel host contexts remain locally owned until insertion into the tab map,
    so allocation or map-insertion failure cannot strand either owner.
 14. **Structural DOM snapshot retirement:** `innerHTML`, detached-root
-   `appendChild`/`insertBefore`, `removeChild`, and the native first
-   contenteditable child append mark layout/render work and synchronously
-   retire frame/browser DOM-derived snapshots before a child can move or be
-   destroyed. Browser-side image/effect borrows retire under `Browser.lock`;
+   `appendChild`/`insertBefore`, `removeChild`, zero-argument
+   `replaceChildren`, and the native first contenteditable child append mark
+   layout/render work and synchronously retire frame/browser DOM-derived
+   snapshots before a child can move or be destroyed. Browser-side
+   image/effect borrows retire under `Browser.lock`;
    focus on a surviving mutation root is preserved, while removed-descendant
    focus and accessibility/hit indexes are cleared. JavaScript insertion
    additionally rebinds handles for immediate siblings shifted or relocated by

@@ -20,6 +20,11 @@ or Kiesel allocation/locking.
 - `removeChild` performs the inverse transfer: it accepts only a direct child,
   moves that subtree into a heap-stable window-owned detached root, preserves
   subtree handles, and rebinds siblings shifted in the attached child array.
+- Zero-argument `replaceChildren` empties an Element in one mutation
+  transaction. Removed subtrees with published handles move to heap-stable
+  detached ownership so saved Nodes remain reattachable; unobserved subtrees
+  are reclaimed. An already-empty target is a no-op, and the argument-bearing
+  transfer form remains explicitly unsupported.
 - Element IDs are exposed as named globals for only the active window. The
   first duplicate ID in document order wins; empty IDs and names colliding
   with existing globals are skipped. Refresh the per-window registry whenever
@@ -62,7 +67,8 @@ or Kiesel allocation/locking.
   callback helpers instead of recursively acquiring the mutex. Browser-
   generated focus and blur events are target-only; click, key, and form events
   continue to bubble.
-- Structural JavaScript mutation also clears current style-field subscriber
+- Structural JavaScript mutation, including `replaceChildren`, also clears
+  current style-field subscriber
   maps while every endpoint is alive; the mandatory full style/layout render
   rebuilds dependencies after mutation. Its pre-mutation host callback retires
   pointer borrowers; its paired completion callback runs only after child

@@ -152,6 +152,10 @@ the `null` reference append case with a visible in-page result.
 ownership, verifies its nested and shifted-sibling handles, and reattaches the
 same Node object under a different parent with a visible in-page result.
 
+`tests/manual/replace-children.html` empties a mixed-content element in one
+operation, exposes layout collapse and iframe teardown, verifies removed
+controls leave keyboard focus order, and reattaches one saved child subtree.
+
 `tests/manual/id-globals.html` verifies source and dynamically added element
 IDs as JavaScript globals, including `innerHTML`, rename, detach, reattach, and
 non-identifier access through `window[...]`.

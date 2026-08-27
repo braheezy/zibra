@@ -794,6 +794,13 @@ pub fn evaluate(self: *Js, window_id: u32, code: []const u8) !Value {
         \\  return child;
         \\};
         \\
+        \\Node.prototype.replaceChildren = function() {
+        \\  if (arguments.length !== 0) {
+        \\    throw new TypeError("replaceChildren currently supports no arguments");
+        \\  }
+        \\  __native.replaceChildren(this.handle);
+        \\};
+        \\
         \\Node.prototype.focus = function() {
         \\  __native.focus(this.handle);
         \\};
@@ -1668,6 +1675,112 @@ fn removeHandlesForSubtree(self: *Js, window: *WindowContext, node: *Node) void 
     if (window.node_to_handle.get(node)) |handle| {
         _ = window.node_to_handle.remove(node);
         _ = window.handle_to_node.remove(handle);
+    }
+}
+
+fn subtreeHasPublishedHandle(window: *WindowContext, node: *Node) bool {
+    if (window.node_to_handle.contains(node)) return true;
+    return switch (node.*) {
+        .text => false,
+        .element => |*element| child_handle: {
+            for (element.children.items) |*child| {
+                if (subtreeHasPublishedHandle(window, child)) break :child_handle true;
+            }
+            break :child_handle false;
+        },
+    };
+}
+
+const DetachedReplacementChild = struct {
+    old_ptr: *Node,
+    stable_ptr: *Node,
+};
+
+/// Remove every child in one structural-mutation transaction. A subtree with
+/// a published JavaScript handle remains alive as a detached, heap-stable
+/// root; an unobservable subtree can be reclaimed immediately. All allocations
+/// needed by those ownership moves precede invalidation and child destruction.
+fn emptyElementChildren(
+    self: *Js,
+    window_id: u32,
+    window: *WindowContext,
+    node: *Node,
+) !void {
+    const element = switch (node.*) {
+        .element => |*value| value,
+        .text => unreachable,
+    };
+    if (element.children.items.len == 0) return;
+
+    var retained_count: usize = 0;
+    for (element.children.items) |*child| {
+        if (subtreeHasPublishedHandle(window, child)) retained_count += 1;
+    }
+
+    var retained = std.ArrayList(DetachedReplacementChild).empty;
+    defer retained.deinit(self.allocator);
+    try retained.ensureTotalCapacity(self.allocator, retained_count);
+    const retained_capacity = std.math.cast(u32, retained_count) orelse return error.OutOfMemory;
+    try window.detached_nodes.ensureUnusedCapacity(retained_capacity);
+
+    var stable_roots_owned = true;
+    defer if (stable_roots_owned) {
+        for (retained.items) |entry| self.allocator.destroy(entry.stable_ptr);
+    };
+    for (element.children.items) |*child| {
+        if (!subtreeHasPublishedHandle(window, child)) continue;
+        const stable_ptr = try self.allocator.create(Node);
+        retained.appendAssumeCapacity(.{
+            .old_ptr = child,
+            .stable_ptr = stable_ptr,
+        });
+    }
+
+    const is_attached = isAttachedToCurrentDocument(window, node);
+    if (is_attached) try self.clearNamedIdGlobals(window_id, window);
+
+    element.children_dirty = true;
+    parser.dirtyStyleForElement(element);
+    markElementLayoutDirty(element);
+    if (is_attached) self.prepareDomMutation(node);
+
+    var retained_index: usize = 0;
+    for (element.children.items) |*child| {
+        if (retained_index < retained.items.len and
+            retained.items[retained_index].old_ptr == child)
+        {
+            const stable_ptr = retained.items[retained_index].stable_ptr;
+            retained_index += 1;
+
+            const root_handle = window.node_to_handle.get(child);
+            if (root_handle != null) _ = window.node_to_handle.remove(child);
+
+            stable_ptr.* = child.*;
+            if (root_handle) |handle| {
+                window.node_to_handle.putAssumeCapacity(stable_ptr, handle);
+                window.handle_to_node.putAssumeCapacity(handle, stable_ptr);
+            }
+            parser.fixParentPointers(stable_ptr, null);
+            clearDetachedLayoutPointers(stable_ptr);
+            parser.dirtyStyleSubtree(stable_ptr);
+            window.detached_nodes.putAssumeCapacity(stable_ptr, {});
+        } else {
+            self.removeHandlesForSubtree(window, child);
+            child.deinit(self.allocator);
+        }
+    }
+    std.debug.assert(retained_index == retained.items.len);
+    element.children.deinit(self.allocator);
+    element.children = std.ArrayList(Node).empty;
+    stable_roots_owned = false;
+
+    if (is_attached) {
+        self.completeDomMutation(node);
+        // The pre-mutation callback already publishes a replacement frame;
+        // keep the ordinary render callback observable even if rebuilding ID
+        // globals subsequently runs out of memory.
+        self.requestRender();
+        try self.syncNamedIdGlobals(window_id, window);
     }
 }
 
@@ -2576,15 +2689,20 @@ test "innerHTML and outerHTML serialize the live DOM" {
 const DomMutationTestContext = struct {
     count: usize = 0,
     complete_count: usize = 0,
+    prepared_child_count: usize = 0,
     completed_child_count: usize = 0,
     js_to_switch: ?*Js = null,
     window_to_clear: ?u32 = null,
 
-    fn callback(context: ?*anyopaque, _: *Node) void {
+    fn callback(context: ?*anyopaque, mutation_root: *Node) void {
         const raw = context orelse return;
         const unaligned: *align(1) DomMutationTestContext = @ptrCast(raw);
         const self: *DomMutationTestContext = @alignCast(unaligned);
         self.count += 1;
+        self.prepared_child_count = switch (mutation_root.*) {
+            .element => |element| element.children.items.len,
+            .text => 0,
+        };
     }
 
     fn completeCallback(context: ?*anyopaque, mutation_root: *Node) void {
@@ -2650,6 +2768,100 @@ test "innerHTML completion callback observes installed child generation" {
     try std.testing.expectEqual(@as(usize, 1), mutation_context.complete_count);
     try std.testing.expectEqual(@as(usize, 2), mutation_context.completed_child_count);
     try std.testing.expectEqual(@as(?u32, 0), js.current_window_id);
+}
+
+test "replaceChildren empties once, invalidates relational style, and detaches live nodes" {
+    const allocator = std.testing.allocator;
+    const html =
+        "<main>" ++
+        "<section class=card id=target>" ++
+        "<article id=removed><strong id=nested>saved</strong></article><i>other</i>" ++
+        "</section><aside></aside>" ++
+        "</main>";
+    const css =
+        "section.card:has(strong) { color: green; }" ++
+        "section.card { color: blue; }";
+
+    var html_parser = try parser.HTMLParser.init(allocator, html);
+    html_parser.use_implicit_tags = false;
+    defer html_parser.deinit(allocator);
+    var root = try html_parser.parse();
+    defer root.deinit(allocator);
+    parser.fixParentPointers(&root, null);
+
+    var css_parser = try CSSParser.init(allocator, css, false);
+    defer css_parser.deinit(allocator);
+    const rules = try css_parser.parse(allocator);
+    defer {
+        for (rules) |*rule| rule.deinit(allocator);
+        allocator.free(rules);
+    }
+    try parser.style(allocator, &root, rules);
+    const target_element = &root.element.children.items[0].element;
+    try std.testing.expectEqualStrings(
+        "green",
+        target_element.style.?.getPtr("color").?.get().*,
+    );
+    target_element.children_dirty = false;
+
+    var environ = std.process.Environ.Map.init(allocator);
+    defer environ.deinit();
+    var js = try Js.init(allocator, std.testing.io, &environ);
+    defer js.deinit(allocator);
+    js.setNodes(0, &root);
+    defer js.setNodes(0, null);
+
+    var mutation_context = DomMutationTestContext{};
+    js.setDomMutationCallback(0, DomMutationTestContext.callback, &mutation_context);
+    js.setDomMutationCompleteCallback(
+        0,
+        DomMutationTestContext.completeCallback,
+        &mutation_context,
+    );
+
+    const emptied = try js.evaluate(0,
+        \\var targetNode = document.querySelectorAll('section')[0];
+        \\var oldChildren = targetNode.children;
+        \\var savedArticle = oldChildren[0];
+        \\var savedNested = savedArticle.children[0];
+        \\var savedSibling = oldChildren[1];
+        \\var emptyResult = targetNode.replaceChildren();
+        \\var rejected = false;
+        \\try { targetNode.replaceChildren(document.createElement('b')); }
+        \\catch (error) { rejected = true; }
+        \\var noopResult = targetNode.replaceChildren();
+        \\emptyResult === undefined && noopResult === undefined && rejected &&
+        \\  targetNode.children.length === 0 && targetNode.innerHTML === '' &&
+        \\  typeof removed === 'undefined' && typeof nested === 'undefined' &&
+        \\  savedArticle.getAttribute('id') === 'removed' &&
+        \\  savedArticle.children[0].handle === savedNested.handle &&
+        \\  savedSibling.getAttribute('id') === null
+    );
+    try std.testing.expect(emptied.toBoolean());
+    try std.testing.expect(target_element.children_dirty);
+    try std.testing.expectEqual(@as(usize, 1), mutation_context.count);
+    try std.testing.expectEqual(@as(usize, 2), mutation_context.prepared_child_count);
+    try std.testing.expectEqual(@as(usize, 1), mutation_context.complete_count);
+    try std.testing.expectEqual(@as(usize, 0), mutation_context.completed_child_count);
+
+    // The removed descendant changes the target's :has() match; the mutation
+    // must dirty that style even though the target element itself survives.
+    try parser.style(allocator, &root, rules);
+    try std.testing.expectEqualStrings(
+        "blue",
+        target_element.style.?.getPtr("color").?.get().*,
+    );
+
+    const reattached = try js.evaluate(0,
+        \\var destination = document.querySelectorAll('aside')[0];
+        \\var appendResult = destination.appendChild(savedArticle);
+        \\appendResult === savedArticle &&
+        \\  destination.children[0].handle === savedArticle.handle &&
+        \\  savedArticle.children[0].handle === savedNested.handle
+    );
+    try std.testing.expect(reattached.toBoolean());
+    try std.testing.expectEqual(@as(usize, 2), mutation_context.count);
+    try std.testing.expectEqual(@as(usize, 2), mutation_context.complete_count);
 }
 
 test "createElement appendChild and insertBefore preserve handles and order" {
@@ -3285,6 +3497,25 @@ fn setupDocument(self: *Js, realm: *Realm) !void {
         PropertyKey.from("removeChild"),
         .{
             .value_or_accessor = .{ .value = Value.from(&remove_child_fn.object) },
+            .attributes = .builtin_default,
+        },
+    );
+
+    const replace_children_fn = try kiesel.builtins.createBuiltinFunction(
+        &self.agent,
+        .{ .function = replaceChildren },
+        1,
+        "replaceChildren",
+        .{
+            .realm = realm,
+            .additional_fields = self_ptr,
+        },
+    );
+    try native_obj.definePropertyDirect(
+        &self.agent,
+        PropertyKey.from("replaceChildren"),
+        .{
+            .value_or_accessor = .{ .value = Value.from(&replace_children_fn.object) },
             .attributes = .builtin_default,
         },
     );
@@ -4205,6 +4436,43 @@ fn removeChild(agent: *Agent, this_value: Value, arguments: kiesel.types.Argumen
     );
 
     try js_instance.detachChild(window, parent, child, remove_index);
+    return .undefined;
+}
+
+/// __native.replaceChildren implementation for the zero-argument exercise.
+/// The JavaScript wrapper rejects arguments until the transfer form of the API
+/// is implemented, leaving this host boundary responsible only for emptying.
+fn replaceChildren(agent: *Agent, this_value: Value, arguments: kiesel.types.Arguments) Agent.Error!Value {
+    const function_obj = agent.activeFunctionObject();
+    const builtin_fn = function_obj.as(kiesel.builtins.BuiltinFunction);
+    const js_instance = builtin_fn.fields.additionalFieldsAs(Js);
+    const window_id = js_instance.current_window_id orelse return agent.throwException(
+        .internal_error,
+        "Missing active window",
+        .{},
+    );
+    const window = js_instance.windows.getPtr(window_id) orelse return agent.throwException(
+        .internal_error,
+        "Missing window context",
+        .{},
+    );
+    _ = this_value;
+
+    const handle_arg = arguments.get(0);
+    if (!handle_arg.isNumber()) {
+        return agent.throwException(.type_error, "replaceChildren requires a Node", .{});
+    }
+    const handle: u32 = @intFromFloat(handle_arg.asNumber().asFloat());
+    const node = js_instance.getNode(window, handle) orelse return agent.throwException(
+        .internal_error,
+        "Invalid node handle",
+        .{},
+    );
+    if (node.* != .element) {
+        return agent.throwException(.type_error, "Text nodes do not support replaceChildren", .{});
+    }
+
+    try js_instance.emptyElementChildren(window_id, window, node);
     return .undefined;
 }
 
