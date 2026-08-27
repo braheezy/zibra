@@ -650,6 +650,14 @@ display-list ownership boundary. CSS box shorthands are expanded into
 longhands during declaration parsing, so stylesheet rules and inline style
 attributes share the same cascade and `!important` behavior.
 
+Each block formatting context retains primitive geometry for its direct
+left/right floats during a layout pass. Floats are removed from normal block
+height accumulation, exclude their margin boxes from following block and
+inline content, and remain available until their bottom edge. `clear: left`,
+`right`, or `both` advances a block past the corresponding active float
+bottoms. A block's auto height still includes the bottom of its direct floats;
+the retained float records contain no DOM or layout pointers.
+
 An Element lazily owns a heap-stable canvas pointee when JavaScript first calls
 `getContext("2d")`. z2d Context retains the address of the Surface inside that
 pointee, so DOM child-array moves transfer the pointer but never copy the

@@ -1792,6 +1792,8 @@ const CSS_PROPERTIES = [_]struct { name: []const u8, default_value: []const u8 }
     .{ .name = "zoom", .default_value = "1" },
     .{ .name = "width", .default_value = "auto" },
     .{ .name = "height", .default_value = "auto" },
+    .{ .name = "float", .default_value = "none" },
+    .{ .name = "clear", .default_value = "none" },
 };
 
 fn isInheritedProperty(property: []const u8) bool {

@@ -1323,6 +1323,35 @@ test "box model longhands survive style computation" {
     try std.testing.expectEqualStrings("#123456", styles.getPtr("border-top-color").?.get().*);
 }
 
+test "float and clear survive style computation" {
+    const allocator = std.testing.allocator;
+    const html = "<html><body><div class=left>left</div><div class=right>right</div><p class=after>after</p></body></html>";
+    const css = ".left { float: left; } .right { float: right; } .after { clear: both; }";
+
+    var html_parser = try HTMLParser.init(allocator, html);
+    html_parser.use_implicit_tags = false;
+    defer html_parser.deinit(allocator);
+    var root = try html_parser.parse();
+    defer root.deinit(allocator);
+
+    var css_parser = try CSSParser.init(allocator, css, false);
+    defer css_parser.deinit(allocator);
+    const rules = try css_parser.parse(allocator);
+    defer {
+        for (rules) |*rule| rule.deinit(allocator);
+        allocator.free(rules);
+    }
+
+    try document_parser.style(allocator, &root, rules);
+    const body = &root.element.children.items[0].element;
+    const left = body.children.items[0].element.style.?;
+    const right = body.children.items[1].element.style.?;
+    const after = body.children.items[2].element.style.?;
+    try std.testing.expectEqualStrings("left", left.getPtr("float").?.get().*);
+    try std.testing.expectEqualStrings("right", right.getPtr("float").?.get().*);
+    try std.testing.expectEqualStrings("both", after.getPtr("clear").?.get().*);
+}
+
 test "font shorthand produces inherited computed longhands" {
     const allocator = std.testing.allocator;
     const html = "<p class=sample>parent <span>child</span></p>";
