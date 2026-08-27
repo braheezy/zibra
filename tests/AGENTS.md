@@ -47,6 +47,11 @@ POST body.
 the address bar leaves exactly one visible cursor and clears the old focused
 input styling.
 
+`tests/manual/multi-frame-focus.html` and its child fixtures verify that Tab
+and Shift-Tab exhaust each document, skip an iframe with no focusable content,
+cross nested and sibling frame boundaries, and wrap only after the complete
+frame tree.
+
 `tests/manual/focus-ring-contrast.html` places focusable inputs on white and
 black panels. The same 4px-white/2px-black two-tone ring must remain visible on
 both backgrounds and follow keyboard focus without leaving a stale ring.

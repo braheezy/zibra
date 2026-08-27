@@ -3060,6 +3060,21 @@ fn collectFocusableElements(self: *Tab, frame: *Frame, out: *std.ArrayList(*Node
     }
 }
 
+/// Sequential keyboard focus visits every element in one document before
+/// entering that document's child frames. Keeping the frame walk separate
+/// from the DOM walk makes empty frames skippable without flattening or
+/// confusing nodes from distinct document trees.
+fn collectFramesInFocusOrder(
+    self: *Tab,
+    frame: *Frame,
+    out: *std.ArrayList(*Frame),
+) !void {
+    try out.append(self.allocator, frame);
+    for (frame.children.items) |child| {
+        try self.collectFramesInFocusOrder(child, out);
+    }
+}
+
 fn focusBoundsForNode(frame: *const Frame, node: *Node) ?Bounds {
     for (frame.focus_bounds.items) |entry| {
         if (entry.node == node) return entry.bounds;
@@ -3316,11 +3331,26 @@ pub fn focusElementFromScript(
 
 pub fn cycleFocus(self: *Tab, b: *Browser, reverse: bool) !void {
     self.noteKeyboardInteraction();
-    const frame = self.focused_frame orelse self.root_frame orelse return;
+    const root = self.root_frame orelse return;
+
+    var frames = std.ArrayList(*Frame).empty;
+    defer frames.deinit(self.allocator);
+    try self.collectFramesInFocusOrder(root, &frames);
+
+    var frame_index: usize = 0;
+    if (self.focused_frame) |focused_frame| {
+        for (frames.items, 0..) |frame, i| {
+            if (frame == focused_frame) {
+                frame_index = i;
+                break;
+            }
+        }
+    }
+
+    const frame = frames.items[frame_index];
     var focusables = std.ArrayList(*Node).empty;
     defer focusables.deinit(self.allocator);
     try self.collectFocusableElements(frame, &focusables);
-    if (focusables.items.len == 0) return;
 
     var found_index: ?usize = null;
     if (frame.focus) |current_focus| {
@@ -3332,14 +3362,44 @@ pub fn cycleFocus(self: *Tab, b: *Browser, reverse: bool) !void {
         }
     }
 
-    const next_index = if (found_index) |i| blk: {
+    if (found_index) |i| {
         if (reverse) {
-            break :blk if (i == 0) focusables.items.len - 1 else i - 1;
+            if (i > 0) {
+                _ = try self.focusElement(b, frame, focusables.items[i - 1]);
+                return;
+            }
+        } else if (i + 1 < focusables.items.len) {
+            _ = try self.focusElement(b, frame, focusables.items[i + 1]);
+            return;
         }
-        break :blk (i + 1) % focusables.items.len;
-    } else if (reverse) focusables.items.len - 1 else 0;
+    } else if (focusables.items.len > 0) {
+        const edge = if (reverse) focusables.items.len - 1 else 0;
+        _ = try self.focusElement(b, frame, focusables.items[edge]);
+        return;
+    }
 
-    _ = try self.focusElement(b, frame, focusables.items[next_index]);
+    // The current frame is exhausted (or empty). Visit the remaining frames
+    // in the requested direction, wrapping only after the whole frame tree.
+    // Including the current frame after a full revolution preserves cycling
+    // when it is the only frame with focusable content.
+    var candidate_frame_index = frame_index;
+    var frames_examined: usize = 0;
+    while (frames_examined < frames.items.len) : (frames_examined += 1) {
+        candidate_frame_index = if (reverse)
+            (if (candidate_frame_index == 0) frames.items.len - 1 else candidate_frame_index - 1)
+        else
+            (candidate_frame_index + 1) % frames.items.len;
+
+        const candidate_frame = frames.items[candidate_frame_index];
+        var candidates = std.ArrayList(*Node).empty;
+        defer candidates.deinit(self.allocator);
+        try self.collectFocusableElements(candidate_frame, &candidates);
+        if (candidates.items.len == 0) continue;
+
+        const edge = if (reverse) candidates.items.len - 1 else 0;
+        _ = try self.focusElement(b, candidate_frame, candidates.items[edge]);
+        return;
+    }
 }
 
 pub fn activateFocusedElement(self: *Tab, b: *Browser) !void {

@@ -1064,6 +1064,16 @@ Blur clears every frame-local focus and
 `is_focused` marker in the tab, resets accessibility focus, and requests paint
 when it removed a content cursor. The chrome path never mutates those DOM
 borrows directly.
+Tab and Shift-Tab traversal share that same handoff across the whole frame
+tree. The root frame and each descendant frame form preorder focus groups:
+DOM-order sequential focus stops in one document are exhausted before its
+child frames, frames with no stops are skipped, and only the end of the full
+tree wraps to the opposite edge. If a pointer selected a frame background
+without selecting an element, traversal begins at that frame's requested edge;
+an empty selected frame advances to the next non-empty group. No flattened
+list outlives the synchronous key task: collected `*Frame` and `*Node` values
+remain short-lived borrows, and `focusElement` performs the existing tab-wide
+blur before installing the next frame-local focus.
 Primary content clicks also retain the innermost ancestor whose layout marked
 it as an element scroll container. Up/Down tasks mutate that element offset on
 the serialized tab worker, repaint without relayout, and try enclosing scroll

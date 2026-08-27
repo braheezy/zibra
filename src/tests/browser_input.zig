@@ -253,6 +253,185 @@ test "tab blur clears focused elements across the frame tree" {
     try std.testing.expect(!tab.blur());
 }
 
+fn appendFocusTestFrame(
+    allocator: std.mem.Allocator,
+    tab: *tab_module.Tab,
+    parent: *tab_module.Frame,
+) !*tab_module.Frame {
+    const child = try allocator.create(tab_module.Frame);
+    errdefer allocator.destroy(child);
+    child.* = tab_module.Frame.init(allocator, tab, parent, null);
+    errdefer child.deinit();
+    tab.registerFrame(child);
+    try parent.children.append(allocator, child);
+    return child;
+}
+
+fn installFocusTestDocument(frame: *tab_module.Frame, source: []const u8) !void {
+    var html_parser = try parser_module.HTMLParser.init(frame.allocator, source);
+    defer html_parser.deinit(frame.allocator);
+    frame.current_node = try html_parser.parse();
+    parser_module.fixParentPointers(&frame.current_node.?, null);
+}
+
+fn findNamedFocusTestElement(frame: *tab_module.Frame, name: []const u8) !*parser_module.Node {
+    var nodes = std.ArrayList(*parser_module.Node).empty;
+    defer nodes.deinit(frame.allocator);
+    try parser_module.treeToList(frame.allocator, &frame.current_node.?, &nodes);
+    for (nodes.items) |node| switch (node.*) {
+        .element => |element| {
+            const attributes = element.attributes orelse continue;
+            const candidate = attributes.get("name") orelse continue;
+            if (std.mem.eql(u8, candidate, name)) return node;
+        },
+        .text => {},
+    };
+    return error.TestElementMissing;
+}
+
+fn expectSingleFocus(
+    tab: *tab_module.Tab,
+    frames: []const *tab_module.Frame,
+    expected_frame: *tab_module.Frame,
+    expected_node: *parser_module.Node,
+) !void {
+    try std.testing.expect(tab.focused_frame == expected_frame);
+    var focused_elements: usize = 0;
+    for (frames) |frame| {
+        const expected: ?*parser_module.Node = if (frame == expected_frame) expected_node else null;
+        try std.testing.expect(frame.focus == expected);
+
+        var nodes = std.ArrayList(*parser_module.Node).empty;
+        defer nodes.deinit(tab.allocator);
+        try parser_module.treeToList(tab.allocator, &frame.current_node.?, &nodes);
+        for (nodes.items) |node| switch (node.*) {
+            .element => |element| {
+                if (element.is_focused) {
+                    focused_elements += 1;
+                    try std.testing.expect(node == expected_node);
+                    try std.testing.expect(element.is_focus_visible);
+                }
+            },
+            .text => {},
+        };
+    }
+    try std.testing.expectEqual(@as(usize, 1), focused_elements);
+}
+
+test "Tab traversal crosses nested frames in both directions" {
+    const allocator = std.testing.allocator;
+
+    var test_browser: browser.Browser = undefined;
+    test_browser.allocator = allocator;
+    test_browser.lock = .init(std.testing.io);
+    test_browser.tabs = .empty;
+    defer test_browser.tabs.deinit(allocator);
+    test_browser.active_tab_index = 0;
+    // Prevent this focused unit test from creating an animation helper. Focus
+    // state and dirty publication still run through the production path.
+    test_browser.shutting_down = true;
+    test_browser.needs_animation_frame = false;
+
+    var tab: tab_module.Tab = undefined;
+    tab.allocator = allocator;
+    tab.browser = &test_browser;
+    tab.accessibility = .{};
+    tab.root_frame = null;
+    tab.focused_frame = null;
+    tab.focus_modality = .keyboard;
+    tab.accessibility_root = null;
+    tab.accessibility_focused = null;
+    tab.needs_style = false;
+    tab.needs_layout = false;
+    tab.needs_paint = false;
+    tab.next_window_id = 1;
+    tab.frames_by_id = std.AutoHashMap(u32, *tab_module.Frame).init(allocator);
+    defer tab.frames_by_id.deinit();
+    tab.parent_window_ids = std.AutoHashMap(u32, u32).init(allocator);
+    defer tab.parent_window_ids.deinit();
+    try test_browser.tabs.append(allocator, &tab);
+
+    var root = tab_module.Frame.init(allocator, &tab, null, null);
+    defer root.deinit();
+    tab.registerFrame(&root);
+    tab.root_frame = &root;
+    try installFocusTestDocument(
+        &root,
+        "<html><body><input name=root-a><button name=root-b>root</button></body></html>",
+    );
+
+    const empty = try appendFocusTestFrame(allocator, &tab, &root);
+    try installFocusTestDocument(
+        empty,
+        "<html><body><input type=hidden name=hidden><button disabled name=disabled>x</button></body></html>",
+    );
+
+    const child = try appendFocusTestFrame(allocator, &tab, &root);
+    try installFocusTestDocument(
+        child,
+        "<html><body><a href=/ name=child-a>child</a><input name=child-b></body></html>",
+    );
+    const nested = try appendFocusTestFrame(allocator, &tab, child);
+    try installFocusTestDocument(
+        nested,
+        "<html><body><button name=nested-a>nested</button></body></html>",
+    );
+
+    const last = try appendFocusTestFrame(allocator, &tab, &root);
+    try installFocusTestDocument(
+        last,
+        "<html><body><input name=last-a></body></html>",
+    );
+
+    const root_a = try findNamedFocusTestElement(&root, "root-a");
+    const root_b = try findNamedFocusTestElement(&root, "root-b");
+    const child_a = try findNamedFocusTestElement(child, "child-a");
+    const child_b = try findNamedFocusTestElement(child, "child-b");
+    const nested_a = try findNamedFocusTestElement(nested, "nested-a");
+    const last_a = try findNamedFocusTestElement(last, "last-a");
+    const frames = [_]*tab_module.Frame{ &root, empty, child, nested, last };
+
+    // Forward traversal exhausts one document before entering its child
+    // frames, skips the empty frame, and wraps after the final sibling.
+    try tab.cycleFocus(&test_browser, false);
+    try expectSingleFocus(&tab, &frames, &root, root_a);
+    try tab.cycleFocus(&test_browser, false);
+    try expectSingleFocus(&tab, &frames, &root, root_b);
+    try tab.cycleFocus(&test_browser, false);
+    try expectSingleFocus(&tab, &frames, child, child_a);
+    try tab.cycleFocus(&test_browser, false);
+    try expectSingleFocus(&tab, &frames, child, child_b);
+    try tab.cycleFocus(&test_browser, false);
+    try expectSingleFocus(&tab, &frames, nested, nested_a);
+    try tab.cycleFocus(&test_browser, false);
+    try expectSingleFocus(&tab, &frames, last, last_a);
+    try tab.cycleFocus(&test_browser, false);
+    try expectSingleFocus(&tab, &frames, &root, root_a);
+
+    // Reverse traversal is the exact inverse across frame boundaries.
+    try tab.cycleFocus(&test_browser, true);
+    try expectSingleFocus(&tab, &frames, last, last_a);
+    try tab.cycleFocus(&test_browser, true);
+    try expectSingleFocus(&tab, &frames, nested, nested_a);
+    try tab.cycleFocus(&test_browser, true);
+    try expectSingleFocus(&tab, &frames, child, child_b);
+
+    // A frame focused by clicking its background starts at its own edge; an
+    // empty focused frame advances to the nearest non-empty frame.
+    _ = tab.blur();
+    tab.focused_frame = child;
+    try tab.cycleFocus(&test_browser, false);
+    try expectSingleFocus(&tab, &frames, child, child_a);
+    _ = tab.blur();
+    tab.focused_frame = empty;
+    try tab.cycleFocus(&test_browser, false);
+    try expectSingleFocus(&tab, &frames, child, child_a);
+    _ = tab.blur();
+    tab.focused_frame = empty;
+    try tab.cycleFocus(&test_browser, true);
+    try expectSingleFocus(&tab, &frames, &root, root_b);
+}
+
 test "tab blur dispatches a non-bubbling DOM blur event" {
     const allocator = std.testing.allocator;
     var html_parser = try parser_module.HTMLParser.init(

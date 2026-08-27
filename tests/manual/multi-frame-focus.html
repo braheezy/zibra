@@ -1,0 +1,30 @@
+<!--
+How to verify:
+1. Load this page and press Tab repeatedly. The black focus ring must visit
+   Root A, Root B, Child A, Child B, Nested A, and Last A in that order.
+2. The empty iframe between the root controls and Child A must not trap focus.
+3. Continue past Last A: focus must wrap to Root A. Shift-Tab must traverse the
+   same six controls in reverse, crossing each iframe boundary.
+4. At every step exactly one control should have a visible focus ring.
+-->
+<!doctype html>
+<html>
+<head>
+  <title>Multi-frame keyboard focus</title>
+  <style>
+    body { font-family: sans-serif; padding: 16px; }
+    .root-control { display: inline-block; margin: 8px; padding: 8px; }
+    iframe { display: block; width: 520px; height: 150px; margin: 12px 0; border: 2px solid #777; }
+    #child { height: 260px; }
+  </style>
+</head>
+<body>
+  <h1>Multi-frame keyboard focus</h1>
+  <label class="root-control">Root A <input name="root-a" value="first root stop"></label>
+  <button class="root-control" name="root-b">Root B</button>
+  <p>The next framed area has only hidden and disabled controls and must be skipped.</p>
+  <iframe title="empty focus group" src="multi-frame-focus-empty.html"></iframe>
+  <iframe id="child" title="child focus group" src="multi-frame-focus-child.html"></iframe>
+  <iframe title="last focus group" src="multi-frame-focus-last.html"></iframe>
+</body>
+</html>

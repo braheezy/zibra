@@ -233,6 +233,12 @@ before changing `root.zig`, `tab.zig`, `render/`, or browser task scheduling.
   accessibility focus, and triggers a repaint when a content cursor was
   removed. Address-bar transitions preserve tab-worker ownership by enqueueing
   that blur instead of mutating frame focus directly from the UI thread.
+- Sequential Tab focus is tab-wide. Traverse the root Frame and its descendant
+  Frames in preorder, exhaust each frame's DOM-order focusable elements before
+  entering its children, skip frames with no sequential focus stop, and wrap
+  only after the complete frame tree. Shift-Tab is the exact reverse order.
+  Cross-frame transitions still use the ordinary tab-wide blur/focus handoff
+  so only one Frame may retain DOM focus or a focus-visible marker.
 - A Tab retains the latest pointer/keyboard focus modality. Primary page clicks
   publish pointer modality before event listeners run; keyboard editing,
   activation, scrolling, and focus traversal publish keyboard modality and
