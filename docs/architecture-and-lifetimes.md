@@ -639,6 +639,17 @@ command's optional half-open source rectangle crops oversized output at the
 right/bottom border; raster snapshots copy the underlying complete bitmap and
 preserve that numeric crop.
 
+Block layout treats `x`, `y`, `width`, and `height` as the used border box.
+Computed CSS `width` and `height` remain content-box dimensions; each block
+also retains resolved margin, padding, and border edges so child flow starts
+at the parent content edge and auto heights include the surrounding insets.
+Adjacent block margins collapse to the larger edge in the supported positive
+margin case. Backgrounds fill the border box and solid/other visible border
+styles are emitted as four side rectangles, all within the block's effect and
+display-list ownership boundary. CSS box shorthands are expanded into
+longhands during declaration parsing, so stylesheet rules and inline style
+attributes share the same cascade and `!important` behavior.
+
 An Element lazily owns a heap-stable canvas pointee when JavaScript first calls
 `getContext("2d")`. z2d Context retains the address of the Surface inside that
 pointee, so DOM child-array moves transfer the pointer but never copy the

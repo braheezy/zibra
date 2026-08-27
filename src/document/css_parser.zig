@@ -259,6 +259,196 @@ fn putLonghand(map: *DeclarationMap, property: []const u8, declaration: Declarat
     try map.put(property, declaration);
 }
 
+const BoxSide = enum { top, right, bottom, left };
+
+fn boxSideProperty(prefix: []const u8, side: BoxSide) []const u8 {
+    return switch (side) {
+        .top => if (std.mem.eql(u8, prefix, "margin")) "margin-top" else if (std.mem.eql(u8, prefix, "padding")) "padding-top" else "border-top-width",
+        .right => if (std.mem.eql(u8, prefix, "margin")) "margin-right" else if (std.mem.eql(u8, prefix, "padding")) "padding-right" else "border-right-width",
+        .bottom => if (std.mem.eql(u8, prefix, "margin")) "margin-bottom" else if (std.mem.eql(u8, prefix, "padding")) "padding-bottom" else "border-bottom-width",
+        .left => if (std.mem.eql(u8, prefix, "margin")) "margin-left" else if (std.mem.eql(u8, prefix, "padding")) "padding-left" else "border-left-width",
+    };
+}
+
+fn splitShorthand(raw_value: []const u8, tokens: *[4][]const u8) ?usize {
+    var count: usize = 0;
+    var iterator = std.mem.tokenizeAny(u8, raw_value, " \t\r\n\x0c");
+    while (iterator.next()) |token| {
+        if (count == tokens.len) return null;
+        tokens[count] = token;
+        count += 1;
+    }
+    return if (count > 0) count else null;
+}
+
+fn expandBoxShorthand(
+    map: *DeclarationMap,
+    prefix: []const u8,
+    raw_value: []const u8,
+    declaration: Declaration,
+) !bool {
+    var tokens: [4][]const u8 = undefined;
+    const count = splitShorthand(raw_value, &tokens) orelse return false;
+    const values = switch (count) {
+        1 => [4][]const u8{ tokens[0], tokens[0], tokens[0], tokens[0] },
+        2 => [4][]const u8{ tokens[0], tokens[1], tokens[0], tokens[1] },
+        3 => [4][]const u8{ tokens[0], tokens[1], tokens[2], tokens[1] },
+        4 => [4][]const u8{ tokens[0], tokens[1], tokens[2], tokens[3] },
+        else => return false,
+    };
+    const sides = [_]BoxSide{ .top, .right, .bottom, .left };
+    for (sides, values) |side, side_value| {
+        try putLonghand(map, boxSideProperty(prefix, side), .{
+            .value = side_value,
+            .important = declaration.important,
+        });
+    }
+    return true;
+}
+
+fn isBorderStyle(raw_value: []const u8) bool {
+    return std.ascii.eqlIgnoreCase(raw_value, "none") or
+        std.ascii.eqlIgnoreCase(raw_value, "hidden") or
+        std.ascii.eqlIgnoreCase(raw_value, "dotted") or
+        std.ascii.eqlIgnoreCase(raw_value, "dashed") or
+        std.ascii.eqlIgnoreCase(raw_value, "solid") or
+        std.ascii.eqlIgnoreCase(raw_value, "double") or
+        std.ascii.eqlIgnoreCase(raw_value, "groove") or
+        std.ascii.eqlIgnoreCase(raw_value, "ridge") or
+        std.ascii.eqlIgnoreCase(raw_value, "inset") or
+        std.ascii.eqlIgnoreCase(raw_value, "outset");
+}
+
+fn isBorderWidth(raw_value: []const u8) bool {
+    if (std.ascii.eqlIgnoreCase(raw_value, "thin") or
+        std.ascii.eqlIgnoreCase(raw_value, "medium") or
+        std.ascii.eqlIgnoreCase(raw_value, "thick") or
+        std.mem.eql(u8, std.mem.trim(u8, raw_value, " \t\r\n"), "0")) return true;
+    return css_length.parse(raw_value) != null;
+}
+
+fn borderSideProperty(kind: []const u8, side: BoxSide) []const u8 {
+    if (std.mem.eql(u8, kind, "width")) {
+        return switch (side) {
+            .top => "border-top-width",
+            .right => "border-right-width",
+            .bottom => "border-bottom-width",
+            .left => "border-left-width",
+        };
+    }
+    if (std.mem.eql(u8, kind, "style")) {
+        return switch (side) {
+            .top => "border-top-style",
+            .right => "border-right-style",
+            .bottom => "border-bottom-style",
+            .left => "border-left-style",
+        };
+    }
+    return switch (side) {
+        .top => "border-top-color",
+        .right => "border-right-color",
+        .bottom => "border-bottom-color",
+        .left => "border-left-color",
+    };
+}
+
+fn expandBorderWidthOrStyle(
+    map: *DeclarationMap,
+    kind: []const u8,
+    raw_value: []const u8,
+    declaration: Declaration,
+) !bool {
+    var tokens: [4][]const u8 = undefined;
+    const count = splitShorthand(raw_value, &tokens) orelse return false;
+    const values = switch (count) {
+        1 => [4][]const u8{ tokens[0], tokens[0], tokens[0], tokens[0] },
+        2 => [4][]const u8{ tokens[0], tokens[1], tokens[0], tokens[1] },
+        3 => [4][]const u8{ tokens[0], tokens[1], tokens[2], tokens[1] },
+        4 => [4][]const u8{ tokens[0], tokens[1], tokens[2], tokens[3] },
+        else => return false,
+    };
+    const sides = [_]BoxSide{ .top, .right, .bottom, .left };
+    for (values) |side_value| {
+        if (std.mem.eql(u8, kind, "width")) {
+            if (!isBorderWidth(side_value)) return false;
+        } else if (!isBorderStyle(side_value)) return false;
+    }
+    for (sides, values) |side, side_value| {
+        try putLonghand(map, borderSideProperty(kind, side), .{
+            .value = side_value,
+            .important = declaration.important,
+        });
+    }
+    return true;
+}
+
+fn expandBorderColor(
+    map: *DeclarationMap,
+    raw_value: []const u8,
+    declaration: Declaration,
+) !bool {
+    var tokens: [4][]const u8 = undefined;
+    const count = splitShorthand(raw_value, &tokens) orelse return false;
+    const values = switch (count) {
+        1 => [4][]const u8{ tokens[0], tokens[0], tokens[0], tokens[0] },
+        2 => [4][]const u8{ tokens[0], tokens[1], tokens[0], tokens[1] },
+        3 => [4][]const u8{ tokens[0], tokens[1], tokens[2], tokens[1] },
+        4 => [4][]const u8{ tokens[0], tokens[1], tokens[2], tokens[3] },
+        else => return false,
+    };
+    const sides = [_]BoxSide{ .top, .right, .bottom, .left };
+    for (sides, values) |side, side_value| {
+        try putLonghand(map, borderSideProperty("color", side), .{
+            .value = side_value,
+            .important = declaration.important,
+        });
+    }
+    return true;
+}
+
+fn expandBorder(
+    map: *DeclarationMap,
+    property: []const u8,
+    raw_value: []const u8,
+    declaration: Declaration,
+) !bool {
+    var tokens: [4][]const u8 = undefined;
+    const count = splitShorthand(raw_value, &tokens) orelse return false;
+    if (count > 3) return false;
+
+    var width: []const u8 = "medium";
+    var style: []const u8 = "none";
+    var color: []const u8 = "currentColor";
+    for (tokens[0..count]) |token| {
+        if (isBorderWidth(token)) {
+            width = token;
+        } else if (isBorderStyle(token)) {
+            style = token;
+        } else {
+            color = token;
+        }
+    }
+
+    const side: ?BoxSide = if (std.ascii.eqlIgnoreCase(property, "border"))
+        null
+    else if (std.ascii.eqlIgnoreCase(property, "border-top"))
+        .top
+    else if (std.ascii.eqlIgnoreCase(property, "border-right"))
+        .right
+    else if (std.ascii.eqlIgnoreCase(property, "border-bottom"))
+        .bottom
+    else
+        .left;
+    const sides = [_]BoxSide{ .top, .right, .bottom, .left };
+    for (sides) |candidate| {
+        if (side) |selected| if (candidate != selected) continue;
+        try putLonghand(map, borderSideProperty("width", candidate), .{ .value = width, .important = declaration.important });
+        try putLonghand(map, borderSideProperty("style", candidate), .{ .value = style, .important = declaration.important });
+        try putLonghand(map, borderSideProperty("color", candidate), .{ .value = color, .important = declaration.important });
+    }
+    return true;
+}
+
 /// Apply one declaration in source order. Shorthands expand here so inline
 /// attributes and stylesheet rules share identical precedence behavior and
 /// every generated longhand retains the shorthand's importance.
@@ -268,12 +458,40 @@ fn putDeclaration(
     raw_value: []const u8,
 ) !void {
     const declaration = parseDeclarationValue(raw_value) orelse return;
-    if (std.mem.eql(u8, property, "font")) {
+    if (std.ascii.eqlIgnoreCase(property, "font")) {
         const font = parseFontShorthand(declaration.value) orelse return;
         try putLonghand(map, "font-style", .{ .value = font.style, .important = declaration.important });
         try putLonghand(map, "font-weight", .{ .value = font.weight, .important = declaration.important });
         try putLonghand(map, "font-size", .{ .value = font.size, .important = declaration.important });
         try putLonghand(map, "font-family", .{ .value = font.family, .important = declaration.important });
+        return;
+    }
+
+    if (std.ascii.eqlIgnoreCase(property, "margin") or
+        std.ascii.eqlIgnoreCase(property, "padding"))
+    {
+        const prefix = if (std.ascii.eqlIgnoreCase(property, "margin")) "margin" else "padding";
+        if (try expandBoxShorthand(map, prefix, declaration.value, declaration)) return;
+        return;
+    }
+    if (std.ascii.eqlIgnoreCase(property, "border-width") or
+        std.ascii.eqlIgnoreCase(property, "border-style"))
+    {
+        const kind = if (std.ascii.eqlIgnoreCase(property, "border-width")) "width" else "style";
+        if (try expandBorderWidthOrStyle(map, kind, declaration.value, declaration)) return;
+        return;
+    }
+    if (std.ascii.eqlIgnoreCase(property, "border-color")) {
+        if (try expandBorderColor(map, declaration.value, declaration)) return;
+        return;
+    }
+    if (std.ascii.eqlIgnoreCase(property, "border") or
+        std.ascii.eqlIgnoreCase(property, "border-top") or
+        std.ascii.eqlIgnoreCase(property, "border-right") or
+        std.ascii.eqlIgnoreCase(property, "border-bottom") or
+        std.ascii.eqlIgnoreCase(property, "border-left"))
+    {
+        if (try expandBorder(map, property, declaration.value, declaration)) return;
         return;
     }
     try putLonghand(map, property, declaration);

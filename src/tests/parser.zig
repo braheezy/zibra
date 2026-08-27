@@ -1255,6 +1255,74 @@ test "font shorthand expands in declaration order" {
     try std.testing.expectEqualStrings("red", invalid_properties.get("color").?.value);
 }
 
+test "box model shorthands expand into computed longhands" {
+    const allocator = std.testing.allocator;
+
+    var css_parser = try CSSParser.init(
+        allocator,
+        "margin: 1px 2px 3px 4px; padding: 5px 6px 7px; " ++
+            "border: 2px solid red; border-left: 4px dashed blue; " ++
+            "border-right-width: 3px; margin-top: 8px !important; margin: 9px",
+        false,
+    );
+    defer css_parser.deinit(allocator);
+    var declarations = try css_parser.body(allocator);
+    defer declarations.deinit();
+
+    try std.testing.expectEqualStrings("8px", declarations.get("margin-top").?.value);
+    try std.testing.expect(declarations.get("margin-top").?.important);
+    try std.testing.expectEqualStrings("9px", declarations.get("margin-right").?.value);
+    try std.testing.expectEqualStrings("9px", declarations.get("margin-bottom").?.value);
+    try std.testing.expectEqualStrings("9px", declarations.get("margin-left").?.value);
+
+    try std.testing.expectEqualStrings("5px", declarations.get("padding-top").?.value);
+    try std.testing.expectEqualStrings("6px", declarations.get("padding-right").?.value);
+    try std.testing.expectEqualStrings("7px", declarations.get("padding-bottom").?.value);
+    try std.testing.expectEqualStrings("6px", declarations.get("padding-left").?.value);
+
+    try std.testing.expectEqualStrings("2px", declarations.get("border-top-width").?.value);
+    try std.testing.expectEqualStrings("3px", declarations.get("border-right-width").?.value);
+    try std.testing.expectEqualStrings("2px", declarations.get("border-bottom-width").?.value);
+    try std.testing.expectEqualStrings("4px", declarations.get("border-left-width").?.value);
+    try std.testing.expectEqualStrings("solid", declarations.get("border-top-style").?.value);
+    try std.testing.expectEqualStrings("solid", declarations.get("border-right-style").?.value);
+    try std.testing.expectEqualStrings("solid", declarations.get("border-bottom-style").?.value);
+    try std.testing.expectEqualStrings("dashed", declarations.get("border-left-style").?.value);
+    try std.testing.expectEqualStrings("red", declarations.get("border-top-color").?.value);
+    try std.testing.expectEqualStrings("red", declarations.get("border-right-color").?.value);
+    try std.testing.expectEqualStrings("red", declarations.get("border-bottom-color").?.value);
+    try std.testing.expectEqualStrings("blue", declarations.get("border-left-color").?.value);
+}
+
+test "box model longhands survive style computation" {
+    const allocator = std.testing.allocator;
+    const html = "<div class=box>content</div>";
+    const css = ".box { margin: 1em 2em; padding: 3px; border: 4px solid #123456; }";
+
+    var html_parser = try HTMLParser.init(allocator, html);
+    html_parser.use_implicit_tags = false;
+    defer html_parser.deinit(allocator);
+    var root = try html_parser.parse();
+    defer root.deinit(allocator);
+
+    var css_parser = try CSSParser.init(allocator, css, false);
+    defer css_parser.deinit(allocator);
+    const rules = try css_parser.parse(allocator);
+    defer {
+        for (rules) |*rule| rule.deinit(allocator);
+        allocator.free(rules);
+    }
+
+    try document_parser.style(allocator, &root, rules);
+    const styles = root.element.style.?;
+    try std.testing.expectEqualStrings("1em", styles.getPtr("margin-top").?.get().*);
+    try std.testing.expectEqualStrings("2em", styles.getPtr("margin-right").?.get().*);
+    try std.testing.expectEqualStrings("3px", styles.getPtr("padding-bottom").?.get().*);
+    try std.testing.expectEqualStrings("4px", styles.getPtr("border-left-width").?.get().*);
+    try std.testing.expectEqualStrings("solid", styles.getPtr("border-right-style").?.get().*);
+    try std.testing.expectEqualStrings("#123456", styles.getPtr("border-top-color").?.get().*);
+}
+
 test "font shorthand produces inherited computed longhands" {
     const allocator = std.testing.allocator;
     const html = "<p class=sample>parent <span>child</span></p>";

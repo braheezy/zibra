@@ -38,6 +38,27 @@ const ContentBounds = struct {
     width: i32,
 };
 
+const BoxEdges = struct {
+    top: i32 = 0,
+    right: i32 = 0,
+    bottom: i32 = 0,
+    left: i32 = 0,
+
+    fn horizontal(self: BoxEdges) i32 {
+        return self.left + self.right;
+    }
+
+    fn vertical(self: BoxEdges) i32 {
+        return self.top + self.bottom;
+    }
+};
+
+const BoxModelEdges = struct {
+    margin: BoxEdges,
+    padding: BoxEdges,
+    border: BoxEdges,
+};
+
 const EmbeddedBlockBox = struct {
     x: i32,
     y: i32,
@@ -220,6 +241,136 @@ fn parseCssPixelLength(value: []const u8) ?i32 {
 fn resolveCssLength(value: []const u8, context: parser.CssLengthResolutionContext) ?i32 {
     const pixels = parser.resolveCssLength(value, context) orelse return null;
     return parser.pixelLengthToLayoutPixels(pixels);
+}
+
+/// Resolve a box-model length. Padding and borders use the regular
+/// non-negative CSS length grammar; margins additionally accept negative
+/// lengths and `auto` (which is zero in this block-only layout model).
+fn resolveBoxCssLength(
+    value: []const u8,
+    context: parser.CssLengthResolutionContext,
+    allow_negative: bool,
+) ?f64 {
+    const trimmed = std.mem.trim(u8, value, " \t\r\n\x0c");
+    if (std.ascii.eqlIgnoreCase(trimmed, "auto")) return if (allow_negative) 0.0 else null;
+    if (trimmed.len == 0) return null;
+    if (std.mem.eql(u8, trimmed, "0")) return 0.0;
+
+    var sign: f64 = 1.0;
+    var magnitude = trimmed;
+    if (trimmed[0] == '-') {
+        if (!allow_negative) return null;
+        sign = -1.0;
+        magnitude = trimmed[1..];
+    } else if (trimmed[0] == '+') {
+        magnitude = trimmed[1..];
+    }
+    if (magnitude.len == 0) return null;
+    const resolved = parser.resolveCssLength(magnitude, context) orelse return null;
+    return sign * resolved;
+}
+
+fn resolveBoxEdge(
+    style_map: *const parser.StyleMap,
+    property: []const u8,
+    context: parser.CssLengthResolutionContext,
+    effective_zoom: f32,
+    page_zoom: f32,
+    allow_negative: bool,
+) i32 {
+    const value = styleValue(style_map, property) orelse return 0;
+    const css_value = resolveBoxCssLength(value, context, allow_negative) orelse return 0;
+    return @intFromFloat(std.math.clamp(
+        scaleCssFloat(css_value, effective_zoom, page_zoom),
+        @as(f64, @floatFromInt(std.math.minInt(i32))),
+        @as(f64, @floatFromInt(std.math.maxInt(i32))),
+    ));
+}
+
+fn borderWidthCss(value: []const u8) ?f64 {
+    const trimmed = std.mem.trim(u8, value, " \t\r\n\x0c");
+    if (std.mem.eql(u8, trimmed, "0")) return 0.0;
+    if (std.ascii.eqlIgnoreCase(trimmed, "thin")) return 1.0;
+    if (std.ascii.eqlIgnoreCase(trimmed, "medium")) return 3.0;
+    if (std.ascii.eqlIgnoreCase(trimmed, "thick")) return 5.0;
+    return resolveBoxCssLength(trimmed, .{}, false);
+}
+
+fn resolveBorderEdge(
+    style_map: *const parser.StyleMap,
+    property: []const u8,
+    font_size: f64,
+    effective_zoom: f32,
+    page_zoom: f32,
+) i32 {
+    const value = styleValue(style_map, property) orelse return 0;
+    const parsed = if (std.mem.eql(u8, std.mem.trim(u8, value, " \t\r\n"), "0"))
+        0.0
+    else if (borderWidthCss(value)) |length|
+        // Border lengths use the element's font size for em values.
+        resolveBoxCssLength(value, .{ .font_size = font_size }, false) orelse length
+    else
+        0.0;
+    return @intFromFloat(std.math.clamp(
+        scaleCssFloat(parsed, effective_zoom, page_zoom),
+        0.0,
+        @as(f64, @floatFromInt(std.math.maxInt(i32))),
+    ));
+}
+
+fn resolveBoxEdges(
+    style_map: *const parser.StyleMap,
+    font_size: f64,
+    percentage_base: ?f64,
+    effective_zoom: f32,
+    page_zoom: f32,
+) BoxModelEdges {
+    const length_context = parser.CssLengthResolutionContext{
+        .font_size = font_size,
+        .percentage_base = percentage_base,
+    };
+    const margin = BoxEdges{
+        .top = resolveBoxEdge(style_map, "margin-top", length_context, effective_zoom, page_zoom, true),
+        .right = resolveBoxEdge(style_map, "margin-right", length_context, effective_zoom, page_zoom, true),
+        .bottom = resolveBoxEdge(style_map, "margin-bottom", length_context, effective_zoom, page_zoom, true),
+        .left = resolveBoxEdge(style_map, "margin-left", length_context, effective_zoom, page_zoom, true),
+    };
+    const padding = BoxEdges{
+        .top = resolveBoxEdge(style_map, "padding-top", length_context, effective_zoom, page_zoom, false),
+        .right = resolveBoxEdge(style_map, "padding-right", length_context, effective_zoom, page_zoom, false),
+        .bottom = resolveBoxEdge(style_map, "padding-bottom", length_context, effective_zoom, page_zoom, false),
+        .left = resolveBoxEdge(style_map, "padding-left", length_context, effective_zoom, page_zoom, false),
+    };
+    const border = BoxEdges{
+        .top = resolveBorderEdge(style_map, "border-top-width", font_size, effective_zoom, page_zoom),
+        .right = resolveBorderEdge(style_map, "border-right-width", font_size, effective_zoom, page_zoom),
+        .bottom = resolveBorderEdge(style_map, "border-bottom-width", font_size, effective_zoom, page_zoom),
+        .left = resolveBorderEdge(style_map, "border-left-width", font_size, effective_zoom, page_zoom),
+    };
+    return .{ .margin = margin, .padding = padding, .border = border };
+}
+
+test "box model edges resolve relative lengths against the containing block" {
+    const allocator = std.testing.allocator;
+    var html_parser = try parser.HTMLParser.init(
+        allocator,
+        "<div style='margin: 1em 2%; padding: 3px 4px; border: .5em solid red'></div>",
+    );
+    html_parser.use_implicit_tags = false;
+    defer html_parser.deinit(allocator);
+    var root = try html_parser.parse();
+    defer root.deinit(allocator);
+    try parser.style(allocator, &root, &.{});
+
+    const edges = resolveBoxEdges(&root.element.style.?, 16.0, 400.0, 1.0, 1.0);
+    try std.testing.expectEqual(@as(i32, 16), edges.margin.top);
+    try std.testing.expectEqual(@as(i32, 8), edges.margin.right);
+    try std.testing.expectEqual(@as(i32, 16), edges.margin.bottom);
+    try std.testing.expectEqual(@as(i32, 8), edges.margin.left);
+    try std.testing.expectEqual(@as(i32, 3), edges.padding.top);
+    try std.testing.expectEqual(@as(i32, 4), edges.padding.right);
+    try std.testing.expectEqual(@as(i32, 8), edges.border.top);
+    try std.testing.expectEqual(@as(i32, 8), edges.border.left);
 }
 
 fn animatedPixelDimension(element: *const parser.Element, property: []const u8) ?i32 {
@@ -1946,9 +2097,9 @@ fn containingBlockCssDimension(self: *const Layout, height: bool) ?f64 {
         inline_block.parent_block orelse inline_block
     else
         inline_block;
-    const dimension = if (height) &block.height else &block.width;
-    if (dimension.dirty) return null;
-    const layout_value = dimension.get().*;
+    if (height and !block.content_height_definite) return null;
+    if (height and block.height.dirty) return null;
+    const layout_value = if (height) block.content_height else block.content_width;
     if (layout_value < 0 or (height and layout_value <= 0)) return null;
     return cssPixelsFromLayout(layout_value, block.zoom.get().*, block.document.page_zoom);
 }
@@ -5626,6 +5777,16 @@ const BlockLayout = struct {
     y: ProtectedField(i32),
     width: ProtectedField(i32),
     height: ProtectedField(i32),
+    /// `x/y/width/height` describe the border box. CSS width and height are
+    /// content-box values; these fields retain the used content rectangle so
+    /// child flow and percentage resolution do not accidentally include
+    /// padding or borders.
+    margin: BoxEdges = .{},
+    padding: BoxEdges = .{},
+    border: BoxEdges = .{},
+    content_width: i32 = 0,
+    content_height: i32 = 0,
+    content_height_definite: bool = false,
     children_epoch: u64 = 0,
     children_version: ProtectedField(u64),
 
@@ -5685,6 +5846,12 @@ const BlockLayout = struct {
             .y = ProtectedField(i32).init(allocator, 0),
             .width = ProtectedField(i32).init(allocator, 0),
             .height = ProtectedField(i32).init(allocator, 0),
+            .margin = .{},
+            .padding = .{},
+            .border = .{},
+            .content_width = 0,
+            .content_height = 0,
+            .content_height_definite = false,
             .children = std.ArrayList(LayoutChild).empty,
             .paint_order = std.ArrayList(usize).empty,
             .display_list = std.ArrayList(DisplayItem).empty,
@@ -5728,6 +5895,26 @@ const BlockLayout = struct {
                 } else {
                     block.y.addDependency(&parent.y);
                 }
+
+                // Parent padding and border widths affect the containing
+                // content origin/width even when the parent's outer width is
+                // unchanged. Subscribe the child directly because those
+                // used values are plain box-model fields, not ProtectedFields.
+                if (parent.node_ptr) |parent_ptr| switch (parent_ptr.*) {
+                    .element => |*element| if (element.style) |*style_map| {
+                        for ([_][]const u8{
+                            "padding-top",      "padding-right",      "padding-bottom",      "padding-left",
+                            "border-top-width", "border-right-width", "border-bottom-width", "border-left-width",
+                        }) |property| {
+                            if (style_map.getPtr(property)) |field| {
+                                block.x.addDependency(field);
+                                block.y.addDependency(field);
+                                block.width.addDependency(field);
+                            }
+                        }
+                    },
+                    .text => {},
+                };
             } else {
                 block.zoom.addDependency(&document.zoom);
                 block.x.addDependency(&document.x);
@@ -5752,6 +5939,15 @@ const BlockLayout = struct {
                             if (style_map.getPtr("width")) |field| block.width.addDependency(field);
                             if (style_map.getPtr("height")) |field| block.height.addDependency(field);
                             if (style_map.getPtr("overflow")) |field| block.height.addDependency(field);
+                            for ([_][]const u8{
+                                "margin-top",       "margin-right",       "margin-bottom",       "margin-left",
+                                "padding-top",      "padding-right",      "padding-bottom",      "padding-left",
+                                "border-top-width", "border-right-width", "border-bottom-width", "border-left-width",
+                                "border-top-style", "border-right-style", "border-bottom-style", "border-left-style",
+                                "border-top-color", "border-right-color", "border-bottom-color", "border-left-color",
+                            }) |property| {
+                                if (style_map.getPtr(property)) |field| block.height.addDependency(field);
+                            }
                         }
                     },
                     .text => {},
@@ -6098,13 +6294,14 @@ const BlockLayout = struct {
         self.zoom.set(zoom_value);
 
         const parent_x = if (self.parent_block) |pb|
-            if (self.persistent_dependencies) pb.x.read(&self.x).* else pb.x.get().*
+            (if (self.persistent_dependencies) pb.x.read(&self.x).* else pb.x.get().*) +
+                pb.border.left + pb.padding.left
         else if (self.persistent_dependencies)
             self.document.x.read(&self.x).*
         else
             self.document.x.get().*;
         const parent_width = if (self.parent_block) |pb|
-            if (self.persistent_dependencies) pb.width.read(&self.width).* else pb.width.get().*
+            pb.content_width
         else if (self.persistent_dependencies)
             self.document.width.read(&self.width).*
         else
@@ -6115,27 +6312,61 @@ const BlockLayout = struct {
             self.document.page_zoom,
         );
         const containing_height_css = if (self.parent_block) |pb| blk: {
-            if (pb.height.dirty) break :blk null;
-            const height = pb.height.get().*;
+            if (pb.height.dirty or !pb.content_height_definite) break :blk null;
+            const height = pb.content_height;
             if (height <= 0) break :blk null;
             break :blk cssPixelsFromLayout(height, pb.zoom.get().*, self.document.page_zoom);
         } else null;
+
+        const edge_values = if (self.embedded_box == null) switch (self.node) {
+            .element => |*element| if (element.style) |*style_map|
+                resolveBoxEdges(
+                    style_map,
+                    self.computedFontSizeCss(),
+                    containing_width_css,
+                    zoom_value,
+                    engine.zoom(),
+                )
+            else
+                BoxModelEdges{ .margin = .{}, .padding = .{}, .border = .{} },
+            .text => BoxModelEdges{ .margin = .{}, .padding = .{}, .border = .{} },
+        } else BoxModelEdges{ .margin = .{}, .padding = .{}, .border = .{} };
+        self.margin = edge_values.margin;
+        self.padding = edge_values.padding;
+        self.border = edge_values.border;
+
+        // A non-first sibling is positioned from the preceding block, so it
+        // intentionally has no dependency on the parent's y field. Avoid
+        // reading that field here: ProtectedField requires every read target
+        // to have been registered during initialization.
+        const parent_content_y = if (self.previous == null) blk: {
+            if (self.parent_block) |pb| {
+                const parent_y = if (self.persistent_dependencies)
+                    pb.y.read(&self.y).*
+                else
+                    pb.y.get().*;
+                break :blk parent_y + pb.border.top + pb.padding.top;
+            }
+            break :blk if (self.persistent_dependencies)
+                self.document.y.read(&self.y).*
+            else
+                self.document.y.get().*;
+        } else 0;
         const prev_y = if (self.previous) |prev|
-            if (self.persistent_dependencies)
+            (if (self.persistent_dependencies)
                 prev.y.read(&self.y).* + prev.height.read(&self.y).*
             else
-                prev.y.get().* + prev.height.get().*
-        else if (self.parent_block) |pb|
-            (if (self.persistent_dependencies) pb.y.read(&self.y).* else pb.y.get().*) +
+                prev.y.get().* + prev.height.get().*) +
+                @max(prev.margin.bottom, self.margin.top)
+        else
+            parent_content_y + self.margin.top + if (self.parent_block) |pb|
                 tableOfContentsHeaderHeight(
                     pb.node,
                     pb.zoom.get().*,
                     engine.zoom(),
                 )
-        else if (self.persistent_dependencies)
-            self.document.y.read(&self.y).*
-        else
-            self.document.y.get().*;
+            else
+                0;
 
         // Set x, y, width early so children can read them
         const content_bounds = if (self.embedded_box) |embedded|
@@ -6167,9 +6398,22 @@ const BlockLayout = struct {
                 null
         else
             null;
-        self.x.set(content_bounds.x);
+        const horizontal_insets = self.padding.horizontal() + self.border.horizontal();
+        const auto_content_width = @max(
+            content_bounds.width - self.margin.horizontal() - horizontal_insets,
+            0,
+        );
+        const border_box_width = if (specified_width) |width|
+            @max(width + horizontal_insets, 0)
+        else
+            auto_content_width + horizontal_insets;
+        self.x.set(content_bounds.x + self.margin.left);
         self.y.set(if (self.embedded_box) |embedded| embedded.y else prev_y);
-        self.width.set(specified_width orelse content_bounds.width);
+        self.width.set(if (self.embedded_box) |embedded| embedded.width else border_box_width);
+        self.content_width = if (self.embedded_box) |embedded|
+            embedded.width
+        else
+            @max(self.width.get().* - horizontal_insets, 0);
         if (engine.collect_hit_test_bounds) {
             if (self.node_ptr) |ptr| try engine.recordFragmentTargets(ptr, prev_y);
         }
@@ -6191,7 +6435,13 @@ const BlockLayout = struct {
         // percentage height can resolve against this containing block. Auto
         // heights remain unavailable until children have been measured.
         if (is_block) {
-            if (specified_height) |height| self.height.set(height);
+            self.content_height_definite = specified_height != null;
+            if (specified_height) |height| {
+                self.content_height = height;
+                self.height.set(@max(height + self.padding.vertical() + self.border.vertical(), 0));
+            } else {
+                self.content_height = 0;
+            }
         }
 
         // Reset any cached inline commands
@@ -6248,12 +6498,18 @@ const BlockLayout = struct {
             // Layout all children and compute height
             // Use .read() to register invalidation dependencies on children's heights
             var computed_height: i32 = 0;
+            var previous_block: ?*BlockLayout = null;
             _ = self.children_version.read(&self.height);
             for (self.children.items) |child| {
                 switch (child) {
                     .block => |b| {
                         try b.layout(engine);
-                        computed_height += b.height.read(&self.height).*;
+                        const vertical_gap = if (previous_block) |previous|
+                            @max(previous.margin.bottom, b.margin.top)
+                        else
+                            b.margin.top;
+                        computed_height += vertical_gap + b.height.read(&self.height).*;
+                        previous_block = b;
                     },
                     .line => |l| {
                         try l.layout(engine);
@@ -6261,17 +6517,23 @@ const BlockLayout = struct {
                     },
                 }
             }
+            if (previous_block) |previous| computed_height += previous.margin.bottom;
             const auto_height = computed_height + tableOfContentsHeaderHeight(
                 self.node,
                 zoom_value,
                 engine.zoom(),
             );
             natural_height = auto_height;
-            self.height.set(specified_height orelse auto_height);
+            self.content_height = specified_height orelse auto_height;
+            self.height.set(@max(
+                self.content_height + self.padding.vertical() + self.border.vertical(),
+                0,
+            ));
         } else {
             // Inline layout mode - use the old approach for now
             // TODO: Refactor to populate LineLayout and TextLayout objects
             self.height.frozen_dependencies = false;
+            self.content_height_definite = specified_height != null;
             try engine.layoutInlineBlock(self);
 
             if (self.children.items.len > 0) {
@@ -6283,15 +6545,22 @@ const BlockLayout = struct {
             self.children_epoch += 1;
             self.children_version.set(self.children_epoch);
 
-            natural_height = self.height.get().*;
-            if (specified_height) |height| self.height.set(height);
+            natural_height = self.content_height;
+            if (specified_height) |height| {
+                self.content_height = height;
+                self.content_height_definite = true;
+            }
+            self.height.set(@max(
+                self.content_height + self.padding.vertical() + self.border.vertical(),
+                0,
+            ));
 
             // Height is set by layoutInlineBlock - need to ensure it uses .set()
         }
 
         try recordElementFocusBounds(engine, self);
 
-        self.updateScrollGeometry(specified_height, natural_height);
+        self.updateScrollGeometry(specified_height, natural_height + self.padding.vertical() + self.border.vertical());
 
         // Clear descendant flags after layout pass
         self.has_dirty_descendants = false;
@@ -7067,11 +7336,11 @@ fn layoutInlineBlock(self: *Layout, block: *BlockLayout) !void {
     self.effective_zoom = block.zoom.get().*;
     self.resetSoftHyphenWord();
 
-    self.line_left = block.x.get().*;
-    const block_width = block.width.get().*;
-    self.line_right = block.x.get().* + block_width;
+    self.line_left = block.x.get().* + block.border.left + block.padding.left;
+    const block_width = block.content_width;
+    self.line_right = self.line_left + block_width;
     self.cursor_x = self.line_left;
-    self.cursor_y = block.y.get().*;
+    self.cursor_y = block.y.get().* + block.border.top + block.padding.top;
     self.line_direction = textDirectionForBlock(block, self.default_direction);
     self.size = self.default_font_size;
     self.font_size_css = @floatFromInt(self.default_font_size);
@@ -7175,8 +7444,13 @@ fn layoutInlineBlock(self: *Layout, block: *BlockLayout) !void {
     }
 
     try self.flushLine(&line_buffer);
-    const computed_height = self.cursor_y - block.y.get().*;
-    block.height.set(if (computed_height < 0) 0 else computed_height);
+    const computed_height = self.cursor_y -
+        (block.y.get().* + block.border.top + block.padding.top);
+    block.content_height = if (computed_height < 0) 0 else computed_height;
+    block.height.set(@max(
+        block.content_height + block.padding.vertical() + block.border.vertical(),
+        0,
+    ));
 }
 
 fn parseColor(color_str: []const u8) ?browser.Color {
@@ -7727,9 +8001,82 @@ fn applyPaintEffects(self: *Layout, block: *BlockLayout, commands: []DisplayItem
     }
 }
 
-// Add an element's color and image backgrounds to a command list. Keeping both
-// in the subtree means opacity, transforms, scrolling, and rounded clips apply
-// to backgrounds and content in the same order.
+fn borderColorForSide(
+    self: *Layout,
+    style_map: *const parser.StyleMap,
+    element: *const parser.Element,
+    property: []const u8,
+) browser.Color {
+    const value = styleValue(style_map, property) orelse "currentColor";
+    if (std.ascii.eqlIgnoreCase(std.mem.trim(u8, value, " \t\r\n"), "currentColor")) {
+        return self.remapColor(textColorForElement(element), .border);
+    }
+    return self.remapColor(parseColor(value) orelse textColorForElement(element), .border);
+}
+
+fn textColorForElement(element: *const parser.Element) browser.Color {
+    if (element.style) |*style_map| {
+        if (styleValue(style_map, "color")) |value| {
+            if (parseColor(value)) |color| return color;
+        }
+    }
+    return .{ .r = 0, .g = 0, .b = 0, .a = 255 };
+}
+
+fn appendBorderBoxes(
+    self: *Layout,
+    commands: *std.ArrayList(DisplayItem),
+    x: i32,
+    y: i32,
+    width: i32,
+    height: i32,
+    edges: BoxEdges,
+    style_map: *const parser.StyleMap,
+    element: *const parser.Element,
+    source: ?browser.DisplayItemSource,
+) !void {
+    if (width <= 0 or height <= 0) return;
+
+    const side_data = [_]struct {
+        width: i32,
+        style_property: []const u8,
+        color_property: []const u8,
+    }{
+        .{ .width = edges.top, .style_property = "border-top-style", .color_property = "border-top-color" },
+        .{ .width = edges.right, .style_property = "border-right-style", .color_property = "border-right-color" },
+        .{ .width = edges.bottom, .style_property = "border-bottom-style", .color_property = "border-bottom-color" },
+        .{ .width = edges.left, .style_property = "border-left-style", .color_property = "border-left-color" },
+    };
+    for (side_data, 0..) |side, index| {
+        if (side.width <= 0) continue;
+        const style = styleValue(style_map, side.style_property) orelse "none";
+        if (std.ascii.eqlIgnoreCase(std.mem.trim(u8, style, " \t\r\n"), "none") or
+            std.ascii.eqlIgnoreCase(std.mem.trim(u8, style, " \t\r\n"), "hidden")) continue;
+        const color = borderColorForSide(self, style_map, element, side.color_property);
+        if (color.a == 0) continue;
+
+        const rect = switch (index) {
+            0 => browser.Rect{ .left = x, .top = y, .right = x + width, .bottom = y + @min(side.width, height) },
+            1 => browser.Rect{ .left = x + @max(width - side.width, 0), .top = y, .right = x + width, .bottom = y + height },
+            2 => browser.Rect{ .left = x, .top = y + @max(height - side.width, 0), .right = x + width, .bottom = y + height },
+            3 => browser.Rect{ .left = x, .top = y, .right = x + @min(side.width, width), .bottom = y + height },
+            else => unreachable,
+        };
+        if (rect.width() <= 0 or rect.height() <= 0) continue;
+        try commands.append(self.allocator, .{ .rect = .{
+            .x1 = rect.left,
+            .y1 = rect.top,
+            .x2 = rect.right,
+            .y2 = rect.bottom,
+            .color = color,
+            .source = source,
+        } });
+    }
+}
+
+// Add an element's color, image background, and border to a command list.
+// Keeping them in the subtree means opacity, transforms, scrolling, and
+// rounded clips apply to the complete border box in one coherent order.
 fn addBackgroundIfNeededToList(self: *Layout, commands: *std.ArrayList(DisplayItem), block: *const BlockLayout) !void {
     if (!block.shouldPaint()) return;
     // Anonymous inline-run blocks copy their first node only as a layout
@@ -7791,5 +8138,20 @@ fn addBackgroundIfNeededToList(self: *Layout, commands: *std.ArrayList(DisplayIt
                 source,
             );
         }
+    }
+
+    if (styles) |style_map| {
+        try appendBorderBoxes(
+            self,
+            commands,
+            block_x,
+            block_y,
+            block_width,
+            block_height,
+            block.border,
+            style_map,
+            element,
+            source,
+        );
     }
 }
