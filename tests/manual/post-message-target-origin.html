@@ -1,0 +1,38 @@
+<!doctype html>
+<!--
+How to verify:
+1. From the repository root, run `python3 -m http.server 8000` and, in a
+   second terminal, `python3 -m http.server 8001`.
+2. Open
+   http://127.0.0.1:8000/tests/manual/post-message-target-origin.html in Zibra.
+3. The iframe is served from port 8001. Its message aimed at port 8001 must be
+   discarded, while its message aimed at port 8000 (with an irrelevant path)
+   and its wildcard message must arrive in order.
+4. The single status line below must turn green. Red means a forbidden message
+   arrived; amber means the two allowed messages did not both arrive.
+-->
+<style>
+  body { font-family: sans-serif; background-color: white; color: #17233b; }
+  h1, p, iframe { display: block; }
+  #targetOriginStatus { color: #92400e; background-color: #fef3c7; }
+  iframe { width: 520px; height: 120px; }
+</style>
+<h1>postMessage target origin</h1>
+<p id=targetOriginStatus>Target-origin result: green is PASS, red is FAIL, amber is waiting.</p>
+<iframe src="http://127.0.0.1:8001/tests/manual/post-message-target-origin-child.html"></iframe>
+<script>
+var received = [];
+var failed = false;
+window.addEventListener("message", function(event) {
+  received.push(event.data + " from " + event.origin);
+  if (received.length > 2 ||
+      event.origin !== "http://127.0.0.1:8001" ||
+      (received.length === 1 && event.data !== "explicit") ||
+      (received.length === 2 && event.data !== "wildcard")) {
+    failed = true;
+    targetOriginStatus.setAttribute("style", "color: #991b1b; background-color: #fee2e2");
+  } else if (received.length === 2 && !failed) {
+    targetOriginStatus.setAttribute("style", "color: #14532d; background-color: #dcfce7");
+  }
+});
+</script>

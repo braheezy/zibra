@@ -83,6 +83,11 @@ root CSS viewport from an iframe's exact `width` query. Page zoom activates a
 parent rule that changes the iframe from 420px to 300px; the child must switch
 its retained stylesheet generation in both directions on the follow-up frame.
 
+`tests/manual/post-message-target-origin.html` and its port-8001 child fixture
+send a mismatched, exact, and wildcard cross-origin message. Only the latter
+two may reach the port-8000 parent, and the delivered event origin must name
+the sending iframe's origin.
+
 `tests/manual/css-zoom.html` and its child-frame fixture compare unzoomed,
 2x, and nested 3x subtrees. Fixed boxes, fonts, controls, rounded geometry,
 iframe contents, focus, and clicks must share the same authored scale, which

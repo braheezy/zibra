@@ -1019,14 +1019,14 @@ pub fn evaluate(self: *Js, window_id: u32, code: []const u8) !Value {
         \\};
         \\window.postMessage = function(message, targetWindowId, targetOrigin) {
         \\  var payload = message == null ? "null" : message.toString();
-        \\  var origin = targetOrigin === undefined ? "*" : targetOrigin.toString();
+        \\  var origin = targetOrigin === undefined ? "/" : targetOrigin.toString();
         \\  __native.postMessage(payload, targetWindowId, origin);
         \\};
         \\Object.defineProperty(window, "parent", {
         \\  get: function() {
         \\    var parentId = __native.getParentWindowId(window.__id);
         \\    if (parentId === null || parentId === undefined) return null;
-        \\    return { __id: parentId, postMessage: function(message, targetOrigin) { var payload = message == null ? "null" : message.toString(); var origin = targetOrigin === undefined ? "*" : targetOrigin.toString(); __native.postMessage(payload, parentId, origin); } };
+        \\    return { __id: parentId, postMessage: function(message, targetOrigin) { var payload = message == null ? "null" : message.toString(); var origin = targetOrigin === undefined ? "/" : targetOrigin.toString(); __native.postMessage(payload, parentId, origin); } };
         \\  }
         \\});
         \\function clearActiveIdGlobals() {
@@ -1836,8 +1836,10 @@ fn dispatchMessageImpl(
     const fn_value = try window.realm.global_object.get(&self.agent, key);
     if (!fn_value.isCallable()) return error.MissingMessageHandler;
 
-    const message_value = try self.stringToJsValue(message);
-    const origin_value = try self.stringToJsValue(origin);
+    // Task and pending-message buffers are released immediately after this
+    // call, while Kiesel may retain ASCII input bytes in its string cache.
+    const message_value = try self.copiedStringToJsValue(message);
+    const origin_value = try self.copiedStringToJsValue(origin);
     const source_value = Value.from(@as(f64, @floatFromInt(source_window_id)));
     const target_value = Value.from(@as(f64, @floatFromInt(target_window_id)));
 
@@ -5163,9 +5165,9 @@ fn getParentWindowIdNative(agent: *Agent, this_value: Value, arguments: kiesel.t
     }
     const window_id = @as(u32, @intFromFloat(raw_id));
     const parent_id = js_instance.parent_window_ids.get(window_id) orelse return .null;
-    if (!js_instance.windows.contains(parent_id)) {
-        return .null;
-    }
+    // A cross-origin parent intentionally has no WindowContext in this Js
+    // realm. The JavaScript wrapper exposes only an opaque numeric proxy with
+    // postMessage, so its identity remains safe and useful across origins.
     return Value.from(@as(f64, @floatFromInt(parent_id)));
 }
 
@@ -5213,6 +5215,9 @@ fn postMessageNative(agent: *Agent, this_value: Value, arguments: kiesel.types.A
     if (window.post_message_callback.function) |callback| {
         const ctx = window.post_message_callback.context;
         callback(ctx, window_id, target_window_id, target_origin, message) catch |err| {
+            if (err == error.InvalidTargetOrigin) {
+                return agent.throwException(.syntax_error, "Invalid postMessage target origin", .{});
+            }
             return agent.throwException(.internal_error, "postMessage failed: {any}", .{err});
         };
     }

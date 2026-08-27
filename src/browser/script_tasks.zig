@@ -13,6 +13,57 @@ const JsRenderContext = @import("js_context.zig").JsRenderContext;
 const Url = url_module.Url;
 const Task = task_module.Task;
 
+/// The origin restriction captured synchronously by `postMessage` and owned by
+/// the queued delivery task. Exact origins retain a parsed URL so comparison
+/// uses the URL implementation's scheme/host/effective-port rules instead of
+/// comparing author-provided strings.
+pub const PostMessageTargetOrigin = union(enum) {
+    wildcard,
+    exact: Url,
+
+    pub fn parse(
+        allocator: std.mem.Allocator,
+        value: []const u8,
+        source_url: ?*const Url,
+    ) !PostMessageTargetOrigin {
+        if (std.mem.eql(u8, value, "*")) return .wildcard;
+
+        if (std.mem.eql(u8, value, "/")) {
+            const source = source_url orelse return error.InvalidTargetOrigin;
+            return .{ .exact = try source.*.clone(allocator) };
+        }
+
+        // The URL parser has no base here, matching the web API: an ordinary
+        // relative reference is not a target origin. Paths, queries, and
+        // fragments on an absolute URL are accepted but ignored by sameOrigin.
+        if (!Url.hasExplicitScheme(value)) return error.InvalidTargetOrigin;
+        const parsed = Url.init(allocator, value) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            else => return error.InvalidTargetOrigin,
+        };
+        return .{ .exact = parsed };
+    }
+
+    pub fn deinit(self: *PostMessageTargetOrigin, allocator: std.mem.Allocator) void {
+        switch (self.*) {
+            .wildcard => {},
+            .exact => |url| url.free(allocator),
+        }
+        self.* = undefined;
+    }
+
+    /// Evaluate the restriction against the target document at delivery time.
+    pub fn allows(self: *const PostMessageTargetOrigin, target_url: ?*const Url) bool {
+        return switch (self.*) {
+            .wildcard => true,
+            .exact => |expected| if (target_url) |actual|
+                expected.sameOrigin(actual.*)
+            else
+                false,
+        };
+    }
+};
+
 pub fn Contexts(comptime Browser: type, comptime DocumentHandle: type) type {
     return struct {
         pub const SetTimeoutThreadContext = struct {
@@ -889,23 +940,7 @@ pub fn Contexts(comptime Browser: type, comptime DocumentHandle: type) type {
         }
 
         pub fn originStringForUrl(allocator: std.mem.Allocator, url: Url) ![]u8 {
-            if (std.mem.eql(u8, url.scheme, "file")) {
-                return allocator.dupe(u8, "file://");
-            }
-            if (std.mem.eql(u8, url.scheme, "about") or std.mem.eql(u8, url.scheme, "data")) {
-                return std.fmt.allocPrint(allocator, "{s}:", .{url.scheme});
-            }
-            const host = url.host orelse "";
-            return std.fmt.allocPrint(allocator, "{s}://{s}:{d}", .{ url.scheme, host, url.port });
-        }
-
-        pub fn normalizeOrigin(allocator: std.mem.Allocator, origin: []const u8) ![]const u8 {
-            const trimmed = std.mem.trim(u8, origin, " \t\r\n");
-            const lower = try allocator.alloc(u8, trimmed.len);
-            for (trimmed, 0..) |ch, idx| {
-                lower[idx] = std.ascii.toLower(ch);
-            }
-            return lower;
+            return url.toOwnedOrigin(allocator);
         }
 
         pub fn jsPostMessageCallback(
@@ -929,8 +964,6 @@ pub fn Contexts(comptime Browser: type, comptime DocumentHandle: type) type {
             const tab: *Tab = @alignCast(raw_tab);
 
             const source_frame = tab.frameForWindowId(source_window_id) orelse return;
-            const target_frame = tab.frameForWindowId(target_window_id) orelse return;
-
             const allocator = browser.allocator;
 
             var source_origin = try allocator.dupe(u8, "null");
@@ -940,24 +973,15 @@ pub fn Contexts(comptime Browser: type, comptime DocumentHandle: type) type {
                 source_origin = try originStringForUrl(allocator, url_ptr.*);
             }
 
-            if (!std.mem.eql(u8, target_origin, "*")) {
-                var target_origin_actual = try allocator.dupe(u8, "null");
-                defer allocator.free(target_origin_actual);
-                if (target_frame.current_url) |url_ptr| {
-                    allocator.free(target_origin_actual);
-                    target_origin_actual = try originStringForUrl(allocator, url_ptr.*);
-                }
+            var target_origin_policy = try PostMessageTargetOrigin.parse(
+                allocator,
+                target_origin,
+                if (source_frame.current_url) |url_ptr| url_ptr else null,
+            );
+            var target_origin_policy_owned = true;
+            defer if (target_origin_policy_owned) target_origin_policy.deinit(allocator);
 
-                const target_origin_norm = try normalizeOrigin(allocator, target_origin);
-                defer allocator.free(target_origin_norm);
-                const actual_origin_norm = try normalizeOrigin(allocator, target_origin_actual);
-                defer allocator.free(actual_origin_norm);
-
-                if (!std.mem.eql(u8, target_origin_norm, actual_origin_norm)) {
-                    std.log.warn("Blocked postMessage due to target origin mismatch", .{});
-                    return;
-                }
-            }
+            const target_frame = tab.frameForWindowId(target_window_id) orelse return;
 
             const task_ctx = try PostMessageTaskContext.create(
                 allocator,
@@ -967,7 +991,9 @@ pub fn Contexts(comptime Browser: type, comptime DocumentHandle: type) type {
                 source_window_id,
                 message,
                 source_origin,
+                target_origin_policy,
             );
+            target_origin_policy_owned = false;
             const task = Task.init(
                 .javascript,
                 "task:post_message",
@@ -989,6 +1015,7 @@ pub fn Contexts(comptime Browser: type, comptime DocumentHandle: type) type {
             source_window_id: u32,
             message: []const u8,
             origin: []const u8,
+            target_origin: PostMessageTargetOrigin,
 
             pub fn create(
                 allocator: std.mem.Allocator,
@@ -998,8 +1025,10 @@ pub fn Contexts(comptime Browser: type, comptime DocumentHandle: type) type {
                 source_window_id: u32,
                 message: []const u8,
                 origin: []const u8,
+                target_origin: PostMessageTargetOrigin,
             ) !*PostMessageTaskContext {
                 const ctx = try allocator.create(PostMessageTaskContext);
+                errdefer allocator.destroy(ctx);
                 const message_copy = try allocator.dupe(u8, message);
                 errdefer allocator.free(message_copy);
                 const origin_copy = try allocator.dupe(u8, origin);
@@ -1012,6 +1041,7 @@ pub fn Contexts(comptime Browser: type, comptime DocumentHandle: type) type {
                     .source_window_id = source_window_id,
                     .message = message_copy,
                     .origin = origin_copy,
+                    .target_origin = target_origin,
                 };
                 return ctx;
             }
@@ -1019,6 +1049,7 @@ pub fn Contexts(comptime Browser: type, comptime DocumentHandle: type) type {
             pub fn destroy(self: *PostMessageTaskContext) void {
                 self.allocator.free(self.message);
                 self.allocator.free(self.origin);
+                self.target_origin.deinit(self.allocator);
                 self.allocator.destroy(self);
             }
 
@@ -1041,6 +1072,12 @@ pub fn Contexts(comptime Browser: type, comptime DocumentHandle: type) type {
 
             fn run(self: *PostMessageTaskContext) !void {
                 const target_frame = self.target_document.resolve(self.tab) orelse return;
+                if (!self.target_origin.allows(
+                    if (target_frame.current_url) |url_ptr| url_ptr else null,
+                )) {
+                    std.log.warn("Blocked postMessage due to target origin mismatch", .{});
+                    return;
+                }
                 const target_context = target_frame.js_context orelse return;
                 target_context.dispatchPostMessage(
                     self.target_document.window_id,

@@ -1,0 +1,14 @@
+<!doctype html>
+<!-- This page is intentionally served from port 8001 by the parent fixture. -->
+<style>
+  body { font-family: sans-serif; color: #1e3a8a; background-color: #dbeafe; }
+  p { display: block; }
+</style>
+<p>Cross-origin child: sending one blocked and two allowed messages.</p>
+<script>
+setTimeout(function() {
+  parent.postMessage("blocked", "http://127.0.0.1:8001");
+  parent.postMessage("explicit", "http://127.0.0.1:8000/ignored/path?q=1#fragment");
+  parent.postMessage("wildcard", "*");
+}, 50);
+</script>

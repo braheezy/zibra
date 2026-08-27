@@ -54,6 +54,10 @@ before changing `root.zig`, `tab.zig`, `render/`, or browser task scheduling.
   asynchronous XHR, cookie, and postMessage adapters plus their queued cleanup
   payloads. It receives Browser and document-handle types at comptime to avoid
   importing the per-window coordinator and creating an import cycle.
+  A queued postMessage owns both the canonical target-origin policy and the
+  source-origin/message copies; resolve its generation-stamped target first,
+  then compare that live document's URL at delivery rather than trusting a
+  send-time string comparison.
 - `navigation.zig` owns browser-generated certificate-warning documents and
   transport-security classification. `frame_timing.zig` owns frame cadence
   estimation and absolute deadlines. `window_geometry.zig` owns pure resize

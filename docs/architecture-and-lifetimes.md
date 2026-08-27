@@ -1444,6 +1444,15 @@ Current enforced behavior includes:
 - pending scripts, child-frame navigations, timers, XHR completions, and
   `postMessage` tasks carry a copied `(window_id, document_generation)` handle
   and resolve it only on the serialized tab worker.
+- `postMessage` additionally owns a parsed target-origin policy. `*` permits
+  every target, `/` snapshots the sender's origin, and absolute URL values are
+  reduced to scheme, host, and effective port by URL same-origin comparison.
+  The task evaluates that policy only after resolving the target document at
+  delivery time; stale generations and mismatched origins dispatch no event.
+  The source origin is serialized at send time, and event data/origin move to
+  Kiesel-owned storage before the queued payload is freed. Cross-origin child
+  realms retain only their parent's numeric window identity, which backs a
+  postMessage-only JavaScript proxy without installing the parent's DOM realm.
 
 Unresolved parts of the contract are:
 

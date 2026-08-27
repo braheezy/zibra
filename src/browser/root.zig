@@ -3091,23 +3091,10 @@ pub const Browser = struct {
             self.attachJsCallbacks(frame.tab, frame, ctx);
         }
 
-        var parent_window_id: ?u32 = null;
-        if (frame.parent) |parent| {
-            if (parent.current_url != null and frame.current_url != null) {
-                if (parent.current_url.?.*.sameOrigin(frame.current_url.?.*) or
-                    (std.mem.eql(u8, parent.current_url.?.*.scheme, "file") and std.mem.eql(u8, frame.current_url.?.*.scheme, "file")))
-                {
-                    parent_window_id = parent.window_id;
-                }
-            }
-        }
+        const parent_window_id: ?u32 = if (frame.parent) |parent| parent.window_id else null;
         frame.tab.setParentWindow(frame.window_id, parent_window_id);
         if (frame.js_context) |ctx| {
-            if (parent_window_id != null and frame.parent != null and frame.parent.?.js_context != null and frame.parent.?.js_context == ctx) {
-                ctx.setParentWindow(frame.window_id, parent_window_id);
-            } else {
-                ctx.setParentWindow(frame.window_id, null);
-            }
+            ctx.setParentWindow(frame.window_id, parent_window_id);
         }
 
         var node_list = std.ArrayList(*parser.Node).empty;
@@ -3457,21 +3444,10 @@ pub const Browser = struct {
         if (frame.js_context) |ctx| {
             self.attachJsCallbacks(parent.tab, frame, ctx);
         }
-        var parent_window_id: ?u32 = null;
-        if (frame.current_url) |child_url_ptr| {
-            if (page_url.*.sameOrigin(child_url_ptr.*) or
-                (std.mem.eql(u8, page_url.*.scheme, "file") and std.mem.eql(u8, child_url_ptr.*.scheme, "file")))
-            {
-                parent_window_id = parent.window_id;
-            }
-        }
+        const parent_window_id: ?u32 = parent.window_id;
         parent.tab.setParentWindow(frame.window_id, parent_window_id);
         if (frame.js_context) |ctx| {
-            if (parent_window_id != null and parent.js_context != null and parent.js_context == ctx) {
-                ctx.setParentWindow(frame.window_id, parent_window_id);
-            } else {
-                ctx.setParentWindow(frame.window_id, null);
-            }
+            ctx.setParentWindow(frame.window_id, parent_window_id);
         }
 
         var node_list = std.ArrayList(*parser.Node).empty;

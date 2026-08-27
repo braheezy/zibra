@@ -72,6 +72,15 @@ or Kiesel allocation/locking.
 - Detached/queued work must use the document generation contract from
   `src/browser/`; never retain a callback context or frame as a long-lived
   pointer.
+- `postMessage` parses `targetOrigin` synchronously. `*` is unrestricted,
+  `/` captures the sending document's origin, and any other value must be an
+  absolute URL whose scheme, host, and effective port are retained in the
+  queued task. Enforce the owned policy only after resolving the target
+  document at delivery time. Message-event data and serialized source origins
+  must be copied into Kiesel-owned storage before task buffers are released.
+  A cross-origin `window.parent` is an opaque numeric proxy exposing only
+  `postMessage`; it does not require or create a parent WindowContext in the
+  child's realm.
 - Preserve Kiesel's GC-root and `JsLock` assumptions. Do not add unlocked
   cross-thread host mutation without documenting and enforcing its owner.
 - Timer handles and callback registries are scoped by JavaScript window ID.
