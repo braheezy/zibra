@@ -90,6 +90,12 @@ before changing ownership or thread boundaries.
   Inputs and rich buttons resolve their image from live provenance at paint
   time rather than retaining another decoded-pixel borrow in layout state.
 - Replaced `<img>` layout keeps its element box independent from its bitmap.
+  `replaced_sizing.zig` is the shared unscaled-CSS-pixel resolver for image and
+  iframe width, height, and `aspect-ratio`; both layout and initial child-frame
+  viewport setup must use it. The supported ratio grammar is
+  `auto || <positive-number> [ / <positive-number> ]`. An explicit ratio
+  supplies only a missing axis, while `auto <ratio>` uses that ratio before an
+  image loads and switches to its natural ratio afterward.
   `object-fit` supports `fill`, `contain`, `cover`, `none`, and `scale-down`
   using the initial centered object position. Layout emits only the visible
   destination and an exact source crop, while hit testing uses the complete

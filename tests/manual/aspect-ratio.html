@@ -1,0 +1,40 @@
+<!doctype html>
+<!--
+How to verify:
+1. From the repository root run `python3 -m http.server 8000`, then open
+   http://127.0.0.1:8000/tests/manual/aspect-ratio.html in Zibra.
+2. The first iframe is 320x180 (16:9). The second is 200x150 (4:3). In each
+   case only the labeled width or height is authored. The two dark-outlined
+   iframe boxes must visibly have those different proportions and sizes.
+3. The diagnostic image is a 240x180 (4:3) box even though its pixels are 2:1.
+4. No `?lazy-ratio` request appears initially. Scroll toward the final panel:
+   it reserves a 240x180 4:3 box before loading. After the request, `auto`
+   selects the image's natural 2:1 ratio, the box becomes 240x120, and the
+   green AFTER marker moves upward. Scrolling away and back must not refetch.
+-->
+<style>
+  body { background-color: #f8fafc; color: #17233b; }
+  h1, h2, p, .card, .spacer, .marker { display: block; }
+  .card { width: 340px; background-color: #dbeafe; }
+  .wide { width: 320px; aspect-ratio: 16 / 9; }
+  .tall { height: 150px; aspect-ratio: 4 / 3; }
+  .forced { width: 240px; aspect-ratio: 4 / 3; }
+  .spacer { height: 1400px; background-color: #e2e8f0; }
+  .lazy { width: 240px; aspect-ratio: auto 4 / 3; }
+  .marker { height: 40px; background-color: #86efac; color: #14532d; }
+</style>
+<h1>CSS aspect-ratio</h1>
+<div class=card>
+  <p>Width 320px + 16:9 =&gt; height 180px</p>
+  <iframe class=wide src=aspect-ratio-child.html></iframe>
+</div>
+<div class=card>
+  <p>Height 150px + 4:3 =&gt; width 200px</p>
+  <iframe class=tall src=aspect-ratio-child.html></iframe>
+</div>
+<h2>Explicit image ratio</h2>
+<img class=forced src=background-image-pattern.ppm>
+<div class=spacer>Scroll toward the lazy ratio fallback.</div>
+<h2 id=lazy-ratio>Lazy auto + fallback ratio</h2>
+<img class=lazy loading=lazy src="background-image-pattern.ppm?lazy-ratio">
+<div class=marker>AFTER: this moves upward when the natural ratio replaces the fallback.</div>

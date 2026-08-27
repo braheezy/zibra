@@ -147,12 +147,16 @@ test "eager and lazy image batches fetch only their selected candidates" {
     try std.testing.expectEqual(@as(usize, 3), context.fetch_count);
 }
 
-test "lazy image layout preserves authored size then reflows intrinsic size after decode" {
+test "lazy image layout preserves authored and fallback ratios then reflows intrinsic auto ratio" {
     const allocator = std.testing.allocator;
     var html_parser = try document.HTMLParser.init(
         allocator,
         "<main><img id=fixed loading=lazy src=fixed.ppm width=40 height=20>" ++
-            "<br><img id=natural loading=lazy src=natural.ppm></main>",
+            "<br><img id=natural loading=lazy src=natural.ppm>" ++
+            "<br><img id=fallback loading=lazy src=fallback.ppm width=160 " ++
+            "style='aspect-ratio: auto 16 / 9'>" ++
+            "<br><img id=forced loading=lazy src=forced.ppm width=160 " ++
+            "style='aspect-ratio: 16 / 9'></main>",
     );
     defer html_parser.deinit(allocator);
     var root = try html_parser.parse();
@@ -162,6 +166,8 @@ test "lazy image layout preserves authored size then reflows intrinsic size afte
 
     const fixed_node = findNodeById(&root, "fixed").?;
     const natural_node = findNodeById(&root, "natural").?;
+    const fallback_node = findNodeById(&root, "fallback").?;
+    const forced_node = findNodeById(&root, "forced").?;
     var environ = std.process.Environ.Map.init(allocator);
     defer environ.deinit();
     try environ.put("HOME", "/tmp");
@@ -179,6 +185,12 @@ test "lazy image layout preserves authored size then reflows intrinsic size afte
     const natural_before = layout.image_bounds.get(natural_node).?;
     try std.testing.expectEqual(@as(i32, 1), natural_before.width);
     try std.testing.expectEqual(@as(i32, 1), natural_before.height);
+    const fallback_before = layout.image_bounds.get(fallback_node).?;
+    try std.testing.expectEqual(@as(i32, 160), fallback_before.width);
+    try std.testing.expectEqual(@as(i32, 90), fallback_before.height);
+    const forced_before = layout.image_bounds.get(forced_node).?;
+    try std.testing.expectEqual(@as(i32, 160), forced_before.width);
+    try std.testing.expectEqual(@as(i32, 90), forced_before.height);
     const height_before = laid_out.height.get().*;
 
     var page_url = try Url.init(allocator, "https://example.test/page.html");
@@ -197,8 +209,20 @@ test "lazy image layout preserves authored size then reflows intrinsic size afte
             .width = natural_before.width,
             .height = natural_before.height,
         } },
+        .{ .element = &fallback_node.element, .bounds = .{
+            .x = fallback_before.x,
+            .y = fallback_before.y,
+            .width = fallback_before.width,
+            .height = fallback_before.height,
+        } },
+        .{ .element = &forced_node.element, .bounds = .{
+            .x = forced_before.x,
+            .y = forced_before.y,
+            .width = forced_before.width,
+            .height = forced_before.height,
+        } },
     };
-    try std.testing.expectEqual(@as(usize, 2), try image_loader.loadCandidates(
+    try std.testing.expectEqual(@as(usize, 4), try image_loader.loadCandidates(
         allocator,
         &candidates,
         .{ .lazy_near = .{ .scroll = 0, .height = 600, .preload_margin = 600 } },
@@ -216,5 +240,11 @@ test "lazy image layout preserves authored size then reflows intrinsic size afte
     const natural_after = layout.image_bounds.get(natural_node).?;
     try std.testing.expectEqual(@as(i32, 30), natural_after.width);
     try std.testing.expectEqual(@as(i32, 12), natural_after.height);
-    try std.testing.expect(laid_out.height.get().* > height_before);
+    const fallback_after = layout.image_bounds.get(fallback_node).?;
+    try std.testing.expectEqual(@as(i32, 160), fallback_after.width);
+    try std.testing.expectEqual(@as(i32, 64), fallback_after.height);
+    const forced_after = layout.image_bounds.get(forced_node).?;
+    try std.testing.expectEqual(@as(i32, 160), forced_after.width);
+    try std.testing.expectEqual(@as(i32, 90), forced_after.height);
+    try std.testing.expect(laid_out.height.get().* != height_before);
 }

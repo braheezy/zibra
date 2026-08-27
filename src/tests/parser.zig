@@ -1352,6 +1352,29 @@ test "object-fit is computed per element and defaults to fill" {
     );
 }
 
+test "aspect-ratio is computed per element and defaults to auto" {
+    const allocator = std.testing.allocator;
+    const html = "<div style='aspect-ratio: 4 / 3'><img id=child></div>";
+
+    var html_parser = try HTMLParser.init(allocator, html);
+    html_parser.use_implicit_tags = false;
+    defer html_parser.deinit(allocator);
+    var root = try html_parser.parse();
+    defer root.deinit(allocator);
+
+    const rules = &[_]CSSParser.CSSRule{};
+    try document_parser.style(allocator, &root, rules);
+
+    try std.testing.expectEqualStrings(
+        "4 / 3",
+        root.element.style.?.getPtr("aspect-ratio").?.get().*,
+    );
+    try std.testing.expectEqualStrings(
+        "auto",
+        root.element.children.items[0].element.style.?.getPtr("aspect-ratio").?.get().*,
+    );
+}
+
 test "zoom is computed per element without inheriting" {
     const allocator = std.testing.allocator;
     const html = "<div style=\"zoom: 175%\"><p>child</p></div>";

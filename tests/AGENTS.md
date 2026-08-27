@@ -296,3 +296,7 @@ replaced-element boxes. It distinguishes stretched `fill`, centered letterbox
 `tests/manual/lazy-loading.html` distinguishes eager, near-viewport lazy, and
 far lazy requests using HTTP-log query suffixes. Its far intrinsic-size image
 must reflow the green marker after decode and remain stable without refetching.
+
+`tests/manual/aspect-ratio.html` covers width-derived and height-derived iframe
+boxes, an explicit image ratio, and an `auto <ratio>` lazy-image fallback that
+switches to the decoded natural ratio without a second request.

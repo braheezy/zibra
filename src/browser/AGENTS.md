@@ -60,6 +60,12 @@ before changing `root.zig`, `tab.zig`, `render/`, or browser task scheduling.
   one-CSS-pixel-viewport preload margin after accessibility zoom conversion. A
   newly decoded image always schedules layout and paint because its natural
   dimensions may change geometry.
+- `render/replaced_sizing.zig` resolves unscaled image and iframe dimensions
+  from computed CSS, HTML attributes, natural image size, and `aspect-ratio`.
+  Parent layout and initial iframe viewport setup share this resolver; layout
+  applies authored zoom only after both axes have been derived. A lazy image's
+  `auto <ratio>` value reserves the fallback ratio until decoded pixels provide
+  the natural one.
 - A Tab also owns the native `setInterval` cancellation registry under its
   interval mutex. Keys include window ID, document generation, and JavaScript
   handle. Sleeping one-shot helpers poll this registry at most every 10ms;

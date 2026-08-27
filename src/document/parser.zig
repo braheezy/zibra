@@ -1747,6 +1747,7 @@ const CSS_PROPERTIES = [_]struct { name: []const u8, default_value: []const u8 }
     .{ .name = "background-image", .default_value = "none" },
     .{ .name = "background-size", .default_value = "auto" },
     .{ .name = "object-fit", .default_value = "fill" },
+    .{ .name = "aspect-ratio", .default_value = "auto" },
     .{ .name = "image-rendering", .default_value = "auto" },
     .{ .name = "color-scheme", .default_value = "light dark" },
     .{ .name = "display", .default_value = "inline" },

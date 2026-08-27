@@ -12,6 +12,7 @@ const grapheme = @import("grapheme");
 const parser = @import("../../document/parser.zig");
 const background_image = @import("../../document/background_image.zig");
 const object_fit = @import("../../document/object_fit.zig");
+const replaced_sizing = @import("replaced_sizing.zig");
 const dom_focus = @import("../../document/focus.zig");
 const ProtectedField = @import("../../core/protected_field.zig").ProtectedField;
 const DisplayItem = browser.DisplayItem;
@@ -1929,28 +1930,6 @@ fn parseColorSchemeValue(value: []const u8) ColorSchemeSupport {
     return .{ .light = supports_light, .dark = supports_dark };
 }
 
-fn parseLengthAttribute(value: []const u8) ?i32 {
-    if (value.len == 0) return null;
-    if (std.mem.endsWith(u8, value, "px")) {
-        const num_str = value[0 .. value.len - 2];
-        return std.fmt.parseInt(i32, num_str, 10) catch null;
-    }
-    return std.fmt.parseInt(i32, value, 10) catch null;
-}
-
-fn preserveAspectDimension(fixed: i32, numerator: i32, denominator: i32) i32 {
-    if (denominator <= 0) return 0;
-    const result = @divTrunc(
-        @as(i64, fixed) * @as(i64, numerator),
-        @as(i64, denominator),
-    );
-    return @intCast(std.math.clamp(
-        result,
-        @as(i64, std.math.minInt(i32)),
-        @as(i64, std.math.maxInt(i32)),
-    ));
-}
-
 pub fn resolveColorScheme(self: *const Layout, value: []const u8) bool {
     const support = parseColorSchemeValue(value);
     if (!support.light and !support.dark) return self.accessibility.prefers_dark;
@@ -2263,70 +2242,18 @@ fn handleImageElement(self: *Layout, node: Node, node_ptr: ?*Node, line_buffer: 
         if (node.element.style) |*map| break :blk map;
         break :blk null;
     } else null;
-
-    var width_attr: ?i32 = null;
-    var height_attr: ?i32 = null;
-    if (element.attributes) |attrs| {
-        if (attrs.get("width")) |width_str| {
-            width_attr = parseLengthAttribute(width_str);
-        }
-        if (attrs.get("height")) |height_str| {
-            height_attr = parseLengthAttribute(height_str);
-        }
-    }
-
-    const css_width = if (style_map) |styles|
-        if (resolvedPixelDimension(&element, styles, "width")) |width|
-            self.scaleActiveCssPixel(width)
-        else
-            null
-    else
-        null;
-    const css_height = if (style_map) |styles|
-        if (resolvedPixelDimension(&element, styles, "height")) |height|
-            self.scaleActiveCssPixel(height)
-        else
-            null
-    else
-        null;
-    const specified_width = css_width orelse
-        if (width_attr) |width| self.scaleActiveCssPixel(width) else null;
-    const specified_height = css_height orelse
-        if (height_attr) |height| self.scaleActiveCssPixel(height) else null;
+    if (style_map) |styles| registerReplacedSizeDependencies(self, styles);
 
     const image_data = element.image_data;
-    const intrinsic_width: i32 = if (image_data) |data|
-        self.scaleActiveCssPixel(@intCast(data.image.width))
-    else
-        0;
-    const intrinsic_height: i32 = if (image_data) |data|
-        self.scaleActiveCssPixel(@intCast(data.image.height))
-    else
-        0;
-    var layout_width: i32 = 0;
-    var layout_height: i32 = 0;
-
-    if (specified_width != null and specified_height != null) {
-        layout_width = specified_width.?;
-        layout_height = specified_height.?;
-    } else if (specified_width != null) {
-        layout_width = specified_width.?;
-        if (intrinsic_width > 0 and intrinsic_height > 0) {
-            layout_height = preserveAspectDimension(layout_width, intrinsic_height, intrinsic_width);
-        } else {
-            layout_height = layout_width;
-        }
-    } else if (specified_height != null) {
-        layout_height = specified_height.?;
-        if (intrinsic_width > 0 and intrinsic_height > 0) {
-            layout_width = preserveAspectDimension(layout_height, intrinsic_width, intrinsic_height);
-        } else {
-            layout_width = layout_height;
-        }
-    } else {
-        layout_width = intrinsic_width;
-        layout_height = intrinsic_height;
-    }
+    const intrinsic_size: ?replaced_sizing.Size = if (image_data) |data| .{
+        .width = @intCast(data.image.width),
+        .height = @intCast(data.image.height),
+    } else null;
+    const box = replaced_sizing.imageSize(&element, intrinsic_size);
+    const layout_width = self.scaleActiveCssPixel(box.width);
+    const layout_height = self.scaleActiveCssPixel(box.height);
+    const intrinsic_width = self.scaleActiveCssPixel(if (intrinsic_size) |size| size.width else 0);
+    const intrinsic_height = self.scaleActiveCssPixel(if (intrinsic_size) |size| size.height else 0);
 
     if (layout_width <= 0 or layout_height <= 0) {
         // An intrinsic-only lazy image has no dimensions until decode, but it
@@ -2368,32 +2295,18 @@ fn handleIframeElement(self: *Layout, node: Node, node_ptr: ?*Node, line_buffer:
     };
     self.resetSoftHyphenWord();
 
-    var width_attr: ?i32 = null;
-    var height_attr: ?i32 = null;
-    if (element.attributes) |attrs| {
-        if (attrs.get("width")) |width_str| {
-            width_attr = parseLengthAttribute(width_str);
-        }
-        if (attrs.get("height")) |height_str| {
-            height_attr = parseLengthAttribute(height_str);
-        }
-    }
-
-    var layout_width: i32 = self.scaleActiveCssPixel(300);
-    var layout_height: i32 = self.scaleActiveCssPixel(150);
-    if (width_attr != null) {
-        layout_width = self.scaleActiveCssPixel(width_attr.?);
-    }
-    if (height_attr != null) {
-        layout_height = self.scaleActiveCssPixel(height_attr.?);
-    }
-
-    if (layout_width <= 0 or layout_height <= 0) return;
-
     const style_map = if (node == .element) blk: {
         if (node.element.style) |*map| break :blk map;
         break :blk null;
     } else null;
+    if (style_map) |styles| registerReplacedSizeDependencies(self, styles);
+
+    const box = replaced_sizing.iframeSize(&element);
+    const layout_width = self.scaleActiveCssPixel(box.width);
+    const layout_height = self.scaleActiveCssPixel(box.height);
+
+    if (layout_width <= 0 or layout_height <= 0) return;
+
     var iframe_layout = IframeLayout.init(
         self.allocator,
         layout_width,
@@ -2471,6 +2384,17 @@ fn registerStyleDependencies(
 ) void {
     var iterator = @constCast(style_map).iterator();
     while (iterator.next()) |entry| target.addDependency(entry.value_ptr);
+}
+
+fn registerReplacedSizeDependencies(self: *Layout, style_map: *const parser.StyleMap) void {
+    const block = self.inline_block orelse return;
+    const target = if (block.persistent_dependencies)
+        &block.height
+    else
+        block.temporary_dependency_target orelse return;
+    _ = styleValueRead(style_map, "width", target);
+    _ = styleValueRead(style_map, "height", target);
+    _ = styleValueRead(style_map, "aspect-ratio", target);
 }
 
 fn liveBlockElement(block: *const BlockLayout) ?*const parser.Element {

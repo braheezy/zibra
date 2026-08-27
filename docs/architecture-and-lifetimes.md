@@ -47,6 +47,7 @@ The source tree is organized by responsibility:
 | [`src/browser/window_geometry.zig`](../src/browser/window_geometry.zig) | Pure native-window resize and bounded tab-surface geometry derivation. |
 | [`src/browser/session_state.zig`](../src/browser/session_state.zig) | Window-independent networking task runner, HTTP client/cookies/cache, visited/bookmarked URL state, generated bookmark HTML, and separate network-data/metadata synchronization. |
 | [`src/browser/render/layout.zig`](../src/browser/render/layout.zig) | Layout tree, invalidation dependencies, hit-test collection, paint, and replaced-element layout. |
+| [`src/browser/render/replaced_sizing.zig`](../src/browser/render/replaced_sizing.zig) | Pure image/iframe width, height, intrinsic-size, and CSS aspect-ratio resolution. |
 | [`src/browser/render/font.zig`](../src/browser/render/font.zig) | Font discovery, SDL_ttf handles, Unicode fallback selection, and owned RGBA glyph bitmaps. |
 | [`src/browser/render/display_list.zig`](../src/browser/render/display_list.zig) | Display-command and composited-layer data, recursive ownership cleanup, provenance, and painted hit testing without Browser or SDL dependencies. |
 | [`src/browser/render/focus_ring.zig`](../src/browser/render/focus_ring.zig) | Pointer-free high-contrast focus-ring and accessibility-outline command generation. |
@@ -405,16 +406,25 @@ computed-style change invalidates descendant geometry and paint/hit effects
 read the same generation.
 
 Replaced `<img>` elements retain a CSS/attribute-selected element box separately
-from decoded bitmap geometry. `object-fit` resolves a centered visible
-destination for `fill`, `contain`, `cover`, `none`, or `scale-down`, then emits
-an optional fractional source-pixel crop where content crosses the box. The
-fractional boundary matters for low-resolution images and is copied unchanged
-through display-list and raster-snapshot owners. Paint/compositor bounds use
-the visible destination, while the synchronous display item retains the full
-element box for hit testing; source provenance is still cleared at the worker
-snapshot boundary. Authored width and height therefore reserve their box before
-a lazy request completes; without either dimension the pre-load box is zero
-space, and the post-decode layout uses the natural bitmap size.
+from decoded bitmap geometry. Images and iframes share one unscaled
+replaced-size resolver: supported CSS pixel dimensions override their matching
+HTML attributes, two specified axes win over `aspect-ratio`, and a preferred
+ratio derives only the missing axis. `auto <ratio>` gives an unloaded lazy
+image a stable fallback ratio, then switches to its natural ratio once decoded;
+plain `auto` retains the existing natural-image and 300x150 iframe defaults.
+Authored subtree zoom is applied only after both axes are resolved, and the
+same iframe result seeds its child Frame viewport before later parent paint
+republishes exact placeholder geometry. `object-fit` then resolves a centered
+visible destination for `fill`, `contain`, `cover`, `none`, or `scale-down`
+and emits an optional fractional source-pixel crop where content crosses the
+box. The fractional boundary matters for low-resolution images and is copied
+unchanged through display-list and raster-snapshot owners. Paint/compositor
+bounds use the visible destination, while the synchronous display item retains
+the full element box for hit testing; source provenance is still cleared at
+the worker snapshot boundary. Authored dimensions therefore reserve their box
+before a lazy request completes; one dimension plus a usable aspect ratio
+reserves both axes. Without either dimension the pre-load box is zero space,
+and the post-decode layout uses the natural bitmap size.
 
 An iframe placeholder carries its numeric authored effective zoom alongside
 its already-scaled rectangle. The child Frame stores that factor independently

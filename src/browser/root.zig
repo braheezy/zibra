@@ -54,6 +54,7 @@ pub const resizeGeometry = window_geometry.resize;
 const url_module = @import("../network/url.zig");
 const Url = url_module.Url;
 const Layout = @import("render/layout.zig");
+const replaced_sizing = @import("render/replaced_sizing.zig");
 const parser = @import("../document/parser.zig");
 const dom_focus = @import("../document/focus.zig");
 const HTMLParser = parser.HTMLParser;
@@ -3331,40 +3332,15 @@ pub const Browser = struct {
         }
     }
 
-    fn parseLengthAttribute(value: []const u8) ?i32 {
-        if (value.len == 0) return null;
-        if (std.mem.endsWith(u8, value, "px")) {
-            const num_str = value[0 .. value.len - 2];
-            return std.fmt.parseInt(i32, num_str, 10) catch null;
-        }
-        return std.fmt.parseInt(i32, value, 10) catch null;
-    }
-
     fn iframeViewportFromNode(node: *Node) ?struct { width: i32, height: i32 } {
         const element = switch (node.*) {
             .element => |e| e,
             else => return null,
         };
         if (!std.mem.eql(u8, element.tag, "iframe")) return null;
-
-        var width: i32 = 300;
-        var height: i32 = 150;
-
-        if (element.attributes) |attrs| {
-            if (attrs.get("width")) |width_str| {
-                if (parseLengthAttribute(width_str)) |parsed_width| {
-                    width = parsed_width;
-                }
-            }
-            if (attrs.get("height")) |height_str| {
-                if (parseLengthAttribute(height_str)) |parsed_height| {
-                    height = parsed_height;
-                }
-            }
-        }
-
-        if (width <= 0 or height <= 0) return null;
-        return .{ .width = width, .height = height };
+        const size = replaced_sizing.iframeSize(&element);
+        if (size.width <= 0 or size.height <= 0) return null;
+        return .{ .width = size.width, .height = size.height };
     }
 
     /// A parent document's CSP applies to the response's final destination,

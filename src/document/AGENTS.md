@@ -139,6 +139,11 @@ or selector/rule lifetime.
 - `object-fit` is non-inherited and defaults to `fill`. The supported modes are
   `fill`, `contain`, `cover`, `none`, and `scale-down`; invalid values fall
   back to `fill` in the layout value-validation subset.
+- `aspect-ratio` is non-inherited and defaults to `auto`. Replaced-element
+  layout accepts a positive number, a positive numerator/denominator pair, and
+  the `auto || <ratio>` fallback form; invalid and zero ratios behave as
+  `auto`. The computed map retains the borrowed declaration string, while the
+  pure used-size parser lives in `browser/render/replaced_sizing.zig`.
 - `zoom` is non-inherited and defaults to `1`. Layout accepts positive numbers
   and percentages, treats zero as one for web compatibility, and multiplies
   used fixed lengths through the ancestor chain. Invalid/negative values fall
