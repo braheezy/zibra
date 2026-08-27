@@ -988,6 +988,10 @@ const EmbedLayout = struct {
             .hit_offset_y = engine.transform_offset_y,
             .ascent = self.ascent.get().*,
             .descent = self.descent.get().*,
+            .line_height = engine.lineHeightForNatural(@max(
+                self.ascent.get().* + self.descent.get().*,
+                height_value,
+            )),
             .width = width_value,
             .height = height_value,
             .node_ptr = node_ptr,
@@ -1277,6 +1281,8 @@ const LineItem = struct {
     ascent: i32,
     /// The glyph's descent as a positive value (–TTF_FontDescent)
     descent: i32,
+    /// Used line-box height contributed by this inline item.
+    line_height: i32,
     width: i32,
     height: i32,
     /// Pointer to the DOM node that produced this item (if available)
@@ -2065,6 +2071,9 @@ size: i32 = 16,
 /// font-raster unit used by this layout engine; relative lengths use this
 /// unrounded CSS value as their `em` base.
 font_size_css: f64 = 16.0,
+/// Explicit CSS line-height in CSS pixels. A null value represents `normal`;
+/// unitless values are resolved against the current element's font size.
+line_height_css: ?f64 = null,
 cursor_x: i32,
 cursor_y: i32,
 line_left: i32,
@@ -2072,6 +2081,9 @@ line_right: i32,
 is_bold: bool = false,
 is_italic: bool = false,
 font_family: FontFamily = .proportional,
+/// CSS `font-variant: small-caps`; semantic elements such as `abbr` keep
+/// their separate state in `is_small_caps` so nested styles do not erase it.
+css_small_caps: bool = false,
 is_title: bool = false,
 is_superscript: bool = false,
 is_small_caps: bool = false,
@@ -2125,9 +2137,11 @@ const InlineSnapshot = struct {
     line_right: i32,
     size: i32,
     font_size_css: f64,
+    line_height_css: ?f64,
     is_bold: bool,
     is_italic: bool,
     font_family: FontFamily,
+    css_small_caps: bool,
     is_title: bool,
     is_superscript: bool,
     is_small_caps: bool,
@@ -2147,9 +2161,11 @@ fn snapshotInlineState(self: *const Layout) InlineSnapshot {
         .line_right = self.line_right,
         .size = self.size,
         .font_size_css = self.font_size_css,
+        .line_height_css = self.line_height_css,
         .is_bold = self.is_bold,
         .is_italic = self.is_italic,
         .font_family = self.font_family,
+        .css_small_caps = self.css_small_caps,
         .is_title = self.is_title,
         .is_superscript = self.is_superscript,
         .is_small_caps = self.is_small_caps,
@@ -2169,9 +2185,11 @@ fn restoreInlineState(self: *Layout, snapshot: InlineSnapshot) void {
     self.line_right = snapshot.line_right;
     self.size = snapshot.size;
     self.font_size_css = snapshot.font_size_css;
+    self.line_height_css = snapshot.line_height_css;
     self.is_bold = snapshot.is_bold;
     self.is_italic = snapshot.is_italic;
     self.font_family = snapshot.font_family;
+    self.css_small_caps = snapshot.css_small_caps;
     self.is_title = snapshot.is_title;
     self.is_superscript = snapshot.is_superscript;
     self.is_small_caps = snapshot.is_small_caps;
@@ -2212,6 +2230,48 @@ fn scaleActiveCssPixel(self: *const Layout, css_px: i32) i32 {
 
 fn scaleActiveCssFloat(self: *const Layout, css_px: f64) f64 {
     return scaleCssFloat(css_px, self.effectiveZoom(), self.zoom());
+}
+
+fn lineHeightForNatural(self: *const Layout, natural_height: i32) i32 {
+    const natural = @max(natural_height, 1);
+    if (self.line_height_css) |line_height_css| {
+        const scaled = self.scaleActiveCssFloat(line_height_css);
+        if (!std.math.isFinite(scaled)) return natural;
+        const scaled_layout: i32 = @intFromFloat(std.math.clamp(
+            scaled,
+            0.0,
+            @as(f64, @floatFromInt(std.math.maxInt(i32))),
+        ));
+        return @max(scaled_layout, natural);
+    }
+
+    const extra_leading: i32 = @intFromFloat(@as(f32, @floatFromInt(natural)) * 0.25);
+    return natural + extra_leading;
+}
+
+fn resolveLineHeightCss(value: []const u8, font_size_css: f64) ?f64 {
+    const trimmed = std.mem.trim(u8, value, " \t\r\n\x0c");
+    if (trimmed.len == 0 or std.ascii.eqlIgnoreCase(trimmed, "normal")) return null;
+
+    // Unitless line-height inherits as a multiplier, so resolve it against
+    // the element's current font size at use time.
+    if (std.fmt.parseFloat(f64, trimmed)) |multiplier| {
+        if (!std.math.isFinite(multiplier) or multiplier < 0) return null;
+        return multiplier * font_size_css;
+    } else |_| {}
+
+    return parser.resolveCssLength(trimmed, .{
+        .font_size = font_size_css,
+        .percentage_base = font_size_css,
+    });
+}
+
+fn fontWeightIsBold(value: []const u8) bool {
+    const trimmed = std.mem.trim(u8, value, " \t\r\n");
+    if (std.ascii.eqlIgnoreCase(trimmed, "bold") or
+        std.ascii.eqlIgnoreCase(trimmed, "bolder")) return true;
+    const numeric = std.fmt.parseInt(u16, trimmed, 10) catch return false;
+    return numeric >= 600;
 }
 
 fn containingBlockCssDimension(self: *const Layout, height: bool) ?f64 {
@@ -2716,6 +2776,8 @@ const StyleSnapshot = struct {
     font_family: FontFamily,
     size: i32,
     font_size_css: f64,
+    line_height_css: ?f64,
+    css_small_caps: bool,
     text_color: browser.Color,
     transform_offset_x: i32,
     transform_offset_y: i32,
@@ -2877,6 +2939,8 @@ fn applyNodeStyles(
         .font_family = self.font_family,
         .size = self.size,
         .font_size_css = self.font_size_css,
+        .line_height_css = self.line_height_css,
+        .css_small_caps = self.css_small_caps,
         .text_color = self.text_color,
         .transform_offset_x = self.transform_offset_x,
         .transform_offset_y = self.transform_offset_y,
@@ -2928,19 +2992,21 @@ fn applyNodeStyles(
         // Apply font-weight
         if (notify_target) |target| {
             if (styleValueRead(style_map, "font-weight", target)) |weight_str| {
-                self.is_bold = std.mem.eql(u8, weight_str, "bold");
+                self.is_bold = fontWeightIsBold(weight_str);
             }
         } else if (styleValue(style_map, "font-weight")) |weight_str| {
-            self.is_bold = std.mem.eql(u8, weight_str, "bold");
+            self.is_bold = fontWeightIsBold(weight_str);
         }
 
         // Apply font-style
         if (notify_target) |target| {
             if (styleValueRead(style_map, "font-style", target)) |style_str| {
-                self.is_italic = std.mem.eql(u8, style_str, "italic");
+                self.is_italic = std.ascii.eqlIgnoreCase(style_str, "italic") or
+                    std.ascii.eqlIgnoreCase(style_str, "oblique");
             }
         } else if (styleValue(style_map, "font-style")) |style_str| {
-            self.is_italic = std.mem.eql(u8, style_str, "italic");
+            self.is_italic = std.ascii.eqlIgnoreCase(style_str, "italic") or
+                std.ascii.eqlIgnoreCase(style_str, "oblique");
         }
 
         // Apply font-size
@@ -2958,6 +3024,28 @@ fn applyNodeStyles(
                 // (multiply by 0.75 for points).
                 self.size = @intFromFloat(size_float * 0.75);
             }
+        }
+
+        // Line-height is inherited independently from font-size. Unitless
+        // values have already retained their multiplier in computed style;
+        // resolve them after the element's font-size has been applied.
+        const line_height_value = if (notify_target) |target|
+            styleValueRead(style_map, "line-height", target)
+        else
+            styleValue(style_map, "line-height");
+        if (line_height_value) |line_height_str| {
+            self.line_height_css = resolveLineHeightCss(line_height_str, self.font_size_css);
+        }
+
+        const variant_value = if (notify_target) |target|
+            styleValueRead(style_map, "font-variant", target)
+        else
+            styleValue(style_map, "font-variant");
+        if (variant_value) |variant_str| {
+            self.css_small_caps = std.ascii.eqlIgnoreCase(
+                std.mem.trim(u8, variant_str, " \t\r\n"),
+                "small-caps",
+            );
         }
 
         // Apply color
@@ -2993,6 +3081,8 @@ fn restoreNodeStyles(self: *Layout, _: *std.ArrayList(LineItem)) !void {
         self.font_family = snapshot.font_family;
         self.size = snapshot.size;
         self.font_size_css = snapshot.font_size_css;
+        self.line_height_css = snapshot.line_height_css;
+        self.css_small_caps = snapshot.css_small_caps;
         self.text_color = snapshot.text_color;
         self.transform_offset_x = snapshot.transform_offset_x;
         self.transform_offset_y = snapshot.transform_offset_y;
@@ -3057,6 +3147,9 @@ fn recordSoftHyphenBreak(
             .hit_offset_y = self.transform_offset_y,
             .ascent = self.toLayoutPx(hyphen.ascent),
             .descent = self.toLayoutPx(hyphen.descent),
+            .line_height = self.lineHeightForNatural(
+                self.toLayoutPx(hyphen.ascent) + self.toLayoutPx(hyphen.descent),
+            ),
             .width = hyphen_width,
             .height = self.toLayoutPx(hyphen.h),
             .node_ptr = node_ptr,
@@ -3166,8 +3259,10 @@ fn flushLine(self: *Layout, line_buffer: *std.ArrayList(LineItem)) !void {
     var max_normal_descent: i32 = 0;
     var max_superscript_ascent: i32 = 0;
     var max_superscript_descent: i32 = 0;
+    var max_item_line_height: i32 = 0;
 
     for (line_buffer.items) |item| {
+        max_item_line_height = @max(max_item_line_height, item.line_height);
         const is_superscript = switch (item.payload) {
             .glyph => |glyph_payload| glyph_payload.glyph.is_superscript,
             .input => false,
@@ -3192,11 +3287,13 @@ fn flushLine(self: *Layout, line_buffer: *std.ArrayList(LineItem)) !void {
     const baseline_ascent = if (has_normal_item) max_normal_ascent else max_superscript_ascent;
     const normal_height = max_normal_ascent + max_normal_descent;
     const superscript_height = max_superscript_ascent + max_superscript_descent;
-    const line_height = @max(normal_height, superscript_height);
-    const extra_leading: i32 = @intFromFloat(@as(f32, @floatFromInt(line_height)) * 0.25);
+    const line_height = @max(
+        @max(normal_height, superscript_height),
+        max_item_line_height,
+    );
     const baseline = self.cursor_y + baseline_ascent;
     const line_top = self.cursor_y;
-    const line_box_height = line_height + extra_leading;
+    const line_box_height = line_height;
 
     var focus_map = std.AutoHashMap(*Node, Bounds).init(self.allocator);
     defer focus_map.deinit();
@@ -3381,7 +3478,7 @@ fn flushLine(self: *Layout, line_buffer: *std.ArrayList(LineItem)) !void {
     }
 
     // Advance cursor_y and reset cursor_x
-    self.cursor_y = line_top + line_height + extra_leading;
+    self.cursor_y = line_top + line_box_height;
     self.updateInlineBounds();
     self.cursor_x = self.line_left;
 
@@ -3409,10 +3506,8 @@ fn breakPreformattedLine(self: *Layout, line_buffer: *std.ArrayList(LineItem)) !
     );
     const ascent = self.toLayoutPx(reference.ascent);
     const descent = self.toLayoutPx(reference.descent);
-    const line_height = @max(ascent + descent, 1);
-    const extra_leading: i32 = @intFromFloat(@as(f32, @floatFromInt(line_height)) * 0.25);
-
-    self.cursor_y += line_height + extra_leading;
+    const line_height = self.lineHeightForNatural(ascent + descent);
+    self.cursor_y += line_height;
     self.updateInlineBounds();
     self.cursor_x = self.line_left;
     self.resetSoftHyphenWord();
@@ -3459,6 +3554,8 @@ fn processGrapheme(
     node_ptr: ?*Node,
     options: GraphemeOptions,
 ) !void {
+    const small_caps = options.is_small_caps or self.css_small_caps;
+
     // Handle newlines explicitly before font shaping.
     if (std.mem.eql(u8, gme, "\n") or std.mem.eql(u8, gme, "\r") or options.force_newline) {
         try self.breakExplicitLine(line_buffer);
@@ -3493,7 +3590,7 @@ fn processGrapheme(
 
     // Handle small caps rendering
     var glyph: font.Glyph = undefined;
-    if (options.is_small_caps) {
+    if (small_caps) {
         const is_lowercase = isSmallCapsLowercaseGrapheme(gme);
 
         if (is_lowercase) {
@@ -3556,6 +3653,7 @@ fn processGrapheme(
         .hit_offset_y = self.transform_offset_y,
         .ascent = glyph_ascent,
         .descent = glyph_descent,
+        .line_height = self.lineHeightForNatural(glyph_ascent + glyph_descent),
         .width = glyph_width,
         .height = glyph_height,
         .node_ptr = node_ptr,
@@ -3880,7 +3978,9 @@ fn breakParagraph(self: *Layout, line_buffer: *std.ArrayList(LineItem)) !void {
     if (self.cursor_y == initial_y) {
         // Preserve an empty source line even though flushLine has no glyph
         // metrics from which to derive its normal advance.
-        self.cursor_y += @max(self.scaleActiveCssPixel(self.size), 1);
+        self.cursor_y += self.lineHeightForNatural(
+            @max(self.scaleActiveCssPixel(self.size), 1),
+        );
     }
     self.cursor_y += gap;
     self.cursor_x = self.line_left;
@@ -3976,6 +4076,14 @@ test "paragraph gap adds visible leading beyond a normal line step" {
     try std.testing.expectEqual(@as(i32, 1), paragraphGap(1));
 }
 
+test "line-height resolves unitless and relative values" {
+    try std.testing.expectEqual(@as(?f64, null), resolveLineHeightCss("normal", 16.0));
+    try std.testing.expectApproxEqAbs(@as(f64, 24.0), resolveLineHeightCss("1.5", 16.0).?, 0.000001);
+    try std.testing.expectApproxEqAbs(@as(f64, 24.0), resolveLineHeightCss("150%", 16.0).?, 0.000001);
+    try std.testing.expectApproxEqAbs(@as(f64, 20.0), resolveLineHeightCss("1.25em", 16.0).?, 0.000001);
+    try std.testing.expect(resolveLineHeightCss("-1", 16.0) == null);
+}
+
 // Text stays source-backed in the DOM; decode references only while laying it
 // out. Attribute values use the same lexer but copy decoded bytes in parser.zig.
 fn lexEntityAt(
@@ -4043,6 +4151,8 @@ pub fn layoutSourceCode(self: *Layout, source: []const u8) ![]DisplayItem {
     self.line_direction = self.default_direction;
     self.size = self.default_font_size;
     self.font_size_css = @floatFromInt(self.default_font_size);
+    self.line_height_css = null;
+    self.css_small_caps = false;
     self.resetSoftHyphenWord();
 
     // Save current state
@@ -4050,6 +4160,8 @@ pub fn layoutSourceCode(self: *Layout, source: []const u8) ![]DisplayItem {
     const original_font_category = self.current_font_category;
     const original_is_bold = self.is_bold;
     const original_font_family = self.font_family;
+    const original_line_height_css = self.line_height_css;
+    const original_css_small_caps = self.css_small_caps;
 
     // Start with preformatted mode on for whitespace preservation
     // but use normal font for initial state
@@ -4057,6 +4169,8 @@ pub fn layoutSourceCode(self: *Layout, source: []const u8) ![]DisplayItem {
     self.font_family = .proportional;
     self.current_font_category = .latin; // Start with normal font
     self.is_bold = false; // Start with normal weight
+    self.line_height_css = null;
+    self.css_small_caps = false;
 
     var line_buffer = std.ArrayList(LineItem).empty;
     defer line_buffer.deinit(self.allocator);
@@ -4162,6 +4276,8 @@ pub fn layoutSourceCode(self: *Layout, source: []const u8) ![]DisplayItem {
     self.current_font_category = original_font_category;
     self.is_bold = original_is_bold;
     self.font_family = original_font_family;
+    self.line_height_css = original_line_height_css;
+    self.css_small_caps = original_css_small_caps;
 
     // `cursor_y` already includes the top page padding. Keep matching bottom
     // whitespace so source documents use the same scroll contract as HTML.
@@ -5165,7 +5281,7 @@ const TextLayout = struct {
 
     fn addStyleDependencies(text: *TextLayout, style_map: ?*parser.StyleMap) void {
         const map = style_map orelse return;
-        for ([_][]const u8{ "font-weight", "font-style", "font-size", "font-family" }) |property| {
+        for ([_][]const u8{ "font-weight", "font-style", "font-size", "font-family", "line-height" }) |property| {
             if (map.getPtr(property)) |field| {
                 text.width.addDependency(field);
                 text.height.addDependency(field);
@@ -7643,9 +7759,11 @@ fn layoutInlineBlock(self: *Layout, block: *BlockLayout) !void {
     self.line_direction = textDirectionForBlock(block, self.default_direction);
     self.size = self.default_font_size;
     self.font_size_css = @floatFromInt(self.default_font_size);
+    self.line_height_css = null;
     self.is_bold = false;
     self.is_italic = false;
     self.font_family = .proportional;
+    self.css_small_caps = false;
     // Centering belongs to the complete title block, not one buffered line.
     // Keeping this state stable lets explicit and automatic line breaks center
     // each completed line independently in flushLine().
@@ -7674,6 +7792,34 @@ fn layoutInlineBlock(self: *Layout, block: *BlockLayout) !void {
                             self.font_family = font.familyFromCss(value);
                         }
 
+                        const weight_value = if (block.persistent_dependencies)
+                            styleValueRead(style_map, "font-weight", &block.height)
+                        else
+                            styleValue(style_map, "font-weight");
+                        if (weight_value) |value| {
+                            self.is_bold = fontWeightIsBold(value);
+                        }
+
+                        const style_value = if (block.persistent_dependencies)
+                            styleValueRead(style_map, "font-style", &block.height)
+                        else
+                            styleValue(style_map, "font-style");
+                        if (style_value) |value| {
+                            self.is_italic = std.ascii.eqlIgnoreCase(value, "italic") or
+                                std.ascii.eqlIgnoreCase(value, "oblique");
+                        }
+
+                        const variant_value = if (block.persistent_dependencies)
+                            styleValueRead(style_map, "font-variant", &block.height)
+                        else
+                            styleValue(style_map, "font-variant");
+                        if (variant_value) |value| {
+                            self.css_small_caps = std.ascii.eqlIgnoreCase(
+                                std.mem.trim(u8, value, " \t\r\n"),
+                                "small-caps",
+                            );
+                        }
+
                         // The anonymous block has no element of its own on
                         // which applyNodeStyles can establish inherited text
                         // metrics. Seed the computed font size from its
@@ -7692,6 +7838,14 @@ fn layoutInlineBlock(self: *Layout, block: *BlockLayout) !void {
                                 self.font_size_css = size_css;
                                 self.size = @intFromFloat(size_css * 0.75);
                             }
+                        }
+
+                        const line_height_value = if (block.persistent_dependencies)
+                            styleValueRead(style_map, "line-height", &block.height)
+                        else
+                            styleValue(style_map, "line-height");
+                        if (line_height_value) |value| {
+                            self.line_height_css = resolveLineHeightCss(value, self.font_size_css);
                         }
                     }
                 },

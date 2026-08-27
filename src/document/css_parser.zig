@@ -185,8 +185,11 @@ fn pair(self: *CSSParser) !struct { property: []const u8, value: []const u8 } {
 
 const FontShorthand = struct {
     style: []const u8 = "normal",
+    variant: []const u8 = "normal",
     weight: []const u8 = "normal",
+    stretch: []const u8 = "normal",
     size: []const u8,
+    line_height: []const u8 = "normal",
     family: []const u8,
 };
 
@@ -195,14 +198,44 @@ fn isSupportedFontSize(font_size: []const u8) bool {
     return length.unit == .px or length.unit == .em or length.unit == .percent;
 }
 
-/// Parse the subset of the `font` shorthand represented by Zibra's computed
-/// style: optional `italic` and `bold`, followed by a required px/em/percentage
-/// size and a required family or fallback list. Unsupported syntax invalidates
-/// the declaration instead of applying only part of it.
+fn isSupportedFontLineHeight(line_height: []const u8) bool {
+    if (std.ascii.eqlIgnoreCase(line_height, "normal")) return true;
+    if (css_length.parse(line_height) != null) return true;
+    const number = std.fmt.parseFloat(f64, line_height) catch return false;
+    return std.math.isFinite(number) and number >= 0;
+}
+
+fn isFontWeight(token: []const u8) bool {
+    if (std.ascii.eqlIgnoreCase(token, "normal") or
+        std.ascii.eqlIgnoreCase(token, "bold") or
+        std.ascii.eqlIgnoreCase(token, "bolder") or
+        std.ascii.eqlIgnoreCase(token, "lighter")) return true;
+    const weight = std.fmt.parseInt(u16, token, 10) catch return false;
+    return weight >= 100 and weight <= 900 and weight % 100 == 0;
+}
+
+fn isFontStretch(token: []const u8) bool {
+    return std.ascii.eqlIgnoreCase(token, "normal") or
+        std.ascii.eqlIgnoreCase(token, "ultra-condensed") or
+        std.ascii.eqlIgnoreCase(token, "extra-condensed") or
+        std.ascii.eqlIgnoreCase(token, "condensed") or
+        std.ascii.eqlIgnoreCase(token, "semi-condensed") or
+        std.ascii.eqlIgnoreCase(token, "semi-expanded") or
+        std.ascii.eqlIgnoreCase(token, "expanded") or
+        std.ascii.eqlIgnoreCase(token, "extra-expanded") or
+        std.ascii.eqlIgnoreCase(token, "ultra-expanded");
+}
+
+/// Parse the standard font shorthand ordering: optional style, variant,
+/// weight, and stretch; required size with an optional `/line-height`; and a
+/// family/fallback list. The family is retained as the original suffix so
+/// quoted family names and commas remain intact.
 fn parseFontShorthand(declaration_value: []const u8) ?FontShorthand {
     var result = FontShorthand{ .size = undefined, .family = undefined };
     var saw_style = false;
+    var saw_variant = false;
     var saw_weight = false;
+    var saw_stretch = false;
     var pos: usize = 0;
 
     while (pos < declaration_value.len) {
@@ -213,23 +246,88 @@ fn parseFontShorthand(declaration_value: []const u8) ?FontShorthand {
         while (pos < declaration_value.len and !std.ascii.isWhitespace(declaration_value[pos])) : (pos += 1) {}
         const token = declaration_value[token_start..pos];
 
-        if (isSupportedFontSize(token)) {
-            const family = std.mem.trim(u8, declaration_value[pos..], " \t\r\n");
+        var size_token: ?[]const u8 = null;
+        var line_height_token: ?[]const u8 = null;
+        var family_start = pos;
+
+        if (std.mem.indexOfScalar(u8, token, '/')) |slash| {
+            const possible_size = token[0..slash];
+            const possible_line_height = token[slash + 1 ..];
+            if (!isSupportedFontSize(possible_size)) return null;
+            size_token = possible_size;
+            if (possible_line_height.len != 0) {
+                if (!isSupportedFontLineHeight(possible_line_height)) return null;
+                line_height_token = possible_line_height;
+            } else {
+                var line_start = pos;
+                while (line_start < declaration_value.len and
+                    std.ascii.isWhitespace(declaration_value[line_start])) : (line_start += 1)
+                {}
+                const line_end = blk: {
+                    var end = line_start;
+                    while (end < declaration_value.len and !std.ascii.isWhitespace(declaration_value[end])) : (end += 1) {}
+                    break :blk end;
+                };
+                const separate_line_height = declaration_value[line_start..line_end];
+                if (!isSupportedFontLineHeight(separate_line_height)) return null;
+                line_height_token = separate_line_height;
+                family_start = line_end;
+                pos = line_end;
+            }
+        } else if (isSupportedFontSize(token)) {
+            size_token = token;
+            var after_size = pos;
+            while (after_size < declaration_value.len and std.ascii.isWhitespace(declaration_value[after_size])) : (after_size += 1) {}
+            if (after_size < declaration_value.len and declaration_value[after_size] == '/') {
+                after_size += 1;
+                while (after_size < declaration_value.len and std.ascii.isWhitespace(declaration_value[after_size])) : (after_size += 1) {}
+                const line_start = after_size;
+                while (after_size < declaration_value.len and !std.ascii.isWhitespace(declaration_value[after_size])) : (after_size += 1) {}
+                const possible_line_height = declaration_value[line_start..after_size];
+                if (!isSupportedFontLineHeight(possible_line_height)) return null;
+                line_height_token = possible_line_height;
+                family_start = after_size;
+            }
+        }
+
+        if (size_token) |size| {
+            const family = std.mem.trim(u8, declaration_value[family_start..], " \t\r\n");
             if (family.len == 0) return null;
-            result.size = token;
+            result.size = size;
+            if (line_height_token) |line_height| result.line_height = line_height;
             result.family = family;
             return result;
         }
 
-        if (std.ascii.eqlIgnoreCase(token, "italic")) {
+        if (std.ascii.eqlIgnoreCase(token, "italic") or
+            std.ascii.eqlIgnoreCase(token, "oblique"))
+        {
             if (saw_style) return null;
-            result.style = "italic";
+            result.style = if (std.ascii.eqlIgnoreCase(token, "oblique")) "oblique" else "italic";
             saw_style = true;
-        } else if (std.ascii.eqlIgnoreCase(token, "bold")) {
+        } else if (std.ascii.eqlIgnoreCase(token, "small-caps")) {
+            if (saw_variant) return null;
+            result.variant = "small-caps";
+            saw_variant = true;
+        } else if (std.ascii.eqlIgnoreCase(token, "normal")) {
+            // `normal` is valid for each optional font component. It does
+            // not reserve one component, since another optional component may
+            // still appear later in the shorthand.
+        } else if (isFontWeight(token)) {
             if (saw_weight) return null;
-            result.weight = "bold";
+            if (std.ascii.eqlIgnoreCase(token, "normal")) {
+                result.weight = "normal";
+            } else if (std.ascii.eqlIgnoreCase(token, "bold")) {
+                result.weight = "bold";
+            } else {
+                result.weight = token;
+            }
             saw_weight = true;
-        } else if (!std.ascii.eqlIgnoreCase(token, "normal")) {
+        } else if (isFontStretch(token)) {
+            if (saw_stretch) return null;
+            result.stretch = token;
+            saw_stretch = true;
+        } else {
             return null;
         }
     }
@@ -461,8 +559,11 @@ fn putDeclaration(
     if (std.ascii.eqlIgnoreCase(property, "font")) {
         const font = parseFontShorthand(declaration.value) orelse return;
         try putLonghand(map, "font-style", .{ .value = font.style, .important = declaration.important });
+        try putLonghand(map, "font-variant", .{ .value = font.variant, .important = declaration.important });
         try putLonghand(map, "font-weight", .{ .value = font.weight, .important = declaration.important });
+        try putLonghand(map, "font-stretch", .{ .value = font.stretch, .important = declaration.important });
         try putLonghand(map, "font-size", .{ .value = font.size, .important = declaration.important });
+        try putLonghand(map, "line-height", .{ .value = font.line_height, .important = declaration.important });
         try putLonghand(map, "font-family", .{ .value = font.family, .important = declaration.important });
         return;
     }

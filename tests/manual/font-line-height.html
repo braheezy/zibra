@@ -1,0 +1,21 @@
+<!doctype html>
+<!-- Verify with --dump-style and --dump-layout: font shorthand must expose
+     the slash line-height, and the second block must start after the taller
+     line box produced by the first block. -->
+<html>
+<head>
+  <style>
+    html { font: 10px/1 Verdana, sans-serif; }
+    body { margin: 0; padding: 8px; border: 2px solid #234; }
+    .wide {
+      font: oblique small-caps 600 semi-condensed 20px/1.5 "Courier New", monospace;
+      background: #dbeafe;
+    }
+    .normal { font: 10px / 1 Verdana, sans-serif; background: #dcfce7; }
+  </style>
+</head>
+<body>
+  <div class="wide">Wide line-height</div>
+  <div class="normal">Normal line-height</div>
+</body>
+</html>

@@ -1225,6 +1225,7 @@ test "font shorthand expands in declaration order" {
     try std.testing.expectEqualStrings("normal", properties.get("font-style").?.value);
     try std.testing.expectEqualStrings("bold", properties.get("font-weight").?.value);
     try std.testing.expectEqualStrings("125%", properties.get("font-size").?.value);
+    try std.testing.expectEqualStrings("normal", properties.get("line-height").?.value);
     try std.testing.expectEqualStrings("\"Courier New\", monospace", properties.get("font-family").?.value);
 
     var reset_parser = try CSSParser.init(
@@ -1238,6 +1239,7 @@ test "font shorthand expands in declaration order" {
     try std.testing.expectEqualStrings("normal", reset_properties.get("font-style").?.value);
     try std.testing.expectEqualStrings("normal", reset_properties.get("font-weight").?.value);
     try std.testing.expectEqualStrings("18px", reset_properties.get("font-size").?.value);
+    try std.testing.expectEqualStrings("normal", reset_properties.get("line-height").?.value);
     try std.testing.expectEqualStrings("sans-serif", reset_properties.get("font-family").?.value);
 
     var invalid_parser = try CSSParser.init(
@@ -1253,6 +1255,40 @@ test "font shorthand expands in declaration order" {
     try std.testing.expect(invalid_properties.get("font-size") == null);
     try std.testing.expect(invalid_properties.get("font-family") == null);
     try std.testing.expectEqualStrings("red", invalid_properties.get("color").?.value);
+}
+
+test "font shorthand accepts full optional fields and slash line-height" {
+    const allocator = std.testing.allocator;
+
+    var css_parser = try CSSParser.init(
+        allocator,
+        "font: oblique small-caps 600 semi-condensed 10px/1.5 \"Verdana\", sans-serif !important",
+        false,
+    );
+    defer css_parser.deinit(allocator);
+    var declarations = try css_parser.body(allocator);
+    defer declarations.deinit();
+
+    try std.testing.expectEqualStrings("oblique", declarations.get("font-style").?.value);
+    try std.testing.expectEqualStrings("small-caps", declarations.get("font-variant").?.value);
+    try std.testing.expectEqualStrings("600", declarations.get("font-weight").?.value);
+    try std.testing.expectEqualStrings("semi-condensed", declarations.get("font-stretch").?.value);
+    try std.testing.expectEqualStrings("10px", declarations.get("font-size").?.value);
+    try std.testing.expectEqualStrings("1.5", declarations.get("line-height").?.value);
+    try std.testing.expectEqualStrings("\"Verdana\", sans-serif", declarations.get("font-family").?.value);
+    try std.testing.expect(declarations.get("line-height").?.important);
+
+    var spacing_parser = try CSSParser.init(
+        allocator,
+        "font: 10px / 1 Courier, monospace",
+        false,
+    );
+    defer spacing_parser.deinit(allocator);
+    var spacing = try spacing_parser.body(allocator);
+    defer spacing.deinit();
+    try std.testing.expectEqualStrings("10px", spacing.get("font-size").?.value);
+    try std.testing.expectEqualStrings("1", spacing.get("line-height").?.value);
+    try std.testing.expectEqualStrings("Courier, monospace", spacing.get("font-family").?.value);
 }
 
 test "box model shorthands expand into computed longhands" {
@@ -1375,6 +1411,7 @@ test "font shorthand produces inherited computed longhands" {
     const styles = root.element.style.?;
     try std.testing.expectEqualStrings("italic", styles.getPtr("font-style").?.get().*);
     try std.testing.expectEqualStrings("bold", styles.getPtr("font-weight").?.get().*);
+    try std.testing.expectEqualStrings("normal", styles.getPtr("line-height").?.get().*);
     try std.testing.expectEqualStrings("24.0px", styles.getPtr("font-size").?.get().*);
     try std.testing.expectEqualStrings(
         "\"Courier New\", monospace",
@@ -1384,6 +1421,7 @@ test "font shorthand produces inherited computed longhands" {
     const child = &root.element.children.items[1].element;
     try std.testing.expectEqualStrings("italic", child.style.?.getPtr("font-style").?.get().*);
     try std.testing.expectEqualStrings("bold", child.style.?.getPtr("font-weight").?.get().*);
+    try std.testing.expectEqualStrings("normal", child.style.?.getPtr("line-height").?.get().*);
     try std.testing.expectEqualStrings("24.0px", child.style.?.getPtr("font-size").?.get().*);
     try std.testing.expectEqualStrings(
         "\"Courier New\", monospace",
@@ -1405,6 +1443,39 @@ test "font shorthand accepts em sizes and resolves them against the parent" {
     const child = &root.element.children.items[0].element;
     try std.testing.expectEqualStrings("bold", child.style.?.getPtr("font-weight").?.get().*);
     try std.testing.expectEqualStrings("30.0px", child.style.?.getPtr("font-size").?.get().*);
+}
+
+test "line-height computes lengths and inherits unitless multipliers" {
+    const allocator = std.testing.allocator;
+    const html = "<div style='font-size: 20px; line-height: 1.5em'><span style='font-size: 10px'>child</span></div>";
+
+    var html_parser = try HTMLParser.init(allocator, html);
+    html_parser.use_implicit_tags = false;
+    defer html_parser.deinit(allocator);
+    var root = try html_parser.parse();
+    defer root.deinit(allocator);
+
+    try document_parser.style(allocator, &root, &.{});
+    const parent = &root.element;
+    const child = &parent.children.items[0].element;
+    try std.testing.expectEqualStrings("30.0px", parent.style.?.getPtr("line-height").?.get().*);
+    try std.testing.expectEqualStrings("30.0px", child.style.?.getPtr("line-height").?.get().*);
+
+    const shorthand_html = "<div style='font: 10px/1 Verdana, sans-serif'><span>child</span></div>";
+    var shorthand_parser = try HTMLParser.init(allocator, shorthand_html);
+    shorthand_parser.use_implicit_tags = false;
+    defer shorthand_parser.deinit(allocator);
+    var shorthand_root = try shorthand_parser.parse();
+    defer shorthand_root.deinit(allocator);
+    try document_parser.style(allocator, &shorthand_root, &.{});
+    try std.testing.expectEqualStrings(
+        "1",
+        shorthand_root.element.style.?.getPtr("line-height").?.get().*,
+    );
+    try std.testing.expectEqualStrings(
+        "1",
+        shorthand_root.element.children.items[0].element.style.?.getPtr("line-height").?.get().*,
+    );
 }
 
 test "width and height are computed without inheriting" {
