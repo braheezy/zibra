@@ -78,6 +78,11 @@ cancels speech that has not started.
 `max-width` query using page zoom and native resize; the visible text and panel
 change from red to green while the query is active.
 
+`tests/manual/width-media-iframes.html` and its child fixture distinguish the
+root CSS viewport from an iframe's exact `width` query. Page zoom activates a
+parent rule that changes the iframe from 420px to 300px; the child must switch
+its retained stylesheet generation in both directions on the follow-up frame.
+
 `tests/manual/css-zoom.html` and its child-frame fixture compare unzoomed,
 2x, and nested 3x subtrees. Fixed boxes, fonts, controls, rounded geometry,
 iframe contents, focus, and clicks must share the same authored scale, which

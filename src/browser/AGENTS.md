@@ -40,7 +40,11 @@ before changing `root.zig`, `tab.zig`, `render/`, or browser task scheduling.
   iframe boundary. Recompute it from the styled containing-node ancestry
   before child layout, rescale the already-published viewport by the factor
   delta, and schedule a media/style follow-up because iframe media queries use
-  the unscaled CSS width. Root Frames always start at one.
+  the unscaled CSS width. Parent composition publishes changed iframe geometry
+  through `Frame.updateViewportFromParent`; dirty that frame's complete layout
+  subtree before scheduling the media/style follow-up so neither its exact
+  `width` rules nor ordinary line layout reuse the prior viewport. Root Frames
+  always start at one.
 - `tab_tasks.zig` owns heap payloads transferred from Browser/UI work to the
   serialized Tab runner. Its comptime Browser parameter avoids a root import
   cycle. Simple input/history/resize work shares one tagged action adapter;
@@ -99,8 +103,10 @@ before changing `root.zig`, `tab.zig`, `render/`, or browser task scheduling.
 - Zoom and native-width changes invalidate the tab's media environment as well
   as layout. On the serialized render path, every frame reparses its retained
   author sheets using its current CSS-pixel viewport width, dirties the DOM
-  style subtree, and only then runs style/layout/paint. Child-frame widths are
-  already CSS geometry; root widths divide native pixels by page zoom.
+  style subtree, and only then runs style/layout/paint. Both inclusive
+  `max-width` and exact `width` consume this value. Child-frame widths are
+  authored-zoom-scaled layout geometry and divide out that inherited factor;
+  root widths divide native pixels by page zoom.
 - Browser task producers classify animation frames and native input as urgent,
   navigation and script discovery as normal, and timeout/interval/XHR/message
   callbacks as JavaScript-low. Do not infer priority from the trace label:

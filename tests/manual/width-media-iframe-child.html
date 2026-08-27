@@ -1,0 +1,18 @@
+<!doctype html>
+<style>
+  body { font-family: sans-serif; }
+  h2, p, .sample { display: block; }
+  .sample { height: 160px; color: #7f1d1d; background-color: #fee2e2; }
+
+  @media (width: 420px) {
+    .sample { color: #14532d; background-color: #dcfce7; }
+  }
+
+  @media (width: 300px) {
+    .sample { color: #1e3a8a; background-color: #dbeafe; }
+  }
+</style>
+<div class=sample>
+  <h2>Child viewport</h2>
+  <p>Green means exactly 420px; blue means exactly 300px; red means no match.</p>
+</div>

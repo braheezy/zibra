@@ -3874,18 +3874,10 @@ pub const Browser = struct {
     /// caller retains ownership of `css_text` on error and transfers it to
     /// `css_texts` only after this function succeeds.
     fn frameMediaEnvironment(frame: *const Frame) CSSParser.MediaEnvironment {
-        const viewport_width_css = if (frame.parent != null and frame.viewport_width > 0)
-            @as(f64, @floatFromInt(frame.viewport_width)) /
-                @as(f64, if (frame.inherited_css_zoom > 0.0) frame.inherited_css_zoom else 1.0)
-        else
-            tab_module.viewportWidthInCssPixels(
-                frame.tab.tab_width,
-                frame.tab.accessibility.zoom,
-            );
         return .{
             .prefers_dark = frame.tab.accessibility.prefers_dark,
             .forced_colors = frame.tab.accessibility.forced_colors,
-            .viewport_width_css = viewport_width_css,
+            .viewport_width_css = frame.mediaViewportWidthCssPixels(),
         };
     }
 

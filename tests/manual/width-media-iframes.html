@@ -1,0 +1,39 @@
+<!doctype html>
+<!--
+How to verify:
+1. Serve the repository with `python3 -m http.server 8000`, then open
+   http://127.0.0.1:8000/tests/manual/width-media-iframes.html in Zibra's
+   default 800px-wide window.
+2. The parent panel is lavender because `(width: 800px)` matches. Its iframe
+   is 420px wide, and the child is green because `(width: 420px)` matches the
+   iframe viewport rather than the native window.
+3. Press + until page zoom reaches 1.6. The parent viewport is then 500 CSS
+   pixels wide: the panel turns yellow and the parent's max-width rule changes
+   the iframe to 300px. On the follow-up frame the child turns blue because
+   `(width: 300px)` now matches; it must not remain green or use 500px.
+4. Press - back to zoom 1.0. The iframe returns to 420px and its child returns
+   to green, proving retained child stylesheets are rebuilt in both directions.
+-->
+<style>
+  body { font-family: sans-serif; color: #17233b; background-color: white; }
+  h1, p, .panel { display: block; }
+  .panel { background-color: #fee2e2; }
+  iframe { width: 420px; height: 180px; }
+
+  @media (width: 800px) {
+    .panel { background-color: #ede9fe; }
+  }
+
+  @media (width: 500px) {
+    .panel { background-color: #fef3c7; }
+  }
+
+  @media (max-width: 500px) {
+    iframe { width: 300px; }
+  }
+</style>
+<h1>Exact width queries in iframes</h1>
+<div class=panel>
+  <p>The parent changes this iframe from 420px to 300px at 500 CSS pixels.</p>
+  <iframe src=width-media-iframe-child.html></iframe>
+</div>

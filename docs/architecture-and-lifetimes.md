@@ -442,8 +442,12 @@ of DOM provenance; after parent style, Tab updates it before the post-order
 layout pass and rescales the prior viewport by the factor delta. Child layout
 uses the scaled viewport coordinate space, while conditional CSS divides by
 the inherited factor to recover the iframe's unscaled CSS-pixel media width.
-The numeric factor may cross composition boundaries; it does not extend any
-DOM or layout-object lifetime.
+When parent layout publishes a different iframe rectangle during composition,
+the Frame installs both dimensions and synchronously dirties its layout subtree
+before scheduling a follow-up media/style generation. The current commit may
+contain the prior child snapshot, but the next frame cannot reuse its geometry
+or exact-width rule set. The numeric factor may cross composition boundaries;
+it does not extend any DOM or layout-object lifetime.
 
 DOM focus is also a synchronous, generation-bound operation. JavaScript
 `Node.focus()` crosses the host boundary with a numeric handle rather than a
@@ -1315,10 +1319,12 @@ before retiring the old one; it runs on the serialized tab render path after
 zoom, viewport width, color-scheme preference, or forced-colors changes. Root
 media width is the native tab width divided by accessibility zoom. An iframe's
 published viewport is in authored-zoom-scaled layout pixels, so media matching
-divides it by the Frame's inherited authored factor. Every successfully replaced frame
-dirties its complete computed-style subtree before style runs, so rules that
-became inactive reset to the cascade beneath them. See `loadInTab`,
-`loadInFrame`, `loadIframe`, and `rebuildFrameStyleRules`.
+divides it by the Frame's inherited authored factor. `max-width` compares
+inclusively and `width` compares for equality with only enough tolerance to
+erase f32 zoom round-trip noise. Every successfully replaced frame dirties its
+complete computed-style subtree before style runs, so rules that became
+inactive reset to the cascade beneath them. See `loadInTab`, `loadInFrame`,
+`loadIframe`, and `rebuildFrameStyleRules`.
 
 ### Required navigation invariant
 

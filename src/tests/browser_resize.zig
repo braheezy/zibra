@@ -133,6 +133,85 @@ test "page zoom crosses a max-width media query in CSS pixels" {
     try std.testing.expectEqualStrings("red", root.element.style.?.getPtr("color").?.get().*);
 }
 
+test "iframe width queries follow parent-published viewport changes" {
+    const allocator = std.testing.allocator;
+
+    var tab: tab_module.Tab = undefined;
+    tab.tab_width = 800;
+    tab.tab_height = 520;
+    tab.accessibility = .{};
+    tab.root_frame = null;
+    tab.frames_by_id = std.AutoHashMap(u32, *tab_module.Frame).init(allocator);
+    defer tab.frames_by_id.deinit();
+    tab.parent_window_ids = std.AutoHashMap(u32, u32).init(allocator);
+    defer tab.parent_window_ids.deinit();
+
+    var parent = tab_module.Frame.init(allocator, &tab, null, null);
+    defer parent.deinit();
+    var child = tab_module.Frame.init(allocator, &tab, &parent, null);
+    defer child.deinit();
+    child.viewport_width = 300;
+    child.viewport_height = 150;
+    child.inherited_css_zoom = 1.0;
+    child.document_layout = try createCleanDocument(allocator);
+
+    const css =
+        "p { color: red; }" ++
+        "@media (width: 300px) { p { color: green; } }" ++
+        "@media (width: 420px) { p { color: blue; } }";
+    var child_parser = try document_parser.HTMLParser.init(allocator, "<p>child</p>");
+    child_parser.use_implicit_tags = false;
+    defer child_parser.deinit(allocator);
+    var child_root = try child_parser.parse();
+    defer child_root.deinit(allocator);
+
+    try std.testing.expectEqual(@as(f64, 300), child.mediaViewportWidthCssPixels());
+    var initial_parser = try CSSParser.initWithMedia(
+        allocator,
+        css,
+        .{ .viewport_width_css = child.mediaViewportWidthCssPixels() },
+    );
+    defer initial_parser.deinit(allocator);
+    const initial_rules = try initial_parser.parse(allocator);
+    defer {
+        for (initial_rules) |*rule| rule.deinit(allocator);
+        allocator.free(initial_rules);
+    }
+    try document_parser.style(allocator, &child_root, initial_rules);
+    try std.testing.expectEqualStrings(
+        "green",
+        child_root.element.style.?.getPtr("color").?.get().*,
+    );
+
+    const change = child.updateViewportFromParent(420, 180);
+    try std.testing.expect(change.width_changed);
+    try std.testing.expect(change.height_changed);
+    try std.testing.expect(child.document_layout.?.layoutNeeded());
+    try std.testing.expectEqual(@as(f64, 420), child.mediaViewportWidthCssPixels());
+
+    var resized_parser = try CSSParser.initWithMedia(
+        allocator,
+        css,
+        .{ .viewport_width_css = child.mediaViewportWidthCssPixels() },
+    );
+    defer resized_parser.deinit(allocator);
+    const resized_rules = try resized_parser.parse(allocator);
+    defer {
+        for (resized_rules) |*rule| rule.deinit(allocator);
+        allocator.free(resized_rules);
+    }
+    document_parser.dirtyStyleSubtree(&child_root);
+    try document_parser.style(allocator, &child_root, resized_rules);
+    try std.testing.expectEqualStrings(
+        "blue",
+        child_root.element.style.?.getPtr("color").?.get().*,
+    );
+
+    child.inherited_css_zoom = 1.5;
+    _ = child.updateViewportFromParent(450, 180);
+    try std.testing.expectEqual(@as(f64, 300), child.mediaViewportWidthCssPixels());
+}
+
 test "tab resize updates root viewport and invalidates layout" {
     const allocator = std.testing.allocator;
 

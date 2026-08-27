@@ -252,6 +252,55 @@ pub const Frame = struct {
         };
     }
 
+    /// Width queries in a nested browsing context use that iframe's own CSS
+    /// viewport, not the native tab width. The stored geometry already omits
+    /// accessibility zoom but includes authored CSS zoom inherited from the
+    /// iframe element, so remove only the latter.
+    pub fn mediaViewportWidthCssPixels(self: *const Frame) f64 {
+        if (self.parent != null and self.viewport_width > 0) {
+            const css_zoom = if (std.math.isFinite(self.inherited_css_zoom) and
+                self.inherited_css_zoom > 0)
+                self.inherited_css_zoom
+            else
+                1.0;
+            return @as(f64, @floatFromInt(self.viewport_width)) /
+                @as(f64, css_zoom);
+        }
+        return viewportWidthInCssPixels(
+            self.tab.tab_width,
+            self.tab.accessibility.zoom,
+        );
+    }
+
+    pub const ViewportChange = struct {
+        width_changed: bool,
+        height_changed: bool,
+
+        pub fn any(self: ViewportChange) bool {
+            return self.width_changed or self.height_changed;
+        }
+    };
+
+    /// Parent layout publishes iframe geometry during composition. Dirty this
+    /// frame and every nested frame before retaining the new viewport so the
+    /// follow-up render cannot reuse layout built for the old containing box.
+    pub fn updateViewportFromParent(
+        self: *Frame,
+        width: i32,
+        height: i32,
+    ) ViewportChange {
+        const next_width = @max(width, 0);
+        const next_height = @max(height, 0);
+        const change = ViewportChange{
+            .width_changed = self.viewport_width != next_width,
+            .height_changed = self.viewport_height != next_height,
+        };
+        self.viewport_width = next_width;
+        self.viewport_height = next_height;
+        if (change.any()) markFrameLayoutDirty(self);
+        return change;
+    }
+
     pub fn deinit(self: *Frame) void {
         // A zero generation has never hosted a live JavaScript document. This
         // guard also keeps lightweight Frame-only tests from needing to
@@ -1969,10 +2018,18 @@ fn appendIframeContent(
         self.browser.setNeedsAnimationFrame(self);
         self.browser.scheduleAnimationFrame();
     }
-    const child_width_changed = child_frame.?.viewport_width != child_width;
-    child_frame.?.viewport_width = child_width;
-    child_frame.?.viewport_height = child_height;
-    if (child_width_changed) self.mediaEnvironmentChanged();
+    const viewport_change = child_frame.?.updateViewportFromParent(child_width, child_height);
+    if (viewport_change.width_changed) {
+        // Reparse retained child stylesheets under the iframe's new width.
+        self.mediaEnvironmentChanged();
+    } else if (viewport_change.height_changed) {
+        // Height is not a supported media feature yet, but child layout and
+        // scroll geometry still consume the containing viewport.
+        self.needs_layout = true;
+        self.needs_paint = true;
+        self.browser.setNeedsAnimationFrame(self);
+        self.browser.scheduleAnimationFrame();
+    }
 
     const child_list = child_frame.?.display_list.?;
 

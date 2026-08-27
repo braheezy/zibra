@@ -474,6 +474,14 @@ fn parseMediaPixelLength(raw_value: []const u8) ?f64 {
     return parsed_length;
 }
 
+fn mediaWidthsEqual(actual: f64, expected: f64) bool {
+    const magnitude = @max(@max(@abs(actual), @abs(expected)), 1.0);
+    // Viewport zoom is stored as f32, so values such as 800 / 1.6 carry a
+    // small representation error. This tolerance is far below one device
+    // pixel while preserving the author-visible equality boundary.
+    return @abs(actual - expected) <= magnitude * 0.000001;
+}
+
 fn mediaFeatureMatches(self: *const CSSParser, raw_feature: []const u8) ?bool {
     const feature = std.mem.trim(u8, raw_feature, " \t\r\n");
     const colon = std.mem.indexOfScalar(u8, feature, ':') orelse return null;
@@ -496,6 +504,12 @@ fn mediaFeatureMatches(self: *const CSSParser, raw_feature: []const u8) ?bool {
         const limit = parseMediaPixelLength(media_value) orelse return null;
         const viewport_width = self.media.viewport_width_css orelse return false;
         return viewport_width <= limit;
+    }
+
+    if (std.ascii.eqlIgnoreCase(name, "width")) {
+        const expected = parseMediaPixelLength(media_value) orelse return null;
+        const viewport_width = self.media.viewport_width_css orelse return false;
+        return mediaWidthsEqual(viewport_width, expected);
     }
 
     return null;
@@ -1019,6 +1033,42 @@ test "max-width media queries use CSS viewport pixels and inclusive bounds" {
     }
     try std.testing.expectEqual(@as(usize, 3), narrow_rules.len);
     try std.testing.expectEqualStrings("blue", narrow_rules[2].properties.get("background-color").?.value);
+}
+
+test "width media queries match the exact CSS viewport width" {
+    const allocator = std.testing.allocator;
+    const css =
+        "p { color: red; }" ++
+        "@MEDIA (WIDTH: 300PX) { p { color: green; } }" ++
+        "@media (width: 0) { p { background-color: blue; } }";
+
+    const widths = [_]struct {
+        value: ?f64,
+        rule_count: usize,
+    }{
+        .{ .value = null, .rule_count = 1 },
+        .{ .value = 299, .rule_count = 1 },
+        .{ .value = 300, .rule_count = 2 },
+        // Permit only floating-point normalization noise from iframe zoom.
+        .{ .value = 300.00000001, .rule_count = 2 },
+        .{ .value = 300.001, .rule_count = 1 },
+        .{ .value = 0, .rule_count = 2 },
+    };
+
+    for (widths) |expected| {
+        var parser = try CSSParser.initWithMedia(
+            allocator,
+            css,
+            .{ .viewport_width_css = expected.value },
+        );
+        defer parser.deinit(allocator);
+        const rules = try parser.parse(allocator);
+        defer {
+            for (rules) |*rule| rule.deinit(allocator);
+            allocator.free(rules);
+        }
+        try std.testing.expectEqual(expected.rule_count, rules.len);
+    }
 }
 
 test "width and color media features compose and reject unsupported lengths" {
