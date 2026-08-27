@@ -296,6 +296,10 @@ def handle_connection(conx, now=None):
         policy = urllib.parse.parse_qs(request_url.query).get("policy", [""])[0]
         if policy in {"no-referrer", "same-origin"}:
             response += "Referrer-Policy: {}\r\n".format(policy)
+    if request_url.path.rstrip("/") == "/x-frame-options":
+        policy = urllib.parse.parse_qs(request_url.query).get("policy", [""])[0]
+        if policy in {"deny", "sameorigin"}:
+            response += "X-Frame-Options: {}\r\n".format(policy.upper())
     response += "Content-Security-Policy: default-src 'self'\r\n"
     response += "\r\n"
     conx.sendall(response.encode("utf8") + encoded_body)
@@ -337,6 +341,11 @@ def do_request(session, method, url, headers, body):
         policy = urllib.parse.parse_qs(request_url.query).get("policy", [""])[0]
         if policy in {"default", "no-referrer", "same-origin"}:
             return "200 OK", show_referrer_policy(policy)
+    elif method == "GET" and path == "/x-frame-options-demo":
+        return serve_tutorial_file("tests/manual/x-frame-options.html")
+    elif method == "GET" and path == "/x-frame-options":
+        policy = urllib.parse.parse_qs(request_url.query).get("policy", [""])[0]
+        return "200 OK", show_x_frame_options(policy)
 
     parts = [urllib.parse.unquote(part) for part in path.split("/") if part]
     if method == "GET" and len(parts) == 1 and parts[0] in TOPICS:
@@ -583,6 +592,16 @@ def show_referrer_policy(policy):
             "<p>Open this page through <b>localhost</b>, not 127.0.0.1, "
             "so the second link changes origin.</p>"
         ).format(policy=html.escape(policy)),
+    )
+
+
+def show_x_frame_options(policy):
+    return page(
+        "X-Frame-Options probe",
+        (
+            "<h1>X-Frame-Options: {policy}</h1>"
+            "<p id=result>This protected response is visible.</p>"
+        ).format(policy=html.escape(policy or "none")),
     )
 
 

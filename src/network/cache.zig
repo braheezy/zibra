@@ -1,9 +1,10 @@
 //! Browser-session HTTP response cache and Cache-Control policy parsing.
 //!
 //! Entries own their URL key, decoded response body, CSP header, and final
-//! redirect URL. They also retain response policies needed when recreating a
-//! document fetch. `lookup` returns borrowed entry data; callers must copy any
-//! fields that need to outlive the next cache mutation.
+//! redirect URL. They also retain scalar response policies, including
+//! Referrer-Policy and X-Frame-Options, needed when recreating a document
+//! fetch. `lookup` returns borrowed entry data; callers must copy any fields
+//! that need to outlive the next cache mutation.
 
 const std = @import("std");
 
@@ -12,6 +13,14 @@ const std = @import("std");
 pub const ReferrerPolicy = enum {
     default,
     no_referrer,
+    same_origin,
+};
+
+/// The supported X-Frame-Options response policies. Unknown and obsolete
+/// directives are represented as `none` and therefore do not affect framing.
+pub const XFrameOptions = enum {
+    none,
+    deny,
     same_origin,
 };
 
@@ -87,6 +96,7 @@ pub const HttpCache = struct {
         final_url: ?[]u8,
         policy: CacheControl,
         referrer_policy: ReferrerPolicy,
+        x_frame_options: XFrameOptions,
         expires_at_ns: ?i96,
     };
 
@@ -134,6 +144,7 @@ pub const HttpCache = struct {
         final_url: ?[]const u8,
         policy: CacheControl,
         referrer_policy: ReferrerPolicy,
+        x_frame_options: XFrameOptions,
         now_ns: i96,
     ) !void {
         std.debug.assert(policy.isCacheable());
@@ -156,6 +167,7 @@ pub const HttpCache = struct {
             .final_url = final_url_copy,
             .policy = policy,
             .referrer_policy = referrer_policy,
+            .x_frame_options = x_frame_options,
             .expires_at_ns = expires_at_ns,
         };
 
@@ -201,11 +213,30 @@ test "HTTP cache expires max-age entries and retains default entries" {
     var cache = HttpCache.init(std.testing.allocator);
     defer cache.deinit();
 
-    try cache.store("https://example.com/default", "default", null, null, .default, .same_origin, 10);
+    try cache.store(
+        "https://example.com/default",
+        "default",
+        null,
+        null,
+        .default,
+        .same_origin,
+        .deny,
+        10,
+    );
     try std.testing.expectEqualStrings("default", cache.lookup("https://example.com/default", 1_000_000).?.body);
     try std.testing.expectEqual(ReferrerPolicy.same_origin, cache.lookup("https://example.com/default", 1_000_000).?.referrer_policy);
+    try std.testing.expectEqual(XFrameOptions.deny, cache.lookup("https://example.com/default", 1_000_000).?.x_frame_options);
 
-    try cache.store("https://example.com/timed", "timed", null, null, .{ .max_age = 2 }, .default, 10);
+    try cache.store(
+        "https://example.com/timed",
+        "timed",
+        null,
+        null,
+        .{ .max_age = 2 },
+        .default,
+        .none,
+        10,
+    );
     try std.testing.expect(cache.lookup("https://example.com/timed", 10 + std.time.ns_per_s) != null);
     try std.testing.expect(cache.lookup("https://example.com/timed", 10 + 2 * std.time.ns_per_s) == null);
 }

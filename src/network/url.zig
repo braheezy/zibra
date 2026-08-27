@@ -14,6 +14,7 @@ const Mutex = @import("../runtime/sync.zig").Mutex;
 pub const CacheControl = cache_module.CacheControl;
 pub const HttpCache = cache_module.HttpCache;
 pub const ReferrerPolicy = cache_module.ReferrerPolicy;
+pub const XFrameOptions = cache_module.XFrameOptions;
 
 const user_agent = "Zibra/0.0.0";
 const redirect_limit: u16 = 3;
@@ -317,6 +318,7 @@ pub const HttpResponse = struct {
     status: ?std.http.Status = null,
     cache_control: CacheControl = .default,
     referrer_policy: ReferrerPolicy = .default,
+    x_frame_options: XFrameOptions = .none,
 };
 
 /// Parse the two response policy tokens supported by this exercise. Unknown
@@ -327,6 +329,32 @@ pub fn parseReferrerPolicy(value: []const u8) ?ReferrerPolicy {
     if (std.ascii.eqlIgnoreCase(trimmed, "no-referrer")) return .no_referrer;
     if (std.ascii.eqlIgnoreCase(trimmed, "same-origin")) return .same_origin;
     return null;
+}
+
+/// Parse the supported framing directives. Header field values are
+/// case-insensitive, and repeated field lines may arrive comma-combined.
+/// Recognized policies are merged restrictively; obsolete ALLOW-FROM and
+/// unknown tokens are ignored like current browsers do.
+pub fn parseXFrameOptions(value: []const u8) ?XFrameOptions {
+    var parsed: ?XFrameOptions = null;
+    var directives = std.mem.splitScalar(u8, value, ',');
+    while (directives.next()) |raw_directive| {
+        const directive = std.mem.trim(u8, raw_directive, " \t\r\n");
+        if (std.ascii.eqlIgnoreCase(directive, "deny")) return .deny;
+        if (std.ascii.eqlIgnoreCase(directive, "sameorigin")) {
+            parsed = .same_origin;
+        }
+    }
+    return parsed;
+}
+
+fn mergeXFrameOptions(
+    current: XFrameOptions,
+    incoming: XFrameOptions,
+) XFrameOptions {
+    if (current == .deny or incoming == .deny) return .deny;
+    if (current == .same_origin or incoming == .same_origin) return .same_origin;
+    return .none;
 }
 
 /// Same-origin XHR needs no response opt-in. Cross-origin XHR exposes its body
@@ -999,6 +1027,7 @@ pub const Url = struct {
                         .status = .ok,
                         .cache_control = entry.policy,
                         .referrer_policy = entry.referrer_policy,
+                        .x_frame_options = entry.x_frame_options,
                     };
                 }
                 break :cache_lookup null;
@@ -1031,6 +1060,7 @@ pub const Url = struct {
                 final_url_text,
                 response.cache_control,
                 response.referrer_policy,
+                response.x_frame_options,
                 std.Io.Clock.awake.now(io).nanoseconds,
             ) catch |err| {
                 std.log.warn("Failed to cache {s}: {}", .{ cache_key, err });
@@ -1148,6 +1178,7 @@ pub const Url = struct {
         defer if (access_control_allow_origin_cleanup) if (access_control_allow_origin) |hdr| al.free(hdr);
         var cache_control: CacheControl = .default;
         var response_referrer_policy: ReferrerPolicy = .default;
+        var response_x_frame_options: XFrameOptions = .none;
 
         const max_attempts: usize = 2;
         var attempt: usize = 0;
@@ -1236,6 +1267,13 @@ pub const Url = struct {
                         if (parseReferrerPolicy(header.value)) |parsed| {
                             response_referrer_policy = parsed;
                         }
+                    } else if (std.ascii.eqlIgnoreCase(header.name, "x-frame-options")) {
+                        if (parseXFrameOptions(header.value)) |parsed| {
+                            response_x_frame_options = mergeXFrameOptions(
+                                response_x_frame_options,
+                                parsed,
+                            );
+                        }
                     }
                 }
             }
@@ -1305,6 +1343,7 @@ pub const Url = struct {
                 .status = response.head.status,
                 .cache_control = cache_control,
                 .referrer_policy = response_referrer_policy,
+                .x_frame_options = response_x_frame_options,
             };
             csp_header_cleanup = false;
             access_control_allow_origin_cleanup = false;
@@ -1714,6 +1753,20 @@ test "view-source URLs preserve their wrapper when serialized and cloned" {
     try expect(std.mem.eql(u8, try cloned.toString(&cloned_buffer), "view-source:https://example.com/path"));
 }
 
+test "X-Frame-Options parsing is case-insensitive and restrictive" {
+    try std.testing.expectEqual(XFrameOptions.deny, parseXFrameOptions("  DeNy\t").?);
+    try std.testing.expectEqual(
+        XFrameOptions.same_origin,
+        parseXFrameOptions("SAMEORIGIN").?,
+    );
+    try std.testing.expectEqual(
+        XFrameOptions.deny,
+        parseXFrameOptions("sameorigin, DENY").?,
+    );
+    try std.testing.expect(parseXFrameOptions("ALLOW-FROM https://example.com") == null);
+    try std.testing.expect(parseXFrameOptions("unknown") == null);
+}
+
 test "http request" {
     const url = try Url.init(std.testing.allocator, "http://example.com");
     defer url.free(std.testing.allocator);
@@ -1745,7 +1798,7 @@ test "HTTP requests identify Zibra and keep HTTP/1.1 connections alive" {
     try std.testing.expectEqualStrings("present", options.extra_headers[0].value);
 }
 
-test "CORS fetch sends Origin and target cookies and retains response opt-in" {
+test "HTTP fetch retains CORS, referrer, and frame response policies" {
     const CorsServer = struct {
         server: std.Io.net.Server,
         io: std.Io,
@@ -1791,6 +1844,7 @@ test "CORS fetch sends Origin and target cookies and retains response opt-in" {
                     "Content-Length: 7\r\n" ++
                     "Access-Control-Allow-Origin: http://source.example:8080\r\n" ++
                     "Referrer-Policy: same-origin\r\n" ++
+                    "X-Frame-Options: SAMEORIGIN\r\n" ++
                     "Connection: close\r\n\r\n" ++
                     "allowed",
             );
@@ -1860,6 +1914,7 @@ test "CORS fetch sends Origin and target cookies and retains response opt-in" {
     try std.testing.expect(context.saw_referer);
     try std.testing.expectEqualStrings("allowed", response.body);
     try std.testing.expectEqual(ReferrerPolicy.same_origin, response.referrer_policy);
+    try std.testing.expectEqual(XFrameOptions.same_origin, response.x_frame_options);
     try std.testing.expectEqualStrings(
         "http://source.example:8080",
         response.access_control_allow_origin.?,

@@ -183,6 +183,11 @@ DOM-mutation iframe lifecycle. An `innerHTML` insertion loads A, replacement
 unloads A and loads B without duplicates, removal makes the child unfocusable,
 and a later insertion creates a fresh child context.
 
+`tests/manual/x-frame-options.html` is served by the tutorial server at
+`/x-frame-options-demo`. It verifies that a `DENY` response remains absent,
+same-origin `SAMEORIGIN` content renders, and the protected response is still
+available as a top-level navigation.
+
 `tests/manual/display-list-hit-testing.html` exercises painted-fragment,
 translation, rounded-clip, overlap, and iframe click routing. Only the visible
 topmost painted target should activate; its child and destination pages are

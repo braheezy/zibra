@@ -1,9 +1,34 @@
-//! Browser-generated navigation documents and transport security presentation.
+//! Browser-generated navigation documents, framing policy, and transport
+//! security presentation.
 
 const std = @import("std");
 const url_module = @import("../network/url.zig");
 
 const Url = url_module.Url;
+
+/// Apply an HTTP response's framing policy to the complete ancestor chain.
+/// The URL pointers are synchronous borrows from live Frames; this function
+/// does not retain or take ownership of them. Missing ancestor identity is
+/// represented by the caller omitting it, which fails closed for SAMEORIGIN.
+pub fn xFrameOptionsAllowsEmbedding(
+    policy: url_module.XFrameOptions,
+    response_url: *const Url,
+    ancestor_urls: []const *const Url,
+) bool {
+    return switch (policy) {
+        .none => true,
+        .deny => false,
+        .same_origin => same_origin: {
+            if (ancestor_urls.len == 0) break :same_origin false;
+            for (ancestor_urls) |ancestor_url| {
+                if (!response_url.*.sameOrigin(ancestor_url.*)) {
+                    break :same_origin false;
+                }
+            }
+            break :same_origin true;
+        },
+    };
+}
 
 /// A navigation response plus explicit ownership for generated/fetched bytes.
 pub const NavigationDocument = struct {

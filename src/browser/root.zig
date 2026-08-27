@@ -3083,6 +3083,19 @@ pub const Browser = struct {
                     return error.IframeRedirectBlockedByCsp;
                 }
             }
+
+            const response_url: *const Url = final_destination orelse url;
+            if (!try self.iframeResponseAllowsEmbedding(
+                response.x_frame_options,
+                response_url,
+                parent,
+            )) {
+                std.log.warn(
+                    "Blocked iframe navigation to {s} due to X-Frame-Options",
+                    .{url.*.path},
+                );
+                return error.IframeBlockedByXFrameOptions;
+            }
         }
 
         if (!document.certificate_error) {
@@ -3456,6 +3469,38 @@ pub const Browser = struct {
             iframeRedirectAllowed(parent, page_url, final_destination);
     }
 
+    /// Collect synchronous URL borrows from every live ancestor Frame and
+    /// apply the response's framing policy. SAMEORIGIN fails closed when an
+    /// ancestor has no installed document URL.
+    fn iframeResponseAllowsEmbedding(
+        self: *Browser,
+        policy: url_module.XFrameOptions,
+        response_url: *const Url,
+        parent: *Frame,
+    ) !bool {
+        if (policy != .same_origin) {
+            return navigation.xFrameOptionsAllowsEmbedding(
+                policy,
+                response_url,
+                &.{},
+            );
+        }
+
+        var ancestor_urls = std.ArrayList(*const Url).empty;
+        defer ancestor_urls.deinit(self.allocator);
+
+        var ancestor: ?*Frame = parent;
+        while (ancestor) |frame| : (ancestor = frame.parent) {
+            const ancestor_url = frame.current_url orelse return false;
+            try ancestor_urls.append(self.allocator, ancestor_url);
+        }
+        return navigation.xFrameOptionsAllowsEmbedding(
+            policy,
+            response_url,
+            ancestor_urls.items,
+        );
+    }
+
     fn loadIframe(
         self: *Browser,
         parent: *Frame,
@@ -3489,6 +3534,16 @@ pub const Browser = struct {
         if (!iframeNavigationAllowed(parent, page_url, &iframe_url, final_destination)) {
             std.log.warn("Blocked redirected iframe {s} due to CSP", .{src});
             return error.IframeRedirectBlockedByCsp;
+        }
+
+        const response_url: *const Url = final_destination orelse &iframe_url;
+        if (!try self.iframeResponseAllowsEmbedding(
+            response.x_frame_options,
+            response_url,
+            parent,
+        )) {
+            std.log.warn("Blocked iframe {s} due to X-Frame-Options", .{src});
+            return error.IframeBlockedByXFrameOptions;
         }
 
         if (!document.certificate_error) {

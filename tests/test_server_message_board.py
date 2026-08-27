@@ -131,6 +131,26 @@ class MessageBoardTests(unittest.TestCase):
         _, absent = server.do_request({}, "GET", "/referer", {}, None)
         self.assertIn("(none)", absent)
 
+    def test_x_frame_options_probe_emits_only_supported_policies(self):
+        for policy, expected in (("deny", b"DENY"), ("sameorigin", b"SAMEORIGIN")):
+            with self.subTest(policy=policy):
+                connection = MemoryConnection(
+                    "GET /x-frame-options?policy={} HTTP/1.0\r\n"
+                    "Host: localhost:8005\r\n\r\n".format(policy).encode("ascii")
+                )
+                server.handle_connection(connection, now=1_000)
+                headers, body = connection.response.split(b"\r\n\r\n", 1)
+                self.assertIn(b"X-Frame-Options: " + expected + b"\r\n", headers + b"\r\n")
+                self.assertIn(b"This protected response is visible.", body)
+
+        ignored = MemoryConnection(
+            b"GET /x-frame-options?policy=allow-from HTTP/1.0\r\n"
+            b"Host: localhost:8005\r\n\r\n"
+        )
+        server.handle_connection(ignored, now=1_000)
+        ignored_headers = ignored.response.split(b"\r\n\r\n", 1)[0]
+        self.assertNotIn(b"X-Frame-Options:", ignored_headers)
+
     def test_home_lists_each_topic_at_its_own_url(self):
         status, body = request({}, "GET", "/")
 

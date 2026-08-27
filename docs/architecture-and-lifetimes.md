@@ -230,6 +230,9 @@ values are synchronous borrows across that wait; the response and optional
 redirect URL then move back to the producer. Queue rejection still runs
 cleanup, so shutdown cannot strand a waiter. The runner borrows shared
 `MeasureTime` and must stop before either measurement or transport storage.
+HTTP responses and cache entries carry X-Frame-Options as a scalar policy, so
+cache hits cannot accidentally discard an embedding restriction and no header
+slice gains another owner.
 
 Zig opens client connections thread-safely. A dedicated network-data mutex
 stabilizes cookie/cache lookup, copying, eviction, and mutation, but does not
@@ -326,7 +329,12 @@ completion pass validates Element-carried numeric window IDs, rebinds surviving
 Frame pointers in final DOM order, and deinitializes contexts whose Elements
 disappeared. Marker-free attached iframes are fetched only by the later resource
 scan, after the host call has returned, through the same CSP, Referrer-Policy,
-document-generation, and nested-frame loader used at navigation time.
+document-generation, and nested-frame loader used at navigation time. After
+the final response URL is known, that loader applies X-Frame-Options before
+publishing visits, history, or a child document: `DENY` rejects all embedding,
+while `SAMEORIGIN` compares the response with every ancestor Frame URL and
+fails closed if any ancestor identity is unavailable. Top-level navigation
+does not consult this embedding-only policy.
 
 CSS background images intentionally follow a later resource boundary. After
 each initial or dynamic computed-style pass, `background_images.zig` walks the

@@ -2,8 +2,10 @@
 
 const std = @import("std");
 const browser = @import("../browser/root.zig");
+const navigation = @import("../browser/navigation.zig");
 const Chrome = @import("../browser/chrome.zig");
-const Url = @import("../network/url.zig").Url;
+const url_module = @import("../network/url.zig");
+const Url = url_module.Url;
 
 test "TLS initialization failures are the certificate-error boundary" {
     try std.testing.expect(Url.isCertificateError(error.TlsInitializationFailed));
@@ -27,6 +29,47 @@ test "certificate warning is owned escaped browser HTML without a bypass" {
     try std.testing.expect(std.mem.indexOf(u8, warning, "https://example.com/search?a=1&amp;b=2") != null);
     try std.testing.expect(std.mem.indexOf(u8, warning, "TlsInitializationFailed") != null);
     try std.testing.expect(std.mem.indexOf(u8, warning, "<a") == null);
+}
+
+test "X-Frame-Options denies framing and checks the complete ancestor chain" {
+    const allocator = std.testing.allocator;
+    var response_url = try Url.init(allocator, "https://protected.example/document");
+    defer response_url.free(allocator);
+    var same_parent = try Url.init(allocator, "https://protected.example/embedder");
+    defer same_parent.free(allocator);
+    var same_top = try Url.init(allocator, "https://protected.example/top");
+    defer same_top.free(allocator);
+    var cross_origin = try Url.init(allocator, "https://attacker.example/top");
+    defer cross_origin.free(allocator);
+
+    const same_chain = [_]*const Url{ &same_parent, &same_top };
+    const mixed_chain = [_]*const Url{ &same_parent, &cross_origin };
+
+    try std.testing.expect(navigation.xFrameOptionsAllowsEmbedding(
+        .none,
+        &response_url,
+        &mixed_chain,
+    ));
+    try std.testing.expect(!navigation.xFrameOptionsAllowsEmbedding(
+        .deny,
+        &response_url,
+        &same_chain,
+    ));
+    try std.testing.expect(navigation.xFrameOptionsAllowsEmbedding(
+        .same_origin,
+        &response_url,
+        &same_chain,
+    ));
+    try std.testing.expect(!navigation.xFrameOptionsAllowsEmbedding(
+        .same_origin,
+        &response_url,
+        &mixed_chain,
+    ));
+    try std.testing.expect(!navigation.xFrameOptionsAllowsEmbedding(
+        .same_origin,
+        &response_url,
+        &.{},
+    ));
 }
 
 test "padlock requires a verified committed HTTPS URL matching chrome" {

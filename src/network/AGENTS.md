@@ -46,7 +46,9 @@ before changing URL or response ownership.
   fetches must continue returning the transport error to their caller.
 - Cache hits must preserve the normal fetch ownership contract by returning
   caller-owned body and header copies, and must reproduce response metadata
-  such as Referrer-Policy. Interactive cache, cookie, and HTTP client state
+  such as Referrer-Policy and X-Frame-Options. X-Frame-Options is parsed into
+  scalar `DENY`/`SAMEORIGIN` policy at the HTTP boundary; obsolete
+  `ALLOW-FROM` and unknown values are ignored. Interactive cache, cookie, and HTTP client state
   belongs to the shared `BrowserSession`; standalone screenshot browsers own
   their session. Zig's client opens connections thread-safely. The session's
   network mutex protects cookie/cache lookup, copying, eviction, and mutation,

@@ -465,6 +465,11 @@ before changing `root.zig`, `tab.zig`, `render/`, or browser task scheduling.
 - Parent CSP checks both the requested and final redirect destinations before
   installing an initial iframe or a later navigation in an existing child
   frame. Blocked targets are not recorded as visits.
+- After a document response and its redirects complete, X-Frame-Options is
+  checked before an initial, dynamic, history, or existing child-frame
+  navigation is recorded or installed. `DENY` rejects every ancestor chain;
+  `SAMEORIGIN` requires the final response URL to match every live ancestor
+  document origin and fails closed when an ancestor URL is unavailable.
 - Chrome owns separate complete URL snapshots for optimistic address display
   and the latest committed document. Public optimistic updates copy under
   `Browser.lock` before navigation ownership can move to a worker; the `*`
