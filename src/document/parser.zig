@@ -25,6 +25,10 @@ pub const EasingFunction = easing.Function;
 pub const parseEasingFunction = easing.parse;
 pub const Translation = css_transform.Translation;
 pub const parseTranslate = css_transform.parse;
+pub const CssLength = css_length.Length;
+pub const CssLengthResolutionContext = css_length.ResolutionContext;
+pub const parseCssLength = css_length.parse;
+pub const resolveCssLength = css_length.resolve;
 pub const parsePixelLength = css_length.parsePixel;
 pub const pixelLengthToLayoutPixels = css_length.toLayoutPixels;
 
@@ -567,7 +571,7 @@ pub const Element = struct {
     children: std.ArrayList(Node),
     layout_ptr: ?*anyopaque = null,
     layout_mark: ?*const fn (*anyopaque) void = null,
-    // Track strings we've allocated (like resolved percentage font sizes) so we can free them
+    // Track strings we've allocated (like resolved relative font sizes) so we can free them
     owned_strings: ?std.ArrayList([]const u8) = null,
     is_focused: bool = false,
     // Snapshot of the user-agent focus-visible heuristic for this focus
@@ -586,6 +590,13 @@ pub const Element = struct {
     // Classic scripts are evaluated at most once for the lifetime of this
     // element, including when a detached node is later re-attached.
     script_started: bool = false,
+    // Stable identity of the child browsing context currently attached to an
+    // iframe element. Node values may move with their containing child array;
+    // the Browser uses this scalar to rebind the Frame's raw frame_element
+    // pointer after a supported structural JavaScript mutation. A detached
+    // iframe may temporarily retain a stale value, which is validated against
+    // the Tab registry before reattachment creates a fresh context.
+    iframe_window_id: ?u32 = null,
     children_dirty: bool = true,
     // Property interpolation state shared by transitions and the currently
     // selected named keyframe animation. CssAnimationState identifies which
@@ -649,7 +660,7 @@ pub const Element = struct {
             deinitStyleMap(styles);
         }
 
-        // Free any strings we allocated (like resolved percentage font sizes)
+        // Free any strings we allocated (like resolved relative font sizes)
         if (self.owned_strings) |owned| {
             for (owned.items) |str| {
                 allocator.free(str);
@@ -2287,33 +2298,41 @@ fn styleWithParent(
                     );
                 }
 
-                // Fourth, resolve percentage font sizes to absolute pixels
+                // Fourth, resolve relative font sizes to absolute pixels.
+                // Computed font-size values are kept in px so inherited
+                // descendants can use them as the base for their own `em`
+                // and percentage lengths.
                 if (new_style.get("font-size")) |font_size| {
-                    if (std.mem.endsWith(u8, font_size, "%")) {
+                    const font_size_length = css_length.parse(font_size);
+                    if (font_size_length) |length| {
                         const child_field = style_map.getPtr("font-size").?;
                         const parent_font_size = if (parent_style.getPtr("font-size")) |parent_field|
                             inheritedValue(parent_field, child_field, parent_is_ephemeral_default)
                         else
                             "16px";
 
-                        const pct_str = font_size[0 .. font_size.len - 1];
-                        const node_pct = try std.fmt.parseFloat(f64, pct_str);
+                        const parent_px = css_length.resolve(parent_font_size, .{}) orelse 16.0;
+                        const absolute_px = css_length.resolveLength(length, .{
+                            .font_size = parent_px,
+                            .percentage_base = parent_px,
+                        }) orelse 0.0;
+                        if (length.unit != .px) {
+                            const resolved_size = try std.fmt.allocPrint(
+                                allocator,
+                                "{d:.1}px",
+                                .{absolute_px},
+                            );
+                            var resolved_size_owned = true;
+                            defer if (resolved_size_owned) allocator.free(resolved_size);
 
-                        const parent_px_str = parent_font_size[0 .. parent_font_size.len - 2];
-                        const parent_px = try std.fmt.parseFloat(f64, parent_px_str);
+                            if (e.owned_strings == null) {
+                                e.owned_strings = std.ArrayList([]const u8).empty;
+                            }
+                            try e.owned_strings.?.append(allocator, resolved_size);
+                            resolved_size_owned = false;
 
-                        const absolute_px = (node_pct / 100.0) * parent_px;
-                        const resolved_size = try std.fmt.allocPrint(allocator, "{d:.1}px", .{absolute_px});
-                        var resolved_size_owned = true;
-                        defer if (resolved_size_owned) allocator.free(resolved_size);
-
-                        if (e.owned_strings == null) {
-                            e.owned_strings = std.ArrayList([]const u8).empty;
+                            try new_style.put("font-size", resolved_size);
                         }
-                        try e.owned_strings.?.append(allocator, resolved_size);
-                        resolved_size_owned = false;
-
-                        try new_style.put("font-size", resolved_size);
                     }
                 }
 

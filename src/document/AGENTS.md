@@ -21,6 +21,11 @@ or selector/rule lifetime.
 - `Node` children are stored by value in resizable arrays. Do not retain a
   `*Node` across structural mutation unless all consumers are invalidated or a
   stable identity scheme is in place.
+- An attached iframe Element carries only its child window's numeric ID; that
+  scalar moves safely with the by-value Node. The browser validates it against
+  the current Tab registry before rebinding a Frame pointer. Detached iframe
+  nodes may retain stale IDs, so no consumer may treat the scalar alone as a
+  live browsing-context owner.
 - Supported structural mutation must enter the dedicated synchronous host
   invalidation boundary after marking the target layout dirty and before child
   storage can move or retire. Keep ordinary render callbacks separate so
@@ -133,8 +138,9 @@ or selector/rule lifetime.
   parent slice; rendering resolves the supported family/fallback list without
   retaining a new borrowed value.
 - `width` and `height` are non-inherited computed properties. Their default is
-  `auto`; layout currently resolves only non-negative pixel lengths and keeps
-  the borrowed computed-value slice in the style map. Replaced images use a
+  `auto`; layout resolves non-negative `px`, `em`, and percentage lengths
+  against an explicit font-size/containing-block context and keeps the
+  borrowed computed-value slice in the style map. Replaced images use a
   supported CSS dimension before the corresponding HTML width/height fallback.
 - `background-image` and `background-size` are non-inherited and default to
   `none` and `auto`. Their declaration values remain borrowed computed-style
@@ -158,8 +164,9 @@ or selector/rule lifetime.
   pixel entries preserve the `px` unit for width/height, and transform entries
   interpolate both axes of a parsed `translate(...)`. All store their timing
   function and apply it to normalized frame progress before interpolation.
-  `length.zig` owns the supported non-negative pixel grammar; `easing.zig` owns
-  the timing-function parser and cubic Bezier solver. Opacity's computed-style
+  `length.zig` owns the supported non-negative `px`, `em`, and percentage
+  grammar plus context-based CSS-pixel resolution; `easing.zig` owns the
+  timing-function parser and cubic Bezier solver. Opacity's computed-style
   string borrows a fixed buffer embedded in that same Element; layout reads
   animated colors and dimensions directly from the tagged map.
 - `css_animation.zig` parses the supported single-animation shorthand: named

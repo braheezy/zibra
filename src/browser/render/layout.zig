@@ -173,6 +173,16 @@ fn scaleCssFloat(value: f64, effective_zoom: f32, page_zoom: f32) f64 {
     return value * (@as(f64, effective) / @as(f64, page));
 }
 
+fn cssPixelsFromLayout(value: i32, effective_zoom: f32, page_zoom: f32) f64 {
+    const page = if (std.math.isFinite(page_zoom) and page_zoom > 0.0) page_zoom else 1.0;
+    const effective = if (std.math.isFinite(effective_zoom) and effective_zoom > 0.0)
+        effective_zoom
+    else
+        page;
+    return @as(f64, @floatFromInt(value)) *
+        (@as(f64, page) / @as(f64, effective));
+}
+
 fn tableOfContentsHeaderHeight(node: Node, effective_zoom: f32, page_zoom: f32) i32 {
     return switch (node) {
         .element => |element| if (isTableOfContentsElement(&element))
@@ -207,6 +217,11 @@ fn parseCssPixelLength(value: []const u8) ?i32 {
     return parser.pixelLengthToLayoutPixels(pixels);
 }
 
+fn resolveCssLength(value: []const u8, context: parser.CssLengthResolutionContext) ?i32 {
+    const pixels = parser.resolveCssLength(value, context) orelse return null;
+    return parser.pixelLengthToLayoutPixels(pixels);
+}
+
 fn animatedPixelDimension(element: *const parser.Element, property: []const u8) ?i32 {
     const animations = element.animations orelse return null;
     const animation = animations.get(property) orelse return null;
@@ -220,9 +235,10 @@ fn resolvedPixelDimension(
     element: *const parser.Element,
     style_map: *const parser.StyleMap,
     property: []const u8,
+    context: parser.CssLengthResolutionContext,
 ) ?i32 {
     return animatedPixelDimension(element, property) orelse
-        if (styleValue(style_map, property)) |value| parseCssPixelLength(value) else null;
+        if (styleValue(style_map, property)) |value| resolveCssLength(value, context) else null;
 }
 
 /// Parse the single-radius subset supported by paint and hit testing. Invalid,
@@ -1768,6 +1784,10 @@ color_scheme_dark: bool = false,
 document_color_scheme_dark: bool = false,
 default_font_size: i32 = 16,
 size: i32 = 16,
+/// Computed CSS font size in CSS pixels. `size` retains the historical
+/// font-raster unit used by this layout engine; relative lengths use this
+/// unrounded CSS value as their `em` base.
+font_size_css: f64 = 16.0,
 cursor_x: i32,
 cursor_y: i32,
 line_left: i32,
@@ -1827,6 +1847,7 @@ const InlineSnapshot = struct {
     line_left: i32,
     line_right: i32,
     size: i32,
+    font_size_css: f64,
     is_bold: bool,
     is_italic: bool,
     font_family: FontFamily,
@@ -1848,6 +1869,7 @@ fn snapshotInlineState(self: *const Layout) InlineSnapshot {
         .line_left = self.line_left,
         .line_right = self.line_right,
         .size = self.size,
+        .font_size_css = self.font_size_css,
         .is_bold = self.is_bold,
         .is_italic = self.is_italic,
         .font_family = self.font_family,
@@ -1869,6 +1891,7 @@ fn restoreInlineState(self: *Layout, snapshot: InlineSnapshot) void {
     self.line_left = snapshot.line_left;
     self.line_right = snapshot.line_right;
     self.size = snapshot.size;
+    self.font_size_css = snapshot.font_size_css;
     self.is_bold = snapshot.is_bold;
     self.is_italic = snapshot.is_italic;
     self.font_family = snapshot.font_family;
@@ -1912,6 +1935,22 @@ fn scaleActiveCssPixel(self: *const Layout, css_px: i32) i32 {
 
 fn scaleActiveCssFloat(self: *const Layout, css_px: f64) f64 {
     return scaleCssFloat(css_px, self.effectiveZoom(), self.zoom());
+}
+
+fn containingBlockCssDimension(self: *const Layout, height: bool) ?f64 {
+    const inline_block = self.inline_block orelse return null;
+    // Anonymous inline-run blocks are implementation details; their
+    // containing block is the real parent block, whose definite height may
+    // already be published for percentage-height descendants.
+    const block = if (inline_block.inline_nodes != null)
+        inline_block.parent_block orelse inline_block
+    else
+        inline_block;
+    const dimension = if (height) &block.height else &block.width;
+    if (dimension.dirty) return null;
+    const layout_value = dimension.get().*;
+    if (layout_value < 0 or (height and layout_value <= 0)) return null;
+    return cssPixelsFromLayout(layout_value, block.zoom.get().*, block.document.page_zoom);
 }
 
 fn scaledFontSize(self: *const Layout, css_size: i32) i32 {
@@ -2281,7 +2320,11 @@ fn handleImageElement(self: *Layout, node: Node, node_ptr: ?*Node, line_buffer: 
         .width = @intCast(data.image.width),
         .height = @intCast(data.image.height),
     } else null;
-    const box = replaced_sizing.imageSize(&element, intrinsic_size);
+    const box = replaced_sizing.imageSizeWithContext(&element, intrinsic_size, .{
+        .font_size = self.font_size_css,
+        .percentage_width = self.containingBlockCssDimension(false),
+        .percentage_height = self.containingBlockCssDimension(true),
+    });
     const layout_width = self.scaleActiveCssPixel(box.width);
     const layout_height = self.scaleActiveCssPixel(box.height);
     const intrinsic_width = self.scaleActiveCssPixel(if (intrinsic_size) |size| size.width else 0);
@@ -2335,7 +2378,11 @@ fn handleIframeElement(self: *Layout, node: Node, node_ptr: ?*Node, line_buffer:
     } else null;
     if (style_map) |styles| registerReplacedSizeDependencies(self, styles);
 
-    const box = replaced_sizing.iframeSize(&element);
+    const box = replaced_sizing.iframeSizeWithContext(&element, .{
+        .font_size = self.font_size_css,
+        .percentage_width = self.containingBlockCssDimension(false),
+        .percentage_height = self.containingBlockCssDimension(true),
+    });
     const layout_width = self.scaleActiveCssPixel(box.width);
     const layout_height = self.scaleActiveCssPixel(box.height);
 
@@ -2391,6 +2438,7 @@ const StyleSnapshot = struct {
     is_italic: bool,
     font_family: FontFamily,
     size: i32,
+    font_size_css: f64,
     text_color: browser.Color,
     transform_offset_x: i32,
     transform_offset_y: i32,
@@ -2551,6 +2599,7 @@ fn applyNodeStyles(
         .is_italic = self.is_italic,
         .font_family = self.font_family,
         .size = self.size,
+        .font_size_css = self.font_size_css,
         .text_color = self.text_color,
         .transform_offset_x = self.transform_offset_x,
         .transform_offset_y = self.transform_offset_y,
@@ -2623,12 +2672,14 @@ fn applyNodeStyles(
         else
             styleValue(style_map, "font-size");
         if (size_value) |size_str| {
-            if (std.mem.endsWith(u8, size_str, "px")) {
-                const size_num_str = size_str[0 .. size_str.len - 2];
-                if (std.fmt.parseFloat(f64, size_num_str)) |size_float| {
-                    // Convert CSS pixels to our size (multiply by 0.75 for points)
-                    self.size = @intFromFloat(size_float * 0.75);
-                } else |_| {}
+            if (parser.resolveCssLength(size_str, .{
+                .font_size = self.font_size_css,
+                .percentage_base = self.font_size_css,
+            })) |size_float| {
+                self.font_size_css = size_float;
+                // Convert CSS pixels to our historical font-raster unit
+                // (multiply by 0.75 for points).
+                self.size = @intFromFloat(size_float * 0.75);
             }
         }
 
@@ -2664,6 +2715,7 @@ fn restoreNodeStyles(self: *Layout, _: *std.ArrayList(LineItem)) !void {
         self.is_italic = snapshot.is_italic;
         self.font_family = snapshot.font_family;
         self.size = snapshot.size;
+        self.font_size_css = snapshot.font_size_css;
         self.text_color = snapshot.text_color;
         self.transform_offset_x = snapshot.transform_offset_x;
         self.transform_offset_y = snapshot.transform_offset_y;
@@ -3685,6 +3737,7 @@ pub fn layoutSourceCode(self: *Layout, source: []const u8) ![]DisplayItem {
     self.cursor_y = v_offset;
     self.line_direction = self.default_direction;
     self.size = self.default_font_size;
+    self.font_size_css = @floatFromInt(self.default_font_size);
     self.resetSoftHyphenWord();
 
     // Save current state
@@ -3891,9 +3944,15 @@ const InputLayout = struct {
         var height_value = natural_height;
         if (!self.is_checkbox) {
             if (element.style) |*style_map| {
-                if (resolvedPixelDimension(&element, style_map, "width")) |pixels|
+                if (resolvedPixelDimension(&element, style_map, "width", .{
+                    .font_size = engine.font_size_css,
+                    .percentage_base = engine.containingBlockCssDimension(false),
+                })) |pixels|
                     width_value = @max(engine.scaleActiveCssPixel(pixels), 1);
-                if (resolvedPixelDimension(&element, style_map, "height")) |pixels|
+                if (resolvedPixelDimension(&element, style_map, "height", .{
+                    .font_size = engine.font_size_css,
+                    .percentage_base = engine.containingBlockCssDimension(true),
+                })) |pixels|
                     height_value = @max(engine.scaleActiveCssPixel(pixels), natural_height);
             }
         }
@@ -4218,9 +4277,15 @@ const ButtonLayout = struct {
         var requested_width = engine.scaleActiveCssPixel(INPUT_WIDTH_PX);
         var requested_height: ?i32 = null;
         if (element.style) |*style_map| {
-            if (resolvedPixelDimension(&element, style_map, "width")) |pixels|
+            if (resolvedPixelDimension(&element, style_map, "width", .{
+                .font_size = engine.font_size_css,
+                .percentage_base = engine.containingBlockCssDimension(false),
+            })) |pixels|
                 requested_width = @max(engine.scaleActiveCssPixel(pixels), 1);
-            if (resolvedPixelDimension(&element, style_map, "height")) |pixels|
+            if (resolvedPixelDimension(&element, style_map, "height", .{
+                .font_size = engine.font_size_css,
+                .percentage_base = engine.containingBlockCssDimension(true),
+            })) |pixels|
                 requested_height = @max(engine.scaleActiveCssPixel(pixels), 1);
         }
         const content_width = @max(requested_width - 2 * padding, 1);
@@ -5748,6 +5813,7 @@ const BlockLayout = struct {
         self: *BlockLayout,
         property: []const u8,
         target: *ProtectedField(i32),
+        context: parser.CssLengthResolutionContext,
     ) ?i32 {
         if (self.inline_nodes != null) return null;
         const node_ptr = self.node_ptr orelse return null;
@@ -5762,10 +5828,23 @@ const BlockLayout = struct {
                 else
                     styleValue(style_map, property)) orelse break :blk null;
                 break :blk animatedPixelDimension(element, property) orelse
-                    parseCssPixelLength(computed);
+                    resolveCssLength(computed, context);
             } else null,
             .text => null,
         };
+    }
+
+    fn computedFontSizeCss(self: *const BlockLayout) f64 {
+        const element = switch (self.node) {
+            .element => |*value| value,
+            .text => return 16.0,
+        };
+        const styles = element.style orelse return 16.0;
+        const value = styleValue(&styles, "font-size") orelse return 16.0;
+        return parser.resolveCssLength(value, .{
+            .font_size = 16.0,
+            .percentage_base = 16.0,
+        }) orelse 16.0;
     }
 
     fn updateScrollGeometry(
@@ -6030,6 +6109,17 @@ const BlockLayout = struct {
             self.document.width.read(&self.width).*
         else
             self.document.width.get().*;
+        const containing_width_css = cssPixelsFromLayout(
+            parent_width,
+            parent_zoom,
+            self.document.page_zoom,
+        );
+        const containing_height_css = if (self.parent_block) |pb| blk: {
+            if (pb.height.dirty) break :blk null;
+            const height = pb.height.get().*;
+            if (height <= 0) break :blk null;
+            break :blk cssPixelsFromLayout(height, pb.zoom.get().*, self.document.page_zoom);
+        } else null;
         const prev_y = if (self.previous) |prev|
             if (self.persistent_dependencies)
                 prev.y.read(&self.y).* + prev.height.read(&self.y).*
@@ -6058,14 +6148,20 @@ const BlockLayout = struct {
                 scaleCssPixel(list_item_indent, zoom_value, engine.zoom()),
             );
         const specified_width = if (self.embedded_box == null)
-            if (self.specifiedPixelDimension("width", &self.width)) |width|
+            if (self.specifiedPixelDimension("width", &self.width, .{
+                .font_size = self.computedFontSizeCss(),
+                .percentage_base = containing_width_css,
+            })) |width|
                 scaleCssPixel(width, zoom_value, engine.zoom())
             else
                 null
         else
             null;
         const specified_height = if (self.embedded_box == null)
-            if (self.specifiedPixelDimension("height", &self.height)) |height|
+            if (self.specifiedPixelDimension("height", &self.height, .{
+                .font_size = self.computedFontSizeCss(),
+                .percentage_base = containing_height_css,
+            })) |height|
                 scaleCssPixel(height, zoom_value, engine.zoom())
             else
                 null
@@ -6089,6 +6185,13 @@ const BlockLayout = struct {
             {
                 is_block = false;
             }
+        }
+
+        // Publish a definite block height before laying out descendants so a
+        // percentage height can resolve against this containing block. Auto
+        // heights remain unavailable until children have been measured.
+        if (is_block) {
+            if (specified_height) |height| self.height.set(height);
         }
 
         // Reset any cached inline commands
@@ -6971,6 +7074,7 @@ fn layoutInlineBlock(self: *Layout, block: *BlockLayout) !void {
     self.cursor_y = block.y.get().*;
     self.line_direction = textDirectionForBlock(block, self.default_direction);
     self.size = self.default_font_size;
+    self.font_size_css = @floatFromInt(self.default_font_size);
     self.is_bold = false;
     self.is_italic = false;
     self.font_family = .proportional;
@@ -7000,6 +7104,26 @@ fn layoutInlineBlock(self: *Layout, block: *BlockLayout) !void {
                             styleValue(style_map, "font-family");
                         if (family_value) |value| {
                             self.font_family = font.familyFromCss(value);
+                        }
+
+                        // The anonymous block has no element of its own on
+                        // which applyNodeStyles can establish inherited text
+                        // metrics. Seed the computed font size from its
+                        // containing element so bare text and replaced
+                        // descendants use the same `em` base as inline
+                        // elements.
+                        const size_value = if (block.persistent_dependencies)
+                            styleValueRead(style_map, "font-size", &block.height)
+                        else
+                            styleValue(style_map, "font-size");
+                        if (size_value) |value| {
+                            if (parser.resolveCssLength(value, .{
+                                .font_size = self.font_size_css,
+                                .percentage_base = self.font_size_css,
+                            })) |size_css| {
+                                self.font_size_css = size_css;
+                                self.size = @intFromFloat(size_css * 0.75);
+                            }
                         }
                     }
                 },

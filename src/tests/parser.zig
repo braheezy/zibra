@@ -1294,6 +1294,22 @@ test "font shorthand produces inherited computed longhands" {
     );
 }
 
+test "font shorthand accepts em sizes and resolves them against the parent" {
+    const allocator = std.testing.allocator;
+    const html = "<div style='font-size: 20px'><span style='font: bold 1.5em sans-serif'>child</span></div>";
+
+    var html_parser = try HTMLParser.init(allocator, html);
+    html_parser.use_implicit_tags = false;
+    defer html_parser.deinit(allocator);
+    var root = try html_parser.parse();
+    defer root.deinit(allocator);
+
+    try document_parser.style(allocator, &root, &.{});
+    const child = &root.element.children.items[0].element;
+    try std.testing.expectEqualStrings("bold", child.style.?.getPtr("font-weight").?.get().*);
+    try std.testing.expectEqualStrings("30.0px", child.style.?.getPtr("font-size").?.get().*);
+}
+
 test "width and height are computed without inheriting" {
     const allocator = std.testing.allocator;
     const html = "<div style=\"width: 320px; height: 90px\"><p>child</p></div>";

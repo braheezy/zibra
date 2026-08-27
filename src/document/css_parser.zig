@@ -8,6 +8,7 @@
 
 const std = @import("std");
 const selector_mod = @import("selector.zig");
+const css_length = @import("length.zig");
 const Selector = selector_mod.Selector;
 const SimpleSelector = selector_mod.SimpleSelector;
 const TagSelector = selector_mod.TagSelector;
@@ -190,19 +191,12 @@ const FontShorthand = struct {
 };
 
 fn isSupportedFontSize(font_size: []const u8) bool {
-    const number = if (std.mem.endsWith(u8, font_size, "px"))
-        font_size[0 .. font_size.len - 2]
-    else if (std.mem.endsWith(u8, font_size, "%"))
-        font_size[0 .. font_size.len - 1]
-    else
-        return false;
-    if (number.len == 0) return false;
-    const parsed = std.fmt.parseFloat(f64, number) catch return false;
-    return std.math.isFinite(parsed) and parsed >= 0;
+    const length = css_length.parse(font_size) orelse return false;
+    return length.unit == .px or length.unit == .em or length.unit == .percent;
 }
 
 /// Parse the subset of the `font` shorthand represented by Zibra's computed
-/// style: optional `italic` and `bold`, followed by a required px/percentage
+/// style: optional `italic` and `bold`, followed by a required px/em/percentage
 /// size and a required family or fallback list. Unsupported syntax invalidates
 /// the declaration instead of applying only part of it.
 fn parseFontShorthand(declaration_value: []const u8) ?FontShorthand {

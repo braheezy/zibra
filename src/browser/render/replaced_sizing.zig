@@ -18,6 +18,16 @@ pub const SpecifiedSize = struct {
     height: ?i32 = null,
 };
 
+/// CSS context used while resolving the dimensions of a replaced element.
+/// Percentages are passed in separately because width and height can have
+/// different containing-block bases, and an auto-height containing block has
+/// no usable percentage-height base.
+pub const SizeContext = struct {
+    font_size: f64 = 16.0,
+    percentage_width: ?f64 = null,
+    percentage_height: ?f64 = null,
+};
+
 /// The supported `aspect-ratio` grammar is `auto || <ratio>`, where a ratio is
 /// one positive finite number or two such numbers separated by `/`.
 pub const AspectRatio = struct {
@@ -102,10 +112,23 @@ fn animatedPixelDimension(element: *const parser.Element, property: []const u8) 
     };
 }
 
-fn cssPixelDimension(element: *const parser.Element, property: []const u8) ?i32 {
+fn cssPixelDimension(
+    element: *const parser.Element,
+    property: []const u8,
+    context: SizeContext,
+) ?i32 {
     if (animatedPixelDimension(element, property)) |pixels| return pixels;
     const value = styleValue(element, property) orelse return null;
-    const pixels = parser.parsePixelLength(value) orelse return null;
+    const percentage_base = if (std.mem.eql(u8, property, "width"))
+        context.percentage_width
+    else if (std.mem.eql(u8, property, "height"))
+        context.percentage_height
+    else
+        null;
+    const pixels = parser.resolveCssLength(value, .{
+        .font_size = context.font_size,
+        .percentage_base = percentage_base,
+    }) orelse return null;
     return parser.pixelLengthToLayoutPixels(pixels);
 }
 
@@ -119,7 +142,10 @@ fn parseLengthAttribute(input: []const u8) ?i32 {
     return std.fmt.parseInt(i32, number, 10) catch null;
 }
 
-pub fn specifiedSize(element: *const parser.Element) SpecifiedSize {
+pub fn specifiedSizeWithContext(
+    element: *const parser.Element,
+    context: SizeContext,
+) SpecifiedSize {
     var result = SpecifiedSize{};
     if (element.attributes) |attributes| {
         if (attributes.get("width")) |value| result.width = parseLengthAttribute(value);
@@ -128,9 +154,13 @@ pub fn specifiedSize(element: *const parser.Element) SpecifiedSize {
     // A supported CSS dimension overrides the matching HTML presentational
     // hint. `auto` and unsupported CSS values retain the existing attribute
     // fallback used by this browser.
-    if (cssPixelDimension(element, "width")) |width| result.width = width;
-    if (cssPixelDimension(element, "height")) |height| result.height = height;
+    if (cssPixelDimension(element, "width", context)) |width| result.width = width;
+    if (cssPixelDimension(element, "height", context)) |height| result.height = height;
     return result;
+}
+
+pub fn specifiedSize(element: *const parser.Element) SpecifiedSize {
+    return specifiedSizeWithContext(element, .{});
 }
 
 pub fn aspectRatio(element: *const parser.Element) AspectRatio {
@@ -208,8 +238,20 @@ pub fn imageSize(element: *const parser.Element, intrinsic: ?Size) Size {
     return resolve(.image, specifiedSize(element), intrinsic, aspectRatio(element));
 }
 
+pub fn imageSizeWithContext(
+    element: *const parser.Element,
+    intrinsic: ?Size,
+    context: SizeContext,
+) Size {
+    return resolve(.image, specifiedSizeWithContext(element, context), intrinsic, aspectRatio(element));
+}
+
 pub fn iframeSize(element: *const parser.Element) Size {
     return resolve(.iframe, specifiedSize(element), null, aspectRatio(element));
+}
+
+pub fn iframeSizeWithContext(element: *const parser.Element, context: SizeContext) Size {
+    return resolve(.iframe, specifiedSizeWithContext(element, context), null, aspectRatio(element));
 }
 
 test "aspect-ratio parses auto, ratios, and the replaced fallback syntax" {

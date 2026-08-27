@@ -178,6 +178,11 @@ joint Back/Forward chronology. Navigating two sibling frames must undo only the
 most recent frame, while restoring a replaced parent frame must also restore
 the nested-frame state that existed immediately before that replacement.
 
+`tests/manual/script-iframes.html` and its two child fixtures verify the paired
+DOM-mutation iframe lifecycle. An `innerHTML` insertion loads A, replacement
+unloads A and loads B without duplicates, removal makes the child unfocusable,
+and a later insertion creates a fresh child context.
+
 `tests/manual/display-list-hit-testing.html` exercises painted-fragment,
 translation, rounded-clip, overlap, and iframe click routing. Only the visible
 topmost painted target should activate; its child and destination pages are

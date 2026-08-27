@@ -64,7 +64,13 @@ or Kiesel allocation/locking.
   continue to bubble.
 - Structural JavaScript mutation also clears current style-field subscriber
   maps while every endpoint is alive; the mandatory full style/layout render
-  rebuilds dependencies after mutation.
+  rebuilds dependencies after mutation. Its pre-mutation host callback retires
+  pointer borrowers; its paired completion callback runs only after child
+  storage, parent pointers, and Node handles are final. The completion side may
+  synchronously rebind/unload iframe contexts but must defer iframe network
+  loading until the host call returns. Unloading a same-origin child can switch
+  the shared Js host's active window, so restore the mutating window before
+  returning to Kiesel.
 - Null-root invalidation may run outside the Kiesel-owning tab worker. It must
   make wrappers inert by clearing native handle maps without calling back into
   JavaScript; a later non-null root install clears and rebuilds the registry on

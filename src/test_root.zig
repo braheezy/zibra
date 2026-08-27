@@ -33,6 +33,7 @@ comptime {
     _ = @import("tests/browser_background_images.zig");
     _ = @import("tests/browser_lazy_images.zig");
     _ = @import("tests/browser_aspect_ratio.zig");
+    _ = @import("tests/browser_lengths.zig");
     _ = @import("tests/browser_dynamic_resources.zig");
     _ = @import("tests/browser_networking.zig");
     _ = @import("tests/browser_security.zig");
