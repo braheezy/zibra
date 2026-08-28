@@ -333,6 +333,35 @@ test "Parse HTML with implicit tags" {
     try std.testing.expectEqualStrings("Hello, world!", text.text);
 }
 
+test "explicit structural tags replace implicit nodes and normalize HTML names" {
+    const allocator = std.testing.allocator;
+    const html =
+        "<!DOCTYPE html><HTML LANG=en><HEAD><TITLE>Title</TITLE></HEAD>" ++
+        "<BODY ID=main><A HREF=next.html>Next</A></BODY></HTML>";
+
+    var html_parser = try HTMLParser.init(allocator, html);
+    defer html_parser.deinit(allocator);
+    var root = try html_parser.parse();
+    defer root.deinit(allocator);
+
+    try std.testing.expectEqualStrings("html", root.element.tag);
+    try std.testing.expectEqualStrings("en", root.element.attributes.?.get("lang").?);
+    try std.testing.expectEqual(@as(usize, 2), root.element.children.items.len);
+
+    const head = &root.element.children.items[0].element;
+    try std.testing.expectEqualStrings("head", head.tag);
+    try std.testing.expectEqual(@as(usize, 1), head.children.items.len);
+    try std.testing.expectEqualStrings("title", head.children.items[0].element.tag);
+
+    const body = &root.element.children.items[1].element;
+    try std.testing.expectEqualStrings("body", body.tag);
+    try std.testing.expectEqualStrings("main", body.attributes.?.get("id").?);
+    try std.testing.expectEqual(@as(usize, 1), body.children.items.len);
+    const anchor = &body.children.items[0].element;
+    try std.testing.expectEqualStrings("a", anchor.tag);
+    try std.testing.expectEqualStrings("next.html", anchor.attributes.?.get("href").?);
+}
+
 test "Parse empty HTML as an implicit blank document" {
     const allocator = std.testing.allocator;
 
@@ -885,6 +914,72 @@ test "selector sequences require every member and sum priorities" {
     var invalid_parser = try CSSParser.init(allocator, "span..urgent", false);
     defer invalid_parser.deinit(allocator);
     try std.testing.expectError(error.InvalidSelector, invalid_parser.selector(allocator));
+}
+
+test "CSS comments ID selectors and background shorthand preserve cascade data" {
+    const allocator = std.testing.allocator;
+    const html =
+        "<html><li id=bar class=important>bar</li>" ++
+        "<li id=baz>baz</li></html>";
+    const css =
+        "/* stylesheet header must not consume the first rule */" ++
+        "html { font: 10px/1 Verdana, sans-serif; background-color: blue; }" ++
+        "li { display: block /* suppress marker */; background: #FC0; }" ++
+        "#bar.important { background: rgb(204, 0, 0); color: white; }";
+
+    var html_parser = try HTMLParser.init(allocator, html);
+    html_parser.use_implicit_tags = false;
+    defer html_parser.deinit(allocator);
+    var root = try html_parser.parse();
+    defer root.deinit(allocator);
+
+    var css_parser = try CSSParser.init(allocator, css, false);
+    defer css_parser.deinit(allocator);
+    const rules = try css_parser.parse(allocator);
+    defer {
+        for (rules) |*rule| rule.deinit(allocator);
+        allocator.free(rules);
+    }
+
+    try std.testing.expectEqual(@as(usize, 3), rules.len);
+    try std.testing.expectEqual(@as(u32, 110), rules[2].cascadePriority());
+    try document_parser.style(allocator, &root, rules);
+
+    try std.testing.expectEqualStrings("10px", root.element.style.?.getPtr("font-size").?.get().*);
+    try std.testing.expectEqualStrings("1", root.element.style.?.getPtr("line-height").?.get().*);
+    try std.testing.expectEqualStrings("blue", root.element.style.?.getPtr("background-color").?.get().*);
+
+    const bar = &root.element.children.items[0].element;
+    try std.testing.expectEqualStrings("block", bar.style.?.getPtr("display").?.get().*);
+    try std.testing.expectEqualStrings("rgb(204, 0, 0)", bar.style.?.getPtr("background-color").?.get().*);
+    try std.testing.expectEqualStrings("none", bar.style.?.getPtr("background-image").?.get().*);
+    try std.testing.expectEqualStrings("auto", bar.style.?.getPtr("background-size").?.get().*);
+    try std.testing.expectEqualStrings("white", bar.style.?.getPtr("color").?.get().*);
+
+    const baz = &root.element.children.items[1].element;
+    try std.testing.expectEqualStrings("#FC0", baz.style.?.getPtr("background-color").?.get().*);
+    try std.testing.expectEqualStrings("black", baz.style.?.getPtr("color").?.get().*);
+}
+
+test "background shorthand resets supported longhands in declaration order" {
+    const allocator = std.testing.allocator;
+    var css_parser = try CSSParser.init(
+        allocator,
+        "background-color: red; background-image: url(old.ppm); " ++
+            "background: url(new.ppm) #FC0 / cover !important; " ++
+            "background-color: blue",
+        false,
+    );
+    defer css_parser.deinit(allocator);
+    var declarations = try css_parser.body(allocator);
+    defer declarations.deinit();
+
+    try std.testing.expectEqualStrings("#FC0", declarations.get("background-color").?.value);
+    try std.testing.expectEqualStrings("url(new.ppm)", declarations.get("background-image").?.value);
+    try std.testing.expectEqualStrings("cover", declarations.get("background-size").?.value);
+    try std.testing.expect(declarations.get("background-color").?.important);
+    try std.testing.expect(declarations.get("background-image").?.important);
+    try std.testing.expect(declarations.get("background-size").?.important);
 }
 
 test ":focus-visible matches the installed focus heuristic and recomputes styles" {
@@ -1872,13 +1967,31 @@ test "display defaults to inline and browser rules define block elements" {
         "inline",
         root.element.children.items[0].element.children.items[0].text.style.?.getPtr("display").?.get().*,
     );
+
+    var list_parser = try HTMLParser.init(
+        allocator,
+        "<ul><li>default marker</li><li style=\"display:block\">suppressed</li></ul>",
+    );
+    list_parser.use_implicit_tags = false;
+    defer list_parser.deinit(allocator);
+    var list_root = try list_parser.parse();
+    defer list_root.deinit(allocator);
+    try document_parser.style(allocator, &list_root, rules);
+    try std.testing.expectEqualStrings(
+        "list-item",
+        list_root.element.children.items[0].element.style.?.getPtr("display").?.get().*,
+    );
+    try std.testing.expectEqualStrings(
+        "block",
+        list_root.element.children.items[1].element.style.?.getPtr("display").?.get().*,
+    );
 }
 
 test "position and z-index are computed non-inherited properties" {
     const allocator = std.testing.allocator;
     const html =
         "<div style=\"z-index: 99\">" ++
-        "<span style=\"position: relative; z-index: -4\">nested</span>" ++
+        "<span style=\"position: relative; left: 2em; top: -3px; z-index: -4\">nested</span>" ++
         "<p>default</p></div>";
 
     var html_parser = try HTMLParser.init(allocator, html);
@@ -1894,8 +2007,14 @@ test "position and z-index are computed non-inherited properties" {
     try std.testing.expectEqualStrings("static", root.element.style.?.getPtr("position").?.get().*);
     try std.testing.expectEqualStrings("99", root.element.style.?.getPtr("z-index").?.get().*);
     try std.testing.expectEqualStrings("relative", positioned.style.?.getPtr("position").?.get().*);
+    try std.testing.expectEqualStrings("2em", positioned.style.?.getPtr("left").?.get().*);
+    try std.testing.expectEqualStrings("-3px", positioned.style.?.getPtr("top").?.get().*);
+    try std.testing.expectEqualStrings("auto", positioned.style.?.getPtr("right").?.get().*);
+    try std.testing.expectEqualStrings("auto", positioned.style.?.getPtr("bottom").?.get().*);
     try std.testing.expectEqualStrings("-4", positioned.style.?.getPtr("z-index").?.get().*);
     try std.testing.expectEqualStrings("static", defaulted.style.?.getPtr("position").?.get().*);
+    try std.testing.expectEqualStrings("auto", defaulted.style.?.getPtr("left").?.get().*);
+    try std.testing.expectEqualStrings("auto", defaulted.style.?.getPtr("top").?.get().*);
     try std.testing.expectEqualStrings("0", defaulted.style.?.getPtr("z-index").?.get().*);
     try std.testing.expectEqualStrings(
         "0",

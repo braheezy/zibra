@@ -1,0 +1,23 @@
+<!doctype html>
+<!-- How to verify: the green relative box leaves its original flow gap, the
+     blue absolute box sits at the stage's top-right, and the final paragraph
+     starts immediately after the stage rather than after the absolute box. -->
+<html>
+  <head>
+    <title>Positioned offset regression</title>
+    <style>
+      body { margin: 20px; background: white; color: black; }
+      .stage { position: relative; width: 360px; height: 180px; background: #eee; }
+      .relative { position: relative; left: 35px; top: 12px; width: 180px; height: 45px; background: lightgreen; }
+      .absolute { position: absolute; right: 18px; top: 22px; width: 100px; height: 70px; background: lightblue; }
+      .after { width: 360px; background: #FC0; }
+    </style>
+  </head>
+  <body>
+    <div class="stage">
+      <div class="relative">relative</div>
+      <div class="absolute">absolute</div>
+    </div>
+    <p class="after">normal flow after stage</p>
+  </body>
+</html>

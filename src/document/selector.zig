@@ -11,6 +11,7 @@ const Node = parser.Node;
 pub const Selector = union(enum) {
     tag: TagSelector,
     class: ClassSelector,
+    id: IdSelector,
     focus_visible: FocusVisibleSelector,
     hover: HoverSelector,
     sequence: SelectorSequence,
@@ -32,6 +33,7 @@ pub const Selector = union(enum) {
         return switch (self) {
             .tag => |t| t.matches(node),
             .class => |c| c.matches(node),
+            .id => |id| id.matches(node),
             .focus_visible => |focus_visible| focus_visible.matches(node),
             .hover => |hover| hover.matches(node),
             .sequence => |s| s.matches(node),
@@ -58,6 +60,7 @@ pub const Selector = union(enum) {
         switch (self.*) {
             .tag => |*t| t.deinit(allocator),
             .class => |*c| c.deinit(allocator),
+            .id => |*id| id.deinit(allocator),
             .focus_visible => {},
             .hover => {},
             .sequence => |*s| s.deinit(allocator),
@@ -72,6 +75,7 @@ pub const Selector = union(enum) {
         return switch (self) {
             .tag => |t| t.priority(),
             .class => |c| c.priority(),
+            .id => |id| id.priority(),
             .focus_visible => |focus_visible| focus_visible.priority(),
             .hover => |hover| hover.priority(),
             .sequence => |s| s.priority(),
@@ -86,6 +90,7 @@ pub const Selector = union(enum) {
 pub const SimpleSelector = union(enum) {
     tag: TagSelector,
     class: ClassSelector,
+    id: IdSelector,
     focus_visible: FocusVisibleSelector,
     hover: HoverSelector,
     sequence: SelectorSequence,
@@ -95,6 +100,7 @@ pub const SimpleSelector = union(enum) {
         return switch (self) {
             .tag => |tag| .{ .tag = tag },
             .class => |class| .{ .class = class },
+            .id => |id| .{ .id = id },
             .focus_visible => |focus_visible| .{ .focus_visible = focus_visible },
             .hover => |hover| .{ .hover = hover },
             .sequence => |sequence| .{ .sequence = sequence },
@@ -106,6 +112,7 @@ pub const SimpleSelector = union(enum) {
         return switch (self) {
             .tag => |tag| tag.matches(node),
             .class => |class| class.matches(node),
+            .id => |id| id.matches(node),
             .focus_visible => |focus_visible| focus_visible.matches(node),
             .hover => |hover| hover.matches(node),
             .sequence => |sequence| sequence.matches(node),
@@ -128,6 +135,7 @@ pub const SimpleSelector = union(enum) {
         switch (self.*) {
             .tag => |*tag| tag.deinit(allocator),
             .class => |*class| class.deinit(allocator),
+            .id => |*id| id.deinit(allocator),
             .focus_visible => {},
             .hover => {},
             .sequence => |*sequence| sequence.deinit(allocator),
@@ -139,6 +147,7 @@ pub const SimpleSelector = union(enum) {
         return switch (self) {
             .tag => |tag| tag.priority(),
             .class => |class| class.priority(),
+            .id => |id| id.priority(),
             .focus_visible => |focus_visible| focus_visible.priority(),
             .hover => |hover| hover.priority(),
             .sequence => |sequence| sequence.priority(),
@@ -176,6 +185,34 @@ pub const ClassSelector = struct {
     fn priority(self: ClassSelector) u32 {
         _ = self;
         return 10;
+    }
+};
+
+/// An ID selector such as `#main`. HTML ID matching is case-sensitive and an
+/// ID contributes the selector specificity's hundreds component.
+pub const IdSelector = struct {
+    id: []const u8,
+
+    pub fn init(id: []const u8) IdSelector {
+        return .{ .id = id };
+    }
+
+    fn matches(self: IdSelector, node: *Node) bool {
+        const element = switch (node.*) {
+            .element => |*value| value,
+            .text => return false,
+        };
+        const attributes = element.attributes orelse return false;
+        return std.mem.eql(u8, self.id, attributes.get("id") orelse return false);
+    }
+
+    fn deinit(self: IdSelector, allocator: std.mem.Allocator) void {
+        allocator.free(self.id);
+    }
+
+    fn priority(self: IdSelector) u32 {
+        _ = self;
+        return 100;
     }
 };
 
@@ -244,11 +281,12 @@ pub const TagSelector = struct {
 };
 
 /// One atomic member of a selector sequence. A sequence matches only when all
-/// of its tag, class, and supported pseudo-class members match the same
+/// of its tag, ID, class, and supported pseudo-class members match the same
 /// element.
 pub const SequenceSelector = union(enum) {
     tag: TagSelector,
     class: ClassSelector,
+    id: IdSelector,
     focus_visible: FocusVisibleSelector,
     hover: HoverSelector,
 
@@ -256,6 +294,7 @@ pub const SequenceSelector = union(enum) {
         return switch (self) {
             .tag => |tag| .{ .tag = tag },
             .class => |class| .{ .class = class },
+            .id => |id| .{ .id = id },
             .focus_visible => |focus_visible| .{ .focus_visible = focus_visible },
             .hover => |hover| .{ .hover = hover },
         };
@@ -265,6 +304,7 @@ pub const SequenceSelector = union(enum) {
         return switch (self) {
             .tag => |tag| tag.matches(node),
             .class => |class| class.matches(node),
+            .id => |id| id.matches(node),
             .focus_visible => |focus_visible| focus_visible.matches(node),
             .hover => |hover| hover.matches(node),
         };
@@ -274,6 +314,7 @@ pub const SequenceSelector = union(enum) {
         switch (self.*) {
             .tag => |*tag| tag.deinit(allocator),
             .class => |*class| class.deinit(allocator),
+            .id => |*id| id.deinit(allocator),
             .focus_visible => {},
             .hover => {},
         }
@@ -283,6 +324,7 @@ pub const SequenceSelector = union(enum) {
         return switch (self) {
             .tag => |tag| tag.priority(),
             .class => |class| class.priority(),
+            .id => |id| id.priority(),
             .focus_visible => |focus_visible| focus_visible.priority(),
             .hover => |hover| hover.priority(),
         };

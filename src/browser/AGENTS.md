@@ -126,7 +126,12 @@ before changing `root.zig`, `tab.zig`, `render/`, or browser task scheduling.
   style subtree, and only then runs style/layout/paint. Both inclusive
   `max-width` and exact `width` consume this value. Child-frame widths are
   authored-zoom-scaled layout geometry and divide out that inherited factor;
-  root widths divide native pixels by page zoom.
+  root widths divide native pixels by page zoom. Interactive zoom also
+  publishes the new scalar immediately under `Browser.lock`, invalidates the
+  page interest region, and rerasterizes the retained committed list while the
+  tab worker prepares that full replacement generation. Retained glyph commands
+  record the page zoom of their bitmap and resample by the old-to-new zoom ratio
+  during that preview; the replacement generation supplies crisp glyphs.
 - Browser task producers classify animation frames and native input as urgent,
   navigation and script discovery as normal, and timeout/interval/XHR/message
   callbacks as JavaScript-low. Do not infer priority from the trace label:

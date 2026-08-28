@@ -1513,6 +1513,7 @@ pub fn logAccessibilitySettings(self: *const Tab, reason: []const u8) void {
 
 pub fn setZoom(self: *Tab, zoom: f32) void {
     if (!self.updateZoomState(zoom)) return;
+    self.browser.previewActiveTabZoom(self, self.accessibility.zoom);
     self.browser.setNeedsAnimationFrame(self);
     self.browser.scheduleAnimationFrame();
 }

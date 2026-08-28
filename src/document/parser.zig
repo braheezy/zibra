@@ -660,15 +660,40 @@ pub const Element = struct {
         };
         errdefer e.deinit(allocator);
 
-        // Only parse attributes if there's a space in the tag
-        if (std.mem.indexOf(u8, tag, " ") != null) {
+        var has_whitespace = false;
+        for (tag) |byte| {
+            if (std.ascii.isWhitespace(byte)) {
+                has_whitespace = true;
+                break;
+            }
+        }
+        if (has_whitespace) {
             try e.parse(allocator, tag);
         } else {
-            // No attributes, just use the tag as is
-            e.tag = tag;
+            e.tag = try e.normalizedHtmlName(allocator, tag);
         }
 
         return e;
+    }
+
+    /// HTML element and attribute names are ASCII case-insensitive. Borrow an
+    /// already-normalized source slice, or retain one lowercase allocation in
+    /// the element's existing owned-string list when uppercase bytes occur.
+    fn normalizedHtmlName(self: *Element, allocator: std.mem.Allocator, value: []const u8) ![]const u8 {
+        var needs_normalization = false;
+        for (value) |byte| {
+            if (std.ascii.isUpper(byte)) {
+                needs_normalization = true;
+                break;
+            }
+        }
+        if (!needs_normalization) return value;
+
+        const normalized = try std.ascii.allocLowerString(allocator, value);
+        errdefer allocator.free(normalized);
+        if (self.owned_strings == null) self.owned_strings = std.ArrayList([]const u8).empty;
+        try self.owned_strings.?.append(allocator, normalized);
+        return normalized;
     }
 
     /// Invalidate the complete layout-child list. This is the conservative
@@ -874,8 +899,7 @@ pub const Element = struct {
         // Parse the tag name: read until whitespace.
         const start_name = idx;
         while (idx < raw.len and !std.ascii.isWhitespace(raw[idx])) : (idx += 1) {}
-        // Just store the tag name slice
-        self.tag = raw[start_name..idx];
+        self.tag = try self.normalizedHtmlName(al, raw[start_name..idx]);
 
         // Early return if no attributes
         if (idx >= raw.len) return;
@@ -892,7 +916,7 @@ pub const Element = struct {
             // Capture attribute name.
             const attr_start = idx;
             while (idx < raw.len and raw[idx] != '=' and !std.ascii.isWhitespace(raw[idx])) : (idx += 1) {}
-            const attr_name_slice = raw[attr_start..idx];
+            const attr_name_slice = try self.normalizedHtmlName(al, raw[attr_start..idx]);
 
             // Skip whitespace until '='.
             while (idx < raw.len and std.ascii.isWhitespace(raw[idx])) : (idx += 1) {}
@@ -1221,7 +1245,7 @@ pub const HTMLParser = struct {
             if (self.in_script_tag) {
                 // Special handling for script tag content
                 if (c == '<' and pos + 8 < self.body.len and
-                    std.mem.eql(u8, self.body[pos + 1 .. pos + 9], "/script>"))
+                    std.ascii.eqlIgnoreCase(self.body[pos + 1 .. pos + 9], "/script>"))
                 {
                     // Found </script> closing tag
 
@@ -1355,6 +1379,12 @@ pub const HTMLParser = struct {
         // Parse tag information
         const tag_info = parseTagInfo(tag_slice);
 
+        // Explicit structural start tags supply the nodes that the implicit
+        // algorithm would otherwise synthesize. Consume them here so normal
+        // opening-tag handling cannot nest a second html/head/body element.
+        if (self.use_implicit_tags and !tag_info.is_closing and
+            try self.handleExplicitStructuralStart(tag_slice, tag_info.name)) return;
+
         // Handle implicit tags before processing the current tag
         // This ensures proper HTML/HEAD/BODY structure even with incomplete markup
         try self.implicitTags(tag_info.name, tag_info.is_closing);
@@ -1372,6 +1402,61 @@ pub const HTMLParser = struct {
         } else {
             try self.handleOpeningTag(tag_slice, tag_info.name);
         }
+    }
+
+    fn hasOpenElement(self: *const HTMLParser, tag_name: []const u8) bool {
+        for (self.unfinished.items) |node| switch (node) {
+            .element => |element| if (std.ascii.eqlIgnoreCase(element.tag, tag_name)) return true,
+            .text => {},
+        };
+        return false;
+    }
+
+    /// Return true when an explicit structural start tag was fully handled.
+    fn handleExplicitStructuralStart(
+        self: *HTMLParser,
+        tag_slice: []const u8,
+        tag_name: []const u8,
+    ) !bool {
+        const is_html = std.ascii.eqlIgnoreCase(tag_name, "html");
+        const is_head = std.ascii.eqlIgnoreCase(tag_name, "head");
+        const is_body = std.ascii.eqlIgnoreCase(tag_name, "body");
+        if (!is_html and !is_head and !is_body) return false;
+
+        if (is_html) {
+            if (self.unfinished.items.len == 0) try self.createTopLevelElement(tag_slice);
+            // Later html start tags are parse errors whose attributes would
+            // merge onto the root in the full tree builder; never nest them.
+            return true;
+        }
+
+        if (self.unfinished.items.len == 0) try self.createHtmlElement();
+        if (is_head) {
+            if (self.head_found or self.hasOpenElement("body")) return true;
+            if (self.unfinished.items.len == 1) {
+                try self.handleOpeningTag(tag_slice, tag_name);
+            }
+            return true;
+        }
+
+        if (self.hasOpenElement("body")) return true;
+        if (self.unfinished.items.len > 1 and
+            self.unfinished.items[self.unfinished.items.len - 1] == .element and
+            std.ascii.eqlIgnoreCase(
+                self.unfinished.items[self.unfinished.items.len - 1].element.tag,
+                "head",
+            ))
+        {
+            const head_closed = self.unfinished.pop() orelse unreachable;
+            try self.unfinished.items[0].appendChild(self.allocator, head_closed);
+        }
+        if (!self.head_found) {
+            try self.ensureHeadElement();
+            const head_closed = self.unfinished.pop() orelse unreachable;
+            try self.unfinished.items[0].appendChild(self.allocator, head_closed);
+        }
+        if (self.unfinished.items.len == 1) try self.handleOpeningTag(tag_slice, tag_name);
+        return true;
     }
 
     // Extract tag name and determine if it's a closing tag
@@ -1401,7 +1486,7 @@ pub const HTMLParser = struct {
     // These are HTML elements that don't need or allow closing tags
     fn isTagSelfClosing(tag_name: []const u8) bool {
         return for (self_closing_tags) |self_closing_tag| {
-            if (std.mem.eql(u8, tag_name, self_closing_tag)) break true;
+            if (std.ascii.eqlIgnoreCase(tag_name, self_closing_tag)) break true;
         } else false;
     }
 
@@ -1423,7 +1508,7 @@ pub const HTMLParser = struct {
             i -= 1;
             const current = &self.unfinished.items[i];
 
-            if (current.* == .element and std.mem.eql(u8, current.element.tag, tag_name)) {
+            if (current.* == .element and std.ascii.eqlIgnoreCase(current.element.tag, tag_name)) {
                 // Check if this is a formatting element and if there are other formatting elements
                 // that would be implicitly closed
                 const is_formatting_element = isFormattingElement(tag_name);
@@ -1442,7 +1527,7 @@ pub const HTMLParser = struct {
     // Check if a tag is a formatting element
     fn isFormattingElement(tag_name: []const u8) bool {
         return for (formatting_elements) |formatting_element| {
-            if (std.mem.eql(u8, tag_name, formatting_element)) break true;
+            if (std.ascii.eqlIgnoreCase(tag_name, formatting_element)) break true;
         } else false;
     }
 
@@ -1528,7 +1613,7 @@ pub const HTMLParser = struct {
         try self.unfinished.append(self.allocator, node);
 
         // Mark when we've found a head tag
-        if (std.mem.eql(u8, tag_name, "head")) {
+        if (std.ascii.eqlIgnoreCase(tag_name, "head")) {
             self.head_found = true;
         }
     }
@@ -1556,7 +1641,7 @@ pub const HTMLParser = struct {
 
         // Is this tag a head element?
         const is_head_tag = for (head_tags) |head_tag| {
-            if (std.mem.eql(u8, tag_name, head_tag)) break true;
+            if (std.ascii.eqlIgnoreCase(tag_name, head_tag)) break true;
         } else false;
 
         // If we have no tags yet, add html tag
@@ -1567,19 +1652,19 @@ pub const HTMLParser = struct {
         // Check what's the current structure
         const current_open_tags = self.unfinished.items.len;
         const in_html_only = current_open_tags == 1 and
-            std.mem.eql(u8, self.unfinished.items[0].element.tag, "html");
+            std.ascii.eqlIgnoreCase(self.unfinished.items[0].element.tag, "html");
 
         // Add head tag if needed
         if (in_html_only) {
             // We're at the HTML level
-            if (std.mem.eql(u8, tag_name, "head") or is_head_tag) {
+            if (std.ascii.eqlIgnoreCase(tag_name, "head") or is_head_tag) {
                 // If this is a head tag or belongs in head, add the head element
                 try self.ensureHeadElement();
-            } else if (!is_closing and !std.mem.eql(u8, tag_name, "/head")) {
+            } else if (!is_closing) {
                 // This is a non-head tag and not a closing tag, add both head and body
                 try self.ensureHeadAndBodyElements();
             }
-        } else if (current_open_tags > 1 and std.mem.eql(u8, self.unfinished.items[self.unfinished.items.len - 1].element.tag, "head")) {
+        } else if (current_open_tags > 1 and std.ascii.eqlIgnoreCase(self.unfinished.items[self.unfinished.items.len - 1].element.tag, "head")) {
             // We're inside a head tag
             if (!is_head_tag and !is_closing) {
                 // This is a non-head element - close the head and open body
@@ -1670,7 +1755,7 @@ pub const HTMLParser = struct {
 
         // Check if this is a tag that can't contain itself
         const is_self_closing_element = for (self_closing_elements) |elem| {
-            if (std.mem.eql(u8, tag_name, elem)) break true;
+            if (std.ascii.eqlIgnoreCase(tag_name, elem)) break true;
         } else false;
 
         if (is_self_closing_element) {
@@ -1688,14 +1773,14 @@ pub const HTMLParser = struct {
 
             // A nested list is valid content of an outer list item. When
             // opening an li inside it, do not close the outer item.
-            if (std.mem.eql(u8, tag_name, "li") and
+            if (std.ascii.eqlIgnoreCase(tag_name, "li") and
                 current.* == .element and isListContainer(current.element.tag))
             {
                 break;
             }
 
             // If we find the same tag type
-            if (current.* == .element and std.mem.eql(u8, current.element.tag, tag_name)) {
+            if (current.* == .element and std.ascii.eqlIgnoreCase(current.element.tag, tag_name)) {
                 try self.closeNodesUpTo(i);
                 break;
             }
@@ -1704,10 +1789,10 @@ pub const HTMLParser = struct {
             // source, and a later button start still closes it through those
             // descendants. The simplified p/li recovery keeps its historical
             // div boundary.
-            if (current.* == .element and ((!std.mem.eql(u8, tag_name, "button") and
-                std.mem.eql(u8, current.element.tag, "div")) or
-                std.mem.eql(u8, current.element.tag, "body") or
-                std.mem.eql(u8, current.element.tag, "html")))
+            if (current.* == .element and ((!std.ascii.eqlIgnoreCase(tag_name, "button") and
+                std.ascii.eqlIgnoreCase(current.element.tag, "div")) or
+                std.ascii.eqlIgnoreCase(current.element.tag, "body") or
+                std.ascii.eqlIgnoreCase(current.element.tag, "html")))
             {
                 break;
             }
@@ -1717,7 +1802,7 @@ pub const HTMLParser = struct {
     fn isListContainer(tag_name: []const u8) bool {
         const list_containers = [_][]const u8{ "ul", "ol", "menu" };
         return for (list_containers) |list_container| {
-            if (std.mem.eql(u8, tag_name, list_container)) break true;
+            if (std.ascii.eqlIgnoreCase(tag_name, list_container)) break true;
         } else false;
     }
 
@@ -1772,7 +1857,7 @@ pub const HTMLParser = struct {
     // Check if a tag is a raw text element (like script)
     fn isRawTextElement(tag_name: []const u8) bool {
         return for (raw_text_elements) |raw_text_element| {
-            if (std.mem.eql(u8, tag_name, raw_text_element)) break true;
+            if (std.ascii.eqlIgnoreCase(tag_name, raw_text_element)) break true;
         } else false;
     }
 
@@ -1789,8 +1874,8 @@ pub const HTMLParser = struct {
 
         // If we have an HTML element and a HEAD element but no BODY element
         if (self.unfinished.items.len == 2 and
-            std.mem.eql(u8, self.unfinished.items[0].element.tag, "html") and
-            std.mem.eql(u8, self.unfinished.items[1].element.tag, "head"))
+            std.ascii.eqlIgnoreCase(self.unfinished.items[0].element.tag, "html") and
+            std.ascii.eqlIgnoreCase(self.unfinished.items[1].element.tag, "head"))
         {
 
             // Close the head
@@ -1868,6 +1953,10 @@ const CSS_PROPERTIES = [_]struct { name: []const u8, default_value: []const u8 }
     .{ .name = "color-scheme", .default_value = "light dark" },
     .{ .name = "display", .default_value = "inline" },
     .{ .name = "position", .default_value = "static" },
+    .{ .name = "top", .default_value = "auto" },
+    .{ .name = "right", .default_value = "auto" },
+    .{ .name = "bottom", .default_value = "auto" },
+    .{ .name = "left", .default_value = "auto" },
     .{ .name = "z-index", .default_value = "0" },
     .{ .name = "scroll-behavior", .default_value = "auto" },
     .{ .name = "zoom", .default_value = "1" },

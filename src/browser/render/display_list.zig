@@ -289,6 +289,10 @@ pub const DisplayItem = union(enum) {
         y: i32,
         glyph: Glyph,
         color: Color,
+        /// Accessibility zoom at which `glyph.pixels` was rasterized. A
+        /// retained-list zoom preview rescales those pixels until layout
+        /// publishes a crisp replacement glyph at the new page zoom.
+        page_zoom: f32 = 1.0,
         source: ?DisplayItemSource = null,
     },
     rect: struct {
@@ -540,6 +544,30 @@ pub const DisplayItem = union(enum) {
         return @intFromFloat(@as(f32, @floatFromInt(value)) * zoom);
     }
 
+    pub fn rasterScale(source_zoom_value: f32, target_zoom_value: f32) f32 {
+        const source_zoom = if (std.math.isFinite(source_zoom_value) and source_zoom_value > 0)
+            source_zoom_value
+        else
+            1.0;
+        const target_zoom = if (std.math.isFinite(target_zoom_value) and target_zoom_value > 0)
+            target_zoom_value
+        else
+            1.0;
+        return target_zoom / source_zoom;
+    }
+
+    pub fn scaleRasterPx(value: i32, source_zoom: f32, target_zoom: f32) i32 {
+        if (value <= 0) return 0;
+        const scaled = @as(f64, @floatFromInt(value)) *
+            @as(f64, rasterScale(source_zoom, target_zoom));
+        if (!std.math.isFinite(scaled)) return value;
+        return @intFromFloat(std.math.clamp(
+            @round(scaled),
+            1.0,
+            @as(f64, @floatFromInt(std.math.maxInt(i32))),
+        ));
+    }
+
     pub fn deviceToLayoutPx(value: i32, zoom_value: f32) i32 {
         const zoom = if (zoom_value > 0) zoom_value else 1.0;
         if (zoom == 1.0) return value;
@@ -714,8 +742,16 @@ pub const DisplayItem = union(enum) {
                 y,
                 scaleLayoutPx(glyph_item.x, zoom),
                 scaleLayoutPx(glyph_item.y, zoom),
-                scaleLayoutPx(glyph_item.x, zoom) + glyph_item.glyph.w,
-                scaleLayoutPx(glyph_item.y, zoom) + glyph_item.glyph.h,
+                scaleLayoutPx(glyph_item.x, zoom) + scaleRasterPx(
+                    glyph_item.glyph.w,
+                    glyph_item.page_zoom,
+                    zoom,
+                ),
+                scaleLayoutPx(glyph_item.y, zoom) + scaleRasterPx(
+                    glyph_item.glyph.h,
+                    glyph_item.page_zoom,
+                    zoom,
+                ),
             ),
             .rect => |rect_item| rect_item.color.a > 0 and pointInScaledRect(
                 x,

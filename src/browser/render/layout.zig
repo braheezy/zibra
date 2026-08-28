@@ -51,6 +51,17 @@ const ClearSide = enum {
     both,
 };
 
+const PositionMode = enum {
+    static,
+    relative,
+    absolute,
+};
+
+const PositionOffset = struct {
+    x: i32 = 0,
+    y: i32 = 0,
+};
+
 const BoxEdges = struct {
     top: i32 = 0,
     right: i32 = 0,
@@ -114,7 +125,13 @@ pub fn documentScrollHeight(document_height_css: i32) i32 {
 }
 
 fn isBlockDisplay(value: []const u8) bool {
-    return std.ascii.eqlIgnoreCase(std.mem.trim(u8, value, " \t\r\n"), "block");
+    const display = std.mem.trim(u8, value, " \t\r\n");
+    return std.ascii.eqlIgnoreCase(display, "block") or
+        std.ascii.eqlIgnoreCase(display, "list-item");
+}
+
+fn isListItemDisplay(value: []const u8) bool {
+    return std.ascii.eqlIgnoreCase(std.mem.trim(u8, value, " \t\r\n"), "list-item");
 }
 
 fn parseFloatSide(value: []const u8) FloatSide {
@@ -132,7 +149,30 @@ fn parseClearSide(value: []const u8) ClearSide {
     return .none;
 }
 
+fn parsePositionMode(value: []const u8) PositionMode {
+    const trimmed = std.mem.trim(u8, value, " \t\r\n");
+    if (std.ascii.eqlIgnoreCase(trimmed, "relative")) return .relative;
+    if (std.ascii.eqlIgnoreCase(trimmed, "absolute")) return .absolute;
+    return .static;
+}
+
+fn nodePositionMode(node: Node, dependency_target: ?*ProtectedField(u64)) PositionMode {
+    return switch (node) {
+        .element => |element| blk: {
+            const style_map = if (element.style) |*styles| styles else break :blk .static;
+            const field = @constCast(style_map).getPtr("position") orelse break :blk .static;
+            const value = if (dependency_target) |target| value: {
+                target.addDependency(field, style_map.allocator);
+                break :value field.read(target, style_map.allocator).*;
+            } else field.get().*;
+            break :blk parsePositionMode(value);
+        },
+        .text => .static,
+    };
+}
+
 fn nodeFloatSide(node: Node, dependency_target: ?*ProtectedField(u64)) FloatSide {
+    if (nodePositionMode(node, dependency_target) == .absolute) return .none;
     return switch (node) {
         .element => |element| blk: {
             const style_map = if (element.style) |*styles| styles else break :blk .none;
@@ -148,6 +188,7 @@ fn nodeFloatSide(node: Node, dependency_target: ?*ProtectedField(u64)) FloatSide
 }
 
 fn nodeClearSide(node: Node) ClearSide {
+    if (nodePositionMode(node, null) == .absolute) return .none;
     return switch (node) {
         .element => |element| blk: {
             const style_map = if (element.style) |*styles| styles else break :blk .none;
@@ -163,14 +204,27 @@ fn nodeClearSide(node: Node) ClearSide {
 fn isContainerNode(node: Node, dependency_target: ?*ProtectedField(u64)) bool {
     return switch (node) {
         .element => |element| blk: {
-            const style_map = if (element.style) |*styles| styles else break :blk false;
+            if (nodePositionMode(node, dependency_target) == .absolute) break :blk true;
             if (nodeFloatSide(node, dependency_target) != .none) break :blk true;
-            const field = @constCast(style_map).getPtr("display") orelse break :blk false;
-            const value = if (dependency_target) |target| value: {
-                target.addDependency(field, style_map.allocator);
-                break :value field.read(target, style_map.allocator).*;
-            } else field.get().*;
-            break :blk isBlockDisplay(value);
+            if (element.style) |*styles| {
+                const style_map = @constCast(styles);
+                if (style_map.getPtr("display")) |field| {
+                    const value = if (dependency_target) |target| value: {
+                        target.addDependency(field, style_map.allocator);
+                        break :value field.read(target, style_map.allocator).*;
+                    } else field.get().*;
+                    if (isBlockDisplay(value)) break :blk true;
+                }
+            }
+
+            // CSS block-in-inline fixup is substantially richer than this
+            // layout tree, but retaining an inline wrapper as a container is
+            // enough to keep its block descendants out of one flattened text
+            // run. The wrapper then supplies the anonymous block boundary.
+            for (element.children.items) |child| {
+                if (isContainerNode(child, dependency_target)) break :blk true;
+            }
+            break :blk false;
         },
         .text => false,
     };
@@ -185,6 +239,13 @@ fn isRunInHeadingNode(node: Node) bool {
 
 fn isListItemElement(element: *const parser.Element) bool {
     return std.ascii.eqlIgnoreCase(element.tag, "li");
+}
+
+fn usesListItemMarker(element: *const parser.Element) bool {
+    if (!isListItemElement(element)) return false;
+    const styles = if (element.style) |*style_map| style_map else return false;
+    const field = @constCast(styles).getPtr("display") orelse return false;
+    return isListItemDisplay(field.get().*);
 }
 
 fn isTableOfContentsElement(element: *const parser.Element) bool {
@@ -304,7 +365,7 @@ fn listItemContentBounds(parent_x: i32, parent_width: i32, indent: i32) ContentB
 fn contentBoundsForNode(node: Node, parent_x: i32, parent_width: i32, indent: i32) ContentBounds {
     switch (node) {
         .element => |element| {
-            if (isListItemElement(&element)) return listItemContentBounds(parent_x, parent_width, indent);
+            if (usesListItemMarker(&element)) return listItemContentBounds(parent_x, parent_width, indent);
         },
         .text => {},
     }
@@ -321,6 +382,24 @@ fn parseCssPixelLength(value: []const u8) ?i32 {
 fn resolveCssLength(value: []const u8, context: parser.CssLengthResolutionContext) ?i32 {
     const pixels = parser.resolveCssLength(value, context) orelse return null;
     return parser.pixelLengthToLayoutPixels(pixels);
+}
+
+/// Position offsets use the same px/em/percentage subset as dimensions but
+/// permit a leading sign. Width/height deliberately retain their non-negative
+/// parser contract.
+fn resolveSignedCssLength(value: []const u8, context: parser.CssLengthResolutionContext) ?i32 {
+    const trimmed = std.mem.trim(u8, value, " \t\r\n\x0c");
+    if (trimmed.len == 0 or std.ascii.eqlIgnoreCase(trimmed, "auto")) return null;
+    const negative = trimmed[0] == '-';
+    const positive = trimmed[0] == '+';
+    const magnitude = if (negative or positive) trimmed[1..] else trimmed;
+    if (magnitude.len == 0) return null;
+    const pixels = parser.resolveCssLength(magnitude, context) orelse return null;
+    const signed = if (negative) -pixels else pixels;
+    const minimum: f64 = @floatFromInt(std.math.minInt(i32));
+    const maximum: f64 = @floatFromInt(std.math.maxInt(i32));
+    if (!std.math.isFinite(signed)) return null;
+    return @intFromFloat(std.math.clamp(signed, minimum, maximum));
 }
 
 /// Resolve a box-model length. Padding and borders use the regular
@@ -998,6 +1077,11 @@ const EmbedLayout = struct {
             .payload = payload,
         });
         engine.cursor_x += width_value;
+        // Replaced content separates adjacent normal-whitespace runs. A
+        // following source-space therefore remains eligible to produce one
+        // collapsed space instead of being merged with whitespace before the
+        // control or image.
+        engine.last_was_collapsible_space = false;
     }
 };
 
@@ -1339,6 +1423,7 @@ const SoftHyphenBreak = struct {
 
 const GraphemeOptions = struct {
     force_newline: bool = false,
+    is_collapsed_space: bool = false,
     is_superscript: bool = false,
     is_small_caps: bool = false,
 };
@@ -1790,6 +1875,7 @@ test "computed display classifies block children" {
     try std.testing.expect(tree_version.dirty);
 
     try std.testing.expect(isBlockDisplay("block"));
+    try std.testing.expect(isBlockDisplay("list-item"));
     try std.testing.expect(!isBlockDisplay("inline"));
     try std.testing.expect(!isBlockDisplay("unsupported"));
 }
@@ -1800,9 +1886,18 @@ test "list items reserve room for square markers" {
     defer item.deinit(allocator);
     try std.testing.expect(isListItemElement(&item.element));
 
-    const bounds = listItemContentBounds(13, 100, list_item_indent);
+    try setTestDisplay(allocator, &item, "list-item");
+    try std.testing.expect(usesListItemMarker(&item.element));
+
+    const bounds = contentBoundsForNode(item, 13, 100, list_item_indent);
     try std.testing.expectEqual(@as(i32, 37), bounds.x);
     try std.testing.expectEqual(@as(i32, 76), bounds.width);
+
+    item.element.style.?.getPtr("display").?.set("block");
+    try std.testing.expect(!usesListItemMarker(&item.element));
+    const unmarked_bounds = contentBoundsForNode(item, 13, 100, list_item_indent);
+    try std.testing.expectEqual(@as(i32, 13), unmarked_bounds.x);
+    try std.testing.expectEqual(@as(i32, 100), unmarked_bounds.width);
 }
 
 test "block dimensions accept non-negative pixel lengths" {
@@ -1816,6 +1911,20 @@ test "block dimensions accept non-negative pixel lengths" {
     try std.testing.expectEqual(@as(?i32, null), parseCssPixelLength("-1px"));
     try std.testing.expectEqual(@as(?i32, null), parseCssPixelLength("NaNpx"));
     try std.testing.expectEqual(@as(?i32, null), parseCssPixelLength("999999999999px"));
+}
+
+test "position offsets accept signed relative lengths" {
+    try std.testing.expectEqual(
+        @as(?i32, 24),
+        resolveSignedCssLength("+2em", .{ .font_size = 12 }),
+    );
+    try std.testing.expectEqual(
+        @as(?i32, -50),
+        resolveSignedCssLength("-25%", .{ .percentage_base = 200 }),
+    );
+    try std.testing.expectEqual(@as(?i32, -3), resolveSignedCssLength("-3px", .{}));
+    try std.testing.expectEqual(@as(?i32, null), resolveSignedCssLength("auto", .{}));
+    try std.testing.expectEqual(@as(?i32, null), resolveSignedCssLength("-2ex", .{}));
 }
 
 test "CSS zoom parses numbers and percentages and composes nested lengths" {
@@ -1988,6 +2097,18 @@ test "anonymous blocks group only consecutive inline siblings" {
     try std.testing.expect(!isContainerNode(inline_node, null));
     try std.testing.expect(isContainerNode(paragraph, null));
     try std.testing.expect(!isContainerNode(text, null));
+
+    var inline_form = Node{ .element = try parser.Element.init(allocator, "form", null) };
+    defer inline_form.deinit(allocator);
+    try setTestDisplay(allocator, &inline_form, "inline");
+    var form_paragraph = Node{ .element = try parser.Element.init(allocator, "p", &inline_form) };
+    var form_paragraph_owned = true;
+    errdefer if (form_paragraph_owned) form_paragraph.deinit(allocator);
+    try setTestDisplay(allocator, &form_paragraph, "block");
+    try inline_form.element.children.append(allocator, form_paragraph);
+    form_paragraph_owned = false;
+    parser.fixParentPointers(&inline_form, null);
+    try std.testing.expect(isContainerNode(inline_form, null));
 }
 
 test "append-only block layout retains its existing child objects after DOM relocation" {
@@ -2303,6 +2424,136 @@ test "float exclusions use margin boxes and stop at the float bottom" {
     try std.testing.expectEqual(@as(i32, 200), restored.width);
 }
 
+test "non-formatting blocks share their nearest float context" {
+    const allocator = std.testing.allocator;
+    var root_node = Node{ .element = try parser.Element.init(allocator, "html", null) };
+    defer root_node.deinit(allocator);
+    var transparent_node = Node{ .element = try parser.Element.init(allocator, "div", null) };
+    defer transparent_node.deinit(allocator);
+    try setTestStyleValue(allocator, &transparent_node, "overflow", "visible");
+    var float_node = Node{ .element = try parser.Element.init(allocator, "div", null) };
+    defer float_node.deinit(allocator);
+    try setTestStyleValue(allocator, &float_node, "float", "left");
+    var clipped_node = Node{ .element = try parser.Element.init(allocator, "div", null) };
+    defer clipped_node.deinit(allocator);
+    try setTestStyleValue(allocator, &clipped_node, "overflow", "hidden");
+
+    const document = try DocumentLayout.init(allocator, &root_node);
+    defer {
+        document.deinit();
+        allocator.destroy(document);
+    }
+    const root = try BlockLayout.init(allocator, root_node, &root_node, document, null, null);
+    try document.children.append(allocator, root);
+    const transparent = try BlockLayout.init(
+        allocator,
+        transparent_node,
+        &transparent_node,
+        document,
+        root,
+        null,
+    );
+    try root.children.append(allocator, .{ .block = transparent });
+    const floating = try BlockLayout.init(
+        allocator,
+        float_node,
+        &float_node,
+        document,
+        transparent,
+        null,
+    );
+    try transparent.children.append(allocator, .{ .block = floating });
+    const clipped = try BlockLayout.init(
+        allocator,
+        clipped_node,
+        &clipped_node,
+        document,
+        transparent,
+        null,
+    );
+    try transparent.children.append(allocator, .{ .block = clipped });
+
+    try std.testing.expect(root.establishesFloatContext());
+    try std.testing.expect(!transparent.establishesFloatContext());
+    try std.testing.expect(transparent.floatContextForChildren() == root);
+    try std.testing.expect(floating.establishesFloatContext());
+    try std.testing.expect(floating.floatContextForChildren() == floating);
+    try std.testing.expect(clipped.establishesFloatContext());
+    try std.testing.expect(clipped.floatContextForChildren() == clipped);
+}
+
+test "nested floats place and clear in a shared context after invalidation" {
+    const allocator = std.testing.allocator;
+    var html_parser = try parser.HTMLParser.init(
+        allocator,
+        "<html style='display:block'><body style='display:block;margin:0'>" ++
+            "<main id=stage style='display:block;width:180px'>" ++
+            "<div id=wrapper style='display:block'>" ++
+            "<div id=a style='display:block;float:left;width:60px;height:40px'></div>" ++
+            "<div id=b style='display:block;float:left;width:60px;height:40px'></div>" ++
+            "</div>" ++
+            "<div id=c style='display:block;float:left;width:60px;height:40px'></div>" ++
+            "<p id=clear style='display:block;clear:both;height:10px'></p>" ++
+            "</main></body></html>",
+    );
+    html_parser.use_implicit_tags = false;
+    defer html_parser.deinit(allocator);
+    var root_node = try html_parser.parse();
+    defer root_node.deinit(allocator);
+    parser.fixParentPointers(&root_node, null);
+    try parser.style(allocator, &root_node, &.{});
+
+    var environ = std.process.Environ.Map.init(allocator);
+    defer environ.deinit();
+    try environ.put("HOME", "/tmp");
+    const engine = try Layout.init(allocator, std.testing.io, &environ, 800, 600, false);
+    defer engine.deinit();
+    const document = try engine.buildDocument(&root_node);
+    defer {
+        document.deinit();
+        allocator.destroy(document);
+    }
+
+    var nodes = std.ArrayList(*Node).empty;
+    defer nodes.deinit(allocator);
+    try parser.treeToList(allocator, &root_node, &nodes);
+    var wrapper_node: ?*Node = null;
+    var first_float_node: ?*Node = null;
+    var third_float_node: ?*Node = null;
+    var clear_node: ?*Node = null;
+    for (nodes.items) |node| switch (node.*) {
+        .element => |*element| {
+            const attributes = element.attributes orelse continue;
+            const id = attributes.get("id") orelse continue;
+            if (std.mem.eql(u8, id, "wrapper")) wrapper_node = node;
+            if (std.mem.eql(u8, id, "a")) first_float_node = node;
+            if (std.mem.eql(u8, id, "c")) third_float_node = node;
+            if (std.mem.eql(u8, id, "clear")) clear_node = node;
+        },
+        .text => {},
+    };
+
+    const wrapper: *BlockLayout = @ptrCast(@alignCast(wrapper_node.?.element.layout_ptr.?));
+    const first_float: *BlockLayout = @ptrCast(@alignCast(first_float_node.?.element.layout_ptr.?));
+    const third_float: *BlockLayout = @ptrCast(@alignCast(third_float_node.?.element.layout_ptr.?));
+    const clearing: *BlockLayout = @ptrCast(@alignCast(clear_node.?.element.layout_ptr.?));
+    try std.testing.expectEqual(@as(i32, 0), wrapper.height.get().*);
+    try std.testing.expectEqual(first_float.y.get().*, third_float.y.get().*);
+    try std.testing.expectEqual(
+        first_float.y.get().* + first_float.height.get().*,
+        clearing.y.get().*,
+    );
+
+    first_float_node.?.element.style.?.getPtr("height").?.set("80px");
+    try document.layout(engine);
+    try std.testing.expectEqual(@as(i32, 0), wrapper.height.get().*);
+    try std.testing.expectEqual(first_float.y.get().*, third_float.y.get().*);
+    try std.testing.expectEqual(
+        first_float.y.get().* + first_float.height.get().*,
+        clearing.y.get().*,
+    );
+}
+
 // Layout state
 allocator: std.mem.Allocator,
 // Font manager for handling fonts and glyphs
@@ -2382,6 +2633,7 @@ transform_offset_x: i32 = 0,
 transform_offset_y: i32 = 0,
 
 is_preformatted: bool = false,
+last_was_collapsible_space: bool = false,
 prev_font_category: ?FontCategory = null,
 current_font_category: FontCategory = .latin,
 
@@ -2401,6 +2653,7 @@ const InlineSnapshot = struct {
     is_superscript: bool,
     is_small_caps: bool,
     is_preformatted: bool,
+    last_was_collapsible_space: bool,
     prev_font_category: ?FontCategory,
     current_font_category: FontCategory,
     text_color: browser.Color,
@@ -2425,6 +2678,7 @@ fn snapshotInlineState(self: *const Layout) InlineSnapshot {
         .is_superscript = self.is_superscript,
         .is_small_caps = self.is_small_caps,
         .is_preformatted = self.is_preformatted,
+        .last_was_collapsible_space = self.last_was_collapsible_space,
         .prev_font_category = self.prev_font_category,
         .current_font_category = self.current_font_category,
         .text_color = self.text_color,
@@ -2449,6 +2703,7 @@ fn restoreInlineState(self: *Layout, snapshot: InlineSnapshot) void {
     self.is_superscript = snapshot.is_superscript;
     self.is_small_caps = snapshot.is_small_caps;
     self.is_preformatted = snapshot.is_preformatted;
+    self.last_was_collapsible_space = snapshot.last_was_collapsible_space;
     self.prev_font_category = snapshot.prev_font_category;
     self.current_font_category = snapshot.current_font_category;
     self.text_color = snapshot.text_color;
@@ -3631,6 +3886,7 @@ fn flushLine(self: *Layout, line_buffer: *std.ArrayList(LineItem)) !void {
                         .y = final_y,
                         .glyph = glyph_payload.glyph,
                         .color = glyph_payload.color,
+                        .page_zoom = self.zoom(),
                         .source = source,
                     },
                 });
@@ -3771,13 +4027,17 @@ fn breakPreformattedLine(self: *Layout, line_buffer: *std.ArrayList(LineItem)) !
 fn inlineContentBounds(block: *const BlockLayout, y: i32) ContentBounds {
     const block_left = block.x.get().* + block.border.left + block.padding.left;
     const block_right = block_left +| block.content_width;
-    if (block.floatSide() != .none) {
+    if (block.establishesFloatContext()) {
         return .{ .x = block_left, .width = @max(block_right -| block_left, 0) };
     }
 
     if (block.parent_block) |parent| {
         const parent_left = parent.x.get().* + parent.border.left + parent.padding.left;
-        const parent_bounds = parent.floatBoundsAt(y, parent_left, parent.content_width);
+        const parent_bounds = parent.floatContextForChildrenConst().floatBoundsAt(
+            y,
+            parent_left,
+            parent.content_width,
+        );
         const left = @max(block_left, parent_bounds.x);
         const right = @min(block_right, parent_bounds.x +| parent_bounds.width);
         return .{ .x = left, .width = @max(right -| left, 0) };
@@ -3811,8 +4071,12 @@ fn processGrapheme(
 ) !void {
     const small_caps = options.is_small_caps or self.css_small_caps;
 
-    // Handle newlines explicitly before font shaping.
-    if (std.mem.eql(u8, gme, "\n") or std.mem.eql(u8, gme, "\r") or options.force_newline) {
+    // Source newlines are collapsible whitespace in normal flow. Only an
+    // explicit request or a preformatted run turns one into a line break.
+    if (options.force_newline or
+        (self.is_preformatted and
+            (std.mem.eql(u8, gme, "\n") or std.mem.eql(u8, gme, "\r"))))
+    {
         try self.breakExplicitLine(line_buffer);
         return;
     }
@@ -3888,6 +4152,19 @@ fn processGrapheme(
     const glyph_height = self.toLayoutPx(glyph.h);
     const glyph_ascent = self.toLayoutPx(glyph.ascent);
     const glyph_descent = self.toLayoutPx(glyph.descent);
+
+    // A collapsed source-space at the right edge is trailing whitespace, not
+    // the first glyph of the next line.
+    if (options.is_collapsed_space and shouldAutomaticallyWrap(
+        self.is_preformatted,
+        self.cursor_x,
+        glyph_width,
+        self.line_right,
+        line_buffer.items.len > 0,
+    )) {
+        try self.flushLine(line_buffer);
+        return;
+    }
 
     // Check if we need to wrap (only at window edge)
     while (shouldAutomaticallyWrap(
@@ -4220,25 +4497,36 @@ fn lineBreakLengthAt(text: []const u8, position: usize) usize {
     };
 }
 
-fn paragraphGap(font_size: i32) i32 {
-    const line_step = @max(font_size, 1);
-    return @max(@divTrunc(line_step, 2), 1);
+fn isCollapsibleWhitespaceGrapheme(gme: []const u8) bool {
+    return gme.len == 1 and switch (gme[0]) {
+        ' ', '\t', '\n', '\r', 0x0c => true,
+        else => false,
+    };
 }
 
-fn breakParagraph(self: *Layout, line_buffer: *std.ArrayList(LineItem)) !void {
-    const initial_y = self.cursor_y;
-    try self.flushLine(line_buffer);
-
-    const gap = @max(self.scaleActiveCssPixel(paragraphGap(self.size)), 1);
-    if (self.cursor_y == initial_y) {
-        // Preserve an empty source line even though flushLine has no glyph
-        // metrics from which to derive its normal advance.
-        self.cursor_y += self.lineHeightForNatural(
-            @max(self.scaleActiveCssPixel(self.size), 1),
-        );
+fn processNormalGrapheme(
+    self: *Layout,
+    gme: []const u8,
+    line_buffer: *std.ArrayList(LineItem),
+    node_ptr: ?*Node,
+) !void {
+    if (isCollapsibleWhitespaceGrapheme(gme)) {
+        if (self.last_was_collapsible_space) return;
+        self.last_was_collapsible_space = true;
+        if (line_buffer.items.len == 0 and self.cursor_x == self.line_left) return;
+        try self.processGrapheme(" ", line_buffer, node_ptr, .{
+            .is_collapsed_space = true,
+            .is_superscript = self.is_superscript,
+            .is_small_caps = self.is_small_caps,
+        });
+        return;
     }
-    self.cursor_y += gap;
-    self.cursor_x = self.line_left;
+
+    self.last_was_collapsible_space = false;
+    try self.processGrapheme(gme, line_buffer, node_ptr, .{
+        .is_superscript = self.is_superscript,
+        .is_small_caps = self.is_small_caps,
+    });
 }
 
 fn handleTextToken(
@@ -4252,54 +4540,35 @@ fn handleTextToken(
         return;
     }
 
-    // Keep source text in Unicode grapheme clusters while stopping at syntax
-    // that needs special handling. This keeps emoji modifiers, flags, and ZWJ
-    // sequences together for font fallback and rasterization.
+    // Keep source text in Unicode grapheme clusters while stopping at entity
+    // syntax. HTML source formatting whitespace collapses to one ordinary
+    // space; only preformatted text preserves source line breaks.
     var i: usize = 0;
     while (i < content.len) {
-        const line_break_len = lineBreakLengthAt(content, i);
-        if (line_break_len != 0) {
-            try self.breakParagraph(line_buffer);
-            i += line_break_len;
-            continue;
-        }
-
         if (content[i] == '&') {
             var entity_buffer: [4]u8 = undefined;
             if (lexEntityAt(content, i, &entity_buffer)) |entity| {
-                try self.processGrapheme(entity.replacement, line_buffer, node_ptr, .{
-                    .is_superscript = self.is_superscript,
-                    .is_small_caps = self.is_small_caps,
-                });
+                try self.processNormalGrapheme(entity.replacement, line_buffer, node_ptr);
 
                 i += entity.len;
                 continue;
             }
 
             // An ampersand that does not begin a recognized entity is text.
-            try self.processGrapheme("&", line_buffer, node_ptr, .{
-                .is_superscript = self.is_superscript,
-                .is_small_caps = self.is_small_caps,
-            });
+            try self.processNormalGrapheme("&", line_buffer, node_ptr);
             i += 1;
             continue;
         }
 
         var run_end = i;
-        while (run_end < content.len and
-            content[run_end] != '&' and
-            lineBreakLengthAt(content, run_end) == 0)
-        {
+        while (run_end < content.len and content[run_end] != '&') {
             run_end += 1;
         }
 
         const run = content[i..run_end];
         var g_iter = grapheme.iterator(run);
         while (g_iter.next()) |gc| {
-            try self.processGrapheme(gc.bytes(run), line_buffer, node_ptr, .{
-                .is_superscript = self.is_superscript,
-                .is_small_caps = self.is_small_caps,
-            });
+            try self.processNormalGrapheme(gc.bytes(run), line_buffer, node_ptr);
         }
         i = run_end;
     }
@@ -4325,10 +4594,15 @@ test "lineBreakLengthAt recognizes platform newline encodings" {
     try std.testing.expectEqual(@as(usize, 0), lineBreakLengthAt("abc", 1));
 }
 
-test "paragraph gap adds visible leading beyond a normal line step" {
-    try std.testing.expectEqual(@as(i32, 8), paragraphGap(16));
-    try std.testing.expect(paragraphGap(16) > 0);
-    try std.testing.expectEqual(@as(i32, 1), paragraphGap(1));
+test "normal-flow source whitespace collapses while preformatted breaks remain recognizable" {
+    for ([_][]const u8{ " ", "\t", "\n", "\r", "\x0c" }) |value| {
+        try std.testing.expect(isCollapsibleWhitespaceGrapheme(value));
+    }
+    try std.testing.expect(!isCollapsibleWhitespaceGrapheme("x"));
+    try std.testing.expect(!isCollapsibleWhitespaceGrapheme("\u{00a0}"));
+
+    try std.testing.expectEqual(@as(usize, 1), lineBreakLengthAt("a\nb", 1));
+    try std.testing.expectEqual(@as(usize, 2), lineBreakLengthAt("a\r\nb", 1));
 }
 
 test "line-height resolves unitless and relative values" {
@@ -4439,6 +4713,15 @@ pub fn layoutSourceCode(self: *Layout, source: []const u8) ![]DisplayItem {
 
     // Process the source character by character
     while (i < source.len) {
+        // View-source recognizes physical source-line boundaries even while
+        // tag glyphs temporarily use normal wrapping for syntax coloring.
+        const source_break_len = lineBreakLengthAt(source, i);
+        if (source_break_len != 0) {
+            try self.breakExplicitLine(&line_buffer);
+            i += source_break_len;
+            continue;
+        }
+
         // Check for tag start
         if (i + 1 < source.len and source[i] == '<') {
             // We're entering a tag
@@ -4556,6 +4839,7 @@ const InputLayout = struct {
     text: []const u8 = "",
     is_focused: bool = false,
     is_checkbox: bool = false,
+    is_radio: bool = false,
     is_checked: bool = false,
     is_password: bool = false,
 
@@ -4576,9 +4860,14 @@ const InputLayout = struct {
         self.font_size = engine.scaledFontSize(engine.size);
         self.color = engine.text_color;
         self.is_checkbox = element.isCheckbox();
-        self.is_checked = element.isChecked();
+        self.is_radio = element.isInputType("radio");
+        self.is_checked = if (self.is_radio)
+            if (element.attributes) |attributes| attributes.get("checked") != null else false
+        else
+            element.isChecked();
         self.is_password = element.isPasswordInput();
-        if (self.is_checkbox) {
+        const is_choice = self.is_checkbox or self.is_radio;
+        if (is_choice) {
             self.bgcolor = .{ .r = 255, .g = 255, .b = 255, .a = 255 };
         }
 
@@ -4597,7 +4886,7 @@ const InputLayout = struct {
             }
         }
 
-        if (self.is_checkbox) {
+        if (is_choice) {
             self.text = "";
         } else if (std.mem.eql(u8, element.tag, "input")) {
             if (element.attributes) |attrs| {
@@ -4616,9 +4905,12 @@ const InputLayout = struct {
         const ascent_value = engine.toLayoutPx(glyph.ascent);
         const descent_value = engine.toLayoutPx(glyph.descent);
         const natural_height = ascent_value + descent_value;
-        var width_value = if (self.is_checkbox) natural_height else engine.scaleActiveCssPixel(INPUT_WIDTH_PX);
+        if (self.is_radio and self.border_radius == 0) {
+            self.border_radius = @as(f64, @floatFromInt(natural_height)) / 2.0;
+        }
+        var width_value = if (is_choice) natural_height else engine.scaleActiveCssPixel(INPUT_WIDTH_PX);
         var height_value = natural_height;
-        if (!self.is_checkbox) {
+        if (!is_choice) {
             if (element.style) |*style_map| {
                 if (resolvedPixelDimension(&element, style_map, "width", .{
                     .font_size = engine.font_size_css,
@@ -4682,7 +4974,7 @@ const InputLayout = struct {
             }
         }
 
-        if (engine.accessibility.forced_colors and !self.is_checkbox) {
+        if (engine.accessibility.forced_colors and !self.is_checkbox and !self.is_radio) {
             try target.append(engine.allocator, .{ .outline = .{
                 .rect = .{
                     .left = x,
@@ -4758,6 +5050,62 @@ const InputLayout = struct {
             return;
         }
 
+        if (self.is_radio) {
+            const ink = engine.remapColor(
+                .{ .r = 48, .g = 48, .b = 48, .a = 255 },
+                .control_text,
+            );
+            const inset = @max(@divTrunc(height_value, 7), 1);
+            try appendBackgroundBox(
+                target,
+                engine.allocator,
+                x,
+                y,
+                width_value,
+                height_value,
+                self.border_radius,
+                ink,
+                source,
+            );
+            try appendBackgroundBox(
+                target,
+                engine.allocator,
+                x + inset,
+                y + inset,
+                @max(width_value - 2 * inset, 1),
+                @max(height_value - 2 * inset, 1),
+                @max(self.border_radius - @as(f64, @floatFromInt(inset)), 0),
+                remapped_bg,
+                source,
+            );
+            if (self.is_checked) {
+                const dot_inset = @max(@divTrunc(height_value, 3), inset + 1);
+                try appendBackgroundBox(
+                    target,
+                    engine.allocator,
+                    x + dot_inset,
+                    y + dot_inset,
+                    @max(width_value - 2 * dot_inset, 1),
+                    @max(height_value - 2 * dot_inset, 1),
+                    @max(self.border_radius - @as(f64, @floatFromInt(dot_inset)), 0),
+                    ink,
+                    source,
+                );
+            }
+            try appendRoundedControlGroup(
+                commands,
+                engine.allocator,
+                &rounded_items,
+                x,
+                y,
+                width_value,
+                height_value,
+                self.border_radius,
+                source,
+            );
+            return;
+        }
+
         var text_x = x + scaleCssPixel(2, self.embed.zoom.get().*, engine.zoom());
         const baseline_y = y + ascent_value;
         if (self.text.len > 0) {
@@ -4780,6 +5128,7 @@ const InputLayout = struct {
                         .y = baseline_y - engine.toLayoutPx(glyph.ascent),
                         .glyph = glyph,
                         .color = engine.remapColor(self.color, .control_text),
+                        .page_zoom = engine.zoom(),
                         .source = source,
                     },
                 });
@@ -4853,6 +5202,27 @@ test "hidden inputs emit no inline box and password graphemes paint as stars" {
     }
     try std.testing.expectEqual(@as(usize, 3), masked_count);
     try std.testing.expectEqualStrings("x", inputDisplayGrapheme(false, "x"));
+}
+
+test "radio inputs use compact circular control metrics" {
+    const allocator = std.testing.allocator;
+    var radio = try parser.Element.init(allocator, "input type=radio checked", null);
+    defer radio.deinit(allocator);
+    var environ = std.process.Environ.Map.init(allocator);
+    defer environ.deinit();
+    try environ.put("HOME", "/tmp");
+    const engine = try Layout.init(allocator, std.testing.io, &environ, 800, 600, false);
+    defer engine.deinit();
+
+    var input = InputLayout.init(allocator);
+    defer input.deinit();
+    try input.measure(engine, radio);
+    try std.testing.expect(input.is_radio);
+    try std.testing.expect(input.is_checked);
+    try std.testing.expectEqualStrings("", input.text);
+    try std.testing.expectEqual(input.embed.height.get().*, input.embed.width.get().*);
+    try std.testing.expect(input.embed.width.get().* < engine.scaleActiveCssPixel(INPUT_WIDTH_PX));
+    try std.testing.expect(input.border_radius > 0);
 }
 
 /// An inline button whose contents are laid out as a real block subtree. The
@@ -5759,6 +6129,7 @@ const TextLayout = struct {
                 .y = self.y.get().*,
                 .glyph = glyph,
                 .color = engine.remapTextColor(&self.node, self.color),
+                .page_zoom = engine.zoom(),
                 .source = displaySource(self, self.node_ptr),
             },
         });
@@ -6373,15 +6744,21 @@ const BlockLayout = struct {
     content_width: i32 = 0,
     content_height: i32 = 0,
     content_height_definite: bool = false,
+    /// Visual movement applied after normal-flow geometry. Keeping this
+    /// separate from x/y prevents relative positioning from moving the slot
+    /// used by a following sibling.
+    position_offset: PositionOffset = .{},
     /// Number of direct DOM children represented by the last successfully
     /// published block-child list. An accepted insertion matches those
     /// existing objects and creates layout objects only for new DOM gaps.
     laid_out_dom_children: usize = 0,
     children_epoch: u64 = 0,
     children_version: ProtectedField(u64),
-    /// Direct floated siblings in this block formatting context. Entries
-    /// contain only primitive geometry and are rebuilt on every layout pass.
+    /// Floats owned by this block formatting context. Non-context descendants
+    /// contribute to their nearest owning ancestor instead of retaining a
+    /// private exclusion list.
     floats: std.ArrayList(FloatBox),
+    rebuilding_floats: bool = false,
 
     children: std.ArrayList(LayoutChild),
     /// DOM-index permutation captured at the last paint. Retaining it keeps
@@ -6487,15 +6864,19 @@ const BlockLayout = struct {
                     .line => return false,
                 };
                 if (ownsNode(block, dom_child)) {
+                    const position_mode = block.positionMode();
+                    const block_previous = if (position_mode == .absolute) null else expected_previous;
                     if (block.inline_nodes != null or
                         block.parent_block != self or
                         block.node_ptr != dom_child or
                         block.previous.dirty or
-                        block.previous.get().* != expected_previous)
+                        block.previous.get().* != block_previous)
                     {
                         return false;
                     }
-                    if (block.floatSide() == .none) expected_previous = block;
+                    if (block.floatSide() == .none and position_mode != .absolute) {
+                        expected_previous = block;
+                    }
                     retained_index += 1;
                     continue;
                 }
@@ -6634,9 +7015,10 @@ const BlockLayout = struct {
         var dom_index: usize = 0;
         while (dom_index < dom_children.len) {
             if (retained_for_dom[dom_index]) |block| {
-                desired_previous[retained_index] = previous;
+                const position_mode = block.positionMode();
+                desired_previous[retained_index] = if (position_mode == .absolute) null else previous;
                 replacement.appendAssumeCapacity(.{ .block = block });
-                if (block.floatSide() == .none) previous = block;
+                if (block.floatSide() == .none and position_mode != .absolute) previous = block;
                 retained_index += 1;
                 dom_index += 1;
                 continue;
@@ -6660,24 +7042,25 @@ const BlockLayout = struct {
                 );
                 created.appendAssumeCapacity(child);
                 replacement.appendAssumeCapacity(.{ .block = child });
-                if (child.floatSide() == .none) previous = child;
+                if (child.floatSide() == .none and child.positionMode() != .absolute) previous = child;
                 dom_index += 2;
                 continue;
             }
 
             if (isContainerNode(dom_children[dom_index], &self.children_version)) {
                 const child_node = &dom_children[dom_index];
+                const child_position = nodePositionMode(child_node.*, &self.children_version);
                 const child = try BlockLayout.init(
                     self.allocator,
                     child_node.*,
                     child_node,
                     self.document,
                     self,
-                    previous,
+                    if (child_position == .absolute) null else previous,
                 );
                 created.appendAssumeCapacity(child);
                 replacement.appendAssumeCapacity(.{ .block = child });
-                if (child.floatSide() == .none) previous = child;
+                if (child.floatSide() == .none and child_position != .absolute) previous = child;
                 dom_index += 1;
                 continue;
             }
@@ -6702,7 +7085,7 @@ const BlockLayout = struct {
             );
             created.appendAssumeCapacity(child);
             replacement.appendAssumeCapacity(.{ .block = child });
-            if (child.floatSide() == .none) previous = child;
+            if (child.floatSide() == .none and child.positionMode() != .absolute) previous = child;
         }
         std.debug.assert(retained_index == self.children.items.len);
 
@@ -6764,6 +7147,7 @@ const BlockLayout = struct {
             .content_width = 0,
             .content_height = 0,
             .content_height_definite = false,
+            .position_offset = .{},
             .laid_out_dom_children = 0,
             .children = std.ArrayList(LayoutChild).empty,
             .paint_order = std.ArrayList(usize).empty,
@@ -6780,6 +7164,7 @@ const BlockLayout = struct {
             .children_epoch = 0,
             .children_version = ProtectedField(u64).init(0),
             .floats = std.ArrayList(FloatBox).empty,
+            .rebuilding_floats = false,
         };
         block.zoom.setOwner(block, markOpaque);
         block.x.setOwner(block, markOpaque);
@@ -6853,10 +7238,24 @@ const BlockLayout = struct {
                 switch (ptr.*) {
                     .element => |*element| {
                         if (element.style) |*style_map| {
-                            if (style_map.getPtr("zoom")) |field| block.zoom.addDependency(field, allocator);
-                            if (style_map.getPtr("width")) |field| block.width.addDependency(field, allocator);
-                            if (style_map.getPtr("height")) |field| block.height.addDependency(field, allocator);
-                            if (style_map.getPtr("overflow")) |field| block.height.addDependency(field, allocator);
+                            if (style_map.getPtr("zoom")) |field| block.zoom.addDependency(field, style_map.allocator);
+                            if (style_map.getPtr("width")) |field| block.width.addDependency(field, style_map.allocator);
+                            if (style_map.getPtr("height")) |field| block.height.addDependency(field, style_map.allocator);
+                            if (style_map.getPtr("overflow")) |field| block.height.addDependency(field, style_map.allocator);
+                            if (style_map.getPtr("position")) |field| {
+                                block.x.addDependency(field, style_map.allocator);
+                                block.y.addDependency(field, style_map.allocator);
+                            }
+                            for ([_][]const u8{ "left", "right" }) |property| {
+                                if (style_map.getPtr(property)) |field| {
+                                    block.x.addDependency(field, style_map.allocator);
+                                }
+                            }
+                            for ([_][]const u8{ "top", "bottom" }) |property| {
+                                if (style_map.getPtr(property)) |field| {
+                                    block.y.addDependency(field, style_map.allocator);
+                                }
+                            }
                             for ([_][]const u8{
                                 "margin-top",       "margin-right",       "margin-bottom",       "margin-left",
                                 "padding-top",      "padding-right",      "padding-bottom",      "padding-left",
@@ -7191,6 +7590,106 @@ const BlockLayout = struct {
         self.previous.set(previous);
     }
 
+    fn positionMode(self: *const BlockLayout) PositionMode {
+        return nodePositionMode(self.node, null);
+    }
+
+    fn establishesFloatContext(self: *const BlockLayout) bool {
+        if (self.parent_block == null or self.embedded_box != null) return true;
+        if (self.floatSide() != .none or self.positionMode() == .absolute) return true;
+
+        const element = liveBlockElement(self) orelse return false;
+        const styles = if (element.style) |*style_map| style_map else return false;
+        const overflow = std.mem.trim(
+            u8,
+            styleValue(styles, "overflow") orelse "visible",
+            " \t\r\n",
+        );
+        return !std.ascii.eqlIgnoreCase(overflow, "visible");
+    }
+
+    fn floatContextForChildren(self: *BlockLayout) *BlockLayout {
+        if (self.establishesFloatContext()) return self;
+        return self.parent_block.?.floatContextForChildren();
+    }
+
+    fn floatContextForChildrenConst(self: *const BlockLayout) *const BlockLayout {
+        if (self.establishesFloatContext()) return self;
+        return self.parent_block.?.floatContextForChildrenConst();
+    }
+
+    fn specifiedPositionOffset(
+        self: *const BlockLayout,
+        property: []const u8,
+        context: parser.CssLengthResolutionContext,
+        engine_zoom: f32,
+    ) ?i32 {
+        if (self.inline_nodes != null or self.embedded_box != null) return null;
+        const node_ptr = self.node_ptr orelse return null;
+        const element = switch (node_ptr.*) {
+            .element => |*value| value,
+            .text => return null,
+        };
+        const styles = if (element.style) |*style_map| style_map else return null;
+        const value = styleValue(styles, property) orelse return null;
+        const pixels = resolveSignedCssLength(value, context) orelse return null;
+        return scaleCssPixel(pixels, self.zoom.get().*, engine_zoom);
+    }
+
+    fn updatePositionOffset(
+        self: *BlockLayout,
+        containing_x: i32,
+        containing_y: i32,
+        containing_width: i32,
+        containing_height: ?i32,
+        containing_width_css: f64,
+        containing_height_css: ?f64,
+        engine_zoom: f32,
+    ) void {
+        self.position_offset = .{};
+        const mode = self.positionMode();
+        if (mode == .static) return;
+
+        const horizontal_context = parser.CssLengthResolutionContext{
+            .font_size = self.computedFontSizeCss(),
+            .percentage_base = containing_width_css,
+        };
+        const vertical_context = parser.CssLengthResolutionContext{
+            .font_size = self.computedFontSizeCss(),
+            .percentage_base = containing_height_css,
+        };
+        const left = self.specifiedPositionOffset("left", horizontal_context, engine_zoom);
+        const right = self.specifiedPositionOffset("right", horizontal_context, engine_zoom);
+        const top = self.specifiedPositionOffset("top", vertical_context, engine_zoom);
+        const bottom = self.specifiedPositionOffset("bottom", vertical_context, engine_zoom);
+
+        if (mode == .relative) {
+            self.position_offset.x = left orelse if (right) |value| 0 -| value else 0;
+            self.position_offset.y = top orelse if (bottom) |value| 0 -| value else 0;
+            return;
+        }
+
+        if (left) |value| {
+            const desired_x = containing_x +| value +| self.margin.left;
+            self.position_offset.x = desired_x -| self.x.get().*;
+        } else if (right) |value| {
+            const desired_x = containing_x +| containing_width -| value -|
+                self.margin.right -| self.width.get().*;
+            self.position_offset.x = desired_x -| self.x.get().*;
+        }
+
+        if (top) |value| {
+            const desired_y = containing_y +| value +| self.margin.top;
+            self.position_offset.y = desired_y -| self.y.get().*;
+        } else if (bottom) |value| {
+            if (containing_height) |height| {
+                const desired_y = containing_y +| height -| value -|
+                    self.margin.bottom -| self.height.get().*;
+                self.position_offset.y = desired_y -| self.y.get().*;
+            }
+        }
+    }
+
     fn floatBoundsAt(
         self: *const BlockLayout,
         y: i32,
@@ -7306,8 +7805,12 @@ const BlockLayout = struct {
     }
 
     fn layout(self: *BlockLayout, engine: *Layout) !void {
+        const inherited_float_rebuild = if (self.parent_block) |parent|
+            parent.floatContextForChildren().rebuilding_floats
+        else
+            false;
         // Skip layout if nothing is dirty
-        if (!self.layoutNeeded()) return;
+        if (!self.layoutNeeded() and !inherited_float_rebuild) return;
         self.paint_dirty = true;
         self.document.paint_dirty = true;
         self.in_layout = true;
@@ -7458,63 +7961,70 @@ const BlockLayout = struct {
         else
             null;
         const horizontal_insets = self.padding.horizontal() + self.border.horizontal();
+        const position_mode = self.positionMode();
         const float_side = self.floatSide();
         var layout_y = prev_y;
         var float_x: ?i32 = null;
 
         if (self.parent_block) |parent| {
-            const clear_side = self.clearSide();
-            if (clear_side != .none) {
-                layout_y = parent.clearBottom(layout_y, clear_side);
-            }
+            if (position_mode != .absolute) {
+                const float_context = parent.floatContextForChildren();
+                const clear_side = self.clearSide();
+                if (clear_side != .none) {
+                    layout_y = float_context.clearBottom(layout_y, clear_side);
+                }
 
-            if (float_side != .none) {
-                // A specified float width is enough to place the common CSS
-                // case precisely. Auto floats use the available line width,
-                // which keeps them deterministic until shrink-to-fit sizing
-                // is added to the replaced/content measurement path.
-                var candidate_width = if (specified_width) |width|
-                    @max(width + horizontal_insets, 0)
-                else
-                    @max(base_content_bounds.width - self.margin.horizontal(), 0);
+                if (float_side != .none) {
+                    // A specified float width is enough to place the common CSS
+                    // case precisely. Auto floats use the available line width,
+                    // which keeps them deterministic until shrink-to-fit sizing
+                    // is added to the replaced/content measurement path.
+                    var candidate_width = if (specified_width) |width|
+                        @max(width + horizontal_insets, 0)
+                    else
+                        @max(base_content_bounds.width - self.margin.horizontal(), 0);
 
-                while (true) {
-                    const available = parent.floatBoundsAt(
-                        layout_y,
-                        base_content_bounds.x,
-                        base_content_bounds.width,
-                    );
-                    const outer_width = candidate_width + self.margin.horizontal();
-                    if (available.width >= outer_width) {
-                        float_x = if (float_side == .left)
-                            available.x + self.margin.left
-                        else
-                            available.x + available.width - self.margin.right - candidate_width;
-                        break;
-                    }
-                    const next_y = parent.nextFloatBottom(layout_y) orelse break;
-                    if (next_y <= layout_y) break;
-                    layout_y = next_y;
-                    if (specified_width == null) {
-                        candidate_width = @max(
-                            parent.floatBoundsAt(
-                                layout_y,
-                                base_content_bounds.x,
-                                base_content_bounds.width,
-                            ).width - self.margin.horizontal(),
-                            0,
+                    while (true) {
+                        const available = float_context.floatBoundsAt(
+                            layout_y,
+                            base_content_bounds.x,
+                            base_content_bounds.width,
                         );
+                        const outer_width = candidate_width + self.margin.horizontal();
+                        if (available.width >= outer_width) {
+                            float_x = if (float_side == .left)
+                                available.x + self.margin.left
+                            else
+                                available.x + available.width - self.margin.right - candidate_width;
+                            break;
+                        }
+                        const next_y = float_context.nextFloatBottom(layout_y) orelse break;
+                        if (next_y <= layout_y) break;
+                        layout_y = next_y;
+                        if (specified_width == null) {
+                            candidate_width = @max(
+                                float_context.floatBoundsAt(
+                                    layout_y,
+                                    base_content_bounds.x,
+                                    base_content_bounds.width,
+                                ).width - self.margin.horizontal(),
+                                0,
+                            );
+                        }
                     }
                 }
             }
         }
 
         const content_bounds = if (self.parent_block) |parent|
-            parent.floatBoundsAt(
-                layout_y,
-                base_content_bounds.x,
-                base_content_bounds.width,
-            )
+            if (position_mode == .absolute)
+                base_content_bounds
+            else
+                parent.floatContextForChildren().floatBoundsAt(
+                    layout_y,
+                    base_content_bounds.x,
+                    base_content_bounds.width,
+                )
         else
             base_content_bounds;
         const auto_content_width = @max(
@@ -7570,6 +8080,15 @@ const BlockLayout = struct {
         // Reset any cached inline commands
         DisplayItem.freeItems(self.allocator, self.display_list.items);
         self.display_list.clearRetainingCapacity();
+
+        const owns_float_context = self.establishesFloatContext();
+        if (owns_float_context) {
+            self.floats.clearRetainingCapacity();
+            self.rebuilding_floats = true;
+        }
+        defer {
+            if (owns_float_context) self.rebuilding_floats = false;
+        }
 
         var natural_height: i32 = 0;
         if (is_block) {
@@ -7649,7 +8168,7 @@ const BlockLayout = struct {
             // Layout all children and compute height
             // Use .read() to register invalidation dependencies on children's heights
             var computed_height: i32 = 0;
-            self.floats.clearRetainingCapacity();
+            const float_context = self.floatContextForChildren();
             const flow_origin = self.y.get().* + self.border.top + self.padding.top +
                 tableOfContentsHeaderHeight(self.node, zoom_value, engine.zoom());
             _ = self.children_version.read(&self.height, self.allocator);
@@ -7660,13 +8179,18 @@ const BlockLayout = struct {
                         // every later block, even when that block's own style
                         // is clean. Mark it before laying it out so the
                         // exclusion geometry is recomputed.
-                        if (self.floats.items.len > 0 or b.clearSide() != .none) {
+                        if (b.positionMode() != .absolute and
+                            (float_context.floats.items.len > 0 or b.clearSide() != .none))
+                        {
                             b.mark();
                         }
                         try b.layout(engine);
                         const child_height = b.height.read(&self.height, self.allocator).*;
-                        if (b.floatSide() != .none) {
-                            try self.floats.append(self.allocator, .{
+                        if (b.positionMode() == .absolute) {
+                            // Absolutely positioned descendants paint in this
+                            // subtree but contribute no normal-flow height.
+                        } else if (b.floatSide() != .none) {
+                            try float_context.floats.append(float_context.allocator, .{
                                 .side = b.floatSide(),
                                 .x = b.x.get().*,
                                 .y = b.y.get().*,
@@ -7688,8 +8212,10 @@ const BlockLayout = struct {
                     },
                 }
             }
-            for (self.floats.items) |float_box| {
-                computed_height = @max(float_box.bottom() -| flow_origin, computed_height);
+            if (owns_float_context) {
+                for (self.floats.items) |float_box| {
+                    computed_height = @max(float_box.bottom() -| flow_origin, computed_height);
+                }
             }
             const auto_height = computed_height + tableOfContentsHeaderHeight(
                 self.node,
@@ -7707,7 +8233,7 @@ const BlockLayout = struct {
             // TODO: Refactor to populate LineLayout and TextLayout objects
             self.height.frozen_dependencies = false;
             self.content_height_definite = specified_height != null;
-            try engine.layoutInlineBlock(self);
+            try engine.layoutInlineBlock(self, true);
             self.used_inline_layout = true;
             self.inline_paint_dirty = false;
 
@@ -7740,12 +8266,37 @@ const BlockLayout = struct {
             // Height is set by layoutInlineBlock - need to ensure it uses .set()
         }
 
+        const position_containing_height = if (self.parent_block) |parent|
+            if (parent.content_height_definite) parent.content_height else null
+        else
+            null;
+        self.updatePositionOffset(
+            parent_x,
+            parent_content_y,
+            parent_width,
+            position_containing_height,
+            containing_width_css,
+            containing_height_css,
+            engine.zoom(),
+        );
+
         try recordElementFocusBounds(engine, self);
 
         self.updateScrollGeometry(specified_height, natural_height + self.padding.vertical() + self.border.vertical());
 
         // Clear descendant flags after layout pass
         self.has_dirty_descendants = false;
+    }
+
+    fn lastInFlowBlock(self: *BlockLayout) ?*BlockLayout {
+        var previous: ?*BlockLayout = null;
+        for (self.children.items) |child| switch (child) {
+            .block => |block| if (block.floatSide() == .none and block.positionMode() != .absolute) {
+                previous = block;
+            },
+            .line => {},
+        };
+        return previous;
     }
 
     fn appendBlockChildren(self: *BlockLayout, nodes: []Node) !void {
@@ -7757,6 +8308,7 @@ const BlockLayout = struct {
             // anonymous block, normal inline recursion preserves the h6's
             // style while continuing straight into the paragraph text.
             if (isRunInHeadingNode(nodes[index]) and
+                nodePositionMode(nodes[index], if (self.persistent_dependencies) &self.children_version else null) != .absolute and
                 index + 1 < nodes.len and isContainerNode(
                 nodes[index + 1],
                 if (self.persistent_dependencies) &self.children_version else null,
@@ -7767,7 +8319,7 @@ const BlockLayout = struct {
                 run_in_nodes[1] = &nodes[index + 1];
                 const child = try BlockLayout.initAnonymous(self.allocator, run_in_nodes, self.document, self, previous);
                 try self.children.append(self.allocator, .{ .block = child });
-                if (child.floatSide() == .none) previous = child;
+                if (child.floatSide() == .none and child.positionMode() != .absolute) previous = child;
                 index += 2;
                 continue;
             }
@@ -7777,9 +8329,20 @@ const BlockLayout = struct {
                 if (self.persistent_dependencies) &self.children_version else null,
             )) {
                 const child_node = &nodes[index];
-                const child = try BlockLayout.init(self.allocator, child_node.*, child_node, self.document, self, previous);
+                const child_position = nodePositionMode(
+                    child_node.*,
+                    if (self.persistent_dependencies) &self.children_version else null,
+                );
+                const child = try BlockLayout.init(
+                    self.allocator,
+                    child_node.*,
+                    child_node,
+                    self.document,
+                    self,
+                    if (child_position == .absolute) null else previous,
+                );
                 try self.children.append(self.allocator, .{ .block = child });
-                if (child.floatSide() == .none) previous = child;
+                if (child.floatSide() == .none and child.positionMode() != .absolute) previous = child;
                 index += 1;
                 continue;
             }
@@ -7796,7 +8359,7 @@ const BlockLayout = struct {
             }
             const child = try BlockLayout.initAnonymous(self.allocator, inline_nodes, self.document, self, previous);
             try self.children.append(self.allocator, .{ .block = child });
-            if (child.floatSide() == .none) previous = child;
+            if (child.floatSide() == .none and child.positionMode() != .absolute) previous = child;
         }
     }
 
@@ -7824,6 +8387,7 @@ const BlockLayout = struct {
             relativeHitOffset(self.x.get().*, parent_origin.x),
             relativeHitOffset(self.y.get().*, parent_origin.y),
         );
+        local = subtractHitOffset(local, self.position_offset.x, self.position_offset.y);
         const translation = blockHitTranslation(self);
         local = subtractHitOffset(local, translation.x, translation.y);
 
@@ -7984,6 +8548,65 @@ test "layout hit testing localizes nested transforms and reverses sibling order"
     setTestLayoutBox(later, 160, 100, 20, 20);
     const overlap_hit = document.hitTest(165, 105).?;
     try std.testing.expect(overlap_hit.node == &later_node);
+}
+
+test "position offsets share geometry with layout hit testing" {
+    const allocator = std.testing.allocator;
+
+    var root_node = Node{ .element = try parser.Element.init(allocator, "html", null) };
+    defer root_node.deinit(allocator);
+    var relative_node = Node{ .element = try parser.Element.init(allocator, "div", null) };
+    defer relative_node.deinit(allocator);
+    try setTestStyleValue(allocator, &relative_node, "position", "relative");
+    try setTestStyleValue(allocator, &relative_node, "left", "20px");
+    try setTestStyleValue(allocator, &relative_node, "top", "-5px");
+
+    const document = try DocumentLayout.init(allocator, &root_node);
+    defer {
+        document.deinit();
+        allocator.destroy(document);
+    }
+    setTestLayoutBox(document, 0, 0, 500, 500);
+
+    const relative = try BlockLayout.init(
+        allocator,
+        relative_node,
+        &relative_node,
+        document,
+        null,
+        null,
+    );
+    try document.children.append(allocator, relative);
+    setTestLayoutBox(relative, 10, 20, 100, 40);
+    relative.updatePositionOffset(0, 0, 500, 500, 500, 500, 1.0);
+    try std.testing.expectEqual(PositionOffset{ .x = 20, .y = -5 }, relative.position_offset);
+
+    const hit = document.hitTest(35, 20).?;
+    try std.testing.expect(hit.node == &relative_node);
+    try std.testing.expectEqual(@as(i32, 5), hit.local_x);
+    try std.testing.expectEqual(@as(i32, 5), hit.local_y);
+    try std.testing.expect(document.hitTest(15, 25).?.node == &root_node);
+
+    var absolute_node = Node{ .element = try parser.Element.init(allocator, "div", null) };
+    defer absolute_node.deinit(allocator);
+    try setTestStyleValue(allocator, &absolute_node, "position", "absolute");
+    try setTestStyleValue(allocator, &absolute_node, "right", "15px");
+    try setTestStyleValue(allocator, &absolute_node, "bottom", "25px");
+    const absolute = try BlockLayout.init(
+        allocator,
+        absolute_node,
+        &absolute_node,
+        document,
+        relative,
+        null,
+    );
+    defer {
+        absolute.deinit();
+        allocator.destroy(absolute);
+    }
+    setTestLayoutBox(absolute, 10, 20, 50, 40);
+    absolute.updatePositionOffset(10, 20, 300, 200, 300, 200, 1.0);
+    try std.testing.expectEqual(PositionOffset{ .x = 235, .y = 135 }, absolute.position_offset);
 }
 
 test "layout hit testing localizes nested overflow scrolling" {
@@ -8314,7 +8937,7 @@ fn appendListMarker(self: *Layout, commands: *std.ArrayList(DisplayItem), block:
         .element => |*value| value,
         .text => return,
     };
-    if (!isListItemElement(element) or block.height.get().* <= 0) return;
+    if (!usesListItemMarker(element) or block.height.get().* <= 0) return;
 
     const indent = scaleBlockCssPixel(block, list_item_indent);
     const marker_size = @max(scaleBlockCssPixel(block, list_marker_size), 1);
@@ -8379,6 +9002,7 @@ fn appendTableOfContentsHeader(self: *Layout, commands: *std.ArrayList(DisplayIt
             .{ .r = 0, .g = 0, .b = 0, .a = 255 },
             .text,
         ),
+        .page_zoom = self.zoom(),
         .source = displaySource(block, block.node_ptr),
     } });
 }
@@ -8506,7 +9130,7 @@ test "block focus boxes replace line fragments without hiding descendants" {
     try std.testing.expectEqual(block_bounds.height, entries.items[1].bounds.height);
 }
 
-fn layoutInlineBlock(self: *Layout, block: *BlockLayout) !void {
+fn layoutInlineBlock(self: *Layout, block: *BlockLayout, publish_geometry: bool) !void {
     const snapshot = snapshotInlineState(self);
     const previous_target = self.current_display_target;
     const previous_inline_block = self.inline_block;
@@ -8538,6 +9162,7 @@ fn layoutInlineBlock(self: *Layout, block: *BlockLayout) !void {
     self.is_small_caps = isWithinSmallCapsBlock(block);
     self.text_color = .{ .r = 0, .g = 0, .b = 0, .a = 255 }; // Reset to black
     self.is_preformatted = isWithinPreformattedBlock(block);
+    self.last_was_collapsible_space = false;
     self.prev_font_category = null;
     self.current_font_category = .latin;
 
@@ -8556,6 +9181,14 @@ fn layoutInlineBlock(self: *Layout, block: *BlockLayout) !void {
                             styleValue(style_map, "font-family");
                         if (family_value) |value| {
                             self.font_family = font.familyFromCss(value);
+                        }
+
+                        const color_value = if (block.persistent_dependencies)
+                            styleValueRead(style_map, "color", &block.height)
+                        else
+                            styleValue(style_map, "color");
+                        if (color_value) |value| {
+                            if (parseColor(value)) |color| self.text_color = color;
                         }
 
                         const weight_value = if (block.persistent_dependencies)
@@ -8663,13 +9296,15 @@ fn layoutInlineBlock(self: *Layout, block: *BlockLayout) !void {
     }
 
     try self.flushLine(&line_buffer);
-    const computed_height = self.cursor_y -
-        (block.y.get().* + block.border.top + block.padding.top);
-    block.content_height = if (computed_height < 0) 0 else computed_height;
-    block.height.set(@max(
-        block.content_height + block.padding.vertical() + block.border.vertical(),
-        0,
-    ));
+    if (publish_geometry) {
+        const computed_height = self.cursor_y -
+            (block.y.get().* + block.border.top + block.padding.top);
+        block.content_height = if (computed_height < 0) 0 else computed_height;
+        block.height.set(@max(
+            block.content_height + block.padding.vertical() + block.border.vertical(),
+            0,
+        ));
+    }
 }
 
 fn parseColor(color_str: []const u8) ?browser.Color {
@@ -8685,6 +9320,16 @@ fn animatedBackgroundColor(element: parser.Element) ?browser.Color {
         .numeric, .pixel, .transform => return null,
     };
     return .{ .r = color.r, .g = color.g, .b = color.b, .a = color.a };
+}
+
+fn rootCanvasBackgroundColor(document: *const DocumentLayout) ?browser.Color {
+    if (document.children.items.len == 0) return null;
+    const element = liveBlockElement(document.children.items[0]) orelse return null;
+    if (animatedBackgroundColor(element.*)) |color| return color;
+    const styles = if (element.style) |*style_map| style_map else return null;
+    const value = styleValue(styles, "background-color") orelse return null;
+    if (std.ascii.eqlIgnoreCase(std.mem.trim(u8, value, " \t\r\n"), "transparent")) return null;
+    return parseColor(value);
 }
 
 test "layout reads the current background color animation value" {
@@ -8708,6 +9353,25 @@ test "layout reads the current background color animation value" {
     );
 }
 
+test "root background color propagates to the canvas" {
+    const allocator = std.testing.allocator;
+    var root_node = Node{ .element = try parser.Element.init(allocator, "html", null) };
+    defer root_node.deinit(allocator);
+    try setTestStyleValue(allocator, &root_node, "background-color", "blue");
+    const document = try DocumentLayout.init(allocator, &root_node);
+    defer {
+        document.deinit();
+        allocator.destroy(document);
+    }
+    const root = try BlockLayout.init(allocator, root_node, &root_node, document, null, null);
+    try document.children.append(allocator, root);
+
+    try std.testing.expectEqual(
+        browser.Color{ .r = 0, .g = 0, .b = 255, .a = 255 },
+        rootCanvasBackgroundColor(document).?,
+    );
+}
+
 pub fn buildDocument(self: *Layout, root: *Node) !*DocumentLayout {
     self.color_scheme_dark = self.resolveColorScheme("light dark");
     self.document_color_scheme_dark = self.color_scheme_dark;
@@ -8726,14 +9390,19 @@ pub fn paintDocument(self: *Layout, document: *DocumentLayout) ![]DisplayItem {
         var commands_own_items = true;
         errdefer if (commands_own_items) DisplayItem.freeItems(self.allocator, commands.items);
 
-        if (self.accessibility.forced_colors or self.document_color_scheme_dark) {
-            const width = self.layoutWindowWidth();
-            const bg_color = if (self.accessibility.forced_colors)
-                forced_colors.canvas
-            else if (self.accessibility.dark_palette) |palette|
+        const canvas_color: ?browser.Color = if (self.accessibility.forced_colors)
+            forced_colors.canvas
+        else if (rootCanvasBackgroundColor(document)) |color|
+            self.remapColor(color, .background)
+        else if (self.document_color_scheme_dark)
+            if (self.accessibility.dark_palette) |palette|
                 palette.background
             else
-                browser.Color{ .r = 18, .g = 18, .b = 18, .a = 255 };
+                browser.Color{ .r = 18, .g = 18, .b = 18, .a = 255 }
+        else
+            null;
+        if (canvas_color) |bg_color| {
+            const width = self.layoutWindowWidth();
             try commands.append(self.allocator, .{ .rect = .{
                 .x1 = 0,
                 .y1 = 0,
@@ -8855,6 +9524,59 @@ test "retained paint caches repaint one branch and preserve clean siblings" {
     try std.testing.expectEqual(right_inline_generation, right_inline.paint_generation);
 }
 
+test "paint-only inline refresh preserves fixed zoomed geometry" {
+    const allocator = std.testing.allocator;
+    var html_parser = try parser.HTMLParser.init(
+        allocator,
+        "<main style='display:block'>" ++
+            "<section style='display:block;zoom:2'>" ++
+            "<div style='display:block;width:120px;height:40px'>fixed</div>" ++
+            "<div style='display:block'>following</div>" ++
+            "</section></main>",
+    );
+    html_parser.use_implicit_tags = false;
+    defer html_parser.deinit(allocator);
+    var root_node = try html_parser.parse();
+    defer root_node.deinit(allocator);
+    parser.fixParentPointers(&root_node, null);
+    try parser.style(allocator, &root_node, &.{});
+
+    var environ = std.process.Environ.Map.init(allocator);
+    defer environ.deinit();
+    try environ.put("HOME", "/tmp");
+    const engine = try Layout.init(allocator, std.testing.io, &environ, 800, 600, false);
+    defer engine.deinit();
+    const document = try engine.buildDocument(&root_node);
+    defer {
+        document.deinit();
+        allocator.destroy(document);
+    }
+
+    const first_frame = try engine.paintDocument(document);
+    DisplayItem.freeList(allocator, first_frame);
+
+    const root_layout = document.children.items[0];
+    const section = root_layout.children.items[0].block;
+    const fixed = section.children.items[0].block;
+    const following = section.children.items[1].block;
+    try std.testing.expect(fixed.used_inline_layout);
+    try std.testing.expect(following.used_inline_layout);
+    const fixed_height = fixed.height.get().*;
+    const following_y = following.y.get().*;
+
+    // A frame-wide paint request must only replace command buffers. In
+    // particular, regenerating the fixed block's inline commands must not
+    // publish its content-derived text height and dirty the following block.
+    document.markPaintSubtree();
+    try std.testing.expect(!document.layoutNeeded());
+    const second_frame = try engine.paintDocument(document);
+    DisplayItem.freeList(allocator, second_frame);
+
+    try std.testing.expect(!document.layoutNeeded());
+    try std.testing.expectEqual(fixed_height, fixed.height.get().*);
+    try std.testing.expectEqual(following_y, following.y.get().*);
+}
+
 test "document scroll height includes Chapter 5 page padding" {
     try std.testing.expectEqual(@as(i32, 136), documentScrollHeight(100));
     try std.testing.expectEqual(@as(i32, 36), documentScrollHeight(0));
@@ -8879,13 +9601,11 @@ fn refreshInlinePaintCommands(self: *Layout, block: *BlockLayout) !void {
     if (!block.inline_paint_dirty or !block.used_inline_layout) return;
 
     const previous_commands = block.display_list;
-    const previous_content_height = block.content_height;
     block.display_list = .empty;
     errdefer {
         DisplayItem.freeItems(self.allocator, block.display_list.items);
         block.display_list.deinit(self.allocator);
         block.display_list = previous_commands;
-        block.content_height = previous_content_height;
     }
 
     // Paint-only regeneration must not append duplicate geometry records to
@@ -8895,7 +9615,7 @@ fn refreshInlinePaintCommands(self: *Layout, block: *BlockLayout) !void {
     defer self.collect_hit_test_bounds = previous_collect;
 
     if (block.node_ptr) |node| block.node = node.*;
-    try self.layoutInlineBlock(block);
+    try self.layoutInlineBlock(block, false);
 
     DisplayItem.freeItems(self.allocator, previous_commands.items);
     var old = previous_commands;
@@ -9187,6 +9907,28 @@ fn applyElementScroll(
     } });
 }
 
+/// Positioning is a static outer translation, separate from the transform
+/// wrapper that compositor-only animation may update between layouts.
+fn wrapPositionOffset(
+    self: *Layout,
+    block: *const BlockLayout,
+    commands: []DisplayItem,
+) ![]DisplayItem {
+    if (block.position_offset.x == 0 and block.position_offset.y == 0) return commands;
+    const result = self.allocator.alloc(DisplayItem, 1) catch |err| {
+        DisplayItem.freeItems(self.allocator, commands);
+        self.allocator.free(commands);
+        return err;
+    };
+    result[0] = .{ .transform = .{
+        .translate_x = block.position_offset.x,
+        .translate_y = block.position_offset.y,
+        .children = commands,
+        .source = displaySource(block, block.node_ptr),
+    } };
+    return result;
+}
+
 // Apply visual effects like opacity, blend modes, and clipping to a list of display commands
 fn applyPaintEffects(self: *Layout, block: *BlockLayout, commands: []DisplayItem) ![]DisplayItem {
     // Check for filter, opacity, blend mode, overflow clipping, and transform.
@@ -9425,9 +10167,9 @@ fn applyPaintEffects(self: *Layout, block: *BlockLayout, commands: []DisplayItem
             };
             const transform_result = try self.allocator.alloc(DisplayItem, 1);
             transform_result[0] = transform_item;
-            return transform_result;
+            return wrapPositionOffset(self, block, transform_result);
         }
-        return result;
+        return wrapPositionOffset(self, block, result);
     } else {
         // No blend effects, but may still have transform
         if (has_transform) {
@@ -9450,13 +10192,13 @@ fn applyPaintEffects(self: *Layout, block: *BlockLayout, commands: []DisplayItem
             };
             const result = try self.allocator.alloc(DisplayItem, 1);
             result[0] = transform_item;
-            return result;
+            return wrapPositionOffset(self, block, result);
         }
 
         // No effects, return commands as-is
         const result = try self.allocator.alloc(DisplayItem, current_commands.len);
         @memcpy(result, current_commands);
-        return result;
+        return wrapPositionOffset(self, block, result);
     }
 }
 
@@ -9561,6 +10303,16 @@ fn addBackgroundIfNeededToList(self: *Layout, commands: *std.ArrayList(DisplayIt
         if (!std.ascii.eqlIgnoreCase(bg, "transparent")) color = parseColor(bg);
     } else if (std.mem.eql(u8, element.tag, "pre")) {
         color = .{ .r = 230, .g = 230, .b = 230, .a = 255 };
+    }
+
+    // The root element's background is propagated to the document canvas by
+    // paintDocument. Avoid painting it a second time over only the root
+    // block's content-sized border box.
+    if (color != null and
+        block.parent_block == null and
+        rootCanvasBackgroundColor(block.document) != null)
+    {
+        color = null;
     }
 
     if (color) |value| {

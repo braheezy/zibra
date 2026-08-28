@@ -9,10 +9,13 @@
 const std = @import("std");
 const selector_mod = @import("selector.zig");
 const css_length = @import("length.zig");
+const css_color = @import("color.zig");
+const background_image = @import("background_image.zig");
 const Selector = selector_mod.Selector;
 const SimpleSelector = selector_mod.SimpleSelector;
 const TagSelector = selector_mod.TagSelector;
 const ClassSelector = selector_mod.ClassSelector;
+const IdSelector = selector_mod.IdSelector;
 const FocusVisibleSelector = selector_mod.FocusVisibleSelector;
 const HoverSelector = selector_mod.HoverSelector;
 const SequenceSelector = selector_mod.SequenceSelector;
@@ -106,10 +109,53 @@ pub fn deinit(self: *CSSParser, allocator: std.mem.Allocator) void {
     allocator.destroy(self);
 }
 
+fn consumeComment(self: *CSSParser) bool {
+    if (self.pos + 1 >= self.string.len or
+        self.string[self.pos] != '/' or self.string[self.pos + 1] != '*') return false;
+    const close = std.mem.indexOfPos(u8, self.string, self.pos + 2, "*/") orelse {
+        self.pos = self.string.len;
+        return true;
+    };
+    self.pos = close + 2;
+    return true;
+}
+
 fn whitespace(self: *CSSParser) void {
-    while (self.pos < self.string.len and std.ascii.isWhitespace(self.string[self.pos])) {
-        self.pos += 1;
+    while (self.pos < self.string.len) {
+        if (std.ascii.isWhitespace(self.string[self.pos])) {
+            self.pos += 1;
+            continue;
+        }
+        if (self.consumeComment()) continue;
+        break;
     }
+}
+
+/// Remove CSS whitespace and complete comments from the ends of one borrowed
+/// value. Interior comments remain in source storage, but the common trailing
+/// declaration-comment form becomes the exact authored token slice.
+fn trimValueTrivia(input: []const u8) []const u8 {
+    var start: usize = 0;
+    var end = input.len;
+    while (true) {
+        while (start < end and std.ascii.isWhitespace(input[start])) start += 1;
+        if (start + 1 < end and input[start] == '/' and input[start + 1] == '*') {
+            const close = std.mem.indexOfPos(u8, input, start + 2, "*/") orelse return input[start..end];
+            start = close + 2;
+            continue;
+        }
+        break;
+    }
+    while (true) {
+        while (end > start and std.ascii.isWhitespace(input[end - 1])) end -= 1;
+        if (end >= start + 2 and input[end - 2] == '*' and input[end - 1] == '/') {
+            const open = std.mem.lastIndexOf(u8, input[start .. end - 2], "/*") orelse break;
+            end = start + open;
+            continue;
+        }
+        break;
+    }
+    return input[start..end];
 }
 
 fn word(self: *CSSParser) ![]const u8 {
@@ -153,6 +199,9 @@ fn value(self: *CSSParser) ![]const u8 {
             } else if (c == delimiter) {
                 quote = null;
             }
+        } else if (c == '/' and self.pos + 1 < self.string.len and self.string[self.pos + 1] == '*') {
+            _ = self.consumeComment();
+            continue;
         } else switch (c) {
             '\'', '"' => quote = c,
             '(' => parentheses += 1,
@@ -167,12 +216,9 @@ fn value(self: *CSSParser) ![]const u8 {
     if (self.pos <= start) {
         return error.InvalidValue;
     }
-    // Trim trailing whitespace
-    var end = self.pos;
-    while (end > start and std.ascii.isWhitespace(self.string[end - 1])) {
-        end -= 1;
-    }
-    return self.string[start..end];
+    const trimmed = trimValueTrivia(self.string[start..self.pos]);
+    if (trimmed.len == 0) return error.InvalidValue;
+    return trimmed;
 }
 
 fn pair(self: *CSSParser) !struct { property: []const u8, value: []const u8 } {
@@ -548,6 +594,93 @@ fn expandBorder(
     return true;
 }
 
+const BackgroundTokenIterator = struct {
+    input: []const u8,
+    pos: usize = 0,
+
+    fn next(self: *BackgroundTokenIterator) ?[]const u8 {
+        while (self.pos < self.input.len and std.ascii.isWhitespace(self.input[self.pos])) self.pos += 1;
+        if (self.pos >= self.input.len) return null;
+        if (self.input[self.pos] == '/') {
+            self.pos += 1;
+            return self.input[self.pos - 1 .. self.pos];
+        }
+
+        const start = self.pos;
+        var depth: usize = 0;
+        var quote: ?u8 = null;
+        var escaped = false;
+        while (self.pos < self.input.len) {
+            const char = self.input[self.pos];
+            if (quote) |delimiter| {
+                if (escaped) {
+                    escaped = false;
+                } else if (char == '\\') {
+                    escaped = true;
+                } else if (char == delimiter) {
+                    quote = null;
+                }
+            } else switch (char) {
+                '\'', '"' => quote = char,
+                '(' => depth += 1,
+                ')' => if (depth > 0) {
+                    depth -= 1;
+                },
+                '/' => if (depth == 0) break,
+                else => if (depth == 0 and std.ascii.isWhitespace(char)) break,
+            }
+            self.pos += 1;
+        }
+        return self.input[start..self.pos];
+    }
+};
+
+/// Expand the subset that the renderer can consume. Repeat, attachment, and
+/// position tokens are accepted but currently have no longhand counterpart;
+/// color, one image, and an optional supported size retain borrowed slices.
+fn expandBackground(
+    map: *DeclarationMap,
+    raw_value: []const u8,
+    declaration: Declaration,
+) !bool {
+    var color: []const u8 = "transparent";
+    var image: []const u8 = "none";
+    var size: []const u8 = "auto";
+    var iterator = BackgroundTokenIterator{ .input = raw_value };
+    var after_slash = false;
+    var size_start: ?usize = null;
+
+    while (iterator.next()) |token| {
+        if (std.mem.eql(u8, token, "/")) {
+            if (after_slash) return false;
+            after_slash = true;
+            continue;
+        }
+        if (after_slash) {
+            if (size_start == null) size_start = @intFromPtr(token.ptr) - @intFromPtr(raw_value.ptr);
+            continue;
+        }
+        if (css_color.parse(token) != null) {
+            color = token;
+        } else if (std.ascii.eqlIgnoreCase(token, "none") or background_image.parseUrl(token) != null) {
+            image = token;
+        }
+    }
+
+    if (size_start) |start| {
+        const candidate = std.mem.trim(u8, raw_value[start..], " \t\r\n");
+        if (background_image.parseSize(candidate) == null) return false;
+        size = candidate;
+    } else if (after_slash) {
+        return false;
+    }
+
+    try putLonghand(map, "background-color", .{ .value = color, .important = declaration.important });
+    try putLonghand(map, "background-image", .{ .value = image, .important = declaration.important });
+    try putLonghand(map, "background-size", .{ .value = size, .important = declaration.important });
+    return true;
+}
+
 /// Apply one declaration in source order. Shorthands expand here so inline
 /// attributes and stylesheet rules share identical precedence behavior and
 /// every generated longhand retains the shorthand's importance.
@@ -566,6 +699,11 @@ fn putDeclaration(
         try putLonghand(map, "font-size", .{ .value = font.size, .important = declaration.important });
         try putLonghand(map, "line-height", .{ .value = font.line_height, .important = declaration.important });
         try putLonghand(map, "font-family", .{ .value = font.family, .important = declaration.important });
+        return;
+    }
+
+    if (std.ascii.eqlIgnoreCase(property, "background")) {
+        if (try expandBackground(map, declaration.value, declaration)) return;
         return;
     }
 
@@ -911,9 +1049,9 @@ fn startsWithMediaRule(self: *const CSSParser) bool {
     return next == self.string.len or std.ascii.isWhitespace(self.string[next]) or self.string[next] == '(';
 }
 
-/// Parse a tag/class/dynamic-pseudo selector, `:has(...)` relational
-/// selector, or a whitespace-separated descendant selector. ID, attribute,
-/// and other combinator selectors are not yet supported.
+/// Parse tag, class, ID, and supported dynamic-pseudo selectors; `:has(...)`
+/// relational selectors; or whitespace-separated descendant selectors.
+/// Attribute selectors and other combinators are not yet supported.
 pub fn selector(self: *CSSParser, allocator: std.mem.Allocator) !Selector {
     var selectors = std.ArrayList(SimpleSelector).empty;
     errdefer {
@@ -982,11 +1120,11 @@ fn simpleSelector(self: *CSSParser, allocator: std.mem.Allocator) !SimpleSelecto
 
     if (self.pos < self.string.len and self.string[self.pos] != ':') {
         const raw = try self.word();
-        if (std.mem.indexOfAny(u8, raw, "#%") != null) return error.InvalidSelector;
+        if (std.mem.indexOfScalar(u8, raw, '%') != null) return error.InvalidSelector;
 
         var cursor: usize = 0;
-        if (raw[0] != '.') {
-            const tag_end = std.mem.indexOfScalar(u8, raw, '.') orelse raw.len;
+        if (raw[0] != '.' and raw[0] != '#') {
+            const tag_end = std.mem.indexOfAny(u8, raw, ".#") orelse raw.len;
             const lower_tag = try std.ascii.allocLowerString(allocator, raw[0..tag_end]);
             try appendSequenceSelector(
                 allocator,
@@ -997,20 +1135,30 @@ fn simpleSelector(self: *CSSParser, allocator: std.mem.Allocator) !SimpleSelecto
         }
 
         while (cursor < raw.len) {
-            if (raw[cursor] != '.') return error.InvalidSelector;
-            const class_start = cursor + 1;
-            if (class_start >= raw.len) return error.InvalidSelector;
+            const marker = raw[cursor];
+            if (marker != '.' and marker != '#') return error.InvalidSelector;
+            const name_start = cursor + 1;
+            if (name_start >= raw.len) return error.InvalidSelector;
 
-            const remaining = raw[class_start..];
-            const class_len = std.mem.indexOfScalar(u8, remaining, '.') orelse remaining.len;
-            if (class_len == 0) return error.InvalidSelector;
+            const remaining = raw[name_start..];
+            const name_len = std.mem.indexOfAny(u8, remaining, ".#") orelse remaining.len;
+            if (name_len == 0) return error.InvalidSelector;
 
-            try appendSequenceSelector(
-                allocator,
-                &selectors,
-                .{ .class = ClassSelector.init(try allocator.dupe(u8, remaining[0..class_len])) },
-            );
-            cursor = class_start + class_len;
+            const name = try allocator.dupe(u8, remaining[0..name_len]);
+            if (marker == '.') {
+                try appendSequenceSelector(
+                    allocator,
+                    &selectors,
+                    .{ .class = ClassSelector.init(name) },
+                );
+            } else {
+                try appendSequenceSelector(
+                    allocator,
+                    &selectors,
+                    .{ .id = IdSelector.init(name) },
+                );
+            }
+            cursor = name_start + name_len;
         }
     }
 

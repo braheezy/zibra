@@ -476,12 +476,16 @@ test "zoomed glyph hit testing uses device bitmap dimensions" {
             .descent = 3,
         },
         .color = test_color,
+        .page_zoom = 2.0,
         .source = source(&generator, null),
     } }};
 
-    // At 2x, the 20-device-pixel bitmap occupies ten layout pixels.
+    // A bitmap rasterized at 2x occupies ten layout pixels at 2x and keeps
+    // that footprint when a retained-list preview resamples it at 3x.
     try std.testing.expect(DisplayItem.hitTest(&items, 19, 6, 2.0) != null);
     try std.testing.expect(DisplayItem.hitTest(&items, 20, 6, 2.0) == null);
+    try std.testing.expect(DisplayItem.hitTest(&items, 19, 6, 3.0) != null);
+    try std.testing.expect(DisplayItem.hitTest(&items, 20, 6, 3.0) == null);
 }
 
 fn findElement(root: *Node, tag: []const u8) !*Node {

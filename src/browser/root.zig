@@ -4924,8 +4924,16 @@ pub const Browser = struct {
             .glyph => |g| Rect{
                 .left = self.scalePxWithZoom(g.x, zoom),
                 .top = self.scalePxWithZoom(g.y, zoom),
-                .right = self.scalePxWithZoom(g.x, zoom) + g.glyph.w,
-                .bottom = self.scalePxWithZoom(g.y, zoom) + g.glyph.h,
+                .right = self.scalePxWithZoom(g.x, zoom) + DisplayItem.scaleRasterPx(
+                    g.glyph.w,
+                    g.page_zoom,
+                    zoom,
+                ),
+                .bottom = self.scalePxWithZoom(g.y, zoom) + DisplayItem.scaleRasterPx(
+                    g.glyph.h,
+                    g.page_zoom,
+                    zoom,
+                ),
             },
             .rect => |r| Rect{
                 .left = self.scalePxWithZoom(r.x1, zoom),
@@ -6150,6 +6158,20 @@ pub const Browser = struct {
         self.needs_draw = true;
     }
 
+    /// Make interactive page zoom visible using the retained committed list
+    /// while the tab worker prepares its media/style/layout replacement.
+    pub fn previewActiveTabZoom(self: *Browser, tab: *Tab, zoom: f32) void {
+        const safe_zoom = if (std.math.isFinite(zoom) and zoom > 0) zoom else 1.0;
+        self.lock.lock();
+        defer self.lock.unlock();
+        if (self.activeTab() != tab or self.active_tab_zoom == safe_zoom) return;
+
+        self.active_tab_zoom = safe_zoom;
+        self.invalidateInterestRegion();
+        self.needs_raster = true;
+        self.needs_draw = true;
+    }
+
     pub fn setNeedsAnimationFrame(self: *Browser, tab: *Tab) void {
         self.lock.lock();
         defer self.lock.unlock();
@@ -6981,7 +7003,7 @@ pub const Browser = struct {
             .glyph => |glyph_item| {
                 const glyph_x = self.scalePxWithZoom(glyph_item.x, zoom);
                 const glyph_y = self.scalePxWithZoom(glyph_item.y, zoom) - scroll_offset;
-                try drawGlyphBitmap(context, glyph_item, glyph_x, glyph_y);
+                try drawGlyphBitmap(context, glyph_item, glyph_x, glyph_y, zoom);
             },
             .rect => |rect_item| {
                 const left = self.scalePxWithZoom(rect_item.x1, zoom);
@@ -7306,6 +7328,7 @@ pub const Browser = struct {
         glyph_item: anytype,
         glyph_x: i32,
         glyph_y: i32,
+        target_zoom: f32,
     ) !void {
         const pixels = glyph_item.glyph.pixels orelse return;
         const img_surface = switch (context.surface.*) {
@@ -7315,23 +7338,26 @@ pub const Browser = struct {
 
         const surface_width = img_surface.width;
         const surface_height = img_surface.height;
-        const w: i32 = glyph_item.glyph.w;
-        const h: i32 = glyph_item.glyph.h;
+        const source_w: i32 = glyph_item.glyph.w;
+        const source_h: i32 = glyph_item.glyph.h;
 
-        if (w <= 0 or h <= 0) return;
+        if (source_w <= 0 or source_h <= 0) return;
 
-        const w_usize: usize = @intCast(w);
-        const h_usize: usize = @intCast(h);
-        const pixel_count = std.math.mul(usize, w_usize, h_usize) catch
+        const source_w_usize: usize = @intCast(source_w);
+        const source_h_usize: usize = @intCast(source_h);
+        const pixel_count = std.math.mul(usize, source_w_usize, source_h_usize) catch
             return error.InvalidGlyphBitmap;
         const byte_count = std.math.mul(usize, pixel_count, 4) catch
             return error.InvalidGlyphBitmap;
         if (pixels.len != byte_count) return error.InvalidGlyphBitmap;
 
+        const raster_scale = DisplayItem.rasterScale(glyph_item.page_zoom, target_zoom);
+        const dest_w = DisplayItem.scaleRasterPx(source_w, glyph_item.page_zoom, target_zoom);
+        const dest_h = DisplayItem.scaleRasterPx(source_h, glyph_item.page_zoom, target_zoom);
         const start_x_i64 = @max(@as(i64, 0), -@as(i64, glyph_x));
         const start_y_i64 = @max(@as(i64, 0), -@as(i64, glyph_y));
-        const end_x_i64 = @min(@as(i64, w), @as(i64, surface_width) - glyph_x);
-        const end_y_i64 = @min(@as(i64, h), @as(i64, surface_height) - glyph_y);
+        const end_x_i64 = @min(@as(i64, dest_w), @as(i64, surface_width) - glyph_x);
+        const end_y_i64 = @min(@as(i64, dest_h), @as(i64, surface_height) - glyph_y);
         if (end_x_i64 <= start_x_i64 or end_y_i64 <= start_y_i64) return;
 
         const start_x: i32 = @intCast(start_x_i64);
@@ -7346,13 +7372,21 @@ pub const Browser = struct {
         while (y < end_y) : (y += 1) {
             const dest_y = glyph_y + y;
             const row_start = @as(usize, @intCast(dest_y)) * surface_w_usize;
-            const src_row_start = @as(usize, @intCast(y)) * @as(usize, @intCast(w));
+            const source_y: i32 = @min(
+                @as(i32, @intFromFloat(@floor(@as(f32, @floatFromInt(y)) / raster_scale))),
+                source_h - 1,
+            );
+            const src_row_start = @as(usize, @intCast(source_y)) * source_w_usize;
 
             var x: i32 = start_x;
             while (x < end_x) : (x += 1) {
                 const dest_x = glyph_x + x;
                 const dst_idx = row_start + @as(usize, @intCast(dest_x));
-                const src_idx = (src_row_start + @as(usize, @intCast(x))) * 4;
+                const source_x: i32 = @min(
+                    @as(i32, @intFromFloat(@floor(@as(f32, @floatFromInt(x)) / raster_scale))),
+                    source_w - 1,
+                );
+                const src_idx = (src_row_start + @as(usize, @intCast(source_x))) * 4;
                 const source = glyphSourcePixel(
                     glyph_item.glyph.pixel_mode,
                     pixels[src_idx..][0..4],
@@ -7386,7 +7420,7 @@ pub const Browser = struct {
             .glyph => |glyph_item| {
                 const glyph_x = self.scalePxWithZoom(glyph_item.x, zoom) + x_offset;
                 const glyph_y = self.scalePxWithZoom(glyph_item.y, zoom) - scroll_offset;
-                try drawGlyphBitmap(context, glyph_item, glyph_x, glyph_y);
+                try drawGlyphBitmap(context, glyph_item, glyph_x, glyph_y, zoom);
             },
             .rect => |rect_item| {
                 const top = self.scalePxWithZoom(rect_item.y1, zoom) - scroll_offset;
@@ -7651,7 +7685,7 @@ pub const Browser = struct {
             .glyph => |glyph_item| {
                 const glyph_x = self.scalePxWithZoom(glyph_item.x, zoom) - layer_x;
                 const glyph_y = self.scalePxWithZoom(glyph_item.y, zoom) - layer_y;
-                try drawGlyphBitmap(context, glyph_item, glyph_x, glyph_y);
+                try drawGlyphBitmap(context, glyph_item, glyph_x, glyph_y, zoom);
             },
             .rect => |rect_item| {
                 // Map absolute coordinates to layer-local space
@@ -8149,6 +8183,128 @@ test "direct worker commands preserve plane transform and opacity at draw time" 
     try std.testing.expectEqual(@as(u8, 255), painted.r);
     try std.testing.expect(painted.g >= 126 and painted.g <= 129);
     try std.testing.expect(painted.b >= 126 and painted.b <= 129);
+}
+
+test "tab zoom publishes an immediate active render preview" {
+    const allocator = std.testing.allocator;
+    var tab: Tab = undefined;
+    tab.accessibility = .{};
+    tab.root_frame = null;
+    tab.media_environment_dirty = false;
+    tab.needs_paint = false;
+
+    var browser: Browser = undefined;
+    browser.io = std.testing.io;
+    browser.lock = .init(std.testing.io);
+    browser.tabs = .empty;
+    defer browser.tabs.deinit(allocator);
+    try browser.tabs.append(allocator, &tab);
+    browser.active_tab_index = 0;
+    browser.active_tab_zoom = 1.0;
+    browser.tab_interest_region_valid = true;
+    browser.needs_raster = false;
+    browser.needs_draw = false;
+    browser.needs_animation_frame = false;
+    browser.shutting_down = true;
+    tab.browser = &browser;
+
+    tab.setZoom(2.0);
+
+    try std.testing.expectApproxEqAbs(@as(f32, 2.0), browser.active_tab_zoom, 0.0001);
+    try std.testing.expect(!browser.tab_interest_region_valid);
+    try std.testing.expect(browser.needs_raster);
+    try std.testing.expect(browser.needs_draw);
+    try std.testing.expect(browser.needs_animation_frame);
+    try std.testing.expect(tab.media_environment_dirty);
+    try std.testing.expect(tab.needs_paint);
+}
+
+test "retained display commands rasterize at preview zoom" {
+    const allocator = std.testing.allocator;
+    var surface = try z2d.Surface.init(.image_surface_rgba, allocator, 16, 16);
+    defer surface.deinit(allocator);
+    const pixels = switch (surface) {
+        .image_surface_rgba => |*image_surface| image_surface.buf,
+        else => unreachable,
+    };
+    @memset(pixels, .{ .r = 255, .g = 255, .b = 255, .a = 255 });
+
+    var context = z2d.Context.init(std.testing.io, allocator, &surface);
+    defer context.deinit();
+    var browser: Browser = undefined;
+    try browser.drawDisplayItemZ2dContextForLayer(
+        &context,
+        .{ .rect = .{
+            .x1 = 2,
+            .y1 = 2,
+            .x2 = 6,
+            .y2 = 6,
+            .color = .{ .r = 255, .g = 0, .b = 0, .a = 255 },
+        } },
+        0,
+        0,
+        2.0,
+    );
+
+    const width: usize = 16;
+    try std.testing.expectEqual(@as(u8, 255), pixels[3 * width + 3].g);
+    try std.testing.expectEqual(@as(u8, 0), pixels[10 * width + 10].g);
+}
+
+test "retained glyph bitmaps resample only across page zoom generations" {
+    const allocator = std.testing.allocator;
+    var surface = try z2d.Surface.init(.image_surface_rgba, allocator, 12, 12);
+    defer surface.deinit(allocator);
+    const pixels = switch (surface) {
+        .image_surface_rgba => |*image_surface| image_surface.buf,
+        else => unreachable,
+    };
+    @memset(pixels, .{ .r = 255, .g = 255, .b = 255, .a = 255 });
+
+    var context = z2d.Context.init(std.testing.io, allocator, &surface);
+    defer context.deinit();
+    var browser: Browser = undefined;
+    var glyph_pixels = [_]u8{ 255, 255, 255, 255 };
+    const glyph = font.Glyph{
+        .w = 1,
+        .h = 1,
+        .ascent = 1,
+        .descent = 0,
+        .pixels = &glyph_pixels,
+    };
+
+    try browser.drawDisplayItemZ2dContextForLayer(
+        &context,
+        .{ .glyph = .{
+            .x = 2,
+            .y = 2,
+            .glyph = glyph,
+            .color = .{ .r = 0, .g = 0, .b = 0, .a = 255 },
+            .page_zoom = 1.0,
+        } },
+        0,
+        0,
+        2.0,
+    );
+    try browser.drawDisplayItemZ2dContextForLayer(
+        &context,
+        .{ .glyph = .{
+            .x = 1,
+            .y = 4,
+            .glyph = glyph,
+            .color = .{ .r = 0, .g = 0, .b = 0, .a = 255 },
+            .page_zoom = 2.0,
+        } },
+        0,
+        0,
+        2.0,
+    );
+
+    const width: usize = 12;
+    try std.testing.expectEqual(@as(u8, 0), pixels[5 * width + 5].g);
+    try std.testing.expectEqual(@as(u8, 255), pixels[5 * width + 6].g);
+    try std.testing.expectEqual(@as(u8, 0), pixels[8 * width + 2].g);
+    try std.testing.expectEqual(@as(u8, 255), pixels[8 * width + 3].g);
 }
 
 const BrowserTaskContexts = tab_tasks.Contexts(Browser);
