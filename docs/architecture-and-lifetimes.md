@@ -809,6 +809,9 @@ effect wrappers containing stable child-cache edges. Clean sibling buffers and
 their generations are neither copied nor replaced. Paint invalidation follows
 layout ancestry without setting geometry fields, and an element-backed block
 forwards it to direct anonymous inline runs that contain inherited text paint.
+Paint-only legacy-inline regeneration rebuilds commands from the clean box but
+does not republish its content-derived height; doing so could notify following
+siblings and turn a paint pass into an unprocessed layout invalidation.
 Layout invalidation still dirties paint, while compositor-only opacity and
 translation updates bypass both phases.
 
