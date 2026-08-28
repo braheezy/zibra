@@ -2231,13 +2231,13 @@ pub fn prepareForDomMutation(self: *Tab, b: *Browser, frame: *Frame, mutation_ro
     b.scheduleAnimationFrame();
 }
 
-/// Narrow structural boundary for a layout-verified append. Display, hit,
+/// Narrow structural boundary for a layout-verified child insertion. Display, hit,
 /// accessibility, compositor, and iframe borrows are retired exactly as for a
 /// general mutation, but the installed style dependency graph and
 /// DocumentLayout stay alive. The JavaScript host synchronously rebinds every
 /// retained direct-child Node pointer after the child array reaches its final
 /// address and before completion callbacks or script resume.
-pub fn prepareForDomAppend(self: *Tab, b: *Browser, frame: *Frame, mutation_root: *Node) void {
+pub fn prepareForDomInsert(self: *Tab, b: *Browser, frame: *Frame, mutation_root: *Node) void {
     std.debug.assert(frame.tab == self);
 
     // The compatibility check that selected this path requires a live layout
@@ -2246,12 +2246,12 @@ pub fn prepareForDomAppend(self: *Tab, b: *Browser, frame: *Frame, mutation_root
     switch (mutation_root.*) {
         .element => |*element| {
             const layout_ptr = element.layout_ptr orelse
-                @panic("append-only mutation missing retained layout owner");
+                @panic("retained insertion missing layout owner");
             const mark = element.layout_mark orelse
-                @panic("append-only mutation missing retained layout marker");
+                @panic("retained insertion missing layout marker");
             mark(layout_ptr);
         },
-        .text => @panic("append-only mutation requires an Element"),
+        .text => @panic("retained insertion requires an Element"),
     }
 
     self.needs_paint = true;

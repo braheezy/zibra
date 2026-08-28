@@ -304,9 +304,9 @@ pub const DomMutationKind = enum {
     /// Child storage may be removed, reordered, or replaced. Every style and
     /// layout dependency is retired before mutation.
     structural,
-    /// A block-mode owner has verified that its existing direct-child prefix
-    /// can be rebound and retained while a new suffix is appended.
-    append_only,
+    /// A block-mode owner has verified that its existing direct children can
+    /// be matched and retained while a new child is inserted.
+    retained_insert,
 };
 
 pub const DomMutationCallbackFn = *const fn (
@@ -1525,7 +1525,7 @@ fn isInclusiveAncestor(ancestor: *Node, node: *Node) bool {
 }
 
 /// A newly attached style sheet can change the block/inline classification of
-/// nodes in the retained prefix. Keep those mutations on the full dependency-
+/// retained nodes. Keep those mutations on the full dependency-
 /// retirement path; ordinary appended content cannot replace author rules.
 fn subtreeCanChangeAuthorStyleRules(node: *const Node) bool {
     return switch (node.*) {
@@ -1538,6 +1538,17 @@ fn subtreeCanChangeAuthorStyleRules(node: *const Node) bool {
             }
             break :blk false;
         },
+    };
+}
+
+/// An inserted h6 immediately before existing content can become a run-in
+/// heading and share one anonymous layout object with its following sibling.
+/// Keep that shape change on the conservative structural path.
+fn insertionCanMergeRunIn(node: *const Node, insert_index: usize, child_count: usize) bool {
+    if (insert_index >= child_count) return false;
+    return switch (node.*) {
+        .element => |element| std.ascii.eqlIgnoreCase(element.tag, "h6"),
+        .text => false,
     };
 }
 
@@ -1571,22 +1582,22 @@ fn insertDetachedChild(
     const parent_parent = nodeParent(parent);
     const child_handle = window.node_to_handle.get(child).?;
     const element = &parent.element;
-    const preserves_layout_prefix = parent_is_attached and
-        insert_index == element.children.items.len and
+    const retains_layout_children = parent_is_attached and
         window.dom_mutation_callback.function != null and
         !subtreeCanChangeAuthorStyleRules(child) and
-        element.canReuseLayoutForAppend();
+        !insertionCanMergeRunIn(child, insert_index, element.children.items.len) and
+        element.canReuseLayoutForInsert(insert_index);
 
-    if (preserves_layout_prefix) {
-        element.markChildrenAppended();
+    if (retains_layout_children) {
+        element.markChildInserted();
     } else {
         element.markChildrenDirty();
     }
     parser.dirtyStyleForElement(element);
     markElementLayoutDirty(element);
     if (parent_is_attached) {
-        if (preserves_layout_prefix) {
-            self.prepareDomAppend(parent);
+        if (retains_layout_children) {
+            self.prepareDomRetainedInsert(parent);
         } else {
             self.prepareDomMutation(parent);
         }
@@ -1628,8 +1639,8 @@ fn insertDetachedChild(
     parser.fixParentPointers(parent, parent_parent);
     parser.dirtyStyleSubtree(installed_child);
 
-    if (preserves_layout_prefix and !element.rebindLayoutAfterAppend(parent)) {
-        @panic("verified append-only layout prefix could not be rebound");
+    if (retains_layout_children and !element.rebindLayoutAfterInsert(parent)) {
+        @panic("verified retained layout children could not be rebound after insertion");
     }
 
     if (parent_is_attached) {
@@ -2202,14 +2213,14 @@ fn prepareDomMutation(self: *Js, mutation_root: *Node) void {
     }
 }
 
-/// Append-only mutations preserve both installed style subscriber maps and a
-/// verified block-layout prefix. The retained layout owner repairs direct DOM
+/// Verified insertions preserve both installed style subscriber maps and the
+/// matched block-layout children. The retained layout owner repairs direct DOM
 /// pointers synchronously after storage moves.
-fn prepareDomAppend(self: *Js, mutation_root: *Node) void {
+fn prepareDomRetainedInsert(self: *Js, mutation_root: *Node) void {
     const window_id = self.current_window_id orelse return;
     const window = self.windows.getPtr(window_id) orelse return;
     if (window.dom_mutation_callback.function) |callback| {
-        callback(window.dom_mutation_callback.context, mutation_root, .append_only);
+        callback(window.dom_mutation_callback.context, mutation_root, .retained_insert);
     }
 }
 
@@ -3133,19 +3144,24 @@ const DomMutationTestContext = struct {
     }
 };
 
-test "append-only layout state accumulates and excludes stylesheet subtrees" {
+test "retained insertion state accumulates and excludes stylesheet subtrees" {
     const allocator = std.testing.allocator;
 
     var ordinary = Node{ .element = try parser.Element.init(allocator, "div", null) };
     defer ordinary.deinit(allocator);
     ordinary.element.clearChildrenDirty();
-    ordinary.element.markChildrenAppended();
-    ordinary.element.markChildrenAppended();
+    ordinary.element.markChildInserted();
+    ordinary.element.markChildInserted();
     try std.testing.expect(ordinary.element.children_dirty);
-    try std.testing.expect(ordinary.element.children_append_only);
+    try std.testing.expect(ordinary.element.children_insertions_only);
     ordinary.element.markChildrenDirty();
-    try std.testing.expect(!ordinary.element.children_append_only);
+    try std.testing.expect(!ordinary.element.children_insertions_only);
     try std.testing.expect(!subtreeCanChangeAuthorStyleRules(&ordinary));
+
+    var run_in = Node{ .element = try parser.Element.init(allocator, "h6", null) };
+    defer run_in.deinit(allocator);
+    try std.testing.expect(insertionCanMergeRunIn(&run_in, 0, 1));
+    try std.testing.expect(!insertionCanMergeRunIn(&run_in, 1, 1));
 
     var wrapper = Node{ .element = try parser.Element.init(allocator, "section", null) };
     defer wrapper.deinit(allocator);

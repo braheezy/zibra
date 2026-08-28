@@ -1,0 +1,51 @@
+<!--
+How to verify:
+1. Open this page and click "Insert before second" one or more times.
+2. Each green inserted row must appear between the first and second rows.
+3. The original first, second, and third DOM objects must remain identical;
+   the status line reports PASS when their order and identity are preserved.
+-->
+<!doctype html>
+<meta charset="utf-8">
+<title>insertBefore matching children</title>
+<style>
+  body { font-family: sans-serif; }
+  #target { display: block; width: 320px; }
+  .row { display: block; height: 28px; margin: 3px; padding: 4px; background-color: #dddddd; }
+  .inserted { background-color: #a8e6a1; }
+  #status { display: block; margin-top: 12px; font-weight: bold; }
+</style>
+
+<button id="insert">Insert before second</button>
+<div id="target">
+  <div id="first" class="row">First (retained)</div>
+  <div id="second" class="row">Second (predecessor changes)</div>
+  <div id="third" class="row">Third (retained)</div>
+</div>
+<div id="status">Click the button to test.</div>
+
+<script>
+var target = document.querySelectorAll('#target')[0];
+var first = document.querySelectorAll('#first')[0];
+var second = document.querySelectorAll('#second')[0];
+var third = document.querySelectorAll('#third')[0];
+var status = document.querySelectorAll('#status')[0];
+var insert = document.querySelectorAll('#insert')[0];
+var count = 0;
+
+insert.addEventListener('click', function() {
+  count = count + 1;
+  var row = document.createElement('div');
+  row.setAttribute('class', 'row inserted');
+  row.innerHTML = 'Inserted row ' + count;
+  target.insertBefore(row, second);
+
+  var children = target.children;
+  var stable = children[0] === first &&
+      children[children.length - 2] === second &&
+      children[children.length - 1] === third;
+  status.innerHTML = stable ?
+      'PASS: matched old rows and rewired previous' :
+      'FAIL: an existing row changed identity or order';
+});
+</script>

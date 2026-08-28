@@ -2034,7 +2034,7 @@ test "append-only block layout retains its existing child objects after DOM relo
     };
     const target_node = target.?;
     const target_layout: *BlockLayout = @ptrCast(@alignCast(target_node.element.layout_ptr.?));
-    try std.testing.expect(target_node.element.canReuseLayoutForAppend());
+    try std.testing.expect(target_node.element.canReuseLayoutForInsert(2));
     try std.testing.expectEqual(@as(usize, 2), target_layout.children.items.len);
     const first_layout = target_layout.children.items[0].block;
     const second_layout = target_layout.children.items[1].block;
@@ -2049,7 +2049,7 @@ test "append-only block layout retains its existing child objects after DOM relo
     var appended_owned = true;
     defer if (appended_owned) appended.deinit(allocator);
 
-    target_node.element.markChildrenAppended();
+    target_node.element.markChildInserted();
     parser.dirtyStyleForElement(&target_node.element);
     target_node.element.layout_mark.?(target_node.element.layout_ptr.?);
 
@@ -2073,13 +2073,13 @@ test "append-only block layout retains its existing child objects after DOM relo
     parser.fixParentPointers(&root_node, null);
 
     try std.testing.expect(old_children_ptr != target_node.element.children.items.ptr);
-    try std.testing.expect(target_node.element.rebindLayoutAfterAppend(target_node));
+    try std.testing.expect(target_node.element.rebindLayoutAfterInsert(target_node));
     try std.testing.expect(first_layout.node_ptr.? == &target_node.element.children.items[0]);
     try std.testing.expect(second_layout.node_ptr.? == &target_node.element.children.items[1]);
 
     // A second append before layout keeps the original represented prefix and
     // accumulates both new DOM nodes into one suffix.
-    try std.testing.expect(target_node.element.canReuseLayoutForAppend());
+    try std.testing.expect(target_node.element.canReuseLayoutForInsert(3));
     var fourth = Node{ .element = try parser.Element.init(
         allocator,
         "div id=four style='display:block'",
@@ -2087,12 +2087,12 @@ test "append-only block layout retains its existing child objects after DOM relo
     ) };
     var fourth_owned = true;
     defer if (fourth_owned) fourth.deinit(allocator);
-    target_node.element.markChildrenAppended();
+    target_node.element.markChildInserted();
     try target_node.element.children.ensureUnusedCapacity(allocator, 1);
     target_node.element.children.appendAssumeCapacity(fourth);
     fourth_owned = false;
     parser.fixParentPointers(&root_node, null);
-    try std.testing.expect(target_node.element.rebindLayoutAfterAppend(target_node));
+    try std.testing.expect(target_node.element.rebindLayoutAfterInsert(target_node));
 
     parser.dirtyStyleSubtree(&target_node.element.children.items[2]);
     parser.dirtyStyleSubtree(&target_node.element.children.items[3]);
@@ -2124,19 +2124,125 @@ test "append-only block layout retains its existing child objects after DOM relo
         target_layout.children.items[2].block.node_ptr.? ==
             &target_node.element.children.items[2],
     );
-    try std.testing.expect(target_layout.children.items[2].block.previous == second_layout);
+    try std.testing.expect(target_layout.children.items[2].block.previousBlock() == second_layout);
     try std.testing.expect(
         target_layout.children.items[3].block.node_ptr.? ==
             &target_node.element.children.items[3],
     );
     try std.testing.expect(
-        target_layout.children.items[3].block.previous ==
+        target_layout.children.items[3].block.previousBlock() ==
             target_layout.children.items[2].block,
     );
     try std.testing.expectEqual(prior_epoch + 1, target_layout.children_epoch);
     try std.testing.expectEqual(@as(usize, 4), target_layout.laid_out_dom_children);
     try std.testing.expect(!target_node.element.children_dirty);
-    try std.testing.expect(!target_node.element.children_append_only);
+    try std.testing.expect(!target_node.element.children_insertions_only);
+}
+
+test "inserted block matches siblings and invalidates only the changed previous link" {
+    const allocator = std.testing.allocator;
+    var html_parser = try parser.HTMLParser.init(
+        allocator,
+        "<main style='display:block'>" ++
+            "<section id=target style='display:block'>" ++
+            "<div id=one style='display:block;height:10px'></div>" ++
+            "<div id=two style='display:block;height:10px'></div>" ++
+            "<div id=three style='display:block;height:10px'></div>" ++
+            "</section></main>",
+    );
+    html_parser.use_implicit_tags = false;
+    defer html_parser.deinit(allocator);
+    var root_node = try html_parser.parse();
+    defer root_node.deinit(allocator);
+    parser.fixParentPointers(&root_node, null);
+    try parser.style(allocator, &root_node, &.{});
+
+    var environ = std.process.Environ.Map.init(allocator);
+    defer environ.deinit();
+    try environ.put("HOME", "/tmp");
+    const engine = try Layout.init(allocator, std.testing.io, &environ, 800, 600, false);
+    defer engine.deinit();
+    const document = try engine.buildDocument(&root_node);
+    defer {
+        document.deinit();
+        allocator.destroy(document);
+    }
+
+    var nodes = std.ArrayList(*Node).empty;
+    defer nodes.deinit(allocator);
+    try parser.treeToList(allocator, &root_node, &nodes);
+    var target: ?*Node = null;
+    for (nodes.items) |node| switch (node.*) {
+        .element => |*element| {
+            const attributes = element.attributes orelse continue;
+            if (std.mem.eql(u8, attributes.get("id") orelse "", "target")) {
+                target = node;
+                break;
+            }
+        },
+        .text => {},
+    };
+    const target_node = target.?;
+    const target_layout: *BlockLayout = @ptrCast(@alignCast(target_node.element.layout_ptr.?));
+    const first_layout = target_layout.children.items[0].block;
+    const second_layout = target_layout.children.items[1].block;
+    const third_layout = target_layout.children.items[2].block;
+    const second_y_before = second_layout.y.get().*;
+    const third_y_before = third_layout.y.get().*;
+    const prior_epoch = target_layout.children_epoch;
+
+    try std.testing.expect(first_layout.previousBlock() == null);
+    try std.testing.expect(second_layout.previousBlock() == first_layout);
+    try std.testing.expect(third_layout.previousBlock() == second_layout);
+    try std.testing.expect(second_layout.previous.invalidations.contains(&second_layout.y));
+    try std.testing.expect(target_node.element.canReuseLayoutForInsert(1));
+
+    var inserted = Node{ .element = try parser.Element.init(
+        allocator,
+        "div id=inserted style='display:block;height:7px'",
+        null,
+    ) };
+    var inserted_owned = true;
+    defer if (inserted_owned) inserted.deinit(allocator);
+
+    target_node.element.markChildInserted();
+    parser.dirtyStyleForElement(&target_node.element);
+    target_node.element.layout_mark.?(target_node.element.layout_ptr.?);
+
+    var relocated = std.ArrayList(Node).empty;
+    defer relocated.deinit(allocator);
+    try relocated.ensureTotalCapacityPrecise(
+        allocator,
+        target_node.element.children.items.len + 1,
+    );
+    relocated.appendAssumeCapacity(target_node.element.children.items[0]);
+    relocated.appendAssumeCapacity(inserted);
+    inserted_owned = false;
+    for (target_node.element.children.items[1..]) |child| relocated.appendAssumeCapacity(child);
+    target_node.element.children.deinit(allocator);
+    target_node.element.children = relocated;
+    relocated = std.ArrayList(Node).empty;
+    parser.fixParentPointers(&root_node, null);
+    try std.testing.expect(target_node.element.rebindLayoutAfterInsert(target_node));
+    parser.dirtyStyleSubtree(&target_node.element.children.items[1]);
+
+    try parser.style(allocator, &root_node, &.{});
+    try document.layout(engine);
+
+    try std.testing.expectEqual(@as(usize, 4), target_layout.children.items.len);
+    try std.testing.expect(target_layout.children.items[0].block == first_layout);
+    const inserted_layout = target_layout.children.items[1].block;
+    try std.testing.expect(target_layout.children.items[2].block == second_layout);
+    try std.testing.expect(target_layout.children.items[3].block == third_layout);
+    try std.testing.expect(inserted_layout.previousBlock() == first_layout);
+    try std.testing.expect(second_layout.previousBlock() == inserted_layout);
+    try std.testing.expect(third_layout.previousBlock() == second_layout);
+    try std.testing.expect(inserted_layout.height.invalidations.contains(&second_layout.y));
+    try std.testing.expectEqual(second_y_before + 7, second_layout.y.get().*);
+    try std.testing.expectEqual(third_y_before + 7, third_layout.y.get().*);
+    try std.testing.expectEqual(prior_epoch + 1, target_layout.children_epoch);
+    try std.testing.expect(!target_node.element.children_dirty);
+    try std.testing.expect(!target_node.element.children_insertions_only);
 }
 
 test "h6 headings run into a following block" {
@@ -6172,7 +6278,10 @@ const BlockLayout = struct {
     node_ptr: ?*Node,
     document: *DocumentLayout,
     parent_block: ?*BlockLayout,
-    previous: ?*BlockLayout,
+    /// The preceding in-flow block can change when a DOM child is inserted.
+    /// Keeping the pointer protected lets that narrow structural mutation
+    /// invalidate only this block's vertical position and its dependents.
+    previous: ProtectedField(?*BlockLayout),
     // An anonymous block owns this pointer slice and lays out each sibling as
     // one inline run. Normal blocks retain their single DOM node instead.
     inline_nodes: ?[]*Node = null,
@@ -6207,8 +6316,8 @@ const BlockLayout = struct {
     content_height: i32 = 0,
     content_height_definite: bool = false,
     /// Number of direct DOM children represented by the last successfully
-    /// published block-child list. An accepted append keeps this prefix and
-    /// creates layout objects only for the later DOM suffix.
+    /// published block-child list. An accepted insertion matches those
+    /// existing objects and creates layout objects only for new DOM gaps.
     laid_out_dom_children: usize = 0,
     children_epoch: u64 = 0,
     children_version: ProtectedField(u64),
@@ -6231,14 +6340,14 @@ const BlockLayout = struct {
         self.mark();
     }
 
-    fn canReuseAppendOpaque(ptr: *anyopaque) bool {
+    fn canReuseInsertOpaque(ptr: *anyopaque, insert_index: usize) bool {
         const self: *BlockLayout = @ptrCast(@alignCast(ptr));
-        return self.canReuseAppend();
+        return self.canReuseInsert(insert_index);
     }
 
-    fn rebindAfterAppendOpaque(ptr: *anyopaque, node: *Node) bool {
+    fn rebindAfterInsertOpaque(ptr: *anyopaque, node: *Node) bool {
         const self: *BlockLayout = @ptrCast(@alignCast(ptr));
-        return self.rebindAfterAppend(node);
+        return self.rebindAfterInsert(node);
     }
 
     fn bindDomNode(self: *BlockLayout, node: *Node) void {
@@ -6248,18 +6357,30 @@ const BlockLayout = struct {
             .element => |*element| {
                 element.layout_ptr = self;
                 element.layout_mark = markOpaque;
-                element.layout_can_reuse_append = canReuseAppendOpaque;
-                element.layout_rebind_after_append = rebindAfterAppendOpaque;
+                element.layout_can_reuse_insert = canReuseInsertOpaque;
+                element.layout_rebind_after_insert = rebindAfterInsertOpaque;
             },
             .text => {},
         }
     }
 
-    /// This deliberately accepts only the simplest stable block-mode shape:
-    /// every already-laid-out DOM child maps to one DOM-backed BlockLayout.
-    /// Anonymous inline runs and a trailing run-in heading can merge with an
-    /// appended node, so they retain the conservative full-rebuild path.
-    fn canReuseAppend(self: *BlockLayout) bool {
+    fn nodeLayoutOwner(node: *const Node) ?*anyopaque {
+        return switch (node.*) {
+            .element => |element| element.layout_ptr,
+            .text => null,
+        };
+    }
+
+    fn ownsNode(block: *BlockLayout, node: *const Node) bool {
+        const block_ptr: *anyopaque = @ptrCast(@alignCast(block));
+        return nodeLayoutOwner(node) == block_ptr;
+    }
+
+    /// This deliberately accepts only a stable block-mode shape: every
+    /// already-laid-out DOM child maps one-to-one to a DOM-backed BlockLayout.
+    /// Previously inserted, not-yet-laid-out nodes may appear as gaps between
+    /// those owners. Anonymous inline runs retain the conservative path.
+    fn canReuseInsert(self: *BlockLayout, insert_index: usize) bool {
         if (!self.persistent_dependencies or self.inline_nodes != null) return false;
         if (self.children_version.dirty or self.laid_out_dom_children == 0) return false;
 
@@ -6268,29 +6389,56 @@ const BlockLayout = struct {
             .element => |*value| value,
             .text => return false,
         };
-        if (element.children_dirty and !element.children_append_only) return false;
+        if (insert_index > element.children.items.len) return false;
+        if (element.children_dirty and !element.children_insertions_only) return false;
         if (self.laid_out_dom_children > element.children.items.len) return false;
         if (!element.children_dirty and
             self.laid_out_dom_children != element.children.items.len) return false;
         if (self.children.items.len != self.laid_out_dom_children) return false;
-        if (isRunInHeadingNode(element.children.items[self.laid_out_dom_children - 1])) return false;
 
-        for (self.children.items, 0..) |layout_child, index| {
-            const block = switch (layout_child) {
-                .block => |value| value,
-                .line => return false,
-            };
-            if (block.inline_nodes != null or
-                block.node_ptr != &element.children.items[index]) return false;
+        // Appending after a trailing run-in heading can merge that retained
+        // child with the new block. A middle insertion leaves that trailing
+        // boundary untouched and can still use identity matching.
+        if (insert_index == element.children.items.len and
+            isRunInHeadingNode(element.children.items[element.children.items.len - 1]))
+        {
+            return false;
         }
-        return true;
+
+        var retained_index: usize = 0;
+        var expected_previous: ?*BlockLayout = null;
+        for (element.children.items) |*dom_child| {
+            if (retained_index < self.children.items.len) {
+                const block = switch (self.children.items[retained_index]) {
+                    .block => |value| value,
+                    .line => return false,
+                };
+                if (ownsNode(block, dom_child)) {
+                    if (block.inline_nodes != null or
+                        block.parent_block != self or
+                        block.node_ptr != dom_child or
+                        block.previous.dirty or
+                        block.previous.get().* != expected_previous)
+                    {
+                        return false;
+                    }
+                    if (block.floatSide() == .none) expected_previous = block;
+                    retained_index += 1;
+                    continue;
+                }
+            }
+
+            // A gap is safe only when it has no unrelated live layout owner.
+            if (nodeLayoutOwner(dom_child) != null) return false;
+        }
+        return retained_index == self.children.items.len;
     }
 
     /// Child-array capacity growth can move every direct Node by value. Repair
-    /// the retained prefix synchronously, before JavaScript or teardown can
-    /// dereference one of the old addresses. The new suffix is intentionally
+    /// every retained child synchronously, before JavaScript or teardown can
+    /// dereference one of the old addresses. Inserted gaps are intentionally
     /// left without layout objects until the next protected layout phase.
-    fn rebindAfterAppend(self: *BlockLayout, node: *Node) bool {
+    fn rebindAfterInsert(self: *BlockLayout, node: *Node) bool {
         if (self.node_ptr != node or self.children.items.len != self.laid_out_dom_children) {
             return false;
         }
@@ -6298,53 +6446,201 @@ const BlockLayout = struct {
             .element => |*value| value,
             .text => return false,
         };
-        if (!element.children_dirty or !element.children_append_only or
+        if (!element.children_dirty or !element.children_insertions_only or
             self.laid_out_dom_children > element.children.items.len) return false;
 
-        // Validate the complete prefix before changing any owner pointers.
-        for (self.children.items, 0..) |layout_child, index| {
-            if (layout_child != .block or
-                element.children.items[index] != .element) return false;
+        // Validate the complete identity mapping before changing any pointers.
+        var retained_index: usize = 0;
+        for (element.children.items) |*dom_child| {
+            if (retained_index < self.children.items.len) {
+                const block = switch (self.children.items[retained_index]) {
+                    .block => |value| value,
+                    .line => return false,
+                };
+                if (ownsNode(block, dom_child)) {
+                    if (block.inline_nodes != null or block.parent_block != self) return false;
+                    retained_index += 1;
+                    continue;
+                }
+            }
+            if (nodeLayoutOwner(dom_child) != null) return false;
         }
+        if (retained_index != self.children.items.len) return false;
 
         self.bindDomNode(node);
-        for (self.children.items, 0..) |layout_child, index| {
-            layout_child.block.bindDomNode(&element.children.items[index]);
+        retained_index = 0;
+        for (element.children.items) |*dom_child| {
+            if (retained_index >= self.children.items.len) break;
+            const block = self.children.items[retained_index].block;
+            if (!ownsNode(block, dom_child)) continue;
+            block.bindDomNode(dom_child);
+            retained_index += 1;
         }
         return true;
     }
 
-    /// Revalidate the retained one-to-one prefix after style publication.
-    /// Resource refresh can republish identical display values from new CSS
-    /// backing storage, dirtying children_version even though the layout shape
-    /// is unchanged. Compare the actual block/run-in/previous structure before
-    /// deciding whether the prefix still matches.
-    fn appendPrefixMatchesCurrentDom(
+    /// Match retained block objects to their live DOM owners after style has
+    /// been republished, then build layout objects only for inserted gaps.
+    /// This also computes the new in-flow predecessor for every retained
+    /// block; `setPrevious` invalidates only blocks whose link changed.
+    fn rebuildInsertedChildren(
         self: *BlockLayout,
         element: *parser.Element,
-    ) bool {
+    ) !bool {
         if (self.children.items.len != self.laid_out_dom_children or
-            self.laid_out_dom_children > element.children.items.len) return false;
+            self.laid_out_dom_children > element.children.items.len)
+        {
+            return false;
+        }
 
-        var expected_previous: ?*BlockLayout = null;
-        for (self.children.items, 0..) |layout_child, index| {
-            const block = switch (layout_child) {
-                .block => |value| value,
-                .line => return false,
-            };
-            const dom_child = element.children.items[index];
-            if (!isContainerNode(dom_child, &self.children_version)) return false;
-            if (isRunInHeadingNode(dom_child) and
-                index + 1 < element.children.items.len and
-                isContainerNode(element.children.items[index + 1], &self.children_version))
+        const dom_children = element.children.items;
+        const retained_for_dom = try self.allocator.alloc(?*BlockLayout, dom_children.len);
+        defer self.allocator.free(retained_for_dom);
+        @memset(retained_for_dom, null);
+
+        var retained_index: usize = 0;
+        for (dom_children, 0..) |*dom_child, dom_index| {
+            if (retained_index < self.children.items.len) {
+                const block = switch (self.children.items[retained_index]) {
+                    .block => |value| value,
+                    .line => return false,
+                };
+                if (ownsNode(block, dom_child)) {
+                    if (block.inline_nodes != null or
+                        block.parent_block != self or
+                        block.node_ptr != dom_child or
+                        !isContainerNode(dom_child.*, &self.children_version))
+                    {
+                        return false;
+                    }
+                    retained_for_dom[dom_index] = block;
+                    retained_index += 1;
+                    continue;
+                }
+            }
+            if (nodeLayoutOwner(dom_child) != null) return false;
+        }
+        if (retained_index != self.children.items.len) return false;
+
+        // A run-in pair is represented by one anonymous block. Reusing either
+        // member's old one-to-one BlockLayout would therefore be incorrect.
+        for (dom_children, 0..) |dom_child, dom_index| {
+            if (!isRunInHeadingNode(dom_child) or dom_index + 1 >= dom_children.len) continue;
+            if (!isContainerNode(dom_children[dom_index + 1], &self.children_version)) continue;
+            if (retained_for_dom[dom_index] != null or
+                retained_for_dom[dom_index + 1] != null)
             {
                 return false;
             }
-            if (block.inline_nodes != null or block.previous != expected_previous) return false;
-            if (nodeFloatSide(dom_child, &self.children_version) == .none) {
-                expected_previous = block;
-            }
         }
+
+        // Refresh every shallow Node copy after style publication before
+        // querying float state or installing new predecessor links.
+        for (retained_for_dom, dom_children) |retained, *dom_child| {
+            if (retained) |block| block.bindDomNode(dom_child);
+        }
+
+        const desired_previous = try self.allocator.alloc(?*BlockLayout, self.children.items.len);
+        defer self.allocator.free(desired_previous);
+        @memset(desired_previous, null);
+
+        var replacement = std.ArrayList(LayoutChild).empty;
+        defer replacement.deinit(self.allocator);
+        try replacement.ensureTotalCapacity(self.allocator, dom_children.len);
+
+        var created = std.ArrayList(*BlockLayout).empty;
+        defer created.deinit(self.allocator);
+        try created.ensureTotalCapacity(self.allocator, dom_children.len);
+        errdefer for (created.items) |block| {
+            block.deinit();
+            self.allocator.destroy(block);
+        };
+
+        var previous: ?*BlockLayout = null;
+        retained_index = 0;
+        var dom_index: usize = 0;
+        while (dom_index < dom_children.len) {
+            if (retained_for_dom[dom_index]) |block| {
+                desired_previous[retained_index] = previous;
+                replacement.appendAssumeCapacity(.{ .block = block });
+                if (block.floatSide() == .none) previous = block;
+                retained_index += 1;
+                dom_index += 1;
+                continue;
+            }
+
+            if (isRunInHeadingNode(dom_children[dom_index]) and
+                dom_index + 1 < dom_children.len and
+                isContainerNode(dom_children[dom_index + 1], &self.children_version))
+            {
+                std.debug.assert(retained_for_dom[dom_index + 1] == null);
+                const run_in_nodes = try self.allocator.alloc(*Node, 2);
+                errdefer self.allocator.free(run_in_nodes);
+                run_in_nodes[0] = &dom_children[dom_index];
+                run_in_nodes[1] = &dom_children[dom_index + 1];
+                const child = try BlockLayout.initAnonymous(
+                    self.allocator,
+                    run_in_nodes,
+                    self.document,
+                    self,
+                    previous,
+                );
+                created.appendAssumeCapacity(child);
+                replacement.appendAssumeCapacity(.{ .block = child });
+                if (child.floatSide() == .none) previous = child;
+                dom_index += 2;
+                continue;
+            }
+
+            if (isContainerNode(dom_children[dom_index], &self.children_version)) {
+                const child_node = &dom_children[dom_index];
+                const child = try BlockLayout.init(
+                    self.allocator,
+                    child_node.*,
+                    child_node,
+                    self.document,
+                    self,
+                    previous,
+                );
+                created.appendAssumeCapacity(child);
+                replacement.appendAssumeCapacity(.{ .block = child });
+                if (child.floatSide() == .none) previous = child;
+                dom_index += 1;
+                continue;
+            }
+
+            const start = dom_index;
+            while (dom_index < dom_children.len and
+                !isContainerNode(dom_children[dom_index], &self.children_version)) : (dom_index += 1)
+            {
+                std.debug.assert(retained_for_dom[dom_index] == null);
+            }
+            const inline_nodes = try self.allocator.alloc(*Node, dom_index - start);
+            errdefer self.allocator.free(inline_nodes);
+            for (dom_children[start..dom_index], 0..) |*dom_child, output_index| {
+                inline_nodes[output_index] = dom_child;
+            }
+            const child = try BlockLayout.initAnonymous(
+                self.allocator,
+                inline_nodes,
+                self.document,
+                self,
+                previous,
+            );
+            created.appendAssumeCapacity(child);
+            replacement.appendAssumeCapacity(.{ .block = child });
+            if (child.floatSide() == .none) previous = child;
+        }
+        std.debug.assert(retained_index == self.children.items.len);
+
+        for (self.children.items, desired_previous) |layout_child, new_previous| {
+            layout_child.block.setPrevious(new_previous);
+        }
+
+        var old_children = self.children;
+        self.children = replacement;
+        replacement = std.ArrayList(LayoutChild).empty;
+        old_children.deinit(self.allocator);
         return true;
     }
 
@@ -6383,7 +6679,7 @@ const BlockLayout = struct {
             .node_ptr = node_ptr,
             .document = document,
             .parent_block = parent_block,
-            .previous = previous,
+            .previous = ProtectedField(?*BlockLayout).init(allocator, previous),
             .zoom = ProtectedField(f32).init(allocator, 1.0),
             .x = ProtectedField(i32).init(allocator, 0),
             .y = ProtectedField(i32).init(allocator, 0),
@@ -6417,6 +6713,9 @@ const BlockLayout = struct {
         block.width.setOwner(block, markOpaque);
         block.height.setOwner(block, markOpaque);
         block.children_version.setOwner(block, markOpaque);
+        block.previous.setOwner(block, markOpaque);
+        block.previous.set(previous);
+        block.y.addDependency(&block.previous);
 
         if (!persistent_dependencies) {
             if (block.temporary_dependency_target) |target| {
@@ -6505,14 +6804,15 @@ const BlockLayout = struct {
         block.y.freezeDependencies();
         block.width.freezeDependencies();
         block.children_version.freezeDependencies();
+        block.previous.freezeDependencies();
 
         if (node_ptr) |ptr| {
             switch (ptr.*) {
                 .element => |*e| {
                     e.layout_ptr = block;
                     e.layout_mark = markOpaque;
-                    e.layout_can_reuse_append = canReuseAppendOpaque;
-                    e.layout_rebind_after_append = rebindAfterAppendOpaque;
+                    e.layout_can_reuse_insert = canReuseInsertOpaque;
+                    e.layout_rebind_after_insert = rebindAfterInsertOpaque;
                 },
                 else => {},
             }
@@ -6663,6 +6963,7 @@ const BlockLayout = struct {
         self.width.deinit();
         self.height.deinit();
         self.children_version.deinit();
+        self.previous.deinit();
     }
 
     fn mark(self: *BlockLayout) void {
@@ -6739,6 +7040,30 @@ const BlockLayout = struct {
 
     fn clearSide(self: *const BlockLayout) ClearSide {
         return nodeClearSide(self.node);
+    }
+
+    fn previousBlock(self: *const BlockLayout) ?*BlockLayout {
+        return self.previous.get().*;
+    }
+
+    /// Rewire one retained block after insertion. The protected pointer marks
+    /// `y`, while the newly selected predecessor's metrics are added to the
+    /// dependency graph before that pointer becomes observable. Old edges are
+    /// harmlessly conservative because retained insertion destroys no block.
+    fn setPrevious(self: *BlockLayout, previous: ?*BlockLayout) void {
+        if (self.previous.get().* == previous) return;
+
+        if (self.persistent_dependencies) {
+            if (previous) |block| {
+                self.y.addDependency(&block.y);
+                self.y.addDependency(&block.height);
+            } else if (self.parent_block) |parent| {
+                self.y.addDependency(&parent.y);
+            } else {
+                self.y.addDependency(&self.document.y);
+            }
+        }
+        self.previous.set(previous);
     }
 
     fn floatBoundsAt(
@@ -6943,7 +7268,11 @@ const BlockLayout = struct {
         // intentionally has no dependency on the parent's y field. Avoid
         // reading that field here: ProtectedField requires every read target
         // to have been registered during initialization.
-        const parent_content_y = if (self.previous == null) blk: {
+        const previous = if (self.persistent_dependencies)
+            self.previous.read(&self.y).*
+        else
+            self.previous.get().*;
+        const parent_content_y = if (previous == null) blk: {
             if (self.parent_block) |pb| {
                 const parent_y = if (self.persistent_dependencies)
                     pb.y.read(&self.y).*
@@ -6956,7 +7285,7 @@ const BlockLayout = struct {
             else
                 self.document.y.get().*;
         } else 0;
-        const prev_y = if (self.previous) |prev|
+        const prev_y = if (previous) |prev|
             (if (self.persistent_dependencies)
                 prev.y.read(&self.y).* + prev.height.read(&self.y).*
             else
@@ -7117,11 +7446,11 @@ const BlockLayout = struct {
 
         var natural_height: i32 = 0;
         if (is_block) {
-            // Check whether the DOM child list changed. A verified append can
-            // retain the existing block-child prefix; every other change
+            // Check whether the DOM child list changed. Verified insertions
+            // match and retain existing block children; every other change
             // keeps the conservative rebuild behavior.
             var children_dirty = false;
-            var append_only = false;
+            var insertions_only = false;
             var live_element: ?*parser.Element = null;
             if (self.node_ptr) |node| {
                 switch (node.*) {
@@ -7129,7 +7458,7 @@ const BlockLayout = struct {
                         live_element = el;
                         if (el.children_dirty) {
                             children_dirty = true;
-                            append_only = el.children_append_only;
+                            insertions_only = el.children_insertions_only;
                         }
                     },
                     else => {},
@@ -7138,27 +7467,23 @@ const BlockLayout = struct {
 
             // Rebuild if children are dirty OR if we have no children yet (first layout)
             if (children_dirty or self.children_version.dirty or self.children.items.len == 0) {
-                var reused_prefix = false;
-                if (append_only) {
+                var reused_children = false;
+                if (insertions_only) {
                     // The host normally performs this rebind synchronously
                     // after child storage moves. Repeat it defensively here
-                    // for direct DOM users that honor the same append marker.
-                    append_only = if (self.node_ptr) |node| self.rebindAfterAppend(node) else false;
+                    // for direct DOM users that honor the same insert marker.
+                    insertions_only = if (self.node_ptr) |node| self.rebindAfterInsert(node) else false;
                 }
 
-                if (append_only and self.children.items.len > 0) {
+                if (insertions_only and self.children.items.len > 0) {
                     const element = live_element.?;
-                    if (self.appendPrefixMatchesCurrentDom(element)) {
-                        try self.appendBlockChildrenAfter(
-                            element.children.items[self.laid_out_dom_children..],
-                            self.lastInFlowBlock(),
-                        );
+                    if (try self.rebuildInsertedChildren(element)) {
                         self.laid_out_dom_children = element.children.items.len;
-                        reused_prefix = true;
+                        reused_children = true;
                     }
                 }
 
-                if (!reused_prefix) {
+                if (!reused_children) {
                     for (self.children.items) |child| {
                         child.deinit(self.allocator);
                     }
@@ -7292,27 +7617,8 @@ const BlockLayout = struct {
         self.has_dirty_descendants = false;
     }
 
-    fn lastInFlowBlock(self: *BlockLayout) ?*BlockLayout {
-        var previous: ?*BlockLayout = null;
-        for (self.children.items) |child| switch (child) {
-            .block => |block| if (block.floatSide() == .none) {
-                previous = block;
-            },
-            .line => {},
-        };
-        return previous;
-    }
-
     fn appendBlockChildren(self: *BlockLayout, nodes: []Node) !void {
-        return self.appendBlockChildrenAfter(nodes, null);
-    }
-
-    fn appendBlockChildrenAfter(
-        self: *BlockLayout,
-        nodes: []Node,
-        starting_previous: ?*BlockLayout,
-    ) !void {
-        var previous = starting_previous;
+        var previous: ?*BlockLayout = null;
         var index: usize = 0;
         while (index < nodes.len) {
             // A run-in heading is laid out with the following paragraph rather
@@ -7364,6 +7670,7 @@ const BlockLayout = struct {
     }
 
     fn layoutNeeded(self: *const BlockLayout) bool {
+        if (self.previous.dirty) return true;
         if (self.zoom.dirty) return true;
         if (self.x.dirty) return true;
         if (self.y.dirty) return true;

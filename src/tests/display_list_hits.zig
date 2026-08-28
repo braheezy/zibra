@@ -695,7 +695,7 @@ test "structural mutation retires a painted link before DOM removal" {
     try std.testing.expectEqual(@as(usize, 0), test_browser.pending_new_tabs.items.len);
 }
 
-test "verified append mutation retires render borrows but retains document layout" {
+test "verified insertBefore mutation retains document and matched block layouts" {
     const allocator = std.testing.allocator;
     var session = BrowserSession.init(allocator, std.testing.io);
     defer session.deinit();
@@ -724,7 +724,8 @@ test "verified append mutation retires render borrows but retains document layou
     var html_parser = try parser.HTMLParser.init(
         allocator,
         "<main style='display:block'><section style='display:block'>" ++
-            "<div style='display:block'></div></section></main>",
+            "<div id=first style='display:block'></div>" ++
+            "<div id=last style='display:block'></div></section></main>",
     );
     html_parser.use_implicit_tags = false;
     defer html_parser.deinit(allocator);
@@ -735,8 +736,9 @@ test "verified append mutation retires render borrows but retains document layou
     const document = try layout_engine.buildDocument(&frame.current_node.?);
     frame.setDocumentLayout(document);
     const section = try findElement(&frame.current_node.?, "section");
-    try std.testing.expect(section.element.canReuseLayoutForAppend());
-    const original_child_layout = section.element.children.items[0].element.layout_ptr.?;
+    try std.testing.expect(section.element.canReuseLayoutForInsert(1));
+    const first_layout = section.element.children.items[0].element.layout_ptr.?;
+    const last_layout = section.element.children.items[1].element.layout_ptr.?;
 
     const MutationContext = struct {
         tab: *tab_module.Tab,
@@ -758,7 +760,7 @@ test "verified append mutation retires render borrows but retains document layou
                     context.frame,
                     mutation_root,
                 ),
-                .append_only => context.tab.prepareForDomAppend(
+                .retained_insert => context.tab.prepareForDomInsert(
                     context.browser,
                     context.frame,
                     mutation_root,
@@ -787,14 +789,19 @@ test "verified append mutation retires render borrows but retains document layou
 
     const appended = try js.evaluate(0,
         \\var target = document.querySelectorAll('section')[0];
-        \\var child = document.createElement('div');
-        \\child.setAttribute('style', 'display:block');
-        \\target.appendChild(child) === child && target.children.length === 2
+        \\var reference = target.children[1];
+        \\var childA = document.createElement('div');
+        \\childA.setAttribute('style', 'display:block');
+        \\var childB = document.createElement('div');
+        \\childB.setAttribute('style', 'display:block');
+        \\var resultA = target.insertBefore(childA, reference);
+        \\var resultB = target.insertBefore(childB, reference);
+        \\resultA === childA && resultB === childB && target.children.length === 4
     );
     try std.testing.expect(appended.toBoolean());
 
-    try std.testing.expectEqual(ScriptJs.DomMutationKind.append_only, mutation_context.observed_kind.?);
-    try std.testing.expectEqual(@as(usize, 1), mutation_context.completion_count);
+    try std.testing.expectEqual(ScriptJs.DomMutationKind.retained_insert, mutation_context.observed_kind.?);
+    try std.testing.expectEqual(@as(usize, 2), mutation_context.completion_count);
     try std.testing.expect(frame.styleNeeded());
     try std.testing.expect(frame.document.lastValue().* == document);
     try std.testing.expect(document.layoutNeeded());
@@ -806,9 +813,11 @@ test "verified append mutation retires render borrows but retains document layou
     try parser.style(allocator, &frame.current_node.?, &.{});
     frame.publishStyledDocument();
     try document.layout(layout_engine);
-    try std.testing.expectEqual(@as(usize, 2), section.element.children.items.len);
-    try std.testing.expect(section.element.children.items[0].element.layout_ptr.? == original_child_layout);
+    try std.testing.expectEqual(@as(usize, 4), section.element.children.items.len);
+    try std.testing.expect(section.element.children.items[0].element.layout_ptr.? == first_layout);
     try std.testing.expect(section.element.children.items[1].element.layout_ptr != null);
+    try std.testing.expect(section.element.children.items[2].element.layout_ptr != null);
+    try std.testing.expect(section.element.children.items[3].element.layout_ptr.? == last_layout);
 }
 
 test "first contenteditable append preserves focus for subsequent typing" {

@@ -420,12 +420,13 @@ before changing `root.zig`, `tab.zig`, `render/`, or browser task scheduling.
   storage and parent pointers are final, run the paired completion callback
   synchronously so moved iframe identities are rebound and removed child-frame
   workers/callbacks are quiesced before JavaScript resumes.
-  A layout-verified at-end append is the narrow exception to complete layout
+  A layout-verified child insertion is the narrow exception to complete layout
   teardown: retire the same display, interaction, accessibility, compositor,
   and Browser state, but retain the frame's style subscriber graph and
-  `DocumentLayout`. The JavaScript host must rebind the accepted block-child
-  prefix immediately after storage relocation. If the layout shape is not a
-  one-to-one block prefix, use the general boundary above.
+  `DocumentLayout`. The JavaScript host must match and rebind every accepted
+  block child immediately after storage relocation. Layout then fills only the
+  inserted gaps and updates protected predecessor links. If the existing shape
+  is not a one-to-one block mapping, use the general boundary above.
 - Content clicks walk the retained list in reverse paint order. A primary hit
   also runs the retained layout tree's parent-local point query; painted
   provenance remains authoritative for fragment gaps, glyph geometry, rounded

@@ -571,13 +571,13 @@ pub const Element = struct {
     children: std.ArrayList(Node),
     layout_ptr: ?*anyopaque = null,
     layout_mark: ?*const fn (*anyopaque) void = null,
-    // Block-mode layout owners can opt into retaining an already-laid-out
-    // direct-child prefix across an append-only child-array relocation. The
-    // compatibility callback runs before storage can move; the rebind
-    // callback runs immediately after parent pointers have been repaired.
-    // Both callbacks borrow the opaque layout owner synchronously.
-    layout_can_reuse_append: ?*const fn (*anyopaque) bool = null,
-    layout_rebind_after_append: ?*const fn (*anyopaque, *Node) bool = null,
+    // Block-mode layout owners can opt into matching already-laid-out direct
+    // children across insertion-only child-array relocation. The compatibility
+    // callback runs before storage can move; the rebind callback runs
+    // immediately after parent pointers have been repaired. Both callbacks
+    // borrow the opaque layout owner synchronously.
+    layout_can_reuse_insert: ?*const fn (*anyopaque, usize) bool = null,
+    layout_rebind_after_insert: ?*const fn (*anyopaque, *Node) bool = null,
     // Track strings we've allocated (like resolved relative font sizes) so we can free them
     owned_strings: ?std.ArrayList([]const u8) = null,
     is_focused: bool = false,
@@ -606,9 +606,10 @@ pub const Element = struct {
     iframe_window_id: ?u32 = null,
     children_dirty: bool = true,
     // True only when every child mutation since the last successful layout
-    // appended a suffix and the retained layout owner accepted prefix reuse.
-    // Any other mutation must call markChildrenDirty, which clears this bit.
-    children_append_only: bool = false,
+    // inserted a new child and the retained layout owner accepted matching the
+    // existing children. Any other mutation must call markChildrenDirty,
+    // which clears this bit.
+    children_insertions_only: bool = false,
     // Summary bit for incremental style traversal. Individual computed
     // properties retain their own ProtectedField dirty bits; this records
     // whether any node strictly below this element may need style work.
@@ -662,49 +663,49 @@ pub const Element = struct {
     }
 
     /// Invalidate the complete layout-child list. This is the conservative
-    /// state for removals, replacements, insertions, and non-structural
-    /// changes that can alter child classification.
+    /// state for removals, replacements, unverified insertions, and
+    /// non-structural changes that can alter child classification.
     pub fn markChildrenDirty(self: *Element) void {
         self.children_dirty = true;
-        self.children_append_only = false;
+        self.children_insertions_only = false;
     }
 
-    /// Record an append-only change without overriding an earlier, more
+    /// Record a layout-verified insertion without overriding an earlier, more
     /// conservative invalidation that has not yet been consumed by layout.
-    pub fn markChildrenAppended(self: *Element) void {
+    pub fn markChildInserted(self: *Element) void {
         if (!self.children_dirty) {
             self.children_dirty = true;
-            self.children_append_only = true;
+            self.children_insertions_only = true;
         }
     }
 
     pub fn clearChildrenDirty(self: *Element) void {
         self.children_dirty = false;
-        self.children_append_only = false;
+        self.children_insertions_only = false;
     }
 
-    /// Ask the current layout owner whether its block-child prefix has a
-    /// one-to-one mapping that can survive appending to this Element.
-    pub fn canReuseLayoutForAppend(self: *Element) bool {
+    /// Ask the current layout owner whether its block children can be matched
+    /// across an insertion at `insert_index`.
+    pub fn canReuseLayoutForInsert(self: *Element, insert_index: usize) bool {
         const owner = self.layout_ptr orelse return false;
-        const callback = self.layout_can_reuse_append orelse return false;
-        return callback(owner);
+        const callback = self.layout_can_reuse_insert orelse return false;
+        return callback(owner, insert_index);
     }
 
     /// Repair retained layout-to-DOM pointers after by-value children move.
     /// The caller must invoke this before another host callback or JavaScript
     /// statement can observe the new child storage.
-    pub fn rebindLayoutAfterAppend(self: *Element, node: *Node) bool {
+    pub fn rebindLayoutAfterInsert(self: *Element, node: *Node) bool {
         const owner = self.layout_ptr orelse return false;
-        const callback = self.layout_rebind_after_append orelse return false;
+        const callback = self.layout_rebind_after_insert orelse return false;
         return callback(owner, node);
     }
 
     pub fn clearLayoutOwner(self: *Element) void {
         self.layout_ptr = null;
         self.layout_mark = null;
-        self.layout_can_reuse_append = null;
-        self.layout_rebind_after_append = null;
+        self.layout_can_reuse_insert = null;
+        self.layout_rebind_after_insert = null;
     }
 
     pub fn deinit(self: *Element, allocator: std.mem.Allocator) void {

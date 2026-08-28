@@ -43,12 +43,14 @@ before changing ownership or thread boundaries.
   DOM-style invalidations directly to the containing persistent block instead.
   Document/block/line `in_layout` guards suppress only reentrant owner-wide
   invalidation caused by child metrics during that same serialized traversal.
-  A DOM-backed block may advertise append-prefix reuse only when every retained
-  direct DOM child maps one-to-one to a DOM-backed `BlockLayout`; anonymous
-  inline runs and trailing run-in headings stay conservative. Record the
-  represented DOM-prefix length, synchronously rebind those child `node_ptr`s
-  after `ArrayList(Node)` relocation, and append layout objects only for the
-  new suffix. Any removal, reorder, classification invalidation, or incompatible
+  A DOM-backed block may advertise retained insertion matching only when every
+  represented direct DOM child maps one-to-one to a DOM-backed `BlockLayout`;
+  anonymous inline runs and run-in merges stay conservative. Synchronously
+  rebind matched child `node_ptr`s after `ArrayList(Node)` relocation, then
+  create layout objects only for unmatched gaps. Every block predecessor is a
+  `ProtectedField`; rewiring the immediate successor registers its new metric
+  dependencies and invalidates vertical flow without rebuilding later
+  siblings. Any removal, reorder, incompatible classification, or ambiguous
   shape still destroys and rebuilds the complete child list.
 - `font.zig` owns SDL_ttf handles and cached RGBA glyph pixels. Display items
   borrow those pixels until a raster snapshot copies them.

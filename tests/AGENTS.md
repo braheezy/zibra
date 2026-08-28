@@ -163,6 +163,11 @@ time, verifies saved DOM handles remain stable, and keeps the original prefix
 visible while new rows flow below it. Unit coverage forces direct-child storage
 to relocate and asserts the existing `BlockLayout` identities are reused.
 
+`tests/manual/invalidating-previous.html` inserts block-displayed children
+between retained siblings. It verifies stable DOM identity and visible order;
+unit coverage additionally asserts that the original `BlockLayout` objects are
+matched and only changed protected predecessor links invalidate vertical flow.
+
 `tests/manual/remove-child.html` removes an attached subtree into detached
 ownership, verifies its nested and shifted-sibling handles, and reattaches the
 same Node object under a different parent with a visible in-page result.

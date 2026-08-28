@@ -17,10 +17,11 @@ or Kiesel allocation/locking.
   `appendChild` and `insertBefore` transfer only such detached roots into a
   child array, rebind handles for every relocated immediate child, and invoke
   the synchronous DOM-mutation boundary before attached storage can move. An
-  at-end insertion may use the append-only boundary only when the target's
-  opaque layout callback verifies a one-to-one block-child prefix. Mark that
-  state before mutation and invoke its paired pointer-rebind callback after
-  `fixParentPointers`, before completion callbacks or JavaScript resume.
+  insertion may use the retained-child boundary only when the target's opaque
+  layout callback verifies that every existing child has a one-to-one block
+  owner. Mark that state before mutation and invoke its paired pointer-rebind
+  callback after `fixParentPointers`, before completion callbacks or
+  JavaScript resume.
 - `removeChild` performs the inverse transfer: it accepts only a direct child,
   moves that subtree into a heap-stable window-owned detached root, preserves
   subtree handles, and rebinds siblings shifted in the attached child array.
@@ -80,9 +81,9 @@ or Kiesel allocation/locking.
 - General structural JavaScript mutation, including `replaceChildren`, clears
   current style-field subscriber maps while every endpoint is alive; the
   mandatory full style/layout render rebuilds dependencies after mutation. A
-  verified append-only mutation preserves those maps and its block-layout
-  prefix because no existing style field or layout owner is destroyed; it must
-  synchronously rebind every relocated direct-child layout pointer. Both paths'
+  verified insertion-only mutation preserves those maps and its matched block
+  layouts because no existing style field or layout owner is destroyed; it
+  must synchronously rebind every relocated direct-child layout pointer. Both paths'
   pre-mutation host callback retires pointer borrowers, and the paired
   completion callback runs only after child storage, parent pointers, Node
   handles, and any retained layout pointers are final. The completion side may

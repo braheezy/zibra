@@ -728,7 +728,7 @@ pub fn Contexts(comptime Browser: type, comptime DocumentHandle: type) type {
 
             switch (kind) {
                 .structural => tab.prepareForDomMutation(browser, frame, mutation_root),
-                .append_only => tab.prepareForDomAppend(browser, frame, mutation_root),
+                .retained_insert => tab.prepareForDomInsert(browser, frame, mutation_root),
             }
         }
 
