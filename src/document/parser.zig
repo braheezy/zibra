@@ -1745,7 +1745,10 @@ const INHERITED_PROPERTIES = [_]InheritedProperty{
     .{ .name = "font-family", .default_value = "sans-serif" },
     .{ .name = "font-size", .default_value = "16px" },
     .{ .name = "font-style", .default_value = "normal" },
+    .{ .name = "font-variant", .default_value = "normal" },
     .{ .name = "font-weight", .default_value = "normal" },
+    .{ .name = "font-stretch", .default_value = "normal" },
+    .{ .name = "line-height", .default_value = "normal" },
     .{ .name = "color", .default_value = "black" },
     .{ .name = "color-scheme", .default_value = "light dark" },
 };
@@ -1755,6 +1758,9 @@ const CSS_PROPERTIES = [_]struct { name: []const u8, default_value: []const u8 }
     .{ .name = "font-size", .default_value = "inherit" },
     .{ .name = "font-weight", .default_value = "inherit" },
     .{ .name = "font-style", .default_value = "inherit" },
+    .{ .name = "font-variant", .default_value = "inherit" },
+    .{ .name = "font-stretch", .default_value = "inherit" },
+    .{ .name = "line-height", .default_value = "inherit" },
     .{ .name = "color", .default_value = "inherit" },
     .{ .name = "opacity", .default_value = "1.0" },
     .{ .name = "transition", .default_value = "" },
@@ -1763,6 +1769,26 @@ const CSS_PROPERTIES = [_]struct { name: []const u8, default_value: []const u8 }
     .{ .name = "filter", .default_value = "none" },
     .{ .name = "mix-blend-mode", .default_value = "" },
     .{ .name = "border-radius", .default_value = "0px" },
+    .{ .name = "margin-top", .default_value = "0px" },
+    .{ .name = "margin-right", .default_value = "0px" },
+    .{ .name = "margin-bottom", .default_value = "0px" },
+    .{ .name = "margin-left", .default_value = "0px" },
+    .{ .name = "padding-top", .default_value = "0px" },
+    .{ .name = "padding-right", .default_value = "0px" },
+    .{ .name = "padding-bottom", .default_value = "0px" },
+    .{ .name = "padding-left", .default_value = "0px" },
+    .{ .name = "border-top-width", .default_value = "0px" },
+    .{ .name = "border-right-width", .default_value = "0px" },
+    .{ .name = "border-bottom-width", .default_value = "0px" },
+    .{ .name = "border-left-width", .default_value = "0px" },
+    .{ .name = "border-top-style", .default_value = "none" },
+    .{ .name = "border-right-style", .default_value = "none" },
+    .{ .name = "border-bottom-style", .default_value = "none" },
+    .{ .name = "border-left-style", .default_value = "none" },
+    .{ .name = "border-top-color", .default_value = "currentColor" },
+    .{ .name = "border-right-color", .default_value = "currentColor" },
+    .{ .name = "border-bottom-color", .default_value = "currentColor" },
+    .{ .name = "border-left-color", .default_value = "currentColor" },
     .{ .name = "overflow", .default_value = "visible" },
     .{ .name = "outline", .default_value = "none" },
     .{ .name = "background-color", .default_value = "transparent" },
@@ -1779,6 +1805,8 @@ const CSS_PROPERTIES = [_]struct { name: []const u8, default_value: []const u8 }
     .{ .name = "zoom", .default_value = "1" },
     .{ .name = "width", .default_value = "auto" },
     .{ .name = "height", .default_value = "auto" },
+    .{ .name = "float", .default_value = "none" },
+    .{ .name = "clear", .default_value = "none" },
 };
 
 fn isInheritedProperty(property: []const u8) bool {
@@ -2153,6 +2181,18 @@ fn resolveFontFamilyKeyword(value: []const u8, inherited_value: []const u8) []co
     return value;
 }
 
+fn resolveInheritedFontKeyword(
+    value: []const u8,
+    inherited_value: []const u8,
+    initial_value: []const u8,
+) []const u8 {
+    const keyword = std.mem.trim(u8, value, " \t\r\n");
+    if (std.ascii.eqlIgnoreCase(keyword, "inherit") or
+        std.ascii.eqlIgnoreCase(keyword, "unset")) return inherited_value;
+    if (std.ascii.eqlIgnoreCase(keyword, "initial")) return initial_value;
+    return value;
+}
+
 // Helper to get a default parent style map with inherited defaults
 fn getDefaultParentStyle(allocator: std.mem.Allocator) !StyleMap {
     var parent_style = try initStyleMap(allocator, "Node", null);
@@ -2426,6 +2466,31 @@ fn styleWithParent(
                     );
                 }
 
+                // Resolve CSS-wide keywords for the other inherited font
+                // longhands before layout reads the computed style. Shorthand
+                // expansion writes concrete values, while an explicit
+                // `inherit`, `unset`, or `initial` still needs its computed
+                // value rather than leaking the keyword into rendering.
+                for ([_]struct { name: []const u8, initial: []const u8 }{
+                    .{ .name = "font-style", .initial = "normal" },
+                    .{ .name = "font-variant", .initial = "normal" },
+                    .{ .name = "font-weight", .initial = "normal" },
+                    .{ .name = "font-stretch", .initial = "normal" },
+                    .{ .name = "line-height", .initial = "normal" },
+                }) |prop| {
+                    if (new_style.get(prop.name)) |value| {
+                        const child_field = style_map.getPtr(prop.name).?;
+                        const inherited_value = if (parent_style.getPtr(prop.name)) |parent_field|
+                            inheritedValue(parent_field, child_field, parent_is_ephemeral_default)
+                        else
+                            prop.initial;
+                        try new_style.put(
+                            prop.name,
+                            resolveInheritedFontKeyword(value, inherited_value, prop.initial),
+                        );
+                    }
+                }
+
                 // Fourth, resolve relative font sizes to absolute pixels.
                 // Computed font-size values are kept in px so inherited
                 // descendants can use them as the base for their own `em`
@@ -2460,6 +2525,40 @@ fn styleWithParent(
                             resolved_size_owned = false;
 
                             try new_style.put("font-size", resolved_size);
+                        }
+                    }
+                }
+
+                // Length and percentage line-heights compute to an absolute
+                // value at the element's font size. Unitless numbers remain
+                // unitless so descendants inherit the multiplier and apply it
+                // to their own font size, matching CSS's useful distinction.
+                if (new_style.get("line-height")) |line_height| {
+                    if (css_length.parse(line_height)) |length| {
+                        if (length.unit != .px) {
+                            const font_size = css_length.resolve(
+                                new_style.get("font-size") orelse "16px",
+                                .{},
+                            ) orelse 16.0;
+                            if (css_length.resolveLength(length, .{
+                                .font_size = font_size,
+                                .percentage_base = font_size,
+                            })) |absolute_px| {
+                                const resolved_line_height = try std.fmt.allocPrint(
+                                    allocator,
+                                    "{d:.1}px",
+                                    .{absolute_px},
+                                );
+                                var resolved_line_height_owned = true;
+                                defer if (resolved_line_height_owned) allocator.free(resolved_line_height);
+
+                                if (e.owned_strings == null) {
+                                    e.owned_strings = std.ArrayList([]const u8).empty;
+                                }
+                                try e.owned_strings.?.append(allocator, resolved_line_height);
+                                resolved_line_height_owned = false;
+                                try new_style.put("line-height", resolved_line_height);
+                            }
                         }
                     }
                 }

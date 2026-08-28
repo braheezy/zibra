@@ -1,0 +1,54 @@
+<!--
+  Verification: run
+  zig build run -- --dump-layout tests/manual/float-clear.html
+  and confirm the colored boxes share the top row while the green block
+  starts below both floats because of clear: both.
+-->
+<!doctype html>
+<style>
+  html, body {
+    margin: 0;
+    padding: 0;
+  }
+
+  .stage {
+    display: block;
+    width: 420px;
+    padding: 10px;
+    border: 2px solid #000000;
+  }
+
+  .left {
+    float: left;
+    width: 90px;
+    height: 90px;
+    margin-right: 10px;
+    background-color: #ffcccc;
+  }
+
+  .right {
+    float: right;
+    width: 90px;
+    height: 60px;
+    margin-left: 10px;
+    background-color: #ccccff;
+  }
+
+  .clear-both {
+    clear: both;
+    height: 28px;
+    background-color: #ccffcc;
+  }
+
+  .wrap {
+    padding: 4px;
+    background-color: #ffffcc;
+  }
+</style>
+
+<div class="stage">
+  <div class="left">left</div>
+  <div class="right">right</div>
+  <div class="wrap">This line flows between the left and right floats before the next block clears them.</div>
+  <div class="clear-both">clear: both</div>
+</div>

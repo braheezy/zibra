@@ -142,9 +142,15 @@ or selector/rule lifetime.
   preserve quotes, escapes, and parenthesis depth so `url(data:...;...)` and
   other supported CSS functions remain one borrowed value.
 - Keep the computed-style property table and inherited-property defaults in
-  sync. A computed `font-family` borrows either its declaration or inherited
-  parent slice; rendering resolves the supported family/fallback list without
-  retaining a new borrowed value.
+  sync. Font shorthand expansion covers style, variant, weight, stretch, size,
+  line-height, and family, preserving declaration importance. A computed
+  `font-family` borrows either its declaration or inherited parent slice;
+  rendering resolves the supported family/fallback list without retaining a
+  new borrowed value. Unitless computed `line-height` values remain
+  multipliers, while relative length values compute to pixels at the element's
+  font size. The renderer supports the shorthand's small-caps variant through
+  its existing glyph path; font-stretch remains a computed value until the
+  font backend exposes stretch axes.
 - `width` and `height` are non-inherited computed properties. Their default is
   `auto`; layout resolves non-negative `px`, `em`, and percentage lengths
   against an explicit font-size/containing-block context and keeps the

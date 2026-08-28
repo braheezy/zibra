@@ -698,6 +698,25 @@ command's optional half-open source rectangle crops oversized output at the
 right/bottom border; raster snapshots copy the underlying complete bitmap and
 preserve that numeric crop.
 
+Block layout treats `x`, `y`, `width`, and `height` as the used border box.
+Computed CSS `width` and `height` remain content-box dimensions; each block
+also retains resolved margin, padding, and border edges so child flow starts
+at the parent content edge and auto heights include the surrounding insets.
+Adjacent block margins collapse to the larger edge in the supported positive
+margin case. Backgrounds fill the border box and solid/other visible border
+styles are emitted as four side rectangles, all within the block's effect and
+display-list ownership boundary. CSS box shorthands are expanded into
+longhands during declaration parsing, so stylesheet rules and inline style
+attributes share the same cascade and `!important` behavior.
+
+Each block formatting context retains primitive geometry for its direct
+left/right floats during a layout pass. Floats are removed from normal block
+height accumulation, exclude their margin boxes from following block and
+inline content, and remain available until their bottom edge. `clear: left`,
+`right`, or `both` advances a block past the corresponding active float
+bottoms. A block's auto height still includes the bottom of its direct floats;
+the retained float records contain no DOM or layout pointers.
+
 An Element lazily owns a heap-stable canvas pointee when JavaScript first calls
 `getContext("2d")`. z2d Context retains the address of the Surface inside that
 pointee, so DOM child-array moves transfer the pointer but never copy the
@@ -932,12 +951,22 @@ Preformatted state follows that scoped model for `pre`. Its text retains source
 spaces and explicit CR, LF, and CRLF line breaks, advances consecutive empty
 lines, suppresses viewport wrapping, and selects the monospace font while
 allowing nested elements to change weight, slant, color, and size normally.
-The inherited `font-family` computed value selects either the proportional or
-platform monospace face for Latin text. Common Courier and monospace aliases
-map to that platform face, while CJK, symbol, and emoji graphemes continue to
-use their specialized fallback categories. Each loaded font owns its glyph
-cache, so identical grapheme/style/size keys remain isolated between selected
-families.
+The inherited font metrics are represented by `font-family`, `font-size`,
+`font-style`, `font-variant`, `font-weight`, `font-stretch`, and `line-height`.
+The `font` shorthand expands to those longhands, including the optional
+`size/line-height` syntax; omitted optional fields reset to their initial
+values. Relative line-height lengths compute against the element's font size,
+while unitless values remain multipliers for descendants. Layout records the
+used line-height on each inline item so a line containing nested styles uses
+the largest required line box. `font-variant: small-caps` selects the existing
+small-caps glyph path; `font-stretch` is retained in computed style while the
+current font backend keeps its normal glyph width. The inherited
+`font-family` computed value
+selects either the proportional or platform monospace face for Latin text.
+Common Courier and monospace aliases map to that platform face, while CJK,
+symbol, and emoji graphemes continue to use their specialized fallback
+categories. Each loaded font owns its glyph cache, so identical
+grapheme/style/size keys remain isolated between selected families.
 Block `width` and `height` computed values remain borrowed style slices and are
 registered as dependencies of their DOM-backed layout box. A non-negative
 pixel width replaces the available content width before descendant layout; a

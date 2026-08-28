@@ -185,8 +185,11 @@ fn pair(self: *CSSParser) !struct { property: []const u8, value: []const u8 } {
 
 const FontShorthand = struct {
     style: []const u8 = "normal",
+    variant: []const u8 = "normal",
     weight: []const u8 = "normal",
+    stretch: []const u8 = "normal",
     size: []const u8,
+    line_height: []const u8 = "normal",
     family: []const u8,
 };
 
@@ -195,14 +198,44 @@ fn isSupportedFontSize(font_size: []const u8) bool {
     return length.unit == .px or length.unit == .em or length.unit == .percent;
 }
 
-/// Parse the subset of the `font` shorthand represented by Zibra's computed
-/// style: optional `italic` and `bold`, followed by a required px/em/percentage
-/// size and a required family or fallback list. Unsupported syntax invalidates
-/// the declaration instead of applying only part of it.
+fn isSupportedFontLineHeight(line_height: []const u8) bool {
+    if (std.ascii.eqlIgnoreCase(line_height, "normal")) return true;
+    if (css_length.parse(line_height) != null) return true;
+    const number = std.fmt.parseFloat(f64, line_height) catch return false;
+    return std.math.isFinite(number) and number >= 0;
+}
+
+fn isFontWeight(token: []const u8) bool {
+    if (std.ascii.eqlIgnoreCase(token, "normal") or
+        std.ascii.eqlIgnoreCase(token, "bold") or
+        std.ascii.eqlIgnoreCase(token, "bolder") or
+        std.ascii.eqlIgnoreCase(token, "lighter")) return true;
+    const weight = std.fmt.parseInt(u16, token, 10) catch return false;
+    return weight >= 100 and weight <= 900 and weight % 100 == 0;
+}
+
+fn isFontStretch(token: []const u8) bool {
+    return std.ascii.eqlIgnoreCase(token, "normal") or
+        std.ascii.eqlIgnoreCase(token, "ultra-condensed") or
+        std.ascii.eqlIgnoreCase(token, "extra-condensed") or
+        std.ascii.eqlIgnoreCase(token, "condensed") or
+        std.ascii.eqlIgnoreCase(token, "semi-condensed") or
+        std.ascii.eqlIgnoreCase(token, "semi-expanded") or
+        std.ascii.eqlIgnoreCase(token, "expanded") or
+        std.ascii.eqlIgnoreCase(token, "extra-expanded") or
+        std.ascii.eqlIgnoreCase(token, "ultra-expanded");
+}
+
+/// Parse the standard font shorthand ordering: optional style, variant,
+/// weight, and stretch; required size with an optional `/line-height`; and a
+/// family/fallback list. The family is retained as the original suffix so
+/// quoted family names and commas remain intact.
 fn parseFontShorthand(declaration_value: []const u8) ?FontShorthand {
     var result = FontShorthand{ .size = undefined, .family = undefined };
     var saw_style = false;
+    var saw_variant = false;
     var saw_weight = false;
+    var saw_stretch = false;
     var pos: usize = 0;
 
     while (pos < declaration_value.len) {
@@ -213,23 +246,88 @@ fn parseFontShorthand(declaration_value: []const u8) ?FontShorthand {
         while (pos < declaration_value.len and !std.ascii.isWhitespace(declaration_value[pos])) : (pos += 1) {}
         const token = declaration_value[token_start..pos];
 
-        if (isSupportedFontSize(token)) {
-            const family = std.mem.trim(u8, declaration_value[pos..], " \t\r\n");
+        var size_token: ?[]const u8 = null;
+        var line_height_token: ?[]const u8 = null;
+        var family_start = pos;
+
+        if (std.mem.indexOfScalar(u8, token, '/')) |slash| {
+            const possible_size = token[0..slash];
+            const possible_line_height = token[slash + 1 ..];
+            if (!isSupportedFontSize(possible_size)) return null;
+            size_token = possible_size;
+            if (possible_line_height.len != 0) {
+                if (!isSupportedFontLineHeight(possible_line_height)) return null;
+                line_height_token = possible_line_height;
+            } else {
+                var line_start = pos;
+                while (line_start < declaration_value.len and
+                    std.ascii.isWhitespace(declaration_value[line_start])) : (line_start += 1)
+                {}
+                const line_end = blk: {
+                    var end = line_start;
+                    while (end < declaration_value.len and !std.ascii.isWhitespace(declaration_value[end])) : (end += 1) {}
+                    break :blk end;
+                };
+                const separate_line_height = declaration_value[line_start..line_end];
+                if (!isSupportedFontLineHeight(separate_line_height)) return null;
+                line_height_token = separate_line_height;
+                family_start = line_end;
+                pos = line_end;
+            }
+        } else if (isSupportedFontSize(token)) {
+            size_token = token;
+            var after_size = pos;
+            while (after_size < declaration_value.len and std.ascii.isWhitespace(declaration_value[after_size])) : (after_size += 1) {}
+            if (after_size < declaration_value.len and declaration_value[after_size] == '/') {
+                after_size += 1;
+                while (after_size < declaration_value.len and std.ascii.isWhitespace(declaration_value[after_size])) : (after_size += 1) {}
+                const line_start = after_size;
+                while (after_size < declaration_value.len and !std.ascii.isWhitespace(declaration_value[after_size])) : (after_size += 1) {}
+                const possible_line_height = declaration_value[line_start..after_size];
+                if (!isSupportedFontLineHeight(possible_line_height)) return null;
+                line_height_token = possible_line_height;
+                family_start = after_size;
+            }
+        }
+
+        if (size_token) |size| {
+            const family = std.mem.trim(u8, declaration_value[family_start..], " \t\r\n");
             if (family.len == 0) return null;
-            result.size = token;
+            result.size = size;
+            if (line_height_token) |line_height| result.line_height = line_height;
             result.family = family;
             return result;
         }
 
-        if (std.ascii.eqlIgnoreCase(token, "italic")) {
+        if (std.ascii.eqlIgnoreCase(token, "italic") or
+            std.ascii.eqlIgnoreCase(token, "oblique"))
+        {
             if (saw_style) return null;
-            result.style = "italic";
+            result.style = if (std.ascii.eqlIgnoreCase(token, "oblique")) "oblique" else "italic";
             saw_style = true;
-        } else if (std.ascii.eqlIgnoreCase(token, "bold")) {
+        } else if (std.ascii.eqlIgnoreCase(token, "small-caps")) {
+            if (saw_variant) return null;
+            result.variant = "small-caps";
+            saw_variant = true;
+        } else if (std.ascii.eqlIgnoreCase(token, "normal")) {
+            // `normal` is valid for each optional font component. It does
+            // not reserve one component, since another optional component may
+            // still appear later in the shorthand.
+        } else if (isFontWeight(token)) {
             if (saw_weight) return null;
-            result.weight = "bold";
+            if (std.ascii.eqlIgnoreCase(token, "normal")) {
+                result.weight = "normal";
+            } else if (std.ascii.eqlIgnoreCase(token, "bold")) {
+                result.weight = "bold";
+            } else {
+                result.weight = token;
+            }
             saw_weight = true;
-        } else if (!std.ascii.eqlIgnoreCase(token, "normal")) {
+        } else if (isFontStretch(token)) {
+            if (saw_stretch) return null;
+            result.stretch = token;
+            saw_stretch = true;
+        } else {
             return null;
         }
     }
@@ -259,6 +357,196 @@ fn putLonghand(map: *DeclarationMap, property: []const u8, declaration: Declarat
     try map.put(property, declaration);
 }
 
+const BoxSide = enum { top, right, bottom, left };
+
+fn boxSideProperty(prefix: []const u8, side: BoxSide) []const u8 {
+    return switch (side) {
+        .top => if (std.mem.eql(u8, prefix, "margin")) "margin-top" else if (std.mem.eql(u8, prefix, "padding")) "padding-top" else "border-top-width",
+        .right => if (std.mem.eql(u8, prefix, "margin")) "margin-right" else if (std.mem.eql(u8, prefix, "padding")) "padding-right" else "border-right-width",
+        .bottom => if (std.mem.eql(u8, prefix, "margin")) "margin-bottom" else if (std.mem.eql(u8, prefix, "padding")) "padding-bottom" else "border-bottom-width",
+        .left => if (std.mem.eql(u8, prefix, "margin")) "margin-left" else if (std.mem.eql(u8, prefix, "padding")) "padding-left" else "border-left-width",
+    };
+}
+
+fn splitShorthand(raw_value: []const u8, tokens: *[4][]const u8) ?usize {
+    var count: usize = 0;
+    var iterator = std.mem.tokenizeAny(u8, raw_value, " \t\r\n\x0c");
+    while (iterator.next()) |token| {
+        if (count == tokens.len) return null;
+        tokens[count] = token;
+        count += 1;
+    }
+    return if (count > 0) count else null;
+}
+
+fn expandBoxShorthand(
+    map: *DeclarationMap,
+    prefix: []const u8,
+    raw_value: []const u8,
+    declaration: Declaration,
+) !bool {
+    var tokens: [4][]const u8 = undefined;
+    const count = splitShorthand(raw_value, &tokens) orelse return false;
+    const values = switch (count) {
+        1 => [4][]const u8{ tokens[0], tokens[0], tokens[0], tokens[0] },
+        2 => [4][]const u8{ tokens[0], tokens[1], tokens[0], tokens[1] },
+        3 => [4][]const u8{ tokens[0], tokens[1], tokens[2], tokens[1] },
+        4 => [4][]const u8{ tokens[0], tokens[1], tokens[2], tokens[3] },
+        else => return false,
+    };
+    const sides = [_]BoxSide{ .top, .right, .bottom, .left };
+    for (sides, values) |side, side_value| {
+        try putLonghand(map, boxSideProperty(prefix, side), .{
+            .value = side_value,
+            .important = declaration.important,
+        });
+    }
+    return true;
+}
+
+fn isBorderStyle(raw_value: []const u8) bool {
+    return std.ascii.eqlIgnoreCase(raw_value, "none") or
+        std.ascii.eqlIgnoreCase(raw_value, "hidden") or
+        std.ascii.eqlIgnoreCase(raw_value, "dotted") or
+        std.ascii.eqlIgnoreCase(raw_value, "dashed") or
+        std.ascii.eqlIgnoreCase(raw_value, "solid") or
+        std.ascii.eqlIgnoreCase(raw_value, "double") or
+        std.ascii.eqlIgnoreCase(raw_value, "groove") or
+        std.ascii.eqlIgnoreCase(raw_value, "ridge") or
+        std.ascii.eqlIgnoreCase(raw_value, "inset") or
+        std.ascii.eqlIgnoreCase(raw_value, "outset");
+}
+
+fn isBorderWidth(raw_value: []const u8) bool {
+    if (std.ascii.eqlIgnoreCase(raw_value, "thin") or
+        std.ascii.eqlIgnoreCase(raw_value, "medium") or
+        std.ascii.eqlIgnoreCase(raw_value, "thick") or
+        std.mem.eql(u8, std.mem.trim(u8, raw_value, " \t\r\n"), "0")) return true;
+    return css_length.parse(raw_value) != null;
+}
+
+fn borderSideProperty(kind: []const u8, side: BoxSide) []const u8 {
+    if (std.mem.eql(u8, kind, "width")) {
+        return switch (side) {
+            .top => "border-top-width",
+            .right => "border-right-width",
+            .bottom => "border-bottom-width",
+            .left => "border-left-width",
+        };
+    }
+    if (std.mem.eql(u8, kind, "style")) {
+        return switch (side) {
+            .top => "border-top-style",
+            .right => "border-right-style",
+            .bottom => "border-bottom-style",
+            .left => "border-left-style",
+        };
+    }
+    return switch (side) {
+        .top => "border-top-color",
+        .right => "border-right-color",
+        .bottom => "border-bottom-color",
+        .left => "border-left-color",
+    };
+}
+
+fn expandBorderWidthOrStyle(
+    map: *DeclarationMap,
+    kind: []const u8,
+    raw_value: []const u8,
+    declaration: Declaration,
+) !bool {
+    var tokens: [4][]const u8 = undefined;
+    const count = splitShorthand(raw_value, &tokens) orelse return false;
+    const values = switch (count) {
+        1 => [4][]const u8{ tokens[0], tokens[0], tokens[0], tokens[0] },
+        2 => [4][]const u8{ tokens[0], tokens[1], tokens[0], tokens[1] },
+        3 => [4][]const u8{ tokens[0], tokens[1], tokens[2], tokens[1] },
+        4 => [4][]const u8{ tokens[0], tokens[1], tokens[2], tokens[3] },
+        else => return false,
+    };
+    const sides = [_]BoxSide{ .top, .right, .bottom, .left };
+    for (values) |side_value| {
+        if (std.mem.eql(u8, kind, "width")) {
+            if (!isBorderWidth(side_value)) return false;
+        } else if (!isBorderStyle(side_value)) return false;
+    }
+    for (sides, values) |side, side_value| {
+        try putLonghand(map, borderSideProperty(kind, side), .{
+            .value = side_value,
+            .important = declaration.important,
+        });
+    }
+    return true;
+}
+
+fn expandBorderColor(
+    map: *DeclarationMap,
+    raw_value: []const u8,
+    declaration: Declaration,
+) !bool {
+    var tokens: [4][]const u8 = undefined;
+    const count = splitShorthand(raw_value, &tokens) orelse return false;
+    const values = switch (count) {
+        1 => [4][]const u8{ tokens[0], tokens[0], tokens[0], tokens[0] },
+        2 => [4][]const u8{ tokens[0], tokens[1], tokens[0], tokens[1] },
+        3 => [4][]const u8{ tokens[0], tokens[1], tokens[2], tokens[1] },
+        4 => [4][]const u8{ tokens[0], tokens[1], tokens[2], tokens[3] },
+        else => return false,
+    };
+    const sides = [_]BoxSide{ .top, .right, .bottom, .left };
+    for (sides, values) |side, side_value| {
+        try putLonghand(map, borderSideProperty("color", side), .{
+            .value = side_value,
+            .important = declaration.important,
+        });
+    }
+    return true;
+}
+
+fn expandBorder(
+    map: *DeclarationMap,
+    property: []const u8,
+    raw_value: []const u8,
+    declaration: Declaration,
+) !bool {
+    var tokens: [4][]const u8 = undefined;
+    const count = splitShorthand(raw_value, &tokens) orelse return false;
+    if (count > 3) return false;
+
+    var width: []const u8 = "medium";
+    var style: []const u8 = "none";
+    var color: []const u8 = "currentColor";
+    for (tokens[0..count]) |token| {
+        if (isBorderWidth(token)) {
+            width = token;
+        } else if (isBorderStyle(token)) {
+            style = token;
+        } else {
+            color = token;
+        }
+    }
+
+    const side: ?BoxSide = if (std.ascii.eqlIgnoreCase(property, "border"))
+        null
+    else if (std.ascii.eqlIgnoreCase(property, "border-top"))
+        .top
+    else if (std.ascii.eqlIgnoreCase(property, "border-right"))
+        .right
+    else if (std.ascii.eqlIgnoreCase(property, "border-bottom"))
+        .bottom
+    else
+        .left;
+    const sides = [_]BoxSide{ .top, .right, .bottom, .left };
+    for (sides) |candidate| {
+        if (side) |selected| if (candidate != selected) continue;
+        try putLonghand(map, borderSideProperty("width", candidate), .{ .value = width, .important = declaration.important });
+        try putLonghand(map, borderSideProperty("style", candidate), .{ .value = style, .important = declaration.important });
+        try putLonghand(map, borderSideProperty("color", candidate), .{ .value = color, .important = declaration.important });
+    }
+    return true;
+}
+
 /// Apply one declaration in source order. Shorthands expand here so inline
 /// attributes and stylesheet rules share identical precedence behavior and
 /// every generated longhand retains the shorthand's importance.
@@ -268,12 +556,43 @@ fn putDeclaration(
     raw_value: []const u8,
 ) !void {
     const declaration = parseDeclarationValue(raw_value) orelse return;
-    if (std.mem.eql(u8, property, "font")) {
+    if (std.ascii.eqlIgnoreCase(property, "font")) {
         const font = parseFontShorthand(declaration.value) orelse return;
         try putLonghand(map, "font-style", .{ .value = font.style, .important = declaration.important });
+        try putLonghand(map, "font-variant", .{ .value = font.variant, .important = declaration.important });
         try putLonghand(map, "font-weight", .{ .value = font.weight, .important = declaration.important });
+        try putLonghand(map, "font-stretch", .{ .value = font.stretch, .important = declaration.important });
         try putLonghand(map, "font-size", .{ .value = font.size, .important = declaration.important });
+        try putLonghand(map, "line-height", .{ .value = font.line_height, .important = declaration.important });
         try putLonghand(map, "font-family", .{ .value = font.family, .important = declaration.important });
+        return;
+    }
+
+    if (std.ascii.eqlIgnoreCase(property, "margin") or
+        std.ascii.eqlIgnoreCase(property, "padding"))
+    {
+        const prefix = if (std.ascii.eqlIgnoreCase(property, "margin")) "margin" else "padding";
+        if (try expandBoxShorthand(map, prefix, declaration.value, declaration)) return;
+        return;
+    }
+    if (std.ascii.eqlIgnoreCase(property, "border-width") or
+        std.ascii.eqlIgnoreCase(property, "border-style"))
+    {
+        const kind = if (std.ascii.eqlIgnoreCase(property, "border-width")) "width" else "style";
+        if (try expandBorderWidthOrStyle(map, kind, declaration.value, declaration)) return;
+        return;
+    }
+    if (std.ascii.eqlIgnoreCase(property, "border-color")) {
+        if (try expandBorderColor(map, declaration.value, declaration)) return;
+        return;
+    }
+    if (std.ascii.eqlIgnoreCase(property, "border") or
+        std.ascii.eqlIgnoreCase(property, "border-top") or
+        std.ascii.eqlIgnoreCase(property, "border-right") or
+        std.ascii.eqlIgnoreCase(property, "border-bottom") or
+        std.ascii.eqlIgnoreCase(property, "border-left"))
+    {
+        if (try expandBorder(map, property, declaration.value, declaration)) return;
         return;
     }
     try putLonghand(map, property, declaration);
