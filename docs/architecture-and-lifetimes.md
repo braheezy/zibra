@@ -306,7 +306,8 @@ and the standalone Browser in screenshot mode.
 - the root DOM `Node` value;
 - a `ProtectedField(?*DocumentLayout)` named `document` and the frame-side
   display list. The field owns the optional layout pointer; its dirty bit is
-  also the style/layout phase boundary;
+  also the style/layout phase boundary. The list contains transient overlays
+  and may hold a non-owning root edge into that layout's retained paint cache;
 - owned CSS rules and keyframe containers plus their source buffers, including
   decoded linked sheets and copied `<style>` text retained in DOM order;
 - hit-test collections, image visibility boxes, fragment target positions, and
@@ -759,8 +760,9 @@ backing object. Canvas width/height attributes select unzoomed bitmap pixels
 with 300x150 defaults; layout applies authored/accessibility zoom only to the
 replaced-element box. Assigning either dimension resets pixels and drawing
 state even when the numeric size is unchanged. Canvas drawing is serialized
-with JavaScript and layout on the tab worker. A cached layout command can
-predate lazy context allocation, so each provenance-backed paint clone resolves
+with JavaScript and layout on the tab worker. A cached inline command can
+predate lazy context allocation, so every pixel-changing script command dirties
+the nearest retained paint owner; paint-only inline regeneration then resolves
 the current Element backing and converts its live premultiplied z2d pixels into
 one independently owned straight-alpha `.canvas` command. Subsequent script
 drawing therefore cannot race or rewrite a committed/browser-worker generation;
@@ -772,12 +774,29 @@ their child slices, and `.blend` owns its copied blend-mode string. A blend's
 copyable `blur_radius` marks a CSS filter wrapper without adding another owner.
 See `DisplayItem.freeList` in
 [`src/browser/render/display_list.zig`](../src/browser/render/display_list.zig).
-`BlockLayout.display_list` is a persistent paint cache and recursively owns
-any such containers stored in it. Painting a frame deep-clones cached items
-before wrapping them in effects or transferring the resulting snapshot; frame
-retirement must therefore free only the clone and leave the cache reusable for
-paint-only animation frames. Relayout recursively releases cached containers
-before replacing the cache.
+The exception is `.cached_subtree`: it is a non-owning edge to the stable
+`ArrayList(DisplayItem)` field of a retained layout object, so recursive cleanup
+does nothing to it and every synchronous reader descends through it.
+
+Document, block, line, and text layout objects own retained `paint_cache`
+lists and paint dirty bits. Legacy inline-mode `BlockLayout.display_list`
+remains a separately owned leaf cache. A dirty leaf transactionally replaces
+its own command buffer; dirty ancestors rebuild only shallow ordering and
+effect wrappers containing stable child-cache edges. Clean sibling buffers and
+their generations are neither copied nor replaced. Paint invalidation follows
+layout ancestry without setting geometry fields, and an element-backed block
+forwards it to direct anonymous inline runs that contain inherited text paint.
+Layout invalidation still dirties paint, while compositor-only opacity and
+translation updates bypass both phases.
+
+A Frame's uncomposed list contains only the retained document root edge plus
+transient focus/accessibility overlays. That edge may observe item-buffer
+replacement because it points to the stable list field, but it cannot outlive
+the layout object or a structural rebuild that destroys descendants. Tab
+composition recursively materializes cache edges into an independently owned,
+provenance-free command tree before Browser locking or thread transfer.
+Temporary rich-button layout trees use the materializing path immediately and
+never publish an edge to an owner that is about to retire.
 Primitive entries are not self-contained:
 
 - `.image.pixels` borrows decoded image memory;

@@ -1,0 +1,32 @@
+<!--
+How to verify:
+1. Type continuously in the input and then in the editable yellow box.
+2. Each character and caret move must appear immediately without stale pixels.
+3. The long list of blue sibling rows must remain unchanged. In a debug or
+   profiled run, those clean sibling paint caches should not regenerate.
+-->
+<!doctype html>
+<meta charset="utf-8">
+<title>Retained paint invalidation</title>
+<style>
+  body { font-family: sans-serif; margin: 24px; }
+  .editor { display: block; background-color: lightyellow; padding: 10px; margin: 12px 0; }
+  .static-list { display: block; }
+  .static-row { display: block; color: navy; margin: 3px 0; }
+</style>
+
+<h1>Retained paint invalidation</h1>
+<section style="display:block">
+  <label>Text input: <input value="type here"></label>
+  <div class="editor" contenteditable>Editable text</div>
+</section>
+<section class="static-list"></section>
+
+<script>
+  var list = document.querySelectorAll('.static-list')[0];
+  var rows = '';
+  for (var i = 0; i < 200; i = i + 1) {
+    rows = rows + '<p class="static-row">Unchanged cached sibling ' + i + '</p>';
+  }
+  list.innerHTML = rows;
+</script>

@@ -57,6 +57,9 @@ fn findImageDisplayItem(
     node: *document.Node,
 ) ?*const browser.ImageDisplayItem {
     for (items) |*item| switch (item.*) {
+        .cached_subtree => |cached| {
+            if (findImageDisplayItem(cached.list.items, node)) |found| return found;
+        },
         .image => |*image| {
             const source = image.source orelse continue;
             if (source.node == node) return image;

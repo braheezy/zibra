@@ -28,6 +28,11 @@ before changing `root.zig`, `tab.zig`, `render/`, or browser task scheduling.
   `render/compositor_cache.zig` owns worker-thread planes and scalar opacity /
   translation updates. Operations requiring per-window drawing state remain
   Browser methods.
+  Frame-side lists may contain non-owning `cached_subtree` edges into the
+  retained layout tree. Retire those lists before destroying/rebuilding their
+  layout owners, and expand every edge into an independently owned,
+  provenance-free command tree during Tab composition before publishing it to
+  Browser or raster-worker state.
 - `root.zig` remains an oversized legacy coordinator, so do not add another
   standalone algorithm or data-owner there by default. The remaining natural
   seams include fetch/resource coordination and the per-window presentation
@@ -302,9 +307,10 @@ before changing `root.zig`, `tab.zig`, `render/`, or browser task scheduling.
   origin, and translated only after the outer line chooses a baseline. The
   orange box expands around tall, oversized, and negative-offset descendants;
   descendant links and inputs retain their own topmost paint provenance.
-  Persistent block paint caches recursively own nested display containers;
-  every frame paint deep-clones cached items before effects or snapshots take
-  ownership, so retiring one frame never poisons a later paint-only pass.
+  Temporary rich-button paint is deep-materialized before its short-lived
+  layout tree retires. Persistent document/block/line/text paint caches instead
+  reference clean child caches through non-owning edges, so a repaint can
+  replace one dirty branch without copying its siblings.
 - Each tab owns an indexed joint session history for its root and iframe tree.
   Every entry independently owns the resulting URL/request, an index path from
   the root Frame, the document-replacement bit, and an owned snapshot of the
@@ -368,11 +374,14 @@ before changing `root.zig`, `tab.zig`, `render/`, or browser task scheduling.
   Raster jobs are the exception: they copy every glyph/image buffer before
   releasing `Browser.lock` and do not borrow either source generation.
 - Every frame retains its authoritative uncomposed display list for synchronous
-  worker-thread clicks. Its optional `DisplayItemSource` pointers borrow the
-  current layout and DOM generation, so retire that list before layout rebuild
-  or DOM teardown. Iframe composition creates a separate recursively owned
-  list, clears all source metadata, and transfers only that copy to
-  `Browser.commit`; clean-tab activation must republish the same way. Source
+  worker-thread clicks. It contains transient overlays plus a non-owning root
+  edge into the retained layout paint cache; optional `DisplayItemSource`
+  pointers borrow the current layout and DOM generation. Retire the list before
+  layout-owner rebuild or DOM teardown. Paint-only replacement is safe because
+  cache edges point to stable layout-object list fields, not their replaceable
+  item buffers. Iframe composition creates a separate recursively owned list,
+  expands every cache edge, clears all source metadata, and transfers only that
+  copy to `Browser.commit`; clean-tab activation must republish the same way. Source
   activation must consult the typed layout-origin resolver and validate any
   inline fragment node against that origin. Apply compositor-only opacity and
   translation updates to this retained list before committing them to the

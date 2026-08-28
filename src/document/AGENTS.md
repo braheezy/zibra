@@ -31,6 +31,12 @@ or selector/rule lifetime.
   invalidation boundary after marking the target layout dirty and before child
   storage can move or retire. Keep ordinary render callbacks separate so
   style-only changes do not discard focus or hit/accessibility state.
+- A DOM-backed layout owner installs separate synchronous callbacks for
+  geometry and paint. Computed-style recomputation and direct pixel/content
+  mutations call the paint callback on the nearest retained owner; text and
+  inline elements may walk to a containing element owner. The layout side is
+  responsible for forwarding that invalidation to anonymous inline caches.
+  Clear both callbacks whenever the layout owner retires.
 - Before general structural mutation destroys or relocates style fields, clear
   raw `ProtectedField` subscribers across the installed document. That boundary
   also dirties every computed style; the required full style/layout pass

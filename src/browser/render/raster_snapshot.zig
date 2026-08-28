@@ -61,6 +61,12 @@ pub const RasterSnapshot = struct {
         item: DisplayItem,
     ) CloneError!DisplayItem {
         return switch (item) {
+            .cached_subtree => |cached| .{ .transform = .{
+                .translate_x = 0,
+                .translate_y = 0,
+                .children = try self.cloneList(cached.list.items),
+                .source = null,
+            } },
             .glyph => |glyph_item| blk: {
                 var copy = glyph_item;
                 copy.source = null;

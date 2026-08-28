@@ -5211,6 +5211,12 @@ fn displayListLayoutBounds(
     var result: ?browser.Rect = null;
     for (items) |item| {
         const bounds: ?browser.Rect = switch (item) {
+            .cached_subtree => |cached| displayListLayoutBounds(
+                engine,
+                cached.list.items,
+                translate_x,
+                translate_y,
+            ),
             .glyph => |glyph| .{
                 .left = translate_x + glyph.x,
                 .top = translate_y + glyph.y,
@@ -5296,10 +5302,10 @@ fn rebaseDisplaySources(items: []DisplayItem, parent_block: *BlockLayout) void {
     }
 }
 
-/// Persistent BlockLayout paint caches own every nested display-list
-/// container they contain. Frame snapshots therefore deep-clone cached items
-/// before effects wrap or retain them; retiring a frame must never invalidate
-/// the cache used by a later paint-only pass.
+/// Materialize a command tree for a boundary that cannot borrow retained
+/// layout caches. Persistent layout ancestors use cached_subtree edges instead;
+/// temporary rich-button trees must deep-clone because their owners retire as
+/// soon as the surrounding inline command is complete.
 const DisplayListCloneError = error{OutOfMemory};
 
 fn cloneDisplayListOwned(
@@ -5324,6 +5330,16 @@ fn cloneDisplayItemOwned(
     item: DisplayItem,
 ) DisplayListCloneError!DisplayItem {
     return switch (item) {
+        // Materialization boundaries (temporary rich-button layout and tests)
+        // must not retain a pointer to another layout object's cache. An
+        // identity transform preserves this one-item clone API while owning a
+        // recursively cloned command list.
+        .cached_subtree => |cached| .{ .transform = .{
+            .translate_x = 0,
+            .translate_y = 0,
+            .children = try cloneDisplayListOwned(allocator, cached.list.items),
+            .source = cached.source,
+        } },
         .canvas => |canvas| blk: {
             var copy = canvas;
             copy.pixels = pixels: {
@@ -5389,7 +5405,7 @@ fn appendClonedDisplayItem(
     transferred = true;
 }
 
-test "display-list cache clones recursively own nested containers" {
+test "display-list materialization recursively owns nested containers" {
     const allocator = std.testing.allocator;
 
     const transform_children = try allocator.alloc(DisplayItem, 1);
@@ -5528,6 +5544,11 @@ const TextLayout = struct {
 
     // Dirty tracking for descendants
     has_dirty_descendants: bool = false,
+    /// Complete paint commands for this text fragment. LineLayout references
+    /// this list through a non-owning cached_subtree edge.
+    paint_cache: std.ArrayList(DisplayItem) = .empty,
+    paint_dirty: bool = true,
+    paint_generation: u64 = 0,
 
     fn markOpaque(ptr: *anyopaque) void {
         const self: *TextLayout = @ptrCast(@alignCast(ptr));
@@ -5569,6 +5590,7 @@ const TextLayout = struct {
             .height = ProtectedField(i32).init(0),
             .ascent = ProtectedField(i32).init(0),
             .descent = ProtectedField(i32).init(0),
+            .paint_cache = std.ArrayList(DisplayItem).empty,
         };
         text.zoom.setOwner(text, markOpaque);
         text.x.setOwner(text, markOpaque);
@@ -5612,6 +5634,8 @@ const TextLayout = struct {
     }
 
     fn deinit(self: *TextLayout) void {
+        DisplayItem.freeItems(self.allocator, self.paint_cache.items);
+        self.paint_cache.deinit(self.allocator);
         self.zoom.deinit(self.allocator);
         self.x.deinit(self.allocator);
         self.y.deinit(self.allocator);
@@ -5622,6 +5646,7 @@ const TextLayout = struct {
     }
 
     fn mark(self: *TextLayout) void {
+        self.markPaint();
         // Mark all layout properties as dirty
         self.x.markNoOwner();
         self.y.markNoOwner();
@@ -5647,6 +5672,11 @@ const TextLayout = struct {
         // Mark document
         if (block_parent.document.has_dirty_descendants) return;
         block_parent.document.has_dirty_descendants = true;
+    }
+
+    fn markPaint(self: *TextLayout) void {
+        self.paint_dirty = true;
+        self.parent.markPaint();
     }
 
     fn layout(self: *TextLayout, engine: *Layout) !void {
@@ -5788,6 +5818,9 @@ const LineLayout = struct {
 
     children: std.ArrayList(*TextLayout),
     has_dirty_descendants: bool = false,
+    paint_cache: std.ArrayList(DisplayItem) = .empty,
+    paint_dirty: bool = true,
+    paint_generation: u64 = 0,
     initialized_fields: bool = false,
     in_layout: bool = false,
 
@@ -5817,6 +5850,7 @@ const LineLayout = struct {
             .ascent = ProtectedField(i32).init(0),
             .descent = ProtectedField(i32).init(0),
             .children = std.ArrayList(*TextLayout).empty,
+            .paint_cache = std.ArrayList(DisplayItem).empty,
             .initialized_fields = false,
         };
         line.zoom.setOwner(line, markOpaque);
@@ -5852,6 +5886,8 @@ const LineLayout = struct {
             self.allocator.destroy(child);
         }
         self.children.deinit(self.allocator);
+        DisplayItem.freeItems(self.allocator, self.paint_cache.items);
+        self.paint_cache.deinit(self.allocator);
         self.zoom.deinit(self.allocator);
         self.x.deinit(self.allocator);
         self.y.deinit(self.allocator);
@@ -5997,6 +6033,7 @@ const LineLayout = struct {
     }
 
     fn mark(self: *LineLayout) void {
+        self.markPaint();
         // Mark all layout properties as dirty
         self.x.markNoOwner();
         self.y.markNoOwner();
@@ -6019,6 +6056,11 @@ const LineLayout = struct {
         // Mark document
         if (block_parent.document.has_dirty_descendants) return;
         block_parent.document.has_dirty_descendants = true;
+    }
+
+    fn markPaint(self: *LineLayout) void {
+        self.paint_dirty = true;
+        self.parent.markPaint(false);
     }
 
     fn markSubtree(self: *LineLayout) void {
@@ -6044,6 +6086,12 @@ pub const DocumentLayout = struct {
     width: ProtectedField(i32),
     height: ProtectedField(i32),
     children: std.ArrayList(*BlockLayout),
+    /// Authoritative retained display-list root. Its children are cache edges
+    /// into BlockLayouts, so a narrow repaint does not copy the rest of the
+    /// page merely to publish a new frame snapshot.
+    paint_cache: std.ArrayList(DisplayItem) = .empty,
+    paint_dirty: bool = true,
+    paint_generation: u64 = 0,
 
     has_dirty_descendants: bool = false,
     in_layout: bool = false,
@@ -6063,6 +6111,7 @@ pub const DocumentLayout = struct {
             .page_zoom = 1.0,
             .zoom = ProtectedField(f32).init(1.0),
             .children = std.ArrayList(*BlockLayout).empty,
+            .paint_cache = std.ArrayList(DisplayItem).empty,
             .x = ProtectedField(i32).init(h_offset),
             .y = ProtectedField(i32).init(v_offset),
             .width = ProtectedField(i32).init(0),
@@ -6088,6 +6137,8 @@ pub const DocumentLayout = struct {
             self.allocator.destroy(child);
         }
         self.children.deinit(self.allocator);
+        DisplayItem.freeItems(self.allocator, self.paint_cache.items);
+        self.paint_cache.deinit(self.allocator);
         self.zoom.deinit(self.allocator);
         self.x.deinit(self.allocator);
         self.y.deinit(self.allocator);
@@ -6107,6 +6158,7 @@ pub const DocumentLayout = struct {
 
     pub fn layout(self: *DocumentLayout, engine: *Layout) !void {
         if (!self.layoutNeeded()) return;
+        self.paint_dirty = true;
         self.in_layout = true;
         defer self.in_layout = false;
 
@@ -6203,6 +6255,7 @@ pub const DocumentLayout = struct {
     }
 
     pub fn mark(self: *DocumentLayout) void {
+        self.paint_dirty = true;
         // Mark all layout properties as dirty
         self.x.markNoOwner();
         self.y.markNoOwner();
@@ -6214,6 +6267,11 @@ pub const DocumentLayout = struct {
         for (self.children.items) |child| {
             child.markSubtree();
         }
+    }
+
+    pub fn markPaintSubtree(self: *DocumentLayout) void {
+        self.paint_dirty = true;
+        for (self.children.items) |child| child.markPaintSubtree();
     }
 
     fn shouldPaint(self: *const DocumentLayout) bool {
@@ -6329,7 +6387,16 @@ const BlockLayout = struct {
     /// DOM-index permutation captured at the last paint. Retaining it keeps
     /// structural hit queries aligned with that exact display generation.
     paint_order: std.ArrayList(usize),
+    /// Layout-time commands for the legacy inline formatter. `paint_cache`
+    /// wraps these with this block's background, descendants, scrolling, and
+    /// effects, while cached_subtree edges keep both lists independently
+    /// reusable.
     display_list: std.ArrayList(DisplayItem),
+    paint_cache: std.ArrayList(DisplayItem) = .empty,
+    paint_dirty: bool = true,
+    inline_paint_dirty: bool = false,
+    used_inline_layout: bool = false,
+    paint_generation: u64 = 0,
     cursor_x: i32 = 0,
     has_dirty_descendants: bool = false,
     in_layout: bool = false,
@@ -6338,6 +6405,11 @@ const BlockLayout = struct {
         const self: *BlockLayout = @ptrCast(@alignCast(ptr));
         if (self.in_layout) return;
         self.mark();
+    }
+
+    fn markPaintOpaque(ptr: *anyopaque) void {
+        const self: *BlockLayout = @ptrCast(@alignCast(ptr));
+        self.markPaint(true);
     }
 
     fn canReuseInsertOpaque(ptr: *anyopaque, insert_index: usize) bool {
@@ -6357,6 +6429,7 @@ const BlockLayout = struct {
             .element => |*element| {
                 element.layout_ptr = self;
                 element.layout_mark = markOpaque;
+                element.layout_paint_mark = markPaintOpaque;
                 element.layout_can_reuse_insert = canReuseInsertOpaque;
                 element.layout_rebind_after_insert = rebindAfterInsertOpaque;
             },
@@ -6695,6 +6768,7 @@ const BlockLayout = struct {
             .children = std.ArrayList(LayoutChild).empty,
             .paint_order = std.ArrayList(usize).empty,
             .display_list = std.ArrayList(DisplayItem).empty,
+            .paint_cache = std.ArrayList(DisplayItem).empty,
             .embedded_box = null,
             .rich_button_root = false,
             .effective_zoom_override = null,
@@ -6811,6 +6885,7 @@ const BlockLayout = struct {
                 .element => |*e| {
                     e.layout_ptr = block;
                     e.layout_mark = markOpaque;
+                    e.layout_paint_mark = markPaintOpaque;
                     e.layout_can_reuse_insert = canReuseInsertOpaque;
                     e.layout_rebind_after_insert = rebindAfterInsertOpaque;
                 },
@@ -6956,6 +7031,8 @@ const BlockLayout = struct {
         if (self.inline_nodes) |nodes| self.allocator.free(nodes);
         DisplayItem.freeItems(self.allocator, self.display_list.items);
         self.display_list.deinit(self.allocator);
+        DisplayItem.freeItems(self.allocator, self.paint_cache.items);
+        self.paint_cache.deinit(self.allocator);
         self.floats.deinit(self.allocator);
         self.zoom.deinit(self.allocator);
         self.x.deinit(self.allocator);
@@ -6967,6 +7044,9 @@ const BlockLayout = struct {
     }
 
     fn mark(self: *BlockLayout) void {
+        // Geometry changes always make this block's recorded commands stale.
+        // The layout pass will regenerate legacy inline commands before paint.
+        self.markPaint(false);
         // Mark all layout properties as dirty
         self.x.markNoOwner();
         self.y.markNoOwner();
@@ -6989,6 +7069,51 @@ const BlockLayout = struct {
             if (self.document.has_dirty_descendants) return;
             self.document.has_dirty_descendants = true;
         }
+    }
+
+    fn markPaint(self: *BlockLayout, inline_commands_dirty: bool) void {
+        self.paint_dirty = true;
+        if (inline_commands_dirty and self.used_inline_layout) {
+            self.inline_paint_dirty = true;
+        } else if (inline_commands_dirty) {
+            // A block-formatting element owns its background/effects, while
+            // each direct run of inline DOM children is painted by an
+            // anonymous BlockLayout. DOM style invalidation resolves to the
+            // nearest element-backed owner, so forward paint-only changes to
+            // those anonymous runs without dirtying ordinary block siblings.
+            for (self.children.items) |child| switch (child) {
+                .block => |block| {
+                    if (block.node_ptr != null) continue;
+                    block.paint_dirty = true;
+                    if (block.used_inline_layout) block.inline_paint_dirty = true;
+                },
+                .line => |line| {
+                    line.paint_dirty = true;
+                    for (line.children.items) |text| text.paint_dirty = true;
+                },
+            };
+        }
+
+        // Ancestor lists contain stable cache edges, but their shallow order
+        // and effect wrappers can depend on descendant styles (notably
+        // z-index). Mark the path, without dirtying sibling caches.
+        var ancestor = self.parent_block;
+        while (ancestor) |parent| {
+            parent.paint_dirty = true;
+            ancestor = parent.parent_block;
+        }
+        self.document.paint_dirty = true;
+    }
+
+    fn markPaintSubtree(self: *BlockLayout) void {
+        self.markPaint(true);
+        for (self.children.items) |child| switch (child) {
+            .block => |block| block.markPaintSubtree(),
+            .line => |line| {
+                line.paint_dirty = true;
+                for (line.children.items) |text| text.paint_dirty = true;
+            },
+        };
     }
 
     fn markSubtree(self: *BlockLayout) void {
@@ -7183,6 +7308,8 @@ const BlockLayout = struct {
     fn layout(self: *BlockLayout, engine: *Layout) !void {
         // Skip layout if nothing is dirty
         if (!self.layoutNeeded()) return;
+        self.paint_dirty = true;
+        self.document.paint_dirty = true;
         self.in_layout = true;
         defer self.in_layout = false;
 
@@ -7446,6 +7573,8 @@ const BlockLayout = struct {
 
         var natural_height: i32 = 0;
         if (is_block) {
+            self.used_inline_layout = false;
+            self.inline_paint_dirty = false;
             // Check whether the DOM child list changed. Verified insertions
             // match and retain existing block children; every other change
             // keeps the conservative rebuild behavior.
@@ -7579,6 +7708,8 @@ const BlockLayout = struct {
             self.height.frozen_dependencies = false;
             self.content_height_definite = specified_height != null;
             try engine.layoutInlineBlock(self);
+            self.used_inline_layout = true;
+            self.inline_paint_dirty = false;
 
             if (self.children.items.len > 0) {
                 for (self.children.items) |child| {
@@ -8586,34 +8717,142 @@ pub fn buildDocument(self: *Layout, root: *Node) !*DocumentLayout {
 }
 
 pub fn paintDocument(self: *Layout, document: *DocumentLayout) ![]DisplayItem {
-    self.display_list.clearRetainingCapacity();
     const content_height = documentScrollHeight(document.height.get().*);
-
-    if (self.accessibility.forced_colors or self.document_color_scheme_dark) {
-        const width = self.layoutWindowWidth();
-        const bg_color = if (self.accessibility.forced_colors)
-            forced_colors.canvas
-        else if (self.accessibility.dark_palette) |palette|
-            palette.background
-        else
-            browser.Color{ .r = 18, .g = 18, .b = 18, .a = 255 };
-        const bg = DisplayItem{ .rect = .{
-            .x1 = 0,
-            .y1 = 0,
-            .x2 = width,
-            .y2 = @max(content_height, self.toLayoutPx(self.window_height)),
-            .color = bg_color,
-            .source = displaySource(document, document.node_ptr),
-        } };
-        try self.display_list.append(self.allocator, bg);
-    }
-
-    for (document.children.items) |child| {
-        try paintBlockTree(self, child);
-    }
-
     self.content_height = content_height;
+
+    if (document.paint_dirty) {
+        var commands = std.ArrayList(DisplayItem).empty;
+        defer commands.deinit(self.allocator);
+        var commands_own_items = true;
+        errdefer if (commands_own_items) DisplayItem.freeItems(self.allocator, commands.items);
+
+        if (self.accessibility.forced_colors or self.document_color_scheme_dark) {
+            const width = self.layoutWindowWidth();
+            const bg_color = if (self.accessibility.forced_colors)
+                forced_colors.canvas
+            else if (self.accessibility.dark_palette) |palette|
+                palette.background
+            else
+                browser.Color{ .r = 18, .g = 18, .b = 18, .a = 255 };
+            try commands.append(self.allocator, .{ .rect = .{
+                .x1 = 0,
+                .y1 = 0,
+                .x2 = width,
+                .y2 = @max(content_height, self.toLayoutPx(self.window_height)),
+                .color = bg_color,
+                .source = displaySource(document, document.node_ptr),
+            } });
+        }
+
+        for (document.children.items) |child| {
+            try refreshBlockPaintCache(self, child);
+            try commands.append(self.allocator, .{ .cached_subtree = .{
+                .list = &child.paint_cache,
+                .source = displaySource(child, child.node_ptr),
+            } });
+        }
+
+        const replacement = try commands.toOwnedSlice(self.allocator);
+        commands_own_items = false;
+        replaceRetainedPaintCache(
+            self.allocator,
+            &document.paint_cache,
+            replacement,
+            &document.paint_generation,
+        );
+        document.paint_dirty = false;
+    }
+
+    // Frame display lists retain only this stable root edge plus transient
+    // focus/accessibility overlays. Browser-facing composition expands the
+    // edge into an independently owned snapshot before crossing threads.
+    self.display_list.clearRetainingCapacity();
+    try self.display_list.append(self.allocator, .{ .cached_subtree = .{
+        .list = &document.paint_cache,
+        .source = displaySource(document, document.node_ptr),
+    } });
     return try self.display_list.toOwnedSlice(self.allocator);
+}
+
+test "retained paint caches repaint one branch and preserve clean siblings" {
+    const allocator = std.testing.allocator;
+    var html_parser = try parser.HTMLParser.init(
+        allocator,
+        "<main style='display:block'>" ++
+            "<section id=left style='display:block'>left" ++
+            "<div style='display:block'></div></section>" ++
+            "<section id=right style='display:block'>right" ++
+            "<div style='display:block'></div></section>" ++
+            "</main>",
+    );
+    html_parser.use_implicit_tags = false;
+    defer html_parser.deinit(allocator);
+    var root_node = try html_parser.parse();
+    defer root_node.deinit(allocator);
+    parser.fixParentPointers(&root_node, null);
+    try parser.style(allocator, &root_node, &.{});
+
+    var environ = std.process.Environ.Map.init(allocator);
+    defer environ.deinit();
+    try environ.put("HOME", "/tmp");
+    const engine = try Layout.init(allocator, std.testing.io, &environ, 800, 600, false);
+    defer engine.deinit();
+    const document = try engine.buildDocument(&root_node);
+    defer {
+        document.deinit();
+        allocator.destroy(document);
+    }
+
+    const first_frame = try engine.paintDocument(document);
+    DisplayItem.freeList(allocator, first_frame);
+
+    const root_layout = document.children.items[0];
+    const left_layout = root_layout.children.items[0].block;
+    const right_layout = root_layout.children.items[1].block;
+    const left_inline = left_layout.children.items[0].block;
+    const right_inline = right_layout.children.items[0].block;
+    try std.testing.expect(!document.layoutNeeded());
+    try std.testing.expect(left_inline.used_inline_layout);
+    try std.testing.expect(right_inline.used_inline_layout);
+
+    const document_generation = document.paint_generation;
+    const root_generation = root_layout.paint_generation;
+    const left_generation = left_layout.paint_generation;
+    const left_inline_generation = left_inline.paint_generation;
+    const right_generation = right_layout.paint_generation;
+    const right_inline_generation = right_inline.paint_generation;
+
+    // The element-backed section owns its box, while its bare text is held by
+    // one anonymous inline cache. Paint invalidation must reach both without
+    // turning into layout invalidation or touching the other section.
+    parser.markPaintForElement(&root_node.element.children.items[0].element);
+    try std.testing.expect(!document.layoutNeeded());
+    try std.testing.expect(document.paint_dirty);
+    try std.testing.expect(root_layout.paint_dirty);
+    try std.testing.expect(left_layout.paint_dirty);
+    try std.testing.expect(left_inline.paint_dirty);
+    try std.testing.expect(left_inline.inline_paint_dirty);
+    try std.testing.expect(!right_layout.paint_dirty);
+    try std.testing.expect(!right_inline.paint_dirty);
+
+    const second_frame = try engine.paintDocument(document);
+    DisplayItem.freeList(allocator, second_frame);
+    try std.testing.expectEqual(document_generation + 1, document.paint_generation);
+    try std.testing.expectEqual(root_generation + 1, root_layout.paint_generation);
+    try std.testing.expectEqual(left_generation + 1, left_layout.paint_generation);
+    try std.testing.expectEqual(left_inline_generation + 1, left_inline.paint_generation);
+    try std.testing.expectEqual(right_generation, right_layout.paint_generation);
+    try std.testing.expectEqual(right_inline_generation, right_inline.paint_generation);
+
+    // A requested frame with no dirty paint reuses every retained generation.
+    const third_frame = try engine.paintDocument(document);
+    DisplayItem.freeList(allocator, third_frame);
+    try std.testing.expectEqual(document_generation + 1, document.paint_generation);
+    try std.testing.expectEqual(root_generation + 1, root_layout.paint_generation);
+    try std.testing.expectEqual(left_generation + 1, left_layout.paint_generation);
+    try std.testing.expectEqual(left_inline_generation + 1, left_inline.paint_generation);
+    try std.testing.expectEqual(right_generation, right_layout.paint_generation);
+    try std.testing.expectEqual(right_inline_generation, right_inline.paint_generation);
 }
 
 test "document scroll height includes Chapter 5 page padding" {
@@ -8623,49 +8862,176 @@ test "document scroll height includes Chapter 5 page padding" {
     try std.testing.expectEqual(std.math.maxInt(i32), documentScrollHeight(std.math.maxInt(i32)));
 }
 
-// Paint a block and its subtree, applying stacking context effects
-fn paintBlockTree(self: *Layout, block: *BlockLayout) !void {
-    // Only paint if the block should be painted
-    if (!block.shouldPaint()) return;
+fn replaceRetainedPaintCache(
+    allocator: std.mem.Allocator,
+    cache: *std.ArrayList(DisplayItem),
+    replacement: []DisplayItem,
+    generation: *u64,
+) void {
+    DisplayItem.freeItems(allocator, cache.items);
+    cache.deinit(allocator);
+    cache.* = std.ArrayList(DisplayItem).fromOwnedSlice(replacement);
+    generation.* +%= 1;
+    if (generation.* == 0) generation.* = 1;
+}
 
-    // Collect all display commands for this block and its subtree
+fn refreshInlinePaintCommands(self: *Layout, block: *BlockLayout) !void {
+    if (!block.inline_paint_dirty or !block.used_inline_layout) return;
+
+    const previous_commands = block.display_list;
+    const previous_content_height = block.content_height;
+    block.display_list = .empty;
+    errdefer {
+        DisplayItem.freeItems(self.allocator, block.display_list.items);
+        block.display_list.deinit(self.allocator);
+        block.display_list = previous_commands;
+        block.content_height = previous_content_height;
+    }
+
+    // Paint-only regeneration must not append duplicate geometry records to
+    // the frame's retained hit-test collectors.
+    const previous_collect = self.collect_hit_test_bounds;
+    self.collect_hit_test_bounds = false;
+    defer self.collect_hit_test_bounds = previous_collect;
+
+    if (block.node_ptr) |node| block.node = node.*;
+    try self.layoutInlineBlock(block);
+
+    DisplayItem.freeItems(self.allocator, previous_commands.items);
+    var old = previous_commands;
+    old.deinit(self.allocator);
+    block.inline_paint_dirty = false;
+}
+
+fn refreshTextPaintCache(self: *Layout, text: *TextLayout) !void {
+    if (!text.paint_dirty) return;
+
+    if (text.node_ptr) |node| {
+        text.node = node.*;
+        const style_map: ?*parser.StyleMap = switch (node.*) {
+            .element => |*element| if (element.style) |*map| map else null,
+            .text => |*value| if (value.style) |*map| map else null,
+        };
+        if (style_map) |map| {
+            if (styleValue(map, "color")) |value| {
+                if (parseColor(value)) |color| text.color = color;
+            }
+        }
+    }
+
     var commands = std.ArrayList(DisplayItem).empty;
     defer commands.deinit(self.allocator);
+    var commands_own_items = true;
+    errdefer if (commands_own_items) DisplayItem.freeItems(self.allocator, commands.items);
+    try text.paintToList(&commands, self);
+    const replacement = try commands.toOwnedSlice(self.allocator);
+    commands_own_items = false;
+    replaceRetainedPaintCache(
+        self.allocator,
+        &text.paint_cache,
+        replacement,
+        &text.paint_generation,
+    );
+    text.paint_dirty = false;
+}
 
-    // Add the block's own background/borders
+fn refreshLinePaintCache(self: *Layout, line: *LineLayout) !void {
+    if (!line.paint_dirty) return;
+
+    var commands = std.ArrayList(DisplayItem).empty;
+    defer commands.deinit(self.allocator);
+    var commands_own_items = true;
+    errdefer if (commands_own_items) DisplayItem.freeItems(self.allocator, commands.items);
+    for (line.children.items) |text| {
+        try refreshTextPaintCache(self, text);
+        try commands.append(self.allocator, .{ .cached_subtree = .{
+            .list = &text.paint_cache,
+            .source = displaySource(text, text.node_ptr),
+        } });
+    }
+    const replacement = try commands.toOwnedSlice(self.allocator);
+    commands_own_items = false;
+    replaceRetainedPaintCache(
+        self.allocator,
+        &line.paint_cache,
+        replacement,
+        &line.paint_generation,
+    );
+    line.paint_dirty = false;
+}
+
+/// Refresh one dirty paint-cache path. Clean descendants remain referenced by
+/// stable cached_subtree edges; no command tree is cloned merely because a
+/// sibling changed.
+fn refreshBlockPaintCache(self: *Layout, block: *BlockLayout) !void {
+    if (!block.paint_dirty) return;
+    try refreshInlinePaintCommands(self, block);
+    if (block.node_ptr) |node| block.node = node.*;
+
+    if (!block.shouldPaint()) {
+        const empty = try self.allocator.alloc(DisplayItem, 0);
+        replaceRetainedPaintCache(
+            self.allocator,
+            &block.paint_cache,
+            empty,
+            &block.paint_generation,
+        );
+        block.paint_dirty = false;
+        return;
+    }
+
+    var commands = std.ArrayList(DisplayItem).empty;
+    defer commands.deinit(self.allocator);
+    var commands_own_items = true;
+    errdefer if (commands_own_items) DisplayItem.freeItems(self.allocator, commands.items);
+
     try addBackgroundIfNeededToList(self, &commands, block);
     const content_start = commands.items.len;
     try appendTableOfContentsHeader(self, &commands, block);
 
-    // Add the block's display items (from children like text, etc.)
-    for (block.display_list.items) |item| {
-        try appendClonedDisplayItem(self.allocator, &commands, item);
+    if (block.display_list.items.len > 0) {
+        try commands.append(self.allocator, .{ .cached_subtree = .{
+            .list = &block.display_list,
+            .source = displaySource(block, block.node_ptr),
+        } });
     }
     try appendListMarker(self, &commands, block);
 
-    // Recursively paint children in stable ascending stack order. Layout and
-    // DOM storage remain untouched; reverse hit testing uses the same keys.
     try block.refreshPaintOrder();
     for (block.paint_order.items) |document_index| {
         switch (block.children.items[document_index]) {
-            .block => |b| try paintBlockTreeRecursive(&commands, self, b),
-            .line => |l| try l.paintToList(&commands, self),
+            .block => |child| {
+                try refreshBlockPaintCache(self, child);
+                try commands.append(self.allocator, .{ .cached_subtree = .{
+                    .list = &child.paint_cache,
+                    .source = displaySource(child, child.node_ptr),
+                } });
+            },
+            .line => |line| {
+                try refreshLinePaintCache(self, line);
+                try commands.append(self.allocator, .{ .cached_subtree = .{
+                    .list = &line.paint_cache,
+                    .source = null,
+                } });
+            },
         }
     }
 
     try appendContentEditableCursor(self, &commands, block);
     try applyElementScroll(block, &commands, content_start);
 
-    // Apply visual effects (opacity, etc.) to wrap the entire subtree
     const final_commands = try applyPaintEffects(self, block, commands.items);
-
-    // Add the final commands to the display list
-    for (final_commands) |cmd| {
-        try self.display_list.append(self.allocator, cmd);
-    }
-    if (final_commands.len > 0) {
-        self.allocator.free(final_commands);
-    }
+    commands_own_items = false;
+    var final_owned = true;
+    errdefer if (final_owned) DisplayItem.freeList(self.allocator, final_commands);
+    replaceRetainedPaintCache(
+        self.allocator,
+        &block.paint_cache,
+        final_commands,
+        &block.paint_generation,
+    );
+    final_owned = false;
+    block.paint_dirty = false;
 }
 
 fn writeBlockDebug(writer: *std.Io.Writer, block: *const BlockLayout, indent: usize) !void {
@@ -8708,8 +9074,13 @@ pub fn writeDisplayListDebug(writer: *std.Io.Writer, items: []const DisplayItem)
 
 fn writeDisplayItemsDebug(writer: *std.Io.Writer, items: []const DisplayItem, indent: usize) !void {
     for (items) |item| {
+        if (item == .cached_subtree) {
+            try writeDisplayItemsDebug(writer, item.cached_subtree.list.items, indent);
+            continue;
+        }
         try writeIndent(writer, indent);
         switch (item) {
+            .cached_subtree => unreachable,
             .glyph => |glyph| try writer.print("glyph x={d} y={d} width={d} height={d} color=#{x:0>2}{x:0>2}{x:0>2}{x:0>2}\n", .{ glyph.x, glyph.y, glyph.glyph.w, glyph.glyph.h, glyph.color.r, glyph.color.g, glyph.color.b, glyph.color.a }),
             .rect => |rect| try writer.print("rect x1={d} y1={d} x2={d} y2={d} color=#{x:0>2}{x:0>2}{x:0>2}{x:0>2}\n", .{ rect.x1, rect.y1, rect.x2, rect.y2, rect.color.r, rect.color.g, rect.color.b, rect.color.a }),
             .image => |image| try writer.print("image x1={d} y1={d} x2={d} y2={d} source_width={d} source_height={d} opacity={d}\n", .{ image.x1, image.y1, image.x2, image.y2, image.source_width, image.source_height, image.opacity }),

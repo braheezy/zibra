@@ -1077,21 +1077,53 @@ pub const Browser = struct {
     /// Annotate every anchor against the browser-session visited set. Each
     /// element stores only a boolean; resolved Url values remain local owners.
     pub fn annotateVisitedLinks(self: *Browser, root: *Node, base_url: *const Url) !void {
+        try self.annotateVisitedLinksWithPaintOwner(root, base_url, null, null);
+    }
+
+    fn annotateVisitedLinksWithPaintOwner(
+        self: *Browser,
+        root: *Node,
+        base_url: *const Url,
+        inherited_owner: ?*anyopaque,
+        inherited_mark: ?*const fn (*anyopaque) void,
+    ) !void {
         switch (root.*) {
             .text => {},
             .element => |*element| {
+                const paint_owner = if (element.layout_ptr != null and
+                    element.layout_paint_mark != null)
+                    element.layout_ptr
+                else
+                    inherited_owner;
+                const paint_mark = if (element.layout_ptr != null and
+                    element.layout_paint_mark != null)
+                    element.layout_paint_mark
+                else
+                    inherited_mark;
                 if (std.ascii.eqlIgnoreCase(element.tag, "a")) {
-                    element.is_visited = false;
+                    const was_visited = element.is_visited;
+                    var is_visited = false;
                     if (element.attributes) |attrs| {
                         if (attrs.get("href")) |href| {
                             const resolved = try base_url.*.resolveForNavigation(self.allocator, href);
                             defer resolved.free(self.allocator);
-                            element.is_visited = try self.session_state.isVisited(&resolved);
+                            is_visited = try self.session_state.isVisited(&resolved);
+                        }
+                    }
+                    element.is_visited = is_visited;
+                    if (was_visited != is_visited) {
+                        if (paint_owner) |owner| {
+                            if (paint_mark) |mark_fn| mark_fn(owner);
                         }
                     }
                 }
                 for (element.children.items) |*child| {
-                    try self.annotateVisitedLinks(child, base_url);
+                    try self.annotateVisitedLinksWithPaintOwner(
+                        child,
+                        base_url,
+                        paint_owner,
+                        paint_mark,
+                    );
                 }
             },
         }
@@ -4523,10 +4555,14 @@ pub const Browser = struct {
         }
         // Repaint if layout ran or paint was requested
         if (did_layout or force_paint) {
-            // Paint the document to produce draw commands
+            // Refresh only dirty layout-object paint caches. The returned
+            // frame list is a tiny retained root reference, not a deep copy
+            // of the complete page.
             frame.retireDisplayList();
             frame.display_list = try self.layout_engine.paintDocument(frame.documentLayout().?);
-            try frame.updateHitTestBounds(self.layout_engine);
+            // Paint-only regeneration deliberately suppresses geometry
+            // collection; the previous layout generation remains valid.
+            if (did_layout) try frame.updateHitTestBounds(self.layout_engine);
         }
 
         var focus_items = std.ArrayList(DisplayItem).empty;
@@ -4879,6 +4915,12 @@ pub const Browser = struct {
     /// Get the bounding rect of a display item in device/document coordinates.
     fn getDisplayItemBounds(self: *Browser, item: DisplayItem, zoom: f32) Rect {
         return switch (item) {
+            .cached_subtree => |cached| self.displayItemsBounds(cached.list.items, zoom) orelse .{
+                .left = 0,
+                .top = 0,
+                .right = 0,
+                .bottom = 0,
+            },
             .glyph => |g| Rect{
                 .left = self.scalePxWithZoom(g.x, zoom),
                 .top = self.scalePxWithZoom(g.y, zoom),
@@ -7330,6 +7372,17 @@ pub const Browser = struct {
     // Draw a display item with both scroll offset and x translation
     fn drawDisplayItemZ2dContextWithTransform(self: *Browser, context: *z2d.Context, item: DisplayItem, scroll_offset: i32, x_offset: i32, zoom: f32) !void {
         switch (item) {
+            .cached_subtree => |cached| {
+                for (cached.list.items) |child| {
+                    try self.drawDisplayItemZ2dContextWithTransform(
+                        context,
+                        child,
+                        scroll_offset,
+                        x_offset,
+                        zoom,
+                    );
+                }
+            },
             .glyph => |glyph_item| {
                 const glyph_x = self.scalePxWithZoom(glyph_item.x, zoom) + x_offset;
                 const glyph_y = self.scalePxWithZoom(glyph_item.y, zoom) - scroll_offset;
@@ -7584,6 +7637,17 @@ pub const Browser = struct {
     /// This function offsets all coordinates by the layer's origin to draw in layer-local space
     fn drawDisplayItemZ2dContextForLayer(self: *Browser, context: *z2d.Context, item: DisplayItem, layer_x: i32, layer_y: i32, zoom: f32) !void {
         switch (item) {
+            .cached_subtree => |cached| {
+                for (cached.list.items) |child| {
+                    try self.drawDisplayItemZ2dContextForLayer(
+                        context,
+                        child,
+                        layer_x,
+                        layer_y,
+                        zoom,
+                    );
+                }
+            },
             .glyph => |glyph_item| {
                 const glyph_x = self.scalePxWithZoom(glyph_item.x, zoom) - layer_x;
                 const glyph_y = self.scalePxWithZoom(glyph_item.y, zoom) - layer_y;

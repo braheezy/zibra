@@ -43,6 +43,14 @@ before changing ownership or thread boundaries.
   DOM-style invalidations directly to the containing persistent block instead.
   Document/block/line `in_layout` guards suppress only reentrant owner-wide
   invalidation caused by child metrics during that same serialized traversal.
+  Document, block, line, and text objects also own retained paint-command
+  lists plus paint dirty bits. A dirty leaf replaces only its own command
+  buffer; ancestors rebuild their shallow order/effect wrappers around stable
+  child-cache edges, while clean sibling generations remain untouched. The
+  legacy inline formatter is a retained leaf cache and must be regenerated
+  without appending duplicate hit-test geometry. Forward paint invalidation
+  from an element-backed block to its direct anonymous inline runs because
+  inherited text paint is stored there.
   A DOM-backed block may advertise retained insertion matching only when every
   represented direct DOM child maps one-to-one to a DOM-backed `BlockLayout`;
   anonymous inline runs and run-in merges stay conservative. Synchronously
@@ -64,6 +72,13 @@ before changing ownership or thread boundaries.
   opacity; opacity-only paint ancestors multiply that scalar so the cached
   surface is sampled once during its final draw. Keep this module independent
   of `Browser`, SDL, and native-window lifecycle.
+  `.cached_subtree` is the one non-owning container: it points at the stable
+  `ArrayList` field owned by a retained layout object, recursive readers must
+  enter it, and recursive cleanup must leave it alone. It may exist only in a
+  frame/layout-side list. Composition and raster snapshots must materialize it
+  into ordinary independently owned containers and clear provenance before a
+  browser lock or thread boundary. Temporary rich-button layout trees cannot
+  publish cache edges because their owners retire immediately.
   Iframe placeholders additionally publish the containing element's authored
   effective zoom; Tab transfers that scalar to the child Frame before its next
   layout. It is plain numeric state, not DOM/layout provenance.
@@ -77,9 +92,10 @@ before changing ownership or thread boundaries.
   owns an immutable straight-alpha RGBA snapshot copied from the live
   premultiplied z2d surface. Deep-clone that buffer at every command-tree owner
   boundary and free it recursively; raster snapshots must never observe the
-  mutable DOM backing store. A cached layout command can predate lazy
-  `getContext("2d")` allocation, so provenance-backed layout clones refresh its
-  pixels from the live element on paint. An empty snapshot is a valid
+  mutable DOM backing store. A cached inline command can predate lazy
+  `getContext("2d")` allocation, so every pixel-changing script command dirties
+  its retained paint owner and inline paint regeneration snapshots the live
+  element again. An empty snapshot is a valid
   transparent canvas, and raster must validate byte length before indexing.
 - `layout.zig` resolves every painted inline fragment to its nearest focusable
   DOM ancestor and unions those fragments once per visual line. Nested inline

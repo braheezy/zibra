@@ -571,6 +571,10 @@ pub const Element = struct {
     children: std.ArrayList(Node),
     layout_ptr: ?*anyopaque = null,
     layout_mark: ?*const fn (*anyopaque) void = null,
+    /// Paint invalidation is intentionally separate from layout invalidation:
+    /// controls, canvas pixels, colors, and other visual-only state can reuse
+    /// geometry while refreshing the retained display-list cache.
+    layout_paint_mark: ?*const fn (*anyopaque) void = null,
     // Block-mode layout owners can opt into matching already-laid-out direct
     // children across insertion-only child-array relocation. The compatibility
     // callback runs before storage can move; the rebind callback runs
@@ -709,6 +713,7 @@ pub const Element = struct {
     pub fn clearLayoutOwner(self: *Element) void {
         self.layout_ptr = null;
         self.layout_mark = null;
+        self.layout_paint_mark = null;
         self.layout_can_reuse_insert = null;
         self.layout_rebind_after_insert = null;
     }
@@ -1984,6 +1989,38 @@ pub fn styleTreeNeedsUpdate(node: *const Node) bool {
     };
 }
 
+/// Mark the nearest retained layout object whose paint commands represent
+/// this DOM node. Inline descendants often share an anonymous or containing
+/// BlockLayout, so walking upward is required when the node itself has no
+/// layout owner. The callback is a synchronous borrow installed by layout.
+pub fn markPaintForNode(node: *Node) void {
+    var current: ?*Node = node;
+    while (current) |candidate| {
+        switch (candidate.*) {
+            .text => |text| current = text.parent,
+            .element => |*element| {
+                if (element.layout_ptr) |owner| {
+                    if (element.layout_paint_mark) |mark_fn| {
+                        mark_fn(owner);
+                        return;
+                    }
+                }
+                current = element.parent;
+            },
+        }
+    }
+}
+
+pub fn markPaintForElement(element: *Element) void {
+    if (element.layout_ptr) |owner| {
+        if (element.layout_paint_mark) |mark_fn| {
+            mark_fn(owner);
+            return;
+        }
+    }
+    if (element.parent) |parent| markPaintForNode(parent);
+}
+
 pub fn dirtyStyleForElement(e: *Element) void {
     if (e.style) |*style_map| markStyleMapWithoutOwner(style_map);
     markAncestorStyleSummaries(e.parent);
@@ -2403,6 +2440,7 @@ fn styleWithParent(
             }
             var style_map = &t.style.?;
             std.debug.assert(styleNeedsUpdate(style_map));
+            markPaintForNode(node);
             if (stats) |pass_stats| pass_stats.recomputed_nodes += 1;
             errdefer markStyleMapWithoutOwner(style_map);
 
@@ -2450,6 +2488,7 @@ fn styleWithParent(
             const needs_style = styleNeedsUpdate(style_map);
 
             if (needs_style) {
+                markPaintForNode(node);
                 if (stats) |pass_stats| pass_stats.recomputed_nodes += 1;
                 errdefer markStyleMapWithoutOwner(style_map);
                 var new_style = std.StringHashMap([]const u8).init(allocator);

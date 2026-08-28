@@ -53,8 +53,9 @@ or Kiesel allocation/locking.
   the same document-generation boundary as XHR and DOM callbacks.
 - Canvas wrappers are scoped by JavaScript window and cached by stable Node
   handle so repeated `getContext("2d")` calls return one object. Drawing stays
-  serialized on the tab worker; pixel-changing commands request paint, while
-  path/state-only commands do not. A z2d-missing method must return native
+  serialized on the tab worker; pixel-changing commands dirty the canvas's
+  nearest retained layout paint cache and request paint, while path/state-only
+  commands do neither. A z2d-missing method must return native
   `error.NotImplemented`, which the host consumes as a non-fatal `undefined`
   result so later page script still runs. Assigning either canvas dimension
   resets native pixels/path/transforms and the cached wrapper's paint state,

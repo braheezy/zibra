@@ -5403,7 +5403,10 @@ fn canvasCommand(agent: *Agent, this_value: Value, arguments: kiesel.types.Argum
             return .undefined;
         },
     };
-    if (result == .pixels_changed) js_instance.requestRender();
+    if (result == .pixels_changed) {
+        parser.markPaintForElement(element);
+        js_instance.requestRender();
+    }
     return .undefined;
 }
 

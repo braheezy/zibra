@@ -275,6 +275,15 @@ pub const RoundedHitClip = struct {
 };
 
 pub const DisplayItem = union(enum) {
+    /// Non-owning edge into a layout object's retained paint cache. The
+    /// ArrayList field itself lives at a stable address for the lifetime of
+    /// that layout object; replacing its buffer therefore updates every
+    /// ancestor display list without copying the cached subtree. Frame-side
+    /// snapshots must be retired before the referenced layout generation.
+    cached_subtree: struct {
+        list: *std.ArrayList(DisplayItem),
+        source: ?DisplayItemSource = null,
+    },
     glyph: struct {
         x: i32,
         y: i32,
@@ -381,6 +390,7 @@ pub const DisplayItem = union(enum) {
         const opacity = std.math.clamp(opacity_value, 0.0, 1.0);
         var result = self;
         switch (result) {
+            .cached_subtree => {},
             .glyph => |*glyph_item| {
                 glyph_item.color.a = scaleAlpha(glyph_item.color.a, opacity);
             },
@@ -436,6 +446,10 @@ pub const DisplayItem = union(enum) {
     pub fn clearSources(items: []DisplayItem) void {
         for (items) |*item| {
             switch (item.*) {
+                // The referenced cache remains layout-owned. A browser-facing
+                // snapshot expands these edges before clearing provenance, so
+                // never mutate the authoritative cache from this helper.
+                .cached_subtree => |*cached| cached.source = null,
                 .blend => |*blend_item| {
                     blend_item.source = null;
                     clearSources(blend_item.children);
@@ -457,6 +471,9 @@ pub const DisplayItem = union(enum) {
         var updated = false;
         for (items) |*item| {
             switch (item.*) {
+                .cached_subtree => |cached| {
+                    if (applyCompositedOpacity(cached.list.items, node, opacity)) updated = true;
+                },
                 .blend => |*blend_item| {
                     if (blend_item.node == node) {
                         blend_item.opacity = opacity;
@@ -482,6 +499,14 @@ pub const DisplayItem = union(enum) {
         var updated = false;
         for (items) |*item| {
             switch (item.*) {
+                .cached_subtree => |cached| {
+                    if (applyCompositedTransform(
+                        cached.list.items,
+                        node,
+                        translate_x,
+                        translate_y,
+                    )) updated = true;
+                },
                 .blend => |*blend_item| {
                     if (applyCompositedTransform(
                         blend_item.children,
@@ -556,6 +581,9 @@ pub const DisplayItem = union(enum) {
             index -= 1;
             const item = &items[index];
             switch (item.*) {
+                .cached_subtree => |cached| {
+                    if (hitTestDeviceList(cached.list.items, x, y, zoom)) |hit| return hit;
+                },
                 .blend => |blend_item| {
                     if (blend_item.opacity <= 0) continue;
                     if (blend_item.hit_clip) |clip| {
@@ -613,6 +641,7 @@ pub const DisplayItem = union(enum) {
         zoom: f32,
     ) bool {
         return switch (item.*) {
+            .cached_subtree => |cached| listContainsPaintedPoint(cached.list.items, x, y, zoom),
             .blend => |blend_item| blk: {
                 if (blend_item.opacity <= 0) break :blk false;
                 if (blend_item.hit_clip) |clip| {
@@ -746,7 +775,7 @@ pub const DisplayItem = union(enum) {
                 layer_item.layer.bounds.right,
                 layer_item.layer.bounds.bottom,
             ),
-            .blend, .transform => false,
+            .cached_subtree, .blend, .transform => false,
         };
     }
 
@@ -884,6 +913,7 @@ pub const DisplayItem = union(enum) {
 
     fn freeItem(allocator: std.mem.Allocator, item: DisplayItem) void {
         switch (item) {
+            .cached_subtree => {},
             .blend => |blend_item| {
                 if (blend_item.blend_mode) |mode| allocator.free(mode);
                 freeList(allocator, blend_item.children);

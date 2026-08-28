@@ -1544,6 +1544,7 @@ pub fn viewportWidthInCssPixels(device_width: i32, zoom_value: f32) f64 {
 
 pub fn mediaEnvironmentChanged(self: *Tab) void {
     self.media_environment_dirty = true;
+    if (self.root_frame) |frame| markFramePaintDirty(frame);
     self.setNeedsRender();
 }
 
@@ -1551,7 +1552,10 @@ fn updateForcedColorsState(self: *Tab, enabled: bool) bool {
     if (self.accessibility.forced_colors == enabled) return false;
     self.accessibility.forced_colors = enabled;
     self.media_environment_dirty = true;
-    if (self.root_frame) |frame| markFrameStyleDirty(frame);
+    if (self.root_frame) |frame| {
+        markFrameStyleDirty(frame);
+        markFramePaintDirty(frame);
+    }
     self.needs_paint = true;
     return true;
 }
@@ -1569,6 +1573,11 @@ fn markFrameLayoutDirty(frame: *Frame) void {
     for (frame.children.items) |child| {
         markFrameLayoutDirty(child);
     }
+}
+
+fn markFramePaintDirty(frame: *Frame) void {
+    if (frame.document.lastValue().*) |document| document.markPaintSubtree();
+    for (frame.children.items) |child| markFramePaintDirty(child);
 }
 
 fn markFrameStyleDirty(frame: *Frame) void {
@@ -2578,6 +2587,9 @@ fn replaceIframesInList(
 ) IframeComposeError!void {
     for (items) |item| {
         switch (item) {
+            .cached_subtree => |cached| {
+                try self.replaceIframesInList(root, cached.list.items, out);
+            },
             .iframe => |iframe_item| {
                 try self.appendIframeContent(root, .{ .iframe = iframe_item }, out);
             },
@@ -3283,6 +3295,10 @@ fn invalidateRemovedCssAnimation(self: *Tab, elem: *parser.Element, property_mas
             markAnimationLayout(self, elem);
             if (std.mem.eql(u8, property, "background-color")) self.needs_paint = true;
         } else {
+            // Opacity and transform tracks mutate retained effect wrappers
+            // directly while running. Once a finite CSS animation is removed,
+            // rebuild this element's cache from its underlying computed style.
+            parser.markPaintForElement(elem);
             self.needs_paint = true;
         }
     }
@@ -4637,7 +4653,10 @@ pub fn scrollElementChain(scroll_start: ?*Node, delta: i32) bool {
         switch (node.*) {
             .element => |*element| {
                 const parent = element.parent;
-                if (element.scrollBy(delta)) return true;
+                if (element.scrollBy(delta)) {
+                    parser.markPaintForElement(element);
+                    return true;
+                }
                 current = parent;
             },
             .text => |text| current = text.parent,
@@ -4755,6 +4774,7 @@ pub fn keypress(self: *Tab, b: *Browser, char: u8) !void {
                         }
                         try e.owned_strings.?.append(self.allocator, new_value);
                     }
+                    parser.markPaintForElement(e);
                     self.setNeedsRender();
                 } else if (e.attributes) |*attrs| {
                     if (attrs.get("contenteditable") != null) {
@@ -4800,6 +4820,11 @@ pub fn keypress(self: *Tab, b: *Browser, char: u8) !void {
                             switch (text_node.*) {
                                 .text => |*t| t.text = new_text,
                                 else => unreachable,
+                            }
+                            // Contenteditable text can change wrapping and
+                            // therefore remains a layout invalidation.
+                            if (e.layout_ptr) |layout_ptr| {
+                                if (e.layout_mark) |mark_fn| mark_fn(layout_ptr);
                             }
                         } else {
                             const text_node = Node{ .text = .{
@@ -4853,6 +4878,7 @@ pub fn backspace(self: *Tab, b: *Browser) !void {
                                 e.owned_strings = std.ArrayList([]const u8).empty;
                             }
                             try e.owned_strings.?.append(self.allocator, new_value);
+                            parser.markPaintForElement(e);
                         }
                         self.setNeedsRender();
                     }

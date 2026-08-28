@@ -23,6 +23,7 @@ fn findElement(node: *parser.Node, tag: []const u8) ?*parser.Node {
 fn findCanvasDisplayItem(items: []const browser.DisplayItem) ?*const browser.CanvasDisplayItem {
     for (items) |*item| {
         switch (item.*) {
+            .cached_subtree => |cached| if (findCanvasDisplayItem(cached.list.items)) |found| return found,
             .canvas => |*canvas_item| return canvas_item,
             .blend => |blend| if (findCanvasDisplayItem(blend.children)) |found| return found,
             .transform => |transform| if (findCanvasDisplayItem(transform.children)) |found| return found,

@@ -28,6 +28,9 @@ const DirectPaintInfo = struct {
 fn collectDirectPaintInfo(items: []const DisplayItem, info: *DirectPaintInfo) bool {
     for (items) |item| {
         switch (item) {
+            .cached_subtree => |cached| {
+                if (!collectDirectPaintInfo(cached.list.items, info)) return false;
+            },
             .rect, .rounded_rect, .line, .outline => {
                 info.count += 1;
                 if (info.count > maximum_direct_paint_commands) return false;
