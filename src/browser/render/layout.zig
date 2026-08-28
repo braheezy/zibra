@@ -51,6 +51,17 @@ const ClearSide = enum {
     both,
 };
 
+const PositionMode = enum {
+    static,
+    relative,
+    absolute,
+};
+
+const PositionOffset = struct {
+    x: i32 = 0,
+    y: i32 = 0,
+};
+
 const BoxEdges = struct {
     top: i32 = 0,
     right: i32 = 0,
@@ -114,7 +125,13 @@ pub fn documentScrollHeight(document_height_css: i32) i32 {
 }
 
 fn isBlockDisplay(value: []const u8) bool {
-    return std.ascii.eqlIgnoreCase(std.mem.trim(u8, value, " \t\r\n"), "block");
+    const display = std.mem.trim(u8, value, " \t\r\n");
+    return std.ascii.eqlIgnoreCase(display, "block") or
+        std.ascii.eqlIgnoreCase(display, "list-item");
+}
+
+fn isListItemDisplay(value: []const u8) bool {
+    return std.ascii.eqlIgnoreCase(std.mem.trim(u8, value, " \t\r\n"), "list-item");
 }
 
 fn parseFloatSide(value: []const u8) FloatSide {
@@ -132,7 +149,30 @@ fn parseClearSide(value: []const u8) ClearSide {
     return .none;
 }
 
+fn parsePositionMode(value: []const u8) PositionMode {
+    const trimmed = std.mem.trim(u8, value, " \t\r\n");
+    if (std.ascii.eqlIgnoreCase(trimmed, "relative")) return .relative;
+    if (std.ascii.eqlIgnoreCase(trimmed, "absolute")) return .absolute;
+    return .static;
+}
+
+fn nodePositionMode(node: Node, dependency_target: ?*ProtectedField(u64)) PositionMode {
+    return switch (node) {
+        .element => |element| blk: {
+            const style_map = if (element.style) |*styles| styles else break :blk .static;
+            const field = @constCast(style_map).getPtr("position") orelse break :blk .static;
+            const value = if (dependency_target) |target| value: {
+                target.addDependency(field);
+                break :value field.read(target).*;
+            } else field.get().*;
+            break :blk parsePositionMode(value);
+        },
+        .text => .static,
+    };
+}
+
 fn nodeFloatSide(node: Node, dependency_target: ?*ProtectedField(u64)) FloatSide {
+    if (nodePositionMode(node, dependency_target) == .absolute) return .none;
     return switch (node) {
         .element => |element| blk: {
             const style_map = if (element.style) |*styles| styles else break :blk .none;
@@ -148,6 +188,7 @@ fn nodeFloatSide(node: Node, dependency_target: ?*ProtectedField(u64)) FloatSide
 }
 
 fn nodeClearSide(node: Node) ClearSide {
+    if (nodePositionMode(node, null) == .absolute) return .none;
     return switch (node) {
         .element => |element| blk: {
             const style_map = if (element.style) |*styles| styles else break :blk .none;
@@ -164,6 +205,7 @@ fn isContainerNode(node: Node, dependency_target: ?*ProtectedField(u64)) bool {
     return switch (node) {
         .element => |element| blk: {
             const style_map = if (element.style) |*styles| styles else break :blk false;
+            if (nodePositionMode(node, dependency_target) == .absolute) break :blk true;
             if (nodeFloatSide(node, dependency_target) != .none) break :blk true;
             const field = @constCast(style_map).getPtr("display") orelse break :blk false;
             const value = if (dependency_target) |target| value: {
@@ -185,6 +227,13 @@ fn isRunInHeadingNode(node: Node) bool {
 
 fn isListItemElement(element: *const parser.Element) bool {
     return std.ascii.eqlIgnoreCase(element.tag, "li");
+}
+
+fn usesListItemMarker(element: *const parser.Element) bool {
+    if (!isListItemElement(element)) return false;
+    const styles = if (element.style) |*style_map| style_map else return false;
+    const field = @constCast(styles).getPtr("display") orelse return false;
+    return isListItemDisplay(field.get().*);
 }
 
 fn isTableOfContentsElement(element: *const parser.Element) bool {
@@ -304,7 +353,7 @@ fn listItemContentBounds(parent_x: i32, parent_width: i32, indent: i32) ContentB
 fn contentBoundsForNode(node: Node, parent_x: i32, parent_width: i32, indent: i32) ContentBounds {
     switch (node) {
         .element => |element| {
-            if (isListItemElement(&element)) return listItemContentBounds(parent_x, parent_width, indent);
+            if (usesListItemMarker(&element)) return listItemContentBounds(parent_x, parent_width, indent);
         },
         .text => {},
     }
@@ -321,6 +370,24 @@ fn parseCssPixelLength(value: []const u8) ?i32 {
 fn resolveCssLength(value: []const u8, context: parser.CssLengthResolutionContext) ?i32 {
     const pixels = parser.resolveCssLength(value, context) orelse return null;
     return parser.pixelLengthToLayoutPixels(pixels);
+}
+
+/// Position offsets use the same px/em/percentage subset as dimensions but
+/// permit a leading sign. Width/height deliberately retain their non-negative
+/// parser contract.
+fn resolveSignedCssLength(value: []const u8, context: parser.CssLengthResolutionContext) ?i32 {
+    const trimmed = std.mem.trim(u8, value, " \t\r\n\x0c");
+    if (trimmed.len == 0 or std.ascii.eqlIgnoreCase(trimmed, "auto")) return null;
+    const negative = trimmed[0] == '-';
+    const positive = trimmed[0] == '+';
+    const magnitude = if (negative or positive) trimmed[1..] else trimmed;
+    if (magnitude.len == 0) return null;
+    const pixels = parser.resolveCssLength(magnitude, context) orelse return null;
+    const signed = if (negative) -pixels else pixels;
+    const minimum: f64 = @floatFromInt(std.math.minInt(i32));
+    const maximum: f64 = @floatFromInt(std.math.maxInt(i32));
+    if (!std.math.isFinite(signed)) return null;
+    return @intFromFloat(std.math.clamp(signed, minimum, maximum));
 }
 
 /// Resolve a box-model length. Padding and borders use the regular
@@ -1790,6 +1857,7 @@ test "computed display classifies block children" {
     try std.testing.expect(tree_version.dirty);
 
     try std.testing.expect(isBlockDisplay("block"));
+    try std.testing.expect(isBlockDisplay("list-item"));
     try std.testing.expect(!isBlockDisplay("inline"));
     try std.testing.expect(!isBlockDisplay("unsupported"));
 }
@@ -1800,9 +1868,18 @@ test "list items reserve room for square markers" {
     defer item.deinit(allocator);
     try std.testing.expect(isListItemElement(&item.element));
 
-    const bounds = listItemContentBounds(13, 100, list_item_indent);
+    try setTestDisplay(allocator, &item, "list-item");
+    try std.testing.expect(usesListItemMarker(&item.element));
+
+    const bounds = contentBoundsForNode(item, 13, 100, list_item_indent);
     try std.testing.expectEqual(@as(i32, 37), bounds.x);
     try std.testing.expectEqual(@as(i32, 76), bounds.width);
+
+    item.element.style.?.getPtr("display").?.set("block");
+    try std.testing.expect(!usesListItemMarker(&item.element));
+    const unmarked_bounds = contentBoundsForNode(item, 13, 100, list_item_indent);
+    try std.testing.expectEqual(@as(i32, 13), unmarked_bounds.x);
+    try std.testing.expectEqual(@as(i32, 100), unmarked_bounds.width);
 }
 
 test "block dimensions accept non-negative pixel lengths" {
@@ -1816,6 +1893,20 @@ test "block dimensions accept non-negative pixel lengths" {
     try std.testing.expectEqual(@as(?i32, null), parseCssPixelLength("-1px"));
     try std.testing.expectEqual(@as(?i32, null), parseCssPixelLength("NaNpx"));
     try std.testing.expectEqual(@as(?i32, null), parseCssPixelLength("999999999999px"));
+}
+
+test "position offsets accept signed relative lengths" {
+    try std.testing.expectEqual(
+        @as(?i32, 24),
+        resolveSignedCssLength("+2em", .{ .font_size = 12 }),
+    );
+    try std.testing.expectEqual(
+        @as(?i32, -50),
+        resolveSignedCssLength("-25%", .{ .percentage_base = 200 }),
+    );
+    try std.testing.expectEqual(@as(?i32, -3), resolveSignedCssLength("-3px", .{}));
+    try std.testing.expectEqual(@as(?i32, null), resolveSignedCssLength("auto", .{}));
+    try std.testing.expectEqual(@as(?i32, null), resolveSignedCssLength("-2ex", .{}));
 }
 
 test "CSS zoom parses numbers and percentages and composes nested lengths" {
@@ -6206,6 +6297,10 @@ const BlockLayout = struct {
     content_width: i32 = 0,
     content_height: i32 = 0,
     content_height_definite: bool = false,
+    /// Visual movement applied after normal-flow geometry. Keeping this
+    /// separate from x/y prevents relative positioning from moving the slot
+    /// used by a following sibling.
+    position_offset: PositionOffset = .{},
     /// Number of direct DOM children represented by the last successfully
     /// published block-child list. An accepted append keeps this prefix and
     /// creates layout objects only for the later DOM suffix.
@@ -6340,8 +6435,12 @@ const BlockLayout = struct {
             {
                 return false;
             }
-            if (block.inline_nodes != null or block.previous != expected_previous) return false;
-            if (nodeFloatSide(dom_child, &self.children_version) == .none) {
+            const position_mode = nodePositionMode(dom_child, &self.children_version);
+            const block_previous = if (position_mode == .absolute) null else expected_previous;
+            if (block.inline_nodes != null or block.previous != block_previous) return false;
+            if (nodeFloatSide(dom_child, &self.children_version) == .none and
+                position_mode != .absolute)
+            {
                 expected_previous = block;
             }
         }
@@ -6395,6 +6494,7 @@ const BlockLayout = struct {
             .content_width = 0,
             .content_height = 0,
             .content_height_definite = false,
+            .position_offset = .{},
             .laid_out_dom_children = 0,
             .children = std.ArrayList(LayoutChild).empty,
             .paint_order = std.ArrayList(usize).empty,
@@ -6484,6 +6584,16 @@ const BlockLayout = struct {
                             if (style_map.getPtr("width")) |field| block.width.addDependency(field);
                             if (style_map.getPtr("height")) |field| block.height.addDependency(field);
                             if (style_map.getPtr("overflow")) |field| block.height.addDependency(field);
+                            if (style_map.getPtr("position")) |field| {
+                                block.x.addDependency(field);
+                                block.y.addDependency(field);
+                            }
+                            for ([_][]const u8{ "left", "right" }) |property| {
+                                if (style_map.getPtr(property)) |field| block.x.addDependency(field);
+                            }
+                            for ([_][]const u8{ "top", "bottom" }) |property| {
+                                if (style_map.getPtr(property)) |field| block.y.addDependency(field);
+                            }
                             for ([_][]const u8{
                                 "margin-top",       "margin-right",       "margin-bottom",       "margin-left",
                                 "padding-top",      "padding-right",      "padding-bottom",      "padding-left",
@@ -6739,6 +6849,82 @@ const BlockLayout = struct {
 
     fn clearSide(self: *const BlockLayout) ClearSide {
         return nodeClearSide(self.node);
+    }
+
+    fn positionMode(self: *const BlockLayout) PositionMode {
+        return nodePositionMode(self.node, null);
+    }
+
+    fn specifiedPositionOffset(
+        self: *const BlockLayout,
+        property: []const u8,
+        context: parser.CssLengthResolutionContext,
+        engine_zoom: f32,
+    ) ?i32 {
+        if (self.inline_nodes != null or self.embedded_box != null) return null;
+        const node_ptr = self.node_ptr orelse return null;
+        const element = switch (node_ptr.*) {
+            .element => |*value| value,
+            .text => return null,
+        };
+        const styles = if (element.style) |*style_map| style_map else return null;
+        const value = styleValue(styles, property) orelse return null;
+        const pixels = resolveSignedCssLength(value, context) orelse return null;
+        return scaleCssPixel(pixels, self.zoom.get().*, engine_zoom);
+    }
+
+    fn updatePositionOffset(
+        self: *BlockLayout,
+        containing_x: i32,
+        containing_y: i32,
+        containing_width: i32,
+        containing_height: ?i32,
+        containing_width_css: f64,
+        containing_height_css: ?f64,
+        engine_zoom: f32,
+    ) void {
+        self.position_offset = .{};
+        const mode = self.positionMode();
+        if (mode == .static) return;
+
+        const horizontal_context = parser.CssLengthResolutionContext{
+            .font_size = self.computedFontSizeCss(),
+            .percentage_base = containing_width_css,
+        };
+        const vertical_context = parser.CssLengthResolutionContext{
+            .font_size = self.computedFontSizeCss(),
+            .percentage_base = containing_height_css,
+        };
+        const left = self.specifiedPositionOffset("left", horizontal_context, engine_zoom);
+        const right = self.specifiedPositionOffset("right", horizontal_context, engine_zoom);
+        const top = self.specifiedPositionOffset("top", vertical_context, engine_zoom);
+        const bottom = self.specifiedPositionOffset("bottom", vertical_context, engine_zoom);
+
+        if (mode == .relative) {
+            self.position_offset.x = left orelse if (right) |value| 0 -| value else 0;
+            self.position_offset.y = top orelse if (bottom) |value| 0 -| value else 0;
+            return;
+        }
+
+        if (left) |value| {
+            const desired_x = containing_x +| value +| self.margin.left;
+            self.position_offset.x = desired_x -| self.x.get().*;
+        } else if (right) |value| {
+            const desired_x = containing_x +| containing_width -| value -|
+                self.margin.right -| self.width.get().*;
+            self.position_offset.x = desired_x -| self.x.get().*;
+        }
+
+        if (top) |value| {
+            const desired_y = containing_y +| value +| self.margin.top;
+            self.position_offset.y = desired_y -| self.y.get().*;
+        } else if (bottom) |value| {
+            if (containing_height) |height| {
+                const desired_y = containing_y +| height -| value -|
+                    self.margin.bottom -| self.height.get().*;
+                self.position_offset.y = desired_y -| self.y.get().*;
+            }
+        }
     }
 
     fn floatBoundsAt(
@@ -7002,63 +7188,69 @@ const BlockLayout = struct {
         else
             null;
         const horizontal_insets = self.padding.horizontal() + self.border.horizontal();
+        const position_mode = self.positionMode();
         const float_side = self.floatSide();
         var layout_y = prev_y;
         var float_x: ?i32 = null;
 
         if (self.parent_block) |parent| {
-            const clear_side = self.clearSide();
-            if (clear_side != .none) {
-                layout_y = parent.clearBottom(layout_y, clear_side);
-            }
+            if (position_mode != .absolute) {
+                const clear_side = self.clearSide();
+                if (clear_side != .none) {
+                    layout_y = parent.clearBottom(layout_y, clear_side);
+                }
 
-            if (float_side != .none) {
-                // A specified float width is enough to place the common CSS
-                // case precisely. Auto floats use the available line width,
-                // which keeps them deterministic until shrink-to-fit sizing
-                // is added to the replaced/content measurement path.
-                var candidate_width = if (specified_width) |width|
-                    @max(width + horizontal_insets, 0)
-                else
-                    @max(base_content_bounds.width - self.margin.horizontal(), 0);
+                if (float_side != .none) {
+                    // A specified float width is enough to place the common CSS
+                    // case precisely. Auto floats use the available line width,
+                    // which keeps them deterministic until shrink-to-fit sizing
+                    // is added to the replaced/content measurement path.
+                    var candidate_width = if (specified_width) |width|
+                        @max(width + horizontal_insets, 0)
+                    else
+                        @max(base_content_bounds.width - self.margin.horizontal(), 0);
 
-                while (true) {
-                    const available = parent.floatBoundsAt(
-                        layout_y,
-                        base_content_bounds.x,
-                        base_content_bounds.width,
-                    );
-                    const outer_width = candidate_width + self.margin.horizontal();
-                    if (available.width >= outer_width) {
-                        float_x = if (float_side == .left)
-                            available.x + self.margin.left
-                        else
-                            available.x + available.width - self.margin.right - candidate_width;
-                        break;
-                    }
-                    const next_y = parent.nextFloatBottom(layout_y) orelse break;
-                    if (next_y <= layout_y) break;
-                    layout_y = next_y;
-                    if (specified_width == null) {
-                        candidate_width = @max(
-                            parent.floatBoundsAt(
-                                layout_y,
-                                base_content_bounds.x,
-                                base_content_bounds.width,
-                            ).width - self.margin.horizontal(),
-                            0,
+                    while (true) {
+                        const available = parent.floatBoundsAt(
+                            layout_y,
+                            base_content_bounds.x,
+                            base_content_bounds.width,
                         );
+                        const outer_width = candidate_width + self.margin.horizontal();
+                        if (available.width >= outer_width) {
+                            float_x = if (float_side == .left)
+                                available.x + self.margin.left
+                            else
+                                available.x + available.width - self.margin.right - candidate_width;
+                            break;
+                        }
+                        const next_y = parent.nextFloatBottom(layout_y) orelse break;
+                        if (next_y <= layout_y) break;
+                        layout_y = next_y;
+                        if (specified_width == null) {
+                            candidate_width = @max(
+                                parent.floatBoundsAt(
+                                    layout_y,
+                                    base_content_bounds.x,
+                                    base_content_bounds.width,
+                                ).width - self.margin.horizontal(),
+                                0,
+                            );
+                        }
                     }
                 }
             }
         }
 
         const content_bounds = if (self.parent_block) |parent|
-            parent.floatBoundsAt(
-                layout_y,
-                base_content_bounds.x,
-                base_content_bounds.width,
-            )
+            if (position_mode == .absolute)
+                base_content_bounds
+            else
+                parent.floatBoundsAt(
+                    layout_y,
+                    base_content_bounds.x,
+                    base_content_bounds.width,
+                )
         else
             base_content_bounds;
         const auto_content_width = @max(
@@ -7206,12 +7398,17 @@ const BlockLayout = struct {
                         // every later block, even when that block's own style
                         // is clean. Mark it before laying it out so the
                         // exclusion geometry is recomputed.
-                        if (self.floats.items.len > 0 or b.clearSide() != .none) {
+                        if (b.positionMode() != .absolute and
+                            (self.floats.items.len > 0 or b.clearSide() != .none))
+                        {
                             b.mark();
                         }
                         try b.layout(engine);
                         const child_height = b.height.read(&self.height).*;
-                        if (b.floatSide() != .none) {
+                        if (b.positionMode() == .absolute) {
+                            // Absolutely positioned descendants paint in this
+                            // subtree but contribute no normal-flow height.
+                        } else if (b.floatSide() != .none) {
                             try self.floats.append(self.allocator, .{
                                 .side = b.floatSide(),
                                 .x = b.x.get().*,
@@ -7284,6 +7481,20 @@ const BlockLayout = struct {
             // Height is set by layoutInlineBlock - need to ensure it uses .set()
         }
 
+        const position_containing_height = if (self.parent_block) |parent|
+            if (parent.content_height_definite) parent.content_height else null
+        else
+            null;
+        self.updatePositionOffset(
+            parent_x,
+            parent_content_y,
+            parent_width,
+            position_containing_height,
+            containing_width_css,
+            containing_height_css,
+            engine.zoom(),
+        );
+
         try recordElementFocusBounds(engine, self);
 
         self.updateScrollGeometry(specified_height, natural_height + self.padding.vertical() + self.border.vertical());
@@ -7295,7 +7506,7 @@ const BlockLayout = struct {
     fn lastInFlowBlock(self: *BlockLayout) ?*BlockLayout {
         var previous: ?*BlockLayout = null;
         for (self.children.items) |child| switch (child) {
-            .block => |block| if (block.floatSide() == .none) {
+            .block => |block| if (block.floatSide() == .none and block.positionMode() != .absolute) {
                 previous = block;
             },
             .line => {},
@@ -7320,6 +7531,7 @@ const BlockLayout = struct {
             // anonymous block, normal inline recursion preserves the h6's
             // style while continuing straight into the paragraph text.
             if (isRunInHeadingNode(nodes[index]) and
+                nodePositionMode(nodes[index], if (self.persistent_dependencies) &self.children_version else null) != .absolute and
                 index + 1 < nodes.len and isContainerNode(
                 nodes[index + 1],
                 if (self.persistent_dependencies) &self.children_version else null,
@@ -7330,7 +7542,7 @@ const BlockLayout = struct {
                 run_in_nodes[1] = &nodes[index + 1];
                 const child = try BlockLayout.initAnonymous(self.allocator, run_in_nodes, self.document, self, previous);
                 try self.children.append(self.allocator, .{ .block = child });
-                if (child.floatSide() == .none) previous = child;
+                if (child.floatSide() == .none and child.positionMode() != .absolute) previous = child;
                 index += 2;
                 continue;
             }
@@ -7340,9 +7552,20 @@ const BlockLayout = struct {
                 if (self.persistent_dependencies) &self.children_version else null,
             )) {
                 const child_node = &nodes[index];
-                const child = try BlockLayout.init(self.allocator, child_node.*, child_node, self.document, self, previous);
+                const child_position = nodePositionMode(
+                    child_node.*,
+                    if (self.persistent_dependencies) &self.children_version else null,
+                );
+                const child = try BlockLayout.init(
+                    self.allocator,
+                    child_node.*,
+                    child_node,
+                    self.document,
+                    self,
+                    if (child_position == .absolute) null else previous,
+                );
                 try self.children.append(self.allocator, .{ .block = child });
-                if (child.floatSide() == .none) previous = child;
+                if (child.floatSide() == .none and child.positionMode() != .absolute) previous = child;
                 index += 1;
                 continue;
             }
@@ -7359,7 +7582,7 @@ const BlockLayout = struct {
             }
             const child = try BlockLayout.initAnonymous(self.allocator, inline_nodes, self.document, self, previous);
             try self.children.append(self.allocator, .{ .block = child });
-            if (child.floatSide() == .none) previous = child;
+            if (child.floatSide() == .none and child.positionMode() != .absolute) previous = child;
         }
     }
 
@@ -7386,6 +7609,7 @@ const BlockLayout = struct {
             relativeHitOffset(self.x.get().*, parent_origin.x),
             relativeHitOffset(self.y.get().*, parent_origin.y),
         );
+        local = subtractHitOffset(local, self.position_offset.x, self.position_offset.y);
         const translation = blockHitTranslation(self);
         local = subtractHitOffset(local, translation.x, translation.y);
 
@@ -7546,6 +7770,65 @@ test "layout hit testing localizes nested transforms and reverses sibling order"
     setTestLayoutBox(later, 160, 100, 20, 20);
     const overlap_hit = document.hitTest(165, 105).?;
     try std.testing.expect(overlap_hit.node == &later_node);
+}
+
+test "position offsets share geometry with layout hit testing" {
+    const allocator = std.testing.allocator;
+
+    var root_node = Node{ .element = try parser.Element.init(allocator, "html", null) };
+    defer root_node.deinit(allocator);
+    var relative_node = Node{ .element = try parser.Element.init(allocator, "div", null) };
+    defer relative_node.deinit(allocator);
+    try setTestStyleValue(allocator, &relative_node, "position", "relative");
+    try setTestStyleValue(allocator, &relative_node, "left", "20px");
+    try setTestStyleValue(allocator, &relative_node, "top", "-5px");
+
+    const document = try DocumentLayout.init(allocator, &root_node);
+    defer {
+        document.deinit();
+        allocator.destroy(document);
+    }
+    setTestLayoutBox(document, 0, 0, 500, 500);
+
+    const relative = try BlockLayout.init(
+        allocator,
+        relative_node,
+        &relative_node,
+        document,
+        null,
+        null,
+    );
+    try document.children.append(allocator, relative);
+    setTestLayoutBox(relative, 10, 20, 100, 40);
+    relative.updatePositionOffset(0, 0, 500, 500, 500, 500, 1.0);
+    try std.testing.expectEqual(PositionOffset{ .x = 20, .y = -5 }, relative.position_offset);
+
+    const hit = document.hitTest(35, 20).?;
+    try std.testing.expect(hit.node == &relative_node);
+    try std.testing.expectEqual(@as(i32, 5), hit.local_x);
+    try std.testing.expectEqual(@as(i32, 5), hit.local_y);
+    try std.testing.expect(document.hitTest(15, 25).?.node == &root_node);
+
+    var absolute_node = Node{ .element = try parser.Element.init(allocator, "div", null) };
+    defer absolute_node.deinit(allocator);
+    try setTestStyleValue(allocator, &absolute_node, "position", "absolute");
+    try setTestStyleValue(allocator, &absolute_node, "right", "15px");
+    try setTestStyleValue(allocator, &absolute_node, "bottom", "25px");
+    const absolute = try BlockLayout.init(
+        allocator,
+        absolute_node,
+        &absolute_node,
+        document,
+        relative,
+        null,
+    );
+    defer {
+        absolute.deinit();
+        allocator.destroy(absolute);
+    }
+    setTestLayoutBox(absolute, 10, 20, 50, 40);
+    absolute.updatePositionOffset(10, 20, 300, 200, 300, 200, 1.0);
+    try std.testing.expectEqual(PositionOffset{ .x = 235, .y = 135 }, absolute.position_offset);
 }
 
 test "layout hit testing localizes nested overflow scrolling" {
@@ -7876,7 +8159,7 @@ fn appendListMarker(self: *Layout, commands: *std.ArrayList(DisplayItem), block:
         .element => |*value| value,
         .text => return,
     };
-    if (!isListItemElement(element) or block.height.get().* <= 0) return;
+    if (!usesListItemMarker(element) or block.height.get().* <= 0) return;
 
     const indent = scaleBlockCssPixel(block, list_item_indent);
     const marker_size = @max(scaleBlockCssPixel(block, list_marker_size), 1);
@@ -8509,6 +8792,28 @@ fn applyElementScroll(
     } });
 }
 
+/// Positioning is a static outer translation, separate from the transform
+/// wrapper that compositor-only animation may update between layouts.
+fn wrapPositionOffset(
+    self: *Layout,
+    block: *const BlockLayout,
+    commands: []DisplayItem,
+) ![]DisplayItem {
+    if (block.position_offset.x == 0 and block.position_offset.y == 0) return commands;
+    const result = self.allocator.alloc(DisplayItem, 1) catch |err| {
+        DisplayItem.freeItems(self.allocator, commands);
+        self.allocator.free(commands);
+        return err;
+    };
+    result[0] = .{ .transform = .{
+        .translate_x = block.position_offset.x,
+        .translate_y = block.position_offset.y,
+        .children = commands,
+        .source = displaySource(block, block.node_ptr),
+    } };
+    return result;
+}
+
 // Apply visual effects like opacity, blend modes, and clipping to a list of display commands
 fn applyPaintEffects(self: *Layout, block: *BlockLayout, commands: []DisplayItem) ![]DisplayItem {
     // Check for filter, opacity, blend mode, overflow clipping, and transform.
@@ -8747,9 +9052,9 @@ fn applyPaintEffects(self: *Layout, block: *BlockLayout, commands: []DisplayItem
             };
             const transform_result = try self.allocator.alloc(DisplayItem, 1);
             transform_result[0] = transform_item;
-            return transform_result;
+            return wrapPositionOffset(self, block, transform_result);
         }
-        return result;
+        return wrapPositionOffset(self, block, result);
     } else {
         // No blend effects, but may still have transform
         if (has_transform) {
@@ -8772,13 +9077,13 @@ fn applyPaintEffects(self: *Layout, block: *BlockLayout, commands: []DisplayItem
             };
             const result = try self.allocator.alloc(DisplayItem, 1);
             result[0] = transform_item;
-            return result;
+            return wrapPositionOffset(self, block, result);
         }
 
         // No effects, return commands as-is
         const result = try self.allocator.alloc(DisplayItem, current_commands.len);
         @memcpy(result, current_commands);
-        return result;
+        return wrapPositionOffset(self, block, result);
     }
 }
 

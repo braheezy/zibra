@@ -7,12 +7,16 @@ Read [`../../docs/architecture-and-lifetimes.md`](../../docs/architecture-and-li
 before changing DOM storage, parser source-buffer ownership, style invalidation,
 or selector/rule lifetime.
 
-- Parser-created tag names, text, undecoded attributes, and CSS property slices
-  borrow document or stylesheet buffers. Attribute character references are
-  decoded into `Element.owned_strings`; DOM text stays source-backed and
+- Parser-created text, lowercase HTML names, undecoded attribute values, and
+  CSS property slices borrow document or stylesheet buffers. Uppercase HTML
+  tag/attribute names are normalized into `Element.owned_strings`, as are
+  decoded attribute character references; DOM text stays source-backed and
   escaped because layout decodes it exactly once. DOM dump serialization
   re-escapes decoded attribute values before quoting them. Preserve all source
   buffers until their remaining borrowers retire.
+- Explicit `html`, `head`, and `body` start tags provide the structural nodes
+  that the implicit-tag algorithm would otherwise create. Never process the
+  same token through both paths or nest duplicate document structures.
 - Live HTML serialization emits attributes in deterministic name order, always
   quotes and escapes their current values, recursively emits ordinary element
   closing tags, and omits closing tags/children from void-element outer HTML.
@@ -51,6 +55,10 @@ or selector/rule lifetime.
 - CSS rules and `@keyframes` own their selector/frame/map containers while
   names and property slices borrow the stylesheet. Move and retire both parsed
   products with their source text as one generation.
+- CSS comments are parser trivia between rules, selectors, and declarations;
+  value scanning skips complete comments so braces or semicolons inside them
+  cannot terminate a declaration, and trims boundary comments while retaining
+  a borrowed value slice.
 - Conditional stylesheet parsing receives an explicit media environment.
   `max-width` compares its non-negative pixel limit against the viewport width
   in CSS pixels, inclusively, while `width` matches that value exactly modulo
@@ -59,11 +67,12 @@ or selector/rule lifetime.
   and follows the browsing context's accessibility setting. Retain stylesheet
   text so a browsing context can rebuild the filtered rule/keyframe generation
   when that environment changes.
-- Concatenated tag/class selectors own a source-ordered `SelectorSequence` of
-  atomic selectors, all of which must match the same element. Sequence
-  specificity is the sum of its members.
+- Concatenated tag/class/ID selectors own a source-ordered `SelectorSequence`
+  of atomic selectors, all of which must match the same element. Sequence
+  specificity is the sum of its members; IDs contribute 100 and match the
+  normalized `id` attribute value case-sensitively.
 - `:focus-visible` is a dynamic class-specificity selector and may stand alone
-  or join a tag/class sequence. It matches only when both `Element.is_focused`
+  or join a tag/class/ID sequence. It matches only when both `Element.is_focused`
   and the Tab-installed `Element.is_focus_visible` heuristic snapshot are set.
   Focus transitions must dirty the element before styling so selector queries,
   author rules, and the native focus ring observe the same generation.
@@ -164,6 +173,10 @@ or selector/rule lifetime.
   `none` and `auto`. Their declaration values remain borrowed computed-style
   slices; only a finally selected supported URL receives an independent
   Element-owned resource identity.
+- The `background` shorthand resets and expands the supported color, image,
+  and size longhands in declaration order while preserving `!important`.
+  Shared color parsing accepts named values, 3/4/6/8-digit hexadecimal forms,
+  and comma-separated `rgb()`/`rgba()` values.
 - `object-fit` is non-inherited and defaults to `fill`. The supported modes are
   `fill`, `contain`, `cover`, `none`, and `scale-down`; invalid values fall
   back to `fill` in the layout value-validation subset.
@@ -202,11 +215,13 @@ or selector/rule lifetime.
 - `filter` is non-inherited and defaults to `none`. Layout currently accepts a
   single non-negative `blur()` pixel length (or unitless zero); unsupported
   filter functions and chains have no effect.
-- `display` is non-inherited and defaults to `inline`. HTML block defaults live
-  in the user-agent stylesheet; layout reads the borrowed computed value.
-- `position` and `z-index` are non-inherited and default to `static` and `0`.
-  The layout painter accepts signed integer z-index values only when position
-  is non-static; invalid values retain the zero paint layer.
+- `display` is non-inherited and defaults to `inline`. HTML defaults live in
+  the user-agent stylesheet, including `list-item` for `li`; layout reads the
+  borrowed computed value.
+- `position`, `top`, `right`, `bottom`, `left`, and `z-index` are non-inherited.
+  Position defaults to `static`, offsets to `auto`, and z-index to `0`. The
+  layout painter accepts signed integer z-index values only when position is
+  non-static; invalid values retain the zero paint layer.
 - `scroll-behavior` is non-inherited and defaults to `auto`. The tab worker
   reads the authored body element's computed value when an arrow-key viewport
   scroll begins; descendants do not opt the viewport into smooth scrolling.

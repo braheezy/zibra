@@ -27,6 +27,11 @@ before changing ownership or thread boundaries.
   with the same rule for nested stacking, and use its reverse order for layout
   hit queries so visual and interaction order cannot diverge. Refresh the
   permutation at paint and retain it with that display generation.
+  Relative positioning retains normal-flow x/y and stores a separate static
+  visual offset shared by paint and layout hit testing. Absolute blocks use
+  their containing block's content box, do not become a sibling's `previous`,
+  and contribute neither float exclusion nor parent auto-height. Keep this
+  static wrapper separate from the live CSS-transform compositor wrapper.
   Active width/height transitions override their computed pixel endpoints here;
   every frame relayouts descendants so line wrapping follows animated width.
   Authored `zoom` is layout-inducing and multiplicative. Each block retains
@@ -80,6 +85,10 @@ before changing ownership or thread boundaries.
   descendants therefore share their ancestor's wrapped focus geometry. After
   child layout, a block-displayed focusable element replaces only its own line
   fragments with one block box; independently focusable descendants remain.
+- List markers and their indentation are selected by computed
+  `display: list-item`, not merely by an `li` tag. The user-agent stylesheet
+  supplies that default; an authored `display: block` keeps block flow while
+  suppressing marker paint and marker space.
 - `focus_ring.zig` generates pointer-free focus-indicator commands. Each
   published focus rectangle is padded and painted as a 4px white outline
   followed by a 2px black outline; reserve both commands before appending

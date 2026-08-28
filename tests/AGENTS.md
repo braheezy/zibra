@@ -230,6 +230,10 @@ element's old untransformed or unscrolled box.
 stable DOM-order ties, the static-position gate, and recursive nested sibling
 stacking. Visible counters verify that reverse hit testing follows paint order.
 
+`tests/manual/positioned-offsets.html` distinguishes relative visual movement
+from its retained flow slot and places an absolute child from top/right
+offsets without extending the containing block or pushing its next sibling.
+
 `tests/manual/animated-scroll.html` exercises body `scroll-behavior`, smooth
 Up/Down motion, repeated-key retargeting, the immediate `auto`/wheel path, and
 the reduced-motion override. `tests/manual/composited-animations.html` also

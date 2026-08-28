@@ -11,6 +11,7 @@ const Node = parser.Node;
 pub const Selector = union(enum) {
     tag: TagSelector,
     class: ClassSelector,
+    id: IdSelector,
     focus_visible: FocusVisibleSelector,
     sequence: SelectorSequence,
     has: HasSelector,
@@ -31,6 +32,7 @@ pub const Selector = union(enum) {
         return switch (self) {
             .tag => |t| t.matches(node),
             .class => |c| c.matches(node),
+            .id => |id| id.matches(node),
             .focus_visible => |focus_visible| focus_visible.matches(node),
             .sequence => |s| s.matches(node),
             .has => |h| h.matches(node, context),
@@ -56,6 +58,7 @@ pub const Selector = union(enum) {
         switch (self.*) {
             .tag => |*t| t.deinit(allocator),
             .class => |*c| c.deinit(allocator),
+            .id => |*id| id.deinit(allocator),
             .focus_visible => {},
             .sequence => |*s| s.deinit(allocator),
             .has => |*h| h.deinit(allocator),
@@ -69,6 +72,7 @@ pub const Selector = union(enum) {
         return switch (self) {
             .tag => |t| t.priority(),
             .class => |c| c.priority(),
+            .id => |id| id.priority(),
             .focus_visible => |focus_visible| focus_visible.priority(),
             .sequence => |s| s.priority(),
             .has => |h| h.priority(),
@@ -82,6 +86,7 @@ pub const Selector = union(enum) {
 pub const SimpleSelector = union(enum) {
     tag: TagSelector,
     class: ClassSelector,
+    id: IdSelector,
     focus_visible: FocusVisibleSelector,
     sequence: SelectorSequence,
     has: HasSelector,
@@ -90,6 +95,7 @@ pub const SimpleSelector = union(enum) {
         return switch (self) {
             .tag => |tag| .{ .tag = tag },
             .class => |class| .{ .class = class },
+            .id => |id| .{ .id = id },
             .focus_visible => |focus_visible| .{ .focus_visible = focus_visible },
             .sequence => |sequence| .{ .sequence = sequence },
             .has => |has| .{ .has = has },
@@ -100,6 +106,7 @@ pub const SimpleSelector = union(enum) {
         return switch (self) {
             .tag => |tag| tag.matches(node),
             .class => |class| class.matches(node),
+            .id => |id| id.matches(node),
             .focus_visible => |focus_visible| focus_visible.matches(node),
             .sequence => |sequence| sequence.matches(node),
             .has => |has| has.matches(node, context),
@@ -121,6 +128,7 @@ pub const SimpleSelector = union(enum) {
         switch (self.*) {
             .tag => |*tag| tag.deinit(allocator),
             .class => |*class| class.deinit(allocator),
+            .id => |*id| id.deinit(allocator),
             .focus_visible => {},
             .sequence => |*sequence| sequence.deinit(allocator),
             .has => |*has| has.deinit(allocator),
@@ -131,6 +139,7 @@ pub const SimpleSelector = union(enum) {
         return switch (self) {
             .tag => |tag| tag.priority(),
             .class => |class| class.priority(),
+            .id => |id| id.priority(),
             .focus_visible => |focus_visible| focus_visible.priority(),
             .sequence => |sequence| sequence.priority(),
             .has => |has| has.priority(),
@@ -167,6 +176,34 @@ pub const ClassSelector = struct {
     fn priority(self: ClassSelector) u32 {
         _ = self;
         return 10;
+    }
+};
+
+/// An ID selector such as `#main`. HTML ID matching is case-sensitive and an
+/// ID contributes the selector specificity's hundreds component.
+pub const IdSelector = struct {
+    id: []const u8,
+
+    pub fn init(id: []const u8) IdSelector {
+        return .{ .id = id };
+    }
+
+    fn matches(self: IdSelector, node: *Node) bool {
+        const element = switch (node.*) {
+            .element => |*value| value,
+            .text => return false,
+        };
+        const attributes = element.attributes orelse return false;
+        return std.mem.eql(u8, self.id, attributes.get("id") orelse return false);
+    }
+
+    fn deinit(self: IdSelector, allocator: std.mem.Allocator) void {
+        allocator.free(self.id);
+    }
+
+    fn priority(self: IdSelector) u32 {
+        _ = self;
+        return 100;
     }
 };
 
@@ -217,17 +254,19 @@ pub const TagSelector = struct {
 };
 
 /// One atomic member of a selector sequence. A sequence matches only when all
-/// of its tag, class, and supported pseudo-class members match the same
+/// of its tag, ID, class, and supported pseudo-class members match the same
 /// element.
 pub const SequenceSelector = union(enum) {
     tag: TagSelector,
     class: ClassSelector,
+    id: IdSelector,
     focus_visible: FocusVisibleSelector,
 
     pub fn intoSimpleSelector(self: SequenceSelector) SimpleSelector {
         return switch (self) {
             .tag => |tag| .{ .tag = tag },
             .class => |class| .{ .class = class },
+            .id => |id| .{ .id = id },
             .focus_visible => |focus_visible| .{ .focus_visible = focus_visible },
         };
     }
@@ -236,6 +275,7 @@ pub const SequenceSelector = union(enum) {
         return switch (self) {
             .tag => |tag| tag.matches(node),
             .class => |class| class.matches(node),
+            .id => |id| id.matches(node),
             .focus_visible => |focus_visible| focus_visible.matches(node),
         };
     }
@@ -244,6 +284,7 @@ pub const SequenceSelector = union(enum) {
         switch (self.*) {
             .tag => |*tag| tag.deinit(allocator),
             .class => |*class| class.deinit(allocator),
+            .id => |*id| id.deinit(allocator),
             .focus_visible => {},
         }
     }
@@ -252,6 +293,7 @@ pub const SequenceSelector = union(enum) {
         return switch (self) {
             .tag => |tag| tag.priority(),
             .class => |class| class.priority(),
+            .id => |id| id.priority(),
             .focus_visible => |focus_visible| focus_visible.priority(),
         };
     }

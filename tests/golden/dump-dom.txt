@@ -1,14 +1,11 @@
 <html>
   <head>
+    <title>
+      DOM dump fixture
   <body>
-    <html>
-      <head>
-        <title>
-          DOM dump fixture
-      <body>
-        <main id="content">
-          <p>
-            Hello
-            <strong>
-              Zibra
-            .
+    <main id="content">
+      <p>
+        Hello
+        <strong>
+          Zibra
+        .

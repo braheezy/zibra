@@ -21,7 +21,7 @@ blockquote { display: block; }
 ol { display: block; }
 ul { display: block; }
 menu { display: block; }
-li { display: block; }
+li { display: list-item; }
 dl { display: block; }
 dt { display: block; }
 dd { display: block; }
