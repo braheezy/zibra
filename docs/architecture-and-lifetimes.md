@@ -442,6 +442,17 @@ multiplied. A BlockLayout's protected zoom field stores the total factor so a
 computed-style change invalidates descendant geometry and paint/hit effects
 read the same generation.
 
+Interactive accessibility zoom publishes that raster factor to the active
+Browser immediately under `Browser.lock`. It invalidates the bounded page
+interest region and rerasterizes the retained committed command list so input
+has visible feedback without waiting for style and layout. The serialized tab
+worker still rebuilds media rules, style, layout, paint, and hit geometry; its
+later commit confirms the same scalar with the replacement list. Glyph commands
+record the accessibility zoom that produced their bitmap. Preview rasterization
+resamples that bitmap by the target/source zoom ratio, while the replacement
+list carries newly rasterized glyphs at the final size; authored CSS `zoom`
+remains baked into both generations and is not applied twice.
+
 Replaced `<img>` elements retain a CSS/attribute-selected element box separately
 from decoded bitmap geometry. Images and iframes share one unscaled
 replaced-size resolver: supported CSS pixel dimensions override their matching
@@ -733,13 +744,25 @@ display-list ownership boundary. CSS box shorthands are expanded into
 longhands during declaration parsing, so stylesheet rules and inline style
 attributes share the same cascade and `!important` behavior.
 
-Each block formatting context retains primitive geometry for its direct
-left/right floats during a layout pass. Floats are removed from normal block
-height accumulation, exclude their margin boxes from following block and
-inline content, and remain available until their bottom edge. `clear: left`,
-`right`, or `both` advances a block past the corresponding active float
-bottoms. A block's auto height still includes the bottom of its direct floats;
-the retained float records contain no DOM or layout pointers.
+Each block formatting context retains primitive geometry for all left/right
+floats that participate in that context, including floats beneath intervening
+ordinary block wrappers. The root, floated and absolutely positioned blocks,
+embedded block roots, and blocks with non-visible overflow own contexts;
+non-owning descendants route exclusion records to their nearest owner. Floats
+are removed from ordinary block-height accumulation, exclude their margin
+boxes from following block and inline content, and remain available until
+their bottom edge. `clear: left`, `right`, or `both` consults that same owner
+and advances a block past the corresponding active float bottoms. Only a
+context owner includes its floats in auto-height containment. An owner rebuild
+forces participating descendants through layout again so incremental passes
+reconstruct the pointer-free float records instead of retaining stale geometry.
+
+Normal-flow text collapses source spaces, tabs, and line endings across inline
+element boundaries; preformatted subtrees retain their explicit line breaks.
+Anonymous inline-run blocks seed inherited font and color state from their
+container. An inline element containing block-displayed descendants is kept as
+a layout container, providing the engine's bounded block-in-inline fixup rather
+than flattening those descendants into one line run.
 
 An Element lazily owns a heap-stable canvas pointee when JavaScript first calls
 `getContext("2d")`. z2d Context retains the address of the Surface inside that

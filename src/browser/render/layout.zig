@@ -204,15 +204,26 @@ fn nodeClearSide(node: Node) ClearSide {
 fn isContainerNode(node: Node, dependency_target: ?*ProtectedField(u64)) bool {
     return switch (node) {
         .element => |element| blk: {
-            const style_map = if (element.style) |*styles| styles else break :blk false;
             if (nodePositionMode(node, dependency_target) == .absolute) break :blk true;
             if (nodeFloatSide(node, dependency_target) != .none) break :blk true;
-            const field = @constCast(style_map).getPtr("display") orelse break :blk false;
-            const value = if (dependency_target) |target| value: {
-                target.addDependency(field);
-                break :value field.read(target).*;
-            } else field.get().*;
-            break :blk isBlockDisplay(value);
+            if (element.style) |*styles| {
+                if (@constCast(styles).getPtr("display")) |field| {
+                    const value = if (dependency_target) |target| value: {
+                        target.addDependency(field);
+                        break :value field.read(target).*;
+                    } else field.get().*;
+                    if (isBlockDisplay(value)) break :blk true;
+                }
+            }
+
+            // CSS block-in-inline fixup is substantially richer than this
+            // layout tree, but retaining an inline wrapper as a container is
+            // enough to keep its block descendants out of one flattened text
+            // run. The wrapper then supplies the anonymous block boundary.
+            for (element.children.items) |child| {
+                if (isContainerNode(child, dependency_target)) break :blk true;
+            }
+            break :blk false;
         },
         .text => false,
     };
@@ -1065,6 +1076,11 @@ const EmbedLayout = struct {
             .payload = payload,
         });
         engine.cursor_x += width_value;
+        // Replaced content separates adjacent normal-whitespace runs. A
+        // following source-space therefore remains eligible to produce one
+        // collapsed space instead of being merged with whitespace before the
+        // control or image.
+        engine.last_was_collapsible_space = false;
     }
 };
 
@@ -1406,6 +1422,7 @@ const SoftHyphenBreak = struct {
 
 const GraphemeOptions = struct {
     force_newline: bool = false,
+    is_collapsed_space: bool = false,
     is_superscript: bool = false,
     is_small_caps: bool = false,
 };
@@ -2079,6 +2096,18 @@ test "anonymous blocks group only consecutive inline siblings" {
     try std.testing.expect(!isContainerNode(inline_node, null));
     try std.testing.expect(isContainerNode(paragraph, null));
     try std.testing.expect(!isContainerNode(text, null));
+
+    var inline_form = Node{ .element = try parser.Element.init(allocator, "form", null) };
+    defer inline_form.deinit(allocator);
+    try setTestDisplay(allocator, &inline_form, "inline");
+    var form_paragraph = Node{ .element = try parser.Element.init(allocator, "p", &inline_form) };
+    var form_paragraph_owned = true;
+    errdefer if (form_paragraph_owned) form_paragraph.deinit(allocator);
+    try setTestDisplay(allocator, &form_paragraph, "block");
+    try inline_form.element.children.append(allocator, form_paragraph);
+    form_paragraph_owned = false;
+    parser.fixParentPointers(&inline_form, null);
+    try std.testing.expect(isContainerNode(inline_form, null));
 }
 
 test "append-only block layout retains its existing child objects after DOM relocation" {
@@ -2288,6 +2317,136 @@ test "float exclusions use margin boxes and stop at the float bottom" {
     try std.testing.expectEqual(@as(i32, 200), restored.width);
 }
 
+test "non-formatting blocks share their nearest float context" {
+    const allocator = std.testing.allocator;
+    var root_node = Node{ .element = try parser.Element.init(allocator, "html", null) };
+    defer root_node.deinit(allocator);
+    var transparent_node = Node{ .element = try parser.Element.init(allocator, "div", null) };
+    defer transparent_node.deinit(allocator);
+    try setTestStyleValue(allocator, &transparent_node, "overflow", "visible");
+    var float_node = Node{ .element = try parser.Element.init(allocator, "div", null) };
+    defer float_node.deinit(allocator);
+    try setTestStyleValue(allocator, &float_node, "float", "left");
+    var clipped_node = Node{ .element = try parser.Element.init(allocator, "div", null) };
+    defer clipped_node.deinit(allocator);
+    try setTestStyleValue(allocator, &clipped_node, "overflow", "hidden");
+
+    const document = try DocumentLayout.init(allocator, &root_node);
+    defer {
+        document.deinit();
+        allocator.destroy(document);
+    }
+    const root = try BlockLayout.init(allocator, root_node, &root_node, document, null, null);
+    try document.children.append(allocator, root);
+    const transparent = try BlockLayout.init(
+        allocator,
+        transparent_node,
+        &transparent_node,
+        document,
+        root,
+        null,
+    );
+    try root.children.append(allocator, .{ .block = transparent });
+    const floating = try BlockLayout.init(
+        allocator,
+        float_node,
+        &float_node,
+        document,
+        transparent,
+        null,
+    );
+    try transparent.children.append(allocator, .{ .block = floating });
+    const clipped = try BlockLayout.init(
+        allocator,
+        clipped_node,
+        &clipped_node,
+        document,
+        transparent,
+        null,
+    );
+    try transparent.children.append(allocator, .{ .block = clipped });
+
+    try std.testing.expect(root.establishesFloatContext());
+    try std.testing.expect(!transparent.establishesFloatContext());
+    try std.testing.expect(transparent.floatContextForChildren() == root);
+    try std.testing.expect(floating.establishesFloatContext());
+    try std.testing.expect(floating.floatContextForChildren() == floating);
+    try std.testing.expect(clipped.establishesFloatContext());
+    try std.testing.expect(clipped.floatContextForChildren() == clipped);
+}
+
+test "nested floats place and clear in a shared context after invalidation" {
+    const allocator = std.testing.allocator;
+    var html_parser = try parser.HTMLParser.init(
+        allocator,
+        "<html style='display:block'><body style='display:block;margin:0'>" ++
+            "<main id=stage style='display:block;width:180px'>" ++
+            "<div id=wrapper style='display:block'>" ++
+            "<div id=a style='display:block;float:left;width:60px;height:40px'></div>" ++
+            "<div id=b style='display:block;float:left;width:60px;height:40px'></div>" ++
+            "</div>" ++
+            "<div id=c style='display:block;float:left;width:60px;height:40px'></div>" ++
+            "<p id=clear style='display:block;clear:both;height:10px'></p>" ++
+            "</main></body></html>",
+    );
+    html_parser.use_implicit_tags = false;
+    defer html_parser.deinit(allocator);
+    var root_node = try html_parser.parse();
+    defer root_node.deinit(allocator);
+    parser.fixParentPointers(&root_node, null);
+    try parser.style(allocator, &root_node, &.{});
+
+    var environ = std.process.Environ.Map.init(allocator);
+    defer environ.deinit();
+    try environ.put("HOME", "/tmp");
+    const engine = try Layout.init(allocator, std.testing.io, &environ, 800, 600, false);
+    defer engine.deinit();
+    const document = try engine.buildDocument(&root_node);
+    defer {
+        document.deinit();
+        allocator.destroy(document);
+    }
+
+    var nodes = std.ArrayList(*Node).empty;
+    defer nodes.deinit(allocator);
+    try parser.treeToList(allocator, &root_node, &nodes);
+    var wrapper_node: ?*Node = null;
+    var first_float_node: ?*Node = null;
+    var third_float_node: ?*Node = null;
+    var clear_node: ?*Node = null;
+    for (nodes.items) |node| switch (node.*) {
+        .element => |*element| {
+            const attributes = element.attributes orelse continue;
+            const id = attributes.get("id") orelse continue;
+            if (std.mem.eql(u8, id, "wrapper")) wrapper_node = node;
+            if (std.mem.eql(u8, id, "a")) first_float_node = node;
+            if (std.mem.eql(u8, id, "c")) third_float_node = node;
+            if (std.mem.eql(u8, id, "clear")) clear_node = node;
+        },
+        .text => {},
+    };
+
+    const wrapper: *BlockLayout = @ptrCast(@alignCast(wrapper_node.?.element.layout_ptr.?));
+    const first_float: *BlockLayout = @ptrCast(@alignCast(first_float_node.?.element.layout_ptr.?));
+    const third_float: *BlockLayout = @ptrCast(@alignCast(third_float_node.?.element.layout_ptr.?));
+    const clearing: *BlockLayout = @ptrCast(@alignCast(clear_node.?.element.layout_ptr.?));
+    try std.testing.expectEqual(@as(i32, 0), wrapper.height.get().*);
+    try std.testing.expectEqual(first_float.y.get().*, third_float.y.get().*);
+    try std.testing.expectEqual(
+        first_float.y.get().* + first_float.height.get().*,
+        clearing.y.get().*,
+    );
+
+    first_float_node.?.element.style.?.getPtr("height").?.set("80px");
+    try document.layout(engine);
+    try std.testing.expectEqual(@as(i32, 0), wrapper.height.get().*);
+    try std.testing.expectEqual(first_float.y.get().*, third_float.y.get().*);
+    try std.testing.expectEqual(
+        first_float.y.get().* + first_float.height.get().*,
+        clearing.y.get().*,
+    );
+}
+
 // Layout state
 allocator: std.mem.Allocator,
 // Font manager for handling fonts and glyphs
@@ -2367,6 +2526,7 @@ transform_offset_x: i32 = 0,
 transform_offset_y: i32 = 0,
 
 is_preformatted: bool = false,
+last_was_collapsible_space: bool = false,
 prev_font_category: ?FontCategory = null,
 current_font_category: FontCategory = .latin,
 
@@ -2386,6 +2546,7 @@ const InlineSnapshot = struct {
     is_superscript: bool,
     is_small_caps: bool,
     is_preformatted: bool,
+    last_was_collapsible_space: bool,
     prev_font_category: ?FontCategory,
     current_font_category: FontCategory,
     text_color: browser.Color,
@@ -2410,6 +2571,7 @@ fn snapshotInlineState(self: *const Layout) InlineSnapshot {
         .is_superscript = self.is_superscript,
         .is_small_caps = self.is_small_caps,
         .is_preformatted = self.is_preformatted,
+        .last_was_collapsible_space = self.last_was_collapsible_space,
         .prev_font_category = self.prev_font_category,
         .current_font_category = self.current_font_category,
         .text_color = self.text_color,
@@ -2434,6 +2596,7 @@ fn restoreInlineState(self: *Layout, snapshot: InlineSnapshot) void {
     self.is_superscript = snapshot.is_superscript;
     self.is_small_caps = snapshot.is_small_caps;
     self.is_preformatted = snapshot.is_preformatted;
+    self.last_was_collapsible_space = snapshot.last_was_collapsible_space;
     self.prev_font_category = snapshot.prev_font_category;
     self.current_font_category = snapshot.current_font_category;
     self.text_color = snapshot.text_color;
@@ -3616,6 +3779,7 @@ fn flushLine(self: *Layout, line_buffer: *std.ArrayList(LineItem)) !void {
                         .y = final_y,
                         .glyph = glyph_payload.glyph,
                         .color = glyph_payload.color,
+                        .page_zoom = self.zoom(),
                         .source = source,
                     },
                 });
@@ -3756,13 +3920,17 @@ fn breakPreformattedLine(self: *Layout, line_buffer: *std.ArrayList(LineItem)) !
 fn inlineContentBounds(block: *const BlockLayout, y: i32) ContentBounds {
     const block_left = block.x.get().* + block.border.left + block.padding.left;
     const block_right = block_left +| block.content_width;
-    if (block.floatSide() != .none) {
+    if (block.establishesFloatContext()) {
         return .{ .x = block_left, .width = @max(block_right -| block_left, 0) };
     }
 
     if (block.parent_block) |parent| {
         const parent_left = parent.x.get().* + parent.border.left + parent.padding.left;
-        const parent_bounds = parent.floatBoundsAt(y, parent_left, parent.content_width);
+        const parent_bounds = parent.floatContextForChildrenConst().floatBoundsAt(
+            y,
+            parent_left,
+            parent.content_width,
+        );
         const left = @max(block_left, parent_bounds.x);
         const right = @min(block_right, parent_bounds.x +| parent_bounds.width);
         return .{ .x = left, .width = @max(right -| left, 0) };
@@ -3796,8 +3964,12 @@ fn processGrapheme(
 ) !void {
     const small_caps = options.is_small_caps or self.css_small_caps;
 
-    // Handle newlines explicitly before font shaping.
-    if (std.mem.eql(u8, gme, "\n") or std.mem.eql(u8, gme, "\r") or options.force_newline) {
+    // Source newlines are collapsible whitespace in normal flow. Only an
+    // explicit request or a preformatted run turns one into a line break.
+    if (options.force_newline or
+        (self.is_preformatted and
+            (std.mem.eql(u8, gme, "\n") or std.mem.eql(u8, gme, "\r"))))
+    {
         try self.breakExplicitLine(line_buffer);
         return;
     }
@@ -3873,6 +4045,19 @@ fn processGrapheme(
     const glyph_height = self.toLayoutPx(glyph.h);
     const glyph_ascent = self.toLayoutPx(glyph.ascent);
     const glyph_descent = self.toLayoutPx(glyph.descent);
+
+    // A collapsed source-space at the right edge is trailing whitespace, not
+    // the first glyph of the next line.
+    if (options.is_collapsed_space and shouldAutomaticallyWrap(
+        self.is_preformatted,
+        self.cursor_x,
+        glyph_width,
+        self.line_right,
+        line_buffer.items.len > 0,
+    )) {
+        try self.flushLine(line_buffer);
+        return;
+    }
 
     // Check if we need to wrap (only at window edge)
     while (shouldAutomaticallyWrap(
@@ -4205,25 +4390,36 @@ fn lineBreakLengthAt(text: []const u8, position: usize) usize {
     };
 }
 
-fn paragraphGap(font_size: i32) i32 {
-    const line_step = @max(font_size, 1);
-    return @max(@divTrunc(line_step, 2), 1);
+fn isCollapsibleWhitespaceGrapheme(gme: []const u8) bool {
+    return gme.len == 1 and switch (gme[0]) {
+        ' ', '\t', '\n', '\r', 0x0c => true,
+        else => false,
+    };
 }
 
-fn breakParagraph(self: *Layout, line_buffer: *std.ArrayList(LineItem)) !void {
-    const initial_y = self.cursor_y;
-    try self.flushLine(line_buffer);
-
-    const gap = @max(self.scaleActiveCssPixel(paragraphGap(self.size)), 1);
-    if (self.cursor_y == initial_y) {
-        // Preserve an empty source line even though flushLine has no glyph
-        // metrics from which to derive its normal advance.
-        self.cursor_y += self.lineHeightForNatural(
-            @max(self.scaleActiveCssPixel(self.size), 1),
-        );
+fn processNormalGrapheme(
+    self: *Layout,
+    gme: []const u8,
+    line_buffer: *std.ArrayList(LineItem),
+    node_ptr: ?*Node,
+) !void {
+    if (isCollapsibleWhitespaceGrapheme(gme)) {
+        if (self.last_was_collapsible_space) return;
+        self.last_was_collapsible_space = true;
+        if (line_buffer.items.len == 0 and self.cursor_x == self.line_left) return;
+        try self.processGrapheme(" ", line_buffer, node_ptr, .{
+            .is_collapsed_space = true,
+            .is_superscript = self.is_superscript,
+            .is_small_caps = self.is_small_caps,
+        });
+        return;
     }
-    self.cursor_y += gap;
-    self.cursor_x = self.line_left;
+
+    self.last_was_collapsible_space = false;
+    try self.processGrapheme(gme, line_buffer, node_ptr, .{
+        .is_superscript = self.is_superscript,
+        .is_small_caps = self.is_small_caps,
+    });
 }
 
 fn handleTextToken(
@@ -4237,54 +4433,35 @@ fn handleTextToken(
         return;
     }
 
-    // Keep source text in Unicode grapheme clusters while stopping at syntax
-    // that needs special handling. This keeps emoji modifiers, flags, and ZWJ
-    // sequences together for font fallback and rasterization.
+    // Keep source text in Unicode grapheme clusters while stopping at entity
+    // syntax. HTML source formatting whitespace collapses to one ordinary
+    // space; only preformatted text preserves source line breaks.
     var i: usize = 0;
     while (i < content.len) {
-        const line_break_len = lineBreakLengthAt(content, i);
-        if (line_break_len != 0) {
-            try self.breakParagraph(line_buffer);
-            i += line_break_len;
-            continue;
-        }
-
         if (content[i] == '&') {
             var entity_buffer: [4]u8 = undefined;
             if (lexEntityAt(content, i, &entity_buffer)) |entity| {
-                try self.processGrapheme(entity.replacement, line_buffer, node_ptr, .{
-                    .is_superscript = self.is_superscript,
-                    .is_small_caps = self.is_small_caps,
-                });
+                try self.processNormalGrapheme(entity.replacement, line_buffer, node_ptr);
 
                 i += entity.len;
                 continue;
             }
 
             // An ampersand that does not begin a recognized entity is text.
-            try self.processGrapheme("&", line_buffer, node_ptr, .{
-                .is_superscript = self.is_superscript,
-                .is_small_caps = self.is_small_caps,
-            });
+            try self.processNormalGrapheme("&", line_buffer, node_ptr);
             i += 1;
             continue;
         }
 
         var run_end = i;
-        while (run_end < content.len and
-            content[run_end] != '&' and
-            lineBreakLengthAt(content, run_end) == 0)
-        {
+        while (run_end < content.len and content[run_end] != '&') {
             run_end += 1;
         }
 
         const run = content[i..run_end];
         var g_iter = grapheme.iterator(run);
         while (g_iter.next()) |gc| {
-            try self.processGrapheme(gc.bytes(run), line_buffer, node_ptr, .{
-                .is_superscript = self.is_superscript,
-                .is_small_caps = self.is_small_caps,
-            });
+            try self.processNormalGrapheme(gc.bytes(run), line_buffer, node_ptr);
         }
         i = run_end;
     }
@@ -4310,10 +4487,15 @@ test "lineBreakLengthAt recognizes platform newline encodings" {
     try std.testing.expectEqual(@as(usize, 0), lineBreakLengthAt("abc", 1));
 }
 
-test "paragraph gap adds visible leading beyond a normal line step" {
-    try std.testing.expectEqual(@as(i32, 8), paragraphGap(16));
-    try std.testing.expect(paragraphGap(16) > 0);
-    try std.testing.expectEqual(@as(i32, 1), paragraphGap(1));
+test "normal-flow source whitespace collapses while preformatted breaks remain recognizable" {
+    for ([_][]const u8{ " ", "\t", "\n", "\r", "\x0c" }) |value| {
+        try std.testing.expect(isCollapsibleWhitespaceGrapheme(value));
+    }
+    try std.testing.expect(!isCollapsibleWhitespaceGrapheme("x"));
+    try std.testing.expect(!isCollapsibleWhitespaceGrapheme("\u{00a0}"));
+
+    try std.testing.expectEqual(@as(usize, 1), lineBreakLengthAt("a\nb", 1));
+    try std.testing.expectEqual(@as(usize, 2), lineBreakLengthAt("a\r\nb", 1));
 }
 
 test "line-height resolves unitless and relative values" {
@@ -4424,6 +4606,15 @@ pub fn layoutSourceCode(self: *Layout, source: []const u8) ![]DisplayItem {
 
     // Process the source character by character
     while (i < source.len) {
+        // View-source recognizes physical source-line boundaries even while
+        // tag glyphs temporarily use normal wrapping for syntax coloring.
+        const source_break_len = lineBreakLengthAt(source, i);
+        if (source_break_len != 0) {
+            try self.breakExplicitLine(&line_buffer);
+            i += source_break_len;
+            continue;
+        }
+
         // Check for tag start
         if (i + 1 < source.len and source[i] == '<') {
             // We're entering a tag
@@ -4541,6 +4732,7 @@ const InputLayout = struct {
     text: []const u8 = "",
     is_focused: bool = false,
     is_checkbox: bool = false,
+    is_radio: bool = false,
     is_checked: bool = false,
     is_password: bool = false,
 
@@ -4561,9 +4753,14 @@ const InputLayout = struct {
         self.font_size = engine.scaledFontSize(engine.size);
         self.color = engine.text_color;
         self.is_checkbox = element.isCheckbox();
-        self.is_checked = element.isChecked();
+        self.is_radio = element.isInputType("radio");
+        self.is_checked = if (self.is_radio)
+            if (element.attributes) |attributes| attributes.get("checked") != null else false
+        else
+            element.isChecked();
         self.is_password = element.isPasswordInput();
-        if (self.is_checkbox) {
+        const is_choice = self.is_checkbox or self.is_radio;
+        if (is_choice) {
             self.bgcolor = .{ .r = 255, .g = 255, .b = 255, .a = 255 };
         }
 
@@ -4582,7 +4779,7 @@ const InputLayout = struct {
             }
         }
 
-        if (self.is_checkbox) {
+        if (is_choice) {
             self.text = "";
         } else if (std.mem.eql(u8, element.tag, "input")) {
             if (element.attributes) |attrs| {
@@ -4601,9 +4798,12 @@ const InputLayout = struct {
         const ascent_value = engine.toLayoutPx(glyph.ascent);
         const descent_value = engine.toLayoutPx(glyph.descent);
         const natural_height = ascent_value + descent_value;
-        var width_value = if (self.is_checkbox) natural_height else engine.scaleActiveCssPixel(INPUT_WIDTH_PX);
+        if (self.is_radio and self.border_radius == 0) {
+            self.border_radius = @as(f64, @floatFromInt(natural_height)) / 2.0;
+        }
+        var width_value = if (is_choice) natural_height else engine.scaleActiveCssPixel(INPUT_WIDTH_PX);
         var height_value = natural_height;
-        if (!self.is_checkbox) {
+        if (!is_choice) {
             if (element.style) |*style_map| {
                 if (resolvedPixelDimension(&element, style_map, "width", .{
                     .font_size = engine.font_size_css,
@@ -4667,7 +4867,7 @@ const InputLayout = struct {
             }
         }
 
-        if (engine.accessibility.forced_colors and !self.is_checkbox) {
+        if (engine.accessibility.forced_colors and !self.is_checkbox and !self.is_radio) {
             try target.append(engine.allocator, .{ .outline = .{
                 .rect = .{
                     .left = x,
@@ -4743,6 +4943,62 @@ const InputLayout = struct {
             return;
         }
 
+        if (self.is_radio) {
+            const ink = engine.remapColor(
+                .{ .r = 48, .g = 48, .b = 48, .a = 255 },
+                .control_text,
+            );
+            const inset = @max(@divTrunc(height_value, 7), 1);
+            try appendBackgroundBox(
+                target,
+                engine.allocator,
+                x,
+                y,
+                width_value,
+                height_value,
+                self.border_radius,
+                ink,
+                source,
+            );
+            try appendBackgroundBox(
+                target,
+                engine.allocator,
+                x + inset,
+                y + inset,
+                @max(width_value - 2 * inset, 1),
+                @max(height_value - 2 * inset, 1),
+                @max(self.border_radius - @as(f64, @floatFromInt(inset)), 0),
+                remapped_bg,
+                source,
+            );
+            if (self.is_checked) {
+                const dot_inset = @max(@divTrunc(height_value, 3), inset + 1);
+                try appendBackgroundBox(
+                    target,
+                    engine.allocator,
+                    x + dot_inset,
+                    y + dot_inset,
+                    @max(width_value - 2 * dot_inset, 1),
+                    @max(height_value - 2 * dot_inset, 1),
+                    @max(self.border_radius - @as(f64, @floatFromInt(dot_inset)), 0),
+                    ink,
+                    source,
+                );
+            }
+            try appendRoundedControlGroup(
+                commands,
+                engine.allocator,
+                &rounded_items,
+                x,
+                y,
+                width_value,
+                height_value,
+                self.border_radius,
+                source,
+            );
+            return;
+        }
+
         var text_x = x + scaleCssPixel(2, self.embed.zoom.get().*, engine.zoom());
         const baseline_y = y + ascent_value;
         if (self.text.len > 0) {
@@ -4765,6 +5021,7 @@ const InputLayout = struct {
                         .y = baseline_y - engine.toLayoutPx(glyph.ascent),
                         .glyph = glyph,
                         .color = engine.remapColor(self.color, .control_text),
+                        .page_zoom = engine.zoom(),
                         .source = source,
                     },
                 });
@@ -4838,6 +5095,27 @@ test "hidden inputs emit no inline box and password graphemes paint as stars" {
     }
     try std.testing.expectEqual(@as(usize, 3), masked_count);
     try std.testing.expectEqualStrings("x", inputDisplayGrapheme(false, "x"));
+}
+
+test "radio inputs use compact circular control metrics" {
+    const allocator = std.testing.allocator;
+    var radio = try parser.Element.init(allocator, "input type=radio checked", null);
+    defer radio.deinit(allocator);
+    var environ = std.process.Environ.Map.init(allocator);
+    defer environ.deinit();
+    try environ.put("HOME", "/tmp");
+    const engine = try Layout.init(allocator, std.testing.io, &environ, 800, 600, false);
+    defer engine.deinit();
+
+    var input = InputLayout.init(allocator);
+    defer input.deinit();
+    try input.measure(engine, radio);
+    try std.testing.expect(input.is_radio);
+    try std.testing.expect(input.is_checked);
+    try std.testing.expectEqualStrings("", input.text);
+    try std.testing.expectEqual(input.embed.height.get().*, input.embed.width.get().*);
+    try std.testing.expect(input.embed.width.get().* < engine.scaleActiveCssPixel(INPUT_WIDTH_PX));
+    try std.testing.expect(input.border_radius > 0);
 }
 
 /// An inline button whose contents are laid out as a real block subtree. The
@@ -5714,6 +5992,7 @@ const TextLayout = struct {
                 .y = self.y.get().*,
                 .glyph = glyph,
                 .color = engine.remapTextColor(&self.node, self.color),
+                .page_zoom = engine.zoom(),
                 .source = displaySource(self, self.node_ptr),
             },
         });
@@ -6307,9 +6586,11 @@ const BlockLayout = struct {
     laid_out_dom_children: usize = 0,
     children_epoch: u64 = 0,
     children_version: ProtectedField(u64),
-    /// Direct floated siblings in this block formatting context. Entries
-    /// contain only primitive geometry and are rebuilt on every layout pass.
+    /// Floats owned by this block formatting context. Non-context descendants
+    /// contribute to their nearest owning ancestor instead of retaining a
+    /// private exclusion list.
     floats: std.ArrayList(FloatBox),
+    rebuilding_floats: bool = false,
 
     children: std.ArrayList(LayoutChild),
     /// DOM-index permutation captured at the last paint. Retaining it keeps
@@ -6510,6 +6791,7 @@ const BlockLayout = struct {
             .children_epoch = 0,
             .children_version = ProtectedField(u64).init(allocator, 0),
             .floats = std.ArrayList(FloatBox).empty,
+            .rebuilding_floats = false,
         };
         block.zoom.setOwner(block, markOpaque);
         block.x.setOwner(block, markOpaque);
@@ -6855,6 +7137,30 @@ const BlockLayout = struct {
         return nodePositionMode(self.node, null);
     }
 
+    fn establishesFloatContext(self: *const BlockLayout) bool {
+        if (self.parent_block == null or self.embedded_box != null) return true;
+        if (self.floatSide() != .none or self.positionMode() == .absolute) return true;
+
+        const element = liveBlockElement(self) orelse return false;
+        const styles = if (element.style) |*style_map| style_map else return false;
+        const overflow = std.mem.trim(
+            u8,
+            styleValue(styles, "overflow") orelse "visible",
+            " \t\r\n",
+        );
+        return !std.ascii.eqlIgnoreCase(overflow, "visible");
+    }
+
+    fn floatContextForChildren(self: *BlockLayout) *BlockLayout {
+        if (self.establishesFloatContext()) return self;
+        return self.parent_block.?.floatContextForChildren();
+    }
+
+    fn floatContextForChildrenConst(self: *const BlockLayout) *const BlockLayout {
+        if (self.establishesFloatContext()) return self;
+        return self.parent_block.?.floatContextForChildrenConst();
+    }
+
     fn specifiedPositionOffset(
         self: *const BlockLayout,
         property: []const u8,
@@ -7042,8 +7348,12 @@ const BlockLayout = struct {
     }
 
     fn layout(self: *BlockLayout, engine: *Layout) !void {
+        const inherited_float_rebuild = if (self.parent_block) |parent|
+            parent.floatContextForChildren().rebuilding_floats
+        else
+            false;
         // Skip layout if nothing is dirty
-        if (!self.layoutNeeded()) return;
+        if (!self.layoutNeeded() and !inherited_float_rebuild) return;
         self.in_layout = true;
         defer self.in_layout = false;
 
@@ -7195,9 +7505,10 @@ const BlockLayout = struct {
 
         if (self.parent_block) |parent| {
             if (position_mode != .absolute) {
+                const float_context = parent.floatContextForChildren();
                 const clear_side = self.clearSide();
                 if (clear_side != .none) {
-                    layout_y = parent.clearBottom(layout_y, clear_side);
+                    layout_y = float_context.clearBottom(layout_y, clear_side);
                 }
 
                 if (float_side != .none) {
@@ -7211,7 +7522,7 @@ const BlockLayout = struct {
                         @max(base_content_bounds.width - self.margin.horizontal(), 0);
 
                     while (true) {
-                        const available = parent.floatBoundsAt(
+                        const available = float_context.floatBoundsAt(
                             layout_y,
                             base_content_bounds.x,
                             base_content_bounds.width,
@@ -7224,12 +7535,12 @@ const BlockLayout = struct {
                                 available.x + available.width - self.margin.right - candidate_width;
                             break;
                         }
-                        const next_y = parent.nextFloatBottom(layout_y) orelse break;
+                        const next_y = float_context.nextFloatBottom(layout_y) orelse break;
                         if (next_y <= layout_y) break;
                         layout_y = next_y;
                         if (specified_width == null) {
                             candidate_width = @max(
-                                parent.floatBoundsAt(
+                                float_context.floatBoundsAt(
                                     layout_y,
                                     base_content_bounds.x,
                                     base_content_bounds.width,
@@ -7246,7 +7557,7 @@ const BlockLayout = struct {
             if (position_mode == .absolute)
                 base_content_bounds
             else
-                parent.floatBoundsAt(
+                parent.floatContextForChildren().floatBoundsAt(
                     layout_y,
                     base_content_bounds.x,
                     base_content_bounds.width,
@@ -7306,6 +7617,15 @@ const BlockLayout = struct {
         // Reset any cached inline commands
         DisplayItem.freeItems(self.allocator, self.display_list.items);
         self.display_list.clearRetainingCapacity();
+
+        const owns_float_context = self.establishesFloatContext();
+        if (owns_float_context) {
+            self.floats.clearRetainingCapacity();
+            self.rebuilding_floats = true;
+        }
+        defer {
+            if (owns_float_context) self.rebuilding_floats = false;
+        }
 
         var natural_height: i32 = 0;
         if (is_block) {
@@ -7387,7 +7707,7 @@ const BlockLayout = struct {
             // Layout all children and compute height
             // Use .read() to register invalidation dependencies on children's heights
             var computed_height: i32 = 0;
-            self.floats.clearRetainingCapacity();
+            const float_context = self.floatContextForChildren();
             const flow_origin = self.y.get().* + self.border.top + self.padding.top +
                 tableOfContentsHeaderHeight(self.node, zoom_value, engine.zoom());
             _ = self.children_version.read(&self.height);
@@ -7399,7 +7719,7 @@ const BlockLayout = struct {
                         // is clean. Mark it before laying it out so the
                         // exclusion geometry is recomputed.
                         if (b.positionMode() != .absolute and
-                            (self.floats.items.len > 0 or b.clearSide() != .none))
+                            (float_context.floats.items.len > 0 or b.clearSide() != .none))
                         {
                             b.mark();
                         }
@@ -7409,7 +7729,7 @@ const BlockLayout = struct {
                             // Absolutely positioned descendants paint in this
                             // subtree but contribute no normal-flow height.
                         } else if (b.floatSide() != .none) {
-                            try self.floats.append(self.allocator, .{
+                            try float_context.floats.append(float_context.allocator, .{
                                 .side = b.floatSide(),
                                 .x = b.x.get().*,
                                 .y = b.y.get().*,
@@ -7431,8 +7751,10 @@ const BlockLayout = struct {
                     },
                 }
             }
-            for (self.floats.items) |float_box| {
-                computed_height = @max(float_box.bottom() -| flow_origin, computed_height);
+            if (owns_float_context) {
+                for (self.floats.items) |float_box| {
+                    computed_height = @max(float_box.bottom() -| flow_origin, computed_height);
+                }
             }
             const auto_height = computed_height + tableOfContentsHeaderHeight(
                 self.node,
@@ -8224,6 +8546,7 @@ fn appendTableOfContentsHeader(self: *Layout, commands: *std.ArrayList(DisplayIt
             .{ .r = 0, .g = 0, .b = 0, .a = 255 },
             .text,
         ),
+        .page_zoom = self.zoom(),
         .source = displaySource(block, block.node_ptr),
     } });
 }
@@ -8383,6 +8706,7 @@ fn layoutInlineBlock(self: *Layout, block: *BlockLayout) !void {
     self.is_small_caps = isWithinSmallCapsBlock(block);
     self.text_color = .{ .r = 0, .g = 0, .b = 0, .a = 255 }; // Reset to black
     self.is_preformatted = isWithinPreformattedBlock(block);
+    self.last_was_collapsible_space = false;
     self.prev_font_category = null;
     self.current_font_category = .latin;
 
@@ -8401,6 +8725,14 @@ fn layoutInlineBlock(self: *Layout, block: *BlockLayout) !void {
                             styleValue(style_map, "font-family");
                         if (family_value) |value| {
                             self.font_family = font.familyFromCss(value);
+                        }
+
+                        const color_value = if (block.persistent_dependencies)
+                            styleValueRead(style_map, "color", &block.height)
+                        else
+                            styleValue(style_map, "color");
+                        if (color_value) |value| {
+                            if (parseColor(value)) |color| self.text_color = color;
                         }
 
                         const weight_value = if (block.persistent_dependencies)
@@ -8532,6 +8864,16 @@ fn animatedBackgroundColor(element: parser.Element) ?browser.Color {
     return .{ .r = color.r, .g = color.g, .b = color.b, .a = color.a };
 }
 
+fn rootCanvasBackgroundColor(document: *const DocumentLayout) ?browser.Color {
+    if (document.children.items.len == 0) return null;
+    const element = liveBlockElement(document.children.items[0]) orelse return null;
+    if (animatedBackgroundColor(element.*)) |color| return color;
+    const styles = if (element.style) |*style_map| style_map else return null;
+    const value = styleValue(styles, "background-color") orelse return null;
+    if (std.ascii.eqlIgnoreCase(std.mem.trim(u8, value, " \t\r\n"), "transparent")) return null;
+    return parseColor(value);
+}
+
 test "layout reads the current background color animation value" {
     const allocator = std.testing.allocator;
     var element = try parser.Element.init(allocator, "div", null);
@@ -8553,6 +8895,25 @@ test "layout reads the current background color animation value" {
     );
 }
 
+test "root background color propagates to the canvas" {
+    const allocator = std.testing.allocator;
+    var root_node = Node{ .element = try parser.Element.init(allocator, "html", null) };
+    defer root_node.deinit(allocator);
+    try setTestStyleValue(allocator, &root_node, "background-color", "blue");
+    const document = try DocumentLayout.init(allocator, &root_node);
+    defer {
+        document.deinit();
+        allocator.destroy(document);
+    }
+    const root = try BlockLayout.init(allocator, root_node, &root_node, document, null, null);
+    try document.children.append(allocator, root);
+
+    try std.testing.expectEqual(
+        browser.Color{ .r = 0, .g = 0, .b = 255, .a = 255 },
+        rootCanvasBackgroundColor(document).?,
+    );
+}
+
 pub fn buildDocument(self: *Layout, root: *Node) !*DocumentLayout {
     self.color_scheme_dark = self.resolveColorScheme("light dark");
     self.document_color_scheme_dark = self.color_scheme_dark;
@@ -8565,14 +8926,19 @@ pub fn paintDocument(self: *Layout, document: *DocumentLayout) ![]DisplayItem {
     self.display_list.clearRetainingCapacity();
     const content_height = documentScrollHeight(document.height.get().*);
 
-    if (self.accessibility.forced_colors or self.document_color_scheme_dark) {
-        const width = self.layoutWindowWidth();
-        const bg_color = if (self.accessibility.forced_colors)
-            forced_colors.canvas
-        else if (self.accessibility.dark_palette) |palette|
+    const canvas_color: ?browser.Color = if (self.accessibility.forced_colors)
+        forced_colors.canvas
+    else if (rootCanvasBackgroundColor(document)) |color|
+        self.remapColor(color, .background)
+    else if (self.document_color_scheme_dark)
+        if (self.accessibility.dark_palette) |palette|
             palette.background
         else
-            browser.Color{ .r = 18, .g = 18, .b = 18, .a = 255 };
+            browser.Color{ .r = 18, .g = 18, .b = 18, .a = 255 }
+    else
+        null;
+    if (canvas_color) |bg_color| {
+        const width = self.layoutWindowWidth();
         const bg = DisplayItem{ .rect = .{
             .x1 = 0,
             .y1 = 0,
@@ -9188,6 +9554,16 @@ fn addBackgroundIfNeededToList(self: *Layout, commands: *std.ArrayList(DisplayIt
         if (!std.ascii.eqlIgnoreCase(bg, "transparent")) color = parseColor(bg);
     } else if (std.mem.eql(u8, element.tag, "pre")) {
         color = .{ .r = 230, .g = 230, .b = 230, .a = 255 };
+    }
+
+    // The root element's background is propagated to the document canvas by
+    // paintDocument. Avoid painting it a second time over only the root
+    // block's content-sized border box.
+    if (color != null and
+        block.parent_block == null and
+        rootCanvasBackgroundColor(block.document) != null)
+    {
+        color = null;
     }
 
     if (color) |value| {

@@ -32,6 +32,12 @@ before changing ownership or thread boundaries.
   their containing block's content box, do not become a sibling's `previous`,
   and contribute neither float exclusion nor parent auto-height. Keep this
   static wrapper separate from the live CSS-transform compositor wrapper.
+  Float exclusion belongs to the nearest block-formatting-context owner, not
+  mechanically to the direct DOM parent. Root, float, absolute, embedded-root,
+  and non-visible-overflow blocks own pointer-free float lists; transparent
+  block wrappers share the ancestor list. Rebuild every participant while an
+  owner reconstructs that list, and include floats in auto height only at the
+  owner.
   Active width/height transitions override their computed pixel endpoints here;
   every frame relayouts descendants so line wrapping follows animated width.
   Authored `zoom` is layout-inducing and multiplicative. Each block retains
@@ -55,6 +61,15 @@ before changing ownership or thread boundaries.
   after `ArrayList(Node)` relocation, and append layout objects only for the
   new suffix. Any removal, reorder, classification invalidation, or incompatible
   shape still destroys and rebuilds the complete child list.
+  Normal inline text collapses ASCII source whitespace across nested inline
+  nodes, while `pre` keeps source line endings. Anonymous inline runs must seed
+  inherited text color and metrics from their container. Keep an inline wrapper
+  with block descendants as a block-layout container so block-in-inline content
+  is not flattened into one anonymous line run.
+  Root author background color is painted once over the complete viewport
+  canvas; suppress its duplicate content-height block fill. Checkbox and radio
+  inputs use compact natural square metrics, with radios painted as circular
+  controls rather than generic 200px text fields.
 - `font.zig` owns SDL_ttf handles and cached RGBA glyph pixels. Display items
   borrow those pixels until a raster snapshot copies them.
 - `display_list.zig` owns display-command types, recursive cleanup, painted hit
@@ -66,6 +81,9 @@ before changing ownership or thread boundaries.
   Iframe placeholders additionally publish the containing element's authored
   effective zoom; Tab transfers that scalar to the child Frame before its next
   layout. It is plain numeric state, not DOM/layout provenance.
+  Glyph commands carry the accessibility page zoom used to rasterize their
+  borrowed bitmap so a retained-list zoom preview can resample it while keeping
+  authored CSS zoom baked into the bitmap itself.
   Image commands normally sample the complete borrowed bitmap. Their optional
   half-open, fractional source-pixel rectangle supports CSS backgrounds and
   fitted `<img>` content cropped at the element box and must survive every
