@@ -300,7 +300,20 @@ const FocusCallback = struct {
 /// Runs synchronously before JavaScript changes DOM child storage. Browser
 /// embedders use this boundary to retire every snapshot that borrows the
 /// current DOM generation before any node can move or be destroyed.
-pub const DomMutationCallbackFn = *const fn (context: ?*anyopaque, mutation_root: *Node) void;
+pub const DomMutationKind = enum {
+    /// Child storage may be removed, reordered, or replaced. Every style and
+    /// layout dependency is retired before mutation.
+    structural,
+    /// A block-mode owner has verified that its existing direct-child prefix
+    /// can be rebound and retained while a new suffix is appended.
+    append_only,
+};
+
+pub const DomMutationCallbackFn = *const fn (
+    context: ?*anyopaque,
+    mutation_root: *Node,
+    kind: DomMutationKind,
+) void;
 
 const DomMutationCallback = struct {
     function: ?DomMutationCallbackFn = null,
@@ -1511,6 +1524,23 @@ fn isInclusiveAncestor(ancestor: *Node, node: *Node) bool {
     return false;
 }
 
+/// A newly attached style sheet can change the block/inline classification of
+/// nodes in the retained prefix. Keep those mutations on the full dependency-
+/// retirement path; ordinary appended content cannot replace author rules.
+fn subtreeCanChangeAuthorStyleRules(node: *const Node) bool {
+    return switch (node.*) {
+        .text => false,
+        .element => |*element| blk: {
+            if (std.ascii.eqlIgnoreCase(element.tag, "style") or
+                std.ascii.eqlIgnoreCase(element.tag, "link")) break :blk true;
+            for (element.children.items) |*child| {
+                if (subtreeCanChangeAuthorStyleRules(child)) break :blk true;
+            }
+            break :blk false;
+        },
+    };
+}
+
 fn directChildIndex(parent: *Node, child: *Node) ?usize {
     return switch (parent.*) {
         .text => null,
@@ -1541,11 +1571,26 @@ fn insertDetachedChild(
     const parent_parent = nodeParent(parent);
     const child_handle = window.node_to_handle.get(child).?;
     const element = &parent.element;
+    const preserves_layout_prefix = parent_is_attached and
+        insert_index == element.children.items.len and
+        window.dom_mutation_callback.function != null and
+        !subtreeCanChangeAuthorStyleRules(child) and
+        element.canReuseLayoutForAppend();
 
-    element.children_dirty = true;
+    if (preserves_layout_prefix) {
+        element.markChildrenAppended();
+    } else {
+        element.markChildrenDirty();
+    }
     parser.dirtyStyleForElement(element);
     markElementLayoutDirty(element);
-    if (parent_is_attached) self.prepareDomMutation(parent);
+    if (parent_is_attached) {
+        if (preserves_layout_prefix) {
+            self.prepareDomAppend(parent);
+        } else {
+            self.prepareDomMutation(parent);
+        }
+    }
 
     const window_id = self.current_window_id.?;
     if (parent_is_attached) try self.clearNamedIdGlobals(window_id, window);
@@ -1581,6 +1626,11 @@ fn insertDetachedChild(
     window.node_to_handle.putAssumeCapacity(installed_child, child_handle);
     window.handle_to_node.putAssumeCapacity(child_handle, installed_child);
     parser.fixParentPointers(parent, parent_parent);
+    parser.dirtyStyleSubtree(installed_child);
+
+    if (preserves_layout_prefix and !element.rebindLayoutAfterAppend(parent)) {
+        @panic("verified append-only layout prefix could not be rebound");
+    }
 
     if (parent_is_attached) {
         self.completeDomMutation(parent);
@@ -1593,9 +1643,8 @@ fn clearDetachedLayoutPointers(node: *Node) void {
     switch (node.*) {
         .text => {},
         .element => |*element| {
-            element.layout_ptr = null;
-            element.layout_mark = null;
-            element.children_dirty = true;
+            element.clearLayoutOwner();
+            element.markChildrenDirty();
             for (element.children.items) |*child| clearDetachedLayoutPointers(child);
         },
     }
@@ -1627,7 +1676,7 @@ fn detachChild(
 
     if (parent_is_attached) try self.clearNamedIdGlobals(window_id, window);
 
-    element.children_dirty = true;
+    element.markChildrenDirty();
     parser.dirtyStyleForElement(element);
     markElementLayoutDirty(element);
     if (parent_is_attached) self.prepareDomMutation(parent);
@@ -1741,7 +1790,7 @@ fn emptyElementChildren(
     const is_attached = isAttachedToCurrentDocument(window, node);
     if (is_attached) try self.clearNamedIdGlobals(window_id, window);
 
-    element.children_dirty = true;
+    element.markChildrenDirty();
     parser.dirtyStyleForElement(element);
     markElementLayoutDirty(element);
     if (is_attached) self.prepareDomMutation(node);
@@ -2019,7 +2068,7 @@ fn transferElementChildren(
 
     for (parents.items) |parent| {
         const element = &parent.node.element;
-        element.children_dirty = true;
+        element.markChildrenDirty();
         parser.dirtyStyleForElement(element);
         markElementLayoutDirty(element);
     }
@@ -2149,7 +2198,18 @@ fn prepareDomMutation(self: *Js, mutation_root: *Node) void {
     const window = self.windows.getPtr(window_id) orelse return;
     if (window.current_nodes) |root| parser.clearStyleInvalidations(root);
     if (window.dom_mutation_callback.function) |callback| {
-        callback(window.dom_mutation_callback.context, mutation_root);
+        callback(window.dom_mutation_callback.context, mutation_root, .structural);
+    }
+}
+
+/// Append-only mutations preserve both installed style subscriber maps and a
+/// verified block-layout prefix. The retained layout owner repairs direct DOM
+/// pointers synchronously after storage moves.
+fn prepareDomAppend(self: *Js, mutation_root: *Node) void {
+    const window_id = self.current_window_id orelse return;
+    const window = self.windows.getPtr(window_id) orelse return;
+    if (window.dom_mutation_callback.function) |callback| {
+        callback(window.dom_mutation_callback.context, mutation_root, .append_only);
     }
 }
 
@@ -3043,7 +3103,11 @@ const DomMutationTestContext = struct {
     js_to_switch: ?*Js = null,
     window_to_clear: ?u32 = null,
 
-    fn callback(context: ?*anyopaque, mutation_root: *Node) void {
+    fn callback(
+        context: ?*anyopaque,
+        mutation_root: *Node,
+        _: DomMutationKind,
+    ) void {
         const raw = context orelse return;
         const unaligned: *align(1) DomMutationTestContext = @ptrCast(raw);
         const self: *DomMutationTestContext = @alignCast(unaligned);
@@ -3068,6 +3132,35 @@ const DomMutationTestContext = struct {
         }
     }
 };
+
+test "append-only layout state accumulates and excludes stylesheet subtrees" {
+    const allocator = std.testing.allocator;
+
+    var ordinary = Node{ .element = try parser.Element.init(allocator, "div", null) };
+    defer ordinary.deinit(allocator);
+    ordinary.element.clearChildrenDirty();
+    ordinary.element.markChildrenAppended();
+    ordinary.element.markChildrenAppended();
+    try std.testing.expect(ordinary.element.children_dirty);
+    try std.testing.expect(ordinary.element.children_append_only);
+    ordinary.element.markChildrenDirty();
+    try std.testing.expect(!ordinary.element.children_append_only);
+    try std.testing.expect(!subtreeCanChangeAuthorStyleRules(&ordinary));
+
+    var wrapper = Node{ .element = try parser.Element.init(allocator, "section", null) };
+    defer wrapper.deinit(allocator);
+    var nested_link = Node{ .element = try parser.Element.init(
+        allocator,
+        "link rel=stylesheet href=theme.css",
+        null,
+    ) };
+    var nested_link_owned = true;
+    defer if (nested_link_owned) nested_link.deinit(allocator);
+    try wrapper.element.children.append(allocator, nested_link);
+    nested_link_owned = false;
+    parser.fixParentPointers(&wrapper, null);
+    try std.testing.expect(subtreeCanChangeAuthorStyleRules(&wrapper));
+}
 
 test "innerHTML completion callback observes installed child generation" {
     const allocator = std.testing.allocator;
@@ -3151,7 +3244,7 @@ test "replaceChildren empties once, invalidates relational style, and detaches l
         "green",
         target_element.style.?.getPtr("color").?.get().*,
     );
-    target_element.children_dirty = false;
+    target_element.clearChildrenDirty();
 
     var environ = std.process.Environ.Map.init(allocator);
     defer environ.deinit();
@@ -5394,7 +5487,7 @@ fn setAttribute(agent: *Agent, this_value: Value, arguments: kiesel.types.Argume
                 std.mem.eql(u8, e.tag, "canvas")) and
                 (std.mem.eql(u8, attr_name, "width") or std.mem.eql(u8, attr_name, "height")))
             {
-                e.children_dirty = true;
+                e.markChildrenDirty();
                 markElementLayoutDirty(e);
             }
             if (canvas_dimension) {
@@ -5625,7 +5718,7 @@ fn innerHTML(agent: *Agent, this_value: Value, arguments: kiesel.types.Arguments
             // borrower before destroying the old nodes or replacing their
             // backing array. Dirty state and repaint scheduling are published
             // before this point, so any later failure remains recoverable.
-            e.children_dirty = true;
+            e.markChildrenDirty();
             markElementLayoutDirty(e);
             if (is_attached) js_instance.prepareDomMutation(node);
 

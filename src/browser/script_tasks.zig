@@ -706,7 +706,11 @@ pub fn Contexts(comptime Browser: type, comptime DocumentHandle: type) type {
             );
         }
 
-        pub fn jsDomMutationCallback(context: ?*anyopaque, mutation_root: *parser.Node) void {
+        pub fn jsDomMutationCallback(
+            context: ?*anyopaque,
+            mutation_root: *parser.Node,
+            kind: js_module.DomMutationKind,
+        ) void {
             const ctx_ptr = context orelse return;
             const raw_ctx: *align(1) JsRenderContext = @ptrCast(ctx_ptr);
             const ctx: *JsRenderContext = @alignCast(raw_ctx);
@@ -722,7 +726,10 @@ pub fn Contexts(comptime Browser: type, comptime DocumentHandle: type) type {
             if (frame.document_generation == 0 or
                 !ctx.matchesGeneration(frame.document_generation)) return;
 
-            tab.prepareForDomMutation(browser, frame, mutation_root);
+            switch (kind) {
+                .structural => tab.prepareForDomMutation(browser, frame, mutation_root),
+                .append_only => tab.prepareForDomAppend(browser, frame, mutation_root),
+            }
         }
 
         pub fn jsDomMutationCompleteCallback(

@@ -536,9 +536,13 @@ before a fallible
 capacity change and performs the same subscriber clear. JavaScript
 `createElement` results are heap-stable roots owned by their window while
 detached. `appendChild` and `insertBefore` accept those
-detached roots, snapshot immediate-child handle bindings, enter the same
-invalidation seam, reserve capacity, and then transfer the new owner into the
-by-value child array while rebinding every relocated handle. `removeChild`
+detached roots and snapshot immediate-child handle bindings. An at-end insert
+first asks the target Element's opaque layout owner whether the last published
+child list is a one-to-one DOM-backed block prefix. If so, it enters the narrow
+append-only seam, reserves capacity, transfers the new owner, and rebinds every
+relocated JavaScript handle and retained direct-child layout pointer while
+keeping the existing style/layout dependency graph. Any incompatible append
+and every non-tail insertion enter the general invalidation seam. `removeChild`
 preallocates the inverse heap-stable owner, enters the seam, moves the direct
 child out of attached storage, and rebinds the removed root plus every shifted
 sibling. Zero-argument `replaceChildren` stages stable owners for each removed
@@ -560,14 +564,19 @@ target itself. Each detached subtree keeps its
 owning DOM resources and handles, but clears layout back-pointers and dirties
 retained style fields. Reattachment
 registers inherited-style dependencies against the current parent before a
-frozen dependency read. That seam retires the frame display list and DOM-keyed
-bounds, clears the accessibility tree and
+frozen dependency read. Both seams retire the frame display list and DOM-keyed
+bounds, clear the accessibility tree and
 pending composited node updates, and retires the active browser draw list,
-layers, and committed display list under `Browser.lock`. It then destroys the
-mutating frame's complete `DocumentLayout` while the old DOM still exists, so
-the full replacement render constructs a fresh dependency graph. Dirty flags
-and an animation-frame request are published before the mutation proceeds, so
-allocation failure still rebuilds the retired state. A focused mutation root
+layers, and committed display list under `Browser.lock`. The general seam then
+destroys the mutating frame's complete `DocumentLayout` while the old DOM still
+exists, so the full replacement render constructs a fresh dependency graph.
+The append-only seam retains that `DocumentLayout` and its installed style
+subscribers because it removes no existing Node and destroys no style map or
+layout owner; the synchronous post-relocation rebind makes the retained prefix
+safe before another mutation, navigation, or JavaScript statement can run.
+Dirty flags and an animation-frame request are published before either mutation
+proceeds, so allocation failure still repairs the retired render state. A
+focused mutation root
 survives; focus is cleared only when the focused node is a strict descendant
 that the replacement removes. After the mutation has installed its final child
 array, repaired parent pointers, and rebound JavaScript handles, a paired
@@ -649,13 +658,26 @@ Paint remains independently dirty for focus/visited and non-animation color
 changes, while opacity and translation animations bypass every full render
 phase.
 
-Supported structural DOM mutation uses a coarse lifetime boundary:
+General structural DOM mutation uses a coarse lifetime boundary:
 `clearStyleInvalidations` drops every raw subscriber from every installed DOM
 style field before child storage moves or retires and marks the complete
 installed style tree dirty. The already-required full style/layout pass then
 rebuilds live edges. This prevents surviving parent style sources from
 notifying destroyed child-style or layout subscribers on these paths without
 pretending to provide general per-edge unsubscription.
+
+A verified append-only mutation is narrower. `BlockLayout` accepts it only
+when every represented direct DOM child maps to one DOM-backed block child and
+the retained child-classification field is clean; anonymous inline runs and a
+trailing run-in heading are rejected because an appended node could merge with
+them, and a subtree containing `style` or `link` is rejected because it can
+change the prefix's computed classification. The Element records an append-only
+dirty state across repeated appends.
+After its by-value child array reaches its final address, an opaque callback
+immediately rebinds the retained block prefix. The next layout pass keeps those
+objects, builds only the unrepresented DOM suffix, repairs `previous` from the
+last retained in-flow block, and publishes a new child epoch. Any other child
+mutation clears the append-only marker and uses the coarse boundary above.
 
 Inherited style fields establish these edges between parent and child DOM
 styles in [`src/document/parser.zig`](../src/document/parser.zig). Layout fields
@@ -678,7 +700,9 @@ rebuild boundary.
 
 `DocumentLayout` retains both a shallow `Node` copy and the original `*Node`.
 Individual block layouts also retain node pointers and install
-`layout_ptr`/`layout_mark` back-pointers on elements; see
+`layout_ptr`/`layout_mark` back-pointers on elements. DOM-backed blocks also
+install synchronous append-compatibility and pointer-rebind callbacks on that
+same opaque owner; see
 [`src/browser/render/layout.zig`](../src/browser/render/layout.zig). Layout
 therefore borrows the DOM and must be destroyed before it.
 

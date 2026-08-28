@@ -688,11 +688,127 @@ test "structural mutation retires a painted link before DOM removal" {
 
     for (body.element.children.items) |*child| child.deinit(allocator);
     body.element.children.clearRetainingCapacity();
-    body.element.children_dirty = true;
+    body.element.markChildrenDirty();
     parser.fixParentPointers(&frame.current_node.?, null);
 
     try std.testing.expect(!try frame.click(&test_browser, 20, 20, .middle));
     try std.testing.expectEqual(@as(usize, 0), test_browser.pending_new_tabs.items.len);
+}
+
+test "verified append mutation retires render borrows but retains document layout" {
+    const allocator = std.testing.allocator;
+    var session = BrowserSession.init(allocator, std.testing.io);
+    defer session.deinit();
+
+    var test_browser: browser.Browser = undefined;
+    initMutationBrowser(&test_browser, allocator, &session);
+    defer deinitMutationBrowser(&test_browser);
+
+    var tab: tab_module.Tab = undefined;
+    initMutationTab(&tab, allocator, &test_browser);
+    defer deinitMutationTab(&tab);
+    try test_browser.tabs.append(allocator, &tab);
+    test_browser.active_tab_index = 0;
+
+    var environ = std.process.Environ.Map.init(allocator);
+    defer environ.deinit();
+    try environ.put("HOME", "/tmp");
+    const layout_engine = try Layout.init(allocator, std.testing.io, &environ, 800, 600, false);
+    defer layout_engine.deinit();
+
+    var frame = tab_module.Frame.init(allocator, &tab, null, null);
+    defer frame.deinit();
+    tab.root_frame = &frame;
+    tab.focused_frame = &frame;
+
+    var html_parser = try parser.HTMLParser.init(
+        allocator,
+        "<main style='display:block'><section style='display:block'>" ++
+            "<div style='display:block'></div></section></main>",
+    );
+    html_parser.use_implicit_tags = false;
+    defer html_parser.deinit(allocator);
+    frame.current_node = try html_parser.parse();
+    parser.fixParentPointers(&frame.current_node.?, null);
+    try parser.style(allocator, &frame.current_node.?, &.{});
+
+    const document = try layout_engine.buildDocument(&frame.current_node.?);
+    frame.setDocumentLayout(document);
+    const section = try findElement(&frame.current_node.?, "section");
+    try std.testing.expect(section.element.canReuseLayoutForAppend());
+    const original_child_layout = section.element.children.items[0].element.layout_ptr.?;
+
+    const MutationContext = struct {
+        tab: *tab_module.Tab,
+        browser: *browser.Browser,
+        frame: *tab_module.Frame,
+        observed_kind: ?ScriptJs.DomMutationKind = null,
+        completion_count: usize = 0,
+
+        fn prepare(
+            raw: ?*anyopaque,
+            mutation_root: *Node,
+            kind: ScriptJs.DomMutationKind,
+        ) void {
+            const context: *@This() = @ptrCast(@alignCast(raw.?));
+            context.observed_kind = kind;
+            switch (kind) {
+                .structural => context.tab.prepareForDomMutation(
+                    context.browser,
+                    context.frame,
+                    mutation_root,
+                ),
+                .append_only => context.tab.prepareForDomAppend(
+                    context.browser,
+                    context.frame,
+                    mutation_root,
+                ),
+            }
+        }
+
+        fn complete(raw: ?*anyopaque, _: *Node) void {
+            const context: *@This() = @ptrCast(@alignCast(raw.?));
+            context.completion_count += 1;
+            context.tab.completeDomMutation(context.frame);
+        }
+    };
+    var mutation_context = MutationContext{
+        .tab = &tab,
+        .browser = &test_browser,
+        .frame = &frame,
+    };
+
+    const js = try ScriptJs.init(allocator, std.testing.io, &environ);
+    defer js.deinit(allocator);
+    js.setNodes(0, &frame.current_node.?);
+    defer js.setNodes(0, null);
+    js.setDomMutationCallback(0, MutationContext.prepare, &mutation_context);
+    js.setDomMutationCompleteCallback(0, MutationContext.complete, &mutation_context);
+
+    const appended = try js.evaluate(0,
+        \\var target = document.querySelectorAll('section')[0];
+        \\var child = document.createElement('div');
+        \\child.setAttribute('style', 'display:block');
+        \\target.appendChild(child) === child && target.children.length === 2
+    );
+    try std.testing.expect(appended.toBoolean());
+
+    try std.testing.expectEqual(ScriptJs.DomMutationKind.append_only, mutation_context.observed_kind.?);
+    try std.testing.expectEqual(@as(usize, 1), mutation_context.completion_count);
+    try std.testing.expect(frame.styleNeeded());
+    try std.testing.expect(frame.document.lastValue().* == document);
+    try std.testing.expect(document.layoutNeeded());
+    try std.testing.expect(section.element.layout_ptr != null);
+    try std.testing.expect(tab.needs_paint);
+    try std.testing.expect(frame.resources_dirty);
+    try std.testing.expect(test_browser.needs_animation_frame);
+
+    try parser.style(allocator, &frame.current_node.?, &.{});
+    frame.publishStyledDocument();
+    try document.layout(layout_engine);
+    try std.testing.expectEqual(@as(usize, 2), section.element.children.items.len);
+    try std.testing.expect(section.element.children.items[0].element.layout_ptr.? == original_child_layout);
+    try std.testing.expect(section.element.children.items[1].element.layout_ptr != null);
 }
 
 test "first contenteditable append preserves focus for subsequent typing" {

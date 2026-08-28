@@ -20,7 +20,8 @@ or selector/rule lifetime.
   not escaped a second time.
 - `Node` children are stored by value in resizable arrays. Do not retain a
   `*Node` across structural mutation unless all consumers are invalidated or a
-  stable identity scheme is in place.
+  synchronous relocation callback rebinds a verified append-only layout
+  prefix before control can escape the mutation.
 - An attached iframe Element carries only its child window's numeric ID; that
   scalar moves safely with the by-value Node. The browser validates it against
   the current Tab registry before rebinding a Frame pointer. Detached iframe
@@ -30,10 +31,13 @@ or selector/rule lifetime.
   invalidation boundary after marking the target layout dirty and before child
   storage can move or retire. Keep ordinary render callbacks separate so
   style-only changes do not discard focus or hit/accessibility state.
-- Before structural mutation destroys or relocates style fields, clear raw
-  `ProtectedField` subscribers across the installed document. That boundary
+- Before general structural mutation destroys or relocates style fields, clear
+  raw `ProtectedField` subscribers across the installed document. That boundary
   also dirties every computed style; the required full style/layout pass
-  rebuilds live dependency edges afterward.
+  rebuilds live dependency edges afterward. A verified append-only mutation
+  moves `Node` values but destroys no existing style-map backing or layout
+  owner, so it preserves subscriber maps and immediately rebinds raw layout
+  pointers to the relocated prefix.
 - Each Element summarizes strict-descendant style work in
   `has_dirty_style_descendants`. Explicit selector invalidation raises the bit
   along the parent chain, and inherited `ProtectedField` notifications do the

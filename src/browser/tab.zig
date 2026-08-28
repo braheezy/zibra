@@ -2231,6 +2231,42 @@ pub fn prepareForDomMutation(self: *Tab, b: *Browser, frame: *Frame, mutation_ro
     b.scheduleAnimationFrame();
 }
 
+/// Narrow structural boundary for a layout-verified append. Display, hit,
+/// accessibility, compositor, and iframe borrows are retired exactly as for a
+/// general mutation, but the installed style dependency graph and
+/// DocumentLayout stay alive. The JavaScript host synchronously rebinds every
+/// retained direct-child Node pointer after the child array reaches its final
+/// address and before completion callbacks or script resume.
+pub fn prepareForDomAppend(self: *Tab, b: *Browser, frame: *Frame, mutation_root: *Node) void {
+    std.debug.assert(frame.tab == self);
+
+    // The compatibility check that selected this path requires a live layout
+    // owner. Mark it once more at the ownership boundary so callers cannot
+    // accidentally preserve a clean layout-child cache after DOM growth.
+    switch (mutation_root.*) {
+        .element => |*element| {
+            const layout_ptr = element.layout_ptr orelse
+                @panic("append-only mutation missing retained layout owner");
+            const mark = element.layout_mark orelse
+                @panic("append-only mutation missing retained layout marker");
+            mark(layout_ptr);
+        },
+        .text => @panic("append-only mutation requires an Element"),
+    }
+
+    self.needs_paint = true;
+    frame.resources_dirty = true;
+    frame.markDocumentStyleDirty();
+
+    frame.retireDomMutationBorrows(mutation_root);
+    self.composited_updates.clearRetainingCapacity();
+    self.clearAccessibilityTree();
+    b.retireRenderStateForTab(self);
+
+    b.setNeedsAnimationFrame(self);
+    b.scheduleAnimationFrame();
+}
+
 /// Synchronous post-mutation half of the structural boundary. Parent pointers
 /// and JavaScript node handles have already been repaired, so stable iframe
 /// window IDs can rebind surviving Frame pointers. Removed child contexts are
@@ -4356,7 +4392,7 @@ pub fn keypress(self: *Tab, b: *Browser, char: u8) !void {
                             // Appending can relocate every by-value child.
                             // Dirty and retire all current DOM-derived state
                             // before the first fallible capacity change.
-                            e.children_dirty = true;
+                            e.markChildrenDirty();
                             parser.dirtyStyleForElement(e);
                             if (e.layout_ptr) |ptr| {
                                 if (e.layout_mark) |mark_fn| mark_fn(ptr);

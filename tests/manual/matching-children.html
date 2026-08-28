@@ -1,0 +1,46 @@
+<!--
+How to verify: load this page and confirm it reports PASS with five rows.
+Click "Append another block" repeatedly; the original rows must stay in place,
+their saved JavaScript handles must remain stable, and each new block must flow
+below the preceding one without overlap or a stale hit target.
+-->
+<!doctype html>
+<meta charset="utf-8">
+<title>Append-only layout child matching</title>
+<style>
+  body { font: 16px sans-serif; margin: 20px; }
+  #rows, .row { display: block; }
+  .row { margin: 4px 0; padding: 6px; background-color: #dbeafe; }
+  #status { display: block; margin: 10px 0; font-weight: bold; }
+  button { padding: 6px; }
+</style>
+<h1>Append-only layout child matching</h1>
+<div id="rows">
+  <div class="row" id="first">original row 1</div>
+  <div class="row">original row 2</div>
+</div>
+<div id="status">running</div>
+<button id="append">Append another block</button>
+<script>
+  var rows = document.querySelectorAll('#rows')[0];
+  var status = document.querySelectorAll('#status')[0];
+  var button = document.querySelectorAll('#append')[0];
+  var first = document.querySelectorAll('#first')[0];
+  var firstHandle = first.handle;
+  var nextRow = 3;
+
+  function appendRow() {
+    var row = document.createElement('div');
+    row.setAttribute('class', 'row');
+    row.innerHTML = 'appended row ' + nextRow;
+    rows.appendChild(row);
+    nextRow = nextRow + 1;
+    var stable = rows.children[0].handle === firstHandle;
+    status.innerHTML = stable ? 'PASS: existing rows retained' : 'FAIL: first row changed';
+  }
+
+  button.addEventListener('click', appendRow);
+  appendRow();
+  appendRow();
+  appendRow();
+</script>

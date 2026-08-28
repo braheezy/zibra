@@ -158,6 +158,11 @@ deeper descendants, and produces a visible in-page result.
 parsing, covering `document.createElement`, `appendChild`, `insertBefore`, and
 the `null` reference append case with a visible in-page result.
 
+`tests/manual/matching-children.html` appends block-displayed children one at a
+time, verifies saved DOM handles remain stable, and keeps the original prefix
+visible while new rows flow below it. Unit coverage forces direct-child storage
+to relocate and asserts the existing `BlockLayout` identities are reused.
+
 `tests/manual/remove-child.html` removes an attached subtree into detached
 ownership, verifies its nested and shifted-sibling handles, and reattaches the
 same Node object under a different parent with a visible in-page result.

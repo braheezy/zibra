@@ -16,7 +16,11 @@ or Kiesel allocation/locking.
 - `document.createElement` returns a window-owned, heap-stable detached Node.
   `appendChild` and `insertBefore` transfer only such detached roots into a
   child array, rebind handles for every relocated immediate child, and invoke
-  the synchronous DOM-mutation boundary before attached storage can move.
+  the synchronous DOM-mutation boundary before attached storage can move. An
+  at-end insertion may use the append-only boundary only when the target's
+  opaque layout callback verifies a one-to-one block-child prefix. Mark that
+  state before mutation and invoke its paired pointer-rebind callback after
+  `fixParentPointers`, before completion callbacks or JavaScript resume.
 - `removeChild` performs the inverse transfer: it accepts only a direct child,
   moves that subtree into a heap-stable window-owned detached root, preserves
   subtree handles, and rebinds siblings shifted in the attached child array.
@@ -73,12 +77,15 @@ or Kiesel allocation/locking.
   callback helpers instead of recursively acquiring the mutex. Browser-
   generated focus and blur events are target-only; click, key, and form events
   continue to bubble.
-- Structural JavaScript mutation, including `replaceChildren`, also clears
-  current style-field subscriber
-  maps while every endpoint is alive; the mandatory full style/layout render
-  rebuilds dependencies after mutation. Its pre-mutation host callback retires
-  pointer borrowers; its paired completion callback runs only after child
-  storage, parent pointers, and Node handles are final. The completion side may
+- General structural JavaScript mutation, including `replaceChildren`, clears
+  current style-field subscriber maps while every endpoint is alive; the
+  mandatory full style/layout render rebuilds dependencies after mutation. A
+  verified append-only mutation preserves those maps and its block-layout
+  prefix because no existing style field or layout owner is destroyed; it must
+  synchronously rebind every relocated direct-child layout pointer. Both paths'
+  pre-mutation host callback retires pointer borrowers, and the paired
+  completion callback runs only after child storage, parent pointers, Node
+  handles, and any retained layout pointers are final. The completion side may
   synchronously rebind/unload iframe contexts but must defer iframe network
   loading until the host call returns. Unloading a same-origin child can switch
   the shared Js host's active window, so restore the mutating window before
