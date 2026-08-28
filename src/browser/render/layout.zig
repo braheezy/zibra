@@ -138,8 +138,8 @@ fn nodeFloatSide(node: Node, dependency_target: ?*ProtectedField(u64)) FloatSide
             const style_map = if (element.style) |*styles| styles else break :blk .none;
             const field = @constCast(style_map).getPtr("float") orelse break :blk .none;
             const value = if (dependency_target) |target| value: {
-                target.addDependency(field);
-                break :value field.read(target).*;
+                target.addDependency(field, style_map.allocator);
+                break :value field.read(target, style_map.allocator).*;
             } else field.get().*;
             break :blk parseFloatSide(value);
         },
@@ -167,8 +167,8 @@ fn isContainerNode(node: Node, dependency_target: ?*ProtectedField(u64)) bool {
             if (nodeFloatSide(node, dependency_target) != .none) break :blk true;
             const field = @constCast(style_map).getPtr("display") orelse break :blk false;
             const value = if (dependency_target) |target| value: {
-                target.addDependency(field);
-                break :value field.read(target).*;
+                target.addDependency(field, style_map.allocator);
+                break :value field.read(target, style_map.allocator).*;
             } else field.get().*;
             break :blk isBlockDisplay(value);
         },
@@ -886,22 +886,22 @@ const EmbedLayout = struct {
         return .{
             .allocator = allocator,
             .deps_initialized = false,
-            .zoom = ProtectedField(f32).init(allocator, 1.0),
-            .font_stub = ProtectedField(i32).init(allocator, 0),
-            .width = ProtectedField(i32).init(allocator, 0),
-            .height = ProtectedField(i32).init(allocator, 0),
-            .ascent = ProtectedField(i32).init(allocator, 0),
-            .descent = ProtectedField(i32).init(allocator, 0),
+            .zoom = ProtectedField(f32).init(1.0),
+            .font_stub = ProtectedField(i32).init(0),
+            .width = ProtectedField(i32).init(0),
+            .height = ProtectedField(i32).init(0),
+            .ascent = ProtectedField(i32).init(0),
+            .descent = ProtectedField(i32).init(0),
         };
     }
 
     fn deinit(self: *EmbedLayout) void {
-        self.zoom.deinit();
-        self.font_stub.deinit();
-        self.width.deinit();
-        self.height.deinit();
-        self.ascent.deinit();
-        self.descent.deinit();
+        self.zoom.deinit(self.allocator);
+        self.font_stub.deinit(self.allocator);
+        self.width.deinit(self.allocator);
+        self.height.deinit(self.allocator);
+        self.ascent.deinit(self.allocator);
+        self.descent.deinit(self.allocator);
     }
 
     /// Inline embed records are destroyed as soon as their completed line is
@@ -913,18 +913,18 @@ const EmbedLayout = struct {
 
         self.zoom.freezeDependencies();
 
-        self.font_stub.addDependency(&self.zoom);
+        self.font_stub.addDependency(&self.zoom, self.allocator);
         self.font_stub.freezeDependencies();
 
-        self.width.addDependency(&self.zoom);
+        self.width.addDependency(&self.zoom, self.allocator);
         self.width.freezeDependencies();
 
-        self.height.addDependency(&self.zoom);
-        self.height.addDependency(&self.font_stub);
-        self.height.addDependency(&self.width);
+        self.height.addDependency(&self.zoom, self.allocator);
+        self.height.addDependency(&self.font_stub, self.allocator);
+        self.height.addDependency(&self.width, self.allocator);
         self.height.freezeDependencies();
 
-        self.ascent.addDependency(&self.height);
+        self.ascent.addDependency(&self.height, self.allocator);
         self.ascent.freezeDependencies();
 
         self.descent.freezeDependencies();
@@ -1756,10 +1756,10 @@ fn setTestStyleValue(
 ) !void {
     std.debug.assert(node.* == .element);
     if (node.element.style == null) node.element.style = parser.StyleMap.init(allocator);
-    var field = ProtectedField([]const u8).init(allocator, value);
+    var field = ProtectedField([]const u8).init(value);
     field.set(value);
     node.element.style.?.put(property, field) catch |err| {
-        field.deinit();
+        field.deinit(allocator);
         return err;
     };
 }
@@ -1779,8 +1779,8 @@ test "computed display classifies block children" {
     try setTestDisplay(allocator, &promoted_span, " BLOCK ");
     try std.testing.expect(isContainerNode(promoted_span, null));
 
-    var tree_version = ProtectedField(u64).init(allocator, 0);
-    defer tree_version.deinit();
+    var tree_version = ProtectedField(u64).init(0);
+    defer tree_version.deinit(allocator);
     tree_version.set(0);
     tree_version.freezeDependencies();
     try std.testing.expect(isContainerNode(promoted_span, &tree_version));
@@ -1948,10 +1948,10 @@ test "active layout suppresses reentrant owner-wide invalidation" {
     const allocator = std.testing.allocator;
     var block: BlockLayout = undefined;
     block.in_layout = true;
-    block.x = ProtectedField(i32).init(allocator, 10);
-    defer block.x.deinit();
-    block.width = ProtectedField(i32).init(allocator, 100);
-    defer block.width.deinit();
+    block.x = ProtectedField(i32).init(10);
+    defer block.x.deinit(allocator);
+    block.width = ProtectedField(i32).init(100);
+    defer block.width.deinit(allocator);
     block.x.set(10);
     block.width.set(100);
     block.width.setOwner(&block, BlockLayout.markOpaque);
@@ -3049,7 +3049,7 @@ fn styleValue(style_map: *const parser.StyleMap, property: []const u8) ?[]const 
 
 fn styleValueRead(style_map: *const parser.StyleMap, property: []const u8, notify: anytype) ?[]const u8 {
     if (@constCast(style_map).getPtr(property)) |field| {
-        return field.read(notify).*;
+        return field.read(notify, style_map.allocator).*;
     }
     return null;
 }
@@ -3059,7 +3059,7 @@ fn registerStyleDependencies(
     target: *ProtectedField(i32),
 ) void {
     var iterator = @constCast(style_map).iterator();
-    while (iterator.next()) |entry| target.addDependency(entry.value_ptr);
+    while (iterator.next()) |entry| target.addDependency(entry.value_ptr, style_map.allocator);
 }
 
 fn registerReplacedSizeDependencies(self: *Layout, style_map: *const parser.StyleMap) void {
@@ -5538,10 +5538,10 @@ const TextLayout = struct {
         const map = style_map orelse return;
         for ([_][]const u8{ "font-weight", "font-style", "font-size", "font-family", "line-height" }) |property| {
             if (map.getPtr(property)) |field| {
-                text.width.addDependency(field);
-                text.height.addDependency(field);
-                text.ascent.addDependency(field);
-                text.descent.addDependency(field);
+                text.width.addDependency(field, text.allocator);
+                text.height.addDependency(field, text.allocator);
+                text.ascent.addDependency(field, text.allocator);
+                text.descent.addDependency(field, text.allocator);
             }
         }
     }
@@ -5562,13 +5562,13 @@ const TextLayout = struct {
             .word = word,
             .parent = parent,
             .previous = previous,
-            .zoom = ProtectedField(f32).init(allocator, 1.0),
-            .x = ProtectedField(i32).init(allocator, 0),
-            .y = ProtectedField(i32).init(allocator, 0),
-            .width = ProtectedField(i32).init(allocator, 0),
-            .height = ProtectedField(i32).init(allocator, 0),
-            .ascent = ProtectedField(i32).init(allocator, 0),
-            .descent = ProtectedField(i32).init(allocator, 0),
+            .zoom = ProtectedField(f32).init(1.0),
+            .x = ProtectedField(i32).init(0),
+            .y = ProtectedField(i32).init(0),
+            .width = ProtectedField(i32).init(0),
+            .height = ProtectedField(i32).init(0),
+            .ascent = ProtectedField(i32).init(0),
+            .descent = ProtectedField(i32).init(0),
         };
         text.zoom.setOwner(text, markOpaque);
         text.x.setOwner(text, markOpaque);
@@ -5579,26 +5579,26 @@ const TextLayout = struct {
         text.descent.setOwner(text, markOpaque);
 
         // Freeze dependencies for layout fields.
-        text.zoom.addDependency(&parent.zoom);
+        text.zoom.addDependency(&parent.zoom, allocator);
         text.zoom.freezeDependencies();
 
         if (previous) |prev| {
-            text.x.addDependency(&prev.x);
-            text.x.addDependency(&prev.width);
+            text.x.addDependency(&prev.x, allocator);
+            text.x.addDependency(&prev.width, allocator);
         } else {
-            text.x.addDependency(&parent.x);
+            text.x.addDependency(&parent.x, allocator);
         }
         text.x.freezeDependencies();
 
-        text.y.addDependency(&text.ascent);
-        text.y.addDependency(&parent.y);
-        text.y.addDependency(&parent.ascent);
+        text.y.addDependency(&text.ascent, allocator);
+        text.y.addDependency(&parent.y, allocator);
+        text.y.addDependency(&parent.ascent, allocator);
         text.y.freezeDependencies();
 
-        text.width.addDependency(&text.zoom);
-        text.height.addDependency(&text.zoom);
-        text.ascent.addDependency(&text.zoom);
-        text.descent.addDependency(&text.zoom);
+        text.width.addDependency(&text.zoom, allocator);
+        text.height.addDependency(&text.zoom, allocator);
+        text.ascent.addDependency(&text.zoom, allocator);
+        text.descent.addDependency(&text.zoom, allocator);
 
         if (parent.parent.persistent_dependencies) switch (text.node) {
             .text => |*t| addStyleDependencies(text, if (t.style) |*style_map| style_map else null),
@@ -5612,13 +5612,13 @@ const TextLayout = struct {
     }
 
     fn deinit(self: *TextLayout) void {
-        self.zoom.deinit();
-        self.x.deinit();
-        self.y.deinit();
-        self.width.deinit();
-        self.height.deinit();
-        self.ascent.deinit();
-        self.descent.deinit();
+        self.zoom.deinit(self.allocator);
+        self.x.deinit(self.allocator);
+        self.y.deinit(self.allocator);
+        self.width.deinit(self.allocator);
+        self.height.deinit(self.allocator);
+        self.ascent.deinit(self.allocator);
+        self.descent.deinit(self.allocator);
     }
 
     fn mark(self: *TextLayout) void {
@@ -5686,9 +5686,9 @@ const TextLayout = struct {
                 prev.font_family,
             );
             const space = engine.toLayoutPx(space_glyph.w);
-            break :x prev.x.read(&self.x).* + space + prev.width.read(&self.x).*;
+            break :x prev.x.read(&self.x, self.allocator).* + space + prev.width.read(&self.x, self.allocator).*;
         } else x: {
-            break :x self.parent.x.read(&self.x).*;
+            break :x self.parent.x.read(&self.x, self.allocator).*;
         };
 
         // Set all values using ProtectedField.set() (clears dirty flags)
@@ -5697,7 +5697,7 @@ const TextLayout = struct {
         self.ascent.set(ascent_value);
         self.descent.set(descent_value);
         self.x.set(x_value);
-        self.zoom.set(self.parent.zoom.read(&self.zoom).*);
+        self.zoom.set(self.parent.zoom.read(&self.zoom, self.allocator).*);
         // y position is computed by LineLayout after baseline is determined
 
         // Clear descendant flags after layout pass
@@ -5809,13 +5809,13 @@ const LineLayout = struct {
             .node = node,
             .parent = parent,
             .previous = previous,
-            .zoom = ProtectedField(f32).init(allocator, 1.0),
-            .x = ProtectedField(i32).init(allocator, 0),
-            .y = ProtectedField(i32).init(allocator, 0),
-            .width = ProtectedField(i32).init(allocator, 0),
-            .height = ProtectedField(i32).init(allocator, 0),
-            .ascent = ProtectedField(i32).init(allocator, 0),
-            .descent = ProtectedField(i32).init(allocator, 0),
+            .zoom = ProtectedField(f32).init(1.0),
+            .x = ProtectedField(i32).init(0),
+            .y = ProtectedField(i32).init(0),
+            .width = ProtectedField(i32).init(0),
+            .height = ProtectedField(i32).init(0),
+            .ascent = ProtectedField(i32).init(0),
+            .descent = ProtectedField(i32).init(0),
             .children = std.ArrayList(*TextLayout).empty,
             .initialized_fields = false,
         };
@@ -5827,21 +5827,21 @@ const LineLayout = struct {
         line.ascent.setOwner(line, markOpaque);
         line.descent.setOwner(line, markOpaque);
 
-        line.zoom.addDependency(&parent.zoom);
+        line.zoom.addDependency(&parent.zoom, allocator);
         line.zoom.freezeDependencies();
-        line.x.addDependency(&parent.x);
+        line.x.addDependency(&parent.x, allocator);
         line.x.freezeDependencies();
-        line.width.addDependency(&parent.width);
+        line.width.addDependency(&parent.width, allocator);
         line.width.freezeDependencies();
         if (previous) |prev| {
-            line.y.addDependency(&prev.y);
-            line.y.addDependency(&prev.height);
+            line.y.addDependency(&prev.y, allocator);
+            line.y.addDependency(&prev.height, allocator);
         } else {
-            line.y.addDependency(&parent.y);
+            line.y.addDependency(&parent.y, allocator);
         }
         line.y.freezeDependencies();
-        line.height.addDependency(&line.ascent);
-        line.height.addDependency(&line.descent);
+        line.height.addDependency(&line.ascent, allocator);
+        line.height.addDependency(&line.descent, allocator);
         line.height.freezeDependencies();
         return line;
     }
@@ -5852,13 +5852,13 @@ const LineLayout = struct {
             self.allocator.destroy(child);
         }
         self.children.deinit(self.allocator);
-        self.zoom.deinit();
-        self.x.deinit();
-        self.y.deinit();
-        self.width.deinit();
-        self.height.deinit();
-        self.ascent.deinit();
-        self.descent.deinit();
+        self.zoom.deinit(self.allocator);
+        self.x.deinit(self.allocator);
+        self.y.deinit(self.allocator);
+        self.width.deinit(self.allocator);
+        self.height.deinit(self.allocator);
+        self.ascent.deinit(self.allocator);
+        self.descent.deinit(self.allocator);
     }
 
     fn layout(self: *LineLayout, engine: *Layout) !void {
@@ -5877,10 +5877,10 @@ const LineLayout = struct {
                 try descent_deps.append(self.allocator, &child.descent);
             }
             for (ascent_deps.items) |dep| {
-                self.ascent.addDependency(dep);
+                self.ascent.addDependency(dep, self.allocator);
             }
             for (descent_deps.items) |dep| {
-                self.descent.addDependency(dep);
+                self.descent.addDependency(dep, self.allocator);
             }
             self.ascent.freezeDependencies();
             self.descent.freezeDependencies();
@@ -5889,12 +5889,12 @@ const LineLayout = struct {
 
         // Compute x position from parent block
         // Use .read() to register invalidation dependencies on parent's fields
-        const x_value = self.parent.x.read(&self.x).*;
-        const width_value = self.parent.width.read(&self.width).*;
+        const x_value = self.parent.x.read(&self.x, self.allocator).*;
+        const width_value = self.parent.width.read(&self.width, self.allocator).*;
 
         // Position is below previous line, or at parent's y
         // Use .read() to register invalidation dependencies on previous/parent fields
-        const y_value = if (self.previous) |prev| prev.y.read(&self.y).* + prev.height.read(&self.y).* else self.parent.y.read(&self.y).*;
+        const y_value = if (self.previous) |prev| prev.y.read(&self.y, self.allocator).* + prev.height.read(&self.y, self.allocator).* else self.parent.y.read(&self.y, self.allocator).*;
 
         // Set x and y BEFORE child layout so children can read them
         self.x.set(x_value);
@@ -5910,7 +5910,7 @@ const LineLayout = struct {
         // Use .read() to register invalidation dependencies on children's ascent
         var max_ascent: i32 = 0;
         for (self.children.items) |word| {
-            const word_ascent = word.ascent.read(&self.ascent).*;
+            const word_ascent = word.ascent.read(&self.ascent, self.allocator).*;
             if (word_ascent > max_ascent) {
                 max_ascent = word_ascent;
             }
@@ -5921,7 +5921,7 @@ const LineLayout = struct {
 
         // Position each word vertically relative to baseline
         for (self.children.items) |word| {
-            const word_ascent = word.ascent.read(&self.ascent).*;
+            const word_ascent = word.ascent.read(&self.ascent, self.allocator).*;
             const y_word = baseline - word_ascent;
             word.y.set(y_word);
         }
@@ -5930,7 +5930,7 @@ const LineLayout = struct {
         // Use .read() to register invalidation dependencies on children's descent
         var max_descent: i32 = 0;
         for (self.children.items) |word| {
-            const word_descent = word.descent.read(&self.descent).*;
+            const word_descent = word.descent.read(&self.descent, self.allocator).*;
             if (word_descent > max_descent) {
                 max_descent = word_descent;
             }
@@ -5943,7 +5943,7 @@ const LineLayout = struct {
         self.ascent.set(max_ascent);
         self.descent.set(max_descent);
         self.height.set(height_value);
-        self.zoom.set(self.parent.zoom.read(&self.zoom).*);
+        self.zoom.set(self.parent.zoom.read(&self.zoom, self.allocator).*);
 
         // Clear descendant flags after layout pass
         self.has_dirty_descendants = false;
@@ -6061,12 +6061,12 @@ pub const DocumentLayout = struct {
             .node = node.*,
             .node_ptr = node,
             .page_zoom = 1.0,
-            .zoom = ProtectedField(f32).init(allocator, 1.0),
+            .zoom = ProtectedField(f32).init(1.0),
             .children = std.ArrayList(*BlockLayout).empty,
-            .x = ProtectedField(i32).init(allocator, h_offset),
-            .y = ProtectedField(i32).init(allocator, v_offset),
-            .width = ProtectedField(i32).init(allocator, 0),
-            .height = ProtectedField(i32).init(allocator, 0),
+            .x = ProtectedField(i32).init(h_offset),
+            .y = ProtectedField(i32).init(v_offset),
+            .width = ProtectedField(i32).init(0),
+            .height = ProtectedField(i32).init(0),
         };
         document.zoom.setOwner(document, markOpaque);
         document.x.setOwner(document, markOpaque);
@@ -6088,11 +6088,11 @@ pub const DocumentLayout = struct {
             self.allocator.destroy(child);
         }
         self.children.deinit(self.allocator);
-        self.zoom.deinit();
-        self.x.deinit();
-        self.y.deinit();
-        self.width.deinit();
-        self.height.deinit();
+        self.zoom.deinit(self.allocator);
+        self.x.deinit(self.allocator);
+        self.y.deinit(self.allocator);
+        self.width.deinit(self.allocator);
+        self.height.deinit(self.allocator);
     }
 
     /// Serialize geometry only. This is for deterministic inspection before
@@ -6143,10 +6143,10 @@ pub const DocumentLayout = struct {
 
         const block = root_block.?;
         if (!self.height.frozen_dependencies) {
-            self.height.addDependency(&block.height);
+            self.height.addDependency(&block.height, self.allocator);
             self.height.freezeDependencies();
         } else {
-            self.height.addDependency(&block.height);
+            self.height.addDependency(&block.height, self.allocator);
         }
         block.node = self.node;
         block.node_ptr = self.node_ptr;
@@ -6154,7 +6154,7 @@ pub const DocumentLayout = struct {
 
         // Set height after child layout completes
         // Use .read() to register invalidation dependency on child's height
-        self.height.set(block.height.read(&self.height).*);
+        self.height.set(block.height.read(&self.height, self.allocator).*);
 
         // Clear descendant flags after layout pass
         self.has_dirty_descendants = false;
@@ -6679,12 +6679,12 @@ const BlockLayout = struct {
             .node_ptr = node_ptr,
             .document = document,
             .parent_block = parent_block,
-            .previous = ProtectedField(?*BlockLayout).init(allocator, previous),
-            .zoom = ProtectedField(f32).init(allocator, 1.0),
-            .x = ProtectedField(i32).init(allocator, 0),
-            .y = ProtectedField(i32).init(allocator, 0),
-            .width = ProtectedField(i32).init(allocator, 0),
-            .height = ProtectedField(i32).init(allocator, 0),
+            .previous = ProtectedField(?*BlockLayout).init(previous),
+            .zoom = ProtectedField(f32).init(1.0),
+            .x = ProtectedField(i32).init(0),
+            .y = ProtectedField(i32).init(0),
+            .width = ProtectedField(i32).init(0),
+            .height = ProtectedField(i32).init(0),
             .margin = .{},
             .padding = .{},
             .border = .{},
@@ -6704,7 +6704,7 @@ const BlockLayout = struct {
             else
                 null,
             .children_epoch = 0,
-            .children_version = ProtectedField(u64).init(allocator, 0),
+            .children_version = ProtectedField(u64).init(0),
             .floats = std.ArrayList(FloatBox).empty,
         };
         block.zoom.setOwner(block, markOpaque);
@@ -6715,7 +6715,7 @@ const BlockLayout = struct {
         block.children_version.setOwner(block, markOpaque);
         block.previous.setOwner(block, markOpaque);
         block.previous.set(previous);
-        block.y.addDependency(&block.previous);
+        block.y.addDependency(&block.previous, allocator);
 
         if (!persistent_dependencies) {
             if (block.temporary_dependency_target) |target| {
@@ -6730,14 +6730,14 @@ const BlockLayout = struct {
 
         if (persistent_dependencies) {
             if (parent_block) |parent| {
-                block.zoom.addDependency(&parent.zoom);
-                block.x.addDependency(&parent.x);
-                block.width.addDependency(&parent.width);
+                block.zoom.addDependency(&parent.zoom, allocator);
+                block.x.addDependency(&parent.x, allocator);
+                block.width.addDependency(&parent.width, allocator);
                 if (previous) |prev| {
-                    block.y.addDependency(&prev.y);
-                    block.y.addDependency(&prev.height);
+                    block.y.addDependency(&prev.y, allocator);
+                    block.y.addDependency(&prev.height, allocator);
                 } else {
-                    block.y.addDependency(&parent.y);
+                    block.y.addDependency(&parent.y, allocator);
                 }
 
                 // Parent padding and border widths affect the containing
@@ -6751,23 +6751,23 @@ const BlockLayout = struct {
                             "border-top-width", "border-right-width", "border-bottom-width", "border-left-width",
                         }) |property| {
                             if (style_map.getPtr(property)) |field| {
-                                block.x.addDependency(field);
-                                block.y.addDependency(field);
-                                block.width.addDependency(field);
+                                block.x.addDependency(field, allocator);
+                                block.y.addDependency(field, allocator);
+                                block.width.addDependency(field, allocator);
                             }
                         }
                     },
                     .text => {},
                 };
             } else {
-                block.zoom.addDependency(&document.zoom);
-                block.x.addDependency(&document.x);
-                block.width.addDependency(&document.width);
+                block.zoom.addDependency(&document.zoom, allocator);
+                block.x.addDependency(&document.x, allocator);
+                block.width.addDependency(&document.width, allocator);
                 if (previous) |prev| {
-                    block.y.addDependency(&prev.y);
-                    block.y.addDependency(&prev.height);
+                    block.y.addDependency(&prev.y, allocator);
+                    block.y.addDependency(&prev.height, allocator);
                 } else {
-                    block.y.addDependency(&document.y);
+                    block.y.addDependency(&document.y, allocator);
                 }
             }
         }
@@ -6779,10 +6779,10 @@ const BlockLayout = struct {
                 switch (ptr.*) {
                     .element => |*element| {
                         if (element.style) |*style_map| {
-                            if (style_map.getPtr("zoom")) |field| block.zoom.addDependency(field);
-                            if (style_map.getPtr("width")) |field| block.width.addDependency(field);
-                            if (style_map.getPtr("height")) |field| block.height.addDependency(field);
-                            if (style_map.getPtr("overflow")) |field| block.height.addDependency(field);
+                            if (style_map.getPtr("zoom")) |field| block.zoom.addDependency(field, allocator);
+                            if (style_map.getPtr("width")) |field| block.width.addDependency(field, allocator);
+                            if (style_map.getPtr("height")) |field| block.height.addDependency(field, allocator);
+                            if (style_map.getPtr("overflow")) |field| block.height.addDependency(field, allocator);
                             for ([_][]const u8{
                                 "margin-top",       "margin-right",       "margin-bottom",       "margin-left",
                                 "padding-top",      "padding-right",      "padding-bottom",      "padding-left",
@@ -6791,7 +6791,7 @@ const BlockLayout = struct {
                                 "border-top-color", "border-right-color", "border-bottom-color", "border-left-color",
                                 "float",            "clear",
                             }) |property| {
-                                if (style_map.getPtr(property)) |field| block.height.addDependency(field);
+                                if (style_map.getPtr(property)) |field| block.height.addDependency(field, allocator);
                             }
                         }
                     },
@@ -6957,13 +6957,13 @@ const BlockLayout = struct {
         DisplayItem.freeItems(self.allocator, self.display_list.items);
         self.display_list.deinit(self.allocator);
         self.floats.deinit(self.allocator);
-        self.zoom.deinit();
-        self.x.deinit();
-        self.y.deinit();
-        self.width.deinit();
-        self.height.deinit();
-        self.children_version.deinit();
-        self.previous.deinit();
+        self.zoom.deinit(self.allocator);
+        self.x.deinit(self.allocator);
+        self.y.deinit(self.allocator);
+        self.width.deinit(self.allocator);
+        self.height.deinit(self.allocator);
+        self.children_version.deinit(self.allocator);
+        self.previous.deinit(self.allocator);
     }
 
     fn mark(self: *BlockLayout) void {
@@ -7055,12 +7055,12 @@ const BlockLayout = struct {
 
         if (self.persistent_dependencies) {
             if (previous) |block| {
-                self.y.addDependency(&block.y);
-                self.y.addDependency(&block.height);
+                self.y.addDependency(&block.y, self.allocator);
+                self.y.addDependency(&block.height, self.allocator);
             } else if (self.parent_block) |parent| {
-                self.y.addDependency(&parent.y);
+                self.y.addDependency(&parent.y, self.allocator);
             } else {
-                self.y.addDependency(&self.document.y);
+                self.y.addDependency(&self.document.y, self.allocator);
             }
         }
         self.previous.set(previous);
@@ -7205,9 +7205,9 @@ const BlockLayout = struct {
         // Compute position and dimensions
         // Use .read() to register invalidation dependencies on parent/document/previous fields
         const parent_zoom = if (self.parent_block) |pb|
-            if (self.persistent_dependencies) pb.zoom.read(&self.zoom).* else pb.zoom.get().*
+            if (self.persistent_dependencies) pb.zoom.read(&self.zoom, self.allocator).* else pb.zoom.get().*
         else if (self.persistent_dependencies)
-            self.document.zoom.read(&self.zoom).*
+            self.document.zoom.read(&self.zoom, self.allocator).*
         else
             self.document.zoom.get().*;
         const local_zoom = if (self.inline_nodes == null and self.node_ptr != null) local: {
@@ -7223,16 +7223,16 @@ const BlockLayout = struct {
         self.zoom.set(zoom_value);
 
         const parent_x = if (self.parent_block) |pb|
-            (if (self.persistent_dependencies) pb.x.read(&self.x).* else pb.x.get().*) +
+            (if (self.persistent_dependencies) pb.x.read(&self.x, self.allocator).* else pb.x.get().*) +
                 pb.border.left + pb.padding.left
         else if (self.persistent_dependencies)
-            self.document.x.read(&self.x).*
+            self.document.x.read(&self.x, self.allocator).*
         else
             self.document.x.get().*;
         const parent_width = if (self.parent_block) |pb|
             pb.content_width
         else if (self.persistent_dependencies)
-            self.document.width.read(&self.width).*
+            self.document.width.read(&self.width, self.allocator).*
         else
             self.document.width.get().*;
         const containing_width_css = cssPixelsFromLayout(
@@ -7269,25 +7269,25 @@ const BlockLayout = struct {
         // reading that field here: ProtectedField requires every read target
         // to have been registered during initialization.
         const previous = if (self.persistent_dependencies)
-            self.previous.read(&self.y).*
+            self.previous.read(&self.y, self.allocator).*
         else
             self.previous.get().*;
         const parent_content_y = if (previous == null) blk: {
             if (self.parent_block) |pb| {
                 const parent_y = if (self.persistent_dependencies)
-                    pb.y.read(&self.y).*
+                    pb.y.read(&self.y, self.allocator).*
                 else
                     pb.y.get().*;
                 break :blk parent_y + pb.border.top + pb.padding.top;
             }
             break :blk if (self.persistent_dependencies)
-                self.document.y.read(&self.y).*
+                self.document.y.read(&self.y, self.allocator).*
             else
                 self.document.y.get().*;
         } else 0;
         const prev_y = if (previous) |prev|
             (if (self.persistent_dependencies)
-                prev.y.read(&self.y).* + prev.height.read(&self.y).*
+                prev.y.read(&self.y, self.allocator).* + prev.height.read(&self.y, self.allocator).*
             else
                 prev.y.get().* + prev.height.get().*) +
                 @max(prev.margin.bottom, self.margin.top)
@@ -7511,9 +7511,9 @@ const BlockLayout = struct {
                     }
                 }
                 for (height_deps.items) |dep| {
-                    self.height.addDependency(dep);
+                    self.height.addDependency(dep, self.allocator);
                 }
-                self.height.addDependency(&self.children_version);
+                self.height.addDependency(&self.children_version, self.allocator);
                 self.height.frozen_dependencies = true;
             }
 
@@ -7523,7 +7523,7 @@ const BlockLayout = struct {
             self.floats.clearRetainingCapacity();
             const flow_origin = self.y.get().* + self.border.top + self.padding.top +
                 tableOfContentsHeaderHeight(self.node, zoom_value, engine.zoom());
-            _ = self.children_version.read(&self.height);
+            _ = self.children_version.read(&self.height, self.allocator);
             for (self.children.items) |child| {
                 switch (child) {
                     .block => |b| {
@@ -7535,7 +7535,7 @@ const BlockLayout = struct {
                             b.mark();
                         }
                         try b.layout(engine);
-                        const child_height = b.height.read(&self.height).*;
+                        const child_height = b.height.read(&self.height, self.allocator).*;
                         if (b.floatSide() != .none) {
                             try self.floats.append(self.allocator, .{
                                 .side = b.floatSide(),
@@ -7555,7 +7555,7 @@ const BlockLayout = struct {
                     },
                     .line => |l| {
                         try l.layout(engine);
-                        computed_height += l.height.read(&self.height).*;
+                        computed_height += l.height.read(&self.height, self.allocator).*;
                     },
                 }
             }

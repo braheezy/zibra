@@ -15,11 +15,11 @@ fn createCleanDocument(allocator: std.mem.Allocator) !*Layout.DocumentLayout {
         .allocator = allocator,
         .node = undefined,
         .node_ptr = undefined,
-        .zoom = ProtectedField(f32).init(allocator, 1.0),
-        .x = ProtectedField(i32).init(allocator, 0),
-        .y = ProtectedField(i32).init(allocator, 0),
-        .width = ProtectedField(i32).init(allocator, 0),
-        .height = ProtectedField(i32).init(allocator, 0),
+        .zoom = ProtectedField(f32).init(1.0),
+        .x = ProtectedField(i32).init(0),
+        .y = ProtectedField(i32).init(0),
+        .width = ProtectedField(i32).init(0),
+        .height = ProtectedField(i32).init(0),
         .children = .empty,
     };
     document.zoom.dirty = false;

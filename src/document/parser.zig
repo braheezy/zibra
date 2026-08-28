@@ -725,7 +725,7 @@ pub const Element = struct {
         }
 
         if (self.style) |*styles| {
-            deinitStyleMap(styles);
+            deinitStyleMap(styles, allocator);
         }
 
         // Free any strings we allocated (like resolved relative font sizes)
@@ -1099,7 +1099,7 @@ pub const Node = union(enum) {
         switch (self.*) {
             .text => |*t| {
                 if (t.style) |*styles| {
-                    deinitStyleMap(styles);
+                    deinitStyleMap(styles, allocator);
                 }
             },
             .element => |*e| e.deinit(allocator),
@@ -1881,12 +1881,12 @@ fn isInheritedProperty(property: []const u8) bool {
 
 fn initStyleMap(allocator: std.mem.Allocator, obj_name: []const u8, parent_style: ?*StyleMap) !StyleMap {
     var map = StyleMap.init(allocator);
-    errdefer deinitStyleMap(&map);
+    errdefer deinitStyleMap(&map, allocator);
     for (CSS_PROPERTIES) |prop| {
-        var field = ProtectedField([]const u8).initNamed(allocator, prop.default_value, obj_name, prop.name);
+        var field = ProtectedField([]const u8).initNamed(prop.default_value, obj_name, prop.name);
         field.dirty = true;
         map.put(prop.name, field) catch |err| {
-            field.deinit();
+            field.deinit(allocator);
             return err;
         };
     }
@@ -1894,7 +1894,7 @@ fn initStyleMap(allocator: std.mem.Allocator, obj_name: []const u8, parent_style
         if (map.getPtr(prop.name)) |child_field| {
             if (parent_style != null and isInheritedProperty(prop.name)) {
                 if (parent_style.?.getPtr(prop.name)) |parent_field| {
-                    child_field.addDependency(parent_field);
+                    child_field.addDependency(parent_field, allocator);
                 }
             }
             child_field.freezeDependencies();
@@ -1903,10 +1903,10 @@ fn initStyleMap(allocator: std.mem.Allocator, obj_name: []const u8, parent_style
     return map;
 }
 
-fn deinitStyleMap(map: *StyleMap) void {
+fn deinitStyleMap(map: *StyleMap, allocator: std.mem.Allocator) void {
     var it = map.iterator();
     while (it.next()) |entry| {
-        entry.value_ptr.deinit();
+        entry.value_ptr.deinit(allocator);
     }
     map.deinit();
 }
@@ -2325,7 +2325,7 @@ fn styleWithKeyframesInternal(
     for (rules) |rule| try rule.selector.populateHasMatches(&has_cache, node);
 
     var default_parent = try getDefaultParentStyle(allocator);
-    defer deinitStyleMap(&default_parent);
+    defer deinitStyleMap(&default_parent, allocator);
     const empty_ancestors = &[_]*Node{};
     try styleWithParent(
         allocator,
@@ -2361,6 +2361,7 @@ fn inheritedValue(
     parent_field: *ProtectedField([]const u8),
     child_field: *ProtectedField([]const u8),
     parent_is_ephemeral_default: bool,
+    allocator: std.mem.Allocator,
 ) []const u8 {
     // The synthetic root parent is destroyed at the end of every style pass,
     // so root fields may read it but must never register a dependency on it.
@@ -2369,8 +2370,8 @@ fn inheritedValue(
     // A retained style map can move between parents through removeChild.
     // Register the current edge before a frozen dependency read. Former edges
     // remain registered under ProtectedField's current no-unsubscribe model.
-    child_field.addDependency(parent_field);
-    return parent_field.read(child_field).*;
+    child_field.addDependency(parent_field, allocator);
+    return parent_field.read(child_field, allocator).*;
 }
 
 fn styleWithParent(
@@ -2419,6 +2420,7 @@ fn styleWithParent(
                             parent_field,
                             child_field,
                             parent_is_ephemeral_default,
+                            allocator,
                         );
                         try new_style.put(prop.name, parent_value);
                     } else {
@@ -2467,6 +2469,7 @@ fn styleWithParent(
                                 parent_field,
                                 child_field,
                                 parent_is_ephemeral_default,
+                                allocator,
                             );
                             try new_style.put(prop.name, parent_value);
                         } else {
@@ -2520,7 +2523,7 @@ fn styleWithParent(
                 if (new_style.get("font-family")) |font_family| {
                     const child_field = style_map.getPtr("font-family").?;
                     const inherited_family = if (parent_style.getPtr("font-family")) |parent_field|
-                        inheritedValue(parent_field, child_field, parent_is_ephemeral_default)
+                        inheritedValue(parent_field, child_field, parent_is_ephemeral_default, allocator)
                     else
                         "sans-serif";
                     try new_style.put(
@@ -2544,7 +2547,7 @@ fn styleWithParent(
                     if (new_style.get(prop.name)) |value| {
                         const child_field = style_map.getPtr(prop.name).?;
                         const inherited_value = if (parent_style.getPtr(prop.name)) |parent_field|
-                            inheritedValue(parent_field, child_field, parent_is_ephemeral_default)
+                            inheritedValue(parent_field, child_field, parent_is_ephemeral_default, allocator)
                         else
                             prop.initial;
                         try new_style.put(
@@ -2563,7 +2566,7 @@ fn styleWithParent(
                     if (font_size_length) |length| {
                         const child_field = style_map.getPtr("font-size").?;
                         const parent_font_size = if (parent_style.getPtr("font-size")) |parent_field|
-                            inheritedValue(parent_field, child_field, parent_is_ephemeral_default)
+                            inheritedValue(parent_field, child_field, parent_is_ephemeral_default, allocator)
                         else
                             "16px";
 

@@ -392,7 +392,7 @@ pub const Frame = struct {
             .focus_bounds = std.ArrayList(FrameBoundEntry).empty,
             .accessibility_bounds = std.ArrayList(FrameBoundEntry).empty,
             .fragment_targets = std.ArrayList(Layout.FragmentTarget).empty,
-            .document = ProtectedField(?*Layout.DocumentLayout).init(allocator, null),
+            .document = ProtectedField(?*Layout.DocumentLayout).init(null),
         };
     }
 
@@ -552,7 +552,7 @@ pub const Frame = struct {
         self.children.deinit(self.allocator);
 
         self.destroyDocumentLayout();
-        self.document.deinit();
+        self.document.deinit(self.allocator);
 
         if (self.current_node) |*node| {
             node.deinit(self.allocator);
@@ -3357,11 +3357,11 @@ fn createCleanPhaseTestDocument(
         .allocator = allocator,
         .node = node.*,
         .node_ptr = node,
-        .zoom = ProtectedField(f32).init(allocator, 1.0),
-        .x = ProtectedField(i32).init(allocator, 0),
-        .y = ProtectedField(i32).init(allocator, 0),
-        .width = ProtectedField(i32).init(allocator, 0),
-        .height = ProtectedField(i32).init(allocator, 0),
+        .zoom = ProtectedField(f32).init(1.0),
+        .x = ProtectedField(i32).init(0),
+        .y = ProtectedField(i32).init(0),
+        .width = ProtectedField(i32).init(0),
+        .height = ProtectedField(i32).init(0),
         .children = .empty,
     };
     document.zoom.set(1.0);

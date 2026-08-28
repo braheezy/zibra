@@ -5,52 +5,71 @@
 //! safe; callers must destroy an entire dependency graph in a compatible order.
 
 const std = @import("std");
+const builtin = @import("builtin");
 
 // Debug flag: set to true to enable invalidation logging
 const DEBUG_PROTECTED_FIELDS = false;
 
 pub fn ProtectedField(comptime T: type) type {
+    // The generic is a comptime type factory: values and dirty state live
+    // directly in their owner instead of requiring a boxed field object. Keep
+    // the remaining dependency collection unmanaged too, so every field does
+    // not carry another allocator interface. Callers already know the owning
+    // allocator at the graph construction/destruction boundary and pass it to
+    // the operations that can allocate.
+    const Invalidations = std.AutoHashMapUnmanaged(*anyopaque, *const fn (*anyopaque) void);
+    const DebugInfo = if (builtin.mode == .Debug)
+        struct {
+            obj: []const u8,
+            name: []const u8,
+        }
+    else
+        struct {};
+
     return struct {
         value: T,
         dirty: bool,
-        invalidations: std.AutoHashMap(*anyopaque, *const fn (*anyopaque) void),
-        obj: []const u8 = "",
-        name: []const u8 = "",
+        invalidations: Invalidations,
+        debug_info: DebugInfo,
         owner_mark: ?*const fn (*anyopaque) void = null,
         owner_ptr: ?*anyopaque = null,
         frozen_dependencies: bool = false,
 
-        pub fn init(allocator: std.mem.Allocator, value: T) @This() {
+        pub inline fn init(value: T) @This() {
             return .{
                 .value = value,
                 .dirty = true,
-                .invalidations = std.AutoHashMap(*anyopaque, *const fn (*anyopaque) void).init(allocator),
-                .obj = "",
-                .name = "",
+                .invalidations = .empty,
+                .debug_info = if (builtin.mode == .Debug)
+                    .{ .obj = "", .name = "" }
+                else
+                    .{},
                 .owner_mark = null,
                 .owner_ptr = null,
                 .frozen_dependencies = false,
             };
         }
 
-        pub fn initNamed(allocator: std.mem.Allocator, value: T, obj: []const u8, name: []const u8) @This() {
+        pub inline fn initNamed(value: T, obj: []const u8, name: []const u8) @This() {
             return .{
                 .value = value,
                 .dirty = true,
-                .invalidations = std.AutoHashMap(*anyopaque, *const fn (*anyopaque) void).init(allocator),
-                .obj = obj,
-                .name = name,
+                .invalidations = .empty,
+                .debug_info = if (builtin.mode == .Debug)
+                    .{ .obj = obj, .name = name }
+                else
+                    .{},
                 .owner_mark = null,
                 .owner_ptr = null,
                 .frozen_dependencies = false,
             };
         }
 
-        pub fn deinit(self: *@This()) void {
-            self.invalidations.deinit();
+        pub fn deinit(self: *@This(), allocator: std.mem.Allocator) void {
+            self.invalidations.deinit(allocator);
         }
 
-        pub fn mark(self: *@This()) void {
+        pub inline fn mark(self: *@This()) void {
             if (self.dirty) return;
             self.dirty = true;
             if (self.owner_ptr) |owner| {
@@ -60,20 +79,24 @@ pub fn ProtectedField(comptime T: type) type {
             }
         }
 
-        pub fn markNoOwner(self: *@This()) void {
+        pub inline fn markNoOwner(self: *@This()) void {
             self.dirty = true;
         }
 
-        pub fn setOwner(self: *@This(), owner: anytype, mark_fn: *const fn (*anyopaque) void) void {
+        pub inline fn setOwner(self: *@This(), owner: anytype, mark_fn: *const fn (*anyopaque) void) void {
             self.owner_ptr = @ptrCast(@alignCast(owner));
             self.owner_mark = mark_fn;
         }
 
-        pub fn addDependency(self: *@This(), dependency: anytype) void {
-            dependency.addInvalidation(self);
+        pub inline fn addDependency(
+            self: *@This(),
+            dependency: anytype,
+            allocator: std.mem.Allocator,
+        ) void {
+            dependency.addInvalidation(self, allocator);
         }
 
-        pub fn freezeDependencies(self: *@This()) void {
+        pub inline fn freezeDependencies(self: *@This()) void {
             self.frozen_dependencies = true;
         }
 
@@ -95,7 +118,11 @@ pub fn ProtectedField(comptime T: type) type {
             }
         }
 
-        fn addInvalidation(self: *@This(), target: anytype) void {
+        fn addInvalidation(
+            self: *@This(),
+            target: anytype,
+            allocator: std.mem.Allocator,
+        ) void {
             const notify_ptr: *anyopaque = @ptrCast(@alignCast(@constCast(target)));
             const self_ptr: *anyopaque = @ptrCast(@alignCast(self));
             if (notify_ptr == self_ptr) return;
@@ -108,23 +135,31 @@ pub fn ProtectedField(comptime T: type) type {
                 }
             };
 
-            self.invalidations.put(notify_ptr, MarkFn.mark) catch {};
+            self.invalidations.put(allocator, notify_ptr, MarkFn.mark) catch {};
         }
 
-        pub fn read(self: *const @This(), target: anytype) *const T {
+        pub inline fn read(
+            self: *const @This(),
+            target: anytype,
+            allocator: std.mem.Allocator,
+        ) *const T {
             const self_mut: *@This() = @constCast(self);
             const notify_ptr: *anyopaque = @ptrCast(@alignCast(@constCast(target)));
             if (@hasField(@TypeOf(target.*), "frozen_dependencies") and target.frozen_dependencies) {
                 std.debug.assert(self.invalidations.contains(notify_ptr));
             } else {
-                self_mut.addInvalidation(target);
+                self_mut.addInvalidation(target, allocator);
             }
             return self.get();
         }
 
-        pub fn get(self: *const @This()) *const T {
+        pub inline fn get(self: *const @This()) *const T {
             if (self.dirty) {
-                std.debug.print("[PROTECTED_FIELD] get() called on dirty field! Type={s} obj={s} name={s}\n", .{ @typeName(T), self.obj, self.name });
+                if (builtin.mode == .Debug) {
+                    std.debug.print("[PROTECTED_FIELD] get() called on dirty field! Type={s} obj={s} name={s}\n", .{ @typeName(T), self.debug_info.obj, self.debug_info.name });
+                } else {
+                    std.debug.print("[PROTECTED_FIELD] get() called on dirty field! Type={s}\n", .{@typeName(T)});
+                }
                 // Print stack trace to help identify the caller
                 std.debug.dumpCurrentStackTrace(.{ .first_address = @returnAddress() });
             }
@@ -135,11 +170,11 @@ pub fn ProtectedField(comptime T: type) type {
         /// Return the last published value without requiring the field to be
         /// clean or registering a dependency. This is a historical snapshot,
         /// not permission to use a dirty field as current computed state.
-        pub fn lastValue(self: *const @This()) *const T {
+        pub inline fn lastValue(self: *const @This()) *const T {
             return &self.value;
         }
 
-        pub fn set(self: *@This(), value: T) void {
+        pub inline fn set(self: *@This(), value: T) void {
             // Only notify dependents if the value actually changed (for comparable types)
             // Check type at comptime and decide whether to compare
             if (comptime T == []const u8) {
@@ -177,14 +212,14 @@ pub fn ProtectedField(comptime T: type) type {
 
 test "clearInvalidations detaches subscribers before their lifetime ends" {
     const Field = ProtectedField(i32);
-    var source = Field.init(std.testing.allocator, 1);
-    defer source.deinit();
-    var subscriber = Field.init(std.testing.allocator, 2);
-    defer subscriber.deinit();
+    var source = Field.init(1);
+    defer source.deinit(std.testing.allocator);
+    var subscriber = Field.init(2);
+    defer subscriber.deinit(std.testing.allocator);
     source.set(1);
     subscriber.set(2);
 
-    subscriber.addDependency(&source);
+    subscriber.addDependency(&source, std.testing.allocator);
     try std.testing.expectEqual(@as(usize, 1), source.invalidations.count());
     source.clearInvalidations();
     try std.testing.expectEqual(@as(usize, 0), source.invalidations.count());
@@ -195,8 +230,8 @@ test "clearInvalidations detaches subscribers before their lifetime ends" {
 
 test "last published value remains available while recomputation is pending" {
     const Field = ProtectedField(i32);
-    var field = Field.init(std.testing.allocator, 4);
-    defer field.deinit();
+    var field = Field.init(4);
+    defer field.deinit(std.testing.allocator);
     field.set(9);
     field.mark();
 
@@ -206,13 +241,13 @@ test "last published value remains available while recomputation is pending" {
 
 test "identical borrowed slices suppress invalidation without reading storage" {
     const Field = ProtectedField([]const u8);
-    var source = Field.init(std.testing.allocator, "same");
-    defer source.deinit();
-    var subscriber = Field.init(std.testing.allocator, "child");
-    defer subscriber.deinit();
+    var source = Field.init("same");
+    defer source.deinit(std.testing.allocator);
+    var subscriber = Field.init("child");
+    defer subscriber.deinit(std.testing.allocator);
     source.set("same");
     subscriber.set("child");
-    subscriber.addDependency(&source);
+    subscriber.addDependency(&source, std.testing.allocator);
 
     const original = source.lastValue().*;
     source.set(original);
@@ -223,4 +258,16 @@ test "identical borrowed slices suppress invalidation without reading storage" {
     source.set(replacement);
     try std.testing.expect(subscriber.dirty);
     try std.testing.expect(source.lastValue().*.ptr == replacement.ptr);
+}
+
+test "comptime fields use compact unmanaged dependency storage" {
+    const Field = ProtectedField(i32);
+    const ManagedInvalidations = std.AutoHashMap(*anyopaque, *const fn (*anyopaque) void);
+    const UnmanagedInvalidations = std.AutoHashMapUnmanaged(*anyopaque, *const fn (*anyopaque) void);
+
+    try std.testing.expect(@sizeOf(UnmanagedInvalidations) < @sizeOf(ManagedInvalidations));
+
+    var field = Field.init(7);
+    defer field.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(usize, 0), field.invalidations.capacity());
 }

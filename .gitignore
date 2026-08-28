@@ -4,3 +4,5 @@ zig-out
 autorun
 message_board.json
 message_board.json.*.tmp
+.zig-global-cache
+.zig-local-cache

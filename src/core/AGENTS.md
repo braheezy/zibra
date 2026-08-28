@@ -10,6 +10,12 @@ before changing dependency registration or destruction behavior.
   before its address becomes invalid. Supported structural DOM mutation uses a
   coarse pre-mutation clear of all style publishers and forces full style and
   layout recomputation; general per-edge unsubscription remains unresolved.
+- `ProtectedField(T)` is a comptime-generated inline value, not a heap object.
+  Its dependency table is unmanaged: `init` is allocation-free, while
+  `addDependency`/`read` receive the dependency source's allocator and
+  `deinit` must receive that same allocator. Release builds erase diagnostic
+  object/property names. Do not put a managed allocator back into every field
+  or allocate merely to construct a clean dependency graph.
 - `ProtectedField.lastValue` is an explicit non-subscribing historical read.
   It may be used while dirty only when the consumer needs the last published
   state, such as the visual baseline for an interrupted CSS transition; it is

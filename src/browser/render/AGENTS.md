@@ -52,6 +52,10 @@ before changing ownership or thread boundaries.
   dependencies and invalidates vertical flow without rebuilding later
   siblings. Any removal, reorder, incompatible classification, or ambiguous
   shape still destroys and rebuilds the complete child list.
+  Protected dependency storage is unmanaged. Layout-to-layout edges use the
+  common layout owner allocator; edges published by a computed-style field use
+  that `StyleMap`'s allocator. Pass the same allocator again when the source
+  field is destroyed.
 - `font.zig` owns SDL_ttf handles and cached RGBA glyph pixels. Display items
   borrow those pixels until a raster snapshot copies them.
 - `display_list.zig` owns display-command types, recursive cleanup, painted hit

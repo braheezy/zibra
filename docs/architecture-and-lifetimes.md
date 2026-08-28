@@ -623,10 +623,17 @@ dirty the changed element and its ancestor chain in O(depth) time. The cache
 borrows DOM and selector pointers only for the synchronous traversal and must
 not survive either tree or rule mutation.
 
-Style and layout values use `ProtectedField`. A dependency registers a raw
-target pointer and callback in the dependency's `invalidations` map.
-`ProtectedField.deinit` only destroys the field's own map; it does not remove
-that field from maps in its dependencies. See `addDependency`,
+Style and layout values use `ProtectedField`. Zig specializes this generic at
+comptime and stores its value and dirty bit inline in the owning object; there
+is no separately allocated field object or dynamic dispatch. Its remaining
+subscriber table is an unmanaged hash map, so constructing a field is
+allocation-free and does not embed a managed allocator interface per CSS or
+layout property. Dependency registration and reads receive the source field's
+owning allocator explicitly, and destruction must receive that same allocator.
+Diagnostic object/property labels exist only in Debug builds. A dependency
+registers a raw target pointer and callback in that table.
+`ProtectedField.deinit` only destroys the field's own table; it does not remove
+that field from tables in its dependencies. See `addDependency`,
 `addInvalidation`, `notify`, and `deinit` in
 [`src/core/protected_field.zig`](../src/core/protected_field.zig).
 Computed-style string fields notify subscribers only when the published slice

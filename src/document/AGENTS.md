@@ -38,6 +38,10 @@ or selector/rule lifetime.
   moves `Node` values but destroys no existing style-map backing or layout
   owner, so it preserves subscriber maps and immediately rebinds raw layout
   pointers to the relocated children.
+- Computed-style `ProtectedField`s use unmanaged dependency tables. Initialize
+  them without an allocator, but pass the owning `StyleMap` allocator whenever
+  registering or reading a dependency and when destroying the field. This
+  keeps every CSS property from embedding its own allocator interface.
 - Each Element summarizes strict-descendant style work in
   `has_dirty_style_descendants`. Explicit selector invalidation raises the bit
   along the parent chain, and inherited `ProtectedField` notifications do the
