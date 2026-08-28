@@ -44,6 +44,11 @@ does not submit.
 children from two attached parents plus a detached subtree into one target and
 checks order, identity, source collapse, and iframe rebinding.
 
+`tests/manual/style-descendant-invalidation.html` repeatedly changes one
+leaf's selector state while an unrelated styled branch stays unchanged. Unit
+instrumentation verifies that the incremental pass enters only the dirty
+ancestor path and skips the clean sibling subtree.
+
 `tests/manual/form-get.html` and its target fixture verify over a localhost
 server that GET submission puts encoded controls in the URL query and sends no
 POST body.

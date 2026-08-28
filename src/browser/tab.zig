@@ -524,14 +524,20 @@ pub const Frame = struct {
             self.publishStyledDocument();
             return;
         };
-        try parser.styleWithKeyframes(
-            browser.allocator,
-            root,
-            self.rules.items,
-            self.keyframes.items,
-        );
-        if (self.current_url) |page_url| {
-            try browser.loadUsedBackgroundImages(self, page_url);
+        // Browser-level focus/paint requests conservatively enter the
+        // protected style phase. The DOM summary lets a clean document
+        // republish immediately without walking its tree (or rescanning
+        // background-image users).
+        if (parser.styleTreeNeedsUpdate(root)) {
+            try parser.styleWithKeyframes(
+                browser.allocator,
+                root,
+                self.rules.items,
+                self.keyframes.items,
+            );
+            if (self.current_url) |page_url| {
+                try browser.loadUsedBackgroundImages(self, page_url);
+            }
         }
         self.publishStyledDocument();
     }

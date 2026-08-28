@@ -1012,6 +1012,119 @@ test "descendant selectors are flat and match ordered ancestor chains" {
     );
 }
 
+test "style descendant flags skip clean sibling subtrees" {
+    const allocator = std.testing.allocator;
+    const html =
+        "<main><section><span class=idle>x</span></section>" ++
+        "<aside><b>y</b></aside></main>";
+
+    var html_parser = try HTMLParser.init(allocator, html);
+    html_parser.use_implicit_tags = false;
+    defer html_parser.deinit(allocator);
+    var root = try html_parser.parse();
+    defer root.deinit(allocator);
+    document_parser.fixParentPointers(&root, null);
+
+    var css_parser = try CSSParser.init(
+        allocator,
+        ".active { background-color: red; }",
+        false,
+    );
+    defer css_parser.deinit(allocator);
+    const rules = try css_parser.parse(allocator);
+    defer {
+        for (rules) |*rule| rule.deinit(allocator);
+        allocator.free(rules);
+    }
+
+    var initial_stats: document_parser.StylePassStats = .{};
+    try document_parser.styleWithStats(allocator, &root, rules, &initial_stats);
+    try std.testing.expectEqual(@as(usize, 7), initial_stats.recomputed_nodes);
+
+    const section = &root.element.children.items[0].element;
+    const target = &section.children.items[0].element;
+    const aside = &root.element.children.items[1].element;
+    try std.testing.expect(!root.element.has_dirty_style_descendants);
+    try std.testing.expect(!section.has_dirty_style_descendants);
+    try std.testing.expect(!aside.has_dirty_style_descendants);
+
+    try target.attributes.?.put("class", "active");
+    document_parser.dirtyStyleForElement(target);
+    try std.testing.expect(root.element.has_dirty_style_descendants);
+    try std.testing.expect(section.has_dirty_style_descendants);
+    try std.testing.expect(!aside.has_dirty_style_descendants);
+
+    var incremental_stats: document_parser.StylePassStats = .{};
+    try document_parser.styleWithStats(allocator, &root, rules, &incremental_stats);
+    try std.testing.expectEqual(@as(usize, 3), incremental_stats.visited_nodes);
+    try std.testing.expectEqual(@as(usize, 3), incremental_stats.recomputed_nodes);
+    try std.testing.expectEqual(@as(usize, 2), incremental_stats.skipped_subtrees);
+    try std.testing.expectEqualStrings(
+        "red",
+        target.style.?.getPtr("background-color").?.get().*,
+    );
+    try std.testing.expect(!root.element.has_dirty_style_descendants);
+    try std.testing.expect(!section.has_dirty_style_descendants);
+
+    var clean_stats: document_parser.StylePassStats = .{};
+    try document_parser.styleWithStats(allocator, &root, rules, &clean_stats);
+    try std.testing.expectEqual(@as(usize, 0), clean_stats.visited_nodes);
+    try std.testing.expectEqual(@as(usize, 1), clean_stats.skipped_subtrees);
+
+    // Structural mutation drops every raw dependency edge. Its invalidation
+    // boundary must therefore request a full recomputation, after which
+    // inherited dependencies work again.
+    document_parser.clearStyleInvalidations(&root);
+    var rebuild_stats: document_parser.StylePassStats = .{};
+    try document_parser.styleWithStats(allocator, &root, rules, &rebuild_stats);
+    try std.testing.expectEqual(@as(usize, 7), rebuild_stats.recomputed_nodes);
+
+    root.element.style.?.getPtr("color").?.set("purple");
+    try std.testing.expect(root.element.has_dirty_style_descendants);
+    var inherited_stats: document_parser.StylePassStats = .{};
+    try document_parser.styleWithStats(allocator, &root, rules, &inherited_stats);
+    try std.testing.expectEqual(@as(usize, 7), inherited_stats.visited_nodes);
+    try std.testing.expectEqual(@as(usize, 6), inherited_stats.recomputed_nodes);
+    try std.testing.expectEqualStrings(
+        "purple",
+        aside.children.items[0].element.children.items[0]
+            .text.style.?.getPtr("color").?.get().*,
+    );
+    try std.testing.expect(!root.element.has_dirty_style_descendants);
+}
+
+test "style field owners follow by-value DOM moves" {
+    const allocator = std.testing.allocator;
+
+    var child_parser = try HTMLParser.init(allocator, "<span>moved</span>");
+    child_parser.use_implicit_tags = false;
+    defer child_parser.deinit(allocator);
+    var child = try child_parser.parse();
+    var child_owned = true;
+    defer if (child_owned) child.deinit(allocator);
+    try document_parser.style(allocator, &child, &.{});
+
+    var wrapper = document_parser.Node{
+        .element = try document_parser.Element.init(allocator, "div", null),
+    };
+    defer wrapper.deinit(allocator);
+    try wrapper.appendChild(allocator, child);
+    child_owned = false;
+    document_parser.fixParentPointers(&wrapper, null);
+    try document_parser.style(allocator, &wrapper, &.{});
+
+    const installed_child = &wrapper.element.children.items[0];
+    try std.testing.expect(!wrapper.element.has_dirty_style_descendants);
+    installed_child.element.style.?.getPtr("background-color").?.mark();
+    try std.testing.expect(wrapper.element.has_dirty_style_descendants);
+
+    var stats: document_parser.StylePassStats = .{};
+    try document_parser.styleWithStats(allocator, &wrapper, &.{}, &stats);
+    try std.testing.expectEqual(@as(usize, 2), stats.visited_nodes);
+    try std.testing.expectEqual(@as(usize, 1), stats.recomputed_nodes);
+    try std.testing.expect(!wrapper.element.has_dirty_style_descendants);
+}
+
 test ":has selectors match strict descendants, cascade, and recompute" {
     const allocator = std.testing.allocator;
     const html =

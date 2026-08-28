@@ -618,6 +618,24 @@ target pointer and callback in the dependency's `invalidations` map.
 that field from maps in its dependencies. See `addDependency`,
 `addInvalidation`, `notify`, and `deinit` in
 [`src/core/protected_field.zig`](../src/core/protected_field.zig).
+Computed-style string fields notify subscribers only when the published slice
+identity changes. The comparison deliberately uses pointer and length rather
+than reading bytes: an old stylesheet generation may already have retired its
+backing text. Stable rules/defaults therefore let selector recomputation on an
+ancestor preserve unchanged inherited subtrees, while a new backing generation
+notifies conservatively and can retire the old text safely.
+
+Each DOM Element also owns a `has_dirty_style_descendants` summary for strict
+descendants. A style field remains the authority for the node itself. Explicit
+selector invalidation dirties the changed element and relational-selector
+ancestors, while raising summaries along that path; inherited-field
+notifications use a field-owner callback to raise the same summaries. The
+style traversal rejects a clean summary before entering any child, and clears
+it only after every requested child finishes successfully. Since DOM Nodes are
+stored by value, `fixParentPointers` also rebinds every retained style field's
+owner pointer after a move. A `:has` generation may still require its separate
+ephemeral relational-cache preprocessing pass across the tree, but ordinary
+selector passes visit only dirty branches.
 
 Each Frame's owning `document` field adds a coarse phase guard above that
 fine-grained graph. Marking it dirty requests style and makes ordinary `get`
@@ -633,10 +651,11 @@ phase.
 
 Supported structural DOM mutation uses a coarse lifetime boundary:
 `clearStyleInvalidations` drops every raw subscriber from every installed DOM
-style field before child storage moves or retires, and the already-required
-full style/layout pass rebuilds live edges. This prevents surviving parent
-style sources from notifying destroyed child-style or layout subscribers on
-these paths without pretending to provide general per-edge unsubscription.
+style field before child storage moves or retires and marks the complete
+installed style tree dirty. The already-required full style/layout pass then
+rebuilds live edges. This prevents surviving parent style sources from
+notifying destroyed child-style or layout subscribers on these paths without
+pretending to provide general per-edge unsubscription.
 
 Inherited style fields establish these edges between parent and child DOM
 styles in [`src/document/parser.zig`](../src/document/parser.zig). Layout fields

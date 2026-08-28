@@ -142,7 +142,16 @@ pub fn ProtectedField(comptime T: type) type {
         pub fn set(self: *@This(), value: T) void {
             // Only notify dependents if the value actually changed (for comparable types)
             // Check type at comptime and decide whether to compare
-            if (comptime (T == i32 or T == f32 or T == i64 or T == f64 or T == bool or T == u32 or T == u64)) {
+            if (comptime T == []const u8) {
+                // Computed CSS values are borrowed slices, and the prior
+                // stylesheet generation may already be retired when this is
+                // called. Comparing bytes could therefore dereference stale
+                // storage. Treat only the exact same slice as unchanged;
+                // values from new backing storage notify conservatively.
+                if (self.value.ptr != value.ptr or self.value.len != value.len) {
+                    self.notify();
+                }
+            } else if (comptime (T == i32 or T == f32 or T == i64 or T == f64 or T == bool or T == u32 or T == u64)) {
                 // Simple types: only notify if value changed
                 if (self.value != value) {
                     if (DEBUG_PROTECTED_FIELDS) {
@@ -193,4 +202,25 @@ test "last published value remains available while recomputation is pending" {
 
     try std.testing.expect(field.dirty);
     try std.testing.expectEqual(@as(i32, 9), field.lastValue().*);
+}
+
+test "identical borrowed slices suppress invalidation without reading storage" {
+    const Field = ProtectedField([]const u8);
+    var source = Field.init(std.testing.allocator, "same");
+    defer source.deinit();
+    var subscriber = Field.init(std.testing.allocator, "child");
+    defer subscriber.deinit();
+    source.set("same");
+    subscriber.set("child");
+    subscriber.addDependency(&source);
+
+    const original = source.lastValue().*;
+    source.set(original);
+    try std.testing.expect(!subscriber.dirty);
+
+    const replacement = try std.testing.allocator.dupe(u8, "same");
+    defer std.testing.allocator.free(replacement);
+    source.set(replacement);
+    try std.testing.expect(subscriber.dirty);
+    try std.testing.expect(source.lastValue().*.ptr == replacement.ptr);
 }

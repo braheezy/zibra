@@ -1,0 +1,33 @@
+<!--
+How to verify:
+1. Click "Toggle target style" repeatedly. Only the target card should switch
+   between gray and red.
+2. The blue unrelated branch must never change or disappear.
+3. There should be no stale frame after any click. The unit suite additionally
+   verifies that each update skips the unrelated subtree during style.
+-->
+<!doctype html>
+<style>
+  body { font-family: sans-serif; margin: 28px; }
+  .card { width: 300px; margin: 14px 0; padding: 16px; color: white; }
+  .idle { background-color: gray; }
+  .active { background-color: red; }
+  .unrelated { background-color: blue; }
+</style>
+<h1>Descendant style invalidation</h1>
+<button id="toggle">Toggle target style</button>
+<main>
+  <section>
+    <div id="target" class="card idle">Target branch: <b>selector mutation</b></div>
+  </section>
+  <aside class="card unrelated">
+    Unrelated branch <span>must stay blue</span>
+  </aside>
+</main>
+<script>
+  let active = false;
+  toggle.addEventListener("click", function() {
+    active = !active;
+    target.setAttribute("class", active ? "card active" : "card idle");
+  });
+</script>

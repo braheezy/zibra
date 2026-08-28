@@ -31,8 +31,16 @@ or selector/rule lifetime.
   storage can move or retire. Keep ordinary render callbacks separate so
   style-only changes do not discard focus or hit/accessibility state.
 - Before structural mutation destroys or relocates style fields, clear raw
-  `ProtectedField` subscribers across the installed document. The required
-  full style/layout pass rebuilds live dependency edges afterward.
+  `ProtectedField` subscribers across the installed document. That boundary
+  also dirties every computed style; the required full style/layout pass
+  rebuilds live dependency edges afterward.
+- Each Element summarizes strict-descendant style work in
+  `has_dirty_style_descendants`. Explicit selector invalidation raises the bit
+  along the parent chain, and inherited `ProtectedField` notifications do the
+  same through a Node owner callback. Because Nodes move by value, every
+  `fixParentPointers` call must also rebind style-field owners. Clear a summary
+  only after its requested child passes succeed; a clean summary is permission
+  to skip the complete subtree.
 - A detached retained subtree keeps its style maps but dirties every field and
   clears layout back-pointers. When it is reparented, inherited style reads
   register the current parent dependency before using a frozen field.

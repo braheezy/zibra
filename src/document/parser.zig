@@ -598,6 +598,11 @@ pub const Element = struct {
     // the Tab registry before reattachment creates a fresh context.
     iframe_window_id: ?u32 = null,
     children_dirty: bool = true,
+    // Summary bit for incremental style traversal. Individual computed
+    // properties retain their own ProtectedField dirty bits; this records
+    // whether any node strictly below this element may need style work.
+    // Style-field owners are rebound whenever by-value DOM nodes move.
+    has_dirty_style_descendants: bool = true,
     // Property interpolation state shared by transitions and the currently
     // selected named keyframe animation. CssAnimationState identifies which
     // entries belong to the latter so CSS animations override transitions.
@@ -1091,12 +1096,14 @@ pub fn fixParentPointers(node: *Node, parent: ?*Node) void {
     switch (node.*) {
         .element => |*e| {
             e.parent = parent;
+            bindStyleOwner(node);
             for (e.children.items) |*child| {
                 fixParentPointers(child, node);
             }
         },
         .text => |*t| {
             t.parent = parent;
+            bindStyleOwner(node);
         },
     }
 }
@@ -1821,8 +1828,74 @@ fn styleNeedsUpdate(map: *StyleMap) bool {
     return false;
 }
 
+fn nodeParent(node: *const Node) ?*Node {
+    return switch (node.*) {
+        .text => |text| text.parent,
+        .element => |element| element.parent,
+    };
+}
+
+/// Publish a newly dirty computed-style field into the owning DOM tree's
+/// summary bits. The field itself remains the source of truth for whether the
+/// node needs recomputation; ancestors only summarize strict descendants.
+fn markStyleOwnerOpaque(ptr: *anyopaque) void {
+    const node: *Node = @ptrCast(@alignCast(ptr));
+    var ancestor = nodeParent(node);
+    while (ancestor) |parent| {
+        switch (parent.*) {
+            .text => break,
+            .element => |*element| {
+                element.has_dirty_style_descendants = true;
+                ancestor = element.parent;
+            },
+        }
+    }
+}
+
+/// DOM nodes live by value in resizable child arrays. Rebind every computed
+/// field after a supported move so a later ProtectedField dependency
+/// invalidation never calls through a stale Node address.
+fn bindStyleOwner(node: *Node) void {
+    const style_map = switch (node.*) {
+        .text => |*text| if (text.style) |*map| map else return,
+        .element => |*element| if (element.style) |*map| map else return,
+    };
+    var it = style_map.iterator();
+    while (it.next()) |entry| {
+        entry.value_ptr.setOwner(node, markStyleOwnerOpaque);
+    }
+}
+
+fn markStyleMapWithoutOwner(style_map: *StyleMap) void {
+    var it = style_map.iterator();
+    while (it.next()) |entry| entry.value_ptr.markNoOwner();
+}
+
+fn markAncestorStyleSummaries(node: ?*Node) void {
+    var ancestor = node;
+    while (ancestor) |parent| {
+        switch (parent.*) {
+            .text => break,
+            .element => |*element| {
+                element.has_dirty_style_descendants = true;
+                ancestor = element.parent;
+            },
+        }
+    }
+}
+
+pub fn styleTreeNeedsUpdate(node: *const Node) bool {
+    return switch (node.*) {
+        .text => |*text| text.style == null or styleNeedsUpdate(@constCast(&text.style.?)),
+        .element => |*element| element.style == null or
+            styleNeedsUpdate(@constCast(&element.style.?)) or
+            element.has_dirty_style_descendants,
+    };
+}
+
 pub fn dirtyStyleForElement(e: *Element) void {
-    if (e.style) |*style_map| dirtyStyleMap(style_map);
+    if (e.style) |*style_map| markStyleMapWithoutOwner(style_map);
+    markAncestorStyleSummaries(e.parent);
 
     // Relational selectors make an element's attributes/style relevant to
     // every ancestor. Conservatively dirty that chain; this remains O(depth)
@@ -1832,7 +1905,7 @@ pub fn dirtyStyleForElement(e: *Element) void {
         switch (node.*) {
             .text => break,
             .element => |*element| {
-                if (element.style) |*style_map| dirtyStyleMap(style_map);
+                if (element.style) |*style_map| markStyleMapWithoutOwner(style_map);
                 ancestor = element.parent;
             },
         }
@@ -1845,11 +1918,12 @@ pub fn dirtyStyleForElement(e: *Element) void {
 pub fn dirtyStyleSubtree(node: *Node) void {
     switch (node.*) {
         .text => |*text| {
-            if (text.style) |*style_map| dirtyStyleMap(style_map);
+            if (text.style) |*style_map| markStyleMapWithoutOwner(style_map);
         },
         .element => |*element| {
-            if (element.style) |*style_map| dirtyStyleMap(style_map);
+            if (element.style) |*style_map| markStyleMapWithoutOwner(style_map);
             for (element.children.items) |*child| dirtyStyleSubtree(child);
+            element.has_dirty_style_descendants = element.children.items.len != 0;
         },
     }
 }
@@ -1860,11 +1934,20 @@ pub fn dirtyStyleSubtree(node: *Node) void {
 pub fn clearStyleInvalidations(node: *Node) void {
     switch (node.*) {
         .text => |*text| {
-            if (text.style) |*style_map| clearStyleMapInvalidations(style_map);
+            if (text.style) |*style_map| {
+                clearStyleMapInvalidations(style_map);
+                markStyleMapWithoutOwner(style_map);
+            }
         },
         .element => |*element| {
-            if (element.style) |*style_map| clearStyleMapInvalidations(style_map);
+            if (element.style) |*style_map| {
+                clearStyleMapInvalidations(style_map);
+                markStyleMapWithoutOwner(style_map);
+            }
             for (element.children.items) |*child| clearStyleInvalidations(child);
+            // Clearing raw dependency edges requires a complete subtree style
+            // pass to rebuild them, not merely a walk through clean nodes.
+            element.has_dirty_style_descendants = element.children.items.len != 0;
         },
     }
 }
@@ -1872,11 +1955,6 @@ pub fn clearStyleInvalidations(node: *Node) void {
 fn clearStyleMapInvalidations(style_map: *StyleMap) void {
     var it = style_map.iterator();
     while (it.next()) |entry| entry.value_ptr.clearInvalidations();
-}
-
-fn dirtyStyleMap(style_map: *StyleMap) void {
-    var it = style_map.iterator();
-    while (it.next()) |entry| entry.value_ptr.mark();
 }
 
 fn cssDefaultFor(property: []const u8) []const u8 {
@@ -2091,10 +2169,31 @@ fn getDefaultParentStyle(allocator: std.mem.Allocator) !StyleMap {
     return parent_style;
 }
 
-// Parse inline styles from the style attribute and apply CSS rules to the node tree
-// This function recurses through the HTML tree to process all elements
+pub const StylePassStats = struct {
+    /// Nodes whose own style or descendant summary required entering them.
+    visited_nodes: usize = 0,
+    /// Nodes whose computed-style fields were actually recalculated.
+    recomputed_nodes: usize = 0,
+    /// Clean subtree roots rejected without visiting any of their children.
+    skipped_subtrees: usize = 0,
+};
+
+// Parse inline styles from the style attribute and apply CSS rules to the node tree.
 pub fn style(allocator: std.mem.Allocator, node: *Node, rules: []const CSSParser.CSSRule) !void {
-    return styleWithKeyframes(allocator, node, rules, &.{});
+    return styleWithKeyframesInternal(allocator, node, rules, &.{}, null);
+}
+
+/// Instrumented style entry point used by invalidation regressions and
+/// isolated diagnostics. Production callers use `style` or
+/// `styleWithKeyframes`; the traversal and behavior are identical.
+pub fn styleWithStats(
+    allocator: std.mem.Allocator,
+    node: *Node,
+    rules: []const CSSParser.CSSRule,
+    stats: *StylePassStats,
+) !void {
+    stats.* = .{};
+    return styleWithKeyframesInternal(allocator, node, rules, &.{}, stats);
 }
 
 pub fn styleWithKeyframes(
@@ -2103,6 +2202,21 @@ pub fn styleWithKeyframes(
     rules: []const CSSParser.CSSRule,
     keyframes: []const CSSParser.KeyframesRule,
 ) !void {
+    return styleWithKeyframesInternal(allocator, node, rules, keyframes, null);
+}
+
+fn styleWithKeyframesInternal(
+    allocator: std.mem.Allocator,
+    node: *Node,
+    rules: []const CSSParser.CSSRule,
+    keyframes: []const CSSParser.KeyframesRule,
+    stats: ?*StylePassStats,
+) !void {
+    if (!styleTreeNeedsUpdate(node)) {
+        if (stats) |pass_stats| pass_stats.skipped_subtrees += 1;
+        return;
+    }
+
     var has_cache = CSSParser.HasMatchCache.init(allocator);
     defer has_cache.deinit();
     for (rules) |rule| try rule.selector.populateHasMatches(&has_cache, node);
@@ -2119,6 +2233,7 @@ pub fn styleWithKeyframes(
         empty_ancestors,
         .{ .has_cache = &has_cache },
         true,
+        stats,
     );
 }
 
@@ -2164,7 +2279,14 @@ fn styleWithParent(
     ancestor_chain: []const *Node,
     match_context: CSSParser.MatchContext,
     parent_is_ephemeral_default: bool,
+    stats: ?*StylePassStats,
 ) !void {
+    if (!styleTreeNeedsUpdate(node)) {
+        if (stats) |pass_stats| pass_stats.skipped_subtrees += 1;
+        return;
+    }
+    if (stats) |pass_stats| pass_stats.visited_nodes += 1;
+
     switch (node.*) {
         .text => |*t| {
             if (t.style == null) {
@@ -2173,9 +2295,12 @@ fn styleWithParent(
                     "TextNode",
                     if (parent_is_ephemeral_default) null else parent_style,
                 );
+                bindStyleOwner(node);
             }
             var style_map = &t.style.?;
-            if (!styleNeedsUpdate(style_map)) return;
+            std.debug.assert(styleNeedsUpdate(style_map));
+            if (stats) |pass_stats| pass_stats.recomputed_nodes += 1;
+            errdefer markStyleMapWithoutOwner(style_map);
 
             var new_style = std.StringHashMap([]const u8).init(allocator);
             defer new_style.deinit();
@@ -2214,11 +2339,14 @@ fn styleWithParent(
                     "Element",
                     if (parent_is_ephemeral_default) null else parent_style,
                 );
+                bindStyleOwner(node);
             }
             var style_map = &e.style.?;
             const needs_style = styleNeedsUpdate(style_map);
 
             if (needs_style) {
+                if (stats) |pass_stats| pass_stats.recomputed_nodes += 1;
+                errdefer markStyleMapWithoutOwner(style_map);
                 var new_style = std.StringHashMap([]const u8).init(allocator);
                 defer new_style.deinit();
                 var cascade_priorities = std.StringHashMap(u32).init(allocator);
@@ -2372,8 +2500,13 @@ fn styleWithParent(
                     new_ancestors,
                     match_context,
                     false,
+                    stats,
                 );
             }
+            // Clear only after every requested descendant completed. An error
+            // leaves the summary set so a later protected style generation
+            // retries the unfinished branch.
+            e.has_dirty_style_descendants = false;
         },
     }
 }

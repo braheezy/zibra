@@ -42,7 +42,10 @@ before changing `root.zig`, `tab.zig`, `render/`, or browser task scheduling.
   for a successful style pass to republish it clean. Do not reintroduce
   tab-wide `needs_style` or `needs_layout` flags. The retained
   `DocumentLayout.layoutNeeded()` graph is the sole geometry dirty source;
-  `Tab.needs_paint` remains independent for paint-only changes.
+  `Tab.needs_paint` remains independent for paint-only changes. A conservative
+  Frame-level style request may find a clean DOM summary; in that case publish
+  the protected document immediately without traversing nodes or rescanning
+  background-image users.
   Each child Frame also stores the numeric authored zoom inherited at its
   iframe boundary. Recompute it from the styled containing-node ancestry
   before child layout, rescale the already-published viewport by the factor
