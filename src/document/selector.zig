@@ -12,6 +12,7 @@ pub const Selector = union(enum) {
     tag: TagSelector,
     class: ClassSelector,
     focus_visible: FocusVisibleSelector,
+    hover: HoverSelector,
     sequence: SelectorSequence,
     has: HasSelector,
     descendant: DescendantSelector,
@@ -32,6 +33,7 @@ pub const Selector = union(enum) {
             .tag => |t| t.matches(node),
             .class => |c| c.matches(node),
             .focus_visible => |focus_visible| focus_visible.matches(node),
+            .hover => |hover| hover.matches(node),
             .sequence => |s| s.matches(node),
             .has => |h| h.matches(node, context),
             .descendant => |d| d.matches(node, ancestor_chain, context),
@@ -57,6 +59,7 @@ pub const Selector = union(enum) {
             .tag => |*t| t.deinit(allocator),
             .class => |*c| c.deinit(allocator),
             .focus_visible => {},
+            .hover => {},
             .sequence => |*s| s.deinit(allocator),
             .has => |*h| h.deinit(allocator),
             .descendant => |*d| d.deinit(allocator),
@@ -70,6 +73,7 @@ pub const Selector = union(enum) {
             .tag => |t| t.priority(),
             .class => |c| c.priority(),
             .focus_visible => |focus_visible| focus_visible.priority(),
+            .hover => |hover| hover.priority(),
             .sequence => |s| s.priority(),
             .has => |h| h.priority(),
             .descendant => |d| d.priority(),
@@ -83,6 +87,7 @@ pub const SimpleSelector = union(enum) {
     tag: TagSelector,
     class: ClassSelector,
     focus_visible: FocusVisibleSelector,
+    hover: HoverSelector,
     sequence: SelectorSequence,
     has: HasSelector,
 
@@ -91,6 +96,7 @@ pub const SimpleSelector = union(enum) {
             .tag => |tag| .{ .tag = tag },
             .class => |class| .{ .class = class },
             .focus_visible => |focus_visible| .{ .focus_visible = focus_visible },
+            .hover => |hover| .{ .hover = hover },
             .sequence => |sequence| .{ .sequence = sequence },
             .has => |has| .{ .has = has },
         };
@@ -101,6 +107,7 @@ pub const SimpleSelector = union(enum) {
             .tag => |tag| tag.matches(node),
             .class => |class| class.matches(node),
             .focus_visible => |focus_visible| focus_visible.matches(node),
+            .hover => |hover| hover.matches(node),
             .sequence => |sequence| sequence.matches(node),
             .has => |has| has.matches(node, context),
         };
@@ -122,6 +129,7 @@ pub const SimpleSelector = union(enum) {
             .tag => |*tag| tag.deinit(allocator),
             .class => |*class| class.deinit(allocator),
             .focus_visible => {},
+            .hover => {},
             .sequence => |*sequence| sequence.deinit(allocator),
             .has => |*has| has.deinit(allocator),
         }
@@ -132,6 +140,7 @@ pub const SimpleSelector = union(enum) {
             .tag => |tag| tag.priority(),
             .class => |class| class.priority(),
             .focus_visible => |focus_visible| focus_visible.priority(),
+            .hover => |hover| hover.priority(),
             .sequence => |sequence| sequence.priority(),
             .has => |has| has.priority(),
         };
@@ -188,6 +197,24 @@ pub const FocusVisibleSelector = struct {
     }
 };
 
+/// The dynamic `:hover` pseudo-class. Pointer hit resolution marks the
+/// innermost hovered element and its element ancestors, matching the browser
+/// behavior where a parent remains hovered while the pointer is over a child.
+pub const HoverSelector = struct {
+    fn matches(self: HoverSelector, node: *Node) bool {
+        _ = self;
+        return switch (node.*) {
+            .element => |element| element.is_hovered,
+            .text => false,
+        };
+    }
+
+    fn priority(self: HoverSelector) u32 {
+        _ = self;
+        return 10;
+    }
+};
+
 /// Tag selector - matches elements by tag name (e.g., "p", "div", "ul")
 pub const TagSelector = struct {
     tag: []const u8,
@@ -223,12 +250,14 @@ pub const SequenceSelector = union(enum) {
     tag: TagSelector,
     class: ClassSelector,
     focus_visible: FocusVisibleSelector,
+    hover: HoverSelector,
 
     pub fn intoSimpleSelector(self: SequenceSelector) SimpleSelector {
         return switch (self) {
             .tag => |tag| .{ .tag = tag },
             .class => |class| .{ .class = class },
             .focus_visible => |focus_visible| .{ .focus_visible = focus_visible },
+            .hover => |hover| .{ .hover = hover },
         };
     }
 
@@ -237,6 +266,7 @@ pub const SequenceSelector = union(enum) {
             .tag => |tag| tag.matches(node),
             .class => |class| class.matches(node),
             .focus_visible => |focus_visible| focus_visible.matches(node),
+            .hover => |hover| hover.matches(node),
         };
     }
 
@@ -245,6 +275,7 @@ pub const SequenceSelector = union(enum) {
             .tag => |*tag| tag.deinit(allocator),
             .class => |*class| class.deinit(allocator),
             .focus_visible => {},
+            .hover => {},
         }
     }
 
@@ -253,6 +284,7 @@ pub const SequenceSelector = union(enum) {
             .tag => |tag| tag.priority(),
             .class => |class| class.priority(),
             .focus_visible => |focus_visible| focus_visible.priority(),
+            .hover => |hover| hover.priority(),
         };
     }
 };

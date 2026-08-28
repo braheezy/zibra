@@ -434,8 +434,8 @@ before changing `root.zig`, `tab.zig`, `render/`, or browser task scheduling.
   a synthetic wrapper has none. Layout descent must invert live translations,
   apply element scroll at the owning block, and visit later siblings first
   instead of rebuilding per-object absolute rectangles. Keep this query on the
-  serialized tab worker; UI-thread accessibility continues to consume its
-  committed bounds snapshot. Positioned siblings use signed z-index followed
+  serialized tab worker; accessibility hit selection consumes its separate
+  committed bounds snapshot on that same queued worker path. Positioned siblings use signed z-index followed
   by DOM index for both paint and reverse hit order; static elements remain in
   layer zero even when they declare z-index. A primary hit
   dispatches one click at the painted element and bubbles through its
@@ -446,6 +446,16 @@ before changing `root.zig`, `tab.zig`, `render/`, or browser task scheduling.
   `stopPropagation`. `link_bounds` and `iframe_bounds` may support
   layout-derived accessibility/coordinate bookkeeping, but must not select a
   click target; keep focus, accessibility, and fragment bounds intact.
+- Native mouse motion crosses to the serialized Tab runner as scalar
+  content-viewport device coordinates only. `Tab.pending_hover` enters the
+  render gate without dirtying style or layout; after any pending layout
+  completes, the worker applies its live root scroll/zoom and uses the retained
+  local-coordinate hit query to install one hovered element per Frame along an
+  iframe path. It then dirties the changed branch subtrees and their ancestor
+  style summaries before scheduling a separate render. Moving over chrome,
+  leaving the window, or losing window focus queues a clear request.
+  `Frame.hovered_node` is a generation-bound raw DOM borrow and must retire at
+  the same structural-mutation boundary as focus and element-scroll focus.
 - Rounded backgrounds are rounded hit targets, not their containing
   rectangles: corner misses continue through reverse paint order to visible
   content underneath. Keep an ordinary rounded element's complete paint group,

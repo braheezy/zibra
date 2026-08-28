@@ -67,6 +67,11 @@ or selector/rule lifetime.
   and the Tab-installed `Element.is_focus_visible` heuristic snapshot are set.
   Focus transitions must dirty the element before styling so selector queries,
   author rules, and the native focus ring observe the same generation.
+- `:hover` has the same class specificity and sequence support. The serialized
+  Tab worker installs `Element.is_hovered` on the innermost hit element and
+  each element ancestor in that document. A changed hover path dirties the
+  changed branch subtrees (for ancestor-dependent descendant selectors) and
+  their ancestor summaries before its follow-up paint.
 - Descendant selectors own a flat, source-ordered list of simple selectors.
   Matching callers must pass ancestors from the document root through the
   immediate parent so matching remains one O(n + d) backward walk.

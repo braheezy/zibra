@@ -222,6 +222,10 @@ translation, rounded-clip, overlap, and iframe click routing. Only the visible
 topmost painted target should activate; its child and destination pages are
 support fixtures in the same directory.
 
+`tests/manual/hover.html` verifies deferred `:hover` hit resolution, ancestor
+matching, target transitions and clearing over chrome/window leave, plus a
+layout-changing hover rule that must settle without stale state.
+
 `tests/manual/rounded-hit-testing.html` isolates rounded-corner targeting for
 ordinary blocks, rich buttons, and text inputs. Corner clicks leave the visible
 counters unchanged while clicks in painted centers increment exactly one.

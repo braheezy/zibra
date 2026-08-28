@@ -14,6 +14,7 @@ const SimpleSelector = selector_mod.SimpleSelector;
 const TagSelector = selector_mod.TagSelector;
 const ClassSelector = selector_mod.ClassSelector;
 const FocusVisibleSelector = selector_mod.FocusVisibleSelector;
+const HoverSelector = selector_mod.HoverSelector;
 const SequenceSelector = selector_mod.SequenceSelector;
 const SelectorSequence = selector_mod.SelectorSequence;
 const HasSelector = selector_mod.HasSelector;
@@ -910,7 +911,7 @@ fn startsWithMediaRule(self: *const CSSParser) bool {
     return next == self.string.len or std.ascii.isWhitespace(self.string[next]) or self.string[next] == '(';
 }
 
-/// Parse a tag/class/`:focus-visible` selector, `:has(...)` relational
+/// Parse a tag/class/dynamic-pseudo selector, `:has(...)` relational
 /// selector, or a whitespace-separated descendant selector. ID, attribute,
 /// and other combinator selectors are not yet supported.
 pub fn selector(self: *CSSParser, allocator: std.mem.Allocator) !Selector {
@@ -951,7 +952,7 @@ pub fn selector(self: *CSSParser, allocator: std.mem.Allocator) !Selector {
 
 /// Parse a selector anchored to the current element and optionally constrained
 /// by a matching strict descendant. Zibra's current selector subset accepts a
-/// tag/class/focus-visible sequence on each side of `:has`.
+/// tag/class/dynamic-pseudo sequence on each side of `:has`.
 fn relationalSelector(self: *CSSParser, allocator: std.mem.Allocator) !SimpleSelector {
     var ancestor = try self.simpleSelector(allocator);
     errdefer ancestor.deinit(allocator);
@@ -1023,14 +1024,21 @@ fn simpleSelector(self: *CSSParser, allocator: std.mem.Allocator) !SimpleSelecto
             self.pos = pseudo_start;
             break;
         };
-        if (!std.ascii.eqlIgnoreCase(pseudo_class, "focus-visible")) {
+        const dynamic_selector: SequenceSelector = if (std.ascii.eqlIgnoreCase(
+            pseudo_class,
+            "focus-visible",
+        ))
+            .{ .focus_visible = FocusVisibleSelector{} }
+        else if (std.ascii.eqlIgnoreCase(pseudo_class, "hover"))
+            .{ .hover = HoverSelector{} }
+        else {
             self.pos = pseudo_start;
             break;
-        }
+        };
         try appendSequenceSelector(
             allocator,
             &selectors,
-            .{ .focus_visible = FocusVisibleSelector{} },
+            dynamic_selector,
         );
     }
 

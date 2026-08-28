@@ -585,6 +585,10 @@ pub const Element = struct {
     // generation. Native focus-ring paint and `:focus-visible` both consume
     // this bit so author styling cannot drift from the browser indicator.
     is_focus_visible: bool = false,
+    // Dynamic selector state installed by the serialized Tab worker after a
+    // retained-layout hit test. The pointed-to element and each of its DOM
+    // ancestors carry this bit while the pointer is inside their subtree.
+    is_hovered: bool = false,
     // Browser-session annotation used only while painting link descendants.
     // It owns no URL or session storage.
     is_visited: bool = false,
@@ -641,6 +645,7 @@ pub const Element = struct {
             .owned_strings = null,
             .is_focused = false,
             .is_focus_visible = false,
+            .is_hovered = false,
             .is_visited = false,
             .script_started = false,
             .animations = null,

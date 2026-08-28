@@ -316,8 +316,8 @@ and the standalone Browser in screenshot mode.
 
 History entries own separate replay URL/body copies, so truncating a Forward
 branch cannot invalidate the currently installed root URL. `parent`, `tab`,
-`frame_element`, DOM focus and element-scroll focus pointers, hit-test node
-pointers, `js_context`, and layout-related node pointers are borrowed.
+`frame_element`, DOM focus, hover, and element-scroll focus pointers, hit-test
+node pointers, `js_context`, and layout-related node pointers are borrowed.
 
 Structural DOM mutation also marks the affected frame's resources dirty. On
 the serialized tab worker, after the JavaScript host call has completed and
@@ -855,10 +855,25 @@ their provenance-bearing cached paint commands as an exact local leaf. Content
 clicks still require a painted-command hit—preserving fragment gaps, glyph
 bitmap geometry, rich controls, and masks—but always perform the layout query
 and use it when painted provenance cannot resolve an originating node.
-Run this layout query only on the serialized tab worker; UI-thread accessibility
-continues to consume its committed root-relative bounds snapshot rather than
-borrowing a concurrently rebuilt layout graph. Neither hit-test path rebuilds
-every descendant's absolute bounds.
+Run this layout query only on the serialized tab worker; accessibility hit
+selection is queued to that worker too and consumes its separate committed
+root-relative bounds snapshot rather than borrowing a concurrently rebuilt
+layout graph. Neither hit-test path rebuilds every descendant's absolute bounds.
+
+Mouse motion transfers only content-viewport device coordinates from the UI
+thread to the serialized Tab runner. The Tab stores the latest point plus a
+pending bit; that bit enters the render gate without marking style, layout, or
+paint. After the render has completed any already-required layout, the worker
+adds its live root scroll and applies its current accessibility zoom, queries
+the clean retained layout (with a painted-provenance fallback), descends
+through iframe bounds, and retains one innermost element pointer in every Frame
+on that path. Each target and its DOM element ancestors receive `is_hovered`;
+changed branch subtrees plus their ancestor summaries become dirty before a
+separate render, covering descendant selectors anchored by `:hover` without an
+input-time layout. Chrome motion and native leave/focus-loss events enqueue the
+same path with no point to clear it. These Frame hover pointers borrow one DOM
+generation and are cleared before structural child storage can relocate or
+retire them.
 
 Block painting preserves layout and DOM storage order but visits immediate
 children through a retained stable permutation of their DOM indices. A non-static

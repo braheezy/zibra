@@ -33,6 +33,11 @@ const FrameBoundEntry = struct {
     bounds: Bounds,
 };
 
+const FrameHoverTarget = struct {
+    frame: *Frame,
+    node: *Node,
+};
+
 fn isStrictDomDescendant(node: *Node, ancestor: *Node) bool {
     var current = switch (node.*) {
         .element => |element| element.parent,
@@ -48,9 +53,93 @@ fn isStrictDomDescendant(node: *Node, ancestor: *Node) bool {
     return false;
 }
 
+fn parentNode(node: *Node) ?*Node {
+    return switch (node.*) {
+        .element => |element| element.parent,
+        .text => |text| text.parent,
+    };
+}
+
+/// Painted text fragments hover their containing element. Display/layout hit
+/// provenance can name either kind of Node, so normalize before retaining a
+/// generation-bound target.
+fn hoverElementForNode(node: *Node) ?*Node {
+    var current: ?*Node = node;
+    while (current) |candidate| {
+        switch (candidate.*) {
+            .element => return candidate,
+            .text => |text| current = text.parent,
+        }
+    }
+    return null;
+}
+
+fn nodeDepth(node: *Node) usize {
+    var depth: usize = 0;
+    var current: ?*Node = node;
+    while (current) |candidate| : (current = parentNode(candidate)) depth += 1;
+    return depth;
+}
+
+fn commonDomAncestor(left: *Node, right: *Node) ?*Node {
+    var left_node = left;
+    var right_node = right;
+    var left_depth = nodeDepth(left_node);
+    var right_depth = nodeDepth(right_node);
+    while (left_depth > right_depth) : (left_depth -= 1) {
+        left_node = parentNode(left_node) orelse return null;
+    }
+    while (right_depth > left_depth) : (right_depth -= 1) {
+        right_node = parentNode(right_node) orelse return null;
+    }
+    while (left_node != right_node) {
+        left_node = parentNode(left_node) orelse return null;
+        right_node = parentNode(right_node) orelse return null;
+    }
+    return left_node;
+}
+
+/// Toggle one side of a hover-path transition and return the highest changed
+/// element. Restyling that element's subtree covers descendant selectors such
+/// as `.card:hover .label` without revisiting a shared hovered ancestor.
+fn updateHoverBranch(branch_start: *Node, stop_before: ?*Node, hovered: bool) ?*Node {
+    var highest_changed: ?*Node = null;
+    var current: ?*Node = branch_start;
+    while (current) |candidate| : (current = parentNode(candidate)) {
+        if (candidate == stop_before) break;
+        switch (candidate.*) {
+            .element => |*element| {
+                if (element.is_hovered != hovered) {
+                    element.is_hovered = hovered;
+                    highest_changed = candidate;
+                }
+            },
+            .text => {},
+        }
+    }
+    return highest_changed;
+}
+
+fn dirtyHoverBranch(root: ?*Node) void {
+    const node = root orelse return;
+    parser.dirtyStyleSubtree(node);
+    switch (node.*) {
+        .element => |*element| parser.dirtyStyleForElement(element),
+        .text => {},
+    }
+}
+
 pub const ClickButton = enum {
     primary,
     middle,
+};
+
+/// Latest pointer location in content-viewport device pixels. The UI thread
+/// copies this scalar snapshot into a Tab task; the worker adds its live root
+/// scroll and zoom only when resolving after layout.
+pub const HoverPosition = struct {
+    device_x: i32,
+    viewport_device_y: i32,
 };
 
 /// JavaScript event helpers normally acquire the Js mutex. A synchronous
@@ -259,6 +348,10 @@ pub const Frame = struct {
     // The innermost clicked `overflow: scroll` element. This worker-owned DOM
     // borrow is retired at the same structural-mutation boundary as focus.
     scroll_focus: ?*Node = null,
+    // Innermost element under the pointer in this browsing context. A nested
+    // iframe hover keeps one target in every Frame along the embedding path.
+    // Like focus, this raw DOM borrow is worker-owned and generation-bound.
+    hovered_node: ?*Node = null,
     js_context: ?*js_module = null,
     js_render_context: JsRenderContext = .{},
     js_render_context_initialized: bool = false,
@@ -325,6 +418,30 @@ pub const Frame = struct {
     /// style-field notifications decide whether its geometry is also dirty.
     pub fn markDocumentStyleDirty(self: *Frame) void {
         self.document.mark();
+    }
+
+    fn updateHoveredNode(self: *Frame, node: ?*Node) bool {
+        const target = if (node) |candidate| hoverElementForNode(candidate) else null;
+        if (self.hovered_node == target) return false;
+
+        const common = if (self.hovered_node) |previous|
+            if (target) |next| commonDomAncestor(previous, next) else null
+        else
+            null;
+        const cleared_root = if (self.hovered_node) |previous|
+            updateHoverBranch(previous, common, false)
+        else
+            null;
+        const set_root = if (target) |next|
+            updateHoverBranch(next, common, true)
+        else
+            null;
+        self.hovered_node = target;
+        dirtyHoverBranch(cleared_root);
+        dirtyHoverBranch(set_root);
+        const changed = cleared_root != null or set_root != null;
+        if (changed) self.markDocumentStyleDirty();
+        return changed;
     }
 
     /// Destroy the last retained layout while its DOM dependencies are still
@@ -415,6 +532,7 @@ pub const Frame = struct {
         self.tab.unregisterFrame(self);
         self.js_context = null;
         self.js_render_context_initialized = false;
+        self.hovered_node = null;
 
         // Display-item provenance borrows this frame's layout and DOM. Retire
         // it before any descendant/layout/node generation can be destroyed.
@@ -499,6 +617,11 @@ pub const Frame = struct {
         if (self.scroll_focus) |scroll_node| {
             if (isStrictDomDescendant(scroll_node, mutation_root)) {
                 self.scroll_focus = null;
+            }
+        }
+        if (self.hovered_node) |hovered_node| {
+            if (isStrictDomDescendant(hovered_node, mutation_root)) {
+                _ = self.updateHoveredNode(null);
             }
         }
         self.retireDisplayList();
@@ -875,6 +998,65 @@ pub const Frame = struct {
         return target;
     }
 
+    /// Resolve a point only against an already-published generation. This is
+    /// called after the render layout phase and deliberately declines to read
+    /// a dirty protected document or a retained tree that still needs layout.
+    fn hoverHitNodeDevice(
+        self: *Frame,
+        device_x: i32,
+        device_y: i32,
+        zoom: f32,
+    ) ?*Node {
+        if (!self.document.dirty) {
+            if (self.document.get().*) |document| {
+                if (!document.layoutNeeded()) {
+                    if (document.hitTestDevice(device_x, device_y, zoom)) |hit| {
+                        return hoverElementForNode(hit.node);
+                    }
+                }
+            }
+        }
+
+        const items = self.display_list orelse return null;
+        const hit = DisplayItem.hitTestDevice(items, device_x, device_y, zoom) orelse return null;
+        const node = hit.source.originatingNode() orelse return null;
+        return hoverElementForNode(node);
+    }
+
+    fn iframeBoundsForNode(self: *const Frame, node: *Node) ?Bounds {
+        for (self.iframe_bounds.items) |entry| {
+            if (entry.node == node) return entry.bounds;
+        }
+        return null;
+    }
+
+    /// Collect one hovered element per browsing context along an iframe path.
+    /// Keeping the host iframe in the parent path makes parent-document
+    /// `iframe:hover` and ancestor selectors behave as expected.
+    fn collectHoverPathDevice(
+        self: *Frame,
+        device_x: i32,
+        device_y: i32,
+        zoom: f32,
+        path: *std.ArrayList(FrameHoverTarget),
+    ) !void {
+        const target = self.hoverHitNodeDevice(device_x, device_y, zoom) orelse return;
+        try path.append(self.allocator, .{ .frame = self, .node = target });
+
+        const element = switch (target.*) {
+            .element => |*value| value,
+            .text => return,
+        };
+        if (!std.ascii.eqlIgnoreCase(element.tag, "iframe")) return;
+
+        const child = self.findFrameByElement(target) orelse return;
+        const bounds = self.iframeBoundsForNode(target) orelse return;
+        const child_x = device_x -| DisplayItem.scaleLayoutPx(bounds.x, zoom);
+        const child_origin_y = bounds.y -| child.scroll;
+        const child_y = device_y -| DisplayItem.scaleLayoutPx(child_origin_y, zoom);
+        try child.collectHoverPathDevice(child_x, child_y, zoom, path);
+    }
+
     pub fn click(self: *Frame, b: *Browser, x: i32, y: i32, button: ClickButton) !bool {
         const zoom = self.tab.accessibility.zoom;
         return self.clickDevice(
@@ -1247,6 +1429,11 @@ shutting_down: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
 // Paint is the only coarse render flag. Style readiness is protected by each
 // Frame.document, while layout dirtiness lives in the retained layout graph.
 needs_paint: bool = true,
+// Mouse motion publishes only scalar content-viewport coordinates. The next
+// worker-side render applies live scroll/zoom after any required layout, then
+// queues a second style generation if the hovered DOM path changed.
+hover_position: ?HoverPosition = null,
+pending_hover: bool = false,
 // Author rules were filtered under an older color/viewport media environment.
 media_environment_dirty: bool = false,
 // Browser-session visited generation reflected by the current display list.
@@ -1389,6 +1576,21 @@ fn markFrameStyleDirty(frame: *Frame) void {
     for (frame.children.items) |child| markFrameStyleDirty(child);
 }
 
+fn desiredHoverTarget(path: []const FrameHoverTarget, frame: *Frame) ?*Node {
+    for (path) |entry| {
+        if (entry.frame == frame) return entry.node;
+    }
+    return null;
+}
+
+fn applyHoverPath(frame: *Frame, path: []const FrameHoverTarget) bool {
+    var changed = frame.updateHoveredNode(desiredHoverTarget(path, frame));
+    for (frame.children.items) |child| {
+        changed = applyHoverPath(child, path) or changed;
+    }
+    return changed;
+}
+
 fn frameTreeNeedsStyle(frame: *const Frame) bool {
     if (frame.styleNeeded()) return true;
     for (frame.children.items) |child| {
@@ -1491,6 +1693,7 @@ test "zoom changes CSS viewport width and invalidates media rules" {
     tab.accessibility = .{ .zoom = 1.0, .dark_palette = .{} };
     tab.root_frame = null;
     tab.needs_paint = false;
+    tab.pending_hover = false;
     tab.media_environment_dirty = false;
 
     try std.testing.expectEqual(@as(f64, 800), viewportWidthInCssPixels(800, 1.0));
@@ -1517,6 +1720,7 @@ test "forced colors changes invalidate media rules and the complete render pipel
     tab.accessibility = .{};
     tab.root_frame = null;
     tab.needs_paint = false;
+    tab.pending_hover = false;
     tab.media_environment_dirty = false;
 
     try std.testing.expect(tab.updateForcedColorsState(true));
@@ -2209,6 +2413,7 @@ pub fn prepareForDomMutation(self: *Tab, b: *Browser, frame: *Frame, mutation_ro
     std.debug.assert(frame.tab == self);
 
     self.needs_paint = true;
+    self.pending_hover = true;
     frame.resources_dirty = true;
     frame.markDocumentStyleDirty();
 
@@ -2255,6 +2460,7 @@ pub fn prepareForDomInsert(self: *Tab, b: *Browser, frame: *Frame, mutation_root
     }
 
     self.needs_paint = true;
+    self.pending_hover = true;
     frame.resources_dirty = true;
     frame.markDocumentStyleDirty();
 
@@ -2582,9 +2788,71 @@ pub fn animationFrameNeedsFullRender(self: *Tab, b: *Browser) bool {
 }
 
 pub fn renderPhasesNeeded(self: *const Tab) bool {
+    if (self.pending_hover) return true;
     if (self.needs_paint) return true;
     const frame = self.root_frame orelse return false;
     return frameTreeNeedsStyle(frame) or frameTreeNeedsLayout(frame);
+}
+
+fn sameHoverPosition(left: ?HoverPosition, right: ?HoverPosition) bool {
+    if (left == null or right == null) return left == null and right == null;
+    return left.?.device_x == right.?.device_x and
+        left.?.viewport_device_y == right.?.viewport_device_y;
+}
+
+/// Worker-side half of mouse motion. Publishing a point never reads layout;
+/// `render` consumes it only after completing any pending geometry work.
+pub fn hover(self: *Tab, position: ?HoverPosition) void {
+    if (sameHoverPosition(self.hover_position, position) and !self.pending_hover) return;
+    self.hover_position = position;
+    self.pending_hover = true;
+    self.browser.setNeedsAnimationFrame(self);
+    self.browser.scheduleAnimationFrame();
+}
+
+fn resolveHoverAfterLayout(self: *Tab, refresh: bool) !bool {
+    if (!self.pending_hover and !refresh) return false;
+
+    var path = std.ArrayList(FrameHoverTarget).empty;
+    defer path.deinit(self.allocator);
+
+    if (self.root_frame) |frame| {
+        if (self.hover_position) |position| {
+            const zoom = self.accessibility.zoom;
+            const page_device_y = position.viewport_device_y +|
+                DisplayItem.scaleLayoutPx(frame.scroll, zoom);
+            try frame.collectHoverPathDevice(
+                position.device_x,
+                page_device_y,
+                zoom,
+                &path,
+            );
+        }
+    }
+
+    const changed = if (self.root_frame) |frame|
+        applyHoverPath(frame, path.items)
+    else
+        false;
+
+    const accessibility_hit = if (self.accessibility.screen_reader)
+        if (self.hover_position) |position|
+            if (self.root_frame) |frame| blk: {
+                const zoom = self.accessibility.zoom;
+                const page_device_y = position.viewport_device_y +|
+                    DisplayItem.scaleLayoutPx(frame.scroll, zoom);
+                break :blk self.accessibilityHitTest(
+                    DisplayItem.deviceToLayoutPx(position.device_x, zoom),
+                    DisplayItem.deviceToLayoutPx(page_device_y, zoom),
+                );
+            } else null
+        else
+            null
+    else
+        null;
+    self.updateAccessibilityHover(accessibility_hit);
+    self.pending_hover = false;
+    return changed;
 }
 
 pub fn requestActivationCommit(self: *Tab) void {
@@ -2605,13 +2873,16 @@ pub fn render(self: *Tab, b: *Browser) !void {
     const trace_render = b.measure.begin("render");
     defer if (trace_render) b.measure.end("render");
 
+    const refresh_hover_after_render = self.pending_hover or self.hover_position != null;
     const frame = self.root_frame orelse {
+        _ = try self.resolveHoverAfterLayout(refresh_hover_after_render);
         self.needs_paint = false;
         self.visited_generation = visited_generation;
         return;
     };
     if (frame.current_node == null) {
         if (frame.styleNeeded()) frame.publishStyledDocument();
+        _ = try self.resolveHoverAfterLayout(refresh_hover_after_render);
         self.needs_paint = false;
         self.visited_generation = visited_generation;
         return;
@@ -2704,6 +2975,15 @@ pub fn render(self: *Tab, b: *Browser) !void {
     // Store the generation captured before annotation. A concurrent visit
     // leaves the tab conservatively stale for the next scheduled frame.
     self.visited_generation = visited_generation;
+
+    // The hit test consumes only the clean retained generation produced (or
+    // preserved) above. A changed DOM hover path dirties targeted style fields
+    // and deliberately schedules a separate style/layout/paint generation.
+    if (try self.resolveHoverAfterLayout(refresh_hover_after_render)) {
+        self.needs_paint = true;
+        b.setNeedsAnimationFrame(self);
+        b.scheduleAnimationFrame();
+    }
 
     if (profiling) {
         const total_ns: u64 = @intCast(std.Io.Clock.awake.now(b.io).nanoseconds - render_start);
@@ -3100,6 +3380,7 @@ fn initAnimationPhaseTest(
     tab.allocator = allocator;
     tab.root_frame = frame;
     tab.needs_paint = false;
+    tab.pending_hover = false;
     tab.composited_updates = .empty;
     tab.frames_by_id = std.AutoHashMap(u32, *Frame).init(allocator);
     tab.parent_window_ids = std.AutoHashMap(u32, u32).init(allocator);
@@ -3380,6 +3661,143 @@ pub fn clickDevice(
     if (button == .primary and !handled and self.focused_frame != null) {
         self.setNeedsRender();
     }
+}
+
+test "frame hover state follows the innermost element and its ancestors" {
+    const allocator = std.testing.allocator;
+    var html_parser = try parser.HTMLParser.init(
+        allocator,
+        "<main><section><span>first</span></section><section><span>second</span></section></main>",
+    );
+    html_parser.use_implicit_tags = false;
+    defer html_parser.deinit(allocator);
+
+    var tab: Tab = undefined;
+    tab.allocator = allocator;
+    tab.root_frame = null;
+    tab.frames_by_id = std.AutoHashMap(u32, *Frame).init(allocator);
+    defer tab.frames_by_id.deinit();
+    tab.parent_window_ids = std.AutoHashMap(u32, u32).init(allocator);
+    defer tab.parent_window_ids.deinit();
+
+    var frame = Frame.init(allocator, &tab, null, null);
+    defer frame.deinit();
+    tab.root_frame = &frame;
+    frame.current_node = try html_parser.parse();
+    parser.fixParentPointers(&frame.current_node.?, null);
+
+    var css_parser = try CSSParser.init(allocator, "section:hover span { color: green; }", false);
+    defer css_parser.deinit(allocator);
+    const rules = try css_parser.parse(allocator);
+    defer {
+        for (rules) |*rule| rule.deinit(allocator);
+        allocator.free(rules);
+    }
+    try parser.style(allocator, &frame.current_node.?, rules);
+
+    const main = &frame.current_node.?.element;
+    const first_section_node = &main.children.items[0];
+    const first_section = &first_section_node.element;
+    const first_span_node = &first_section.children.items[0];
+    const first_span = &first_span_node.element;
+    const first_text = &first_span.children.items[0];
+    const second_section = &main.children.items[1].element;
+    const second_span_node = &second_section.children.items[0];
+    const second_span = &second_span_node.element;
+
+    // A descendant selector must recompute even though the span itself is not
+    // hovered when the pointer is over section padding.
+    try std.testing.expect(frame.updateHoveredNode(first_section_node));
+    try parser.style(allocator, &frame.current_node.?, rules);
+    try std.testing.expect(first_section.is_hovered);
+    try std.testing.expect(!first_span.is_hovered);
+    try std.testing.expectEqualStrings("green", first_span.style.?.getPtr("color").?.get().*);
+
+    try std.testing.expect(frame.updateHoveredNode(first_text));
+    try std.testing.expect(frame.hovered_node == first_span_node);
+    try std.testing.expect(main.is_hovered);
+    try std.testing.expect(first_section.is_hovered);
+    try std.testing.expect(first_span.is_hovered);
+    try std.testing.expect(!second_section.is_hovered);
+    try std.testing.expect(!second_span.is_hovered);
+
+    try std.testing.expect(frame.updateHoveredNode(second_span_node));
+    try std.testing.expect(frame.hovered_node == second_span_node);
+    try std.testing.expect(main.is_hovered);
+    try std.testing.expect(!first_section.is_hovered);
+    try std.testing.expect(!first_span.is_hovered);
+    try std.testing.expect(second_section.is_hovered);
+    try std.testing.expect(second_span.is_hovered);
+
+    try std.testing.expect(frame.updateHoveredNode(null));
+    try std.testing.expect(frame.hovered_node == null);
+    try std.testing.expect(!main.is_hovered);
+    try std.testing.expect(!second_section.is_hovered);
+    try std.testing.expect(!second_span.is_hovered);
+    try std.testing.expect(!frame.updateHoveredNode(null));
+}
+
+test "pending hover resolves a retained hit after the layout phase" {
+    const allocator = std.testing.allocator;
+    var html_parser = try parser.HTMLParser.init(allocator, "<div><span>hit</span></div>");
+    html_parser.use_implicit_tags = false;
+    defer html_parser.deinit(allocator);
+
+    var tab: Tab = undefined;
+    tab.allocator = allocator;
+    tab.accessibility = .{ .zoom = 2.0, .dark_palette = .{} };
+    tab.accessibility_root = null;
+    tab.accessibility_hovered = null;
+    tab.root_frame = null;
+    tab.hover_position = .{ .device_x = 5, .viewport_device_y = 5 };
+    tab.pending_hover = true;
+    tab.frames_by_id = std.AutoHashMap(u32, *Frame).init(allocator);
+    defer tab.frames_by_id.deinit();
+    tab.parent_window_ids = std.AutoHashMap(u32, u32).init(allocator);
+    defer tab.parent_window_ids.deinit();
+
+    var frame = Frame.init(allocator, &tab, null, null);
+    defer frame.deinit();
+    tab.root_frame = &frame;
+    frame.scroll = 10;
+    frame.current_node = try html_parser.parse();
+    parser.fixParentPointers(&frame.current_node.?, null);
+    frame.publishStyledDocument();
+    try std.testing.expect(!frame.styleNeeded());
+    try std.testing.expect(frame.documentLayout() == null);
+
+    const span_node = &frame.current_node.?.element.children.items[0];
+    var layout_marker: u8 = 0;
+    const items = try allocator.alloc(DisplayItem, 1);
+    items[0] = .{ .rect = .{
+        .x1 = 0,
+        .y1 = 10,
+        .x2 = 20,
+        .y2 = 20,
+        .color = .{ .r = 255, .g = 255, .b = 255, .a = 255 },
+        .source = .{ .layout = &layout_marker, .node = span_node },
+    } };
+    frame.display_list = items;
+
+    try std.testing.expect(try tab.resolveHoverAfterLayout(false));
+    try std.testing.expect(!tab.pending_hover);
+    try std.testing.expect(frame.hovered_node == span_node);
+    try std.testing.expect(span_node.element.is_hovered);
+    try std.testing.expect(frame.current_node.?.element.is_hovered);
+    try std.testing.expect(frame.styleNeeded());
+    try std.testing.expect(frame.document.lastValue().* == null);
+}
+
+test "pending hover enters render without dirtying another phase" {
+    var tab: Tab = undefined;
+    tab.root_frame = null;
+    tab.needs_paint = false;
+    tab.pending_hover = false;
+    try std.testing.expect(!tab.renderPhasesNeeded());
+
+    tab.pending_hover = true;
+    try std.testing.expect(tab.renderPhasesNeeded());
+    try std.testing.expect(!tab.needs_paint);
 }
 
 pub const FormMethod = enum {

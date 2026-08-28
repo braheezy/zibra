@@ -961,9 +961,85 @@ test ":focus-visible matches the installed focus heuristic and recomputes styles
         input.style.?.getPtr("background-color").?.get().*,
     );
 
-    var unsupported_parser = try CSSParser.init(allocator, "button:hover", false);
+    var unsupported_parser = try CSSParser.init(allocator, "button:active", false);
     defer unsupported_parser.deinit(allocator);
     try std.testing.expectError(error.InvalidSelector, unsupported_parser.selector(allocator));
+}
+
+test ":hover matches elements and ancestor paths and recomputes styles" {
+    const allocator = std.testing.allocator;
+    const html =
+        "<main><section class=card><span class=label>First</span></section>" ++
+        "<section class=card><span class=label>Second</span></section></main>";
+    const css =
+        "section.card:hover { background-color: lightgray; }" ++
+        "main :hover { font-weight: bold; }" ++
+        ".card:hover .label:hover { color: green; }";
+
+    var html_parser = try HTMLParser.init(allocator, html);
+    html_parser.use_implicit_tags = false;
+    defer html_parser.deinit(allocator);
+    var root = try html_parser.parse();
+    defer root.deinit(allocator);
+    document_parser.fixParentPointers(&root, null);
+
+    var css_parser = try CSSParser.init(allocator, css, false);
+    defer css_parser.deinit(allocator);
+    const rules = try css_parser.parse(allocator);
+    defer {
+        for (rules) |*rule| rule.deinit(allocator);
+        allocator.free(rules);
+    }
+
+    try std.testing.expectEqual(@as(usize, 3), rules.len);
+    try std.testing.expectEqual(@as(u32, 21), rules[0].cascadePriority());
+    try std.testing.expectEqual(@as(u32, 11), rules[1].cascadePriority());
+    try std.testing.expectEqual(@as(u32, 40), rules[2].cascadePriority());
+
+    try document_parser.style(allocator, &root, rules);
+    const first_card = &root.element.children.items[0].element;
+    const first_label = &first_card.children.items[0].element;
+    const second_card = &root.element.children.items[1].element;
+    const second_label = &second_card.children.items[0].element;
+    try std.testing.expectEqualStrings(
+        "transparent",
+        first_card.style.?.getPtr("background-color").?.get().*,
+    );
+    try std.testing.expectEqualStrings("black", first_label.style.?.getPtr("color").?.get().*);
+
+    root.element.is_hovered = true;
+    first_card.is_hovered = true;
+    first_label.is_hovered = true;
+    document_parser.dirtyStyleForElement(first_label);
+    try document_parser.style(allocator, &root, rules);
+    try std.testing.expectEqualStrings(
+        "lightgray",
+        first_card.style.?.getPtr("background-color").?.get().*,
+    );
+    try std.testing.expectEqualStrings("bold", first_card.style.?.getPtr("font-weight").?.get().*);
+    try std.testing.expectEqualStrings("green", first_label.style.?.getPtr("color").?.get().*);
+    try std.testing.expectEqualStrings(
+        "transparent",
+        second_card.style.?.getPtr("background-color").?.get().*,
+    );
+
+    first_card.is_hovered = false;
+    first_label.is_hovered = false;
+    second_card.is_hovered = true;
+    second_label.is_hovered = true;
+    document_parser.dirtyStyleForElement(first_label);
+    document_parser.dirtyStyleForElement(second_label);
+    try document_parser.style(allocator, &root, rules);
+    try std.testing.expectEqualStrings(
+        "transparent",
+        first_card.style.?.getPtr("background-color").?.get().*,
+    );
+    try std.testing.expectEqualStrings("black", first_label.style.?.getPtr("color").?.get().*);
+    try std.testing.expectEqualStrings(
+        "lightgray",
+        second_card.style.?.getPtr("background-color").?.get().*,
+    );
+    try std.testing.expectEqualStrings("green", second_label.style.?.getPtr("color").?.get().*);
 }
 
 test "descendant selectors are flat and match ordered ancestor chains" {

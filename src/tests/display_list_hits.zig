@@ -545,6 +545,8 @@ fn initClickTab(tab: *tab_module.Tab, allocator: std.mem.Allocator) void {
     tab.root_frame = null;
     tab.focused_frame = null;
     tab.focus_modality = .keyboard;
+    tab.hover_position = null;
+    tab.pending_hover = false;
     tab.frames_by_id = std.AutoHashMap(u32, *tab_module.Frame).init(allocator);
     tab.parent_window_ids = std.AutoHashMap(u32, u32).init(allocator);
 }

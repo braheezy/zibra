@@ -1,0 +1,54 @@
+<!--
+Verify deferred :hover matching:
+1. Move the pointer over either white label. The label turns yellow/blue and
+   its complete card turns green, proving the hovered element's ancestor path
+   also matches.
+2. Move from a label into the padding of the same card. The card stays green
+   while the label returns to white/black.
+3. Move between cards. No green or yellow state should remain on the old card.
+4. Hover the "layout-changing" label. Its card widens and the paragraph below
+   reflows without a click, crash, or stale hover state.
+5. Move into browser chrome or outside the window. All page hover colors clear.
+-->
+<!doctype html>
+<html>
+<head>
+  <title>Deferred hover pseudo-class</title>
+  <style>
+    body { font-family: sans-serif; background-color: white; color: black; }
+    .card {
+      display: block;
+      width: 280px;
+      margin: 18px;
+      padding: 24px;
+      background-color: lightgray;
+      border-radius: 18px;
+    }
+    .card:hover { background-color: lightgreen; }
+    .label {
+      display: inline-block;
+      padding: 10px;
+      background-color: white;
+      color: black;
+    }
+    .card:hover .label:hover { background-color: yellow; color: blue; }
+    .grow:hover { width: 420px; }
+    .explanation { width: 330px; }
+  </style>
+</head>
+<body>
+  <h1>Deferred :hover</h1>
+  <div class="card">
+    Card padding
+    <span class="label">nested hover target</span>
+  </div>
+  <div class="card grow">
+    Layout-changing card
+    <span class="label">hover me to widen the card</span>
+  </div>
+  <p class="explanation">
+    Pointer motion queues scalar coordinates. Hover hit testing waits for the
+    retained layout generation, then selector invalidation paints the result.
+  </p>
+</body>
+</html>

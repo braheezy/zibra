@@ -221,6 +221,7 @@ test "tab resize updates root viewport and invalidates layout" {
     tab.accessibility = .{};
     tab.root_frame = null;
     tab.needs_paint = false;
+    tab.pending_hover = false;
     tab.media_environment_dirty = false;
     tab.scroll_changed_in_tab = false;
     tab.frames_by_id = std.AutoHashMap(u32, *tab_module.Frame).init(allocator);

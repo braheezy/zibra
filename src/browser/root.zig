@@ -1712,7 +1712,11 @@ pub const Browser = struct {
     pub fn handleWindowEvent(self: *Browser, window_event: sdl2.WindowEvent) !void {
         const canvas = self.canvas orelse return;
         switch (window_event.type) {
-            .focus_lost => self.touch_tracker.clear(),
+            .focus_lost => {
+                self.touch_tracker.clear();
+                if (self.activeTab()) |tab| self.scheduleTabHoverTask(tab, null);
+            },
+            .leave => if (self.activeTab()) |tab| self.scheduleTabHoverTask(tab, null),
             .resized, .size_changed => |size| {
                 self.lock.lock();
                 const active_tab_height = self.active_tab_height;
@@ -2139,24 +2143,19 @@ pub const Browser = struct {
         self.lock.lock();
         const tab = self.activeTab();
         const chrome_bottom = self.chrome.bottom;
-        const screen_reader_on = if (tab) |active| active.accessibility.screen_reader else false;
         self.lock.unlock();
 
-        if (!screen_reader_on) return;
         const active_tab = tab orelse return;
-        const frame = active_tab.root_frame orelse return;
         if (screen_y < chrome_bottom) {
-            active_tab.updateAccessibilityHover(null);
+            self.scheduleTabHoverTask(active_tab, null);
             return;
         }
 
         const tab_y = screen_y - chrome_bottom;
-        const zoom = self.activeZoom();
-        const page_x = if (zoom == 1.0) screen_x else @as(i32, @intFromFloat(@as(f32, @floatFromInt(screen_x)) / zoom));
-        const page_y = (if (zoom == 1.0) tab_y else @as(i32, @intFromFloat(@as(f32, @floatFromInt(tab_y)) / zoom))) + frame.scroll;
-
-        const hit = active_tab.accessibilityHitTest(page_x, page_y);
-        active_tab.updateAccessibilityHover(hit);
+        self.scheduleTabHoverTask(active_tab, .{
+            .device_x = screen_x,
+            .viewport_device_y = tab_y,
+        });
     }
 
     fn handleVoiceCommand(self: *Browser) void {
@@ -2207,6 +2206,14 @@ pub const Browser = struct {
             .button = button,
             .zoom = zoom,
         } }, "task:click");
+    }
+
+    fn scheduleTabHoverTask(
+        self: *Browser,
+        tab: *Tab,
+        position: ?tab_module.HoverPosition,
+    ) void {
+        self.scheduleTabAction(tab, .{ .hover = position }, "task:hover");
     }
 
     fn scheduleTabKeypressTask(self: *Browser, tab: *Tab, char: u8) void {
@@ -2654,6 +2661,7 @@ pub const Browser = struct {
 
         tab.task_runner.clear();
         tab.invalidateJsContext();
+        tab.pending_hover = true;
         self.retireRenderStateForTab(tab);
         if (tab.root_frame) |old_frame| {
             old_frame.deinit();
@@ -2966,6 +2974,8 @@ pub const Browser = struct {
         frame.js_render_context.setPointers(null, null, null, 0);
         frame.js_context = null;
         frame.js_render_context_initialized = false;
+        frame.hovered_node = null;
+        frame.tab.pending_hover = true;
 
         // Source metadata in the retained list borrows this layout/DOM
         // generation, so it must be gone before either tree is rebuilt.

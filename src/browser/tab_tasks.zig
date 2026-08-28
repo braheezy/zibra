@@ -13,6 +13,7 @@ const Node = parser.Node;
 const Tab = tab_module.Tab;
 const Frame = tab_module.Frame;
 const ClickButton = tab_module.ClickButton;
+const HoverPosition = tab_module.HoverPosition;
 const HistoryDirection = tab_module.HistoryDirection;
 
 pub fn Contexts(comptime Browser: type) type {
@@ -175,6 +176,7 @@ pub fn Contexts(comptime Browser: type) type {
                     button: ClickButton,
                     zoom: f32,
                 },
+                hover: ?HoverPosition,
                 keypress: u8,
                 backspace,
                 scroll: i32,
@@ -228,6 +230,7 @@ pub fn Contexts(comptime Browser: type) type {
                         click.button,
                         click.zoom,
                     ),
+                    .hover => |position| self.tab.hover(position),
                     .keypress => |char| try self.tab.keypress(self.browser, char),
                     .backspace => try self.tab.backspace(self.browser),
                     .scroll => |delta| self.tab.scrollFocused(self.browser, delta),

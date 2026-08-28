@@ -199,6 +199,7 @@ test "visited anchors are annotated and override descendant text at paint" {
     source_tab.visited_generation = source_generation;
     source_tab.root_frame = null;
     source_tab.needs_paint = false;
+    source_tab.pending_hover = false;
     try std.testing.expect(source_tab.animationFrameNeedsFullRender(&test_browser));
     try std.testing.expect(source_tab.needs_paint);
 
