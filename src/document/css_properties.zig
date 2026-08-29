@@ -67,7 +67,10 @@ pub const computed = [_]Property{
     .{ .name = "right", .default_value = "auto" },
     .{ .name = "bottom", .default_value = "auto" },
     .{ .name = "left", .default_value = "auto" },
-    .{ .name = "z-index", .default_value = "0" },
+    // `auto` is observably different from an explicit zero: both occupy the
+    // positioned auto/zero paint phase, but only an explicit integer creates
+    // the stacking-level semantics needed by nested contexts.
+    .{ .name = "z-index", .default_value = "auto" },
     .{ .name = "scroll-behavior", .default_value = "auto" },
     .{ .name = "zoom", .default_value = "1" },
     .{ .name = "width", .default_value = "auto" },

@@ -243,9 +243,16 @@ Important geometry contracts:
   `overflow: hidden` uses the same bounded paint and hit-test clip without
   creating element-local scroll state; the present bounded implementation
   clips to the layout block bounds.
-- Immediate layout children retain a stable paint permutation ordered by
-  effective signed z-index and DOM index. Only non-static positioned blocks
-  receive nonzero z-index. Reverse that exact order for hit testing.
+- A direct child context containing a float or positioned child uses the
+  bounded phase sequence: negative positioned, static block
+  backgrounds/borders, floats, inline/content, positioned auto/zero, then
+  positive positioned. Signed z-index and DOM index order only the negative
+  and positive phases. Ordinary effect-free static blocks split between the
+  background and inline phases; inline wrappers, tables, clips, scrolling,
+  blends, filters, transforms, and positioned subtrees remain atomic. The
+  retained paint order records first paint contributions, while structural
+  fallback hit testing uses a separate committed content order; exact display
+  command hit testing remains authoritative for split overlap.
 - Normal inline text collapses ASCII whitespace across nested inline elements;
   `pre` retains line endings and spaces. Temporary embed and rich-button
   layouts must not subscribe short-lived fields to persistent style/layout
@@ -280,6 +287,9 @@ Pure layout leaves are intentionally separated from retained object state:
 - `render/layout_hit.zig` performs pointer-free local-coordinate conversion,
   rounded clipping, scroll/transform localization, and reverse-child ordering
   over a synchronous borrow of the committed paint permutation; and
+- `render/paint_order.zig` classifies pointer-free direct-child metadata and
+  fills stable bounded paint and structural-hit permutations without retaining
+  DOM or layout pointers; and
 - `render/replaced_paint.zig` constructs background and rounded-control
   command leaves/groups whose pixels and provenance remain borrowed from the
   current generation.
@@ -302,13 +312,16 @@ dirty bits. A dirty leaf transactionally replaces its command buffer.
 Ancestors rebuild only shallow ordering/effect wrappers around stable
 `.cached_subtree` edges, allowing clean sibling buffers to survive.
 
-In a direct simple float sibling context, CSS ordering needs a small exception:
-effect-free static normal-flow backgrounds/borders paint before float subtrees,
-then their inline/content paint follows the floats. The owner may flatten that
-one dirty cache subtree to produce the phase-ordered commands, after first
-refreshing its child caches. Positioned, clipped, blended, transformed,
-scrolling, and table subtrees remain atomic and use the normal retained order;
-do not split an effect wrapper merely to improve float ordering.
+When a direct child context contains a float or positioned subtree, it may
+flatten that one dirty cache subtree after refreshing child caches and emit the
+bounded phase sequence: negative positioned, simple static
+backgrounds/borders, floats, inline/content, positioned auto/zero, and
+positive positioned. Only ordinary effect-free static blocks split across the
+background and inline phases. Positioned, clipped, blended, transformed,
+scrolling, table, and inline-wrapper subtrees remain atomic; do not split an
+effect wrapper merely to improve phase ordering. Nested positioned descendants
+remain inside their static parent rather than being hoisted across siblings
+until the engine grows full stacking-context ownership.
 
 `.cached_subtree` is deliberately non-owning. It may appear only in a
 frame/layout-side list, points to a stable list field on a live layout object,
@@ -412,15 +425,16 @@ groups keep their isolation boundary.
 Painted-command hit testing and structural layout hit testing are
 complementary. Command hit testing walks in reverse paint order, inverts
 translations, honors clips and rounded corners, treats masks as clipping rather
-than targets, and retains exact glyph/fragment geometry. Frame interaction
-first checks viewport-attached command groups with viewport coordinates, then
-uses the ordinary document-coordinate command and layout paths. Layout hit testing
-converts the point into parent-local coordinates while descending; blocks
-invert live transforms, add element scroll, apply local clips, and visit
-children in reverse paint order. Do not rebuild absolute rectangles for every
-descendant. The committed child permutation is borrowed only for that
-synchronous traversal; if its length no longer matches the child set, hit
-testing safely falls back to reverse DOM order.
+than targets, and retains exact glyph/fragment geometry. Frame click and hover
+resolve viewport-attached and ordinary display commands before falling back to
+structural boxes, because one static block can paint its background below a
+float and its content above it. Layout hit testing converts the point into
+parent-local coordinates while descending; blocks invert live transforms, add
+element scroll, apply local clips, and visit children in reverse committed
+content order. Do not rebuild absolute rectangles for every descendant. The
+committed child permutation is borrowed only for that synchronous traversal;
+if its length no longer matches the child set, hit testing safely falls back to
+reverse DOM order.
 
 Content clicks require a painted hit but use structural provenance when a
 synthetic wrapper has none. Capture stable JavaScript handles before listener

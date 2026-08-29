@@ -1,0 +1,10 @@
+rect x1=13 y1=18 x2=133 y2=38 color=#800000ff
+rect x1=13 y1=18 x2=133 y2=42 color=#0000ffff
+rect x1=13 y1=18 x2=53 y2=42 color=#ff0000ff
+rect x1=22 y1=25 x2=28 y2=31 color=#ffff00ff
+transform x=48 y=4
+  rect x1=13 y1=18 x2=45 y2=38 color=#00ffffff
+transform x=60 y=8
+  rect x1=13 y1=18 x2=45 y2=38 color=#ff00ffff
+transform x=72 y=12
+  rect x1=13 y1=18 x2=45 y2=38 color=#00ff00ff

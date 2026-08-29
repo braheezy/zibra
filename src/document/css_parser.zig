@@ -423,6 +423,16 @@ fn isAutomaticOrSignedLength(raw_value: []const u8) bool {
         isSignedLength(raw_value);
 }
 
+/// CSS `z-index` accepts `auto` or one signed integer. Keep the authored
+/// token in the declaration map—the style and paint phases need to retain the
+/// distinction between the initial `auto` value and an explicit `0`.
+fn isZIndex(raw_value: []const u8) bool {
+    const trimmed = std.mem.trim(u8, raw_value, " \t\r\n\x0c");
+    if (std.ascii.eqlIgnoreCase(trimmed, "auto")) return true;
+    _ = std.fmt.parseInt(i32, trimmed, 10) catch return false;
+    return true;
+}
+
 fn splitValueTokens(raw_value: []const u8, tokens: *[4][]const u8) ?usize {
     var count: usize = 0;
     var iterator = std.mem.tokenizeAny(u8, raw_value, " \t\r\n\x0c");
@@ -490,6 +500,7 @@ fn isValidLonghandValue(property: []const u8, raw_value: []const u8) bool {
     {
         return isAutomaticOrSignedLength(raw_value);
     }
+    if (std.mem.eql(u8, property, "z-index")) return isZIndex(raw_value);
     if (std.mem.startsWith(u8, property, "margin-")) return isAutomaticOrSignedLength(raw_value);
     if (std.mem.startsWith(u8, property, "padding-")) return isNonnegativeLength(raw_value);
     if (std.mem.endsWith(u8, property, "-width") and std.mem.startsWith(u8, property, "border-")) {
@@ -2112,4 +2123,28 @@ test "content keeps the generated-content subset and defaults to normal" {
     try std.testing.expectEqualStrings("'single quoted'", rules[3].properties.get("content").?.value);
     try std.testing.expect(rules[4].properties.get("content") == null);
     try std.testing.expectEqualStrings("red", rules[4].properties.get("color").?.value);
+}
+
+test "z-index retains auto and signed integers while rejecting invalid values" {
+    const allocator = std.testing.allocator;
+    const css =
+        "a { z-index: -4; z-index: 2.5; }" ++
+        "b { z-index: AUTO; z-index: 1px; }" ++
+        "c { z-index: +0; }" ++
+        "d { z-index: -2147483648; }" ++
+        "e { z-index: 2147483648; }";
+    var parser = try CSSParser.init(allocator, css, false);
+    defer parser.deinit(allocator);
+    const rules = try parser.parse(allocator);
+    defer {
+        for (rules) |*rule| rule.deinit(allocator);
+        allocator.free(rules);
+    }
+
+    try std.testing.expectEqual(@as(usize, 5), rules.len);
+    try std.testing.expectEqualStrings("-4", rules[0].properties.get("z-index").?.value);
+    try std.testing.expectEqualStrings("AUTO", rules[1].properties.get("z-index").?.value);
+    try std.testing.expectEqualStrings("+0", rules[2].properties.get("z-index").?.value);
+    try std.testing.expectEqualStrings("-2147483648", rules[3].properties.get("z-index").?.value);
+    try std.testing.expect(rules[4].properties.get("z-index") == null);
 }

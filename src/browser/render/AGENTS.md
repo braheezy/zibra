@@ -22,6 +22,9 @@ boundaries.
   coordinate conversion, rounded clips, scroll/transform localization, and
   reverse-child ordering over a synchronously borrowed committed paint
   permutation. It never owns or traverses layout objects.
+- `paint_order.zig` owns allocation-free scalar classification and stable
+  ordering for the bounded direct-child paint phases. It receives no DOM or
+  layout pointers; `layout.zig` retains the phase entries and permutations.
 - `box_model.zig` resolves pure CSS box edges, dimensions, positioning
   keywords, radii, and authored-zoom used values. It does not subscribe to
   style fields; `layout.zig` performs dependency-tracked reads before calling
@@ -113,10 +116,13 @@ modules over forwarding wrappers.
   owned slice before calling `paint_effects.wrapOwned`. When transferring the
   returned owning items into another list, reserve its capacity first and free
   only the now-empty top-level container after the transfer.
-- Direct, effect-free static siblings of a float may use the bounded float
-  paint path: backgrounds/borders precede float subtrees and inline/content
-  follows them. Positioned, clipped, blended, transformed, scrolling, and
-  table subtrees remain atomic in the normal retained order.
+- A direct child context that contains a float or positioned child may flatten
+  one retained cache into the bounded phase sequence: negative positioned,
+  static block backgrounds/borders, floats, inline/content, positioned
+  auto/zero, then positive positioned. Split only ordinary effect-free static
+  blocks. Positioned, clipped, blended, transformed, scrolling, table, and
+  inline-wrapper subtrees remain atomic; never crack their effect wrapper to
+  improve ordering.
 - Retire Frame and Browser command generations before replacing decoded image,
   font, canvas, DOM, layout, or layer resources they borrow.
 - A raster snapshot and every worker plane is independently owned through the
@@ -130,9 +136,11 @@ modules over forwarding wrappers.
 - A `layout_hit.ReverseOrder` borrows a committed child permutation only for
   the current traversal. If that permutation is absent or stale, it falls back
   to reverse DOM order rather than retaining a layout-owned slice.
-- Immediate children paint by stable `(effective z-index, DOM index)` order;
-  only non-static positioned blocks receive nonzero z-index. Hit testing uses
-  the exact reverse order.
+- Immediate children use stable phase order; signed z-index then DOM index
+  orders only negative and positive positioned phases. A split static block
+  contributes background early and content in the later inline phase. Exact
+  command hit testing is authoritative for that split; structural fallback
+  uses a separately committed content-aware reverse permutation.
 - Rounded paint groups carry hit-clip metadata so descendant text/control
   commands cannot restore a square target.
 - Focus geometry unions nested inline fragments once per visual line; a

@@ -856,9 +856,10 @@ pub fn FrameType(
             zoom: f32,
         ) ?*Node {
             // Root-frame input arrives in page coordinates, but a fixed
-            // subtree is painted in frame-viewport coordinates. Check that
-            // attachment first without changing the normal structural hit
-            // path, which deliberately covers unpainted layout box areas.
+            // subtree is painted in frame-viewport coordinates. Resolve the
+            // committed display list before structural layout: a split static
+            // block can paint its background below a float and its inline
+            // descendants above it, which one structural box cannot express.
             if (self.display_list) |items| {
                 const frame_viewport_y = device_y -|
                     DisplayItem.scaleLayoutPx(self.scroll, zoom);
@@ -873,8 +874,15 @@ pub fn FrameType(
                         if (hoverElementForNode(node)) |element| return element;
                     }
                 }
+                if (DisplayItem.hitTestDevice(items, device_x, device_y, zoom)) |hit| {
+                    if (hit.source.originatingNode()) |node| {
+                        if (hoverElementForNode(node)) |element| return element;
+                    }
+                }
             }
 
+            // Structural layout remains a fallback for an unpainted box such
+            // as transparent content or a non-painting block container.
             if (!self.document.dirty) {
                 if (self.document.get().*) |document| {
                     if (!document.layoutNeeded()) {
@@ -885,10 +893,7 @@ pub fn FrameType(
                 }
             }
 
-            const items = self.display_list orelse return null;
-            const hit = DisplayItem.hitTestDevice(items, device_x, device_y, zoom) orelse return null;
-            const node = hit.source.originatingNode() orelse return null;
-            return hoverElementForNode(node);
+            return null;
         }
 
         fn iframeBoundsForNode(self: *const Frame, node: *Node) ?Bounds {

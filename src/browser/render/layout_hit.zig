@@ -124,17 +124,7 @@ pub fn localizeBlock(parent_point: Point, input: BlockInput) ?LocalizedBlock {
     };
 }
 
-pub const StackingKey = struct {
-    z_index: i32,
-    document_index: usize,
-
-    pub fn before(left: StackingKey, right: StackingKey) bool {
-        if (left.z_index != right.z_index) return left.z_index < right.z_index;
-        return left.document_index < right.document_index;
-    }
-};
-
-/// Reverse iterator over the paint permutation committed with this tree.
+/// Reverse iterator over one committed direct-child traversal permutation.
 /// A missing or length-mismatched permutation falls back to reverse DOM order.
 pub const ReverseOrder = struct {
     committed: []const usize,
@@ -235,16 +225,7 @@ test "block localization separates scroll from visual offsets and clipping" {
     }) == null);
 }
 
-test "stacking keys and reverse committed order remain stable" {
-    try std.testing.expect(StackingKey.before(
-        .{ .z_index = -1, .document_index = 9 },
-        .{ .z_index = 0, .document_index = 0 },
-    ));
-    try std.testing.expect(StackingKey.before(
-        .{ .z_index = 2, .document_index = 1 },
-        .{ .z_index = 2, .document_index = 4 },
-    ));
-
+test "reverse committed order remains stable" {
     const committed = [_]usize{ 2, 0, 1 };
     var order = ReverseOrder.init(&committed, 3);
     try std.testing.expectEqual(@as(?usize, 1), order.next());

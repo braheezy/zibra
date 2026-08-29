@@ -2263,7 +2263,7 @@ test "position and z-index are computed non-inherited properties" {
     const html =
         "<div style=\"z-index: 99\">" ++
         "<span style=\"position: relative; left: 2em; top: -3px; z-index: -4\">nested</span>" ++
-        "<p>default</p></div>";
+        "<p>default</p><i style=\"position: relative; z-index: 0\">zero</i></div>";
 
     var html_parser = try HTMLParser.init(allocator, html);
     html_parser.use_implicit_tags = false;
@@ -2274,6 +2274,7 @@ test "position and z-index are computed non-inherited properties" {
     try document_parser.style(allocator, &root, &.{});
     const positioned = &root.element.children.items[0].element;
     const defaulted = &root.element.children.items[1].element;
+    const explicit_zero = &root.element.children.items[2].element;
 
     try std.testing.expectEqualStrings("static", root.element.style.?.getPtr("position").?.get().*);
     try std.testing.expectEqualStrings("99", root.element.style.?.getPtr("z-index").?.get().*);
@@ -2286,10 +2287,58 @@ test "position and z-index are computed non-inherited properties" {
     try std.testing.expectEqualStrings("static", defaulted.style.?.getPtr("position").?.get().*);
     try std.testing.expectEqualStrings("auto", defaulted.style.?.getPtr("left").?.get().*);
     try std.testing.expectEqualStrings("auto", defaulted.style.?.getPtr("top").?.get().*);
-    try std.testing.expectEqualStrings("0", defaulted.style.?.getPtr("z-index").?.get().*);
+    try std.testing.expectEqualStrings("auto", defaulted.style.?.getPtr("z-index").?.get().*);
+    try std.testing.expectEqualStrings("0", explicit_zero.style.?.getPtr("z-index").?.get().*);
+    try std.testing.expectEqualStrings(
+        "auto",
+        positioned.children.items[0].text.style.?.getPtr("z-index").?.get().*,
+    );
+}
+
+test "z-index preserves auto and explicit zero through the cascade" {
+    const allocator = std.testing.allocator;
+    const html =
+        "<main style=\"z-index: -3\">" ++
+        "<div class=automatic></div><div class=zero></div>" ++
+        "<div class=inherited></div><div class=initial></div></main>";
+    const css =
+        ".automatic { position: relative; z-index: auto; }" ++
+        ".zero { position: relative; z-index: 0; }" ++
+        ".inherited { position: relative; z-index: inherit; }" ++
+        ".initial { position: relative; z-index: initial; }";
+
+    var html_parser = try HTMLParser.init(allocator, html);
+    html_parser.use_implicit_tags = false;
+    defer html_parser.deinit(allocator);
+    var root = try html_parser.parse();
+    defer root.deinit(allocator);
+    document_parser.fixParentPointers(&root, null);
+
+    var css_parser = try CSSParser.init(allocator, css, false);
+    defer css_parser.deinit(allocator);
+    const rules = try css_parser.parse(allocator);
+    defer {
+        for (rules) |*rule| rule.deinit(allocator);
+        allocator.free(rules);
+    }
+
+    try document_parser.style(allocator, &root, rules);
+    try std.testing.expectEqualStrings("-3", root.element.style.?.getPtr("z-index").?.get().*);
+    try std.testing.expectEqualStrings(
+        "auto",
+        root.element.children.items[0].element.style.?.getPtr("z-index").?.get().*,
+    );
     try std.testing.expectEqualStrings(
         "0",
-        positioned.children.items[0].text.style.?.getPtr("z-index").?.get().*,
+        root.element.children.items[1].element.style.?.getPtr("z-index").?.get().*,
+    );
+    try std.testing.expectEqualStrings(
+        "-3",
+        root.element.children.items[2].element.style.?.getPtr("z-index").?.get().*,
+    );
+    try std.testing.expectEqualStrings(
+        "auto",
+        root.element.children.items[3].element.style.?.getPtr("z-index").?.get().*,
     );
 }
 

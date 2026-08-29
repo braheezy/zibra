@@ -28,6 +28,7 @@ tiers and baseline policy.
 | [`table-of-contents.html`](table-of-contents.html) | User-agent ID selector and generated table-of-contents bar styling |
 | [`float-clear.html`](float-clear.html) | Float exclusion, clearing, and formatting-context containment |
 | [`float-paint-phases.html`](float-paint-phases.html) | Normal block backgrounds below floats, inline wrapping, and overflow formatting-context avoidance |
+| [`paint-order-phases.html`](paint-order-phases.html) | Negative positioned, normal block background, float, inline content, positioned auto/zero, and positive z-index paint/hit phases |
 | [`margin-collapse.html`](margin-collapse.html) | Adjoining sibling/empty-block margin struts and clearance barriers around floats |
 | [`issue-60-line-breaks.html`](issue-60-line-breaks.html) | Line-breaking regression from issue 60 |
 | [`list-bullets.html`](list-bullets.html) | `display:list-item`, marker paint, and indentation |

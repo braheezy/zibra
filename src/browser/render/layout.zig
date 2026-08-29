@@ -20,6 +20,7 @@ const control_geometry = @import("control_geometry.zig");
 const border_geometry = @import("border_geometry.zig");
 const inline_format = @import("inline_format.zig");
 const layout_hit = @import("layout_hit.zig");
+const paint_order = @import("paint_order.zig");
 const table_format = @import("table_format.zig");
 const paint_effects = @import("paint_effects.zig");
 const replaced_paint = @import("replaced_paint.zig");
@@ -2155,6 +2156,59 @@ test "float paint phases keep normal backgrounds below floats" {
     try std.testing.expect(blue_background < red_float);
 }
 
+test "paint phases order positioned floats block backgrounds and inline content" {
+    const allocator = std.testing.allocator;
+    var html_parser = try parser.HTMLParser.init(
+        allocator,
+        "<html style='display:block'><body style='display:block;margin:0'>" ++
+            "<main style='display:block;position:relative;z-index:0;width:160px;height:48px'>" ++
+            "<div style='display:block;position:absolute;z-index:-2;left:0;top:0;width:120px;height:24px;background-color:#110000'></div>" ++
+            "<div style='display:block;float:left;width:40px;height:24px;background-color:#220000'></div>" ++
+            "<ul style='display:block;margin:0;padding:0;height:24px;background-color:#330000'><li style='display:list-item;height:24px;color:#440000'></li></ul>" ++
+            "<div style='display:block;position:absolute;left:48px;top:0;width:32px;height:20px;background-color:#550000'></div>" ++
+            "<div style='display:block;position:absolute;z-index:0;left:60px;top:0;width:32px;height:20px;background-color:#660000'></div>" ++
+            "<div style='display:block;position:absolute;z-index:3;left:72px;top:0;width:32px;height:20px;background-color:#770000'></div>" ++
+            "</main></body></html>",
+    );
+    html_parser.use_implicit_tags = false;
+    defer html_parser.deinit(allocator);
+    var root_node = try html_parser.parse();
+    defer root_node.deinit(allocator);
+    parser.fixParentPointers(&root_node, null);
+    try parser.style(allocator, &root_node, &.{});
+
+    var environ = std.process.Environ.Map.init(allocator);
+    defer environ.deinit();
+    try environ.put("HOME", "/tmp");
+    const engine = try Layout.init(allocator, std.testing.io, &environ, 800, 600, false);
+    defer engine.deinit();
+    const document = try engine.buildDocument(&root_node);
+    defer {
+        document.deinit();
+        allocator.destroy(document);
+    }
+
+    const frame = try engine.paintDocument(document);
+    defer DisplayItem.freeList(allocator, frame);
+    var output = std.Io.Writer.Allocating.init(allocator);
+    defer output.deinit();
+    try writeDisplayListDebug(&output.writer, frame);
+    const display = output.written();
+    const negative = std.mem.indexOf(u8, display, "color=#110000ff").?;
+    const static_background = std.mem.indexOf(u8, display, "color=#330000ff").?;
+    const float = std.mem.indexOf(u8, display, "color=#220000ff").?;
+    const inline_content = std.mem.indexOf(u8, display, "color=#440000ff").?;
+    const automatic = std.mem.indexOf(u8, display, "color=#550000ff").?;
+    const zero = std.mem.indexOf(u8, display, "color=#660000ff").?;
+    const positive = std.mem.indexOf(u8, display, "color=#770000ff").?;
+    try std.testing.expect(negative < static_background);
+    try std.testing.expect(static_background < float);
+    try std.testing.expect(float < inline_content);
+    try std.testing.expect(inline_content < automatic);
+    try std.testing.expect(automatic < zero);
+    try std.testing.expect(zero < positive);
+}
+
 // Layout state
 allocator: std.mem.Allocator,
 // Font manager for handling fonts and glyphs
@@ -2992,24 +3046,20 @@ fn blockHitScrollY(block: *const BlockLayout) i32 {
     return if (element.scroll_container) @max(element.scroll_y, 0) else 0;
 }
 
-/// The exercise's simplified stacking model honors signed integer z-index
-/// only for positioned elements. Invalid values and static elements stay in
-/// the default zero layer.
-fn blockPaintZIndex(block: *const BlockLayout) i32 {
-    const element = liveBlockElement(block) orelse return 0;
-    const styles = if (element.style) |*value| value else return 0;
-    const position = std.mem.trim(
-        u8,
-        styleValue(styles, "position") orelse "static",
-        " \t\r\n",
-    );
-    if (std.ascii.eqlIgnoreCase(position, "static")) return 0;
+/// Return the computed z-index token for a positioned block. The CSS parser
+/// rejects invalid declarations, but this deliberately falls back to `auto`
+/// so a script-mutated or otherwise malformed live style cannot accidentally
+/// create a numeric stacking phase.
+fn blockPaintZIndex(block: *const BlockLayout) paint_order.ZIndex {
+    const element = liveBlockElement(block) orelse return .auto;
+    const styles = if (element.style) |*value| value else return .auto;
     const z_index = std.mem.trim(
         u8,
-        styleValue(styles, "z-index") orelse "0",
+        styleValue(styles, "z-index") orelse "auto",
         " \t\r\n",
     );
-    return std.fmt.parseInt(i32, z_index, 10) catch 0;
+    if (std.ascii.eqlIgnoreCase(z_index, "auto")) return .auto;
+    return .{ .value = std.fmt.parseInt(i32, z_index, 10) catch return .auto };
 }
 
 /// Return whether this block establishes its own normal-flow box alongside
@@ -3029,33 +3079,35 @@ fn blockAvoidsExternalFloats(block: *const BlockLayout) bool {
     return !std.ascii.eqlIgnoreCase(overflow, "visible");
 }
 
-/// A static, effect-free child can be split into its background/border phase
-/// and its content phase when a sibling float is present. Keep every more
-/// complex subtree atomic: its existing effect wrapper remains the authority
-/// for clipping, blending, transforms, positioned stacking, and scrolling.
-fn isFloatPaintPhaseCandidate(block: *const BlockLayout) bool {
+/// A static ordinary block can split its background/border from its content
+/// in a direct paint-phase context. Keep inline wrappers and every subtree
+/// with an effect, clip, scroll, table, float, or position atomic: its
+/// existing wrapper remains authoritative for visual and hit behavior.
+fn isStaticPaintPhaseCandidate(block: *const BlockLayout) bool {
+    if (block.inline_nodes != null or block.embedded_box != null) return false;
     if (block.floatSide() != .none or block.positionMode() != .static) return false;
     if (block.tableRole() != .ordinary or blockAvoidsExternalFloats(block)) return false;
+    // Phase classification may be queried by a structural test before a
+    // layout generation has published zoom. Conservatively keep that subtree
+    // atomic instead of reading a dirty protected field merely to inspect a
+    // paint effect.
+    if (block.zoom.dirty) return false;
     const effects = resolvedBlockEffects(block);
     return !effects.needsBlendGroup() and effects.translation == null;
 }
 
-/// The bounded float painter only reorders a simple direct-sibling context.
-/// If any sibling needs independent stacking or an effect wrapper, retain the
-/// established atomic subtree ordering instead of partially splitting it.
-fn usesFloatPaintPhases(block: *const BlockLayout) bool {
-    var has_float = false;
+/// Return whether this direct-child context crosses one of the CSS-like paint
+/// phase boundaries. A static effectful child remains atomic in the inline
+/// content phase instead of disabling the whole context; positioned and float
+/// children are already atomic through `paintBlockTreeRecursive`.
+fn usesPaintPhases(block: *const BlockLayout) bool {
     for (block.children.items) |child| switch (child) {
         .block => |nested| {
-            if (nested.floatSide() != .none) {
-                has_float = true;
-            } else if (!isFloatPaintPhaseCandidate(nested)) {
-                return false;
-            }
+            if (nested.floatSide() != .none or nested.positionMode() != .static) return true;
         },
         .line => {},
     };
-    return has_float;
+    return false;
 }
 
 fn applyNodeStyles(
@@ -4866,16 +4918,11 @@ const ButtonLayout = struct {
         defer self.swapCollectors(engine);
         try root.layout(engine);
 
-        for (root.display_list.items) |item| {
-            try appendClonedDisplayItem(self.embed.allocator, &self.commands, item);
-        }
-        try root.refreshPaintOrder();
-        for (root.paint_order.items) |document_index| {
-            switch (root.children.items[document_index]) {
-                .block => |block| try paintBlockTreeRecursive(&self.commands, engine, block),
-                .line => |line| try line.paintToList(&self.commands, engine),
-            }
-        }
+        // The rich-button root contributes no independent outer background:
+        // ButtonLayout paints that control shell. Reuse the same after-
+        // background phase helper as ordinary blocks so positioned or floating
+        // descendants cannot escape the button in stale DOM order.
+        try appendBlockPaintContents(&self.commands, engine, root);
 
         rebaseDisplaySources(self.commands.items, parent_block);
 
@@ -6040,13 +6087,32 @@ const LayoutChild = union(enum) {
     }
 };
 
-fn layoutChildPaintKey(child: LayoutChild, document_index: usize) layout_hit.StackingKey {
-    return .{
-        .z_index = switch (child) {
-            .block => |block| blockPaintZIndex(block),
-            .line => 0,
+/// Describe one direct layout child without retaining any of its pointers in
+/// the paint-order utility. Simple static blocks contribute their background
+/// early and their contents later; static atomic subtrees instead enter as
+/// inline content so their existing effect wrapper remains intact.
+fn layoutChildPaintEntry(child: LayoutChild, document_index: usize) paint_order.DirectChild {
+    return switch (child) {
+        .block => |block| blk: {
+            const positioned = block.positionMode() != .static;
+            break :blk .{
+                .document_index = document_index,
+                .normal_flow = if (positioned)
+                    .block_background
+                else if (block.floatSide() != .none)
+                    .float
+                else if (isStaticPaintPhaseCandidate(block))
+                    .block_background
+                else
+                    .inline_content,
+                .positioned = positioned,
+                .z_index = blockPaintZIndex(block),
+            };
         },
-        .document_index = document_index,
+        .line => .{
+            .document_index = document_index,
+            .normal_flow = .inline_content,
+        },
     };
 }
 
@@ -6185,9 +6251,16 @@ const BlockLayout = struct {
     rebuilding_floats: bool = false,
 
     children: std.ArrayList(LayoutChild),
-    /// DOM-index permutation captured at the last paint. Retaining it keeps
-    /// structural hit queries aligned with that exact display generation.
+    /// Direct-child metadata rebuilt synchronously with the paint
+    /// permutations. It owns only scalars, never child or DOM pointers.
+    paint_entries: std.ArrayList(paint_order.DirectChild),
+    /// Direct-child permutation for the first contribution of each paint
+    /// phase. Split static blocks appear here for their background/border.
     paint_order: std.ArrayList(usize),
+    /// Direct-child permutation for structural fallback hit testing. A split
+    /// static block participates here with its later inline/content phase;
+    /// exact painted-command hit testing remains authoritative for overlap.
+    hit_order: std.ArrayList(usize),
     /// Layout-time commands for the legacy inline formatter. `paint_cache`
     /// wraps these with this block's background, descendants, scrolling, and
     /// effects, while cached_subtree edges keep both lists independently
@@ -6638,7 +6711,9 @@ const BlockLayout = struct {
             .position_offset = .{},
             .laid_out_dom_children = 0,
             .children = std.ArrayList(LayoutChild).empty,
+            .paint_entries = std.ArrayList(paint_order.DirectChild).empty,
             .paint_order = std.ArrayList(usize).empty,
+            .hit_order = std.ArrayList(usize).empty,
             .display_list = std.ArrayList(DisplayItem).empty,
             .paint_cache = std.ArrayList(DisplayItem).empty,
             .embedded_box = null,
@@ -6920,7 +6995,9 @@ const BlockLayout = struct {
             child.deinit(self.allocator);
         }
         self.children.deinit(self.allocator);
+        self.paint_entries.deinit(self.allocator);
         self.paint_order.deinit(self.allocator);
+        self.hit_order.deinit(self.allocator);
         if (self.inline_nodes) |nodes| self.allocator.free(nodes);
         DisplayItem.freeItems(self.allocator, self.display_list.items);
         self.display_list.deinit(self.allocator);
@@ -7311,19 +7388,29 @@ const BlockLayout = struct {
     }
 
     fn refreshPaintOrder(self: *BlockLayout) !void {
+        const has_phase_boundary = usesPaintPhases(self);
+        try self.paint_entries.ensureTotalCapacity(self.allocator, self.children.items.len);
+        self.paint_entries.clearRetainingCapacity();
         try self.paint_order.ensureTotalCapacity(self.allocator, self.children.items.len);
         self.paint_order.clearRetainingCapacity();
+        try self.hit_order.ensureTotalCapacity(self.allocator, self.children.items.len);
+        self.hit_order.clearRetainingCapacity();
         for (0..self.children.items.len) |document_index| {
+            self.paint_entries.appendAssumeCapacity(layoutChildPaintEntry(
+                self.children.items[document_index],
+                document_index,
+            ));
             self.paint_order.appendAssumeCapacity(document_index);
+            self.hit_order.appendAssumeCapacity(document_index);
         }
-        std.mem.sort(usize, self.paint_order.items, self.children.items, struct {
-            fn lessThan(children: []const LayoutChild, left: usize, right: usize) bool {
-                return layout_hit.StackingKey.before(
-                    layoutChildPaintKey(children[left], left),
-                    layoutChildPaintKey(children[right], right),
-                );
-            }
-        }.lessThan);
+        // Without a float or positioned direct child, ordinary DOM order is
+        // already the complete paint and structural-hit order. In particular,
+        // do not let a static effectful sibling's atomic inline classification
+        // reorder it ahead of an ordinary static background.
+        if (has_phase_boundary) {
+            paint_order.fillPermutation(self.paint_entries.items, self.paint_order.items);
+            paint_order.fillHitPermutation(self.paint_entries.items, self.hit_order.items);
+        }
     }
 
     fn layout(self: *BlockLayout, engine: *Layout) anyerror!void {
@@ -8585,7 +8672,7 @@ const BlockLayout = struct {
         const local = localized.local;
         const content_point = localized.content;
         const origin = HitPoint{ .x = self.x.get().*, .y = self.y.get().* };
-        var order = layout_hit.ReverseOrder.init(self.paint_order.items, self.children.items.len);
+        var order = layout_hit.ReverseOrder.init(self.hit_order.items, self.children.items.len);
         while (order.next()) |document_index| {
             if (self.children.items[document_index].hitTest(content_point, origin)) |hit| return hit;
         }
@@ -9924,11 +10011,12 @@ fn refreshBlockPaintCache(self: *Layout, block: *BlockLayout) !void {
         return;
     }
 
-    // A float paint context needs a flattened, phase-ordered subtree instead
-    // of cached child edges. Refresh the children first so this bounded escape
-    // hatch still consumes the same current display-list inputs as the normal
-    // retained path. Clean descendants retain their own cache generations.
-    if (usesFloatPaintPhases(block)) {
+    // A direct paint-phase context needs a flattened, phase-ordered subtree
+    // instead of cached child edges. Refresh the children first so this
+    // bounded escape hatch still consumes the same current display-list
+    // inputs as the normal retained path. Clean descendants retain their own
+    // cache generations.
+    if (usesPaintPhases(block)) {
         try block.refreshPaintOrder();
         for (block.paint_order.items) |document_index| {
             switch (block.children.items[document_index]) {
@@ -10112,8 +10200,9 @@ fn writeDisplayItemsDebug(writer: *std.Io.Writer, items: []const DisplayItem, in
 }
 
 /// Append the paint commands that belong after a block background but before
-/// its descendant subtrees. This is deliberately separate from backgrounds so
-/// a simple block can participate in the CSS float paint phases below.
+/// its descendant subtrees. This stays separate so a simple static block can
+/// contribute its background and its inline/content portions to different
+/// bounded direct-child paint phases.
 fn appendBlockOwnPaintContent(
     commands: *std.ArrayList(DisplayItem),
     self: *Layout,
@@ -10126,123 +10215,161 @@ fn appendBlockOwnPaintContent(
     try appendListMarker(self, commands, block);
 }
 
-/// Prepaint the background/border portions of a simple static subtree. A
-/// float is intentionally a boundary: it remains an atomic subtree in the
-/// float phase, with its effects and descendants preserved by the normal
-/// recursive painter.
-fn appendStaticFloatPhaseBackgrounds(
+/// Append the background/border contribution of one split static subtree.
+/// Its own inline content is deliberately deferred to the inline-content
+/// phase. The recursion covers simple descendants too, which keeps all their
+/// backgrounds below a sibling float without splitting an effect wrapper.
+fn appendStaticPaintPhaseBackgrounds(
     commands: *std.ArrayList(DisplayItem),
     self: *Layout,
     block: *BlockLayout,
 ) !void {
-    if (!block.shouldPaint() or !isFloatPaintPhaseCandidate(block)) return;
+    if (!block.shouldPaint() or !isStaticPaintPhaseCandidate(block)) return;
     try addBackgroundIfNeededToList(self, commands, block);
     try block.refreshPaintOrder();
     for (block.paint_order.items) |document_index| {
+        if (paint_order.phaseFor(block.paint_entries.items[document_index]) != .block_background) {
+            continue;
+        }
         switch (block.children.items[document_index]) {
-            .block => |child| {
-                if (child.floatSide() == .none) {
-                    try appendStaticFloatPhaseBackgrounds(commands, self, child);
-                }
+            .block => |child| if (isStaticPaintPhaseCandidate(child)) {
+                try appendStaticPaintPhaseBackgrounds(commands, self, child);
             },
             .line => {},
         }
     }
 }
 
-/// Paint the non-background portion of a simple static subtree. Its
-/// backgrounds were emitted before the sibling float, so this pass emits
-/// inline content and recursively retains atomic paint behavior for any
-/// unsupported nested subtree.
-fn appendStaticFloatPhaseContent(
+/// Paint all atomic direct children belonging to one phase. Positioned and
+/// floating blocks retain their own paint-effects wrapper, so this function
+/// never cracks a clip, blend, transform, scroll, or table subtree apart.
+fn appendAtomicPaintPhase(
+    commands: *std.ArrayList(DisplayItem),
+    self: *Layout,
+    block: *BlockLayout,
+    phase: paint_order.Phase,
+) !void {
+    for (block.paint_order.items) |document_index| {
+        if (paint_order.phaseFor(block.paint_entries.items[document_index]) != phase) continue;
+        switch (block.children.items[document_index]) {
+            .block => |child| try paintBlockTreeRecursive(commands, self, child),
+            .line => {},
+        }
+    }
+}
+
+/// Append the direct contributions that paint with normal inline content.
+/// Split static blocks have no entry in the inline phase—their background
+/// entry was already consumed—so walk source order explicitly to splice their
+/// later content between direct line boxes and atomic inline subtrees.
+fn appendInlinePaintPhase(
+    commands: *std.ArrayList(DisplayItem),
+    self: *Layout,
+    block: *BlockLayout,
+) !void {
+    try appendBlockOwnPaintContent(commands, self, block);
+    for (block.children.items, 0..) |child, document_index| {
+        switch (child) {
+            .block => |nested| {
+                if (nested.positionMode() != .static or nested.floatSide() != .none) continue;
+                if (isStaticPaintPhaseCandidate(nested)) {
+                    try appendStaticPaintPhaseContent(commands, self, nested);
+                } else {
+                    std.debug.assert(
+                        paint_order.phaseFor(block.paint_entries.items[document_index]) == .inline_content,
+                    );
+                    try paintBlockTreeRecursive(commands, self, nested);
+                }
+            },
+            .line => |line| try line.paintToList(commands, self),
+        }
+    }
+}
+
+/// Paint the non-background portion of a split static subtree. Its background
+/// has already been emitted by `appendStaticPaintPhaseBackgrounds`; nested
+/// direct phase boundaries remain ordered locally without hoisting their
+/// positioned descendants through unrelated ancestor stacking contexts.
+fn appendStaticPaintPhaseContent(
     commands: *std.ArrayList(DisplayItem),
     self: *Layout,
     block: *BlockLayout,
 ) !void {
     if (!block.shouldPaint()) return;
-    std.debug.assert(isFloatPaintPhaseCandidate(block));
-    const float_phases = usesFloatPaintPhases(block);
+    std.debug.assert(isStaticPaintPhaseCandidate(block));
+    try appendBlockPaintContentsAfterBackground(commands, self, block, false);
+}
+
+/// Append the portion of a block after its own background has been emitted.
+/// In a phase context the caller selects whether static block backgrounds are
+/// still pending; a split static subtree passes `false` because its background
+/// was emitted by its ancestor's background pass.
+fn appendBlockPaintContentsAfterBackground(
+    commands: *std.ArrayList(DisplayItem),
+    self: *Layout,
+    block: *BlockLayout,
+    include_static_backgrounds: bool,
+) anyerror!void {
     try block.refreshPaintOrder();
-    if (float_phases) {
+    if (!usesPaintPhases(block)) {
+        try appendBlockOwnPaintContent(commands, self, block);
         for (block.paint_order.items) |document_index| {
             switch (block.children.items[document_index]) {
-                .block => |child| if (child.floatSide() != .none) {
-                    try paintBlockTreeRecursive(commands, self, child);
+                .block => |child| {
+                    if (!include_static_backgrounds and isStaticPaintPhaseCandidate(child)) {
+                        try appendStaticPaintPhaseContent(commands, self, child);
+                    } else {
+                        try paintBlockTreeRecursive(commands, self, child);
+                    }
+                },
+                .line => |line| try line.paintToList(commands, self),
+            }
+        }
+        try appendContentEditableCursor(self, commands, block);
+        return;
+    }
+
+    // This is deliberately a bounded, direct-child stacking context:
+    // positioned descendants remain atomic inside a split static subtree.
+    try appendAtomicPaintPhase(commands, self, block, .negative_positioned);
+
+    if (include_static_backgrounds) {
+        for (block.paint_order.items) |document_index| {
+            if (paint_order.phaseFor(block.paint_entries.items[document_index]) != .block_background) {
+                continue;
+            }
+            switch (block.children.items[document_index]) {
+                .block => |child| if (isStaticPaintPhaseCandidate(child)) {
+                    try appendStaticPaintPhaseBackgrounds(commands, self, child);
                 },
                 .line => {},
             }
         }
     }
-    try appendBlockOwnPaintContent(commands, self, block);
-    for (block.paint_order.items) |document_index| {
-        switch (block.children.items[document_index]) {
-            .block => |child| {
-                if (float_phases and child.floatSide() != .none) continue;
-                if (isFloatPaintPhaseCandidate(child)) {
-                    try appendStaticFloatPhaseContent(commands, self, child);
-                } else {
-                    try paintBlockTreeRecursive(commands, self, child);
-                }
-            },
-            .line => |line| try line.paintToList(commands, self),
-        }
-    }
+
+    try appendAtomicPaintPhase(commands, self, block, .float);
+    try appendInlinePaintPhase(commands, self, block);
+    try appendAtomicPaintPhase(commands, self, block, .positioned_auto_or_zero);
+    try appendAtomicPaintPhase(commands, self, block, .positive_positioned);
     try appendContentEditableCursor(self, commands, block);
 }
 
-/// Append a block's descendants in source order, except for a conservative
-/// direct-float context. In that case CSS paints simple normal-flow
-/// backgrounds first, then floating subtrees, then inline/content paint. The
-/// caller has already emitted the block's own background.
+/// Append a block's descendants after its own background. This models the
+/// bounded direct-child phases: negative positioned, static block
+/// backgrounds, floats, inline content, positioned auto/zero, then positive
+/// positioned descendants.
 fn appendBlockPaintContents(
     commands: *std.ArrayList(DisplayItem),
     self: *Layout,
     block: *BlockLayout,
 ) !void {
-    const float_phases = usesFloatPaintPhases(block);
-    if (float_phases) {
-        try block.refreshPaintOrder();
-        for (block.paint_order.items) |document_index| {
-            switch (block.children.items[document_index]) {
-                .block => |child| if (child.floatSide() == .none) {
-                    std.debug.assert(isFloatPaintPhaseCandidate(child));
-                    try appendStaticFloatPhaseBackgrounds(commands, self, child);
-                },
-                .line => {},
-            }
-        }
-        for (block.paint_order.items) |document_index| {
-            switch (block.children.items[document_index]) {
-                .block => |child| if (child.floatSide() != .none) {
-                    try paintBlockTreeRecursive(commands, self, child);
-                },
-                .line => {},
-            }
-        }
-    }
-
-    try appendBlockOwnPaintContent(commands, self, block);
-    try block.refreshPaintOrder();
-    for (block.paint_order.items) |document_index| {
-        switch (block.children.items[document_index]) {
-            .block => |child| {
-                if (float_phases and child.floatSide() != .none) continue;
-                if (float_phases) {
-                    std.debug.assert(isFloatPaintPhaseCandidate(child));
-                    try appendStaticFloatPhaseContent(commands, self, child);
-                } else {
-                    try paintBlockTreeRecursive(commands, self, child);
-                }
-            },
-            .line => |line| try line.paintToList(commands, self),
-        }
-    }
-    try appendContentEditableCursor(self, commands, block);
+    try appendBlockPaintContentsAfterBackground(commands, self, block, true);
 }
 
 // Recursively paint a block's subtree into a command list, applying effects
-// for each atomic block. Float-phase candidates deliberately bypass only
-// their own empty effect wrapper; every other subtree follows this path.
+// for each atomic block. Split static blocks bypass only their empty wrapper;
+// every positioned, floating, clipped, blended, transformed, scrolling, or
+// table subtree follows this atomic path.
 fn paintBlockTreeRecursive(
     commands: *std.ArrayList(DisplayItem),
     self: *Layout,
