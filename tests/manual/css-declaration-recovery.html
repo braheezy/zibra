@@ -1,0 +1,29 @@
+<!--
+How to verify:
+1. Open this page in Zibra.
+2. The first swatch is a 32px-wide yellow rectangle, not a 200px red one.
+3. The second swatch stays yellow even though its background shorthand contains
+   an interior CSS comment.
+-->
+<!doctype html>
+<style>
+  body { margin: 24px; font: 16px sans-serif; }
+  .swatch { display: block; height: 1em; margin: 8px 0; }
+
+  .escaped-delimiter {
+    width: 2em;
+    error: \};
+    background: yellow;
+    width: 200;
+    background: red pink;
+  }
+
+  .commented-shorthand {
+    width: 2em;
+    background: yellow /* CSS comments are whitespace */ no-repeat fixed;
+  }
+</style>
+
+<p>CSS declaration recovery</p>
+<div class="swatch escaped-delimiter"></div>
+<div class="swatch commented-shorthand"></div>

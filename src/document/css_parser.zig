@@ -11,6 +11,8 @@ const selector_mod = @import("selector.zig");
 const css_length = @import("length.zig");
 const css_color = @import("color.zig");
 const background_image = @import("background_image.zig");
+const css_syntax = @import("css_syntax.zig");
+const css_properties = @import("css_properties.zig");
 const Selector = selector_mod.Selector;
 const SimpleSelector = selector_mod.SimpleSelector;
 const UniversalSelector = selector_mod.UniversalSelector;
@@ -115,25 +117,11 @@ pub fn deinit(self: *CSSParser, allocator: std.mem.Allocator) void {
 }
 
 fn consumeComment(self: *CSSParser) bool {
-    if (self.pos + 1 >= self.string.len or
-        self.string[self.pos] != '/' or self.string[self.pos + 1] != '*') return false;
-    const close = std.mem.indexOfPos(u8, self.string, self.pos + 2, "*/") orelse {
-        self.pos = self.string.len;
-        return true;
-    };
-    self.pos = close + 2;
-    return true;
+    return css_syntax.consumeComment(self.string, &self.pos);
 }
 
 fn whitespace(self: *CSSParser) void {
-    while (self.pos < self.string.len) {
-        if (std.ascii.isWhitespace(self.string[self.pos])) {
-            self.pos += 1;
-            continue;
-        }
-        if (self.consumeComment()) continue;
-        break;
-    }
+    css_syntax.skipWhitespaceAndComments(self.string, &self.pos);
 }
 
 /// Remove CSS whitespace and complete comments from the ends of one borrowed
@@ -169,6 +157,8 @@ fn word(self: *CSSParser) ![]const u8 {
         const c = self.string[self.pos];
         if (std.ascii.isAlphanumeric(c) or c == '#' or c == '-' or c == '_' or c == '.' or c == '%') {
             self.pos += 1;
+        } else if (c == '\\') {
+            if (!css_syntax.consumeEscape(self.string, &self.pos)) return error.InvalidWord;
         } else {
             break;
         }
@@ -191,33 +181,8 @@ fn literal(self: *CSSParser, lit: u8) !void {
 /// `url(...)` and also keeps other supported function values intact.
 fn value(self: *CSSParser) ![]const u8 {
     const start = self.pos;
-    var parentheses: usize = 0;
-    var quote: ?u8 = null;
-    var escaped = false;
-    while (self.pos < self.string.len) {
-        const c = self.string[self.pos];
-        if (quote) |delimiter| {
-            if (escaped) {
-                escaped = false;
-            } else if (c == '\\') {
-                escaped = true;
-            } else if (c == delimiter) {
-                quote = null;
-            }
-        } else if (c == '/' and self.pos + 1 < self.string.len and self.string[self.pos + 1] == '*') {
-            _ = self.consumeComment();
-            continue;
-        } else switch (c) {
-            '\'', '"' => quote = c,
-            '(' => parentheses += 1,
-            ')' => if (parentheses > 0) {
-                parentheses -= 1;
-            },
-            ';', '}' => if (parentheses == 0) break,
-            else => {},
-        }
-        self.pos += 1;
-    }
+    const terminator = css_syntax.scanToTopLevel(self.string, self.pos, ";}");
+    self.pos = terminator.end;
     if (self.pos <= start) {
         return error.InvalidValue;
     }
@@ -398,6 +363,134 @@ fn parseDeclarationValue(raw_value: []const u8) ?Declaration {
     const value_without_priority = std.mem.trimEnd(u8, raw_value[0..bang], " \t\r\n");
     if (value_without_priority.len == 0) return null;
     return .{ .value = value_without_priority, .important = true };
+}
+
+// The style application owns defaults and inheritance, while the parser owns
+// the subset of names whose grammar it can validate before cascade. Keeping
+// this table here lets escaped identifiers resolve without allocating a
+// normalized copy, so rule and inline-style values keep borrowing source.
+const supported_shorthand_names = [_][]const u8{
+    "font",   "background", "margin",       "padding",       "border-width", "border-style", "border-color",
+    "border", "border-top", "border-right", "border-bottom", "border-left",
+};
+
+/// Return the canonical static property spelling for a supported CSS name.
+/// CSS property identifiers are ASCII-case-insensitive and may contain CSS
+/// escapes, but unsupported names intentionally have no effect in Zibra.
+fn canonicalPropertyName(raw_property: []const u8) ?[]const u8 {
+    for (css_properties.computed) |property| {
+        if (css_syntax.identifierEquals(raw_property, property.name)) return property.name;
+    }
+    for (supported_shorthand_names) |candidate| {
+        if (css_syntax.identifierEquals(raw_property, candidate)) return candidate;
+    }
+    return null;
+}
+
+fn isCssWideKeyword(raw_value: []const u8) bool {
+    const trimmed = std.mem.trim(u8, raw_value, " \t\r\n\x0c");
+    return std.ascii.eqlIgnoreCase(trimmed, "inherit") or
+        std.ascii.eqlIgnoreCase(trimmed, "initial") or
+        std.ascii.eqlIgnoreCase(trimmed, "unset");
+}
+
+fn isUnitlessZero(raw_value: []const u8) bool {
+    const trimmed = std.mem.trim(u8, raw_value, " \t\r\n\x0c");
+    const number = std.fmt.parseFloat(f64, trimmed) catch return false;
+    return std.math.isFinite(number) and number == 0;
+}
+
+fn isNonnegativeLength(raw_value: []const u8) bool {
+    return isUnitlessZero(raw_value) or css_length.parse(raw_value) != null;
+}
+
+fn isSignedLength(raw_value: []const u8) bool {
+    const trimmed = std.mem.trim(u8, raw_value, " \t\r\n\x0c");
+    if (isNonnegativeLength(trimmed)) return true;
+    if (trimmed.len < 2 or (trimmed[0] != '-' and trimmed[0] != '+')) return false;
+    return css_length.parse(trimmed[1..]) != null;
+}
+
+fn isAutomaticOrNonnegativeLength(raw_value: []const u8) bool {
+    return std.ascii.eqlIgnoreCase(std.mem.trim(u8, raw_value, " \t\r\n\x0c"), "auto") or
+        isNonnegativeLength(raw_value);
+}
+
+fn isAutomaticOrSignedLength(raw_value: []const u8) bool {
+    return std.ascii.eqlIgnoreCase(std.mem.trim(u8, raw_value, " \t\r\n\x0c"), "auto") or
+        isSignedLength(raw_value);
+}
+
+fn splitValueTokens(raw_value: []const u8, tokens: *[4][]const u8) ?usize {
+    var count: usize = 0;
+    var iterator = std.mem.tokenizeAny(u8, raw_value, " \t\r\n\x0c");
+    while (iterator.next()) |token| {
+        if (count == tokens.len) return null;
+        tokens[count] = token;
+        count += 1;
+    }
+    return if (count == 0) null else count;
+}
+
+fn isBorderColor(raw_value: []const u8) bool {
+    const trimmed = std.mem.trim(u8, raw_value, " \t\r\n\x0c");
+    return std.ascii.eqlIgnoreCase(trimmed, "currentcolor") or css_color.parse(trimmed) != null;
+}
+
+fn validBackgroundPosition(raw_value: []const u8) bool {
+    var tokens: [4][]const u8 = undefined;
+    const count = splitValueTokens(raw_value, &tokens) orelse return false;
+    if (count > 2) return false;
+    for (tokens[0..count]) |token| if (!isBackgroundPosition(token)) return false;
+    return true;
+}
+
+/// Validate values whose unsupported grammar would otherwise replace a valid
+/// earlier declaration in the cascade. Other supported values stay permissive
+/// until a focused feature owns their used-value grammar.
+fn isValidLonghandValue(property: []const u8, raw_value: []const u8) bool {
+    if (isCssWideKeyword(raw_value)) return true;
+
+    if (std.mem.eql(u8, property, "width") or std.mem.eql(u8, property, "height")) {
+        return isAutomaticOrNonnegativeLength(raw_value);
+    }
+    if (std.mem.eql(u8, property, "min-width") or std.mem.eql(u8, property, "min-height")) {
+        return isNonnegativeLength(raw_value);
+    }
+    if (std.mem.eql(u8, property, "max-width") or std.mem.eql(u8, property, "max-height")) {
+        return std.ascii.eqlIgnoreCase(std.mem.trim(u8, raw_value, " \t\r\n\x0c"), "none") or
+            isNonnegativeLength(raw_value);
+    }
+    if (std.mem.eql(u8, property, "top") or std.mem.eql(u8, property, "right") or
+        std.mem.eql(u8, property, "bottom") or std.mem.eql(u8, property, "left"))
+    {
+        return isAutomaticOrSignedLength(raw_value);
+    }
+    if (std.mem.startsWith(u8, property, "margin-")) return isAutomaticOrSignedLength(raw_value);
+    if (std.mem.startsWith(u8, property, "padding-")) return isNonnegativeLength(raw_value);
+    if (std.mem.endsWith(u8, property, "-width") and std.mem.startsWith(u8, property, "border-")) {
+        return isBorderWidth(raw_value);
+    }
+    if (std.mem.endsWith(u8, property, "-style") and std.mem.startsWith(u8, property, "border-")) {
+        return isBorderStyle(raw_value);
+    }
+    if (std.mem.endsWith(u8, property, "-color") and std.mem.startsWith(u8, property, "border-")) {
+        return isBorderColor(raw_value);
+    }
+    if (std.mem.eql(u8, property, "color") or std.mem.eql(u8, property, "background-color")) {
+        return isBorderColor(raw_value);
+    }
+    if (std.mem.eql(u8, property, "background-image")) {
+        const trimmed = std.mem.trim(u8, raw_value, " \t\r\n\x0c");
+        return std.ascii.eqlIgnoreCase(trimmed, "none") or background_image.parseUrl(trimmed) != null;
+    }
+    if (std.mem.eql(u8, property, "background-size")) return background_image.parseSize(raw_value) != null;
+    if (std.mem.eql(u8, property, "background-repeat")) return background_image.parseRepeat(raw_value) != null;
+    if (std.mem.eql(u8, property, "background-position")) return validBackgroundPosition(raw_value);
+    if (std.mem.eql(u8, property, "background-attachment")) return isBackgroundAttachment(raw_value);
+    if (std.mem.eql(u8, property, "font-size")) return isNonnegativeLength(raw_value);
+    if (std.mem.eql(u8, property, "line-height")) return isSupportedFontLineHeight(raw_value);
+    return std.mem.trim(u8, raw_value, " \t\r\n\x0c").len != 0;
 }
 
 fn putLonghand(map: *DeclarationMap, property: []const u8, declaration: Declaration) !void {
@@ -604,7 +697,7 @@ const BackgroundTokenIterator = struct {
     pos: usize = 0,
 
     fn next(self: *BackgroundTokenIterator) ?[]const u8 {
-        while (self.pos < self.input.len and std.ascii.isWhitespace(self.input[self.pos])) self.pos += 1;
+        css_syntax.skipWhitespaceAndComments(self.input, &self.pos);
         if (self.pos >= self.input.len) return null;
         if (self.input[self.pos] == '/') {
             self.pos += 1;
@@ -625,6 +718,13 @@ const BackgroundTokenIterator = struct {
                 } else if (char == delimiter) {
                     quote = null;
                 }
+            } else if (char == '/' and self.pos + 1 < self.input.len and self.input[self.pos + 1] == '*') {
+                if (depth == 0) break;
+                _ = css_syntax.consumeComment(self.input, &self.pos);
+                continue;
+            } else if (char == '\\') {
+                if (!css_syntax.consumeEscape(self.input, &self.pos)) self.pos += 1;
+                continue;
             } else switch (char) {
                 '\'', '"' => quote = char,
                 '(' => depth += 1,
@@ -750,9 +850,10 @@ fn expandBackground(
 /// every generated longhand retains the shorthand's importance.
 fn putDeclaration(
     map: *DeclarationMap,
-    property: []const u8,
+    raw_property: []const u8,
     raw_value: []const u8,
 ) !void {
+    const property = canonicalPropertyName(raw_property) orelse return;
     const declaration = parseDeclarationValue(raw_value) orelse return;
     if (std.ascii.eqlIgnoreCase(property, "font")) {
         const font = parseFontShorthand(declaration.value) orelse return;
@@ -798,6 +899,7 @@ fn putDeclaration(
         if (try expandBorder(map, property, declaration.value, declaration)) return;
         return;
     }
+    if (!isValidLonghandValue(property, declaration.value)) return;
     try putLonghand(map, property, declaration);
 }
 
@@ -806,6 +908,8 @@ pub fn body(self: *CSSParser, allocator: std.mem.Allocator) !DeclarationMap {
     errdefer map.deinit();
     // Stop at closing brace
     while (self.pos < self.string.len and self.string[self.pos] != '}') {
+        self.whitespace();
+        if (self.pos >= self.string.len or self.string[self.pos] == '}') break;
         // Try to parse a property-value pair, but catch any errors
         const result = self.pair() catch {
             // If parsing failed, skip to the next semicolon or closing brace
@@ -835,32 +939,13 @@ pub fn body(self: *CSSParser, allocator: std.mem.Allocator) !DeclarationMap {
 }
 
 fn ignoreUntil(self: *CSSParser, chars: []const u8) ?u8 {
-    while (self.pos < self.string.len) {
-        const current_char = self.string[self.pos];
-        for (chars) |c| {
-            if (current_char == c) {
-                return current_char;
-            }
-        }
-        self.pos += 1;
-    }
-    return null;
+    const match = css_syntax.scanToTopLevel(self.string, self.pos, chars);
+    self.pos = match.end;
+    return match.delimiter;
 }
 
 fn findMatchingBrace(self: *CSSParser, start: usize) ?usize {
-    if (start >= self.string.len or self.string[start] != '{') return null;
-    var depth: i32 = 0;
-    var i = start;
-    while (i < self.string.len) : (i += 1) {
-        const c = self.string[i];
-        if (c == '{') {
-            depth += 1;
-        } else if (c == '}') {
-            depth -= 1;
-            if (depth == 0) return i;
-        }
-    }
-    return null;
+    return css_syntax.findMatchingBrace(self.string, start);
 }
 
 fn parseKeyframeOffset(raw: []const u8) ?f64 {
@@ -1841,4 +1926,34 @@ test "declaration values retain semicolons inside URL functions" {
         rules[0].properties.get("background-size").?.value,
     );
     try std.testing.expectEqualStrings("red", rules[0].properties.get("color").?.value);
+}
+
+test "escaped declaration syntax preserves later values and rejects invalid cascade overrides" {
+    const allocator = std.testing.allocator;
+    const css =
+        "div { width: 2em; error: \\}; background: yellow; width: 200; background: red pink; }" ++
+        "span { background: yellow /* comment is whitespace */ no-repeat fixed; }" ++
+        "p { m\\61rgin: 2em; m\\argin: 3em; margin-top: 1em; }";
+    var parser = try CSSParser.init(allocator, css, false);
+    defer parser.deinit(allocator);
+    const rules = try parser.parse(allocator);
+    defer {
+        for (rules) |*rule| rule.deinit(allocator);
+        allocator.free(rules);
+    }
+
+    try std.testing.expectEqual(@as(usize, 3), rules.len);
+    const first = &rules[0].properties;
+    try std.testing.expectEqualStrings("2em", first.get("width").?.value);
+    try std.testing.expectEqualStrings("yellow", first.get("background-color").?.value);
+    try std.testing.expect(first.get("error") == null);
+
+    const second = &rules[1].properties;
+    try std.testing.expectEqualStrings("yellow", second.get("background-color").?.value);
+    try std.testing.expectEqualStrings("no-repeat", second.get("background-repeat").?.value);
+    try std.testing.expectEqualStrings("fixed", second.get("background-attachment").?.value);
+
+    const third = &rules[2].properties;
+    try std.testing.expectEqualStrings("1em", third.get("margin-top").?.value);
+    try std.testing.expectEqualStrings("2em", third.get("margin-right").?.value);
 }

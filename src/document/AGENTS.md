@@ -98,6 +98,9 @@ The document pipeline is split by ownership and algorithm boundaries:
 - `html_serialization.zig` is a generic leaf that traverses the live DOM,
   escapes attributes, and applies void-element rules without owning nodes or
   source buffers.
+- `css_syntax.zig` is a pure source-buffer scanner for CSS comments, escapes,
+  strings, and structural delimiters; `css_properties.zig` is the shared
+  static registry of computed longhand names and defaults.
 - `animation.zig` owns pure CSS transition/keyframe value objects stored by
   Elements. It does not decide whether an animation dirties compositor,
   paint, or layout; the Tab driver owns that phase decision.

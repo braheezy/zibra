@@ -40,6 +40,12 @@ split across acyclic modules:
   generic over the DOM types and final parent-pointer repair callback;
 - `html_serialization.zig` generically serializes the current live tree and
   owns only temporary output/sorting allocations;
+- `css_syntax.zig` owns source-buffer scanning for comments, strings, escapes,
+  balanced functions, and top-level structural delimiters; it returns only
+  borrowed ranges and never decides property grammar or computed values;
+- `css_properties.zig` owns the static set of published computed longhands and
+  their initial source slices, shared by declaration-name recognition and
+  style-map initialization;
 - `animation.zig` defines pure transition/keyframe interpolation values that
   Elements own, while the serialized Tab animation driver decides which
   render phase each published value dirties;
@@ -53,6 +59,14 @@ Focused owners may import their direct leaf dependencies, but must not import
 `parser.zig` back through the compatibility surface. Keep the facade
 logic-free so DOM storage, parsing, serialization, animation values, and style
 application retain unambiguous lifetimes.
+
+CSS declaration parsing must keep escaped delimiters and delimiters inside
+strings/functions out of block recovery. Comments are CSS whitespace for
+token-based shorthand parsing. The parser validates the supported used-value
+grammar before a declaration enters its per-rule cascade map, so an invalid
+later value cannot replace a valid earlier supported value. Values and
+canonical property names remain static or source-borrowed; no normalized
+stylesheet string may outlive the stylesheet generation that supplied it.
 
 ## Address-unstable Node storage
 

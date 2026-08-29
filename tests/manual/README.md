@@ -42,6 +42,7 @@ tiers and baseline policy.
 | [`font-line-height.html`](font-line-height.html) | Nested used line height |
 | [`font-shorthand.html`](font-shorthand.html) | Font shorthand expansion/reset and longhand interaction |
 | [`important.html`](important.html) | Declaration-local `!important` cascade |
+| [`css-declaration-recovery.html`](css-declaration-recovery.html) | Escaped declaration delimiters, comment whitespace, and invalid-value cascade recovery |
 | [`selector-sequences.html`](selector-sequences.html) | Concatenated tag/class/ID selectors and specificity |
 | [`has-selectors.html`](has-selectors.html) | Strict-descendant `:has` matching and recomputation |
 | [`style-descendant-invalidation.html`](style-descendant-invalidation.html) | Dirty ancestor path traversal while clean sibling subtrees are skipped |
