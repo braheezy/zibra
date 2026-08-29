@@ -1,17 +1,20 @@
 # zibra
 
-> [!WARNING]
-> This project is actively in work! `HEAD` usually works but it may be broken or produce nasty results.
-
 This repo holds my Zig code for the browser implemented in [Web Browser Engineering](https://browser.engineering/).
 
-Where possible, this project takes the most difficult route possible to implement features that are implemented quite easily in the book. It benefits from Python and mature third-party libraries and bindings. We get no such benefits.
+Where possible, this project takes the most difficult route possible to implement features that are implemented quite easily in the book. The book benefits from Python and mature third-party libraries and bindings. We get no such benefits.
+
+[Acid1:](https://www.w3.org/Style/CSS/Test/CSS1/current/test5526c.htm)
+![acid1](./docs/images/acid1.png)
+
+[Acid2:](http://acid2.acidtests.org/#top)
+![acid2](./docs/images/acid2.png)
 
 ## Usage
 
 You'll need Zig installed.
 
-Clone the project
+Clone the project:
 
 ```sh
 git clone https://github.com/braheezy/zibra.git
