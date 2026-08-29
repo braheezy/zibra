@@ -85,4 +85,16 @@ pub const cases = [_]Case{
         .fixture = "tests/pipeline/float-paint-phases.html",
         .golden = "tests/golden/pipeline/float-paint-phases.display-list.txt",
     },
+    .{
+        .name = "margin-collapse-layout",
+        .mode = .layout,
+        .fixture = "tests/pipeline/margin-collapse.html",
+        .golden = "tests/golden/pipeline/margin-collapse.layout.txt",
+    },
+    .{
+        .name = "margin-collapse-display-list",
+        .mode = .display_list,
+        .fixture = "tests/pipeline/margin-collapse.html",
+        .golden = "tests/golden/pipeline/margin-collapse.display-list.txt",
+    },
 };

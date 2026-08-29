@@ -26,6 +26,10 @@ boundaries.
   keywords, radii, and authored-zoom used values. It does not subscribe to
   style fields; `layout.zig` performs dependency-tracked reads before calling
   it.
+- `margin_collapse.zig` owns allocation-free adjoining vertical-margin struts.
+  It retains the positive and negative extrema of an arbitrary chain; layout
+  owns the DOM-backed cursor, clearance barriers, and block geometry that use
+  those scalar values.
 - `inline_format.zig` owns pure text normalization, entity decoding, line
   alignment/wrapping decisions, and inline font-size used values. Layout-tree
   traversal, glyph ownership, and retained line objects remain in

@@ -209,6 +209,14 @@ Important geometry contracts:
   their inline line ranges are excluded. Floats themselves and bounded
   formatting contexts (currently non-visible overflow and `display: table`)
   avoid the external float area as whole boxes.
+- Direct ordinary block children use a synchronous, pointer-free vertical
+  margin cursor. Its pure strut retains the largest positive and most-negative
+  adjoining values, allowing sibling chains and fully empty nested blocks to
+  collapse without reducing an intermediate chain to one lossy scalar. Borders,
+  padding, definite dimensions, formatting contexts, inline content, floats,
+  positioned children, and clearance are barriers. When clearance moves a
+  block, the incoming strut is consumed before the block is placed below the
+  relevant float margin box.
 - Relative position preserves the flow slot and stores a separate visual
   offset. Absolute blocks use the containing block's content box, have no
   in-flow predecessor, and do not extend normal height. Fixed blocks use the

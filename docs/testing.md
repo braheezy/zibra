@@ -34,8 +34,8 @@ Run from the repository root:
 - `zig build test` for the unified Zig suite;
 - `zig build test-dump-dom` for the isolated HTML/DOM CLI contract;
 - `zig build test-pipeline` for exact text-free style/layout/display-list
-  goldens covering the box model, nested CSS zoom, bounded tables, and float
-  paint phases under SDL dummy mode;
+  goldens covering the box model, nested CSS zoom, bounded tables, float paint
+  phases, and adjoining-margin/clearance flow under SDL dummy mode;
 - `zig build test-docs` for repository Markdown links when documentation
   changes;
 - `zig build test-server` after tutorial server routing, topic, session,

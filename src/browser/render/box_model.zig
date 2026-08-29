@@ -6,6 +6,7 @@
 
 const std = @import("std");
 const parser = @import("../../document/parser.zig");
+const margin_collapse = @import("margin_collapse.zig");
 
 const min_effective_zoom: f32 = 0.01;
 const max_effective_zoom: f32 = 1024.0;
@@ -226,13 +227,12 @@ pub fn constrainDimension(value: i32, minimum: ?i32, maximum: ?i32) i32 {
     return @max(constrained, 0);
 }
 
-/// Collapse two adjoining vertical margins. Positive margins choose the
-/// largest, negative margins choose the most negative, and opposite signs
-/// cancel. Parent/child and clearance collapsing remain layout concerns.
+/// Collapse two adjoining vertical margins. Longer chains are represented by
+/// `margin_collapse.MarginStrut` so nested empty blocks retain both extrema.
 pub fn collapseAdjoiningMargins(first: i32, second: i32) i32 {
-    if (first >= 0 and second >= 0) return @max(first, second);
-    if (first <= 0 and second <= 0) return @min(first, second);
-    return first +| second;
+    var strut = margin_collapse.MarginStrut.init(first);
+    strut.append(second);
+    return strut.used();
 }
 
 /// Resolve the supported px/em/percentage subset while permitting a sign.

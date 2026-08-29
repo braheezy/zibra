@@ -1,0 +1,81 @@
+<!--
+  How to verify: the blue block follows the red block by only a small collapsed
+  gap, not the sum of every nested empty-box margin. In the lower example, the
+  green clear block starts directly below the red float rather than after a
+  large blank gap.
+-->
+<!doctype html>
+<style>
+  html, body {
+    margin: 0;
+    padding: 0;
+  }
+
+  .stage {
+    display: block;
+    width: 300px;
+    margin: 24px;
+    outline: 1px solid #777777;
+  }
+
+  .lead {
+    display: block;
+    height: 24px;
+    margin-bottom: 8px;
+    background: #ff7777;
+  }
+
+  .empty {
+    display: block;
+    margin: 48px 0 64px;
+  }
+
+  .empty > div {
+    display: block;
+    margin: 0 0 -60px;
+  }
+
+  .following {
+    display: block;
+    height: 24px;
+    margin-top: 28px;
+    background: #7777ff;
+  }
+
+  .float {
+    display: block;
+    float: left;
+    width: 72px;
+    height: 72px;
+    background: #ff7777;
+  }
+
+  .clear-empty {
+    display: block;
+    margin: 96px 0;
+  }
+
+  .clear-empty > div {
+    display: block;
+    margin: 0 0 -92px;
+  }
+
+  .clear {
+    display: block;
+    clear: both;
+    height: 24px;
+    background: #77dd77;
+  }
+</style>
+
+<div class="stage">
+  <div class="lead"></div>
+  <div class="empty"><div></div></div>
+  <div class="following"></div>
+</div>
+
+<div class="stage">
+  <div class="float"></div>
+  <div class="clear-empty"><div></div></div>
+  <div class="clear"></div>
+</div>

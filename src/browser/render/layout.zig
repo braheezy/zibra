@@ -14,6 +14,7 @@ const parser = @import("../../document/parser.zig");
 const object_fit = @import("../../document/object_fit.zig");
 const replaced_sizing = @import("replaced_sizing.zig");
 const box_model = @import("box_model.zig");
+const margin_collapse = @import("margin_collapse.zig");
 const control_geometry = @import("control_geometry.zig");
 const inline_format = @import("inline_format.zig");
 const layout_hit = @import("layout_hit.zig");
@@ -46,6 +47,7 @@ const BoxEdges = box_model.BoxEdges;
 const FloatBox = box_model.FloatBox;
 const BoxModelEdges = box_model.BoxModelEdges;
 const EmbeddedBlockBox = box_model.EmbeddedBlockBox;
+const MarginStrut = margin_collapse.MarginStrut;
 
 fn addPageBottomPadding(content_bottom_css: i32) i32 {
     const padded = @as(i64, @max(content_bottom_css, 0)) + v_offset;
@@ -1933,6 +1935,8 @@ test "nested floats place and clear in a shared context after invalidation" {
             "<div id=b style='display:block;float:left;width:60px;height:40px'></div>" ++
             "</div>" ++
             "<div id=c style='display:block;float:left;width:60px;height:40px'></div>" ++
+            "<div id=empty style='display:block;margin:120px 0'>" ++
+            "<div style='display:block;margin:0 0 -116px'></div></div>" ++
             "<p id=clear style='display:block;clear:both;height:10px'></p>" ++
             "</main></body></html>",
     );
@@ -1960,6 +1964,7 @@ test "nested floats place and clear in a shared context after invalidation" {
     var wrapper_node: ?*Node = null;
     var first_float_node: ?*Node = null;
     var third_float_node: ?*Node = null;
+    var empty_node: ?*Node = null;
     var clear_node: ?*Node = null;
     for (nodes.items) |node| switch (node.*) {
         .element => |*element| {
@@ -1968,6 +1973,7 @@ test "nested floats place and clear in a shared context after invalidation" {
             if (std.mem.eql(u8, id, "wrapper")) wrapper_node = node;
             if (std.mem.eql(u8, id, "a")) first_float_node = node;
             if (std.mem.eql(u8, id, "c")) third_float_node = node;
+            if (std.mem.eql(u8, id, "empty")) empty_node = node;
             if (std.mem.eql(u8, id, "clear")) clear_node = node;
         },
         .text => {},
@@ -1976,8 +1982,10 @@ test "nested floats place and clear in a shared context after invalidation" {
     const wrapper: *BlockLayout = @ptrCast(@alignCast(wrapper_node.?.element.layout_ptr.?));
     const first_float: *BlockLayout = @ptrCast(@alignCast(first_float_node.?.element.layout_ptr.?));
     const third_float: *BlockLayout = @ptrCast(@alignCast(third_float_node.?.element.layout_ptr.?));
+    const empty: *BlockLayout = @ptrCast(@alignCast(empty_node.?.element.layout_ptr.?));
     const clearing: *BlockLayout = @ptrCast(@alignCast(clear_node.?.element.layout_ptr.?));
     try std.testing.expectEqual(@as(i32, 0), wrapper.height.get().*);
+    try std.testing.expect(empty.normal_flow_result.?.collapses_through);
     try std.testing.expectEqual(first_float.y.get().*, third_float.y.get().*);
     try std.testing.expectEqual(
         first_float.y.get().* + first_float.height.get().*,
@@ -1987,6 +1995,7 @@ test "nested floats place and clear in a shared context after invalidation" {
     first_float_node.?.element.style.?.getPtr("height").?.set("80px");
     try document.layout(engine);
     try std.testing.expectEqual(@as(i32, 0), wrapper.height.get().*);
+    try std.testing.expect(empty.normal_flow_result.?.collapses_through);
     try std.testing.expectEqual(first_float.y.get().*, third_float.y.get().*);
     try std.testing.expectEqual(
         first_float.y.get().* + first_float.height.get().*,
@@ -5951,6 +5960,31 @@ const TableBox = struct {
     height: ?i32 = null,
 };
 
+/// A parent supplies this synchronous, scalar-only cursor immediately before
+/// laying out one ordinary in-flow block child. It is intentionally not a
+/// ProtectedField: it is valid only during the serialized parent traversal
+/// and owns neither a layout object nor a dependency edge.
+const NormalFlowPlacement = struct {
+    origin_y: i32,
+    preceding_margin: MarginStrut = .{},
+
+    fn eql(self: NormalFlowPlacement, other: NormalFlowPlacement) bool {
+        return self.origin_y == other.origin_y and
+            self.preceding_margin.eql(other.preceding_margin);
+    }
+};
+
+/// The part of a direct child's vertical flow that its parent needs for the
+/// next sibling. Empty blocks leave `cursor_y` unchanged and carry their
+/// adjoining margins in `trailing_margin`; a visible block consumes the prior
+/// strut at its border top and starts a new trailing chain at its border
+/// bottom.
+const NormalFlowResult = struct {
+    cursor_y: i32,
+    trailing_margin: MarginStrut = .{},
+    collapses_through: bool = false,
+};
+
 const BlockLayout = struct {
     allocator: std.mem.Allocator,
     node: Node,
@@ -5973,6 +6007,12 @@ const BlockLayout = struct {
     /// Unlike `embedded_box`, this preserves the child element's CSS edges,
     /// effects, and content dimensions while forcing its grid border box.
     table_box: ?TableBox = null,
+    /// Ephemeral direct-parent normal-flow state. The parent updates this
+    /// before calling `layout`; `normal_flow_result` is then read before it
+    /// visits the next sibling. Neither field survives a layout phase as an
+    /// owned cross-object reference.
+    normal_flow_placement: ?NormalFlowPlacement = null,
+    normal_flow_result: ?NormalFlowResult = null,
     /// Borrowed column widths used only while a real `table-row` lays out its
     /// direct cells. `layoutWithTableRowBox` clears this before its caller's
     /// temporary table plan is released.
@@ -6888,6 +6928,88 @@ const BlockLayout = struct {
         self.previous.set(previous);
     }
 
+    /// Install the scalar position of an ordinary in-flow child before its
+    /// parent calls `layout`. A changed cursor is a real geometry change even
+    /// when this child's style fields stayed clean, so mark the subtree then.
+    fn setNormalFlowPlacement(self: *BlockLayout, placement: NormalFlowPlacement) void {
+        if (self.normal_flow_placement) |current| {
+            if (current.eql(placement)) return;
+        }
+        self.normal_flow_placement = placement;
+        self.normal_flow_result = null;
+        self.mark();
+    }
+
+    /// A block that has become floating, positioned, or table-placed must not
+    /// reuse the ordinary-flow result from an earlier layout generation.
+    fn clearNormalFlowPlacement(self: *BlockLayout) void {
+        if (self.normal_flow_placement == null and self.normal_flow_result == null) return;
+        self.normal_flow_placement = null;
+        self.normal_flow_result = null;
+        self.mark();
+    }
+
+    /// Whether this box's bottom edge may pass the pending bottom-margin
+    /// strut of its last ordinary child to its own parent. This deliberately
+    /// covers only ordinary auto-height block flow; formatting contexts,
+    /// definite heights, direct line content, floats, and positioned children
+    /// remain barriers in the caller.
+    fn canCollapseBottomMargin(
+        self: *const BlockLayout,
+        is_block: bool,
+        specified_height: ?i32,
+        min_height: ?i32,
+        has_flow_barrier: bool,
+    ) bool {
+        if (!is_block or has_flow_barrier) return false;
+        if (self.parent_block == null or self.inline_nodes != null or self.embedded_box != null) {
+            return false;
+        }
+        if (self.table_box != null or self.tableRole() != .ordinary) return false;
+        if (self.floatSide() != .none or isOutOfFlowPosition(self.positionMode())) return false;
+        if (blockAvoidsExternalFloats(self)) return false;
+        if (specified_height) |height| {
+            if (height != 0) return false;
+        }
+        if (min_height) |height| {
+            if (height != 0) return false;
+        }
+        return self.padding.bottom == 0 and self.border.bottom == 0;
+    }
+
+    /// An empty ordinary block can let its top margin, descendants' adjoining
+    /// margins, and bottom margin form one strut. All visual/formatting
+    /// boundaries are excluded here so a returned result never skips a box
+    /// that occupies space or paints a non-empty border/padding area.
+    fn canCollapseThrough(
+        self: *const BlockLayout,
+        is_block: bool,
+        specified_height: ?i32,
+        min_height: ?i32,
+        natural_height: i32,
+        clearance_applied: bool,
+    ) bool {
+        if (!self.canCollapseBottomMargin(
+            is_block,
+            specified_height,
+            min_height,
+            false,
+        )) return false;
+        if (clearance_applied or self.clearSide() != .none) return false;
+        if (self.padding.top != 0 or self.border.top != 0 or natural_height != 0) return false;
+        for (self.children.items) |child| switch (child) {
+            .line => return false,
+            .block => |block| {
+                if (block.floatSide() != .none or isOutOfFlowPosition(block.positionMode())) {
+                    return false;
+                }
+                const result = block.normal_flow_result orelse return false;
+                if (!result.collapses_through) return false;
+            },
+        };
+        return true;
+    }
+
     fn positionMode(self: *const BlockLayout) PositionMode {
         return nodePositionMode(self.node, null);
     }
@@ -7315,6 +7437,11 @@ const BlockLayout = struct {
         // Table grid placement supplies the border box directly. A cell or
         // row must not independently enter the surrounding float context.
         const float_side: FloatSide = if (table_box == null) self.floatSide() else .none;
+        const normal_flow_placement = if (table_box == null and
+            !isOutOfFlowPosition(position_mode) and float_side == .none)
+            self.normal_flow_placement
+        else
+            null;
         const shrink_to_fit_width = if (specified_width == null and
             (isOutOfFlowPosition(position_mode) or float_side != .none))
         shrink: {
@@ -7330,7 +7457,13 @@ const BlockLayout = struct {
             break :shrink scaleCssPixel(css_width, zoom_value, engine.zoom());
         } else null;
         var layout_y = prev_y;
+        if (normal_flow_placement) |placement| {
+            var adjoining = placement.preceding_margin;
+            adjoining.append(self.margin.top);
+            layout_y = placement.origin_y +| adjoining.used();
+        }
         var float_x: ?i32 = null;
+        var clearance_applied = false;
 
         if (table_box == null) {
             if (self.parent_block) |parent| {
@@ -7338,7 +7471,26 @@ const BlockLayout = struct {
                     const float_context = parent.floatContextForChildren();
                     const clear_side = self.clearSide();
                     if (clear_side != .none) {
-                        layout_y = float_context.clearBottom(layout_y, clear_side);
+                        const clear_origin = if (normal_flow_placement) |placement|
+                            placement.origin_y
+                        else
+                            layout_y;
+                        const cleared_y = float_context.clearBottom(clear_origin, clear_side);
+                        if (normal_flow_placement) |placement| {
+                            // Clearance creates a real separator. If it moves
+                            // this box, do not let an adjoining predecessor
+                            // margin pull its border back through the cleared
+                            // float; retain only this box's own top margin.
+                            if (cleared_y > layout_y) {
+                                layout_y = @max(
+                                    cleared_y,
+                                    placement.origin_y +| self.margin.top,
+                                );
+                                clearance_applied = true;
+                            }
+                        } else {
+                            layout_y = cleared_y;
+                        }
                     }
 
                     if (float_side != .none) {
@@ -7465,7 +7617,7 @@ const BlockLayout = struct {
         else
             @max(self.width.get().* - horizontal_insets, 0);
         if (engine.collect_hit_test_bounds) {
-            if (self.node_ptr) |ptr| try engine.recordFragmentTargets(ptr, prev_y);
+            if (self.node_ptr) |ptr| try engine.recordFragmentTargets(ptr, layout_y);
         }
 
         var is_block = self.isBlockContainer();
@@ -7509,6 +7661,8 @@ const BlockLayout = struct {
         }
 
         var natural_height: i32 = 0;
+        var normal_flow_ending: ?NormalFlowResult = null;
+        var normal_flow_bottom_collapses = false;
         if (is_block) {
             self.used_inline_layout = false;
             self.inline_paint_dirty = false;
@@ -7566,6 +7720,8 @@ const BlockLayout = struct {
                 const float_context = self.floatContextForChildren();
                 const flow_origin = self.y.get().* + self.border.top + self.padding.top +
                     tableOfContentsHeaderHeight(self.node, zoom_value, engine.zoom());
+                var flow_cursor = NormalFlowResult{ .cursor_y = flow_origin };
+                var has_flow_barrier = false;
                 _ = self.children_version.read(&self.height, self.allocator);
                 for (self.children.items) |child| {
                     switch (child) {
@@ -7581,12 +7737,23 @@ const BlockLayout = struct {
                             {
                                 b.mark();
                             }
+                            const child_is_out_of_flow = isOutOfFlowPosition(b.positionMode());
+                            const child_is_float = b.floatSide() != .none;
+                            if (!child_is_out_of_flow and !child_is_float) {
+                                b.setNormalFlowPlacement(.{
+                                    .origin_y = flow_cursor.cursor_y,
+                                    .preceding_margin = flow_cursor.trailing_margin,
+                                });
+                            } else {
+                                b.clearNormalFlowPlacement();
+                                has_flow_barrier = true;
+                            }
                             try b.layout(engine);
                             const child_height = b.height.read(&self.height, self.allocator).*;
-                            if (isOutOfFlowPosition(b.positionMode())) {
+                            if (child_is_out_of_flow) {
                                 // Absolutely positioned descendants paint in this
                                 // subtree but contribute no normal-flow height.
-                            } else if (b.floatSide() != .none) {
+                            } else if (child_is_float) {
                                 try float_context.floats.append(float_context.allocator, .{
                                     .side = b.floatSide(),
                                     .x = b.x.get().*,
@@ -7596,19 +7763,36 @@ const BlockLayout = struct {
                                     .margin = b.margin,
                                 });
                             } else {
-                                const child_bottom = b.y.get().* +| child_height +| b.margin.bottom;
+                                const child_flow = b.normal_flow_result orelse NormalFlowResult{
+                                    .cursor_y = b.y.get().* +| child_height,
+                                    .trailing_margin = MarginStrut.init(b.margin.bottom),
+                                };
+                                flow_cursor = child_flow;
                                 computed_height = @max(
                                     computed_height,
-                                    child_bottom -| flow_origin,
+                                    flow_cursor.cursor_y -| flow_origin,
                                 );
                             }
                         },
                         .line => |l| {
+                            has_flow_barrier = true;
                             try l.layout(engine);
                             computed_height += l.height.read(&self.height, self.allocator).*;
                         },
                     }
                 }
+                normal_flow_bottom_collapses = self.canCollapseBottomMargin(
+                    is_block,
+                    specified_height,
+                    min_height,
+                    has_flow_barrier,
+                );
+                if (!normal_flow_bottom_collapses) {
+                    const trailing_bottom = flow_cursor.cursor_y +|
+                        flow_cursor.trailing_margin.used();
+                    computed_height = @max(computed_height, trailing_bottom -| flow_origin);
+                }
+                normal_flow_ending = flow_cursor;
                 if (owns_float_context) {
                     for (self.floats.items) |float_box| {
                         computed_height = @max(float_box.bottom() -| flow_origin, computed_height);
@@ -7686,6 +7870,42 @@ const BlockLayout = struct {
             containing_height_css,
             engine.zoom(),
         );
+
+        if (normal_flow_placement) |placement| {
+            if (self.canCollapseThrough(
+                is_block,
+                specified_height,
+                min_height,
+                natural_height,
+                clearance_applied,
+            )) {
+                var collapsed = placement.preceding_margin;
+                collapsed.append(self.margin.top);
+                if (normal_flow_ending) |ending| {
+                    collapsed.appendStrut(ending.trailing_margin);
+                }
+                collapsed.append(self.margin.bottom);
+                self.normal_flow_result = .{
+                    .cursor_y = placement.origin_y,
+                    .trailing_margin = collapsed,
+                    .collapses_through = true,
+                };
+            } else {
+                var trailing = MarginStrut.init(self.margin.bottom);
+                if (normal_flow_bottom_collapses) {
+                    if (normal_flow_ending) |ending| {
+                        trailing = ending.trailing_margin;
+                        trailing.append(self.margin.bottom);
+                    }
+                }
+                self.normal_flow_result = .{
+                    .cursor_y = self.y.get().* +| self.height.get().*,
+                    .trailing_margin = trailing,
+                };
+            }
+        } else {
+            self.normal_flow_result = null;
+        }
 
         try recordElementFocusBounds(engine, self);
 

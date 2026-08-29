@@ -1,0 +1,74 @@
+<!doctype html>
+<style>
+  html, body {
+    display: block;
+    margin: 0;
+    padding: 0;
+  }
+
+  .stage {
+    display: block;
+    width: 120px;
+  }
+
+  .lead {
+    display: block;
+    height: 10px;
+    margin-bottom: 8px;
+    background-color: #ff0000;
+  }
+
+  .empty {
+    display: block;
+    margin: 30px 0 40px;
+  }
+
+  .empty > div {
+    display: block;
+    margin: 0 0 -36px;
+  }
+
+  .following {
+    display: block;
+    height: 10px;
+    margin-top: 20px;
+    background-color: #0000ff;
+  }
+
+  .float {
+    display: block;
+    float: left;
+    width: 20px;
+    height: 40px;
+    background-color: #ff0000;
+  }
+
+  .clear-empty {
+    display: block;
+    margin: 120px 0;
+  }
+
+  .clear-empty > div {
+    display: block;
+    margin: 0 0 -116px;
+  }
+
+  .clear {
+    display: block;
+    clear: both;
+    height: 10px;
+    background-color: #00ff00;
+  }
+</style>
+
+<div class="stage">
+  <div class="lead"></div>
+  <div class="empty"><div></div></div>
+  <div class="following"></div>
+</div>
+
+<div class="stage">
+  <div class="float"></div>
+  <div class="clear-empty"><div></div></div>
+  <div class="clear"></div>
+</div>
