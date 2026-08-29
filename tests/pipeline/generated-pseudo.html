@@ -1,0 +1,25 @@
+<!doctype html>
+<style>
+  main { display: block; width: 80px; }
+  #host { display: block; width: 40px; }
+  #host::before {
+    display: block;
+    width: 0;
+    height: 0;
+    content: '';
+    border-style: none solid solid;
+    border-width: 10px;
+    border-color: red yellow black yellow;
+  }
+  #real { display: block; width: 20px; height: 10px; background-color: green; }
+  #host:after {
+    display: block;
+    width: 0;
+    height: 0;
+    content: '';
+    border-style: solid solid none;
+    border-width: 10px;
+    border-color: black yellow red yellow;
+  }
+</style>
+<main><div id="host"><div id="real"></div></div></main>

@@ -59,7 +59,7 @@ fn parentNode(node: *Node) ?*Node {
 /// provenance can name either kind of Node, so normalize before retaining a
 /// generation-bound target.
 fn hoverElementForNode(node: *Node) ?*Node {
-    var current: ?*Node = node;
+    var current: ?*Node = parser.publicEventTarget(node);
     while (current) |candidate| {
         switch (candidate.*) {
             .element => return candidate,
@@ -771,7 +771,7 @@ pub fn FrameType(
         };
 
         fn clickTarget(node: *Node) ?*Node {
-            var current: ?*Node = node;
+            var current: ?*Node = parser.publicEventTarget(node);
             while (current) |candidate| {
                 switch (candidate.*) {
                     .element => return candidate,

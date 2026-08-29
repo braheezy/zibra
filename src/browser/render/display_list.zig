@@ -233,6 +233,40 @@ pub const ImageTiling = struct {
     offset_y: i32 = 0,
     repeat_x: bool = true,
     repeat_y: bool = true,
+    /// Scroll-attached tiles use their element clip as the phase origin.
+    /// Fixed tiles use the current frame viewport instead, while the image
+    /// command's x/y rectangle continues to clip their pixels to the element.
+    attachment: Attachment = .scroll,
+
+    pub const Attachment = enum {
+        scroll,
+        fixed,
+    };
+};
+
+/// Convex four-point paint primitive. CSS solid borders use this for mitered
+/// side geometry, including the degenerate-triangle shape produced by a
+/// zero-content box with opposing borders.
+pub const QuadDisplayItem = struct {
+    x1: i32,
+    y1: i32,
+    x2: i32,
+    y2: i32,
+    x3: i32,
+    y3: i32,
+    x4: i32,
+    y4: i32,
+    color: Color,
+    source: ?DisplayItemSource = null,
+
+    pub fn bounds(self: QuadDisplayItem) Rect {
+        return .{
+            .left = @min(@min(self.x1, self.x2), @min(self.x3, self.x4)),
+            .top = @min(@min(self.y1, self.y2), @min(self.y3, self.y4)),
+            .right = @max(@max(self.x1, self.x2), @max(self.x3, self.x4)),
+            .bottom = @max(@max(self.y1, self.y2), @max(self.y3, self.y4)),
+        };
+    }
 };
 
 /// Validate an RGBA byte buffer before raster code indexes it. A canvas that
@@ -330,6 +364,7 @@ pub const DisplayItem = union(enum) {
         color: Color,
         source: ?DisplayItemSource = null,
     },
+    quad: QuadDisplayItem,
     image: ImageDisplayItem,
     canvas: CanvasDisplayItem,
     iframe: struct {
@@ -437,6 +472,37 @@ pub const DisplayItem = union(enum) {
         return false;
     }
 
+    /// Whether a page contains paint whose pixels are anchored to the frame
+    /// viewport instead of translating uniformly with document scroll.
+    ///
+    /// The Browser uses this conservative recursive check to choose its
+    /// one-viewport raster path. A fixed background is still clipped by its
+    /// document element, but its tile phase must be recomputed at each scroll
+    /// position just like an explicitly fixed transform group.
+    pub fn hasViewportAttachedPaint(items: []const DisplayItem) bool {
+        for (items) |item| {
+            switch (item) {
+                .cached_subtree => |cached| {
+                    if (hasViewportAttachedPaint(cached.list.items)) return true;
+                },
+                .image => |image| {
+                    if (image.tiling) |tile| {
+                        if (tile.attachment == .fixed) return true;
+                    }
+                },
+                .blend => |blend_item| {
+                    if (hasViewportAttachedPaint(blend_item.children)) return true;
+                },
+                .transform => |transform_item| {
+                    if (transform_item.scroll_attachment == .frame_viewport or
+                        hasViewportAttachedPaint(transform_item.children)) return true;
+                },
+                else => {},
+            }
+        }
+        return false;
+    }
+
     /// Return a non-owning command copy with `opacity_value` distributed into
     /// its paint alpha. Grouped cached-layer draws are handled by
     /// `fuseCompositedLayerDraw` so overlapping siblings keep group semantics.
@@ -450,6 +516,9 @@ pub const DisplayItem = union(enum) {
             },
             .rect => |*rect_item| {
                 rect_item.color.a = scaleAlpha(rect_item.color.a, opacity);
+            },
+            .quad => |*quad_item| {
+                quad_item.color.a = scaleAlpha(quad_item.color.a, opacity);
             },
             .image => |*image_item| {
                 image_item.opacity *= opacity;
@@ -932,6 +1001,12 @@ pub const DisplayItem = union(enum) {
                 rect_item.y2,
                 zoom,
             ),
+            .quad => |quad_item| quad_item.color.a > 0 and pointInScaledQuad(
+                x,
+                y,
+                quad_item,
+                zoom,
+            ),
             .image => |image_item| image: {
                 const bounds = image_item.hit_rect orelse Rect{
                     .left = image_item.x1,
@@ -1002,6 +1077,40 @@ pub const DisplayItem = union(enum) {
             scaleLayoutPx(x2, zoom),
             scaleLayoutPx(y2, zoom),
         );
+    }
+
+    fn pointInScaledQuad(
+        x: i32,
+        y: i32,
+        item: QuadDisplayItem,
+        zoom: f32,
+    ) bool {
+        const points = [_]struct { x: i32, y: i32 }{
+            .{ .x = scaleLayoutPx(item.x1, zoom), .y = scaleLayoutPx(item.y1, zoom) },
+            .{ .x = scaleLayoutPx(item.x2, zoom), .y = scaleLayoutPx(item.y2, zoom) },
+            .{ .x = scaleLayoutPx(item.x3, zoom), .y = scaleLayoutPx(item.y3, zoom) },
+            .{ .x = scaleLayoutPx(item.x4, zoom), .y = scaleLayoutPx(item.y4, zoom) },
+        };
+        const bounds = Rect{
+            .left = @min(@min(points[0].x, points[1].x), @min(points[2].x, points[3].x)),
+            .top = @min(@min(points[0].y, points[1].y), @min(points[2].y, points[3].y)),
+            .right = @max(@max(points[0].x, points[1].x), @max(points[2].x, points[3].x)),
+            .bottom = @max(@max(points[0].y, points[1].y), @max(points[2].y, points[3].y)),
+        };
+        if (!bounds.containsPoint(x, y)) return false;
+
+        var sign: i8 = 0;
+        for (points, 0..) |point, index| {
+            const next = points[(index + 1) % points.len];
+            const cross: i128 =
+                (@as(i128, next.x) - @as(i128, point.x)) * (@as(i128, y) - @as(i128, point.y)) -
+                (@as(i128, next.y) - @as(i128, point.y)) * (@as(i128, x) - @as(i128, point.x));
+            if (cross == 0) continue;
+            const current_sign: i8 = if (cross > 0) 1 else -1;
+            if (sign != 0 and sign != current_sign) return false;
+            sign = current_sign;
+        }
+        return sign != 0;
     }
 
     fn pointInRect(x: i32, y: i32, x1: i32, y1: i32, x2: i32, y2: i32) bool {
@@ -1296,7 +1405,24 @@ test "viewport attachment detection visits nested owning and cached subtrees" {
     const roots = [_]DisplayItem{.{ .cached_subtree = .{
         .list = &cached_items,
     } }};
+    const fixed_background = [_]DisplayItem{.{ .image = .{
+        .x1 = 10,
+        .y1 = 20,
+        .x2 = 30,
+        .y2 = 40,
+        .source_width = 1,
+        .source_height = 1,
+        .pixels = &.{},
+        .tiling = .{
+            .width = 1,
+            .height = 1,
+            .attachment = .fixed,
+        },
+    } }};
 
     try std.testing.expect(!DisplayItem.hasFrameViewportAttachment(document_only[0..]));
     try std.testing.expect(DisplayItem.hasFrameViewportAttachment(roots[0..]));
+    try std.testing.expect(!DisplayItem.hasViewportAttachedPaint(document_only[0..]));
+    try std.testing.expect(DisplayItem.hasViewportAttachedPaint(roots[0..]));
+    try std.testing.expect(DisplayItem.hasViewportAttachedPaint(fixed_background[0..]));
 }

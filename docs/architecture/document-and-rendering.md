@@ -24,9 +24,21 @@ are emitted deterministically, values are quoted and escaped, ordinary closing
 tags are recursive, void elements omit children and closing tags, and
 source-backed DOM text is copied verbatim to avoid double escaping.
 
+CSS `:before`/`:after` nodes are private, heap-stable Nodes owned by their
+host Element. They never enter authored child arrays, serialization, ID lookup,
+or script-visible DOM traversal; active layout instead injects them in
+before/authored/after order. The bounded implementation activates only empty
+quoted `content` (`''` or `""`) boxes. Text-bearing generated content remains
+deferred until it has an explicit owned-text lifetime and DOM-boundary design.
+
 `inspection.Page.load` returns its root by value. Call
 `Page.repairParentPointers` after that root reaches its final address and before
 layout or paint performs an ancestry walk.
+
+Raw `HTMLParser.parse` has the same return-by-value boundary: store the root
+at its final address and call `fixParentPointers(&root, null)` before style,
+invalidation, layout, DOM ancestry, or JavaScript publishes Node pointers.
+The parser can only repair its provisional local root before returning it.
 
 ## Document module ownership
 
@@ -34,8 +46,9 @@ layout or paint performs an ancestry walk.
 document owner. Existing callers import one stable surface while the work is
 split across acyclic modules:
 
-- `dom.zig` owns Node/Element/Text storage, Element-backed resources, parent
-  and style-owner rebinding, invalidation callbacks, and DOM traversal helpers;
+- `dom.zig` owns Node/Element/Text storage, private Element-owned generated
+  pseudo nodes, Element-backed resources, parent and style-owner rebinding,
+  invalidation callbacks, and DOM traversal helpers;
 - `html_parser.zig` is a stateful, source-borrowing tokenizer/tree builder
   generic over the DOM types and final parent-pointer repair callback;
 - `html_serialization.zig` generically serializes the current live tree and
@@ -46,6 +59,8 @@ split across acyclic modules:
 - `css_properties.zig` owns the static set of published computed longhands and
   their initial source slices, shared by declaration-name recognition and
   style-map initialization;
+- `pseudo.zig` owns only the shared before/after identity used by DOM,
+  selector, and style owners; it owns neither a Node nor a stylesheet value;
 - `animation.zig` defines pure transition/keyframe interpolation values that
   Elements own, while the serialized Tab animation driver decides which
   render phase each published value dirties;
@@ -225,6 +240,9 @@ Important geometry contracts:
   so their entire paint subtree ignores document scroll.
 - A fixed-height `overflow: scroll` block preserves natural content height as
   DOM scroll geometry, translates only its content, and clips that content.
+  `overflow: hidden` uses the same bounded paint and hit-test clip without
+  creating element-local scroll state; the present bounded implementation
+  clips to the layout block bounds.
 - Immediate layout children retain a stable paint permutation ordered by
   effective signed z-index and DOM index. Only non-static positioned blocks
   receive nonzero z-index. Reverse that exact order for hit testing.
@@ -246,6 +264,10 @@ Pure layout leaves are intentionally separated from retained object state:
 - `render/box_model.zig` resolves box edges, dimensions, positioning values,
   radii, and authored-zoom math after the owning layout object has made any
   dependency-tracked style read;
+- `render/border_geometry.zig` derives the outer-to-inner convex mitered
+  quadrilateral for one resolved solid-border side. It receives no DOM/style
+  pointers: layout resolves per-side style and color, while the display list
+  owns the resulting primitive;
 - `render/inline_format.zig` normalizes inline text and computes alignment,
   wrapping, line-height, and font-variant used values without walking or
   owning the layout tree;
@@ -299,12 +321,18 @@ recursively copies owning command containers and immutable canvas pixels, but
 does not own or extend the lifetime of the source layout cache.
 
 `render/paint_effects.zig` owns scalar effect resolution and the construction
-of blur, clip, blend, transform, position, fixed-viewport, and scroll command
-groups. Its
+of blur, clip (including `overflow: hidden`), blend, transform, position,
+fixed-viewport, and scroll command groups. Its
 `wrapOwned` boundary consumes the independently owned top-level input slice on
 both success and allocation failure. Callers reserve a destination before
 transferring returned owning items, so no recursive command is shallow-copied
 across a fallible operation.
+
+Solid borders paint as four convex quadrilaterals rather than overlapping
+rectangular side strips. Each shape derives its inner corners from all four
+resolved widths, so adjacent colors meet on a shared diagonal miter and a
+zero-content border box can form triangles. Bounds and painted hit testing use
+the quadrilateral rather than treating its bounding rectangle as painted.
 
 Layout invalidation also dirties paint. Paint invalidation follows layout
 ancestry without dirtying geometry. An element-backed block forwards inherited
@@ -344,21 +372,23 @@ worker boundary; `RasterSnapshot` produces the independent worker-owned form.
 
 `software_renderer.Renderer` is the Browser-free interpreter for those owned
 commands: primitive drawing, image sampling, opacity/blend/mask/blur effects,
-and retained-layer rasterization. It borrows immutable allocator/I/O choices
-and the retained compositor's pure bounds calculator, but owns no SDL handle,
-thread, or command tree. Browser and presentation-worker code provide the
-surface lifetime and explicit zoom/offset inputs.
+and retained-layer rasterization. A fixed background image retains its
+element-local clip rectangle while image tiling uses the current viewport-local
+phase. It borrows immutable allocator/I/O choices and the retained compositor's
+pure bounds calculator, but owns no SDL handle, thread, or command tree.
+Browser and presentation-worker code provide the surface lifetime and explicit
+zoom/offset inputs.
 
 The worker keeps either a bounded assembled page surface or ordered compositor
 planes. The interest region is at most four native window heights. A viewport
 fully inside the published region can scroll by drawing cached pixels; crossing
 an edge, resizing, zooming, replacing the list, or changing geometry requires
-a new raster. If the list contains a `frame_viewport` attachment, the worker
-uses a one-viewport region anchored at the current scroll offset and does not
-split compositor planes: only that arrangement preserves source-order blending
-between fixed and document-attached commands. Consequently fixed-content pages
-re-raster after every root scroll until a future multi-stratum cache proves the
-same ordering contract.
+a new raster. If the list contains a `frame_viewport` attachment or a fixed
+background tile, the worker uses a one-viewport region anchored at the current
+scroll offset and does not split compositor planes: only that arrangement
+preserves source-order blending and the viewport tile phase. Consequently such
+pages re-raster after every root scroll until a future multi-stratum cache
+proves the same ordering contract.
 
 Compositor planes own exactly one backing: an RGBA surface or an independent
 short pointer-free command snapshot. Short planes are limited to cheap

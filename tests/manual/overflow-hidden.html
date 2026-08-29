@@ -1,0 +1,31 @@
+<!doctype html>
+<!--
+How to verify:
+1. The patterned image in the first frame is visible only in its 10px-tall
+   strip; no image pixels spill into the white space below it.
+2. The matching `overflow: visible` frame intentionally shows the full image.
+3. Clicking the visible-only part of the first image must not target the image
+   or a descendant inside the hidden frame.
+-->
+<title>Overflow hidden regression</title>
+<style>
+  body { background-color: white; color: black; }
+  .frame {
+    display: block;
+    width: 160px;
+    height: 10px;
+    margin: 18px 0 70px 40px;
+    background-color: #e2e8f0;
+  }
+  .hidden { overflow: hidden; }
+  .visible { overflow: visible; }
+  img {
+    display: block;
+    width: 160px;
+    height: 64px;
+  }
+</style>
+<h1>Overflow hidden clips descendants</h1>
+<p>Only the first frame is a clipping boundary.</p>
+<div class="frame hidden"><img src="background-image-pattern.ppm" alt="pattern"></div>
+<div class="frame visible"><img src="background-image-pattern.ppm" alt="pattern"></div>

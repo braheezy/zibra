@@ -1,0 +1,7 @@
+quad x1=33 y1=18 x2=33 y2=38 x3=23 y3=28 x4=23 y4=28 color=#ffff00ff
+quad x1=33 y1=38 x2=13 y2=38 x3=23 y3=28 x4=23 y4=28 color=#000000ff
+quad x1=13 y1=38 x2=13 y2=18 x3=23 y3=28 x4=23 y4=28 color=#ffff00ff
+rect x1=13 y1=38 x2=33 y2=48 color=#008000ff
+quad x1=13 y1=48 x2=33 y2=48 x3=23 y3=58 x4=23 y4=58 color=#000000ff
+quad x1=33 y1=48 x2=33 y2=68 x3=23 y3=58 x4=23 y4=58 color=#ffff00ff
+quad x1=13 y1=68 x2=13 y2=48 x3=23 y3=58 x4=23 y4=58 color=#ffff00ff

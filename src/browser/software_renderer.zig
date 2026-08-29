@@ -11,6 +11,7 @@ const compositor = z2d.compositor;
 
 const display_commands = @import("render/display_list.zig");
 const effects = @import("render/effects.zig");
+const paint_effects = @import("render/paint_effects.zig");
 const raster_snapshot = @import("render/raster_snapshot.zig");
 const DisplayCompositor = @import("display_compositor.zig").Compositor;
 
@@ -18,6 +19,7 @@ const blurKernelRadius = effects.blurKernelRadius;
 const CompositedLayer = display_commands.CompositedLayer;
 const DisplayItem = display_commands.DisplayItem;
 const ImageDisplayItem = display_commands.ImageDisplayItem;
+const QuadDisplayItem = display_commands.QuadDisplayItem;
 const gaussianBlurPixels = effects.gaussianBlurPixels;
 const rasterBlendNeedsIsolation = raster_snapshot.blendNeedsIsolation;
 
@@ -199,8 +201,15 @@ fn mapImageSourceCoordinateForItem(
             const repeats = if (horizontal) tile.repeat_x else tile.repeat_y;
             const tile_size = display_commands.DisplayItem.scaleLayoutPx(layout_size, zoom);
             if (tile_size <= 0) return -1;
-            const tile_start = destination_start +
-                display_commands.DisplayItem.scaleLayoutPx(layout_offset, zoom);
+            // A scroll-attached image is phased from its element clip. A
+            // fixed image keeps its phase at the current frame viewport's
+            // local origin; every caller that can paint it uses the
+            // viewport-sized raster path, so destination coordinates are
+            // already viewport-local here.
+            const tile_start = if (tile.attachment == .fixed)
+                display_commands.DisplayItem.scaleLayoutPx(layout_offset, zoom)
+            else
+                destination_start + display_commands.DisplayItem.scaleLayoutPx(layout_offset, zoom);
             const relative = destination - tile_start;
             const tile_coordinate = if (repeats)
                 @mod(relative, tile_size)
@@ -280,6 +289,213 @@ test "raster image sampling repeats a positioned background tile" {
     );
 }
 
+test "fixed background tiles keep their viewport phase across element clips" {
+    const pixels = [_]u8{0} ** (2 * 2 * 4);
+    const item = ImageDisplayItem{
+        .x1 = 100,
+        .y1 = 200,
+        .x2 = 120,
+        .y2 = 220,
+        .source_width = 2,
+        .source_height = 2,
+        .pixels = &pixels,
+        .tiling = .{
+            .width = 2,
+            .height = 2,
+            .offset_x = 3,
+            .offset_y = 5,
+            .repeat_x = false,
+            .repeat_y = false,
+            .attachment = .fixed,
+        },
+    };
+
+    // The same viewport pixel maps identically even when the element's
+    // clipping rectangle changes position with document scroll.
+    try std.testing.expectEqual(
+        @as(i32, 0),
+        mapImageSourceCoordinateForItem(item, 3, 100, 20, 0, 2, true, 1.0),
+    );
+    try std.testing.expectEqual(
+        @as(i32, 0),
+        mapImageSourceCoordinateForItem(item, 3, 10, 20, 0, 2, true, 1.0),
+    );
+    try std.testing.expectEqual(
+        @as(i32, -1),
+        mapImageSourceCoordinateForItem(item, 2, 100, 20, 0, 2, true, 1.0),
+    );
+}
+
+test "fixed background raster phase is viewport-local while its clip scrolls" {
+    const allocator = std.testing.allocator;
+    const pixels = [_]u8{
+        255, 0,   0,   255,
+        0,   255, 0,   255,
+        0,   0,   255, 255,
+        255, 255, 0,   255,
+    };
+    var bounds = DisplayCompositor.init(allocator);
+    defer bounds.deinit();
+    var renderer = Renderer.init(allocator, allocator, std.testing.io, &bounds);
+
+    const initial = ImageDisplayItem{
+        .x1 = 4,
+        .y1 = 100,
+        .x2 = 12,
+        .y2 = 106,
+        .source_width = 2,
+        .source_height = 2,
+        .pixels = &pixels,
+        .tiling = .{
+            .width = 2,
+            .height = 2,
+            .offset_x = 4,
+            .offset_y = 1,
+            .repeat_x = false,
+            .repeat_y = false,
+            .attachment = .fixed,
+        },
+    };
+
+    var initial_surface = try z2d.Surface.init(.image_surface_rgba, allocator, 16, 16);
+    defer initial_surface.deinit(allocator);
+    const initial_pixels = switch (initial_surface) {
+        .image_surface_rgba => |*surface| surface.buf,
+        else => unreachable,
+    };
+    @memset(initial_pixels, .{ .r = 255, .g = 255, .b = 255, .a = 255 });
+    var initial_context = z2d.Context.init(std.testing.io, allocator, &initial_surface);
+    defer initial_context.deinit();
+    try renderer.drawDisplayItemZ2dContextForLayer(
+        &initial_context,
+        .{ .image = initial },
+        0,
+        100,
+        1.0,
+    );
+
+    const width: usize = 16;
+    try std.testing.expectEqual(
+        z2d.pixel.RGBA{ .r = 255, .g = 0, .b = 0, .a = 255 },
+        initial_pixels[1 * width + 4],
+    );
+    try std.testing.expectEqual(
+        z2d.pixel.RGBA{ .r = 255, .g = 255, .b = 255, .a = 255 },
+        initial_pixels[0 * width + 4],
+    );
+
+    var scrolled = initial;
+    scrolled.y1 += 100;
+    scrolled.y2 += 100;
+    var scrolled_surface = try z2d.Surface.init(.image_surface_rgba, allocator, 16, 16);
+    defer scrolled_surface.deinit(allocator);
+    const scrolled_pixels = switch (scrolled_surface) {
+        .image_surface_rgba => |*surface| surface.buf,
+        else => unreachable,
+    };
+    @memset(scrolled_pixels, .{ .r = 255, .g = 255, .b = 255, .a = 255 });
+    var scrolled_context = z2d.Context.init(std.testing.io, allocator, &scrolled_surface);
+    defer scrolled_context.deinit();
+    try renderer.drawDisplayItemZ2dContextForLayer(
+        &scrolled_context,
+        .{ .image = scrolled },
+        0,
+        200,
+        1.0,
+    );
+    try std.testing.expectEqual(
+        z2d.pixel.RGBA{ .r = 255, .g = 0, .b = 0, .a = 255 },
+        scrolled_pixels[1 * width + 4],
+    );
+}
+
+test "overflow clip masks an oversized descendant to its block bounds" {
+    const allocator = std.testing.allocator;
+    var bounds = DisplayCompositor.init(allocator);
+    defer bounds.deinit();
+    var renderer = Renderer.init(allocator, allocator, std.testing.io, &bounds);
+
+    const commands = try allocator.alloc(DisplayItem, 1);
+    commands[0] = .{ .rect = .{
+        .x1 = 0,
+        .y1 = 0,
+        .x2 = 20,
+        .y2 = 20,
+        .color = .{ .r = 255, .g = 0, .b = 0, .a = 255 },
+    } };
+    const clipped = try paint_effects.wrapOwned(allocator, commands, .{
+        .clips_overflow = true,
+    }, .{
+        .bounds = .{ .left = 5, .top = 5, .right = 15, .bottom = 15 },
+    });
+    defer DisplayItem.freeList(allocator, clipped);
+
+    var surface = try z2d.Surface.init(.image_surface_rgba, allocator, 24, 24);
+    defer surface.deinit(allocator);
+    const pixels = switch (surface) {
+        .image_surface_rgba => |*image_surface| image_surface.buf,
+        else => unreachable,
+    };
+    @memset(pixels, .{ .r = 255, .g = 255, .b = 255, .a = 255 });
+    var context = z2d.Context.init(std.testing.io, allocator, &surface);
+    defer context.deinit();
+    try renderer.drawDisplayItemZ2dContextForLayer(&context, clipped[0], 0, 0, 1.0);
+
+    const width: usize = 24;
+    try std.testing.expectEqual(
+        z2d.pixel.RGBA{ .r = 255, .g = 255, .b = 255, .a = 255 },
+        pixels[4 * width + 4],
+    );
+    try std.testing.expectEqual(
+        z2d.pixel.RGBA{ .r = 255, .g = 0, .b = 0, .a = 255 },
+        pixels[6 * width + 6],
+    );
+    try std.testing.expectEqual(
+        z2d.pixel.RGBA{ .r = 255, .g = 255, .b = 255, .a = 255 },
+        pixels[16 * width + 16],
+    );
+}
+
+test "convex quad paint preserves mitered border corners" {
+    const allocator = std.testing.allocator;
+    var bounds = DisplayCompositor.init(allocator);
+    defer bounds.deinit();
+    var renderer = Renderer.init(allocator, allocator, std.testing.io, &bounds);
+
+    var surface = try z2d.Surface.init(.image_surface_rgba, allocator, 24, 24);
+    defer surface.deinit(allocator);
+    const pixels = switch (surface) {
+        .image_surface_rgba => |*image_surface| image_surface.buf,
+        else => unreachable,
+    };
+    @memset(pixels, .{ .r = 255, .g = 255, .b = 255, .a = 255 });
+    var context = z2d.Context.init(std.testing.io, allocator, &surface);
+    defer context.deinit();
+    try renderer.drawDisplayItemZ2dContext(&context, .{ .quad = .{
+        .x1 = 4,
+        .y1 = 4,
+        .x2 = 20,
+        .y2 = 4,
+        .x3 = 16,
+        .y3 = 16,
+        .x4 = 8,
+        .y4 = 16,
+        .color = .{ .r = 255, .g = 0, .b = 0, .a = 255 },
+    } }, 0, 1.0);
+
+    const width: usize = 24;
+    try std.testing.expectEqual(
+        z2d.pixel.RGBA{ .r = 255, .g = 0, .b = 0, .a = 255 },
+        pixels[10 * width + 10],
+    );
+    // This lies inside the quadrilateral's bounding rectangle but outside its
+    // diagonal miter edge, proving it was not painted as a rectangular strip.
+    try std.testing.expectEqual(
+        z2d.pixel.RGBA{ .r = 255, .g = 255, .b = 255, .a = 255 },
+        pixels[14 * width + 5],
+    );
+}
+
 pub const Renderer = struct {
     /// Retained layer surfaces use the Browser allocator because their lifetime
     /// follows the Browser compositor generation.
@@ -312,6 +528,39 @@ pub const Renderer = struct {
 
     fn scalePxFWithZoom(_: *const Renderer, value: f64, zoom: f32) f64 {
         return value * @as(f64, zoom);
+    }
+
+    /// Fill a convex display-list quadrilateral after mapping its layout
+    /// coordinates into the current raster surface. Border sides use a
+    /// repeated inner vertex for zero-content triangles, which z2d accepts as
+    /// a normal closed path.
+    fn drawQuad(
+        self: *Renderer,
+        context: *z2d.Context,
+        quad: QuadDisplayItem,
+        x_offset: i32,
+        y_offset: i32,
+        zoom: f32,
+    ) !void {
+        if (quad.color.a == 0) return;
+        const x1 = self.scalePxWithZoom(quad.x1, zoom) + x_offset;
+        const y1 = self.scalePxWithZoom(quad.y1, zoom) + y_offset;
+        const x2 = self.scalePxWithZoom(quad.x2, zoom) + x_offset;
+        const y2 = self.scalePxWithZoom(quad.y2, zoom) + y_offset;
+        const x3 = self.scalePxWithZoom(quad.x3, zoom) + x_offset;
+        const y3 = self.scalePxWithZoom(quad.y3, zoom) + y_offset;
+        const x4 = self.scalePxWithZoom(quad.x4, zoom) + x_offset;
+        const y4 = self.scalePxWithZoom(quad.y4, zoom) + y_offset;
+
+        context.resetPath();
+        context.setSource(.{ .opaque_pattern = .{ .pixel = .{ .rgba = quad.color.toZ2dRgba() } } });
+        try context.moveTo(@floatFromInt(x1), @floatFromInt(y1));
+        try context.lineTo(@floatFromInt(x2), @floatFromInt(y2));
+        try context.lineTo(@floatFromInt(x3), @floatFromInt(y3));
+        try context.lineTo(@floatFromInt(x4), @floatFromInt(y4));
+        try context.closePath();
+        try context.fill();
+        context.resetPath();
     }
 
     fn rasterCompositedLayer(self: *Renderer, layer: *CompositedLayer, zoom: f32) !void {
@@ -773,6 +1022,11 @@ pub const Renderer = struct {
 
     pub fn drawDisplayItemZ2dContext(self: *Renderer, context: *z2d.Context, item: DisplayItem, scroll_offset: i32, zoom: f32) !void {
         switch (item) {
+            .cached_subtree => |cached| {
+                for (cached.list.items) |child| {
+                    try self.drawDisplayItemZ2dContext(context, child, scroll_offset, zoom);
+                }
+            },
             .glyph => |glyph_item| {
                 const glyph_x = self.scalePxWithZoom(glyph_item.x, zoom);
                 const glyph_y = self.scalePxWithZoom(glyph_item.y, zoom) - scroll_offset;
@@ -806,6 +1060,13 @@ pub const Renderer = struct {
                     context.resetPath();
                 }
             },
+            .quad => |quad_item| try self.drawQuad(
+                context,
+                quad_item,
+                0,
+                -scroll_offset,
+                zoom,
+            ),
             .image => |image_item| {
                 const left = self.scalePxWithZoom(image_item.x1, zoom);
                 const right = self.scalePxWithZoom(image_item.x2, zoom);
@@ -1230,6 +1491,13 @@ pub const Renderer = struct {
                     try context.fill();
                 }
             },
+            .quad => |quad_item| try self.drawQuad(
+                context,
+                quad_item,
+                x_offset,
+                -scroll_offset,
+                zoom,
+            ),
             .image => |image_item| {
                 const top = self.scalePxWithZoom(image_item.y1, zoom) - scroll_offset;
                 const bottom = self.scalePxWithZoom(image_item.y2, zoom) - scroll_offset;
@@ -1504,6 +1772,13 @@ pub const Renderer = struct {
                     context.resetPath();
                 }
             },
+            .quad => |quad_item| try self.drawQuad(
+                context,
+                quad_item,
+                -layer_x,
+                -layer_y,
+                zoom,
+            ),
             .image => |image_item| {
                 const left = self.scalePxWithZoom(image_item.x1, zoom) - layer_x;
                 const right = self.scalePxWithZoom(image_item.x2, zoom) - layer_x;

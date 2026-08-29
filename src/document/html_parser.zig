@@ -55,6 +55,13 @@ pub fn Parser(
             allocator.destroy(self);
         }
 
+        /// Parse the source into an owning root Node returned by value.
+        ///
+        /// The parser can repair parent pointers only while its temporary root
+        /// has a provisional address. After the caller stores this result at
+        /// its final address, it must call `fixParentPointersFn(&root, null)`
+        /// before any ancestry walk, style/invalidation, layout, or script
+        /// handle publication.
         pub fn parse(self: *HTMLParser) !Node {
             // Track ranges in the original body
             var pos: usize = 0;

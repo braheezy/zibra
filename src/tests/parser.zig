@@ -870,6 +870,75 @@ test "Apply tag and class CSS selectors" {
     try std.testing.expectEqualStrings("blue", styles.getPtr("color").?.get().*);
 }
 
+test "generated pseudo boxes style privately and invalidate with their host" {
+    const allocator = std.testing.allocator;
+    const html = "<main><div class=host><span id=authored></span></div></main>";
+    const css =
+        ".host { color: blue; }" ++
+        ".host::before { content: ''; display: block; border-style: none solid solid; border-width: 4px; border-color: red yellow black yellow; }" ++
+        ".host:after { content: \"\"; display: block; border-style: solid solid none; border-width: 4px; border-color: black yellow red yellow; }" ++
+        ".host:hover::before { content: none; }";
+
+    var html_parser = try HTMLParser.init(allocator, html);
+    html_parser.use_implicit_tags = false;
+    defer html_parser.deinit(allocator);
+    var root = try html_parser.parse();
+    defer root.deinit(allocator);
+    document_parser.fixParentPointers(&root, null);
+
+    var css_parser = try CSSParser.init(allocator, css, false);
+    defer css_parser.deinit(allocator);
+    const rules = try css_parser.parse(allocator);
+    defer {
+        for (rules) |*rule| rule.deinit(allocator);
+        allocator.free(rules);
+    }
+
+    try document_parser.style(allocator, &root, rules);
+    const host_node = &root.element.children.items[0];
+    const host = &host_node.element;
+    const before = host.generated_before.?;
+    const after = host.generated_after.?;
+
+    // Generated boxes are private: only the authored span remains visible to
+    // DOM children, serialization, and the JavaScript node registry walk.
+    try std.testing.expectEqual(@as(usize, 1), host.children.items.len);
+    const inner = try document_parser.serializeInnerHtml(allocator, host_node);
+    defer allocator.free(inner);
+    try std.testing.expectEqualStrings("<span id=\"authored\"></span>", inner);
+    var nodes = std.ArrayList(*document_parser.Node).empty;
+    defer nodes.deinit(allocator);
+    try document_parser.treeToList(allocator, &root, &nodes);
+    try std.testing.expectEqual(@as(usize, 3), nodes.items.len);
+
+    try std.testing.expect(before.element.generatedPseudoActive());
+    try std.testing.expect(after.element.generatedPseudoActive());
+    try std.testing.expectEqual(host_node, document_parser.publicEventTarget(before));
+    try std.testing.expectEqualStrings("blue", before.element.style.?.getPtr("color").?.get().*);
+    try std.testing.expectEqualStrings("block", before.element.style.?.getPtr("display").?.get().*);
+
+    // A host-state change must restyle the retained private node and force the
+    // host's private layout-child sequence to rebuild when content disappears.
+    host.clearChildrenDirty();
+    host.is_hovered = true;
+    document_parser.dirtyStyleForElement(host);
+    try document_parser.style(allocator, &root, rules);
+    try std.testing.expect(!before.element.generatedPseudoActive());
+    try std.testing.expect(host.generated_before == before);
+    try std.testing.expect(host.children_dirty);
+
+    // Removing the final pseudo selector must reset retained private boxes;
+    // they cannot remain visible merely because their allocation survives a
+    // stylesheet mutation.
+    host.clearChildrenDirty();
+    host.is_hovered = false;
+    document_parser.dirtyStyleForElement(host);
+    try document_parser.style(allocator, &root, &[_]CSSParser.CSSRule{});
+    try std.testing.expect(!before.element.generatedPseudoActive());
+    try std.testing.expect(!after.element.generatedPseudoActive());
+    try std.testing.expect(host.children_dirty);
+}
+
 test "selector sequences require every member and sum priorities" {
     const allocator = std.testing.allocator;
     const html =

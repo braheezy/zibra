@@ -1,0 +1,53 @@
+<!--
+How to verify:
+  Open this page in Zibra. The red :before bar, green authored child, and
+  blue ::after bar must appear in that order. The automated script test covers
+  the separate DOM-transparency contract for host.children.
+-->
+<!doctype html>
+<html>
+  <head>
+    <title>Generated pseudo-elements</title>
+    <style>
+      body {
+        background-color: white;
+        color: black;
+        font-family: sans-serif;
+        padding: 24px;
+      }
+
+      #pseudoHost {
+        display: block;
+        width: 280px;
+        padding: 12px;
+        background-color: lightgray;
+      }
+
+      #pseudoHost:before {
+        content: '';
+        display: block;
+        height: 24px;
+        background-color: red;
+      }
+
+      #authoredChild {
+        display: block;
+        height: 24px;
+        background-color: green;
+        color: white;
+      }
+
+      #pseudoHost::after {
+        content: "";
+        display: block;
+        height: 24px;
+        background-color: blue;
+      }
+    </style>
+  </head>
+  <body>
+    <h1>Generated pseudo-elements</h1>
+    <div id="pseudoHost"><span id="authoredChild">authored child</span></div>
+    <p>The green bar is the authored child; the surrounding bars are generated.</p>
+  </body>
+</html>

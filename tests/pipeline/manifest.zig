@@ -97,4 +97,10 @@ pub const cases = [_]Case{
         .fixture = "tests/pipeline/margin-collapse.html",
         .golden = "tests/golden/pipeline/margin-collapse.display-list.txt",
     },
+    .{
+        .name = "generated-pseudo-display-list",
+        .mode = .display_list,
+        .fixture = "tests/pipeline/generated-pseudo.html",
+        .golden = "tests/golden/pipeline/generated-pseudo.display-list.txt",
+    },
 };

@@ -11,6 +11,7 @@ const css_length = @import("length.zig");
 const css_animation = @import("css_animation.zig");
 const animation = @import("animation.zig");
 const css_properties = @import("css_properties.zig");
+const pseudo = @import("pseudo.zig");
 
 const Animation = animation.Animation;
 const CssAnimationState = animation.CssAnimationState;
@@ -104,6 +105,7 @@ pub fn Application(
     comptime markStyleMapWithoutOwnerFn: anytype,
     comptime styleTreeNeedsUpdateFn: anytype,
     comptime markPaintForNodeFn: anytype,
+    comptime markLayoutForNodeFn: anytype,
 ) type {
     return struct {
         fn cssDefaultFor(property: []const u8) []const u8 {
@@ -439,6 +441,83 @@ pub fn Application(
             return parent_field.read(child_field, allocator).*;
         }
 
+        /// Author rules without a pseudo-element target must never cascade
+        /// onto the private generated nodes. Conversely, a pseudo rule applies
+        /// only to the matching `::before` or `::after` node; selector atoms
+        /// themselves resolve that node's host for matching.
+        fn ruleAppliesToNode(rule: CSSParser.CSSRule, node: *Node) bool {
+            const node_kind: ?pseudo.Kind = switch (node.*) {
+                .element => |element| element.generated_kind,
+                .text => null,
+            };
+            const selector_kind = rule.selector.pseudoElementKind();
+            if (node_kind) |kind| return selector_kind != null and selector_kind.? == kind;
+            return selector_kind == null;
+        }
+
+        fn stylesheetUsesGeneratedKind(
+            rules: []const CSSParser.CSSRule,
+            kind: pseudo.Kind,
+        ) bool {
+            for (rules) |rule| {
+                if (rule.selector.pseudoElementKind()) |target| {
+                    if (target == kind) return true;
+                }
+            }
+            return false;
+        }
+
+        /// Style private generated boxes after their authored host has its
+        /// computed style. The boxes inherit from that host, preserve the
+        /// selector ancestor chain, and remain absent from public DOM APIs.
+        fn styleGeneratedPseudos(
+            allocator: std.mem.Allocator,
+            node: *Node,
+            element: *Element,
+            rules: []const CSSParser.CSSRule,
+            keyframes: []const CSSParser.KeyframesRule,
+            parent_style: *StyleMap,
+            ancestor_chain: []const *Node,
+            match_context: CSSParser.MatchContext,
+            stats: ?*StylePassStats,
+        ) anyerror!void {
+            if (element.generated_kind != null) return;
+
+            for ([_]pseudo.Kind{ .before, .after }) |kind| {
+                // A style-sheet mutation can remove the final selector for an
+                // already allocated pseudo box. Keep styling that retained
+                // private node with the new rule set so its `content` resets
+                // to `normal` and its layout box disappears. Do not allocate
+                // boxes for elements that have never matched a pseudo rule.
+                if (!stylesheetUsesGeneratedKind(rules, kind) and
+                    element.generatedPseudo(kind) == null)
+                {
+                    continue;
+                }
+                const generated = try element.ensureGeneratedPseudo(allocator, node, kind);
+                const was_active = generated.element.generatedPseudoLastActive();
+                try styleWithParent(
+                    allocator,
+                    generated,
+                    rules,
+                    keyframes,
+                    parent_style,
+                    ancestor_chain,
+                    match_context,
+                    false,
+                    stats,
+                );
+                const is_active = generated.element.generatedPseudoActive();
+                if (was_active != is_active) {
+                    // The host's logical child sequence changed even though
+                    // its authored `children` array did not. Layout owns the
+                    // private sequence and will rebuild it next frame.
+                    element.markChildrenDirty();
+                    markLayoutForNodeFn(node);
+                }
+            }
+        }
+
         fn styleWithParent(
             allocator: std.mem.Allocator,
             node: *Node,
@@ -554,7 +633,9 @@ pub fn Application(
 
                         // Second, apply styles from CSS rules (can override inherited values)
                         for (rules) |rule| {
-                            if (rule.selector.matchesWithContext(node, ancestor_chain, match_context)) {
+                            if (ruleAppliesToNode(rule, node) and
+                                rule.selector.matchesWithContext(node, ancestor_chain, match_context))
+                            {
                                 var it = rule.properties.iterator();
                                 while (it.next()) |entry| {
                                     try applyCascadedDeclaration(
@@ -771,6 +852,17 @@ pub fn Application(
                             stats,
                         );
                     }
+                    try styleGeneratedPseudos(
+                        allocator,
+                        node,
+                        e,
+                        rules,
+                        keyframes,
+                        style_map,
+                        new_ancestors,
+                        match_context,
+                        stats,
+                    );
                     // Clear only after every requested descendant completed. An error
                     // leaves the summary set so a later protected style generation
                     // retries the unfinished branch.

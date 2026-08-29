@@ -6,6 +6,7 @@
 
 const std = @import("std");
 const dom = @import("../../document/dom.zig");
+const ProtectedField = @import("../../core/protected_field.zig").ProtectedField;
 const box_model = @import("box_model.zig");
 const display_list = @import("display_list.zig");
 
@@ -96,7 +97,11 @@ pub fn resolveElement(
         styleValue(styles, "overflow") orelse "visible",
         " \t\r\n",
     );
-    result.clips_overflow = std.ascii.eqlIgnoreCase(overflow, "clip") or
+    // `hidden` clips painted descendants just like `clip`; unlike `scroll`,
+    // it does not create an element-local scrolling interaction. Keep the
+    // distinction here so layout/hit testing share the same clip decision.
+    result.clips_overflow = std.ascii.eqlIgnoreCase(overflow, "hidden") or
+        std.ascii.eqlIgnoreCase(overflow, "clip") or
         (std.ascii.eqlIgnoreCase(overflow, "scroll") and value.scroll_container);
 
     var animated_translation: ?dom.Translation = null;
@@ -373,6 +378,25 @@ test "blur parser accepts only the supported single pixel filter" {
     try std.testing.expect(parseBlurFilter("grayscale(1)") == null);
     try std.testing.expect(parseBlurFilter("blur(2em)") == null);
     try std.testing.expect(parseBlurFilter("blur(2px) opacity(.5)") == null);
+}
+
+test "hidden overflow creates a paint and hit clip without a scroll container" {
+    const allocator = std.testing.allocator;
+    var element = try dom.Element.init(allocator, "div", null);
+    defer element.deinit(allocator);
+    element.style = dom.StyleMap.init(allocator);
+
+    var overflow = ProtectedField([]const u8).init("hidden");
+    overflow.set("hidden");
+    var overflow_installed = false;
+    errdefer if (!overflow_installed) overflow.deinit(allocator);
+    try element.style.?.put("overflow", overflow);
+    overflow_installed = true;
+
+    const effects = resolveElement(&element, 1.0, 1.0);
+    try std.testing.expect(effects.clips_overflow);
+    try std.testing.expect(effects.needsBlendGroup());
+    try std.testing.expect(!element.scroll_container);
 }
 
 test "effect wrappers preserve filter clip blend transform and position order" {

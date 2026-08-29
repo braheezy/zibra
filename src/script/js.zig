@@ -1695,6 +1695,51 @@ test "Node.children returns immediate element children in source order" {
     try std.testing.expect(result.toBoolean());
 }
 
+test "Node.children excludes private generated pseudo boxes" {
+    const allocator = std.testing.allocator;
+    var html_parser = try parser.HTMLParser.init(
+        allocator,
+        "<main><section id=host><span id=authored></span></section></main>",
+    );
+    html_parser.use_implicit_tags = false;
+    defer html_parser.deinit(allocator);
+    var root = try html_parser.parse();
+    defer root.deinit(allocator);
+    parser.fixParentPointers(&root, null);
+
+    var css_parser = try CSSParser.init(
+        allocator,
+        "#host::before { content: ''; display: block; }" ++
+            "#host:after { content: \"\"; display: block; }",
+        false,
+    );
+    defer css_parser.deinit(allocator);
+    const rules = try css_parser.parse(allocator);
+    defer {
+        for (rules) |*rule| rule.deinit(allocator);
+        allocator.free(rules);
+    }
+    try parser.style(allocator, &root, rules);
+    try std.testing.expect(root.element.children.items[0].element.generated_before != null);
+    try std.testing.expect(root.element.children.items[0].element.generated_after != null);
+
+    var environ = std.process.Environ.Map.init(allocator);
+    defer environ.deinit();
+    var js = try Js.init(allocator, std.testing.io, &environ);
+    defer js.deinit(allocator);
+    js.setNodes(0, &root);
+    defer js.setNodes(0, null);
+
+    const result = try js.evaluate(0,
+        \\var hostNode = document.querySelectorAll('section')[0];
+        \\var children = hostNode.children;
+        \\children.length === 1 &&
+        \\  children[0].handle === authored.handle &&
+        \\  hostNode.innerHTML === '<span id="authored"></span>'
+    );
+    try std.testing.expect(result.toBoolean());
+}
+
 test "Node.children reflects a later innerHTML generation" {
     const allocator = std.testing.allocator;
     var html_parser = try parser.HTMLParser.init(

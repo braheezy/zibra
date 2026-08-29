@@ -25,10 +25,20 @@ pub const ResolutionContext = struct {
 };
 
 /// Parse a finite, non-negative CSS length in the supported `px`, `em`, or
-/// percentage units. Unitless numbers and `auto` remain invalid lengths.
+/// percentage units. CSS permits a unitless zero anywhere a length is
+/// expected; it canonicalizes to `0px`. Other unitless numbers and `auto`
+/// remain invalid lengths.
 pub fn parse(input: []const u8) ?Length {
     const value = std.mem.trim(u8, input, " \t\r\n\x0c");
     if (value.len == 0) return null;
+
+    // Keep parsing and used-value resolution aligned with declaration
+    // validation: `width: 0` is a real zero length, not an auto width.
+    if (std.fmt.parseFloat(f64, value)) |unitless| {
+        if (std.math.isFinite(unitless) and unitless == 0) {
+            return .{ .value = 0, .unit = .px };
+        }
+    } else |_| {}
 
     const suffix: struct { unit: Unit, number_end: usize } = if (value[value.len - 1] == '%')
         .{ .unit = .percent, .number_end = value.len - 1 }
@@ -85,6 +95,8 @@ pub fn formatPixel(buffer: []u8, value: f64) ![]const u8 {
 
 test "pixel lengths parse and serialize the supported dimension grammar" {
     try std.testing.expectApproxEqAbs(@as(f64, 12.75), parsePixel(" 12.75PX ").?, 0.000001);
+    try std.testing.expectEqual(@as(?f64, 0), parsePixel("0"));
+    try std.testing.expectEqual(@as(?f64, 0), parsePixel("-0"));
     var buffer: [32]u8 = undefined;
     try std.testing.expectEqualStrings("12.750px", try formatPixel(&buffer, 12.75));
     try std.testing.expect(parsePixel("auto") == null);
@@ -110,6 +122,8 @@ test "relative lengths resolve against explicit CSS context" {
     );
     try std.testing.expect(resolve("50%", .{}) == null);
     try std.testing.expectEqual(@as(?f64, 24.0), resolve("2em", .{ .font_size = 12.0 }));
+    try std.testing.expectEqual(@as(?f64, 0), resolve("0", .{}));
     try std.testing.expect(parsePixel("2em") == null);
+    try std.testing.expect(parse("1") == null);
     try std.testing.expect(parse("2EX") == null);
 }

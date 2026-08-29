@@ -935,7 +935,7 @@ pub const Browser = struct {
     /// Browser.lock stabilizes the retained list at every call site.
     fn activeTabHasViewportAttachedPaint(self: *const Browser) bool {
         const items = self.active_tab_display_list orelse return false;
-        return DisplayItem.hasFrameViewportAttachment(items);
+        return DisplayItem.hasViewportAttachedPaint(items);
     }
 
     fn interestRegionContainsScroll(self: *const Browser, scroll_css: i32) bool {
@@ -4383,7 +4383,7 @@ pub const Browser = struct {
         // document commands but has a different scroll basis. Keep such a
         // page in the single viewport raster path rather than splitting it
         // into independently translated compositor planes.
-        if (DisplayItem.hasFrameViewportAttachment(items)) return false;
+        if (DisplayItem.hasViewportAttachedPaint(items)) return false;
         var found_plane = false;
         for (items) |item| {
             if (workerPlaneSpec(item) != null) {
@@ -4754,7 +4754,7 @@ pub const Browser = struct {
                     );
                 }
             },
-            .rect, .rounded_rect, .line, .outline => {
+            .rect, .quad, .rounded_rect, .line, .outline => {
                 const opacity = std.math.clamp(inherited_opacity, 0.0, 1.0);
                 var modified = item.withOpacity(opacity);
                 premultiplyDirectCommandColor(&modified);
@@ -4773,6 +4773,7 @@ pub const Browser = struct {
     fn premultiplyDirectCommandColor(item: *DisplayItem) void {
         const color = switch (item.*) {
             .rect => |payload| payload.color,
+            .quad => |payload| payload.color,
             .rounded_rect => |payload| payload.color,
             .line => |payload| payload.color,
             .outline => |payload| payload.color,
@@ -4787,6 +4788,7 @@ pub const Browser = struct {
         };
         switch (item.*) {
             .rect => |*payload| payload.color = replacement,
+            .quad => |*payload| payload.color = replacement,
             .rounded_rect => |*payload| payload.color = replacement,
             .line => |*payload| payload.color = replacement,
             .outline => |*payload| payload.color = replacement,
@@ -5018,7 +5020,7 @@ pub const Browser = struct {
         // (like dst_in clipping) render correctly.
         const zoom = self.activeZoom();
         const base_list = self.active_tab_display_list orelse &.{};
-        const draw_list = if (!DisplayItem.hasFrameViewportAttachment(base_list) and
+        const draw_list = if (!DisplayItem.hasViewportAttachedPaint(base_list) and
             self.display_compositor.draw_list.items.len > 0)
             self.display_compositor.draw_list.items
         else
@@ -5783,6 +5785,29 @@ test "worker compositor cache accepts representable planes and rejects nested ef
     } }};
     try std.testing.expect(!Browser.workerCacheCanSplit(fixed_page[0..]));
     try std.testing.expect(!Browser.workerCacheSupportsCompositorId(fixed_page[0..], plane_id));
+
+    const fixed_background_page = [_]DisplayItem{
+        plane,
+        .{ .image = .{
+            .x1 = 0,
+            .y1 = 0,
+            .x2 = 1,
+            .y2 = 1,
+            .source_width = 1,
+            .source_height = 1,
+            .pixels = &.{},
+            .tiling = .{
+                .width = 1,
+                .height = 1,
+                .attachment = .fixed,
+            },
+        } },
+    };
+    try std.testing.expect(!Browser.workerCacheCanSplit(fixed_background_page[0..]));
+    try std.testing.expect(!Browser.workerCacheSupportsCompositorId(
+        fixed_background_page[0..],
+        plane_id,
+    ));
 
     var nested_children = [_]DisplayItem{plane};
     var nested = [_]DisplayItem{.{ .blend = .{

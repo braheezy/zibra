@@ -11,11 +11,13 @@ const browser = @import("../root.zig");
 const image_loader = @import("../image_loader.zig");
 const grapheme = @import("grapheme");
 const parser = @import("../../document/parser.zig");
+const pseudo = @import("../../document/pseudo.zig");
 const object_fit = @import("../../document/object_fit.zig");
 const replaced_sizing = @import("replaced_sizing.zig");
 const box_model = @import("box_model.zig");
 const margin_collapse = @import("margin_collapse.zig");
 const control_geometry = @import("control_geometry.zig");
+const border_geometry = @import("border_geometry.zig");
 const inline_format = @import("inline_format.zig");
 const layout_hit = @import("layout_hit.zig");
 const table_format = @import("table_format.zig");
@@ -177,6 +179,11 @@ fn isContainerNode(node: Node, dependency_target: ?*ProtectedField(u64)) bool {
             // layout tree, but retaining an inline wrapper as a container is
             // enough to keep its block descendants out of one flattened text
             // run. The wrapper then supplies the anonymous block boundary.
+            for ([_]pseudo.Kind{ .before, .after }) |kind| {
+                if (activeGeneratedNode(&element, kind)) |generated| {
+                    if (isContainerNode(generated.*, dependency_target)) break :blk true;
+                }
+            }
             for (element.children.items) |child| {
                 if (isContainerNode(child, dependency_target)) break :blk true;
             }
@@ -184,6 +191,25 @@ fn isContainerNode(node: Node, dependency_target: ?*ProtectedField(u64)) bool {
         },
         .text => false,
     };
+}
+
+/// Return an active private generated box without putting it in the authored
+/// DOM child sequence. A generated node owns no public identity and is stable
+/// across relocations of its host Element value.
+fn activeGeneratedNode(element: *const parser.Element, kind: pseudo.Kind) ?*Node {
+    const node = switch (kind) {
+        .before => element.generated_before,
+        .after => element.generated_after,
+    } orelse return null;
+    return switch (node.*) {
+        .element => |generated| if (generated.generatedPseudoActive()) node else null,
+        .text => null,
+    };
+}
+
+fn hasActiveGeneratedChildren(element: *const parser.Element) bool {
+    return activeGeneratedNode(element, .before) != null or
+        activeGeneratedNode(element, .after) != null;
 }
 
 fn isRunInHeadingNode(node: Node) bool {
@@ -654,6 +680,8 @@ const ImageLayout = struct {
                         y,
                         width,
                         height,
+                        engine.layoutWindowWidth(),
+                        engine.layoutWindowHeight(),
                         self.css_scale,
                         source,
                     );
@@ -1277,6 +1305,51 @@ test "computed display classifies block children" {
     try std.testing.expect(!isBlockDisplay("unsupported"));
 }
 
+test "unitless zero dimensions preserve border-only block geometry" {
+    const allocator = std.testing.allocator;
+    var html_parser = try parser.HTMLParser.init(
+        allocator,
+        "<html style='display:block'><body style='display:block;margin:0'>" ++
+            "<div id=shape style='display:block;width:0;height:0;border-style:solid;border-width:10px 20px'></div>" ++
+            "</body></html>",
+    );
+    html_parser.use_implicit_tags = false;
+    defer html_parser.deinit(allocator);
+    var root_node = try html_parser.parse();
+    defer root_node.deinit(allocator);
+    parser.fixParentPointers(&root_node, null);
+    try parser.style(allocator, &root_node, &.{});
+
+    var environ = std.process.Environ.Map.init(allocator);
+    defer environ.deinit();
+    try environ.put("HOME", "/tmp");
+    const engine = try Layout.init(allocator, std.testing.io, &environ, 800, 600, false);
+    defer engine.deinit();
+    const document = try engine.buildDocument(&root_node);
+    defer {
+        document.deinit();
+        allocator.destroy(document);
+    }
+
+    var nodes = std.ArrayList(*Node).empty;
+    defer nodes.deinit(allocator);
+    try parser.treeToList(allocator, &root_node, &nodes);
+    var shape_node: ?*Node = null;
+    for (nodes.items) |node| switch (node.*) {
+        .element => |*element| {
+            const id = (element.attributes orelse continue).get("id") orelse continue;
+            if (std.mem.eql(u8, id, "shape")) shape_node = node;
+        },
+        .text => {},
+    };
+
+    const shape: *BlockLayout = @ptrCast(@alignCast(shape_node.?.element.layout_ptr.?));
+    // The resolved content box is exactly zero; only the opposing borders
+    // contribute to the retained border-box dimensions.
+    try std.testing.expectEqual(@as(i32, 40), shape.width.get().*);
+    try std.testing.expectEqual(@as(i32, 20), shape.height.get().*);
+}
+
 test "bounded tables normalize direct children into grid cells" {
     const allocator = std.testing.allocator;
     var html_parser = try parser.HTMLParser.init(
@@ -1468,7 +1541,7 @@ test "temporary rich-button dependencies target the persistent containing block"
         temporary.deinit();
         allocator.destroy(temporary);
     };
-    try temporary.appendBlockChildren(button.element.children.items);
+    try temporary.appendBlockChildren(.{ .authored = button.element.children.items });
 
     try std.testing.expect(!temporary.persistent_dependencies);
     try std.testing.expect(!temporary.children.items[0].block.persistent_dependencies);
@@ -2604,14 +2677,31 @@ fn recurseNode(self: *Layout, node: Node, node_ptr: ?*Node, line_buffer: *std.Ar
             } else if (std.ascii.eqlIgnoreCase(e.tag, "iframe")) {
                 try self.handleIframeElement(node, node_ptr, line_buffer);
             } else {
-                for (e.children.items) |*child| {
-                    try self.recurseNode(child.*, child, line_buffer);
-                }
+                try self.recurseElementChildren(&e, line_buffer);
             }
 
             // Restore styles after closing this element
             try self.restoreNodeStyles(line_buffer);
         },
+    }
+}
+
+/// Recurse the layout-only direct-child sequence for an inline element. CSS
+/// generated boxes bracket authored children but remain private to the host,
+/// so authored DOM traversal, serialization, and JavaScript never see them.
+fn recurseElementChildren(
+    self: *Layout,
+    element: *const parser.Element,
+    line_buffer: *std.ArrayList(LineItem),
+) anyerror!void {
+    if (activeGeneratedNode(element, .before)) |generated| {
+        try self.recurseNode(generated.*, generated, line_buffer);
+    }
+    for (element.children.items) |*child| {
+        try self.recurseNode(child.*, child, line_buffer);
+    }
+    if (activeGeneratedNode(element, .after)) |generated| {
+        try self.recurseNode(generated.*, generated, line_buffer);
     }
 }
 
@@ -3946,7 +4036,7 @@ fn isElementAccessible(element: *const parser.Element) bool {
 }
 
 fn findAccessibleNode(node_ptr: *Node) ?*Node {
-    var current: ?*Node = node_ptr;
+    var current: ?*Node = parser.publicEventTarget(node_ptr);
     while (current) |ptr| {
         switch (ptr.*) {
             .element => |*el| {
@@ -4408,6 +4498,8 @@ const InputLayout = struct {
                     y,
                     width_value,
                     height_value,
+                    engine.layoutWindowWidth(),
+                    engine.layoutWindowHeight(),
                     scaleCssFloat(1.0, self.embed.zoom.get().*, engine.zoom()),
                     source,
                 );
@@ -4868,6 +4960,8 @@ const ButtonLayout = struct {
                     y,
                     self.embed.width.get().*,
                     self.embed.height.get().*,
+                    engine.layoutWindowWidth(),
+                    engine.layoutWindowHeight(),
                     scaleCssFloat(1.0, self.embed.zoom.get().*, engine.zoom()),
                     source,
                 );
@@ -4985,6 +5079,15 @@ fn displayListLayoutBounds(
                 .top = translate_y + @min(rect.y1, rect.y2),
                 .right = translate_x + @max(rect.x1, rect.x2),
                 .bottom = translate_y + @max(rect.y1, rect.y2),
+            },
+            .quad => |quad| blk: {
+                const rect = quad.bounds();
+                break :blk .{
+                    .left = translate_x + rect.left,
+                    .top = translate_y + rect.top,
+                    .right = translate_x + rect.right,
+                    .bottom = translate_y + rect.bottom,
+                };
             },
             .image => |image| .{
                 .left = translate_x + @min(image.x1, image.x2),
@@ -5985,6 +6088,29 @@ const NormalFlowResult = struct {
     collapses_through: bool = false,
 };
 
+/// A direct layout-child sequence can be backed by authored Nodes stored by
+/// value in an Element's public child array, or by a short temporary list that
+/// also includes private generated pseudo-element nodes. The latter owns no
+/// Nodes and exists only while a parent rebuilds its retained layout children.
+const DirectChildSource = union(enum) {
+    authored: []Node,
+    generated: []const *Node,
+
+    fn len(self: DirectChildSource) usize {
+        return switch (self) {
+            .authored => |nodes| nodes.len,
+            .generated => |nodes| nodes.len,
+        };
+    }
+
+    fn at(self: DirectChildSource, index: usize) *Node {
+        return switch (self) {
+            .authored => |nodes| &nodes[index],
+            .generated => |nodes| nodes[index],
+        };
+    }
+};
+
 const BlockLayout = struct {
     allocator: std.mem.Allocator,
     node: Node,
@@ -6148,6 +6274,39 @@ const BlockLayout = struct {
         return nodeLayoutOwner(node) == block_ptr;
     }
 
+    /// Append the host's private generated boxes around authored children.
+    /// The temporary pointer list borrows stable pseudo allocations and the
+    /// current authored child array only for this synchronous rebuild; retained
+    /// BlockLayouts point directly at the underlying nodes afterward.
+    fn appendElementChildren(self: *BlockLayout, element: *parser.Element) !void {
+        const before = activeGeneratedNode(element, .before);
+        const after = activeGeneratedNode(element, .after);
+        if (before == null and after == null) {
+            return self.appendBlockChildren(.{ .authored = element.children.items });
+        }
+
+        const count = element.children.items.len +
+            @as(usize, if (before != null) 1 else 0) +
+            @as(usize, if (after != null) 1 else 0);
+        const nodes = try self.allocator.alloc(*Node, count);
+        defer self.allocator.free(nodes);
+        var index: usize = 0;
+        if (before) |node| {
+            nodes[index] = node;
+            index += 1;
+        }
+        for (element.children.items) |*child| {
+            nodes[index] = child;
+            index += 1;
+        }
+        if (after) |node| {
+            nodes[index] = node;
+            index += 1;
+        }
+        std.debug.assert(index == nodes.len);
+        return self.appendBlockChildren(.{ .generated = nodes });
+    }
+
     /// This deliberately accepts only a stable block-mode shape: every
     /// already-laid-out DOM child maps one-to-one to a DOM-backed BlockLayout.
     /// Previously inserted, not-yet-laid-out nodes may appear as gaps between
@@ -6166,6 +6325,7 @@ const BlockLayout = struct {
             .element => |*value| value,
             .text => return false,
         };
+        if (hasActiveGeneratedChildren(element)) return false;
         if (insert_index > element.children.items.len) return false;
         if (element.children_dirty and !element.children_insertions_only) return false;
         if (self.laid_out_dom_children > element.children.items.len) return false;
@@ -6227,6 +6387,7 @@ const BlockLayout = struct {
             .element => |*value| value,
             .text => return false,
         };
+        if (hasActiveGeneratedChildren(element)) return false;
         if (!element.children_dirty or !element.children_insertions_only or
             self.laid_out_dom_children > element.children.items.len) return false;
 
@@ -7944,7 +8105,8 @@ const BlockLayout = struct {
         // nodes. Their direct-child topology can therefore change meaning when
         // a display value changes, so retain-insertion is deliberately kept to
         // ordinary block formatting contexts.
-        const preserves_table_topology = self.tableRole() == .ordinary;
+        const preserves_table_topology = self.tableRole() == .ordinary and
+            (live_element == null or !hasActiveGeneratedChildren(live_element.?));
         var reused_children = false;
         if (insertions_only and preserves_table_topology) {
             // The host normally performs this rebind synchronously after child
@@ -7969,7 +8131,7 @@ const BlockLayout = struct {
             self.laid_out_dom_children = 0;
 
             if (live_element) |element| {
-                try self.appendBlockChildren(element.children.items);
+                try self.appendElementChildren(element);
                 self.laid_out_dom_children = element.children.items.len;
             }
         }
@@ -8296,7 +8458,7 @@ const BlockLayout = struct {
         return previous;
     }
 
-    fn appendBlockChildren(self: *BlockLayout, nodes: []Node) !void {
+    fn appendBlockChildren(self: *BlockLayout, source: DirectChildSource) !void {
         // Tables and real rows place their direct children in a grid, not in
         // the usual vertical predecessor chain. Cells themselves still use
         // normal block flow for their contents.
@@ -8306,21 +8468,22 @@ const BlockLayout = struct {
         };
         var previous: ?*BlockLayout = null;
         var index: usize = 0;
-        while (index < nodes.len) {
+        while (index < source.len()) {
+            const node = source.at(index);
             // A run-in heading is laid out with the following paragraph rather
             // than as its own block. Once both DOM nodes are in the same
             // anonymous block, normal inline recursion preserves the h6's
             // style while continuing straight into the paragraph text.
-            if (isRunInHeadingNode(nodes[index]) and
-                !isOutOfFlowPosition(nodePositionMode(nodes[index], if (self.persistent_dependencies) &self.children_version else null)) and
-                index + 1 < nodes.len and isContainerNode(
-                nodes[index + 1],
+            if (isRunInHeadingNode(node.*) and
+                !isOutOfFlowPosition(nodePositionMode(node.*, if (self.persistent_dependencies) &self.children_version else null)) and
+                index + 1 < source.len() and isContainerNode(
+                source.at(index + 1).*,
                 if (self.persistent_dependencies) &self.children_version else null,
             )) {
                 const run_in_nodes = try self.allocator.alloc(*Node, 2);
                 errdefer self.allocator.free(run_in_nodes);
-                run_in_nodes[0] = &nodes[index];
-                run_in_nodes[1] = &nodes[index + 1];
+                run_in_nodes[0] = node;
+                run_in_nodes[1] = source.at(index + 1);
                 const child = try BlockLayout.initAnonymous(
                     self.allocator,
                     run_in_nodes,
@@ -8337,10 +8500,10 @@ const BlockLayout = struct {
             }
 
             if (isContainerNode(
-                nodes[index],
+                node.*,
                 if (self.persistent_dependencies) &self.children_version else null,
             )) {
-                const child_node = &nodes[index];
+                const child_node = node;
                 const child_position = nodePositionMode(
                     child_node.*,
                     if (self.persistent_dependencies) &self.children_version else null,
@@ -8362,14 +8525,14 @@ const BlockLayout = struct {
             }
 
             const start = index;
-            while (index < nodes.len and !isContainerNode(
-                nodes[index],
+            while (index < source.len() and !isContainerNode(
+                source.at(index).*,
                 if (self.persistent_dependencies) &self.children_version else null,
             )) : (index += 1) {}
             const inline_nodes = try self.allocator.alloc(*Node, index - start);
             errdefer self.allocator.free(inline_nodes);
-            for (nodes[start..index], 0..) |*node, output_index| {
-                inline_nodes[output_index] = node;
+            for (start..index) |source_index| {
+                inline_nodes[source_index - start] = source.at(source_index);
             }
             const child = try BlockLayout.initAnonymous(
                 self.allocator,
@@ -8675,6 +8838,56 @@ test "layout hit testing localizes nested overflow scrolling" {
     // therefore falls through to the enclosing document block.
     const clipped_hit = document.hitTest(35, 115).?;
     try std.testing.expect(clipped_hit.node == &root_node);
+}
+
+test "layout hit testing clips hidden overflow without enabling scroll" {
+    const allocator = std.testing.allocator;
+
+    var root_node = Node{ .element = try parser.Element.init(allocator, "html", null) };
+    defer root_node.deinit(allocator);
+    var hidden_node = Node{ .element = try parser.Element.init(allocator, "section", null) };
+    defer hidden_node.deinit(allocator);
+    try setTestStyleValue(allocator, &hidden_node, "overflow", "hidden");
+    var child_node = Node{ .element = try parser.Element.init(allocator, "button", null) };
+    defer child_node.deinit(allocator);
+
+    const document = try DocumentLayout.init(allocator, &root_node);
+    defer {
+        document.deinit();
+        allocator.destroy(document);
+    }
+    setTestLayoutBox(document, 10, 20, 500, 500);
+
+    const root = try BlockLayout.init(allocator, root_node, &root_node, document, null, null);
+    try document.children.append(allocator, root);
+    setTestLayoutBox(root, 10, 20, 400, 400);
+
+    const hidden = try BlockLayout.init(
+        allocator,
+        hidden_node,
+        &hidden_node,
+        document,
+        root,
+        null,
+    );
+    try root.children.append(allocator, .{ .block = hidden });
+    setTestLayoutBox(hidden, 30, 50, 100, 50);
+
+    const child = try BlockLayout.init(
+        allocator,
+        child_node,
+        &child_node,
+        document,
+        hidden,
+        null,
+    );
+    try hidden.children.append(allocator, .{ .block = child });
+    setTestLayoutBox(child, 30, 90, 30, 30);
+
+    try std.testing.expect(document.hitTest(35, 95).?.node == &child_node);
+    // The child extends to y=120, but the hidden container ends at y=100.
+    try std.testing.expect(document.hitTest(35, 105).?.node == &root_node);
+    try std.testing.expect(!hidden_node.element.scroll_container);
 }
 
 test "layout hit testing localizes line and text children" {
@@ -9299,9 +9512,7 @@ fn layoutInlineBlock(self: *Layout, block: *BlockLayout, publish_geometry: bool)
             } else if (std.ascii.eqlIgnoreCase(e.tag, "iframe")) {
                 try self.handleIframeElement(block.node, block.node_ptr, &line_buffer);
             } else {
-                for (e.children.items) |*child| {
-                    try self.recurseNode(child.*, child, &line_buffer);
-                }
+                try self.recurseElementChildren(&e, &line_buffer);
             }
 
             try self.restoreNodeStyles(&line_buffer);
@@ -9849,7 +10060,29 @@ fn writeDisplayItemsDebug(writer: *std.Io.Writer, items: []const DisplayItem, in
             .cached_subtree => unreachable,
             .glyph => |glyph| try writer.print("glyph x={d} y={d} width={d} height={d} color=#{x:0>2}{x:0>2}{x:0>2}{x:0>2}\n", .{ glyph.x, glyph.y, glyph.glyph.w, glyph.glyph.h, glyph.color.r, glyph.color.g, glyph.color.b, glyph.color.a }),
             .rect => |rect| try writer.print("rect x1={d} y1={d} x2={d} y2={d} color=#{x:0>2}{x:0>2}{x:0>2}{x:0>2}\n", .{ rect.x1, rect.y1, rect.x2, rect.y2, rect.color.r, rect.color.g, rect.color.b, rect.color.a }),
-            .image => |image| try writer.print("image x1={d} y1={d} x2={d} y2={d} source_width={d} source_height={d} opacity={d}\n", .{ image.x1, image.y1, image.x2, image.y2, image.source_width, image.source_height, image.opacity }),
+            .quad => |quad| try writer.print("quad x1={d} y1={d} x2={d} y2={d} x3={d} y3={d} x4={d} y4={d} color=#{x:0>2}{x:0>2}{x:0>2}{x:0>2}\n", .{ quad.x1, quad.y1, quad.x2, quad.y2, quad.x3, quad.y3, quad.x4, quad.y4, quad.color.r, quad.color.g, quad.color.b, quad.color.a }),
+            .image => |image| {
+                if (image.tiling) |tile| {
+                    try writer.print("image x1={d} y1={d} x2={d} y2={d} source_width={d} source_height={d} tile_width={d} tile_height={d} tile_x={d} tile_y={d} repeat_x={} repeat_y={} attachment={s} opacity={d}\n", .{
+                        image.x1,
+                        image.y1,
+                        image.x2,
+                        image.y2,
+                        image.source_width,
+                        image.source_height,
+                        tile.width,
+                        tile.height,
+                        tile.offset_x,
+                        tile.offset_y,
+                        tile.repeat_x,
+                        tile.repeat_y,
+                        @tagName(tile.attachment),
+                        image.opacity,
+                    });
+                } else {
+                    try writer.print("image x1={d} y1={d} x2={d} y2={d} source_width={d} source_height={d} opacity={d}\n", .{ image.x1, image.y1, image.x2, image.y2, image.source_width, image.source_height, image.opacity });
+                }
+            },
             .canvas => |canvas| try writer.print("canvas x1={d} y1={d} x2={d} y2={d} source_width={d} source_height={d} opacity={d}\n", .{ canvas.x1, canvas.y1, canvas.x2, canvas.y2, canvas.source_width, canvas.source_height, canvas.opacity }),
             .iframe => |iframe| try writer.print("iframe left={d} top={d} right={d} bottom={d}\n", .{ iframe.rect.left, iframe.rect.top, iframe.rect.right, iframe.rect.bottom }),
             .rounded_rect => |rect| try writer.print("rounded-rect x1={d} y1={d} x2={d} y2={d} radius={d} color=#{x:0>2}{x:0>2}{x:0>2}{x:0>2}\n", .{ rect.x1, rect.y1, rect.x2, rect.y2, rect.radius, rect.color.r, rect.color.g, rect.color.b, rect.color.a }),
@@ -10127,39 +10360,39 @@ fn appendBorderBoxes(
     element: *const parser.Element,
     source: ?browser.DisplayItemSource,
 ) !void {
-    if (width <= 0 or height <= 0) return;
-
     const side_data = [_]struct {
-        width: i32,
+        side: border_geometry.Side,
         style_property: []const u8,
         color_property: []const u8,
     }{
-        .{ .width = edges.top, .style_property = "border-top-style", .color_property = "border-top-color" },
-        .{ .width = edges.right, .style_property = "border-right-style", .color_property = "border-right-color" },
-        .{ .width = edges.bottom, .style_property = "border-bottom-style", .color_property = "border-bottom-color" },
-        .{ .width = edges.left, .style_property = "border-left-style", .color_property = "border-left-color" },
+        .{ .side = .top, .style_property = "border-top-style", .color_property = "border-top-color" },
+        .{ .side = .right, .style_property = "border-right-style", .color_property = "border-right-color" },
+        .{ .side = .bottom, .style_property = "border-bottom-style", .color_property = "border-bottom-color" },
+        .{ .side = .left, .style_property = "border-left-style", .color_property = "border-left-color" },
     };
-    for (side_data, 0..) |side, index| {
-        if (side.width <= 0) continue;
+    const border_box = border_geometry.Box{ .x = x, .y = y, .width = width, .height = height };
+    const border_edges = border_geometry.Edges{
+        .top = edges.top,
+        .right = edges.right,
+        .bottom = edges.bottom,
+        .left = edges.left,
+    };
+    for (side_data) |side| {
         const style = styleValue(style_map, side.style_property) orelse "none";
         if (std.ascii.eqlIgnoreCase(std.mem.trim(u8, style, " \t\r\n"), "none") or
             std.ascii.eqlIgnoreCase(std.mem.trim(u8, style, " \t\r\n"), "hidden")) continue;
         const color = borderColorForSide(self, style_map, element, side.color_property);
         if (color.a == 0) continue;
-
-        const rect = switch (index) {
-            0 => browser.Rect{ .left = x, .top = y, .right = x + width, .bottom = y + @min(side.width, height) },
-            1 => browser.Rect{ .left = x + @max(width - side.width, 0), .top = y, .right = x + width, .bottom = y + height },
-            2 => browser.Rect{ .left = x, .top = y + @max(height - side.width, 0), .right = x + width, .bottom = y + height },
-            3 => browser.Rect{ .left = x, .top = y, .right = x + @min(side.width, width), .bottom = y + height },
-            else => unreachable,
-        };
-        if (rect.width() <= 0 or rect.height() <= 0) continue;
-        try commands.append(self.allocator, .{ .rect = .{
-            .x1 = rect.left,
-            .y1 = rect.top,
-            .x2 = rect.right,
-            .y2 = rect.bottom,
+        const quad = border_geometry.sideQuad(border_box, border_edges, side.side) orelse continue;
+        try commands.append(self.allocator, .{ .quad = .{
+            .x1 = quad.points[0].x,
+            .y1 = quad.points[0].y,
+            .x2 = quad.points[1].x,
+            .y2 = quad.points[1].y,
+            .x3 = quad.points[2].x,
+            .y3 = quad.points[2].y,
+            .x4 = quad.points[3].x,
+            .y4 = quad.points[3].y,
             .color = color,
             .source = source,
         } });
@@ -10236,6 +10469,8 @@ fn addBackgroundIfNeededToList(self: *Layout, commands: *std.ArrayList(DisplayIt
                 block_y,
                 block_width,
                 block_height,
+                self.layoutWindowWidth(),
+                self.layoutWindowHeight(),
                 scaleBlockCssFloat(block, 1.0),
                 source,
             );

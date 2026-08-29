@@ -8,6 +8,7 @@
 
 const std = @import("std");
 const selector_mod = @import("selector.zig");
+const pseudo = @import("pseudo.zig");
 const css_length = @import("length.zig");
 const css_color = @import("color.zig");
 const background_image = @import("background_image.zig");
@@ -23,6 +24,7 @@ const AttributeSelector = selector_mod.AttributeSelector;
 const AttributeMatch = selector_mod.AttributeMatch;
 const FocusVisibleSelector = selector_mod.FocusVisibleSelector;
 const HoverSelector = selector_mod.HoverSelector;
+const PseudoElementSelector = selector_mod.PseudoElementSelector;
 const SequenceSelector = selector_mod.SequenceSelector;
 const SelectorSequence = selector_mod.SelectorSequence;
 const HasSelector = selector_mod.HasSelector;
@@ -445,6 +447,28 @@ fn validBackgroundPosition(raw_value: []const u8) bool {
     return true;
 }
 
+/// Accept the bounded generated-content grammar supported by this browser.
+/// The parser retains the authored string—including escapes—so later stages
+/// can decode it without re-parsing an arbitrary CSS value list.
+fn isQuotedContentString(raw_value: []const u8) bool {
+    const content_value = std.mem.trim(u8, raw_value, " \t\r\n\x0c");
+    if (content_value.len < 2) return false;
+    const quote = content_value[0];
+    if (quote != '\'' and quote != '"') return false;
+    if (content_value[content_value.len - 1] != quote) return false;
+
+    var cursor: usize = 1;
+    while (cursor + 1 < content_value.len) {
+        if (content_value[cursor] == quote) return false;
+        if (content_value[cursor] == '\\') {
+            cursor += 1;
+            if (cursor >= content_value.len - 1) return false;
+        }
+        cursor += 1;
+    }
+    return true;
+}
+
 /// Validate values whose unsupported grammar would otherwise replace a valid
 /// earlier declaration in the cascade. Other supported values stay permissive
 /// until a focused feature owns their used-value grammar.
@@ -490,6 +514,12 @@ fn isValidLonghandValue(property: []const u8, raw_value: []const u8) bool {
     if (std.mem.eql(u8, property, "background-attachment")) return isBackgroundAttachment(raw_value);
     if (std.mem.eql(u8, property, "font-size")) return isNonnegativeLength(raw_value);
     if (std.mem.eql(u8, property, "line-height")) return isSupportedFontLineHeight(raw_value);
+    if (std.mem.eql(u8, property, "content")) {
+        const content_value = std.mem.trim(u8, raw_value, " \t\r\n\x0c");
+        return std.ascii.eqlIgnoreCase(content_value, "normal") or
+            std.ascii.eqlIgnoreCase(content_value, "none") or
+            isQuotedContentString(content_value);
+    }
     return std.mem.trim(u8, raw_value, " \t\r\n\x0c").len != 0;
 }
 
@@ -1247,6 +1277,14 @@ pub fn selector(self: *CSSParser, allocator: std.mem.Allocator) !Selector {
         };
     }
 
+    // A pseudo-element selects a generated box at the end of a selector. It
+    // cannot be an ancestor/left-hand selector for a later combinator.
+    for (selectors.items, 0..) |simple, index| {
+        if (simple.pseudoElementKind() != null and index + 1 != selectors.items.len) {
+            return error.InvalidSelector;
+        }
+    }
+
     if (selectors.items.len == 1) {
         const simple = selectors.items[0];
         selectors.deinit(allocator);
@@ -1383,6 +1421,31 @@ fn appendAttributeSelectors(
     }
 }
 
+fn pseudoElementKind(name: []const u8) ?pseudo.Kind {
+    if (std.ascii.eqlIgnoreCase(name, "before")) return .before;
+    if (std.ascii.eqlIgnoreCase(name, "after")) return .after;
+    return null;
+}
+
+/// Consume the identifier portion of a pseudo selector. `word` intentionally
+/// accepts class and ID punctuation for the compact selector syntax, while a
+/// pseudo name must stop before a following `.class` or `#id` token.
+fn pseudoIdentifier(self: *CSSParser) ![]const u8 {
+    const start = self.pos;
+    while (self.pos < self.string.len) {
+        const char = self.string[self.pos];
+        if (std.ascii.isAlphanumeric(char) or char == '-' or char == '_') {
+            self.pos += 1;
+        } else if (char == '\\') {
+            if (!css_syntax.consumeEscape(self.string, &self.pos)) return error.InvalidWord;
+        } else {
+            break;
+        }
+    }
+    if (self.pos == start) return error.InvalidWord;
+    return self.string[start..self.pos];
+}
+
 fn simpleSelector(self: *CSSParser, allocator: std.mem.Allocator) !SimpleSelector {
     var selectors = std.ArrayList(SequenceSelector).empty;
     errdefer {
@@ -1450,22 +1513,36 @@ fn simpleSelector(self: *CSSParser, allocator: std.mem.Allocator) !SimpleSelecto
     }
     try self.appendAttributeSelectors(allocator, &selectors);
 
-    // Consume the dynamic pseudo when it is part of this compound selector.
-    // Leave any other colon untouched so relationalSelector can recognize
-    // `:has(...)` or report the existing unsupported-pseudo error.
+    // Consume supported dynamic pseudo-classes and terminal pseudo-elements.
+    // Leave an unsupported single colon untouched so relationalSelector can
+    // recognize `:has(...)` or report the existing unsupported-pseudo error.
     while (self.pos < self.string.len and self.string[self.pos] == ':') {
         const pseudo_start = self.pos;
         self.pos += 1;
-        const pseudo_class = self.word() catch {
+        const explicit_pseudo_element = self.pos < self.string.len and self.string[self.pos] == ':';
+        if (explicit_pseudo_element) self.pos += 1;
+        const pseudo_name = self.pseudoIdentifier() catch {
             self.pos = pseudo_start;
             break;
         };
+        if (pseudoElementKind(pseudo_name)) |kind| {
+            try appendSequenceSelector(
+                allocator,
+                &selectors,
+                .{ .pseudo_element = PseudoElementSelector{ .kind = kind } },
+            );
+            break;
+        }
+        if (explicit_pseudo_element) {
+            self.pos = pseudo_start;
+            break;
+        }
         const dynamic_selector: SequenceSelector = if (std.ascii.eqlIgnoreCase(
-            pseudo_class,
+            pseudo_name,
             "focus-visible",
         ))
             .{ .focus_visible = FocusVisibleSelector{} }
-        else if (std.ascii.eqlIgnoreCase(pseudo_class, "hover"))
+        else if (std.ascii.eqlIgnoreCase(pseudo_name, "hover"))
             .{ .hover = HoverSelector{} }
         else {
             self.pos = pseudo_start;
@@ -1956,4 +2033,83 @@ test "escaped declaration syntax preserves later values and rejects invalid casc
     const third = &rules[2].properties;
     try std.testing.expectEqualStrings("1em", third.get("margin-top").?.value);
     try std.testing.expectEqualStrings("2em", third.get("margin-right").?.value);
+}
+
+test "legacy and modern generated pseudo selectors retain kind and specificity" {
+    const allocator = std.testing.allocator;
+    const css =
+        "article.notice:before { content: 'legacy'; }" ++
+        "#message::after { content: \"modern\"; }" ++
+        "main > article:hover::BEFORE { content: \"stateful\"; }";
+    var parser = try CSSParser.init(allocator, css, false);
+    defer parser.deinit(allocator);
+    const rules = try parser.parse(allocator);
+    defer {
+        for (rules) |*rule| rule.deinit(allocator);
+        allocator.free(rules);
+    }
+
+    try std.testing.expectEqual(@as(usize, 3), rules.len);
+    try std.testing.expectEqual(pseudo.Kind.before, rules[0].selector.pseudoElementKind().?);
+    try std.testing.expectEqual(@as(u32, 12), rules[0].cascadePriority());
+    try std.testing.expectEqualStrings("'legacy'", rules[0].properties.get("content").?.value);
+
+    try std.testing.expectEqual(pseudo.Kind.after, rules[1].selector.pseudoElementKind().?);
+    try std.testing.expectEqual(@as(u32, 101), rules[1].cascadePriority());
+    try std.testing.expectEqualStrings("\"modern\"", rules[1].properties.get("content").?.value);
+
+    try std.testing.expectEqual(pseudo.Kind.before, rules[2].selector.pseudoElementKind().?);
+    try std.testing.expectEqual(@as(u32, 13), rules[2].cascadePriority());
+}
+
+test "generated pseudo-elements are terminal selectors" {
+    const allocator = std.testing.allocator;
+    const invalid = [_][]const u8{
+        "div::before span",
+        "div:after > span",
+        "div::before:hover",
+        "div::before.notice",
+    };
+
+    for (invalid) |source| {
+        var parser = try CSSParser.init(allocator, source, false);
+        defer parser.deinit(allocator);
+        try std.testing.expectError(error.InvalidSelector, parser.selector(allocator));
+    }
+}
+
+test "content keeps the generated-content subset and defaults to normal" {
+    var saw_content = false;
+    for (css_properties.computed) |property| {
+        if (!std.mem.eql(u8, property.name, "content")) continue;
+        try std.testing.expectEqualStrings("normal", property.default_value);
+        saw_content = true;
+    }
+    try std.testing.expect(saw_content);
+
+    const allocator = std.testing.allocator;
+    const css =
+        "a::before { content: normal; }" ++
+        "b::after { content: none; }" ++
+        "c::before { content: \"quoted ; { braces }\"; }" ++
+        "d::after { content: 'single quoted'; }" ++
+        "e::before { content: attr(data-label); color: red; }";
+    var parser = try CSSParser.init(allocator, css, false);
+    defer parser.deinit(allocator);
+    const rules = try parser.parse(allocator);
+    defer {
+        for (rules) |*rule| rule.deinit(allocator);
+        allocator.free(rules);
+    }
+
+    try std.testing.expectEqual(@as(usize, 5), rules.len);
+    try std.testing.expectEqualStrings("normal", rules[0].properties.get("content").?.value);
+    try std.testing.expectEqualStrings("none", rules[1].properties.get("content").?.value);
+    try std.testing.expectEqualStrings(
+        "\"quoted ; { braces }\"",
+        rules[2].properties.get("content").?.value,
+    );
+    try std.testing.expectEqualStrings("'single quoted'", rules[3].properties.get("content").?.value);
+    try std.testing.expect(rules[4].properties.get("content") == null);
+    try std.testing.expectEqualStrings("red", rules[4].properties.get("color").?.value);
 }

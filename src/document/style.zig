@@ -15,6 +15,7 @@ const Engine = application.Application(
     dom.markStyleMapWithoutOwner,
     dom.styleTreeNeedsUpdate,
     dom.markPaintForNode,
+    dom.markLayoutForNode,
 );
 
 pub const removeCssAnimationTracks = Engine.removeCssAnimationTracks;

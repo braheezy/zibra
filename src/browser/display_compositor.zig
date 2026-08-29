@@ -349,6 +349,15 @@ pub const Compositor = struct {
                 .right = self.scalePxWithZoom(r.x2, zoom),
                 .bottom = self.scalePxWithZoom(r.y2, zoom),
             },
+            .quad => |quad| blk: {
+                const bounds = quad.bounds();
+                break :blk .{
+                    .left = self.scalePxWithZoom(bounds.left, zoom),
+                    .top = self.scalePxWithZoom(bounds.top, zoom),
+                    .right = self.scalePxWithZoom(bounds.right, zoom),
+                    .bottom = self.scalePxWithZoom(bounds.bottom, zoom),
+                };
+            },
             .image => |img| Rect{
                 .left = self.scalePxWithZoom(img.x1, zoom),
                 .top = self.scalePxWithZoom(img.y1, zoom),

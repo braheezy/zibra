@@ -120,6 +120,7 @@ test "page zoom crosses a max-width media query in CSS pixels" {
     defer html_parser.deinit(allocator);
     var root = try html_parser.parse();
     defer root.deinit(allocator);
+    document_parser.fixParentPointers(&root, null);
 
     try document_parser.style(allocator, &root, normal_rules);
     try std.testing.expectEqualStrings("red", root.element.style.?.getPtr("color").?.get().*);
@@ -164,6 +165,7 @@ test "iframe width queries follow parent-published viewport changes" {
     defer child_parser.deinit(allocator);
     var child_root = try child_parser.parse();
     defer child_root.deinit(allocator);
+    document_parser.fixParentPointers(&child_root, null);
 
     try std.testing.expectEqual(@as(f64, 300), child.mediaViewportWidthCssPixels());
     var initial_parser = try CSSParser.initWithMedia(

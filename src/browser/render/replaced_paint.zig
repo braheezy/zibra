@@ -18,6 +18,7 @@ pub const BackgroundImagePaint = struct {
     size: background_image.Size,
     repeat: background_image.Repeat,
     position: []const u8,
+    attachment: display_list.ImageTiling.Attachment,
 };
 
 pub fn backgroundImagePaint(element: *const parser.Element) ?BackgroundImagePaint {
@@ -39,6 +40,17 @@ pub fn backgroundImagePaint(element: *const parser.Element) ?BackgroundImagePain
         .size = size,
         .repeat = repeat,
         .position = styleValue(styles, "background-position") orelse "0 0",
+        // `local` needs a scrollable element's own scroll offset, which is
+        // outside this single-layer background subset. It therefore retains
+        // the ordinary scroll-attached phase until element scrolling gains a
+        // dedicated background coordinate space.
+        .attachment = if (styleValue(styles, "background-attachment")) |value|
+            if (std.ascii.eqlIgnoreCase(std.mem.trim(u8, value, " \t\r\n\x0c"), "fixed"))
+                .fixed
+            else
+                .scroll
+        else
+            .scroll,
     };
 }
 
@@ -86,7 +98,9 @@ pub fn appendBackgroundBox(
 
 /// Paint one positioned background tile clipped to the element's box. The
 /// raster command retains repetition metadata so small images do not produce
-/// one display command per tile.
+/// one display command per tile. A fixed attachment resolves its size and
+/// position against the frame viewport but keeps the supplied element box as
+/// its paint clip.
 pub fn appendBackgroundImageBox(
     commands: *std.ArrayList(DisplayItem),
     allocator: std.mem.Allocator,
@@ -95,13 +109,18 @@ pub fn appendBackgroundImageBox(
     y: i32,
     width: i32,
     height: i32,
+    viewport_width: i32,
+    viewport_height: i32,
     css_scale: f64,
     source: ?display_list.DisplayItemSource,
 ) !void {
+    if (width <= 0 or height <= 0) return;
+    const positioning_width = if (paint.attachment == .fixed) viewport_width else width;
+    const positioning_height = if (paint.attachment == .fixed) viewport_height else height;
     const resolved = background_image.resolveSize(
         paint.size,
-        width,
-        height,
+        positioning_width,
+        positioning_height,
         paint.source_width,
         paint.source_height,
         css_scale,
@@ -109,8 +128,8 @@ pub fn appendBackgroundImageBox(
     if (resolved.width <= 0 or resolved.height <= 0) return;
     const position = background_image.resolvePosition(
         paint.position,
-        width,
-        height,
+        positioning_width,
+        positioning_height,
         resolved.width,
         resolved.height,
         css_scale,
@@ -131,6 +150,7 @@ pub fn appendBackgroundImageBox(
             .offset_y = position.y,
             .repeat_x = paint.repeat.x,
             .repeat_y = paint.repeat.y,
+            .attachment = paint.attachment,
         },
         .source = source,
     } });
@@ -193,11 +213,14 @@ test "background image paint resolves size and fractional source crop" {
             .size = .cover,
             .repeat = .{ .x = false, .y = false },
             .position = "0 0",
+            .attachment = .scroll,
         },
         10,
         20,
         100,
         100,
+        300,
+        200,
         1.0,
         null,
     );
@@ -208,6 +231,47 @@ test "background image paint resolves size and fractional source crop" {
     try std.testing.expectEqual(@as(i32, 110), image.x2);
     try std.testing.expectEqual(@as(i32, 200), image.tiling.?.width);
     try std.testing.expect(!image.tiling.?.repeat_x);
+}
+
+test "fixed background images use viewport sizing but retain element clipping" {
+    const pixels = [_]u8{
+        255, 0,   0, 255,
+        0,   255, 0, 255,
+    };
+    var commands = std.ArrayList(DisplayItem).empty;
+    defer commands.deinit(std.testing.allocator);
+
+    try appendBackgroundImageBox(
+        &commands,
+        std.testing.allocator,
+        .{
+            .pixels = &pixels,
+            .source_width = 2,
+            .source_height = 1,
+            .size = .{ .dimensions = .{ .width = .{ .percentage = 50 }, .height = .auto } },
+            .repeat = .{ .x = false, .y = false },
+            .position = "100% 0",
+            .attachment = .fixed,
+        },
+        40,
+        80,
+        20,
+        20,
+        200,
+        100,
+        1.0,
+        null,
+    );
+
+    try std.testing.expectEqual(@as(usize, 1), commands.items.len);
+    const image = commands.items[0].image;
+    try std.testing.expectEqual(@as(i32, 40), image.x1);
+    try std.testing.expectEqual(@as(i32, 80), image.y1);
+    try std.testing.expectEqual(@as(i32, 60), image.x2);
+    try std.testing.expectEqual(@as(i32, 100), image.y2);
+    try std.testing.expectEqual(@as(i32, 100), image.tiling.?.width);
+    try std.testing.expectEqual(@as(i32, 100), image.tiling.?.offset_x);
+    try std.testing.expectEqual(display_list.ImageTiling.Attachment.fixed, image.tiling.?.attachment);
 }
 
 test "rounded control group constrains child hits without compositing" {

@@ -13,6 +13,7 @@ const canvas_module = @import("canvas.zig");
 const animation_module = @import("animation.zig");
 const html_serialization = @import("html_serialization.zig");
 const style_application = @import("style_application.zig");
+const pseudo = @import("pseudo.zig");
 
 pub const CssColor = animation_module.CssColor;
 pub const Canvas = canvas_module.Canvas;
@@ -175,6 +176,16 @@ pub const Element = struct {
     style: ?StyleMap = null,
     parent: ?*Node = null,
     children: std.ArrayList(Node),
+    /// Heap-stable generated boxes for CSS `::before` and `::after`. These
+    /// private nodes participate in style and layout only; they are never
+    /// stored in `children`, so DOM APIs, serialization, ID registration, and
+    /// JavaScript `Node.children` continue to expose authored nodes alone.
+    generated_before: ?*Node = null,
+    generated_after: ?*Node = null,
+    /// Non-null only on a private generated box. Its `parent` is always the
+    /// authored host element, which lets selector matching and event-target
+    /// normalization recover the public host without copying attributes.
+    generated_kind: ?pseudo.Kind = null,
     layout_ptr: ?*anyopaque = null,
     layout_mark: ?*const fn (*anyopaque) void = null,
     /// Paint invalidation is intentionally separate from layout invalidation:
@@ -252,6 +263,9 @@ pub const Element = struct {
             .attributes = null,
             .style = null,
             .children = std.ArrayList(Node).empty,
+            .generated_before = null,
+            .generated_after = null,
+            .generated_kind = null,
             .owned_strings = null,
             .is_focused = false,
             .is_focus_visible = false,
@@ -355,6 +369,12 @@ pub const Element = struct {
         }
         self.children.deinit(allocator);
 
+        // Generated boxes are host-owned but intentionally absent from the
+        // public child array. Their retained layout owners are released before
+        // DOM teardown, just like normal child layout owners.
+        self.deinitGeneratedPseudo(allocator, .before);
+        self.deinitGeneratedPseudo(allocator, .after);
+
         if (self.attributes) |attributes| {
             var attrs = attributes;
             attrs.deinit();
@@ -391,6 +411,86 @@ pub const Element = struct {
             var a = animations;
             a.deinit();
         }
+    }
+
+    /// Return a host-owned private generated box, if it has been needed by a
+    /// matching stylesheet rule. The returned node is heap-stable even when
+    /// the host element moves in a resizable DOM child array.
+    pub fn generatedPseudo(self: *const Element, kind: pseudo.Kind) ?*Node {
+        return switch (kind) {
+            .before => self.generated_before,
+            .after => self.generated_after,
+        };
+    }
+
+    /// Allocate the private node used to represent a CSS generated box. It
+    /// never becomes an authored DOM child and therefore must be destroyed by
+    /// `Element.deinit`, not by DOM mutation operations.
+    pub fn ensureGeneratedPseudo(
+        self: *Element,
+        allocator: std.mem.Allocator,
+        host: *Node,
+        kind: pseudo.Kind,
+    ) !*Node {
+        if (self.generatedPseudo(kind)) |node| return node;
+
+        const node = try allocator.create(Node);
+        errdefer allocator.destroy(node);
+        node.* = .{ .element = try Element.init(allocator, "zibra-generated-pseudo", host) };
+        node.element.generated_kind = kind;
+        switch (kind) {
+            .before => self.generated_before = node,
+            .after => self.generated_after = node,
+        }
+        return node;
+    }
+
+    fn deinitGeneratedPseudo(self: *Element, allocator: std.mem.Allocator, kind: pseudo.Kind) void {
+        const node = self.generatedPseudo(kind) orelse return;
+        node.deinit(allocator);
+        allocator.destroy(node);
+        switch (kind) {
+            .before => self.generated_before = null,
+            .after => self.generated_after = null,
+        }
+    }
+
+    /// A generated box participates in layout only when CSS `content`
+    /// computes to an actual generated value. This bounded implementation
+    /// currently supports the empty quoted string used for generated shapes;
+    /// `normal`, `none`, and text-bearing strings suppress the box until text
+    /// generated content has an owned text-node representation.
+    pub fn generatedPseudoActive(self: *const Element) bool {
+        const style_map = self.style orelse return false;
+        const display = if (style_map.get("display")) |field| field.get().* else "inline";
+        const content = if (style_map.get("content")) |field| field.get().* else "normal";
+        return generatedPseudoContentActive(self, display, content);
+    }
+
+    /// Return the previously published generated-content state without reading
+    /// dirty fields. Style recomputation uses this to detect a content flip
+    /// before it replaces the private box's computed values.
+    pub fn generatedPseudoLastActive(self: *const Element) bool {
+        const style_map = self.style orelse return false;
+        const display = if (style_map.get("display")) |field| field.lastValue().* else "inline";
+        const content = if (style_map.get("content")) |field| field.lastValue().* else "normal";
+        return generatedPseudoContentActive(self, display, content);
+    }
+
+    fn generatedPseudoContentActive(
+        self: *const Element,
+        display: []const u8,
+        content: []const u8,
+    ) bool {
+        if (self.generated_kind == null) return false;
+        if (std.ascii.eqlIgnoreCase(std.mem.trim(u8, display, " \t\r\n"), "none")) {
+            return false;
+        }
+        const value = std.mem.trim(u8, content, " \t\r\n");
+        if (std.ascii.eqlIgnoreCase(value, "normal") or std.ascii.eqlIgnoreCase(value, "none")) {
+            return false;
+        }
+        return std.mem.eql(u8, value, "''") or std.mem.eql(u8, value, "\"\"");
     }
 
     /// Return the normalized input type. Unknown types are intentionally left
@@ -716,6 +816,55 @@ pub const Node = union(enum) {
     }
 };
 
+/// Return the private generated-box kind carried by `node`, if any.
+pub fn generatedPseudoKind(node: *const Node) ?pseudo.Kind {
+    return switch (node.*) {
+        .element => |element| element.generated_kind,
+        .text => null,
+    };
+}
+
+/// Follow private generated-box nodes back to the authored element that owns
+/// them. DOM events, focus, hover, accessibility, and JavaScript handles must
+/// never expose implementation-only generated nodes.
+pub fn publicEventTarget(node: *Node) *Node {
+    var current = node;
+    while (true) {
+        switch (current.*) {
+            .element => |element| {
+                if (element.generated_kind == null) return current;
+                current = element.parent orelse return current;
+            },
+            .text => |text| {
+                const parent = text.parent orelse return current;
+                if (generatedPseudoKind(parent) == null) return current;
+                current = parent;
+            },
+        }
+    }
+}
+
+/// Mark the nearest retained layout owner for `node` and its ancestors.
+/// Generated-box activation changes the host's private layout child sequence,
+/// so it needs geometry invalidation in addition to paint invalidation.
+pub fn markLayoutForNode(node: *Node) void {
+    var current: ?*Node = node;
+    while (current) |candidate| {
+        switch (candidate.*) {
+            .text => |text| current = text.parent,
+            .element => |*element| {
+                if (element.layout_ptr) |owner| {
+                    if (element.layout_mark) |mark_fn| {
+                        mark_fn(owner);
+                        return;
+                    }
+                }
+                current = element.parent;
+            },
+        }
+    }
+}
+
 // Public function to fix parent pointers after modifying the tree
 pub fn fixParentPointers(node: *Node, parent: ?*Node) void {
     switch (node.*) {
@@ -725,6 +874,8 @@ pub fn fixParentPointers(node: *Node, parent: ?*Node) void {
             for (e.children.items) |*child| {
                 fixParentPointers(child, node);
             }
+            if (e.generated_before) |generated| fixParentPointers(generated, node);
+            if (e.generated_after) |generated| fixParentPointers(generated, node);
         },
         .text => |*t| {
             t.parent = parent;
@@ -795,8 +946,15 @@ pub fn styleTreeNeedsUpdate(node: *const Node) bool {
             style_application.styleNeedsUpdate(StyleMap, @constCast(&text.style.?)),
         .element => |*element| element.style == null or
             style_application.styleNeedsUpdate(StyleMap, @constCast(&element.style.?)) or
-            element.has_dirty_style_descendants,
+            element.has_dirty_style_descendants or
+            generatedPseudoStyleNeedsUpdate(element.generated_before) or
+            generatedPseudoStyleNeedsUpdate(element.generated_after),
     };
+}
+
+fn generatedPseudoStyleNeedsUpdate(node: ?*Node) bool {
+    const pseudo_node = node orelse return false;
+    return styleTreeNeedsUpdate(pseudo_node);
 }
 
 /// Mark the nearest retained layout object whose paint commands represent
@@ -833,6 +991,8 @@ pub fn markPaintForElement(element: *Element) void {
 
 pub fn dirtyStyleForElement(e: *Element) void {
     if (e.style) |*style_map| markStyleMapWithoutOwner(style_map);
+    if (e.generated_before) |generated| dirtyStyleSubtree(generated);
+    if (e.generated_after) |generated| dirtyStyleSubtree(generated);
     markAncestorStyleSummaries(e.parent);
 
     // Relational selectors make an element's attributes/style relevant to
@@ -861,7 +1021,10 @@ pub fn dirtyStyleSubtree(node: *Node) void {
         .element => |*element| {
             if (element.style) |*style_map| markStyleMapWithoutOwner(style_map);
             for (element.children.items) |*child| dirtyStyleSubtree(child);
-            element.has_dirty_style_descendants = element.children.items.len != 0;
+            if (element.generated_before) |generated| dirtyStyleSubtree(generated);
+            if (element.generated_after) |generated| dirtyStyleSubtree(generated);
+            element.has_dirty_style_descendants = element.children.items.len != 0 or
+                element.generated_before != null or element.generated_after != null;
         },
     }
 }
@@ -883,9 +1046,12 @@ pub fn clearStyleInvalidations(node: *Node) void {
                 markStyleMapWithoutOwner(style_map);
             }
             for (element.children.items) |*child| clearStyleInvalidations(child);
+            if (element.generated_before) |generated| clearStyleInvalidations(generated);
+            if (element.generated_after) |generated| clearStyleInvalidations(generated);
             // Clearing raw dependency edges requires a complete subtree style
             // pass to rebuild them, not merely a walk through clean nodes.
-            element.has_dirty_style_descendants = element.children.items.len != 0;
+            element.has_dirty_style_descendants = element.children.items.len != 0 or
+                element.generated_before != null or element.generated_after != null;
         },
     }
 }

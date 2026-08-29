@@ -22,11 +22,18 @@ behavior. Navigation-owned stylesheet/resource generations are documented in
   invalidates or rebinds every consumer before control escapes.
 - `fixParentPointers` must also rebind computed-style field owners because
   inherited invalidation callbacks retain those owner pointers.
+- `HTMLParser.parse` returns its root by value. Store it in its final owner,
+  then call `fixParentPointers(&root, null)` before style, layout, DOM
+  ancestry, or JavaScript uses it; the parser cannot repair pointers after
+  that return-value move.
 - Rules, named keyframes, and the source text they borrow move and retire as
   one generation. Stage a complete replacement before dropping the prior one.
 - Live HTML serialization reads current attributes/tree, sorts attribute names,
   quotes/escapes values, preserves source-backed text without double escaping,
   and omits children/closing tags for void elements.
+- Generated `:before`/`:after` boxes are private heap-stable Nodes owned by
+  their host Element. They are not child-array entries or script-visible DOM
+  nodes; layout injects active boxes in before/authored/after order.
 
 ## Mutation and invalidation
 
@@ -66,6 +73,9 @@ behavior. Navigation-owned stylesheet/resource generations are documented in
   changes invalidate ancestor matches.
 - Dynamic `:hover` and `:focus-visible` state is installed by the serialized
   Tab worker and must dirty style before matching.
+- The current bounded generated-content implementation renders only
+  `content: ''` and `content: ""` boxes. Do not expose text-bearing generated
+  content until it has an owned text-node lifetime and DOM-boundary design.
 
 ## Focus, controls, canvas, and images
 
@@ -101,6 +111,8 @@ The document pipeline is split by ownership and algorithm boundaries:
 - `css_syntax.zig` is a pure source-buffer scanner for CSS comments, escapes,
   strings, and structural delimiters; `css_properties.zig` is the shared
   static registry of computed longhand names and defaults.
+- `pseudo.zig` owns the shared before/after identity used by DOM storage,
+  selector matching, and style application; it owns neither Nodes nor styles.
 - `animation.zig` owns pure CSS transition/keyframe value objects stored by
   Elements. It does not decide whether an animation dirties compositor,
   paint, or layout; the Tab driver owns that phase decision.

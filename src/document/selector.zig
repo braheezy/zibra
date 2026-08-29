@@ -5,7 +5,41 @@
 
 const std = @import("std");
 const parser = @import("parser.zig");
+const pseudo = @import("pseudo.zig");
 const Node = parser.Node;
+
+fn generatedPseudoHost(node: *Node) ?*Node {
+    const element = switch (node.*) {
+        .element => |*value| value,
+        .text => return null,
+    };
+    if (element.generated_kind == null) return null;
+
+    const host = element.parent orelse return null;
+    return switch (host.*) {
+        .element => host,
+        .text => null,
+    };
+}
+
+/// Generated pseudo boxes are private nodes whose `parent` names the authored
+/// host element. Ordinary selector atoms inspect that host, while the
+/// pseudo-element atom below still distinguishes `::before` from `::after`.
+fn publicHostNode(node: *Node) *Node {
+    return generatedPseudoHost(node) orelse node;
+}
+
+/// Generated pseudo styling receives an ancestor chain ending in its host,
+/// but selector combinators conceptually start at that host. Remove the host
+/// from relationship traversal so it cannot satisfy its own ancestor, child,
+/// or sibling selector.
+fn relationshipAncestors(node: *Node, ancestor_chain: []const *Node) []const *Node {
+    const host = generatedPseudoHost(node) orelse return ancestor_chain;
+    if (ancestor_chain.len != 0 and ancestor_chain[ancestor_chain.len - 1] == host) {
+        return ancestor_chain[0 .. ancestor_chain.len - 1];
+    }
+    return ancestor_chain;
+}
 
 /// CSS selector types.
 pub const Selector = union(enum) {
@@ -16,6 +50,7 @@ pub const Selector = union(enum) {
     attribute: AttributeSelector,
     focus_visible: FocusVisibleSelector,
     hover: HoverSelector,
+    pseudo_element: PseudoElementSelector,
     sequence: SelectorSequence,
     has: HasSelector,
     descendant: DescendantSelector,
@@ -41,6 +76,7 @@ pub const Selector = union(enum) {
             .attribute => |attribute| attribute.matches(node),
             .focus_visible => |focus_visible| focus_visible.matches(node),
             .hover => |hover| hover.matches(node),
+            .pseudo_element => |pseudo_element| pseudo_element.matches(node),
             .sequence => |s| s.matches(node),
             .has => |h| h.matches(node, context),
             .descendant => |d| d.matches(node, ancestor_chain, context),
@@ -72,6 +108,7 @@ pub const Selector = union(enum) {
             .attribute => |*attribute| attribute.deinit(allocator),
             .focus_visible => {},
             .hover => {},
+            .pseudo_element => {},
             .sequence => |*s| s.deinit(allocator),
             .has => |*h| h.deinit(allocator),
             .descendant => |*d| d.deinit(allocator),
@@ -90,10 +127,24 @@ pub const Selector = union(enum) {
             .attribute => |attribute| attribute.priority(),
             .focus_visible => |focus_visible| focus_visible.priority(),
             .hover => |hover| hover.priority(),
+            .pseudo_element => |pseudo_element| pseudo_element.priority(),
             .sequence => |s| s.priority(),
             .has => |h| h.priority(),
             .descendant => |d| d.priority(),
             .complex => |complex| complex.priority(),
+        };
+    }
+
+    /// Return the terminal generated pseudo-element selected by this rule.
+    /// Callers use this to keep author rules for generated boxes separate from
+    /// rules for their real DOM host.
+    pub fn pseudoElementKind(self: Selector) ?pseudo.Kind {
+        return switch (self) {
+            .pseudo_element => |pseudo_element| pseudo_element.kind,
+            .sequence => |sequence| sequence.pseudoElementKind(),
+            .descendant => |descendant| descendant.pseudoElementKind(),
+            .complex => |complex| complex.pseudoElementKind(),
+            else => null,
         };
     }
 };
@@ -108,6 +159,7 @@ pub const SimpleSelector = union(enum) {
     attribute: AttributeSelector,
     focus_visible: FocusVisibleSelector,
     hover: HoverSelector,
+    pseudo_element: PseudoElementSelector,
     sequence: SelectorSequence,
     has: HasSelector,
 
@@ -120,6 +172,7 @@ pub const SimpleSelector = union(enum) {
             .attribute => |attribute| .{ .attribute = attribute },
             .focus_visible => |focus_visible| .{ .focus_visible = focus_visible },
             .hover => |hover| .{ .hover = hover },
+            .pseudo_element => |pseudo_element| .{ .pseudo_element = pseudo_element },
             .sequence => |sequence| .{ .sequence = sequence },
             .has => |has| .{ .has = has },
         };
@@ -134,6 +187,7 @@ pub const SimpleSelector = union(enum) {
             .attribute => |attribute| attribute.matches(node),
             .focus_visible => |focus_visible| focus_visible.matches(node),
             .hover => |hover| hover.matches(node),
+            .pseudo_element => |pseudo_element| pseudo_element.matches(node),
             .sequence => |sequence| sequence.matches(node),
             .has => |has| has.matches(node, context),
         };
@@ -159,6 +213,7 @@ pub const SimpleSelector = union(enum) {
             .attribute => |*attribute| attribute.deinit(allocator),
             .focus_visible => {},
             .hover => {},
+            .pseudo_element => {},
             .sequence => |*sequence| sequence.deinit(allocator),
             .has => |*has| has.deinit(allocator),
         }
@@ -173,8 +228,17 @@ pub const SimpleSelector = union(enum) {
             .attribute => |attribute| attribute.priority(),
             .focus_visible => |focus_visible| focus_visible.priority(),
             .hover => |hover| hover.priority(),
+            .pseudo_element => |pseudo_element| pseudo_element.priority(),
             .sequence => |sequence| sequence.priority(),
             .has => |has| has.priority(),
+        };
+    }
+
+    pub fn pseudoElementKind(self: SimpleSelector) ?pseudo.Kind {
+        return switch (self) {
+            .pseudo_element => |pseudo_element| pseudo_element.kind,
+            .sequence => |sequence| sequence.pseudoElementKind(),
+            else => null,
         };
     }
 };
@@ -184,7 +248,7 @@ pub const SimpleSelector = union(enum) {
 pub const UniversalSelector = struct {
     fn matches(self: UniversalSelector, node: *Node) bool {
         _ = self;
-        return node.* == .element;
+        return publicHostNode(node).* == .element;
     }
 
     fn priority(self: UniversalSelector) u32 {
@@ -215,7 +279,7 @@ pub const AttributeSelector = struct {
     }
 
     fn matches(self: AttributeSelector, node: *Node) bool {
-        const element = switch (node.*) {
+        const element = switch (publicHostNode(node).*) {
             .element => |*value| value,
             .text => return false,
         };
@@ -254,7 +318,7 @@ pub const ClassSelector = struct {
     }
 
     fn matches(self: ClassSelector, node: *Node) bool {
-        const element = switch (node.*) {
+        const element = switch (publicHostNode(node).*) {
             .element => |*value| value,
             .text => return false,
         };
@@ -287,7 +351,7 @@ pub const IdSelector = struct {
     }
 
     fn matches(self: IdSelector, node: *Node) bool {
-        const element = switch (node.*) {
+        const element = switch (publicHostNode(node).*) {
             .element => |*value| value,
             .text => return false,
         };
@@ -311,7 +375,7 @@ pub const IdSelector = struct {
 pub const FocusVisibleSelector = struct {
     fn matches(self: FocusVisibleSelector, node: *Node) bool {
         _ = self;
-        return switch (node.*) {
+        return switch (publicHostNode(node).*) {
             .element => |element| element.is_focused and element.is_focus_visible,
             .text => false,
         };
@@ -329,7 +393,7 @@ pub const FocusVisibleSelector = struct {
 pub const HoverSelector = struct {
     fn matches(self: HoverSelector, node: *Node) bool {
         _ = self;
-        return switch (node.*) {
+        return switch (publicHostNode(node).*) {
             .element => |element| element.is_hovered,
             .text => false,
         };
@@ -351,7 +415,7 @@ pub const TagSelector = struct {
 
     /// Returns true if the node is an Element with matching tag
     fn matches(self: TagSelector, node: *Node) bool {
-        return switch (node.*) {
+        return switch (publicHostNode(node).*) {
             .element => |e| std.mem.eql(u8, self.tag, e.tag),
             .text => false,
         };
@@ -369,6 +433,24 @@ pub const TagSelector = struct {
     }
 };
 
+/// A terminal `::before` or `::after` selector atom. Its specificity is the
+/// type-selector component, as required for pseudo-elements.
+pub const PseudoElementSelector = struct {
+    kind: pseudo.Kind,
+
+    fn matches(self: PseudoElementSelector, node: *Node) bool {
+        return switch (node.*) {
+            .element => |element| element.generated_kind == self.kind,
+            .text => false,
+        };
+    }
+
+    fn priority(self: PseudoElementSelector) u32 {
+        _ = self;
+        return 1;
+    }
+};
+
 /// One atomic member of a selector sequence. A sequence matches only when all
 /// of its tag, ID, class, and supported pseudo-class members match the same
 /// element.
@@ -380,6 +462,7 @@ pub const SequenceSelector = union(enum) {
     attribute: AttributeSelector,
     focus_visible: FocusVisibleSelector,
     hover: HoverSelector,
+    pseudo_element: PseudoElementSelector,
 
     pub fn intoSimpleSelector(self: SequenceSelector) SimpleSelector {
         return switch (self) {
@@ -390,6 +473,7 @@ pub const SequenceSelector = union(enum) {
             .attribute => |attribute| .{ .attribute = attribute },
             .focus_visible => |focus_visible| .{ .focus_visible = focus_visible },
             .hover => |hover| .{ .hover = hover },
+            .pseudo_element => |pseudo_element| .{ .pseudo_element = pseudo_element },
         };
     }
 
@@ -402,6 +486,7 @@ pub const SequenceSelector = union(enum) {
             .attribute => |attribute| attribute.matches(node),
             .focus_visible => |focus_visible| focus_visible.matches(node),
             .hover => |hover| hover.matches(node),
+            .pseudo_element => |pseudo_element| pseudo_element.matches(node),
         };
     }
 
@@ -414,6 +499,7 @@ pub const SequenceSelector = union(enum) {
             .attribute => |*attribute| attribute.deinit(allocator),
             .focus_visible => {},
             .hover => {},
+            .pseudo_element => {},
         }
     }
 
@@ -426,6 +512,7 @@ pub const SequenceSelector = union(enum) {
             .attribute => |attribute| attribute.priority(),
             .focus_visible => |focus_visible| focus_visible.priority(),
             .hover => |hover| hover.priority(),
+            .pseudo_element => |pseudo_element| pseudo_element.priority(),
         };
     }
 };
@@ -462,6 +549,18 @@ pub const SelectorSequence = struct {
         var total: u32 = 0;
         for (self.selectors.items) |selector| total += selector.priority();
         return total;
+    }
+
+    pub fn pseudoElementKind(self: SelectorSequence) ?pseudo.Kind {
+        var result: ?pseudo.Kind = null;
+        for (self.selectors.items) |selector| switch (selector) {
+            .pseudo_element => |pseudo_element| {
+                if (result != null) return null;
+                result = pseudo_element.kind;
+            },
+            else => {},
+        };
+        return result;
     }
 };
 
@@ -657,14 +756,20 @@ pub const DescendantSelector = struct {
         var selector_index = selectors.len - 1;
         if (!selectors[selector_index].matches(node, context)) return false;
 
-        var ancestor_index = ancestor_chain.len;
+        const ancestors = relationshipAncestors(node, ancestor_chain);
+        var ancestor_index = ancestors.len;
         while (selector_index > 0 and ancestor_index > 0) {
             ancestor_index -= 1;
-            if (selectors[selector_index - 1].matches(ancestor_chain[ancestor_index], context)) {
+            if (selectors[selector_index - 1].matches(ancestors[ancestor_index], context)) {
                 selector_index -= 1;
             }
         }
         return selector_index == 0;
+    }
+
+    fn pseudoElementKind(self: DescendantSelector) ?pseudo.Kind {
+        if (self.selectors.items.len == 0) return null;
+        return self.selectors.items[self.selectors.items.len - 1].pseudoElementKind();
     }
 };
 
@@ -749,38 +854,40 @@ pub const ComplexSelector = struct {
         if (!self.selectors.items[selector_index].matches(node, context)) return false;
         if (selector_index == 0) return true;
 
+        const ancestors = relationshipAncestors(node, ancestor_chain);
+
         return switch (self.combinators.items[selector_index - 1]) {
-            .child => if (ancestor_chain.len == 0)
+            .child => if (ancestors.len == 0)
                 false
             else
                 self.matchesAt(
                     selector_index - 1,
-                    ancestor_chain[ancestor_chain.len - 1],
-                    ancestor_chain[0 .. ancestor_chain.len - 1],
+                    ancestors[ancestors.len - 1],
+                    ancestors[0 .. ancestors.len - 1],
                     context,
                 ),
-            .adjacent => if (ancestor_chain.len == 0)
+            .adjacent => if (ancestors.len == 0)
                 false
             else if (previousElementSibling(
-                node,
-                ancestor_chain[ancestor_chain.len - 1],
+                publicHostNode(node),
+                ancestors[ancestors.len - 1],
             )) |previous|
                 self.matchesAt(
                     selector_index - 1,
                     previous,
-                    ancestor_chain,
+                    ancestors,
                     context,
                 )
             else
                 false,
             .descendant => blk: {
-                var ancestor_index = ancestor_chain.len;
+                var ancestor_index = ancestors.len;
                 while (ancestor_index > 0) {
                     ancestor_index -= 1;
                     if (self.matchesAt(
                         selector_index - 1,
-                        ancestor_chain[ancestor_index],
-                        ancestor_chain[0..ancestor_index],
+                        ancestors[ancestor_index],
+                        ancestors[0..ancestor_index],
                         context,
                     )) break :blk true;
                 }
@@ -806,5 +913,10 @@ pub const ComplexSelector = struct {
             ancestor_chain,
             context,
         );
+    }
+
+    fn pseudoElementKind(self: ComplexSelector) ?pseudo.Kind {
+        if (self.selectors.items.len == 0) return null;
+        return self.selectors.items[self.selectors.items.len - 1].pseudoElementKind();
     }
 };

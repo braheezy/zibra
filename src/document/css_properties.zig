@@ -21,6 +21,7 @@ pub const computed = [_]Property{
     .{ .name = "line-height", .default_value = "inherit" },
     .{ .name = "text-align", .default_value = "inherit" },
     .{ .name = "color", .default_value = "inherit" },
+    .{ .name = "content", .default_value = "normal" },
     .{ .name = "opacity", .default_value = "1.0" },
     .{ .name = "transition", .default_value = "" },
     .{ .name = "animation", .default_value = "none" },

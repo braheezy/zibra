@@ -121,6 +121,7 @@ pub const RasterSnapshot = struct {
             } },
             .draw_composited_layer => error.CompositedLayerCannotCrossRasterBoundary,
             .rect => |payload| clearSource(.rect, payload),
+            .quad => |payload| clearSource(.quad, payload),
             .iframe => |payload| clearSource(.iframe, payload),
             .rounded_rect => |payload| clearSource(.rounded_rect, payload),
             .line => |payload| clearSource(.line, payload),

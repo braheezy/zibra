@@ -26,6 +26,9 @@ boundaries.
   keywords, radii, and authored-zoom used values. It does not subscribe to
   style fields; `layout.zig` performs dependency-tracked reads before calling
   it.
+- `border_geometry.zig` derives pointer-free convex mitered solid-border
+  sides from a resolved border box and all four widths. It neither parses
+  styles nor owns display commands; `layout.zig` retains those responsibilities.
 - `margin_collapse.zig` owns allocation-free adjoining vertical-margin struts.
   It retains the positive and negative extrema of an arbitrary chain; layout
   owns the DOM-backed cursor, clearance barriers, and block geometry that use
@@ -42,8 +45,10 @@ boundaries.
   display text. `InputLayout` and `ButtonLayout` remain with their DOM, font,
   collector, and display-command invariants in `layout.zig`.
 - `replaced_paint.zig` appends background-image and rounded-control command
-  leaves/groups without owning layout objects. Its image pixels and provenance
-  are still generation-scoped borrows until snapshot.
+  leaves/groups without owning layout objects. Background attachment selects
+  an element-local or viewport-local tile phase while the command rectangle
+  remains the element clip. Its image pixels and provenance are still
+  generation-scoped borrows until snapshot.
 - `paint_effects.zig` resolves scalar block effects from live style and wraps
   owned command slices in blur, clip, blend, transform, position, and scroll
   groups. `wrapOwned` consumes its input slice on every outcome; callers must
@@ -142,6 +147,9 @@ modules over forwarding wrappers.
 
 - The page interest region is bounded to four native window heights. Scroll
   inside it is draw-only; crossing an edge or changing geometry invalidates it.
+  Frame-viewport transforms and fixed background tiles instead use a single
+  viewport region and re-raster on every root scroll, because their pixel
+  phase cannot translate with a cached document strip.
 - A compositor plane owns either a surface or an independent short cheap-command
   snapshot. Expensive/resources/effectful commands remain surface-backed.
 - Reject static merging before the union exceeds one megapixel; an

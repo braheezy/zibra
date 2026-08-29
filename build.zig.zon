@@ -15,8 +15,8 @@
         },
         // Javascript runtime
         .kiesel = .{
-            .url = "git+https://github.com/braheezy/kiesel-fork#26a59948cfa4eae714e73f3dd68fca9fb6806836",
-            .hash = "kiesel-0.4.0-Q1t3Sm4XkAAlcUKaplfUjQCHgWGdKnalREDos2vZsvVi",
+            .url = "git+https://github.com/braheezy/kiesel-fork#3fcbd15f72ebc172aa3557d2700c9b10a1488036",
+            .hash = "kiesel-0.4.0-Q1t3SsMrkQAcTORHqNobtrJ9Q-s2jfi4Fd4rghaE7Wk5",
         },
         // Zibra embeds Kiesel's Agent in a long-lived host object. Access the
         // collector's scanned, uncollectable allocator so that object can be

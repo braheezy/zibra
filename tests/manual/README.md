@@ -20,6 +20,7 @@ tiers and baseline policy.
 | [`dump-dom.html`](dump-dom.html) | Isolated HTML parser/DOM dump input |
 | [`anonymous-block-boxes.html`](anonymous-block-boxes.html) | Anonymous inline/block grouping |
 | [`block-dimensions.html`](block-dimensions.html) | CSS block width/height and surrounding box edges |
+| [`border-geometry.html`](border-geometry.html) | Asymmetric mitered solid-border joins and zero-content border triangles |
 | [`display.html`](display.html) | Computed display classification and anonymous runs |
 | [`css-tables.html`](css-tables.html) | Bounded table/table-row/table-cell grid tracks, anonymous direct cells, and row-height stretch |
 | [`inline-stylesheet.html`](inline-stylesheet.html) | Inline/linked stylesheet DOM order, hidden style content, and shared inspection stages |
@@ -47,6 +48,7 @@ tiers and baseline policy.
 | [`important.html`](important.html) | Declaration-local `!important` cascade |
 | [`css-declaration-recovery.html`](css-declaration-recovery.html) | Escaped declaration delimiters, comment whitespace, and invalid-value cascade recovery |
 | [`selector-sequences.html`](selector-sequences.html) | Concatenated tag/class/ID selectors and specificity |
+| [`generated-pseudo-elements.html`](generated-pseudo-elements.html) | Private `:before`/`::after` generated boxes, before/authored/after layout order, and DOM-child transparency |
 | [`has-selectors.html`](has-selectors.html) | Strict-descendant `:has` matching and recomputation |
 | [`style-descendant-invalidation.html`](style-descendant-invalidation.html) | Dirty ancestor path traversal while clean sibling subtrees are skipped |
 | [`paint-invalidation.html`](paint-invalidation.html) | Retained display-list mutation and clean sibling reuse |
@@ -120,6 +122,7 @@ tiers and baseline policy.
 | [`mouse-wheel-scroll.html`](mouse-wheel-scroll.html) | Immediate wheel scrolling and clamping |
 | [`scrollbar.html`](scrollbar.html) | Scroll range and native scrollbar-thumb geometry |
 | [`overflow-scroll.html`](overflow-scroll.html) | Focused nested element scrolling, clipping, and boundary fallback |
+| [`overflow-hidden.html`](overflow-hidden.html) | Non-scrolling descendant clipping and clipped hit targets |
 | [`animated-scroll.html`](animated-scroll.html) | Smooth body scrolling, retargeting, immediate paths, and reduced motion |
 | [`touch-input.html`](touch-input.html) | Multitouch taps, drag cancellation, synthetic-event deduplication, and chrome activation |
 | [`accessibility-read-highlight.html`](accessibility-read-highlight.html) | Incremental spoken-node highlighting |
@@ -131,6 +134,7 @@ tiers and baseline policy.
 | Primary fixture | Contract exercised |
 | --- | --- |
 | [`background-images.html`](background-images.html) | Post-cascade loading, size modes, source crop, and rounded clipping |
+| [`fixed-background.html`](fixed-background.html) | Viewport-phased fixed background tiles clipped by moving element boxes |
 | [`object-fit.html`](object-fit.html) | Fill, contain, and fractional cover crop within a replaced box |
 | [`lazy-loading.html`](lazy-loading.html) | Eager/near/far requests and post-decode layout change without refetch |
 | [`aspect-ratio.html`](aspect-ratio.html) | Derived image/iframe axes and lazy fallback-to-natural ratio |

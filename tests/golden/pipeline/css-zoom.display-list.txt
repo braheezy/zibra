@@ -3,8 +3,8 @@ rect x1=13 y1=28 x2=213 y2=90 color=#eeeeffff
 hit-clip rounded x1=13 y1=28 x2=113 y2=48 radius=8
   rounded-rect x1=13 y1=28 x2=113 y2=48 radius=8 color=#008800ff
 rect x1=13 y1=48 x2=175 y2=90 color=#aaaaffff
-rect x1=13 y1=48 x2=175 y2=54 color=#0000aaff
-rect x1=169 y1=48 x2=175 y2=90 color=#0000aaff
-rect x1=13 y1=84 x2=175 y2=90 color=#0000aaff
-rect x1=13 y1=48 x2=19 y2=90 color=#0000aaff
+quad x1=13 y1=48 x2=175 y2=48 x3=169 y3=54 x4=19 y4=54 color=#0000aaff
+quad x1=175 y1=48 x2=175 y2=90 x3=169 y3=84 x4=169 y4=54 color=#0000aaff
+quad x1=175 y1=90 x2=13 y2=90 x3=19 y3=84 x4=169 y4=84 color=#0000aaff
+quad x1=13 y1=90 x2=13 y2=48 x3=19 y3=54 x4=19 y4=84 color=#0000aaff
 rect x1=13 y1=90 x2=63 y2=100 color=#ccccccff
