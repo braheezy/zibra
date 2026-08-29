@@ -1,8 +1,8 @@
 # Script subsystem guide
 
-`js.zig` is the host boundary between Zibra and Kiesel. It owns JavaScript
-window contexts, DOM wrappers, events, timers, XHR, messaging, canvas wrappers,
-and synchronous host callbacks.
+`js.zig` is the owning host boundary between Zibra and Kiesel. Focused modules
+beside it implement DOM identity and mutation transactions, transition
+parsing, and native binding domains without importing the coordinator.
 
 Read [JavaScript and accessibility contracts](../../docs/architecture/javascript-and-accessibility.md)
 before changing this directory. Structural mutation and retained layout
@@ -11,11 +11,32 @@ borrows are documented in
 queued work and shutdown are documented in
 [threads and shutdown](../../docs/architecture/threads-and-shutdown.md).
 
+## Source map
+
+- `js.zig` owns the Agent, lock, realms, window contexts, callback registries,
+  active-window switching, evaluation, and public locked entry points.
+- `runtime/bootstrap.js` defines the page-visible DOM, event, timer, canvas,
+  XHR, cookie, and messaging shims over `__native`; Zig loads it with
+  `@embedFile` before evaluating page code.
+- `dom_handles.zig` owns the two-way Node pointer/numeric identity maps for one
+  window generation.
+- `dom_mutation.zig` owns synchronous child-array transfer transactions and
+  receives only borrowed identity stores plus paired invalidation hooks.
+- `event_focus_bindings.zig`, `canvas_bindings.zig`,
+  `timer_bindings.zig`, and `network_bindings.zig` validate their native APIs
+  and call heap-stable narrow host interfaces embedded in `Js`.
+- `native_bindings.zig` installs comptime binding tables; `transitions.zig`
+  parses and starts typed DOM transitions.
+
 ## Local contracts
 
 - Preserve Kiesel's traced allocation, GC-root, and `JsLock` assumptions. A
   native callback entered with the lock held uses lock-aware helpers; do not
   add an unlocked cross-thread host mutation.
+- Kiesel retains pointers to the binding-domain `Host` interfaces. Keep those
+  interfaces embedded in the heap-stable `Js` allocation, synchronous, and
+  narrower than the coordinator. A returned Node or Element is a callback-
+  scoped borrow and must never be queued.
 - WindowContexts own handle maps, listener/timer registries, named globals, and
   detached roots. Node wrappers must never silently retarget after child-array
   relocation or address reuse.
@@ -47,10 +68,10 @@ queued work and shutdown are documented in
   methods return `error.NotImplemented` and are exposed as nonfatal
   `undefined`.
 
-`js.zig` is already far beyond a cohesive module size. New binding domains
-should become focused modules behind a narrow host interface. Prefer extracting
-pure DOM-transfer planning or self-contained binding state first; do not create
-a cycle where every helper imports or receives the complete `Js` coordinator.
+`js.zig` remains large because it owns the realm/window lifecycle and several
+DOM bindings. Continue extracting cohesive binding domains behind narrow host
+interfaces. Do not create a cycle where helpers import or receive the complete
+`Js` coordinator, and do not replace ownership with forwarding-only façades.
 
 ## Verification
 

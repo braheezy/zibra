@@ -11,9 +11,15 @@ const browser = @import("../root.zig");
 const image_loader = @import("../image_loader.zig");
 const grapheme = @import("grapheme");
 const parser = @import("../../document/parser.zig");
-const background_image = @import("../../document/background_image.zig");
 const object_fit = @import("../../document/object_fit.zig");
 const replaced_sizing = @import("replaced_sizing.zig");
+const box_model = @import("box_model.zig");
+const control_geometry = @import("control_geometry.zig");
+const inline_format = @import("inline_format.zig");
+const layout_hit = @import("layout_hit.zig");
+const paint_effects = @import("paint_effects.zig");
+const replaced_paint = @import("replaced_paint.zig");
+const retained_commands = @import("retained_commands.zig");
 const dom_focus = @import("../../document/focus.zig");
 const ProtectedField = @import("../../core/protected_field.zig").ProtectedField;
 const DisplayItem = browser.DisplayItem;
@@ -30,89 +36,15 @@ const list_marker_size = 6;
 const list_marker_top_offset = 7;
 const toc_header_height = 24;
 const button_padding = 4;
-const min_effective_zoom: f32 = 0.01;
-const max_effective_zoom: f32 = 1024.0;
-
-const ContentBounds = struct {
-    x: i32,
-    width: i32,
-};
-
-const FloatSide = enum {
-    none,
-    left,
-    right,
-};
-
-const ClearSide = enum {
-    none,
-    left,
-    right,
-    both,
-};
-
-const PositionMode = enum {
-    static,
-    relative,
-    absolute,
-};
-
-const PositionOffset = struct {
-    x: i32 = 0,
-    y: i32 = 0,
-};
-
-const BoxEdges = struct {
-    top: i32 = 0,
-    right: i32 = 0,
-    bottom: i32 = 0,
-    left: i32 = 0,
-
-    fn horizontal(self: BoxEdges) i32 {
-        return self.left + self.right;
-    }
-
-    fn vertical(self: BoxEdges) i32 {
-        return self.top + self.bottom;
-    }
-};
-
-const FloatBox = struct {
-    side: FloatSide,
-    x: i32,
-    y: i32,
-    width: i32,
-    height: i32,
-    margin: BoxEdges,
-
-    fn bottom(self: FloatBox) i32 {
-        return self.y +| self.height +| self.margin.bottom;
-    }
-
-    fn top(self: FloatBox) i32 {
-        return self.y -| self.margin.top;
-    }
-
-    fn leftEdge(self: FloatBox) i32 {
-        return self.x -| self.margin.left;
-    }
-
-    fn rightEdge(self: FloatBox) i32 {
-        return self.x +| self.width +| self.margin.right;
-    }
-};
-
-const BoxModelEdges = struct {
-    margin: BoxEdges,
-    padding: BoxEdges,
-    border: BoxEdges,
-};
-
-const EmbeddedBlockBox = struct {
-    x: i32,
-    y: i32,
-    width: i32,
-};
+const ContentBounds = box_model.ContentBounds;
+const FloatSide = box_model.FloatSide;
+const ClearSide = box_model.ClearSide;
+const PositionMode = box_model.PositionMode;
+const PositionOffset = box_model.PositionOffset;
+const BoxEdges = box_model.BoxEdges;
+const FloatBox = box_model.FloatBox;
+const BoxModelEdges = box_model.BoxModelEdges;
+const EmbeddedBlockBox = box_model.EmbeddedBlockBox;
 
 fn addPageBottomPadding(content_bottom_css: i32) i32 {
     const padded = @as(i64, @max(content_bottom_css, 0)) + v_offset;
@@ -134,27 +66,9 @@ fn isListItemDisplay(value: []const u8) bool {
     return std.ascii.eqlIgnoreCase(std.mem.trim(u8, value, " \t\r\n"), "list-item");
 }
 
-fn parseFloatSide(value: []const u8) FloatSide {
-    const trimmed = std.mem.trim(u8, value, " \t\r\n");
-    if (std.ascii.eqlIgnoreCase(trimmed, "left")) return .left;
-    if (std.ascii.eqlIgnoreCase(trimmed, "right")) return .right;
-    return .none;
-}
-
-fn parseClearSide(value: []const u8) ClearSide {
-    const trimmed = std.mem.trim(u8, value, " \t\r\n");
-    if (std.ascii.eqlIgnoreCase(trimmed, "left")) return .left;
-    if (std.ascii.eqlIgnoreCase(trimmed, "right")) return .right;
-    if (std.ascii.eqlIgnoreCase(trimmed, "both")) return .both;
-    return .none;
-}
-
-fn parsePositionMode(value: []const u8) PositionMode {
-    const trimmed = std.mem.trim(u8, value, " \t\r\n");
-    if (std.ascii.eqlIgnoreCase(trimmed, "relative")) return .relative;
-    if (std.ascii.eqlIgnoreCase(trimmed, "absolute")) return .absolute;
-    return .static;
-}
+const parseFloatSide = box_model.parseFloatSide;
+const parseClearSide = box_model.parseClearSide;
+const parsePositionMode = box_model.parsePositionMode;
 
 fn nodePositionMode(node: Node, dependency_target: ?*ProtectedField(u64)) PositionMode {
     return switch (node) {
@@ -254,96 +168,13 @@ fn isTableOfContentsElement(element: *const parser.Element) bool {
     return std.mem.eql(u8, attributes.get("id") orelse return false, "toc");
 }
 
-/// Parse the standardized number/percentage grammar for `zoom`. Invalid,
-/// negative, and zero values use the initial factor of one; zero's behavior is
-/// the CSS compatibility rule rather than a hidden subtree.
-fn parseCssZoom(value: []const u8) f32 {
-    const trimmed = std.mem.trim(u8, value, " \t\r\n");
-    if (trimmed.len == 0 or
-        std.ascii.eqlIgnoreCase(trimmed, "normal") or
-        std.ascii.eqlIgnoreCase(trimmed, "reset"))
-    {
-        return 1.0;
-    }
-
-    const percentage = std.mem.endsWith(u8, trimmed, "%");
-    const number = if (percentage)
-        std.mem.trim(u8, trimmed[0 .. trimmed.len - 1], " \t\r\n")
-    else
-        trimmed;
-    const parsed = std.fmt.parseFloat(f32, number) catch return 1.0;
-    if (!std.math.isFinite(parsed) or parsed <= 0.0) return 1.0;
-    return if (percentage) parsed / 100.0 else parsed;
-}
-
-/// Compute the authored effective zoom at `node` from live computed styles.
-/// Frame code uses this before child layout so iframe documents inherit the
-/// same factor as the containing replaced element.
-pub fn effectiveCssZoomForNode(node: *const Node) f32 {
-    var result: f32 = 1.0;
-    var current: ?*const Node = node;
-    while (current) |candidate| {
-        current = switch (candidate.*) {
-            .element => |*element| next: {
-                if (element.style) |*styles| {
-                    if (styleValue(styles, "zoom")) |value| {
-                        result = combinedEffectiveZoom(result, parseCssZoom(value));
-                    }
-                }
-                break :next element.parent;
-            },
-            .text => |*text| text.parent,
-        };
-    }
-    return result;
-}
-
-fn combinedEffectiveZoom(parent_zoom: f32, local_zoom: f32) f32 {
-    const parent = if (std.math.isFinite(parent_zoom) and parent_zoom > 0.0) parent_zoom else 1.0;
-    const local = if (std.math.isFinite(local_zoom) and local_zoom > 0.0) local_zoom else 1.0;
-    return std.math.clamp(parent * local, min_effective_zoom, max_effective_zoom);
-}
-
-/// Convert an authored CSS-pixel length into the page's layout coordinate
-/// space. Accessibility zoom is applied later by raster, while the ratio here
-/// bakes only subtree zoom into geometry. Signed values support translations.
-fn scaleCssPixel(value: i32, effective_zoom: f32, page_zoom: f32) i32 {
-    const page = if (std.math.isFinite(page_zoom) and page_zoom > 0.0) page_zoom else 1.0;
-    const effective = if (std.math.isFinite(effective_zoom) and effective_zoom > 0.0)
-        effective_zoom
-    else
-        page;
-    const scaled = @as(f64, @floatFromInt(value)) *
-        (@as(f64, effective) / @as(f64, page));
-    return @intFromFloat(std.math.clamp(
-        scaled,
-        @as(f64, @floatFromInt(std.math.minInt(i32))),
-        @as(f64, @floatFromInt(std.math.maxInt(i32))),
-    ));
-}
-
-pub fn scaleCssPixelByFactor(value: i32, factor: f32) i32 {
-    return scaleCssPixel(value, factor, 1.0);
-}
-
-fn scaleCssFloat(value: f64, effective_zoom: f32, page_zoom: f32) f64 {
-    const page = if (std.math.isFinite(page_zoom) and page_zoom > 0.0) page_zoom else 1.0;
-    const effective = if (std.math.isFinite(effective_zoom) and effective_zoom > 0.0)
-        effective_zoom
-    else
-        page;
-    return value * (@as(f64, effective) / @as(f64, page));
-}
-
-fn cssPixelsFromLayout(value: i32, effective_zoom: f32, page_zoom: f32) f64 {
-    const page = if (std.math.isFinite(page_zoom) and page_zoom > 0.0) page_zoom else 1.0;
-    const effective = if (std.math.isFinite(effective_zoom) and effective_zoom > 0.0)
-        effective_zoom
-    else
-        page;
-    return @as(f64, @floatFromInt(value)) *
-        (@as(f64, page) / @as(f64, effective));
-}
+const parseCssZoom = box_model.parseCssZoom;
+pub const effectiveCssZoomForNode = box_model.effectiveCssZoomForNode;
+const combinedEffectiveZoom = box_model.combinedEffectiveZoom;
+const scaleCssPixel = box_model.scaleCssPixel;
+pub const scaleCssPixelByFactor = box_model.scaleCssPixelByFactor;
+const scaleCssFloat = box_model.scaleCssFloat;
+const cssPixelsFromLayout = box_model.cssPixelsFromLayout;
 
 fn tableOfContentsHeaderHeight(node: Node, effective_zoom: f32, page_zoom: f32) i32 {
     return switch (node) {
@@ -372,459 +203,17 @@ fn contentBoundsForNode(node: Node, parent_x: i32, parent_width: i32, indent: i3
     return .{ .x = parent_x, .width = parent_width };
 }
 
-/// Parse the subset of CSS lengths supported by block dimensions. `auto`,
-/// unsupported units, negative lengths, and invalid values use auto layout.
-fn parseCssPixelLength(value: []const u8) ?i32 {
-    const pixels = parser.parsePixelLength(value) orelse return null;
-    return parser.pixelLengthToLayoutPixels(pixels);
-}
-
-fn resolveCssLength(value: []const u8, context: parser.CssLengthResolutionContext) ?i32 {
-    const pixels = parser.resolveCssLength(value, context) orelse return null;
-    return parser.pixelLengthToLayoutPixels(pixels);
-}
-
-/// Position offsets use the same px/em/percentage subset as dimensions but
-/// permit a leading sign. Width/height deliberately retain their non-negative
-/// parser contract.
-fn resolveSignedCssLength(value: []const u8, context: parser.CssLengthResolutionContext) ?i32 {
-    const trimmed = std.mem.trim(u8, value, " \t\r\n\x0c");
-    if (trimmed.len == 0 or std.ascii.eqlIgnoreCase(trimmed, "auto")) return null;
-    const negative = trimmed[0] == '-';
-    const positive = trimmed[0] == '+';
-    const magnitude = if (negative or positive) trimmed[1..] else trimmed;
-    if (magnitude.len == 0) return null;
-    const pixels = parser.resolveCssLength(magnitude, context) orelse return null;
-    const signed = if (negative) -pixels else pixels;
-    const minimum: f64 = @floatFromInt(std.math.minInt(i32));
-    const maximum: f64 = @floatFromInt(std.math.maxInt(i32));
-    if (!std.math.isFinite(signed)) return null;
-    return @intFromFloat(std.math.clamp(signed, minimum, maximum));
-}
-
-/// Resolve a box-model length. Padding and borders use the regular
-/// non-negative CSS length grammar; margins additionally accept negative
-/// lengths and `auto` (which is zero in this block-only layout model).
-fn resolveBoxCssLength(
-    value: []const u8,
-    context: parser.CssLengthResolutionContext,
-    allow_negative: bool,
-) ?f64 {
-    const trimmed = std.mem.trim(u8, value, " \t\r\n\x0c");
-    if (std.ascii.eqlIgnoreCase(trimmed, "auto")) return if (allow_negative) 0.0 else null;
-    if (trimmed.len == 0) return null;
-    if (std.mem.eql(u8, trimmed, "0")) return 0.0;
-
-    var sign: f64 = 1.0;
-    var magnitude = trimmed;
-    if (trimmed[0] == '-') {
-        if (!allow_negative) return null;
-        sign = -1.0;
-        magnitude = trimmed[1..];
-    } else if (trimmed[0] == '+') {
-        magnitude = trimmed[1..];
-    }
-    if (magnitude.len == 0) return null;
-    const resolved = parser.resolveCssLength(magnitude, context) orelse return null;
-    return sign * resolved;
-}
-
-fn resolveBoxEdge(
-    style_map: *const parser.StyleMap,
-    property: []const u8,
-    context: parser.CssLengthResolutionContext,
-    effective_zoom: f32,
-    page_zoom: f32,
-    allow_negative: bool,
-) i32 {
-    const value = styleValue(style_map, property) orelse return 0;
-    const css_value = resolveBoxCssLength(value, context, allow_negative) orelse return 0;
-    return @intFromFloat(std.math.clamp(
-        scaleCssFloat(css_value, effective_zoom, page_zoom),
-        @as(f64, @floatFromInt(std.math.minInt(i32))),
-        @as(f64, @floatFromInt(std.math.maxInt(i32))),
-    ));
-}
-
-fn borderWidthCss(value: []const u8) ?f64 {
-    const trimmed = std.mem.trim(u8, value, " \t\r\n\x0c");
-    if (std.mem.eql(u8, trimmed, "0")) return 0.0;
-    if (std.ascii.eqlIgnoreCase(trimmed, "thin")) return 1.0;
-    if (std.ascii.eqlIgnoreCase(trimmed, "medium")) return 3.0;
-    if (std.ascii.eqlIgnoreCase(trimmed, "thick")) return 5.0;
-    return resolveBoxCssLength(trimmed, .{}, false);
-}
-
-fn resolveBorderEdge(
-    style_map: *const parser.StyleMap,
-    property: []const u8,
-    font_size: f64,
-    effective_zoom: f32,
-    page_zoom: f32,
-) i32 {
-    const value = styleValue(style_map, property) orelse return 0;
-    const parsed = if (std.mem.eql(u8, std.mem.trim(u8, value, " \t\r\n"), "0"))
-        0.0
-    else if (borderWidthCss(value)) |length|
-        // Border lengths use the element's font size for em values.
-        resolveBoxCssLength(value, .{ .font_size = font_size }, false) orelse length
-    else
-        0.0;
-    return @intFromFloat(std.math.clamp(
-        scaleCssFloat(parsed, effective_zoom, page_zoom),
-        0.0,
-        @as(f64, @floatFromInt(std.math.maxInt(i32))),
-    ));
-}
-
-fn resolveBoxEdges(
-    style_map: *const parser.StyleMap,
-    font_size: f64,
-    percentage_base: ?f64,
-    effective_zoom: f32,
-    page_zoom: f32,
-) BoxModelEdges {
-    const length_context = parser.CssLengthResolutionContext{
-        .font_size = font_size,
-        .percentage_base = percentage_base,
-    };
-    const margin = BoxEdges{
-        .top = resolveBoxEdge(style_map, "margin-top", length_context, effective_zoom, page_zoom, true),
-        .right = resolveBoxEdge(style_map, "margin-right", length_context, effective_zoom, page_zoom, true),
-        .bottom = resolveBoxEdge(style_map, "margin-bottom", length_context, effective_zoom, page_zoom, true),
-        .left = resolveBoxEdge(style_map, "margin-left", length_context, effective_zoom, page_zoom, true),
-    };
-    const padding = BoxEdges{
-        .top = resolveBoxEdge(style_map, "padding-top", length_context, effective_zoom, page_zoom, false),
-        .right = resolveBoxEdge(style_map, "padding-right", length_context, effective_zoom, page_zoom, false),
-        .bottom = resolveBoxEdge(style_map, "padding-bottom", length_context, effective_zoom, page_zoom, false),
-        .left = resolveBoxEdge(style_map, "padding-left", length_context, effective_zoom, page_zoom, false),
-    };
-    const border = BoxEdges{
-        .top = resolveBorderEdge(style_map, "border-top-width", font_size, effective_zoom, page_zoom),
-        .right = resolveBorderEdge(style_map, "border-right-width", font_size, effective_zoom, page_zoom),
-        .bottom = resolveBorderEdge(style_map, "border-bottom-width", font_size, effective_zoom, page_zoom),
-        .left = resolveBorderEdge(style_map, "border-left-width", font_size, effective_zoom, page_zoom),
-    };
-    return .{ .margin = margin, .padding = padding, .border = border };
-}
-
-test "box model edges resolve relative lengths against the containing block" {
-    const allocator = std.testing.allocator;
-    var html_parser = try parser.HTMLParser.init(
-        allocator,
-        "<div style='margin: 1em 2%; padding: 3px 4px; border: .5em solid red'></div>",
-    );
-    html_parser.use_implicit_tags = false;
-    defer html_parser.deinit(allocator);
-    var root = try html_parser.parse();
-    defer root.deinit(allocator);
-    try parser.style(allocator, &root, &.{});
-
-    const edges = resolveBoxEdges(&root.element.style.?, 16.0, 400.0, 1.0, 1.0);
-    try std.testing.expectEqual(@as(i32, 16), edges.margin.top);
-    try std.testing.expectEqual(@as(i32, 8), edges.margin.right);
-    try std.testing.expectEqual(@as(i32, 16), edges.margin.bottom);
-    try std.testing.expectEqual(@as(i32, 8), edges.margin.left);
-    try std.testing.expectEqual(@as(i32, 3), edges.padding.top);
-    try std.testing.expectEqual(@as(i32, 4), edges.padding.right);
-    try std.testing.expectEqual(@as(i32, 8), edges.border.top);
-    try std.testing.expectEqual(@as(i32, 8), edges.border.left);
-}
-
-fn animatedPixelDimension(element: *const parser.Element, property: []const u8) ?i32 {
-    const animations = element.animations orelse return null;
-    const animation = animations.get(property) orelse return null;
-    return switch (animation) {
-        .pixel => |pixel| pixel.layoutPixels(),
-        .numeric, .color, .transform => null,
-    };
-}
-
-fn resolvedPixelDimension(
-    element: *const parser.Element,
-    style_map: *const parser.StyleMap,
-    property: []const u8,
-    context: parser.CssLengthResolutionContext,
-) ?i32 {
-    return animatedPixelDimension(element, property) orelse
-        if (styleValue(style_map, property)) |value| resolveCssLength(value, context) else null;
-}
-
-/// Parse the single-radius subset supported by paint and hit testing. Invalid,
-/// negative, and non-pixel radii fall back to a square box.
-fn parseCssPixelRadius(value: []const u8) f64 {
-    const trimmed = std.mem.trim(u8, value, " \t\r\n");
-    if (trimmed.len < 2 or !std.ascii.eqlIgnoreCase(trimmed[trimmed.len - 2 ..], "px")) return 0;
-
-    const number = std.mem.trim(u8, trimmed[0 .. trimmed.len - 2], " \t\r\n");
-    if (number.len == 0) return 0;
-    const radius = std.fmt.parseFloat(f64, number) catch return 0;
-    return if (std.math.isFinite(radius) and radius > 0) radius else 0;
-}
-
-fn appendBackgroundBox(
-    commands: *std.ArrayList(DisplayItem),
-    allocator: std.mem.Allocator,
-    x: i32,
-    y: i32,
-    width: i32,
-    height: i32,
-    radius: f64,
-    color: browser.Color,
-    source: ?browser.DisplayItemSource,
-) !void {
-    if (color.a == 0) return;
-    if (radius > 0) {
-        try commands.append(allocator, .{ .rounded_rect = .{
-            .x1 = x,
-            .y1 = y,
-            .x2 = x + width,
-            .y2 = y + height,
-            .radius = radius,
-            .color = color,
-            .source = source,
-        } });
-    } else {
-        try commands.append(allocator, .{ .rect = .{
-            .x1 = x,
-            .y1 = y,
-            .x2 = x + width,
-            .y2 = y + height,
-            .color = color,
-            .source = source,
-        } });
-    }
-}
-
-const BackgroundImagePaint = struct {
-    pixels: []const u8,
-    source_width: i32,
-    source_height: i32,
-    size: background_image.Size,
-};
-
-fn backgroundImagePaint(element: *const parser.Element) ?BackgroundImagePaint {
-    const installed = element.background_image orelse return null;
-    const data = installed.data orelse return null;
-    const styles = if (element.style) |*styles| styles else return null;
-    const size = if (styleValue(styles, "background-size")) |value|
-        background_image.parseSize(value) orelse background_image.Size.automatic()
-    else
-        background_image.Size.automatic();
-    return .{
-        .pixels = data.image.rawBytes(),
-        .source_width = @intCast(data.image.width),
-        .source_height = @intCast(data.image.height),
-        .size = size,
-    };
-}
-
-fn backgroundImagePaintForSource(source: ?browser.DisplayItemSource) ?BackgroundImagePaint {
-    const node = (source orelse return null).node orelse return null;
-    return switch (node.*) {
-        .element => |*element| backgroundImagePaint(element),
-        .text => null,
-    };
-}
-
-fn croppedSourceExtent(clipped: i32, desired: i32, source: i32) f64 {
-    if (clipped >= desired) return @floatFromInt(source);
-    return @as(f64, @floatFromInt(clipped)) *
-        @as(f64, @floatFromInt(source)) /
-        @as(f64, @floatFromInt(desired));
-}
-
-/// Paint one non-repeating image anchored at the background-position default
-/// (top left). The supported background-size subset can make it smaller than
-/// the box; a larger image is source-cropped at the right/bottom border.
-fn appendBackgroundImageBox(
-    commands: *std.ArrayList(DisplayItem),
-    allocator: std.mem.Allocator,
-    paint: BackgroundImagePaint,
-    x: i32,
-    y: i32,
-    width: i32,
-    height: i32,
-    css_scale: f64,
-    source: ?browser.DisplayItemSource,
-) !void {
-    const resolved = background_image.resolveSize(
-        paint.size,
-        width,
-        height,
-        paint.source_width,
-        paint.source_height,
-        css_scale,
-    );
-    if (resolved.width <= 0 or resolved.height <= 0) return;
-
-    const clipped_width = @min(width, resolved.width);
-    const clipped_height = @min(height, resolved.height);
-    if (clipped_width <= 0 or clipped_height <= 0) return;
-    const is_cropped = clipped_width != resolved.width or clipped_height != resolved.height;
-    const source_rect: ?browser.ImageSourceRect = if (is_cropped) .{
-        .left = 0,
-        .top = 0,
-        .right = croppedSourceExtent(clipped_width, resolved.width, paint.source_width),
-        .bottom = croppedSourceExtent(clipped_height, resolved.height, paint.source_height),
-    } else null;
-
-    try commands.append(allocator, .{ .image = .{
-        .x1 = x,
-        .y1 = y,
-        .x2 = x + clipped_width,
-        .y2 = y + clipped_height,
-        .source_width = paint.source_width,
-        .source_height = paint.source_height,
-        .pixels = paint.pixels,
-        .source_rect = source_rect,
-        .source = source,
-    } });
-}
-
-test "background image paint resolves size and crops oversized cover geometry" {
-    const allocator = std.testing.allocator;
-    const pixels = [_]u8{
-        255, 0,   0, 255,
-        0,   255, 0, 255,
-    };
-    var commands = std.ArrayList(DisplayItem).empty;
-    defer commands.deinit(allocator);
-
-    try appendBackgroundImageBox(
-        &commands,
-        allocator,
-        .{
-            .pixels = &pixels,
-            .source_width = 2,
-            .source_height = 1,
-            .size = .cover,
-        },
-        10,
-        20,
-        100,
-        100,
-        1.0,
-        null,
-    );
-
-    try std.testing.expectEqual(@as(usize, 1), commands.items.len);
-    const image = commands.items[0].image;
-    try std.testing.expectEqual(@as(i32, 10), image.x1);
-    try std.testing.expectEqual(@as(i32, 110), image.x2);
-    try std.testing.expectEqual(
-        browser.ImageSourceRect{ .left = 0, .top = 0, .right = 1, .bottom = 1 },
-        image.source_rect.?,
-    );
-}
-
-/// Wrap one control's complete painted payload in its rounded hit shape.
-/// Non-painting group metadata constrains glyph and descendant-command hits
-/// that would otherwise restore the square containing rectangle after the
-/// rounded background itself missed.
-fn appendRoundedControlGroup(
-    destination: *std.ArrayList(DisplayItem),
-    allocator: std.mem.Allocator,
-    items: *std.ArrayList(DisplayItem),
-    x: i32,
-    y: i32,
-    width: i32,
-    height: i32,
-    radius: f64,
-    source: ?browser.DisplayItemSource,
-) !void {
-    const children = try items.toOwnedSlice(allocator);
-    var children_owned = true;
-    errdefer if (children_owned) DisplayItem.freeList(allocator, children);
-
-    try destination.append(allocator, .{ .blend = .{
-        .opacity = 1.0,
-        .blend_mode = null,
-        .hit_clip = .{
-            .x1 = x,
-            .y1 = y,
-            .x2 = x + width,
-            .y2 = y + height,
-            .radius = radius,
-        },
-        .children = children,
-        .needs_compositing = false,
-        .source = source,
-    } });
-    children_owned = false;
-}
-
-test "control backgrounds preserve CSS border radius in hit geometry" {
-    try std.testing.expectEqual(@as(f64, 12.5), parseCssPixelRadius(" 12.5px "));
-    try std.testing.expectEqual(@as(f64, 0), parseCssPixelRadius("-4px"));
-    try std.testing.expectEqual(@as(f64, 0), parseCssPixelRadius("50%"));
-
-    var commands = std.ArrayList(DisplayItem).empty;
-    defer commands.deinit(std.testing.allocator);
-    var origin: u8 = 0;
-    try appendBackgroundBox(
-        &commands,
-        std.testing.allocator,
-        0,
-        0,
-        100,
-        40,
-        20,
-        .{ .r = 1, .g = 2, .b = 3, .a = 255 },
-        .{ .layout = @ptrCast(&origin), .node = null },
-    );
-
-    try std.testing.expect(commands.items[0] == .rounded_rect);
-    try std.testing.expect(DisplayItem.hitTestDevice(commands.items, 50, 20, 1.0) != null);
-    try std.testing.expect(DisplayItem.hitTestDevice(commands.items, 1, 1, 1.0) == null);
-
-    // A control's text/checkmark commands carry the same source and may cover
-    // the square corner. The group clip must still keep that corner inert.
-    var control_content = std.ArrayList(DisplayItem).empty;
-    defer {
-        DisplayItem.freeItems(std.testing.allocator, control_content.items);
-        control_content.deinit(std.testing.allocator);
-    }
-    try appendBackgroundBox(
-        &control_content,
-        std.testing.allocator,
-        0,
-        0,
-        100,
-        40,
-        0,
-        .{ .r = 1, .g = 2, .b = 3, .a = 255 },
-        .{ .layout = @ptrCast(&origin), .node = null },
-    );
-    var grouped = std.ArrayList(DisplayItem).empty;
-    defer {
-        DisplayItem.freeItems(std.testing.allocator, grouped.items);
-        grouped.deinit(std.testing.allocator);
-    }
-    try appendRoundedControlGroup(
-        &grouped,
-        std.testing.allocator,
-        &control_content,
-        0,
-        0,
-        100,
-        40,
-        20,
-        .{ .layout = @ptrCast(&origin), .node = null },
-    );
-    try std.testing.expect(grouped.items[0] == .blend);
-    try std.testing.expect(grouped.items[0].blend.hit_clip != null);
-    try std.testing.expect(grouped.items[0].blend.blend_mode == null);
-    try std.testing.expect(!grouped.items[0].blend.needs_compositing);
-    try std.testing.expect(DisplayItem.hitTestDevice(grouped.items, 50, 20, 1.0) != null);
-    try std.testing.expect(DisplayItem.hitTestDevice(grouped.items, 1, 1, 1.0) == null);
-
-    const cloned = try cloneDisplayListOwned(std.testing.allocator, grouped.items);
-    defer DisplayItem.freeList(std.testing.allocator, cloned);
-    try std.testing.expect(cloned[0].blend.hit_clip != null);
-    try std.testing.expect(DisplayItem.hitTestDevice(cloned, 1, 1, 1.0) == null);
-}
+const resolveCssLength = box_model.resolveCssLength;
+const resolveSignedCssLength = box_model.resolveSignedCssLength;
+const resolveBoxEdges = box_model.resolveBoxEdges;
+const animatedPixelDimension = box_model.animatedPixelDimension;
+const resolvedPixelDimension = box_model.resolvedPixelDimension;
+const parseCssPixelRadius = box_model.parseCssPixelRadius;
+const appendBackgroundBox = replaced_paint.appendBackgroundBox;
+const backgroundImagePaint = replaced_paint.backgroundImagePaint;
+const backgroundImagePaintForSource = replaced_paint.backgroundImagePaintForSource;
+const appendBackgroundImageBox = replaced_paint.appendBackgroundImageBox;
+const appendRoundedControlGroup = replaced_paint.appendRoundedControlGroup;
 
 fn drawCursor(
     commands: *std.ArrayList(DisplayItem),
@@ -919,37 +308,7 @@ fn parseTranslate(value: []const u8) ?struct { x: i32, y: i32 } {
     return .{ .x = pixels.x, .y = pixels.y };
 }
 
-/// Parse the supported CSS filter syntax. Zibra intentionally implements one
-/// filter function for now, so unsupported chains are ignored as a whole.
-pub fn parseBlurFilter(value: []const u8) ?f64 {
-    const trimmed = std.mem.trim(u8, value, " \t\r\n");
-    if (std.mem.eql(u8, trimmed, "none")) return null;
-
-    const prefix = "blur(";
-    if (!std.mem.startsWith(u8, trimmed, prefix) or !std.mem.endsWith(u8, trimmed, ")")) return null;
-    const argument = std.mem.trim(u8, trimmed[prefix.len .. trimmed.len - 1], " \t\r\n");
-    if (argument.len == 0) return null;
-
-    const number = if (std.mem.endsWith(u8, argument, "px"))
-        std.mem.trim(u8, argument[0 .. argument.len - 2], " \t\r\n")
-    else if (std.mem.eql(u8, argument, "0"))
-        argument
-    else
-        return null;
-    const radius = std.fmt.parseFloat(f64, number) catch return null;
-    if (!std.math.isFinite(radius) or radius < 0) return null;
-    return radius;
-}
-
-test "blur filter parser accepts pixel lengths and rejects unsupported filters" {
-    try std.testing.expectEqual(@as(?f64, 4.5), parseBlurFilter(" blur( 4.5px ) "));
-    try std.testing.expectEqual(@as(?f64, 0.0), parseBlurFilter("blur(0)"));
-    try std.testing.expect(parseBlurFilter("none") == null);
-    try std.testing.expect(parseBlurFilter("blur(-1px)") == null);
-    try std.testing.expect(parseBlurFilter("grayscale(1)") == null);
-    try std.testing.expect(parseBlurFilter("blur(2em)") == null);
-    try std.testing.expect(parseBlurFilter("blur(2px) opacity(.5)") == null);
-}
+pub const parseBlurFilter = paint_effects.parseBlurFilter;
 
 const EmbedLayout = struct {
     allocator: std.mem.Allocator,
@@ -1434,96 +793,9 @@ const WordCache = struct {
     graphemes: []const []const u8,
 };
 
-// Bounding box for hit testing
-pub const Bounds = struct {
-    x: i32,
-    y: i32,
-    width: i32,
-    height: i32,
-};
-
-/// A layout-tree hit carries coordinates local to the object that supplied
-/// the DOM node. Worker-owned callers can reuse it for clicking or other point
-/// queries without reconstructing an absolute rectangle per object.
-pub const LayoutHitResult = struct {
-    node: *Node,
-    local_x: i32,
-    local_y: i32,
-};
-
-const HitPoint = struct {
-    x: i32,
-    y: i32,
-};
-
-fn subtractHitOffset(point: HitPoint, x: i32, y: i32) HitPoint {
-    return .{
-        .x = @intCast(std.math.clamp(
-            @as(i64, point.x) - @as(i64, x),
-            @as(i64, std.math.minInt(i32)),
-            @as(i64, std.math.maxInt(i32)),
-        )),
-        .y = @intCast(std.math.clamp(
-            @as(i64, point.y) - @as(i64, y),
-            @as(i64, std.math.minInt(i32)),
-            @as(i64, std.math.maxInt(i32)),
-        )),
-    };
-}
-
-fn addHitOffset(point: HitPoint, x: i32, y: i32) HitPoint {
-    return .{
-        .x = @intCast(std.math.clamp(
-            @as(i64, point.x) + @as(i64, x),
-            @as(i64, std.math.minInt(i32)),
-            @as(i64, std.math.maxInt(i32)),
-        )),
-        .y = @intCast(std.math.clamp(
-            @as(i64, point.y) + @as(i64, y),
-            @as(i64, std.math.minInt(i32)),
-            @as(i64, std.math.maxInt(i32)),
-        )),
-    };
-}
-
-fn relativeHitOffset(child: i32, parent: i32) i32 {
-    return @intCast(std.math.clamp(
-        @as(i64, child) - @as(i64, parent),
-        @as(i64, std.math.minInt(i32)),
-        @as(i64, std.math.maxInt(i32)),
-    ));
-}
-
-fn pointInLocalBox(point: HitPoint, width: i32, height: i32) bool {
-    return width > 0 and height > 0 and
-        point.x >= 0 and point.x < width and
-        point.y >= 0 and point.y < height;
-}
-
-fn pointInLocalRoundedBox(point: HitPoint, width: i32, height: i32, radius_value: f64) bool {
-    if (!pointInLocalBox(point, width, height)) return false;
-    const radius = @min(
-        @max(radius_value, 0.0),
-        @min(
-            @as(f64, @floatFromInt(width)) / 2.0,
-            @as(f64, @floatFromInt(height)) / 2.0,
-        ),
-    );
-    if (radius <= 0.0) return true;
-
-    const px: f64 = @floatFromInt(point.x);
-    const py: f64 = @floatFromInt(point.y);
-    const right: f64 = @floatFromInt(width);
-    const bottom: f64 = @floatFromInt(height);
-    if (px >= radius and px < right - radius) return true;
-    if (py >= radius and py < bottom - radius) return true;
-
-    const center_x = if (px < radius) radius else right - radius;
-    const center_y = if (py < radius) radius else bottom - radius;
-    const dx = px - center_x;
-    const dy = py - center_y;
-    return dx * dx + dy * dy <= radius * radius;
-}
+pub const Bounds = layout_hit.Bounds;
+pub const LayoutHitResult = layout_hit.Result;
+const HitPoint = layout_hit.Point;
 
 const LinkBoundEntry = struct {
     node: *Node,
@@ -1552,36 +824,10 @@ pub const FragmentTarget = struct {
 
 pub const Layout = @This();
 
-const TextDirection = enum {
-    left_to_right,
-    right_to_left,
-};
-
-const LineAlignment = enum {
-    start,
-    center,
-    end,
-};
-
-fn textDirectionFromFlag(rtl_text: bool) TextDirection {
-    return if (rtl_text) .right_to_left else .left_to_right;
-}
-
-fn lineAlignmentShift(
-    alignment: LineAlignment,
-    line_left: i32,
-    line_right: i32,
-    content_left: i32,
-    content_right: i32,
-) i32 {
-    const content_width = @max(content_right - content_left, 0);
-    const target_left = switch (alignment) {
-        .start => line_left,
-        .center => line_left + @divTrunc((line_right - line_left) - content_width, 2),
-        .end => line_right - content_width,
-    };
-    return target_left - content_left;
-}
+const TextDirection = inline_format.TextDirection;
+const LineAlignment = inline_format.LineAlignment;
+const textDirectionFromFlag = inline_format.textDirectionFromFlag;
+const lineAlignmentShift = inline_format.lineAlignmentShift;
 
 fn explicitTextDirection(element: *const parser.Element) ?TextDirection {
     const attributes = element.attributes orelse return null;
@@ -1671,30 +917,10 @@ fn isWithinPreformattedBlock(block: *const BlockLayout) bool {
     return false;
 }
 
-fn textSizeForSuperscript(size: i32, is_superscript: bool) i32 {
-    if (!is_superscript) return size;
-    return @max(@divTrunc(size, 2), 1);
-}
-
-fn isSmallCapsLowercaseGrapheme(grapheme_bytes: []const u8) bool {
-    return grapheme_bytes.len > 0 and std.ascii.isLower(grapheme_bytes[0]);
-}
-
-fn textSizeForSmallCaps(size: i32) i32 {
-    return @max(@divTrunc(size * 4, 5), 1);
-}
-
-fn shouldAutomaticallyWrap(
-    is_preformatted: bool,
-    cursor_x: i32,
-    glyph_width: i32,
-    line_right: i32,
-    line_has_content: bool,
-) bool {
-    return !is_preformatted and
-        line_has_content and
-        cursor_x + glyph_width > line_right;
-}
+const textSizeForSuperscript = inline_format.textSizeForSuperscript;
+const isSmallCapsLowercaseGrapheme = inline_format.isSmallCapsLowercaseGrapheme;
+const textSizeForSmallCaps = inline_format.textSizeForSmallCaps;
+const shouldAutomaticallyWrap = inline_format.shouldAutomaticallyWrap;
 
 /// Resolve the nearest inherited HTML `dir` value through the acyclic layout
 /// tree. `auto` and invalid values inherit because Zibra does not yet
@@ -1710,21 +936,6 @@ fn textDirectionForBlock(block: *const BlockLayout, fallback: TextDirection) Tex
         }
     }
     return fallback;
-}
-
-test "line alignment preserves source order and selects the requested edge" {
-    try std.testing.expectEqual(
-        @as(i32, 0),
-        lineAlignmentShift(.start, 13, 777, 13, 76),
-    );
-    try std.testing.expectEqual(
-        @as(i32, 701),
-        lineAlignmentShift(.end, 13, 777, 13, 76),
-    );
-    try std.testing.expectEqual(
-        @as(i32, 350),
-        lineAlignmentShift(.center, 13, 777, 13, 76),
-    );
 }
 
 test "HTML dir values override or inherit the CLI fallback" {
@@ -1747,9 +958,6 @@ test "HTML dir values override or inherit the CLI fallback" {
     var automatic = Node{ .element = try parser.Element.init(allocator, "p dir=auto", null) };
     defer automatic.deinit(allocator);
     try std.testing.expectEqual(@as(?TextDirection, null), explicitTextDirection(&automatic.element));
-
-    try std.testing.expectEqual(TextDirection.left_to_right, textDirectionFromFlag(false));
-    try std.testing.expectEqual(TextDirection.right_to_left, textDirectionFromFlag(true));
 }
 
 test "centered title recognizes title as an HTML class token" {
@@ -1780,7 +988,7 @@ test "centered title recognizes title as an HTML class token" {
     try std.testing.expect(!isCenteredTitleElement(&wrong_element.element));
 }
 
-test "superscript elements use a bounded half-size font" {
+test "superscript elements are recognized case-insensitively" {
     const allocator = std.testing.allocator;
 
     var superscript = Node{ .element = try parser.Element.init(allocator, "SUP", null) };
@@ -1790,13 +998,9 @@ test "superscript elements use a bounded half-size font" {
     var subscript = Node{ .element = try parser.Element.init(allocator, "sub", null) };
     defer subscript.deinit(allocator);
     try std.testing.expect(!isSuperscriptElement(&subscript.element));
-
-    try std.testing.expectEqual(@as(i32, 8), textSizeForSuperscript(16, true));
-    try std.testing.expectEqual(@as(i32, 1), textSizeForSuperscript(1, true));
-    try std.testing.expectEqual(@as(i32, 16), textSizeForSuperscript(16, false));
 }
 
-test "abbr elements render lowercase ASCII as bounded small caps" {
+test "abbr elements opt into small caps" {
     const allocator = std.testing.allocator;
 
     var abbreviation = Node{ .element = try parser.Element.init(allocator, "ABBR", null) };
@@ -1806,18 +1010,9 @@ test "abbr elements render lowercase ASCII as bounded small caps" {
     var span = Node{ .element = try parser.Element.init(allocator, "span", null) };
     defer span.deinit(allocator);
     try std.testing.expect(!isSmallCapsElement(&span.element));
-
-    try std.testing.expect(isSmallCapsLowercaseGrapheme("a"));
-    try std.testing.expect(isSmallCapsLowercaseGrapheme("a\u{0301}"));
-    try std.testing.expect(!isSmallCapsLowercaseGrapheme("A"));
-    try std.testing.expect(!isSmallCapsLowercaseGrapheme("7"));
-    try std.testing.expect(!isSmallCapsLowercaseGrapheme("😀"));
-
-    try std.testing.expectEqual(@as(i32, 12), textSizeForSmallCaps(16));
-    try std.testing.expectEqual(@as(i32, 1), textSizeForSmallCaps(1));
 }
 
-test "pre elements preserve text without automatic wrapping" {
+test "pre elements opt into preformatted layout" {
     const allocator = std.testing.allocator;
 
     var pre = Node{ .element = try parser.Element.init(allocator, "PRE", null) };
@@ -1827,10 +1022,6 @@ test "pre elements preserve text without automatic wrapping" {
     var code = Node{ .element = try parser.Element.init(allocator, "code", null) };
     defer code.deinit(allocator);
     try std.testing.expect(!isPreformattedElement(&code.element));
-
-    try std.testing.expect(!shouldAutomaticallyWrap(true, 95, 10, 100, true));
-    try std.testing.expect(shouldAutomaticallyWrap(false, 95, 10, 100, true));
-    try std.testing.expect(!shouldAutomaticallyWrap(false, 95, 10, 100, false));
 }
 
 fn setTestStyleValue(
@@ -1898,50 +1089,6 @@ test "list items reserve room for square markers" {
     const unmarked_bounds = contentBoundsForNode(item, 13, 100, list_item_indent);
     try std.testing.expectEqual(@as(i32, 13), unmarked_bounds.x);
     try std.testing.expectEqual(@as(i32, 100), unmarked_bounds.width);
-}
-
-test "block dimensions accept non-negative pixel lengths" {
-    try std.testing.expectEqual(@as(?i32, 240), parseCssPixelLength("240px"));
-    try std.testing.expectEqual(@as(?i32, 12), parseCssPixelLength(" 12.75PX "));
-    try std.testing.expectEqual(@as(?i32, 0), parseCssPixelLength("0px"));
-
-    try std.testing.expectEqual(@as(?i32, null), parseCssPixelLength("auto"));
-    try std.testing.expectEqual(@as(?i32, null), parseCssPixelLength("AUTO"));
-    try std.testing.expectEqual(@as(?i32, null), parseCssPixelLength("100%"));
-    try std.testing.expectEqual(@as(?i32, null), parseCssPixelLength("-1px"));
-    try std.testing.expectEqual(@as(?i32, null), parseCssPixelLength("NaNpx"));
-    try std.testing.expectEqual(@as(?i32, null), parseCssPixelLength("999999999999px"));
-}
-
-test "position offsets accept signed relative lengths" {
-    try std.testing.expectEqual(
-        @as(?i32, 24),
-        resolveSignedCssLength("+2em", .{ .font_size = 12 }),
-    );
-    try std.testing.expectEqual(
-        @as(?i32, -50),
-        resolveSignedCssLength("-25%", .{ .percentage_base = 200 }),
-    );
-    try std.testing.expectEqual(@as(?i32, -3), resolveSignedCssLength("-3px", .{}));
-    try std.testing.expectEqual(@as(?i32, null), resolveSignedCssLength("auto", .{}));
-    try std.testing.expectEqual(@as(?i32, null), resolveSignedCssLength("-2ex", .{}));
-}
-
-test "CSS zoom parses numbers and percentages and composes nested lengths" {
-    try std.testing.expectEqual(@as(f32, 1.5), parseCssZoom("1.5"));
-    try std.testing.expectEqual(@as(f32, 1.75), parseCssZoom(" 175% "));
-    try std.testing.expectEqual(@as(f32, 1.0), parseCssZoom("0"));
-    try std.testing.expectEqual(@as(f32, 1.0), parseCssZoom("0%"));
-    try std.testing.expectEqual(@as(f32, 1.0), parseCssZoom("-2"));
-    try std.testing.expectEqual(@as(f32, 1.0), parseCssZoom("bogus"));
-
-    const accessibility_zoom: f32 = 1.25;
-    const outer = combinedEffectiveZoom(accessibility_zoom, parseCssZoom("200%"));
-    const inner = combinedEffectiveZoom(outer, parseCssZoom("1.5"));
-    try std.testing.expectEqual(@as(f32, 2.5), outer);
-    try std.testing.expectEqual(@as(f32, 3.75), inner);
-    try std.testing.expectEqual(@as(i32, 60), scaleCssPixel(20, inner, accessibility_zoom));
-    try std.testing.expectEqual(@as(i32, -30), scaleCssPixel(-10, inner, accessibility_zoom));
 }
 
 test "effective CSS zoom follows ancestors and invalidates block layout" {
@@ -2378,19 +1525,12 @@ test "h6 headings run into a following block" {
     try std.testing.expect(isContainerNode(paragraph, null));
 }
 
-test "float and clear keywords normalize case and whitespace" {
+test "floating inline nodes become block containers" {
     const allocator = std.testing.allocator;
     var floating_inline = Node{ .element = try parser.Element.init(allocator, "span", null) };
     defer floating_inline.deinit(allocator);
     try setTestStyleValue(allocator, &floating_inline, "float", "left");
 
-    try std.testing.expectEqual(FloatSide.left, parseFloatSide(" LEFT "));
-    try std.testing.expectEqual(FloatSide.right, parseFloatSide("right"));
-    try std.testing.expectEqual(FloatSide.none, parseFloatSide("inline-start"));
-    try std.testing.expectEqual(ClearSide.left, parseClearSide(" left "));
-    try std.testing.expectEqual(ClearSide.right, parseClearSide("RIGHT"));
-    try std.testing.expectEqual(ClearSide.both, parseClearSide("both"));
-    try std.testing.expectEqual(ClearSide.none, parseClearSide("inline-start"));
     try std.testing.expect(isContainerNode(floating_inline, null));
 }
 
@@ -2759,22 +1899,7 @@ fn lineHeightForNatural(self: *const Layout, natural_height: i32) i32 {
     return natural + extra_leading;
 }
 
-fn resolveLineHeightCss(value: []const u8, font_size_css: f64) ?f64 {
-    const trimmed = std.mem.trim(u8, value, " \t\r\n\x0c");
-    if (trimmed.len == 0 or std.ascii.eqlIgnoreCase(trimmed, "normal")) return null;
-
-    // Unitless line-height inherits as a multiplier, so resolve it against
-    // the element's current font size at use time.
-    if (std.fmt.parseFloat(f64, trimmed)) |multiplier| {
-        if (!std.math.isFinite(multiplier) or multiplier < 0) return null;
-        return multiplier * font_size_css;
-    } else |_| {}
-
-    return parser.resolveCssLength(trimmed, .{
-        .font_size = font_size_css,
-        .percentage_base = font_size_css,
-    });
-}
+const resolveLineHeightCss = inline_format.resolveLineHeightCss;
 
 fn fontWeightIsBold(value: []const u8) bool {
     const trimmed = std.mem.trim(u8, value, " \t\r\n");
@@ -3344,71 +2469,14 @@ fn scaleBlockCssFloat(block: *const BlockLayout, value: f64) f64 {
     return scaleCssFloat(value, block.zoom.get().*, block.document.page_zoom);
 }
 
-/// Resolve the visual translation from the live DOM element. Composited
-/// transform animations can advance without rebuilding the layout tree, so a
-/// point query must not rely on the node snapshot captured by BlockLayout.
-fn blockHitTranslation(block: *const BlockLayout) HitPoint {
-    const element = liveBlockElement(block) orelse return .{ .x = 0, .y = 0 };
-    if (element.animations) |animations| {
-        if (animations.get("transform")) |animation| {
-            switch (animation) {
-                .transform => |value| {
-                    const pixels = value.getValue().layoutPixels();
-                    return .{
-                        .x = scaleBlockCssPixel(block, pixels.x),
-                        .y = scaleBlockCssPixel(block, pixels.y),
-                    };
-                },
-                .numeric, .pixel, .color => {},
-            }
-        }
-    }
-    const styles = if (element.style) |*value| value else return .{ .x = 0, .y = 0 };
-    const value = styleValue(styles, "transform") orelse return .{ .x = 0, .y = 0 };
-    return if (parseTranslate(value)) |translation|
-        .{
-            .x = scaleBlockCssPixel(block, translation.x),
-            .y = scaleBlockCssPixel(block, translation.y),
-        }
-    else
-        .{ .x = 0, .y = 0 };
-}
-
-fn blockHitOpacity(block: *const BlockLayout) f64 {
-    const element = liveBlockElement(block) orelse return 1.0;
-    if (element.animations) |animations| {
-        if (animations.get("opacity")) |animation| {
-            switch (animation) {
-                .numeric => |value| return std.math.clamp(value.getValue(), 0.0, 1.0),
-                .pixel, .color, .transform => {},
-            }
-        }
-    }
-    const styles = if (element.style) |*value| value else return 1.0;
-    const value = styleValue(styles, "opacity") orelse return 1.0;
-    return std.math.clamp(std.fmt.parseFloat(f64, value) catch 1.0, 0.0, 1.0);
-}
-
-const BlockHitClip = struct {
-    enabled: bool,
-    radius: f64,
-};
-
-fn blockHitClip(block: *const BlockLayout) BlockHitClip {
-    const element = liveBlockElement(block) orelse return .{ .enabled = false, .radius = 0.0 };
-    const styles = if (element.style) |*value| value else return .{ .enabled = false, .radius = 0.0 };
-    const radius = if (styleValue(styles, "border-radius")) |value|
-        scaleBlockCssFloat(block, parseCssPixelRadius(value))
-    else
-        0.0;
-    const overflow = std.mem.trim(
-        u8,
-        styleValue(styles, "overflow") orelse "visible",
-        " \t\r\n",
+/// Resolve live compositor-visible values from the current DOM generation.
+/// Neither hit testing nor paint wrapping may retain the returned style slice.
+fn resolvedBlockEffects(block: *const BlockLayout) paint_effects.ResolvedEffects {
+    return paint_effects.resolveElement(
+        liveBlockElement(block),
+        block.zoom.get().*,
+        block.document.page_zoom,
     );
-    const clips_overflow = std.ascii.eqlIgnoreCase(overflow, "clip") or
-        (std.ascii.eqlIgnoreCase(overflow, "scroll") and element.scroll_container);
-    return .{ .enabled = radius > 0.0 or clips_overflow, .radius = radius };
 }
 
 fn blockHitScrollY(block: *const BlockLayout) i32 {
@@ -3601,21 +2669,8 @@ fn restoreNodeStyles(self: *Layout, _: *std.ArrayList(LineItem)) !void {
     }
 }
 
-fn isSoftHyphenGrapheme(gme: []const u8) bool {
-    return std.mem.eql(u8, gme, "\u{00AD}");
-}
-
-fn isWordSeparatorGrapheme(gme: []const u8) bool {
-    return gme.len == 1 and std.ascii.isWhitespace(gme[0]);
-}
-
-test "soft hyphen recognition is distinct from word separation" {
-    try std.testing.expect(isSoftHyphenGrapheme("\u{00AD}"));
-    try std.testing.expect(!isSoftHyphenGrapheme("-"));
-    try std.testing.expect(isWordSeparatorGrapheme(" "));
-    try std.testing.expect(isWordSeparatorGrapheme("\t"));
-    try std.testing.expect(!isWordSeparatorGrapheme("a"));
-}
+const isSoftHyphenGrapheme = inline_format.isSoftHyphenGrapheme;
+const isWordSeparatorGrapheme = inline_format.isWordSeparatorGrapheme;
 
 fn resetSoftHyphenWord(self: *Layout) void {
     self.soft_hyphen_breaks.clearRetainingCapacity();
@@ -4488,21 +3543,8 @@ fn handlePreformattedText(
     }
 }
 
-fn lineBreakLengthAt(text: []const u8, position: usize) usize {
-    if (position >= text.len) return 0;
-    return switch (text[position]) {
-        '\n' => 1,
-        '\r' => if (position + 1 < text.len and text[position + 1] == '\n') 2 else 1,
-        else => 0,
-    };
-}
-
-fn isCollapsibleWhitespaceGrapheme(gme: []const u8) bool {
-    return gme.len == 1 and switch (gme[0]) {
-        ' ', '\t', '\n', '\r', 0x0c => true,
-        else => false,
-    };
-}
+const lineBreakLengthAt = inline_format.lineBreakLengthAt;
+const isCollapsibleWhitespaceGrapheme = inline_format.isCollapsibleWhitespaceGrapheme;
 
 fn processNormalGrapheme(
     self: *Layout,
@@ -4574,101 +3616,8 @@ fn handleTextToken(
     }
 }
 
-fn graphemeCount(text: []const u8) usize {
-    var count: usize = 0;
-    var iter = grapheme.iterator(text);
-    while (iter.next()) |_| count += 1;
-    return count;
-}
-
-test "emoji sequences stay in one grapheme cluster" {
-    try std.testing.expectEqual(@as(usize, 1), graphemeCount("👍🏽"));
-    try std.testing.expectEqual(@as(usize, 1), graphemeCount("👨‍👩‍👧‍👦"));
-    try std.testing.expectEqual(@as(usize, 1), graphemeCount("🇺🇸"));
-}
-
-test "lineBreakLengthAt recognizes platform newline encodings" {
-    try std.testing.expectEqual(@as(usize, 1), lineBreakLengthAt("a\nb", 1));
-    try std.testing.expectEqual(@as(usize, 2), lineBreakLengthAt("a\r\nb", 1));
-    try std.testing.expectEqual(@as(usize, 1), lineBreakLengthAt("a\rb", 1));
-    try std.testing.expectEqual(@as(usize, 0), lineBreakLengthAt("abc", 1));
-}
-
-test "normal-flow source whitespace collapses while preformatted breaks remain recognizable" {
-    for ([_][]const u8{ " ", "\t", "\n", "\r", "\x0c" }) |value| {
-        try std.testing.expect(isCollapsibleWhitespaceGrapheme(value));
-    }
-    try std.testing.expect(!isCollapsibleWhitespaceGrapheme("x"));
-    try std.testing.expect(!isCollapsibleWhitespaceGrapheme("\u{00a0}"));
-
-    try std.testing.expectEqual(@as(usize, 1), lineBreakLengthAt("a\nb", 1));
-    try std.testing.expectEqual(@as(usize, 2), lineBreakLengthAt("a\r\nb", 1));
-}
-
-test "line-height resolves unitless and relative values" {
-    try std.testing.expectEqual(@as(?f64, null), resolveLineHeightCss("normal", 16.0));
-    try std.testing.expectApproxEqAbs(@as(f64, 24.0), resolveLineHeightCss("1.5", 16.0).?, 0.000001);
-    try std.testing.expectApproxEqAbs(@as(f64, 24.0), resolveLineHeightCss("150%", 16.0).?, 0.000001);
-    try std.testing.expectApproxEqAbs(@as(f64, 20.0), resolveLineHeightCss("1.25em", 16.0).?, 0.000001);
-    try std.testing.expect(resolveLineHeightCss("-1", 16.0) == null);
-}
-
-// Text stays source-backed in the DOM; decode references only while laying it
-// out. Attribute values use the same lexer but copy decoded bytes in parser.zig.
-fn lexEntityAt(
-    text: []const u8,
-    pos: usize,
-    buffer: *[4]u8,
-) ?struct { replacement: []const u8, len: usize } {
-    const reference = parser.characterReferenceAt(text, pos) orelse return null;
-    const encoded_len = std.unicode.utf8Encode(reference.codepoint, buffer) catch return null;
-    return .{ .replacement = buffer[0..encoded_len], .len = reference.len };
-}
-
-/// Decode text exactly as the layout text walkers do. DOM text intentionally
-/// remains source-backed and escaped; this owned helper also provides focused
-/// coverage for generated browser-page labels.
-pub fn decodeTextForDisplay(allocator: std.mem.Allocator, text: []const u8) ![]u8 {
-    var output = std.ArrayList(u8).empty;
-    errdefer output.deinit(allocator);
-
-    var pos: usize = 0;
-    while (pos < text.len) {
-        var buffer: [4]u8 = undefined;
-        if (lexEntityAt(text, pos, &buffer)) |entity| {
-            try output.appendSlice(allocator, entity.replacement);
-            pos += entity.len;
-        } else {
-            try output.append(allocator, text[pos]);
-            pos += 1;
-        }
-    }
-    return output.toOwnedSlice(allocator);
-}
-
-test "lexEntityAt recognizes the entities rendered as text" {
-    const input = "&lt;div&gt; &amp; &quot;quote&quot; &apos;apostrophe&apos;";
-
-    var buffer: [4]u8 = undefined;
-    const less_than = lexEntityAt(input, 0, &buffer).?;
-    try std.testing.expectEqualStrings("<", less_than.replacement);
-    try std.testing.expectEqual(@as(usize, 4), less_than.len);
-
-    const greater_than_start = std.mem.indexOf(u8, input, "&gt;").?;
-    const greater_than = lexEntityAt(input, greater_than_start, &buffer).?;
-    try std.testing.expectEqualStrings(">", greater_than.replacement);
-    try std.testing.expectEqual(@as(usize, 4), greater_than.len);
-
-    const soft_hyphen = lexEntityAt("&shy;", 0, &buffer).?;
-    try std.testing.expectEqualStrings("\u{00AD}", soft_hyphen.replacement);
-    try std.testing.expectEqual(@as(usize, 5), soft_hyphen.len);
-
-    const numeric = lexEntityAt("&#x1F642;", 0, &buffer).?;
-    try std.testing.expectEqualStrings("🙂", numeric.replacement);
-
-    try std.testing.expect(lexEntityAt("&unknown;", 0, &buffer) == null);
-    try std.testing.expect(lexEntityAt("&lt", 0, &buffer) == null);
-}
+const lexEntityAt = inline_format.lexEntityAt;
+pub const decodeTextForDisplay = inline_format.decodeTextForDisplay;
 
 // Update layoutSourceCode to format HTML source with tags in normal font and content in bold
 pub fn layoutSourceCode(self: *Layout, source: []const u8) ![]DisplayItem {
@@ -4905,27 +3854,41 @@ const InputLayout = struct {
         const ascent_value = engine.toLayoutPx(glyph.ascent);
         const descent_value = engine.toLayoutPx(glyph.descent);
         const natural_height = ascent_value + descent_value;
-        if (self.is_radio and self.border_radius == 0) {
-            self.border_radius = @as(f64, @floatFromInt(natural_height)) / 2.0;
-        }
-        var width_value = if (is_choice) natural_height else engine.scaleActiveCssPixel(INPUT_WIDTH_PX);
-        var height_value = natural_height;
+        var authored_width: ?i32 = null;
+        var authored_height: ?i32 = null;
         if (!is_choice) {
             if (element.style) |*style_map| {
                 if (resolvedPixelDimension(&element, style_map, "width", .{
                     .font_size = engine.font_size_css,
                     .percentage_base = engine.containingBlockCssDimension(false),
                 })) |pixels|
-                    width_value = @max(engine.scaleActiveCssPixel(pixels), 1);
+                    authored_width = @max(engine.scaleActiveCssPixel(pixels), 1);
                 if (resolvedPixelDimension(&element, style_map, "height", .{
                     .font_size = engine.font_size_css,
                     .percentage_base = engine.containingBlockCssDimension(true),
                 })) |pixels|
-                    height_value = @max(engine.scaleActiveCssPixel(pixels), natural_height);
+                    authored_height = @max(engine.scaleActiveCssPixel(pixels), natural_height);
             }
         }
+        const metrics = control_geometry.inputBoxMetrics(
+            natural_height,
+            engine.scaleActiveCssPixel(INPUT_WIDTH_PX),
+            is_choice,
+            self.is_radio,
+            authored_width,
+            authored_height,
+            self.border_radius,
+        );
+        self.border_radius = metrics.border_radius;
         self.embed.setupDependencies();
-        self.embed.setMetrics(width_value, height_value, ascent_value, descent_value, engine.effectiveZoom(), self.font_size);
+        self.embed.setMetrics(
+            metrics.width,
+            metrics.height,
+            ascent_value,
+            descent_value,
+            engine.effectiveZoom(),
+            self.font_size,
+        );
         self.is_focused = element.is_focused;
     }
 
@@ -5167,13 +4130,9 @@ const InputLayout = struct {
     }
 };
 
-fn inputDisplayGrapheme(is_password: bool, source: []const u8) []const u8 {
-    if (is_password) return "*";
-    if (std.mem.eql(u8, source, "\n") or std.mem.eql(u8, source, "\r")) return " ";
-    return source;
-}
+const inputDisplayGrapheme = control_geometry.inputDisplayGrapheme;
 
-test "hidden inputs emit no inline box and password graphemes paint as stars" {
+test "hidden inputs emit no inline box" {
     const allocator = std.testing.allocator;
     var hidden_node = Node{ .element = try parser.Element.init(
         allocator,
@@ -5189,19 +4148,6 @@ test "hidden inputs emit no inline box and password graphemes paint as stars" {
     defer line_items.deinit(allocator);
     try unused_engine.handleInputElement(hidden_node, &hidden_node, &line_items);
     try std.testing.expectEqual(@as(usize, 0), line_items.items.len);
-
-    const password = "aé🙂";
-    var iterator = grapheme.iterator(password);
-    var masked_count: usize = 0;
-    while (iterator.next()) |cluster| {
-        try std.testing.expectEqualStrings(
-            "*",
-            inputDisplayGrapheme(true, cluster.bytes(password)),
-        );
-        masked_count += 1;
-    }
-    try std.testing.expectEqual(@as(usize, 3), masked_count);
-    try std.testing.expectEqualStrings("x", inputDisplayGrapheme(false, "x"));
 }
 
 test "radio inputs use compact circular control metrics" {
@@ -5388,7 +4334,7 @@ const ButtonLayout = struct {
             ),
         };
         if (displayListLayoutBounds(engine, self.commands.items, 0, 0)) |paint_bounds| {
-            content_bounds = unionRects(content_bounds, paint_bounds);
+            content_bounds = content_bounds.unionWith(paint_bounds);
         }
 
         const box_metrics = buttonBoxMetrics(content_bounds, padding);
@@ -5534,43 +4480,7 @@ fn offsetBounds(bounds: Bounds, dx: i32, dy: i32) Bounds {
     };
 }
 
-fn unionRects(a: browser.Rect, b: browser.Rect) browser.Rect {
-    return .{
-        .left = @min(a.left, b.left),
-        .top = @min(a.top, b.top),
-        .right = @max(a.right, b.right),
-        .bottom = @max(a.bottom, b.bottom),
-    };
-}
-
-const ButtonBoxMetrics = struct {
-    width: i32,
-    height: i32,
-    content_offset_x: i32,
-    content_offset_y: i32,
-};
-
-fn buttonBoxMetrics(content_bounds: browser.Rect, padding: i32) ButtonBoxMetrics {
-    return .{
-        .width = content_bounds.width() + 2 * padding,
-        .height = content_bounds.height() + 2 * padding,
-        .content_offset_x = padding - content_bounds.left,
-        .content_offset_y = padding - content_bounds.top,
-    };
-}
-
-test "rich button box encloses tall oversized and negative-offset content" {
-    const metrics = buttonBoxMetrics(.{
-        .left = -12,
-        .top = -3,
-        .right = 240,
-        .bottom = 117,
-    }, button_padding);
-    try std.testing.expectEqual(@as(i32, 260), metrics.width);
-    try std.testing.expectEqual(@as(i32, 128), metrics.height);
-    try std.testing.expectEqual(@as(i32, 16), metrics.content_offset_x);
-    try std.testing.expectEqual(@as(i32, 7), metrics.content_offset_y);
-}
+const buttonBoxMetrics = control_geometry.buttonBoxMetrics;
 
 fn displayListLayoutBounds(
     engine: *Layout,
@@ -5649,7 +4559,7 @@ fn displayListLayoutBounds(
             ),
             .draw_composited_layer => null,
         };
-        if (bounds) |rect| result = if (result) |existing| unionRects(existing, rect) else rect;
+        if (bounds) |rect| result = if (result) |existing| existing.unionWith(rect) else rect;
     }
     return result;
 }
@@ -5672,143 +4582,7 @@ fn rebaseDisplaySources(items: []DisplayItem, parent_block: *BlockLayout) void {
     }
 }
 
-/// Materialize a command tree for a boundary that cannot borrow retained
-/// layout caches. Persistent layout ancestors use cached_subtree edges instead;
-/// temporary rich-button trees must deep-clone because their owners retire as
-/// soon as the surrounding inline command is complete.
-const DisplayListCloneError = error{OutOfMemory};
-
-fn cloneDisplayListOwned(
-    allocator: std.mem.Allocator,
-    items: []const DisplayItem,
-) DisplayListCloneError![]DisplayItem {
-    const copy = try allocator.alloc(DisplayItem, items.len);
-    var initialized: usize = 0;
-    errdefer {
-        DisplayItem.freeItems(allocator, copy[0..initialized]);
-        allocator.free(copy);
-    }
-    for (items, 0..) |item, index| {
-        copy[index] = try cloneDisplayItemOwned(allocator, item);
-        initialized += 1;
-    }
-    return copy;
-}
-
-fn cloneDisplayItemOwned(
-    allocator: std.mem.Allocator,
-    item: DisplayItem,
-) DisplayListCloneError!DisplayItem {
-    return switch (item) {
-        // Materialization boundaries (temporary rich-button layout and tests)
-        // must not retain a pointer to another layout object's cache. An
-        // identity transform preserves this one-item clone API while owning a
-        // recursively cloned command list.
-        .cached_subtree => |cached| .{ .transform = .{
-            .translate_x = 0,
-            .translate_y = 0,
-            .children = try cloneDisplayListOwned(allocator, cached.list.items),
-            .source = cached.source,
-        } },
-        .canvas => |canvas| blk: {
-            var copy = canvas;
-            copy.pixels = pixels: {
-                const source = canvas.source orelse break :pixels try allocator.dupe(u8, canvas.pixels);
-                const node = source.originatingNode() orelse break :pixels try allocator.dupe(u8, canvas.pixels);
-                if (node.* != .element or
-                    !std.ascii.eqlIgnoreCase(node.element.tag, "canvas"))
-                {
-                    break :pixels try allocator.dupe(u8, canvas.pixels);
-                }
-                const backing = node.element.canvas orelse break :pixels try allocator.dupe(u8, canvas.pixels);
-                break :pixels try backing.snapshot(allocator);
-            };
-            copy.owns_pixels = true;
-            break :blk .{ .canvas = copy };
-        },
-        .blend => |blend| blk: {
-            const children = try cloneDisplayListOwned(allocator, blend.children);
-            var children_owned = true;
-            errdefer if (children_owned) DisplayItem.freeList(allocator, children);
-
-            const blend_mode = if (blend.blend_mode) |mode|
-                try allocator.dupe(u8, mode)
-            else
-                null;
-            children_owned = false;
-            break :blk .{ .blend = .{
-                .opacity = blend.opacity,
-                .blend_mode = blend_mode,
-                .blur_radius = blend.blur_radius,
-                .hit_clip = blend.hit_clip,
-                .children = children,
-                .node = blend.node,
-                .parent = null,
-                .needs_compositing = blend.needs_compositing,
-                .compositor_id = blend.compositor_id,
-                .source = blend.source,
-            } };
-        },
-        .transform => |transform| .{ .transform = .{
-            .translate_x = transform.translate_x,
-            .translate_y = transform.translate_y,
-            .children = try cloneDisplayListOwned(allocator, transform.children),
-            .node = transform.node,
-            .composited = transform.composited,
-            .animation_active = transform.animation_active,
-            .compositor_id = transform.compositor_id,
-            .source = transform.source,
-        } },
-        else => item,
-    };
-}
-
-fn appendClonedDisplayItem(
-    allocator: std.mem.Allocator,
-    destination: *std.ArrayList(DisplayItem),
-    item: DisplayItem,
-) !void {
-    var owned = [1]DisplayItem{try cloneDisplayItemOwned(allocator, item)};
-    var transferred = false;
-    errdefer if (!transferred) DisplayItem.freeItems(allocator, owned[0..]);
-    try destination.append(allocator, owned[0]);
-    transferred = true;
-}
-
-test "display-list materialization recursively owns nested containers" {
-    const allocator = std.testing.allocator;
-
-    const transform_children = try allocator.alloc(DisplayItem, 1);
-    transform_children[0] = .{ .rect = .{
-        .x1 = 1,
-        .y1 = 2,
-        .x2 = 30,
-        .y2 = 40,
-        .color = .{ .r = 1, .g = 2, .b = 3, .a = 255 },
-    } };
-    const blend_children = try allocator.alloc(DisplayItem, 1);
-    blend_children[0] = .{ .transform = .{
-        .translate_x = 5,
-        .translate_y = 7,
-        .children = transform_children,
-    } };
-    const blend_mode = try allocator.dupe(u8, "multiply");
-    var cached = [1]DisplayItem{.{ .blend = .{
-        .opacity = 0.5,
-        .blend_mode = blend_mode,
-        .blur_radius = 3.0,
-        .children = blend_children,
-    } }};
-
-    const snapshot = try cloneDisplayListOwned(allocator, cached[0..]);
-    defer DisplayItem.freeList(allocator, snapshot);
-    DisplayItem.freeItems(allocator, cached[0..]);
-
-    try std.testing.expectEqualStrings("multiply", snapshot[0].blend.blend_mode.?);
-    try std.testing.expectEqual(@as(f64, 3.0), snapshot[0].blend.blur_radius);
-    try std.testing.expectEqual(@as(i32, 5), snapshot[0].blend.children[0].transform.translate_x);
-    try std.testing.expectEqual(@as(i32, 30), snapshot[0].blend.children[0].transform.children[0].rect.x2);
-}
+const appendClonedDisplayItem = retained_commands.appendClone;
 
 test "rich-button descendant paint retains its own activation origin" {
     const allocator = std.testing.allocator;
@@ -6140,12 +4914,15 @@ const TextLayout = struct {
         parent_point: HitPoint,
         parent_origin: HitPoint,
     ) ?LayoutHitResult {
-        const local = subtractHitOffset(
+        const local = layout_hit.childLocalPoint(
             parent_point,
-            relativeHitOffset(self.x.get().*, parent_origin.x),
-            relativeHitOffset(self.y.get().*, parent_origin.y),
+            .{ .x = self.x.get().*, .y = self.y.get().* },
+            parent_origin,
         );
-        if (!pointInLocalBox(local, self.width.get().*, self.height.get().*)) return null;
+        if (!layout_hit.containsBox(local, .{
+            .width = self.width.get().*,
+            .height = self.height.get().*,
+        })) return null;
         return .{
             .node = self.node_ptr orelse return null,
             .local_x = local.x,
@@ -6377,10 +5154,10 @@ const LineLayout = struct {
         parent_point: HitPoint,
         parent_origin: HitPoint,
     ) ?LayoutHitResult {
-        const local = subtractHitOffset(
+        const local = layout_hit.childLocalPoint(
             parent_point,
-            relativeHitOffset(self.x.get().*, parent_origin.x),
-            relativeHitOffset(self.y.get().*, parent_origin.y),
+            .{ .x = self.x.get().*, .y = self.y.get().* },
+            parent_origin,
         );
         var index = self.children.items.len;
         const origin = HitPoint{ .x = self.x.get().*, .y = self.y.get().* };
@@ -6598,10 +5375,9 @@ pub const DocumentLayout = struct {
     /// its offset from its parent; transforms and element scrolling are
     /// inverted at the object that owns them.
     pub fn hitTest(self: *const DocumentLayout, x: i32, y: i32) ?LayoutHitResult {
-        const local = subtractHitOffset(
+        const local = layout_hit.subtractOffset(
             .{ .x = x, .y = y },
-            self.x.get().*,
-            self.y.get().*,
+            .{ .x = self.x.get().*, .y = self.y.get().* },
         );
         const origin = HitPoint{ .x = self.x.get().*, .y = self.y.get().* };
         var index = self.children.items.len;
@@ -6609,7 +5385,10 @@ pub const DocumentLayout = struct {
             index -= 1;
             if (self.children.items[index].hitTest(local, origin)) |hit| return hit;
         }
-        if (!pointInLocalBox(local, self.width.get().*, self.height.get().*)) return null;
+        if (!layout_hit.containsBox(local, .{
+            .width = self.width.get().*,
+            .height = self.height.get().*,
+        })) return null;
         return .{ .node = self.node_ptr, .local_x = local.x, .local_y = local.y };
     }
 
@@ -6681,12 +5460,7 @@ const LayoutChild = union(enum) {
     }
 };
 
-const LayoutChildPaintKey = struct {
-    z_index: i32,
-    document_index: usize,
-};
-
-fn layoutChildPaintKey(child: LayoutChild, document_index: usize) LayoutChildPaintKey {
+fn layoutChildPaintKey(child: LayoutChild, document_index: usize) layout_hit.StackingKey {
     return .{
         .z_index = switch (child) {
             .block => |block| blockPaintZIndex(block),
@@ -6694,11 +5468,6 @@ fn layoutChildPaintKey(child: LayoutChild, document_index: usize) LayoutChildPai
         },
         .document_index = document_index,
     };
-}
-
-fn paintKeyBefore(left: LayoutChildPaintKey, right: LayoutChildPaintKey) bool {
-    if (left.z_index != right.z_index) return left.z_index < right.z_index;
-    return left.document_index < right.document_index;
 }
 
 const BlockLayout = struct {
@@ -7745,63 +6514,12 @@ const BlockLayout = struct {
         }
         std.mem.sort(usize, self.paint_order.items, self.children.items, struct {
             fn lessThan(children: []const LayoutChild, left: usize, right: usize) bool {
-                return paintKeyBefore(
+                return layout_hit.StackingKey.before(
                     layoutChildPaintKey(children[left], left),
                     layoutChildPaintKey(children[right], right),
                 );
             }
         }.lessThan);
-    }
-
-    // Create a new line for inline content
-    fn newLine(self: *BlockLayout) !void {
-        self.cursor_x = 0;
-        const last_line: ?*LineLayout = if (self.children.items.len > 0) blk: {
-            const last_child = self.children.items[self.children.items.len - 1];
-            break :blk if (last_child == .line) last_child.line else null;
-        } else null;
-
-        const new_line = try LineLayout.init(self.allocator, self.node, self, last_line);
-        try self.appendChild(.{ .line = new_line });
-    }
-
-    // Add a word to the current line
-    fn word(
-        self: *BlockLayout,
-        node: Node,
-        node_ptr: ?*Node,
-        word_text: []const u8,
-        font_mgr: *font.FontManager,
-        width: i32,
-    ) !void {
-        // Get the current line (should be the last child)
-        if (self.children.items.len == 0) {
-            try self.newLine();
-        }
-
-        const last_child = &self.children.items[self.children.items.len - 1];
-        if (last_child.* != .line) {
-            // If last child isn't a line, create a new line
-            try self.newLine();
-        }
-
-        const line = self.children.items[self.children.items.len - 1].line;
-
-        // Check if we need to wrap to a new line
-        if (wordNeedsNewLine(self.cursor_x, width, self.width)) {
-            try self.newLine();
-        }
-
-        const previous_word: ?*TextLayout = if (line.children.items.len > 0)
-            line.children.items[line.children.items.len - 1]
-        else
-            null;
-
-        const text = try TextLayout.init(self.allocator, node, node_ptr, word_text, line, previous_word);
-        try line.children.append(self.allocator, text);
-        self.cursor_x += width;
-
-        _ = font_mgr; // Will use this later for measuring
     }
 
     fn layout(self: *BlockLayout, engine: *Layout) !void {
@@ -8380,41 +7098,29 @@ const BlockLayout = struct {
         parent_point: HitPoint,
         parent_origin: HitPoint,
     ) ?LayoutHitResult {
-        if (blockHitOpacity(self) <= 0.0) return null;
-
-        var local = subtractHitOffset(
-            parent_point,
-            relativeHitOffset(self.x.get().*, parent_origin.x),
-            relativeHitOffset(self.y.get().*, parent_origin.y),
-        );
-        local = subtractHitOffset(local, self.position_offset.x, self.position_offset.y);
-        const translation = blockHitTranslation(self);
-        local = subtractHitOffset(local, translation.x, translation.y);
-
         const width = self.width.get().*;
         const height = self.height.get().*;
-        const clip = blockHitClip(self);
-        if (clip.enabled and !pointInLocalRoundedBox(local, width, height, clip.radius)) return null;
-
-        // Scroll moves the contents but not the element's own box. Convert the
-        // local point back into the unscrolled content space before descending.
-        const content_point = addHitOffset(local, 0, blockHitScrollY(self));
+        const effects = resolvedBlockEffects(self);
+        const translation = effects.translation orelse paint_effects.Offset{};
+        const localized = layout_hit.localizeBlock(parent_point, .{
+            .child_origin = .{ .x = self.x.get().*, .y = self.y.get().* },
+            .parent_origin = parent_origin,
+            .size = .{ .width = width, .height = height },
+            .position_offset = .{ .x = self.position_offset.x, .y = self.position_offset.y },
+            .transform_translation = .{ .x = translation.x, .y = translation.y },
+            .opacity = effects.opacity,
+            .clip = .{
+                .enabled = effects.border_radius > 0.0 or effects.clips_overflow,
+                .radius = effects.border_radius,
+            },
+            .scroll_y = blockHitScrollY(self),
+        }) orelse return null;
+        const local = localized.local;
+        const content_point = localized.content;
         const origin = HitPoint{ .x = self.x.get().*, .y = self.y.get().* };
-        if (self.paint_order.items.len == self.children.items.len) {
-            var order_index = self.paint_order.items.len;
-            while (order_index > 0) {
-                order_index -= 1;
-                const document_index = self.paint_order.items[order_index];
-                if (self.children.items[document_index].hitTest(content_point, origin)) |hit| return hit;
-            }
-        } else {
-            // Before the first paint there is no committed stack snapshot.
-            // DOM reverse order is the zero-layer fallback.
-            var document_index = self.children.items.len;
-            while (document_index > 0) {
-                document_index -= 1;
-                if (self.children.items[document_index].hitTest(content_point, origin)) |hit| return hit;
-            }
+        var order = layout_hit.ReverseOrder.init(self.paint_order.items, self.children.items.len);
+        while (order.next()) |document_index| {
+            if (self.children.items[document_index].hitTest(content_point, origin)) |hit| return hit;
         }
 
         // Inline-mode blocks still use the legacy inline formatter and do not
@@ -8422,7 +7128,10 @@ const BlockLayout = struct {
         // the cached paint commands, preserving fragment gaps, controls, and
         // rich-button descendants until that TODO is removed.
         if (self.display_list.items.len > 0) {
-            const absolute_content_point = addHitOffset(content_point, self.x.get().*, self.y.get().*);
+            const absolute_content_point = layout_hit.addOffset(content_point, .{
+                .x = self.x.get().*,
+                .y = self.y.get().*,
+            });
             if (DisplayItem.hitTest(
                 self.display_list.items,
                 absolute_content_point.x,
@@ -8435,7 +7144,7 @@ const BlockLayout = struct {
             }
         }
 
-        if (!pointInLocalRoundedBox(local, width, height, clip.radius)) return null;
+        if (!localized.hits_own_box) return null;
         return .{
             .node = self.node_ptr orelse return null,
             .local_x = local.x,
@@ -8458,9 +7167,7 @@ const BlockLayout = struct {
     }
 };
 
-fn wordNeedsNewLine(cursor_x: i32, word_width: i32, line_width: i32) bool {
-    return cursor_x > 0 and cursor_x +| word_width > line_width;
-}
+const wordNeedsNewLine = inline_format.wordNeedsNewLine;
 
 fn setTestLayoutBox(layout_object: anytype, x: i32, y: i32, width: i32, height: i32) void {
     layout_object.zoom.set(1.0);
@@ -9740,8 +8447,9 @@ fn refreshBlockPaintCache(self: *Layout, block: *BlockLayout) !void {
     try appendContentEditableCursor(self, &commands, block);
     try applyElementScroll(block, &commands, content_start);
 
-    const final_commands = try applyPaintEffects(self, block, commands.items);
+    const owned_commands = try commands.toOwnedSlice(self.allocator);
     commands_own_items = false;
+    const final_commands = try applyPaintEffects(self, block, owned_commands);
     var final_owned = true;
     errdefer if (final_owned) DisplayItem.freeList(self.allocator, final_commands);
     replaceRetainedPaintCache(
@@ -9839,6 +8547,10 @@ fn paintBlockTreeRecursive(commands: *std.ArrayList(DisplayItem), self: *Layout,
     // Collect this block's own commands
     var block_commands = std.ArrayList(DisplayItem).empty;
     defer block_commands.deinit(self.allocator);
+    var block_commands_own_items = true;
+    errdefer if (block_commands_own_items) {
+        DisplayItem.freeItems(self.allocator, block_commands.items);
+    };
 
     // Add background/borders for this block
     try addBackgroundIfNeededToList(self, &block_commands, block);
@@ -9864,16 +8576,18 @@ fn paintBlockTreeRecursive(commands: *std.ArrayList(DisplayItem), self: *Layout,
     try appendContentEditableCursor(self, &block_commands, block);
     try applyElementScroll(block, &block_commands, content_start);
 
-    // Apply visual effects (opacity, transform, etc.) for this block
-    const final_commands = try applyPaintEffects(self, block, block_commands.items);
+    const owned_commands = try block_commands.toOwnedSlice(self.allocator);
+    block_commands_own_items = false;
+    const final_commands = try applyPaintEffects(self, block, owned_commands);
 
-    // Add the wrapped commands to the parent's list
-    for (final_commands) |cmd| {
-        try commands.append(self.allocator, cmd);
-    }
-    if (final_commands.len > 0) {
-        self.allocator.free(final_commands);
-    }
+    // Reserve before transferring any owning command so failure cannot leave
+    // a half-moved tree split between the temporary and destination lists.
+    commands.ensureUnusedCapacity(self.allocator, final_commands.len) catch |err| {
+        DisplayItem.freeList(self.allocator, final_commands);
+        return err;
+    };
+    for (final_commands) |command| commands.appendAssumeCapacity(command);
+    self.allocator.free(final_commands);
 }
 
 /// Keep the element's own background stationary while moving all of its
@@ -9884,324 +8598,44 @@ fn applyElementScroll(
     commands: *std.ArrayList(DisplayItem),
     content_start: usize,
 ) !void {
-    const node_ptr = block.node_ptr orelse return;
-    const element = switch (node_ptr.*) {
-        .element => |*value| value,
-        .text => return,
-    };
-    if (!element.scroll_container or element.scroll_y <= 0) return;
-    if (content_start >= commands.items.len) return;
-
-    const children = try block.allocator.alloc(DisplayItem, commands.items.len - content_start);
-    @memcpy(children, commands.items[content_start..]);
-
-    // The list already had room for every moved child, so replacing the
-    // suffix by one transform cannot allocate after ownership is transferred.
-    commands.shrinkRetainingCapacity(content_start);
-    commands.appendAssumeCapacity(.{ .transform = .{
-        .translate_x = 0,
-        .translate_y = -element.scroll_y,
-        .children = children,
-        .node = opaqueElementForNode(block.node_ptr),
-        .source = displaySource(block, block.node_ptr),
-    } });
+    const element = liveBlockElement(block) orelse return;
+    try paint_effects.wrapScrolledSuffix(
+        block.allocator,
+        commands,
+        content_start,
+        if (element.scroll_container) @max(element.scroll_y, 0) else 0,
+        opaqueElementForNode(block.node_ptr),
+        displaySource(block, block.node_ptr),
+    );
 }
 
-/// Positioning is a static outer translation, separate from the transform
-/// wrapper that compositor-only animation may update between layouts.
-fn wrapPositionOffset(
+/// Transfer an owned block command list into the command-level effect builder.
+/// Cache generations and dirty state remain owned by the calling layout object.
+fn applyPaintEffects(
     self: *Layout,
     block: *const BlockLayout,
     commands: []DisplayItem,
 ) ![]DisplayItem {
-    if (block.position_offset.x == 0 and block.position_offset.y == 0) return commands;
-    const result = self.allocator.alloc(DisplayItem, 1) catch |err| {
-        DisplayItem.freeItems(self.allocator, commands);
-        self.allocator.free(commands);
-        return err;
-    };
-    result[0] = .{ .transform = .{
-        .translate_x = block.position_offset.x,
-        .translate_y = block.position_offset.y,
-        .children = commands,
-        .source = displaySource(block, block.node_ptr),
-    } };
-    return result;
+    return paint_effects.wrapOwned(
+        self.allocator,
+        commands,
+        resolvedBlockEffects(block),
+        .{
+            .bounds = .{
+                .left = block.x.get().*,
+                .top = block.y.get().*,
+                .right = block.x.get().* + block.width.get().*,
+                .bottom = block.y.get().* + block.height.get().*,
+            },
+            .position_offset = .{
+                .x = block.position_offset.x,
+                .y = block.position_offset.y,
+            },
+            .identity = opaqueElementForNode(block.node_ptr),
+            .source = displaySource(block, block.node_ptr),
+        },
+    );
 }
-
-// Apply visual effects like opacity, blend modes, and clipping to a list of display commands
-fn applyPaintEffects(self: *Layout, block: *BlockLayout, commands: []DisplayItem) ![]DisplayItem {
-    // Check for filter, opacity, blend mode, overflow clipping, and transform.
-    var opacity: f64 = 1.0;
-    var blend_mode: ?[]const u8 = null;
-    var blur_radius: f64 = 0.0;
-    var should_clip = false;
-    var border_radius: f64 = 0.0;
-    var transform_x: i32 = 0;
-    var transform_y: i32 = 0;
-    var has_transform = false;
-    var has_animated_transform = false;
-    var has_animated_opacity = false;
-
-    if (block.node == .element) {
-        const elem = block.node.element;
-        if (elem.style) |*style_map| {
-            // Check for active opacity animation first
-            if (elem.animations) |animations| {
-                if (animations.get("opacity")) |anim| {
-                    switch (anim) {
-                        .numeric => |numeric| {
-                            opacity = numeric.getValue();
-                            opacity = @max(0.0, @min(1.0, opacity)); // Clamp to valid range
-                            has_animated_opacity = true;
-                        },
-                        .pixel, .color, .transform => {},
-                    }
-                }
-            }
-            // Fall back to style value if no animation
-            if (!has_animated_opacity) {
-                if (styleValue(style_map, "opacity")) |op_str| {
-                    opacity = std.fmt.parseFloat(f64, op_str) catch 1.0;
-                    opacity = @max(0.0, @min(1.0, opacity)); // Clamp to valid range
-                }
-            }
-            if (styleValue(style_map, "mix-blend-mode")) |blend_str| {
-                if (blend_str.len > 0 and !std.mem.eql(u8, blend_str, "normal")) {
-                    blend_mode = blend_str;
-                }
-            }
-            if (styleValue(style_map, "filter")) |filter_str| {
-                blur_radius = scaleBlockCssFloat(block, parseBlurFilter(filter_str) orelse 0.0);
-            }
-            if (styleValue(style_map, "border-radius")) |radius_str| {
-                border_radius = scaleBlockCssFloat(block, parseCssPixelRadius(radius_str));
-            }
-            const overflow = std.mem.trim(
-                u8,
-                styleValue(style_map, "overflow") orelse "visible",
-                " \t\r\n",
-            );
-            const scroll_container = if (block.node_ptr) |node_ptr| switch (node_ptr.*) {
-                .element => |element| element.scroll_container,
-                .text => false,
-            } else false;
-            if (std.ascii.eqlIgnoreCase(overflow, "clip") or
-                (std.ascii.eqlIgnoreCase(overflow, "scroll") and scroll_container))
-            {
-                should_clip = true;
-            }
-            // An active translate animation overrides the computed endpoint.
-            // Keep even a zero-valued animated transform wrapped so subsequent
-            // frames can update only this compositor node.
-            var animated_transform: ?parser.Translation = null;
-            if (elem.animations) |animations| {
-                if (animations.get("transform")) |animation| {
-                    const css_track_will_continue = if (elem.css_animation) |state|
-                        !state.finished and state.contains("transform")
-                    else
-                        false;
-                    has_animated_transform = !animation.isComplete() or css_track_will_continue;
-                    animated_transform = switch (animation) {
-                        .transform => |value| value.getValue(),
-                        .numeric, .pixel, .color => null,
-                    };
-                }
-            }
-            if (animated_transform) |translation| {
-                const pixels = translation.layoutPixels();
-                transform_x = scaleBlockCssPixel(block, pixels.x);
-                transform_y = scaleBlockCssPixel(block, pixels.y);
-                has_transform = true;
-            } else if (styleValue(style_map, "transform")) |transform_str| {
-                if (!std.ascii.eqlIgnoreCase(std.mem.trim(u8, transform_str, " \t\r\n"), "none")) {
-                    if (parseTranslate(transform_str)) |translate| {
-                        transform_x = scaleBlockCssPixel(block, translate.x);
-                        transform_y = scaleBlockCssPixel(block, translate.y);
-                        has_transform = true;
-                    }
-                }
-            }
-        }
-    }
-
-    // Start with the original commands
-    var current_commands = commands;
-    var owned_commands: ?[]DisplayItem = null;
-    defer if (owned_commands) |owned| self.allocator.free(owned);
-
-    // CSS filters consume the fully painted element subtree as one image.
-    // Keep this wrapper inside clipping and opacity: filter first, then clip,
-    // then group opacity/blending; translation remains outermost below.
-    if (blur_radius > 0.0) {
-        const blur_children = try self.allocator.alloc(DisplayItem, current_commands.len);
-        @memcpy(blur_children, current_commands);
-
-        const filtered_commands = try self.allocator.alloc(DisplayItem, 1);
-        filtered_commands[0] = .{
-            .blend = .{
-                .opacity = 1.0,
-                .blend_mode = null,
-                .blur_radius = blur_radius,
-                .children = blur_children,
-                // The outer group owns compositor animation identity. Sharing it
-                // here would apply one opacity update to both wrappers.
-                .node = null,
-                .needs_compositing = true,
-                .source = displaySource(block, block.node_ptr),
-            },
-        };
-        current_commands = filtered_commands;
-        owned_commands = filtered_commands;
-    }
-
-    // Clipping is applied to the filtered result, so blur pixels cannot escape
-    // an overflow clip even though content outside the edge contributes.
-    if (should_clip) {
-        // Create a clipping mask using dst_in blend mode.
-        // The mask is a white rounded rectangle that will clip the content.
-        // Create the clipping blend that applies dst_in to mask the content
-        const clip_blend_mode = try self.allocator.alloc(u8, 6);
-        @memcpy(clip_blend_mode, "dst_in");
-
-        const block_width = block.width.get().*;
-        const block_x = block.x.get().*;
-        const block_y = block.y.get().*;
-        const block_height = block.height.get().*;
-        const clip_mask_commands = try self.allocator.alloc(DisplayItem, 1);
-        clip_mask_commands[0] = if (border_radius > 0.0)
-            DisplayItem{ .rounded_rect = .{
-                .x1 = block_x,
-                .y1 = block_y,
-                .x2 = block_x + block_width,
-                .y2 = block_y + block_height,
-                .radius = border_radius,
-                .color = browser.Color{ .r = 255, .g = 255, .b = 255, .a = 255 },
-                .source = displaySource(block, block.node_ptr),
-            } }
-        else
-            DisplayItem{ .rect = .{
-                .x1 = block_x,
-                .y1 = block_y,
-                .x2 = block_x + block_width,
-                .y2 = block_y + block_height,
-                .color = browser.Color{ .r = 255, .g = 255, .b = 255, .a = 255 },
-                .source = displaySource(block, block.node_ptr),
-            } };
-
-        const clip_blend = DisplayItem{
-            .blend = .{
-                .opacity = 1.0, // No opacity for clipping blend
-                .blend_mode = clip_blend_mode,
-                .children = clip_mask_commands,
-                .needs_compositing = true, // Has blend mode, needs compositing
-                .source = displaySource(block, block.node_ptr),
-            },
-        };
-
-        // Append the clipping blend to the commands
-        const new_commands = try self.allocator.alloc(DisplayItem, current_commands.len + 1);
-        @memcpy(new_commands[0..current_commands.len], current_commands);
-        new_commands[current_commands.len] = clip_blend;
-        if (owned_commands) |old_container| self.allocator.free(old_container);
-        current_commands = new_commands;
-        owned_commands = new_commands;
-    }
-
-    // Create a single merged blend operation for opacity and blend mode
-    var final_blend_mode: ?[]const u8 = null;
-    if (blend_mode) |mode| {
-        // Copy the blend mode string since it needs to be owned by the DisplayItem
-        final_blend_mode = try self.allocator.alloc(u8, mode.len);
-        @memcpy(@constCast(final_blend_mode.?), mode);
-    }
-
-    // Only create a blend operation if we have effects to apply
-    if (has_animated_opacity or opacity < 1.0 or final_blend_mode != null or blur_radius > 0.0 or border_radius > 0.0 or should_clip) {
-        const wrapped_commands = try self.allocator.alloc(DisplayItem, current_commands.len);
-        @memcpy(wrapped_commands, current_commands);
-
-        // Get pointer to the element for identifying this blend across frames
-        const node_ptr = opaqueElementForNode(block.node_ptr);
-
-        // Determine if this blend needs compositing (does actual work)
-        // Blur uses an inner blend so clipping can follow it; this outer group
-        // keeps the ordered filter/clip sequence in one composited surface.
-        const needs_compositing = has_animated_opacity or opacity < 1.0 or final_blend_mode != null or blur_radius > 0.0 or should_clip;
-
-        const blend_item = DisplayItem{
-            .blend = .{
-                .opacity = opacity,
-                .blend_mode = final_blend_mode,
-                .hit_clip = if (border_radius > 0.0 or should_clip) .{
-                    .x1 = block.x.get().*,
-                    .y1 = block.y.get().*,
-                    .x2 = block.x.get().* + block.width.get().*,
-                    .y2 = block.y.get().* + block.height.get().*,
-                    .radius = border_radius,
-                } else null,
-                .children = wrapped_commands,
-                .node = node_ptr,
-                .needs_compositing = needs_compositing,
-                .compositor_id = if (node_ptr) |ptr| @intFromPtr(ptr) else null,
-                .source = displaySource(block, block.node_ptr),
-            },
-        };
-
-        const result = try self.allocator.alloc(DisplayItem, 1);
-        result[0] = blend_item;
-
-        // Wrap in transform if needed
-        if (has_transform) {
-            const transform_item = DisplayItem{
-                .transform = .{
-                    .translate_x = transform_x,
-                    .translate_y = transform_y,
-                    .children = result,
-                    .node = node_ptr,
-                    .composited = true,
-                    .animation_active = has_animated_transform,
-                    .compositor_id = if (node_ptr) |ptr| @intFromPtr(ptr) else null,
-                    .source = displaySource(block, block.node_ptr),
-                },
-            };
-            const transform_result = try self.allocator.alloc(DisplayItem, 1);
-            transform_result[0] = transform_item;
-            return wrapPositionOffset(self, block, transform_result);
-        }
-        return wrapPositionOffset(self, block, result);
-    } else {
-        // No blend effects, but may still have transform
-        if (has_transform) {
-            const wrapped_for_transform = try self.allocator.alloc(DisplayItem, current_commands.len);
-            @memcpy(wrapped_for_transform, current_commands);
-
-            const node_ptr = opaqueElementForNode(block.node_ptr);
-
-            const transform_item = DisplayItem{
-                .transform = .{
-                    .translate_x = transform_x,
-                    .translate_y = transform_y,
-                    .children = wrapped_for_transform,
-                    .node = node_ptr,
-                    .composited = true,
-                    .animation_active = has_animated_transform,
-                    .compositor_id = if (node_ptr) |ptr| @intFromPtr(ptr) else null,
-                    .source = displaySource(block, block.node_ptr),
-                },
-            };
-            const result = try self.allocator.alloc(DisplayItem, 1);
-            result[0] = transform_item;
-            return wrapPositionOffset(self, block, result);
-        }
-
-        // No effects, return commands as-is
-        const result = try self.allocator.alloc(DisplayItem, current_commands.len);
-        @memcpy(result, current_commands);
-        return wrapPositionOffset(self, block, result);
-    }
-}
-
 fn borderColorForSide(
     self: *Layout,
     style_map: *const parser.StyleMap,

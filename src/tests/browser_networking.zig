@@ -72,6 +72,7 @@ test "Browser fetch crosses the networking queue and returns its response" {
     test_browser.allocator = allocator;
     test_browser.io = std.testing.io;
     test_browser.session_state = &session;
+    test_browser.resource_loader = .init(allocator, std.testing.io, &session);
 
     var data_url = try Url.init(allocator, "data:text/plain,networked");
     defer data_url.free(allocator);

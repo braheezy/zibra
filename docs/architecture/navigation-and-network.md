@@ -5,10 +5,41 @@ resource loading, URL/response ownership, cookies, cache policy, referrers,
 CORS, CSP, and embedding policy. Read it before changing navigation or
 `src/network/`.
 
+## Network implementation boundary
+
+`src/network/url.zig` is both the owner of parsed URL identity and the stable
+compatibility facade for existing consumers. Code outside `src/network/`
+imports it for `Url`, `HttpResponse`, cookie/cache/policy aliases and helpers,
+and the `Url.fetchBody*` family. Those fetch methods remain the
+browser-independent public boundary; they delegate rather than implementing
+HTTP inline.
+
+The implementation behind that facade is split by ownership:
+
+- `response.zig` defines response metadata and stateless response-policy,
+  CORS, and UTF-8 decoding helpers;
+- `cookie.zig` defines owning cookie entries and the parser/selection
+  operations over a caller-owned jar;
+- `cache.zig` owns cache entries and keys, freshness, Cache-Control, and the
+  scalar response-policy types retained by cached responses;
+- `transport.zig` borrows the caller's client, jar, cache, URLs, and optional
+  network mutex while it performs scheme dispatch, HTTP, redirects, and
+  cookie/cache coordination.
+
+The facade imports and re-exports the leaf types and delegates to transport.
+Transport imports the response, cookie, and cache leaves, but receives `Url`
+and the URL-specific fragment/referrer operations as comptime parameters; it
+does not import the facade back and therefore does not create a cycle.
+`transport.fetchBodyInternal` is an internal seam. Preserve the facade when
+adding a fetch mode so inspection, Browser, and tests retain one ownership
+contract.
+
 ## URL ownership
 
-`Url` wraps an owning Ada URL and may also own data-URL storage. Ordinary Zig
-assignment is a shallow copy, so treat it as logically move-only:
+`url.zig` owns URL identity and scheme-local parsing/storage, not the
+browser-session HTTP client, cookie jar, or cache. `Url` wraps an owning Ada URL
+and may also own decoded data-URL storage. Ordinary Zig assignment is a shallow
+copy, so treat it as logically move-only:
 
 - borrow it only for a synchronous call whose owner remains alive;
 - use `Url.clone` for two independently live owners;
@@ -28,28 +59,60 @@ containing page.
 
 ## Response ownership
 
-`HttpResponse.body` does not encode ownership in its type. Current behavior is:
-HTTP and file bodies are allocated, while data and about bodies borrow URL or
-static storage. Preserve the boundary and release via the known request owner;
-do not infer ownership at an unrelated distant call site. A tagged response
-owner remains a desired cleanup.
+`response.zig` defines `Response`, re-exported by the facade as `HttpResponse`.
+The value has no deinitializer and its slice types do not encode ownership.
+Current behavior is:
+
+- HTTP and file bodies are allocated by the caller-provided allocator;
+- data bodies borrow decoded storage owned by the request `Url`, and about
+  bodies borrow static storage;
+- HTTP and cache hits return an independently owned `csp_header` when present;
+- only an Origin-bearing HTTP request can return an independently owned
+  `access_control_allow_origin`;
+- status, Cache-Control, Referrer-Policy, and X-Frame-Options are scalars.
+
+Preserve the boundary and release via the known request owner; do not infer
+ownership at an unrelated distant call site. A tagged response owner remains a
+desired cleanup.
 
 `NavigationDocument` makes document-fetch ownership explicit: allocated
 HTTP/file data, generated bookmark HTML, and certificate-warning HTML use its
 owned-body field; data/about bodies leave that field absent. Keep the wrapper
 alive until the Frame has copied/decoded the document.
 
-The response cache stores owned copies and returns independent copies on a hit,
-including metadata such as CSP, Referrer-Policy, final redirect URL, and
-X-Frame-Options. Cache hits must obey the same caller ownership contract as
-transport responses.
+## Cache ownership
+
+`cache.HttpCache` owns its allocator, canonical fragment-free URL keys, decoded
+bodies, optional CSP headers, optional final redirect URLs, freshness
+deadlines, and retained scalar policies. `store` duplicates the supplied
+slices. `lookup` returns borrowed entry storage which is valid only until the
+next mutation or cache deinitialization; it does not itself produce a public
+fetch result.
+
+Transport performs lookup under the session network mutex and duplicates a
+hit's body, CSP header, and final URL before unlocking. The resulting
+`HttpResponse` therefore obeys the same caller ownership contract as an HTTP
+round trip and reproduces Referrer-Policy and X-Frame-Options. Ordinary
+cacheable GET responses use the cache; POST and Origin-bearing CORS requests
+bypass it.
 
 ## Session network boundary
 
 Interactive cookies, cache, HTTP client, and request runner belong to the
 shared `BrowserSession`. Standalone screenshot Browser owns its own session.
-Ordinary Browser requests synchronously bridge through the networking runner.
-The inspection CLI intentionally calls browser-independent transport directly.
+Each heap-stable Browser embeds a `resource_loader.Loader` that borrows this
+session. Ordinary requests synchronously bridge through the networking runner;
+their stack task contexts borrow the Loader and request inputs only until the
+runner cleanup posts the completion semaphore. The Loader owns no independent
+thread or transport state and therefore has no separate shutdown phase. The
+inspection CLI intentionally calls the browser-independent `Url.fetchBody*`
+facade directly; it does not import `transport.zig`.
+
+Transport owns only per-call temporaries and returned allocations. It borrows
+the supplied request URL, referrer, payload, Origin, HTTP client, cookie jar,
+cache, and optional mutex for the synchronous call. Cookie and cache updates
+are mutations of `BrowserSession` state, not state retained by the transport
+module.
 
 The network-data mutex covers only shared map lookup, copying, eviction, and
 mutation. Copy Cookie headers and cached responses before unlocking, then leave
@@ -59,7 +122,9 @@ A linked-resource batch crosses the networking queue as one task. Build the
 complete slot array first; each slot owns its resolved URL and referrer. The
 network task starts and joins transport workers, then the Tab consumes slots in
 DOM source order. Completion order must not reorder classic scripts or CSS
-cascade order.
+cascade order. Batch transport workers borrow the Loader and their slot, call
+the synchronized low-level transport directly, and are all joined before the
+batch can be consumed or destroyed.
 
 ## Root document replacement
 
@@ -198,9 +263,11 @@ both requested and final iframe destinations and to all supported subresources.
 
 ## Cookies
 
-The tutorial jar owns one entry per normalized host: value, raw parameter
-string, derived SameSite/HttpOnly state, and optional absolute expiration.
-HTTP Set-Cookie and script assignment use one transactional parser.
+The `BrowserSession` tutorial jar owns one entry per normalized host. The jar
+owns each host key; its `cookie.Entry` owns the value and optional raw parameter
+string alongside derived SameSite/HttpOnly state and optional absolute
+expiration. `cookie.zig` supplies operations over that jar but owns no global
+jar. HTTP Set-Cookie and script assignment use one transactional parser.
 
 - Replacing a cookie replaces its deadline.
 - An already-expired assignment deletes the existing entry.
@@ -208,6 +275,9 @@ HTTP Set-Cookie and script assignment use one transactional parser.
   mutex.
 - HttpOnly cookies remain request-visible but script-hidden and
   script-immutable; script cannot create HttpOnly state.
+- `cookieForScript` returns an independent allocation. The leaf
+  `cookieForRequest` returns a borrowed entry value; transport duplicates it
+  while holding the network mutex before adding it to a request.
 - `document.cookie` copies results before unlocking and then moves bytes into
   Kiesel's traced allocator because string construction may retain them.
 

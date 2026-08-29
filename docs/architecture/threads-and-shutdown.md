@@ -29,23 +29,30 @@ or callback-context pointer.
 
 ### Raster-and-draw worker
 
-Every Browser owns one named raster runner. The job is a self-contained
-`RasterSnapshot` plus scalar presentation state. It owns all recursive command
-containers and copied leaf pixels, uses the SMP allocator, and never calls SDL.
-The worker may raster and assemble software surfaces while the UI thread keeps
-handling input and the Tab worker builds a later generation.
+Every Browser embeds one `presentation_worker.Worker`, which owns the named
+raster runner, active/result state, worker-only software surfaces, compositor
+cache, and their joined teardown. A job is a self-contained `RasterSnapshot`
+plus scalar presentation state. It owns all recursive command containers and
+copied leaf pixels, uses the SMP allocator, and never calls SDL. Pure z2d
+command interpretation belongs to `software_renderer.Renderer`, which imports
+neither Browser nor SDL. The worker may raster and assemble software surfaces
+while the UI thread keeps handling input and the Tab worker builds a later
+generation.
 
-Completed results publish under `Browser.lock`. A dirty newer generation,
-window/tab mismatch, or shutdown discards them. Accepted surface ownership
-moves to the UI thread together with its allocator.
+Completed results publish into the presentation owner under `Browser.lock`.
+They carry only numeric tab identity; a dirty newer generation, identity/window
+mismatch, or shutdown discards them. Accepted surface ownership moves to the UI
+thread together with its allocator. Browser alone uploads it and presents.
 
 ### Networking worker
 
 `BrowserSession` owns one heap-stable named networking runner. Ordinary Browser
-fetches synchronously bridge through it. A document's complete linked-resource
-batch is one queued task; that task starts all transport workers and joins them
-before returning so results remain in source-order slots and no transport
-worker outlives its borrowed batch storage.
+fetches synchronously bridge through an embedded `resource_loader.Loader` that
+borrows only the Browser allocator/I/O and shared session. A document's
+complete linked-resource batch is one queued task; that task starts all
+transport workers and joins them before returning so results remain in
+source-order slots and no transport worker outlives its borrowed Loader or
+batch storage.
 
 Joined transport workers call the low-level synchronized transport directly.
 They must not submit back to the same networking queue and deadlock behind the
@@ -176,8 +183,8 @@ exports the root surface.
 The enforced process order is:
 
 1. publish Browser/Tab shutdown and reject new UI, Tab, and JavaScript work;
-2. stop and join each Browser raster runner; release queued/completed worker
-   surfaces and snapshots;
+2. deinitialize each Browser presentation worker, which stops/joins its raster
+   runner before releasing queued/completed results, surfaces, and caches;
 3. wake timers, install the Kiesel host interrupt, and stop/join serialized Tab
    runners;
 4. with the last speech producer stopped, clear and join each accessibility

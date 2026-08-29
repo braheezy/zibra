@@ -9,6 +9,9 @@ const std = @import("std");
 
 const ada = @import("ada");
 const cache_module = @import("cache.zig");
+const cookie = @import("cookie.zig");
+const response_module = @import("response.zig");
+const transport = @import("transport.zig");
 const Mutex = @import("../runtime/sync.zig").Mutex;
 
 pub const CacheControl = cache_module.CacheControl;
@@ -16,280 +19,18 @@ pub const HttpCache = cache_module.HttpCache;
 pub const ReferrerPolicy = cache_module.ReferrerPolicy;
 pub const XFrameOptions = cache_module.XFrameOptions;
 
-const user_agent = "Zibra/0.0.0";
-const redirect_limit: u16 = 3;
+const user_agent = transport.user_agent;
+const requestOptions = transport.requestOptions;
 
-fn requestOptions(
-    redirect_behavior: std.http.Client.Request.RedirectBehavior,
-    extra_headers: []const std.http.Header,
-) std.http.Client.RequestOptions {
-    return .{
-        .version = .@"HTTP/1.1",
-        // A long-lived Browser owns this client, so fully consumed responses
-        // can return their connections to Zig's per-origin pool.
-        .keep_alive = true,
-        .redirect_behavior = redirect_behavior,
-        .headers = .{
-            .user_agent = .{ .override = user_agent },
-            // Compression support is part of Zibra's HTTP contract rather
-            // than an incidental std.http default. Keep negotiation aligned
-            // with the encoding handled by the browser-engineering exercise.
-            .accept_encoding = .{ .override = "gzip" },
-        },
-        .extra_headers = extra_headers,
-    };
-}
+pub const SameSiteMode = cookie.SameSiteMode;
+pub const CookieEntry = cookie.Entry;
+pub const CookieSource = cookie.Source;
+pub const parseCookieExpiration = cookie.parseCookieExpiration;
+pub const applySetCookie = cookie.applySetCookie;
+pub const cookieForScript = cookie.cookieForScript;
 
-pub const SameSiteMode = enum { none, lax };
-
-pub const CookieEntry = struct {
-    value: []u8,
-    // Owned Set-Cookie attributes without the leading semicolon. The tutorial
-    // jar stores one cookie per host and exposes these parameters through
-    // document.cookie unless the entry is HttpOnly.
-    parameters: ?[]u8 = null,
-    same_site: SameSiteMode = .none,
-    http_only: bool = false,
-    /// Absolute Unix time parsed from Expires. Null entries last for the
-    /// browser session; expired entries are removed before any read.
-    expires_at: ?i64 = null,
-
-    pub fn deinit(self: *CookieEntry, allocator: std.mem.Allocator) void {
-        allocator.free(self.value);
-        if (self.parameters) |parameters| allocator.free(parameters);
-        self.* = undefined;
-    }
-};
-
-pub const CookieSource = enum {
-    http,
-    script,
-};
-
-const ParsedCookie = struct {
-    value: []const u8,
-    parameters: ?[]const u8,
-    same_site: SameSiteMode,
-    http_only: bool,
-    expires_at: ?i64,
-};
-
-fn cookieMonth(value: []const u8) ?u8 {
-    const names = [_][]const u8{
-        "Jan", "Feb", "Mar", "Apr", "May", "Jun",
-        "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
-    };
-    for (names, 1..) |name, month| {
-        if (std.ascii.eqlIgnoreCase(value, name)) return @intCast(month);
-    }
-    return null;
-}
-
-fn cookieDaysInMonth(year: i64, month: u8) u8 {
-    return switch (month) {
-        1, 3, 5, 7, 8, 10, 12 => 31,
-        4, 6, 9, 11 => 30,
-        2 => if (@mod(year, 4) == 0 and (@mod(year, 100) != 0 or @mod(year, 400) == 0)) 29 else 28,
-        else => 0,
-    };
-}
-
-/// Convert a civil UTC date to days since 1970-01-01. This is the inverse of
-/// the standard epoch decomposition and also handles valid pre-epoch dates.
-fn daysFromCivil(year_value: i64, month: u8, day: u8) i64 {
-    var year = year_value;
-    if (month <= 2) year -= 1;
-    const era = @divFloor(year, 400);
-    const year_of_era = year - era * 400;
-    const month_shift: i64 = if (month > 2) -3 else 9;
-    const shifted_month: i64 = @as(i64, month) + month_shift;
-    const day_of_year = @divFloor(153 * shifted_month + 2, 5) + @as(i64, day) - 1;
-    const day_of_era = year_of_era * 365 + @divFloor(year_of_era, 4) -
-        @divFloor(year_of_era, 100) + day_of_year;
-    return era * 146097 + day_of_era - 719468;
-}
-
-/// Parse the IMF-fixdate form emitted by HTTP servers, for example
-/// `Wed, 09 Jun 2021 10:18:14 GMT`. Invalid Expires attributes are ignored by
-/// the cookie parser rather than rejecting an otherwise usable cookie.
-pub fn parseCookieExpiration(value: []const u8) ?i64 {
-    const trimmed = std.mem.trim(u8, value, " \t\r\n");
-    const date = if (std.mem.indexOfScalar(u8, trimmed, ',')) |comma|
-        std.mem.trim(u8, trimmed[comma + 1 ..], " \t")
-    else
-        trimmed;
-
-    var parts = std.mem.tokenizeAny(u8, date, " \t");
-    const day_text = parts.next() orelse return null;
-    const month_text = parts.next() orelse return null;
-    const year_text = parts.next() orelse return null;
-    const time_text = parts.next() orelse return null;
-    const zone = parts.next() orelse return null;
-    if (parts.next() != null or !std.ascii.eqlIgnoreCase(zone, "GMT")) return null;
-
-    const day = std.fmt.parseInt(u8, day_text, 10) catch return null;
-    const month = cookieMonth(month_text) orelse return null;
-    var year = std.fmt.parseInt(i64, year_text, 10) catch return null;
-    if (year_text.len == 2) year += if (year >= 70) 1900 else 2000;
-    if (year < 1601 or year > 9999 or day == 0 or day > cookieDaysInMonth(year, month)) return null;
-
-    var clock = std.mem.splitScalar(u8, time_text, ':');
-    const hour = std.fmt.parseInt(u8, clock.next() orelse return null, 10) catch return null;
-    const minute = std.fmt.parseInt(u8, clock.next() orelse return null, 10) catch return null;
-    const second = std.fmt.parseInt(u8, clock.next() orelse return null, 10) catch return null;
-    if (clock.next() != null or hour > 23 or minute > 59 or second > 59) return null;
-
-    return daysFromCivil(year, month, day) * std.time.s_per_day +
-        @as(i64, hour) * std.time.s_per_hour +
-        @as(i64, minute) * std.time.s_per_min + second;
-}
-
-fn parseSetCookie(value: []const u8) ?ParsedCookie {
-    const trimmed = std.mem.trim(u8, value, " \t\r\n");
-    if (trimmed.len == 0) return null;
-
-    const semicolon = std.mem.indexOfScalar(u8, trimmed, ';');
-    const cookie_value = std.mem.trim(
-        u8,
-        if (semicolon) |index| trimmed[0..index] else trimmed,
-        " \t",
-    );
-    if (cookie_value.len == 0 or std.mem.indexOfScalar(u8, cookie_value, '=') == null) return null;
-
-    const parameters = if (semicolon) |index| blk: {
-        const attributes = std.mem.trim(u8, trimmed[index + 1 ..], " \t");
-        break :blk if (attributes.len == 0) null else attributes;
-    } else null;
-    var same_site: SameSiteMode = .none;
-    var http_only = false;
-    var expires_at: ?i64 = null;
-    if (parameters) |attributes| {
-        var iterator = std.mem.tokenizeScalar(u8, attributes, ';');
-        while (iterator.next()) |raw_attribute| {
-            const attribute = std.mem.trim(u8, raw_attribute, " \t");
-            if (attribute.len == 0) continue;
-            if (std.mem.indexOfScalar(u8, attribute, '=')) |equals| {
-                const key = std.mem.trim(u8, attribute[0..equals], " \t");
-                const attribute_value = std.mem.trim(u8, attribute[equals + 1 ..], " \t");
-                if (std.ascii.eqlIgnoreCase(key, "samesite")) {
-                    same_site = if (std.ascii.eqlIgnoreCase(attribute_value, "lax")) .lax else .none;
-                } else if (std.ascii.eqlIgnoreCase(key, "expires")) {
-                    expires_at = parseCookieExpiration(attribute_value);
-                }
-            } else if (std.ascii.eqlIgnoreCase(attribute, "samesite")) {
-                same_site = .lax;
-            } else if (std.ascii.eqlIgnoreCase(attribute, "httponly")) {
-                http_only = true;
-            }
-        }
-    }
-    return .{
-        .value = cookie_value,
-        .parameters = parameters,
-        .same_site = same_site,
-        .http_only = http_only,
-        .expires_at = expires_at,
-    };
-}
-
-fn removeCookie(
-    allocator: std.mem.Allocator,
-    cookie_jar: *std.StringHashMap(CookieEntry),
-    host: []const u8,
-) bool {
-    const removed = cookie_jar.fetchRemove(host) orelse return false;
-    var value = removed.value;
-    value.deinit(allocator);
-    allocator.free(removed.key);
-    return true;
-}
-
-fn removeCookieIfExpired(
-    allocator: std.mem.Allocator,
-    cookie_jar: *std.StringHashMap(CookieEntry),
-    host: []const u8,
-    now_seconds: i64,
-) bool {
-    const entry = cookie_jar.get(host) orelse return false;
-    const expires_at = entry.expires_at orelse return false;
-    if (expires_at > now_seconds) return false;
-    return removeCookie(allocator, cookie_jar, host);
-}
-
-/// Parse and atomically install one tutorial-style cookie for a host. HTTP
-/// responses may replace any entry. Script cannot create an HttpOnly entry or
-/// replace an entry that the server marked HttpOnly.
-pub fn applySetCookie(
-    allocator: std.mem.Allocator,
-    cookie_jar: *std.StringHashMap(CookieEntry),
-    host: []const u8,
-    raw_value: []const u8,
-    source: CookieSource,
-    now_seconds: i64,
-) !bool {
-    if (host.len == 0) return false;
-    const parsed = parseSetCookie(raw_value) orelse return false;
-    _ = removeCookieIfExpired(allocator, cookie_jar, host, now_seconds);
-    if (source == .script and parsed.http_only) return false;
-    if (source == .script) {
-        if (cookie_jar.get(host)) |existing| {
-            if (existing.http_only) return false;
-        }
-    }
-    if (parsed.expires_at) |expires_at| {
-        if (expires_at <= now_seconds) {
-            _ = removeCookie(allocator, cookie_jar, host);
-            return true;
-        }
-    }
-
-    const value_copy = try allocator.dupe(u8, parsed.value);
-    errdefer allocator.free(value_copy);
-    const parameters_copy = if (parsed.parameters) |parameters|
-        try allocator.dupe(u8, parameters)
-    else
-        null;
-    errdefer if (parameters_copy) |parameters| allocator.free(parameters);
-
-    const replacement = CookieEntry{
-        .value = value_copy,
-        .parameters = parameters_copy,
-        .same_site = parsed.same_site,
-        .http_only = parsed.http_only,
-        .expires_at = parsed.expires_at,
-    };
-    if (cookie_jar.getPtr(host)) |existing| {
-        existing.deinit(allocator);
-        existing.* = replacement;
-        return true;
-    }
-
-    try cookie_jar.ensureUnusedCapacity(1);
-    const host_copy = try allocator.dupe(u8, host);
-    cookie_jar.putAssumeCapacity(host_copy, replacement);
-    return true;
-}
-
-/// Return an independent script-visible serialization. HttpOnly entries are
-/// indistinguishable from a missing cookie at this boundary.
-pub fn cookieForScript(
-    allocator: std.mem.Allocator,
-    cookie_jar: *std.StringHashMap(CookieEntry),
-    host: []const u8,
-    now_seconds: i64,
-) ![]u8 {
-    _ = removeCookieIfExpired(allocator, cookie_jar, host, now_seconds);
-    const entry = cookie_jar.get(host) orelse return allocator.dupe(u8, "");
-    if (entry.http_only) return allocator.dupe(u8, "");
-    if (entry.parameters) |parameters| {
-        return std.fmt.allocPrint(allocator, "{s}; {s}", .{ entry.value, parameters });
-    }
-    return allocator.dupe(u8, entry.value);
-}
-
-/// Select the Cookie request-header value. HttpOnly affects only script
-/// visibility; it never prevents the browser from authenticating HTTP or XHR
-/// requests. SameSite keeps its existing tutorial behavior.
+/// Preserve the public URL-aware SameSite API while the cookie owner receives
+/// only the borrowed referrer-host component it needs for the decision.
 pub fn cookieForRequest(
     allocator: std.mem.Allocator,
     cookie_jar: *std.StringHashMap(CookieEntry),
@@ -298,109 +39,22 @@ pub fn cookieForRequest(
     referrer: ?Url,
     now_seconds: i64,
 ) ?[]const u8 {
-    _ = removeCookieIfExpired(allocator, cookie_jar, host, now_seconds);
-    const entry = cookie_jar.get(host) orelse return null;
-    if (entry.same_site == .lax and method != .GET) {
-        if (referrer) |ref| {
-            const ref_host = ref.host orelse return null;
-            if (!std.ascii.eqlIgnoreCase(host, ref_host)) return null;
-        }
-    }
-    return entry.value;
+    const referrer_host = if (referrer) |value| value.host else null;
+    return cookie.cookieForRequest(
+        allocator,
+        cookie_jar,
+        host,
+        method,
+        referrer_host,
+        now_seconds,
+    );
 }
-
-pub const HttpResponse = struct {
-    body: []const u8,
-    csp_header: ?[]u8 = null,
-    /// Owned only for requests that supplied an Origin header. Ordinary
-    /// navigation/subresource responses leave this null.
-    access_control_allow_origin: ?[]u8 = null,
-    status: ?std.http.Status = null,
-    cache_control: CacheControl = .default,
-    referrer_policy: ReferrerPolicy = .default,
-    x_frame_options: XFrameOptions = .none,
-};
-
-/// Parse the two response policy tokens supported by this exercise. Unknown
-/// values are ignored so they do not accidentally become more permissive than
-/// a recognized policy from another header line.
-pub fn parseReferrerPolicy(value: []const u8) ?ReferrerPolicy {
-    const trimmed = std.mem.trim(u8, value, " \t\r\n");
-    if (std.ascii.eqlIgnoreCase(trimmed, "no-referrer")) return .no_referrer;
-    if (std.ascii.eqlIgnoreCase(trimmed, "same-origin")) return .same_origin;
-    return null;
-}
-
-/// Parse the supported framing directives. Header field values are
-/// case-insensitive, and repeated field lines may arrive comma-combined.
-/// Recognized policies are merged restrictively; obsolete ALLOW-FROM and
-/// unknown tokens are ignored like current browsers do.
-pub fn parseXFrameOptions(value: []const u8) ?XFrameOptions {
-    var parsed: ?XFrameOptions = null;
-    var directives = std.mem.splitScalar(u8, value, ',');
-    while (directives.next()) |raw_directive| {
-        const directive = std.mem.trim(u8, raw_directive, " \t\r\n");
-        if (std.ascii.eqlIgnoreCase(directive, "deny")) return .deny;
-        if (std.ascii.eqlIgnoreCase(directive, "sameorigin")) {
-            parsed = .same_origin;
-        }
-    }
-    return parsed;
-}
-
-fn mergeXFrameOptions(
-    current: XFrameOptions,
-    incoming: XFrameOptions,
-) XFrameOptions {
-    if (current == .deny or incoming == .deny) return .deny;
-    if (current == .same_origin or incoming == .same_origin) return .same_origin;
-    return .none;
-}
-
-/// Same-origin XHR needs no response opt-in. Cross-origin XHR exposes its body
-/// only when the server returns the caller's exact serialized origin or `*`.
-pub fn corsAllowsResponse(
-    request_origin: ?[]const u8,
-    access_control_allow_origin: ?[]const u8,
-) bool {
-    const origin = request_origin orelse return true;
-    const allowed = access_control_allow_origin orelse return false;
-    const trimmed = std.mem.trim(u8, allowed, " \t\r\n");
-    return std.mem.eql(u8, trimmed, "*") or std.mem.eql(u8, trimmed, origin);
-}
-
-/// Decode bytes as UTF-8, replacing each malformed sequence with U+FFFD.
-/// The returned buffer is owned by `allocator`.
-pub fn decodeUtf8Replace(allocator: std.mem.Allocator, input: []const u8) ![]u8 {
-    var output = std.ArrayList(u8).empty;
-    errdefer output.deinit(allocator);
-
-    const replacement = "\xEF\xBF\xBD";
-    var i: usize = 0;
-    while (i < input.len) {
-        const seq_len = std.unicode.utf8ByteSequenceLength(input[i]) catch {
-            try output.appendSlice(allocator, replacement);
-            i += 1;
-            continue;
-        };
-
-        if (i + seq_len > input.len) {
-            try output.appendSlice(allocator, replacement);
-            break;
-        }
-
-        const slice = input[i .. i + seq_len];
-        if (std.unicode.utf8ValidateSlice(slice)) {
-            try output.appendSlice(allocator, slice);
-            i += seq_len;
-        } else {
-            try output.appendSlice(allocator, replacement);
-            i += 1;
-        }
-    }
-
-    return output.toOwnedSlice(allocator);
-}
+pub const HttpResponse = response_module.Response;
+pub const parseReferrerPolicy = response_module.parseReferrerPolicy;
+pub const parseXFrameOptions = response_module.parseXFrameOptions;
+const mergeXFrameOptions = response_module.mergeXFrameOptions;
+pub const corsAllowsResponse = response_module.corsAllowsResponse;
+pub const decodeUtf8Replace = response_module.decodeUtf8Replace;
 
 fn percentByte(input: []const u8) ?u8 {
     return std.fmt.parseInt(u8, input, 16) catch null;
@@ -741,7 +395,7 @@ pub const Url = struct {
         return std.fmt.allocPrint(allocator, "{s}://{s}:{d}", .{ self.scheme, host, self.port });
     }
 
-    fn hostHasExplicitPort(host: []const u8) bool {
+    pub fn hostHasExplicitPort(host: []const u8) bool {
         if (std.mem.startsWith(u8, host, "[")) {
             const close = std.mem.indexOfScalar(u8, host, ']') orelse return false;
             return close + 1 < host.len and host[close + 1] == ':';
@@ -979,380 +633,24 @@ pub const Url = struct {
         request_origin: ?[]const u8,
         referrer_policy: ReferrerPolicy,
     ) !HttpResponse {
-        if (std.mem.eql(u8, url.scheme, "file")) {
-            return .{ .body = try url.fileRequest(allocator, io) };
-        }
-        if (std.mem.eql(u8, url.scheme, "data")) {
-            return .{ .body = url.path };
-        }
-        if (std.mem.eql(u8, url.scheme, "about")) {
-            return .{ .body = url.aboutRequest() };
-        }
-
-        const is_http = std.mem.eql(u8, url.scheme, "http") or std.mem.eql(u8, url.scheme, "https");
-        if (!is_http) return error.UnsupportedScheme;
-        const use_cache = is_http and payload == null and cache != null and request_origin == null;
-        const href = url.ada_url.getHref();
-        const cache_key = if (std.mem.indexOfScalar(u8, href, '#')) |fragment_index| href[0..fragment_index] else href;
-
-        if (use_cache) {
-            const cached_response: ?HttpResponse = cache_lookup: {
-                if (network_lock) |lock| lock.lock();
-                defer if (network_lock) |lock| lock.unlock();
-
-                const lookup_time_ns = std.Io.Clock.awake.now(io).nanoseconds;
-                if (cache.?.lookup(cache_key, lookup_time_ns)) |entry| {
-                    var cached_final_url: ?Url = null;
-                    errdefer if (cached_final_url) |resolved| resolved.free(allocator);
-                    if (final_url != null) {
-                        if (entry.final_url) |final_url_text| {
-                            cached_final_url = try Url.init(allocator, final_url_text);
-                            cached_final_url.?.view_source = url.view_source;
-                            try inheritFragment(allocator, url, &cached_final_url.?);
-                        }
-                    }
-
-                    const body = try allocator.dupe(u8, entry.body);
-                    errdefer allocator.free(body);
-                    const csp_header = if (entry.csp_header) |header| try allocator.dupe(u8, header) else null;
-                    errdefer if (csp_header) |header| allocator.free(header);
-
-                    if (final_url) |output| {
-                        output.* = cached_final_url;
-                        cached_final_url = null;
-                    }
-                    break :cache_lookup .{
-                        .body = body,
-                        .csp_header = csp_header,
-                        .status = .ok,
-                        .cache_control = entry.policy,
-                        .referrer_policy = entry.referrer_policy,
-                        .x_frame_options = entry.x_frame_options,
-                    };
-                }
-                break :cache_lookup null;
-            };
-            if (cached_response) |response| return response;
-        }
-
-        var fetched_final_url: ?Url = null;
-        defer if (fetched_final_url) |resolved| resolved.free(allocator);
-        const final_url_output = if (use_cache or final_url != null) &fetched_final_url else null;
-        const response = try url.httpRequest(
+        return transport.fetchBodyInternal(
+            Url,
+            inheritFragment,
+            refererHeaderValue,
             allocator,
+            io,
             http_client,
             cookie_jar,
+            cache,
             network_lock,
+            url,
             referrer,
             payload,
-            final_url_output,
+            final_url,
             request_origin,
             referrer_policy,
         );
-
-        if (use_cache and response.status == .ok and response.cache_control.isCacheable()) {
-            const final_url_text = if (fetched_final_url) |resolved| resolved.ada_url.getHref() else null;
-            if (network_lock) |lock| lock.lock();
-            cache.?.store(
-                cache_key,
-                response.body,
-                response.csp_header,
-                final_url_text,
-                response.cache_control,
-                response.referrer_policy,
-                response.x_frame_options,
-                std.Io.Clock.awake.now(io).nanoseconds,
-            ) catch |err| {
-                std.log.warn("Failed to cache {s}: {}", .{ cache_key, err });
-            };
-            if (network_lock) |lock| lock.unlock();
-        }
-
-        if (final_url) |output| {
-            if (fetched_final_url) |*resolved| try inheritFragment(allocator, url, resolved);
-            output.* = fetched_final_url;
-            fetched_final_url = null;
-        }
-        return response;
     }
-
-    pub fn httpRequest(
-        self: Url,
-        al: std.mem.Allocator,
-        http_client: *std.http.Client,
-        cookie_jar: *std.StringHashMap(CookieEntry),
-        network_lock: ?*Mutex,
-        referrer: ?Url,
-        payload: ?[]const u8,
-        final_url: ?*?Url,
-        request_origin: ?[]const u8,
-        referrer_policy: ReferrerPolicy,
-    ) !HttpResponse {
-        // Build full URL for std.http.Client
-        var url_builder = std.ArrayList(u8).empty;
-        defer url_builder.deinit(al);
-        try url_builder.appendSlice(al, self.scheme);
-        try url_builder.appendSlice(al, "://");
-        const host_str = self.host.?;
-        try url_builder.appendSlice(al, host_str);
-        if (!hostHasExplicitPort(host_str) and self.port != 80 and self.port != 443) {
-            try url_builder.append(al, ':');
-            const port_str = try std.fmt.allocPrint(al, "{d}", .{self.port});
-            defer al.free(port_str);
-            try url_builder.appendSlice(al, port_str);
-        }
-        try url_builder.appendSlice(al, self.path);
-        if (self.ada_url.getSearch()) |search| {
-            try url_builder.appendSlice(al, search);
-        }
-        const url_str = try url_builder.toOwnedSlice(al);
-        defer al.free(url_str);
-
-        const uri = try std.Uri.parse(url_str);
-
-        const method_str = if (payload != null) "POST" else "GET";
-        std.log.info("{s} {s}", .{ method_str, url_str });
-
-        // Keep optional headers in a growable list so adding another request
-        // header does not require resizing and manually indexing fixed storage.
-        var extra_headers: std.ArrayList(std.http.Header) = .empty;
-        defer extra_headers.deinit(al);
-        const method: std.http.Method = if (payload != null) .POST else .GET;
-
-        if (request_origin) |origin| {
-            try extra_headers.append(al, .{
-                .name = "Origin",
-                .value = origin,
-            });
-        }
-
-        if (refererHeaderValue(referrer, self, referrer_policy)) |referer| {
-            try extra_headers.append(al, .{
-                .name = "Referer",
-                .value = referer,
-            });
-        }
-
-        var cookie_header_value: ?[]u8 = null;
-        defer if (cookie_header_value) |value| al.free(value);
-        if (self.host) |host_slice| {
-            cookie_header_value = cookie_snapshot: {
-                if (network_lock) |lock| lock.lock();
-                defer if (network_lock) |lock| lock.unlock();
-                const value = cookieForRequest(
-                    al,
-                    cookie_jar,
-                    host_slice,
-                    method,
-                    referrer,
-                    std.Io.Clock.real.now(http_client.io).toSeconds(),
-                ) orelse break :cookie_snapshot null;
-                break :cookie_snapshot try al.dupe(u8, value);
-            };
-            if (cookie_header_value) |cookie_value| {
-                try extra_headers.append(al, .{
-                    .name = "Cookie",
-                    .value = cookie_value,
-                });
-            }
-        }
-
-        if (payload != null) {
-            try extra_headers.append(al, .{
-                .name = "Content-Type",
-                .value = "application/x-www-form-urlencoded",
-            });
-        }
-
-        const RedirectBehavior = std.http.Client.Request.RedirectBehavior;
-        const redirect_behavior: RedirectBehavior = if (payload == null)
-            RedirectBehavior.init(redirect_limit)
-        else
-            .unhandled;
-
-        var csp_header: ?[]u8 = null;
-        var csp_header_cleanup = true;
-        defer if (csp_header_cleanup) if (csp_header) |hdr| al.free(hdr);
-        var access_control_allow_origin: ?[]u8 = null;
-        var access_control_allow_origin_cleanup = true;
-        defer if (access_control_allow_origin_cleanup) if (access_control_allow_origin) |hdr| al.free(hdr);
-        var cache_control: CacheControl = .default;
-        var response_referrer_policy: ReferrerPolicy = .default;
-        var response_x_frame_options: XFrameOptions = .none;
-
-        const max_attempts: usize = 2;
-        var attempt: usize = 0;
-        var redirect_buffer: [8 * 1024]u8 = undefined;
-
-        request_loop: while (attempt < max_attempts) : (attempt += 1) {
-            var req = try http_client.request(
-                method,
-                uri,
-                requestOptions(redirect_behavior, extra_headers.items),
-            );
-            defer req.deinit();
-
-            if (payload) |body_payload| {
-                req.transfer_encoding = .{ .content_length = body_payload.len };
-                var body_writer = req.sendBody(&.{}) catch |err| {
-                    if (err == error.WriteFailed and attempt + 1 < max_attempts) {
-                        continue :request_loop;
-                    }
-                    return err;
-                };
-
-                body_writer.writer.writeAll(body_payload) catch |err| {
-                    if (err == error.WriteFailed and attempt + 1 < max_attempts) {
-                        continue :request_loop;
-                    }
-                    return err;
-                };
-
-                body_writer.end() catch |err| {
-                    if (err == error.WriteFailed and attempt + 1 < max_attempts) {
-                        continue :request_loop;
-                    }
-                    return err;
-                };
-            } else {
-                req.sendBodiless() catch |err| {
-                    if (err == error.WriteFailed and attempt + 1 < max_attempts) {
-                        continue :request_loop;
-                    }
-                    return err;
-                };
-            }
-
-            var response = req.receiveHead(redirect_buffer[0..]) catch |err| {
-                if (err == error.HttpConnectionClosing and attempt + 1 < max_attempts) {
-                    continue :request_loop;
-                }
-                return err;
-            };
-
-            if (self.host) |host_slice| {
-                const cookie_host = host_slice;
-                var header_it = response.head.iterateHeaders();
-                while (header_it.next()) |header| {
-                    if (std.ascii.eqlIgnoreCase(header.name, "set-cookie")) {
-                        _ = set_cookie: {
-                            if (network_lock) |lock| lock.lock();
-                            defer if (network_lock) |lock| lock.unlock();
-                            break :set_cookie try applySetCookie(
-                                al,
-                                cookie_jar,
-                                cookie_host,
-                                header.value,
-                                .http,
-                                std.Io.Clock.real.now(http_client.io).toSeconds(),
-                            );
-                        };
-                    } else if (std.ascii.eqlIgnoreCase(header.name, "content-security-policy")) {
-                        if (csp_header) |existing| {
-                            al.free(existing);
-                        }
-                        const trimmed = std.mem.trim(u8, header.value, " ");
-                        const copy = try al.alloc(u8, trimmed.len);
-                        @memcpy(copy, trimmed);
-                        csp_header = copy;
-                    } else if (request_origin != null and
-                        std.ascii.eqlIgnoreCase(header.name, "access-control-allow-origin"))
-                    {
-                        if (access_control_allow_origin) |existing| al.free(existing);
-                        const trimmed = std.mem.trim(u8, header.value, " \t");
-                        access_control_allow_origin = try al.dupe(u8, trimmed);
-                    } else if (std.ascii.eqlIgnoreCase(header.name, "cache-control")) {
-                        cache_control.apply(header.value);
-                    } else if (std.ascii.eqlIgnoreCase(header.name, "referrer-policy")) {
-                        if (parseReferrerPolicy(header.value)) |parsed| {
-                            response_referrer_policy = parsed;
-                        }
-                    } else if (std.ascii.eqlIgnoreCase(header.name, "x-frame-options")) {
-                        if (parseXFrameOptions(header.value)) |parsed| {
-                            response_x_frame_options = mergeXFrameOptions(
-                                response_x_frame_options,
-                                parsed,
-                            );
-                        }
-                    }
-                }
-            }
-
-            var allocating_writer = std.Io.Writer.Allocating.init(al);
-            defer allocating_writer.deinit();
-
-            var owned_decompress_buffer: ?[]u8 = null;
-            const decompress_buffer: []u8 = switch (response.head.content_encoding) {
-                .identity => &.{},
-                .zstd => blk: {
-                    const buf = try al.alloc(u8, std.compress.zstd.default_window_len);
-                    owned_decompress_buffer = buf;
-                    break :blk buf;
-                },
-                .deflate, .gzip => blk: {
-                    const buf = try al.alloc(u8, std.compress.flate.max_window_len);
-                    owned_decompress_buffer = buf;
-                    break :blk buf;
-                },
-                .compress => return error.UnsupportedCompressionMethod,
-            };
-            defer if (owned_decompress_buffer) |buf| al.free(buf);
-
-            var transfer_buffer: [64]u8 = undefined;
-            var decompress_state: std.http.Decompress = undefined;
-            const reader = response.readerDecompressing(&transfer_buffer, &decompress_state, decompress_buffer);
-
-            const response_writer: *std.Io.Writer = &allocating_writer.writer;
-            _ = reader.streamRemaining(response_writer) catch |err| switch (err) {
-                error.ReadFailed => blk: {
-                    if (response.bodyErr()) |inner_err| {
-                        std.log.warn("response.bodyErr for {s}: {}", .{ url_str, inner_err });
-                        return inner_err;
-                    }
-                    break :blk;
-                },
-                else => |e| {
-                    std.log.warn("streamRemaining failed for {s}: {}", .{ url_str, e });
-                    return e;
-                },
-            };
-
-            const body = try allocating_writer.toOwnedSlice();
-            errdefer al.free(body);
-            std.log.info("Received {d} bytes, status: {d}", .{
-                body.len,
-                @intFromEnum(response.head.status),
-            });
-
-            if (final_url) |output| {
-                var final_url_writer = std.Io.Writer.Allocating.init(al);
-                defer final_url_writer.deinit();
-                try req.uri.writeToStream(&final_url_writer.writer, .all);
-                const final_url_text = try final_url_writer.toOwnedSlice();
-                defer al.free(final_url_text);
-
-                var resolved = try Url.init(al, final_url_text);
-                resolved.view_source = self.view_source;
-                output.* = resolved;
-            }
-
-            const result = HttpResponse{
-                .body = body,
-                .csp_header = csp_header,
-                .access_control_allow_origin = access_control_allow_origin,
-                .status = response.head.status,
-                .cache_control = cache_control,
-                .referrer_policy = response_referrer_policy,
-                .x_frame_options = response_x_frame_options,
-            };
-            csp_header_cleanup = false;
-            access_control_allow_origin_cleanup = false;
-            return result;
-        }
-
-        unreachable;
-    }
-
     pub fn fileRequest(self: Url, al: std.mem.Allocator, io: std.Io) ![]const u8 {
         const html_file = try std.Io.Dir.cwd().openFile(io, self.path, .{});
 

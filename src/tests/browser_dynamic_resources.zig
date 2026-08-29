@@ -184,6 +184,7 @@ test "resource refresh adds and removes live linked stylesheet generations" {
     test_browser.allocator = allocator;
     test_browser.io = std.testing.io;
     test_browser.session_state = &session;
+    test_browser.resource_loader = .init(allocator, std.testing.io, &session);
     test_browser.default_style_sheet_rules = &.{};
 
     // The document starts without author rules.
@@ -266,6 +267,7 @@ test "parallel stylesheet fetches are applied in DOM source order" {
     test_browser.allocator = allocator;
     test_browser.io = std.testing.io;
     test_browser.session_state = &session;
+    test_browser.resource_loader = .init(allocator, std.testing.io, &session);
     test_browser.default_style_sheet_rules = &.{};
 
     frame.resources_dirty = true;

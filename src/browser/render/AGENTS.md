@@ -13,9 +13,36 @@ boundaries.
 ## Module boundaries
 
 - `layout.zig` owns retained document/block/line/text trees, geometry
-  dependencies, local-coordinate hit testing, focus/image/iframe bounds, and
-  retained paint caches. It borrows DOM, computed style, decoded images, and
-  FontManager resources.
+  dependencies, hit-test traversal and DOM resolution, focus/image/iframe
+  bounds, and retained paint caches. Layout-object methods stay here when they
+  maintain parent/previous links, ProtectedField graphs, DOM callbacks, or
+  cache dirty state. The module borrows DOM, computed style, decoded images,
+  and FontManager resources.
+- `layout_hit.zig` owns pointer-free local-coordinate hit geometry: saturating
+  coordinate conversion, rounded clips, scroll/transform localization, and
+  reverse-child ordering over a synchronously borrowed committed paint
+  permutation. It never owns or traverses layout objects.
+- `box_model.zig` resolves pure CSS box edges, dimensions, positioning
+  keywords, radii, and authored-zoom used values. It does not subscribe to
+  style fields; `layout.zig` performs dependency-tracked reads before calling
+  it.
+- `inline_format.zig` owns pure text normalization, entity decoding, line
+  alignment/wrapping decisions, and inline font-size used values. Layout-tree
+  traversal, glyph ownership, and retained line objects remain in
+  `layout.zig`.
+- `control_geometry.zig` computes input/button leaf geometry and password
+  display text. `InputLayout` and `ButtonLayout` remain with their DOM, font,
+  collector, and display-command invariants in `layout.zig`.
+- `replaced_paint.zig` appends background-image and rounded-control command
+  leaves/groups without owning layout objects. Its image pixels and provenance
+  are still generation-scoped borrows until snapshot.
+- `paint_effects.zig` resolves scalar block effects from live style and wraps
+  owned command slices in blur, clip, blend, transform, position, and scroll
+  groups. `wrapOwned` consumes its input slice on every outcome; callers must
+  pass an independently owned top-level container.
+- `retained_commands.zig` deep-materializes a retained command tree only at a
+  boundary that cannot borrow its cache owner. It owns recursive container
+  copies and canvas snapshots, but does not own a layout cache.
 - `font.zig` owns SDL_ttf handles and canonical allocator-owned RGBA glyph
   bitmaps. Commands borrow glyph pixels only until snapshot.
 - `display_list.zig` owns command types, recursive cleanup, provenance,
@@ -28,14 +55,15 @@ boundaries.
   opacity/translation updates.
 - `effects.zig` owns pixel-only effects and must state premultiplication,
   sampling, and temporary-allocation behavior explicitly.
-- `replaced_sizing.zig`, `focus_ring.zig`, and `forced_colors.zig` are pure
-  focused helpers. Keep Browser orchestration out of them.
+- `replaced_sizing.zig`, `focus_ring.zig`, and `forced_colors.zig` are other
+  pure focused helpers. Keep Browser orchestration out of all leaf modules.
 
 `layout.zig` is already beyond the repository's decomposition threshold. New
 independent formatting, replaced-element, or paint algorithms should become a
 cohesive module with a real owner/interface rather than another region in that
 file. Do not split methods away from the object invariants they maintain or add
-a facade cycle merely to reduce lines.
+a facade cycle merely to reduce lines. Prefer direct imports of pure leaf
+modules over forwarding wrappers.
 
 ## Invalidation and layout
 
@@ -62,10 +90,16 @@ a facade cycle merely to reduce lines.
   order around non-owning `.cached_subtree` edges.
 - `.cached_subtree` may exist only in a synchronous Frame/layout list. Cleanup
   does not own it. Composition and raster snapshots materialize it before a
-  Browser lock or thread boundary.
+  Browser lock or thread boundary. Temporary rich-button trees use
+  `retained_commands.appendClone` because their layout owners retire before
+  the outer line is committed.
 - `.blend` and `.transform` own children; `.blend` owns its copied mode string.
   Image/glyph leaves borrow pixels, canvas leaves own immutable pixels, and
   provenance borrows the current DOM/layout generation.
+- Effect wrapping is transactional: convert a temporary command list to an
+  owned slice before calling `paint_effects.wrapOwned`. When transferring the
+  returned owning items into another list, reserve its capacity first and free
+  only the now-empty top-level container after the transfer.
 - Retire Frame and Browser command generations before replacing decoded image,
   font, canvas, DOM, layout, or layer resources they borrow.
 - A raster snapshot and every worker plane is independently owned through the
@@ -76,6 +110,9 @@ a facade cycle merely to reduce lines.
 - Hit testing descends in parent-local coordinates, inverts live transforms,
   applies scroll/clips locally, and visits reverse paint order. Do not build an
   absolute rectangle for every descendant.
+- A `layout_hit.ReverseOrder` borrows a committed child permutation only for
+  the current traversal. If that permutation is absent or stale, it falls back
+  to reverse DOM order rather than retaining a layout-owned slice.
 - Immediate children paint by stable `(effective z-index, DOM index)` order;
   only non-static positioned blocks receive nonzero z-index. Hit testing uses
   the exact reverse order.

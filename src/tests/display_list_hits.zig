@@ -569,8 +569,7 @@ fn initMutationBrowser(
     result.active_tab_url = null;
     result.active_tab_committed_url = null;
     result.active_tab_display_list = null;
-    result.composited_layers = .empty;
-    result.tab_draw_list = .empty;
+    result.display_compositor = .init(allocator);
     result.pending_composited_updates = .empty;
     result.shutting_down = true;
     result.needs_composite = false;
@@ -582,10 +581,7 @@ fn deinitMutationBrowser(test_browser: *browser.Browser) void {
     if (test_browser.active_tab_url) |url| test_browser.allocator.free(url);
     if (test_browser.active_tab_committed_url) |url| test_browser.allocator.free(url);
     if (test_browser.active_tab_display_list) |items| DisplayItem.freeList(test_browser.allocator, items);
-    for (test_browser.composited_layers.items) |*layer| layer.deinit(test_browser.allocator);
-    test_browser.composited_layers.deinit(test_browser.allocator);
-    DisplayItem.freeItems(test_browser.allocator, test_browser.tab_draw_list.items);
-    test_browser.tab_draw_list.deinit(test_browser.allocator);
+    test_browser.display_compositor.deinit();
     test_browser.pending_composited_updates.deinit(test_browser.allocator);
     deinitQueueBrowser(test_browser);
 }
@@ -1186,10 +1182,8 @@ test "activating a clean tab republishes its retained list and committed URL" {
     defer if (test_browser.active_tab_committed_url) |url| allocator.free(url);
     test_browser.active_tab_display_list = null;
     defer if (test_browser.active_tab_display_list) |items| DisplayItem.freeList(allocator, items);
-    test_browser.composited_layers = .empty;
-    defer test_browser.composited_layers.deinit(allocator);
-    test_browser.tab_draw_list = .empty;
-    defer test_browser.tab_draw_list.deinit(allocator);
+    test_browser.display_compositor = .init(allocator);
+    defer test_browser.display_compositor.deinit();
     test_browser.pending_composited_updates = .empty;
     defer test_browser.pending_composited_updates.deinit(allocator);
     test_browser.shutting_down = true; // Suppress timer threads; run the worker step directly.

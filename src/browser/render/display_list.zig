@@ -7,7 +7,9 @@
 const std = @import("std");
 const z2d = @import("z2d");
 
-const Glyph = @import("font.zig").Glyph;
+const font = @import("font.zig");
+const Glyph = font.Glyph;
+pub const GlyphPixelMode = font.GlyphPixelMode;
 const Node = @import("../../document/parser.zig").Node;
 
 pub const Color = struct {

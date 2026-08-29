@@ -6,6 +6,7 @@
 
 const std = @import("std");
 const browser_mod = @import("root.zig");
+const frame_module = @import("frame.zig");
 const forced_colors = @import("render/forced_colors.zig");
 const url_module = @import("../network/url.zig");
 const parser = @import("../document/parser.zig");
@@ -15,6 +16,8 @@ const CSSParser = @import("../document/css_parser.zig");
 const task = @import("../runtime/task.zig");
 const sync = @import("../runtime/sync.zig");
 const scroll_model = @import("scroll.zig");
+const history_module = @import("history.zig");
+const tab_animation = @import("tab_animation.zig");
 const AccessibilitySpeech = @import("accessibility_speech.zig").Worker;
 const MeasureTime = @import("../runtime/measure_time.zig").MeasureTime;
 const js_module = @import("../script/js.zig");
@@ -22,118 +25,12 @@ const ProtectedField = @import("../core/protected_field.zig").ProtectedField;
 
 const Url = url_module.Url;
 const Browser = browser_mod.Browser;
-const JsRenderContext = browser_mod.JsRenderContext;
 const DisplayItem = browser_mod.DisplayItem;
 const AccessibilitySettings = browser_mod.AccessibilitySettings;
 const TaskRunner = task.TaskRunner;
 const Node = parser.Node;
 const Bounds = Layout.Bounds;
-const FrameBoundEntry = struct {
-    node: *Node,
-    bounds: Bounds,
-};
-
-const FrameHoverTarget = struct {
-    frame: *Frame,
-    node: *Node,
-};
-
-fn isStrictDomDescendant(node: *Node, ancestor: *Node) bool {
-    var current = switch (node.*) {
-        .element => |element| element.parent,
-        .text => |text| text.parent,
-    };
-    while (current) |candidate| {
-        if (candidate == ancestor) return true;
-        current = switch (candidate.*) {
-            .element => |element| element.parent,
-            .text => |text| text.parent,
-        };
-    }
-    return false;
-}
-
-fn parentNode(node: *Node) ?*Node {
-    return switch (node.*) {
-        .element => |element| element.parent,
-        .text => |text| text.parent,
-    };
-}
-
-/// Painted text fragments hover their containing element. Display/layout hit
-/// provenance can name either kind of Node, so normalize before retaining a
-/// generation-bound target.
-fn hoverElementForNode(node: *Node) ?*Node {
-    var current: ?*Node = node;
-    while (current) |candidate| {
-        switch (candidate.*) {
-            .element => return candidate,
-            .text => |text| current = text.parent,
-        }
-    }
-    return null;
-}
-
-fn nodeDepth(node: *Node) usize {
-    var depth: usize = 0;
-    var current: ?*Node = node;
-    while (current) |candidate| : (current = parentNode(candidate)) depth += 1;
-    return depth;
-}
-
-fn commonDomAncestor(left: *Node, right: *Node) ?*Node {
-    var left_node = left;
-    var right_node = right;
-    var left_depth = nodeDepth(left_node);
-    var right_depth = nodeDepth(right_node);
-    while (left_depth > right_depth) : (left_depth -= 1) {
-        left_node = parentNode(left_node) orelse return null;
-    }
-    while (right_depth > left_depth) : (right_depth -= 1) {
-        right_node = parentNode(right_node) orelse return null;
-    }
-    while (left_node != right_node) {
-        left_node = parentNode(left_node) orelse return null;
-        right_node = parentNode(right_node) orelse return null;
-    }
-    return left_node;
-}
-
-/// Toggle one side of a hover-path transition and return the highest changed
-/// element. Restyling that element's subtree covers descendant selectors such
-/// as `.card:hover .label` without revisiting a shared hovered ancestor.
-fn updateHoverBranch(branch_start: *Node, stop_before: ?*Node, hovered: bool) ?*Node {
-    var highest_changed: ?*Node = null;
-    var current: ?*Node = branch_start;
-    while (current) |candidate| : (current = parentNode(candidate)) {
-        if (candidate == stop_before) break;
-        switch (candidate.*) {
-            .element => |*element| {
-                if (element.is_hovered != hovered) {
-                    element.is_hovered = hovered;
-                    highest_changed = candidate;
-                }
-            },
-            .text => {},
-        }
-    }
-    return highest_changed;
-}
-
-fn dirtyHoverBranch(root: ?*Node) void {
-    const node = root orelse return;
-    parser.dirtyStyleSubtree(node);
-    switch (node.*) {
-        .element => |*element| parser.dirtyStyleForElement(element),
-        .text => {},
-    }
-}
-
-pub const ClickButton = enum {
-    primary,
-    middle,
-};
-
+pub const ClickButton = frame_module.ClickButton;
 /// Latest pointer location in content-viewport device pixels. The UI thread
 /// copies this scalar snapshot into a Tab task; the worker adds its live root
 /// scroll and zoom only when resolving after layout.
@@ -150,126 +47,16 @@ const JsEventAccess = enum {
     native_callback,
 };
 
-pub const HistoryDirection = enum {
-    back,
-    forward,
-};
+pub const HistoryDirection = history_module.Direction;
+pub const HistoryNavigation = history_module.Navigation;
+pub const HistoryMethod = history_module.Method;
+pub const HistoryState = history_module.State;
+pub const FrameHistorySnapshot = history_module.FrameSnapshot;
+pub const HistoryEntry = history_module.Entry;
+pub const PreparedHistoryNavigation = history_module.PreparedNavigation;
+pub const HistoryTraversalTarget = history_module.TraversalTarget;
 
-pub const HistoryNavigation = enum {
-    push,
-    replay,
-};
-
-pub const HistoryMethod = enum {
-    get,
-    post,
-};
-
-/// Owned request state for one frame subtree immediately before a navigation.
-/// Back traversal restores this tree after reloading its root request; child
-/// indexes are implicit in `children` order and therefore survive Frame moves.
-pub const FrameHistorySnapshot = struct {
-    url: *Url,
-    method: HistoryMethod,
-    post_body: ?[]u8,
-    children: std.ArrayList(*FrameHistorySnapshot),
-
-    pub fn deinit(self: *FrameHistorySnapshot, allocator: std.mem.Allocator) void {
-        for (self.children.items) |child| child.deinit(allocator);
-        self.children.deinit(allocator);
-        if (self.post_body) |body| allocator.free(body);
-        self.url.*.free(allocator);
-        allocator.destroy(self.url);
-        allocator.destroy(self);
-    }
-
-    fn containsPost(self: *const FrameHistorySnapshot) bool {
-        if (self.method == .post) return true;
-        for (self.children.items) |child| {
-            if (child.containsPost()) return true;
-        }
-        return false;
-    }
-};
-
-/// One replayable navigation in the tab-wide joint session history. Frame
-/// identity is stored as child indexes from the root rather than a `*Frame`,
-/// because every document-replacing replay creates fresh frame allocations.
-pub const HistoryEntry = struct {
-    url: *Url,
-    method: HistoryMethod,
-    post_body: ?[]u8,
-    target_path: []usize,
-    replaces_document: bool,
-    previous: ?*FrameHistorySnapshot,
-
-    fn prepare(
-        allocator: std.mem.Allocator,
-        url: *const Url,
-        payload: ?[]const u8,
-        target_path: []const usize,
-        replaces_document: bool,
-        previous: ?*FrameHistorySnapshot,
-    ) !*HistoryEntry {
-        const entry = try allocator.create(HistoryEntry);
-        errdefer allocator.destroy(entry);
-
-        const url_ptr = try allocator.create(Url);
-        errdefer allocator.destroy(url_ptr);
-        url_ptr.* = try url.*.clone(allocator);
-        errdefer url_ptr.*.free(allocator);
-
-        const body_copy = if (payload) |body| try allocator.dupe(u8, body) else null;
-        errdefer if (body_copy) |body| allocator.free(body);
-        const path_copy = try allocator.dupe(usize, target_path);
-        entry.* = .{
-            .url = url_ptr,
-            .method = if (payload == null) .get else .post,
-            .post_body = body_copy,
-            .target_path = path_copy,
-            .replaces_document = replaces_document,
-            .previous = previous,
-        };
-        return entry;
-    }
-
-    pub fn deinit(self: *HistoryEntry, allocator: std.mem.Allocator) void {
-        if (self.post_body) |body| allocator.free(body);
-        if (self.previous) |snapshot| snapshot.deinit(allocator);
-        allocator.free(self.target_path);
-        self.url.*.free(allocator);
-        allocator.destroy(self.url);
-        allocator.destroy(self);
-    }
-};
-
-/// A history mutation whose URL, body, and frame path have all been copied
-/// before the caller retires the currently installed document.
-pub const PreparedHistoryNavigation = struct {
-    entry: ?*HistoryEntry,
-
-    pub fn deinit(self: *PreparedHistoryNavigation, allocator: std.mem.Allocator) void {
-        const entry = self.entry orelse return;
-        entry.deinit(allocator);
-        self.entry = null;
-    }
-};
-
-pub const HistoryTraversalTarget = struct {
-    index: usize,
-    generation: u64,
-    method: HistoryMethod,
-};
-
-/// Represents one property update that can be applied to an already-rastered
-/// effect plane.
-pub const CompositedUpdate = struct {
-    node: *anyopaque, // Pointer to the element that owns this effect
-    value: union(enum) {
-        opacity: f64,
-        transform: struct { x: i32, y: i32 },
-    },
-};
+pub const CompositedUpdate = tab_animation.CompositedUpdate;
 
 pub const AccessibilityNode = struct {
     role: []const u8,
@@ -300,1081 +87,8 @@ const IntervalKey = struct {
     handle: u32,
 };
 
-pub const Frame = struct {
-    allocator: std.mem.Allocator,
-    tab: *Tab,
-    parent: ?*Frame,
-    frame_element: ?*Node,
-    input_bounds: std.AutoHashMap(*Node, Bounds),
-    /// Last laid-out document-space boxes for `<img>` nodes. Unloaded images
-    /// without authored dimensions retain a one-pixel position anchor so a
-    /// scroll can still bring them into the lazy preload region.
-    image_bounds: std.AutoHashMap(*Node, Bounds),
-    link_bounds: std.ArrayList(FrameBoundEntry),
-    iframe_bounds: std.ArrayList(FrameBoundEntry),
-    focus_bounds: std.ArrayList(FrameBoundEntry),
-    accessibility_bounds: std.ArrayList(FrameBoundEntry),
-    fragment_targets: std.ArrayList(Layout.FragmentTarget),
-    viewport_width: i32 = 0,
-    viewport_height: i32 = 0,
-    /// Authored zoom inherited from the containing iframe. Root frames stay
-    /// at one; descendant document layout multiplies this with its own DOM.
-    inherited_css_zoom: f32 = 1.0,
-    window_id: u32 = 0,
-    current_url: ?*Url = null,
-    current_url_owned: bool = false,
-    // True only for a browser-generated document replacing a failed TLS
-    // certificate navigation. Root-frame commits use this to suppress the
-    // HTTPS padlock while retaining the requested URL in chrome and history.
-    certificate_error: bool = false,
-    /// Policy received with this document generation. Every navigation and
-    /// subresource request originating here consults it before adding Referer.
-    referrer_policy: url_module.ReferrerPolicy = .default,
-    current_html_source: ?[]const u8 = null,
-    current_node: ?Node = null,
-    /// A dirty document means computed style has not been republished for the
-    /// current DOM/rule generation. Layout consumers may use `get()` only
-    /// after the style phase clears this boundary; teardown deliberately uses
-    /// `lastValue()` to retire the previous owning layout pointer.
-    document: ProtectedField(?*Layout.DocumentLayout),
-    display_list: ?[]DisplayItem = null,
-    content_height: i32 = 0,
-    scroll: i32 = 0,
-    // Worker-owned viewport animation. Root-frame steps commit only a new
-    // scalar scroll offset; child-frame steps currently require recomposition
-    // because iframe placement is encoded in the composed command tree.
-    scroll_animation: ?scroll_model.ScrollAnimation = null,
-    focus: ?*Node = null,
-    // The innermost clicked `overflow: scroll` element. This worker-owned DOM
-    // borrow is retired at the same structural-mutation boundary as focus.
-    scroll_focus: ?*Node = null,
-    // Innermost element under the pointer in this browsing context. A nested
-    // iframe hover keeps one target in every Frame along the embedding path.
-    // Like focus, this raw DOM borrow is worker-owned and generation-bound.
-    hovered_node: ?*Node = null,
-    js_context: ?*js_module = null,
-    js_render_context: JsRenderContext = .{},
-    js_render_context_initialized: bool = false,
-    document_generation: u64 = 0,
-    rules: std.ArrayList(CSSParser.CSSRule),
-    keyframes: std.ArrayList(CSSParser.KeyframesRule),
-    default_rules_count: usize = 0,
-    // Owned linked and inline author stylesheet buffers in DOM order. Owned
-    // rules borrow their property strings from these allocations.
-    css_texts: std.ArrayList([]const u8),
-    // Structural DOM mutation can add scripts/stylesheets/iframes or remove
-    // linked stylesheets and iframe contexts. The next worker-side render
-    // rebuilds deferred resources from the final attached DOM generation;
-    // iframe removal itself completes synchronously at the mutation boundary.
-    resources_dirty: bool = false,
-    allowed_origins: ?std.ArrayList([]const u8) = null,
-    children: std.ArrayList(*Frame),
-
-    pub fn init(
-        allocator: std.mem.Allocator,
-        tab: *Tab,
-        parent: ?*Frame,
-        frame_element: ?*Node,
-    ) Frame {
-        return .{
-            .allocator = allocator,
-            .tab = tab,
-            .parent = parent,
-            .frame_element = frame_element,
-            .rules = std.ArrayList(CSSParser.CSSRule).empty,
-            .keyframes = std.ArrayList(CSSParser.KeyframesRule).empty,
-            .css_texts = std.ArrayList([]const u8).empty,
-            .children = std.ArrayList(*Frame).empty,
-            .input_bounds = std.AutoHashMap(*Node, Bounds).init(allocator),
-            .image_bounds = std.AutoHashMap(*Node, Bounds).init(allocator),
-            .link_bounds = std.ArrayList(FrameBoundEntry).empty,
-            .iframe_bounds = std.ArrayList(FrameBoundEntry).empty,
-            .focus_bounds = std.ArrayList(FrameBoundEntry).empty,
-            .accessibility_bounds = std.ArrayList(FrameBoundEntry).empty,
-            .fragment_targets = std.ArrayList(Layout.FragmentTarget).empty,
-            .document = ProtectedField(?*Layout.DocumentLayout).init(null),
-        };
-    }
-
-    pub fn styleNeeded(self: *const Frame) bool {
-        return self.document.dirty;
-    }
-
-    /// Read the current layout generation. Calling this while style is dirty
-    /// is a phase violation and is intentionally rejected by ProtectedField.
-    pub fn documentLayout(self: *const Frame) ?*Layout.DocumentLayout {
-        return self.document.get().*;
-    }
-
-    /// Install an already-computed layout generation and publish a clean
-    /// document phase. Tests and Browser.layoutTabNodes use this ownership
-    /// transfer rather than writing the pointer directly.
-    pub fn setDocumentLayout(self: *Frame, document: ?*Layout.DocumentLayout) void {
-        self.document.set(document);
-    }
-
-    /// Mark style stale without discarding the last layout generation. A
-    /// successful style pass republishes that same owning pointer; resulting
-    /// style-field notifications decide whether its geometry is also dirty.
-    pub fn markDocumentStyleDirty(self: *Frame) void {
-        self.document.mark();
-    }
-
-    fn updateHoveredNode(self: *Frame, node: ?*Node) bool {
-        const target = if (node) |candidate| hoverElementForNode(candidate) else null;
-        if (self.hovered_node == target) return false;
-
-        const common = if (self.hovered_node) |previous|
-            if (target) |next| commonDomAncestor(previous, next) else null
-        else
-            null;
-        const cleared_root = if (self.hovered_node) |previous|
-            updateHoverBranch(previous, common, false)
-        else
-            null;
-        const set_root = if (target) |next|
-            updateHoverBranch(next, common, true)
-        else
-            null;
-        self.hovered_node = target;
-        dirtyHoverBranch(cleared_root);
-        dirtyHoverBranch(set_root);
-        const changed = cleared_root != null or set_root != null;
-        if (changed) self.markDocumentStyleDirty();
-        return changed;
-    }
-
-    /// Destroy the last retained layout while its DOM dependencies are still
-    /// alive. The field is left clean and null; callers that require a new
-    /// style pass must mark it after retirement.
-    pub fn destroyDocumentLayout(self: *Frame) void {
-        if (self.document.lastValue().*) |document| {
-            document.deinit();
-            self.allocator.destroy(document);
-        }
-        self.document.set(null);
-    }
-
-    pub fn layoutNeeded(self: *const Frame) bool {
-        if (self.current_node == null or self.document.dirty) return false;
-        const document = self.document.get().* orelse return true;
-        return document.layoutNeeded();
-    }
-
-    /// Finish a style pass performed by a navigation path before it enters
-    /// Browser.layoutTabNodes directly.
-    pub fn publishStyledDocument(self: *Frame) void {
-        self.document.set(self.document.lastValue().*);
-    }
-
-    /// Width queries in a nested browsing context use that iframe's own CSS
-    /// viewport, not the native tab width. The stored geometry already omits
-    /// accessibility zoom but includes authored CSS zoom inherited from the
-    /// iframe element, so remove only the latter.
-    pub fn mediaViewportWidthCssPixels(self: *const Frame) f64 {
-        if (self.parent != null and self.viewport_width > 0) {
-            const css_zoom = if (std.math.isFinite(self.inherited_css_zoom) and
-                self.inherited_css_zoom > 0)
-                self.inherited_css_zoom
-            else
-                1.0;
-            return @as(f64, @floatFromInt(self.viewport_width)) /
-                @as(f64, css_zoom);
-        }
-        return viewportWidthInCssPixels(
-            self.tab.tab_width,
-            self.tab.accessibility.zoom,
-        );
-    }
-
-    pub const ViewportChange = struct {
-        width_changed: bool,
-        height_changed: bool,
-
-        pub fn any(self: ViewportChange) bool {
-            return self.width_changed or self.height_changed;
-        }
-    };
-
-    /// Parent layout publishes iframe geometry during composition. Dirty this
-    /// frame and every nested frame before retaining the new viewport so the
-    /// follow-up render cannot reuse layout built for the old containing box.
-    pub fn updateViewportFromParent(
-        self: *Frame,
-        width: i32,
-        height: i32,
-    ) ViewportChange {
-        const next_width = @max(width, 0);
-        const next_height = @max(height, 0);
-        const change = ViewportChange{
-            .width_changed = self.viewport_width != next_width,
-            .height_changed = self.viewport_height != next_height,
-        };
-        self.viewport_width = next_width;
-        self.viewport_height = next_height;
-        if (change.any()) markFrameLayoutDirty(self);
-        return change;
-    }
-
-    pub fn deinit(self: *Frame) void {
-        // A zero generation has never hosted a live JavaScript document. This
-        // guard also keeps lightweight Frame-only tests from needing to
-        // initialize the Tab-owned interval registry.
-        if (self.document_generation != 0) {
-            self.tab.clearIntervalsForDocument(self.window_id, self.document_generation);
-        }
-        if (self.js_context) |ctx| {
-            ctx.setNodes(self.window_id, null);
-        }
-        self.document_generation = 0;
-        self.js_render_context.setGeneration(0);
-        self.js_render_context.setPointers(null, null, null, 0);
-        self.tab.unregisterFrame(self);
-        self.js_context = null;
-        self.js_render_context_initialized = false;
-        self.hovered_node = null;
-
-        // Display-item provenance borrows this frame's layout and DOM. Retire
-        // it before any descendant/layout/node generation can be destroyed.
-        self.retireDisplayList();
-
-        self.input_bounds.deinit();
-        self.image_bounds.deinit();
-        self.link_bounds.deinit(self.allocator);
-        self.iframe_bounds.deinit(self.allocator);
-        self.focus_bounds.deinit(self.allocator);
-        self.accessibility_bounds.deinit(self.allocator);
-        self.fragment_targets.deinit(self.allocator);
-        for (self.children.items) |child| {
-            child.deinit();
-            self.allocator.destroy(child);
-        }
-        self.children.deinit(self.allocator);
-
-        self.destroyDocumentLayout();
-        self.document.deinit(self.allocator);
-
-        if (self.current_node) |*node| {
-            node.deinit(self.allocator);
-            self.current_node = null;
-        }
-
-        if (self.current_html_source) |source| {
-            self.allocator.free(source);
-            self.current_html_source = null;
-        }
-
-        for (self.rules.items) |*rule| {
-            if (rule.owned) {
-                rule.deinit(self.allocator);
-            }
-        }
-        self.rules.deinit(self.allocator);
-
-        for (self.keyframes.items) |*rule| rule.deinit(self.allocator);
-        self.keyframes.deinit(self.allocator);
-
-        for (self.css_texts.items) |css_text| {
-            self.allocator.free(css_text);
-        }
-        self.css_texts.deinit(self.allocator);
-
-        self.clearAllowedOrigins();
-
-        if (self.current_url_owned) {
-            if (self.current_url) |url_ptr| {
-                url_ptr.*.free(self.allocator);
-                self.allocator.destroy(url_ptr);
-            }
-        }
-        self.current_url = null;
-        self.current_url_owned = false;
-    }
-
-    pub fn retireDisplayList(self: *Frame) void {
-        if (self.display_list) |items| {
-            DisplayItem.freeList(self.allocator, items);
-            self.display_list = null;
-        }
-    }
-
-    /// Retire every frame-side structure that borrows DOM or layout identity
-    /// before a structural DOM mutation can remove or relocate a Node.
-    pub fn retireDomMutationBorrows(self: *Frame, mutation_root: *Node) void {
-        if (self.focus) |focus_node| {
-            if (isStrictDomDescendant(focus_node, mutation_root)) {
-                switch (focus_node.*) {
-                    .element => |*element| {
-                        element.is_focused = false;
-                        element.is_focus_visible = false;
-                        parser.dirtyStyleForElement(element);
-                    },
-                    .text => {},
-                }
-                self.focus = null;
-            }
-        }
-        if (self.scroll_focus) |scroll_node| {
-            if (isStrictDomDescendant(scroll_node, mutation_root)) {
-                self.scroll_focus = null;
-            }
-        }
-        if (self.hovered_node) |hovered_node| {
-            if (isStrictDomDescendant(hovered_node, mutation_root)) {
-                _ = self.updateHoveredNode(null);
-            }
-        }
-        self.retireDisplayList();
-        self.input_bounds.clearRetainingCapacity();
-        self.image_bounds.clearRetainingCapacity();
-        self.link_bounds.clearRetainingCapacity();
-        self.iframe_bounds.clearRetainingCapacity();
-        self.focus_bounds.clearRetainingCapacity();
-        self.accessibility_bounds.clearRetainingCapacity();
-        self.fragment_targets.clearRetainingCapacity();
-    }
-
-    pub fn annotateVisited(self: *Frame, browser: *Browser) !void {
-        const root = if (self.current_node) |*node| node else return;
-        if (self.current_url) |base_url| {
-            try browser.annotateVisitedLinks(root, base_url);
-        }
-    }
-
-    pub fn renderStyle(self: *Frame, browser: *Browser) !void {
-        if (!self.document.dirty) return;
-        const root = if (self.current_node) |*node| node else {
-            self.publishStyledDocument();
-            return;
-        };
-        // Browser-level focus/paint requests conservatively enter the
-        // protected style phase. The DOM summary lets a clean document
-        // republish immediately without walking its tree (or rescanning
-        // background-image users).
-        if (parser.styleTreeNeedsUpdate(root)) {
-            try parser.styleWithKeyframes(
-                browser.allocator,
-                root,
-                self.rules.items,
-                self.keyframes.items,
-            );
-            if (self.current_url) |page_url| {
-                try browser.loadUsedBackgroundImages(self, page_url);
-            }
-        }
-        self.publishStyledDocument();
-    }
-
-    pub fn updateHitTestBounds(self: *Frame, engine: *Layout) !void {
-        self.input_bounds.clearRetainingCapacity();
-        var input_it = engine.input_bounds.iterator();
-        while (input_it.next()) |entry| {
-            try self.input_bounds.put(entry.key_ptr.*, entry.value_ptr.*);
-        }
-
-        self.image_bounds.clearRetainingCapacity();
-        var image_it = engine.image_bounds.iterator();
-        while (image_it.next()) |entry| {
-            try self.image_bounds.put(entry.key_ptr.*, entry.value_ptr.*);
-        }
-
-        self.link_bounds.clearRetainingCapacity();
-        for (engine.link_bounds.items) |entry| {
-            try self.link_bounds.append(self.allocator, .{
-                .node = entry.node,
-                .bounds = entry.bounds,
-            });
-        }
-
-        self.iframe_bounds.clearRetainingCapacity();
-        for (engine.iframe_bounds.items) |entry| {
-            try self.iframe_bounds.append(self.allocator, .{
-                .node = entry.node,
-                .bounds = entry.bounds,
-            });
-        }
-
-        self.focus_bounds.clearRetainingCapacity();
-        for (engine.focus_bounds.items) |entry| {
-            try self.focus_bounds.append(self.allocator, .{
-                .node = entry.node,
-                .bounds = entry.bounds,
-            });
-        }
-
-        self.accessibility_bounds.clearRetainingCapacity();
-        for (engine.accessibility_bounds.items) |entry| {
-            try self.accessibility_bounds.append(self.allocator, .{
-                .node = entry.node,
-                .bounds = entry.bounds,
-            });
-        }
-
-        self.fragment_targets.clearRetainingCapacity();
-        try self.fragment_targets.appendSlice(self.allocator, engine.fragment_targets.items);
-    }
-
-    pub fn scrollOffsetForFragment(self: *const Frame, fragment: []const u8) ?i32 {
-        if (fragment.len == 0) return 0;
-        for (self.fragment_targets.items) |target| {
-            const element = switch (target.node.*) {
-                .element => |*value| value,
-                .text => continue,
-            };
-            const attributes = element.attributes orelse continue;
-            const id = attributes.get("id") orelse continue;
-            if (url_module.fragmentMatchesId(fragment, id)) {
-                return self.tab.clampScrollForFrame(self, target.y);
-            }
-        }
-        return null;
-    }
-
-    pub fn scrollToFragment(self: *Frame, fragment: []const u8) bool {
-        const target_scroll = self.scrollOffsetForFragment(fragment) orelse return false;
-        self.scroll_animation = null;
-        self.scroll = target_scroll;
-        self.tab.scroll_changed_in_tab = true;
-        return true;
-    }
-
-    fn navigateSameDocumentHistory(
-        self: *Frame,
-        b: *Browser,
-        resolved_url: Url,
-        history_navigation: HistoryNavigation,
-    ) !void {
-        const fragment = resolved_url.fragment();
-        const target_scroll: ?i32 = if (fragment) |value|
-            self.scrollOffsetForFragment(value)
-        else
-            0;
-
-        // Same-document fragment navigations do not pass through loadInTab,
-        // but they still create a visited URL entry.
-        _ = try b.markVisited(&resolved_url);
-
-        const url_ptr = self.allocator.create(Url) catch |err| {
-            resolved_url.free(self.allocator);
-            return err;
-        };
-        url_ptr.* = resolved_url;
-        var url_owned = true;
-        defer if (url_owned) {
-            url_ptr.*.free(self.allocator);
-            self.allocator.destroy(url_ptr);
-        };
-
-        var prepared_history: ?PreparedHistoryNavigation = null;
-        defer if (prepared_history) |*prepared| prepared.deinit(self.allocator);
-        if (history_navigation == .push) {
-            const current_payload = try self.tab.currentHistoryPayloadForFrame(self);
-            prepared_history = try self.tab.prepareHistoryNavigation(
-                self,
-                url_ptr,
-                current_payload,
-                false,
-            );
-        }
-
-        if (self.current_url_owned) {
-            if (self.current_url) |old_url| {
-                old_url.*.free(self.allocator);
-                self.allocator.destroy(old_url);
-            }
-        }
-        self.current_url = url_ptr;
-        self.current_url_owned = true;
-        url_owned = false;
-        if (prepared_history) |*prepared| {
-            self.tab.commitPreparedHistoryNavigation(prepared);
-        }
-
-        if (target_scroll) |scroll| {
-            self.scroll = scroll;
-            self.tab.scroll_changed_in_tab = true;
-        }
-        // A paint commit carries both the new URL and scroll offset to chrome
-        // without rebuilding or replacing the document.
-        self.tab.setNeedsPaint();
-    }
-
-    fn followLink(self: *Frame, b: *Browser, href: []const u8, button: ClickButton) !void {
-        const current_url_ptr = self.current_url orelse return;
-        var resolved_url = try current_url_ptr.*.resolveForNavigation(self.allocator, href);
-
-        if (button == .middle) {
-            b.queueNewTab(resolved_url) catch |err| {
-                resolved_url.free(self.allocator);
-                std.log.err("Failed to queue new tab for {s}: {any}", .{ href, err });
-            };
-            return;
-        }
-
-        if (current_url_ptr.*.sameDocument(resolved_url) and resolved_url.fragment() != null) {
-            try self.navigateSameDocumentHistory(b, resolved_url, .push);
-            return;
-        }
-
-        const new_url_ptr = self.allocator.create(Url) catch |alloc_err| {
-            std.log.err("Failed to allocate URL: {any}", .{alloc_err});
-            resolved_url.free(self.allocator);
-            return;
-        };
-        new_url_ptr.* = resolved_url;
-        var url_owned = true;
-        defer if (url_owned) {
-            new_url_ptr.*.free(self.allocator);
-            self.allocator.destroy(new_url_ptr);
-        };
-
-        if (self.parent != null) {
-            b.scheduleFrameLoad(self, new_url_ptr, null) catch |err| {
-                std.log.err("Failed to schedule iframe load for {s}: {any}", .{ href, err });
-                return;
-            };
-        } else {
-            b.scheduleLoad(self.tab, new_url_ptr, null) catch |err| {
-                std.log.err("Failed to schedule load for {s}: {any}", .{ href, err });
-                return;
-            };
-        }
-        url_owned = false;
-    }
-
-    pub fn dispatchEvent(self: *Frame, event_type: []const u8, node: *Node) bool {
-        return self.dispatchEventWithBubbles(event_type, node, true);
-    }
-
-    pub fn dispatchEventWithBubbles(
-        self: *Frame,
-        event_type: []const u8,
-        node: *Node,
-        bubbles: bool,
-    ) bool {
-        return self.dispatchEventWithAccess(
-            event_type,
-            node,
-            bubbles,
-            .acquire_lock,
-        );
-    }
-
-    fn dispatchEventWithAccess(
-        self: *Frame,
-        event_type: []const u8,
-        node: *Node,
-        bubbles: bool,
-        access: JsEventAccess,
-    ) bool {
-        const ctx = self.js_context orelse return true;
-        const result = switch (access) {
-            .acquire_lock => ctx.dispatchEventWithBubbles(
-                self.window_id,
-                event_type,
-                node,
-                bubbles,
-            ),
-            .native_callback => ctx.dispatchEventWithBubblesFromNativeCallback(
-                self.window_id,
-                event_type,
-                node,
-                bubbles,
-            ),
-        };
-        return result catch |err| blk: {
-            std.log.warn("Failed to dispatch {s} event: {}", .{ event_type, err });
-            break :blk true;
-        };
-    }
-
-    /// Dispatch on the actual event target, then recover the node that owns a
-    /// browser default action through its stable JavaScript handle. A listener
-    /// can move or remove by-value DOM nodes while dispatch is in progress, so
-    /// retaining only `default_node` across the callback would be unsafe.
-    fn dispatchEventForDefault(
-        self: *Frame,
-        event_type: []const u8,
-        target: *Node,
-        default_node: *Node,
-    ) ?*Node {
-        const ctx = self.js_context orelse {
-            return if (self.dispatchEvent(event_type, target)) default_node else null;
-        };
-        const handle = ctx.captureNodeHandle(self.window_id, default_node) catch |err| {
-            std.log.warn("Failed to capture {s} default-action target: {}", .{ event_type, err });
-            return null;
-        };
-        if (!self.dispatchEvent(event_type, target)) return null;
-        return ctx.resolveAttachedNode(self.window_id, handle);
-    }
-
-    const ClickActionKind = enum {
-        iframe,
-        link,
-        input,
-        button,
-        contenteditable,
-    };
-
-    const ClickAction = struct {
-        node: *Node,
-        kind: ClickActionKind,
-    };
-
-    fn clickTarget(node: *Node) ?*Node {
-        var current: ?*Node = node;
-        while (current) |candidate| {
-            switch (candidate.*) {
-                .element => return candidate,
-                .text => |text| current = text.parent,
-            }
-        }
-        return null;
-    }
-
-    fn findClickAction(target: *Node, button: ClickButton) ?ClickAction {
-        var current: ?*Node = target;
-        while (current) |node| {
-            switch (node.*) {
-                .element => |element| {
-                    if (std.ascii.eqlIgnoreCase(element.tag, "iframe")) {
-                        return .{ .node = node, .kind = .iframe };
-                    }
-                    if (std.ascii.eqlIgnoreCase(element.tag, "a")) {
-                        return .{ .node = node, .kind = .link };
-                    }
-                    if (button == .primary and std.ascii.eqlIgnoreCase(element.tag, "input")) {
-                        return .{ .node = node, .kind = .input };
-                    }
-                    if (button == .primary and std.ascii.eqlIgnoreCase(element.tag, "button")) {
-                        return .{ .node = node, .kind = .button };
-                    }
-                    if (button == .primary) {
-                        const is_contenteditable = if (element.attributes) |attributes|
-                            attributes.get("contenteditable") != null
-                        else
-                            false;
-                        if (is_contenteditable) {
-                            return .{ .node = node, .kind = .contenteditable };
-                        }
-                    }
-                    current = element.parent;
-                },
-                .text => |text| current = text.parent,
-            }
-        }
-        return null;
-    }
-
-    fn nearestScrollContainer(target: *Node) ?*Node {
-        var current: ?*Node = target;
-        while (current) |node| {
-            switch (node.*) {
-                .element => |element| {
-                    if (element.scroll_container) return node;
-                    current = element.parent;
-                },
-                .text => |text| current = text.parent,
-            }
-        }
-        return null;
-    }
-
-    /// Focus a primary-click target, then recover it through a stable script
-    /// handle because the resulting focus listener may mutate the DOM before
-    /// link navigation or form submission continues.
-    fn focusPrimaryClickTarget(self: *Frame, b: *Browser, target: *Node) !?*Node {
-        const handle = if (self.js_context) |ctx|
-            try ctx.captureNodeHandle(self.window_id, target)
-        else
-            null;
-
-        _ = try self.tab.focusElement(b, self, target);
-        if (handle) |stable_handle| {
-            const ctx = self.js_context orelse return null;
-            return ctx.resolveAttachedNode(self.window_id, stable_handle);
-        }
-        return target;
-    }
-
-    /// Resolve a point only against an already-published generation. This is
-    /// called after the render layout phase and deliberately declines to read
-    /// a dirty protected document or a retained tree that still needs layout.
-    fn hoverHitNodeDevice(
-        self: *Frame,
-        device_x: i32,
-        device_y: i32,
-        zoom: f32,
-    ) ?*Node {
-        if (!self.document.dirty) {
-            if (self.document.get().*) |document| {
-                if (!document.layoutNeeded()) {
-                    if (document.hitTestDevice(device_x, device_y, zoom)) |hit| {
-                        return hoverElementForNode(hit.node);
-                    }
-                }
-            }
-        }
-
-        const items = self.display_list orelse return null;
-        const hit = DisplayItem.hitTestDevice(items, device_x, device_y, zoom) orelse return null;
-        const node = hit.source.originatingNode() orelse return null;
-        return hoverElementForNode(node);
-    }
-
-    fn iframeBoundsForNode(self: *const Frame, node: *Node) ?Bounds {
-        for (self.iframe_bounds.items) |entry| {
-            if (entry.node == node) return entry.bounds;
-        }
-        return null;
-    }
-
-    /// Collect one hovered element per browsing context along an iframe path.
-    /// Keeping the host iframe in the parent path makes parent-document
-    /// `iframe:hover` and ancestor selectors behave as expected.
-    fn collectHoverPathDevice(
-        self: *Frame,
-        device_x: i32,
-        device_y: i32,
-        zoom: f32,
-        path: *std.ArrayList(FrameHoverTarget),
-    ) !void {
-        const target = self.hoverHitNodeDevice(device_x, device_y, zoom) orelse return;
-        try path.append(self.allocator, .{ .frame = self, .node = target });
-
-        const element = switch (target.*) {
-            .element => |*value| value,
-            .text => return,
-        };
-        if (!std.ascii.eqlIgnoreCase(element.tag, "iframe")) return;
-
-        const child = self.findFrameByElement(target) orelse return;
-        const bounds = self.iframeBoundsForNode(target) orelse return;
-        const child_x = device_x -| DisplayItem.scaleLayoutPx(bounds.x, zoom);
-        const child_origin_y = bounds.y -| child.scroll;
-        const child_y = device_y -| DisplayItem.scaleLayoutPx(child_origin_y, zoom);
-        try child.collectHoverPathDevice(child_x, child_y, zoom, path);
-    }
-
-    pub fn click(self: *Frame, b: *Browser, x: i32, y: i32, button: ClickButton) !bool {
-        const zoom = self.tab.accessibility.zoom;
-        return self.clickDevice(
-            b,
-            DisplayItem.scaleLayoutPx(x, zoom),
-            DisplayItem.scaleLayoutPx(y, zoom),
-            button,
-            zoom,
-        );
-    }
-
-    pub fn clickDevice(
-        self: *Frame,
-        b: *Browser,
-        device_x: i32,
-        device_y: i32,
-        button: ClickButton,
-        zoom: f32,
-    ) !bool {
-        const items = self.display_list orelse return false;
-        const hit = DisplayItem.hitTestDevice(items, device_x, device_y, zoom) orelse return false;
-        const layout_hit = if (!self.document.dirty)
-            if (self.document.get().*) |document|
-                if (!document.layoutNeeded())
-                    document.hitTestDevice(device_x, device_y, zoom)
-                else
-                    null
-            else
-                null
-        else
-            null;
-        const hit_node = hit.source.originatingNode() orelse
-            if (layout_hit) |result| result.node else return false;
-        const target = clickTarget(hit_node) orelse return false;
-        const action = findClickAction(target, button);
-
-        if (action) |candidate| {
-            if (candidate.kind == .iframe) {
-                const rect = switch (hit.item.*) {
-                    .iframe => |iframe_item| iframe_item.rect,
-                    else => return true,
-                };
-                if (self.findFrameByElement(candidate.node)) |child| {
-                    if (button == .primary) self.tab.focused_frame = child;
-                    const child_x = hit.device_x -| DisplayItem.scaleLayoutPx(rect.left, zoom);
-                    // Composition applies one translation for
-                    // `iframe_top - child_scroll`; scale that combined CSS
-                    // offset once so fractional truncation matches the pixels
-                    // the user clicked.
-                    const child_origin_y = rect.top -| child.scroll;
-                    const child_y = hit.device_y -| DisplayItem.scaleLayoutPx(child_origin_y, zoom);
-                    _ = try child.clickDevice(b, child_x, child_y, button, zoom);
-                }
-                return true;
-            }
-        }
-
-        if (button == .primary) {
-            self.scroll_focus = nearestScrollContainer(target);
-            self.tab.focused_frame = self;
-        }
-
-        if (button != .primary) {
-            const candidate = action orelse return false;
-            const element = &candidate.node.element;
-            if (element.attributes) |attributes| {
-                if (attributes.get("href")) |href| {
-                    std.log.info("Link click in window_id={d}: {s}", .{ self.window_id, href });
-                    try self.followLink(b, href, button);
-                }
-            }
-            return true;
-        }
-
-        const candidate = action orelse {
-            _ = self.dispatchEvent("click", target);
-            return true;
-        };
-        const live_node = self.dispatchEventForDefault("click", target, candidate.node) orelse return true;
-        const element = switch (live_node.*) {
-            .element => |*value| value,
-            .text => return true,
-        };
-
-        switch (candidate.kind) {
-            .iframe => unreachable,
-            .link => {
-                const focused_node = try self.focusPrimaryClickTarget(b, live_node) orelse return true;
-                const focused_element = switch (focused_node.*) {
-                    .element => |*value| value,
-                    .text => return true,
-                };
-                if (focused_element.attributes) |attributes| {
-                    if (attributes.get("href")) |href| {
-                        std.log.info("Link click in window_id={d}: {s}", .{ self.window_id, href });
-                        try self.followLink(b, href, button);
-                    }
-                }
-            },
-            .input => {
-                if (element.isCheckbox()) {
-                    _ = try element.toggleChecked();
-                } else if (element.attributes) |*attributes| {
-                    try attributes.put("value", "");
-                }
-                _ = try self.tab.focusElement(b, self, live_node);
-            },
-            .button => {
-                const focused_node = try self.focusPrimaryClickTarget(b, live_node) orelse return true;
-                _ = try self.tab.submitForm(b, self, focused_node);
-            },
-            .contenteditable => {
-                _ = try self.tab.focusElement(b, self, live_node);
-            },
-        }
-        return true;
-    }
-
-    pub fn findFrameByElement(self: *Frame, node: *Node) ?*Frame {
-        if (self.frame_element == node) return self;
-        for (self.children.items) |child| {
-            if (child.findFrameByElement(node)) |hit| return hit;
-        }
-        return null;
-    }
-
-    fn childFrameIndexForWindow(
-        self: *Frame,
-        window_id: u32,
-        first_unbound: usize,
-    ) ?usize {
-        const registered = self.tab.frameForWindowId(window_id) orelse return null;
-        if (registered.parent != self) return null;
-        for (self.children.items[first_unbound..], first_unbound..) |child, index| {
-            if (child == registered) return index;
-        }
-        return null;
-    }
-
-    fn bindAttachedIframeNodes(self: *Frame, node: *Node, bound_count: *usize) void {
-        const element = switch (node.*) {
-            .element => |*value| value,
-            .text => return,
-        };
-
-        if (std.mem.eql(u8, element.tag, "iframe")) {
-            if (element.iframe_window_id) |window_id| {
-                if (self.childFrameIndexForWindow(window_id, bound_count.*)) |index| {
-                    if (index != bound_count.*) {
-                        std.mem.swap(
-                            *Frame,
-                            &self.children.items[index],
-                            &self.children.items[bound_count.*],
-                        );
-                    }
-                    const child = self.children.items[bound_count.*];
-                    child.frame_element = node;
-                    bound_count.* += 1;
-                } else {
-                    // Detached iframes retain their scalar marker so that the
-                    // Node can move without touching a dead Frame. Validate it
-                    // on every attachment and clear it when that context is no
-                    // longer registered beneath this parent.
-                    element.iframe_window_id = null;
-                }
-            }
-        }
-
-        for (element.children.items) |*child| {
-            self.bindAttachedIframeNodes(child, bound_count);
-        }
-    }
-
-    fn containsFrame(ancestor: *Frame, candidate: *Frame) bool {
-        var current: ?*Frame = candidate;
-        while (current) |frame| : (current = frame.parent) {
-            if (frame == ancestor) return true;
-        }
-        return false;
-    }
-
-    /// Rebind child browsing contexts after DOM child arrays move and destroy
-    /// contexts whose iframe element is no longer attached. The Element's
-    /// numeric window marker moves by value with the DOM node; no stale
-    /// frame_element pointer is dereferenced during this pass.
-    pub fn reconcileAttachedChildFrames(self: *Frame) void {
-        var bound_count: usize = 0;
-        if (self.current_node) |*root| {
-            self.bindAttachedIframeNodes(root, &bound_count);
-        }
-
-        while (self.children.items.len > bound_count) {
-            const removed = self.children.pop().?;
-            if (self.tab.focused_frame) |focused| {
-                if (containsFrame(removed, focused)) self.tab.focused_frame = self;
-            }
-            removed.deinit();
-            self.allocator.destroy(removed);
-        }
-    }
-
-    pub fn clearAllowedOrigins(self: *Frame) void {
-        if (self.allowed_origins) |*origins| {
-            for (origins.items) |origin| {
-                self.allocator.free(origin);
-            }
-            origins.deinit(self.allocator);
-            self.allowed_origins = null;
-        }
-    }
-
-    fn allocLowercase(self: *Frame, text: []const u8) ![]const u8 {
-        const copy = try self.allocator.alloc(u8, text.len);
-        for (copy, 0..) |*ch, idx| {
-            ch.* = std.ascii.toLower(text[idx]);
-        }
-        return copy;
-    }
-
-    pub fn allowedRequest(self: *Frame, target_url: Url, base_url: ?*const Url) bool {
-        var page_url: ?Url = null;
-        if (base_url) |base| {
-            page_url = base.*;
-        } else if (self.current_url) |url_ptr| {
-            page_url = url_ptr.*;
-        }
-        if (page_url) |current| {
-            if (current.sameOrigin(target_url)) {
-                return true;
-            }
-        }
-
-        const origins = self.allowed_origins orelse return true;
-
-        var origin_buffer: [256]u8 = undefined;
-        const host = target_url.host orelse return true;
-        const origin_str = std.fmt.bufPrint(&origin_buffer, "{s}://{s}:{d}", .{ target_url.scheme, host, target_url.port }) catch return false;
-
-        var lower_buffer: [256]u8 = undefined;
-        if (origin_str.len > lower_buffer.len) return false;
-        for (origin_str, 0..) |ch, idx| {
-            lower_buffer[idx] = std.ascii.toLower(ch);
-        }
-        const normalized = lower_buffer[0..origin_str.len];
-
-        for (origins.items) |allowed| {
-            if (allowed.len == normalized.len and std.mem.eql(u8, allowed, normalized)) {
-                return true;
-            }
-        }
-
-        return false;
-    }
-
-    pub fn applyContentSecurityPolicy(self: *Frame, header: []const u8, base_url: Url) !void {
-        const whitespace = " \t\r\n";
-        var directives = std.mem.tokenizeScalar(u8, header, ';');
-        while (directives.next()) |directive_raw| {
-            const trimmed = std.mem.trim(u8, directive_raw, whitespace);
-            if (trimmed.len == 0) continue;
-
-            var tokens = std.mem.tokenizeScalar(u8, trimmed, ' ');
-            const directive_name = tokens.next() orelse continue;
-            if (!std.ascii.eqlIgnoreCase(directive_name, "default-src")) continue;
-
-            var origins_list = std.ArrayList([]const u8).empty;
-            var assigned = false;
-            errdefer {
-                if (!assigned) {
-                    for (origins_list.items) |origin| self.allocator.free(origin);
-                    origins_list.deinit(self.allocator);
-                }
-            }
-
-            while (tokens.next()) |origin_token| {
-                const semicolon_trimmed = std.mem.trimEnd(u8, origin_token, ";\r\n \t");
-                const trimmed_origin = std.mem.trim(u8, semicolon_trimmed, whitespace);
-                if (trimmed_origin.len == 0) continue;
-
-                if (std.ascii.eqlIgnoreCase(trimmed_origin, "'self'") or
-                    std.ascii.eqlIgnoreCase(trimmed_origin, "self"))
-                {
-                    if (base_url.host) |host| {
-                        const normalized = try std.fmt.allocPrint(self.allocator, "{s}://{s}:{d}", .{
-                            base_url.scheme,
-                            host,
-                            base_url.port,
-                        });
-                        defer self.allocator.free(normalized);
-
-                        const lowered = try self.allocLowercase(normalized);
-                        try origins_list.append(self.allocator, lowered);
-                    }
-                    continue;
-                }
-
-                const origin_url = url_module.Url.init(self.allocator, trimmed_origin) catch |err| {
-                    std.log.warn("Failed to parse CSP origin {s}: {}", .{ trimmed_origin, err });
-                    continue;
-                };
-                defer origin_url.free(self.allocator);
-
-                const host = origin_url.host orelse continue;
-
-                const normalized = try std.fmt.allocPrint(self.allocator, "{s}://{s}:{d}", .{ origin_url.scheme, host, origin_url.port });
-                defer self.allocator.free(normalized);
-
-                const lowered = try self.allocLowercase(normalized);
-                try origins_list.append(self.allocator, lowered);
-            }
-
-            self.allowed_origins = origins_list;
-            assigned = true;
-            return;
-        }
-    }
-};
-
+pub const Frame = frame_module.FrameType(Tab, Browser, JsEventAccess);
+const FrameHoverTarget = Frame.FrameHoverTarget;
 // Tab represents a single web page
 pub const Tab = @This();
 // Memory allocator
@@ -1384,16 +98,9 @@ accessibility: AccessibilitySettings = .{},
 // Available height for tab content (window height minus chrome height)
 tab_width: i32 = 0,
 tab_height: i32 = 0,
-// Replayable joint root/iframe history with owned requests and prior subtrees.
-history: std.ArrayList(*HistoryEntry),
-// Index of the currently displayed history entry. Forward entries remain
-// owned until a successful ordinary navigation replaces that branch.
-history_index: ?usize = null,
-history_can_go_back: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
-history_can_go_forward: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
-// Invalidates a pending POST-resubmission decision if history changes while a
-// native confirmation dialog is pending.
-history_generation: u64 = 0,
+// Standalone replayable joint root/iframe history owner. It contains no live
+// Frame pointers; UI-thread readers observe only its atomic availability bits.
+history: history_module.State,
 // Owned, sentinel-terminated title from the current root document.
 title: ?[:0]u8 = null,
 // Dynamically allocated text strings (e.g., from JavaScript results) that need to be freed
@@ -1466,11 +173,7 @@ pub fn init(allocator: std.mem.Allocator, tab_width: i32, tab_height: i32, measu
         .accessibility = .{ .dark_palette = .{} },
         .tab_width = tab_width,
         .tab_height = tab_height,
-        .history = std.ArrayList(*HistoryEntry).empty,
-        .history_index = null,
-        .history_can_go_back = std.atomic.Value(bool).init(false),
-        .history_can_go_forward = std.atomic.Value(bool).init(false),
-        .history_generation = 0,
+        .history = history_module.State.init(allocator),
         .title = null,
         .focus_modality = .keyboard,
         .dynamic_texts = std.ArrayList([]const u8).empty,
@@ -1804,9 +507,7 @@ pub fn deinit(self: *Tab) void {
     }
     self.accessibility_strings.deinit(self.allocator);
 
-    // Clean up history
-    for (self.history.items) |entry| entry.deinit(self.allocator);
-    self.history.deinit(self.allocator);
+    self.history.deinit();
 
     self.task_runner.deinit();
     self.accessibility_speech.deinit();
@@ -2024,20 +725,11 @@ pub fn isShuttingDown(self: *const Tab) bool {
 }
 
 pub fn canGoBack(self: *const Tab) bool {
-    return self.history_can_go_back.load(.acquire);
+    return self.history.canGoBack();
 }
 
 pub fn canGoForward(self: *const Tab) bool {
-    return self.history_can_go_forward.load(.acquire);
-}
-
-fn updateHistoryAvailability(self: *Tab) void {
-    const current = self.history_index;
-    self.history_can_go_back.store(current != null and current.? > 0, .release);
-    self.history_can_go_forward.store(
-        current != null and current.? + 1 < self.history.items.len,
-        .release,
-    );
+    return self.history.canGoForward();
 }
 
 /// Return an owned child-index path from the root browsing context. Raw Frame
@@ -2121,7 +813,7 @@ fn prepareHistoryNavigationForPath(
     replaces_document: bool,
     previous: ?*FrameHistorySnapshot,
 ) !PreparedHistoryNavigation {
-    try self.history.ensureUnusedCapacity(self.allocator, 1);
+    try self.history.reserveEntry();
     return .{ .entry = try HistoryEntry.prepare(
         self.allocator,
         url,
@@ -2169,18 +861,7 @@ pub fn commitPreparedHistoryNavigation(
     self: *Tab,
     prepared: *PreparedHistoryNavigation,
 ) void {
-    const entry = prepared.entry orelse return;
-    const retained_len = if (self.history_index) |index| index + 1 else 0;
-    while (self.history.items.len > retained_len) {
-        const stale = self.history.pop().?;
-        stale.deinit(self.allocator);
-    }
-    self.history.appendAssumeCapacity(entry);
-    self.history_index = self.history.items.len - 1;
-    prepared.entry = null;
-    self.history_generation +%= 1;
-    if (self.history_generation == 0) self.history_generation = 1;
-    self.updateHistoryAvailability();
+    self.history.commit(prepared);
 }
 
 /// Testable/direct entry point for recording a completed navigation whose
@@ -2204,43 +885,11 @@ pub fn commitHistoryNavigationForPath(
     self.commitPreparedHistoryNavigation(&prepared);
 }
 
-fn pathEquals(left: []const usize, right: []const usize) bool {
-    return std.mem.eql(usize, left, right);
-}
-
-fn pathIsPrefix(prefix: []const usize, path: []const usize) bool {
-    return prefix.len <= path.len and std.mem.eql(usize, prefix, path[0..prefix.len]);
-}
-
-fn isAdjacentHistoryTarget(self: *const Tab, target: usize) bool {
-    const current = self.history_index orelse return false;
-    return (current > 0 and target == current - 1) or
-        (current + 1 < self.history.items.len and target == current + 1);
-}
-
 pub fn historyTraversalTarget(
     self: *const Tab,
     direction: HistoryDirection,
 ) ?HistoryTraversalTarget {
-    const current = self.history_index orelse return null;
-    const index = switch (direction) {
-        .back => if (current > 0) current - 1 else null,
-        .forward => if (current + 1 < self.history.items.len) current + 1 else null,
-    } orelse return null;
-    const action = self.history.items[if (direction == .back) current else index];
-    const method: HistoryMethod = if (!action.replaces_document)
-        .get
-    else if (direction == .forward)
-        action.method
-    else if (action.previous) |snapshot|
-        if (snapshot.containsPost()) .post else .get
-    else
-        self.history.items[index].method;
-    return .{
-        .index = index,
-        .generation = self.history_generation,
-        .method = method,
-    };
+    return self.history.traversalTarget(direction);
 }
 
 pub fn requestHistoryTraversal(self: *Tab, b: *Browser, direction: HistoryDirection) void {
@@ -2265,8 +914,8 @@ pub fn resubmitHistoryEntry(
     target: usize,
     generation: u64,
 ) !void {
-    if (generation != self.history_generation or !self.isAdjacentHistoryTarget(target)) return;
-    const current = self.history_index orelse return;
+    if (generation != self.history.generation or !self.history.isAdjacentTarget(target)) return;
+    const current = self.history.index orelse return;
     const direction: HistoryDirection = if (target < current) .back else .forward;
     const planned = self.historyTraversalTarget(direction) orelse return;
     if (planned.index != target or planned.method != .post) return;
@@ -2285,17 +934,17 @@ fn frameAtHistoryPath(self: *Tab, path: []const usize) ?*Frame {
 /// Resolve the request body that produced a frame's current document. An
 /// ancestor replacement resets every descendant to its authored initial GET,
 /// so an older exact-path POST must not leak through that boundary.
-fn currentHistoryPayloadForFrame(self: *Tab, frame: *Frame) !?[]const u8 {
-    const current_index = self.history_index orelse return null;
+pub fn currentHistoryPayloadForFrame(self: *Tab, frame: *Frame) !?[]const u8 {
+    const current_index = self.history.index orelse return null;
     const path = try self.historyFramePath(frame);
     defer self.allocator.free(path);
 
     var cursor = current_index + 1;
     while (cursor > 0) {
         cursor -= 1;
-        const entry = self.history.items[cursor];
-        if (pathEquals(entry.target_path, path)) return entry.post_body;
-        if (entry.replaces_document and pathIsPrefix(entry.target_path, path)) return null;
+        const entry = self.history.entries.items[cursor];
+        if (history_module.pathsEqual(entry.target_path, path)) return entry.post_body;
+        if (entry.replaces_document and history_module.pathIsPrefix(entry.target_path, path)) return null;
     }
     return null;
 }
@@ -2369,14 +1018,7 @@ fn restoreFrameHistorySnapshot(
 /// mutation separate from network/document replay makes the old index remain
 /// authoritative until every root and child-frame action has completed.
 pub fn finishHistoryTraversal(self: *Tab, target: usize, generation: u64) bool {
-    if (generation != self.history_generation or !self.isAdjacentHistoryTarget(target)) {
-        return false;
-    }
-    self.history_index = target;
-    self.history_generation +%= 1;
-    if (self.history_generation == 0) self.history_generation = 1;
-    self.updateHistoryAvailability();
-    return true;
+    return self.history.finishTraversal(target, generation);
 }
 
 fn loadHistoryEntry(
@@ -2385,10 +1027,10 @@ fn loadHistoryEntry(
     target: usize,
     generation: u64,
 ) !void {
-    if (generation != self.history_generation or !self.isAdjacentHistoryTarget(target)) return;
-    const current = self.history_index orelse return;
+    if (generation != self.history.generation or !self.history.isAdjacentTarget(target)) return;
+    const current = self.history.index orelse return;
     const is_back = target < current;
-    const entry = self.history.items[if (is_back) current else target];
+    const entry = self.history.entries.items[if (is_back) current else target];
     const frame = self.frameAtHistoryPath(entry.target_path) orelse
         return error.HistoryFramePathMissing;
 
@@ -3173,24 +1815,7 @@ fn advanceScrollAnimations(self: *Tab, now_ns: i96) bool {
 }
 
 fn hasActiveAnimations(node: *const parser.Node) bool {
-    return switch (node.*) {
-        .text => false,
-        .element => |*element| blk: {
-            if (element.css_animation) |state| {
-                if (!state.finished) break :blk true;
-            }
-            if (element.animations) |animations| {
-                var iterator = animations.iterator();
-                while (iterator.next()) |entry| {
-                    if (!entry.value_ptr.isComplete()) break :blk true;
-                }
-            }
-            for (element.children.items) |*child| {
-                if (hasActiveAnimations(child)) break :blk true;
-            }
-            break :blk false;
-        },
-    };
+    return tab_animation.hasActive(node);
 }
 
 fn markAnimationLayout(self: *Tab, elem: *parser.Element) void {
@@ -3205,164 +1830,34 @@ fn markAnimationLayout(self: *Tab, elem: *parser.Element) void {
     if (self.root_frame) |root_frame| markFrameLayoutDirty(root_frame);
 }
 
-fn publishAnimationValue(
-    self: *Tab,
-    elem: *parser.Element,
-    property: []const u8,
-    anim: *parser.Animation,
-    css_keyframe_animation: bool,
-) void {
-    if (std.mem.eql(u8, property, "opacity")) {
-        switch (anim.*) {
-            .numeric => |numeric| {
-                const opacity = numeric.getValue();
-                // Transition values historically publish through the
-                // computed style's Element-owned buffer. A keyframe animation
-                // must leave the underlying computed value untouched so it
-                // can be restored when a finite animation ends.
-                if (!css_keyframe_animation) {
-                    if (elem.style) |*style_map| {
-                        if (style_map.getPtr("opacity")) |field| {
-                            const buf = std.fmt.bufPrint(
-                                &elem.opacity_anim_value,
-                                "{d:.3}",
-                                .{opacity},
-                            ) catch null;
-                            if (buf) |value| field.set(value);
-                        }
-                    }
-                }
-                const update = CompositedUpdate{
-                    .node = @ptrCast(elem),
-                    .value = .{ .opacity = opacity },
-                };
-                self.composited_updates.append(self.allocator, update) catch return;
-                if (self.root_frame) |root_frame| applyRetainedCompositedUpdate(root_frame, update);
-            },
-            .pixel, .color, .transform => {},
-        }
-    } else if (std.mem.eql(u8, property, "background-color")) {
-        switch (anim.*) {
-            .color => {
-                self.needs_paint = true;
-                markAnimationLayout(self, elem);
-            },
-            .numeric, .pixel, .transform => {},
-        }
-    } else if (std.mem.eql(u8, property, "transform")) {
-        switch (anim.*) {
-            .transform => |transform| {
-                const pixels = transform.getValue().layoutPixels();
-                const update = CompositedUpdate{
-                    .node = @ptrCast(elem),
-                    .value = .{ .transform = .{ .x = pixels.x, .y = pixels.y } },
-                };
-                self.composited_updates.append(self.allocator, update) catch return;
-                if (self.root_frame) |root_frame| applyRetainedCompositedUpdate(root_frame, update);
-            },
-            .numeric, .pixel, .color => {},
-        }
-    } else if (std.mem.eql(u8, property, "width") or std.mem.eql(u8, property, "height")) {
-        switch (anim.*) {
-            .pixel => markAnimationLayout(self, elem),
-            .numeric, .color, .transform => {},
-        }
-    }
+fn publishAnimationComposited(context: *anyopaque, update: CompositedUpdate) void {
+    const self: *Tab = @ptrCast(@alignCast(context));
+    self.composited_updates.append(self.allocator, update) catch return;
+    if (self.root_frame) |root_frame| applyRetainedCompositedUpdate(root_frame, update);
 }
 
-fn restartCssAnimation(self: *Tab, elem: *parser.Element, state: *parser.CssAnimationState) void {
-    state.completed_iterations += 1;
-    state.restart_pending = false;
-    const should_reverse = state.direction == .alternate;
-    if (elem.animations) |*animations| {
-        for (parser.css_animation_properties) |property| {
-            if (!state.contains(property)) continue;
-            if (animations.getPtr(property)) |animation| {
-                if (should_reverse) animation.reverse();
-                animation.reset();
-                self.publishAnimationValue(elem, property, animation, true);
-            }
-        }
-    }
+fn markAnimationLayoutFromSink(context: *anyopaque, element: *parser.Element) void {
+    const self: *Tab = @ptrCast(@alignCast(context));
+    self.markAnimationLayout(element);
 }
 
-fn invalidateRemovedCssAnimation(self: *Tab, elem: *parser.Element, property_mask: u8) void {
-    for (parser.css_animation_properties) |property| {
-        if ((property_mask & parser.cssAnimationPropertyBit(property)) == 0) continue;
-        if (std.mem.eql(u8, property, "background-color") or
-            std.mem.eql(u8, property, "width") or
-            std.mem.eql(u8, property, "height"))
-        {
-            markAnimationLayout(self, elem);
-            if (std.mem.eql(u8, property, "background-color")) self.needs_paint = true;
-        } else {
-            // Opacity and transform tracks mutate retained effect wrappers
-            // directly while running. Once a finite CSS animation is removed,
-            // rebuild this element's cache from its underlying computed style.
-            parser.markPaintForElement(elem);
-            self.needs_paint = true;
-        }
-    }
+fn requestAnimationPaint(context: *anyopaque) void {
+    const self: *Tab = @ptrCast(@alignCast(context));
+    self.needs_paint = true;
+}
+
+fn animationSink(self: *Tab) tab_animation.Sink {
+    return .{
+        .context = self,
+        .publish_composited = publishAnimationComposited,
+        .mark_layout = markAnimationLayoutFromSink,
+        .request_paint = requestAnimationPaint,
+    };
 }
 
 /// Advance transitions and named keyframe animations in the node tree.
 fn advanceAnimations(self: *Tab, node: *parser.Node) bool {
-    var any_running = false;
-
-    switch (node.*) {
-        .element => |*elem| {
-            var skip_css_tracks = false;
-            if (elem.css_animation) |*state| {
-                if (state.restart_pending) {
-                    if (state.hasAnotherIteration()) {
-                        self.restartCssAnimation(elem, state);
-                        any_running = true;
-                    } else {
-                        const property_mask = state.property_mask;
-                        parser.finishCssAnimationTracks(elem);
-                        self.invalidateRemovedCssAnimation(elem, property_mask);
-                    }
-                    skip_css_tracks = true;
-                }
-            }
-
-            if (elem.animations) |*animations| {
-                const css_animation_active = if (elem.css_animation) |state| !state.finished else false;
-                var css_tracks_complete = css_animation_active;
-                var it = animations.iterator();
-                while (it.next()) |entry| {
-                    const is_css_track = if (elem.css_animation) |state|
-                        !state.finished and state.contains(entry.key_ptr.*)
-                    else
-                        false;
-                    if (is_css_track and skip_css_tracks) continue;
-
-                    const anim = entry.value_ptr;
-                    if (!anim.isComplete()) {
-                        _ = anim.advance();
-                        any_running = true;
-                        self.publishAnimationValue(elem, entry.key_ptr.*, anim, is_css_track);
-                    }
-                    if (is_css_track and !anim.isComplete()) css_tracks_complete = false;
-                }
-
-                if (!skip_css_tracks and css_animation_active and css_tracks_complete) {
-                    if (elem.css_animation) |*state| {
-                        state.restart_pending = true;
-                        // Preserve the terminal endpoint for this render, then
-                        // schedule one more frame to restart or restore style.
-                        any_running = true;
-                    }
-                }
-            }
-
-            for (elem.children.items) |*child| {
-                if (self.advanceAnimations(child)) any_running = true;
-            }
-        },
-        .text => {},
-    }
-    return any_running;
+    return tab_animation.advance(self.animationSink(), node);
 }
 
 fn createCleanPhaseTestDocument(
@@ -3891,7 +2386,7 @@ pub fn planFormSubmission(
 }
 
 // Submit the form containing an activated button or text entry.
-fn submitForm(self: *Tab, b: *Browser, frame: *Frame, control_node: *Node) !bool {
+pub fn submitForm(self: *Tab, b: *Browser, frame: *Frame, control_node: *Node) !bool {
     // IMPORTANT: We cannot traverse parent pointers here because loadInTab
     // will free the tree, invalidating all pointers. Instead, we search
     // the entire tree from the root to find which form contains this control.

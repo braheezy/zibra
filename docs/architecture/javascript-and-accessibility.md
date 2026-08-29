@@ -23,13 +23,23 @@ Every tab-owned host installs a shutdown interrupt. The VM polls it at safe
 points and turns it into an uncatchable host error at the evaluation boundary,
 allowing Tab shutdown to join an otherwise infinite script.
 
+Page-visible Web API shims live in `src/script/runtime/bootstrap.js` and are
+embedded at compile time, then evaluated once before page code. Native
+functions are installed from comptime tables. Event/focus, canvas, timer, and
+network-facing functions each retain a pointer to a narrow `Host` interface
+embedded in the heap-stable `Js` allocation. These interfaces expose only
+current-window scalars, synchronous borrows, and copied callback arguments;
+binding modules do not import the `Js` coordinator.
+
 ## Window and document generations
 
-A `WindowContext` stores the current DOM root, raw-pointer-to-numeric-handle
-maps, callbacks, timers, listeners, and named globals. `Js.setNodes` changes the
-root and clears handle maps. Installing null during teardown must not call back
-into JavaScript; it immediately makes wrappers inert. A later non-null install
-clears and rebuilds on the serialized Tab worker before evaluation resumes.
+A `WindowContext` stores the current DOM root, its `dom_handles.Store`,
+callbacks, timers, listeners, and named globals. The store owns both pointer-
+to-numeric and numeric-to-pointer directions and reserves both maps before
+publishing an identity. `Js.setNodes` changes the root and clears the store.
+Installing null during teardown must not call back into JavaScript; it
+immediately makes wrappers inert. A later non-null install clears and rebuilds
+on the serialized Tab worker before evaluation resumes.
 
 `JsRenderContext` is the stable synchronous host-callback identity embedded in
 a Frame. It carries current Browser/Tab/host pointers plus a document
@@ -42,6 +52,13 @@ value in resizable child arrays. Supported mutation APIs synchronously retire
 or rebind every affected handle. Future mutation APIs must use the same
 boundary; an old wrapper must never silently retarget when an array address is
 reused.
+
+`dom_mutation.Context` is a synchronous borrow of one window's handle and
+detached-root stores. Its structural transactions stage allocations before
+invalidation, temporarily unpublish pointer keys only during the non-fallible
+move, and repair both handle directions before returning. Paired host hooks
+clear and rebuild ID globals and notify document/layout owners without giving
+the mutation module access to the realm coordinator.
 
 ## DOM handles and mutation APIs
 
@@ -88,6 +105,11 @@ Event object, keep `target` fixed, and update `currentTarget` for each node.
 stopping the next ancestor; `preventDefault` independently cancels the browser
 action.
 
+The event/focus native binding receives only an active-window borrow containing
+the root, handle store, and optional focus callback. That borrow ends with the
+Kiesel call; bubbling continues from its numeric snapshot even if a listener
+relocates the original Nodes.
+
 Browser-generated focus and blur events are target-only. Click, key, form, and
 submit events follow their supported bubbling behavior. Default anchor, input,
 button, or contenteditable actions resolve a previously captured stable handle
@@ -131,10 +153,18 @@ are removed before invocation. `setInterval` reschedules one generation-stamped
 one-shot only after a live callback completes. `clearInterval` removes both
 JavaScript and native cancellation keys; old queued deliveries become no-ops.
 
+Timer native bindings forward only a numeric handle, clamped delay, and repeat
+flag through their host interface. The binding never retains the callback,
+document, or window; the embedded runtime and browser scheduler remain owners.
+
 XHR same-origin/CORS policy belongs to the Browser callback, not a JavaScript
 shim. Both synchronous return and asynchronous `onload` move response bytes to
 traced storage. An async denial intentionally schedules no `onload` because the
 current API subset has no `onerror` event.
+
+Cookie, XHR, and postMessage argument buffers are callback-scoped. The network
+binding copies callback-owned response text into Kiesel's traced allocator
+before releasing it and forwards policy decisions to browser-owned callbacks.
 
 `postMessage` parses target origin synchronously:
 
@@ -155,6 +185,10 @@ Canvas wrappers are window-scoped and cached by stable Node handle so repeated
 heap-stable. Pixel-changing commands dirty retained paint and request paint;
 path/state-only commands do not. Assigning either dimension resets native
 pixels/path/transform and wrapper paint state even when the value is unchanged.
+
+The canvas binding resolves an Element through a synchronous host borrow. It
+owns command validation and backing-store operations, but returns no DOM
+pointer and requests rendering only through its host callback.
 
 If z2d has no equivalent, the native method returns `error.NotImplemented` and
 the host consumes it as a nonfatal `undefined`, allowing later page script to

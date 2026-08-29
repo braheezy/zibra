@@ -28,6 +28,32 @@ source-backed DOM text is copied verbatim to avoid double escaping.
 `Page.repairParentPointers` after that root reaches its final address and before
 layout or paint performs an ancestry walk.
 
+## Document module ownership
+
+`src/document/parser.zig` is a compatibility entry point, not a second
+document owner. Existing callers import one stable surface while the work is
+split across acyclic modules:
+
+- `dom.zig` owns Node/Element/Text storage, Element-backed resources, parent
+  and style-owner rebinding, invalidation callbacks, and DOM traversal helpers;
+- `html_parser.zig` is a stateful, source-borrowing tokenizer/tree builder
+  generic over the DOM types and final parent-pointer repair callback;
+- `html_serialization.zig` generically serializes the current live tree and
+  owns only temporary output/sorting allocations;
+- `animation.zig` defines pure transition/keyframe interpolation values that
+  Elements own, while the serialized Tab animation driver decides which
+  render phase each published value dirties;
+- `style_application.zig` owns property defaults, cascade, inheritance,
+  animation-track updates, and subtree-skipping style traversal behind a
+  narrow comptime DOM/callback interface; and
+- `style.zig` binds that algorithm to `dom.zig` and publishes the concrete
+  style-pass functions re-exported by `parser.zig`.
+
+Focused owners may import their direct leaf dependencies, but must not import
+`parser.zig` back through the compatibility surface. Keep the facade
+logic-free so DOM storage, parsing, serialization, animation values, and style
+application retain unambiguous lifetimes.
+
 ## Address-unstable Node storage
 
 Element children are `Node` values in resizable arrays. A child pointer is
@@ -175,6 +201,29 @@ unless a preferred ratio can derive it. `object-fit` keeps the element box
 separate from the visible bitmap destination and preserves fractional source
 crops through clone/snapshot boundaries.
 
+Pure layout leaves are intentionally separated from retained object state:
+
+- `render/box_model.zig` resolves box edges, dimensions, positioning values,
+  radii, and authored-zoom math after the owning layout object has made any
+  dependency-tracked style read;
+- `render/inline_format.zig` normalizes inline text and computes alignment,
+  wrapping, line-height, and font-variant used values without walking or
+  owning the layout tree;
+- `render/control_geometry.zig` computes control leaf geometry, while the
+  `InputLayout` and `ButtonLayout` objects retain DOM/font/collector
+  invariants in `layout.zig`;
+- `render/layout_hit.zig` performs pointer-free local-coordinate conversion,
+  rounded clipping, scroll/transform localization, and reverse-child ordering
+  over a synchronous borrow of the committed paint permutation; and
+- `render/replaced_paint.zig` constructs background and rounded-control
+  command leaves/groups whose pixels and provenance remain borrowed from the
+  current generation.
+
+These modules must not register ProtectedField dependencies or acquire
+Browser/Frame ownership. Methods that mutate parent/previous links, dirty
+state, DOM callbacks, retained caches, or owned child arrays stay beside their
+layout objects.
+
 A canvas Element lazily owns a heap-stable backing because z2d Context points
 to the embedded Surface. Canvas drawing runs on the serialized tab worker.
 Every pixel-changing command dirties the nearest retained paint owner. Paint
@@ -194,6 +243,16 @@ must be traversed by synchronous readers, and is ignored by recursive cleanup.
 Composition and raster snapshots must materialize it into ordinary owned
 containers before a Browser lock or thread boundary. Temporary rich-button
 trees cannot publish cache edges because their owners retire immediately.
+`render/retained_commands.zig` owns this deep-materialization algorithm: it
+recursively copies owning command containers and immutable canvas pixels, but
+does not own or extend the lifetime of the source layout cache.
+
+`render/paint_effects.zig` owns scalar effect resolution and the construction
+of blur, clip, blend, transform, position, and scroll command groups. Its
+`wrapOwned` boundary consumes the independently owned top-level input slice on
+both success and allocation failure. Callers reserve a destination before
+transferring returned owning items, so no recursive command is shallow-copied
+across a fallible operation.
 
 Layout invalidation also dirties paint. Paint invalidation follows layout
 ancestry without dirtying geometry. An element-backed block forwards inherited
@@ -223,6 +282,20 @@ browser-owned layer pointers. Numeric compositor IDs may cross; raw pointers
 may not. Worker jobs, caches, and results use the SMP allocator.
 
 ## Compositor and interest-region contracts
+
+Each Browser embeds one retained `display_compositor.Compositor`. It owns the
+browser-allocator layer command trees and its derived draw list. A
+`DrawCompositedLayer` command borrows an address in the layer array, so the
+draw list must retire before any layer is destroyed, rebuilt, or moved. Neither
+those raw pointers nor the retained Browser allocator storage cross the raster
+worker boundary; `RasterSnapshot` produces the independent worker-owned form.
+
+`software_renderer.Renderer` is the Browser-free interpreter for those owned
+commands: primitive drawing, image sampling, opacity/blend/mask/blur effects,
+and retained-layer rasterization. It borrows immutable allocator/I/O choices
+and the retained compositor's pure bounds calculator, but owns no SDL handle,
+thread, or command tree. Browser and presentation-worker code provide the
+surface lifetime and explicit zoom/offset inputs.
 
 The worker keeps either a bounded assembled page surface or ordered compositor
 planes. The interest region is at most four native window heights. A viewport
@@ -256,7 +329,9 @@ than targets, and retains exact glyph/fragment geometry. Layout hit testing
 converts the point into parent-local coordinates while descending; blocks
 invert live transforms, add element scroll, apply local clips, and visit
 children in reverse paint order. Do not rebuild absolute rectangles for every
-descendant.
+descendant. The committed child permutation is borrowed only for that
+synchronous traversal; if its length no longer matches the child set, hit
+testing safely falls back to reverse DOM order.
 
 Content clicks require a painted hit but use structural provenance when a
 synthetic wrapper has none. Capture stable JavaScript handles before listener

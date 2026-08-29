@@ -88,14 +88,36 @@ would otherwise create; do not process the same token through both paths.
 Nested button starts implicitly close the active button, while other
 descendants remain within the current button for layout and activation.
 
+The document pipeline is split by ownership and algorithm boundaries:
+
+- `dom.zig` owns `Node`, `Element`, and `Text` representation, Element-backed
+  resources, parent/style-owner rebinding, and DOM invalidation callbacks.
+- `html_parser.zig` is the stateful tokenizer/tree builder. It borrows the
+  decoded HTML buffer and receives DOM types plus final parent-pointer repair
+  through a comptime boundary, so it does not import the compatibility facade.
+- `html_serialization.zig` is a generic leaf that traverses the live DOM,
+  escapes attributes, and applies void-element rules without owning nodes or
+  source buffers.
+- `animation.zig` owns pure CSS transition/keyframe value objects stored by
+  Elements. It does not decide whether an animation dirties compositor,
+  paint, or layout; the Tab driver owns that phase decision.
+- `style_application.zig` owns computed-property defaults, cascade,
+  inheritance, animation-track updates, and the style-pass algorithm behind a
+  narrow comptime DOM/callback interface. It never owns a Node or layout
+  object.
+- `style.zig` binds that generic style application to `dom.zig` and exports
+  Zibra's concrete style-pass API.
+- `parser.zig` is the stable compatibility entry point. It re-exports the DOM,
+  HTML parser, serialization, animation, and style APIs for existing callers;
+  it is not an additional owner and must stay an acyclic, logic-free facade.
+
 `inspection.Page.load` returns the root by value. Repair parent pointers after
 the returned page reaches its final address before any ancestry-dependent
 style/layout/paint operation.
 
-`parser.zig` is already large and combines DOM data, HTML parsing, and style
-application. Add new independent grammar/data owners in focused modules rather
-than expanding it by default; avoid facade cycles or splitting methods away
-from the invariants they maintain.
+Add new grammar/data owners in focused modules rather than putting logic in
+the compatibility entry point. Avoid facade cycles or splitting methods away
+from the DOM/style invariants they maintain.
 
 ## Verification
 

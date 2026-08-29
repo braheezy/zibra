@@ -33,49 +33,44 @@ fn commitRequest(
 }
 
 fn deinitHistory(tab: *tab_module.Tab) void {
-    for (tab.history.items) |entry| entry.deinit(tab.allocator);
-    tab.history.deinit(tab.allocator);
+    tab.history.deinit();
 }
 
 test "indexed history supports back, forward, and forward-branch truncation" {
     const allocator = std.testing.allocator;
     var tab: tab_module.Tab = undefined;
     tab.allocator = allocator;
-    tab.history = .empty;
+    tab.history = tab_module.HistoryState.init(allocator);
     defer deinitHistory(&tab);
-    tab.history_index = null;
-    tab.history_can_go_back = std.atomic.Value(bool).init(false);
-    tab.history_can_go_forward = std.atomic.Value(bool).init(false);
-    tab.history_generation = 0;
 
     try std.testing.expect(!tab.canGoBack());
     try std.testing.expect(!tab.canGoForward());
 
     try commitUrl(&tab, "https://example.com/a", &.{}, true);
-    try std.testing.expectEqual(@as(?usize, 0), tab.history_index);
+    try std.testing.expectEqual(@as(?usize, 0), tab.history.index);
     try std.testing.expect(!tab.canGoBack());
     try std.testing.expect(!tab.canGoForward());
 
     try commitUrl(&tab, "https://example.com/b", &.{}, true);
     try commitUrl(&tab, "https://example.com/c", &.{}, true);
-    try std.testing.expectEqual(@as(?usize, 2), tab.history_index);
+    try std.testing.expectEqual(@as(?usize, 2), tab.history.index);
     try std.testing.expect(tab.canGoBack());
     try std.testing.expect(!tab.canGoForward());
 
     const back = tab.historyTraversalTarget(.back).?;
     try std.testing.expect(tab.finishHistoryTraversal(back.index, back.generation));
-    try std.testing.expectEqual(@as(?usize, 1), tab.history_index);
+    try std.testing.expectEqual(@as(?usize, 1), tab.history.index);
     try std.testing.expect(tab.canGoBack());
     try std.testing.expect(tab.canGoForward());
-    try std.testing.expectEqual(@as(usize, 3), tab.history.items.len);
+    try std.testing.expectEqual(@as(usize, 3), tab.history.entries.items.len);
 
     // A normal navigation after Back replaces the forward branch.
     try commitUrl(&tab, "https://example.com/d", &.{}, true);
-    try std.testing.expectEqual(@as(?usize, 2), tab.history_index);
-    try std.testing.expectEqual(@as(usize, 3), tab.history.items.len);
-    try std.testing.expectEqualStrings("/a", tab.history.items[0].url.path);
-    try std.testing.expectEqualStrings("/b", tab.history.items[1].url.path);
-    try std.testing.expectEqualStrings("/d", tab.history.items[2].url.path);
+    try std.testing.expectEqual(@as(?usize, 2), tab.history.index);
+    try std.testing.expectEqual(@as(usize, 3), tab.history.entries.items.len);
+    try std.testing.expectEqualStrings("/a", tab.history.entries.items[0].url.path);
+    try std.testing.expectEqualStrings("/b", tab.history.entries.items[1].url.path);
+    try std.testing.expectEqualStrings("/d", tab.history.entries.items[2].url.path);
     try std.testing.expect(tab.canGoBack());
     try std.testing.expect(!tab.canGoForward());
 
@@ -91,12 +86,8 @@ test "history owns POST bodies and identifies resubmission targets" {
     const allocator = std.testing.allocator;
     var tab: tab_module.Tab = undefined;
     tab.allocator = allocator;
-    tab.history = .empty;
+    tab.history = tab_module.HistoryState.init(allocator);
     defer deinitHistory(&tab);
-    tab.history_index = null;
-    tab.history_can_go_back = std.atomic.Value(bool).init(false);
-    tab.history_can_go_forward = std.atomic.Value(bool).init(false);
-    tab.history_generation = 0;
 
     try commitUrl(&tab, "https://example.com/start", &.{}, true);
     const submitted = try allocator.dupe(u8, "q=original");
@@ -105,16 +96,16 @@ test "history owns POST bodies and identifies resubmission targets" {
     submitted[2] = 'X';
     try commitUrl(&tab, "https://example.com/after", &.{}, true);
 
-    try std.testing.expectEqual(tab_module.HistoryMethod.get, tab.history.items[0].method);
-    try std.testing.expect(tab.history.items[0].post_body == null);
-    try std.testing.expectEqual(tab_module.HistoryMethod.post, tab.history.items[1].method);
-    try std.testing.expectEqualStrings("q=original", tab.history.items[1].post_body.?);
+    try std.testing.expectEqual(tab_module.HistoryMethod.get, tab.history.entries.items[0].method);
+    try std.testing.expect(tab.history.entries.items[0].post_body == null);
+    try std.testing.expectEqual(tab_module.HistoryMethod.post, tab.history.entries.items[1].method);
+    try std.testing.expectEqualStrings("q=original", tab.history.entries.items[1].post_body.?);
 
     const target = tab.historyTraversalTarget(.back).?;
     try std.testing.expectEqual(@as(usize, 1), target.index);
     try std.testing.expectEqual(tab_module.HistoryMethod.post, target.method);
     // Planning or declining a replay does not move history.
-    try std.testing.expectEqual(@as(?usize, 2), tab.history_index);
+    try std.testing.expectEqual(@as(?usize, 2), tab.history.index);
 
     var test_browser: Browser = undefined;
     test_browser.allocator = allocator;
@@ -137,13 +128,13 @@ test "history owns POST bodies and identifies resubmission targets" {
     );
     // Simulate Cancel: consuming the request schedules no load.
     test_browser.pending_post_resubmission = null;
-    try std.testing.expectEqual(@as(?usize, 2), tab.history_index);
+    try std.testing.expectEqual(@as(?usize, 2), tab.history.index);
 
     try std.testing.expect(tab.finishHistoryTraversal(target.index, target.generation));
-    try std.testing.expectEqual(@as(?usize, 1), tab.history_index);
-    try std.testing.expectEqual(tab_module.HistoryMethod.post, tab.history.items[1].method);
-    try std.testing.expectEqualStrings("q=original", tab.history.items[1].post_body.?);
-    try std.testing.expect(target.generation != tab.history_generation);
+    try std.testing.expectEqual(@as(?usize, 1), tab.history.index);
+    try std.testing.expectEqual(tab_module.HistoryMethod.post, tab.history.entries.items[1].method);
+    try std.testing.expectEqualStrings("q=original", tab.history.entries.items[1].post_body.?);
+    try std.testing.expect(target.generation != tab.history.generation);
 
     const forward = tab.historyTraversalTarget(.forward).?;
     try std.testing.expectEqual(tab_module.HistoryMethod.get, forward.method);
@@ -153,12 +144,8 @@ test "joint history orders interleaved sibling-frame navigations" {
     const allocator = std.testing.allocator;
     var tab: tab_module.Tab = undefined;
     tab.allocator = allocator;
-    tab.history = .empty;
+    tab.history = tab_module.HistoryState.init(allocator);
     defer deinitHistory(&tab);
-    tab.history_index = null;
-    tab.history_can_go_back = std.atomic.Value(bool).init(false);
-    tab.history_can_go_forward = std.atomic.Value(bool).init(false);
-    tab.history_generation = 0;
 
     try commitUrl(&tab, "https://example.com/root", &.{}, true);
     var first_frame_path = [_]usize{0};
@@ -167,8 +154,8 @@ test "joint history orders interleaved sibling-frame navigations" {
     first_frame_path[0] = 99;
     try commitUrl(&tab, "https://example.com/frame-b/one", &.{1}, true);
 
-    try std.testing.expectEqualSlices(usize, &.{0}, tab.history.items[1].target_path);
-    try std.testing.expectEqualSlices(usize, &.{1}, tab.history.items[2].target_path);
+    try std.testing.expectEqualSlices(usize, &.{0}, tab.history.entries.items[1].target_path);
+    try std.testing.expectEqualSlices(usize, &.{1}, tab.history.entries.items[2].target_path);
     try std.testing.expect(tab.canGoBack());
 
     // Back from B reconstructs root + A, leaving B at its authored URL.
@@ -193,9 +180,9 @@ test "joint history orders interleaved sibling-frame navigations" {
     target = tab.historyTraversalTarget(.back).?;
     try std.testing.expect(tab.finishHistoryTraversal(target.index, target.generation));
     try commitUrl(&tab, "https://example.com/frame-a/two", &.{0}, true);
-    try std.testing.expectEqual(@as(usize, 3), tab.history.items.len);
-    try std.testing.expectEqualStrings("/frame-a/two", tab.history.items[2].url.path);
-    try std.testing.expectEqualSlices(usize, &.{0}, tab.history.items[2].target_path);
+    try std.testing.expectEqual(@as(usize, 3), tab.history.entries.items.len);
+    try std.testing.expectEqualStrings("/frame-a/two", tab.history.entries.items[2].url.path);
+    try std.testing.expectEqualSlices(usize, &.{0}, tab.history.entries.items[2].target_path);
     try std.testing.expect(!tab.canGoForward());
 }
 
@@ -203,12 +190,8 @@ test "parent-frame history snapshots retain nested request state" {
     const allocator = std.testing.allocator;
     var tab: tab_module.Tab = undefined;
     tab.allocator = allocator;
-    tab.history = .empty;
+    tab.history = tab_module.HistoryState.init(allocator);
     defer deinitHistory(&tab);
-    tab.history_index = null;
-    tab.history_can_go_back = std.atomic.Value(bool).init(false);
-    tab.history_can_go_forward = std.atomic.Value(bool).init(false);
-    tab.history_generation = 0;
     tab.root_frame = null;
     tab.frames_by_id = std.AutoHashMap(u32, *tab_module.Frame).init(allocator);
     defer tab.frames_by_id.deinit();
@@ -249,7 +232,7 @@ test "parent-frame history snapshots retain nested request state" {
     defer prepared.deinit(allocator);
     tab.commitPreparedHistoryNavigation(&prepared);
 
-    const entry = tab.history.items[2];
+    const entry = tab.history.entries.items[2];
     try std.testing.expectEqualSlices(usize, &.{0}, entry.target_path);
     const previous = entry.previous.?;
     try std.testing.expectEqualStrings("/parent", previous.url.path);
@@ -283,12 +266,8 @@ test "same-document history never requests POST resubmission" {
     const allocator = std.testing.allocator;
     var tab: tab_module.Tab = undefined;
     tab.allocator = allocator;
-    tab.history = .empty;
+    tab.history = tab_module.HistoryState.init(allocator);
     defer deinitHistory(&tab);
-    tab.history_index = null;
-    tab.history_can_go_back = std.atomic.Value(bool).init(false);
-    tab.history_can_go_forward = std.atomic.Value(bool).init(false);
-    tab.history_generation = 0;
 
     try commitRequest(
         &tab,

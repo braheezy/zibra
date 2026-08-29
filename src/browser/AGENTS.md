@@ -23,8 +23,15 @@ The nested [`render/AGENTS.md`](render/AGENTS.md) adds rendering-specific rules.
 | Module | Owner or boundary |
 | --- | --- |
 | `app.zig` | Sole interactive SDL poller, shared session/measurement, heap-stable Browser registry |
-| `root.zig` | One native window, tabs/chrome, fetch/render orchestration, raster result acceptance, native presentation |
-| `tab.zig` | Frame tree, document generations, serialized page work, history, focus/accessibility state |
+| `root.zig` | One native window, tab/chrome coordination, committed-frame acceptance, raster scheduling, native presentation |
+| `resource_loader.zig` | Per-window navigation/resource bridge over the shared session runner and joined source-order batches |
+| `display_compositor.zig` | Browser-allocator owner of retained composited layers and their borrowing draw list |
+| `software_renderer.zig` | Browser-free z2d command interpreter, effects, image sampling, and layer rasterization |
+| `presentation_worker.zig` | Raster runner, worker-only surfaces/cache, completed-result transfer, and joined teardown |
+| `tab.zig` | Serialized page work, render-phase orchestration, focus/accessibility state, and Frame-tree coordination |
+| `frame.zig` | One document generation: DOM/style/layout/display ownership, child Frames, hit testing, and default actions |
+| `history.zig` | Pointer-free owning joint root/iframe session history and traversal preparation |
+| `tab_animation.zig` | Transition/keyframe advancement and compositor-versus-layout/paint phase classification |
 | `session_state.zig` | Window-independent HTTP/cookie/cache and visited/bookmark state plus networking runner |
 | `tab_tasks.zig` | Owned payloads transferred from UI/Browser to a Tab runner |
 | `js_context.zig` | Stable synchronous generation-stamped host-callback identity embedded in a Frame |
@@ -36,11 +43,12 @@ The nested [`render/AGENTS.md`](render/AGENTS.md) adds rendering-specific rules.
 | `window_geometry.zig` | Pure replacement geometry for native resize |
 | `scroll.zig` | Scroll ranges, interest-region geometry, and viewport scroll animation |
 
-`root.zig` remains an oversized coordinator. Do not add an independent
-algorithm or standalone data owner there by default. Natural extraction seams
-include resource coordination and the per-window presentation worker, but an
-extraction must have explicit inputs, ownership, and shutdown without a
-circular facade.
+`root.zig` remains a large coordinator. Do not add an independent algorithm or
+standalone data owner there by default. Keep software drawing in
+`software_renderer.zig` and raster-runner/cache/result ownership in
+`presentation_worker.zig`; further extraction of cache-building algorithms
+must use owned snapshots and scalar inputs rather than importing Browser back
+into either leaf module.
 
 ## Thread and ownership rules
 
@@ -49,13 +57,19 @@ circular facade.
 - A Browser is heap-stable. Interactive construction borrows App session,
   measurement, text-input, and SDL services; standalone screenshot construction
   owns them. Preserve those distinct teardown paths.
+- The embedded resource Loader borrows that stable Browser's session. Its
+  synchronous task contexts borrow the Loader only until their completion
+  semaphore is posted; linked-resource batches join every transport helper.
 - SDL window/renderer/texture/title/dialog/presentation calls stay on the UI
   thread. Raster workers use self-contained SMP-allocated software snapshots.
+- `software_renderer.Renderer` may run on the raster worker but owns no thread
+  or native object. Its retained-layer allocator and pure compositor-bounds
+  borrow remain valid until the presentation worker has joined.
 - Every Tab task or helper that can cross navigation carries a copied document
   identity. Never queue a borrowed `*Frame`, `*Node`, or `JsRenderContext`.
 - Tab workers do not mutate Browser tab/chrome collections. Cross-thread new
   tabs transfer an owning `Url`; ownership moves only after successful queueing.
-- Stop the raster runner before tabs/fonts/surfaces/native handles. Stop a Tab's
+- Stop the presentation worker before tabs/fonts/surfaces/native handles. Stop a Tab's
   serialized producer before its accessibility runner. Stop the session
   networking runner only after every Browser/helper borrow has ended.
 - Keep Browser/session lock scopes narrow and follow the ordering in the thread
@@ -73,11 +87,23 @@ circular facade.
 - Retire a Frame display list and DOM-keyed bounds before rebuilding/destroying
   layout or DOM. It may contain provenance and non-owning retained-cache edges.
   Composition must materialize edges and clear provenance before commit.
+- A Browser's retained compositor owns its layer command trees. Its draw-list
+  layer pointers are borrowers, so clear the draw list before retiring or
+  replacing layers.
 - Structural DOM mutation uses the synchronous retirement/completion boundary.
   Network loading of new resources happens after the host call returns.
 - Each Frame owns its URL, decoded HTML, stylesheet source/rule/keyframe
   generation, layout pointer, display list, and child Frames. Raw parent,
   frame-element, focus/hover, and layout pointers borrow that generation.
+- `frame.zig` is instantiated through a narrow comptime boundary so it can own
+  Frame invariants without importing the Tab coordinator back through a cycle.
+  Keep Frame-to-Tab calls synchronous and explicit; do not widen that boundary
+  into an opaque forwarding facade.
+- `history.State` contains only owned URL/body/path snapshots, numeric frame
+  paths, and atomic UI availability bits. Live Frame pointers never enter it.
+- `tab_animation.zig` mutates Element-owned animation tracks synchronously and
+  reports phase work through its small Sink. Tab remains responsible for
+  scheduling and publishing the resulting composited updates.
 - Child Frame media width divides authored-zoom-scaled geometry by its inherited
   authored factor. Parent viewport changes dirty child layout before the
   follow-up media/style pass.

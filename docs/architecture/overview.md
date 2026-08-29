@@ -11,8 +11,14 @@ changing a boundary; this overview is not a substitute for those contracts.
 | --- | --- |
 | `src/main.zig` | CLI parsing, isolated inspection modes, interactive startup, and standalone screenshot startup |
 | `src/browser/app.zig` | Process-wide SDL event routing, native-window registry, shared session, and shared measurement |
-| `src/browser/root.zig` | One native window, tabs and chrome, fetch orchestration, render commits, raster scheduling, and presentation |
-| `src/browser/tab.zig` | Tabs, frames, document generations, serialized page work, history, focus, and accessibility |
+| `src/browser/root.zig` | One native window, tabs and chrome, render commits, raster coordination, and native presentation |
+| `src/browser/resource_loader.zig` | Session-backed navigation/subresource dispatch and joined resource batches |
+| `src/browser/software_renderer.zig` | Browser-free z2d command drawing, effects, image sampling, and layer rasterization |
+| `src/browser/presentation_worker.zig` | Per-window raster runner, worker caches/surfaces, result transfer, and teardown |
+| `src/browser/tab.zig` | Serialized page work, render orchestration, Frame-tree coordination, focus, and accessibility |
+| `src/browser/frame.zig` | Per-document DOM/style/layout/display generations, child Frames, hit testing, and default actions |
+| `src/browser/history.zig` | Owning pointer-free joint root/iframe session history |
+| `src/browser/tab_animation.zig` | Animation advancement and render-phase classification |
 | `src/browser/render/` | Layout, fonts, display commands, software effects, raster snapshots, and compositor planes |
 | `src/document/` | DOM, HTML and CSS parsing, selectors, computed style, canvas backing, and pure CSS helpers |
 | `src/script/` | Kiesel host integration, JavaScript realms, DOM handles, events, timers, and XHR |
@@ -32,8 +38,10 @@ process main / BrowserApp thread
   owns shared BrowserSession and MeasureTime
   owns heap-stable Browser pointers, one per native window
     Browser
-      owns native window/chrome/presentation state and tabs
-      owns one raster-and-draw TaskRunner
+      owns native window/chrome/final-presentation state and tabs
+      embeds one resource Loader and retained display Compositor
+      embeds one software Renderer and presentation Worker
+        presentation Worker owns one raster-and-draw TaskRunner
       Tab
         owns Frame tree, DOM generations, and one serialized TaskRunner
         owns one accessibility TaskRunner
@@ -65,11 +73,14 @@ window-addressed events cannot reach retired storage.
 ### Browser
 
 One `Browser` owns a native window's renderer, texture and z2d presentation
-surfaces; its tabs; its private HTML chrome and chrome layout/font state; the
-window's page layout/font engine; committed display/compositor state; and its
-raster worker. `Browser.initAppWindow` borrows App services. Standalone
-`Browser.init` owns the corresponding SDL/session/measurement services for the
-windowless screenshot path. Keep those destruction paths explicit.
+surfaces; its tabs; its private HTML chrome and chrome layout/font state; and
+the window's page layout/font engine. Concrete embedded owners hold committed
+display/compositor state, session-backed loading, the pure software command
+interpreter, and raster runner/cache/result state. Browser still coordinates
+their inputs and exclusively performs final SDL upload/presentation.
+`Browser.initAppWindow` borrows App services. Standalone `Browser.init` owns the
+corresponding SDL/session/measurement services for the windowless screenshot
+path. Keep those destruction paths explicit.
 
 The Browser is heap-stable because z2d context state points into it. Browser
 registry growth moves only pointers, never Browser values.
@@ -84,11 +95,16 @@ Tab, DOM, or layout state.
 
 ### Tab and Frame
 
-A Tab owns its root Frame tree, per-origin JavaScript hosts, history, frame and
-document generations, serialized task runner, accessibility runner and tree,
-and animation/helper accounting. It borrows its Browser and MeasureTime.
+A Tab owns its root Frame tree, per-origin JavaScript hosts, a standalone
+pointer-free `history.State`, frame and document generations, serialized task
+runner, accessibility runner and tree, and animation/helper accounting. It
+borrows its Browser and MeasureTime. `tab_animation.zig` advances Element-owned
+tracks through a narrow synchronous sink; Tab still owns animation scheduling
+and render-phase orchestration.
 
-A Frame owns its decoded HTML, root DOM value, child Frames, current URL,
+A Frame's implementation lives in `frame.zig` behind a comptime boundary that
+avoids importing the Tab coordinator back through a cycle. It owns its decoded
+HTML, root DOM value, child Frames, current URL,
 stylesheet source/rule/keyframe generation, protected document-layout pointer,
 frame-side display list, and copied hit/focus/image/fragment indexes. Raw
 parent, frame-element, focus, hover, layout, and callback pointers borrow only

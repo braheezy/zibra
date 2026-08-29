@@ -146,6 +146,7 @@ test "navigation document helper owns generated about bookmarks HTML" {
     var test_browser: browser.Browser = undefined;
     test_browser.allocator = allocator;
     test_browser.session_state = &session;
+    test_browser.resource_loader = .init(allocator, std.testing.io, &session);
 
     const url = try Url.initForNavigation(allocator, "about:bookmarks");
     defer url.free(allocator);

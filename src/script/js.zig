@@ -6,6 +6,13 @@
 
 const std = @import("std");
 const Mutex = @import("../runtime/sync.zig").Mutex;
+const DomHandles = @import("dom_handles.zig").Store;
+const dom_mutation = @import("dom_mutation.zig");
+const native_bindings = @import("native_bindings.zig");
+const canvas_bindings = @import("canvas_bindings.zig");
+const event_focus_bindings = @import("event_focus_bindings.zig");
+const network_bindings = @import("network_bindings.zig");
+const timer_bindings = @import("timer_bindings.zig");
 
 const bdwgc = @import("bdwgc");
 const kiesel = @import("kiesel");
@@ -14,271 +21,13 @@ const Script = kiesel.language.Script;
 const Realm = kiesel.execution.Realm;
 const Value = kiesel.types.Value;
 const parser = @import("../document/parser.zig");
-const dom_focus = @import("../document/focus.zig");
 const Node = parser.Node;
 const CSSParser = @import("../document/css_parser.zig").CSSParser;
-const NumericAnimation = parser.NumericAnimation;
 const PixelAnimation = parser.PixelAnimation;
-const ColorAnimation = parser.ColorAnimation;
-const TransformAnimation = parser.TransformAnimation;
-const Animation = parser.Animation;
-const EasingFunction = parser.EasingFunction;
 
 const Js = @This();
 
-// Assume 60 fps for frame calculations
-const FRAMES_PER_SECOND: u32 = 60;
-
-/// Parse a simple inline style string like "opacity: 0.5; transition: opacity 2s"
-fn parseInlineStyle(allocator: std.mem.Allocator, style_str: []const u8) !std.StringHashMap([]const u8) {
-    var result = std.StringHashMap([]const u8).init(allocator);
-    errdefer result.deinit();
-
-    var parts = std.mem.tokenizeAny(u8, style_str, ";");
-    while (parts.next()) |part| {
-        const trimmed = std.mem.trim(u8, part, " \t\n\r");
-        if (trimmed.len == 0) continue;
-
-        if (std.mem.indexOf(u8, trimmed, ":")) |colon_idx| {
-            const property = std.mem.trim(u8, trimmed[0..colon_idx], " \t");
-            const value = std.mem.trim(u8, trimmed[colon_idx + 1 ..], " \t");
-            try result.put(property, value);
-        }
-    }
-    return result;
-}
-
-const TransitionValue = struct {
-    property: []const u8,
-    frames: u32,
-    easing_function: EasingFunction,
-};
-
-fn takeTransitionToken(remaining: *[]const u8) ?[]const u8 {
-    const trimmed = std.mem.trimStart(u8, remaining.*, " \t\n\r");
-    if (trimmed.len == 0) return null;
-    const end = std.mem.indexOfAny(u8, trimmed, " \t\n\r") orelse trimmed.len;
-    remaining.* = trimmed[end..];
-    return trimmed[0..end];
-}
-
-/// Parse `property duration [timing-function]`. CSS transitions default to
-/// `ease`, while an explicit supported keyword or cubic-bezier overrides it.
-fn parseTransitionValue(value: []const u8) ?TransitionValue {
-    var remaining = value;
-    const property = takeTransitionToken(&remaining) orelse return null;
-    const duration_str = takeTransitionToken(&remaining) orelse return null;
-
-    var duration_seconds: f64 = 0;
-    if (std.mem.endsWith(u8, duration_str, "ms")) {
-        const ms_str = duration_str[0 .. duration_str.len - 2];
-        const ms = std.fmt.parseFloat(f64, ms_str) catch return null;
-        duration_seconds = ms / 1000.0;
-    } else if (std.mem.endsWith(u8, duration_str, "s")) {
-        const s_str = duration_str[0 .. duration_str.len - 1];
-        duration_seconds = std.fmt.parseFloat(f64, s_str) catch return null;
-    } else {
-        return null;
-    }
-
-    const frame_count = duration_seconds * @as(f64, FRAMES_PER_SECOND);
-    const max_frames: f64 = @floatFromInt(std.math.maxInt(u32));
-    if (!std.math.isFinite(frame_count) or frame_count < 0 or frame_count > max_frames) return null;
-    const frames: u32 = @intFromFloat(frame_count);
-
-    const timing_value = std.mem.trim(u8, remaining, " \t\n\r");
-    const easing_function = if (timing_value.len == 0)
-        EasingFunction.ease
-    else
-        parser.parseEasingFunction(timing_value) orelse return null;
-
-    return .{
-        .property = property,
-        .frames = @max(1, frames),
-        .easing_function = easing_function,
-    };
-}
-
-const TransitionListIterator = struct {
-    remaining: []const u8,
-
-    fn init(value: []const u8) TransitionListIterator {
-        return .{ .remaining = value };
-    }
-
-    /// Split only top-level commas so cubic-bezier arguments remain one
-    /// timing function.
-    fn next(self: *TransitionListIterator) ?[]const u8 {
-        self.remaining = std.mem.trim(u8, self.remaining, " \t\n\r,");
-        if (self.remaining.len == 0) return null;
-        var depth: usize = 0;
-        for (self.remaining, 0..) |char, index| {
-            switch (char) {
-                '(' => depth += 1,
-                ')' => depth -|= 1,
-                ',' => if (depth == 0) {
-                    const result = self.remaining[0..index];
-                    self.remaining = self.remaining[index + 1 ..];
-                    return std.mem.trim(u8, result, " \t\n\r");
-                },
-                else => {},
-            }
-        }
-        const result = self.remaining;
-        self.remaining = &.{};
-        return std.mem.trim(u8, result, " \t\n\r");
-    }
-};
-
-/// Start an opacity animation on an element
-fn startOpacityAnimation(
-    allocator: std.mem.Allocator,
-    elem: *parser.Element,
-    start: f64,
-    end: f64,
-    frames: u32,
-    easing_function: EasingFunction,
-) !void {
-    if (elem.animations == null) {
-        elem.animations = std.StringHashMap(Animation).init(allocator);
-    }
-    const animation = Animation{
-        .numeric = NumericAnimation.initWithEasing(start, end, frames, easing_function),
-    };
-    try elem.animations.?.put("opacity", animation);
-}
-
-/// Start a background-color animation on an element.
-fn startBackgroundColorAnimation(
-    allocator: std.mem.Allocator,
-    elem: *parser.Element,
-    start: parser.CssColor,
-    end: parser.CssColor,
-    frames: u32,
-    easing_function: EasingFunction,
-) !void {
-    if (elem.animations == null) {
-        elem.animations = std.StringHashMap(Animation).init(allocator);
-    }
-    const animation = Animation{
-        .color = ColorAnimation.initWithEasing(start, end, frames, easing_function),
-    };
-    try elem.animations.?.put("background-color", animation);
-}
-
-fn startTransformAnimation(
-    allocator: std.mem.Allocator,
-    elem: *parser.Element,
-    start: parser.Translation,
-    end: parser.Translation,
-    frames: u32,
-    easing_function: EasingFunction,
-) !void {
-    if (elem.animations == null) {
-        elem.animations = std.StringHashMap(Animation).init(allocator);
-    }
-    const animation = Animation{
-        .transform = TransformAnimation.initWithEasing(
-            start,
-            end,
-            frames,
-            easing_function,
-        ),
-    };
-    try elem.animations.?.put("transform", animation);
-}
-
-fn startPixelAnimation(
-    allocator: std.mem.Allocator,
-    elem: *parser.Element,
-    property: []const u8,
-    start: f64,
-    end: f64,
-    frames: u32,
-    easing_function: EasingFunction,
-) !void {
-    if (elem.animations == null) {
-        elem.animations = std.StringHashMap(Animation).init(allocator);
-    }
-    const animation = Animation{ .pixel = PixelAnimation.initWithEasing(
-        start,
-        end,
-        frames,
-        easing_function,
-    ) };
-    try elem.animations.?.put(property, animation);
-}
-
-test "transition values default to ease and parse supported timing functions" {
-    const default_transition = parseTransitionValue("background-color 500ms").?;
-    try std.testing.expectEqualStrings("background-color", default_transition.property);
-    try std.testing.expectEqual(@as(u32, 30), default_transition.frames);
-    try std.testing.expectApproxEqAbs(
-        EasingFunction.ease.apply(0.5),
-        default_transition.easing_function.apply(0.5),
-        0.000001,
-    );
-
-    const linear = parseTransitionValue("opacity 2s linear").?;
-    try std.testing.expectEqual(@as(u32, 120), linear.frames);
-    try std.testing.expectApproxEqAbs(0.5, linear.easing_function.apply(0.5), 0.000001);
-
-    const explicit = parseTransitionValue(
-        "opacity 1s cubic-bezier(0.42, 0, 0.58, 1)",
-    ).?;
-    try std.testing.expectApproxEqAbs(0.5, explicit.easing_function.apply(0.5), 0.000001);
-    try std.testing.expect(parseTransitionValue("opacity 1s steps(2)") == null);
-    try std.testing.expect(parseTransitionValue("opacity -1s ease") == null);
-}
-
-test "transition list keeps cubic-bezier commas and simultaneous properties" {
-    var iterator = TransitionListIterator.init(
-        "transform 1s cubic-bezier(0.25, 0.1, 0.25, 1), opacity 1s linear",
-    );
-    const transform = parseTransitionValue(iterator.next().?).?;
-    try std.testing.expectEqualStrings("transform", transform.property);
-    try std.testing.expectApproxEqAbs(EasingFunction.ease.apply(0.5), transform.easing_function.apply(0.5), 0.000001);
-    const opacity = parseTransitionValue(iterator.next().?).?;
-    try std.testing.expectEqualStrings("opacity", opacity.property);
-    try std.testing.expectApproxEqAbs(0.5, opacity.easing_function.apply(0.5), 0.000001);
-    try std.testing.expect(iterator.next() == null);
-}
-
-fn currentAnimatedOpacity(elem: *const parser.Element) ?f64 {
-    const animations = elem.animations orelse return null;
-    const animation = animations.get("opacity") orelse return null;
-    return switch (animation) {
-        .numeric => |numeric| numeric.getValue(),
-        .pixel, .color, .transform => null,
-    };
-}
-
-fn currentAnimatedBackgroundColor(elem: *const parser.Element) ?parser.CssColor {
-    const animations = elem.animations orelse return null;
-    const animation = animations.get("background-color") orelse return null;
-    return switch (animation) {
-        .color => |color| color.getValue(),
-        .numeric, .pixel, .transform => null,
-    };
-}
-
-fn currentAnimatedTransform(elem: *const parser.Element) ?parser.Translation {
-    const animations = elem.animations orelse return null;
-    const animation = animations.get("transform") orelse return null;
-    return switch (animation) {
-        .transform => |transform| transform.getValue(),
-        .numeric, .pixel, .color => null,
-    };
-}
-
-fn currentAnimatedPixel(elem: *const parser.Element, property: []const u8) ?f64 {
-    const animations = elem.animations orelse return null;
-    const animation = animations.get(property) orelse return null;
-    return switch (animation) {
-        .pixel => |pixel| pixel.getValue(),
-        .numeric, .color, .transform => null,
-    };
-}
+const transitions = @import("transitions.zig");
 
 pub const RenderCallbackFn = *const fn (context: ?*anyopaque) anyerror!void;
 
@@ -290,7 +39,7 @@ const RenderCallback = struct {
 /// Runs synchronously for an attached, intrinsically focusable element. The
 /// numeric handle remains the stable identity if blur listeners relocate DOM
 /// children before the browser installs the new focus.
-pub const FocusCallbackFn = *const fn (context: ?*anyopaque, handle: u32) anyerror!void;
+pub const FocusCallbackFn = event_focus_bindings.FocusCallbackFn;
 
 const FocusCallback = struct {
     function: ?FocusCallbackFn = null,
@@ -300,14 +49,7 @@ const FocusCallback = struct {
 /// Runs synchronously before JavaScript changes DOM child storage. Browser
 /// embedders use this boundary to retire every snapshot that borrows the
 /// current DOM generation before any node can move or be destroyed.
-pub const DomMutationKind = enum {
-    /// Child storage may be removed, reordered, or replaced. Every style and
-    /// layout dependency is retired before mutation.
-    structural,
-    /// A block-mode owner has verified that its existing direct children can
-    /// be matched and retained while a new child is inserted.
-    retained_insert,
-};
+pub const DomMutationKind = dom_mutation.Kind;
 
 pub const DomMutationCallbackFn = *const fn (
     context: ?*anyopaque,
@@ -334,24 +76,15 @@ const DomMutationCompleteCallback = struct {
     context: ?*anyopaque = null,
 };
 
-pub const AnimationFrameCallbackFn = *const fn (context: ?*anyopaque) anyerror!void;
+pub const AnimationFrameCallbackFn = timer_bindings.AnimationFrameCallbackFn;
 
 const AnimationFrameCallback = struct {
     function: ?AnimationFrameCallbackFn = null,
     context: ?*anyopaque = null,
 };
 
-pub const SetTimeoutCallbackFn = *const fn (
-    context: ?*anyopaque,
-    handle: u32,
-    delay_ms: u32,
-    is_interval: bool,
-) anyerror!void;
-
-pub const ClearIntervalCallbackFn = *const fn (
-    context: ?*anyopaque,
-    handle: u32,
-) void;
+pub const SetTimeoutCallbackFn = timer_bindings.SetTimeoutCallbackFn;
+pub const ClearIntervalCallbackFn = timer_bindings.ClearIntervalCallbackFn;
 
 const SetTimeoutCallback = struct {
     function: ?SetTimeoutCallbackFn = null,
@@ -391,47 +124,24 @@ const JsLock = struct {
     }
 };
 
-pub const PostMessageCallbackFn = *const fn (
-    context: ?*anyopaque,
-    source_window_id: u32,
-    target_window_id: u32,
-    target_origin: []const u8,
-    message: []const u8,
-) anyerror!void;
+pub const PostMessageCallbackFn = network_bindings.PostMessageCallbackFn;
 
 const PostMessageCallback = struct {
     function: ?PostMessageCallbackFn = null,
     context: ?*anyopaque = null,
 };
 
-pub const XhrResult = struct {
-    data: []const u8,
-    allocator: ?std.mem.Allocator = null,
-    should_free: bool = false,
-};
-
-pub const XhrCallbackFn = *const fn (
-    context: ?*anyopaque,
-    method: []const u8,
-    url: []const u8,
-    body: ?[]const u8,
-    is_async: bool,
-    handle: u32,
-) anyerror!XhrResult;
+pub const XhrResult = network_bindings.XhrResult;
+pub const XhrCallbackFn = network_bindings.XhrCallbackFn;
 
 const XhrCallback = struct {
     function: ?XhrCallbackFn = null,
     context: ?*anyopaque = null,
 };
 
-pub const CookieResult = struct {
-    data: []const u8,
-    allocator: ?std.mem.Allocator = null,
-    should_free: bool = false,
-};
-
-pub const CookieGetCallbackFn = *const fn (context: ?*anyopaque) anyerror!CookieResult;
-pub const CookieSetCallbackFn = *const fn (context: ?*anyopaque, value: []const u8) anyerror!void;
+pub const CookieResult = network_bindings.CookieResult;
+pub const CookieGetCallbackFn = network_bindings.CookieGetCallbackFn;
+pub const CookieSetCallbackFn = network_bindings.CookieSetCallbackFn;
 
 const CookieCallback = struct {
     get_function: ?CookieGetCallbackFn = null,
@@ -447,12 +157,10 @@ const PendingMessage = struct {
 
 const WindowContext = struct {
     realm: *Realm,
-    node_to_handle: std.AutoHashMap(*Node, u32),
-    handle_to_node: std.AutoHashMap(u32, *Node),
+    handles: DomHandles,
     // Heap-stable owners for createElement results and removeChild subtrees
     // that have not yet been transferred into a DOM child array.
     detached_nodes: std.AutoHashMap(*Node, void),
-    next_handle: u32,
     current_nodes: ?*Node,
     // The shared Kiesel realm exposes named element globals for only the
     // active window. This records whether the JavaScript-side per-window
@@ -479,6 +187,12 @@ agent: Agent,
 allocator: std.mem.Allocator,
 io: std.Io,
 storage_allocator: std.mem.Allocator,
+// Kiesel retains pointers to these narrow interfaces for the lifetime of the
+// shared realm. `Js` itself is heap-stable and outlives every native function.
+canvas_host: canvas_bindings.Host,
+event_focus_host: event_focus_bindings.Host,
+network_host: network_bindings.Host,
+timer_host: timer_bindings.Host,
 windows: std.AutoHashMap(u32, WindowContext),
 parent_window_ids: std.AutoHashMap(u32, u32),
 current_window_id: ?u32 = null,
@@ -512,6 +226,33 @@ pub fn init(
     self.allocator = allocator;
     self.io = io;
     self.storage_allocator = storage_allocator;
+    self.canvas_host = .{
+        .context = self,
+        .allocator = allocator,
+        .io = io,
+        .resolve_element = resolveCanvasBindingElement,
+        .request_render = requestBindingRender,
+    };
+    self.event_focus_host = .{
+        .context = self,
+        .active_window = activeEventFocusWindow,
+    };
+    self.network_host = .{
+        .context = self,
+        .allocator = allocator,
+        .current_window_id = currentBindingWindowId,
+        .parent_window_id = parentBindingWindowId,
+        .cookie_get = getBindingCookie,
+        .cookie_set = setBindingCookie,
+        .xhr_send = sendBindingXhr,
+        .post_message = sendBindingPostMessage,
+    };
+    self.timer_host = .{
+        .context = self,
+        .schedule = scheduleBindingTimer,
+        .clear = clearBindingTimer,
+        .request_animation_frame = requestBindingAnimationFrame,
+    };
     self.windows = std.AutoHashMap(u32, WindowContext).init(allocator);
     self.parent_window_ids = std.AutoHashMap(u32, u32).init(allocator);
     self.current_window_id = null;
@@ -534,10 +275,8 @@ fn ensureWindow(self: *Js, window_id: u32) !void {
 
     const ctx = WindowContext{
         .realm = self.realm.?,
-        .node_to_handle = std.AutoHashMap(*Node, u32).init(self.allocator),
-        .handle_to_node = std.AutoHashMap(u32, *Node).init(self.allocator),
+        .handles = DomHandles.init(self.allocator),
         .detached_nodes = std.AutoHashMap(*Node, void).init(self.allocator),
-        .next_handle = 0,
         .current_nodes = null,
         .named_globals_synced = false,
         .pending_messages = std.ArrayList(PendingMessage).empty,
@@ -639,8 +378,7 @@ pub fn deinit(self: *Js, allocator: std.mem.Allocator) void {
     var it = self.windows.valueIterator();
     while (it.next()) |window| {
         self.clearDetachedNodes(window);
-        window.node_to_handle.deinit();
-        window.handle_to_node.deinit();
+        window.handles.deinit();
         window.detached_nodes.deinit();
         for (window.pending_messages.items) |msg| {
             self.allocator.free(msg.message);
@@ -678,476 +416,7 @@ pub fn evaluate(self: *Js, window_id: u32, code: []const u8) !Value {
     self.lock.lock();
     defer self.lock.unlock();
     const window = try self.setCurrentWindow(window_id);
-    // Inject runtime code to wrap handles in Node objects
-    const runtime_code =
-        \\// Node constructor that wraps a handle
-        \\function Node(handle) {
-        \\  this.handle = handle;
-        \\}
-        \\
-        \\var XHR_REQUESTS = {};
-        \\
-        \\function XMLHttpRequest() {
-        \\  this.handle = Object.keys(XHR_REQUESTS).length;
-        \\  XHR_REQUESTS[this.handle] = this;
-        \\  this.is_async = true;
-        \\  this.__method = "GET";
-        \\  this.__url = "";
-        \\}
-        \\
-        \\XMLHttpRequest.prototype.open = function(method, url, is_async) {
-        \\  var flag = (is_async === undefined) ? true : !!is_async;
-        \\  this.is_async = flag;
-        \\  this.__method = method;
-        \\  this.__url = url;
-        \\};
-        \\
-        \\XMLHttpRequest.prototype.send = function(body) {
-        \\  var payload = body == null ? null : body.toString();
-        \\  var response = __native.xhrSend(
-        \\    this.__method || "GET",
-        \\    this.__url,
-        \\    payload,
-        \\    !!this.is_async,
-        \\    this.handle
-        \\  );
-        \\  if (!this.is_async) {
-        \\    this.responseText = response;
-        \\  }
-        \\};
-        \\
-        \\function Event(type) {
-        \\  this.type = type;
-        \\  this.bubbles = false;
-        \\  this.do_default = true;
-        \\  this.defaultPrevented = false;
-        \\  this.propagation_stopped = false;
-        \\  this.target = null;
-        \\  this.currentTarget = null;
-        \\}
-        \\
-        \\Event.prototype.preventDefault = function() {
-        \\  this.do_default = false;
-        \\  this.defaultPrevented = true;
-        \\};
-        \\
-        \\Event.prototype.stopPropagation = function() {
-        \\  this.propagation_stopped = true;
-        \\};
-        \\
-        \\var WINDOW_NODE_LISTENERS = {};
-        \\
-        \\function listenersForWindow(windowId) {
-        \\  if (!WINDOW_NODE_LISTENERS[windowId]) WINDOW_NODE_LISTENERS[windowId] = {};
-        \\  return WINDOW_NODE_LISTENERS[windowId];
-        \\}
-        \\
-        \\Node.prototype.addEventListener = function(type, listener) {
-        \\  var listeners = listenersForWindow(window.__id);
-        \\  if (!listeners[this.handle]) listeners[this.handle] = {};
-        \\  var dict = listeners[this.handle];
-        \\  if (!dict[type]) dict[type] = [];
-        \\  var list = dict[type];
-        \\  list.push(listener);
-        \\};
-        \\
-        \\Node.prototype.dispatchEvent = function(evt) {
-        \\  var event = typeof evt === "string" ? new Event(evt) : evt;
-        \\  var path = event.bubbles ? __native.eventPath(this.handle) : [this.handle];
-        \\  var listeners = listenersForWindow(window.__id);
-        \\  event.propagation_stopped = false;
-        \\  event.target = path.length ? new Node(path[0]) : this;
-        \\  for (var pathIndex = 0; pathIndex < path.length; pathIndex++) {
-        \\    var currentTarget = new Node(path[pathIndex]);
-        \\    event.currentTarget = currentTarget;
-        \\    var dict = listeners[path[pathIndex]];
-        \\    var list = (dict && dict[event.type]) || [];
-        \\    for (var listenerIndex = 0; listenerIndex < list.length; listenerIndex++) {
-        \\      list[listenerIndex].call(currentTarget, event);
-        \\    }
-        \\    if (event.propagation_stopped) break;
-        \\  }
-        \\  event.currentTarget = null;
-        \\  return event.do_default;
-        \\};
-        \\
-        \\// Add getAttribute method to Node prototype
-        \\Node.prototype.getAttribute = function(name) {
-        \\  return __native.getAttribute(this.handle, name);
-        \\};
-        \\
-        \\// Add setAttribute method to Node prototype
-        \\Node.prototype.setAttribute = function(name, value) {
-        \\  var text = value == null ? "" : value.toString();
-        \\  if (__native.setAttribute(this.handle, name, text)) {
-        \\    resetCanvasContextState(this.handle);
-        \\  }
-        \\};
-        \\
-        \\Object.defineProperty(Node.prototype, "id", {
-        \\  get: function() { return this.getAttribute("id") || ""; },
-        \\  set: function(value) {
-        \\    this.setAttribute("id", value == null ? "" : value.toString());
-        \\  }
-        \\});
-        \\
-        \\Node.prototype.appendChild = function(child) {
-        \\  __native.appendChild(this.handle, child && child.handle);
-        \\  return child;
-        \\};
-        \\
-        \\Node.prototype.insertBefore = function(child, reference) {
-        \\  var referenceHandle = reference === null ? null : reference && reference.handle;
-        \\  __native.insertBefore(this.handle, child && child.handle, referenceHandle);
-        \\  return child;
-        \\};
-        \\
-        \\Node.prototype.removeChild = function(child) {
-        \\  __native.removeChild(this.handle, child && child.handle);
-        \\  return child;
-        \\};
-        \\
-        \\Node.prototype.replaceChildren = function() {
-        \\  var nativeArguments = [this.handle];
-        \\  for (var index = 0; index < arguments.length; index++) {
-        \\    var child = arguments[index];
-        \\    nativeArguments.push(child && typeof child.handle === "number" ? child.handle : undefined);
-        \\  }
-        \\  __native.replaceChildren.apply(__native, nativeArguments);
-        \\};
-        \\
-        \\Node.prototype.focus = function() {
-        \\  __native.focus(this.handle);
-        \\};
-        \\
-        \\var WINDOW_CANVAS_CONTEXTS = {};
-        \\
-        \\function canvasContextsForWindow() {
-        \\  var windowId = window.__id;
-        \\  if (!WINDOW_CANVAS_CONTEXTS[windowId]) WINDOW_CANVAS_CONTEXTS[windowId] = {};
-        \\  return WINDOW_CANVAS_CONTEXTS[windowId];
-        \\}
-        \\
-        \\function resetCanvasContextState(handle) {
-        \\  var context = canvasContextsForWindow()[handle];
-        \\  if (!context) return;
-        \\  context.fillStyle = '#000000';
-        \\  context.strokeStyle = '#000000';
-        \\  context.lineWidth = 1;
-        \\  context.globalAlpha = 1;
-        \\  context.__stateStack = [];
-        \\}
-        \\
-        \\function CanvasRenderingContext2D(handle) {
-        \\  this.__canvasHandle = handle;
-        \\  this.canvas = new Node(handle);
-        \\  this.fillStyle = '#000000';
-        \\  this.strokeStyle = '#000000';
-        \\  this.lineWidth = 1;
-        \\  this.globalAlpha = 1;
-        \\  this.__stateStack = [];
-        \\}
-        \\
-        \\CanvasRenderingContext2D.prototype.__command = function(name, args, flag) {
-        \\  function numberAt(index) {
-        \\    return index < args.length ? Number(args[index]) : 0;
-        \\  }
-        \\  return __native.canvasCommand(
-        \\    this.__canvasHandle,
-        \\    name,
-        \\    this.fillStyle == null ? '' : this.fillStyle.toString(),
-        \\    this.strokeStyle == null ? '' : this.strokeStyle.toString(),
-        \\    Number(this.lineWidth),
-        \\    Number(this.globalAlpha),
-        \\    !!flag,
-        \\    numberAt(0), numberAt(1), numberAt(2),
-        \\    numberAt(3), numberAt(4), numberAt(5)
-        \\  );
-        \\};
-        \\
-        \\CanvasRenderingContext2D.prototype.fillRect = function(x, y, width, height) { this.__command('fillRect', arguments, false); };
-        \\CanvasRenderingContext2D.prototype.strokeRect = function(x, y, width, height) { this.__command('strokeRect', arguments, false); };
-        \\CanvasRenderingContext2D.prototype.clearRect = function(x, y, width, height) { this.__command('clearRect', arguments, false); };
-        \\CanvasRenderingContext2D.prototype.beginPath = function() { this.__command('beginPath', arguments, false); };
-        \\CanvasRenderingContext2D.prototype.moveTo = function(x, y) { this.__command('moveTo', arguments, false); };
-        \\CanvasRenderingContext2D.prototype.lineTo = function(x, y) { this.__command('lineTo', arguments, false); };
-        \\CanvasRenderingContext2D.prototype.rect = function(x, y, width, height) { this.__command('rect', arguments, false); };
-        \\CanvasRenderingContext2D.prototype.closePath = function() { this.__command('closePath', arguments, false); };
-        \\CanvasRenderingContext2D.prototype.bezierCurveTo = function(cp1x, cp1y, cp2x, cp2y, x, y) { this.__command('bezierCurveTo', arguments, false); };
-        \\CanvasRenderingContext2D.prototype.arc = function(x, y, radius, startAngle, endAngle, counterclockwise) { this.__command('arc', arguments, !!counterclockwise); };
-        \\CanvasRenderingContext2D.prototype.fill = function() { this.__command('fill', arguments, false); };
-        \\CanvasRenderingContext2D.prototype.stroke = function() { this.__command('stroke', arguments, false); };
-        \\CanvasRenderingContext2D.prototype.translate = function(x, y) { this.__command('translate', arguments, false); };
-        \\CanvasRenderingContext2D.prototype.rotate = function(angle) { this.__command('rotate', arguments, false); };
-        \\CanvasRenderingContext2D.prototype.scale = function(x, y) { this.__command('scale', arguments, false); };
-        \\CanvasRenderingContext2D.prototype.setTransform = function(a, b, c, d, e, f) { this.__command('setTransform', arguments, false); };
-        \\CanvasRenderingContext2D.prototype.resetTransform = function() { this.__command('resetTransform', arguments, false); };
-        \\CanvasRenderingContext2D.prototype.save = function() {
-        \\  this.__command('save', arguments, false);
-        \\  this.__stateStack.push([this.fillStyle, this.strokeStyle, this.lineWidth, this.globalAlpha]);
-        \\};
-        \\CanvasRenderingContext2D.prototype.restore = function() {
-        \\  this.__command('restore', arguments, false);
-        \\  var state = this.__stateStack.pop();
-        \\  if (state) {
-        \\    this.fillStyle = state[0]; this.strokeStyle = state[1];
-        \\    this.lineWidth = state[2]; this.globalAlpha = state[3];
-        \\  }
-        \\};
-        \\
-        \\// These methods deliberately reach a native error.NotImplemented
-        \\// stub. The host consumes that error and returns undefined so one
-        \\// unsupported operation does not terminate the page's script.
-        \\CanvasRenderingContext2D.prototype.quadraticCurveTo = function() { this.__command('quadraticCurveTo', arguments, false); };
-        \\CanvasRenderingContext2D.prototype.drawImage = function() { this.__command('drawImage', arguments, false); };
-        \\CanvasRenderingContext2D.prototype.fillText = function() { this.__command('fillText', arguments, false); };
-        \\CanvasRenderingContext2D.prototype.strokeText = function() { this.__command('strokeText', arguments, false); };
-        \\CanvasRenderingContext2D.prototype.clip = function() { this.__command('clip', arguments, false); };
-        \\CanvasRenderingContext2D.prototype.measureText = function() { return this.__command('measureText', arguments, false); };
-        \\
-        \\Node.prototype.getContext = function(type) {
-        \\  var kind = type == null ? '' : type.toString();
-        \\  if (!__native.canvasGetContext(this.handle, kind)) return null;
-        \\  var contexts = canvasContextsForWindow();
-        \\  if (!contexts[this.handle]) contexts[this.handle] = new CanvasRenderingContext2D(this.handle);
-        \\  return contexts[this.handle];
-        \\};
-        \\
-        \\Object.defineProperty(Node.prototype, 'width', {
-        \\  get: function() { return __native.canvasDimension(this.handle, 'width'); },
-        \\  set: function(value) { this.setAttribute('width', Number(value).toString()); }
-        \\});
-        \\Object.defineProperty(Node.prototype, 'height', {
-        \\  get: function() { return __native.canvasDimension(this.handle, 'height'); },
-        \\  set: function(value) { this.setAttribute('height', Number(value).toString()); }
-        \\});
-        \\
-        \\// Snapshot the immediate element children as wrapped Node objects.
-        \\Object.defineProperty(Node.prototype, "children", {
-        \\  get: function() {
-        \\    return __native.children(this.handle).map(function(h) { return new Node(h); });
-        \\  }
-        \\});
-        \\
-        \\// Serialize or replace an element's child HTML.
-        \\Object.defineProperty(Node.prototype, "innerHTML", {
-        \\  get: function() {
-        \\    return __native.getInnerHTML(this.handle);
-        \\  },
-        \\  set: function(value) {
-        \\    var text = value == null ? "" : value.toString();
-        \\    __native.innerHTML(this.handle, text);
-        \\  }
-        \\});
-        \\
-        \\Object.defineProperty(Node.prototype, "outerHTML", {
-        \\  get: function() {
-        \\    return __native.getOuterHTML(this.handle);
-        \\  }
-        \\});
-        \\
-        \\// Add style setter to Node prototype
-        \\Object.defineProperty(Node.prototype, "style", {
-        \\  set: function(value) {
-        \\    var text = value == null ? "" : value.toString();
-        \\    __native.style_set(this.handle, text);
-        \\  }
-        \\});
-        \\
-        \\__native.dispatchEvent = function(handle, type, bubbles) {
-        \\  var event = new Event(type);
-        \\  event.bubbles = !!bubbles;
-        \\  return new Node(handle).dispatchEvent(event);
-        \\};
-        \\
-        \\globalThis.Event = Event;
-        \\globalThis.XMLHttpRequest = XMLHttpRequest;
-        \\globalThis.CanvasRenderingContext2D = CanvasRenderingContext2D;
-        \\
-        \\globalThis.__resetEventListeners = function(windowId) {
-        \\  var targetId = (windowId === undefined || windowId === null) ? window.__id : windowId;
-        \\  delete WINDOW_NODE_LISTENERS[targetId];
-        \\  delete WINDOW_MESSAGE_LISTENERS[targetId];
-        \\  delete WINDOW_ONMESSAGE[targetId];
-        \\  delete WINDOW_TIMER_REQUESTS[targetId];
-        \\  delete WINDOW_NEXT_TIMER_HANDLE[targetId];
-        \\  delete WINDOW_CANVAS_CONTEXTS[targetId];
-        \\};
-        \\
-        \\var WINDOW_TIMER_REQUESTS = {};
-        \\var WINDOW_NEXT_TIMER_HANDLE = {};
-        \\
-        \\function __timerRequests() {
-        \\  var windowId = window.__id;
-        \\  if (!WINDOW_TIMER_REQUESTS[windowId]) WINDOW_TIMER_REQUESTS[windowId] = {};
-        \\  return WINDOW_TIMER_REQUESTS[windowId];
-        \\}
-        \\
-        \\function __scheduleTimer(callback, timeout, repeats) {
-        \\  var windowId = window.__id;
-        \\  var handle = WINDOW_NEXT_TIMER_HANDLE[windowId] || 0;
-        \\  WINDOW_NEXT_TIMER_HANDLE[windowId] = handle + 1;
-        \\  var delay = timeout || 0;
-        \\  __timerRequests()[handle] = {
-        \\    callback: callback,
-        \\    delay: delay,
-        \\    repeats: repeats
-        \\  };
-        \\  __native.setTimeout(handle, delay, repeats);
-        \\  return handle;
-        \\}
-        \\
-        \\globalThis.__runSetTimeout = function(handle) {
-        \\  var requests = __timerRequests();
-        \\  var request = requests[handle];
-        \\  if (!request) return;
-        \\  if (!request.repeats) delete requests[handle];
-        \\  try {
-        \\    request.callback();
-        \\  } finally {
-        \\    if (request.repeats && requests[handle] === request) {
-        \\      __native.setTimeout(handle, request.delay, true);
-        \\    }
-        \\  }
-        \\};
-        \\
-        \\globalThis.setTimeout = function(callback, timeout) {
-        \\  return __scheduleTimer(callback, timeout, false);
-        \\};
-        \\
-        \\globalThis.setInterval = function(callback, timeout) {
-        \\  return __scheduleTimer(callback, timeout, true);
-        \\};
-        \\
-        \\globalThis.clearInterval = function(handle) {
-        \\  delete __timerRequests()[handle];
-        \\  __native.clearInterval(handle);
-        \\};
-        \\
-        \\var RAF_LISTENERS = [];
-        \\
-        \\function __runRAFHandlers() {
-        \\  var handlers_copy = RAF_LISTENERS;
-        \\  RAF_LISTENERS = [];
-        \\  for (var i = 0; i < handlers_copy.length; i++) {
-        \\    handlers_copy[i]();
-        \\  }
-        \\}
-        \\
-        \\globalThis.requestAnimationFrame = function(fn) {
-        \\  RAF_LISTENERS.push(fn);
-        \\  __native.requestAnimationFrame();
-        \\};
-        \\
-        \\var WINDOW_MESSAGE_LISTENERS = {};
-        \\var WINDOW_ONMESSAGE = {};
-        \\var WINDOW_ID_GLOBALS = {};
-        \\var ACTIVE_ID_GLOBALS = [];
-        \\
-        \\globalThis.window = globalThis;
-        \\window.__id = __native.getWindowId();
-        \\Object.defineProperty(window, "onmessage", {
-        \\  get: function() { return WINDOW_ONMESSAGE[window.__id] || null; },
-        \\  set: function(fn) { WINDOW_ONMESSAGE[window.__id] = fn; }
-        \\});
-        \\window.addEventListener = function(type, listener) {
-        \\  if (type !== "message") return;
-        \\  if (!WINDOW_MESSAGE_LISTENERS[window.__id]) WINDOW_MESSAGE_LISTENERS[window.__id] = [];
-        \\  WINDOW_MESSAGE_LISTENERS[window.__id].push(listener);
-        \\};
-        \\window.postMessage = function(message, targetWindowId, targetOrigin) {
-        \\  var payload = message == null ? "null" : message.toString();
-        \\  var origin = targetOrigin === undefined ? "/" : targetOrigin.toString();
-        \\  __native.postMessage(payload, targetWindowId, origin);
-        \\};
-        \\Object.defineProperty(window, "parent", {
-        \\  get: function() {
-        \\    var parentId = __native.getParentWindowId(window.__id);
-        \\    if (parentId === null || parentId === undefined) return null;
-        \\    return { __id: parentId, postMessage: function(message, targetOrigin) { var payload = message == null ? "null" : message.toString(); var origin = targetOrigin === undefined ? "/" : targetOrigin.toString(); __native.postMessage(payload, parentId, origin); } };
-        \\  }
-        \\});
-        \\function clearActiveIdGlobals() {
-        \\  for (var i = 0; i < ACTIVE_ID_GLOBALS.length; i++) {
-        \\    var entry = ACTIVE_ID_GLOBALS[i];
-        \\    if (globalThis[entry[0]] === entry[1]) delete globalThis[entry[0]];
-        \\  }
-        \\  ACTIVE_ID_GLOBALS = [];
-        \\}
-        \\function installActiveIdGlobals(entries) {
-        \\  for (var i = 0; i < entries.length; i++) {
-        \\    var entry = entries[i];
-        \\    var name = entry[0];
-        \\    if (name in globalThis) continue;
-        \\    Object.defineProperty(globalThis, name, {
-        \\      value: entry[1], writable: true, enumerable: true, configurable: true
-        \\    });
-        \\    ACTIVE_ID_GLOBALS.push(entry);
-        \\  }
-        \\}
-        \\globalThis.__clearIdGlobals = function(windowId) {
-        \\  if (window.__id === windowId) clearActiveIdGlobals();
-        \\  delete WINDOW_ID_GLOBALS[windowId];
-        \\};
-        \\globalThis.__setIdGlobals = function(windowId, names, handles) {
-        \\  var entries = [];
-        \\  for (var i = 0; i < names.length; i++) {
-        \\    entries.push([names[i], new Node(handles[i])]);
-        \\  }
-        \\  WINDOW_ID_GLOBALS[windowId] = entries;
-        \\  if (window.__id === windowId) {
-        \\    clearActiveIdGlobals();
-        \\    installActiveIdGlobals(entries);
-        \\  }
-        \\};
-        \\globalThis.__setActiveWindow = function(id) {
-        \\  if (window.__id !== id) clearActiveIdGlobals();
-        \\  window.__id = id;
-        \\  installActiveIdGlobals(WINDOW_ID_GLOBALS[id] || []);
-        \\};
-        \\globalThis.__dispatchMessageEvent = function(message, origin, sourceId, targetId) {
-        \\  var evt = { type: 'message', data: message, origin: origin, source: { __id: sourceId } };
-        \\  var list = WINDOW_MESSAGE_LISTENERS[targetId] || [];
-        \\  for (var i = 0; i < list.length; i++) {
-        \\    list[i].call(window, evt);
-        \\  }
-        \\  var handler = WINDOW_ONMESSAGE[targetId];
-        \\  if (handler) {
-        \\    handler(evt);
-        \\  }
-        \\};
-        \\
-        \\globalThis.__runXHROnload = function(body, handle) {
-        \\  var obj = XHR_REQUESTS[handle];
-        \\  if (!obj) return;
-        \\  var evt = new Event('load');
-        \\  obj.responseText = body;
-        \\  if (obj.onload) {
-        \\    obj.onload(evt);
-        \\  }
-        \\};
-        \\
-        \\// Wrap document.querySelectorAll to return Node objects
-        \\(function() {
-        \\  var originalQuerySelectorAll = document.querySelectorAll;
-        \\  document.querySelectorAll = function(selector) {
-        \\    var handles = originalQuerySelectorAll.call(this, selector);
-        \\    return handles.map(function(h) { return new Node(h); });
-        \\  };
-        \\  document.createElement = function(tagName) {
-        \\    var text = tagName == null ? "" : tagName.toString();
-        \\    return new Node(__native.createElement(text));
-        \\  };
-        \\  Object.defineProperty(document, "cookie", {
-        \\    get: function() { return __native.cookieGet(); },
-        \\    set: function(value) {
-        \\      __native.cookieSet(value == null ? "" : value.toString());
-        \\    },
-        \\    enumerable: true,
-        \\    configurable: true
-        \\  });
-        \\})();
-    ;
+    const runtime_code = @embedFile("runtime/bootstrap.js");
 
     if (!self.runtime_initialized) {
         const runtime_script = try Script.parse(
@@ -1217,9 +486,7 @@ pub fn setNodes(self: *Js, window_id: u32, nodes: ?*Node) void {
     self.clearDetachedNodes(window);
     window.current_nodes = nodes;
     // Clear handle mappings when nodes change
-    window.node_to_handle.clearRetainingCapacity();
-    window.handle_to_node.clearRetainingCapacity();
-    window.next_handle = 0;
+    window.handles.clear();
     if (nodes == null) {
         window.render_callback = .{};
         window.focus_callback = .{};
@@ -1345,29 +612,16 @@ pub fn setParentWindow(self: *Js, child_window_id: u32, parent_window_id: ?u32) 
     }
 }
 
-/// Get or create a handle for a node
+/// Publish a stable numeric identity in this window's current DOM generation.
 fn getHandle(self: *Js, window: *WindowContext, node: *Node) !u32 {
     _ = self;
-    if (window.node_to_handle.get(node)) |handle| {
-        return handle;
-    }
-
-    // Reserve both directions before publishing either half of the mapping.
-    // A failed allocation must not leave a one-way handle or consume an ID.
-    try window.node_to_handle.ensureUnusedCapacity(1);
-    try window.handle_to_node.ensureUnusedCapacity(1);
-    const handle = window.next_handle;
-    window.next_handle += 1;
-    window.node_to_handle.putAssumeCapacity(node, handle);
-    window.handle_to_node.putAssumeCapacity(handle, node);
-
-    return handle;
+    return window.handles.getOrCreate(node);
 }
 
-/// Get a node from a handle
+/// Resolve a handle without asserting that its Node remains attached.
 fn getNode(self: *Js, window: *WindowContext, handle: u32) ?*Node {
     _ = self;
-    return window.handle_to_node.get(handle);
+    return window.handles.resolve(handle);
 }
 
 const NamedElement = struct {
@@ -1470,729 +724,6 @@ fn clearDetachedNodes(self: *Js, window: *WindowContext) void {
     window.detached_nodes.clearRetainingCapacity();
 }
 
-const DirectChildHandle = struct {
-    old_ptr: *Node,
-    old_index: usize,
-    handle: u32,
-};
-
-fn snapshotDirectChildHandles(
-    self: *Js,
-    window: *WindowContext,
-    parent: *Node,
-) !std.ArrayList(DirectChildHandle) {
-    var bindings = std.ArrayList(DirectChildHandle).empty;
-    errdefer bindings.deinit(self.allocator);
-
-    switch (parent.*) {
-        .text => {},
-        .element => |*element| {
-            for (element.children.items, 0..) |*child, index| {
-                if (window.node_to_handle.get(child)) |handle| {
-                    try bindings.append(self.allocator, .{
-                        .old_ptr = child,
-                        .old_index = index,
-                        .handle = handle,
-                    });
-                }
-            }
-        },
-    }
-    return bindings;
-}
-
-fn nodeParent(node: *Node) ?*Node {
-    return switch (node.*) {
-        .text => |text| text.parent,
-        .element => |element| element.parent,
-    };
-}
-
-fn isAttachedToCurrentDocument(window: *WindowContext, node: *Node) bool {
-    const root = window.current_nodes orelse return false;
-    var current = node;
-    while (nodeParent(current)) |parent| current = parent;
-    return current == root;
-}
-
-fn isInclusiveAncestor(ancestor: *Node, node: *Node) bool {
-    var current: ?*Node = node;
-    while (current) |candidate| {
-        if (candidate == ancestor) return true;
-        current = nodeParent(candidate);
-    }
-    return false;
-}
-
-/// A newly attached style sheet can change the block/inline classification of
-/// retained nodes. Keep those mutations on the full dependency-
-/// retirement path; ordinary appended content cannot replace author rules.
-fn subtreeCanChangeAuthorStyleRules(node: *const Node) bool {
-    return switch (node.*) {
-        .text => false,
-        .element => |*element| blk: {
-            if (std.ascii.eqlIgnoreCase(element.tag, "style") or
-                std.ascii.eqlIgnoreCase(element.tag, "link")) break :blk true;
-            for (element.children.items) |*child| {
-                if (subtreeCanChangeAuthorStyleRules(child)) break :blk true;
-            }
-            break :blk false;
-        },
-    };
-}
-
-/// An inserted h6 immediately before existing content can become a run-in
-/// heading and share one anonymous layout object with its following sibling.
-/// Keep that shape change on the conservative structural path.
-fn insertionCanMergeRunIn(node: *const Node, insert_index: usize, child_count: usize) bool {
-    if (insert_index >= child_count) return false;
-    return switch (node.*) {
-        .element => |element| std.ascii.eqlIgnoreCase(element.tag, "h6"),
-        .text => false,
-    };
-}
-
-fn directChildIndex(parent: *Node, child: *Node) ?usize {
-    return switch (parent.*) {
-        .text => null,
-        .element => |*element| index: {
-            for (element.children.items, 0..) |*candidate, i| {
-                if (candidate == child) break :index i;
-            }
-            break :index null;
-        },
-    };
-}
-
-/// Move a window-owned detached root into an element's by-value child array.
-/// All mutation-related allocations happen before handle maps or detached
-/// ownership change. Republishing named globals can still fail afterward, but
-/// stale globals have already been removed before any node moves.
-fn insertDetachedChild(
-    self: *Js,
-    window: *WindowContext,
-    parent: *Node,
-    child: *Node,
-    insert_index: usize,
-) !void {
-    var bindings = try self.snapshotDirectChildHandles(window, parent);
-    defer bindings.deinit(self.allocator);
-
-    const parent_is_attached = isAttachedToCurrentDocument(window, parent);
-    const parent_parent = nodeParent(parent);
-    const child_handle = window.node_to_handle.get(child).?;
-    const element = &parent.element;
-    const retains_layout_children = parent_is_attached and
-        window.dom_mutation_callback.function != null and
-        !subtreeCanChangeAuthorStyleRules(child) and
-        !insertionCanMergeRunIn(child, insert_index, element.children.items.len) and
-        element.canReuseLayoutForInsert(insert_index);
-
-    if (retains_layout_children) {
-        element.markChildInserted();
-    } else {
-        element.markChildrenDirty();
-    }
-    parser.dirtyStyleForElement(element);
-    markElementLayoutDirty(element);
-    if (parent_is_attached) {
-        if (retains_layout_children) {
-            self.prepareDomRetainedInsert(parent);
-        } else {
-            self.prepareDomMutation(parent);
-        }
-    }
-
-    const window_id = self.current_window_id.?;
-    if (parent_is_attached) try self.clearNamedIdGlobals(window_id, window);
-    var mutation_started = false;
-    errdefer if (parent_is_attached and !mutation_started) {
-        self.syncNamedIdGlobals(window_id, window) catch {};
-    };
-
-    // Capacity growth may relocate the by-value children. No JavaScript call
-    // may occur between this operation and the handle-map repair below.
-    try element.children.ensureUnusedCapacity(self.allocator, 1);
-
-    // Capacity growth and insertion can relocate or shift every immediate
-    // child. Remove all old pointer keys before any new address is installed.
-    for (bindings.items) |binding| {
-        _ = window.node_to_handle.remove(binding.old_ptr);
-    }
-    _ = window.node_to_handle.remove(child);
-
-    mutation_started = true;
-    element.children.insertAssumeCapacity(insert_index, child.*);
-    _ = window.detached_nodes.remove(child);
-    self.allocator.destroy(child);
-
-    for (bindings.items) |binding| {
-        const new_index = binding.old_index + @intFromBool(binding.old_index >= insert_index);
-        const new_ptr = &element.children.items[new_index];
-        window.node_to_handle.putAssumeCapacity(new_ptr, binding.handle);
-        window.handle_to_node.putAssumeCapacity(binding.handle, new_ptr);
-    }
-
-    const installed_child = &element.children.items[insert_index];
-    window.node_to_handle.putAssumeCapacity(installed_child, child_handle);
-    window.handle_to_node.putAssumeCapacity(child_handle, installed_child);
-    parser.fixParentPointers(parent, parent_parent);
-    parser.dirtyStyleSubtree(installed_child);
-
-    if (retains_layout_children and !element.rebindLayoutAfterInsert(parent)) {
-        @panic("verified retained layout children could not be rebound after insertion");
-    }
-
-    if (parent_is_attached) {
-        self.completeDomMutation(parent);
-        try self.syncNamedIdGlobals(window_id, window);
-        self.requestRender();
-    }
-}
-
-fn clearDetachedLayoutPointers(node: *Node) void {
-    switch (node.*) {
-        .text => {},
-        .element => |*element| {
-            element.clearLayoutOwner();
-            element.markChildrenDirty();
-            for (element.children.items) |*child| clearDetachedLayoutPointers(child);
-        },
-    }
-}
-
-/// Move one by-value child into a heap-stable, window-owned detached root.
-/// Allocation for the ownership move precedes the child-array mutation. ID
-/// globals are cleared before pointer relocation and republished afterward.
-fn detachChild(
-    self: *Js,
-    window: *WindowContext,
-    parent: *Node,
-    child: *Node,
-    remove_index: usize,
-) !void {
-    var bindings = try self.snapshotDirectChildHandles(window, parent);
-    defer bindings.deinit(self.allocator);
-
-    const detached = try self.allocator.create(Node);
-    var detached_owned = true;
-    errdefer if (detached_owned) self.allocator.destroy(detached);
-    try window.detached_nodes.ensureUnusedCapacity(1);
-
-    const parent_is_attached = isAttachedToCurrentDocument(window, parent);
-    const parent_parent = nodeParent(parent);
-    const child_handle = window.node_to_handle.get(child).?;
-    const element = &parent.element;
-    const window_id = self.current_window_id.?;
-
-    if (parent_is_attached) try self.clearNamedIdGlobals(window_id, window);
-
-    element.markChildrenDirty();
-    parser.dirtyStyleForElement(element);
-    markElementLayoutDirty(element);
-    if (parent_is_attached) self.prepareDomMutation(parent);
-
-    // orderedRemove shifts later children, invalidating their pointer keys.
-    // Remove every published direct-child address before performing the move.
-    for (bindings.items) |binding| {
-        _ = window.node_to_handle.remove(binding.old_ptr);
-    }
-
-    detached.* = element.children.orderedRemove(remove_index);
-    window.detached_nodes.putAssumeCapacity(detached, {});
-    detached_owned = false;
-
-    for (bindings.items) |binding| {
-        if (binding.old_index == remove_index) continue;
-        const new_index = binding.old_index - @intFromBool(binding.old_index > remove_index);
-        const new_ptr = &element.children.items[new_index];
-        window.node_to_handle.putAssumeCapacity(new_ptr, binding.handle);
-        window.handle_to_node.putAssumeCapacity(binding.handle, new_ptr);
-    }
-
-    window.node_to_handle.putAssumeCapacity(detached, child_handle);
-    window.handle_to_node.putAssumeCapacity(child_handle, detached);
-    parser.fixParentPointers(parent, parent_parent);
-    parser.fixParentPointers(detached, null);
-    clearDetachedLayoutPointers(detached);
-    parser.dirtyStyleSubtree(detached);
-
-    if (parent_is_attached) {
-        self.completeDomMutation(parent);
-        try self.syncNamedIdGlobals(window_id, window);
-        self.requestRender();
-    }
-}
-
-fn removeHandlesForSubtree(self: *Js, window: *WindowContext, node: *Node) void {
-    switch (node.*) {
-        .element => |*element| {
-            for (element.children.items) |*child| {
-                self.removeHandlesForSubtree(window, child);
-            }
-        },
-        .text => {},
-    }
-
-    if (window.node_to_handle.get(node)) |handle| {
-        _ = window.node_to_handle.remove(node);
-        _ = window.handle_to_node.remove(handle);
-    }
-}
-
-fn subtreeHasPublishedHandle(window: *WindowContext, node: *Node) bool {
-    if (window.node_to_handle.contains(node)) return true;
-    return switch (node.*) {
-        .text => false,
-        .element => |*element| child_handle: {
-            for (element.children.items) |*child| {
-                if (subtreeHasPublishedHandle(window, child)) break :child_handle true;
-            }
-            break :child_handle false;
-        },
-    };
-}
-
-const DetachedReplacementChild = struct {
-    old_ptr: *Node,
-    stable_ptr: *Node,
-};
-
-/// Remove every child in one structural-mutation transaction. A subtree with
-/// a published JavaScript handle remains alive as a detached, heap-stable
-/// root; an unobservable subtree can be reclaimed immediately. All allocations
-/// needed by those ownership moves precede invalidation and child destruction.
-fn emptyElementChildren(
-    self: *Js,
-    window_id: u32,
-    window: *WindowContext,
-    node: *Node,
-) !void {
-    const element = switch (node.*) {
-        .element => |*value| value,
-        .text => unreachable,
-    };
-    if (element.children.items.len == 0) return;
-
-    var retained_count: usize = 0;
-    for (element.children.items) |*child| {
-        if (subtreeHasPublishedHandle(window, child)) retained_count += 1;
-    }
-
-    var retained = std.ArrayList(DetachedReplacementChild).empty;
-    defer retained.deinit(self.allocator);
-    try retained.ensureTotalCapacity(self.allocator, retained_count);
-    const retained_capacity = std.math.cast(u32, retained_count) orelse return error.OutOfMemory;
-    try window.detached_nodes.ensureUnusedCapacity(retained_capacity);
-
-    var stable_roots_owned = true;
-    defer if (stable_roots_owned) {
-        for (retained.items) |entry| self.allocator.destroy(entry.stable_ptr);
-    };
-    for (element.children.items) |*child| {
-        if (!subtreeHasPublishedHandle(window, child)) continue;
-        const stable_ptr = try self.allocator.create(Node);
-        retained.appendAssumeCapacity(.{
-            .old_ptr = child,
-            .stable_ptr = stable_ptr,
-        });
-    }
-
-    const is_attached = isAttachedToCurrentDocument(window, node);
-    if (is_attached) try self.clearNamedIdGlobals(window_id, window);
-
-    element.markChildrenDirty();
-    parser.dirtyStyleForElement(element);
-    markElementLayoutDirty(element);
-    if (is_attached) self.prepareDomMutation(node);
-
-    var retained_index: usize = 0;
-    for (element.children.items) |*child| {
-        if (retained_index < retained.items.len and
-            retained.items[retained_index].old_ptr == child)
-        {
-            const stable_ptr = retained.items[retained_index].stable_ptr;
-            retained_index += 1;
-
-            const root_handle = window.node_to_handle.get(child);
-            if (root_handle != null) _ = window.node_to_handle.remove(child);
-
-            stable_ptr.* = child.*;
-            if (root_handle) |handle| {
-                window.node_to_handle.putAssumeCapacity(stable_ptr, handle);
-                window.handle_to_node.putAssumeCapacity(handle, stable_ptr);
-            }
-            parser.fixParentPointers(stable_ptr, null);
-            clearDetachedLayoutPointers(stable_ptr);
-            parser.dirtyStyleSubtree(stable_ptr);
-            window.detached_nodes.putAssumeCapacity(stable_ptr, {});
-        } else {
-            self.removeHandlesForSubtree(window, child);
-            child.deinit(self.allocator);
-        }
-    }
-    std.debug.assert(retained_index == retained.items.len);
-    element.children.deinit(self.allocator);
-    element.children = std.ArrayList(Node).empty;
-    stable_roots_owned = false;
-
-    if (is_attached) {
-        self.completeDomMutation(node);
-        // The pre-mutation callback already publishes a replacement frame;
-        // keep the ordinary render callback observable even if rebuilding ID
-        // globals subsequently runs out of memory.
-        self.requestRender();
-        try self.syncNamedIdGlobals(window_id, window);
-    }
-}
-
-const ReplacementArgument = struct {
-    handle: u32,
-    source_parent: ?*Node,
-    source_index: ?usize,
-    transfer: *Node,
-    transfer_allocated: bool,
-    has_value: bool,
-};
-
-const ReplacementParent = struct {
-    node: *Node,
-    depth: usize,
-    is_target: bool,
-    bindings: std.ArrayList(DirectChildHandle),
-    remaining: std.ArrayList(Node),
-};
-
-const RemovedTargetChild = struct {
-    old_index: usize,
-    stable_ptr: *Node,
-    consumed: bool = false,
-};
-
-fn nodeDepth(node: *Node) usize {
-    var depth: usize = 0;
-    var current = nodeParent(node);
-    while (current) |parent| {
-        depth += 1;
-        current = nodeParent(parent);
-    }
-    return depth;
-}
-
-fn nearestCommonAncestor(first: *Node, second: *Node) *Node {
-    var candidate: ?*Node = first;
-    while (candidate) |node| {
-        if (isInclusiveAncestor(node, second)) return node;
-        candidate = nodeParent(node);
-    }
-    unreachable;
-}
-
-fn replacementArgumentAt(
-    arguments: []const ReplacementArgument,
-    parent: *Node,
-    child_index: usize,
-) ?usize {
-    for (arguments, 0..) |argument, index| {
-        if (argument.source_parent == parent and argument.source_index == child_index) return index;
-    }
-    return null;
-}
-
-fn directChildHandle(bindings: []const DirectChildHandle, child_index: usize) ?u32 {
-    for (bindings) |binding| {
-        if (binding.old_index == child_index) return binding.handle;
-    }
-    return null;
-}
-
-fn selectedChildrenBefore(
-    arguments: []const ReplacementArgument,
-    parent: *Node,
-    child_index: usize,
-) usize {
-    var count: usize = 0;
-    for (arguments) |argument| {
-        if (argument.source_parent == parent and argument.source_index.? < child_index) count += 1;
-    }
-    return count;
-}
-
-fn addReplacementParent(
-    self: *Js,
-    window: *WindowContext,
-    parents: *std.ArrayList(ReplacementParent),
-    node: *Node,
-    is_target: bool,
-) !void {
-    for (parents.items) |*parent| {
-        if (parent.node != node) continue;
-        parent.is_target = parent.is_target or is_target;
-        return;
-    }
-
-    var bindings = try self.snapshotDirectChildHandles(window, node);
-    errdefer bindings.deinit(self.allocator);
-    try parents.append(self.allocator, .{
-        .node = node,
-        .depth = nodeDepth(node),
-        .is_target = is_target,
-        .bindings = bindings,
-        .remaining = std.ArrayList(Node).empty,
-    });
-}
-
-/// Replace an Element's children with existing Element roots in one ownership
-/// transaction. Every fallible allocation precedes DOM invalidation. Affected
-/// parents are processed deepest-first so moving a by-value ancestor cannot
-/// invalidate a descendant parent that still needs mutation.
-fn transferElementChildren(
-    self: *Js,
-    window_id: u32,
-    window: *WindowContext,
-    target: *Node,
-    argument_nodes: []const *Node,
-) !void {
-    std.debug.assert(argument_nodes.len > 0);
-    const target_handle = window.node_to_handle.get(target).?;
-
-    var arguments = std.ArrayList(ReplacementArgument).empty;
-    defer arguments.deinit(self.allocator);
-    try arguments.ensureTotalCapacity(self.allocator, argument_nodes.len);
-    var transfer_boxes_owned = true;
-    defer if (transfer_boxes_owned) {
-        for (arguments.items) |argument| {
-            if (argument.transfer_allocated) self.allocator.destroy(argument.transfer);
-        }
-    };
-
-    // `convert nodes into a node` appends arguments to a temporary fragment.
-    // Repeating a node therefore keeps only its last occurrence.
-    for (argument_nodes, 0..) |node, index| {
-        var appears_later = false;
-        for (argument_nodes[index + 1 ..]) |later| {
-            if (later == node) {
-                appears_later = true;
-                break;
-            }
-        }
-        if (appears_later) continue;
-
-        const is_detached = window.detached_nodes.contains(node);
-        const source_parent = if (is_detached) null else nodeParent(node);
-        const source_index = if (source_parent) |parent|
-            directChildIndex(parent, node)
-        else
-            null;
-        const transfer = if (is_detached) node else try self.allocator.create(Node);
-        arguments.appendAssumeCapacity(.{
-            .handle = window.node_to_handle.get(node).?,
-            .source_parent = source_parent,
-            .source_index = source_index,
-            .transfer = transfer,
-            .transfer_allocated = !is_detached,
-            .has_value = is_detached,
-        });
-    }
-
-    var mutation_started = false;
-
-    var parents = std.ArrayList(ReplacementParent).empty;
-    defer {
-        for (parents.items) |*parent| {
-            parent.bindings.deinit(self.allocator);
-            parent.remaining.deinit(self.allocator);
-        }
-        parents.deinit(self.allocator);
-    }
-    try self.addReplacementParent(window, &parents, target, true);
-    for (arguments.items) |argument| {
-        if (argument.source_parent) |parent| {
-            try self.addReplacementParent(window, &parents, parent, false);
-        }
-    }
-
-    for (parents.items) |*parent| {
-        if (parent.is_target) continue;
-        var selected_count: usize = 0;
-        for (arguments.items) |argument| {
-            if (argument.source_parent == parent.node) selected_count += 1;
-        }
-        try parent.remaining.ensureTotalCapacity(
-            self.allocator,
-            parent.node.element.children.items.len - selected_count,
-        );
-    }
-
-    // Post-order mutation keeps every stored parent pointer valid until its
-    // own child array has been rebuilt.
-    var sort_index: usize = 1;
-    while (sort_index < parents.items.len) : (sort_index += 1) {
-        var cursor = sort_index;
-        while (cursor > 0 and parents.items[cursor - 1].depth < parents.items[cursor].depth) {
-            std.mem.swap(ReplacementParent, &parents.items[cursor - 1], &parents.items[cursor]);
-            cursor -= 1;
-        }
-    }
-
-    var removed_target_children = std.ArrayList(RemovedTargetChild).empty;
-    defer {
-        for (removed_target_children.items) |removed| {
-            if (!removed.consumed) self.allocator.destroy(removed.stable_ptr);
-        }
-        removed_target_children.deinit(self.allocator);
-    }
-    const target_child_count = target.element.children.items.len;
-    try removed_target_children.ensureTotalCapacity(self.allocator, target_child_count);
-    for (target.element.children.items, 0..) |_, child_index| {
-        if (replacementArgumentAt(arguments.items, target, child_index) != null) continue;
-        const stable_ptr = try self.allocator.create(Node);
-        removed_target_children.appendAssumeCapacity(.{
-            .old_index = child_index,
-            .stable_ptr = stable_ptr,
-        });
-    }
-    const detached_capacity = std.math.cast(u32, removed_target_children.items.len) orelse
-        return error.OutOfMemory;
-    try window.detached_nodes.ensureUnusedCapacity(detached_capacity);
-
-    var replacement = std.ArrayList(Node).empty;
-    defer replacement.deinit(self.allocator);
-    try replacement.ensureTotalCapacity(self.allocator, arguments.items.len);
-
-    const target_was_attached = isAttachedToCurrentDocument(window, target);
-    var document_mutation_root: ?*Node = if (target_was_attached) target else null;
-    for (arguments.items) |argument| {
-        const parent = argument.source_parent orelse continue;
-        if (!isAttachedToCurrentDocument(window, parent)) continue;
-        document_mutation_root = if (document_mutation_root) |root|
-            nearestCommonAncestor(root, parent)
-        else
-            parent;
-    }
-    const mutates_document = document_mutation_root != null;
-
-    if (mutates_document) try self.clearNamedIdGlobals(window_id, window);
-    errdefer if (mutates_document and !mutation_started) {
-        self.syncNamedIdGlobals(window_id, window) catch {};
-    };
-
-    for (parents.items) |parent| {
-        const element = &parent.node.element;
-        element.markChildrenDirty();
-        parser.dirtyStyleForElement(element);
-        markElementLayoutDirty(element);
-    }
-    if (document_mutation_root) |mutation_root| self.prepareDomMutation(mutation_root);
-    mutation_started = true;
-
-    for (parents.items) |*parent_state| {
-        const parent = parent_state.node;
-        const parent_parent = nodeParent(parent);
-        const element = &parent.element;
-
-        for (parent_state.bindings.items) |binding| {
-            _ = window.node_to_handle.remove(binding.old_ptr);
-        }
-
-        var removed_slot_index: usize = 0;
-        for (element.children.items, 0..) |*child, child_index| {
-            if (replacementArgumentAt(arguments.items, parent, child_index)) |argument_index| {
-                const argument = &arguments.items[argument_index];
-                std.debug.assert(!argument.has_value);
-                argument.transfer.* = child.*;
-                argument.has_value = true;
-                window.node_to_handle.putAssumeCapacity(argument.transfer, argument.handle);
-                window.handle_to_node.putAssumeCapacity(argument.handle, argument.transfer);
-                parser.fixParentPointers(argument.transfer, null);
-                clearDetachedLayoutPointers(argument.transfer);
-                parser.dirtyStyleSubtree(argument.transfer);
-                continue;
-            }
-
-            if (parent_state.is_target) {
-                const removed = &removed_target_children.items[removed_slot_index];
-                removed_slot_index += 1;
-                std.debug.assert(removed.old_index == child_index);
-                const root_handle = directChildHandle(parent_state.bindings.items, child_index);
-                const retain = root_handle != null or subtreeHasPublishedHandle(window, child);
-                if (retain) {
-                    removed.stable_ptr.* = child.*;
-                    if (root_handle) |handle| {
-                        window.node_to_handle.putAssumeCapacity(removed.stable_ptr, handle);
-                        window.handle_to_node.putAssumeCapacity(handle, removed.stable_ptr);
-                    }
-                    parser.fixParentPointers(removed.stable_ptr, null);
-                    clearDetachedLayoutPointers(removed.stable_ptr);
-                    parser.dirtyStyleSubtree(removed.stable_ptr);
-                    window.detached_nodes.putAssumeCapacity(removed.stable_ptr, {});
-                    removed.consumed = true;
-                } else {
-                    self.removeHandlesForSubtree(window, child);
-                    child.deinit(self.allocator);
-                    self.allocator.destroy(removed.stable_ptr);
-                    removed.consumed = true;
-                }
-                continue;
-            }
-
-            parent_state.remaining.appendAssumeCapacity(child.*);
-        }
-
-        element.children.deinit(self.allocator);
-        if (parent_state.is_target) {
-            element.children = std.ArrayList(Node).empty;
-            std.debug.assert(removed_slot_index == removed_target_children.items.len);
-        } else {
-            element.children = parent_state.remaining;
-            parent_state.remaining = std.ArrayList(Node).empty;
-            for (parent_state.bindings.items) |binding| {
-                if (replacementArgumentAt(arguments.items, parent, binding.old_index) != null) continue;
-                const new_index = binding.old_index - selectedChildrenBefore(
-                    arguments.items,
-                    parent,
-                    binding.old_index,
-                );
-                const new_ptr = &element.children.items[new_index];
-                window.node_to_handle.putAssumeCapacity(new_ptr, binding.handle);
-                window.handle_to_node.putAssumeCapacity(binding.handle, new_ptr);
-            }
-        }
-        parser.fixParentPointers(parent, parent_parent);
-    }
-
-    const installed_target = window.handle_to_node.get(target_handle).?;
-    std.debug.assert(installed_target.* == .element);
-    for (arguments.items) |*argument| {
-        std.debug.assert(argument.has_value);
-        clearDetachedLayoutPointers(argument.transfer);
-        parser.dirtyStyleSubtree(argument.transfer);
-        _ = window.node_to_handle.remove(argument.transfer);
-        _ = window.detached_nodes.remove(argument.transfer);
-        replacement.appendAssumeCapacity(argument.transfer.*);
-        self.allocator.destroy(argument.transfer);
-
-        const installed = &replacement.items[replacement.items.len - 1];
-        window.node_to_handle.putAssumeCapacity(installed, argument.handle);
-        window.handle_to_node.putAssumeCapacity(argument.handle, installed);
-    }
-    transfer_boxes_owned = false;
-
-    installed_target.element.children = replacement;
-    replacement = std.ArrayList(Node).empty;
-    parser.fixParentPointers(installed_target, nodeParent(installed_target));
-
-    if (mutates_document) {
-        const completion_root = if (target_was_attached)
-            installed_target
-        else
-            window.current_nodes.?;
-        self.completeDomMutation(completion_root);
-        self.requestRender();
-        try self.syncNamedIdGlobals(window_id, window);
-    }
-}
-
 fn requestRender(self: *Js) void {
     const window_id = self.current_window_id orelse return;
     const window = self.windows.getPtr(window_id) orelse return;
@@ -2204,27 +735,171 @@ fn requestRender(self: *Js) void {
     }
 }
 
-fn prepareDomMutation(self: *Js, mutation_root: *Node) void {
+fn hostFromBindingContext(context: ?*anyopaque) *Js {
+    return @ptrCast(@alignCast(context.?));
+}
+
+/// Native binding adapters run synchronously with `JsLock` already held. They
+/// expose only current-window scalars or short-lived Element borrows to the
+/// domain modules and never recursively enter a lock-taking public API.
+fn resolveCanvasBindingElement(context: ?*anyopaque, handle: u32) ?*parser.Element {
+    const self = hostFromBindingContext(context);
+    const window_id = self.current_window_id orelse return null;
+    const window = self.windows.getPtr(window_id) orelse return null;
+    const node = window.handles.resolve(handle) orelse return null;
+    return switch (node.*) {
+        .element => |*element| element,
+        .text => null,
+    };
+}
+
+fn activeEventFocusWindow(context: ?*anyopaque) ?event_focus_bindings.WindowBorrow {
+    const self = hostFromBindingContext(context);
+    const window_id = self.current_window_id orelse return null;
+    const window = self.windows.getPtr(window_id) orelse return null;
+    return .{
+        .current_nodes = window.current_nodes,
+        .handles = &window.handles,
+        .focus_context = window.focus_callback.context,
+        .focus = window.focus_callback.function,
+    };
+}
+
+fn requestBindingRender(context: ?*anyopaque) void {
+    hostFromBindingContext(context).requestRender();
+}
+
+fn currentBindingWindowId(context: ?*anyopaque) ?u32 {
+    const self = hostFromBindingContext(context);
+    const window_id = self.current_window_id orelse return null;
+    if (!self.windows.contains(window_id)) return null;
+    return window_id;
+}
+
+fn parentBindingWindowId(context: ?*anyopaque, window_id: u32) ?u32 {
+    return hostFromBindingContext(context).parent_window_ids.get(window_id);
+}
+
+fn getBindingCookie(context: ?*anyopaque) anyerror!CookieResult {
+    const self = hostFromBindingContext(context);
+    const window_id = self.current_window_id orelse return error.MissingActiveWindow;
+    const window = self.windows.getPtr(window_id) orelse return error.MissingWindowContext;
+    const callback = window.cookie_callback.get_function orelse return .{ .data = "" };
+    return callback(window.cookie_callback.context);
+}
+
+fn setBindingCookie(context: ?*anyopaque, value: []const u8) anyerror!void {
+    const self = hostFromBindingContext(context);
+    const window_id = self.current_window_id orelse return error.MissingActiveWindow;
+    const window = self.windows.getPtr(window_id) orelse return error.MissingWindowContext;
+    const callback = window.cookie_callback.set_function orelse return;
+    try callback(window.cookie_callback.context, value);
+}
+
+fn sendBindingXhr(
+    context: ?*anyopaque,
+    method: []const u8,
+    url: []const u8,
+    body: ?[]const u8,
+    is_async: bool,
+    handle: u32,
+) anyerror!XhrResult {
+    const self = hostFromBindingContext(context);
+    const window_id = self.current_window_id orelse return error.MissingActiveWindow;
+    const window = self.windows.getPtr(window_id) orelse return error.MissingWindowContext;
+    const callback = window.xhr_callback.function orelse return error.XmlHttpRequestUnavailable;
+    return callback(window.xhr_callback.context, method, url, body, is_async, handle);
+}
+
+fn sendBindingPostMessage(
+    context: ?*anyopaque,
+    source_window_id: u32,
+    target_window_id: u32,
+    target_origin: []const u8,
+    message: []const u8,
+) anyerror!void {
+    const self = hostFromBindingContext(context);
+    const window = self.windows.getPtr(source_window_id) orelse return error.MissingWindowContext;
+    const callback = window.post_message_callback.function orelse return;
+    try callback(
+        window.post_message_callback.context,
+        source_window_id,
+        target_window_id,
+        target_origin,
+        message,
+    );
+}
+
+fn scheduleBindingTimer(
+    context: ?*anyopaque,
+    handle: u32,
+    delay_ms: u32,
+    is_interval: bool,
+) anyerror!void {
+    const self = hostFromBindingContext(context);
+    const window_id = self.current_window_id orelse return error.MissingActiveWindow;
+    const window = self.windows.getPtr(window_id) orelse return error.MissingWindowContext;
+    const callback = window.set_timeout_callback.function orelse return;
+    try callback(window.set_timeout_callback.context, handle, delay_ms, is_interval);
+}
+
+fn clearBindingTimer(context: ?*anyopaque, handle: u32) void {
+    const self = hostFromBindingContext(context);
     const window_id = self.current_window_id orelse return;
     const window = self.windows.getPtr(window_id) orelse return;
-    if (window.current_nodes) |root| parser.clearStyleInvalidations(root);
+    const callback = window.clear_interval_callback.function orelse return;
+    callback(window.clear_interval_callback.context, handle);
+}
+
+fn requestBindingAnimationFrame(context: ?*anyopaque) anyerror!void {
+    const self = hostFromBindingContext(context);
+    const window_id = self.current_window_id orelse return error.MissingActiveWindow;
+    const window = self.windows.getPtr(window_id) orelse return error.MissingWindowContext;
+    const callback = window.animation_frame_callback.function orelse return;
+    try callback(window.animation_frame_callback.context);
+}
+
+fn domMutationContext(
+    self: *Js,
+    window_id: u32,
+    window: *WindowContext,
+) dom_mutation.Context {
+    return .{
+        .allocator = self.allocator,
+        .window_id = window_id,
+        .current_nodes = window.current_nodes,
+        .handles = &window.handles,
+        .detached_nodes = &window.detached_nodes,
+        .can_retain_layout_insert = window.dom_mutation_callback.function != null,
+        .host_context = self,
+        .hooks = .{
+            .prepare = prepareDomMutation,
+            .complete = completeDomMutation,
+            .clear_named = clearDomMutationGlobals,
+            .sync_named = syncDomMutationGlobals,
+            .request_render = requestDomMutationRender,
+        },
+    };
+}
+
+fn hostFromMutationContext(context: ?*anyopaque) *Js {
+    return @ptrCast(@alignCast(context.?));
+}
+
+fn prepareDomMutation(context: ?*anyopaque, mutation_root: *Node, kind: DomMutationKind) void {
+    const self = hostFromMutationContext(context);
+    const window_id = self.current_window_id orelse return;
+    const window = self.windows.getPtr(window_id) orelse return;
+    if (kind == .structural) {
+        if (window.current_nodes) |root| parser.clearStyleInvalidations(root);
+    }
     if (window.dom_mutation_callback.function) |callback| {
-        callback(window.dom_mutation_callback.context, mutation_root, .structural);
+        callback(window.dom_mutation_callback.context, mutation_root, kind);
     }
 }
 
-/// Verified insertions preserve both installed style subscriber maps and the
-/// matched block-layout children. The retained layout owner repairs direct DOM
-/// pointers synchronously after storage moves.
-fn prepareDomRetainedInsert(self: *Js, mutation_root: *Node) void {
-    const window_id = self.current_window_id orelse return;
-    const window = self.windows.getPtr(window_id) orelse return;
-    if (window.dom_mutation_callback.function) |callback| {
-        callback(window.dom_mutation_callback.context, mutation_root, .retained_insert);
-    }
-}
-
-fn completeDomMutation(self: *Js, mutation_root: *Node) void {
+fn completeDomMutation(context: ?*anyopaque, mutation_root: *Node) void {
+    const self = hostFromMutationContext(context);
     const window_id = self.current_window_id orelse return;
     const window = self.windows.getPtr(window_id) orelse return;
     if (window.dom_mutation_complete_callback.function) |callback| {
@@ -2237,12 +912,20 @@ fn completeDomMutation(self: *Js, mutation_root: *Node) void {
     }
 }
 
-fn markElementLayoutDirty(e: *parser.Element) void {
-    if (e.layout_ptr) |ptr| {
-        if (e.layout_mark) |mark_fn| {
-            mark_fn(ptr);
-        }
-    }
+fn clearDomMutationGlobals(context: ?*anyopaque, window_id: u32) Agent.Error!void {
+    const self = hostFromMutationContext(context);
+    const window = self.windows.getPtr(window_id) orelse return;
+    try self.clearNamedIdGlobals(window_id, window);
+}
+
+fn syncDomMutationGlobals(context: ?*anyopaque, window_id: u32) Agent.Error!void {
+    const self = hostFromMutationContext(context);
+    const window = self.windows.getPtr(window_id) orelse return;
+    try self.syncNamedIdGlobals(window_id, window);
+}
+
+fn requestDomMutationRender(context: ?*anyopaque) void {
+    hostFromMutationContext(context).requestRender();
 }
 
 /// Dispatch an event to the JavaScript environment for the given node
@@ -2349,7 +1032,7 @@ pub fn captureNodeHandleFromNativeCallback(self: *Js, window_id: u32, node: *Nod
 
 fn captureNodeHandleLocked(self: *Js, window_id: u32, node: *Node) !u32 {
     const window = try self.setCurrentWindow(window_id);
-    if (!isAttachedToCurrentDocument(window, node)) return error.DetachedNode;
+    if (!dom_mutation.isAttachedToCurrentDocument(window.current_nodes, node)) return error.DetachedNode;
     return self.getHandle(window, node);
 }
 
@@ -2372,7 +1055,7 @@ pub fn resolveAttachedNodeFromNativeCallback(self: *Js, window_id: u32, handle: 
 fn resolveAttachedNodeLocked(self: *Js, window_id: u32, handle: u32) ?*Node {
     const window = self.windows.getPtr(window_id) orelse return null;
     const node = self.getNode(window, handle) orelse return null;
-    return if (isAttachedToCurrentDocument(window, node)) node else null;
+    return if (dom_mutation.isAttachedToCurrentDocument(window.current_nodes, node)) node else null;
 }
 
 pub fn dispatchPostMessage(
@@ -3156,12 +1839,12 @@ test "retained insertion state accumulates and excludes stylesheet subtrees" {
     try std.testing.expect(ordinary.element.children_insertions_only);
     ordinary.element.markChildrenDirty();
     try std.testing.expect(!ordinary.element.children_insertions_only);
-    try std.testing.expect(!subtreeCanChangeAuthorStyleRules(&ordinary));
+    try std.testing.expect(!dom_mutation.subtreeCanChangeAuthorStyleRules(&ordinary));
 
     var run_in = Node{ .element = try parser.Element.init(allocator, "h6", null) };
     defer run_in.deinit(allocator);
-    try std.testing.expect(insertionCanMergeRunIn(&run_in, 0, 1));
-    try std.testing.expect(!insertionCanMergeRunIn(&run_in, 1, 1));
+    try std.testing.expect(dom_mutation.insertionCanMergeRunIn(&run_in, 0, 1));
+    try std.testing.expect(!dom_mutation.insertionCanMergeRunIn(&run_in, 1, 1));
 
     var wrapper = Node{ .element = try parser.Element.init(allocator, "section", null) };
     defer wrapper.deinit(allocator);
@@ -3175,7 +1858,7 @@ test "retained insertion state accumulates and excludes stylesheet subtrees" {
     try wrapper.element.children.append(allocator, nested_link);
     nested_link_owned = false;
     parser.fixParentPointers(&wrapper, null);
-    try std.testing.expect(subtreeCanChangeAuthorStyleRules(&wrapper));
+    try std.testing.expect(dom_mutation.subtreeCanChangeAuthorStyleRules(&wrapper));
 }
 
 test "innerHTML completion callback observes installed child generation" {
@@ -4013,585 +2696,58 @@ test "native style_set requests render" {
     try std.testing.expect(called);
 }
 
-/// Set up the document object with DOM API
+/// Install document and native DOM bindings for a newly created realm.
 fn setupDocument(self: *Js, realm: *Realm) !void {
-    const builtins = kiesel.builtins;
-    const PropertyKey = kiesel.types.PropertyKey;
-    const self_ptr: *anyopaque = self;
-
-    // Create document object
-    const document_obj = try builtins.ordinaryObjectCreate(&self.agent, null);
-
-    // Create querySelectorAll function with self pointer
-    const query_selector_all_fn = try kiesel.builtins.createBuiltinFunction(
+    const host_context: *anyopaque = self;
+    const native = try native_bindings.install(
         &self.agent,
-        .{ .function = querySelectorAll },
-        1,
-        "querySelectorAll",
-        .{
-            .realm = realm,
-            .additional_fields = self_ptr,
+        realm,
+        host_context,
+        &.{
+            .{ .name = "querySelectorAll", .length = 1, .function = querySelectorAll },
+        },
+        &.{
+            .{ .name = "getAttribute", .length = 2, .function = getAttribute },
+            .{ .name = "children", .length = 1, .function = getChildren },
+            .{ .name = "createElement", .length = 1, .function = createElement },
+            .{ .name = "appendChild", .length = 2, .function = appendChild },
+            .{ .name = "insertBefore", .length = 3, .function = insertBefore },
+            .{ .name = "removeChild", .length = 2, .function = removeChild },
+            .{ .name = "replaceChildren", .length = 1, .function = replaceChildren },
+            .{ .name = "setAttribute", .length = 3, .function = setAttribute },
+            .{ .name = "innerHTML", .length = 2, .function = innerHTML },
+            .{ .name = "getInnerHTML", .length = 1, .function = getInnerHTML },
+            .{ .name = "getOuterHTML", .length = 1, .function = getOuterHTML },
+            .{ .name = "style_set", .length = 2, .function = styleSet },
         },
     );
-
-    // Add querySelectorAll to document
-    try document_obj.definePropertyDirect(
+    try native_bindings.installFunctions(
         &self.agent,
-        PropertyKey.from("querySelectorAll"),
-        .{
-            .value_or_accessor = .{ .value = Value.from(&query_selector_all_fn.object) },
-            .attributes = .builtin_default,
-        },
+        realm,
+        native,
+        &self.canvas_host,
+        &canvas_bindings.bindings,
     );
-
-    // Add document to global object
-    try realm.global_object.definePropertyDirect(
+    try native_bindings.installFunctions(
         &self.agent,
-        PropertyKey.from("document"),
-        .{
-            .value_or_accessor = .{ .value = Value.from(document_obj) },
-            .attributes = .{
-                .writable = true,
-                .enumerable = false,
-                .configurable = true,
-            },
-        },
+        realm,
+        native,
+        &self.event_focus_host,
+        &event_focus_bindings.bindings,
     );
-
-    // Create __native object to hold native DOM methods
-    const native_obj = try builtins.ordinaryObjectCreate(&self.agent, null);
-
-    // Create getAttribute function with self pointer
-    const get_attribute_fn = try kiesel.builtins.createBuiltinFunction(
+    try native_bindings.installFunctions(
         &self.agent,
-        .{ .function = getAttribute },
-        2,
-        "getAttribute",
-        .{
-            .realm = realm,
-            .additional_fields = self_ptr,
-        },
+        realm,
+        native,
+        &self.network_host,
+        &network_bindings.bindings,
     );
-
-    // Add getAttribute to __native
-    try native_obj.definePropertyDirect(
+    try native_bindings.installFunctions(
         &self.agent,
-        PropertyKey.from("getAttribute"),
-        .{
-            .value_or_accessor = .{ .value = Value.from(&get_attribute_fn.object) },
-            .attributes = .builtin_default,
-        },
-    );
-
-    const children_fn = try kiesel.builtins.createBuiltinFunction(
-        &self.agent,
-        .{ .function = getChildren },
-        1,
-        "children",
-        .{
-            .realm = realm,
-            .additional_fields = self_ptr,
-        },
-    );
-
-    try native_obj.definePropertyDirect(
-        &self.agent,
-        PropertyKey.from("children"),
-        .{
-            .value_or_accessor = .{ .value = Value.from(&children_fn.object) },
-            .attributes = .builtin_default,
-        },
-    );
-
-    const event_path_fn = try kiesel.builtins.createBuiltinFunction(
-        &self.agent,
-        .{ .function = getEventPath },
-        1,
-        "eventPath",
-        .{
-            .realm = realm,
-            .additional_fields = self_ptr,
-        },
-    );
-
-    try native_obj.definePropertyDirect(
-        &self.agent,
-        PropertyKey.from("eventPath"),
-        .{
-            .value_or_accessor = .{ .value = Value.from(&event_path_fn.object) },
-            .attributes = .builtin_default,
-        },
-    );
-
-    const focus_fn = try kiesel.builtins.createBuiltinFunction(
-        &self.agent,
-        .{ .function = focusNode },
-        1,
-        "focus",
-        .{
-            .realm = realm,
-            .additional_fields = self_ptr,
-        },
-    );
-
-    try native_obj.definePropertyDirect(
-        &self.agent,
-        PropertyKey.from("focus"),
-        .{
-            .value_or_accessor = .{ .value = Value.from(&focus_fn.object) },
-            .attributes = .builtin_default,
-        },
-    );
-
-    const create_element_fn = try kiesel.builtins.createBuiltinFunction(
-        &self.agent,
-        .{ .function = createElement },
-        1,
-        "createElement",
-        .{
-            .realm = realm,
-            .additional_fields = self_ptr,
-        },
-    );
-    try native_obj.definePropertyDirect(
-        &self.agent,
-        PropertyKey.from("createElement"),
-        .{
-            .value_or_accessor = .{ .value = Value.from(&create_element_fn.object) },
-            .attributes = .builtin_default,
-        },
-    );
-
-    const append_child_fn = try kiesel.builtins.createBuiltinFunction(
-        &self.agent,
-        .{ .function = appendChild },
-        2,
-        "appendChild",
-        .{
-            .realm = realm,
-            .additional_fields = self_ptr,
-        },
-    );
-    try native_obj.definePropertyDirect(
-        &self.agent,
-        PropertyKey.from("appendChild"),
-        .{
-            .value_or_accessor = .{ .value = Value.from(&append_child_fn.object) },
-            .attributes = .builtin_default,
-        },
-    );
-
-    const insert_before_fn = try kiesel.builtins.createBuiltinFunction(
-        &self.agent,
-        .{ .function = insertBefore },
-        3,
-        "insertBefore",
-        .{
-            .realm = realm,
-            .additional_fields = self_ptr,
-        },
-    );
-    try native_obj.definePropertyDirect(
-        &self.agent,
-        PropertyKey.from("insertBefore"),
-        .{
-            .value_or_accessor = .{ .value = Value.from(&insert_before_fn.object) },
-            .attributes = .builtin_default,
-        },
-    );
-
-    const remove_child_fn = try kiesel.builtins.createBuiltinFunction(
-        &self.agent,
-        .{ .function = removeChild },
-        2,
-        "removeChild",
-        .{
-            .realm = realm,
-            .additional_fields = self_ptr,
-        },
-    );
-    try native_obj.definePropertyDirect(
-        &self.agent,
-        PropertyKey.from("removeChild"),
-        .{
-            .value_or_accessor = .{ .value = Value.from(&remove_child_fn.object) },
-            .attributes = .builtin_default,
-        },
-    );
-
-    const replace_children_fn = try kiesel.builtins.createBuiltinFunction(
-        &self.agent,
-        .{ .function = replaceChildren },
-        1,
-        "replaceChildren",
-        .{
-            .realm = realm,
-            .additional_fields = self_ptr,
-        },
-    );
-    try native_obj.definePropertyDirect(
-        &self.agent,
-        PropertyKey.from("replaceChildren"),
-        .{
-            .value_or_accessor = .{ .value = Value.from(&replace_children_fn.object) },
-            .attributes = .builtin_default,
-        },
-    );
-
-    // Create setAttribute function with self pointer
-    const set_attribute_fn = try kiesel.builtins.createBuiltinFunction(
-        &self.agent,
-        .{ .function = setAttribute },
-        3,
-        "setAttribute",
-        .{
-            .realm = realm,
-            .additional_fields = self_ptr,
-        },
-    );
-
-    // Add setAttribute to __native
-    try native_obj.definePropertyDirect(
-        &self.agent,
-        PropertyKey.from("setAttribute"),
-        .{
-            .value_or_accessor = .{ .value = Value.from(&set_attribute_fn.object) },
-            .attributes = .builtin_default,
-        },
-    );
-
-    const canvas_get_context_fn = try kiesel.builtins.createBuiltinFunction(
-        &self.agent,
-        .{ .function = canvasGetContext },
-        2,
-        "canvasGetContext",
-        .{
-            .realm = realm,
-            .additional_fields = self_ptr,
-        },
-    );
-    try native_obj.definePropertyDirect(
-        &self.agent,
-        PropertyKey.from("canvasGetContext"),
-        .{
-            .value_or_accessor = .{ .value = Value.from(&canvas_get_context_fn.object) },
-            .attributes = .builtin_default,
-        },
-    );
-
-    const canvas_dimension_fn = try kiesel.builtins.createBuiltinFunction(
-        &self.agent,
-        .{ .function = canvasDimension },
-        2,
-        "canvasDimension",
-        .{
-            .realm = realm,
-            .additional_fields = self_ptr,
-        },
-    );
-    try native_obj.definePropertyDirect(
-        &self.agent,
-        PropertyKey.from("canvasDimension"),
-        .{
-            .value_or_accessor = .{ .value = Value.from(&canvas_dimension_fn.object) },
-            .attributes = .builtin_default,
-        },
-    );
-
-    const canvas_command_fn = try kiesel.builtins.createBuiltinFunction(
-        &self.agent,
-        .{ .function = canvasCommand },
-        13,
-        "canvasCommand",
-        .{
-            .realm = realm,
-            .additional_fields = self_ptr,
-        },
-    );
-    try native_obj.definePropertyDirect(
-        &self.agent,
-        PropertyKey.from("canvasCommand"),
-        .{
-            .value_or_accessor = .{ .value = Value.from(&canvas_command_fn.object) },
-            .attributes = .builtin_default,
-        },
-    );
-
-    // Create innerHTML function with self pointer
-    const inner_html_fn = try kiesel.builtins.createBuiltinFunction(
-        &self.agent,
-        .{ .function = innerHTML },
-        2,
-        "innerHTML",
-        .{
-            .realm = realm,
-            .additional_fields = self_ptr,
-        },
-    );
-
-    const get_inner_html_fn = try kiesel.builtins.createBuiltinFunction(
-        &self.agent,
-        .{ .function = getInnerHTML },
-        1,
-        "getInnerHTML",
-        .{
-            .realm = realm,
-            .additional_fields = self_ptr,
-        },
-    );
-
-    const get_outer_html_fn = try kiesel.builtins.createBuiltinFunction(
-        &self.agent,
-        .{ .function = getOuterHTML },
-        1,
-        "getOuterHTML",
-        .{
-            .realm = realm,
-            .additional_fields = self_ptr,
-        },
-    );
-
-    // Create style_set function with self pointer
-    const style_set_fn = try kiesel.builtins.createBuiltinFunction(
-        &self.agent,
-        .{ .function = styleSet },
-        2,
-        "style_set",
-        .{
-            .realm = realm,
-            .additional_fields = self_ptr,
-        },
-    );
-
-    // Add innerHTML to __native
-    try native_obj.definePropertyDirect(
-        &self.agent,
-        PropertyKey.from("innerHTML"),
-        .{
-            .value_or_accessor = .{ .value = Value.from(&inner_html_fn.object) },
-            .attributes = .builtin_default,
-        },
-    );
-
-    try native_obj.definePropertyDirect(
-        &self.agent,
-        PropertyKey.from("getInnerHTML"),
-        .{
-            .value_or_accessor = .{ .value = Value.from(&get_inner_html_fn.object) },
-            .attributes = .builtin_default,
-        },
-    );
-
-    try native_obj.definePropertyDirect(
-        &self.agent,
-        PropertyKey.from("getOuterHTML"),
-        .{
-            .value_or_accessor = .{ .value = Value.from(&get_outer_html_fn.object) },
-            .attributes = .builtin_default,
-        },
-    );
-
-    // Add style_set to __native
-    try native_obj.definePropertyDirect(
-        &self.agent,
-        PropertyKey.from("style_set"),
-        .{
-            .value_or_accessor = .{ .value = Value.from(&style_set_fn.object) },
-            .attributes = .builtin_default,
-        },
-    );
-
-    const cookie_get_fn = try kiesel.builtins.createBuiltinFunction(
-        &self.agent,
-        .{ .function = cookieGetNative },
-        0,
-        "cookieGet",
-        .{
-            .realm = realm,
-            .additional_fields = self_ptr,
-        },
-    );
-    try native_obj.definePropertyDirect(
-        &self.agent,
-        PropertyKey.from("cookieGet"),
-        .{
-            .value_or_accessor = .{ .value = Value.from(&cookie_get_fn.object) },
-            .attributes = .builtin_default,
-        },
-    );
-
-    const cookie_set_fn = try kiesel.builtins.createBuiltinFunction(
-        &self.agent,
-        .{ .function = cookieSetNative },
-        1,
-        "cookieSet",
-        .{
-            .realm = realm,
-            .additional_fields = self_ptr,
-        },
-    );
-    try native_obj.definePropertyDirect(
-        &self.agent,
-        PropertyKey.from("cookieSet"),
-        .{
-            .value_or_accessor = .{ .value = Value.from(&cookie_set_fn.object) },
-            .attributes = .builtin_default,
-        },
-    );
-
-    // Create xhrSend function with self pointer
-    const xhr_send_fn = try kiesel.builtins.createBuiltinFunction(
-        &self.agent,
-        .{ .function = xhrSend },
-        5,
-        "xhrSend",
-        .{
-            .realm = realm,
-            .additional_fields = self_ptr,
-        },
-    );
-
-    try native_obj.definePropertyDirect(
-        &self.agent,
-        PropertyKey.from("xhrSend"),
-        .{
-            .value_or_accessor = .{ .value = Value.from(&xhr_send_fn.object) },
-            .attributes = .builtin_default,
-        },
-    );
-
-    const set_timeout_fn = try kiesel.builtins.createBuiltinFunction(
-        &self.agent,
-        .{ .function = setTimeoutNative },
-        2,
-        "setTimeout",
-        .{
-            .realm = realm,
-            .additional_fields = self_ptr,
-        },
-    );
-
-    try native_obj.definePropertyDirect(
-        &self.agent,
-        PropertyKey.from("setTimeout"),
-        .{
-            .value_or_accessor = .{ .value = Value.from(&set_timeout_fn.object) },
-            .attributes = .builtin_default,
-        },
-    );
-
-    const clear_interval_fn = try kiesel.builtins.createBuiltinFunction(
-        &self.agent,
-        .{ .function = clearIntervalNative },
-        1,
-        "clearInterval",
-        .{
-            .realm = realm,
-            .additional_fields = self_ptr,
-        },
-    );
-
-    try native_obj.definePropertyDirect(
-        &self.agent,
-        PropertyKey.from("clearInterval"),
-        .{
-            .value_or_accessor = .{ .value = Value.from(&clear_interval_fn.object) },
-            .attributes = .builtin_default,
-        },
-    );
-
-    const request_animation_fn = try kiesel.builtins.createBuiltinFunction(
-        &self.agent,
-        .{ .function = requestAnimationFrameNative },
-        0,
-        "requestAnimationFrame",
-        .{
-            .realm = realm,
-            .additional_fields = self_ptr,
-        },
-    );
-
-    try native_obj.definePropertyDirect(
-        &self.agent,
-        PropertyKey.from("requestAnimationFrame"),
-        .{
-            .value_or_accessor = .{ .value = Value.from(&request_animation_fn.object) },
-            .attributes = .builtin_default,
-        },
-    );
-
-    const get_window_id_fn = try kiesel.builtins.createBuiltinFunction(
-        &self.agent,
-        .{ .function = getWindowIdNative },
-        0,
-        "getWindowId",
-        .{
-            .realm = realm,
-            .additional_fields = self_ptr,
-        },
-    );
-
-    try native_obj.definePropertyDirect(
-        &self.agent,
-        PropertyKey.from("getWindowId"),
-        .{
-            .value_or_accessor = .{ .value = Value.from(&get_window_id_fn.object) },
-            .attributes = .builtin_default,
-        },
-    );
-
-    const get_parent_window_id_fn = try kiesel.builtins.createBuiltinFunction(
-        &self.agent,
-        .{ .function = getParentWindowIdNative },
-        1,
-        "getParentWindowId",
-        .{
-            .realm = realm,
-            .additional_fields = self_ptr,
-        },
-    );
-
-    try native_obj.definePropertyDirect(
-        &self.agent,
-        PropertyKey.from("getParentWindowId"),
-        .{
-            .value_or_accessor = .{ .value = Value.from(&get_parent_window_id_fn.object) },
-            .attributes = .builtin_default,
-        },
-    );
-
-    const post_message_fn = try kiesel.builtins.createBuiltinFunction(
-        &self.agent,
-        .{ .function = postMessageNative },
-        3,
-        "postMessage",
-        .{
-            .realm = realm,
-            .additional_fields = self_ptr,
-        },
-    );
-
-    try native_obj.definePropertyDirect(
-        &self.agent,
-        PropertyKey.from("postMessage"),
-        .{
-            .value_or_accessor = .{ .value = Value.from(&post_message_fn.object) },
-            .attributes = .builtin_default,
-        },
-    );
-
-    // Add __native to global
-    try realm.global_object.definePropertyDirect(
-        &self.agent,
-        PropertyKey.from("__native"),
-        .{
-            .value_or_accessor = .{ .value = Value.from(native_obj) },
-            .attributes = .{
-                .writable = false,
-                .enumerable = false,
-                .configurable = false,
-            },
-        },
+        realm,
+        native,
+        &self.timer_host,
+        &timer_bindings.bindings,
     );
 }
 
@@ -4833,97 +2989,6 @@ fn getChildren(agent: *Agent, this_value: Value, arguments: kiesel.types.Argumen
     return Value.from(&result.object);
 }
 
-/// Snapshot a node's target-to-root event path before any listener runs.
-/// JavaScript dispatch consumes only numeric handles after this returns, so a
-/// listener may structurally mutate the DOM without invalidating the remaining
-/// bubbling traversal.
-fn getEventPath(agent: *Agent, this_value: Value, arguments: kiesel.types.Arguments) Agent.Error!Value {
-    const function_obj = agent.activeFunctionObject();
-    const builtin_fn = function_obj.as(kiesel.builtins.BuiltinFunction);
-    const js_instance = builtin_fn.fields.additionalFieldsAs(Js);
-    const window_id = js_instance.current_window_id orelse return agent.throwException(
-        .internal_error,
-        "Missing active window",
-        .{},
-    );
-    const window = js_instance.windows.getPtr(window_id) orelse return agent.throwException(
-        .internal_error,
-        "Missing window context",
-        .{},
-    );
-    _ = this_value;
-
-    const handle_arg = arguments.get(0);
-    if (!handle_arg.isNumber()) {
-        return agent.throwException(
-            .type_error,
-            "eventPath requires a numeric node handle",
-            .{},
-        );
-    }
-    const handle: u32 = @intFromFloat(handle_arg.asNumber().asFloat());
-    const target = js_instance.getNode(window, handle) orelse return agent.throwException(
-        .internal_error,
-        "Invalid node handle",
-        .{},
-    );
-
-    var path_length: usize = 1;
-    var ancestor = nodeParent(target);
-    while (ancestor) |node| : (ancestor = nodeParent(node)) path_length += 1;
-
-    const result = try kiesel.builtins.arrayCreate(agent, @intCast(path_length), null);
-    var current: ?*Node = target;
-    var index: usize = 0;
-    while (current) |node| : (current = nodeParent(node)) {
-        const node_handle = try js_instance.getHandle(window, node);
-        try result.object.createDataPropertyDirect(
-            agent,
-            kiesel.types.PropertyKey.from(
-                @as(kiesel.types.PropertyKey.IntegerIndex, @intCast(index)),
-            ),
-            Value.from(@as(f64, @floatFromInt(node_handle))),
-        );
-        index += 1;
-    }
-
-    return Value.from(&result.object);
-}
-
-/// __native.focus implementation. Detached, text, hidden, disabled, and
-/// otherwise non-focusable nodes are silent no-ops, matching HTMLElement's
-/// focus contract. Layout-dependent visibility is checked by the browser
-/// callback after it synchronously brings style/layout up to date.
-fn focusNode(agent: *Agent, this_value: Value, arguments: kiesel.types.Arguments) Agent.Error!Value {
-    const function_obj = agent.activeFunctionObject();
-    const builtin_fn = function_obj.as(kiesel.builtins.BuiltinFunction);
-    const js_instance = builtin_fn.fields.additionalFieldsAs(Js);
-    const window_id = js_instance.current_window_id orelse return .undefined;
-    const window = js_instance.windows.getPtr(window_id) orelse return .undefined;
-    _ = this_value;
-
-    const handle_arg = arguments.get(0);
-    if (!handle_arg.isNumber()) return .undefined;
-    const raw_handle = handle_arg.asNumber().asFloat();
-    const max_handle = @as(f64, @floatFromInt(std.math.maxInt(u32)));
-    if (std.math.isNan(raw_handle) or raw_handle < 0 or raw_handle > max_handle) return .undefined;
-    const handle: u32 = @intFromFloat(raw_handle);
-    const node = js_instance.getNode(window, handle) orelse return .undefined;
-    if (!isAttachedToCurrentDocument(window, node)) return .undefined;
-    const element = switch (node.*) {
-        .element => |*value| value,
-        .text => return .undefined,
-    };
-    if (!dom_focus.isProgrammaticallyFocusable(element)) return .undefined;
-
-    if (window.focus_callback.function) |callback| {
-        callback(window.focus_callback.context, handle) catch |err| {
-            std.log.warn("Failed to focus DOM element: {}", .{err});
-        };
-    }
-    return .undefined;
-}
-
 fn isValidCreatedTagName(tag: []const u8) bool {
     if (tag.len == 0) return false;
     for (tag) |byte| {
@@ -5036,11 +3101,12 @@ fn appendChild(agent: *Agent, this_value: Value, arguments: kiesel.types.Argumen
     if (!window.detached_nodes.contains(child)) {
         return agent.throwException(.type_error, "appendChild requires a detached element", .{});
     }
-    if (isInclusiveAncestor(child, parent)) {
+    if (dom_mutation.isInclusiveAncestor(child, parent)) {
         return agent.throwException(.type_error, "appendChild would create a cycle", .{});
     }
 
-    try js_instance.insertDetachedChild(window, parent, child, parent.element.children.items.len);
+    var mutation = js_instance.domMutationContext(window_id, window);
+    try dom_mutation.insertDetachedChild(&mutation, parent, child, parent.element.children.items.len);
     return .undefined;
 }
 
@@ -5083,7 +3149,7 @@ fn insertBefore(agent: *Agent, this_value: Value, arguments: kiesel.types.Argume
     if (!window.detached_nodes.contains(child)) {
         return agent.throwException(.type_error, "insertBefore requires a detached element", .{});
     }
-    if (isInclusiveAncestor(child, parent)) {
+    if (dom_mutation.isInclusiveAncestor(child, parent)) {
         return agent.throwException(.type_error, "insertBefore would create a cycle", .{});
     }
 
@@ -5100,14 +3166,15 @@ fn insertBefore(agent: *Agent, this_value: Value, arguments: kiesel.types.Argume
             "Invalid reference node handle",
             .{},
         );
-        break :index directChildIndex(parent, reference) orelse return agent.throwException(
+        break :index dom_mutation.directChildIndex(parent, reference) orelse return agent.throwException(
             .type_error,
             "insertBefore reference is not a child of this node",
             .{},
         );
     };
 
-    try js_instance.insertDetachedChild(window, parent, child, insert_index);
+    var mutation = js_instance.domMutationContext(window_id, window);
+    try dom_mutation.insertDetachedChild(&mutation, parent, child, insert_index);
     return .undefined;
 }
 
@@ -5147,13 +3214,14 @@ fn removeChild(agent: *Agent, this_value: Value, arguments: kiesel.types.Argumen
     if (parent.* != .element) {
         return agent.throwException(.type_error, "Text nodes do not support removeChild", .{});
     }
-    const remove_index = directChildIndex(parent, child) orelse return agent.throwException(
+    const remove_index = dom_mutation.directChildIndex(parent, child) orelse return agent.throwException(
         .type_error,
         "removeChild target is not a child of this node",
         .{},
     );
 
-    try js_instance.detachChild(window, parent, child, remove_index);
+    var mutation = js_instance.domMutationContext(window_id, window);
+    try dom_mutation.detachChild(&mutation, parent, child, remove_index);
     return .undefined;
 }
 
@@ -5191,7 +3259,8 @@ fn replaceChildren(agent: *Agent, this_value: Value, arguments: kiesel.types.Arg
     }
 
     if (arguments.count() == 1) {
-        try js_instance.emptyElementChildren(window_id, window, node);
+        var mutation = js_instance.domMutationContext(window_id, window);
+        try dom_mutation.emptyElementChildren(&mutation, node);
         return .undefined;
     }
 
@@ -5213,200 +3282,24 @@ fn replaceChildren(agent: *Agent, this_value: Value, arguments: kiesel.types.Arg
         if (child.* != .element) {
             return agent.throwException(.type_error, "replaceChildren arguments must be Elements", .{});
         }
-        if (isInclusiveAncestor(child, node)) {
+        if (dom_mutation.isInclusiveAncestor(child, node)) {
             return agent.throwException(.type_error, "replaceChildren would create a cycle", .{});
         }
         if (!window.detached_nodes.contains(child)) {
-            const parent = nodeParent(child) orelse return agent.throwException(
+            const parent = dom_mutation.nodeParent(child) orelse return agent.throwException(
                 .type_error,
                 "replaceChildren cannot transfer a document root",
                 .{},
             );
-            if (directChildIndex(parent, child) == null) {
+            if (dom_mutation.directChildIndex(parent, child) == null) {
                 return agent.throwException(.internal_error, "Replacement child has an invalid parent", .{});
             }
         }
         child_nodes.appendAssumeCapacity(child);
     }
 
-    try js_instance.transferElementChildren(window_id, window, node, child_nodes.items);
-    return .undefined;
-}
-
-fn canvasElementForHandle(window: *WindowContext, handle: u32) ?*parser.Element {
-    const node = window.handle_to_node.get(handle) orelse return null;
-    if (node.* != .element) return null;
-    if (!std.ascii.eqlIgnoreCase(node.element.tag, "canvas")) return null;
-    return &node.element;
-}
-
-fn ensureCanvasBacking(
-    agent: *Agent,
-    js_instance: *Js,
-    element: *parser.Element,
-) Agent.Error!*parser.Canvas {
-    const dimensions = element.canvasDimensions();
-    if (element.canvas == null) {
-        element.canvas = parser.Canvas.create(
-            js_instance.allocator,
-            js_instance.io,
-            dimensions.width,
-            dimensions.height,
-        ) catch |err| switch (err) {
-            error.OutOfMemory => return error.OutOfMemory,
-            else => return agent.throwException(
-                .internal_error,
-                "Could not allocate canvas backing store",
-                .{},
-            ),
-        };
-    } else {
-        element.canvas.?.resize(dimensions.width, dimensions.height) catch |err| switch (err) {
-            error.OutOfMemory => return error.OutOfMemory,
-            else => return agent.throwException(
-                .internal_error,
-                "Could not resize canvas backing store",
-                .{},
-            ),
-        };
-    }
-    return element.canvas.?;
-}
-
-/// Allocate (or return) the one 2D backing store for a canvas element. The JS
-/// runtime owns wrapper identity; this native seam owns only z2d state.
-fn canvasGetContext(agent: *Agent, this_value: Value, arguments: kiesel.types.Arguments) Agent.Error!Value {
-    _ = this_value;
-    const function_obj = agent.activeFunctionObject();
-    const builtin_fn = function_obj.as(kiesel.builtins.BuiltinFunction);
-    const js_instance = builtin_fn.fields.additionalFieldsAs(Js);
-    const window_id = js_instance.current_window_id orelse return .null;
-    const window = js_instance.windows.getPtr(window_id) orelse return .null;
-
-    const handle_arg = arguments.get(0);
-    const type_arg = arguments.get(1);
-    if (!handle_arg.isNumber() or !type_arg.isString()) return Value.from(@as(f64, 0));
-    const raw_handle = handle_arg.asNumber().asFloat();
-    if (!std.math.isFinite(raw_handle) or raw_handle < 0 or raw_handle > std.math.maxInt(u32)) {
-        return Value.from(@as(f64, 0));
-    }
-    const context_type = try type_arg.asString().toUtf8(js_instance.allocator);
-    defer js_instance.allocator.free(context_type);
-    if (!std.mem.eql(u8, context_type, "2d")) return Value.from(@as(f64, 0));
-
-    const element = canvasElementForHandle(window, @intFromFloat(raw_handle)) orelse
-        return Value.from(@as(f64, 0));
-    _ = try ensureCanvasBacking(agent, js_instance, element);
-    return Value.from(@as(f64, 1));
-}
-
-/// Width/height IDL-like properties use canvas defaults while retaining a
-/// useful numeric reflection for other replaced elements.
-fn canvasDimension(agent: *Agent, this_value: Value, arguments: kiesel.types.Arguments) Agent.Error!Value {
-    _ = this_value;
-    const function_obj = agent.activeFunctionObject();
-    const builtin_fn = function_obj.as(kiesel.builtins.BuiltinFunction);
-    const js_instance = builtin_fn.fields.additionalFieldsAs(Js);
-    const window_id = js_instance.current_window_id orelse return Value.from(@as(f64, 0));
-    const window = js_instance.windows.getPtr(window_id) orelse return Value.from(@as(f64, 0));
-    const handle_arg = arguments.get(0);
-    const name_arg = arguments.get(1);
-    if (!handle_arg.isNumber() or !name_arg.isString()) return Value.from(@as(f64, 0));
-
-    const raw_handle = handle_arg.asNumber().asFloat();
-    if (!std.math.isFinite(raw_handle) or raw_handle < 0 or raw_handle > std.math.maxInt(u32)) {
-        return Value.from(@as(f64, 0));
-    }
-    const node = window.handle_to_node.get(@intFromFloat(raw_handle)) orelse
-        return Value.from(@as(f64, 0));
-    if (node.* != .element) return Value.from(@as(f64, 0));
-    const name = try name_arg.asString().toUtf8(js_instance.allocator);
-    defer js_instance.allocator.free(name);
-    const is_width = std.mem.eql(u8, name, "width");
-    const is_height = std.mem.eql(u8, name, "height");
-    if (!is_width and !is_height) return Value.from(@as(f64, 0));
-
-    if (std.ascii.eqlIgnoreCase(node.element.tag, "canvas")) {
-        const dimensions = node.element.canvasDimensions();
-        return Value.from(@as(f64, @floatFromInt(if (is_width) dimensions.width else dimensions.height)));
-    }
-    const attributes = node.element.attributes orelse return Value.from(@as(f64, 0));
-    const raw = attributes.get(name) orelse return Value.from(@as(f64, 0));
-    const value = std.fmt.parseFloat(f64, raw) catch 0;
-    return Value.from(value);
-}
-
-/// Dispatch one CanvasRenderingContext2D call. Unsupported z2d operations and
-/// invalid drawing state are non-fatal stubs; allocation failures still
-/// propagate through Kiesel normally.
-fn canvasCommand(agent: *Agent, this_value: Value, arguments: kiesel.types.Arguments) Agent.Error!Value {
-    _ = this_value;
-    const function_obj = agent.activeFunctionObject();
-    const builtin_fn = function_obj.as(kiesel.builtins.BuiltinFunction);
-    const js_instance = builtin_fn.fields.additionalFieldsAs(Js);
-    const window_id = js_instance.current_window_id orelse return .undefined;
-    const window = js_instance.windows.getPtr(window_id) orelse return .undefined;
-
-    const handle_arg = arguments.get(0);
-    const name_arg = arguments.get(1);
-    const fill_arg = arguments.get(2);
-    const stroke_arg = arguments.get(3);
-    if (!handle_arg.isNumber() or !name_arg.isString() or
-        !fill_arg.isString() or !stroke_arg.isString()) return .undefined;
-    const raw_handle = handle_arg.asNumber().asFloat();
-    if (!std.math.isFinite(raw_handle) or raw_handle < 0 or raw_handle > std.math.maxInt(u32)) {
-        return .undefined;
-    }
-    const element = canvasElementForHandle(window, @intFromFloat(raw_handle)) orelse return .undefined;
-    const canvas = try ensureCanvasBacking(agent, js_instance, element);
-
-    const name = try name_arg.asString().toUtf8(js_instance.allocator);
-    defer js_instance.allocator.free(name);
-    const fill_style = try fill_arg.asString().toUtf8(js_instance.allocator);
-    defer js_instance.allocator.free(fill_style);
-    const stroke_style = try stroke_arg.asString().toUtf8(js_instance.allocator);
-    defer js_instance.allocator.free(stroke_style);
-
-    const line_width_arg = arguments.get(4);
-    const global_alpha_arg = arguments.get(5);
-    if (!line_width_arg.isNumber() or !global_alpha_arg.isNumber()) return .undefined;
-    const line_width = line_width_arg.asNumber().asFloat();
-    const global_alpha = global_alpha_arg.asNumber().asFloat();
-    if (!std.math.isFinite(line_width) or !std.math.isFinite(global_alpha)) return .undefined;
-
-    var values = [_]f64{0} ** 6;
-    for (0..values.len) |index| {
-        const value_arg = arguments.get(7 + index);
-        if (!value_arg.isNumber()) return .undefined;
-        values[index] = value_arg.asNumber().asFloat();
-        if (!std.math.isFinite(values[index])) return .undefined;
-    }
-
-    const result = canvas.command(
-        name,
-        values,
-        arguments.get(6).toBoolean(),
-        .{
-            .fill_style = fill_style,
-            .stroke_style = stroke_style,
-            .line_width = line_width,
-            .global_alpha = global_alpha,
-        },
-    ) catch |err| switch (err) {
-        error.OutOfMemory => return error.OutOfMemory,
-        error.NotImplemented => {
-            std.log.debug("CanvasRenderingContext2D.{s} is not implemented", .{name});
-            return .undefined;
-        },
-        else => {
-            std.log.warn("CanvasRenderingContext2D.{s} ignored: {}", .{ name, err });
-            return .undefined;
-        },
-    };
-    if (result == .pixels_changed) {
-        parser.markPaintForElement(element);
-        js_instance.requestRender();
-    }
+    var mutation = js_instance.domMutationContext(window_id, window);
+    try dom_mutation.transferElementChildren(&mutation, node, child_nodes.items);
     return .undefined;
 }
 
@@ -5486,7 +3379,7 @@ fn setAttribute(agent: *Agent, this_value: Value, arguments: kiesel.types.Argume
             errdefer if (value_owned) js_instance.allocator.free(owned_value);
 
             const refresh_id_globals = std.mem.eql(u8, attr_name, "id") and
-                isAttachedToCurrentDocument(window, node);
+                dom_mutation.isAttachedToCurrentDocument(window.current_nodes, node);
             if (refresh_id_globals) {
                 try js_instance.clearNamedIdGlobals(window_id, window);
             }
@@ -5507,7 +3400,7 @@ fn setAttribute(agent: *Agent, this_value: Value, arguments: kiesel.types.Argume
                 (std.mem.eql(u8, attr_name, "width") or std.mem.eql(u8, attr_name, "height")))
             {
                 e.markChildrenDirty();
-                markElementLayoutDirty(e);
+                dom_mutation.markElementLayoutDirty(e);
             }
             if (canvas_dimension) {
                 if (e.canvas) |canvas| {
@@ -5728,7 +3621,7 @@ fn innerHTML(agent: *Agent, this_value: Value, arguments: kiesel.types.Arguments
                 e.owned_strings = std.ArrayList([]const u8).empty;
             }
             try e.owned_strings.?.ensureUnusedCapacity(js_instance.allocator, 1);
-            const is_attached = isAttachedToCurrentDocument(window, node);
+            const is_attached = dom_mutation.isAttachedToCurrentDocument(window.current_nodes, node);
             if (is_attached) {
                 try js_instance.clearNamedIdGlobals(window_id, window);
             }
@@ -5738,11 +3631,11 @@ fn innerHTML(agent: *Agent, this_value: Value, arguments: kiesel.types.Arguments
             // backing array. Dirty state and repaint scheduling are published
             // before this point, so any later failure remains recoverable.
             e.markChildrenDirty();
-            markElementLayoutDirty(e);
-            if (is_attached) js_instance.prepareDomMutation(node);
+            dom_mutation.markElementLayoutDirty(e);
+            if (is_attached) prepareDomMutation(js_instance, node, .structural);
 
             for (e.children.items) |*child| {
-                js_instance.removeHandlesForSubtree(window, child);
+                dom_mutation.removeHandlesForSubtree(&window.handles, child);
                 child.deinit(js_instance.allocator);
             }
             e.children.deinit(js_instance.allocator);
@@ -5755,7 +3648,7 @@ fn innerHTML(agent: *Agent, this_value: Value, arguments: kiesel.types.Arguments
             parser.fixParentPointers(node, e.parent);
 
             if (is_attached) {
-                js_instance.completeDomMutation(node);
+                completeDomMutation(js_instance, node);
                 try js_instance.syncNamedIdGlobals(window_id, window);
             }
             js_instance.requestRender();
@@ -5829,11 +3722,11 @@ fn styleSet(agent: *Agent, this_value: Value, arguments: kiesel.types.Arguments)
             // Capture current computed values before replacing the inline
             // declaration. An interrupted transition therefore starts from
             // its currently painted value rather than its original endpoint.
-            var old_opacity = currentAnimatedOpacity(e);
-            var old_background_color = currentAnimatedBackgroundColor(e);
-            var old_transform = currentAnimatedTransform(e);
-            var old_width = currentAnimatedPixel(e, "width");
-            var old_height = currentAnimatedPixel(e, "height");
+            var old_opacity = transitions.currentAnimatedOpacity(e);
+            var old_background_color = transitions.currentAnimatedBackgroundColor(e);
+            var old_transform = transitions.currentAnimatedTransform(e);
+            var old_width = transitions.currentAnimatedPixel(e, "width");
+            var old_height = transitions.currentAnimatedPixel(e, "height");
             if (e.style) |*style_map| {
                 if (old_opacity == null) {
                     if (style_map.getPtr("opacity")) |field| {
@@ -5882,16 +3775,16 @@ fn styleSet(agent: *Agent, this_value: Value, arguments: kiesel.types.Arguments)
             try e.attributes.?.put("style", owned_style);
 
             // Parse new style to check for opacity changes and transitions
-            const style_result = parseInlineStyle(js_instance.allocator, style_str);
+            const style_result = transitions.parseInlineStyle(js_instance.allocator, style_str);
             if (style_result) |ns| {
                 var new_style = ns;
                 defer new_style.deinit();
 
                 // Check for transition definition
                 if (new_style.get("transition")) |transition_str| {
-                    var transitions = TransitionListIterator.init(transition_str);
-                    while (transitions.next()) |transition_part| {
-                        const transition = parseTransitionValue(transition_part) orelse continue;
+                    var transition_list = transitions.TransitionListIterator.init(transition_str);
+                    while (transition_list.next()) |transition_part| {
+                        const transition = transitions.parseTransitionValue(transition_part) orelse continue;
                         const canonical_property: ?[]const u8 = for (parser.css_animation_properties) |property| {
                             if (std.ascii.eqlIgnoreCase(transition.property, property)) break property;
                         } else null;
@@ -5906,7 +3799,7 @@ fn styleSet(agent: *Agent, this_value: Value, arguments: kiesel.types.Arguments)
                                 const new_opacity = std.fmt.parseFloat(f64, new_op_str) catch null;
                                 if (new_opacity != null and old_opacity != null and old_opacity.? != new_opacity.?) {
                                     // Start animation from old to new value
-                                    startOpacityAnimation(
+                                    transitions.startOpacityAnimation(
                                         js_instance.allocator,
                                         e,
                                         old_opacity.?,
@@ -5924,7 +3817,7 @@ fn styleSet(agent: *Agent, this_value: Value, arguments: kiesel.types.Arguments)
                                 if (new_color != null and old_background_color != null and
                                     !std.meta.eql(old_background_color.?, new_color.?))
                                 {
-                                    startBackgroundColorAnimation(
+                                    transitions.startBackgroundColorAnimation(
                                         js_instance.allocator,
                                         e,
                                         old_background_color.?,
@@ -5942,7 +3835,7 @@ fn styleSet(agent: *Agent, this_value: Value, arguments: kiesel.types.Arguments)
                                 if (new_transform != null and old_transform != null and
                                     !old_transform.?.eql(new_transform.?))
                                 {
-                                    startTransformAnimation(
+                                    transitions.startTransformAnimation(
                                         js_instance.allocator,
                                         e,
                                         old_transform.?,
@@ -5970,7 +3863,7 @@ fn styleSet(agent: *Agent, this_value: Value, arguments: kiesel.types.Arguments)
                                 if (new_value != null and old_value != null and
                                     old_value.? != new_value.?)
                                 {
-                                    startPixelAnimation(
+                                    transitions.startPixelAnimation(
                                         js_instance.allocator,
                                         e,
                                         property,
@@ -5989,7 +3882,7 @@ fn styleSet(agent: *Agent, this_value: Value, arguments: kiesel.types.Arguments)
             } else |_| {}
 
             parser.dirtyStyleForElement(e);
-            markElementLayoutDirty(e);
+            dom_mutation.markElementLayoutDirty(e);
 
             js_instance.requestRender();
 
@@ -6003,379 +3896,4 @@ fn styleSet(agent: *Agent, this_value: Value, arguments: kiesel.types.Arguments)
             );
         },
     }
-}
-
-fn cookieGetNative(agent: *Agent, this_value: Value, _: kiesel.types.Arguments) Agent.Error!Value {
-    _ = this_value;
-    const function_obj = agent.activeFunctionObject();
-    const builtin_fn = function_obj.as(kiesel.builtins.BuiltinFunction);
-    const js_instance = builtin_fn.fields.additionalFieldsAs(Js);
-    const window_id = js_instance.current_window_id orelse return agent.throwException(
-        .internal_error,
-        "Missing active window",
-        .{},
-    );
-    const window = js_instance.windows.getPtr(window_id) orelse return agent.throwException(
-        .internal_error,
-        "Missing window context",
-        .{},
-    );
-
-    var result = CookieResult{ .data = "" };
-    if (window.cookie_callback.get_function) |callback| {
-        result = callback(window.cookie_callback.context) catch |err| {
-            std.log.err("document.cookie read failed: {}", .{err});
-            return agent.throwException(.type_error, "document.cookie read failed", .{});
-        };
-    }
-    defer if (result.should_free) {
-        if (result.allocator) |allocator| {
-            allocator.free(result.data);
-        } else {
-            js_instance.allocator.free(result.data);
-        }
-    };
-    // Kiesel may retain an ASCII input buffer in its string cache. Move an
-    // independent copy into the traced heap before the callback-owned result
-    // is released at the end of this host call.
-    const stable_data = if (result.data.len == 0)
-        result.data
-    else
-        try agent.gc_allocator.dupe(u8, result.data);
-    const js_string = try kiesel.types.String.fromUtf8(agent, stable_data);
-    return Value.from(js_string);
-}
-
-fn cookieSetNative(agent: *Agent, this_value: Value, arguments: kiesel.types.Arguments) Agent.Error!Value {
-    _ = this_value;
-    const function_obj = agent.activeFunctionObject();
-    const builtin_fn = function_obj.as(kiesel.builtins.BuiltinFunction);
-    const js_instance = builtin_fn.fields.additionalFieldsAs(Js);
-    const window_id = js_instance.current_window_id orelse return agent.throwException(
-        .internal_error,
-        "Missing active window",
-        .{},
-    );
-    const window = js_instance.windows.getPtr(window_id) orelse return agent.throwException(
-        .internal_error,
-        "Missing window context",
-        .{},
-    );
-    const value_arg = arguments.get(0);
-    if (!value_arg.isString()) {
-        return agent.throwException(.type_error, "document.cookie value must be a string", .{});
-    }
-    const value = try value_arg.asString().toUtf8(js_instance.allocator);
-    defer js_instance.allocator.free(value);
-    if (window.cookie_callback.set_function) |callback| {
-        callback(window.cookie_callback.context, value) catch |err| {
-            std.log.err("document.cookie write failed: {}", .{err});
-            return agent.throwException(.type_error, "document.cookie write failed", .{});
-        };
-    }
-    return .undefined;
-}
-
-/// __native.xhrSend implementation
-fn xhrSend(agent: *Agent, this_value: Value, arguments: kiesel.types.Arguments) Agent.Error!Value {
-    _ = this_value;
-
-    const function_obj = agent.activeFunctionObject();
-    const builtin_fn = function_obj.as(kiesel.builtins.BuiltinFunction);
-    const js_instance = builtin_fn.fields.additionalFieldsAs(Js);
-    const window_id = js_instance.current_window_id orelse return agent.throwException(
-        .internal_error,
-        "Missing active window",
-        .{},
-    );
-    const window = js_instance.windows.getPtr(window_id) orelse return agent.throwException(
-        .internal_error,
-        "Missing window context",
-        .{},
-    );
-
-    const callback = window.xhr_callback.function orelse
-        return agent.throwException(.type_error, "XMLHttpRequest is not available", .{});
-    const callback_context = window.xhr_callback.context;
-
-    const method_arg = arguments.get(0);
-    if (!method_arg.isString()) {
-        return agent.throwException(.type_error, "XMLHttpRequest method must be a string", .{});
-    }
-    const method_slice = try method_arg.asString().toUtf8(js_instance.allocator);
-    defer js_instance.allocator.free(method_slice);
-
-    const url_arg = arguments.get(1);
-    if (!url_arg.isString()) {
-        return agent.throwException(.type_error, "XMLHttpRequest URL must be a string", .{});
-    }
-    const url_slice = try url_arg.asString().toUtf8(js_instance.allocator);
-    defer js_instance.allocator.free(url_slice);
-
-    var owned_body_slice: ?[]const u8 = null;
-    if (arguments.count() >= 3) {
-        const body_arg = arguments.get(2);
-        if (!body_arg.isUndefined() and !body_arg.isNull()) {
-            if (!body_arg.isString()) {
-                return agent.throwException(.type_error, "XMLHttpRequest body must be a string", .{});
-            }
-            owned_body_slice = try body_arg.asString().toUtf8(js_instance.allocator);
-        }
-    }
-    defer if (owned_body_slice) |slice| js_instance.allocator.free(slice);
-
-    const payload = owned_body_slice;
-
-    const is_async = if (arguments.count() >= 4)
-        arguments.get(3).toBoolean()
-    else
-        false;
-
-    if (arguments.count() < 5) {
-        return agent.throwException(.type_error, "XMLHttpRequest handle missing", .{});
-    }
-    const handle_arg = arguments.get(4);
-    if (!handle_arg.isNumber()) {
-        return agent.throwException(.type_error, "XMLHttpRequest handle must be numeric", .{});
-    }
-    const raw_handle = handle_arg.asNumber().asFloat();
-    if (std.math.isNan(raw_handle)) {
-        return agent.throwException(.type_error, "Invalid XMLHttpRequest handle", .{});
-    }
-    const handle: u32 = @intFromFloat(raw_handle);
-
-    const result = callback(callback_context, method_slice, url_slice, payload, is_async, handle) catch |err| {
-        if (err == error.CrossOriginBlocked) {
-            return agent.throwException(.type_error, "Cross-origin XMLHttpRequest not allowed", .{});
-        }
-        if (err == error.CspViolation) {
-            return agent.throwException(.type_error, "XMLHttpRequest blocked by Content-Security-Policy", .{});
-        }
-        std.log.err("XMLHttpRequest failed: {}", .{err});
-        return agent.throwException(.type_error, "XMLHttpRequest failed", .{});
-    };
-
-    if (is_async) {
-        return .undefined;
-    }
-
-    defer if (result.should_free) {
-        if (result.allocator) |alloc| {
-            alloc.free(result.data);
-        } else {
-            js_instance.allocator.free(result.data);
-        }
-    };
-
-    const stable_data = if (result.data.len == 0)
-        result.data
-    else
-        try agent.gc_allocator.dupe(u8, result.data);
-    const js_string = try kiesel.types.String.fromUtf8(agent, stable_data);
-
-    return Value.from(js_string);
-}
-
-fn setTimeoutNative(agent: *Agent, this_value: Value, arguments: kiesel.types.Arguments) Agent.Error!Value {
-    _ = this_value;
-
-    const function_obj = agent.activeFunctionObject();
-    const builtin_fn = function_obj.as(kiesel.builtins.BuiltinFunction);
-    const js_instance = builtin_fn.fields.additionalFieldsAs(Js);
-    const window_id = js_instance.current_window_id orelse return agent.throwException(
-        .internal_error,
-        "Missing active window",
-        .{},
-    );
-    const window = js_instance.windows.getPtr(window_id) orelse return agent.throwException(
-        .internal_error,
-        "Missing window context",
-        .{},
-    );
-
-    const handle_arg = arguments.get(0);
-    if (!handle_arg.isNumber()) {
-        return agent.throwException(
-            .type_error,
-            "setTimeout requires a numeric handle",
-            .{},
-        );
-    }
-
-    const raw_handle = handle_arg.asNumber().asFloat();
-    if (std.math.isNan(raw_handle)) {
-        return agent.throwException(
-            .type_error,
-            "setTimeout handle must be a valid number",
-            .{},
-        );
-    }
-    const handle: u32 = @intFromFloat(raw_handle);
-
-    var delay_ms: u32 = 0;
-    if (arguments.count() >= 2) {
-        const delay_arg = arguments.get(1);
-        if (delay_arg.isNumber()) {
-            const delay_float = delay_arg.asNumber().asFloat();
-            if (!std.math.isNan(delay_float) and delay_float > 0) {
-                const max_delay = @as(f64, @floatFromInt(std.math.maxInt(u32)));
-                const clamped = @min(delay_float, max_delay);
-                delay_ms = @intFromFloat(clamped);
-            }
-        }
-    }
-
-    const is_interval = arguments.count() >= 3 and arguments.get(2).toBoolean();
-
-    if (window.set_timeout_callback.function) |callback| {
-        const callback_context = window.set_timeout_callback.context;
-        callback(callback_context, handle, delay_ms, is_interval) catch |err| {
-            std.log.warn("Failed to schedule setTimeout callback: {}", .{err});
-        };
-    }
-
-    return .undefined;
-}
-
-fn clearIntervalNative(agent: *Agent, this_value: Value, arguments: kiesel.types.Arguments) Agent.Error!Value {
-    _ = this_value;
-
-    const function_obj = agent.activeFunctionObject();
-    const builtin_fn = function_obj.as(kiesel.builtins.BuiltinFunction);
-    const js_instance = builtin_fn.fields.additionalFieldsAs(Js);
-    const window_id = js_instance.current_window_id orelse return .undefined;
-    const window = js_instance.windows.getPtr(window_id) orelse return .undefined;
-
-    const handle_arg = arguments.get(0);
-    if (!handle_arg.isNumber()) return .undefined;
-    const raw_handle = handle_arg.asNumber().asFloat();
-    const max_handle = @as(f64, @floatFromInt(std.math.maxInt(u32)));
-    if (std.math.isNan(raw_handle) or raw_handle < 0 or raw_handle > max_handle) return .undefined;
-
-    if (window.clear_interval_callback.function) |callback| {
-        callback(
-            window.clear_interval_callback.context,
-            @intFromFloat(raw_handle),
-        );
-    }
-    return .undefined;
-}
-
-fn requestAnimationFrameNative(agent: *Agent, this_value: Value, arguments: kiesel.types.Arguments) Agent.Error!Value {
-    _ = this_value;
-    _ = arguments;
-
-    const function_obj = agent.activeFunctionObject();
-    const builtin_fn = function_obj.as(kiesel.builtins.BuiltinFunction);
-    const js_instance = builtin_fn.fields.additionalFieldsAs(Js);
-    const window_id = js_instance.current_window_id orelse return agent.throwException(
-        .internal_error,
-        "Missing active window",
-        .{},
-    );
-    const window = js_instance.windows.getPtr(window_id) orelse return agent.throwException(
-        .internal_error,
-        "Missing window context",
-        .{},
-    );
-
-    if (window.animation_frame_callback.function) |callback| {
-        const callback_context = window.animation_frame_callback.context;
-        callback(callback_context) catch |err| {
-            std.log.warn("Failed to schedule animation frame: {}", .{err});
-        };
-    }
-
-    return .undefined;
-}
-
-fn getWindowIdNative(agent: *Agent, this_value: Value, _: kiesel.types.Arguments) Agent.Error!Value {
-    const function_obj = agent.activeFunctionObject();
-    const builtin_fn = function_obj.as(kiesel.builtins.BuiltinFunction);
-    const js_instance = builtin_fn.fields.additionalFieldsAs(Js);
-    _ = this_value;
-
-    const window_id = js_instance.current_window_id orelse return agent.throwException(
-        .internal_error,
-        "Missing active window",
-        .{},
-    );
-    return Value.from(@as(f64, @floatFromInt(window_id)));
-}
-
-fn getParentWindowIdNative(agent: *Agent, this_value: Value, arguments: kiesel.types.Arguments) Agent.Error!Value {
-    const function_obj = agent.activeFunctionObject();
-    const builtin_fn = function_obj.as(kiesel.builtins.BuiltinFunction);
-    const js_instance = builtin_fn.fields.additionalFieldsAs(Js);
-    _ = this_value;
-
-    const id_arg = arguments.get(0);
-    if (!id_arg.isNumber()) {
-        return agent.throwException(.type_error, "getParentWindowId requires a numeric window id", .{});
-    }
-
-    const raw_id = id_arg.asNumber().asFloat();
-    if (std.math.isNan(raw_id)) {
-        return agent.throwException(.type_error, "getParentWindowId requires a valid window id", .{});
-    }
-    const window_id = @as(u32, @intFromFloat(raw_id));
-    const parent_id = js_instance.parent_window_ids.get(window_id) orelse return .null;
-    // A cross-origin parent intentionally has no WindowContext in this Js
-    // realm. The JavaScript wrapper exposes only an opaque numeric proxy with
-    // postMessage, so its identity remains safe and useful across origins.
-    return Value.from(@as(f64, @floatFromInt(parent_id)));
-}
-
-fn postMessageNative(agent: *Agent, this_value: Value, arguments: kiesel.types.Arguments) Agent.Error!Value {
-    const function_obj = agent.activeFunctionObject();
-    const builtin_fn = function_obj.as(kiesel.builtins.BuiltinFunction);
-    const js_instance = builtin_fn.fields.additionalFieldsAs(Js);
-    _ = this_value;
-
-    const window_id = js_instance.current_window_id orelse return agent.throwException(
-        .internal_error,
-        "Missing active window",
-        .{},
-    );
-    const window = js_instance.windows.getPtr(window_id) orelse return agent.throwException(
-        .internal_error,
-        "Missing window context",
-        .{},
-    );
-
-    const message_arg = arguments.get(0);
-    const target_id_arg = arguments.get(1);
-    const target_origin_arg = arguments.get(2);
-
-    if (!target_id_arg.isNumber()) {
-        return agent.throwException(.type_error, "postMessage requires a numeric target window id", .{});
-    }
-    if (!target_origin_arg.isString()) {
-        return agent.throwException(.type_error, "postMessage requires a string target origin", .{});
-    }
-
-    const message_str = try message_arg.toString(&js_instance.agent);
-    const message = try message_str.toUtf8(js_instance.allocator);
-    defer js_instance.allocator.free(message);
-
-    const target_origin = try target_origin_arg.asString().toUtf8(js_instance.allocator);
-    defer js_instance.allocator.free(target_origin);
-
-    const raw_target_id = target_id_arg.asNumber().asFloat();
-    if (std.math.isNan(raw_target_id)) {
-        return agent.throwException(.type_error, "postMessage requires a valid target window id", .{});
-    }
-    const target_window_id = @as(u32, @intFromFloat(raw_target_id));
-
-    if (window.post_message_callback.function) |callback| {
-        const ctx = window.post_message_callback.context;
-        callback(ctx, window_id, target_window_id, target_origin, message) catch |err| {
-            if (err == error.InvalidTargetOrigin) {
-                return agent.throwException(.syntax_error, "Invalid postMessage target origin", .{});
-            }
-            return agent.throwException(.internal_error, "postMessage failed: {any}", .{err});
-        };
-    }
-
-    return .undefined;
 }
