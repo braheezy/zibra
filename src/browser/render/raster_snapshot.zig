@@ -111,6 +111,7 @@ pub const RasterSnapshot = struct {
             .transform => |transform_item| .{ .transform = .{
                 .translate_x = transform_item.translate_x,
                 .translate_y = transform_item.translate_y,
+                .scroll_attachment = transform_item.scroll_attachment,
                 .children = try self.cloneList(transform_item.children),
                 .node = null,
                 .composited = transform_item.composited,
@@ -140,6 +141,29 @@ pub const RasterSnapshot = struct {
         self.pixel_buffers.deinit(self.allocator);
     }
 };
+
+test "raster snapshots preserve transform scroll attachment" {
+    var children = [_]DisplayItem{.{ .rect = .{
+        .x1 = 1,
+        .y1 = 2,
+        .x2 = 3,
+        .y2 = 4,
+        .color = .{ .r = 1, .g = 2, .b = 3 },
+    } }};
+    const source = [_]DisplayItem{.{ .transform = .{
+        .translate_x = 5,
+        .translate_y = 6,
+        .scroll_attachment = .frame_viewport,
+        .children = &children,
+    } }};
+
+    var snapshot = try RasterSnapshot.clone(std.testing.allocator, source[0..]);
+    defer snapshot.deinit();
+    try std.testing.expectEqual(
+        display.ScrollAttachment.frame_viewport,
+        snapshot.items[0].transform.scroll_attachment,
+    );
+}
 
 /// A one-child dst_in command is a list-level mask for already-painted
 /// siblings. Every other compositing boundary gets an isolated surface.

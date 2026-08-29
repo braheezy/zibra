@@ -10,6 +10,7 @@ const box_model = @import("box_model.zig");
 const display_list = @import("display_list.zig");
 
 const DisplayItem = display_list.DisplayItem;
+const ScrollAttachment = display_list.ScrollAttachment;
 
 pub const Offset = struct {
     x: i32 = 0,
@@ -37,6 +38,9 @@ pub const ResolvedEffects = struct {
 pub const WrapContext = struct {
     bounds: display_list.Rect,
     position_offset: Offset = .{},
+    /// Fixed-position boxes retain ordinary layout geometry, but their
+    /// complete paint subtree is resolved against the owning frame viewport.
+    scroll_attachment: ScrollAttachment = .document,
     identity: ?*anyopaque = null,
     source: ?display_list.DisplayItemSource = null,
 };
@@ -237,6 +241,7 @@ pub fn wrapOwned(
             context.source,
             true,
             effects.transform_animation_active,
+            .document,
         ) catch |err| return err;
     }
     if (context.position_offset.x != 0 or context.position_offset.y != 0) {
@@ -248,6 +253,22 @@ pub fn wrapOwned(
             context.source,
             false,
             false,
+            .document,
+        ) catch |err| return err;
+    }
+    if (context.scroll_attachment == .frame_viewport) {
+        // This must be the outermost wrapper: it discards document scroll and
+        // ancestor translations before position, animation, and clipping are
+        // evaluated within the fixed subtree.
+        current = wrapTransformOwned(
+            allocator,
+            current,
+            .{},
+            null,
+            context.source,
+            false,
+            false,
+            .frame_viewport,
         ) catch |err| return err;
     }
     return current;
@@ -325,6 +346,7 @@ fn wrapTransformOwned(
     source: ?display_list.DisplayItemSource,
     composited: bool,
     animation_active: bool,
+    scroll_attachment: ScrollAttachment,
 ) std.mem.Allocator.Error![]DisplayItem {
     const result = allocator.alloc(DisplayItem, 1) catch |err| {
         DisplayItem.freeList(allocator, children);
@@ -333,6 +355,7 @@ fn wrapTransformOwned(
     result[0] = .{ .transform = .{
         .translate_x = offset.x,
         .translate_y = offset.y,
+        .scroll_attachment = scroll_attachment,
         .children = children,
         .node = identity,
         .composited = composited,
@@ -388,6 +411,32 @@ test "effect wrappers preserve filter clip blend transform and position order" {
     try std.testing.expectEqual(@as(usize, 2), outer.children.len);
     try std.testing.expectEqual(@as(f64, 2.0), outer.children[0].blend.blur_radius);
     try std.testing.expectEqualStrings("dst_in", outer.children[1].blend.blend_mode.?);
+}
+
+test "viewport-attached effects wrap the complete subtree outermost" {
+    const commands = try std.testing.allocator.alloc(DisplayItem, 1);
+    commands[0] = .{ .rect = .{
+        .x1 = 0,
+        .y1 = 0,
+        .x2 = 20,
+        .y2 = 20,
+        .color = .{ .r = 1, .g = 2, .b = 3, .a = 255 },
+    } };
+    const result = try wrapOwned(std.testing.allocator, commands, .{
+        .translation = .{ .x = 3, .y = 4 },
+    }, .{
+        .bounds = .{ .left = 0, .top = 0, .right = 20, .bottom = 20 },
+        .position_offset = .{ .x = 1, .y = 2 },
+        .scroll_attachment = .frame_viewport,
+    });
+    defer DisplayItem.freeList(std.testing.allocator, result);
+
+    const viewport = result[0].transform;
+    try std.testing.expectEqual(ScrollAttachment.frame_viewport, viewport.scroll_attachment);
+    const positioned = viewport.children[0].transform;
+    try std.testing.expectEqual(@as(i32, 1), positioned.translate_x);
+    const transformed = positioned.children[0].transform;
+    try std.testing.expectEqual(@as(i32, 3), transformed.translate_x);
 }
 
 test "rounded hit group stays non-compositing and cached edges remain shallow" {

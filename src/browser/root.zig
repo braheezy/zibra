@@ -901,12 +901,41 @@ pub const Browser = struct {
     /// Browser.lock stabilizes the active document geometry at every call site.
     fn interestRegionForScroll(self: *const Browser, scroll_css: i32) scroll_model.InterestRegion {
         const zoom = self.activeZoom();
+        const viewport_height = self.tabViewportHeightPx();
+        const scroll_px = scroll_model.scaleCssPx(scroll_css, zoom);
+        if (self.activeTabHasViewportAttachedPaint()) {
+            // A cached strip can be translated only when every pixel moves by
+            // the same amount. Fixed paint groups do not, so retain exactly
+            // one viewport at the current scroll position and re-raster on
+            // every scroll. This preserves source-order blending between page
+            // and fixed content without allocating a page-sized surface.
+            const height = @max(viewport_height, 1);
+            const content_height = @max(scroll_model.scaleCssPx(self.active_tab_height, zoom), height);
+            const max_scroll = @max(
+                @as(i64, content_height) - @as(i64, height),
+                0,
+            );
+            return .{
+                .start_px = @intCast(std.math.clamp(
+                    @as(i64, scroll_px),
+                    0,
+                    max_scroll,
+                )),
+                .height_px = height,
+            };
+        }
         return scroll_model.calculateInterestRegion(
             scroll_model.scaleCssPx(self.active_tab_height, zoom),
-            self.tabViewportHeightPx(),
+            viewport_height,
             self.window_height,
-            scroll_model.scaleCssPx(scroll_css, zoom),
+            scroll_px,
         );
+    }
+
+    /// Browser.lock stabilizes the retained list at every call site.
+    fn activeTabHasViewportAttachedPaint(self: *const Browser) bool {
+        const items = self.active_tab_display_list orelse return false;
+        return DisplayItem.hasFrameViewportAttachment(items);
     }
 
     fn interestRegionContainsScroll(self: *const Browser, scroll_css: i32) bool {
@@ -4350,6 +4379,11 @@ pub const Browser = struct {
     }
 
     fn workerCacheCanSplit(items: []const DisplayItem) bool {
+        // A viewport-attached group shares paint order with surrounding
+        // document commands but has a different scroll basis. Keep such a
+        // page in the single viewport raster path rather than splitting it
+        // into independently translated compositor planes.
+        if (DisplayItem.hasFrameViewportAttachment(items)) return false;
         var found_plane = false;
         for (items) |item| {
             if (workerPlaneSpec(item) != null) {
@@ -4984,7 +5018,11 @@ pub const Browser = struct {
         // (like dst_in clipping) render correctly.
         const zoom = self.activeZoom();
         const base_list = self.active_tab_display_list orelse &.{};
-        const draw_list = if (self.display_compositor.draw_list.items.len > 0) self.display_compositor.draw_list.items else base_list;
+        const draw_list = if (!DisplayItem.hasFrameViewportAttachment(base_list) and
+            self.display_compositor.draw_list.items.len > 0)
+            self.display_compositor.draw_list.items
+        else
+            base_list;
         for (draw_list) |item| {
             try self.software_renderer.drawDisplayItemZ2dContext(&tab_context, item, region.start_px, zoom);
         }
@@ -5736,6 +5774,16 @@ test "worker compositor cache accepts representable planes and rejects nested ef
     try std.testing.expect(Browser.workerCacheSupportsCompositorId(&top_level, plane_id));
     try std.testing.expect(Browser.workerPlaneSpec(plane).?.assume_overlap_after);
 
+    var fixed_children = [_]DisplayItem{plane};
+    const fixed_page = [_]DisplayItem{.{ .transform = .{
+        .translate_x = 0,
+        .translate_y = 0,
+        .scroll_attachment = .frame_viewport,
+        .children = &fixed_children,
+    } }};
+    try std.testing.expect(!Browser.workerCacheCanSplit(fixed_page[0..]));
+    try std.testing.expect(!Browser.workerCacheSupportsCompositorId(fixed_page[0..], plane_id));
+
     var nested_children = [_]DisplayItem{plane};
     var nested = [_]DisplayItem{.{ .blend = .{
         .opacity = 1.0,
@@ -5824,6 +5872,57 @@ test "direct worker commands preserve plane transform and opacity at draw time" 
     try std.testing.expectEqual(@as(u8, 255), painted.r);
     try std.testing.expect(painted.g >= 126 and painted.g <= 129);
     try std.testing.expect(painted.b >= 126 and painted.b <= 129);
+}
+
+test "viewport-attached raster groups ignore the document cache origin" {
+    const allocator = std.testing.allocator;
+    var surface = try z2d.Surface.init(.image_surface_rgba, allocator, 20, 20);
+    defer surface.deinit(allocator);
+    const pixels = switch (surface) {
+        .image_surface_rgba => |*image_surface| image_surface.buf,
+        else => unreachable,
+    };
+    @memset(pixels, .{ .r = 255, .g = 255, .b = 255, .a = 255 });
+
+    var document_children = [_]DisplayItem{.{ .rect = .{
+        .x1 = 1,
+        .y1 = 103,
+        .x2 = 5,
+        .y2 = 107,
+        .color = .{ .r = 0, .g = 0, .b = 255, .a = 255 },
+    } }};
+    var fixed_children = [_]DisplayItem{.{ .rect = .{
+        .x1 = 1,
+        .y1 = 8,
+        .x2 = 5,
+        .y2 = 12,
+        .color = .{ .r = 255, .g = 0, .b = 0, .a = 255 },
+    } }};
+    const document = DisplayItem{ .transform = .{
+        .translate_x = 0,
+        .translate_y = 0,
+        .children = &document_children,
+    } };
+    const fixed = DisplayItem{ .transform = .{
+        .translate_x = 0,
+        .translate_y = 2,
+        .scroll_attachment = .frame_viewport,
+        .children = &fixed_children,
+    } };
+
+    var context = z2d.Context.init(std.testing.io, allocator, &surface);
+    defer context.deinit();
+    var bounds = DisplayCompositor.init(allocator);
+    defer bounds.deinit();
+    var renderer = SoftwareRenderer.init(allocator, allocator, std.testing.io, &bounds);
+    try renderer.drawDisplayItemZ2dContextForLayer(&context, document, 0, 100, 1.0);
+    try renderer.drawDisplayItemZ2dContextForLayer(&context, fixed, 0, 100, 1.0);
+
+    const width: usize = 20;
+    const scrolled = pixels[4 * width + 2];
+    const viewport = pixels[11 * width + 2];
+    try std.testing.expectEqual(z2d.pixel.RGBA{ .r = 0, .g = 0, .b = 255, .a = 255 }, scrolled);
+    try std.testing.expectEqual(z2d.pixel.RGBA{ .r = 255, .g = 0, .b = 0, .a = 255 }, viewport);
 }
 
 test "tab zoom publishes an immediate active render preview" {

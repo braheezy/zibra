@@ -1,0 +1,35 @@
+<!-- How to verify: Scroll the page. The dark header and its checkbox stay at the
+     top of the content viewport while the numbered stripes move beneath it.
+     Click the checkbox after scrolling; it must still toggle. -->
+<!doctype html>
+<title>Fixed positioning</title>
+<style>
+  body { margin: 0; font: 18px sans-serif; }
+  .fixed {
+    position: fixed;
+    z-index: 1;
+    top: 0;
+    left: 0;
+    right: 0;
+    height: 52px;
+    padding: 10px 20px;
+    box-sizing: border-box;
+    background: #20242b;
+    color: white;
+  }
+  .page { padding-top: 60px; }
+  .stripe { height: 180px; padding: 20px; box-sizing: border-box; }
+  .sky { background: #d9ecff; }
+  .sand { background: #fff2c4; }
+</style>
+<div class=fixed>
+  Fixed to the viewport <label><input type=checkbox> still clickable</label>
+</div>
+<main class=page>
+  <div class="stripe sky">1</div>
+  <div class="stripe sand">2</div>
+  <div class="stripe sky">3</div>
+  <div class="stripe sand">4</div>
+  <div class="stripe sky">5</div>
+  <div id=bottom class="stripe sand">6</div>
+</main>

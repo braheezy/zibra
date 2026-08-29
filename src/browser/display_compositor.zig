@@ -203,6 +203,7 @@ pub const Compositor = struct {
                     .transform = .{
                         .translate_x = transform_item.translate_x,
                         .translate_y = transform_item.translate_y,
+                        .scroll_attachment = transform_item.scroll_attachment,
                         .children = children,
                         .node = transform_item.node,
                         .composited = transform_item.composited,
@@ -273,6 +274,7 @@ pub const Compositor = struct {
                             .transform = .{
                                 .translate_x = transform_item.translate_x,
                                 .translate_y = transform_item.translate_y,
+                                .scroll_attachment = transform_item.scroll_attachment,
                                 .children = children_copy,
                                 .node = transform_item.node,
                                 .composited = transform_item.composited,
@@ -483,6 +485,7 @@ pub const Compositor = struct {
                         .transform = .{
                             .translate_x = transform_item.translate_x,
                             .translate_y = transform_item.translate_y,
+                            .scroll_attachment = transform_item.scroll_attachment,
                             .children = children_copy,
                             .node = transform_item.node,
                             .composited = transform_item.composited,
@@ -555,4 +558,38 @@ test "compositor owns layer commands and retires draw borrowers first" {
     compositor.clear();
     try std.testing.expectEqual(@as(usize, 0), compositor.draw_list.items.len);
     try std.testing.expectEqual(@as(usize, 0), compositor.layers.items.len);
+}
+
+test "compositor cloning and draw-list building preserve transform scroll attachment" {
+    const allocator = std.testing.allocator;
+    var compositor = Compositor.init(allocator);
+    defer compositor.deinit();
+
+    var children = [_]DisplayItem{.{ .rect = .{
+        .x1 = 1,
+        .y1 = 2,
+        .x2 = 11,
+        .y2 = 12,
+        .color = .{ .r = 1, .g = 2, .b = 3 },
+    } }};
+    var source = [_]DisplayItem{.{ .transform = .{
+        .translate_x = 3,
+        .translate_y = 4,
+        .scroll_attachment = .frame_viewport,
+        .children = &children,
+    } }};
+
+    const cloned = try compositor.cloneDisplayItemList(source[0..]);
+    defer DisplayItem.freeList(allocator, cloned);
+    try std.testing.expectEqual(
+        display_commands.ScrollAttachment.frame_viewport,
+        cloned[0].transform.scroll_attachment,
+    );
+
+    try compositor.rebuildDrawList(source[0..]);
+    try std.testing.expectEqual(@as(usize, 1), compositor.draw_list.items.len);
+    try std.testing.expectEqual(
+        display_commands.ScrollAttachment.frame_viewport,
+        compositor.draw_list.items[0].transform.scroll_attachment,
+    );
 }

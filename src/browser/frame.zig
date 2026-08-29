@@ -855,6 +855,26 @@ pub fn FrameType(
             device_y: i32,
             zoom: f32,
         ) ?*Node {
+            // Root-frame input arrives in page coordinates, but a fixed
+            // subtree is painted in frame-viewport coordinates. Check that
+            // attachment first without changing the normal structural hit
+            // path, which deliberately covers unpainted layout box areas.
+            if (self.display_list) |items| {
+                const frame_viewport_y = device_y -|
+                    DisplayItem.scaleLayoutPx(self.scroll, zoom);
+                if (DisplayItem.hitTestFrameViewportDevice(
+                    items,
+                    device_x,
+                    device_y,
+                    frame_viewport_y,
+                    zoom,
+                )) |hit| {
+                    if (hit.source.originatingNode()) |node| {
+                        if (hoverElementForNode(node)) |element| return element;
+                    }
+                }
+            }
+
             if (!self.document.dirty) {
                 if (self.document.get().*) |document| {
                     if (!document.layoutNeeded()) {
@@ -925,7 +945,18 @@ pub fn FrameType(
             zoom: f32,
         ) !bool {
             const items = self.display_list orelse return false;
-            const hit = DisplayItem.hitTestDevice(items, device_x, device_y, zoom) orelse return false;
+            const frame_viewport_y = device_y -|
+                DisplayItem.scaleLayoutPx(self.scroll, zoom);
+            // Keep regular document-attached commands on their established
+            // path, but give fixed controls a chance to resolve using the
+            // unscrolled frame viewport before layout falls back to page space.
+            const hit = DisplayItem.hitTestFrameViewportDevice(
+                items,
+                device_x,
+                device_y,
+                frame_viewport_y,
+                zoom,
+            ) orelse DisplayItem.hitTestDevice(items, device_x, device_y, zoom) orelse return false;
             const layout_hit = if (!self.document.dirty)
                 if (self.document.get().*) |document|
                     if (!document.layoutNeeded())

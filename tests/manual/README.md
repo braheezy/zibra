@@ -16,7 +16,6 @@ tiers and baseline policy.
 | Primary fixture | Contract exercised |
 | --- | --- |
 | [`acid1-box-model.html`](acid1-box-model.html) | Acid1-inspired nested box spacing, borders, backgrounds, and visual compatibility baseline |
-| [`acid2-compat.html`](acid2-compat.html) | Isolated Acid2-inspired tree recovery, selector, object fallback, sizing, alignment, auto-margin, non-breaking-space, and repeated-background contracts |
 | [`dump-pipeline.html`](dump-pipeline.html) | Shared style, layout, and display-list inspection input |
 | [`dump-dom.html`](dump-dom.html) | Isolated HTML parser/DOM dump input |
 | [`anonymous-block-boxes.html`](anonymous-block-boxes.html) | Anonymous inline/block grouping |
@@ -31,6 +30,7 @@ tiers and baseline policy.
 | [`run-in-headings.html`](run-in-headings.html) | Run-in heading/layout behavior |
 | [`relative-lengths.html`](relative-lengths.html) | Relative CSS length resolution |
 | [`positioned-offsets.html`](positioned-offsets.html) | Relative visual offsets and absolute positioning without flow growth |
+| [`fixed-positioning.html`](fixed-positioning.html) | Viewport containing block, scroll-stable paint, and post-scroll input hit testing |
 | [`z-index.html`](z-index.html) | Positioned signed z-index, stable ties, nested paint/hit order |
 | [`alternate-text-direction.html`](alternate-text-direction.html) | Basic directed line alignment |
 | [`centered-title.html`](centered-title.html) | Multiline title centering |

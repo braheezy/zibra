@@ -182,7 +182,10 @@ Important geometry contracts:
   owner includes floats in auto height.
 - Relative position preserves the flow slot and stores a separate visual
   offset. Absolute blocks use the containing block's content box, have no
-  in-flow predecessor, and do not extend normal height.
+  in-flow predecessor, and do not extend normal height. Fixed blocks use the
+  owning frame viewport as their containing block, likewise have no in-flow
+  predecessor, and retain an outer `frame_viewport` display-transform wrapper
+  so their entire paint subtree ignores document scroll.
 - A fixed-height `overflow: scroll` block preserves natural content height as
   DOM scroll geometry, translates only its content, and clips that content.
 - Immediate layout children retain a stable paint permutation ordered by
@@ -248,7 +251,8 @@ recursively copies owning command containers and immutable canvas pixels, but
 does not own or extend the lifetime of the source layout cache.
 
 `render/paint_effects.zig` owns scalar effect resolution and the construction
-of blur, clip, blend, transform, position, and scroll command groups. Its
+of blur, clip, blend, transform, position, fixed-viewport, and scroll command
+groups. Its
 `wrapOwned` boundary consumes the independently owned top-level input slice on
 both success and allocation failure. Callers reserve a destination before
 transferring returned owning items, so no recursive command is shallow-copied
@@ -301,7 +305,12 @@ The worker keeps either a bounded assembled page surface or ordered compositor
 planes. The interest region is at most four native window heights. A viewport
 fully inside the published region can scroll by drawing cached pixels; crossing
 an edge, resizing, zooming, replacing the list, or changing geometry requires
-a new raster.
+a new raster. If the list contains a `frame_viewport` attachment, the worker
+uses a one-viewport region anchored at the current scroll offset and does not
+split compositor planes: only that arrangement preserves source-order blending
+between fixed and document-attached commands. Consequently fixed-content pages
+re-raster after every root scroll until a future multi-stratum cache proves the
+same ordering contract.
 
 Compositor planes own exactly one backing: an RGBA surface or an independent
 short pointer-free command snapshot. Short planes are limited to cheap
@@ -325,7 +334,9 @@ groups keep their isolation boundary.
 Painted-command hit testing and structural layout hit testing are
 complementary. Command hit testing walks in reverse paint order, inverts
 translations, honors clips and rounded corners, treats masks as clipping rather
-than targets, and retains exact glyph/fragment geometry. Layout hit testing
+than targets, and retains exact glyph/fragment geometry. Frame interaction
+first checks viewport-attached command groups with viewport coordinates, then
+uses the ordinary document-coordinate command and layout paths. Layout hit testing
 converts the point into parent-local coordinates while descending; blocks
 invert live transforms, add element scroll, apply local clips, and visit
 children in reverse paint order. Do not rebuild absolute rectangles for every

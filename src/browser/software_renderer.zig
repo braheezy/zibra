@@ -1081,8 +1081,17 @@ pub const Renderer = struct {
                 }
             },
             .transform => |t| {
-                // Apply translation by adjusting scroll offset for children
-                const new_scroll_offset = scroll_offset - self.scalePxWithZoom(t.translate_y, zoom);
+                // A viewport-attached group starts a fresh frame coordinate
+                // space. Its own translate still applies, but the root page
+                // scroll and any ancestor document translation do not.
+                const new_scroll_offset = if (t.scroll_attachment == .frame_viewport)
+                    0 - self.scalePxWithZoom(t.translate_y, zoom)
+                else
+                    scroll_offset - self.scalePxWithZoom(t.translate_y, zoom);
+                const new_x_offset = if (t.scroll_attachment == .frame_viewport)
+                    self.scalePxWithZoom(t.translate_x, zoom)
+                else
+                    self.scalePxWithZoom(t.translate_x, zoom);
                 for (t.children) |child| {
                     // Recursively draw children with adjusted offset
                     // For x translation, we need to handle it differently since scroll is y-only
@@ -1090,7 +1099,7 @@ pub const Renderer = struct {
                         context,
                         child,
                         new_scroll_offset,
-                        self.scalePxWithZoom(t.translate_x, zoom),
+                        new_x_offset,
                         zoom,
                     );
                 }
@@ -1430,13 +1439,23 @@ pub const Renderer = struct {
                 }
             },
             .transform => |t| {
-                // Nested transform: combine offsets
+                // A viewport attachment cancels the inherited root-scroll
+                // basis exactly once. Nested document transforms then compose
+                // normally inside that fresh coordinate space.
+                const child_scroll = if (t.scroll_attachment == .frame_viewport)
+                    0 - self.scalePxWithZoom(t.translate_y, zoom)
+                else
+                    scroll_offset - self.scalePxWithZoom(t.translate_y, zoom);
+                const child_x = if (t.scroll_attachment == .frame_viewport)
+                    self.scalePxWithZoom(t.translate_x, zoom)
+                else
+                    x_offset + self.scalePxWithZoom(t.translate_x, zoom);
                 for (t.children) |child| {
                     try self.drawDisplayItemZ2dContextWithTransform(
                         context,
                         child,
-                        scroll_offset - self.scalePxWithZoom(t.translate_y, zoom),
-                        x_offset + self.scalePxWithZoom(t.translate_x, zoom),
+                        child_scroll,
+                        child_x,
                         zoom,
                     );
                 }
@@ -1680,13 +1699,24 @@ pub const Renderer = struct {
                 // They would have been handled by the compositing pass
             },
             .transform => |t| {
-                // Apply transform offsets to the layer coordinates
+                // Document rasters express their origin as `layer_x/y`.
+                // Viewport-attached groups deliberately discard that origin,
+                // so a one-viewport raster can contain both scrolled page
+                // pixels and fixed pixels without moving the latter.
+                const child_layer_x = if (t.scroll_attachment == .frame_viewport)
+                    0 - self.scalePxWithZoom(t.translate_x, zoom)
+                else
+                    layer_x - self.scalePxWithZoom(t.translate_x, zoom);
+                const child_layer_y = if (t.scroll_attachment == .frame_viewport)
+                    0 - self.scalePxWithZoom(t.translate_y, zoom)
+                else
+                    layer_y - self.scalePxWithZoom(t.translate_y, zoom);
                 for (t.children) |child| {
                     try self.drawDisplayItemZ2dContextForLayer(
                         context,
                         child,
-                        layer_x - self.scalePxWithZoom(t.translate_x, zoom),
-                        layer_y - self.scalePxWithZoom(t.translate_y, zoom),
+                        child_layer_x,
+                        child_layer_y,
                         zoom,
                     );
                 }

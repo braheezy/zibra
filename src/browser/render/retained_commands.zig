@@ -83,6 +83,7 @@ pub fn cloneItem(
         .transform => |transform| .{ .transform = .{
             .translate_x = transform.translate_x,
             .translate_y = transform.translate_y,
+            .scroll_attachment = transform.scroll_attachment,
             .children = try cloneList(allocator, transform.children),
             .node = transform.node,
             .composited = transform.composited,
@@ -121,6 +122,7 @@ test "materialization recursively owns nested containers and metadata" {
     blend_children[0] = .{ .transform = .{
         .translate_x = 5,
         .translate_y = 7,
+        .scroll_attachment = .frame_viewport,
         .children = transform_children,
     } };
     const blend_mode = try allocator.dupe(u8, "multiply");
@@ -140,6 +142,10 @@ test "materialization recursively owns nested containers and metadata" {
     try std.testing.expectEqual(@as(f64, 3.0), snapshot[0].blend.blur_radius);
     try std.testing.expectEqual(@as(f64, 8), snapshot[0].blend.hit_clip.?.radius);
     try std.testing.expectEqual(@as(i32, 5), snapshot[0].blend.children[0].transform.translate_x);
+    try std.testing.expectEqual(
+        display_list.ScrollAttachment.frame_viewport,
+        snapshot[0].blend.children[0].transform.scroll_attachment,
+    );
     try std.testing.expectEqual(
         @as(i32, 30),
         snapshot[0].blend.children[0].transform.children[0].rect.x2,

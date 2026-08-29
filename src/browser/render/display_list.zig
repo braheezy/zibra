@@ -290,6 +290,17 @@ pub const RoundedHitClip = struct {
     radius: f64,
 };
 
+/// Coordinate space to which an owning transform group is attached.
+///
+/// Document-attached groups inherit the page cache's scroll origin.
+/// Frame-viewport-attached groups reset that origin before evaluating their
+/// subtree, which lets fixed-position layout retain ordinary primitive
+/// geometry and ownership.
+pub const ScrollAttachment = enum {
+    document,
+    frame_viewport,
+};
+
 pub const DisplayItem = union(enum) {
     /// Non-owning edge into a layout object's retained paint cache. The
     /// ArrayList field itself lives at a stable address for the lifetime of
@@ -378,6 +389,7 @@ pub const DisplayItem = union(enum) {
     transform: struct {
         translate_x: i32,
         translate_y: i32,
+        scroll_attachment: ScrollAttachment = .document,
         children: []DisplayItem,
         node: ?*anyopaque = null,
         composited: bool = false,
@@ -401,6 +413,28 @@ pub const DisplayItem = union(enum) {
         return switch (self.*) {
             inline else => |payload| payload.source,
         };
+    }
+
+    /// Whether a synchronous display-list traversal encounters a transform
+    /// attached to the owning frame viewport. Cached subtrees remain
+    /// layout-owned live edges, so inspect them before a snapshot boundary.
+    pub fn hasFrameViewportAttachment(items: []const DisplayItem) bool {
+        for (items) |item| {
+            switch (item) {
+                .cached_subtree => |cached| {
+                    if (hasFrameViewportAttachment(cached.list.items)) return true;
+                },
+                .blend => |blend_item| {
+                    if (hasFrameViewportAttachment(blend_item.children)) return true;
+                },
+                .transform => |transform_item| {
+                    if (transform_item.scroll_attachment == .frame_viewport or
+                        hasFrameViewportAttachment(transform_item.children)) return true;
+                },
+                else => {},
+            }
+        }
+        return false;
     }
 
     /// Return a non-owning command copy with `opacity_value` distributed into
@@ -612,6 +646,126 @@ pub const DisplayItem = union(enum) {
     ) ?HitResult {
         const zoom = if (zoom_value > 0) zoom_value else 1.0;
         return hitTestDeviceList(items, x, y, zoom);
+    }
+
+    /// Hit test only transform subtrees attached to the owning frame viewport.
+    ///
+    /// `document_x` and `document_y` describe the normal page-space pointer,
+    /// while `frame_viewport_y` is the same pointer before the Frame's root
+    /// scroll translation. Root scrolling is vertical, so the viewport x
+    /// coordinate remains `document_x`. Normal document-attached items are
+    /// deliberately ignored here; callers use `hitTestDevice` as their normal
+    /// fallback so existing layout and painted hit testing keep their behavior.
+    pub fn hitTestFrameViewportDevice(
+        items: []const DisplayItem,
+        document_x: i32,
+        document_y: i32,
+        frame_viewport_y: i32,
+        zoom_value: f32,
+    ) ?HitResult {
+        const zoom = if (zoom_value > 0) zoom_value else 1.0;
+        return hitTestFrameViewportDeviceList(
+            items,
+            document_x,
+            document_y,
+            document_x,
+            frame_viewport_y,
+            zoom,
+        );
+    }
+
+    /// Traverse in reverse paint order until a viewport-attached transform is
+    /// reached. A document-attached transform can contain a fixed descendant,
+    /// but its translation must not affect the descendant's viewport point, so
+    /// retain `frame_viewport_x`/`frame_viewport_y` separately while walking.
+    fn hitTestFrameViewportDeviceList(
+        items: []const DisplayItem,
+        document_x: i32,
+        document_y: i32,
+        frame_viewport_x: i32,
+        frame_viewport_y: i32,
+        zoom: f32,
+    ) ?HitResult {
+        var index = items.len;
+        while (index > 0) {
+            index -= 1;
+            const item = &items[index];
+            switch (item.*) {
+                .cached_subtree => |cached| {
+                    if (hitTestFrameViewportDeviceList(
+                        cached.list.items,
+                        document_x,
+                        document_y,
+                        frame_viewport_x,
+                        frame_viewport_y,
+                        zoom,
+                    )) |hit| return hit;
+                },
+                .blend => |blend_item| {
+                    if (blend_item.opacity <= 0) continue;
+                    // A clip that encloses a viewport attachment is expressed
+                    // in its enclosing document coordinate space. Effects
+                    // inside the attachment itself are handled by the normal
+                    // subtree hit test once that coordinate space is reset.
+                    if (blend_item.hit_clip) |clip| {
+                        if (!pointInRoundedRect(document_x, document_y, clip, zoom)) continue;
+                    }
+                    const is_dst_in = if (blend_item.blend_mode) |mode|
+                        std.mem.eql(u8, mode, "dst_in")
+                    else
+                        false;
+                    if (is_dst_in) {
+                        if (blend_item.children.len < 2) continue;
+                        const mask = &blend_item.children[blend_item.children.len - 1];
+                        if (!containsPaintedPoint(mask, document_x, document_y, zoom)) continue;
+                        if (hitTestFrameViewportDeviceList(
+                            blend_item.children[0 .. blend_item.children.len - 1],
+                            document_x,
+                            document_y,
+                            frame_viewport_x,
+                            frame_viewport_y,
+                            zoom,
+                        )) |hit| return hit;
+                        continue;
+                    }
+                    if (hitTestFrameViewportDeviceList(
+                        blend_item.children,
+                        document_x,
+                        document_y,
+                        frame_viewport_x,
+                        frame_viewport_y,
+                        zoom,
+                    )) |hit| return hit;
+                },
+                .transform => |transform_item| {
+                    if (transform_item.scroll_attachment == .frame_viewport) {
+                        const local_x = frame_viewport_x -
+                            scaleLayoutPx(transform_item.translate_x, zoom);
+                        const local_y = frame_viewport_y -
+                            scaleLayoutPx(transform_item.translate_y, zoom);
+                        // The full existing hit-test walker owns the subtree's
+                        // masks, clips, and ordinary transforms after the
+                        // coordinate reset. This transform establishes the
+                        // only new coordinate-space boundary.
+                        if (hitTestDeviceList(transform_item.children, local_x, local_y, zoom)) |hit| return hit;
+                        continue;
+                    }
+
+                    const local_x = document_x - scaleLayoutPx(transform_item.translate_x, zoom);
+                    const local_y = document_y - scaleLayoutPx(transform_item.translate_y, zoom);
+                    if (hitTestFrameViewportDeviceList(
+                        transform_item.children,
+                        local_x,
+                        local_y,
+                        frame_viewport_x,
+                        frame_viewport_y,
+                        zoom,
+                    )) |hit| return hit;
+                },
+                else => {},
+            }
+        }
+        return null;
     }
 
     fn hitTestDeviceList(
@@ -1001,4 +1155,148 @@ test "fitted image hit testing uses its complete replaced element box" {
     try std.testing.expect(DisplayItem.hitTest(items[0..], 50, 5, 1.0) != null);
     try std.testing.expect(DisplayItem.hitTest(items[0..], 50, 95, 1.0) != null);
     try std.testing.expect(DisplayItem.hitTest(items[0..], 100, 50, 1.0) == null);
+}
+
+test "viewport attachment hit testing resets page scroll in reverse paint order" {
+    var older_layout: u8 = 0;
+    var newer_layout: u8 = 0;
+    var older_viewport_children = [_]DisplayItem{.{ .rect = .{
+        .x1 = 0,
+        .y1 = 0,
+        .x2 = 20,
+        .y2 = 20,
+        .color = .{ .r = 1, .g = 2, .b = 3, .a = 255 },
+        .source = .{ .layout = &older_layout, .node = null },
+    } }};
+    var newer_viewport_children = [_]DisplayItem{.{ .rect = .{
+        .x1 = 0,
+        .y1 = 0,
+        .x2 = 20,
+        .y2 = 20,
+        .color = .{ .r = 4, .g = 5, .b = 6, .a = 255 },
+        .source = .{ .layout = &newer_layout, .node = null },
+    } }};
+    var document_children = [_]DisplayItem{
+        .{ .transform = .{
+            .translate_x = 0,
+            .translate_y = 0,
+            .scroll_attachment = .frame_viewport,
+            .children = &older_viewport_children,
+        } },
+        .{ .transform = .{
+            .translate_x = 0,
+            .translate_y = 0,
+            .scroll_attachment = .frame_viewport,
+            .children = &newer_viewport_children,
+        } },
+    };
+    const roots = [_]DisplayItem{.{
+        .transform = .{
+            // An enclosing document transform is representative of a scrolled
+            // parent. It must not leak into the fixed subtree's pointer space.
+            .translate_x = 0,
+            .translate_y = 100,
+            .children = &document_children,
+        },
+    }};
+
+    const hit = DisplayItem.hitTestFrameViewportDevice(
+        roots[0..],
+        8,
+        200,
+        8,
+        1.0,
+    ) orelse return error.TestExpectedEqual;
+    try std.testing.expect(hit.item == &newer_viewport_children[0]);
+    try std.testing.expectEqual(@intFromPtr(&newer_layout), @intFromPtr(hit.source.layout));
+    try std.testing.expectEqual(@as(i32, 8), hit.device_y);
+
+    // The existing walker stays document-attached; callers use the new helper
+    // first and then this path for every ordinary command.
+    try std.testing.expect(DisplayItem.hitTestDevice(roots[0..], 8, 200, 1.0) == null);
+
+    const document_only = [_]DisplayItem{.{ .rect = .{
+        .x1 = 0,
+        .y1 = 190,
+        .x2 = 20,
+        .y2 = 210,
+        .color = .{ .r = 7, .g = 8, .b = 9, .a = 255 },
+        .source = .{ .layout = &older_layout, .node = null },
+    } }};
+    try std.testing.expect(DisplayItem.hitTestFrameViewportDevice(
+        document_only[0..],
+        8,
+        200,
+        8,
+        1.0,
+    ) == null);
+}
+
+test "transform scroll attachment defaults and survives value copies" {
+    var children = [_]DisplayItem{.{ .rect = .{
+        .x1 = 0,
+        .y1 = 0,
+        .x2 = 1,
+        .y2 = 1,
+        .color = .{ .r = 1, .g = 2, .b = 3 },
+    } }};
+    const document_transform = DisplayItem{ .transform = .{
+        .translate_x = 0,
+        .translate_y = 0,
+        .children = &children,
+    } };
+    const viewport_transform = DisplayItem{ .transform = .{
+        .translate_x = 4,
+        .translate_y = 8,
+        .scroll_attachment = .frame_viewport,
+        .children = &children,
+    } };
+
+    try std.testing.expectEqual(ScrollAttachment.document, document_transform.transform.scroll_attachment);
+    try std.testing.expectEqual(ScrollAttachment.frame_viewport, viewport_transform.withOpacity(0.5).transform.scroll_attachment);
+}
+
+test "viewport attachment detection visits nested owning and cached subtrees" {
+    var leaf_children = [_]DisplayItem{.{ .rect = .{
+        .x1 = 0,
+        .y1 = 0,
+        .x2 = 1,
+        .y2 = 1,
+        .color = .{ .r = 1, .g = 2, .b = 3 },
+    } }};
+    var fixed_transform_children = [_]DisplayItem{.{ .transform = .{
+        .translate_x = 0,
+        .translate_y = 0,
+        .scroll_attachment = .frame_viewport,
+        .children = &leaf_children,
+    } }};
+    var document_transform_children = [_]DisplayItem{.{ .transform = .{
+        .translate_x = 3,
+        .translate_y = 4,
+        .children = &fixed_transform_children,
+    } }};
+    var blend_children = [_]DisplayItem{.{ .blend = .{
+        .opacity = 1.0,
+        .blend_mode = null,
+        .children = &document_transform_children,
+    } }};
+    var cached_items = std.ArrayList(DisplayItem).empty;
+    defer cached_items.deinit(std.testing.allocator);
+    try cached_items.append(std.testing.allocator, .{ .blend = .{
+        .opacity = 1.0,
+        .blend_mode = null,
+        .children = &blend_children,
+    } });
+
+    const document_only = [_]DisplayItem{.{ .transform = .{
+        .translate_x = 0,
+        .translate_y = 0,
+        .children = &leaf_children,
+    } }};
+    const roots = [_]DisplayItem{.{ .cached_subtree = .{
+        .list = &cached_items,
+    } }};
+
+    try std.testing.expect(!DisplayItem.hasFrameViewportAttachment(document_only[0..]));
+    try std.testing.expect(DisplayItem.hasFrameViewportAttachment(roots[0..]));
 }

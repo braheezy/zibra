@@ -1284,6 +1284,7 @@ fn replaceIframesInList(
                     .transform = .{
                         .translate_x = transform_item.translate_x,
                         .translate_y = transform_item.translate_y,
+                        .scroll_attachment = transform_item.scroll_attachment,
                         .children = child_slice,
                         .node = transform_item.node,
                         .composited = transform_item.composited,
@@ -1426,6 +1427,39 @@ fn appendIframeContent(
             .thickness = 1,
         },
     });
+}
+
+test "iframe composition replacement preserves transform scroll attachment" {
+    const allocator = std.testing.allocator;
+    var tab: Tab = undefined;
+    tab.allocator = allocator;
+    var root: Frame = undefined;
+
+    var children = [_]DisplayItem{.{ .rect = .{
+        .x1 = 0,
+        .y1 = 0,
+        .x2 = 10,
+        .y2 = 10,
+        .color = .{ .r = 1, .g = 2, .b = 3 },
+    } }};
+    var source = [_]DisplayItem{.{ .transform = .{
+        .translate_x = 7,
+        .translate_y = 9,
+        .scroll_attachment = .frame_viewport,
+        .children = &children,
+    } }};
+    var output = std.ArrayList(DisplayItem).empty;
+    defer {
+        DisplayItem.freeItems(allocator, output.items);
+        output.deinit(allocator);
+    }
+
+    try tab.replaceIframesInList(&root, source[0..], &output);
+    try std.testing.expectEqual(@as(usize, 1), output.items.len);
+    try std.testing.expectEqual(
+        @import("render/display_list.zig").ScrollAttachment.frame_viewport,
+        output.items[0].transform.scroll_attachment,
+    );
 }
 
 // Re-render the page without reloading (style, layout, paint)

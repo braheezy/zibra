@@ -70,6 +70,10 @@ const parseFloatSide = box_model.parseFloatSide;
 const parseClearSide = box_model.parseClearSide;
 const parsePositionMode = box_model.parsePositionMode;
 
+fn isOutOfFlowPosition(mode: PositionMode) bool {
+    return mode == .absolute or mode == .fixed;
+}
+
 fn nodePositionMode(node: Node, dependency_target: ?*ProtectedField(u64)) PositionMode {
     return switch (node) {
         .element => |element| blk: {
@@ -86,7 +90,7 @@ fn nodePositionMode(node: Node, dependency_target: ?*ProtectedField(u64)) Positi
 }
 
 fn nodeFloatSide(node: Node, dependency_target: ?*ProtectedField(u64)) FloatSide {
-    if (nodePositionMode(node, dependency_target) == .absolute) return .none;
+    if (isOutOfFlowPosition(nodePositionMode(node, dependency_target))) return .none;
     return switch (node) {
         .element => |element| blk: {
             const style_map = if (element.style) |*styles| styles else break :blk .none;
@@ -102,7 +106,7 @@ fn nodeFloatSide(node: Node, dependency_target: ?*ProtectedField(u64)) FloatSide
 }
 
 fn nodeClearSide(node: Node) ClearSide {
-    if (nodePositionMode(node, null) == .absolute) return .none;
+    if (isOutOfFlowPosition(nodePositionMode(node, null))) return .none;
     return switch (node) {
         .element => |element| blk: {
             const style_map = if (element.style) |*styles| styles else break :blk .none;
@@ -118,7 +122,7 @@ fn nodeClearSide(node: Node) ClearSide {
 fn isContainerNode(node: Node, dependency_target: ?*ProtectedField(u64)) bool {
     return switch (node) {
         .element => |element| blk: {
-            if (nodePositionMode(node, dependency_target) == .absolute) break :blk true;
+            if (isOutOfFlowPosition(nodePositionMode(node, dependency_target))) break :blk true;
             if (nodeFloatSide(node, dependency_target) != .none) break :blk true;
             if (element.style) |*styles| {
                 const style_map = @constCast(styles);
@@ -2112,6 +2116,10 @@ fn activeFontFamily(self: *const Layout) FontFamily {
 
 fn layoutWindowWidth(self: *const Layout) i32 {
     return self.toLayoutPx(self.window_width);
+}
+
+fn layoutWindowHeight(self: *const Layout) i32 {
+    return self.toLayoutPx(self.window_height);
 }
 
 fn layoutScrollbarWidth(self: *const Layout) i32 {
@@ -5837,7 +5845,7 @@ const BlockLayout = struct {
                 };
                 if (ownsNode(block, dom_child)) {
                     const position_mode = block.positionMode();
-                    const block_previous = if (position_mode == .absolute) null else expected_previous;
+                    const block_previous = if (isOutOfFlowPosition(position_mode)) null else expected_previous;
                     if (block.inline_nodes != null or
                         block.parent_block != self or
                         block.node_ptr != dom_child or
@@ -5846,7 +5854,7 @@ const BlockLayout = struct {
                     {
                         return false;
                     }
-                    if (block.floatSide() == .none and position_mode != .absolute) {
+                    if (block.floatSide() == .none and !isOutOfFlowPosition(position_mode)) {
                         expected_previous = block;
                     }
                     retained_index += 1;
@@ -5988,9 +5996,9 @@ const BlockLayout = struct {
         while (dom_index < dom_children.len) {
             if (retained_for_dom[dom_index]) |block| {
                 const position_mode = block.positionMode();
-                desired_previous[retained_index] = if (position_mode == .absolute) null else previous;
+                desired_previous[retained_index] = if (isOutOfFlowPosition(position_mode)) null else previous;
                 replacement.appendAssumeCapacity(.{ .block = block });
-                if (block.floatSide() == .none and position_mode != .absolute) previous = block;
+                if (block.floatSide() == .none and !isOutOfFlowPosition(position_mode)) previous = block;
                 retained_index += 1;
                 dom_index += 1;
                 continue;
@@ -6014,7 +6022,7 @@ const BlockLayout = struct {
                 );
                 created.appendAssumeCapacity(child);
                 replacement.appendAssumeCapacity(.{ .block = child });
-                if (child.floatSide() == .none and child.positionMode() != .absolute) previous = child;
+                if (child.floatSide() == .none and !isOutOfFlowPosition(child.positionMode())) previous = child;
                 dom_index += 2;
                 continue;
             }
@@ -6028,11 +6036,11 @@ const BlockLayout = struct {
                     child_node,
                     self.document,
                     self,
-                    if (child_position == .absolute) null else previous,
+                    if (isOutOfFlowPosition(child_position)) null else previous,
                 );
                 created.appendAssumeCapacity(child);
                 replacement.appendAssumeCapacity(.{ .block = child });
-                if (child.floatSide() == .none and child_position != .absolute) previous = child;
+                if (child.floatSide() == .none and !isOutOfFlowPosition(child_position)) previous = child;
                 dom_index += 1;
                 continue;
             }
@@ -6057,7 +6065,7 @@ const BlockLayout = struct {
             );
             created.appendAssumeCapacity(child);
             replacement.appendAssumeCapacity(.{ .block = child });
-            if (child.floatSide() == .none and child.positionMode() != .absolute) previous = child;
+            if (child.floatSide() == .none and !isOutOfFlowPosition(child.positionMode())) previous = child;
         }
         std.debug.assert(retained_index == self.children.items.len);
 
@@ -6572,7 +6580,7 @@ const BlockLayout = struct {
 
     fn establishesFloatContext(self: *const BlockLayout) bool {
         if (self.parent_block == null or self.embedded_box != null) return true;
-        if (self.floatSide() != .none or self.positionMode() == .absolute) return true;
+        if (self.floatSide() != .none or isOutOfFlowPosition(self.positionMode())) return true;
 
         const element = liveBlockElement(self) orelse return false;
         const styles = if (element.style) |*style_map| style_map else return false;
@@ -6757,7 +6765,14 @@ const BlockLayout = struct {
             };
         }
 
-        // Compute position and dimensions
+        // Compute position and dimensions.
+        //
+        // Fixed boxes remain in the DOM/layout tree for inherited styles and
+        // descendants, but resolve their used offsets against the owning
+        // frame viewport. Their outer paint group carries the same attachment
+        // through raster so page scrolling does not move them.
+        const position_mode = self.positionMode();
+        const fixed_to_viewport = position_mode == .fixed and self.embedded_box == null;
         // Use .read() to register invalidation dependencies on parent/document/previous fields
         const parent_zoom = if (self.parent_block) |pb|
             if (self.persistent_dependencies) pb.zoom.read(&self.zoom, self.allocator).* else pb.zoom.get().*
@@ -6777,30 +6792,44 @@ const BlockLayout = struct {
             combinedEffectiveZoom(parent_zoom, local_zoom);
         self.zoom.set(zoom_value);
 
-        const parent_x = if (self.parent_block) |pb|
+        var parent_x = if (self.parent_block) |pb|
             (if (self.persistent_dependencies) pb.x.read(&self.x, self.allocator).* else pb.x.get().*) +
                 pb.border.left + pb.padding.left
         else if (self.persistent_dependencies)
             self.document.x.read(&self.x, self.allocator).*
         else
             self.document.x.get().*;
-        const parent_width = if (self.parent_block) |pb|
+        var parent_width = if (self.parent_block) |pb|
             pb.content_width
         else if (self.persistent_dependencies)
             self.document.width.read(&self.width, self.allocator).*
         else
             self.document.width.get().*;
-        const containing_width_css = cssPixelsFromLayout(
+        var containing_width_css = cssPixelsFromLayout(
             parent_width,
             parent_zoom,
             self.document.page_zoom,
         );
-        const containing_height_css = if (self.parent_block) |pb| blk: {
+        var containing_height_css = if (self.parent_block) |pb| blk: {
             if (pb.height.dirty or !pb.content_height_definite) break :blk null;
             const height = pb.content_height;
             if (height <= 0) break :blk null;
             break :blk cssPixelsFromLayout(height, pb.zoom.get().*, self.document.page_zoom);
         } else null;
+        if (fixed_to_viewport) {
+            parent_x = 0;
+            parent_width = @max(engine.layoutWindowWidth() - engine.layoutScrollbarWidth(), 0);
+            containing_width_css = cssPixelsFromLayout(
+                parent_width,
+                self.document.zoom.get().*,
+                self.document.page_zoom,
+            );
+            containing_height_css = cssPixelsFromLayout(
+                engine.layoutWindowHeight(),
+                self.document.zoom.get().*,
+                self.document.page_zoom,
+            );
+        }
 
         const edge_values = if (self.embedded_box == null) switch (self.node) {
             .element => |*element| if (element.style) |*style_map|
@@ -6834,7 +6863,9 @@ const BlockLayout = struct {
             self.previous.read(&self.y, self.allocator).*
         else
             self.previous.get().*;
-        const parent_content_y = if (previous == null) blk: {
+        const parent_content_y = if (fixed_to_viewport)
+            0
+        else if (previous == null) blk: {
             if (self.parent_block) |pb| {
                 const parent_y = if (self.persistent_dependencies)
                     pb.y.read(&self.y, self.allocator).*
@@ -6847,7 +6878,9 @@ const BlockLayout = struct {
             else
                 self.document.y.get().*;
         } else 0;
-        const prev_y = if (previous) |prev|
+        const prev_y = if (fixed_to_viewport)
+            self.margin.top
+        else if (previous) |prev|
             (if (self.persistent_dependencies)
                 prev.y.read(&self.y, self.allocator).* + prev.height.read(&self.y, self.allocator).*
             else
@@ -6894,6 +6927,8 @@ const BlockLayout = struct {
             null;
         const base_content_bounds = if (self.embedded_box) |embedded|
             ContentBounds{ .x = embedded.x, .width = embedded.width }
+        else if (fixed_to_viewport)
+            ContentBounds{ .x = 0, .width = parent_width }
         else
             contentBoundsForNode(
                 self.node,
@@ -6931,10 +6966,9 @@ const BlockLayout = struct {
         else
             null;
         const horizontal_insets = self.padding.horizontal() + self.border.horizontal();
-        const position_mode = self.positionMode();
         const float_side = self.floatSide();
         const shrink_to_fit_width = if (specified_width == null and
-            (position_mode == .absolute or float_side != .none))
+            (isOutOfFlowPosition(position_mode) or float_side != .none))
         shrink: {
             const element = switch (self.node) {
                 .element => |*value| value,
@@ -6951,7 +6985,7 @@ const BlockLayout = struct {
         var float_x: ?i32 = null;
 
         if (self.parent_block) |parent| {
-            if (position_mode != .absolute) {
+            if (!isOutOfFlowPosition(position_mode)) {
                 const float_context = parent.floatContextForChildren();
                 const clear_side = self.clearSide();
                 if (clear_side != .none) {
@@ -7003,7 +7037,7 @@ const BlockLayout = struct {
         }
 
         const content_bounds = if (self.parent_block) |parent|
-            if (position_mode == .absolute)
+            if (isOutOfFlowPosition(position_mode))
                 base_content_bounds
             else
                 parent.floatContextForChildren().floatBoundsAt(
@@ -7029,7 +7063,7 @@ const BlockLayout = struct {
         // separate CSS sizing rules and keep auto margins at their resolved
         // zero value here.
         if (specified_width != null and
-            position_mode != .absolute and
+            !isOutOfFlowPosition(position_mode) and
             float_side == .none and
             self.isBlockContainer() and
             (auto_margins.left or auto_margins.right))
@@ -7192,14 +7226,14 @@ const BlockLayout = struct {
                         // every later block, even when that block's own style
                         // is clean. Mark it before laying it out so the
                         // exclusion geometry is recomputed.
-                        if (b.positionMode() != .absolute and
+                        if (!isOutOfFlowPosition(b.positionMode()) and
                             (float_context.floats.items.len > 0 or b.clearSide() != .none))
                         {
                             b.mark();
                         }
                         try b.layout(engine);
                         const child_height = b.height.read(&self.height, self.allocator).*;
-                        if (b.positionMode() == .absolute) {
+                        if (isOutOfFlowPosition(b.positionMode())) {
                             // Absolutely positioned descendants paint in this
                             // subtree but contribute no normal-flow height.
                         } else if (b.floatSide() != .none) {
@@ -7286,7 +7320,9 @@ const BlockLayout = struct {
             // Height is set by layoutInlineBlock - need to ensure it uses .set()
         }
 
-        const position_containing_height = if (self.parent_block) |parent|
+        const position_containing_height = if (fixed_to_viewport)
+            engine.layoutWindowHeight()
+        else if (self.parent_block) |parent|
             if (parent.content_height_definite) parent.content_height else null
         else
             null;
@@ -7311,7 +7347,7 @@ const BlockLayout = struct {
     fn lastInFlowBlock(self: *BlockLayout) ?*BlockLayout {
         var previous: ?*BlockLayout = null;
         for (self.children.items) |child| switch (child) {
-            .block => |block| if (block.floatSide() == .none and block.positionMode() != .absolute) {
+            .block => |block| if (block.floatSide() == .none and !isOutOfFlowPosition(block.positionMode())) {
                 previous = block;
             },
             .line => {},
@@ -7328,7 +7364,7 @@ const BlockLayout = struct {
             // anonymous block, normal inline recursion preserves the h6's
             // style while continuing straight into the paragraph text.
             if (isRunInHeadingNode(nodes[index]) and
-                nodePositionMode(nodes[index], if (self.persistent_dependencies) &self.children_version else null) != .absolute and
+                !isOutOfFlowPosition(nodePositionMode(nodes[index], if (self.persistent_dependencies) &self.children_version else null)) and
                 index + 1 < nodes.len and isContainerNode(
                 nodes[index + 1],
                 if (self.persistent_dependencies) &self.children_version else null,
@@ -7339,7 +7375,7 @@ const BlockLayout = struct {
                 run_in_nodes[1] = &nodes[index + 1];
                 const child = try BlockLayout.initAnonymous(self.allocator, run_in_nodes, self.document, self, previous);
                 try self.children.append(self.allocator, .{ .block = child });
-                if (child.floatSide() == .none and child.positionMode() != .absolute) previous = child;
+                if (child.floatSide() == .none and !isOutOfFlowPosition(child.positionMode())) previous = child;
                 index += 2;
                 continue;
             }
@@ -7359,10 +7395,10 @@ const BlockLayout = struct {
                     child_node,
                     self.document,
                     self,
-                    if (child_position == .absolute) null else previous,
+                    if (isOutOfFlowPosition(child_position)) null else previous,
                 );
                 try self.children.append(self.allocator, .{ .block = child });
-                if (child.floatSide() == .none and child.positionMode() != .absolute) previous = child;
+                if (child.floatSide() == .none and !isOutOfFlowPosition(child.positionMode())) previous = child;
                 index += 1;
                 continue;
             }
@@ -7379,7 +7415,7 @@ const BlockLayout = struct {
             }
             const child = try BlockLayout.initAnonymous(self.allocator, inline_nodes, self.document, self, previous);
             try self.children.append(self.allocator, .{ .block = child });
-            if (child.floatSide() == .none and child.positionMode() != .absolute) previous = child;
+            if (child.floatSide() == .none and !isOutOfFlowPosition(child.positionMode())) previous = child;
         }
     }
 
@@ -8934,6 +8970,10 @@ fn applyPaintEffects(
                 .x = block.position_offset.x,
                 .y = block.position_offset.y,
             },
+            .scroll_attachment = if (block.positionMode() == .fixed)
+                .frame_viewport
+            else
+                .document,
             .identity = opaqueElementForNode(block.node_ptr),
             .source = displaySource(block, block.node_ptr),
         },
