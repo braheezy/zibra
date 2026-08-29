@@ -17,6 +17,7 @@ const box_model = @import("box_model.zig");
 const control_geometry = @import("control_geometry.zig");
 const inline_format = @import("inline_format.zig");
 const layout_hit = @import("layout_hit.zig");
+const table_format = @import("table_format.zig");
 const paint_effects = @import("paint_effects.zig");
 const replaced_paint = @import("replaced_paint.zig");
 const retained_commands = @import("retained_commands.zig");
@@ -64,6 +65,38 @@ fn isBlockDisplay(value: []const u8) bool {
 
 fn isListItemDisplay(value: []const u8) bool {
     return std.ascii.eqlIgnoreCase(std.mem.trim(u8, value, " \t\r\n"), "list-item");
+}
+
+/// Read only the bounded table roles that need retained layout boxes. The
+/// display field is also a child-tree dependency: changing a box into or out
+/// of a table role changes anonymous row/cell normalization.
+fn nodeTableRole(node: Node, dependency_target: ?*ProtectedField(u64)) table_format.Role {
+    return switch (node) {
+        .element => |element| blk: {
+            const style_map = if (element.style) |*styles| styles else break :blk .ordinary;
+            const field = @constCast(style_map).getPtr("display") orelse break :blk .ordinary;
+            const value = if (dependency_target) |target| value: {
+                target.addDependency(field, style_map.allocator);
+                break :value field.read(target, style_map.allocator).*;
+            } else field.get().*;
+            break :blk table_format.roleForDisplay(value);
+        },
+        .text => .ordinary,
+    };
+}
+
+/// Return the last published table role for a structural-mutation eligibility
+/// check. Such checks can run after style has been dirtied but before the next
+/// style pass; unlike layout, they must not read a dirty computed field.
+fn publishedNodeTableRole(node: Node) table_format.Role {
+    return switch (node) {
+        .element => |element| blk: {
+            const style_map = if (element.style) |*styles| styles else break :blk .ordinary;
+            const field = @constCast(style_map).getPtr("display") orelse break :blk .ordinary;
+            break :blk table_format.roleForDisplay(field.lastValue().*);
+        },
+        .text => .ordinary,
+    };
 }
 
 const parseFloatSide = box_model.parseFloatSide;
@@ -124,6 +157,9 @@ fn isContainerNode(node: Node, dependency_target: ?*ProtectedField(u64)) bool {
         .element => |element| blk: {
             if (isOutOfFlowPosition(nodePositionMode(node, dependency_target))) break :blk true;
             if (nodeFloatSide(node, dependency_target) != .none) break :blk true;
+            if (table_format.establishesFormattingContext(nodeTableRole(node, dependency_target))) {
+                break :blk true;
+            }
             if (element.style) |*styles| {
                 const style_map = @constCast(styles);
                 if (style_map.getPtr("display")) |field| {
@@ -1237,6 +1273,102 @@ test "computed display classifies block children" {
     try std.testing.expect(isBlockDisplay("list-item"));
     try std.testing.expect(!isBlockDisplay("inline"));
     try std.testing.expect(!isBlockDisplay("unsupported"));
+}
+
+test "bounded tables normalize direct children into grid cells" {
+    const allocator = std.testing.allocator;
+    var html_parser = try parser.HTMLParser.init(
+        allocator,
+        "<html style='display:block'><body style='display:block;margin:0'>" ++
+            "<div id=table style='display:table'>" ++
+            "<div id=a style='display:table-cell;width:11px;height:13px'></div>" ++
+            "<div id=b style='display:table;width:17px;height:13px'></div>" ++
+            "<div id=c style='display:table-cell;width:19px;height:5px'></div>" ++
+            "<div id=d style='display:block;width:23px;height:13px'></div>" ++
+            "</div>" ++
+            "<div id=rows style='display:table'>" ++
+            "<div id=row style='display:table-row'>" ++
+            "<div id=e style='display:table-cell;width:7px;height:9px'></div>" ++
+            "<div id=f style='display:table-cell;width:13px;height:5px'></div>" ++
+            "</div></div></body></html>",
+    );
+    html_parser.use_implicit_tags = false;
+    defer html_parser.deinit(allocator);
+    var root_node = try html_parser.parse();
+    defer root_node.deinit(allocator);
+    parser.fixParentPointers(&root_node, null);
+    try parser.style(allocator, &root_node, &.{});
+
+    var environ = std.process.Environ.Map.init(allocator);
+    defer environ.deinit();
+    try environ.put("HOME", "/tmp");
+    const engine = try Layout.init(allocator, std.testing.io, &environ, 800, 600, false);
+    defer engine.deinit();
+    const document = try engine.buildDocument(&root_node);
+    defer {
+        document.deinit();
+        allocator.destroy(document);
+    }
+
+    var nodes = std.ArrayList(*Node).empty;
+    defer nodes.deinit(allocator);
+    try parser.treeToList(allocator, &root_node, &nodes);
+    var table_node: ?*Node = null;
+    var a_node: ?*Node = null;
+    var b_node: ?*Node = null;
+    var c_node: ?*Node = null;
+    var d_node: ?*Node = null;
+    var rows_node: ?*Node = null;
+    var row_node: ?*Node = null;
+    var e_node: ?*Node = null;
+    var f_node: ?*Node = null;
+    for (nodes.items) |node| switch (node.*) {
+        .element => |*element| {
+            const id = (element.attributes orelse continue).get("id") orelse continue;
+            if (std.mem.eql(u8, id, "table")) table_node = node;
+            if (std.mem.eql(u8, id, "a")) a_node = node;
+            if (std.mem.eql(u8, id, "b")) b_node = node;
+            if (std.mem.eql(u8, id, "c")) c_node = node;
+            if (std.mem.eql(u8, id, "d")) d_node = node;
+            if (std.mem.eql(u8, id, "rows")) rows_node = node;
+            if (std.mem.eql(u8, id, "row")) row_node = node;
+            if (std.mem.eql(u8, id, "e")) e_node = node;
+            if (std.mem.eql(u8, id, "f")) f_node = node;
+        },
+        .text => {},
+    };
+
+    const table: *BlockLayout = @ptrCast(@alignCast(table_node.?.element.layout_ptr.?));
+    const a: *BlockLayout = @ptrCast(@alignCast(a_node.?.element.layout_ptr.?));
+    const b: *BlockLayout = @ptrCast(@alignCast(b_node.?.element.layout_ptr.?));
+    const c: *BlockLayout = @ptrCast(@alignCast(c_node.?.element.layout_ptr.?));
+    const d: *BlockLayout = @ptrCast(@alignCast(d_node.?.element.layout_ptr.?));
+    try std.testing.expectEqual(@as(i32, 70), table.width.get().*);
+    try std.testing.expectEqual(@as(i32, 13), table.height.get().*);
+    try std.testing.expectEqual(table.x.get().*, a.x.get().*);
+    try std.testing.expectEqual(a.x.get().* + 11, b.x.get().*);
+    try std.testing.expectEqual(b.x.get().* + 17, c.x.get().*);
+    try std.testing.expectEqual(c.x.get().* + 19, d.x.get().*);
+    try std.testing.expectEqual(@as(i32, 13), c.height.get().*);
+    try std.testing.expect(a.previousBlock() == null);
+    try std.testing.expect(b.previousBlock() == null);
+    try std.testing.expect(c.previousBlock() == null);
+    try std.testing.expect(d.previousBlock() == null);
+    try std.testing.expect(!table_node.?.element.canReuseLayoutForInsert(1));
+
+    const rows: *BlockLayout = @ptrCast(@alignCast(rows_node.?.element.layout_ptr.?));
+    const row: *BlockLayout = @ptrCast(@alignCast(row_node.?.element.layout_ptr.?));
+    const e: *BlockLayout = @ptrCast(@alignCast(e_node.?.element.layout_ptr.?));
+    const f: *BlockLayout = @ptrCast(@alignCast(f_node.?.element.layout_ptr.?));
+    try std.testing.expectEqual(@as(i32, 20), rows.width.get().*);
+    try std.testing.expectEqual(@as(i32, 9), rows.height.get().*);
+    try std.testing.expectEqual(rows.x.get().*, row.x.get().*);
+    try std.testing.expectEqual(@as(i32, 20), row.width.get().*);
+    try std.testing.expectEqual(row.x.get().*, e.x.get().*);
+    try std.testing.expectEqual(e.x.get().* + 7, f.x.get().*);
+    try std.testing.expectEqual(@as(i32, 9), f.height.get().*);
+    try std.testing.expect(e.previousBlock() == null);
+    try std.testing.expect(f.previousBlock() == null);
 }
 
 test "list items reserve room for square markers" {
@@ -5681,6 +5813,19 @@ fn layoutChildPaintKey(child: LayoutChild, document_index: usize) layout_hit.Sta
     };
 }
 
+/// A synchronous table-grid placement constraint for one existing DOM-backed
+/// block. It never owns or outlives the `layoutWithTableBox` call that installs
+/// it; the layout object still owns its style, children, paint cache, and DOM
+/// callback identity.
+const TableBox = struct {
+    x: i32,
+    y: i32,
+    width: i32,
+    /// A forced border-box height for the row-stretch pass. Null permits a
+    /// first natural-height measurement pass.
+    height: ?i32 = null,
+};
+
 const BlockLayout = struct {
     allocator: std.mem.Allocator,
     node: Node,
@@ -5699,6 +5844,14 @@ const BlockLayout = struct {
     embedded_box: ?EmbeddedBlockBox = null,
     rich_button_root: bool = false,
     effective_zoom_override: ?f32 = null,
+    /// Present only during a table parent's synchronous child-layout pass.
+    /// Unlike `embedded_box`, this preserves the child element's CSS edges,
+    /// effects, and content dimensions while forcing its grid border box.
+    table_box: ?TableBox = null,
+    /// Borrowed column widths used only while a real `table-row` lays out its
+    /// direct cells. `layoutWithTableRowBox` clears this before its caller's
+    /// temporary table plan is released.
+    table_row_columns: ?[]const i32 = null,
     /// False for rich-button layout trees, which are destroyed after their
     /// paint commands are rebased into the persistent surrounding block.
     /// ProtectedField has no unsubscribe operation, so those temporary trees
@@ -5758,6 +5911,30 @@ const BlockLayout = struct {
     has_dirty_descendants: bool = false,
     in_layout: bool = false,
 
+    /// An ephemeral row record points only at already-owned DOM-backed
+    /// BlockLayouts. Anonymous rows are represented by a null owner; no
+    /// synthetic DOM node or retained anonymous layout object is created.
+    const TableRowPlan = struct {
+        owner: ?*BlockLayout,
+        first_cell: usize,
+        cell_count: usize,
+    };
+
+    const TablePlan = struct {
+        allocator: std.mem.Allocator,
+        rows: std.ArrayList(TableRowPlan) = .empty,
+        cells: std.ArrayList(*BlockLayout) = .empty,
+
+        fn init(allocator: std.mem.Allocator) TablePlan {
+            return .{ .allocator = allocator };
+        }
+
+        fn deinit(self: *TablePlan) void {
+            self.rows.deinit(self.allocator);
+            self.cells.deinit(self.allocator);
+        }
+    };
+
     fn markOpaque(ptr: *anyopaque) void {
         const self: *BlockLayout = @ptrCast(@alignCast(ptr));
         if (self.in_layout) return;
@@ -5811,6 +5988,11 @@ const BlockLayout = struct {
     /// Previously inserted, not-yet-laid-out nodes may appear as gaps between
     /// those owners. Anonymous inline runs retain the conservative path.
     fn canReuseInsert(self: *BlockLayout, insert_index: usize) bool {
+        // A table's direct-child sequence defines its anonymous rows and cells,
+        // so even an append can change the formatting topology. Rebuild this
+        // bounded formatting context conservatively rather than retaining an
+        // ordinary block-child mapping.
+        if (publishedNodeTableRole(self.node) != .ordinary) return false;
         if (!self.persistent_dependencies or self.inline_nodes != null) return false;
         if (self.children_version.dirty or self.laid_out_dom_children == 0) return false;
 
@@ -6136,6 +6318,8 @@ const BlockLayout = struct {
             .embedded_box = null,
             .rich_button_root = false,
             .effective_zoom_override = null,
+            .table_box = null,
+            .table_row_columns = null,
             .persistent_dependencies = persistent_dependencies,
             .temporary_dependency_target = if (!persistent_dependencies and parent_block != null)
                 parent_block.?.temporary_dependency_target
@@ -6509,6 +6693,7 @@ const BlockLayout = struct {
 
     fn isBlockContainer(self: *BlockLayout) bool {
         if (self.inline_nodes != null) return false;
+        if (table_format.establishesFormattingContext(self.tableRole())) return true;
         switch (self.node) {
             .text => return false,
             .element => |e| {
@@ -6540,6 +6725,10 @@ const BlockLayout = struct {
                 return e.children.items.len == 0;
             },
         }
+    }
+
+    fn tableRole(self: *const BlockLayout) table_format.Role {
+        return nodeTableRole(self.node, null);
     }
 
     fn floatSide(self: *const BlockLayout) FloatSide {
@@ -6737,7 +6926,7 @@ const BlockLayout = struct {
         }.lessThan);
     }
 
-    fn layout(self: *BlockLayout, engine: *Layout) !void {
+    fn layout(self: *BlockLayout, engine: *Layout) anyerror!void {
         const inherited_float_rebuild = if (self.parent_block) |parent|
             parent.floatContextForChildren().rebuilding_floats
         else
@@ -6773,6 +6962,7 @@ const BlockLayout = struct {
         // through raster so page scrolling does not move them.
         const position_mode = self.positionMode();
         const fixed_to_viewport = position_mode == .fixed and self.embedded_box == null;
+        const table_box = self.table_box;
         // Use .read() to register invalidation dependencies on parent/document/previous fields
         const parent_zoom = if (self.parent_block) |pb|
             if (self.persistent_dependencies) pb.zoom.read(&self.zoom, self.allocator).* else pb.zoom.get().*
@@ -6829,6 +7019,21 @@ const BlockLayout = struct {
                 self.document.zoom.get().*,
                 self.document.page_zoom,
             );
+        } else if (table_box) |box| {
+            // A table pass supplies a grid border box. It replaces normal
+            // predecessor/float placement, but the child retains its own
+            // padding, borders, descendants, effects, and paint cache.
+            parent_x = box.x;
+            parent_width = box.width;
+            containing_width_css = cssPixelsFromLayout(
+                box.width,
+                self.document.zoom.get().*,
+                self.document.page_zoom,
+            );
+            containing_height_css = if (box.height) |height|
+                cssPixelsFromLayout(height, self.document.zoom.get().*, self.document.page_zoom)
+            else
+                null;
         }
 
         const edge_values = if (self.embedded_box == null) switch (self.node) {
@@ -6865,6 +7070,8 @@ const BlockLayout = struct {
             self.previous.get().*;
         const parent_content_y = if (fixed_to_viewport)
             0
+        else if (table_box) |box|
+            box.y
         else if (previous == null) blk: {
             if (self.parent_block) |pb| {
                 const parent_y = if (self.persistent_dependencies)
@@ -6880,6 +7087,8 @@ const BlockLayout = struct {
         } else 0;
         const prev_y = if (fixed_to_viewport)
             self.margin.top
+        else if (table_box) |box|
+            box.y
         else if (previous) |prev|
             (if (self.persistent_dependencies)
                 prev.y.read(&self.y, self.allocator).* + prev.height.read(&self.y, self.allocator).*
@@ -6896,6 +7105,12 @@ const BlockLayout = struct {
             else
                 0;
 
+        if (self.tableRole() == .table and table_box == null) {
+            // The intrinsic table width depends on its actual DOM-backed
+            // descendants. Build that child tree before the outer box picks a
+            // shrink-to-fit used width; ordinary blocks remain lazy below.
+            try self.rebuildChildrenIfNeeded();
+        }
         const width_context = parser.CssLengthResolutionContext{
             .font_size = self.computedFontSizeCss(),
             .percentage_base = containing_width_css,
@@ -6921,14 +7136,21 @@ const BlockLayout = struct {
                 null
         else
             null;
-        const specified_width = if (unconstrained_width) |width|
+        const style_specified_width = if (unconstrained_width) |width|
             constrainDimension(width, min_width, max_width)
         else
             null;
+        const specified_width = style_specified_width orelse
+            if (self.tableRole() == .table and table_box == null)
+                try self.preferredTableWidth(zoom_value, engine.zoom(), containing_width_css)
+            else
+                null;
         const base_content_bounds = if (self.embedded_box) |embedded|
             ContentBounds{ .x = embedded.x, .width = embedded.width }
         else if (fixed_to_viewport)
             ContentBounds{ .x = 0, .width = parent_width }
+        else if (table_box) |box|
+            ContentBounds{ .x = box.x, .width = box.width }
         else
             contentBoundsForNode(
                 self.node,
@@ -6961,12 +7183,21 @@ const BlockLayout = struct {
                 null
         else
             null;
-        const specified_height = if (unconstrained_height) |height|
+        const style_specified_height = if (unconstrained_height) |height|
             constrainDimension(height, min_height, max_height)
         else
             null;
+        const specified_height = if (table_box) |box|
+            if (box.height) |height|
+                @max(height -| self.padding.vertical() -| self.border.vertical(), 0)
+            else
+                style_specified_height
+        else
+            style_specified_height;
         const horizontal_insets = self.padding.horizontal() + self.border.horizontal();
-        const float_side = self.floatSide();
+        // Table grid placement supplies the border box directly. A cell or
+        // row must not independently enter the surrounding float context.
+        const float_side: FloatSide = if (table_box == null) self.floatSide() else .none;
         const shrink_to_fit_width = if (specified_width == null and
             (isOutOfFlowPosition(position_mode) or float_side != .none))
         shrink: {
@@ -6984,59 +7215,63 @@ const BlockLayout = struct {
         var layout_y = prev_y;
         var float_x: ?i32 = null;
 
-        if (self.parent_block) |parent| {
-            if (!isOutOfFlowPosition(position_mode)) {
-                const float_context = parent.floatContextForChildren();
-                const clear_side = self.clearSide();
-                if (clear_side != .none) {
-                    layout_y = float_context.clearBottom(layout_y, clear_side);
-                }
+        if (table_box == null) {
+            if (self.parent_block) |parent| {
+                if (!isOutOfFlowPosition(position_mode)) {
+                    const float_context = parent.floatContextForChildren();
+                    const clear_side = self.clearSide();
+                    if (clear_side != .none) {
+                        layout_y = float_context.clearBottom(layout_y, clear_side);
+                    }
 
-                if (float_side != .none) {
-                    // A specified float width is enough to place the common CSS
-                    // case precisely. Auto floats use the available line width,
-                    // which keeps them deterministic until shrink-to-fit sizing
-                    // is added to the replaced/content measurement path.
-                    var candidate_width = if (specified_width) |width|
-                        @max(width + horizontal_insets, 0)
-                    else if (shrink_to_fit_width) |width|
-                        @max(width + horizontal_insets, 0)
-                    else
-                        @max(base_content_bounds.width - self.margin.horizontal(), 0);
+                    if (float_side != .none) {
+                        // A specified float width is enough to place the common CSS
+                        // case precisely. Auto floats use the available line width,
+                        // which keeps them deterministic until shrink-to-fit sizing
+                        // is added to the replaced/content measurement path.
+                        var candidate_width = if (specified_width) |width|
+                            @max(width + horizontal_insets, 0)
+                        else if (shrink_to_fit_width) |width|
+                            @max(width + horizontal_insets, 0)
+                        else
+                            @max(base_content_bounds.width - self.margin.horizontal(), 0);
 
-                    while (true) {
-                        const available = float_context.floatBoundsAt(
-                            layout_y,
-                            base_content_bounds.x,
-                            base_content_bounds.width,
-                        );
-                        const outer_width = candidate_width + self.margin.horizontal();
-                        if (available.width >= outer_width) {
-                            float_x = if (float_side == .left)
-                                available.x + self.margin.left
-                            else
-                                available.x + available.width - self.margin.right - candidate_width;
-                            break;
-                        }
-                        const next_y = float_context.nextFloatBottom(layout_y) orelse break;
-                        if (next_y <= layout_y) break;
-                        layout_y = next_y;
-                        if (specified_width == null and shrink_to_fit_width == null) {
-                            candidate_width = @max(
-                                float_context.floatBoundsAt(
-                                    layout_y,
-                                    base_content_bounds.x,
-                                    base_content_bounds.width,
-                                ).width - self.margin.horizontal(),
-                                0,
+                        while (true) {
+                            const available = float_context.floatBoundsAt(
+                                layout_y,
+                                base_content_bounds.x,
+                                base_content_bounds.width,
                             );
+                            const outer_width = candidate_width + self.margin.horizontal();
+                            if (available.width >= outer_width) {
+                                float_x = if (float_side == .left)
+                                    available.x + self.margin.left
+                                else
+                                    available.x + available.width - self.margin.right - candidate_width;
+                                break;
+                            }
+                            const next_y = float_context.nextFloatBottom(layout_y) orelse break;
+                            if (next_y <= layout_y) break;
+                            layout_y = next_y;
+                            if (specified_width == null and shrink_to_fit_width == null) {
+                                candidate_width = @max(
+                                    float_context.floatBoundsAt(
+                                        layout_y,
+                                        base_content_bounds.x,
+                                        base_content_bounds.width,
+                                    ).width - self.margin.horizontal(),
+                                    0,
+                                );
+                            }
                         }
                     }
                 }
             }
         }
 
-        const content_bounds = if (self.parent_block) |parent|
+        const content_bounds = if (table_box != null)
+            base_content_bounds
+        else if (self.parent_block) |parent|
             if (isOutOfFlowPosition(position_mode))
                 base_content_bounds
             else
@@ -7065,6 +7300,7 @@ const BlockLayout = struct {
         if (specified_width != null and
             !isOutOfFlowPosition(position_mode) and
             float_side == .none and
+            table_box == null and
             self.isBlockContainer() and
             (auto_margins.left or auto_margins.right))
         {
@@ -7083,12 +7319,24 @@ const BlockLayout = struct {
         }
         self.x.set(if (self.embedded_box) |embedded|
             embedded.x
+        else if (table_box) |box|
+            box.x
         else if (float_x) |x|
             x
         else
             content_bounds.x + self.margin.left);
-        self.y.set(if (self.embedded_box) |embedded| embedded.y else layout_y);
-        self.width.set(if (self.embedded_box) |embedded| embedded.width else border_box_width);
+        self.y.set(if (self.embedded_box) |embedded|
+            embedded.y
+        else if (table_box) |box|
+            box.y
+        else
+            layout_y);
+        self.width.set(if (self.embedded_box) |embedded|
+            embedded.width
+        else if (table_box) |box|
+            box.width
+        else
+            border_box_width);
         self.content_width = if (self.embedded_box) |embedded|
             embedded.width
         else
@@ -7141,60 +7389,7 @@ const BlockLayout = struct {
         if (is_block) {
             self.used_inline_layout = false;
             self.inline_paint_dirty = false;
-            // Check whether the DOM child list changed. Verified insertions
-            // match and retain existing block children; every other change
-            // keeps the conservative rebuild behavior.
-            var children_dirty = false;
-            var insertions_only = false;
-            var live_element: ?*parser.Element = null;
-            if (self.node_ptr) |node| {
-                switch (node.*) {
-                    .element => |*el| {
-                        live_element = el;
-                        if (el.children_dirty) {
-                            children_dirty = true;
-                            insertions_only = el.children_insertions_only;
-                        }
-                    },
-                    else => {},
-                }
-            }
-
-            // Rebuild if children are dirty OR if we have no children yet (first layout)
-            if (children_dirty or self.children_version.dirty or self.children.items.len == 0) {
-                var reused_children = false;
-                if (insertions_only) {
-                    // The host normally performs this rebind synchronously
-                    // after child storage moves. Repeat it defensively here
-                    // for direct DOM users that honor the same insert marker.
-                    insertions_only = if (self.node_ptr) |node| self.rebindAfterInsert(node) else false;
-                }
-
-                if (insertions_only and self.children.items.len > 0) {
-                    const element = live_element.?;
-                    if (try self.rebuildInsertedChildren(element)) {
-                        self.laid_out_dom_children = element.children.items.len;
-                        reused_children = true;
-                    }
-                }
-
-                if (!reused_children) {
-                    for (self.children.items) |child| {
-                        child.deinit(self.allocator);
-                    }
-                    self.children.clearRetainingCapacity();
-                    self.laid_out_dom_children = 0;
-
-                    if (live_element) |element| {
-                        try self.appendBlockChildren(element.children.items);
-                        self.laid_out_dom_children = element.children.items.len;
-                    }
-                }
-
-                self.children_epoch += 1;
-                self.children_version.set(self.children_epoch);
-                if (live_element) |element| element.clearChildrenDirty();
-            }
+            try self.rebuildChildrenIfNeeded();
 
             {
                 var height_deps = std.ArrayList(*ProtectedField(i32)).empty;
@@ -7212,70 +7407,101 @@ const BlockLayout = struct {
                 self.height.frozen_dependencies = true;
             }
 
-            // Layout all children and compute height
-            // Use .read() to register invalidation dependencies on children's heights
-            var computed_height: i32 = 0;
-            const float_context = self.floatContextForChildren();
-            const flow_origin = self.y.get().* + self.border.top + self.padding.top +
-                tableOfContentsHeaderHeight(self.node, zoom_value, engine.zoom());
-            _ = self.children_version.read(&self.height, self.allocator);
-            for (self.children.items) |child| {
-                switch (child) {
-                    .block => |b| {
-                        // A sibling float changes the available bounds of
-                        // every later block, even when that block's own style
-                        // is clean. Mark it before laying it out so the
-                        // exclusion geometry is recomputed.
-                        if (!isOutOfFlowPosition(b.positionMode()) and
-                            (float_context.floats.items.len > 0 or b.clearSide() != .none))
-                        {
-                            b.mark();
-                        }
-                        try b.layout(engine);
-                        const child_height = b.height.read(&self.height, self.allocator).*;
-                        if (isOutOfFlowPosition(b.positionMode())) {
-                            // Absolutely positioned descendants paint in this
-                            // subtree but contribute no normal-flow height.
-                        } else if (b.floatSide() != .none) {
-                            try float_context.floats.append(float_context.allocator, .{
-                                .side = b.floatSide(),
-                                .x = b.x.get().*,
-                                .y = b.y.get().*,
-                                .width = b.width.get().*,
-                                .height = child_height,
-                                .margin = b.margin,
-                            });
-                        } else {
-                            const child_bottom = b.y.get().* +| child_height +| b.margin.bottom;
-                            computed_height = @max(
-                                computed_height,
-                                child_bottom -| flow_origin,
-                            );
-                        }
-                    },
-                    .line => |l| {
-                        try l.layout(engine);
-                        computed_height += l.height.read(&self.height, self.allocator).*;
-                    },
+            const table_role = self.tableRole();
+            if (table_role == .table) {
+                const auto_height = try self.layoutTableChildren(engine);
+                natural_height = auto_height;
+                self.content_height = specified_height orelse
+                    constrainDimension(auto_height, min_height, max_height);
+                self.height.set(@max(
+                    self.content_height + self.padding.vertical() + self.border.vertical(),
+                    0,
+                ));
+            } else if (self.table_row_columns) |columns| {
+                const natural_content_height = try self.layoutTableRowChildren(
+                    engine,
+                    columns,
+                    0,
+                );
+                self.content_height = specified_height orelse
+                    constrainDimension(natural_content_height, min_height, max_height);
+                if (self.content_height != natural_content_height) {
+                    _ = try self.layoutTableRowChildren(
+                        engine,
+                        columns,
+                        self.content_height,
+                    );
                 }
-            }
-            if (owns_float_context) {
-                for (self.floats.items) |float_box| {
-                    computed_height = @max(float_box.bottom() -| flow_origin, computed_height);
+                natural_height = natural_content_height;
+                self.height.set(@max(
+                    self.content_height + self.padding.vertical() + self.border.vertical(),
+                    0,
+                ));
+            } else {
+                // Layout all children and compute height.
+                var computed_height: i32 = 0;
+                const float_context = self.floatContextForChildren();
+                const flow_origin = self.y.get().* + self.border.top + self.padding.top +
+                    tableOfContentsHeaderHeight(self.node, zoom_value, engine.zoom());
+                _ = self.children_version.read(&self.height, self.allocator);
+                for (self.children.items) |child| {
+                    switch (child) {
+                        .block => |b| {
+                            // A sibling float changes the available bounds of
+                            // every later block, even when that block's own style
+                            // is clean. Mark it before laying it out so the
+                            // exclusion geometry is recomputed.
+                            if (!isOutOfFlowPosition(b.positionMode()) and
+                                (float_context.floats.items.len > 0 or b.clearSide() != .none))
+                            {
+                                b.mark();
+                            }
+                            try b.layout(engine);
+                            const child_height = b.height.read(&self.height, self.allocator).*;
+                            if (isOutOfFlowPosition(b.positionMode())) {
+                                // Absolutely positioned descendants paint in this
+                                // subtree but contribute no normal-flow height.
+                            } else if (b.floatSide() != .none) {
+                                try float_context.floats.append(float_context.allocator, .{
+                                    .side = b.floatSide(),
+                                    .x = b.x.get().*,
+                                    .y = b.y.get().*,
+                                    .width = b.width.get().*,
+                                    .height = child_height,
+                                    .margin = b.margin,
+                                });
+                            } else {
+                                const child_bottom = b.y.get().* +| child_height +| b.margin.bottom;
+                                computed_height = @max(
+                                    computed_height,
+                                    child_bottom -| flow_origin,
+                                );
+                            }
+                        },
+                        .line => |l| {
+                            try l.layout(engine);
+                            computed_height += l.height.read(&self.height, self.allocator).*;
+                        },
+                    }
                 }
+                if (owns_float_context) {
+                    for (self.floats.items) |float_box| {
+                        computed_height = @max(float_box.bottom() -| flow_origin, computed_height);
+                    }
+                }
+                const auto_height = computed_height + tableOfContentsHeaderHeight(
+                    self.node,
+                    zoom_value,
+                    engine.zoom(),
+                );
+                natural_height = auto_height;
+                self.content_height = specified_height orelse
+                    constrainDimension(auto_height, min_height, max_height);
+                self.height.set(@max(
+                    self.content_height + self.padding.vertical() + self.border.vertical(),
+                    0,
+                ));
             }
-            const auto_height = computed_height + tableOfContentsHeaderHeight(
-                self.node,
-                zoom_value,
-                engine.zoom(),
-            );
-            natural_height = auto_height;
-            self.content_height = specified_height orelse
-                constrainDimension(auto_height, min_height, max_height);
-            self.height.set(@max(
-                self.content_height + self.padding.vertical() + self.border.vertical(),
-                0,
-            ));
         } else {
             // Inline layout mode - use the old approach for now
             // TODO: Refactor to populate LineLayout and TextLayout objects
@@ -7344,6 +7570,376 @@ const BlockLayout = struct {
         self.has_dirty_descendants = false;
     }
 
+    /// Reconcile direct DOM children with retained layout children. Table
+    /// planning calls this before measuring a real row, but the conservative
+    /// DOM-mutation path remains the only owner of child-array lifetime and
+    /// layout-owner rebinding.
+    fn rebuildChildrenIfNeeded(self: *BlockLayout) !void {
+        var children_dirty = false;
+        var insertions_only = false;
+        var live_element: ?*parser.Element = null;
+        if (self.node_ptr) |node| {
+            switch (node.*) {
+                .element => |*el| {
+                    live_element = el;
+                    if (el.children_dirty) {
+                        children_dirty = true;
+                        insertions_only = el.children_insertions_only;
+                    }
+                },
+                else => {},
+            }
+        }
+
+        if (!children_dirty and !self.children_version.dirty and self.children.items.len != 0) {
+            return;
+        }
+
+        // Table contexts synthesize only ephemeral row/cell records, not DOM
+        // nodes. Their direct-child topology can therefore change meaning when
+        // a display value changes, so retain-insertion is deliberately kept to
+        // ordinary block formatting contexts.
+        const preserves_table_topology = self.tableRole() == .ordinary;
+        var reused_children = false;
+        if (insertions_only and preserves_table_topology) {
+            // The host normally performs this rebind synchronously after child
+            // storage moves. Repeat it defensively for direct DOM users that
+            // honor the same insert marker.
+            insertions_only = if (self.node_ptr) |node| self.rebindAfterInsert(node) else false;
+        }
+
+        if (insertions_only and preserves_table_topology and self.children.items.len > 0) {
+            const element = live_element.?;
+            if (try self.rebuildInsertedChildren(element)) {
+                self.laid_out_dom_children = element.children.items.len;
+                reused_children = true;
+            }
+        }
+
+        if (!reused_children) {
+            for (self.children.items) |child| {
+                child.deinit(self.allocator);
+            }
+            self.children.clearRetainingCapacity();
+            self.laid_out_dom_children = 0;
+
+            if (live_element) |element| {
+                try self.appendBlockChildren(element.children.items);
+                self.laid_out_dom_children = element.children.items.len;
+            }
+        }
+
+        self.children_epoch += 1;
+        self.children_version.set(self.children_epoch);
+        if (live_element) |element| element.clearChildrenDirty();
+    }
+
+    fn isIgnorableTableWhitespace(self: *const BlockLayout) bool {
+        const nodes = self.inline_nodes orelse return false;
+        for (nodes) |node| switch (node.*) {
+            .text => |text| {
+                if (std.mem.trim(u8, text.text, " \t\r\n\x0c").len != 0) return false;
+            },
+            .element => return false,
+        };
+        return true;
+    }
+
+    /// Build the temporary logical grid inputs for this table. A direct real
+    /// row remains the owner of its own box; every other non-whitespace direct
+    /// child participates in one anonymous row, which is sufficient for the
+    /// CSS anonymous-table-box cases this bounded context supports.
+    fn buildTablePlan(self: *BlockLayout) !TablePlan {
+        std.debug.assert(self.tableRole() == .table);
+        try self.rebuildChildrenIfNeeded();
+
+        var plan = TablePlan.init(self.allocator);
+        errdefer plan.deinit();
+        var anonymous_row: ?usize = null;
+
+        for (self.children.items) |child| {
+            const block = switch (child) {
+                .block => |value| value,
+                .line => continue,
+            };
+            if (block.isIgnorableTableWhitespace()) continue;
+
+            if (block.tableRole() == .row) {
+                anonymous_row = null;
+                try block.rebuildChildrenIfNeeded();
+                const first_cell = plan.cells.items.len;
+                for (block.children.items) |row_child| {
+                    const cell = switch (row_child) {
+                        .block => |value| value,
+                        .line => continue,
+                    };
+                    if (cell.isIgnorableTableWhitespace()) continue;
+                    try plan.cells.append(plan.allocator, cell);
+                }
+                try plan.rows.append(plan.allocator, .{
+                    .owner = block,
+                    .first_cell = first_cell,
+                    .cell_count = plan.cells.items.len - first_cell,
+                });
+                continue;
+            }
+
+            const row_index = anonymous_row orelse row: {
+                try plan.rows.append(plan.allocator, .{
+                    .owner = null,
+                    .first_cell = plan.cells.items.len,
+                    .cell_count = 0,
+                });
+                const index = plan.rows.items.len - 1;
+                anonymous_row = index;
+                break :row index;
+            };
+            try plan.cells.append(plan.allocator, block);
+            plan.rows.items[row_index].cell_count += 1;
+        }
+        return plan;
+    }
+
+    fn appendTableMetricRows(
+        self: *const BlockLayout,
+        rows: *std.ArrayList(table_format.Row),
+        plan: *const TablePlan,
+    ) !void {
+        try rows.ensureTotalCapacity(self.allocator, plan.rows.items.len);
+        for (plan.rows.items) |row| rows.appendAssumeCapacity(.{
+            .first_cell = row.first_cell,
+            .cell_count = row.cell_count,
+        });
+    }
+
+    fn preferredTableCellWidth(
+        self: *BlockLayout,
+        parent_zoom: f32,
+        engine_zoom: f32,
+        containing_width_css: f64,
+    ) std.mem.Allocator.Error!i32 {
+        const element = liveBlockElement(self) orelse return 0;
+        const styles = element.style orelse return 0;
+        const local_zoom = parseCssZoom(styleValue(&styles, "zoom") orelse "1");
+        const effective_zoom = combinedEffectiveZoom(parent_zoom, local_zoom);
+        const context = parser.CssLengthResolutionContext{
+            .font_size = self.computedFontSizeCss(),
+            .percentage_base = containing_width_css,
+        };
+        const edges = resolveBoxEdges(
+            &styles,
+            self.computedFontSizeCss(),
+            containing_width_css,
+            effective_zoom,
+            engine_zoom,
+        );
+        const raw_width = styleValue(&styles, "width") orelse "auto";
+        var content_width: i32 = if (resolveCssLength(raw_width, context)) |width|
+            scaleCssPixel(width, effective_zoom, engine_zoom)
+        else
+            0;
+        if (self.tableRole() == .table and content_width == 0) {
+            content_width = try self.preferredTableWidth(
+                effective_zoom,
+                engine_zoom,
+                containing_width_css,
+            );
+        }
+        return @max(content_width +| edges.padding.horizontal() +| edges.border.horizontal(), 0);
+    }
+
+    /// Return the bounded intrinsic table content width. The table format
+    /// helper owns track math; this method only maps current DOM-backed boxes
+    /// to scalar preferred widths.
+    fn preferredTableWidth(
+        self: *BlockLayout,
+        zoom_value: f32,
+        engine_zoom: f32,
+        containing_width_css: f64,
+    ) std.mem.Allocator.Error!i32 {
+        var plan = try self.buildTablePlan();
+        defer plan.deinit();
+        if (plan.rows.items.len == 0) return 0;
+
+        var rows = std.ArrayList(table_format.Row).empty;
+        defer rows.deinit(self.allocator);
+        try self.appendTableMetricRows(&rows, &plan);
+        const column_count = table_format.columnCount(rows.items);
+        if (column_count == 0) return 0;
+
+        const metrics = try self.allocator.alloc(table_format.Cell, plan.cells.items.len);
+        defer self.allocator.free(metrics);
+        for (plan.cells.items, metrics) |cell, *metric| {
+            metric.* = .{
+                .preferred_width = try cell.preferredTableCellWidth(
+                    zoom_value,
+                    engine_zoom,
+                    containing_width_css,
+                ),
+            };
+        }
+        const columns = try self.allocator.alloc(i32, column_count);
+        defer self.allocator.free(columns);
+        return table_format.resolveColumnWidths(rows.items, metrics, 0, columns);
+    }
+
+    /// Place one logical row in a resolved grid. A first pass measures natural
+    /// cell heights; a constrained second pass stretches every shorter cell to
+    /// the row height without changing DOM parentage or paint ownership.
+    fn layoutTableCells(
+        self: *BlockLayout,
+        engine: *Layout,
+        cells: []const *BlockLayout,
+        columns: []const i32,
+        x: i32,
+        y: i32,
+        minimum_height: i32,
+    ) !i32 {
+        std.debug.assert(cells.len <= columns.len);
+        if (cells.len == 0) return @max(minimum_height, 0);
+
+        const metrics = try self.allocator.alloc(table_format.Cell, cells.len);
+        defer self.allocator.free(metrics);
+        var cursor_x = x;
+        for (cells, 0..) |cell, column| {
+            try cell.layoutWithTableBox(engine, .{
+                .x = cursor_x,
+                .y = y,
+                .width = columns[column],
+            });
+            metrics[column].natural_height = cell.height.get().*;
+            cursor_x +|= columns[column];
+        }
+
+        const row = [_]table_format.Row{.{ .first_cell = 0, .cell_count = cells.len }};
+        var heights: [1]i32 = undefined;
+        const natural_height = table_format.resolveRowHeights(&row, metrics, &heights);
+        const used_height = @max(natural_height, @max(minimum_height, 0));
+        cursor_x = x;
+        for (cells, 0..) |cell, column| {
+            if (cell.height.get().* != used_height) {
+                try cell.layoutWithTableBox(engine, .{
+                    .x = cursor_x,
+                    .y = y,
+                    .width = columns[column],
+                    .height = used_height,
+                });
+            }
+            cursor_x +|= columns[column];
+        }
+        return used_height;
+    }
+
+    fn layoutWithTableBox(self: *BlockLayout, engine: *Layout, box: TableBox) !void {
+        const previous_box = self.table_box;
+        self.table_box = box;
+        defer self.table_box = previous_box;
+        self.mark();
+        try self.layout(engine);
+    }
+
+    fn layoutWithTableRowBox(
+        self: *BlockLayout,
+        engine: *Layout,
+        box: TableBox,
+        columns: []const i32,
+    ) !void {
+        const previous_box = self.table_box;
+        const previous_columns = self.table_row_columns;
+        self.table_box = box;
+        self.table_row_columns = columns;
+        defer {
+            self.table_row_columns = previous_columns;
+            self.table_box = previous_box;
+        }
+        self.mark();
+        try self.layout(engine);
+    }
+
+    fn layoutTableChildren(self: *BlockLayout, engine: *Layout) !i32 {
+        var plan = try self.buildTablePlan();
+        defer plan.deinit();
+        if (plan.rows.items.len == 0) return 0;
+
+        var rows = std.ArrayList(table_format.Row).empty;
+        defer rows.deinit(self.allocator);
+        try self.appendTableMetricRows(&rows, &plan);
+        const column_count = table_format.columnCount(rows.items);
+        if (column_count == 0) return 0;
+
+        const metrics = try self.allocator.alloc(table_format.Cell, plan.cells.items.len);
+        defer self.allocator.free(metrics);
+        const containing_width_css = cssPixelsFromLayout(
+            self.content_width,
+            self.zoom.get().*,
+            self.document.page_zoom,
+        );
+        for (plan.cells.items, metrics) |cell, *metric| {
+            metric.* = .{
+                .preferred_width = try cell.preferredTableCellWidth(
+                    self.zoom.get().*,
+                    engine.zoom(),
+                    containing_width_css,
+                ),
+            };
+        }
+        const columns = try self.allocator.alloc(i32, column_count);
+        defer self.allocator.free(columns);
+        _ = table_format.resolveColumnWidths(rows.items, metrics, self.content_width, columns);
+
+        const content_x = self.x.get().* + self.border.left + self.padding.left;
+        var row_y = self.y.get().* + self.border.top + self.padding.top;
+        const first_y = row_y;
+        for (plan.rows.items) |row| {
+            const row_cells = plan.cells.items[row.first_cell .. row.first_cell + row.cell_count];
+            const row_height = if (row.owner) |owner| row_height: {
+                try owner.layoutWithTableRowBox(engine, .{
+                    .x = content_x,
+                    .y = row_y,
+                    .width = self.content_width,
+                }, columns);
+                break :row_height owner.height.get().*;
+            } else try self.layoutTableCells(
+                engine,
+                row_cells,
+                columns,
+                content_x,
+                row_y,
+                0,
+            );
+            row_y +|= row_height;
+        }
+        return row_y -| first_y;
+    }
+
+    fn layoutTableRowChildren(
+        self: *BlockLayout,
+        engine: *Layout,
+        columns: []const i32,
+        minimum_height: i32,
+    ) !i32 {
+        var cells = std.ArrayList(*BlockLayout).empty;
+        defer cells.deinit(self.allocator);
+        for (self.children.items) |child| {
+            const cell = switch (child) {
+                .block => |value| value,
+                .line => continue,
+            };
+            if (cell.isIgnorableTableWhitespace()) continue;
+            try cells.append(self.allocator, cell);
+        }
+        const content_x = self.x.get().* + self.border.left + self.padding.left;
+        const content_y = self.y.get().* + self.border.top + self.padding.top;
+        return self.layoutTableCells(
+            engine,
+            cells.items,
+            columns,
+            content_x,
+            content_y,
+            minimum_height,
+        );
+    }
+
     fn lastInFlowBlock(self: *BlockLayout) ?*BlockLayout {
         var previous: ?*BlockLayout = null;
         for (self.children.items) |child| switch (child) {
@@ -7356,6 +7952,13 @@ const BlockLayout = struct {
     }
 
     fn appendBlockChildren(self: *BlockLayout, nodes: []Node) !void {
+        // Tables and real rows place their direct children in a grid, not in
+        // the usual vertical predecessor chain. Cells themselves still use
+        // normal block flow for their contents.
+        const grid_children = switch (self.tableRole()) {
+            .table, .row => true,
+            .ordinary, .cell => false,
+        };
         var previous: ?*BlockLayout = null;
         var index: usize = 0;
         while (index < nodes.len) {
@@ -7373,9 +7976,17 @@ const BlockLayout = struct {
                 errdefer self.allocator.free(run_in_nodes);
                 run_in_nodes[0] = &nodes[index];
                 run_in_nodes[1] = &nodes[index + 1];
-                const child = try BlockLayout.initAnonymous(self.allocator, run_in_nodes, self.document, self, previous);
+                const child = try BlockLayout.initAnonymous(
+                    self.allocator,
+                    run_in_nodes,
+                    self.document,
+                    self,
+                    if (grid_children) null else previous,
+                );
                 try self.children.append(self.allocator, .{ .block = child });
-                if (child.floatSide() == .none and !isOutOfFlowPosition(child.positionMode())) previous = child;
+                if (!grid_children and child.floatSide() == .none and !isOutOfFlowPosition(child.positionMode())) {
+                    previous = child;
+                }
                 index += 2;
                 continue;
             }
@@ -7395,10 +8006,12 @@ const BlockLayout = struct {
                     child_node,
                     self.document,
                     self,
-                    if (isOutOfFlowPosition(child_position)) null else previous,
+                    if (grid_children or isOutOfFlowPosition(child_position)) null else previous,
                 );
                 try self.children.append(self.allocator, .{ .block = child });
-                if (child.floatSide() == .none and !isOutOfFlowPosition(child.positionMode())) previous = child;
+                if (!grid_children and child.floatSide() == .none and !isOutOfFlowPosition(child.positionMode())) {
+                    previous = child;
+                }
                 index += 1;
                 continue;
             }
@@ -7413,9 +8026,17 @@ const BlockLayout = struct {
             for (nodes[start..index], 0..) |*node, output_index| {
                 inline_nodes[output_index] = node;
             }
-            const child = try BlockLayout.initAnonymous(self.allocator, inline_nodes, self.document, self, previous);
+            const child = try BlockLayout.initAnonymous(
+                self.allocator,
+                inline_nodes,
+                self.document,
+                self,
+                if (grid_children) null else previous,
+            );
             try self.children.append(self.allocator, .{ .block = child });
-            if (child.floatSide() == .none and !isOutOfFlowPosition(child.positionMode())) previous = child;
+            if (!grid_children and child.floatSide() == .none and !isOutOfFlowPosition(child.positionMode())) {
+                previous = child;
+            }
         }
     }
 
@@ -8055,7 +8676,8 @@ fn appendTableOfContentsHeader(self: *Layout, commands: *std.ArrayList(DisplayIt
 fn elementUsesBlockFocusBox(element: *const parser.Element) bool {
     const style_map = if (element.style) |*styles| styles else return false;
     const display = styleValue(style_map, "display") orelse return false;
-    return isBlockDisplay(display);
+    return isBlockDisplay(display) or
+        table_format.establishesFormattingContext(table_format.roleForDisplay(display));
 }
 
 fn hasFocusBoundsForNode(entries: []const FocusBoundEntry, node: *Node) bool {

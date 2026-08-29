@@ -30,6 +30,10 @@ boundaries.
   alignment/wrapping decisions, and inline font-size used values. Layout-tree
   traversal, glyph ownership, and retained line objects remain in
   `layout.zig`.
+- `table_format.zig` owns allocation-free scalar roles and single-span grid
+  track math for the bounded CSS table context. `layout.zig` retains all
+  DOM-backed boxes and keeps its temporary row/cell plan synchronous; do not
+  move DOM pointers, style subscriptions, or anonymous-box lifetime here.
 - `control_geometry.zig` computes input/button leaf geometry and password
   display text. `InputLayout` and `ButtonLayout` remain with their DOM, font,
   collector, and display-command invariants in `layout.zig`.

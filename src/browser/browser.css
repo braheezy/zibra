@@ -29,7 +29,10 @@ figure { display: block; }
 figcaption { display: block; }
 main { display: block; }
 div { display: block; }
-table { display: block; }
+table { display: table; }
+tr { display: table-row; }
+td { display: table-cell; }
+th { display: table-cell; }
 form { display: block; }
 fieldset { display: block; }
 legend { display: block; }

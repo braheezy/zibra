@@ -21,6 +21,7 @@ tiers and baseline policy.
 | [`anonymous-block-boxes.html`](anonymous-block-boxes.html) | Anonymous inline/block grouping |
 | [`block-dimensions.html`](block-dimensions.html) | CSS block width/height and surrounding box edges |
 | [`display.html`](display.html) | Computed display classification and anonymous runs |
+| [`css-tables.html`](css-tables.html) | Bounded table/table-row/table-cell grid tracks, anonymous direct cells, and row-height stretch |
 | [`inline-stylesheet.html`](inline-stylesheet.html) | Inline/linked stylesheet DOM order, hidden style content, and shared inspection stages |
 | [`links-bar.html`](links-bar.html) | User-agent class selector styling for repeated navigation bars |
 | [`table-of-contents.html`](table-of-contents.html) | User-agent ID selector and generated table-of-contents bar styling |

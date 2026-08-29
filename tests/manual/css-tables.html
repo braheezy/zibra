@@ -1,0 +1,30 @@
+<!--
+How to verify:
+  zig build run -- --dump-layout tests/manual/css-tables.html
+  zig build run -- tests/manual/css-tables.html
+
+Expected: each colored strip is one horizontal table row. The top strip uses
+real table/tr/td elements; the lower strip uses CSS display values directly.
+The short blue and purple cells stretch to their row's tallest neighbor, and
+the direct ordinary green child is placed as an anonymous table cell.
+-->
+<!doctype html>
+<html>
+  <head>
+    <title>Bounded CSS table formatting</title>
+  </head>
+  <body style="background-color: white; color: black">
+    <table style="margin: 16px; background-color: #dddddd">
+      <tr>
+        <td style="width: 100px; height: 36px; background-color: #ff9999">native cell</td>
+        <td style="width: 60px; height: 14px; background-color: #9999ff">stretched</td>
+      </tr>
+    </table>
+
+    <div style="display: table; margin: 16px; background-color: #dddddd">
+      <div style="display: table-cell; width: 100px; height: 36px; background-color: #ffcc66">CSS cell</div>
+      <div style="display: table-cell; width: 60px; height: 14px; background-color: #cc99ff">stretched</div>
+      <div style="display: block; width: 80px; height: 24px; background-color: #99cc99">anonymous</div>
+    </div>
+  </body>
+</html>

@@ -191,6 +191,17 @@ Important geometry contracts:
   fonts, natural replaced sizes, radii, transforms, and filters incorporate
   authored zoom in page coordinates. Accessibility zoom is applied once at
   raster and must not be baked twice.
+- The bounded table context recognizes `table`, `table-row`, and `table-cell`.
+  `layout.zig` keeps real DOM-backed boxes, creates only a synchronous
+  normalized row/cell plan, and delegates scalar single-span track math to
+  `render/table_format.zig`. Direct non-row table children occupy anonymous
+  row/cell slots without synthetic DOM nodes; whitespace-only anonymous
+  blocks do not create slots. Grid children have no normal-flow `previous`
+  link, because their positions come from table tracks. Structural mutation
+  and display-role changes rebuild table/row children conservatively rather
+  than using retained insertion. Inline tables, captions, columns, row
+  groups, spans, collapse/spacing, and vertical alignment are not part of
+  this context.
 - Float exclusion belongs to the nearest block formatting-context owner.
   Pointer-free float records are rebuilt when that owner lays out; only the
   owner includes floats in auto height.
@@ -226,6 +237,9 @@ Pure layout leaves are intentionally separated from retained object state:
 - `render/inline_format.zig` normalizes inline text and computes alignment,
   wrapping, line-height, and font-variant used values without walking or
   owning the layout tree;
+- `render/table_format.zig` resolves bounded table roles, single-span column
+  widths, row heights, and scalar cell rectangles after `layout.zig` has
+  normalized the current DOM-backed grid;
 - `render/control_geometry.zig` computes control leaf geometry, while the
   `InputLayout` and `ButtonLayout` objects retain DOM/font/collector
   invariants in `layout.zig`;

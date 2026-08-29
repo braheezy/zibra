@@ -1,0 +1,72 @@
+html,
+body {
+  margin: 0;
+  padding: 0;
+}
+
+head {
+  display: none;
+}
+
+#anonymous {
+  display: table;
+  margin: 0;
+  padding: 0;
+  background-color: #ff0000;
+}
+
+#a {
+  display: table-cell;
+  width: 11px;
+  height: 13px;
+  padding: 0;
+  background-color: #111111;
+}
+
+/* A direct nested table receives an anonymous containing table cell. */
+#b {
+  display: table;
+  width: 17px;
+  height: 13px;
+  margin: 0;
+  padding: 0;
+  background-color: #222222;
+}
+
+#c {
+  display: table-cell;
+  width: 19px;
+  height: 5px;
+  padding: 0;
+  background-color: #333333;
+}
+
+/* An ordinary direct child likewise receives an anonymous table cell. */
+#d {
+  display: block;
+  width: 23px;
+  height: 13px;
+  margin: 0;
+  padding: 0;
+  background-color: #444444;
+}
+
+#native {
+  margin: 0;
+  padding: 0;
+  background-color: #aaaaaa;
+}
+
+#e {
+  width: 7px;
+  height: 9px;
+  padding: 0;
+  background-color: #555555;
+}
+
+#f {
+  width: 13px;
+  height: 5px;
+  padding: 0;
+  background-color: #666666;
+}

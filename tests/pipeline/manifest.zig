@@ -61,4 +61,16 @@ pub const cases = [_]Case{
         .fixture = "tests/pipeline/css-zoom.html",
         .golden = "tests/golden/pipeline/css-zoom.display-list.txt",
     },
+    .{
+        .name = "table-format-layout",
+        .mode = .layout,
+        .fixture = "tests/pipeline/table-format.html",
+        .golden = "tests/golden/pipeline/table-format.layout.txt",
+    },
+    .{
+        .name = "table-format-display-list",
+        .mode = .display_list,
+        .fixture = "tests/pipeline/table-format.html",
+        .golden = "tests/golden/pipeline/table-format.display-list.txt",
+    },
 };
