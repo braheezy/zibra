@@ -1,4 +1,4 @@
-//! Discovery, selection, fetch, and decode for HTML `<img>` resources.
+//! Discovery, selection, fetch, and decode for HTML image resources.
 //!
 //! Browser and Frame operations arrive as callbacks so this resource owner
 //! remains independent of the oversized root coordinator and its SDL state.
@@ -33,6 +33,44 @@ pub const Candidate = struct {
     element: *parser.Element,
     bounds: ?Bounds = null,
 };
+
+fn dataUrlHasImageMediaType(source: []const u8) bool {
+    const trimmed = std.mem.trim(u8, source, " \t\r\n");
+    if (!std.ascii.startsWithIgnoreCase(trimmed, "data:")) return false;
+    const comma = std.mem.indexOfScalar(u8, trimmed, ',') orelse return false;
+    const metadata = std.mem.trim(u8, trimmed[5..comma], " \t\r\n");
+    return std.ascii.startsWithIgnoreCase(metadata, "image/");
+}
+
+/// Return the image source selected by an HTML replaced element. `<object>`
+/// participates only when its declared or data-URL media type is image-like;
+/// unsupported object resources keep rendering their fallback children.
+pub fn resourceSource(element: *const parser.Element) ?[]const u8 {
+    const attributes = element.attributes orelse return null;
+    if (std.ascii.eqlIgnoreCase(element.tag, "img")) {
+        const source = attributes.get("src") orelse return null;
+        return if (source.len == 0) null else source;
+    }
+    if (!std.ascii.eqlIgnoreCase(element.tag, "object")) return null;
+
+    const source = attributes.get("data") orelse return null;
+    if (source.len == 0) return null;
+    if (attributes.get("type")) |media_type| {
+        const normalized = std.mem.trim(u8, media_type, " \t\r\n");
+        if (!std.ascii.startsWithIgnoreCase(normalized, "image/")) return null;
+        return source;
+    }
+    if (std.ascii.startsWithIgnoreCase(std.mem.trim(u8, source, " \t\r\n"), "data:") and
+        !dataUrlHasImageMediaType(source))
+    {
+        return null;
+    }
+    return source;
+}
+
+pub fn isImageResourceElement(element: *const parser.Element) bool {
+    return resourceSource(element) != null;
+}
 
 pub fn isLazy(element: *const parser.Element) bool {
     if (!std.ascii.eqlIgnoreCase(element.tag, "img")) return false;
@@ -210,9 +248,7 @@ pub fn loadCandidates(
     var loaded: usize = 0;
     for (candidates) |candidate| {
         if (!selected(candidate, selection)) continue;
-        const attributes = candidate.element.attributes orelse continue;
-        const source = attributes.get("src") orelse continue;
-        if (source.len == 0) continue;
+        const source = resourceSource(candidate.element) orelse continue;
 
         var data = try loadOne(
             allocator,
@@ -245,6 +281,42 @@ test "lazy image selection is case-insensitive and uses a viewport margin" {
     try std.testing.expect(isNearViewport(.{ .x = 0, .y = 400, .width = 10, .height = 1 }, viewport));
     try std.testing.expect(isNearViewport(.{ .x = 0, .y = 2200, .width = 10, .height = 1 }, viewport));
     try std.testing.expect(!isNearViewport(.{ .x = 0, .y = 2202, .width = 10, .height = 1 }, viewport));
+}
+
+test "object image discovery preserves unsupported fallback subtrees" {
+    const allocator = std.testing.allocator;
+    var image = try parser.Element.init(
+        allocator,
+        "object data='data:image/png;base64,AAAA'",
+        null,
+    );
+    defer image.deinit(allocator);
+    var typed_image = try parser.Element.init(
+        allocator,
+        "object data=portrait.bin type=' image/avif '",
+        null,
+    );
+    defer typed_image.deinit(allocator);
+    var unsupported_data = try parser.Element.init(
+        allocator,
+        "object data='data:application/x-unknown,ERROR'",
+        null,
+    );
+    defer unsupported_data.deinit(allocator);
+    var document = try parser.Element.init(
+        allocator,
+        "object data=page.html type=text/html",
+        null,
+    );
+    defer document.deinit(allocator);
+
+    try std.testing.expectEqualStrings(
+        "data:image/png;base64,AAAA",
+        resourceSource(&image).?,
+    );
+    try std.testing.expectEqualStrings("portrait.bin", resourceSource(&typed_image).?);
+    try std.testing.expect(resourceSource(&unsupported_data) == null);
+    try std.testing.expect(resourceSource(&document) == null);
 }
 
 test "broken image visibility requires non-empty alternate text" {

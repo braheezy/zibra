@@ -522,6 +522,28 @@ test "Parse HTML with nested paragraphs" {
     try std.testing.expectEqualStrings("world", p2.children.items[0].text.text);
 }
 
+test "block starts implicitly close open paragraphs" {
+    const allocator = std.testing.allocator;
+    const html =
+        "<p>before<table></table>" ++
+        "<p>middle<blockquote>quote</blockquote><div>after</div>";
+
+    var parser = try HTMLParser.init(allocator, html);
+    defer parser.deinit(allocator);
+    var root = try parser.parse();
+    defer root.deinit(allocator);
+
+    const body = &root.element.children.items[1].element;
+    try std.testing.expectEqual(@as(usize, 5), body.children.items.len);
+    const expected = [_][]const u8{ "p", "table", "p", "blockquote", "div" };
+    for (body.children.items, expected) |child, tag| {
+        try std.testing.expect(child == .element);
+        try std.testing.expectEqualStrings(tag, child.element.tag);
+    }
+    try std.testing.expectEqualStrings("before", body.children.items[0].element.children.items[0].text.text);
+    try std.testing.expectEqualStrings("middle", body.children.items[2].element.children.items[0].text.text);
+}
+
 test "Parse HTML with list items" {
     const allocator = std.testing.allocator;
     // HTML with list items that should be siblings, not nested
@@ -1828,6 +1850,28 @@ test "CSS-wide keywords resolve for inherited and non-inherited properties" {
     try std.testing.expectEqualStrings("30px", child.getPtr("width").?.get().*);
     try std.testing.expectEqualStrings("blue", child.getPtr("color").?.get().*);
     try std.testing.expectEqualStrings("inline", child.getPtr("display").?.get().*);
+}
+
+test "text alignment inherits through inline descendants" {
+    const allocator = std.testing.allocator;
+    var html_parser = try HTMLParser.init(
+        allocator,
+        "<div style='text-align: right'><span>aligned</span></div>",
+    );
+    html_parser.use_implicit_tags = false;
+    defer html_parser.deinit(allocator);
+    var root = try html_parser.parse();
+    defer root.deinit(allocator);
+
+    try document_parser.style(allocator, &root, &.{});
+    try std.testing.expectEqualStrings(
+        "right",
+        root.element.style.?.getPtr("text-align").?.get().*,
+    );
+    try std.testing.expectEqualStrings(
+        "right",
+        root.element.children.items[0].element.style.?.getPtr("text-align").?.get().*,
+    );
 }
 
 test "font shorthand produces inherited computed longhands" {

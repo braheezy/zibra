@@ -206,6 +206,7 @@ fn contentBoundsForNode(node: Node, parent_x: i32, parent_width: i32, indent: i3
 const resolveCssLength = box_model.resolveCssLength;
 const resolveSignedCssLength = box_model.resolveSignedCssLength;
 const constrainDimension = box_model.constrainDimension;
+const collapseAdjoiningMargins = box_model.collapseAdjoiningMargins;
 const shrinkToFitSpecifiedContentWidth = box_model.shrinkToFitSpecifiedContentWidth;
 const resolveBoxEdges = box_model.resolveBoxEdges;
 const horizontalAutoMargins = box_model.horizontalAutoMargins;
@@ -454,6 +455,11 @@ const ImageLayout = struct {
     source_height: i32,
     natural_width: i32,
     natural_height: i32,
+    content_width: i32,
+    content_height: i32,
+    padding: BoxEdges,
+    border: BoxEdges,
+    css_scale: f64,
     fit: object_fit.Mode,
     opacity: f64 = 1.0,
 
@@ -467,6 +473,8 @@ const ImageLayout = struct {
         parent_block: ?*BlockLayout,
         style_map: ?*const parser.StyleMap,
         zoom_value: f32,
+        edges: BoxModelEdges,
+        css_scale: f64,
     ) ImageLayout {
         const empty_pixels = &[_]u8{};
         const src_width: i32 = if (image_data) |data| @intCast(data.image.width) else 0;
@@ -478,6 +486,11 @@ const ImageLayout = struct {
             .source_height = src_height,
             .natural_width = natural_width,
             .natural_height = natural_height,
+            .content_width = layout_width,
+            .content_height = layout_height,
+            .padding = edges.padding,
+            .border = edges.border,
+            .css_scale = css_scale,
             .fit = if (style_map) |styles|
                 if (styleValue(styles, "object-fit")) |value|
                     object_fit.parse(value) orelse .fill
@@ -489,7 +502,15 @@ const ImageLayout = struct {
         };
         _ = parent_block;
         layout.embed.setupDependencies();
-        layout.embed.setMetrics(layout_width, layout_height, layout_height, 0, zoom_value, 0);
+        const outer_width = @max(
+            layout_width + edges.padding.horizontal() + edges.border.horizontal(),
+            0,
+        );
+        const outer_height = @max(
+            layout_height + edges.padding.vertical() + edges.border.vertical(),
+            0,
+        );
+        layout.embed.setMetrics(outer_width, outer_height, outer_height, 0, zoom_value, 0);
         return layout;
     }
 
@@ -497,20 +518,20 @@ const ImageLayout = struct {
         self: *const ImageLayout,
         box_x: i32,
         box_y: i32,
-        box_width: i32,
-        box_height: i32,
         source: ?browser.DisplayItemSource,
     ) browser.ImageDisplayItem {
+        const content_x = box_x +| self.border.left +| self.padding.left;
+        const content_y = box_y +| self.border.top +| self.padding.top;
         const geometry = object_fit.resolve(
             self.fit,
-            box_width,
-            box_height,
+            self.content_width,
+            self.content_height,
             self.natural_width,
             self.natural_height,
             self.source_width,
             self.source_height,
         ) orelse object_fit.Geometry{
-            .destination = .{ .left = 0, .top = 0, .right = box_width, .bottom = box_height },
+            .destination = .{ .left = 0, .top = 0, .right = self.content_width, .bottom = self.content_height },
             .source = null,
         };
         const source_rect: ?browser.ImageSourceRect = if (geometry.source) |crop| .{
@@ -520,10 +541,10 @@ const ImageLayout = struct {
             .bottom = crop.bottom,
         } else null;
         return .{
-            .x1 = box_x +| geometry.destination.left,
-            .y1 = box_y +| geometry.destination.top,
-            .x2 = box_x +| geometry.destination.right,
-            .y2 = box_y +| geometry.destination.bottom,
+            .x1 = content_x +| geometry.destination.left,
+            .y1 = content_y +| geometry.destination.top,
+            .x2 = content_x +| geometry.destination.right,
+            .y2 = content_y +| geometry.destination.bottom,
             .source_width = self.source_width,
             .source_height = self.source_height,
             .pixels = self.pixels,
@@ -531,12 +552,88 @@ const ImageLayout = struct {
             .hit_rect = .{
                 .left = box_x,
                 .top = box_y,
-                .right = box_x +| box_width,
-                .bottom = box_y +| box_height,
+                .right = box_x +| self.embed.width.get().*,
+                .bottom = box_y +| self.embed.height.get().*,
             },
             .opacity = self.opacity,
             .source = source,
         };
+    }
+
+    fn paintAt(
+        self: *const ImageLayout,
+        commands: *std.ArrayList(DisplayItem),
+        engine: *Layout,
+        x: i32,
+        y: i32,
+        source: ?browser.DisplayItemSource,
+    ) !void {
+        const width = self.embed.width.get().*;
+        const height = self.embed.height.get().*;
+        const element: ?*const parser.Element = if (source) |item_source|
+            if (item_source.node) |node| switch (node.*) {
+                .element => |*value| value,
+                .text => null,
+            } else null
+        else
+            null;
+
+        if (element) |live_element| if (live_element.style) |*style_map| {
+            const background = if (animatedBackgroundColor(live_element.*)) |animated|
+                animated
+            else if (styleValue(style_map, "background-color")) |value|
+                parseColor(value)
+            else
+                null;
+            if (background) |color| {
+                const radius = if (styleValue(style_map, "border-radius")) |value|
+                    self.css_scale * parseCssPixelRadius(value)
+                else
+                    0;
+                try appendBackgroundBox(
+                    commands,
+                    engine.allocator,
+                    x,
+                    y,
+                    width,
+                    height,
+                    radius,
+                    engine.remapColor(color, .background),
+                    source,
+                );
+            }
+            if (!engine.accessibility.forced_colors) {
+                if (backgroundImagePaint(live_element)) |paint| {
+                    try appendBackgroundImageBox(
+                        commands,
+                        engine.allocator,
+                        paint,
+                        x,
+                        y,
+                        width,
+                        height,
+                        self.css_scale,
+                        source,
+                    );
+                }
+            }
+            try appendBorderBoxes(
+                engine,
+                commands,
+                x,
+                y,
+                width,
+                height,
+                self.border,
+                style_map,
+                live_element,
+                source,
+            );
+        };
+
+        try commands.append(engine.allocator, .{
+            .image = self.displayItem(x, y, source),
+        });
     }
 
     fn deinit(self: *ImageLayout) void {
@@ -556,13 +653,15 @@ test "object-fit separates fitted image paint from the replaced element hit box"
         null,
         null,
         1.0,
+        .{ .margin = .{}, .padding = .{}, .border = .{} },
+        1.0,
     );
     defer image.deinit();
     image.source_width = 200;
     image.source_height = 100;
 
     image.fit = .contain;
-    const contained = image.displayItem(10, 20, 100, 100, null);
+    const contained = image.displayItem(10, 20, null);
     try std.testing.expectEqual(@as(i32, 10), contained.x1);
     try std.testing.expectEqual(@as(i32, 45), contained.y1);
     try std.testing.expectEqual(@as(i32, 110), contained.x2);
@@ -574,7 +673,7 @@ test "object-fit separates fitted image paint from the replaced element hit box"
     );
 
     image.fit = .cover;
-    const covered = image.displayItem(10, 20, 100, 100, null);
+    const covered = image.displayItem(10, 20, null);
     try std.testing.expectEqual(@as(i32, 10), covered.x1);
     try std.testing.expectEqual(@as(i32, 20), covered.y1);
     try std.testing.expectEqual(@as(i32, 110), covered.x2);
@@ -582,6 +681,42 @@ test "object-fit separates fitted image paint from the replaced element hit box"
     try std.testing.expectEqual(
         browser.ImageSourceRect{ .left = 50, .top = 0, .right = 150, .bottom = 100 },
         covered.source_rect.?,
+    );
+}
+
+test "inline replaced image boxes include padding and borders" {
+    const allocator = std.testing.allocator;
+    var image = ImageLayout.init(
+        allocator,
+        100,
+        50,
+        100,
+        50,
+        null,
+        null,
+        null,
+        1.0,
+        .{
+            .margin = .{},
+            .padding = .{ .top = 3, .right = 7, .bottom = 4, .left = 5 },
+            .border = .{ .top = 1, .right = 6, .bottom = 2, .left = 2 },
+        },
+        1.0,
+    );
+    defer image.deinit();
+    image.source_width = 100;
+    image.source_height = 50;
+
+    try std.testing.expectEqual(@as(i32, 120), image.embed.width.get().*);
+    try std.testing.expectEqual(@as(i32, 60), image.embed.height.get().*);
+    const item = image.displayItem(10, 20, null);
+    try std.testing.expectEqual(@as(i32, 17), item.x1);
+    try std.testing.expectEqual(@as(i32, 24), item.y1);
+    try std.testing.expectEqual(@as(i32, 117), item.x2);
+    try std.testing.expectEqual(@as(i32, 74), item.y2);
+    try std.testing.expectEqual(
+        browser.Rect{ .left = 10, .top = 20, .right = 130, .bottom = 80 },
+        item.hit_rect.?,
     );
 }
 
@@ -939,6 +1074,32 @@ fn textDirectionForBlock(block: *const BlockLayout, fallback: TextDirection) Tex
         }
     }
     return fallback;
+}
+
+fn lineAlignmentForBlock(
+    block: *const BlockLayout,
+    direction: TextDirection,
+    centered_title: bool,
+) LineAlignment {
+    if (centered_title) return .center;
+    const element = liveBlockElement(block) orelse
+        return if (direction == .right_to_left) .end else .start;
+    const styles = if (element.style) |*style_map| style_map else return if (direction == .right_to_left) .end else .start;
+    const value = std.mem.trim(
+        u8,
+        styleValue(styles, "text-align") orelse "start",
+        " \t\r\n",
+    );
+    if (std.ascii.eqlIgnoreCase(value, "center")) return .center;
+    if (std.ascii.eqlIgnoreCase(value, "right")) return .end;
+    if (std.ascii.eqlIgnoreCase(value, "left")) return .start;
+    if (std.ascii.eqlIgnoreCase(value, "start")) {
+        return if (direction == .right_to_left) .end else .start;
+    }
+    if (std.ascii.eqlIgnoreCase(value, "end")) {
+        return if (direction == .right_to_left) .start else .end;
+    }
+    return if (direction == .right_to_left) .end else .start;
 }
 
 test "HTML dir values override or inherit the CLI fallback" {
@@ -1705,6 +1866,7 @@ window_width: i32,
 window_height: i32,
 default_direction: TextDirection = .left_to_right,
 line_direction: TextDirection = .left_to_right,
+line_alignment: LineAlignment = .start,
 accessibility: browser.AccessibilitySettings = .{},
 // Total device-pixel scale for the inline subtree currently being measured:
 // accessibility zoom multiplied by every applicable authored `zoom` value.
@@ -1801,6 +1963,7 @@ const InlineSnapshot = struct {
     current_font_category: FontCategory,
     text_color: browser.Color,
     line_direction: TextDirection,
+    line_alignment: LineAlignment,
     effective_zoom: f32,
 };
 
@@ -1826,6 +1989,7 @@ fn snapshotInlineState(self: *const Layout) InlineSnapshot {
         .current_font_category = self.current_font_category,
         .text_color = self.text_color,
         .line_direction = self.line_direction,
+        .line_alignment = self.line_alignment,
         .effective_zoom = self.effective_zoom,
     };
 }
@@ -1851,6 +2015,7 @@ fn restoreInlineState(self: *Layout, snapshot: InlineSnapshot) void {
     self.current_font_category = snapshot.current_font_category;
     self.text_color = snapshot.text_color;
     self.line_direction = snapshot.line_direction;
+    self.line_alignment = snapshot.line_alignment;
     self.effective_zoom = snapshot.effective_zoom;
 }
 
@@ -2204,7 +2369,7 @@ fn recurseNode(self: *Layout, node: Node, node_ptr: ?*Node, line_buffer: *std.Ar
                 try self.handleInputElement(node, node_ptr, line_buffer);
             } else if (std.mem.eql(u8, e.tag, "button")) {
                 try self.handleButtonElement(node, node_ptr, line_buffer);
-            } else if (std.mem.eql(u8, e.tag, "img")) {
+            } else if (elementUsesImageLayout(&e)) {
                 try self.handleImageElement(node, node_ptr, line_buffer);
             } else if (std.ascii.eqlIgnoreCase(e.tag, "canvas")) {
                 try self.handleCanvasElement(node_ptr, line_buffer);
@@ -2233,6 +2398,16 @@ fn isNonRenderTag(tag: []const u8) bool {
 
 fn isNonRenderedElement(element: *const parser.Element) bool {
     return isNonRenderTag(element.tag) or element.isHiddenInput();
+}
+
+/// `<img>` always establishes an atomic replaced box, including while its
+/// pixels are pending. `<object>` does so only after an image resource decoded;
+/// otherwise its ordinary children remain the rendered fallback subtree.
+fn elementUsesImageLayout(element: *const parser.Element) bool {
+    if (std.ascii.eqlIgnoreCase(element.tag, "img")) return true;
+    if (!std.ascii.eqlIgnoreCase(element.tag, "object")) return false;
+    const data = element.image_data orelse return false;
+    return !data.is_broken;
 }
 
 fn handleInputElement(self: *Layout, node: Node, node_ptr: ?*Node, line_buffer: *std.ArrayList(LineItem)) !void {
@@ -2304,6 +2479,16 @@ fn handleImageElement(self: *Layout, node: Node, node_ptr: ?*Node, line_buffer: 
     const layout_height = self.scaleActiveCssPixel(box.height);
     const intrinsic_width = self.scaleActiveCssPixel(if (intrinsic_size) |size| size.width else 0);
     const intrinsic_height = self.scaleActiveCssPixel(if (intrinsic_size) |size| size.height else 0);
+    const edges = if (style_map) |styles|
+        resolveBoxEdges(
+            styles,
+            self.font_size_css,
+            self.containingBlockCssDimension(false),
+            self.effectiveZoom(),
+            self.zoom(),
+        )
+    else
+        BoxModelEdges{ .margin = .{}, .padding = .{}, .border = .{} };
 
     if (layout_width < 0 or layout_height < 0 or
         (layout_width == 0 and layout_height == 0))
@@ -2334,6 +2519,8 @@ fn handleImageElement(self: *Layout, node: Node, node_ptr: ?*Node, line_buffer: 
         self.inline_block,
         style_map,
         self.effectiveZoom(),
+        edges,
+        self.scaleActiveCssFloat(1.0),
     );
     try image_layout.embed.appendImagePlaceholder(self, line_buffer, node_ptr, .{
         .image = image_layout,
@@ -2805,14 +2992,8 @@ fn flushLine(self: *Layout, line_buffer: *std.ArrayList(LineItem)) !void {
         content_left = @min(content_left, item.x);
         content_right = @max(content_right, item.x + item.width);
     }
-    const alignment: LineAlignment = if (self.is_title)
-        .center
-    else if (self.line_direction == .right_to_left)
-        .end
-    else
-        .start;
     const shift = lineAlignmentShift(
-        alignment,
+        self.line_alignment,
         self.line_left,
         self.line_right,
         content_left,
@@ -2963,15 +3144,13 @@ fn flushLine(self: *Layout, line_buffer: *std.ArrayList(LineItem)) !void {
                 );
             },
             .image => |image_payload| {
-                try self.current_display_target.append(self.allocator, DisplayItem{
-                    .image = image_payload.displayItem(
-                        item.x,
-                        final_y,
-                        item.width,
-                        item.height,
-                        source,
-                    ),
-                });
+                try image_payload.paintAt(
+                    self.current_display_target,
+                    self,
+                    item.x,
+                    final_y,
+                    source,
+                );
             },
             .canvas => |canvas_payload| {
                 const pixels = if (canvas_payload.element.canvas) |canvas|
@@ -3650,6 +3829,7 @@ pub fn layoutSourceCode(self: *Layout, source: []const u8) ![]DisplayItem {
     self.cursor_x = self.line_left;
     self.cursor_y = v_offset;
     self.line_direction = self.default_direction;
+    self.line_alignment = if (self.default_direction == .right_to_left) .end else .start;
     self.size = self.default_font_size;
     self.font_size_css = @floatFromInt(self.default_font_size);
     self.line_height_css = null;
@@ -6331,7 +6511,7 @@ const BlockLayout = struct {
                 // rich button's temporary root is the contained exception.
                 if (std.ascii.eqlIgnoreCase(e.tag, "input") or
                     (std.ascii.eqlIgnoreCase(e.tag, "button") and !self.rich_button_root) or
-                    std.ascii.eqlIgnoreCase(e.tag, "img") or
+                    elementUsesImageLayout(&e) or
                     std.ascii.eqlIgnoreCase(e.tag, "canvas") or
                     std.ascii.eqlIgnoreCase(e.tag, "iframe"))
                 {
@@ -6672,7 +6852,7 @@ const BlockLayout = struct {
                 prev.y.read(&self.y, self.allocator).* + prev.height.read(&self.y, self.allocator).*
             else
                 prev.y.get().* + prev.height.get().*) +
-                @max(prev.margin.bottom, self.margin.top)
+                collapseAdjoiningMargins(prev.margin.bottom, self.margin.top)
         else
             parent_content_y + self.margin.top + if (self.parent_block) |pb|
                 tableOfContentsHeaderHeight(
@@ -6885,10 +7065,11 @@ const BlockLayout = struct {
 
         var is_block = self.isBlockContainer();
         if (self.node == .element) {
-            const tag = self.node.element.tag;
+            const element = &self.node.element;
+            const tag = element.tag;
             if (std.ascii.eqlIgnoreCase(tag, "input") or
                 (std.ascii.eqlIgnoreCase(tag, "button") and !self.rich_button_root) or
-                std.ascii.eqlIgnoreCase(tag, "img") or
+                elementUsesImageLayout(element) or
                 std.ascii.eqlIgnoreCase(tag, "canvas") or
                 std.ascii.eqlIgnoreCase(tag, "iframe"))
             {
@@ -7986,6 +8167,7 @@ fn layoutInlineBlock(self: *Layout, block: *BlockLayout, publish_geometry: bool)
     // Keeping this state stable lets explicit and automatic line breaks center
     // each completed line independently in flushLine().
     self.is_title = isCenteredTitleBlock(block);
+    self.line_alignment = lineAlignmentForBlock(block, self.line_direction, self.is_title);
     self.is_superscript = isWithinSuperscriptBlock(block);
     self.is_small_caps = isWithinSmallCapsBlock(block);
     self.text_color = .{ .r = 0, .g = 0, .b = 0, .a = 255 }; // Reset to black
@@ -8107,7 +8289,7 @@ fn layoutInlineBlock(self: *Layout, block: *BlockLayout, publish_geometry: bool)
                 try self.handleInputElement(block.node, block.node_ptr, &line_buffer);
             } else if (std.ascii.eqlIgnoreCase(e.tag, "button") and !block.rich_button_root) {
                 try self.handleButtonElement(block.node, block.node_ptr, &line_buffer);
-            } else if (std.ascii.eqlIgnoreCase(e.tag, "img")) {
+            } else if (elementUsesImageLayout(&e)) {
                 try self.handleImageElement(block.node, block.node_ptr, &line_buffer);
             } else if (std.ascii.eqlIgnoreCase(e.tag, "canvas")) {
                 try self.handleCanvasElement(block.node_ptr, &line_buffer);

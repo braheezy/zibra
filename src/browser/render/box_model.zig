@@ -222,6 +222,15 @@ pub fn constrainDimension(value: i32, minimum: ?i32, maximum: ?i32) i32 {
     return @max(constrained, 0);
 }
 
+/// Collapse two adjoining vertical margins. Positive margins choose the
+/// largest, negative margins choose the most negative, and opposite signs
+/// cancel. Parent/child and clearance collapsing remain layout concerns.
+pub fn collapseAdjoiningMargins(first: i32, second: i32) i32 {
+    if (first >= 0 and second >= 0) return @max(first, second);
+    if (first <= 0 and second <= 0) return @min(first, second);
+    return first +| second;
+}
+
 /// Resolve the supported px/em/percentage subset while permitting a sign.
 pub fn resolveSignedCssLength(value: []const u8, context: parser.CssLengthResolutionContext) ?i32 {
     const trimmed = std.mem.trim(u8, value, " \t\r\n\x0c");
@@ -351,13 +360,19 @@ fn intrinsicOuterWidth(
         " \t\r\n",
     );
     const float_side = parseFloatSide(styleValue(styles, "float") orelse "none");
+    const is_replaced_image = std.ascii.eqlIgnoreCase(element.tag, "img") or
+        (std.ascii.eqlIgnoreCase(element.tag, "object") and
+            element.image_data != null and !element.image_data.?.is_broken);
     const inline_width_ignored = std.ascii.eqlIgnoreCase(display, "inline") and
-        float_side == .none;
+        float_side == .none and !is_replaced_image;
 
     var content_width = if (!inline_width_ignored)
         if (styleValue(styles, "width")) |width| resolveCssLength(width, context) else null
     else
         null;
+    if (content_width == null and is_replaced_image) {
+        if (element.image_data) |data| content_width = @intCast(data.image.width);
+    }
     if (content_width == null) {
         for (element.children.items) |*child| {
             const child_width = switch (child.*) {
@@ -546,6 +561,9 @@ test "position float clear and dimension values normalize independently of layou
     try std.testing.expectEqual(@as(i32, 20), constrainDimension(10, 20, 40));
     // The minimum wins when the constraints conflict, per CSS 2.1.
     try std.testing.expectEqual(@as(i32, 50), constrainDimension(30, 50, 40));
+    try std.testing.expectEqual(@as(i32, 12), collapseAdjoiningMargins(8, 12));
+    try std.testing.expectEqual(@as(i32, -12), collapseAdjoiningMargins(-8, -12));
+    try std.testing.expectEqual(@as(i32, 4), collapseAdjoiningMargins(-8, 12));
 }
 
 test "shrink-to-fit measurement uses definite descendant outer widths" {

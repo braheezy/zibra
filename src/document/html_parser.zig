@@ -451,7 +451,42 @@ pub fn Parser(
 
             // Handle special cases for elements that can't contain themselves
             if (!is_closing and self.unfinished.items.len > 0) {
+                if (closesOpenParagraph(tag_name)) try self.closeOpenParagraph();
                 try self.handleSelfClosingElements(tag_name);
+            }
+        }
+
+        fn closesOpenParagraph(tag_name: []const u8) bool {
+            const paragraph_closing_starts = [_][]const u8{
+                "address", "article",  "aside",      "blockquote", "details", "div",
+                "dl",      "fieldset", "figcaption", "figure",     "footer",  "form",
+                "h1",      "h2",       "h3",         "h4",         "h5",      "h6",
+                "header",  "hgroup",   "hr",         "main",       "menu",    "nav",
+                "ol",      "p",        "pre",        "search",     "section", "table",
+                "ul",
+            };
+            return for (paragraph_closing_starts) |candidate| {
+                if (std.ascii.eqlIgnoreCase(tag_name, candidate)) break true;
+            } else false;
+        }
+
+        /// Flow-level block starts implicitly end a paragraph, including
+        /// through still-open inline formatting descendants. Stop at the
+        /// document or button scope boundary rather than reaching into an
+        /// unrelated ancestor.
+        fn closeOpenParagraph(self: *HTMLParser) !void {
+            var i = self.unfinished.items.len;
+            while (i > 0) {
+                i -= 1;
+                const current = &self.unfinished.items[i];
+                if (current.* != .element) continue;
+                if (std.ascii.eqlIgnoreCase(current.element.tag, "p")) {
+                    try self.closeNodesUpTo(i);
+                    return;
+                }
+                if (std.ascii.eqlIgnoreCase(current.element.tag, "button") or
+                    std.ascii.eqlIgnoreCase(current.element.tag, "body") or
+                    std.ascii.eqlIgnoreCase(current.element.tag, "html")) return;
             }
         }
 

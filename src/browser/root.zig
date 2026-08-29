@@ -2865,7 +2865,7 @@ pub const Browser = struct {
         for (nodes) |node| {
             switch (node.*) {
                 .element => |*element| {
-                    if (std.ascii.eqlIgnoreCase(element.tag, "img")) {
+                    if (image_loader.isImageResourceElement(element)) {
                         try candidates.append(self.allocator, .{ .element = element });
                     }
                 },

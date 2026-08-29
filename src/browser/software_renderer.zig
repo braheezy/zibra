@@ -79,6 +79,63 @@ fn imageSurfacePixels(surface: *z2d.Surface) ![]z2d.pixel.RGBA {
     };
 }
 
+fn compositeStraightImagePixel(
+    source: []const u8,
+    opacity: f64,
+    destination: z2d.pixel.RGBA,
+) ?z2d.pixel.RGBA {
+    std.debug.assert(source.len == 4);
+    const alpha_f = @as(f64, @floatFromInt(source[3])) *
+        std.math.clamp(opacity, 0.0, 1.0);
+    const alpha: u32 = @intCast(std.math.clamp(
+        @as(i32, @intFromFloat(alpha_f + 0.5)),
+        0,
+        255,
+    ));
+    if (alpha == 0) return null;
+    if (alpha == 255) return .{
+        .r = source[0],
+        .g = source[1],
+        .b = source[2],
+        .a = 255,
+    };
+
+    const inverse = 255 - alpha;
+    return .{
+        // Web image buffers are straight-alpha, while z2d surfaces are
+        // premultiplied. Premultiply the source as part of source-over.
+        .r = @intCast((@as(u32, source[0]) * alpha + @as(u32, destination.r) * inverse) / 255),
+        .g = @intCast((@as(u32, source[1]) * alpha + @as(u32, destination.g) * inverse) / 255),
+        .b = @intCast((@as(u32, source[2]) * alpha + @as(u32, destination.b) * inverse) / 255),
+        .a = @intCast(alpha + @as(u32, destination.a) * inverse / 255),
+    };
+}
+
+test "straight-alpha web images preserve premultiplied surface invariants" {
+    const translucent_white = [_]u8{ 255, 255, 255, 128 };
+    const transparent = z2d.pixel.RGBA{ .r = 0, .g = 0, .b = 0, .a = 0 };
+    const over_transparent = compositeStraightImagePixel(
+        &translucent_white,
+        1.0,
+        transparent,
+    ).?;
+    try std.testing.expectEqual(@as(u8, 128), over_transparent.a);
+    try std.testing.expectEqual(over_transparent.a, over_transparent.r);
+    try std.testing.expectEqual(over_transparent.a, over_transparent.g);
+    try std.testing.expectEqual(over_transparent.a, over_transparent.b);
+
+    const opaque_blue = z2d.pixel.RGBA{ .r = 0, .g = 0, .b = 255, .a = 255 };
+    const over_opaque = compositeStraightImagePixel(
+        &translucent_white,
+        0.5,
+        opaque_blue,
+    ).?;
+    try std.testing.expectEqual(@as(u8, 255), over_opaque.a);
+    try std.testing.expect(over_opaque.r <= over_opaque.a);
+    try std.testing.expect(over_opaque.g <= over_opaque.a);
+    try std.testing.expect(over_opaque.b <= over_opaque.a);
+}
+
 const RasterImageSource = struct {
     left: f64,
     top: f64,
@@ -381,33 +438,12 @@ pub const Renderer = struct {
                         if (src_x < 0 or src_x >= src_w) continue;
 
                         const src_idx = (@as(usize, @intCast(src_y)) * @as(usize, @intCast(src_w)) + @as(usize, @intCast(src_x))) * 4;
-                        const src_a = pixels[src_idx + 3];
-                        if (src_a == 0) continue;
-
-                        const alpha_f = @as(f64, @floatFromInt(src_a)) * opacity;
-                        const alpha = std.math.clamp(@as(i32, @intFromFloat(alpha_f + 0.5)), 0, 255);
-                        if (alpha == 0) continue;
-
                         const dst_idx = row_base + @as(usize, @intCast(x));
-                        const dst = dest_pixels[dst_idx];
-                        const alpha_u32 = @as(u32, @intCast(alpha));
-                        const inv_alpha = 255 - alpha_u32;
-
-                        if (alpha == 255) {
-                            dest_pixels[dst_idx] = .{
-                                .r = pixels[src_idx + 0],
-                                .g = pixels[src_idx + 1],
-                                .b = pixels[src_idx + 2],
-                                .a = 255,
-                            };
-                        } else {
-                            dest_pixels[dst_idx] = .{
-                                .r = @intCast((@as(u32, pixels[src_idx + 0]) * alpha_u32 + @as(u32, dst.r) * inv_alpha) / 255),
-                                .g = @intCast((@as(u32, pixels[src_idx + 1]) * alpha_u32 + @as(u32, dst.g) * inv_alpha) / 255),
-                                .b = @intCast((@as(u32, pixels[src_idx + 2]) * alpha_u32 + @as(u32, dst.b) * inv_alpha) / 255),
-                                .a = @intCast((alpha_u32 + @as(u32, dst.a) * inv_alpha) / 255),
-                            };
-                        }
+                        dest_pixels[dst_idx] = compositeStraightImagePixel(
+                            pixels[src_idx..][0..4],
+                            opacity,
+                            dest_pixels[dst_idx],
+                        ) orelse continue;
                     }
                 }
                 return;

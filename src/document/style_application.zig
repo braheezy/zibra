@@ -36,6 +36,7 @@ const INHERITED_PROPERTIES = [_]InheritedProperty{
     .{ .name = "font-weight", .default_value = "normal" },
     .{ .name = "font-stretch", .default_value = "normal" },
     .{ .name = "line-height", .default_value = "normal" },
+    .{ .name = "text-align", .default_value = "start" },
     .{ .name = "color", .default_value = "black" },
     .{ .name = "color-scheme", .default_value = "light dark" },
 };
@@ -48,6 +49,7 @@ const CSS_PROPERTIES = [_]struct { name: []const u8, default_value: []const u8 }
     .{ .name = "font-variant", .default_value = "inherit" },
     .{ .name = "font-stretch", .default_value = "inherit" },
     .{ .name = "line-height", .default_value = "inherit" },
+    .{ .name = "text-align", .default_value = "inherit" },
     .{ .name = "color", .default_value = "inherit" },
     .{ .name = "opacity", .default_value = "1.0" },
     .{ .name = "transition", .default_value = "" },
