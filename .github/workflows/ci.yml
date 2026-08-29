@@ -44,10 +44,9 @@ jobs:
         run: mkdir --parents "$ZIG_GLOBAL_CACHE_DIR/tmp" "$ZIG_LOCAL_CACHE_DIR"
 
       - name: Install SDL development libraries
-        run: sudo apt-get update && sudo apt-get install --no-install-recommends --yes libsdl2-dev libsdl2-ttf-dev
+        run: |
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends --yes libsdl2-dev libsdl2-ttf-dev fonts-dejavu-core
 
-      - name: Build
-        run: zig build
-
-      - name: Test
-        run: zig build test
+      - name: Portable checks
+        run: zig build check

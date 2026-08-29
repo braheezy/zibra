@@ -5,8 +5,10 @@ decoding, cache integration, and file/data/about resource handling.
 `cache.zig` owns decoded browser-session response entries and the supported
 `Cache-Control` policy parser.
 
-Read [`../../docs/architecture-and-lifetimes.md`](../../docs/architecture-and-lifetimes.md)
-before changing URL or response ownership.
+Read [navigation and network contracts](../../docs/architecture/navigation-and-network.md)
+before changing URL, response, request, cache, cookie, or session ownership;
+read [threads and shutdown](../../docs/architecture/threads-and-shutdown.md)
+before changing networking dispatch or teardown.
 
 - `Url` is logically move-only despite Zig value-copy syntax. Use `Url.clone`
   whenever two independently live owners are needed.
@@ -75,4 +77,5 @@ before changing URL or response ownership.
   but are hidden from, and immutable through, `document.cookie`; script cannot
   create an HttpOnly entry.
 - Add data/file tests for ownership changes; use a local fixture/server for
-  HTTP, redirects, cookies, compression, or CSP behavior.
+  HTTP, redirects, cookies, compression, or CSP behavior. Run
+  `zig build test-network` while iterating and `zig build check` before handoff.

@@ -1,0 +1,15 @@
+rect x1=23 y1=28 x2=301 y2=215 color=#f0f0f0ff
+rect x1=23 y1=28 x2=301 y2=30 color=#111111ff
+rect x1=298 y1=28 x2=301 y2=215 color=#222222ff
+rect x1=23 y1=210 x2=301 y2=215 color=#333333ff
+rect x1=23 y1=28 x2=30 y2=215 color=#444444ff
+rect x1=60 y1=42 x2=198 y2=115 color=#ffccccff
+rect x1=60 y1=42 x2=198 y2=43 color=#aa0000ff
+rect x1=196 y1=42 x2=198 y2=115 color=#00aa00ff
+rect x1=60 y1=112 x2=198 y2=115 color=#0000aaff
+rect x1=60 y1=42 x2=64 y2=115 color=#aaaa00ff
+rect x1=77 y1=48 x2=127 y2=68 color=#ccffffff
+rect x1=77 y1=48 x2=127 y2=50 color=#0088ccff
+rect x1=125 y1=48 x2=127 y2=68 color=#0088ccff
+rect x1=77 y1=66 x2=127 y2=68 color=#0088ccff
+rect x1=77 y1=48 x2=79 y2=68 color=#0088ccff

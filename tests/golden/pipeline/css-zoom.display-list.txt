@@ -1,0 +1,10 @@
+rect x1=13 y1=18 x2=63 y2=28 color=#ccccccff
+rect x1=13 y1=28 x2=213 y2=90 color=#eeeeffff
+hit-clip rounded x1=13 y1=28 x2=113 y2=48 radius=8
+  rounded-rect x1=13 y1=28 x2=113 y2=48 radius=8 color=#008800ff
+rect x1=13 y1=48 x2=175 y2=90 color=#aaaaffff
+rect x1=13 y1=48 x2=175 y2=54 color=#0000aaff
+rect x1=169 y1=48 x2=175 y2=90 color=#0000aaff
+rect x1=13 y1=84 x2=175 y2=90 color=#0000aaff
+rect x1=13 y1=48 x2=19 y2=90 color=#0000aaff
+rect x1=13 y1=90 x2=63 y2=100 color=#ccccccff

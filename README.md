@@ -34,7 +34,7 @@ Run without a URL for a default HTML.
 
 ## Development
 
-There's more Zig commands:
+Development commands:
 
 ```sh
 # build and run
@@ -46,9 +46,22 @@ zig build run -- --dump-layout https://example.com
 zig build run -- --dump-display-list https://example.com
 # Run tests
 zig build test
+# Run a focused subsystem while iterating
+zig build test-document
+zig build test-render
+zig build test-network
+zig build test-script
+zig build test-browser
+# Compare deterministic style, layout, and display-list output
+zig build test-pipeline
+# Run every portable build, test, formatting, pipeline, server, and docs check
+zig build check
 # Capture and compare the windowless macOS screenshot fixtures
 zig build test-screenshot
 ```
+
+See [Testing and verification](docs/testing.md) for the focused-test map,
+golden policy, native visual checks, and manual-fixture catalog.
 
 To test chunked gzip responses, run `gzipServer.py` locally.
 

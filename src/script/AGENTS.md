@@ -1,136 +1,61 @@
 # Script subsystem guide
 
-`js.zig` is the host layer between Zibra's DOM and the Kiesel JavaScript
-runtime. It implements windows, DOM handles, events, timers, XHR, and host
-callbacks.
+`js.zig` is the host boundary between Zibra and Kiesel. It owns JavaScript
+window contexts, DOM wrappers, events, timers, XHR, messaging, canvas wrappers,
+and synchronous host callbacks.
 
-Read [`../../docs/architecture-and-lifetimes.md`](../../docs/architecture-and-lifetimes.md)
-before changing callback registration, DOM handles, asynchronous completion,
-or Kiesel allocation/locking.
+Read [JavaScript and accessibility contracts](../../docs/architecture/javascript-and-accessibility.md)
+before changing this directory. Structural mutation and retained layout
+borrows are documented in
+[document and rendering](../../docs/architecture/document-and-rendering.md);
+queued work and shutdown are documented in
+[threads and shutdown](../../docs/architecture/threads-and-shutdown.md).
 
-- JavaScript node handles must not silently retarget after DOM mutation.
-- `Node.children` is a fresh JavaScript array on each access. It wraps handles
-  for immediate element children in DOM order, excludes text and deeper
-  descendants, and relies on the existing handle invalidation boundary when a
-  structural mutation retires child storage.
-- `document.createElement` returns a window-owned, heap-stable detached Node.
-  `appendChild` and `insertBefore` transfer only such detached roots into a
-  child array, rebind handles for every relocated immediate child, and invoke
-  the synchronous DOM-mutation boundary before attached storage can move. An
-  insertion may use the retained-child boundary only when the target's opaque
-  layout callback verifies that every existing child has a one-to-one block
-  owner. Mark that state before mutation and invoke its paired pointer-rebind
-  callback after `fixParentPointers`, before completion callbacks or
-  JavaScript resume.
-- `removeChild` performs the inverse transfer: it accepts only a direct child,
-  moves that subtree into a heap-stable window-owned detached root, preserves
-  subtree handles, and rebinds siblings shifted in the attached child array.
-- `replaceChildren` runs as one staged mutation transaction. With no arguments
-  it empties the Element; with Element arguments it extracts attached or
-  detached roots, processes nested source parents deepest-first, and installs
-  the roots in argument order. Repeated roots follow the DOM fragment rule and
-  keep only their last occurrence. Removed subtrees with published handles move
-  to heap-stable detached ownership so saved Nodes remain reattachable;
-  unobserved subtrees are reclaimed. Validate every handle and cycle before
-  entering invalidation, and re-resolve a destination shifted by source removal
-  through its stable handle before installing the final child array. Use the
-  nearest common ancestor of attached source/destination parents as the one
-  invalidation root so focused or scroll-focused source nodes cannot dangle.
-- Element IDs are exposed as named globals for only the active window. The
-  first duplicate ID in document order wins; empty IDs and names colliding
-  with existing globals are skipped. Refresh the per-window registry whenever
-  attached structure or an attached element's `id` changes, clearing old
-  wrappers before any DOM pointer can move or disappear.
-- `Node.id` reflects the live `id` attribute. `innerHTML` reads serialize the
-  current children while writes retain the structural-mutation boundary;
-  `outerHTML` reads include the element itself. Serialized buffers passed to
-  Kiesel must use its traced allocator because ASCII String construction can
-  retain the supplied bytes.
-- `document.cookie` is a native accessor resolved through the active window's
-  synchronous document callback. Getter results must move into Kiesel's traced
-  allocator before temporary callback storage is freed, because ASCII String
-  construction may retain the supplied bytes. Callback invalidation follows
-  the same document-generation boundary as XHR and DOM callbacks.
-- Canvas wrappers are scoped by JavaScript window and cached by stable Node
-  handle so repeated `getContext("2d")` calls return one object. Drawing stays
-  serialized on the tab worker; pixel-changing commands dirty the canvas's
-  nearest retained layout paint cache and request paint, while path/state-only
-  commands do neither. A z2d-missing method must return native
-  `error.NotImplemented`, which the host consumes as a non-fatal `undefined`
-  result so later page script still runs. Assigning either canvas dimension
-  resets native pixels/path/transforms and the cached wrapper's paint state,
-  including when the assigned size equals the current size.
-- XHR same-origin/CORS policy belongs to the browser callback, not the
-  JavaScript shim. A synchronous denied response surfaces as the existing
-  cross-origin exception; asynchronous denial intentionally has no `onload`
-  delivery because this exercise does not yet expose an `onerror` event. Both
-  synchronous responseText and asynchronous onload delivery copy callback-owned
-  bytes into Kiesel's traced heap before their native buffers are released.
-- DOM listeners are scoped by window and a dispatched event follows a
-  snapshotted target-to-root handle path. Reuse one Event while bubbling,
-  update `currentTarget` for each node, keep `target` fixed, let
-  `stopPropagation` finish the current node's listeners before stopping, and
-  keep propagation control independent from `preventDefault`.
-- `Node.focus()` first applies the shared intrinsic focusability rule, then
-  synchronously transfers only the stable numeric handle through the current
-  generation's focus callback. The Tab must re-resolve that handle after blur
-  listeners and layout work. This callback runs while `Js.lock` is already
-  held; handle resolution and focus/blur dispatch must use the explicit native-
-  callback helpers instead of recursively acquiring the mutex. Browser-
-  generated focus and blur events are target-only; click, key, and form events
-  continue to bubble.
-- General structural JavaScript mutation, including `replaceChildren`, clears
-  current style-field subscriber maps while every endpoint is alive; the
-  mandatory full style/layout render rebuilds dependencies after mutation. A
-  verified insertion-only mutation preserves those maps and its matched block
-  layouts because no existing style field or layout owner is destroyed; it
-  must synchronously rebind every relocated direct-child layout pointer. Both paths'
-  pre-mutation host callback retires pointer borrowers, and the paired
-  completion callback runs only after child storage, parent pointers, Node
-  handles, and any retained layout pointers are final. The completion side may
-  synchronously rebind/unload iframe contexts but must defer iframe network
-  loading until the host call returns. Unloading a same-origin child can switch
-  the shared Js host's active window, so restore the mutating window before
-  returning to Kiesel.
-- Null-root invalidation may run outside the Kiesel-owning tab worker. It must
-  make wrappers inert by clearing native handle maps without calling back into
-  JavaScript; a later non-null root install clears and rebuilds the registry on
-  the worker before evaluation resumes.
-- Detached/queued work must use the document generation contract from
-  `src/browser/`; never retain a callback context or frame as a long-lived
-  pointer.
-- `postMessage` parses `targetOrigin` synchronously. `*` is unrestricted,
-  `/` captures the sending document's origin, and any other value must be an
-  absolute URL whose scheme, host, and effective port are retained in the
-  queued task. Enforce the owned policy only after resolving the target
-  document at delivery time. Message-event data and serialized source origins
-  must be copied into Kiesel-owned storage before task buffers are released.
-  A cross-origin `window.parent` is an opaque numeric proxy exposing only
-  `postMessage`; it does not require or create a parent WindowContext in the
-  child's realm.
-- Preserve Kiesel's GC-root and `JsLock` assumptions. Do not add unlocked
-  cross-thread host mutation without documenting and enforcing its owner.
-- Timer handles and callback registries are scoped by JavaScript window ID.
-  `setInterval` reuses the generation-stamped one-shot native timer boundary:
-  after a live callback completes, its JavaScript wrapper schedules exactly one
-  next delivery at the same delay. `clearInterval` removes both the JavaScript
-  callback entry and the Tab's native generation-stamped cancellation key;
-  sleeping helpers poll that key and already-queued deliveries become no-ops.
-  Reset both registries when installing a replacement document; timeout
-  callbacks are one-shot entries and must be removed before invocation. Keep
-  timer JavaScript serialized on the tab worker.
-- Attribute and inline-style mutation can affect `:has` matches. Dirty the
-  changed element's style and its ancestor chain before requesting a render.
-- Inline `style` replacement detects supported transitions from the previous
-  computed value to the new declaration. Opacity creates a numeric transition;
-  `background-color` parses both endpoints into RGBA and creates a color
-  transition; `transform` accepts `none` and `translate(...)` and interpolates
-  both axes; `width` and `height` accept non-negative pixel endpoints and retain
-  their `px` representation. Split comma-separated transition lists only at top
-  level so the commas inside `cubic-bezier(...)` remain part of one timing
-  function. An omitted timing function means CSS `ease`; `linear`, `ease-in`,
-  `ease-out`, `ease-in-out`, and valid explicit `cubic-bezier(...)` values are
-  retained by value with the animation. Never retain slices from the temporary
-  inline-style parse map.
-- Exercise interactive behavior with a deterministic `tests/manual/` page that
-  reports success in-page.
+## Local contracts
+
+- Preserve Kiesel's traced allocation, GC-root, and `JsLock` assumptions. A
+  native callback entered with the lock held uses lock-aware helpers; do not
+  add an unlocked cross-thread host mutation.
+- WindowContexts own handle maps, listener/timer registries, named globals, and
+  detached roots. Node wrappers must never silently retarget after child-array
+  relocation or address reuse.
+- Synchronous DOM mutation validates and stages before invalidation, retires or
+  rebinds every affected handle, and invokes the paired completion callback
+  only after storage, parents, and handles are final. Network/resource loading
+  is deferred until the host call returns.
+- Detached roots are heap-stable owners. `appendChild`, `insertBefore`,
+  `removeChild`, and `replaceChildren` transfer ownership rather than
+  shallow-copying a subtree.
+- Null-root invalidation may run outside the Kiesel-owning Tab worker. It makes
+  wrappers inert by clearing native maps and does not call into JavaScript.
+- Asynchronous callbacks carry copied generation-stamped document handles and
+  own every URL, message, policy, body, and string they retain. Never queue a
+  Frame, Node, or `JsRenderContext` pointer.
+- Strings returned to JavaScript from serialization, cookies, XHR, or messages
+  move into Kiesel's traced allocator before temporary native storage retires.
+- Event dispatch snapshots numeric handles target-to-root. Keep `target`
+  stable, update `currentTarget`, and keep propagation control separate from
+  default prevention.
+- Browser-generated focus/blur events are target-only. `focus()` transfers a
+  handle, forces current layout, and re-resolves after blur listeners before
+  installing state.
+- Timer registries are scoped by window/document generation. A live interval
+  schedules one next one-shot after its callback; clearing or navigation makes
+  sleepers/queued deliveries no-ops.
+- Canvas wrappers are scoped by window and stable Node handle. Pixel commands
+  dirty retained paint; path/state-only commands do not. Unsupported z2d
+  methods return `error.NotImplemented` and are exposed as nonfatal
+  `undefined`.
+
+`js.zig` is already far beyond a cohesive module size. New binding domains
+should become focused modules behind a narrow host interface. Prefer extracting
+pure DOM-transfer planning or self-contained binding state first; do not create
+a cycle where every helper imports or receives the complete `Js` coordinator.
+
+## Verification
+
+Run `zig build test-script` while iterating and the relevant
+`test-document`/`test-browser` step for DOM or callback integration. Run
+`zig build check` before handoff. Add a deterministic in-page result and update
+the [manual fixture catalog](../../tests/manual/README.md) for interactive
+JavaScript behavior.

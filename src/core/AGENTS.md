@@ -3,8 +3,10 @@
 This directory contains reusable low-level primitives. Its current
 `ProtectedField` invalidation graph is used by document style and layout.
 
-Read [`../../docs/architecture-and-lifetimes.md`](../../docs/architecture-and-lifetimes.md)
-before changing dependency registration or destruction behavior.
+Read the
+[invalidation contract](../../docs/architecture/document-and-rendering.md#protectedfield-and-style-invalidation)
+and [risk registry](../../docs/architecture/risks-and-review.md) before changing
+dependency registration or destruction behavior.
 
 - Dependency maps retain raw subscriber pointers. A subscriber must be removed
   before its address becomes invalid. Supported structural DOM mutation uses a
@@ -26,4 +28,5 @@ before changing dependency registration or destruction behavior.
   hit testing uses `get`.
 - Keep core primitives independent of Browser, SDL, Kiesel, and URL layers.
 - Changes here need direct unit coverage plus regression coverage in each
-  consuming subsystem where the lifecycle can differ.
+  consuming subsystem where the lifecycle can differ. Run the relevant focused
+  tests and `zig build check`.

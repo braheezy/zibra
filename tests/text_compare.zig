@@ -1,4 +1,4 @@
-//! Exact text comparator for the isolated DOM-dump fixture.
+//! Exact comparator for deterministic text fixtures produced by CLI tests.
 
 const std = @import("std");
 
@@ -21,7 +21,7 @@ pub fn main(init: std.process.Init) !void {
     );
 
     if (!std.mem.eql(u8, expected, actual)) {
-        std.debug.print("DOM dump differs:\nexpected:\n{s}actual:\n{s}", .{ expected, actual });
-        return error.DomDumpMismatch;
+        std.debug.print("Text output differs:\nexpected:\n{s}actual:\n{s}", .{ expected, actual });
+        return error.TextOutputMismatch;
     }
 }

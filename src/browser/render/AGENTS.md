@@ -1,205 +1,113 @@
 # Browser rendering guide
 
 This directory owns layout, font resources, display-command structure,
-software effects, and worker-transfer snapshots. Read
-[`../../../docs/architecture-and-lifetimes.md`](../../../docs/architecture-and-lifetimes.md)
-before changing ownership or thread boundaries.
+software effects, retained compositor planes, and worker-transfer snapshots.
 
-- `layout.zig` builds layout trees and emits provenance-bearing display items.
-  A Frame reaches this module through a clean `Frame.document`
-  `ProtectedField`. After style is republished, `DocumentLayout.layoutNeeded()`
-  and its descendant invalidation graph alone determine whether geometry runs;
-  paint-only work may reuse a clean layout, and compositor-only work must not
-  enter this module at all.
-  Layout and frame-side command lists synchronously borrow DOM and image state.
-  Point queries walk document/block/line/text objects in reverse order and
-  carry parent-local coordinates: each object subtracts its own offset and
-  live translation, while scroll containers add their live scroll before
-  descending. Inline-mode blocks retain an exact painted-command leaf fallback
-  until they gain persistent line/text children. Do not reconstruct an
+Read [document and rendering contracts](../../../docs/architecture/document-and-rendering.md)
+before changing DOM/layout borrows, invalidation, retained paint, commands,
+hit testing, or raster ownership. Read
+[threads and shutdown](../../../docs/architecture/threads-and-shutdown.md)
+before changing FontManager concurrency, worker payloads, allocators, or SDL
+boundaries.
+
+## Module boundaries
+
+- `layout.zig` owns retained document/block/line/text trees, geometry
+  dependencies, local-coordinate hit testing, focus/image/iframe bounds, and
+  retained paint caches. It borrows DOM, computed style, decoded images, and
+  FontManager resources.
+- `font.zig` owns SDL_ttf handles and canonical allocator-owned RGBA glyph
+  bitmaps. Commands borrow glyph pixels only until snapshot.
+- `display_list.zig` owns command types, recursive cleanup, provenance,
+  painted hit testing, and composited-layer data. It remains independent of
+  Browser, SDL, and native-window lifetime.
+- `raster_snapshot.zig` is the deep-copy thread boundary. It clears
+  provenance, materializes retained cache edges, copies leaf pixels, and
+  permits numeric compositor IDs but no DOM/layout pointers.
+- `compositor_cache.zig` owns raster-worker planes and pointer-free scalar
+  opacity/translation updates.
+- `effects.zig` owns pixel-only effects and must state premultiplication,
+  sampling, and temporary-allocation behavior explicitly.
+- `replaced_sizing.zig`, `focus_ring.zig`, and `forced_colors.zig` are pure
+  focused helpers. Keep Browser orchestration out of them.
+
+`layout.zig` is already beyond the repository's decomposition threshold. New
+independent formatting, replaced-element, or paint algorithms should become a
+cohesive module with a real owner/interface rather than another region in that
+file. Do not split methods away from the object invariants they maintain or add
+a facade cycle merely to reduce lines.
+
+## Invalidation and layout
+
+- Enter layout only after the owning Frame republishes a clean protected
+  document. `DocumentLayout.layoutNeeded()` and descendant fields gate
+  geometry; paint-only work reuses clean geometry; compositor-only work does
+  not enter this module.
+- General DOM mutation destroys layout while the old DOM is alive. The narrow
+  retained-insert path is valid only after a one-to-one DOM-backed block match
+  and must synchronously rebind every moved child pointer.
+- Layout-to-layout dependencies use the common layout allocator. Dependencies
+  published by computed-style fields use that StyleMap's allocator. Pass the
+  same allocator when destroying the source field.
+- Short-lived rich-button/embed records may copy values but must not subscribe
+  their own ProtectedFields to persistent DOM/layout sources.
+- Layout invalidation dirties paint. Paint invalidation follows layout ancestry
+  without republishing geometry. Compositor-only opacity/translation dirties
+  neither.
+
+## Paint and command ownership
+
+- Document, block, line, and text objects own stable paint-cache list fields.
+  Dirty leaves replace their buffers; ancestors rebuild shallow wrappers and
+  order around non-owning `.cached_subtree` edges.
+- `.cached_subtree` may exist only in a synchronous Frame/layout list. Cleanup
+  does not own it. Composition and raster snapshots materialize it before a
+  Browser lock or thread boundary.
+- `.blend` and `.transform` own children; `.blend` owns its copied mode string.
+  Image/glyph leaves borrow pixels, canvas leaves own immutable pixels, and
+  provenance borrows the current DOM/layout generation.
+- Retire Frame and Browser command generations before replacing decoded image,
+  font, canvas, DOM, layout, or layer resources they borrow.
+- A raster snapshot and every worker plane is independently owned through the
+  SMP allocator. Plane pixels never return to the DOM/Tab worker.
+
+## Geometry and interaction
+
+- Hit testing descends in parent-local coordinates, inverts live transforms,
+  applies scroll/clips locally, and visits reverse paint order. Do not build an
   absolute rectangle for every descendant.
-  Focus-bound collection uses `document/focus.zig`'s programmatic policy so
-  script-focusable negative-tabindex targets receive geometry even though
-  sequential keyboard traversal skips them.
-  Immediate layout children paint through a retained stable index permutation
-  keyed by effective z-index and DOM index. Only positioned blocks receive a
-  nonzero signed z-index; lines and static/invalid blocks stay at zero. Recurse
-  with the same rule for nested stacking, and use its reverse order for layout
-  hit queries so visual and interaction order cannot diverge. Refresh the
-  permutation at paint and retain it with that display generation.
-  Relative positioning retains normal-flow x/y and stores a separate static
-  visual offset shared by paint and layout hit testing. Absolute blocks use
-  their containing block's content box, do not become a sibling's `previous`,
-  and contribute neither float exclusion nor parent auto-height. Keep this
-  static wrapper separate from the live CSS-transform compositor wrapper.
-  Float exclusion belongs to the nearest block-formatting-context owner, not
-  mechanically to the direct DOM parent. Root, float, absolute, embedded-root,
-  and non-visible-overflow blocks own pointer-free float lists; transparent
-  block wrappers share the ancestor list. Rebuild every participant while an
-  owner reconstructs that list, and include floats in auto height only at the
-  owner.
-  Active width/height transitions override their computed pixel endpoints here;
-  every frame relayouts descendants so line wrapping follows animated width.
-  Authored `zoom` is layout-inducing and multiplicative. Each block retains
-  its total effective zoom (accessibility zoom times frame/DOM zoom), while
-  fixed CSS lengths and natural replaced-element sizes bake only the authored
-  ratio into page-layout coordinates. Font raster size uses the total factor;
-  the later display-list raster pass still applies accessibility zoom exactly
-  once. Keep auto widths unscaled, propagate inline zoom through the scoped
-  style stack, and scale paint/hit effects from the generating block so
-  geometry, focus bounds, and clicks cannot diverge.
-  Inline embed records and rich-button block trees retire after one line is
-  painted. They may copy the current effective zoom, but no `ProtectedField`
-  they own may subscribe to a persistent block or DOM style. Route descendant
-  DOM-style invalidations directly to the containing persistent block instead.
-  Document/block/line `in_layout` guards suppress only reentrant owner-wide
-  invalidation caused by child metrics during that same serialized traversal.
-  Document, block, line, and text objects also own retained paint-command
-  lists plus paint dirty bits. A dirty leaf replaces only its own command
-  buffer; ancestors rebuild their shallow order/effect wrappers around stable
-  child-cache edges, while clean sibling generations remain untouched. The
-  legacy inline formatter is a retained leaf cache and must be regenerated
-  without appending duplicate hit-test geometry or publishing content-derived
-  heights into protected layout fields. Forward paint invalidation from an
-  element-backed block to its direct anonymous inline runs because inherited
-  text paint is stored there.
-  A DOM-backed block may advertise retained insertion matching only when every
-  represented direct DOM child maps one-to-one to a DOM-backed `BlockLayout`;
-  anonymous inline runs and run-in merges stay conservative. Synchronously
-  rebind matched child `node_ptr`s after `ArrayList(Node)` relocation, then
-  create layout objects only for unmatched gaps. Every block predecessor is a
-  `ProtectedField`; rewiring the immediate successor registers its new metric
-  dependencies and invalidates vertical flow without rebuilding later
-  siblings. Any removal, reorder, incompatible classification, or ambiguous
-  shape still destroys and rebuilds the complete child list.
-  Protected dependency storage is unmanaged. Layout-to-layout edges use the
-  common layout owner allocator; edges published by a computed-style field use
-  that `StyleMap`'s allocator. Pass the same allocator again when the source
-  field is destroyed.
-  Normal inline text collapses ASCII source whitespace across nested inline
-  nodes, while `pre` keeps source line endings. Anonymous inline runs must seed
-  inherited text color and metrics from their container. Keep an inline wrapper
-  with block descendants as a block-layout container so block-in-inline content
-  is not flattened into one anonymous line run.
-  Root author background color is painted once over the complete viewport
-  canvas; suppress its duplicate content-height block fill. Checkbox and radio
-  inputs use compact natural square metrics, with radios painted as circular
-  controls rather than generic 200px text fields.
-- `font.zig` owns SDL_ttf handles and cached RGBA glyph pixels. Display items
-  borrow those pixels until a raster snapshot copies them.
-- `display_list.zig` owns display-command types, recursive cleanup, painted hit
-  testing, and composited-layer data. A `DrawCompositedLayer` carries a
-  draw-local opacity multiplier separately from the layer's live compositor
-  opacity; opacity-only paint ancestors multiply that scalar so the cached
-  surface is sampled once during its final draw. Keep this module independent
-  of `Browser`, SDL, and native-window lifecycle.
-  `.cached_subtree` is the one non-owning container: it points at the stable
-  `ArrayList` field owned by a retained layout object, recursive readers must
-  enter it, and recursive cleanup must leave it alone. It may exist only in a
-  frame/layout-side list. Composition and raster snapshots must materialize it
-  into ordinary independently owned containers and clear provenance before a
-  browser lock or thread boundary. Temporary rich-button layout trees cannot
-  publish cache edges because their owners retire immediately.
-  Iframe placeholders additionally publish the containing element's authored
-  effective zoom; Tab transfers that scalar to the child Frame before its next
-  layout. It is plain numeric state, not DOM/layout provenance.
-  Glyph commands carry the accessibility page zoom used to rasterize their
-  borrowed bitmap so a retained-list zoom preview can resample it while keeping
-  authored CSS zoom baked into the bitmap itself.
-  Image commands normally sample the complete borrowed bitmap. Their optional
-  half-open, fractional source-pixel rectangle supports CSS backgrounds and
-  fitted `<img>` content cropped at the element box and must survive every
-  clone/snapshot boundary. A fitted image may also retain a separate element
-  hit rectangle, so transparent `contain` letterbox space still targets the
-  replaced element without enlarging paint/compositor bounds.
-  Canvas commands are the exception to ordinary image borrowing: every paint
-  owns an immutable straight-alpha RGBA snapshot copied from the live
-  premultiplied z2d surface. Deep-clone that buffer at every command-tree owner
-  boundary and free it recursively; raster snapshots must never observe the
-  mutable DOM backing store. A cached inline command can predate lazy
-  `getContext("2d")` allocation, so every pixel-changing script command dirties
-  its retained paint owner and inline paint regeneration snapshots the live
-  element again. An empty snapshot is a valid
-  transparent canvas, and raster must validate byte length before indexing.
-- `layout.zig` resolves every painted inline fragment to its nearest focusable
-  DOM ancestor and unions those fragments once per visual line. Nested inline
-  descendants therefore share their ancestor's wrapped focus geometry. After
-  child layout, a block-displayed focusable element replaces only its own line
-  fragments with one block box; independently focusable descendants remain.
-- List markers and their indentation are selected by computed
-  `display: list-item`, not merely by an `li` tag. The user-agent stylesheet
-  supplies that default; an authored `display: block` keeps block flow while
-  suppressing marker paint and marker space.
-- `focus_ring.zig` generates pointer-free focus-indicator commands. Each
-  published focus rectangle is padded and painted as a 4px white outline
-  followed by a 2px black outline; reserve both commands before appending
-  either so OOM cannot publish a half-ring. Layout continues to publish
-  geometry for every programmatically focusable element because script focus
-  needs it; root paint gates only the native indicator on the focused
-  element's `is_focus_visible` snapshot. Accessibility highlighting remains a
-  separate requested-color outline.
-- `forced_colors.zig` owns the fixed semantic high-contrast palette. Layout
-  assigns paint roles before author colors are replaced, so backgrounds,
-  ordinary text, link states, controls, borders, and cursors cannot collapse
-  into an author-selected low-contrast pair. Transparent paint remains
-  transparent; content images and color emoji are not recolored, while
-  decorative CSS background images are suppressed.
-- Element backgrounds paint in color, image, content order inside the same
-  effect subtree so scrolling, opacity, transforms, overflow, and rounded
-  clipping remain coherent. The supported non-repeating image is anchored at
-  the top-left and accepts intrinsic `auto`, one/two px or percentage sizes,
-  `contain`, and `cover`; oversized output source-crops instead of spilling.
-  Inputs and rich buttons resolve their image from live provenance at paint
-  time rather than retaining another decoded-pixel borrow in layout state.
-- Replaced `<img>` layout keeps its element box independent from its bitmap.
-  `replaced_sizing.zig` is the shared unscaled-CSS-pixel resolver for image and
-  iframe width, height, and `aspect-ratio`; both layout and initial child-frame
-  viewport setup must use it. Its relative dimensions receive explicit
-  font-size and containing-block bases. The supported ratio grammar is
-  `auto || <positive-number> [ / <positive-number> ]`. An explicit ratio
-  supplies only a missing axis, while `auto <ratio>` uses that ratio before an
-  image loads and switches to its natural ratio afterward.
-  `object-fit` supports `fill`, `contain`, `cover`, `none`, and `scale-down`
-  using the initial centered object position. Layout emits only the visible
-  destination and an exact source crop, while hit testing uses the complete
-  element box. CSS pixel width/height override the matching HTML attributes.
-  Every image also publishes document-space bounds for Frame-owned lazy-load
-  selection. Before pixels exist, each unspecified axis is zero; a single
-  authored axis still participates in line flow, while an intrinsic-only image
-  publishes a one-pixel position anchor but occupies no line space. A preferred
-  ratio may derive the missing axis. Broken fallback pixels contribute their
-  16x16 intrinsic size and paint only when `alt` is non-empty; otherwise layout
-  treats them as unavailable while retaining authored axes. After decode,
-  dirtying the complete `DocumentLayout` subtree replaces placeholders with
-  the natural box and reflows following content, including through implicit
-  HTML wrapper blocks.
-- `effects.zig` contains pixel-only software effects. Keep its APIs explicit
-  about premultiplication, edge sampling, and temporary allocation.
-- `raster_snapshot.zig` is the thread-transfer boundary. Snapshots must deep
-  copy every resource-backed leaf, clear synchronous provenance, and reject
-  browser-owned layer pointers. Numeric compositor IDs may cross this boundary;
-  raw DOM/layout pointers may not.
-- `compositor_cache.zig` owns ordered raster-worker planes and applies only
-  scalar opacity/translation updates before draw. A live plane owns exactly
-  one backing: an RGBA surface, or an independent `RasterSnapshot` containing
-  at most three cheap rect/rounded-rect/line/outline commands. Direct planes do
-  no raster work and replay during draw; text, images, filters, blend modes,
-  and unsafe multi-command opacity groups retain surfaces. Static strata may
-  merge
-  backward across stable dynamic planes only when their tight painted bounds
-  do not overlap. Static surfaces are cropped to the interest region and their
-  painted bounds; stop a merge before its union exceeds the fixed one-megapixel
-  allocation budget, while allowing an intrinsically larger individual paint
-  chunk. Merging may keep a direct plane direct or transactionally promote it
-  to a surface when it crosses the threshold. An active transform is an
-  assume-overlap barrier: later paint must
-  remain after it even when the current rectangles are disjoint, because a
-  future compositor update can create overlap. Plane pixels never return to
-  the DOM/tab thread, and fallback decisions remain Browser orchestration.
+- Immediate children paint by stable `(effective z-index, DOM index)` order;
+  only non-static positioned blocks receive nonzero z-index. Hit testing uses
+  the exact reverse order.
+- Rounded paint groups carry hit-clip metadata so descendant text/control
+  commands cannot restore a square target.
+- Focus geometry unions nested inline fragments once per visual line; a
+  focusable block replaces only its own fragments with one block box.
+- Layout coordinates contain authored CSS zoom. Raster applies accessibility
+  zoom once. Preserve that distinction for geometry, glyphs, replaced
+  elements, effects, focus, and hit testing.
+- Replaced size resolution happens before authored zoom and keeps the element
+  box separate from object-fit image geometry and fractional source crop.
 
-Prefer adding a focused rendering module when a feature introduces a distinct
-data owner or pipeline phase. Do not move Browser orchestration into this
-directory merely to reduce a line count.
+## Compositing
 
-Run `zig build`, `zig build test`, the dump-pipeline checks, and macOS
-`zig build test-screenshot` after rendering behavior or ownership changes.
+- The page interest region is bounded to four native window heights. Scroll
+  inside it is draw-only; crossing an edge or changing geometry invalidates it.
+- A compositor plane owns either a surface or an independent short cheap-command
+  snapshot. Expensive/resources/effectful commands remain surface-backed.
+- Reject static merging before the union exceeds one megapixel; an
+  intrinsically larger single chunk remains valid.
+- An active transform is an assume-overlap barrier for the complete raster
+  generation.
+- Fold opacity-only ancestry around one `DrawCompositedLayer` into its draw
+  multiplier. Preserve isolation for masks, filters, blend operators, or
+  multi-command group opacity.
+
+## Verification
+
+Run `zig build test-render`, then `zig build test-pipeline` for semantic
+style/layout/display output. Run `zig build check` before handoff and native
+macOS `zig build test-screenshot` for pixel-sensitive changes. Add a focused
+unit regression for ownership/cleanup and update the relevant
+[manual fixture](../../../tests/manual/README.md) for interaction or visual
+behavior.

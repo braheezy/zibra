@@ -3,6 +3,157 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const sdl = @import("sdl");
+const pipeline_manifest = @import("tests/pipeline/manifest.zig");
+
+const UnitTestSuite = struct {
+    step_name: []const u8,
+    description: []const u8,
+    root_source_file: []const u8,
+    dependencies: Dependencies,
+    comprehensive: bool = false,
+
+    const Dependencies = enum {
+        document,
+        network,
+        script,
+        full,
+    };
+};
+
+const unit_test_suites = [_]UnitTestSuite{
+    .{
+        .step_name = "test",
+        .description = "Run the comprehensive unit-test suite",
+        .root_source_file = "src/test_root.zig",
+        .dependencies = .full,
+        .comprehensive = true,
+    },
+    .{
+        .step_name = "test-document",
+        .description = "Run focused document, HTML, and CSS unit tests",
+        .root_source_file = "src/test_document.zig",
+        .dependencies = .document,
+    },
+    .{
+        .step_name = "test-render",
+        .description = "Run focused layout, paint, and compositing unit tests",
+        .root_source_file = "src/test_render.zig",
+        .dependencies = .full,
+    },
+    .{
+        .step_name = "test-network",
+        .description = "Run focused URL, HTTP, cookie, and cache unit tests",
+        .root_source_file = "src/test_network.zig",
+        .dependencies = .network,
+    },
+    .{
+        .step_name = "test-script",
+        .description = "Run focused JavaScript host and DOM API unit tests",
+        .root_source_file = "src/test_script.zig",
+        .dependencies = .script,
+    },
+    .{
+        .step_name = "test-browser",
+        .description = "Run focused browser, tab, input, and worker unit tests",
+        .root_source_file = "src/test_browser.zig",
+        .dependencies = .full,
+    },
+};
+
+const DumpDomInput = union(enum) {
+    argument: []const u8,
+    file: []const u8,
+};
+
+const DumpDomFixture = struct {
+    input: DumpDomInput,
+    golden: []const u8,
+    output_basename: []const u8,
+};
+
+const dump_dom_fixtures = [_]DumpDomFixture{
+    .{
+        .input = .{ .file = "tests/manual/dump-dom.html" },
+        .golden = "tests/golden/dump-dom.txt",
+        .output_basename = "dump-dom.txt",
+    },
+    .{
+        .input = .{ .argument = "about:blank" },
+        .golden = "tests/golden/about-blank-dom.txt",
+        .output_basename = "about-blank-dom.txt",
+    },
+    .{
+        .input = .{ .argument = "http://[" },
+        .golden = "tests/golden/about-blank-dom.txt",
+        .output_basename = "malformed-url-dom.txt",
+    },
+    .{
+        .input = .{ .argument = "mailto:test@example.com" },
+        .golden = "tests/golden/about-blank-dom.txt",
+        .output_basename = "unsupported-scheme-dom.txt",
+    },
+};
+
+const ScreenshotFixture = struct {
+    input_prefix: []const u8 = "file://",
+    fixture: []const u8,
+    golden: []const u8,
+    output_basename: []const u8,
+};
+
+const screenshot_fixtures = [_]ScreenshotFixture{
+    .{
+        .fixture = "tests/manual/native-screenshot.html",
+        .golden = "tests/golden/native-screenshot.macos.png",
+        .output_basename = "native-screenshot.png",
+    },
+    .{
+        .input_prefix = "view-source:file://",
+        .fixture = "tests/manual/view-source.html",
+        .golden = "tests/golden/view-source.macos.png",
+        .output_basename = "view-source-screenshot.png",
+    },
+    .{
+        .fixture = "tests/manual/scrollbar.html",
+        .golden = "tests/golden/scrollbar.macos.png",
+        .output_basename = "scrollbar-screenshot.png",
+    },
+    .{
+        .fixture = "tests/manual/emoji.html",
+        .golden = "tests/golden/emoji.macos.png",
+        .output_basename = "emoji-screenshot.png",
+    },
+    .{
+        .fixture = "tests/manual/alternate-text-direction.html",
+        .golden = "tests/golden/alternate-text-direction.macos.png",
+        .output_basename = "alternate-text-direction-screenshot.png",
+    },
+    .{
+        .fixture = "tests/manual/centered-title.html",
+        .golden = "tests/golden/centered-title.macos.png",
+        .output_basename = "centered-title-screenshot.png",
+    },
+    .{
+        .fixture = "tests/manual/superscript.html",
+        .golden = "tests/golden/superscript.macos.png",
+        .output_basename = "superscript-screenshot.png",
+    },
+    .{
+        .fixture = "tests/manual/soft-hyphens.html",
+        .golden = "tests/golden/soft-hyphens.macos.png",
+        .output_basename = "soft-hyphens-screenshot.png",
+    },
+    .{
+        .fixture = "tests/manual/small-caps.html",
+        .golden = "tests/golden/small-caps.macos.png",
+        .output_basename = "small-caps-screenshot.png",
+    },
+    .{
+        .fixture = "tests/manual/preformatted.html",
+        .golden = "tests/golden/preformatted.macos.png",
+        .output_basename = "preformatted-screenshot.png",
+    },
+};
 
 pub fn build(b: *std.Build) !void {
     const target = b.standardTargetOptions(.{});
@@ -97,92 +248,127 @@ pub fn build(b: *std.Build) !void {
     const run_step = b.step("run", "Run the app");
     run_step.dependOn(&run_cmd.step);
 
-    const test_step = b.step("test", "Run unit tests");
+    var comprehensive_unit_tests: *std.Build.Step = undefined;
+    var focused_test_compilations: [unit_test_suites.len - 1]*std.Build.Step = undefined;
+    var focused_test_index: usize = 0;
+    for (unit_test_suites) |suite| {
+        const suite_step = b.step(suite.step_name, suite.description);
+        const test_module = b.createModule(.{
+            .root_source_file = b.path(suite.root_source_file),
+            .target = target,
+            .optimize = optimize,
+        });
+        switch (suite.dependencies) {
+            .document => {
+                test_module.addImport("z2d", z2d_dep.module("z2d"));
+                test_module.addImport("zigimg", zigimg_dep.module("zigimg"));
+            },
+            .network => {
+                test_module.addImport("ada", ada_dep.module("ada"));
+            },
+            .script => {
+                test_module.addImport("z2d", z2d_dep.module("z2d"));
+                test_module.addImport("kiesel", kiesel_dep.module("kiesel"));
+                test_module.addImport("bdwgc", bdwgc_dep.module("bdwgc"));
+                test_module.addImport("zigimg", zigimg_dep.module("zigimg"));
+            },
+            .full => {
+                test_module.addImport("sdl", sdl_mod);
+                test_module.addImport("known-folders", known_folders);
+                test_module.addImport("grapheme", zg.module("Graphemes"));
+                test_module.addImport("emoji", zg.module("Emoji"));
+                test_module.addImport("code_point", zg.module("code_point"));
+                test_module.addImport("z2d", z2d_dep.module("z2d"));
+                test_module.addImport("kiesel", kiesel_dep.module("kiesel"));
+                test_module.addImport("bdwgc", bdwgc_dep.module("bdwgc"));
+                test_module.addImport("zigimg", zigimg_dep.module("zigimg"));
+                test_module.addImport("ada", ada_dep.module("ada"));
+            },
+        }
 
-    const test_module = b.createModule(.{
-        .root_source_file = b.path("src/test_root.zig"),
-        .target = target,
-        .optimize = optimize,
-    });
-    test_module.addImport("sdl", sdl_mod);
-    test_module.addImport("known-folders", known_folders);
-    test_module.addImport("grapheme", zg.module("Graphemes"));
-    test_module.addImport("emoji", zg.module("Emoji"));
-    test_module.addImport("code_point", zg.module("code_point"));
-    test_module.addImport("z2d", z2d_dep.module("z2d"));
-    test_module.addImport("kiesel", kiesel_dep.module("kiesel"));
-    test_module.addImport("bdwgc", bdwgc_dep.module("bdwgc"));
-    test_module.addImport("zigimg", zigimg_dep.module("zigimg"));
-    test_module.addImport("ada", ada_dep.module("ada"));
-    const unit_tests = b.addTest(.{
-        .root_module = test_module,
-        .use_llvm = use_llvm,
-    });
-    // Browser input tests exercise real frame activation paths, whose lazy
-    // code generation reaches the renderer and font modules.
-    sdk.link(io, unit_tests, .static, sdl.Library.SDL2);
-    sdk.link(io, unit_tests, .static, sdl.Library.SDL2_ttf);
-    const unit_tests_run = b.addRunArtifact(unit_tests);
-    test_step.dependOn(&unit_tests_run.step);
+        const unit_tests = b.addTest(.{
+            .root_module = test_module,
+            .use_llvm = use_llvm,
+        });
+        if (suite.dependencies == .full) {
+            // Browser input tests exercise real frame activation paths, whose
+            // lazy code generation reaches the renderer and font modules.
+            sdk.link(io, unit_tests, .static, sdl.Library.SDL2);
+            sdk.link(io, unit_tests, .static, sdl.Library.SDL2_ttf);
+        }
+        const unit_tests_run = b.addRunArtifact(unit_tests);
+        suite_step.dependOn(&unit_tests_run.step);
+        if (suite.comprehensive) {
+            comprehensive_unit_tests = &unit_tests_run.step;
+        } else {
+            focused_test_compilations[focused_test_index] = &unit_tests.step;
+            focused_test_index += 1;
+        }
+    }
 
     const dump_dom_test_step = b.step(
         "test-dump-dom",
         "Capture and compare isolated DOM-dump regressions",
     );
-    const dump_dom_compare_module = b.createModule(.{
-        .root_source_file = b.path("tests/dump_dom_compare.zig"),
+    const text_compare_module = b.createModule(.{
+        .root_source_file = b.path("tests/text_compare.zig"),
         .target = target,
         .optimize = optimize,
     });
-    const dump_dom_compare = b.addExecutable(.{
-        .name = "dump-dom-compare",
-        .root_module = dump_dom_compare_module,
+    const text_compare = b.addExecutable(.{
+        .name = "text-compare",
+        .root_module = text_compare_module,
     });
-    const dump_dom = b.addRunArtifact(exe);
-    dump_dom.addArg("--dump-dom");
-    dump_dom.addPrefixedFileArg("file://", b.path("tests/manual/dump-dom.html"));
-    const actual_dom_dump = dump_dom.captureStdOut(.{ .basename = "dump-dom.txt" });
+    var previous_dom_comparison: ?*std.Build.Step = null;
+    for (dump_dom_fixtures) |fixture| {
+        const capture = b.addRunArtifact(exe);
+        if (previous_dom_comparison) |previous| capture.step.dependOn(previous);
+        capture.addArg("--dump-dom");
+        switch (fixture.input) {
+            .argument => |argument| capture.addArg(argument),
+            .file => |path| capture.addPrefixedFileArg("file://", b.path(path)),
+        }
+        const actual = capture.captureStdOut(.{
+            .basename = fixture.output_basename,
+        });
 
-    const compare_dom_dump = b.addRunArtifact(dump_dom_compare);
-    compare_dom_dump.addFileArg(b.path("tests/golden/dump-dom.txt"));
-    compare_dom_dump.addFileArg(actual_dom_dump);
+        const compare = b.addRunArtifact(text_compare);
+        compare.addFileArg(b.path(fixture.golden));
+        compare.addFileArg(actual);
+        dump_dom_test_step.dependOn(&compare.step);
+        previous_dom_comparison = &compare.step;
+    }
 
-    const dump_about_blank = b.addRunArtifact(exe);
-    dump_about_blank.step.dependOn(&compare_dom_dump.step);
-    dump_about_blank.addArg("--dump-dom");
-    dump_about_blank.addArg("about:blank");
-    const actual_about_blank_dump = dump_about_blank.captureStdOut(.{
-        .basename = "about-blank-dom.txt",
-    });
+    const pipeline_test_step = b.step(
+        "test-pipeline",
+        "Capture and compare style, layout, and display-list regressions",
+    );
+    var previous_pipeline_comparison: ?*std.Build.Step = null;
+    for (pipeline_manifest.cases) |case| {
+        const capture = b.addRunArtifact(exe);
+        if (previous_pipeline_comparison) |previous| capture.step.dependOn(previous);
+        capture.addArg(case.mode.cliFlag());
+        capture.addPrefixedFileArg("file://", b.path(case.fixture));
+        if (case.mode != .style) {
+            capture.setEnvironmentVariable("SDL_VIDEODRIVER", "dummy");
+            // Font discovery reports optional missing faces at warning level.
+            // These text-free fixtures do not consume glyphs, so keep that
+            // platform inventory out of successful output. A nonzero process
+            // exit still reports the captured diagnostics.
+            _ = capture.captureStdErr(.{
+                .basename = b.fmt("{s}.stderr.txt", .{case.name}),
+            });
+        }
+        const actual = capture.captureStdOut(.{
+            .basename = b.fmt("{s}.txt", .{case.name}),
+        });
 
-    const compare_about_blank_dump = b.addRunArtifact(dump_dom_compare);
-    compare_about_blank_dump.addFileArg(b.path("tests/golden/about-blank-dom.txt"));
-    compare_about_blank_dump.addFileArg(actual_about_blank_dump);
-
-    const dump_malformed_url = b.addRunArtifact(exe);
-    dump_malformed_url.step.dependOn(&compare_about_blank_dump.step);
-    dump_malformed_url.addArg("--dump-dom");
-    dump_malformed_url.addArg("http://[");
-    const actual_malformed_url_dump = dump_malformed_url.captureStdOut(.{
-        .basename = "malformed-url-dom.txt",
-    });
-
-    const compare_malformed_url_dump = b.addRunArtifact(dump_dom_compare);
-    compare_malformed_url_dump.addFileArg(b.path("tests/golden/about-blank-dom.txt"));
-    compare_malformed_url_dump.addFileArg(actual_malformed_url_dump);
-
-    const dump_unsupported_scheme = b.addRunArtifact(exe);
-    dump_unsupported_scheme.step.dependOn(&compare_malformed_url_dump.step);
-    dump_unsupported_scheme.addArg("--dump-dom");
-    dump_unsupported_scheme.addArg("mailto:test@example.com");
-    const actual_unsupported_scheme_dump = dump_unsupported_scheme.captureStdOut(.{
-        .basename = "unsupported-scheme-dom.txt",
-    });
-
-    const compare_unsupported_scheme_dump = b.addRunArtifact(dump_dom_compare);
-    compare_unsupported_scheme_dump.addFileArg(b.path("tests/golden/about-blank-dom.txt"));
-    compare_unsupported_scheme_dump.addFileArg(actual_unsupported_scheme_dump);
-    dump_dom_test_step.dependOn(&compare_unsupported_scheme_dump.step);
+        const compare = b.addRunArtifact(text_compare);
+        compare.addFileArg(b.path(case.golden));
+        compare.addFileArg(actual);
+        pipeline_test_step.dependOn(&compare.step);
+        previous_pipeline_comparison = &compare.step;
+    }
 
     const screenshot_test_step = b.step(
         "test-screenshot",
@@ -203,120 +389,78 @@ pub fn build(b: *std.Build) !void {
             .root_module = screenshot_compare_module,
         });
 
-        const capture = b.addRunArtifact(exe);
-        capture.addArg("--screenshot");
-        const actual_screenshot = capture.addOutputFileArg("native-screenshot.png");
-        capture.addPrefixedFileArg("file://", b.path("tests/manual/native-screenshot.html"));
+        var previous_screenshot_comparison: ?*std.Build.Step = null;
+        for (screenshot_fixtures) |fixture| {
+            const capture = b.addRunArtifact(exe);
+            // SDL/SDL_ttf initialization is process-global. Serialize captures
+            // even though screenshot mode creates no window or renderer.
+            if (previous_screenshot_comparison) |previous| {
+                capture.step.dependOn(previous);
+            }
+            capture.addArg("--screenshot");
+            const actual = capture.addOutputFileArg(fixture.output_basename);
+            capture.addPrefixedFileArg(
+                fixture.input_prefix,
+                b.path(fixture.fixture),
+            );
 
-        const compare = b.addRunArtifact(screenshot_compare);
-        compare.addFileArg(b.path("tests/golden/native-screenshot.macos.png"));
-        compare.addFileArg(actual_screenshot);
-        screenshot_test_step.dependOn(&compare.step);
-
-        const view_source_capture = b.addRunArtifact(exe);
-        // SDL/SDL_ttf initialization is process-global. Serialize captures even
-        // though screenshot mode creates no window or renderer.
-        view_source_capture.step.dependOn(&compare.step);
-        view_source_capture.addArg("--screenshot");
-        const actual_view_source_screenshot = view_source_capture.addOutputFileArg("view-source-screenshot.png");
-        view_source_capture.addPrefixedFileArg("view-source:file://", b.path("tests/manual/view-source.html"));
-
-        const compare_view_source = b.addRunArtifact(screenshot_compare);
-        compare_view_source.addFileArg(b.path("tests/golden/view-source.macos.png"));
-        compare_view_source.addFileArg(actual_view_source_screenshot);
-        screenshot_test_step.dependOn(&compare_view_source.step);
-
-        const scrollbar_capture = b.addRunArtifact(exe);
-        scrollbar_capture.step.dependOn(&compare_view_source.step);
-        scrollbar_capture.addArg("--screenshot");
-        const actual_scrollbar_screenshot = scrollbar_capture.addOutputFileArg("scrollbar-screenshot.png");
-        scrollbar_capture.addPrefixedFileArg("file://", b.path("tests/manual/scrollbar.html"));
-
-        const compare_scrollbar = b.addRunArtifact(screenshot_compare);
-        compare_scrollbar.addFileArg(b.path("tests/golden/scrollbar.macos.png"));
-        compare_scrollbar.addFileArg(actual_scrollbar_screenshot);
-        screenshot_test_step.dependOn(&compare_scrollbar.step);
-
-        const emoji_capture = b.addRunArtifact(exe);
-        emoji_capture.step.dependOn(&compare_scrollbar.step);
-        emoji_capture.addArg("--screenshot");
-        const actual_emoji_screenshot = emoji_capture.addOutputFileArg("emoji-screenshot.png");
-        emoji_capture.addPrefixedFileArg("file://", b.path("tests/manual/emoji.html"));
-
-        const compare_emoji = b.addRunArtifact(screenshot_compare);
-        compare_emoji.addFileArg(b.path("tests/golden/emoji.macos.png"));
-        compare_emoji.addFileArg(actual_emoji_screenshot);
-        screenshot_test_step.dependOn(&compare_emoji.step);
-
-        const text_direction_capture = b.addRunArtifact(exe);
-        text_direction_capture.step.dependOn(&compare_emoji.step);
-        text_direction_capture.addArg("--screenshot");
-        const actual_text_direction_screenshot = text_direction_capture.addOutputFileArg("alternate-text-direction-screenshot.png");
-        text_direction_capture.addPrefixedFileArg("file://", b.path("tests/manual/alternate-text-direction.html"));
-
-        const compare_text_direction = b.addRunArtifact(screenshot_compare);
-        compare_text_direction.addFileArg(b.path("tests/golden/alternate-text-direction.macos.png"));
-        compare_text_direction.addFileArg(actual_text_direction_screenshot);
-        screenshot_test_step.dependOn(&compare_text_direction.step);
-
-        const centered_title_capture = b.addRunArtifact(exe);
-        centered_title_capture.step.dependOn(&compare_text_direction.step);
-        centered_title_capture.addArg("--screenshot");
-        const actual_centered_title_screenshot = centered_title_capture.addOutputFileArg("centered-title-screenshot.png");
-        centered_title_capture.addPrefixedFileArg("file://", b.path("tests/manual/centered-title.html"));
-
-        const compare_centered_title = b.addRunArtifact(screenshot_compare);
-        compare_centered_title.addFileArg(b.path("tests/golden/centered-title.macos.png"));
-        compare_centered_title.addFileArg(actual_centered_title_screenshot);
-        screenshot_test_step.dependOn(&compare_centered_title.step);
-
-        const superscript_capture = b.addRunArtifact(exe);
-        superscript_capture.step.dependOn(&compare_centered_title.step);
-        superscript_capture.addArg("--screenshot");
-        const actual_superscript_screenshot = superscript_capture.addOutputFileArg("superscript-screenshot.png");
-        superscript_capture.addPrefixedFileArg("file://", b.path("tests/manual/superscript.html"));
-
-        const compare_superscript = b.addRunArtifact(screenshot_compare);
-        compare_superscript.addFileArg(b.path("tests/golden/superscript.macos.png"));
-        compare_superscript.addFileArg(actual_superscript_screenshot);
-        screenshot_test_step.dependOn(&compare_superscript.step);
-
-        const soft_hyphen_capture = b.addRunArtifact(exe);
-        soft_hyphen_capture.step.dependOn(&compare_superscript.step);
-        soft_hyphen_capture.addArg("--screenshot");
-        const actual_soft_hyphen_screenshot = soft_hyphen_capture.addOutputFileArg("soft-hyphens-screenshot.png");
-        soft_hyphen_capture.addPrefixedFileArg("file://", b.path("tests/manual/soft-hyphens.html"));
-
-        const compare_soft_hyphens = b.addRunArtifact(screenshot_compare);
-        compare_soft_hyphens.addFileArg(b.path("tests/golden/soft-hyphens.macos.png"));
-        compare_soft_hyphens.addFileArg(actual_soft_hyphen_screenshot);
-        screenshot_test_step.dependOn(&compare_soft_hyphens.step);
-
-        const small_caps_capture = b.addRunArtifact(exe);
-        small_caps_capture.step.dependOn(&compare_soft_hyphens.step);
-        small_caps_capture.addArg("--screenshot");
-        const actual_small_caps_screenshot = small_caps_capture.addOutputFileArg("small-caps-screenshot.png");
-        small_caps_capture.addPrefixedFileArg("file://", b.path("tests/manual/small-caps.html"));
-
-        const compare_small_caps = b.addRunArtifact(screenshot_compare);
-        compare_small_caps.addFileArg(b.path("tests/golden/small-caps.macos.png"));
-        compare_small_caps.addFileArg(actual_small_caps_screenshot);
-        screenshot_test_step.dependOn(&compare_small_caps.step);
-
-        const preformatted_capture = b.addRunArtifact(exe);
-        preformatted_capture.step.dependOn(&compare_small_caps.step);
-        preformatted_capture.addArg("--screenshot");
-        const actual_preformatted_screenshot = preformatted_capture.addOutputFileArg("preformatted-screenshot.png");
-        preformatted_capture.addPrefixedFileArg("file://", b.path("tests/manual/preformatted.html"));
-
-        const compare_preformatted = b.addRunArtifact(screenshot_compare);
-        compare_preformatted.addFileArg(b.path("tests/golden/preformatted.macos.png"));
-        compare_preformatted.addFileArg(actual_preformatted_screenshot);
-        screenshot_test_step.dependOn(&compare_preformatted.step);
+            const compare = b.addRunArtifact(screenshot_compare);
+            compare.addFileArg(b.path(fixture.golden));
+            compare.addFileArg(actual);
+            screenshot_test_step.dependOn(&compare.step);
+            previous_screenshot_comparison = &compare.step;
+        }
     } else {
         const unsupported = b.addFail(
             "test-screenshot currently requires a native macOS target",
         );
         screenshot_test_step.dependOn(&unsupported.step);
     }
+
+    const server_tests = b.addSystemCommand(&.{
+        "python3",
+        "-m",
+        "unittest",
+        "tests/test_server_message_board.py",
+    });
+    const server_test_step = b.step(
+        "test-server",
+        "Run tutorial message-board server tests",
+    );
+    server_test_step.dependOn(&server_tests.step);
+
+    const docs_tests = b.addSystemCommand(&.{
+        "python3",
+        "tests/check_markdown_links.py",
+    });
+    const docs_test_step = b.step(
+        "test-docs",
+        "Check repository-local Markdown links",
+    );
+    docs_test_step.dependOn(&docs_tests.step);
+
+    const format_check = b.addFmt(.{
+        .paths = &.{ "build.zig", "src", "tests" },
+        .check = true,
+    });
+    const format_test_step = b.step(
+        "test-format",
+        "Check Zig source formatting",
+    );
+    format_test_step.dependOn(&format_check.step);
+
+    const check_step = b.step(
+        "check",
+        "Run portable build, formatting, unit, pipeline, server, and docs checks",
+    );
+    check_step.dependOn(b.getInstallStep());
+    check_step.dependOn(&format_check.step);
+    check_step.dependOn(comprehensive_unit_tests);
+    for (focused_test_compilations) |compilation| {
+        check_step.dependOn(compilation);
+    }
+    check_step.dependOn(dump_dom_test_step);
+    check_step.dependOn(pipeline_test_step);
+    check_step.dependOn(server_test_step);
+    check_step.dependOn(docs_test_step);
 }

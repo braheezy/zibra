@@ -3,8 +3,9 @@
 This directory owns the named task runners used by tabs and the networking
 dispatcher, synchronization wrappers, and measurement support.
 
-Read [`../../docs/architecture-and-lifetimes.md`](../../docs/architecture-and-lifetimes.md)
-before changing queues, thread lifetime, shutdown, or helper accounting.
+Read [threads and shutdown](../../docs/architecture/threads-and-shutdown.md)
+before changing queues, thread lifetime, shutdown, helper accounting, task
+priority, or trace ownership.
 
 - A queued `Task` owns its opaque context until exactly one cleanup callback
   runs.
@@ -35,4 +36,5 @@ before changing queues, thread lifetime, shutdown, or helper accounting.
 - Browser/Tab owners must remain alive until every worker and accounted helper
   that can borrow them has stopped.
 - Add focused concurrency tests that force the ordering being changed; do not
-  rely on sleeps or process exit as proof of safety.
+  rely on sleeps or process exit as proof of safety. Run the consuming focused
+  test and `zig build check`.
