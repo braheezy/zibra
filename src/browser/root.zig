@@ -6101,6 +6101,51 @@ const jsClearIntervalCallback = BrowserScriptTaskContexts.jsClearIntervalCallbac
 const jsRequestAnimationFrameCallback = BrowserScriptTaskContexts.jsRequestAnimationFrameCallback;
 const jsPostMessageCallback = BrowserScriptTaskContexts.jsPostMessageCallback;
 
+test "discarding a queued animation frame recovers its timer generation" {
+    const allocator = std.testing.allocator;
+    var environ = std.process.Environ.Map.init(allocator);
+    defer environ.deinit();
+    var measure = try MeasureTime.init(allocator, std.testing.io, &environ);
+    defer measure.finish();
+
+    var tab = Tab.init(allocator, 1, 1, &measure);
+    defer tab.deinit();
+
+    var browser: Browser = undefined;
+    browser.io = std.testing.io;
+    browser.lock = .init(std.testing.io);
+    browser.tabs = .empty;
+    defer browser.tabs.deinit(allocator);
+    try browser.tabs.append(allocator, &tab);
+    browser.active_tab_index = 0;
+    browser.shutting_down = false;
+    browser.animation_timer_active = true;
+    browser.animation_timer_generation = 17;
+    browser.animation_frame_deadline_ns = 1234;
+    browser.needs_animation_frame = false;
+    tab.browser = &browser;
+
+    const context = try BrowserScriptTaskContexts.AnimationRenderTaskContext.create(
+        allocator,
+        &browser,
+        &tab,
+        0,
+        browser.animation_timer_generation,
+    );
+    try tab.task_runner.schedule(Task.init(
+        .rendering,
+        "task:test_cancelled_animation_frame",
+        context.toOpaque(),
+        BrowserScriptTaskContexts.AnimationRenderTaskContext.runOpaque,
+        BrowserScriptTaskContexts.AnimationRenderTaskContext.cleanupOpaque,
+    ));
+    tab.task_runner.clear();
+
+    try std.testing.expect(!browser.animation_timer_active);
+    try std.testing.expect(browser.animation_frame_deadline_ns == null);
+    try std.testing.expect(browser.needs_animation_frame);
+}
+
 pub const CommitData = struct {
     url: ?*Url,
     certificate_error: bool = false,

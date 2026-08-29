@@ -383,7 +383,15 @@ pub fn Contexts(comptime Browser: type, comptime DocumentHandle: type) type {
             }
 
             pub fn cleanupOpaque(context: *anyopaque) void {
-                AnimationRenderTaskContext.fromOpaque(context).destroy();
+                const self = AnimationRenderTaskContext.fromOpaque(context);
+                // A navigation can clear this queued task after its timer has
+                // fired. The timer owns the matching generation until either
+                // this task finishes it or cancellation recovers it; leaving
+                // it live permanently blocks later animation and screenshot
+                // work. Recovery is generation-checked, so it is a no-op
+                // after normal completion or after a newer frame supersedes it.
+                self.browser.recoverAnimationFrameFailure(self.tab, self.generation);
+                self.destroy();
             }
 
             fn run(self: *AnimationRenderTaskContext) !void {
