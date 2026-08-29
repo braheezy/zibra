@@ -104,6 +104,10 @@ modules over forwarding wrappers.
   owned slice before calling `paint_effects.wrapOwned`. When transferring the
   returned owning items into another list, reserve its capacity first and free
   only the now-empty top-level container after the transfer.
+- Direct, effect-free static siblings of a float may use the bounded float
+  paint path: backgrounds/borders precede float subtrees and inline/content
+  follows them. Positioned, clipped, blended, transformed, scrolling, and
+  table subtrees remain atomic in the normal retained order.
 - Retire Frame and Browser command generations before replacing decoded image,
   font, canvas, DOM, layout, or layer resources they borrow.
 - A raster snapshot and every worker plane is independently owned through the

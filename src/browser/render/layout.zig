@@ -1994,6 +1994,85 @@ test "nested floats place and clear in a shared context after invalidation" {
     );
 }
 
+test "float paint phases keep normal backgrounds below floats" {
+    const allocator = std.testing.allocator;
+    var html_parser = try parser.HTMLParser.init(
+        allocator,
+        "<html style='display:block'><body style='display:block;margin:0'>" ++
+            "<main id=stage style='display:block;width:120px'>" ++
+            "<div id=float style='display:block;float:left;width:40px;height:24px;background-color:#ff0000'></div>" ++
+            "<div id=under style='display:block;height:24px;background-color:#0000ff'></div>" ++
+            "</main>" ++
+            "<main id=bfc-stage style='display:block;width:120px'>" ++
+            "<div id=bfc-float style='display:block;float:left;width:40px;height:24px;background-color:#ff0000'></div>" ++
+            "<div id=bfc style='display:block;overflow:hidden;height:24px;background-color:#00ff00'></div>" ++
+            "</main></body></html>",
+    );
+    html_parser.use_implicit_tags = false;
+    defer html_parser.deinit(allocator);
+    var root_node = try html_parser.parse();
+    defer root_node.deinit(allocator);
+    parser.fixParentPointers(&root_node, null);
+    try parser.style(allocator, &root_node, &.{});
+
+    var environ = std.process.Environ.Map.init(allocator);
+    defer environ.deinit();
+    try environ.put("HOME", "/tmp");
+    const engine = try Layout.init(allocator, std.testing.io, &environ, 800, 600, false);
+    defer engine.deinit();
+    const document = try engine.buildDocument(&root_node);
+    defer {
+        document.deinit();
+        allocator.destroy(document);
+    }
+
+    var nodes = std.ArrayList(*Node).empty;
+    defer nodes.deinit(allocator);
+    try parser.treeToList(allocator, &root_node, &nodes);
+    var stage: ?*BlockLayout = null;
+    var float: ?*BlockLayout = null;
+    var under: ?*BlockLayout = null;
+    var bfc_float: ?*BlockLayout = null;
+    var bfc: ?*BlockLayout = null;
+    for (nodes.items) |node| switch (node.*) {
+        .element => |*element| {
+            const attributes = element.attributes orelse continue;
+            const id = attributes.get("id") orelse continue;
+            const layout: *BlockLayout = @ptrCast(@alignCast(element.layout_ptr.?));
+            if (std.mem.eql(u8, id, "stage")) stage = layout;
+            if (std.mem.eql(u8, id, "float")) float = layout;
+            if (std.mem.eql(u8, id, "under")) under = layout;
+            if (std.mem.eql(u8, id, "bfc-float")) bfc_float = layout;
+            if (std.mem.eql(u8, id, "bfc")) bfc = layout;
+        },
+        .text => {},
+    };
+
+    // A normal-flow block's border box stays at the containing-block origin
+    // and width. Its inline ranges, not this box, wrap around the red float.
+    try std.testing.expectEqual(float.?.x.get().*, under.?.x.get().*);
+    try std.testing.expectEqual(stage.?.width.get().*, under.?.width.get().*);
+    // A new overflow formatting context is the contrasting case: it avoids
+    // the external float as a whole used border box.
+    try std.testing.expectEqual(
+        bfc_float.?.x.get().* + bfc_float.?.width.get().*,
+        bfc.?.x.get().*,
+    );
+    try std.testing.expectEqual(
+        stage.?.width.get().* - bfc_float.?.width.get().*,
+        bfc.?.width.get().*,
+    );
+
+    const frame = try engine.paintDocument(document);
+    defer DisplayItem.freeList(allocator, frame);
+    var output = std.Io.Writer.Allocating.init(allocator);
+    defer output.deinit();
+    try writeDisplayListDebug(&output.writer, frame);
+    const blue_background = std.mem.indexOf(u8, output.written(), "color=#0000ffff").?;
+    const red_float = std.mem.indexOf(u8, output.written(), "color=#ff0000ff").?;
+    try std.testing.expect(blue_background < red_float);
+}
+
 // Layout state
 allocator: std.mem.Allocator,
 // Font manager for handling fonts and glyphs
@@ -2832,6 +2911,52 @@ fn blockPaintZIndex(block: *const BlockLayout) i32 {
         " \t\r\n",
     );
     return std.fmt.parseInt(i32, z_index, 10) catch 0;
+}
+
+/// Return whether this block establishes its own normal-flow box alongside
+/// external floats. Ordinary blocks keep their containing-block width and
+/// only their inline line boxes flow around outside floats. Tables and
+/// non-visible overflow boxes instead establish a bounded formatting context,
+/// so their border boxes avoid the surrounding float area.
+fn blockAvoidsExternalFloats(block: *const BlockLayout) bool {
+    if (block.tableRole() == .table) return true;
+    const element = liveBlockElement(block) orelse return false;
+    const styles = if (element.style) |*style_map| style_map else return false;
+    const overflow = std.mem.trim(
+        u8,
+        styleValue(styles, "overflow") orelse "visible",
+        " \t\r\n",
+    );
+    return !std.ascii.eqlIgnoreCase(overflow, "visible");
+}
+
+/// A static, effect-free child can be split into its background/border phase
+/// and its content phase when a sibling float is present. Keep every more
+/// complex subtree atomic: its existing effect wrapper remains the authority
+/// for clipping, blending, transforms, positioned stacking, and scrolling.
+fn isFloatPaintPhaseCandidate(block: *const BlockLayout) bool {
+    if (block.floatSide() != .none or block.positionMode() != .static) return false;
+    if (block.tableRole() != .ordinary or blockAvoidsExternalFloats(block)) return false;
+    const effects = resolvedBlockEffects(block);
+    return !effects.needsBlendGroup() and effects.translation == null;
+}
+
+/// The bounded float painter only reorders a simple direct-sibling context.
+/// If any sibling needs independent stacking or an effect wrapper, retain the
+/// established atomic subtree ordering instead of partially splitting it.
+fn usesFloatPaintPhases(block: *const BlockLayout) bool {
+    var has_float = false;
+    for (block.children.items) |child| switch (child) {
+        .block => |nested| {
+            if (nested.floatSide() != .none) {
+                has_float = true;
+            } else if (!isFloatPaintPhaseCandidate(nested)) {
+                return false;
+            }
+        },
+        .line => {},
+    };
+    return has_float;
 }
 
 fn applyNodeStyles(
@@ -6770,15 +6895,7 @@ const BlockLayout = struct {
     fn establishesFloatContext(self: *const BlockLayout) bool {
         if (self.parent_block == null or self.embedded_box != null) return true;
         if (self.floatSide() != .none or isOutOfFlowPosition(self.positionMode())) return true;
-
-        const element = liveBlockElement(self) orelse return false;
-        const styles = if (element.style) |*style_map| style_map else return false;
-        const overflow = std.mem.trim(
-            u8,
-            styleValue(styles, "overflow") orelse "visible",
-            " \t\r\n",
-        );
-        return !std.ascii.eqlIgnoreCase(overflow, "visible");
+        return blockAvoidsExternalFloats(self);
     }
 
     fn floatContextForChildren(self: *BlockLayout) *BlockLayout {
@@ -7269,17 +7386,23 @@ const BlockLayout = struct {
             }
         }
 
+        // A float narrows its own available width, and a new formatting
+        // context (for example overflow:hidden or display:table) keeps its
+        // border box clear of external floats. An ordinary in-flow block does
+        // neither: its background spans the containing block underneath the
+        // float while inlineContentBounds narrows only its line boxes.
         const content_bounds = if (table_box != null)
             base_content_bounds
         else if (self.parent_block) |parent|
-            if (isOutOfFlowPosition(position_mode))
-                base_content_bounds
-            else
+            if (!isOutOfFlowPosition(position_mode) and
+                (float_side != .none or blockAvoidsExternalFloats(self)))
                 parent.floatContextForChildren().floatBoundsAt(
                     layout_y,
                     base_content_bounds.x,
                     base_content_bounds.width,
                 )
+            else
+                base_content_bounds
         else
             base_content_bounds;
         const auto_content_width = @max(
@@ -7447,10 +7570,12 @@ const BlockLayout = struct {
                 for (self.children.items) |child| {
                     switch (child) {
                         .block => |b| {
-                            // A sibling float changes the available bounds of
-                            // every later block, even when that block's own style
-                            // is clean. Mark it before laying it out so the
-                            // exclusion geometry is recomputed.
+                            // A sibling float can change a later block's line
+                            // ranges or force a new formatting context beside
+                            // it, even when that block's own style is clean.
+                            // Mark it before layout so those exclusions are
+                            // recomputed without incorrectly narrowing ordinary
+                            // block backgrounds.
                             if (!isOutOfFlowPosition(b.positionMode()) and
                                 (float_context.floats.items.len > 0 or b.clearSide() != .none))
                             {
@@ -9368,6 +9493,38 @@ fn refreshBlockPaintCache(self: *Layout, block: *BlockLayout) !void {
         return;
     }
 
+    // A float paint context needs a flattened, phase-ordered subtree instead
+    // of cached child edges. Refresh the children first so this bounded escape
+    // hatch still consumes the same current display-list inputs as the normal
+    // retained path. Clean descendants retain their own cache generations.
+    if (usesFloatPaintPhases(block)) {
+        try block.refreshPaintOrder();
+        for (block.paint_order.items) |document_index| {
+            switch (block.children.items[document_index]) {
+                .block => |child| try refreshBlockPaintCache(self, child),
+                .line => |line| try refreshLinePaintCache(self, line),
+            }
+        }
+
+        var phased_commands = std.ArrayList(DisplayItem).empty;
+        defer phased_commands.deinit(self.allocator);
+        var phased_commands_own_items = true;
+        errdefer if (phased_commands_own_items) {
+            DisplayItem.freeItems(self.allocator, phased_commands.items);
+        };
+        try paintBlockTreeRecursive(&phased_commands, self, block);
+        const replacement = try phased_commands.toOwnedSlice(self.allocator);
+        phased_commands_own_items = false;
+        replaceRetainedPaintCache(
+            self.allocator,
+            &block.paint_cache,
+            replacement,
+            &block.paint_generation,
+        );
+        block.paint_dirty = false;
+        return;
+    }
+
     var commands = std.ArrayList(DisplayItem).empty;
     defer commands.deinit(self.allocator);
     var commands_own_items = true;
@@ -9501,11 +9658,145 @@ fn writeDisplayItemsDebug(writer: *std.Io.Writer, items: []const DisplayItem, in
     }
 }
 
-// Recursively paint a block's subtree into a command list, applying effects for each block
-fn paintBlockTreeRecursive(commands: *std.ArrayList(DisplayItem), self: *Layout, block: *BlockLayout) !void {
+/// Append the paint commands that belong after a block background but before
+/// its descendant subtrees. This is deliberately separate from backgrounds so
+/// a simple block can participate in the CSS float paint phases below.
+fn appendBlockOwnPaintContent(
+    commands: *std.ArrayList(DisplayItem),
+    self: *Layout,
+    block: *BlockLayout,
+) !void {
+    try appendTableOfContentsHeader(self, commands, block);
+    for (block.display_list.items) |item| {
+        try appendClonedDisplayItem(self.allocator, commands, item);
+    }
+    try appendListMarker(self, commands, block);
+}
+
+/// Prepaint the background/border portions of a simple static subtree. A
+/// float is intentionally a boundary: it remains an atomic subtree in the
+/// float phase, with its effects and descendants preserved by the normal
+/// recursive painter.
+fn appendStaticFloatPhaseBackgrounds(
+    commands: *std.ArrayList(DisplayItem),
+    self: *Layout,
+    block: *BlockLayout,
+) !void {
+    if (!block.shouldPaint() or !isFloatPaintPhaseCandidate(block)) return;
+    try addBackgroundIfNeededToList(self, commands, block);
+    try block.refreshPaintOrder();
+    for (block.paint_order.items) |document_index| {
+        switch (block.children.items[document_index]) {
+            .block => |child| {
+                if (child.floatSide() == .none) {
+                    try appendStaticFloatPhaseBackgrounds(commands, self, child);
+                }
+            },
+            .line => {},
+        }
+    }
+}
+
+/// Paint the non-background portion of a simple static subtree. Its
+/// backgrounds were emitted before the sibling float, so this pass emits
+/// inline content and recursively retains atomic paint behavior for any
+/// unsupported nested subtree.
+fn appendStaticFloatPhaseContent(
+    commands: *std.ArrayList(DisplayItem),
+    self: *Layout,
+    block: *BlockLayout,
+) !void {
+    if (!block.shouldPaint()) return;
+    std.debug.assert(isFloatPaintPhaseCandidate(block));
+    const float_phases = usesFloatPaintPhases(block);
+    try block.refreshPaintOrder();
+    if (float_phases) {
+        for (block.paint_order.items) |document_index| {
+            switch (block.children.items[document_index]) {
+                .block => |child| if (child.floatSide() != .none) {
+                    try paintBlockTreeRecursive(commands, self, child);
+                },
+                .line => {},
+            }
+        }
+    }
+    try appendBlockOwnPaintContent(commands, self, block);
+    for (block.paint_order.items) |document_index| {
+        switch (block.children.items[document_index]) {
+            .block => |child| {
+                if (float_phases and child.floatSide() != .none) continue;
+                if (isFloatPaintPhaseCandidate(child)) {
+                    try appendStaticFloatPhaseContent(commands, self, child);
+                } else {
+                    try paintBlockTreeRecursive(commands, self, child);
+                }
+            },
+            .line => |line| try line.paintToList(commands, self),
+        }
+    }
+    try appendContentEditableCursor(self, commands, block);
+}
+
+/// Append a block's descendants in source order, except for a conservative
+/// direct-float context. In that case CSS paints simple normal-flow
+/// backgrounds first, then floating subtrees, then inline/content paint. The
+/// caller has already emitted the block's own background.
+fn appendBlockPaintContents(
+    commands: *std.ArrayList(DisplayItem),
+    self: *Layout,
+    block: *BlockLayout,
+) !void {
+    const float_phases = usesFloatPaintPhases(block);
+    if (float_phases) {
+        try block.refreshPaintOrder();
+        for (block.paint_order.items) |document_index| {
+            switch (block.children.items[document_index]) {
+                .block => |child| if (child.floatSide() == .none) {
+                    std.debug.assert(isFloatPaintPhaseCandidate(child));
+                    try appendStaticFloatPhaseBackgrounds(commands, self, child);
+                },
+                .line => {},
+            }
+        }
+        for (block.paint_order.items) |document_index| {
+            switch (block.children.items[document_index]) {
+                .block => |child| if (child.floatSide() != .none) {
+                    try paintBlockTreeRecursive(commands, self, child);
+                },
+                .line => {},
+            }
+        }
+    }
+
+    try appendBlockOwnPaintContent(commands, self, block);
+    try block.refreshPaintOrder();
+    for (block.paint_order.items) |document_index| {
+        switch (block.children.items[document_index]) {
+            .block => |child| {
+                if (float_phases and child.floatSide() != .none) continue;
+                if (float_phases) {
+                    std.debug.assert(isFloatPaintPhaseCandidate(child));
+                    try appendStaticFloatPhaseContent(commands, self, child);
+                } else {
+                    try paintBlockTreeRecursive(commands, self, child);
+                }
+            },
+            .line => |line| try line.paintToList(commands, self),
+        }
+    }
+    try appendContentEditableCursor(self, commands, block);
+}
+
+// Recursively paint a block's subtree into a command list, applying effects
+// for each atomic block. Float-phase candidates deliberately bypass only
+// their own empty effect wrapper; every other subtree follows this path.
+fn paintBlockTreeRecursive(
+    commands: *std.ArrayList(DisplayItem),
+    self: *Layout,
+    block: *BlockLayout,
+) anyerror!void {
     if (!block.shouldPaint()) return;
 
-    // Collect this block's own commands
     var block_commands = std.ArrayList(DisplayItem).empty;
     defer block_commands.deinit(self.allocator);
     var block_commands_own_items = true;
@@ -9513,28 +9804,9 @@ fn paintBlockTreeRecursive(commands: *std.ArrayList(DisplayItem), self: *Layout,
         DisplayItem.freeItems(self.allocator, block_commands.items);
     };
 
-    // Add background/borders for this block
     try addBackgroundIfNeededToList(self, &block_commands, block);
     const content_start = block_commands.items.len;
-    try appendTableOfContentsHeader(self, &block_commands, block);
-
-    // Add display items (from text, etc.)
-    for (block.display_list.items) |item| {
-        try appendClonedDisplayItem(self.allocator, &block_commands, item);
-    }
-    try appendListMarker(self, &block_commands, block);
-
-    // Recursively paint children - collect their commands in stable stack
-    // order without mutating their geometry/DOM order.
-    try block.refreshPaintOrder();
-    for (block.paint_order.items) |document_index| {
-        switch (block.children.items[document_index]) {
-            .block => |b| try paintBlockTreeRecursive(&block_commands, self, b),
-            .line => |l| try l.paintToList(&block_commands, self),
-        }
-    }
-
-    try appendContentEditableCursor(self, &block_commands, block);
+    try appendBlockPaintContents(&block_commands, self, block);
     try applyElementScroll(block, &block_commands, content_start);
 
     const owned_commands = try block_commands.toOwnedSlice(self.allocator);

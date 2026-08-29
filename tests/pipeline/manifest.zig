@@ -73,4 +73,16 @@ pub const cases = [_]Case{
         .fixture = "tests/pipeline/table-format.html",
         .golden = "tests/golden/pipeline/table-format.display-list.txt",
     },
+    .{
+        .name = "float-paint-phases-layout",
+        .mode = .layout,
+        .fixture = "tests/pipeline/float-paint-phases.html",
+        .golden = "tests/golden/pipeline/float-paint-phases.layout.txt",
+    },
+    .{
+        .name = "float-paint-phases-display-list",
+        .mode = .display_list,
+        .fixture = "tests/pipeline/float-paint-phases.html",
+        .golden = "tests/golden/pipeline/float-paint-phases.display-list.txt",
+    },
 };

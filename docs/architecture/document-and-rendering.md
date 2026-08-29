@@ -204,7 +204,11 @@ Important geometry contracts:
   this context.
 - Float exclusion belongs to the nearest block formatting-context owner.
   Pointer-free float records are rebuilt when that owner lays out; only the
-  owner includes floats in auto height.
+  owner includes floats in auto height. Ordinary normal-flow block border
+  boxes retain their containing-block geometry beneath external floats; only
+  their inline line ranges are excluded. Floats themselves and bounded
+  formatting contexts (currently non-visible overflow and `display: table`)
+  avoid the external float area as whole boxes.
 - Relative position preserves the flow slot and stores a separate visual
   offset. Absolute blocks use the containing block's content box, have no
   in-flow predecessor, and do not extend normal height. Fixed blocks use the
@@ -267,6 +271,14 @@ Document, block, line, and text layout objects own `paint_cache` lists and paint
 dirty bits. A dirty leaf transactionally replaces its command buffer.
 Ancestors rebuild only shallow ordering/effect wrappers around stable
 `.cached_subtree` edges, allowing clean sibling buffers to survive.
+
+In a direct simple float sibling context, CSS ordering needs a small exception:
+effect-free static normal-flow backgrounds/borders paint before float subtrees,
+then their inline/content paint follows the floats. The owner may flatten that
+one dirty cache subtree to produce the phase-ordered commands, after first
+refreshing its child caches. Positioned, clipped, blended, transformed,
+scrolling, and table subtrees remain atomic and use the normal retained order;
+do not split an effect wrapper merely to improve float ordering.
 
 `.cached_subtree` is deliberately non-owning. It may appear only in a
 frame/layout-side list, points to a stable list field on a live layout object,

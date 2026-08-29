@@ -1,0 +1,44 @@
+<!doctype html>
+<style>
+  html, body {
+    display: block;
+    margin: 0;
+    padding: 0;
+  }
+
+  .stage {
+    display: block;
+    width: 120px;
+  }
+
+  .float {
+    display: block;
+    float: left;
+    width: 40px;
+    height: 24px;
+    background-color: #ff0000;
+  }
+
+  .under {
+    display: block;
+    height: 24px;
+    background-color: #0000ff;
+  }
+
+  .formatting-context {
+    display: block;
+    overflow: hidden;
+    height: 24px;
+    background-color: #00ff00;
+  }
+</style>
+
+<div class="stage">
+  <div class="float"></div>
+  <div class="under"></div>
+</div>
+
+<div class="stage">
+  <div class="float"></div>
+  <div class="formatting-context"></div>
+</div>

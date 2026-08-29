@@ -1,0 +1,56 @@
+<!--
+  How to verify: open this page and confirm the blue ordinary block spans
+  behind the red float while its text begins to the float's right. The green
+  overflow:hidden block below should instead begin beside its red float.
+-->
+<!doctype html>
+<style>
+  html, body {
+    margin: 0;
+    padding: 0;
+  }
+
+  .stage {
+    display: block;
+    width: 360px;
+    margin: 16px;
+    border: 2px solid #111111;
+  }
+
+  .float {
+    display: block;
+    float: left;
+    width: 100px;
+    height: 72px;
+    margin-right: 8px;
+    background-color: #ff9999;
+  }
+
+  .under-float {
+    display: block;
+    min-height: 72px;
+    background-color: #9999ff;
+  }
+
+  .formatting-context {
+    display: block;
+    overflow: hidden;
+    min-height: 72px;
+    background-color: #99ff99;
+  }
+</style>
+
+<div class="stage">
+  <div class="float">float</div>
+  <div class="under-float">
+    Ordinary block background and border paint below a sibling float, while
+    this text wraps in the remaining inline space.
+  </div>
+</div>
+
+<div class="stage">
+  <div class="float">float</div>
+  <div class="formatting-context">
+    An overflow formatting context avoids the external float as a whole.
+  </div>
+</div>
