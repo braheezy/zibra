@@ -303,10 +303,38 @@ pub fn resolveBoxEdges(
             .left = resolveEdge(style_map, "padding-left", context, effective_zoom, page_zoom, false),
         },
         .border = .{
-            .top = resolveBorderEdge(style_map, "border-top-width", font_size, effective_zoom, page_zoom),
-            .right = resolveBorderEdge(style_map, "border-right-width", font_size, effective_zoom, page_zoom),
-            .bottom = resolveBorderEdge(style_map, "border-bottom-width", font_size, effective_zoom, page_zoom),
-            .left = resolveBorderEdge(style_map, "border-left-width", font_size, effective_zoom, page_zoom),
+            .top = resolveBorderEdge(
+                style_map,
+                "border-top-width",
+                "border-top-style",
+                font_size,
+                effective_zoom,
+                page_zoom,
+            ),
+            .right = resolveBorderEdge(
+                style_map,
+                "border-right-width",
+                "border-right-style",
+                font_size,
+                effective_zoom,
+                page_zoom,
+            ),
+            .bottom = resolveBorderEdge(
+                style_map,
+                "border-bottom-width",
+                "border-bottom-style",
+                font_size,
+                effective_zoom,
+                page_zoom,
+            ),
+            .left = resolveBorderEdge(
+                style_map,
+                "border-left-width",
+                "border-left-style",
+                font_size,
+                effective_zoom,
+                page_zoom,
+            ),
         },
     };
 }
@@ -459,12 +487,20 @@ fn borderWidthCss(value: []const u8) ?f64 {
 
 fn resolveBorderEdge(
     style_map: *const parser.StyleMap,
-    property: []const u8,
+    width_property: []const u8,
+    style_property: []const u8,
     font_size: f64,
     effective_zoom: f32,
     page_zoom: f32,
 ) i32 {
-    const value = styleValue(style_map, property) orelse return 0;
+    // CSS border widths are *used* as zero when their style is none or
+    // hidden. Painting already skips those styles; resolving this here keeps
+    // box geometry, descendant containing blocks, and paint quadrilaterals in
+    // agreement. In particular, a `border-style: none solid` box must not
+    // gain phantom top and bottom space from its specified border width.
+    if (borderStyleSuppressesWidth(styleValue(style_map, style_property))) return 0;
+
+    const value = styleValue(style_map, width_property) orelse return 0;
     const parsed = if (std.mem.eql(u8, std.mem.trim(u8, value, " \t\r\n"), "0"))
         0.0
     else if (borderWidthCss(value)) |length|
@@ -476,6 +512,12 @@ fn resolveBorderEdge(
         0.0,
         @as(f64, @floatFromInt(std.math.maxInt(i32))),
     ));
+}
+
+fn borderStyleSuppressesWidth(value: ?[]const u8) bool {
+    const style = std.mem.trim(u8, value orelse return true, " \t\r\n\x0c");
+    return std.ascii.eqlIgnoreCase(style, "none") or
+        std.ascii.eqlIgnoreCase(style, "hidden");
 }
 
 fn styleValue(style_map: *const parser.StyleMap, property: []const u8) ?[]const u8 {
@@ -514,6 +556,25 @@ test "box model edges resolve relative lengths against the containing block" {
     try std.testing.expectEqual(@as(i32, 3), edges.padding.top);
     try std.testing.expectEqual(@as(i32, 4), edges.padding.right);
     try std.testing.expectEqual(@as(i32, 8), edges.border.top);
+}
+
+test "none and hidden border styles have no used width" {
+    const allocator = std.testing.allocator;
+    var html_parser = try parser.HTMLParser.init(
+        allocator,
+        "<div style='border-width:7px;border-style:none solid hidden dashed'></div>",
+    );
+    html_parser.use_implicit_tags = false;
+    defer html_parser.deinit(allocator);
+    var root = try html_parser.parse();
+    defer root.deinit(allocator);
+    try parser.style(allocator, &root, &.{});
+
+    const edges = resolveBoxEdges(&root.element.style.?, 16.0, 400.0, 1.0, 1.0);
+    try std.testing.expectEqual(@as(i32, 0), edges.border.top);
+    try std.testing.expectEqual(@as(i32, 7), edges.border.right);
+    try std.testing.expectEqual(@as(i32, 0), edges.border.bottom);
+    try std.testing.expectEqual(@as(i32, 7), edges.border.left);
 }
 
 test "horizontal auto margins survive edge resolution for block distribution" {

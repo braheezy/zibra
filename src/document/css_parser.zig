@@ -214,7 +214,7 @@ const FontShorthand = struct {
 
 fn isSupportedFontSize(font_size: []const u8) bool {
     const length = css_length.parse(font_size) orelse return false;
-    return length.unit == .px or length.unit == .em or length.unit == .percent;
+    return length.unit == .px or length.unit == .mm or length.unit == .em or length.unit == .percent;
 }
 
 fn isSupportedFontLineHeight(line_height: []const u8) bool {
@@ -373,7 +373,7 @@ fn parseDeclarationValue(raw_value: []const u8) ?Declaration {
 // normalized copy, so rule and inline-style values keep borrowing source.
 const supported_shorthand_names = [_][]const u8{
     "font",   "background", "margin",       "padding",       "border-width", "border-style", "border-color",
-    "border", "border-top", "border-right", "border-bottom", "border-left",
+    "border", "border-top", "border-right", "border-bottom", "border-left",  "list-style",
 };
 
 /// Return the canonical static property spelling for a supported CSS name.
@@ -431,6 +431,15 @@ fn isZIndex(raw_value: []const u8) bool {
     if (std.ascii.eqlIgnoreCase(trimmed, "auto")) return true;
     _ = std.fmt.parseInt(i32, trimmed, 10) catch return false;
     return true;
+}
+
+/// Zibra currently paints only the default square marker. Retain the CSS
+/// distinction needed to suppress that marker without claiming support for
+/// the full list-style grammar.
+fn isSupportedListStyleType(raw_value: []const u8) bool {
+    const style_type = std.mem.trim(u8, raw_value, " \t\r\n\x0c");
+    return std.ascii.eqlIgnoreCase(style_type, "disc") or
+        std.ascii.eqlIgnoreCase(style_type, "none");
 }
 
 fn splitValueTokens(raw_value: []const u8, tokens: *[4][]const u8) ?usize {
@@ -525,6 +534,12 @@ fn isValidLonghandValue(property: []const u8, raw_value: []const u8) bool {
     if (std.mem.eql(u8, property, "background-attachment")) return isBackgroundAttachment(raw_value);
     if (std.mem.eql(u8, property, "font-size")) return isNonnegativeLength(raw_value);
     if (std.mem.eql(u8, property, "line-height")) return isSupportedFontLineHeight(raw_value);
+    if (std.mem.eql(u8, property, "vertical-align")) {
+        const alignment = std.mem.trim(u8, raw_value, " \t\r\n\x0c");
+        return std.ascii.eqlIgnoreCase(alignment, "baseline") or
+            std.ascii.eqlIgnoreCase(alignment, "bottom");
+    }
+    if (std.mem.eql(u8, property, "list-style-type")) return isSupportedListStyleType(raw_value);
     if (std.mem.eql(u8, property, "content")) {
         const content_value = std.mem.trim(u8, raw_value, " \t\r\n\x0c");
         return std.ascii.eqlIgnoreCase(content_value, "normal") or
@@ -940,6 +955,15 @@ fn putDeclaration(
         if (try expandBorder(map, property, declaration.value, declaration)) return;
         return;
     }
+    if (std.ascii.eqlIgnoreCase(property, "list-style")) {
+        if (isCssWideKeyword(declaration.value) or isSupportedListStyleType(declaration.value)) {
+            try putLonghand(map, "list-style-type", .{
+                .value = declaration.value,
+                .important = declaration.important,
+            });
+        }
+        return;
+    }
     if (!isValidLonghandValue(property, declaration.value)) return;
     try putLonghand(map, property, declaration);
 }
@@ -1098,22 +1122,11 @@ fn mediaIdentifier(text: []const u8, cursor: *usize) ?[]const u8 {
 
 fn parseMediaPixelLength(raw_value: []const u8) ?f64 {
     const value_text = std.mem.trim(u8, raw_value, " \t\r\n");
-    if (value_text.len == 0) return null;
-
-    const number_text = if (std.ascii.eqlIgnoreCase(value_text, "0"))
-        value_text
-    else blk: {
-        if (value_text.len <= 2 or
-            !std.ascii.eqlIgnoreCase(value_text[value_text.len - 2 ..], "px"))
-        {
-            return null;
-        }
-        break :blk std.mem.trim(u8, value_text[0 .. value_text.len - 2], " \t\r\n");
+    const parsed_length = css_length.parse(value_text) orelse return null;
+    return switch (parsed_length.unit) {
+        .px, .mm => css_length.resolveLength(parsed_length, .{}),
+        .em, .percent => null,
     };
-    if (number_text.len == 0) return null;
-    const parsed_length = std.fmt.parseFloat(f64, number_text) catch return null;
-    if (!std.math.isFinite(parsed_length) or parsed_length < 0) return null;
-    return parsed_length;
 }
 
 fn mediaWidthsEqual(actual: f64, expected: f64) bool {
@@ -1643,12 +1656,6 @@ pub fn parseWithKeyframes(
     while (self.pos < self.string.len) {
         self.whitespace();
         if (self.pos >= self.string.len) break;
-        // A stray semicolon between qualified rules is parse noise, not the
-        // start of a selector. Ignoring it locally preserves the next rule.
-        if (self.string[self.pos] == ';') {
-            self.pos += 1;
-            continue;
-        }
 
         if (self.string[self.pos] == '@') {
             if (self.startsWithKeyframesRule()) {
@@ -1920,6 +1927,43 @@ test "width media queries match the exact CSS viewport width" {
         }
         try std.testing.expectEqual(expected.rule_count, rules.len);
     }
+}
+
+test "millimeter lengths remain valid CSS dimensions" {
+    const allocator = std.testing.allocator;
+    const css =
+        "div { max-height: 2mm; font: 25.4mm/1em sans-serif; }" ++
+        "span { top: -1mm; }";
+    var parser = try CSSParser.init(allocator, css, false);
+    defer parser.deinit(allocator);
+    const rules = try parser.parse(allocator);
+    defer {
+        for (rules) |*rule| rule.deinit(allocator);
+        allocator.free(rules);
+    }
+
+    try std.testing.expectEqual(@as(usize, 2), rules.len);
+    try std.testing.expectEqualStrings("2mm", rules[0].properties.get("max-height").?.value);
+    try std.testing.expectEqualStrings("25.4mm", rules[0].properties.get("font-size").?.value);
+    try std.testing.expectEqualStrings("-1mm", rules[1].properties.get("top").?.value);
+}
+
+test "vertical-align accepts bounded inline alignment values" {
+    const allocator = std.testing.allocator;
+    var parser = try CSSParser.init(
+        allocator,
+        "img { vertical-align: baseline; vertical-align: middle; vertical-align: bottom; }",
+        false,
+    );
+    defer parser.deinit(allocator);
+    const rules = try parser.parse(allocator);
+    defer {
+        for (rules) |*rule| rule.deinit(allocator);
+        allocator.free(rules);
+    }
+
+    try std.testing.expectEqual(@as(usize, 1), rules.len);
+    try std.testing.expectEqualStrings("bottom", rules[0].properties.get("vertical-align").?.value);
 }
 
 test "width and color media features compose and reject unsupported lengths" {

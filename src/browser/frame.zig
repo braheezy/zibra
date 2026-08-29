@@ -185,6 +185,11 @@ pub fn FrameType(
         /// after the style phase clears this boundary; teardown deliberately uses
         /// `lastValue()` to retire the previous owning layout pointer.
         document: ProtectedField(?*Layout.DocumentLayout),
+        /// Browser-chrome scrollbar choice from the last successful layout
+        /// generation. This deliberately survives a subsequent style
+        /// invalidation: presentation commits must never inspect live computed
+        /// style while `document` is dirty.
+        viewport_scrollbar_visible: bool = true,
         display_list: ?[]DisplayItem = null,
         content_height: i32 = 0,
         scroll: i32 = 0,
@@ -266,6 +271,20 @@ pub fn FrameType(
         /// style-field notifications decide whether its geometry is also dirty.
         pub fn markDocumentStyleDirty(self: *Frame) void {
             self.document.mark();
+        }
+
+        /// Publish the root viewport scrollbar choice after a successful layout
+        /// generation. The caller must have resolved the root's computed style
+        /// while the document phase was clean.
+        pub fn publishViewportScrollbarVisibility(self: *Frame, visible: bool) void {
+            self.viewport_scrollbar_visible = visible;
+        }
+
+        /// Return the last layout generation's browser-chrome scrollbar choice.
+        /// Unlike computed style, this scalar remains readable while a later
+        /// DOM or hover change has made the document's style phase dirty.
+        pub fn committedViewportScrollbarVisible(self: *const Frame) bool {
+            return self.viewport_scrollbar_visible;
         }
 
         pub fn updateHoveredNode(self: *Frame, node: ?*Node) bool {

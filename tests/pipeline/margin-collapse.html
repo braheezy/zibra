@@ -59,6 +59,29 @@
     height: 10px;
     background-color: #00ff00;
   }
+
+  .parent-stage {
+    display: block;
+    width: 120px;
+  }
+
+  .parent-lead {
+    display: block;
+    height: 10px;
+  }
+
+  .parent-collapse {
+    display: block;
+    margin-top: 30px;
+    background-color: #ff0000;
+  }
+
+  .parent-collapse > div {
+    display: block;
+    height: 10px;
+    margin-top: 8px;
+    background-color: #0000ff;
+  }
 </style>
 
 <div class="stage">
@@ -71,4 +94,9 @@
   <div class="float"></div>
   <div class="clear-empty"><div></div></div>
   <div class="clear"></div>
+</div>
+
+<div class="parent-stage">
+  <div class="parent-lead"></div>
+  <div class="parent-collapse"><div></div></div>
 </div>

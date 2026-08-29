@@ -17,6 +17,8 @@ const NamedColor = struct {
 const named_colors = [_]NamedColor{
     .{ .name = "transparent", .value = .{ .r = 0, .g = 0, .b = 0, .a = 0 } },
     .{ .name = "red", .value = .{ .r = 255, .g = 0, .b = 0 } },
+    .{ .name = "maroon", .value = .{ .r = 128, .g = 0, .b = 0 } },
+    .{ .name = "navy", .value = .{ .r = 0, .g = 0, .b = 128 } },
     .{ .name = "green", .value = .{ .r = 0, .g = 128, .b = 0 } },
     .{ .name = "blue", .value = .{ .r = 0, .g = 0, .b = 255 } },
     .{ .name = "yellow", .value = .{ .r = 255, .g = 255, .b = 0 } },
@@ -129,6 +131,8 @@ pub fn parse(input: []const u8) ?Color {
 
 test "CSS colors parse named and alpha-bearing values" {
     try std.testing.expectEqual(Color{ .r = 255, .g = 0, .b = 0 }, parse(" RED ").?);
+    try std.testing.expectEqual(Color{ .r = 128, .g = 0, .b = 0 }, parse("maroon").?);
+    try std.testing.expectEqual(Color{ .r = 0, .g = 0, .b = 128 }, parse("NAVY").?);
     try std.testing.expectEqual(Color{ .r = 0x12, .g = 0x34, .b = 0x56 }, parse("#123456").?);
     try std.testing.expectEqual(Color{ .r = 0xff, .g = 0xcc, .b = 0x00 }, parse("#FC0").?);
     try std.testing.expectEqual(Color{ .r = 0x11, .g = 0x22, .b = 0x33, .a = 0x44 }, parse("#1234").?);

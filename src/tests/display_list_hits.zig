@@ -373,6 +373,7 @@ test "simultaneous transform and opacity commit is draw-only" {
     test_browser.active_tab_committed_security = .none;
     test_browser.active_tab_scroll = 0;
     test_browser.active_tab_height = 100;
+    test_browser.active_tab_show_scrollbar = true;
     test_browser.active_tab_zoom = 1.0;
     test_browser.active_tab_prefers_dark = false;
     test_browser.needs_composite = false;

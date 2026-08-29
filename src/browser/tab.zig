@@ -1788,6 +1788,7 @@ pub fn runAnimationFrameForGeneration(
             .display_list = composed_list,
             .scroll = commit_scroll,
             .height = frame.content_height,
+            .show_scrollbar = committedViewportScrollbarVisible(frame),
             .zoom = self.accessibility.zoom,
             .prefers_dark = self.accessibility.prefers_dark,
             .composited_updates = self.composited_updates.items,
@@ -1796,6 +1797,14 @@ pub fn runAnimationFrameForGeneration(
         self.browser.commit(self, commit_data);
     }
     self.scroll_changed_in_tab = false;
+}
+
+/// Commit the last clean layout generation's browser-chrome scrollbar choice.
+/// A render may have just resolved hover and dirtied computed style again, so
+/// this boundary must not inspect the live DOM or StyleMap.
+fn committedViewportScrollbarVisible(frame: *const Frame) bool {
+    if (frame.current_node == null) return true;
+    return frame.committedViewportScrollbarVisible();
 }
 
 /// A root scroll is itself a visual commit even when layout, paint, and the
@@ -2285,7 +2294,10 @@ test "frame hover state follows the innermost element and its ancestors" {
 
 test "pending hover resolves a retained hit after the layout phase" {
     const allocator = std.testing.allocator;
-    var html_parser = try parser.HTMLParser.init(allocator, "<div><span>hit</span></div>");
+    var html_parser = try parser.HTMLParser.init(
+        allocator,
+        "<html style='overflow: hidden'><span>hit</span></html>",
+    );
     html_parser.use_implicit_tags = false;
     defer html_parser.deinit(allocator);
 
@@ -2308,6 +2320,11 @@ test "pending hover resolves a retained hit after the layout phase" {
     frame.scroll = 10;
     frame.current_node = try html_parser.parse();
     parser.fixParentPointers(&frame.current_node.?, null);
+    try parser.style(allocator, &frame.current_node.?, &.{});
+    frame.publishViewportScrollbarVisibility(
+        Layout.rootViewportScrollbarVisible(&frame.current_node.?),
+    );
+    try std.testing.expect(!frame.committedViewportScrollbarVisible());
     frame.publishStyledDocument();
     try std.testing.expect(!frame.styleNeeded());
     try std.testing.expect(frame.documentLayout() == null);
@@ -2331,6 +2348,11 @@ test "pending hover resolves a retained hit after the layout phase" {
     try std.testing.expect(span_node.element.is_hovered);
     try std.testing.expect(frame.current_node.?.element.is_hovered);
     try std.testing.expect(frame.styleNeeded());
+    try std.testing.expect(frame.current_node.?.element.style.?.getPtr("overflow").?.dirty);
+    // `updateHoveredNode` dirtied the root's computed style, including
+    // `overflow`. A same-frame commit must use the clean generation's scalar
+    // rather than call its ProtectedField getter.
+    try std.testing.expect(!committedViewportScrollbarVisible(&frame));
     try std.testing.expect(frame.document.lastValue().* == null);
 }
 

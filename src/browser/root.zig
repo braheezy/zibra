@@ -283,6 +283,10 @@ const RasterTaskContext = struct {
     // state distinct from draw-only tasks, whose page snapshot is omitted
     // because the worker cache should already be populated.
     active_tab_has_content: bool,
+    /// Root-frame CSS can suppress the browser viewport rail without
+    /// suppressing its scroll range. This scalar crosses the raster boundary;
+    /// the worker never reads DOM or computed style.
+    show_scrollbar: bool,
     scroll: i32,
     document_height: i32,
     zoom: f32,
@@ -421,6 +425,7 @@ pub const Browser = struct {
     active_tab_committed_security: NavigationSecurity = .none,
     active_tab_scroll: i32 = 0,
     active_tab_height: i32 = 0,
+    active_tab_show_scrollbar: bool = true,
     active_tab_zoom: f32 = 1.0,
     active_tab_prefers_dark: bool = false,
     active_tab_display_list: ?[]DisplayItem = null,
@@ -1025,6 +1030,7 @@ pub const Browser = struct {
             tab.requestActivationCommit();
             self.window_title_dirty = true;
             self.active_tab_scroll = 0;
+            self.active_tab_show_scrollbar = true;
             self.active_tab_zoom = tab.accessibility.zoom;
             self.active_tab_prefers_dark = tab.accessibility.prefers_dark;
             if (self.active_tab_url) |url| {
@@ -2638,6 +2644,7 @@ pub const Browser = struct {
         frame.resources_dirty = false;
         frame.content_height = 0;
         frame.scroll = 0;
+        frame.publishViewportScrollbarVisibility(true);
         frame.focus = null;
         frame.scroll_focus = null;
 
@@ -4071,10 +4078,12 @@ pub const Browser = struct {
         const saved_window_width = self.layout_engine.window_width;
         const saved_window_height = self.layout_engine.window_height;
         const saved_frame_css_zoom = self.layout_engine.frame_css_zoom;
+        const saved_viewport_scrollbar_reserved = self.layout_engine.viewport_scrollbar_reserved;
         defer {
             self.layout_engine.window_width = saved_window_width;
             self.layout_engine.window_height = saved_window_height;
             self.layout_engine.frame_css_zoom = saved_frame_css_zoom;
+            self.layout_engine.viewport_scrollbar_reserved = saved_viewport_scrollbar_reserved;
         }
         self.layout_engine.frame_css_zoom = frame.inherited_css_zoom;
         if (frame.parent != null and frame.viewport_width > 0) {
@@ -4086,6 +4095,16 @@ pub const Browser = struct {
             self.layout_engine.window_height = self.scalePxWithZoom(frame.viewport_height, frame.tab.accessibility.zoom);
         } else {
             self.layout_engine.window_height = frame.tab.tab_height;
+        }
+
+        // Root overflow is a viewport property, so it changes available inline
+        // geometry before the document's normal layout dependencies run. Keep
+        // ordinary element overflow inside layout/paint rather than treating it
+        // as browser chrome state. This is the sole live-style read for the
+        // retained commit scalar, while the Frame style phase is clean.
+        const viewport_scrollbar_visible = Layout.rootViewportScrollbarVisible(&frame.current_node.?);
+        if (self.layout_engine.setViewportScrollbarReservation(viewport_scrollbar_visible)) {
+            if (frame.documentLayout()) |document| document.mark();
         }
 
         const scheme_dark = self.layout_engine.resolveColorScheme("light dark");
@@ -4190,6 +4209,11 @@ pub const Browser = struct {
         frame.tab.buildAccessibilityTree() catch |err| {
             std.log.warn("Failed to build accessibility tree: {}", .{err});
         };
+
+        // Commit consumers can run after hover or DOM work has deliberately
+        // dirtied style again. Retain the result from this complete, clean
+        // layout generation rather than asking them to read computed overflow.
+        frame.publishViewportScrollbarVisibility(viewport_scrollbar_visible);
     }
 
     /// Rebuild retained composited layers for the committed page generation.
@@ -4272,6 +4296,7 @@ pub const Browser = struct {
             task.window_height,
             task.chrome_bottom,
             task.document_height,
+            task.show_scrollbar,
             task.scroll,
             task.zoom,
         );
@@ -4920,9 +4945,11 @@ pub const Browser = struct {
         window_height: i32,
         chrome_bottom: i32,
         document_height: i32,
+        show_scrollbar: bool,
         scroll: i32,
         zoom: f32,
     ) !void {
+        if (!show_scrollbar) return;
         const metrics = scroll_model.calculate(
             document_height,
             window_height - chrome_bottom,
@@ -5126,6 +5153,7 @@ pub const Browser = struct {
             .chrome_bottom = self.chrome.bottom,
             .active_tab = self.activeTab(),
             .active_tab_has_content = active_tab_has_content,
+            .show_scrollbar = self.active_tab_show_scrollbar,
             .scroll = self.active_tab_scroll,
             .document_height = self.active_tab_height,
             .zoom = zoom,
@@ -5306,6 +5334,7 @@ pub const Browser = struct {
 
         const previous_scroll = self.active_tab_scroll;
         const previous_height = self.active_tab_height;
+        const previous_show_scrollbar = self.active_tab_show_scrollbar;
         const previous_zoom = self.active_tab_zoom;
         var has_display_list_change = false;
         if (data.display_list) |list| {
@@ -5332,6 +5361,7 @@ pub const Browser = struct {
             self.active_tab_scroll = scroll;
         }
         self.active_tab_height = data.height;
+        self.active_tab_show_scrollbar = data.show_scrollbar;
         self.active_tab_zoom = data.zoom;
         self.active_tab_prefers_dark = data.prefers_dark;
 
@@ -5373,6 +5403,12 @@ pub const Browser = struct {
             previous_zoom != self.active_tab_zoom;
         if (geometry_changed) {
             self.invalidateInterestRegion();
+            self.needs_raster = true;
+            self.needs_draw = true;
+        } else if (previous_show_scrollbar != self.active_tab_show_scrollbar) {
+            // The worker owns the final rail pixels, so a visibility-only
+            // change still needs one fresh root surface but no page layout or
+            // interest-region rebuild.
             self.needs_raster = true;
             self.needs_draw = true;
         } else if (previous_scroll != self.active_tab_scroll) {
@@ -5641,6 +5677,7 @@ pub const Browser = struct {
     }
 
     fn drawScrollbarZ2d(self: *Browser) !void {
+        if (!self.active_tab_show_scrollbar) return;
         const metrics = scroll_model.calculate(
             self.active_tab_height,
             self.window_height - self.chrome.bottom,
@@ -6152,6 +6189,7 @@ pub const CommitData = struct {
     display_list: ?[]DisplayItem,
     scroll: ?i32,
     height: i32,
+    show_scrollbar: bool = true,
     zoom: f32,
     prefers_dark: bool,
     composited_updates: []const Tab.CompositedUpdate = &.{},

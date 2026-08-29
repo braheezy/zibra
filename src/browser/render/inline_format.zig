@@ -20,6 +20,17 @@ pub const LineAlignment = enum {
     end,
 };
 
+/// The invisible inline formatting "strut" contributed by a block container.
+///
+/// It carries the container's inherited font metrics and line-height leading
+/// even when a line contains only replaced content such as an image. Layout
+/// owns the font measurement; this module only performs the CSS-independent
+/// leading split.
+pub const LineStrut = struct {
+    ascent: i32,
+    descent: i32,
+};
+
 pub const Entity = struct {
     replacement: []const u8,
     len: usize,
@@ -122,6 +133,24 @@ pub fn resolveLineHeightCss(value: []const u8, font_size_css: f64) ?f64 {
     });
 }
 
+/// Split extra leading evenly around a font's baseline. An odd pixel of
+/// leading stays below the baseline so the resulting line height is exact.
+pub fn lineStrut(
+    font_ascent: i32,
+    font_descent: i32,
+    used_line_height: i32,
+) LineStrut {
+    const ascent = @max(font_ascent, 0);
+    const descent = @max(font_descent, 0);
+    const natural = ascent +| descent;
+    const leading = @max(used_line_height -| natural, 0);
+    const leading_above = @divTrunc(leading, 2);
+    return .{
+        .ascent = ascent +| leading_above,
+        .descent = descent +| (leading - leading_above),
+    };
+}
+
 /// Lex an HTML character reference into caller-provided UTF-8 storage.
 pub fn lexEntityAt(text: []const u8, pos: usize, buffer: *[4]u8) ?Entity {
     const reference = parser.characterReferenceAt(text, pos) orelse return null;
@@ -208,6 +237,17 @@ test "line-height resolves unitless and relative values" {
     try std.testing.expectApproxEqAbs(@as(f64, 24.0), resolveLineHeightCss("150%", 16.0).?, 0.000001);
     try std.testing.expectApproxEqAbs(@as(f64, 20.0), resolveLineHeightCss("1.25em", 16.0).?, 0.000001);
     try std.testing.expect(resolveLineHeightCss("-1", 16.0) == null);
+}
+
+test "inline strut splits line-height leading around the baseline" {
+    const strut = lineStrut(8, 2, 16);
+    try std.testing.expectEqual(@as(i32, 11), strut.ascent);
+    try std.testing.expectEqual(@as(i32, 5), strut.descent);
+
+    // A smaller declared line-height does not erase font metrics.
+    const natural = lineStrut(8, 2, 4);
+    try std.testing.expectEqual(@as(i32, 8), natural.ascent);
+    try std.testing.expectEqual(@as(i32, 2), natural.descent);
 }
 
 test "entities are decoded with the inline text rules" {

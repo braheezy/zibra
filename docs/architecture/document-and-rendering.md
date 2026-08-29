@@ -82,6 +82,9 @@ grammar before a declaration enters its per-rule cascade map, so an invalid
 later value cannot replace a valid earlier supported value. Values and
 canonical property names remain static or source-borrowed; no normalized
 stylesheet string may outlive the stylesheet generation that supplied it.
+At stylesheet top level, invalid qualified-rule starts recover through the
+matching block terminator; a stray semicolon is not silently discarded ahead
+of a later rule.
 
 ## Address-unstable Node storage
 
@@ -201,7 +204,9 @@ Important geometry contracts:
 
 - Block `x`, `y`, `width`, and `height` are used border-box values; CSS width
   and height are content-box inputs resolved before/after descendants as
-  appropriate.
+  appropriate. Per-side box edges are used values too: a `none` or `hidden`
+  border has zero geometry as well as no paint, while transparent solid
+  borders still reserve their resolved width.
 - Authored CSS `zoom` is multiplicative and layout-inducing. Fixed lengths,
   fonts, natural replaced sizes, radii, transforms, and filters incorporate
   authored zoom in page coordinates. Accessibility zoom is applied once at
@@ -217,6 +222,11 @@ Important geometry contracts:
   than using retained insertion. Inline tables, captions, columns, row
   groups, spans, collapse/spacing, and vertical alignment are not part of
   this context.
+- A `display: list-item` reserves the browser's bounded marker indent and
+  paints its square marker unless the inherited `list-style-type` is `none`.
+  The supported `list-style` shorthand currently maps the bounded `disc` and
+  `none` values to that longhand; it does not expand into a separate marker
+  layout object.
 - Float exclusion belongs to the nearest block formatting-context owner.
   Pointer-free float records are rebuilt when that owner lays out; only the
   owner includes floats in auto height. Ordinary normal-flow block border
@@ -227,10 +237,13 @@ Important geometry contracts:
 - Direct ordinary block children use a synchronous, pointer-free vertical
   margin cursor. Its pure strut retains the largest positive and most-negative
   adjoining values, allowing sibling chains and fully empty nested blocks to
-  collapse without reducing an intermediate chain to one lossy scalar. Borders,
-  padding, definite dimensions, formatting contexts, inline content, floats,
-  positioned children, and clearance are barriers. When clearance moves a
-  block, the incoming strut is consumed before the block is placed below the
+  collapse without reducing an intermediate chain to one lossy scalar. An
+  ordinary border/padding-free parent preflights its first ordinary child and
+  folds that child's top margin into the parent's leading strut before either
+  box is positioned; the child then begins at the parent's content edge.
+  Borders, padding, formatting contexts, inline content, floats, out-of-flow
+  positioned children, and child clearance are barriers. When clearance moves a block,
+  the complete leading strut is retained before the block is placed below the
   relevant float margin box.
 - Relative position preserves the flow slot and stores a separate visual
   offset. Absolute blocks use the containing block's content box, have no
@@ -242,17 +255,25 @@ Important geometry contracts:
   DOM scroll geometry, translates only its content, and clips that content.
   `overflow: hidden` uses the same bounded paint and hit-test clip without
   creating element-local scroll state; the present bounded implementation
-  clips to the layout block bounds.
-- A direct child context containing a float or positioned child uses the
+  clips to the layout block bounds. On the root `html` block it additionally
+  suppresses the viewport scrollbar gutter and rail without disabling the
+  frame's scroll range; layout resolves that boolean before page geometry and
+  commits it as scalar presentation state for browser/raster consumers. The
+  Frame retains the last successfully laid-out value, so a post-layout hover
+  or DOM invalidation never makes an animation commit read a dirty root style
+  map.
+- A paint-phase root containing a float or positioned descendant uses the
   bounded phase sequence: negative positioned, static block
   backgrounds/borders, floats, inline/content, positioned auto/zero, then
-  positive positioned. Signed z-index and DOM index order only the negative
-  and positive phases. Ordinary effect-free static blocks split between the
-  background and inline phases; inline wrappers, tables, clips, scrolling,
-  blends, filters, transforms, and positioned subtrees remain atomic. The
-  retained paint order records first paint contributions, while structural
-  fallback hit testing uses a separate committed content order; exact display
-  command hit testing remains authoritative for split overlap.
+  positive positioned. It collects participants through ordinary,
+  effect-free static wrappers, so a positioned or floating descendant joins
+  the nearest phase root instead of being trapped by a non-stacking wrapper.
+  Signed z-index and document index order only the negative and positive
+  phases. Inline wrappers, tables, clips, scrolling, blends, filters,
+  transforms, and positioned subtrees remain atomic. The retained paint order
+  records first paint contributions, while structural fallback hit testing
+  uses a separate committed content order; exact display command hit testing
+  remains authoritative for split overlap.
 - Normal inline text collapses ASCII whitespace across nested inline elements;
   `pre` retains line endings and spaces. Temporary embed and rich-button
   layouts must not subscribe short-lived fields to persistent style/layout
@@ -312,16 +333,17 @@ dirty bits. A dirty leaf transactionally replaces its command buffer.
 Ancestors rebuild only shallow ordering/effect wrappers around stable
 `.cached_subtree` edges, allowing clean sibling buffers to survive.
 
-When a direct child context contains a float or positioned subtree, it may
-flatten that one dirty cache subtree after refreshing child caches and emit the
-bounded phase sequence: negative positioned, simple static
-backgrounds/borders, floats, inline/content, positioned auto/zero, and
-positive positioned. Only ordinary effect-free static blocks split across the
+When a paint-phase root contains a float or positioned descendant, it may
+refresh child caches, synchronously collect phase participants through
+ordinary effect-free static wrappers, and emit the bounded phase sequence:
+negative positioned, simple static backgrounds/borders, floats,
+inline/content, positioned auto/zero, and positive positioned. The collected
+participant borrow ends when the cache rebuild ends; retained commands keep no
+new layout pointers. Only ordinary effect-free static blocks split across the
 background and inline phases. Positioned, clipped, blended, transformed,
 scrolling, table, and inline-wrapper subtrees remain atomic; do not split an
-effect wrapper merely to improve phase ordering. Nested positioned descendants
-remain inside their static parent rather than being hoisted across siblings
-until the engine grows full stacking-context ownership.
+effect wrapper merely to improve phase ordering. This is still bounded
+phase-root behavior, not full CSS stacking-context ownership.
 
 `.cached_subtree` is deliberately non-owning. It may appear only in a
 frame/layout-side list, points to a stable list field on a live layout object,
@@ -345,7 +367,10 @@ Solid borders paint as four convex quadrilaterals rather than overlapping
 rectangular side strips. Each shape derives its inner corners from all four
 resolved widths, so adjacent colors meet on a shared diagonal miter and a
 zero-content border box can form triangles. Bounds and painted hit testing use
-the quadrilateral rather than treating its bounding rectangle as painted.
+the quadrilateral rather than treating its bounding rectangle as painted. The
+software rasterizer uses hard device-pixel coverage for these integer-rounded
+quads: independently antialiasing adjacent source-over fills would otherwise
+leave translucent seams at mixed-color or transparent miter joins.
 
 Layout invalidation also dirties paint. Paint invalidation follows layout
 ancestry without dirtying geometry. An element-backed block forwards inherited

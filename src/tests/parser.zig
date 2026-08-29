@@ -1179,7 +1179,7 @@ test "background shorthand resets supported longhands in declaration order" {
     try std.testing.expect(declarations.get("background-attachment").?.important);
 }
 
-test "invalid background shorthands and stray semicolons preserve valid rules" {
+test "top-level semicolon recovery drops the following malformed qualified rule" {
     const allocator = std.testing.allocator;
     const css =
         ".parser { height: 1em; background: yellow; }" ++
@@ -1195,7 +1195,10 @@ test "invalid background shorthands and stray semicolons preserve valid rules" {
         allocator.free(rules);
     }
 
-    try std.testing.expectEqual(@as(usize, 4), rules.len);
+    // A top-level semicolon cannot begin a qualified rule. Recovery consumes
+    // the malformed qualified rule through its matching brace, so its later
+    // height declaration must not override the earlier valid one.
+    try std.testing.expectEqual(@as(usize, 3), rules.len);
     var html_parser = try HTMLParser.init(allocator, "<div class=parser></div>");
     html_parser.use_implicit_tags = false;
     defer html_parser.deinit(allocator);
@@ -1203,11 +1206,35 @@ test "invalid background shorthands and stray semicolons preserve valid rules" {
     defer root.deinit(allocator);
     try document_parser.style(allocator, &root, rules);
 
-    try std.testing.expectEqualStrings("3em", root.element.style.?.getPtr("height").?.get().*);
+    try std.testing.expectEqualStrings("1em", root.element.style.?.getPtr("height").?.get().*);
     try std.testing.expectEqualStrings(
         "yellow",
         root.element.style.?.getPtr("background-color").?.get().*,
     );
+}
+
+test "list-style none inherits marker suppression" {
+    const allocator = std.testing.allocator;
+    var css_parser = try CSSParser.init(allocator, "ul { list-style: none; }", false);
+    defer css_parser.deinit(allocator);
+    const rules = try css_parser.parse(allocator);
+    defer {
+        for (rules) |*rule| rule.deinit(allocator);
+        allocator.free(rules);
+    }
+
+    try std.testing.expectEqual(@as(usize, 1), rules.len);
+    try std.testing.expectEqualStrings("none", rules[0].properties.get("list-style-type").?.value);
+
+    var html_parser = try HTMLParser.init(allocator, "<ul><li>item</li></ul>");
+    html_parser.use_implicit_tags = false;
+    defer html_parser.deinit(allocator);
+    var root = try html_parser.parse();
+    defer root.deinit(allocator);
+    try document_parser.style(allocator, &root, rules);
+
+    const item = &root.element.children.items[0].element;
+    try std.testing.expectEqualStrings("none", item.style.?.getPtr("list-style-type").?.get().*);
 }
 
 test ":focus-visible matches the installed focus heuristic and recomputes styles" {

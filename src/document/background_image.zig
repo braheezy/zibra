@@ -65,6 +65,10 @@ fn parseComponent(input: []const u8) ?SizeComponent {
     if (std.ascii.eqlIgnoreCase(input, "auto")) return .auto;
     if (std.mem.eql(u8, input, "0")) return .{ .pixels = 0 };
     if (length.parsePixel(input)) |pixels| return .{ .pixels = pixels };
+    if (length.parse(input)) |parsed| switch (parsed.unit) {
+        .mm => return .{ .pixels = length.resolveLength(parsed, .{}) orelse return null },
+        .px, .em, .percent => {},
+    };
 
     if (input.len > 1 and input[input.len - 1] == '%') {
         const number = input[0 .. input.len - 1];
@@ -118,6 +122,7 @@ fn positionComponent(
     const parsed = length.parse(input) orelse return null;
     return switch (parsed.unit) {
         .px => length.toLayoutPixels(parsed.value * css_scale),
+        .mm => length.toLayoutPixels((length.resolveLength(parsed, .{}) orelse return null) * css_scale),
         .percent => @intFromFloat(@as(f64, @floatFromInt(available)) * parsed.value / 100.0),
         .em => null,
     };
@@ -257,6 +262,10 @@ test "background size resolves intrinsic explicit percentage contain and cover f
 
     const zoomed = resolveSize(parseSize("25px auto").?, 300, 200, 100, 50, 2.0);
     try std.testing.expectEqual(ResolvedSize{ .width = 50, .height = 25 }, zoomed);
+
+    const millimeters = resolveSize(parseSize("25.4mm auto").?, 300, 200, 100, 50, 1.0);
+    try std.testing.expectEqual(ResolvedSize{ .width = 96, .height = 48 }, millimeters);
+
     try std.testing.expect(parseSize("10em") == null);
     try std.testing.expect(parseSize("cover auto") == null);
 }
@@ -274,5 +283,9 @@ test "background repeat and position resolve the supported single layer" {
     try std.testing.expectEqual(
         ResolvedPosition{ .x = 50, .y = 25 },
         resolvePosition("50% 50%", 120, 60, 20, 10, 1.0),
+    );
+    try std.testing.expectEqual(
+        ResolvedPosition{ .x = 96, .y = 0 },
+        resolvePosition("25.4mm 0", 200, 40, 2, 2, 1.0),
     );
 }

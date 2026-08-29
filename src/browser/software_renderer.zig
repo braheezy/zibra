@@ -496,6 +496,63 @@ test "convex quad paint preserves mitered border corners" {
     );
 }
 
+test "border quads keep shared miter coverage opaque" {
+    const allocator = std.testing.allocator;
+    var bounds = DisplayCompositor.init(allocator);
+    defer bounds.deinit();
+    var renderer = Renderer.init(allocator, allocator, std.testing.io, &bounds);
+
+    var surface = try z2d.Surface.init(.image_surface_rgba, allocator, 32, 32);
+    defer surface.deinit(allocator);
+    const pixels = switch (surface) {
+        .image_surface_rgba => |*image_surface| image_surface.buf,
+        else => unreachable,
+    };
+    @memset(pixels, .{ .r = 0, .g = 0, .b = 0, .a = 0 });
+    var context = z2d.Context.init(std.testing.io, allocator, &surface);
+    defer context.deinit();
+
+    // These are the visible right and bottom sides of a zero-content border
+    // box. The transparent top and left sides are deliberately omitted, so a
+    // partially covered shared miter would leave a translucent seam.
+    try renderer.drawDisplayItemZ2dContext(&context, .{ .quad = .{
+        .x1 = 28,
+        .y1 = 4,
+        .x2 = 28,
+        .y2 = 24,
+        .x3 = 16,
+        .y3 = 14,
+        .x4 = 16,
+        .y4 = 14,
+        .color = .{ .r = 255, .g = 255, .b = 0, .a = 255 },
+    } }, 0, 1.0);
+    try renderer.drawDisplayItemZ2dContext(&context, .{ .quad = .{
+        .x1 = 28,
+        .y1 = 24,
+        .x2 = 4,
+        .y2 = 24,
+        .x3 = 16,
+        .y3 = 14,
+        .x4 = 16,
+        .y4 = 14,
+        .color = .{ .r = 0, .g = 0, .b = 0, .a = 255 },
+    } }, 0, 1.0);
+
+    try std.testing.expectEqual(.default, context.getAntiAliasingMode());
+    for (pixels) |pixel| {
+        try std.testing.expect(pixel.a == 0 or pixel.a == 255);
+    }
+    const width: usize = 32;
+    try std.testing.expectEqual(
+        z2d.pixel.RGBA{ .r = 255, .g = 255, .b = 0, .a = 255 },
+        pixels[15 * width + 24],
+    );
+    try std.testing.expectEqual(
+        z2d.pixel.RGBA{ .r = 0, .g = 0, .b = 0, .a = 255 },
+        pixels[21 * width + 14],
+    );
+}
+
 pub const Renderer = struct {
     /// Retained layer surfaces use the Browser allocator because their lifetime
     /// follows the Browser compositor generation.
@@ -552,6 +609,14 @@ pub const Renderer = struct {
         const x4 = self.scalePxWithZoom(quad.x4, zoom) + x_offset;
         const y4 = self.scalePxWithZoom(quad.y4, zoom) + y_offset;
 
+        // Every border point has already been rounded to device coordinates.
+        // MSAA paints adjacent mitered sides as independent fractional source-
+        // over fills, which leaks a translucent line at shared edges. Raster
+        // border quads with hard coverage so both colored and transparent
+        // neighboring sides meet without a seam.
+        const anti_aliasing_mode = context.getAntiAliasingMode();
+        context.setAntiAliasingMode(.none);
+        defer context.setAntiAliasingMode(anti_aliasing_mode);
         context.resetPath();
         context.setSource(.{ .opaque_pattern = .{ .pixel = .{ .rgba = quad.color.toZ2dRgba() } } });
         try context.moveTo(@floatFromInt(x1), @floatFromInt(y1));

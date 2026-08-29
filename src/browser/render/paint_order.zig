@@ -1,10 +1,11 @@
-//! Pointer-free CSS-like paint-phase ordering for direct layout children.
+//! Pointer-free CSS-like paint-phase ordering for layout participants.
 //!
-//! A layout owner supplies one `DirectChild` for each committed direct child,
-//! then retains the resulting permutation alongside that child array. This
-//! module neither observes layout/DOM pointers nor owns the permutation. It
-//! deliberately models only the direct-child phases needed by the bounded
-//! stacking context: negative positioned descendants, static block
+//! A layout owner supplies one `DirectChild` for each committed direct child
+//! or synchronously collected descendant, then retains the resulting
+//! permutation beside its paint cache. This module neither observes
+//! layout/DOM pointers nor owns the permutation. It deliberately models only
+//! the bounded phases needed by the simplified stacking context: negative
+//! positioned descendants, static block
 //! backgrounds, floats, static inline content, positioned auto/zero, and
 //! positive positioned descendants.
 
@@ -28,7 +29,7 @@ pub const NormalFlow = enum {
     inline_content,
 };
 
-/// Pointer-free direct-child metadata collected by the layout owner.
+/// Pointer-free paint-participant metadata collected by the layout owner.
 ///
 /// `document_index` is the stable source-order position used for CSS ties;
 /// it is intentionally separate from the input slice index because a caller
@@ -43,7 +44,7 @@ pub const DirectChild = struct {
     z_index: ZIndex = .auto,
 };
 
-/// CSS-like direct-child paint phases, in forward paint order.
+/// CSS-like paint phases, in forward paint order.
 pub const Phase = enum(u3) {
     negative_positioned,
     block_background,

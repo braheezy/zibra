@@ -51,6 +51,7 @@ const FloatBox = box_model.FloatBox;
 const BoxModelEdges = box_model.BoxModelEdges;
 const EmbeddedBlockBox = box_model.EmbeddedBlockBox;
 const MarginStrut = margin_collapse.MarginStrut;
+const InlineStrut = inline_format.LineStrut;
 
 fn addPageBottomPadding(content_bottom_css: i32) i32 {
     const padded = @as(i64, @max(content_bottom_css, 0)) + v_offset;
@@ -227,8 +228,13 @@ fn isListItemElement(element: *const parser.Element) bool {
 fn usesListItemMarker(element: *const parser.Element) bool {
     if (!isListItemElement(element)) return false;
     const styles = if (element.style) |*style_map| style_map else return false;
-    const field = @constCast(styles).getPtr("display") orelse return false;
-    return isListItemDisplay(field.get().*);
+    const display = @constCast(styles).getPtr("display") orelse return false;
+    if (!isListItemDisplay(display.get().*)) return false;
+    const list_style_type = @constCast(styles).getPtr("list-style-type") orelse return true;
+    return !std.ascii.eqlIgnoreCase(
+        std.mem.trim(u8, list_style_type.get().*, " \t\r\n"),
+        "none",
+    );
 }
 
 fn isTableOfContentsElement(element: *const parser.Element) bool {
@@ -457,7 +463,7 @@ const EmbedLayout = struct {
         node_ptr: ?*Node,
         payload: LineItemPayload,
     ) !void {
-        return self.appendInlineWithPolicy(engine, line_buffer, node_ptr, payload, false);
+        return self.appendInlineWithPolicy(engine, line_buffer, node_ptr, payload, false, .baseline);
     }
 
     /// Unloaded images can reserve just one authored axis. Retaining that
@@ -469,8 +475,16 @@ const EmbedLayout = struct {
         line_buffer: *std.ArrayList(LineItem),
         node_ptr: ?*Node,
         payload: LineItemPayload,
+        vertical_align: VerticalAlign,
     ) !void {
-        return self.appendInlineWithPolicy(engine, line_buffer, node_ptr, payload, true);
+        return self.appendInlineWithPolicy(
+            engine,
+            line_buffer,
+            node_ptr,
+            payload,
+            true,
+            vertical_align,
+        );
     }
 
     fn appendInlineWithPolicy(
@@ -480,6 +494,7 @@ const EmbedLayout = struct {
         node_ptr: ?*Node,
         payload: LineItemPayload,
         allow_single_zero_axis: bool,
+        vertical_align: VerticalAlign,
     ) !void {
         const width_value = self.width.get().*;
         const height_value = self.height.get().*;
@@ -505,6 +520,7 @@ const EmbedLayout = struct {
             )),
             .width = width_value,
             .height = height_value,
+            .vertical_align = vertical_align,
             .node_ptr = node_ptr,
             .payload = payload,
         });
@@ -925,6 +941,14 @@ const LineItemPayload = union(enum) {
     }
 };
 
+/// The bounded inline alignment modes retained on replaced line items.
+/// Full `vertical-align` needs inline-box construction, but baseline and
+/// bottom cover normal replaced content without changing glyph layout.
+const VerticalAlign = enum {
+    baseline,
+    bottom,
+};
+
 const LineItem = struct {
     x: i32,
     hit_offset_x: i32,
@@ -937,6 +961,7 @@ const LineItem = struct {
     line_height: i32,
     width: i32,
     height: i32,
+    vertical_align: VerticalAlign = .baseline,
     /// Pointer to the DOM node that produced this item (if available)
     node_ptr: ?*Node,
     payload: LineItemPayload,
@@ -1306,12 +1331,13 @@ test "computed display classifies block children" {
     try std.testing.expect(!isBlockDisplay("unsupported"));
 }
 
-test "unitless zero dimensions preserve border-only block geometry" {
+test "used border styles control border-only block geometry" {
     const allocator = std.testing.allocator;
     var html_parser = try parser.HTMLParser.init(
         allocator,
         "<html style='display:block'><body style='display:block;margin:0'>" ++
             "<div id=shape style='display:block;width:0;height:0;border-style:solid;border-width:10px 20px'></div>" ++
+            "<div id=side-only style='display:block;width:0;height:0;border-style:none solid;border-width:10px 20px'></div>" ++
             "</body></html>",
     );
     html_parser.use_implicit_tags = false;
@@ -1336,10 +1362,12 @@ test "unitless zero dimensions preserve border-only block geometry" {
     defer nodes.deinit(allocator);
     try parser.treeToList(allocator, &root_node, &nodes);
     var shape_node: ?*Node = null;
+    var side_only_node: ?*Node = null;
     for (nodes.items) |node| switch (node.*) {
         .element => |*element| {
             const id = (element.attributes orelse continue).get("id") orelse continue;
             if (std.mem.eql(u8, id, "shape")) shape_node = node;
+            if (std.mem.eql(u8, id, "side-only")) side_only_node = node;
         },
         .text => {},
     };
@@ -1349,6 +1377,57 @@ test "unitless zero dimensions preserve border-only block geometry" {
     // contribute to the retained border-box dimensions.
     try std.testing.expectEqual(@as(i32, 40), shape.width.get().*);
     try std.testing.expectEqual(@as(i32, 20), shape.height.get().*);
+
+    const side_only: *BlockLayout = @ptrCast(@alignCast(side_only_node.?.element.layout_ptr.?));
+    // `none` does not merely suppress paint: it gives the horizontal sides a
+    // zero used width, while the solid left/right sides still form the box.
+    try std.testing.expectEqual(@as(i32, 40), side_only.width.get().*);
+    try std.testing.expectEqual(@as(i32, 0), side_only.height.get().*);
+}
+
+test "a block strut keeps nested small text at the parent line height" {
+    const allocator = std.testing.allocator;
+    var html_parser = try parser.HTMLParser.init(
+        allocator,
+        "<html style='display:block'><body style='display:block;margin:0'>" ++
+            "<div id=parent style='display:block;font:12px/12px sans-serif'>" ++
+            "<span style='font:2px/4px serif'>x</span></div>" ++
+            "</body></html>",
+    );
+    html_parser.use_implicit_tags = false;
+    defer html_parser.deinit(allocator);
+    var root_node = try html_parser.parse();
+    defer root_node.deinit(allocator);
+    parser.fixParentPointers(&root_node, null);
+    try parser.style(allocator, &root_node, &.{});
+
+    var environ = std.process.Environ.Map.init(allocator);
+    defer environ.deinit();
+    try environ.put("HOME", "/tmp");
+    const engine = try Layout.init(allocator, std.testing.io, &environ, 800, 600, false);
+    defer engine.deinit();
+    const document = try engine.buildDocument(&root_node);
+    defer {
+        document.deinit();
+        allocator.destroy(document);
+    }
+
+    var nodes = std.ArrayList(*Node).empty;
+    defer nodes.deinit(allocator);
+    try parser.treeToList(allocator, &root_node, &nodes);
+    var parent_node: ?*Node = null;
+    for (nodes.items) |node| switch (node.*) {
+        .element => |*element| {
+            const id = (element.attributes orelse continue).get("id") orelse continue;
+            if (std.mem.eql(u8, id, "parent")) parent_node = node;
+        },
+        .text => {},
+    };
+
+    const parent: *BlockLayout = @ptrCast(@alignCast(parent_node.?.element.layout_ptr.?));
+    // The child glyph uses a four-pixel line-height, but the containing
+    // block's invisible 12px strut still defines the line box.
+    try std.testing.expectEqual(@as(i32, 12), parent.height.get().*);
 }
 
 test "bounded tables normalize direct children into grid cells" {
@@ -1459,6 +1538,12 @@ test "list items reserve room for square markers" {
     const bounds = contentBoundsForNode(item, 13, 100, list_item_indent);
     try std.testing.expectEqual(@as(i32, 37), bounds.x);
     try std.testing.expectEqual(@as(i32, 76), bounds.width);
+
+    try setTestStyleValue(allocator, &item, "list-style-type", "none");
+    try std.testing.expect(!usesListItemMarker(&item.element));
+    const suppressed_bounds = contentBoundsForNode(item, 13, 100, list_item_indent);
+    try std.testing.expectEqual(@as(i32, 13), suppressed_bounds.x);
+    try std.testing.expectEqual(@as(i32, 100), suppressed_bounds.width);
 
     item.element.style.?.getPtr("display").?.set("block");
     try std.testing.expect(!usesListItemMarker(&item.element));
@@ -2077,6 +2162,101 @@ test "nested floats place and clear in a shared context after invalidation" {
     );
 }
 
+test "parent top margin collapses with its first ordinary child" {
+    const allocator = std.testing.allocator;
+    var html_parser = try parser.HTMLParser.init(
+        allocator,
+        "<html style='display:block'><body style='display:block;margin:0'>" ++
+            "<main style='display:block'>" ++
+            "<div id=lead style='display:block;height:10px'></div>" ++
+            "<div id=parent style='display:block;margin-top:60px'>" ++
+            "<div id=child style='display:block;height:24px;margin-top:3px;position:relative;bottom:-12px'></div>" ++
+            "</div>" ++
+            "<div id=padded style='display:block;margin-top:60px;padding-top:1px'>" ++
+            "<div id=padded-child style='display:block;height:10px;margin-top:3px'></div>" ++
+            "</div>" ++
+            "<div id=bfc style='display:block;margin-top:60px;overflow:hidden'>" ++
+            "<div id=bfc-child style='display:block;height:10px;margin-top:3px'></div>" ++
+            "</div>" ++
+            "<div id=clear-parent style='display:block;margin-top:60px'>" ++
+            "<div id=clear-child style='display:block;clear:both;height:10px;margin-top:3px'></div>" ++
+            "</div>" ++
+            "</main></body></html>",
+    );
+    html_parser.use_implicit_tags = false;
+    defer html_parser.deinit(allocator);
+    var root_node = try html_parser.parse();
+    defer root_node.deinit(allocator);
+    parser.fixParentPointers(&root_node, null);
+    try parser.style(allocator, &root_node, &.{});
+
+    var environ = std.process.Environ.Map.init(allocator);
+    defer environ.deinit();
+    try environ.put("HOME", "/tmp");
+    const engine = try Layout.init(allocator, std.testing.io, &environ, 800, 600, false);
+    defer engine.deinit();
+    const document = try engine.buildDocument(&root_node);
+    defer {
+        document.deinit();
+        allocator.destroy(document);
+    }
+
+    var nodes = std.ArrayList(*Node).empty;
+    defer nodes.deinit(allocator);
+    try parser.treeToList(allocator, &root_node, &nodes);
+    var lead_node: ?*Node = null;
+    var parent_node: ?*Node = null;
+    var child_node: ?*Node = null;
+    var padded_node: ?*Node = null;
+    var padded_child_node: ?*Node = null;
+    var bfc_node: ?*Node = null;
+    var bfc_child_node: ?*Node = null;
+    var clear_parent_node: ?*Node = null;
+    var clear_child_node: ?*Node = null;
+    for (nodes.items) |node| switch (node.*) {
+        .element => |*element| {
+            const id = (element.attributes orelse continue).get("id") orelse continue;
+            if (std.mem.eql(u8, id, "lead")) lead_node = node;
+            if (std.mem.eql(u8, id, "parent")) parent_node = node;
+            if (std.mem.eql(u8, id, "child")) child_node = node;
+            if (std.mem.eql(u8, id, "padded")) padded_node = node;
+            if (std.mem.eql(u8, id, "padded-child")) padded_child_node = node;
+            if (std.mem.eql(u8, id, "bfc")) bfc_node = node;
+            if (std.mem.eql(u8, id, "bfc-child")) bfc_child_node = node;
+            if (std.mem.eql(u8, id, "clear-parent")) clear_parent_node = node;
+            if (std.mem.eql(u8, id, "clear-child")) clear_child_node = node;
+        },
+        .text => {},
+    };
+
+    const lead: *BlockLayout = @ptrCast(@alignCast(lead_node.?.element.layout_ptr.?));
+    const parent: *BlockLayout = @ptrCast(@alignCast(parent_node.?.element.layout_ptr.?));
+    const child: *BlockLayout = @ptrCast(@alignCast(child_node.?.element.layout_ptr.?));
+    const padded: *BlockLayout = @ptrCast(@alignCast(padded_node.?.element.layout_ptr.?));
+    const padded_child: *BlockLayout = @ptrCast(@alignCast(padded_child_node.?.element.layout_ptr.?));
+    const bfc: *BlockLayout = @ptrCast(@alignCast(bfc_node.?.element.layout_ptr.?));
+    const bfc_child: *BlockLayout = @ptrCast(@alignCast(bfc_child_node.?.element.layout_ptr.?));
+    const clear_parent: *BlockLayout = @ptrCast(@alignCast(clear_parent_node.?.element.layout_ptr.?));
+    const clear_child: *BlockLayout = @ptrCast(@alignCast(clear_child_node.?.element.layout_ptr.?));
+
+    try std.testing.expectEqual(
+        lead.y.get().* + lead.height.get().* + 60,
+        parent.y.get().*,
+    );
+    try std.testing.expectEqual(parent.y.get().*, child.y.get().*);
+    try std.testing.expectEqual(padded.y.get().* + 4, padded_child.y.get().*);
+    try std.testing.expectEqual(bfc.y.get().* + 3, bfc_child.y.get().*);
+    try std.testing.expectEqual(clear_parent.y.get().* + 3, clear_child.y.get().*);
+
+    child_node.?.element.style.?.getPtr("margin-top").?.set("80px");
+    try document.layout(engine);
+    try std.testing.expectEqual(
+        lead.y.get().* + lead.height.get().* + 80,
+        parent.y.get().*,
+    );
+    try std.testing.expectEqual(parent.y.get().*, child.y.get().*);
+}
+
 test "float paint phases keep normal backgrounds below floats" {
     const allocator = std.testing.allocator;
     var html_parser = try parser.HTMLParser.init(
@@ -2209,6 +2389,62 @@ test "paint phases order positioned floats block backgrounds and inline content"
     try std.testing.expect(zero < positive);
 }
 
+test "paint phases hoist atomic descendants through static wrappers" {
+    const allocator = std.testing.allocator;
+    var html_parser = try parser.HTMLParser.init(
+        allocator,
+        "<html style='display:block'><body style='display:block;margin:0'>" ++
+            "<main style='display:block;position:relative;z-index:0;width:160px;height:48px'>" ++
+            "<section style='display:block;height:24px;background-color:#330000'>" ++
+            "<div style='display:block;position:absolute;z-index:-2;left:0;top:0;width:120px;height:20px;background-color:#110000'></div>" ++
+            "<div style='display:block;float:left;width:40px;height:20px;background-color:#220000'></div>" ++
+            "<div style='display:block;position:absolute;left:48px;top:0;width:24px;height:20px;background-color:#550000'></div>" ++
+            "<div style='display:block;position:absolute;z-index:3;left:72px;top:0;width:24px;height:20px;background-color:#770000'></div>" ++
+            "</section>" ++
+            "<aside style='display:block;height:24px;background-color:#440000'></aside>" ++
+            "</main></body></html>",
+    );
+    html_parser.use_implicit_tags = false;
+    defer html_parser.deinit(allocator);
+    var root_node = try html_parser.parse();
+    defer root_node.deinit(allocator);
+    parser.fixParentPointers(&root_node, null);
+    try parser.style(allocator, &root_node, &.{});
+
+    var environ = std.process.Environ.Map.init(allocator);
+    defer environ.deinit();
+    try environ.put("HOME", "/tmp");
+    const engine = try Layout.init(allocator, std.testing.io, &environ, 800, 600, false);
+    defer engine.deinit();
+    const document = try engine.buildDocument(&root_node);
+    defer {
+        document.deinit();
+        allocator.destroy(document);
+    }
+
+    const frame = try engine.paintDocument(document);
+    defer DisplayItem.freeList(allocator, frame);
+    var output = std.Io.Writer.Allocating.init(allocator);
+    defer output.deinit();
+    try writeDisplayListDebug(&output.writer, frame);
+    const display = output.written();
+    const negative = std.mem.indexOf(u8, display, "color=#110000ff").?;
+    const first_static_background = std.mem.indexOf(u8, display, "color=#330000ff").?;
+    const second_static_background = std.mem.indexOf(u8, display, "color=#440000ff").?;
+    const float = std.mem.indexOf(u8, display, "color=#220000ff").?;
+    const automatic = std.mem.indexOf(u8, display, "color=#550000ff").?;
+    const positive = std.mem.indexOf(u8, display, "color=#770000ff").?;
+
+    // All atomic descendants of the ordinary section belong to main's paint
+    // context, rather than being painted inside the section before its later
+    // static sibling. This is the nested shape Acid2 uses for eyes and mouth.
+    try std.testing.expect(negative < first_static_background);
+    try std.testing.expect(first_static_background < second_static_background);
+    try std.testing.expect(second_static_background < float);
+    try std.testing.expect(float < automatic);
+    try std.testing.expect(automatic < positive);
+}
+
 // Layout state
 allocator: std.mem.Allocator,
 // Font manager for handling fonts and glyphs
@@ -2236,6 +2472,14 @@ font_size_css: f64 = 16.0,
 /// Explicit CSS line-height in CSS pixels. A null value represents `normal`;
 /// unitless values are resolved against the current element's font size.
 line_height_css: ?f64 = null,
+/// Whether this browsing context reserves the browser's viewport scrollbar
+/// gutter. Root `overflow: hidden` suppresses the rail but intentionally does
+/// not disable the document's scroll range.
+viewport_scrollbar_reserved: bool = true,
+/// The block-level inline formatting strut. It has no paint payload: it only
+/// supplies the inherited baseline/leading for every line, as CSS requires.
+/// Descendant inline fonts can enlarge this strut but must not shrink it.
+inline_strut: ?InlineStrut = null,
 cursor_x: i32,
 cursor_y: i32,
 line_left: i32,
@@ -2301,6 +2545,7 @@ const InlineSnapshot = struct {
     size: i32,
     font_size_css: f64,
     line_height_css: ?f64,
+    inline_strut: ?InlineStrut,
     is_bold: bool,
     is_italic: bool,
     font_family: FontFamily,
@@ -2327,6 +2572,7 @@ fn snapshotInlineState(self: *const Layout) InlineSnapshot {
         .size = self.size,
         .font_size_css = self.font_size_css,
         .line_height_css = self.line_height_css,
+        .inline_strut = self.inline_strut,
         .is_bold = self.is_bold,
         .is_italic = self.is_italic,
         .font_family = self.font_family,
@@ -2353,6 +2599,7 @@ fn restoreInlineState(self: *Layout, snapshot: InlineSnapshot) void {
     self.size = snapshot.size;
     self.font_size_css = snapshot.font_size_css;
     self.line_height_css = snapshot.line_height_css;
+    self.inline_strut = snapshot.inline_strut;
     self.is_bold = snapshot.is_bold;
     self.is_italic = snapshot.is_italic;
     self.font_family = snapshot.font_family;
@@ -2418,6 +2665,29 @@ fn lineHeightForNatural(self: *const Layout, natural_height: i32) i32 {
     return natural + extra_leading;
 }
 
+/// Capture the block container's invisible inline formatting strut before
+/// descendants alter the active font. Image/control-only lines still inherit
+/// this baseline and leading even though they have no glyph of their own.
+fn captureInlineStrut(self: *Layout) !void {
+    const weight: FontWeight = if (self.is_bold) .Bold else .Normal;
+    const slant: FontSlant = if (self.is_italic) .Italic else .Roman;
+    const text_size = textSizeForSuperscript(self.size, self.is_superscript);
+    const reference = try self.font_manager.getStyledGlyph(
+        "M",
+        weight,
+        slant,
+        self.scaledFontSize(text_size),
+        self.activeFontFamily(),
+    );
+    const ascent = self.toLayoutPx(reference.ascent);
+    const descent = self.toLayoutPx(reference.descent);
+    self.inline_strut = inline_format.lineStrut(
+        ascent,
+        descent,
+        self.lineHeightForNatural(ascent + descent),
+    );
+}
+
 const resolveLineHeightCss = inline_format.resolveLineHeightCss;
 
 fn fontWeightIsBold(value: []const u8) bool {
@@ -2470,7 +2740,45 @@ fn layoutWindowHeight(self: *const Layout) i32 {
 }
 
 fn layoutScrollbarWidth(self: *const Layout) i32 {
-    return self.toLayoutPx(scrollbar_width);
+    return if (self.viewport_scrollbar_reserved)
+        self.toLayoutPx(scrollbar_width)
+    else
+        0;
+}
+
+/// Return whether the document root permits the browser's viewport scrollbar.
+/// This is deliberately root-only: element `overflow` remains a layout clip
+/// or element-local scroll container and must not affect browser chrome.
+pub fn rootViewportScrollbarVisible(root: *const Node) bool {
+    const element = switch (root.*) {
+        .element => |*value| value,
+        .text => return true,
+    };
+    if (!std.ascii.eqlIgnoreCase(element.tag, "html")) return true;
+    const styles = if (element.style) |*value| value else return true;
+    const overflow = std.mem.trim(
+        u8,
+        styleValue(styles, "overflow") orelse "visible",
+        " \t\r\n",
+    );
+    return !std.ascii.eqlIgnoreCase(overflow, "hidden");
+}
+
+/// Apply an already-resolved root viewport overflow choice before document
+/// geometry is consumed. The caller must have read computed style during a
+/// clean style phase. Returns true only when available inline width changed.
+pub fn setViewportScrollbarReservation(self: *Layout, visible: bool) bool {
+    const changed = self.viewport_scrollbar_reserved != visible;
+    self.viewport_scrollbar_reserved = visible;
+    self.line_right = self.layoutWindowWidth() - self.layoutScrollbarWidth() - h_offset;
+    return changed;
+}
+
+/// Resolve and apply root viewport overflow before document geometry is
+/// consumed. This convenience entry point is only valid during a clean style
+/// phase; commits should retain the resulting scalar instead of calling it.
+pub fn updateViewportScrollbarReservation(self: *Layout, root: *const Node) bool {
+    return self.setViewportScrollbarReservation(rootViewportScrollbarVisible(root));
 }
 
 const ColorSchemeSupport = struct {
@@ -2832,6 +3140,10 @@ fn handleImageElement(self: *Layout, node: Node, node_ptr: ?*Node, line_buffer: 
         break :blk null;
     } else null;
     if (style_map) |styles| registerReplacedSizeDependencies(self, styles);
+    const vertical_align = if (style_map) |styles|
+        verticalAlignForStyle(styles)
+    else
+        .baseline;
 
     const loaded_data = element.image_data;
     const image_data: ?parser.ImageData = if (loaded_data) |data|
@@ -2896,7 +3208,7 @@ fn handleImageElement(self: *Layout, node: Node, node_ptr: ?*Node, line_buffer: 
     );
     try image_layout.embed.appendImagePlaceholder(self, line_buffer, node_ptr, .{
         .image = image_layout,
-    });
+    }, vertical_align);
 }
 
 fn handleIframeElement(self: *Layout, node: Node, node_ptr: ?*Node, line_buffer: *std.ArrayList(LineItem)) !void {
@@ -2996,6 +3308,15 @@ fn styleValueRead(style_map: *const parser.StyleMap, property: []const u8, notif
     return null;
 }
 
+fn verticalAlignForStyle(style_map: *const parser.StyleMap) VerticalAlign {
+    const value = std.mem.trim(
+        u8,
+        styleValue(style_map, "vertical-align") orelse "baseline",
+        " \t\r\n",
+    );
+    return if (std.ascii.eqlIgnoreCase(value, "bottom")) .bottom else .baseline;
+}
+
 fn registerStyleDependencies(
     style_map: *const parser.StyleMap,
     target: *ProtectedField(i32),
@@ -3013,6 +3334,7 @@ fn registerReplacedSizeDependencies(self: *Layout, style_map: *const parser.Styl
     _ = styleValueRead(style_map, "width", target);
     _ = styleValueRead(style_map, "height", target);
     _ = styleValueRead(style_map, "aspect-ratio", target);
+    _ = styleValueRead(style_map, "vertical-align", target);
 }
 
 fn liveBlockElement(block: *const BlockLayout) ?*const parser.Element {
@@ -3096,14 +3418,17 @@ fn isStaticPaintPhaseCandidate(block: *const BlockLayout) bool {
     return !effects.needsBlendGroup() and effects.translation == null;
 }
 
-/// Return whether this direct-child context crosses one of the CSS-like paint
-/// phase boundaries. A static effectful child remains atomic in the inline
-/// content phase instead of disabling the whole context; positioned and float
-/// children are already atomic through `paintBlockTreeRecursive`.
+/// Return whether a static descendant introduces one of the CSS-like paint
+/// phase boundaries for this context. Ordinary, effect-free static wrappers do
+/// not form a stacking boundary of their own, so positioned and floating
+/// descendants beneath them participate in the nearest ancestor context.
+/// Effectful, clipped, table, and inline-wrapper subtrees remain atomic and
+/// deliberately stop this walk.
 fn usesPaintPhases(block: *const BlockLayout) bool {
     for (block.children.items) |child| switch (child) {
         .block => |nested| {
             if (nested.floatSide() != .none or nested.positionMode() != .static) return true;
+            if (isStaticPaintPhaseCandidate(nested) and usesPaintPhases(nested)) return true;
         },
         .line => {},
     };
@@ -3389,6 +3714,33 @@ fn trySoftHyphenBreak(self: *Layout, line_buffer: *std.ArrayList(LineItem)) !boo
     return true;
 }
 
+fn alignedLineItemY(
+    vertical_align: VerticalAlign,
+    is_superscript: bool,
+    line_top: i32,
+    line_box_height: i32,
+    baseline: i32,
+    baseline_ascent: i32,
+    item_ascent: i32,
+    item_height: i32,
+) i32 {
+    return switch (vertical_align) {
+        .bottom => line_top + @max(line_box_height - item_height, 0),
+        .baseline => if (is_superscript)
+            baseline - baseline_ascent
+        else
+            baseline - item_ascent,
+    };
+}
+
+test "bottom-aligned replaced inline uses the completed line box" {
+    const baseline_y = alignedLineItemY(.baseline, false, 10, 24, 30, 20, 24, 24);
+    const bottom_y = alignedLineItemY(.bottom, false, 10, 24, 30, 20, 24, 24);
+    try std.testing.expectEqual(@as(i32, 6), baseline_y);
+    try std.testing.expectEqual(@as(i32, 10), bottom_y);
+    try std.testing.expectEqual(@as(i32, 10), alignedLineItemY(.baseline, true, 10, 24, 30, 20, 7, 7));
+}
+
 fn flushLine(self: *Layout, line_buffer: *std.ArrayList(LineItem)) !void {
     // Nothing to flush? Return.
     if (line_buffer.items.len == 0) {
@@ -3429,6 +3781,10 @@ fn flushLine(self: *Layout, line_buffer: *std.ArrayList(LineItem)) !void {
 
     for (line_buffer.items) |item| {
         max_item_line_height = @max(max_item_line_height, item.line_height);
+        // `vertical-align: bottom` participates in line-box height but does
+        // not choose the shared text baseline. Its final position is known
+        // only after all baseline-aligned content has established that box.
+        if (item.vertical_align == .bottom) continue;
         const is_superscript = switch (item.payload) {
             .glyph => |glyph_payload| glyph_payload.glyph.is_superscript,
             .input => false,
@@ -3445,6 +3801,17 @@ fn flushLine(self: *Layout, line_buffer: *std.ArrayList(LineItem)) !void {
             max_normal_ascent = @max(max_normal_ascent, item.ascent);
             max_normal_descent = @max(max_normal_descent, item.descent);
         }
+    }
+
+    // A block container contributes an invisible inherited-font strut to
+    // every line. It establishes the parent baseline and leading even when
+    // the only visible glyph came from a smaller nested inline element.
+    // Replaced-only lines need the same strut for their otherwise missing
+    // baseline.
+    if (self.inline_strut) |strut| {
+        has_normal_item = true;
+        max_normal_ascent = @max(max_normal_ascent, strut.ascent);
+        max_normal_descent = @max(max_normal_descent, strut.descent);
     }
 
     // Normal glyphs share a baseline. Superscripts instead share the top of
@@ -3478,13 +3845,16 @@ fn flushLine(self: *Layout, line_buffer: *std.ArrayList(LineItem)) !void {
             .canvas => false,
             .iframe => false,
         };
-        if (is_superscript) {
-            // Position superscript so its top aligns with normal text top.
-            final_y = baseline - baseline_ascent;
-        } else {
-            // Normal baseline alignment
-            final_y = baseline - item.ascent;
-        }
+        final_y = alignedLineItemY(
+            item.vertical_align,
+            is_superscript,
+            line_top,
+            line_box_height,
+            baseline,
+            baseline_ascent,
+            item.ascent,
+            item.height,
+        );
 
         const bounds_x = item.x + item.hit_offset_x;
         const bounds_y = final_y + item.hit_offset_y;
@@ -4239,6 +4609,7 @@ pub const decodeTextForDisplay = inline_format.decodeTextForDisplay;
 
 // Update layoutSourceCode to format HTML source with tags in normal font and content in bold
 pub fn layoutSourceCode(self: *Layout, source: []const u8) ![]DisplayItem {
+    const original_inline_strut = self.inline_strut;
     self.current_display_target = &self.display_list;
     self.line_left = h_offset;
     self.line_right = self.layoutWindowWidth() - self.layoutScrollbarWidth() - h_offset;
@@ -4249,6 +4620,7 @@ pub fn layoutSourceCode(self: *Layout, source: []const u8) ![]DisplayItem {
     self.size = self.default_font_size;
     self.font_size_css = @floatFromInt(self.default_font_size);
     self.line_height_css = null;
+    self.inline_strut = null;
     self.css_small_caps = false;
     self.resetSoftHyphenWord();
 
@@ -4268,6 +4640,7 @@ pub fn layoutSourceCode(self: *Layout, source: []const u8) ![]DisplayItem {
     self.is_bold = false; // Start with normal weight
     self.line_height_css = null;
     self.css_small_caps = false;
+    try self.captureInlineStrut();
 
     var line_buffer = std.ArrayList(LineItem).empty;
     defer line_buffer.deinit(self.allocator);
@@ -4384,6 +4757,7 @@ pub fn layoutSourceCode(self: *Layout, source: []const u8) ![]DisplayItem {
     self.font_family = original_font_family;
     self.line_height_css = original_line_height_css;
     self.css_small_caps = original_css_small_caps;
+    self.inline_strut = original_inline_strut;
 
     // `cursor_y` already includes the top page padding. Keep matching bottom
     // whitespace so source documents use the same scroll contract as HTML.
@@ -6091,24 +6465,26 @@ const LayoutChild = union(enum) {
 /// the paint-order utility. Simple static blocks contribute their background
 /// early and their contents later; static atomic subtrees instead enter as
 /// inline content so their existing effect wrapper remains intact.
+fn layoutBlockPaintEntry(block: *BlockLayout, document_index: usize) paint_order.DirectChild {
+    const positioned = block.positionMode() != .static;
+    return .{
+        .document_index = document_index,
+        .normal_flow = if (positioned)
+            .block_background
+        else if (block.floatSide() != .none)
+            .float
+        else if (isStaticPaintPhaseCandidate(block))
+            .block_background
+        else
+            .inline_content,
+        .positioned = positioned,
+        .z_index = blockPaintZIndex(block),
+    };
+}
+
 fn layoutChildPaintEntry(child: LayoutChild, document_index: usize) paint_order.DirectChild {
     return switch (child) {
-        .block => |block| blk: {
-            const positioned = block.positionMode() != .static;
-            break :blk .{
-                .document_index = document_index,
-                .normal_flow = if (positioned)
-                    .block_background
-                else if (block.floatSide() != .none)
-                    .float
-                else if (isStaticPaintPhaseCandidate(block))
-                    .block_background
-                else
-                    .inline_content,
-                .positioned = positioned,
-                .z_index = blockPaintZIndex(block),
-            };
-        },
+        .block => |block| layoutBlockPaintEntry(block, document_index),
         .line => .{
             .document_index = document_index,
             .normal_flow = .inline_content,
@@ -6136,11 +6512,23 @@ const TableBox = struct {
 const NormalFlowPlacement = struct {
     origin_y: i32,
     preceding_margin: MarginStrut = .{},
+    /// The parent has already folded this child's top margin into its own
+    /// external margin strut. The child therefore starts at the parent's
+    /// content edge instead of consuming that same margin a second time.
+    collapse_parent_top_margin: bool = false,
 
     fn eql(self: NormalFlowPlacement, other: NormalFlowPlacement) bool {
         return self.origin_y == other.origin_y and
-            self.preceding_margin.eql(other.preceding_margin);
+            self.preceding_margin.eql(other.preceding_margin) and
+            self.collapse_parent_top_margin == other.collapse_parent_top_margin;
     }
+};
+
+/// A parent/first-child top-margin collapse planned before either child flow
+/// or paint begins. It owns only a scalar and a synchronous child borrow.
+const ParentTopMarginCollapse = struct {
+    child: *BlockLayout,
+    child_top_margin: i32,
 };
 
 /// The part of a direct child's vertical flow that its parent needs for the
@@ -6934,6 +7322,55 @@ const BlockLayout = struct {
         }) orelse 16.0;
     }
 
+    /// Return this box's authored `zoom` factor before composing it with the
+    /// containing block. Anonymous inline runs deliberately have no local
+    /// zoom; their containing layout object already represents that scope.
+    fn localCssZoom(self: *const BlockLayout) f32 {
+        if (self.inline_nodes != null or self.node_ptr == null) return 1.0;
+        const element = switch (self.node) {
+            .element => |*value| value,
+            .text => return 1.0,
+        };
+        const styles = element.style orelse return 1.0;
+        return parseCssZoom(styleValue(&styles, "zoom") orelse "1");
+    }
+
+    /// Calculate this layout box's effective zoom without publishing it to
+    /// the protected layout field. Parent-first margin-collapse preflight uses
+    /// this to resolve a child's current percentage or `em` margin before the
+    /// child's own layout call.
+    fn effectiveZoomFromParent(self: *const BlockLayout, parent_zoom: f32) f32 {
+        return self.effective_zoom_override orelse
+            combinedEffectiveZoom(parent_zoom, self.localCssZoom());
+    }
+
+    /// Resolve the current non-animated box edges for this layout box. The
+    /// value owns no DOM state and is safe to use for parent flow preflight as
+    /// well as this box's eventual published geometry.
+    fn resolvedBoxEdges(
+        self: *const BlockLayout,
+        containing_width_css: f64,
+        effective_zoom: f32,
+        page_zoom: f32,
+    ) BoxModelEdges {
+        if (self.embedded_box != null) {
+            return .{ .margin = .{}, .padding = .{}, .border = .{} };
+        }
+        return switch (self.node) {
+            .element => |*element| if (element.style) |*style_map|
+                resolveBoxEdges(
+                    style_map,
+                    self.computedFontSizeCss(),
+                    containing_width_css,
+                    effective_zoom,
+                    page_zoom,
+                )
+            else
+                .{ .margin = .{}, .padding = .{}, .border = .{} },
+            .text => .{ .margin = .{}, .padding = .{}, .border = .{} },
+        };
+    }
+
     fn updateScrollGeometry(
         self: *BlockLayout,
         specified_height: ?i32,
@@ -7248,6 +7685,68 @@ const BlockLayout = struct {
         return true;
     }
 
+    /// Whether this ordinary block has no top-side boundary separating its
+    /// external margin from a first in-flow child's top margin. This is kept
+    /// distinct from bottom and empty-block collapse: a specified height does
+    /// not itself stop top-margin collapse, while a table, float context, or
+    /// an inline run does.
+    fn canCollapseTopMarginWithFirstChild(
+        self: *BlockLayout,
+        effective_zoom: f32,
+        page_zoom: f32,
+    ) bool {
+        if (!self.isBlockContainer()) return false;
+        if (self.parent_block == null or self.inline_nodes != null or self.embedded_box != null) {
+            return false;
+        }
+        if (self.table_box != null or self.tableRole() != .ordinary) return false;
+        if (self.floatSide() != .none or isOutOfFlowPosition(self.positionMode())) return false;
+        if (blockAvoidsExternalFloats(self)) return false;
+        if (self.padding.top != 0 or self.border.top != 0) return false;
+        return tableOfContentsHeaderHeight(self.node, effective_zoom, page_zoom) == 0;
+    }
+
+    /// Identify the sole first-child case which can adjoin the parent's top
+    /// margin. The preflight is deliberately conservative around generated
+    /// boxes, formatting-context roots, and direct non-flow siblings: those
+    /// need richer CSS ordering rules than this block-flow cursor owns.
+    fn firstChildTopMarginCollapse(
+        self: *BlockLayout,
+        parent_content_width: i32,
+        effective_zoom: f32,
+        page_zoom: f32,
+    ) ?ParentTopMarginCollapse {
+        if (!self.canCollapseTopMarginWithFirstChild(effective_zoom, page_zoom)) return null;
+        if (self.children.items.len == 0) return null;
+        const first_child = self.children.items[0];
+        const child = switch (first_child) {
+            .block => |block| block,
+            .line => return null,
+        };
+        if (child.node_ptr == null or child.inline_nodes != null or child.embedded_box != null) {
+            return null;
+        }
+        if (!child.isBlockContainer()) return null;
+        if (child.table_box != null or child.tableRole() != .ordinary) return null;
+        if (child.floatSide() != .none or isOutOfFlowPosition(child.positionMode())) return null;
+        if (child.clearSide() != .none or blockAvoidsExternalFloats(child)) return null;
+
+        const containing_width_css = cssPixelsFromLayout(
+            parent_content_width,
+            effective_zoom,
+            page_zoom,
+        );
+        const child_edges = child.resolvedBoxEdges(
+            containing_width_css,
+            child.effectiveZoomFromParent(effective_zoom),
+            page_zoom,
+        );
+        return .{
+            .child = child,
+            .child_top_margin = child_edges.margin.top,
+        };
+    }
+
     fn positionMode(self: *const BlockLayout) PositionMode {
         return nodePositionMode(self.node, null);
     }
@@ -7457,16 +7956,7 @@ const BlockLayout = struct {
             self.document.zoom.read(&self.zoom, self.allocator).*
         else
             self.document.zoom.get().*;
-        const local_zoom = if (self.inline_nodes == null and self.node_ptr != null) local: {
-            const element = switch (self.node_ptr.?.*) {
-                .element => |*value| value,
-                .text => break :local 1.0,
-            };
-            const styles = if (element.style) |*value| value else break :local 1.0;
-            break :local parseCssZoom(styleValue(styles, "zoom") orelse "1");
-        } else 1.0;
-        const zoom_value = self.effective_zoom_override orelse
-            combinedEffectiveZoom(parent_zoom, local_zoom);
+        const zoom_value = self.effectiveZoomFromParent(parent_zoom);
         self.zoom.set(zoom_value);
 
         var parent_x = if (self.parent_block) |pb|
@@ -7523,19 +8013,11 @@ const BlockLayout = struct {
                 null;
         }
 
-        const edge_values = if (self.embedded_box == null) switch (self.node) {
-            .element => |*element| if (element.style) |*style_map|
-                resolveBoxEdges(
-                    style_map,
-                    self.computedFontSizeCss(),
-                    containing_width_css,
-                    zoom_value,
-                    engine.zoom(),
-                )
-            else
-                BoxModelEdges{ .margin = .{}, .padding = .{}, .border = .{} },
-            .text => BoxModelEdges{ .margin = .{}, .padding = .{}, .border = .{} },
-        } else BoxModelEdges{ .margin = .{}, .padding = .{}, .border = .{} };
+        const edge_values = self.resolvedBoxEdges(
+            containing_width_css,
+            zoom_value,
+            engine.zoom(),
+        );
         self.margin = edge_values.margin;
         self.padding = edge_values.padding;
         self.border = edge_values.border;
@@ -7704,10 +8186,51 @@ const BlockLayout = struct {
             ) orelse break :shrink null;
             break :shrink scaleCssPixel(css_width, zoom_value, engine.zoom());
         } else null;
+
+        var is_block = self.isBlockContainer();
+        if (self.node == .element) {
+            const element = &self.node.element;
+            const tag = element.tag;
+            if (std.ascii.eqlIgnoreCase(tag, "input") or
+                (std.ascii.eqlIgnoreCase(tag, "button") and !self.rich_button_root) or
+                elementUsesImageLayout(element) or
+                std.ascii.eqlIgnoreCase(tag, "canvas") or
+                std.ascii.eqlIgnoreCase(tag, "iframe"))
+            {
+                is_block = false;
+            }
+        }
+
+        // Parent/first-child top collapse changes the parent's border-top
+        // coordinate, so discover the direct child and resolve its current
+        // edge before either box's flow position is published. Ordinary
+        // blocks use `base_content_bounds` unchanged, which makes this width
+        // preview equal to the later used content width.
+        var parent_top_collapse: ?ParentTopMarginCollapse = null;
+        if (is_block and normal_flow_placement != null and
+            !normal_flow_placement.?.collapse_parent_top_margin)
+        {
+            try self.rebuildChildrenIfNeeded();
+            const preflight_auto_content_width = @max(
+                base_content_bounds.width - self.margin.horizontal() - horizontal_insets,
+                0,
+            );
+            const preflight_content_width = specified_width orelse
+                constrainDimension(preflight_auto_content_width, min_width, max_width);
+            parent_top_collapse = self.firstChildTopMarginCollapse(
+                preflight_content_width,
+                zoom_value,
+                engine.zoom(),
+            );
+        }
+
         var layout_y = prev_y;
+        var leading_margin: ?MarginStrut = null;
         if (normal_flow_placement) |placement| {
             var adjoining = placement.preceding_margin;
-            adjoining.append(self.margin.top);
+            if (!placement.collapse_parent_top_margin) adjoining.append(self.margin.top);
+            if (parent_top_collapse) |collapse| adjoining.append(collapse.child_top_margin);
+            leading_margin = adjoining;
             layout_y = placement.origin_y +| adjoining.used();
         }
         var float_x: ?i32 = null;
@@ -7728,11 +8251,13 @@ const BlockLayout = struct {
                             // Clearance creates a real separator. If it moves
                             // this box, do not let an adjoining predecessor
                             // margin pull its border back through the cleared
-                            // float; retain only this box's own top margin.
+                            // float. Keep the complete leading strut, which
+                            // can include a first child's collapsed top
+                            // margin as well as this box's own margin.
                             if (cleared_y > layout_y) {
                                 layout_y = @max(
                                     cleared_y,
-                                    placement.origin_y +| self.margin.top,
+                                    placement.origin_y +| leading_margin.?.used(),
                                 );
                                 clearance_applied = true;
                             }
@@ -7868,20 +8393,6 @@ const BlockLayout = struct {
             if (self.node_ptr) |ptr| try engine.recordFragmentTargets(ptr, layout_y);
         }
 
-        var is_block = self.isBlockContainer();
-        if (self.node == .element) {
-            const element = &self.node.element;
-            const tag = element.tag;
-            if (std.ascii.eqlIgnoreCase(tag, "input") or
-                (std.ascii.eqlIgnoreCase(tag, "button") and !self.rich_button_root) or
-                elementUsesImageLayout(element) or
-                std.ascii.eqlIgnoreCase(tag, "canvas") or
-                std.ascii.eqlIgnoreCase(tag, "iframe"))
-            {
-                is_block = false;
-            }
-        }
-
         // Publish a definite block height before laying out descendants so a
         // percentage height can resolve against this containing block. Auto
         // heights remain unavailable until children have been measured.
@@ -7991,6 +8502,10 @@ const BlockLayout = struct {
                                 b.setNormalFlowPlacement(.{
                                     .origin_y = flow_cursor.cursor_y,
                                     .preceding_margin = flow_cursor.trailing_margin,
+                                    .collapse_parent_top_margin = if (parent_top_collapse) |collapse|
+                                        collapse.child == b
+                                    else
+                                        false,
                                 });
                             } else {
                                 b.clearNormalFlowPlacement();
@@ -9462,6 +9977,7 @@ fn layoutInlineBlock(self: *Layout, block: *BlockLayout, publish_geometry: bool)
     self.size = self.default_font_size;
     self.font_size_css = @floatFromInt(self.default_font_size);
     self.line_height_css = null;
+    self.inline_strut = null;
     self.is_bold = false;
     self.is_italic = false;
     self.font_family = .proportional;
@@ -9566,6 +10082,13 @@ fn layoutInlineBlock(self: *Layout, block: *BlockLayout, publish_geometry: bool)
         }
     }
 
+    // Inline wrappers may subsequently select a different font, but the
+    // block's own inherited metrics define the formatting strut for every
+    // line it creates.
+    if (block.inline_nodes != null) {
+        try self.captureInlineStrut();
+    }
+
     self.current_display_target = &block.display_list;
 
     var line_buffer = std.ArrayList(LineItem).empty;
@@ -9577,11 +10100,13 @@ fn layoutInlineBlock(self: *Layout, block: *BlockLayout, publish_geometry: bool)
         }
     } else switch (block.node) {
         .text => |t| {
+            try self.captureInlineStrut();
             try self.handleTextToken(t.text, &line_buffer, null);
         },
         .element => |e| {
             // Apply CSS styles for this block element
             try self.applyNodeStyles(e, &line_buffer, false);
+            try self.captureInlineStrut();
 
             // Handle br tag for line breaks
             if (std.mem.eql(u8, e.tag, "br")) {
@@ -9683,7 +10208,36 @@ test "root background color propagates to the canvas" {
     );
 }
 
+test "root overflow hidden removes the viewport scrollbar gutter" {
+    const allocator = std.testing.allocator;
+    var html_parser = try parser.HTMLParser.init(
+        allocator,
+        "<html style='display:block;overflow:hidden'><body style='display:block'>content</body></html>",
+    );
+    html_parser.use_implicit_tags = false;
+    defer html_parser.deinit(allocator);
+    var root_node = try html_parser.parse();
+    defer root_node.deinit(allocator);
+    parser.fixParentPointers(&root_node, null);
+    try parser.style(allocator, &root_node, &.{});
+
+    var environ = std.process.Environ.Map.init(allocator);
+    defer environ.deinit();
+    try environ.put("HOME", "/tmp");
+    const engine = try Layout.init(allocator, std.testing.io, &environ, 800, 600, false);
+    defer engine.deinit();
+    const document = try engine.buildDocument(&root_node);
+    defer {
+        document.deinit();
+        allocator.destroy(document);
+    }
+
+    try std.testing.expect(!rootViewportScrollbarVisible(&root_node));
+    try std.testing.expectEqual(@as(i32, 800 - (2 * h_offset)), document.width.get().*);
+}
+
 pub fn buildDocument(self: *Layout, root: *Node) !*DocumentLayout {
+    _ = self.updateViewportScrollbarReservation(root);
     self.color_scheme_dark = self.resolveColorScheme("light dark");
     self.document_color_scheme_dark = self.color_scheme_dark;
     const document = try DocumentLayout.init(self.allocator, root);
@@ -10202,7 +10756,7 @@ fn writeDisplayItemsDebug(writer: *std.Io.Writer, items: []const DisplayItem, in
 /// Append the paint commands that belong after a block background but before
 /// its descendant subtrees. This stays separate so a simple static block can
 /// contribute its background and its inline/content portions to different
-/// bounded direct-child paint phases.
+/// bounded paint phases.
 fn appendBlockOwnPaintContent(
     commands: *std.ArrayList(DisplayItem),
     self: *Layout,
@@ -10240,21 +10794,97 @@ fn appendStaticPaintPhaseBackgrounds(
     }
 }
 
-/// Paint all atomic direct children belonging to one phase. Positioned and
+/// One positioned or floating descendant that contributes to the nearest
+/// ancestor paint context. The arrays below borrow live layout boxes only for
+/// the synchronous command assembly pass; retained paint caches never store
+/// these pointers.
+const DescendantPaintParticipant = struct {
+    block: *BlockLayout,
+    entry: paint_order.DirectChild,
+};
+
+/// Collect atomic descendants without retaining them. CSS's normal-flow
+/// static boxes do not create stacking contexts, so an ordinary wrapper's
+/// positioned or floating descendants must be ordered alongside the wrapper's
+/// siblings. A static effect/table/inline-wrapper remains an atomic boundary
+/// and is deliberately not traversed here.
+const DescendantPaintParticipants = struct {
+    blocks: std.ArrayList(*BlockLayout) = .empty,
+    entries: std.ArrayList(paint_order.DirectChild) = .empty,
+    order: std.ArrayList(usize) = .empty,
+
+    fn deinit(self: *DescendantPaintParticipants, allocator: std.mem.Allocator) void {
+        self.blocks.deinit(allocator);
+        self.entries.deinit(allocator);
+        self.order.deinit(allocator);
+    }
+
+    fn append(
+        self: *DescendantPaintParticipants,
+        allocator: std.mem.Allocator,
+        block: *BlockLayout,
+        entry: paint_order.DirectChild,
+    ) !void {
+        // Reserve both parallel arrays before either is extended so an
+        // allocation failure cannot leave a partially published participant.
+        try self.blocks.ensureUnusedCapacity(allocator, 1);
+        try self.entries.ensureUnusedCapacity(allocator, 1);
+        self.blocks.appendAssumeCapacity(block);
+        self.entries.appendAssumeCapacity(entry);
+    }
+
+    fn collectFromStaticDescendants(
+        self: *DescendantPaintParticipants,
+        allocator: std.mem.Allocator,
+        context: *BlockLayout,
+        source_index: *usize,
+    ) !void {
+        for (context.children.items) |child| {
+            const document_index = source_index.*;
+            source_index.* +%= 1;
+            switch (child) {
+                .block => |nested| {
+                    const entry = layoutBlockPaintEntry(nested, document_index);
+                    const phase = paint_order.phaseFor(entry);
+                    if (phase == .negative_positioned or phase == .float or
+                        phase == .positioned_auto_or_zero or phase == .positive_positioned)
+                    {
+                        try self.append(allocator, nested, entry);
+                    } else if (isStaticPaintPhaseCandidate(nested)) {
+                        try self.collectFromStaticDescendants(allocator, nested, source_index);
+                    }
+                },
+                .line => {},
+            }
+        }
+    }
+
+    fn build(
+        self: *DescendantPaintParticipants,
+        allocator: std.mem.Allocator,
+        context: *BlockLayout,
+    ) !void {
+        var source_index: usize = 0;
+        try self.collectFromStaticDescendants(allocator, context, &source_index);
+        try self.order.ensureTotalCapacity(allocator, self.entries.items.len);
+        self.order.clearRetainingCapacity();
+        for (0..self.entries.items.len) |index| self.order.appendAssumeCapacity(index);
+        paint_order.fillPermutation(self.entries.items, self.order.items);
+    }
+};
+
+/// Paint all atomic descendants belonging to one phase. Positioned and
 /// floating blocks retain their own paint-effects wrapper, so this function
 /// never cracks a clip, blend, transform, scroll, or table subtree apart.
 fn appendAtomicPaintPhase(
     commands: *std.ArrayList(DisplayItem),
     self: *Layout,
-    block: *BlockLayout,
+    participants: *const DescendantPaintParticipants,
     phase: paint_order.Phase,
 ) !void {
-    for (block.paint_order.items) |document_index| {
-        if (paint_order.phaseFor(block.paint_entries.items[document_index]) != phase) continue;
-        switch (block.children.items[document_index]) {
-            .block => |child| try paintBlockTreeRecursive(commands, self, child),
-            .line => {},
-        }
+    for (participants.order.items) |participant_index| {
+        if (paint_order.phaseFor(participants.entries.items[participant_index]) != phase) continue;
+        try paintBlockTreeRecursive(commands, self, participants.blocks.items[participant_index]);
     }
 }
 
@@ -10273,7 +10903,7 @@ fn appendInlinePaintPhase(
             .block => |nested| {
                 if (nested.positionMode() != .static or nested.floatSide() != .none) continue;
                 if (isStaticPaintPhaseCandidate(nested)) {
-                    try appendStaticPaintPhaseContent(commands, self, nested);
+                    try appendFlattenedStaticPaintPhaseContent(commands, self, nested);
                 } else {
                     std.debug.assert(
                         paint_order.phaseFor(block.paint_entries.items[document_index]) == .inline_content,
@@ -10288,40 +10918,47 @@ fn appendInlinePaintPhase(
 
 /// Paint the non-background portion of a split static subtree. Its background
 /// has already been emitted by `appendStaticPaintPhaseBackgrounds`; nested
-/// direct phase boundaries remain ordered locally without hoisting their
-/// positioned descendants through unrelated ancestor stacking contexts.
-fn appendStaticPaintPhaseContent(
+/// positioned and floating descendants are omitted because their nearest
+/// enclosing context emits them in their own phase.
+fn appendFlattenedStaticPaintPhaseContent(
     commands: *std.ArrayList(DisplayItem),
     self: *Layout,
     block: *BlockLayout,
 ) !void {
     if (!block.shouldPaint()) return;
     std.debug.assert(isStaticPaintPhaseCandidate(block));
-    try appendBlockPaintContentsAfterBackground(commands, self, block, false);
+    try appendBlockOwnPaintContent(commands, self, block);
+    for (block.children.items) |child| switch (child) {
+        .block => |nested| {
+            if (nested.positionMode() != .static or nested.floatSide() != .none) continue;
+            if (isStaticPaintPhaseCandidate(nested)) {
+                try appendFlattenedStaticPaintPhaseContent(commands, self, nested);
+            } else {
+                // This is an effect/table/inline-wrapper boundary. Its own
+                // local context remains authoritative, including descendants
+                // that must not be hoisted across that boundary.
+                try paintBlockTreeRecursive(commands, self, nested);
+            }
+        },
+        .line => |line| try line.paintToList(commands, self),
+    };
+    try appendContentEditableCursor(self, commands, block);
 }
 
-/// Append the portion of a block after its own background has been emitted.
-/// In a phase context the caller selects whether static block backgrounds are
-/// still pending; a split static subtree passes `false` because its background
-/// was emitted by its ancestor's background pass.
+/// Append the portion of a paint context after its own background has been
+/// emitted. A context owns all positioned and floating descendants reachable
+/// through ordinary static wrappers; it leaves true atomic boundaries intact.
 fn appendBlockPaintContentsAfterBackground(
     commands: *std.ArrayList(DisplayItem),
     self: *Layout,
     block: *BlockLayout,
-    include_static_backgrounds: bool,
 ) anyerror!void {
     try block.refreshPaintOrder();
     if (!usesPaintPhases(block)) {
         try appendBlockOwnPaintContent(commands, self, block);
         for (block.paint_order.items) |document_index| {
             switch (block.children.items[document_index]) {
-                .block => |child| {
-                    if (!include_static_backgrounds and isStaticPaintPhaseCandidate(child)) {
-                        try appendStaticPaintPhaseContent(commands, self, child);
-                    } else {
-                        try paintBlockTreeRecursive(commands, self, child);
-                    }
-                },
+                .block => |child| try paintBlockTreeRecursive(commands, self, child),
                 .line => |line| try line.paintToList(commands, self),
             }
         }
@@ -10329,41 +10966,44 @@ fn appendBlockPaintContentsAfterBackground(
         return;
     }
 
-    // This is deliberately a bounded, direct-child stacking context:
-    // positioned descendants remain atomic inside a split static subtree.
-    try appendAtomicPaintPhase(commands, self, block, .negative_positioned);
+    var participants = DescendantPaintParticipants{};
+    defer participants.deinit(self.allocator);
+    try participants.build(self.allocator, block);
+    std.debug.assert(participants.blocks.items.len == participants.entries.items.len);
+    std.debug.assert(participants.entries.items.len > 0);
 
-    if (include_static_backgrounds) {
-        for (block.paint_order.items) |document_index| {
-            if (paint_order.phaseFor(block.paint_entries.items[document_index]) != .block_background) {
-                continue;
-            }
-            switch (block.children.items[document_index]) {
-                .block => |child| if (isStaticPaintPhaseCandidate(child)) {
-                    try appendStaticPaintPhaseBackgrounds(commands, self, child);
-                },
-                .line => {},
-            }
+    try appendAtomicPaintPhase(commands, self, &participants, .negative_positioned);
+
+    for (block.paint_order.items) |document_index| {
+        if (paint_order.phaseFor(block.paint_entries.items[document_index]) != .block_background) {
+            continue;
+        }
+        switch (block.children.items[document_index]) {
+            .block => |child| if (isStaticPaintPhaseCandidate(child)) {
+                try appendStaticPaintPhaseBackgrounds(commands, self, child);
+            },
+            .line => {},
         }
     }
 
-    try appendAtomicPaintPhase(commands, self, block, .float);
+    try appendAtomicPaintPhase(commands, self, &participants, .float);
     try appendInlinePaintPhase(commands, self, block);
-    try appendAtomicPaintPhase(commands, self, block, .positioned_auto_or_zero);
-    try appendAtomicPaintPhase(commands, self, block, .positive_positioned);
+    try appendAtomicPaintPhase(commands, self, &participants, .positioned_auto_or_zero);
+    try appendAtomicPaintPhase(commands, self, &participants, .positive_positioned);
     try appendContentEditableCursor(self, commands, block);
 }
 
 /// Append a block's descendants after its own background. This models the
-/// bounded direct-child phases: negative positioned, static block
-/// backgrounds, floats, inline content, positioned auto/zero, then positive
-/// positioned descendants.
+/// bounded paint phases: negative positioned, static block backgrounds,
+/// floats, inline content, positioned auto/zero, then positive positioned
+/// descendants. Ordinary static wrappers are flattened only while collecting
+/// phase participants; atomic boundaries retain their local paint subtree.
 fn appendBlockPaintContents(
     commands: *std.ArrayList(DisplayItem),
     self: *Layout,
     block: *BlockLayout,
 ) !void {
-    try appendBlockPaintContentsAfterBackground(commands, self, block, true);
+    try appendBlockPaintContentsAfterBackground(commands, self, block);
 }
 
 // Recursively paint a block's subtree into a command list, applying effects

@@ -4,6 +4,7 @@ const std = @import("std");
 
 pub const Unit = enum {
     px,
+    mm,
     em,
     percent,
 };
@@ -24,8 +25,8 @@ pub const ResolutionContext = struct {
     percentage_base: ?f64 = null,
 };
 
-/// Parse a finite, non-negative CSS length in the supported `px`, `em`, or
-/// percentage units. CSS permits a unitless zero anywhere a length is
+/// Parse a finite, non-negative CSS length in the supported `px`, `mm`, `em`,
+/// or percentage units. CSS permits a unitless zero anywhere a length is
 /// expected; it canonicalizes to `0px`. Other unitless numbers and `auto`
 /// remain invalid lengths.
 pub fn parse(input: []const u8) ?Length {
@@ -44,6 +45,8 @@ pub fn parse(input: []const u8) ?Length {
         .{ .unit = .percent, .number_end = value.len - 1 }
     else if (value.len >= 2 and std.ascii.eqlIgnoreCase(value[value.len - 2 ..], "px"))
         .{ .unit = .px, .number_end = value.len - 2 }
+    else if (value.len >= 2 and std.ascii.eqlIgnoreCase(value[value.len - 2 ..], "mm"))
+        .{ .unit = .mm, .number_end = value.len - 2 }
     else if (value.len >= 2 and std.ascii.eqlIgnoreCase(value[value.len - 2 ..], "em"))
         .{ .unit = .em, .number_end = value.len - 2 }
     else
@@ -62,6 +65,8 @@ pub fn resolveLength(length: Length, context: ResolutionContext) ?f64 {
     if (!std.math.isFinite(context.font_size) or context.font_size < 0) return null;
     return switch (length.unit) {
         .px => length.value,
+        // CSS defines one inch as 96 CSS pixels, and an inch as 25.4 mm.
+        .mm => length.value / 25.4 * 96.0,
         .em => length.value * context.font_size,
         .percent => blk: {
             const base = context.percentage_base orelse return null;
@@ -126,4 +131,20 @@ test "relative lengths resolve against explicit CSS context" {
     try std.testing.expect(parsePixel("2em") == null);
     try std.testing.expect(parse("1") == null);
     try std.testing.expect(parse("2EX") == null);
+}
+
+test "millimeter lengths use the CSS 96dpi absolute-unit conversion" {
+    const millimeters = parse("25.4MM").?;
+    try std.testing.expectEqual(Unit.mm, millimeters.unit);
+    try std.testing.expectApproxEqAbs(
+        @as(f64, 96.0),
+        resolveLength(millimeters, .{}).?,
+        0.000001,
+    );
+    try std.testing.expectApproxEqAbs(
+        @as(f64, 96.0 / 25.4),
+        resolve("1mm", .{}).?,
+        0.000001,
+    );
+    try std.testing.expect(parsePixel("1mm") == null);
 }
