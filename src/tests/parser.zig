@@ -916,6 +916,103 @@ test "selector sequences require every member and sum priorities" {
     try std.testing.expectError(error.InvalidSelector, invalid_parser.selector(allocator));
 }
 
+test "attribute selectors match presence exact and whitespace-token values" {
+    const allocator = std.testing.allocator;
+    const html =
+        "<blockquote class='first one'>" ++
+        "<address class='second two' data-ready></address>" ++
+        "</blockquote>";
+    const css =
+        "[class~=one].first.one { position: absolute; }" ++
+        "[class~=one][class~=first] [class=second\\ two][class=\"second two\"] {" ++
+        " background-color: yellow; }" ++
+        "[data-ready] { color: green; }" ++
+        "* address { width: 48px; }";
+
+    var html_parser = try HTMLParser.init(allocator, html);
+    html_parser.use_implicit_tags = false;
+    defer html_parser.deinit(allocator);
+    var root = try html_parser.parse();
+    defer root.deinit(allocator);
+
+    var css_parser = try CSSParser.init(allocator, css, false);
+    defer css_parser.deinit(allocator);
+    const rules = try css_parser.parse(allocator);
+    defer {
+        for (rules) |*rule| rule.deinit(allocator);
+        allocator.free(rules);
+    }
+
+    try std.testing.expectEqual(@as(usize, 4), rules.len);
+    try std.testing.expectEqual(@as(u32, 30), rules[0].cascadePriority());
+    try std.testing.expectEqual(@as(u32, 40), rules[1].cascadePriority());
+    try document_parser.style(allocator, &root, rules);
+
+    try std.testing.expectEqualStrings(
+        "absolute",
+        root.element.style.?.getPtr("position").?.get().*,
+    );
+    const child = &root.element.children.items[0].element;
+    try std.testing.expectEqualStrings(
+        "yellow",
+        child.style.?.getPtr("background-color").?.get().*,
+    );
+    try std.testing.expectEqualStrings("green", child.style.?.getPtr("color").?.get().*);
+    try std.testing.expectEqualStrings("48px", child.style.?.getPtr("width").?.get().*);
+
+    var invalid_parser = try CSSParser.init(allocator, "[class=second two]", false);
+    defer invalid_parser.deinit(allocator);
+    try std.testing.expectError(error.InvalidLiteral, invalid_parser.selector(allocator));
+}
+
+test "child and adjacent-sibling combinators match local structure" {
+    const allocator = std.testing.allocator;
+    const html =
+        "<section class=panel>" ++
+        "<p class=first></p><div class=middle></div><p class=last></p>" ++
+        "<div class=wrapper><p class=nested></p></div>" ++
+        "</section>";
+    const css =
+        ".panel > p { color: blue; }" ++
+        ".first + .middle + .last { background-color: green; }" ++
+        ".panel > .wrapper > p { font-weight: bold; }";
+
+    var html_parser = try HTMLParser.init(allocator, html);
+    html_parser.use_implicit_tags = false;
+    defer html_parser.deinit(allocator);
+    var root = try html_parser.parse();
+    defer root.deinit(allocator);
+
+    var css_parser = try CSSParser.init(allocator, css, false);
+    defer css_parser.deinit(allocator);
+    const rules = try css_parser.parse(allocator);
+    defer {
+        for (rules) |*rule| rule.deinit(allocator);
+        allocator.free(rules);
+    }
+    try std.testing.expectEqual(@as(usize, 3), rules.len);
+    switch (rules[1].selector) {
+        .complex => |complex| {
+            try std.testing.expectEqual(@as(usize, 3), complex.selectors.items.len);
+            try std.testing.expectEqual(@as(usize, 2), complex.combinators.items.len);
+        },
+        else => return error.TestExpectedComplexSelector,
+    }
+
+    try document_parser.style(allocator, &root, rules);
+    const first = &root.element.children.items[0].element;
+    const last = &root.element.children.items[2].element;
+    const nested = &root.element.children.items[3].element.children.items[0].element;
+    try std.testing.expectEqualStrings("blue", first.style.?.getPtr("color").?.get().*);
+    try std.testing.expectEqualStrings("blue", last.style.?.getPtr("color").?.get().*);
+    try std.testing.expectEqualStrings(
+        "green",
+        last.style.?.getPtr("background-color").?.get().*,
+    );
+    try std.testing.expectEqualStrings("black", nested.style.?.getPtr("color").?.get().*);
+    try std.testing.expectEqualStrings("bold", nested.style.?.getPtr("font-weight").?.get().*);
+}
+
 test "CSS comments ID selectors and background shorthand preserve cascade data" {
     const allocator = std.testing.allocator;
     const html =
@@ -954,6 +1051,9 @@ test "CSS comments ID selectors and background shorthand preserve cascade data" 
     try std.testing.expectEqualStrings("rgb(204, 0, 0)", bar.style.?.getPtr("background-color").?.get().*);
     try std.testing.expectEqualStrings("none", bar.style.?.getPtr("background-image").?.get().*);
     try std.testing.expectEqualStrings("auto", bar.style.?.getPtr("background-size").?.get().*);
+    try std.testing.expectEqualStrings("repeat", bar.style.?.getPtr("background-repeat").?.get().*);
+    try std.testing.expectEqualStrings("0 0", bar.style.?.getPtr("background-position").?.get().*);
+    try std.testing.expectEqualStrings("scroll", bar.style.?.getPtr("background-attachment").?.get().*);
     try std.testing.expectEqualStrings("white", bar.style.?.getPtr("color").?.get().*);
 
     const baz = &root.element.children.items[1].element;
@@ -966,7 +1066,7 @@ test "background shorthand resets supported longhands in declaration order" {
     var css_parser = try CSSParser.init(
         allocator,
         "background-color: red; background-image: url(old.ppm); " ++
-            "background: url(new.ppm) #FC0 / cover !important; " ++
+            "background: url(new.ppm) #FC0 repeat-x fixed 1px 0 / cover !important; " ++
             "background-color: blue",
         false,
     );
@@ -977,9 +1077,46 @@ test "background shorthand resets supported longhands in declaration order" {
     try std.testing.expectEqualStrings("#FC0", declarations.get("background-color").?.value);
     try std.testing.expectEqualStrings("url(new.ppm)", declarations.get("background-image").?.value);
     try std.testing.expectEqualStrings("cover", declarations.get("background-size").?.value);
+    try std.testing.expectEqualStrings("repeat-x", declarations.get("background-repeat").?.value);
+    try std.testing.expectEqualStrings("1px 0", declarations.get("background-position").?.value);
+    try std.testing.expectEqualStrings("fixed", declarations.get("background-attachment").?.value);
     try std.testing.expect(declarations.get("background-color").?.important);
     try std.testing.expect(declarations.get("background-image").?.important);
     try std.testing.expect(declarations.get("background-size").?.important);
+    try std.testing.expect(declarations.get("background-repeat").?.important);
+    try std.testing.expect(declarations.get("background-position").?.important);
+    try std.testing.expect(declarations.get("background-attachment").?.important);
+}
+
+test "invalid background shorthands and stray semicolons preserve valid rules" {
+    const allocator = std.testing.allocator;
+    const css =
+        ".parser { height: 1em; background: yellow; }" ++
+        ".parser { m\\argin: 2em; };" ++
+        ".parser { height: 3em; }" ++
+        ".parser { background: red pink; }";
+
+    var css_parser = try CSSParser.init(allocator, css, false);
+    defer css_parser.deinit(allocator);
+    const rules = try css_parser.parse(allocator);
+    defer {
+        for (rules) |*rule| rule.deinit(allocator);
+        allocator.free(rules);
+    }
+
+    try std.testing.expectEqual(@as(usize, 4), rules.len);
+    var html_parser = try HTMLParser.init(allocator, "<div class=parser></div>");
+    html_parser.use_implicit_tags = false;
+    defer html_parser.deinit(allocator);
+    var root = try html_parser.parse();
+    defer root.deinit(allocator);
+    try document_parser.style(allocator, &root, rules);
+
+    try std.testing.expectEqualStrings("3em", root.element.style.?.getPtr("height").?.get().*);
+    try std.testing.expectEqualStrings(
+        "yellow",
+        root.element.style.?.getPtr("background-color").?.get().*,
+    );
 }
 
 test ":focus-visible matches the installed focus heuristic and recomputes styles" {
@@ -1670,6 +1807,27 @@ test "float and clear survive style computation" {
     try std.testing.expectEqualStrings("left", left.getPtr("float").?.get().*);
     try std.testing.expectEqualStrings("right", right.getPtr("float").?.get().*);
     try std.testing.expectEqualStrings("both", after.getPtr("clear").?.get().*);
+}
+
+test "CSS-wide keywords resolve for inherited and non-inherited properties" {
+    const allocator = std.testing.allocator;
+    const html =
+        "<div style='float:right;width:30px;color:blue'>" ++
+        "<span style='float:inherit;width:inherit;color:unset;display:initial'></span>" ++
+        "</div>";
+
+    var html_parser = try HTMLParser.init(allocator, html);
+    html_parser.use_implicit_tags = false;
+    defer html_parser.deinit(allocator);
+    var root = try html_parser.parse();
+    defer root.deinit(allocator);
+    try document_parser.style(allocator, &root, &.{});
+
+    const child = root.element.children.items[0].element.style.?;
+    try std.testing.expectEqualStrings("right", child.getPtr("float").?.get().*);
+    try std.testing.expectEqualStrings("30px", child.getPtr("width").?.get().*);
+    try std.testing.expectEqualStrings("blue", child.getPtr("color").?.get().*);
+    try std.testing.expectEqualStrings("inline", child.getPtr("display").?.get().*);
 }
 
 test "font shorthand produces inherited computed longhands" {

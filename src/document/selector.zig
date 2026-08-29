@@ -9,14 +9,17 @@ const Node = parser.Node;
 
 /// CSS selector types.
 pub const Selector = union(enum) {
+    universal: UniversalSelector,
     tag: TagSelector,
     class: ClassSelector,
     id: IdSelector,
+    attribute: AttributeSelector,
     focus_visible: FocusVisibleSelector,
     hover: HoverSelector,
     sequence: SelectorSequence,
     has: HasSelector,
     descendant: DescendantSelector,
+    complex: ComplexSelector,
 
     /// Check if this selector matches the given node. `ancestor_chain` must be
     /// ordered from the root element to the node's immediate parent.
@@ -31,14 +34,17 @@ pub const Selector = union(enum) {
         context: MatchContext,
     ) bool {
         return switch (self) {
+            .universal => |universal| universal.matches(node),
             .tag => |t| t.matches(node),
             .class => |c| c.matches(node),
             .id => |id| id.matches(node),
+            .attribute => |attribute| attribute.matches(node),
             .focus_visible => |focus_visible| focus_visible.matches(node),
             .hover => |hover| hover.matches(node),
             .sequence => |s| s.matches(node),
             .has => |h| h.matches(node, context),
             .descendant => |d| d.matches(node, ancestor_chain, context),
+            .complex => |complex| complex.matches(node, ancestor_chain, context),
         };
     }
 
@@ -51,6 +57,7 @@ pub const Selector = union(enum) {
         switch (self) {
             .has => |has| try has.populateMatches(cache, root),
             .descendant => |descendant| try descendant.populateHasMatches(cache, root),
+            .complex => |complex| try complex.populateHasMatches(cache, root),
             else => {},
         }
     }
@@ -58,14 +65,17 @@ pub const Selector = union(enum) {
     /// Free allocated memory for this selector
     pub fn deinit(self: *Selector, allocator: std.mem.Allocator) void {
         switch (self.*) {
+            .universal => {},
             .tag => |*t| t.deinit(allocator),
             .class => |*c| c.deinit(allocator),
             .id => |*id| id.deinit(allocator),
+            .attribute => |*attribute| attribute.deinit(allocator),
             .focus_visible => {},
             .hover => {},
             .sequence => |*s| s.deinit(allocator),
             .has => |*h| h.deinit(allocator),
             .descendant => |*d| d.deinit(allocator),
+            .complex => |*complex| complex.deinit(allocator),
         }
     }
 
@@ -73,14 +83,17 @@ pub const Selector = union(enum) {
     /// Used for sorting rules - more specific selectors have higher priority
     pub fn priority(self: Selector) u32 {
         return switch (self) {
+            .universal => |universal| universal.priority(),
             .tag => |t| t.priority(),
             .class => |c| c.priority(),
             .id => |id| id.priority(),
+            .attribute => |attribute| attribute.priority(),
             .focus_visible => |focus_visible| focus_visible.priority(),
             .hover => |hover| hover.priority(),
             .sequence => |s| s.priority(),
             .has => |h| h.priority(),
             .descendant => |d| d.priority(),
+            .complex => |complex| complex.priority(),
         };
     }
 };
@@ -88,9 +101,11 @@ pub const Selector = union(enum) {
 /// A non-combinator selector. Descendant selectors store these directly so a
 /// selector chain is flat rather than a recursively nested binary tree.
 pub const SimpleSelector = union(enum) {
+    universal: UniversalSelector,
     tag: TagSelector,
     class: ClassSelector,
     id: IdSelector,
+    attribute: AttributeSelector,
     focus_visible: FocusVisibleSelector,
     hover: HoverSelector,
     sequence: SelectorSequence,
@@ -98,9 +113,11 @@ pub const SimpleSelector = union(enum) {
 
     pub fn intoSelector(self: SimpleSelector) Selector {
         return switch (self) {
+            .universal => |universal| .{ .universal = universal },
             .tag => |tag| .{ .tag = tag },
             .class => |class| .{ .class = class },
             .id => |id| .{ .id = id },
+            .attribute => |attribute| .{ .attribute = attribute },
             .focus_visible => |focus_visible| .{ .focus_visible = focus_visible },
             .hover => |hover| .{ .hover = hover },
             .sequence => |sequence| .{ .sequence = sequence },
@@ -110,9 +127,11 @@ pub const SimpleSelector = union(enum) {
 
     fn matches(self: SimpleSelector, node: *Node, context: MatchContext) bool {
         return switch (self) {
+            .universal => |universal| universal.matches(node),
             .tag => |tag| tag.matches(node),
             .class => |class| class.matches(node),
             .id => |id| id.matches(node),
+            .attribute => |attribute| attribute.matches(node),
             .focus_visible => |focus_visible| focus_visible.matches(node),
             .hover => |hover| hover.matches(node),
             .sequence => |sequence| sequence.matches(node),
@@ -133,9 +152,11 @@ pub const SimpleSelector = union(enum) {
 
     pub fn deinit(self: *SimpleSelector, allocator: std.mem.Allocator) void {
         switch (self.*) {
+            .universal => {},
             .tag => |*tag| tag.deinit(allocator),
             .class => |*class| class.deinit(allocator),
             .id => |*id| id.deinit(allocator),
+            .attribute => |*attribute| attribute.deinit(allocator),
             .focus_visible => {},
             .hover => {},
             .sequence => |*sequence| sequence.deinit(allocator),
@@ -145,14 +166,82 @@ pub const SimpleSelector = union(enum) {
 
     fn priority(self: SimpleSelector) u32 {
         return switch (self) {
+            .universal => |universal| universal.priority(),
             .tag => |tag| tag.priority(),
             .class => |class| class.priority(),
             .id => |id| id.priority(),
+            .attribute => |attribute| attribute.priority(),
             .focus_visible => |focus_visible| focus_visible.priority(),
             .hover => |hover| hover.priority(),
             .sequence => |sequence| sequence.priority(),
             .has => |has| has.priority(),
         };
+    }
+};
+
+/// The universal selector matches every element and contributes no
+/// specificity.
+pub const UniversalSelector = struct {
+    fn matches(self: UniversalSelector, node: *Node) bool {
+        _ = self;
+        return node.* == .element;
+    }
+
+    fn priority(self: UniversalSelector) u32 {
+        _ = self;
+        return 0;
+    }
+};
+
+pub const AttributeMatch = enum {
+    presence,
+    exact,
+    includes,
+};
+
+/// A supported HTML attribute selector: presence, exact value, or
+/// whitespace-token membership.
+pub const AttributeSelector = struct {
+    name: []const u8,
+    value: ?[]const u8,
+    matcher: AttributeMatch,
+
+    pub fn init(
+        name: []const u8,
+        value: ?[]const u8,
+        matcher: AttributeMatch,
+    ) AttributeSelector {
+        return .{ .name = name, .value = value, .matcher = matcher };
+    }
+
+    fn matches(self: AttributeSelector, node: *Node) bool {
+        const element = switch (node.*) {
+            .element => |*value| value,
+            .text => return false,
+        };
+        const attributes = element.attributes orelse return false;
+        const actual = attributes.get(self.name) orelse return false;
+        return switch (self.matcher) {
+            .presence => true,
+            .exact => std.mem.eql(u8, actual, self.value.?),
+            .includes => blk: {
+                var tokens = std.mem.tokenizeAny(u8, actual, " \t\r\n\x0c");
+                while (tokens.next()) |token| {
+                    if (std.mem.eql(u8, token, self.value.?)) break :blk true;
+                }
+                break :blk false;
+            },
+        };
+    }
+
+    fn deinit(self: *AttributeSelector, allocator: std.mem.Allocator) void {
+        allocator.free(self.name);
+        if (self.value) |value| allocator.free(value);
+    }
+
+    fn priority(self: AttributeSelector) u32 {
+        _ = self;
+        return 10;
     }
 };
 
@@ -284,17 +373,21 @@ pub const TagSelector = struct {
 /// of its tag, ID, class, and supported pseudo-class members match the same
 /// element.
 pub const SequenceSelector = union(enum) {
+    universal: UniversalSelector,
     tag: TagSelector,
     class: ClassSelector,
     id: IdSelector,
+    attribute: AttributeSelector,
     focus_visible: FocusVisibleSelector,
     hover: HoverSelector,
 
     pub fn intoSimpleSelector(self: SequenceSelector) SimpleSelector {
         return switch (self) {
+            .universal => |universal| .{ .universal = universal },
             .tag => |tag| .{ .tag = tag },
             .class => |class| .{ .class = class },
             .id => |id| .{ .id = id },
+            .attribute => |attribute| .{ .attribute = attribute },
             .focus_visible => |focus_visible| .{ .focus_visible = focus_visible },
             .hover => |hover| .{ .hover = hover },
         };
@@ -302,9 +395,11 @@ pub const SequenceSelector = union(enum) {
 
     fn matches(self: SequenceSelector, node: *Node) bool {
         return switch (self) {
+            .universal => |universal| universal.matches(node),
             .tag => |tag| tag.matches(node),
             .class => |class| class.matches(node),
             .id => |id| id.matches(node),
+            .attribute => |attribute| attribute.matches(node),
             .focus_visible => |focus_visible| focus_visible.matches(node),
             .hover => |hover| hover.matches(node),
         };
@@ -312,9 +407,11 @@ pub const SequenceSelector = union(enum) {
 
     pub fn deinit(self: *SequenceSelector, allocator: std.mem.Allocator) void {
         switch (self.*) {
+            .universal => {},
             .tag => |*tag| tag.deinit(allocator),
             .class => |*class| class.deinit(allocator),
             .id => |*id| id.deinit(allocator),
+            .attribute => |*attribute| attribute.deinit(allocator),
             .focus_visible => {},
             .hover => {},
         }
@@ -322,9 +419,11 @@ pub const SequenceSelector = union(enum) {
 
     fn priority(self: SequenceSelector) u32 {
         return switch (self) {
+            .universal => |universal| universal.priority(),
             .tag => |tag| tag.priority(),
             .class => |class| class.priority(),
             .id => |id| id.priority(),
+            .attribute => |attribute| attribute.priority(),
             .focus_visible => |focus_visible| focus_visible.priority(),
             .hover => |hover| hover.priority(),
         };
@@ -566,5 +665,146 @@ pub const DescendantSelector = struct {
             }
         }
         return selector_index == 0;
+    }
+};
+
+pub const Combinator = enum {
+    descendant,
+    child,
+    adjacent,
+};
+
+/// A selector chain containing at least one explicit child or adjacent-sibling
+/// combinator. Descendant-only chains keep the smaller flat representation
+/// above for their common linear-time match.
+pub const ComplexSelector = struct {
+    selectors: std.ArrayList(SimpleSelector),
+    combinators: std.ArrayList(Combinator),
+
+    pub fn take(
+        selectors: *std.ArrayList(SimpleSelector),
+        combinators: *std.ArrayList(Combinator),
+    ) ComplexSelector {
+        std.debug.assert(selectors.items.len >= 2);
+        std.debug.assert(combinators.items.len + 1 == selectors.items.len);
+        const owned_selectors = selectors.*;
+        const owned_combinators = combinators.*;
+        selectors.* = .empty;
+        combinators.* = .empty;
+        return .{
+            .selectors = owned_selectors,
+            .combinators = owned_combinators,
+        };
+    }
+
+    fn deinit(self: *ComplexSelector, allocator: std.mem.Allocator) void {
+        for (self.selectors.items) |*selector| selector.deinit(allocator);
+        self.selectors.deinit(allocator);
+        self.combinators.deinit(allocator);
+        self.selectors = .empty;
+        self.combinators = .empty;
+    }
+
+    fn priority(self: ComplexSelector) u32 {
+        var total: u32 = 0;
+        for (self.selectors.items) |selector| total += selector.priority();
+        return total;
+    }
+
+    fn populateHasMatches(
+        self: ComplexSelector,
+        cache: *HasMatchCache,
+        root: *Node,
+    ) std.mem.Allocator.Error!void {
+        for (self.selectors.items) |selector| {
+            try selector.populateHasMatches(cache, root);
+        }
+    }
+
+    fn previousElementSibling(node: *Node, parent: *Node) ?*Node {
+        const element = switch (parent.*) {
+            .element => |*value| value,
+            .text => return null,
+        };
+        for (element.children.items, 0..) |*child, index| {
+            if (child != node) continue;
+            var previous_index = index;
+            while (previous_index > 0) {
+                previous_index -= 1;
+                const previous = &element.children.items[previous_index];
+                if (previous.* == .element) return previous;
+            }
+            return null;
+        }
+        return null;
+    }
+
+    fn matchesAt(
+        self: ComplexSelector,
+        selector_index: usize,
+        node: *Node,
+        ancestor_chain: []const *Node,
+        context: MatchContext,
+    ) bool {
+        if (!self.selectors.items[selector_index].matches(node, context)) return false;
+        if (selector_index == 0) return true;
+
+        return switch (self.combinators.items[selector_index - 1]) {
+            .child => if (ancestor_chain.len == 0)
+                false
+            else
+                self.matchesAt(
+                    selector_index - 1,
+                    ancestor_chain[ancestor_chain.len - 1],
+                    ancestor_chain[0 .. ancestor_chain.len - 1],
+                    context,
+                ),
+            .adjacent => if (ancestor_chain.len == 0)
+                false
+            else if (previousElementSibling(
+                node,
+                ancestor_chain[ancestor_chain.len - 1],
+            )) |previous|
+                self.matchesAt(
+                    selector_index - 1,
+                    previous,
+                    ancestor_chain,
+                    context,
+                )
+            else
+                false,
+            .descendant => blk: {
+                var ancestor_index = ancestor_chain.len;
+                while (ancestor_index > 0) {
+                    ancestor_index -= 1;
+                    if (self.matchesAt(
+                        selector_index - 1,
+                        ancestor_chain[ancestor_index],
+                        ancestor_chain[0..ancestor_index],
+                        context,
+                    )) break :blk true;
+                }
+                break :blk false;
+            },
+        };
+    }
+
+    fn matches(
+        self: ComplexSelector,
+        node: *Node,
+        ancestor_chain: []const *Node,
+        context: MatchContext,
+    ) bool {
+        if (self.selectors.items.len < 2 or
+            self.combinators.items.len + 1 != self.selectors.items.len)
+        {
+            return false;
+        }
+        return self.matchesAt(
+            self.selectors.items.len - 1,
+            node,
+            ancestor_chain,
+            context,
+        );
     }
 };

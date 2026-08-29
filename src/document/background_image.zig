@@ -27,6 +27,16 @@ pub const ResolvedSize = struct {
     height: i32,
 };
 
+pub const Repeat = struct {
+    x: bool,
+    y: bool,
+};
+
+pub const ResolvedPosition = struct {
+    x: i32,
+    y: i32,
+};
+
 /// Parse one CSS `url(...)` image. Multiple backgrounds, gradients, escapes,
 /// and other image functions intentionally remain outside this basic subset.
 pub fn parseUrl(input: []const u8) ?[]const u8 {
@@ -82,6 +92,72 @@ pub fn parseSize(input: []const u8) ?Size {
         SizeComponent.auto;
     if (tokens.next() != null) return null;
     return .{ .dimensions = .{ .width = width, .height = height } };
+}
+
+/// Parse the non-space/round background repeat modes used by the renderer.
+pub fn parseRepeat(input: []const u8) ?Repeat {
+    const value = std.mem.trim(u8, input, " \t\r\n\x0c");
+    if (std.ascii.eqlIgnoreCase(value, "repeat")) return .{ .x = true, .y = true };
+    if (std.ascii.eqlIgnoreCase(value, "no-repeat")) return .{ .x = false, .y = false };
+    if (std.ascii.eqlIgnoreCase(value, "repeat-x")) return .{ .x = true, .y = false };
+    if (std.ascii.eqlIgnoreCase(value, "repeat-y")) return .{ .x = false, .y = true };
+    return null;
+}
+
+fn positionComponent(
+    input: []const u8,
+    available: i32,
+    css_scale: f64,
+    horizontal: bool,
+) ?i32 {
+    if (std.mem.eql(u8, input, "0")) return 0;
+    if (std.ascii.eqlIgnoreCase(input, if (horizontal) "left" else "top")) return 0;
+    if (std.ascii.eqlIgnoreCase(input, "center")) return @divFloor(available, 2);
+    if (std.ascii.eqlIgnoreCase(input, if (horizontal) "right" else "bottom")) return available;
+
+    const parsed = length.parse(input) orelse return null;
+    return switch (parsed.unit) {
+        .px => length.toLayoutPixels(parsed.value * css_scale),
+        .percent => @intFromFloat(@as(f64, @floatFromInt(available)) * parsed.value / 100.0),
+        .em => null,
+    };
+}
+
+/// Resolve the basic one/two-value background-position grammar. Pixel,
+/// percentage, and edge/center keywords are supported; unsupported values
+/// fall back to the initial top-left position.
+pub fn resolvePosition(
+    input: []const u8,
+    box_width: i32,
+    box_height: i32,
+    image_width: i32,
+    image_height: i32,
+    css_scale: f64,
+) ResolvedPosition {
+    var tokens = std.mem.tokenizeAny(u8, input, " \t\r\n\x0c");
+    const first = tokens.next() orelse return .{ .x = 0, .y = 0 };
+    const second = tokens.next();
+    if (tokens.next() != null) return .{ .x = 0, .y = 0 };
+
+    const available_x = box_width - image_width;
+    const available_y = box_height - image_height;
+    if (second) |vertical| {
+        return .{
+            .x = positionComponent(first, available_x, css_scale, true) orelse 0,
+            .y = positionComponent(vertical, available_y, css_scale, false) orelse 0,
+        };
+    }
+
+    if (std.ascii.eqlIgnoreCase(first, "top") or std.ascii.eqlIgnoreCase(first, "bottom")) {
+        return .{
+            .x = @divFloor(available_x, 2),
+            .y = positionComponent(first, available_y, css_scale, false) orelse 0,
+        };
+    }
+    return .{
+        .x = positionComponent(first, available_x, css_scale, true) orelse 0,
+        .y = @divFloor(available_y, 2),
+    };
 }
 
 fn componentPixels(component: SizeComponent, box: f64, css_scale: f64) ?f64 {
@@ -183,4 +259,20 @@ test "background size resolves intrinsic explicit percentage contain and cover f
     try std.testing.expectEqual(ResolvedSize{ .width = 50, .height = 25 }, zoomed);
     try std.testing.expect(parseSize("10em") == null);
     try std.testing.expect(parseSize("cover auto") == null);
+}
+
+test "background repeat and position resolve the supported single layer" {
+    try std.testing.expectEqual(Repeat{ .x = true, .y = true }, parseRepeat("repeat").?);
+    try std.testing.expectEqual(Repeat{ .x = true, .y = false }, parseRepeat("REPEAT-X").?);
+    try std.testing.expectEqual(Repeat{ .x = false, .y = false }, parseRepeat("no-repeat").?);
+    try std.testing.expect(parseRepeat("space") == null);
+
+    try std.testing.expectEqual(
+        ResolvedPosition{ .x = 1, .y = 0 },
+        resolvePosition("1px 0", 120, 40, 2, 2, 1.0),
+    );
+    try std.testing.expectEqual(
+        ResolvedPosition{ .x = 50, .y = 25 },
+        resolvePosition("50% 50%", 120, 60, 20, 10, 1.0),
+    );
 }

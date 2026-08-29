@@ -149,9 +149,8 @@ pub const Page = struct {
             if (!std.mem.eql(u8, element.tag, "link")) continue;
             const base_url = page_url orelse continue;
             const attrs = element.attributes orelse continue;
-            const rel = attrs.get("rel") orelse continue;
             const href = attrs.get("href") orelse continue;
-            if (!std.mem.eql(u8, rel, "stylesheet")) continue;
+            if (!element.attributeHasToken("rel", "stylesheet")) continue;
 
             const stylesheet_url = base_url.resolve(self.allocator, href) catch |err| {
                 std.log.warn("Ignoring stylesheet {s}: {}", .{ href, err });

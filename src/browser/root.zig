@@ -3308,8 +3308,7 @@ pub const Browser = struct {
                 kind = .script;
             } else if (std.mem.eql(u8, element.tag, "link")) {
                 const attrs = element.attributes orelse continue;
-                const rel = attrs.get("rel") orelse continue;
-                if (!std.mem.eql(u8, rel, "stylesheet")) continue;
+                if (!element.attributeHasToken("rel", "stylesheet")) continue;
                 reference = attrs.get("href") orelse continue;
                 kind = .stylesheet;
             } else {
@@ -3675,9 +3674,8 @@ pub const Browser = struct {
 
             if (!std.mem.eql(u8, element.tag, "link")) continue;
             const attrs = element.attributes orelse continue;
-            const rel = attrs.get("rel") orelse continue;
             const href = attrs.get("href") orelse continue;
-            if (!std.mem.eql(u8, rel, "stylesheet")) continue;
+            if (!element.attributeHasToken("rel", "stylesheet")) continue;
 
             std.log.info("Loading stylesheet: {s}", .{href});
             const completed = resources.find(node, .stylesheet) orelse continue;

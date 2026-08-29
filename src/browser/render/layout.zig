@@ -205,7 +205,10 @@ fn contentBoundsForNode(node: Node, parent_x: i32, parent_width: i32, indent: i3
 
 const resolveCssLength = box_model.resolveCssLength;
 const resolveSignedCssLength = box_model.resolveSignedCssLength;
+const constrainDimension = box_model.constrainDimension;
+const shrinkToFitSpecifiedContentWidth = box_model.shrinkToFitSpecifiedContentWidth;
 const resolveBoxEdges = box_model.resolveBoxEdges;
+const horizontalAutoMargins = box_model.horizontalAutoMargins;
 const animatedPixelDimension = box_model.animatedPixelDimension;
 const resolvedPixelDimension = box_model.resolvedPixelDimension;
 const parseCssPixelRadius = box_model.parseCssPixelRadius;
@@ -2670,6 +2673,7 @@ fn restoreNodeStyles(self: *Layout, _: *std.ArrayList(LineItem)) !void {
 }
 
 const isSoftHyphenGrapheme = inline_format.isSoftHyphenGrapheme;
+const isNonBreakingSpaceGrapheme = inline_format.isNonBreakingSpaceGrapheme;
 const isWordSeparatorGrapheme = inline_format.isWordSeparatorGrapheme;
 
 fn resetSoftHyphenWord(self: *Layout) void {
@@ -3142,11 +3146,17 @@ fn processGrapheme(
     }
 
     const separates_word = isWordSeparatorGrapheme(gme);
+    const non_breaking_space = isNonBreakingSpaceGrapheme(gme);
+    const permits_automatic_wrap = !non_breaking_space;
+    // Some native fonts expose NBSP with no drawable outline and a zero
+    // measured width. It shares the ordinary space glyph while retaining its
+    // distinct no-wrap behavior in the formatter.
+    const rendered_gme = if (non_breaking_space) " " else gme;
     if (separates_word) self.resetSoftHyphenWord();
 
     // Choose one font for the complete Unicode grapheme. Emoji sequences must
     // not be split across fallback fonts or rendered as separate code points.
-    const category = font.getGraphemeCategory(gme);
+    const category = font.getGraphemeCategory(rendered_gme);
 
     const active_family = self.activeFontFamily();
 
@@ -3164,13 +3174,26 @@ fn processGrapheme(
 
     // Handle small caps rendering
     var glyph: font.Glyph = undefined;
-    if (small_caps) {
-        const is_lowercase = isSmallCapsLowercaseGrapheme(gme);
+    if (non_breaking_space) {
+        // SDL_ttf can reject an all-whitespace render at small font sizes.
+        // Borrow stable metrics from a representative glyph, keep only a
+        // space-like advance, and omit pixels because whitespace is invisible.
+        glyph = try self.font_manager.getStyledGlyph(
+            "n",
+            weight,
+            slant,
+            self.scaledFontSize(text_size),
+            active_family,
+        );
+        glyph.w = @max(@divTrunc(glyph.w, 2), 1);
+        glyph.pixels = null;
+    } else if (small_caps) {
+        const is_lowercase = isSmallCapsLowercaseGrapheme(rendered_gme);
 
         if (is_lowercase) {
             // Preserve combining marks in the grapheme while uppercasing its
             // ASCII base. The allocation avoids imposing a cluster-size cap.
-            const upper_gme = try self.allocator.dupe(u8, gme);
+            const upper_gme = try self.allocator.dupe(u8, rendered_gme);
             defer self.allocator.free(upper_gme);
             upper_gme[0] = std.ascii.toUpper(upper_gme[0]);
             glyph = try self.font_manager.getStyledGlyph(
@@ -3183,7 +3206,7 @@ fn processGrapheme(
         } else {
             // Regular rendering for non-lowercase characters
             glyph = try self.font_manager.getStyledGlyph(
-                gme,
+                rendered_gme,
                 weight,
                 slant,
                 self.scaledFontSize(text_size),
@@ -3193,7 +3216,7 @@ fn processGrapheme(
     } else {
         // Normal rendering
         glyph = try self.font_manager.getStyledGlyph(
-            gme,
+            rendered_gme,
             weight,
             slant,
             self.scaledFontSize(text_size),
@@ -3222,7 +3245,7 @@ fn processGrapheme(
     }
 
     // Check if we need to wrap (only at window edge)
-    while (shouldAutomaticallyWrap(
+    while (permits_automatic_wrap and shouldAutomaticallyWrap(
         self.is_preformatted,
         self.cursor_x,
         glyph_width,
@@ -6009,7 +6032,11 @@ const BlockLayout = struct {
                         if (element.style) |*style_map| {
                             if (style_map.getPtr("zoom")) |field| block.zoom.addDependency(field, style_map.allocator);
                             if (style_map.getPtr("width")) |field| block.width.addDependency(field, style_map.allocator);
+                            if (style_map.getPtr("min-width")) |field| block.width.addDependency(field, style_map.allocator);
+                            if (style_map.getPtr("max-width")) |field| block.width.addDependency(field, style_map.allocator);
                             if (style_map.getPtr("height")) |field| block.height.addDependency(field, style_map.allocator);
+                            if (style_map.getPtr("min-height")) |field| block.height.addDependency(field, style_map.allocator);
+                            if (style_map.getPtr("max-height")) |field| block.height.addDependency(field, style_map.allocator);
                             if (style_map.getPtr("overflow")) |field| block.height.addDependency(field, style_map.allocator);
                             if (style_map.getPtr("position")) |field| {
                                 block.x.addDependency(field, style_map.allocator);
@@ -6611,6 +6638,13 @@ const BlockLayout = struct {
         self.margin = edge_values.margin;
         self.padding = edge_values.padding;
         self.border = edge_values.border;
+        const auto_margins = if (self.embedded_box == null) switch (self.node) {
+            .element => |*element| if (element.style) |*style_map|
+                horizontalAutoMargins(style_map)
+            else
+                box_model.HorizontalAutoMargins{},
+            .text => box_model.HorizontalAutoMargins{},
+        } else box_model.HorizontalAutoMargins{};
 
         // A non-first sibling is positioned from the preceding block, so it
         // intentionally has no dependency on the parent's y field. Avoid
@@ -6649,14 +6683,33 @@ const BlockLayout = struct {
             else
                 0;
 
-        const specified_width = if (self.embedded_box == null)
-            if (self.specifiedPixelDimension("width", &self.width, .{
-                .font_size = self.computedFontSizeCss(),
-                .percentage_base = containing_width_css,
-            })) |width|
+        const width_context = parser.CssLengthResolutionContext{
+            .font_size = self.computedFontSizeCss(),
+            .percentage_base = containing_width_css,
+        };
+        const unconstrained_width = if (self.embedded_box == null)
+            if (self.specifiedPixelDimension("width", &self.width, width_context)) |width|
                 scaleCssPixel(width, zoom_value, engine.zoom())
             else
                 null
+        else
+            null;
+        const min_width = if (self.embedded_box == null)
+            if (self.specifiedPixelDimension("min-width", &self.width, width_context)) |width|
+                scaleCssPixel(width, zoom_value, engine.zoom())
+            else
+                null
+        else
+            null;
+        const max_width = if (self.embedded_box == null)
+            if (self.specifiedPixelDimension("max-width", &self.width, width_context)) |width|
+                scaleCssPixel(width, zoom_value, engine.zoom())
+            else
+                null
+        else
+            null;
+        const specified_width = if (unconstrained_width) |width|
+            constrainDimension(width, min_width, max_width)
         else
             null;
         const base_content_bounds = if (self.embedded_box) |embedded|
@@ -6668,19 +6721,52 @@ const BlockLayout = struct {
                 parent_width,
                 scaleCssPixel(list_item_indent, zoom_value, engine.zoom()),
             );
-        const specified_height = if (self.embedded_box == null)
-            if (self.specifiedPixelDimension("height", &self.height, .{
-                .font_size = self.computedFontSizeCss(),
-                .percentage_base = containing_height_css,
-            })) |height|
+        const height_context = parser.CssLengthResolutionContext{
+            .font_size = self.computedFontSizeCss(),
+            .percentage_base = containing_height_css,
+        };
+        const unconstrained_height = if (self.embedded_box == null)
+            if (self.specifiedPixelDimension("height", &self.height, height_context)) |height|
                 scaleCssPixel(height, zoom_value, engine.zoom())
             else
                 null
         else
             null;
+        const min_height = if (self.embedded_box == null)
+            if (self.specifiedPixelDimension("min-height", &self.height, height_context)) |height|
+                scaleCssPixel(height, zoom_value, engine.zoom())
+            else
+                null
+        else
+            null;
+        const max_height = if (self.embedded_box == null)
+            if (self.specifiedPixelDimension("max-height", &self.height, height_context)) |height|
+                scaleCssPixel(height, zoom_value, engine.zoom())
+            else
+                null
+        else
+            null;
+        const specified_height = if (unconstrained_height) |height|
+            constrainDimension(height, min_height, max_height)
+        else
+            null;
         const horizontal_insets = self.padding.horizontal() + self.border.horizontal();
         const position_mode = self.positionMode();
         const float_side = self.floatSide();
+        const shrink_to_fit_width = if (specified_width == null and
+            (position_mode == .absolute or float_side != .none))
+        shrink: {
+            const element = switch (self.node) {
+                .element => |*value| value,
+                .text => break :shrink null,
+            };
+            const css_width = shrinkToFitSpecifiedContentWidth(
+                element,
+                containing_width_css,
+                self.computedFontSizeCss(),
+            ) orelse break :shrink null;
+            break :shrink scaleCssPixel(css_width, zoom_value, engine.zoom());
+        } else null;
         var layout_y = prev_y;
         var float_x: ?i32 = null;
 
@@ -6698,6 +6784,8 @@ const BlockLayout = struct {
                     // which keeps them deterministic until shrink-to-fit sizing
                     // is added to the replaced/content measurement path.
                     var candidate_width = if (specified_width) |width|
+                        @max(width + horizontal_insets, 0)
+                    else if (shrink_to_fit_width) |width|
                         @max(width + horizontal_insets, 0)
                     else
                         @max(base_content_bounds.width - self.margin.horizontal(), 0);
@@ -6719,7 +6807,7 @@ const BlockLayout = struct {
                         const next_y = float_context.nextFloatBottom(layout_y) orelse break;
                         if (next_y <= layout_y) break;
                         layout_y = next_y;
-                        if (specified_width == null) {
+                        if (specified_width == null and shrink_to_fit_width == null) {
                             candidate_width = @max(
                                 float_context.floatBoundsAt(
                                     layout_y,
@@ -6749,10 +6837,36 @@ const BlockLayout = struct {
             content_bounds.width - self.margin.horizontal() - horizontal_insets,
             0,
         );
-        const border_box_width = if (specified_width) |width|
-            @max(width + horizontal_insets, 0)
+        const auto_width = if (shrink_to_fit_width) |width|
+            @min(width, auto_content_width)
         else
-            auto_content_width + horizontal_insets;
+            auto_content_width;
+        const used_content_width = specified_width orelse
+            constrainDimension(auto_width, min_width, max_width);
+        const border_box_width = @max(used_content_width + horizontal_insets, 0);
+        // Horizontal auto margins absorb the remaining inline space only for
+        // normal-flow block boxes. Floats and absolutely positioned boxes use
+        // separate CSS sizing rules and keep auto margins at their resolved
+        // zero value here.
+        if (specified_width != null and
+            position_mode != .absolute and
+            float_side == .none and
+            self.isBlockContainer() and
+            (auto_margins.left or auto_margins.right))
+        {
+            const remaining = @max(
+                content_bounds.width -| border_box_width -| self.margin.horizontal(),
+                0,
+            );
+            if (auto_margins.left and auto_margins.right) {
+                self.margin.left = @divFloor(remaining, 2);
+                self.margin.right = remaining -| self.margin.left;
+            } else if (auto_margins.left) {
+                self.margin.left = remaining;
+            } else {
+                self.margin.right = remaining;
+            }
+        }
         self.x.set(if (self.embedded_box) |embedded|
             embedded.x
         else if (float_x) |x|
@@ -6941,7 +7055,8 @@ const BlockLayout = struct {
                 engine.zoom(),
             );
             natural_height = auto_height;
-            self.content_height = specified_height orelse auto_height;
+            self.content_height = specified_height orelse
+                constrainDimension(auto_height, min_height, max_height);
             self.height.set(@max(
                 self.content_height + self.padding.vertical() + self.border.vertical(),
                 0,
@@ -6975,6 +7090,12 @@ const BlockLayout = struct {
             if (specified_height) |height| {
                 self.content_height = height;
                 self.content_height_definite = true;
+            } else {
+                self.content_height = constrainDimension(
+                    self.content_height,
+                    min_height,
+                    max_height,
+                );
             }
             self.height.set(@max(
                 self.content_height + self.padding.vertical() + self.border.vertical(),

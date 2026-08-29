@@ -125,6 +125,50 @@ fn mapImageSourceCoordinate(
     )));
 }
 
+fn mapImageSourceCoordinateForItem(
+    image_item: anytype,
+    destination: i32,
+    destination_start: i32,
+    destination_size: i32,
+    source_start: f64,
+    source_size: f64,
+    horizontal: bool,
+    zoom: f32,
+) i32 {
+    if (comptime @hasField(@TypeOf(image_item), "tiling")) {
+        if (image_item.tiling) |tile| {
+            const layout_size = if (horizontal) tile.width else tile.height;
+            const layout_offset = if (horizontal) tile.offset_x else tile.offset_y;
+            const repeats = if (horizontal) tile.repeat_x else tile.repeat_y;
+            const tile_size = display_commands.DisplayItem.scaleLayoutPx(layout_size, zoom);
+            if (tile_size <= 0) return -1;
+            const tile_start = destination_start +
+                display_commands.DisplayItem.scaleLayoutPx(layout_offset, zoom);
+            const relative = destination - tile_start;
+            const tile_coordinate = if (repeats)
+                @mod(relative, tile_size)
+            else blk: {
+                if (relative < 0 or relative >= tile_size) return -1;
+                break :blk relative;
+            };
+            return mapImageSourceCoordinate(
+                tile_coordinate,
+                0,
+                tile_size,
+                source_start,
+                source_size,
+            );
+        }
+    }
+    return mapImageSourceCoordinate(
+        destination,
+        destination_start,
+        destination_size,
+        source_start,
+        source_size,
+    );
+}
+
 test "raster image sampling honors a clipped background source rectangle" {
     const pixels = [_]u8{0} ** (4 * 2 * 4);
     const item = ImageDisplayItem{
@@ -145,6 +189,38 @@ test "raster image sampling honors a clipped background source rectangle" {
     try std.testing.expectEqual(@as(i32, 1), mapImageSourceCoordinate(119, 0, 120, 0, 2));
     try std.testing.expectEqual(@as(i32, 0), mapImageSourceCoordinate(0, 0, 160, 0.4, 3.2));
     try std.testing.expectEqual(@as(i32, 3), mapImageSourceCoordinate(159, 0, 160, 0.4, 3.2));
+}
+
+test "raster image sampling repeats a positioned background tile" {
+    const pixels = [_]u8{0} ** (2 * 2 * 4);
+    const item = ImageDisplayItem{
+        .x1 = 10,
+        .y1 = 20,
+        .x2 = 30,
+        .y2 = 40,
+        .source_width = 2,
+        .source_height = 2,
+        .pixels = &pixels,
+        .tiling = .{
+            .width = 2,
+            .height = 2,
+            .offset_x = 1,
+            .repeat_x = true,
+            .repeat_y = false,
+        },
+    };
+    try std.testing.expectEqual(
+        @as(i32, 0),
+        mapImageSourceCoordinateForItem(item, 13, 10, 20, 0, 2, true, 1.0),
+    );
+    try std.testing.expectEqual(
+        @as(i32, 1),
+        mapImageSourceCoordinateForItem(item, 14, 10, 20, 0, 2, true, 1.0),
+    );
+    try std.testing.expectEqual(
+        @as(i32, -1),
+        mapImageSourceCoordinateForItem(item, 23, 20, 20, 0, 2, false, 1.0),
+    );
 }
 
 pub const Renderer = struct {
@@ -232,6 +308,7 @@ pub const Renderer = struct {
         self: *Renderer,
         context: *z2d.Context,
         image_item: anytype,
+        zoom: f32,
         dest_left: i32,
         dest_top: i32,
         dest_right: i32,
@@ -275,12 +352,15 @@ pub const Renderer = struct {
 
                 var y = start_y;
                 while (y < end_y) : (y += 1) {
-                    const src_y = mapImageSourceCoordinate(
+                    const src_y = mapImageSourceCoordinateForItem(
+                        image_item,
                         y,
                         dest_top,
                         dest_height,
                         source.top,
                         source.height,
+                        false,
+                        zoom,
                     );
                     if (src_y < 0 or src_y >= src_h) continue;
 
@@ -288,12 +368,15 @@ pub const Renderer = struct {
 
                     var x = start_x;
                     while (x < end_x) : (x += 1) {
-                        const src_x = mapImageSourceCoordinate(
+                        const src_x = mapImageSourceCoordinateForItem(
+                            image_item,
                             x,
                             dest_left,
                             dest_width,
                             source.left,
                             source.width,
+                            true,
+                            zoom,
                         );
                         if (src_x < 0 or src_x >= src_w) continue;
 
@@ -334,23 +417,29 @@ pub const Renderer = struct {
 
         var y = start_y;
         while (y < end_y) : (y += 1) {
-            const src_y = mapImageSourceCoordinate(
+            const src_y = mapImageSourceCoordinateForItem(
+                image_item,
                 y,
                 dest_top,
                 dest_height,
                 source.top,
                 source.height,
+                false,
+                zoom,
             );
             if (src_y < 0 or src_y >= src_h) continue;
 
             var x = start_x;
             while (x < end_x) : (x += 1) {
-                const src_x = mapImageSourceCoordinate(
+                const src_x = mapImageSourceCoordinateForItem(
+                    image_item,
                     x,
                     dest_left,
                     dest_width,
                     source.left,
                     source.width,
+                    true,
+                    zoom,
                 );
                 if (src_x < 0 or src_x >= src_w) continue;
 
@@ -691,6 +780,7 @@ pub const Renderer = struct {
                 try self.drawImageNearest(
                     context,
                     image_item,
+                    zoom,
                     left,
                     top,
                     right,
@@ -707,6 +797,7 @@ pub const Renderer = struct {
                 try self.drawImageNearest(
                     context,
                     canvas_item,
+                    zoom,
                     left,
                     top,
                     right,
@@ -1104,6 +1195,7 @@ pub const Renderer = struct {
                 try self.drawImageNearest(
                     context,
                     image_item,
+                    zoom,
                     left,
                     top,
                     right,
@@ -1120,6 +1212,7 @@ pub const Renderer = struct {
                 try self.drawImageNearest(
                     context,
                     canvas_item,
+                    zoom,
                     left,
                     top,
                     right,
@@ -1366,6 +1459,7 @@ pub const Renderer = struct {
                 try self.drawImageNearest(
                     context,
                     image_item,
+                    zoom,
                     left,
                     top,
                     right,
@@ -1382,6 +1476,7 @@ pub const Renderer = struct {
                 try self.drawImageNearest(
                     context,
                     canvas_item,
+                    zoom,
                     left,
                     top,
                     right,

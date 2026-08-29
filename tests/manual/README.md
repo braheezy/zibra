@@ -16,6 +16,7 @@ tiers and baseline policy.
 | Primary fixture | Contract exercised |
 | --- | --- |
 | [`acid1-box-model.html`](acid1-box-model.html) | Acid1-inspired nested box spacing, borders, backgrounds, and visual compatibility baseline |
+| [`acid2-compat.html`](acid2-compat.html) | Isolated Acid2-inspired parser, selector, sizing, auto-margin, non-breaking-space, and repeated-background contracts |
 | [`dump-pipeline.html`](dump-pipeline.html) | Shared style, layout, and display-list inspection input |
 | [`dump-dom.html`](dump-dom.html) | Isolated HTML parser/DOM dump input |
 | [`anonymous-block-boxes.html`](anonymous-block-boxes.html) | Anonymous inline/block grouping |

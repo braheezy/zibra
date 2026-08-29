@@ -85,6 +85,11 @@ pub const BoxModelEdges = struct {
     border: BoxEdges,
 };
 
+pub const HorizontalAutoMargins = struct {
+    left: bool = false,
+    right: bool = false,
+};
+
 pub const EmbeddedBlockBox = struct {
     x: i32,
     y: i32,
@@ -208,6 +213,15 @@ pub fn resolveCssLength(value: []const u8, context: parser.CssLengthResolutionCo
     return parser.pixelLengthToLayoutPixels(pixels);
 }
 
+/// Apply CSS min/max used-value constraints. CSS resolves the maximum first
+/// and the minimum second, so a minimum larger than the maximum wins.
+pub fn constrainDimension(value: i32, minimum: ?i32, maximum: ?i32) i32 {
+    var constrained = value;
+    if (maximum) |limit| constrained = @min(constrained, limit);
+    if (minimum) |limit| constrained = @max(constrained, limit);
+    return @max(constrained, 0);
+}
+
 /// Resolve the supported px/em/percentage subset while permitting a sign.
 pub fn resolveSignedCssLength(value: []const u8, context: parser.CssLengthResolutionContext) ?i32 {
     const trimmed = std.mem.trim(u8, value, " \t\r\n\x0c");
@@ -284,6 +298,17 @@ pub fn resolveBoxEdges(
     };
 }
 
+/// Report horizontal `auto` margins before their used values are resolved.
+/// `resolveBoxEdges` intentionally represents `auto` as zero so ordinary
+/// width calculations can proceed; a block formatting context distributes
+/// the remaining inline space after it knows the used border-box width.
+pub fn horizontalAutoMargins(style_map: *const parser.StyleMap) HorizontalAutoMargins {
+    return .{
+        .left = isAutoKeyword(styleValue(style_map, "margin-left")),
+        .right = isAutoKeyword(styleValue(style_map, "margin-right")),
+    };
+}
+
 pub fn animatedPixelDimension(element: *const parser.Element, property: []const u8) ?i32 {
     const animations = element.animations orelse return null;
     const animation = animations.get(property) orelse return null;
@@ -301,6 +326,84 @@ pub fn resolvedPixelDimension(
 ) ?i32 {
     return animatedPixelDimension(element, property) orelse
         if (styleValue(style_map, property)) |value| resolveCssLength(value, context) else null;
+}
+
+fn intrinsicOuterWidth(
+    element: *const parser.Element,
+    containing_width_css: f64,
+    inherited_font_size: f64,
+) ?i32 {
+    const styles = if (element.style) |*style_map| style_map else return null;
+    const font_size = if (styleValue(styles, "font-size")) |font_value|
+        parser.resolveCssLength(font_value, .{
+            .font_size = inherited_font_size,
+            .percentage_base = inherited_font_size,
+        }) orelse inherited_font_size
+    else
+        inherited_font_size;
+    const context = parser.CssLengthResolutionContext{
+        .font_size = font_size,
+        .percentage_base = containing_width_css,
+    };
+    const display = std.mem.trim(
+        u8,
+        styleValue(styles, "display") orelse "inline",
+        " \t\r\n",
+    );
+    const float_side = parseFloatSide(styleValue(styles, "float") orelse "none");
+    const inline_width_ignored = std.ascii.eqlIgnoreCase(display, "inline") and
+        float_side == .none;
+
+    var content_width = if (!inline_width_ignored)
+        if (styleValue(styles, "width")) |width| resolveCssLength(width, context) else null
+    else
+        null;
+    if (content_width == null) {
+        for (element.children.items) |*child| {
+            const child_width = switch (child.*) {
+                .text => null,
+                .element => |*child_element| intrinsicOuterWidth(
+                    child_element,
+                    containing_width_css,
+                    font_size,
+                ),
+            };
+            if (child_width) |width| {
+                content_width = @max(content_width orelse 0, width);
+            }
+        }
+    }
+    const content = content_width orelse return null;
+    const edges = resolveBoxEdges(styles, font_size, containing_width_css, 1.0, 1.0);
+    return @max(
+        content + edges.padding.horizontal() + edges.border.horizontal() +
+            edges.margin.horizontal(),
+        0,
+    );
+}
+
+/// Approximate CSS shrink-to-fit width from descendants with definite widths.
+/// This is intentionally a pure pre-layout measurement: callers clamp it to
+/// available space and fall back to the normal auto width when no definite
+/// descendant contributes an intrinsic width.
+pub fn shrinkToFitSpecifiedContentWidth(
+    element: *const parser.Element,
+    containing_width_css: f64,
+    inherited_font_size: f64,
+) ?i32 {
+    var width: ?i32 = null;
+    for (element.children.items) |*child| {
+        const child_width = switch (child.*) {
+            .text => null,
+            .element => |*child_element| intrinsicOuterWidth(
+                child_element,
+                containing_width_css,
+                inherited_font_size,
+            ),
+        };
+        if (child_width) |candidate| width = @max(width orelse 0, candidate);
+    }
+    return width;
 }
 
 /// Parse the single positive pixel radius supported by paint and hit testing.
@@ -361,6 +464,11 @@ fn styleValue(style_map: *const parser.StyleMap, property: []const u8) ?[]const 
     return field.get().*;
 }
 
+fn isAutoKeyword(value: ?[]const u8) bool {
+    const text = value orelse return false;
+    return std.ascii.eqlIgnoreCase(std.mem.trim(u8, text, " \t\r\n\x0c"), "auto");
+}
+
 fn clampedLayoutInt(value: f64) i32 {
     return @intFromFloat(std.math.clamp(
         value,
@@ -389,6 +497,27 @@ test "box model edges resolve relative lengths against the containing block" {
     try std.testing.expectEqual(@as(i32, 8), edges.border.top);
 }
 
+test "horizontal auto margins survive edge resolution for block distribution" {
+    const allocator = std.testing.allocator;
+    var html_parser = try parser.HTMLParser.init(
+        allocator,
+        "<div style='margin: 1px auto 2px'></div>",
+    );
+    html_parser.use_implicit_tags = false;
+    defer html_parser.deinit(allocator);
+    var root = try html_parser.parse();
+    defer root.deinit(allocator);
+    try parser.style(allocator, &root, &.{});
+
+    const styles = &root.element.style.?;
+    const edges = resolveBoxEdges(styles, 16.0, 400.0, 1.0, 1.0);
+    const auto = horizontalAutoMargins(styles);
+    try std.testing.expectEqual(@as(i32, 0), edges.margin.left);
+    try std.testing.expectEqual(@as(i32, 0), edges.margin.right);
+    try std.testing.expect(auto.left);
+    try std.testing.expect(auto.right);
+}
+
 test "position float clear and dimension values normalize independently of layout state" {
     try std.testing.expectEqual(FloatSide.left, parseFloatSide(" LEFT "));
     try std.testing.expectEqual(FloatSide.right, parseFloatSide("right"));
@@ -412,6 +541,31 @@ test "position float clear and dimension values normalize independently of layou
     try std.testing.expectEqual(@as(?i32, -50), resolveSignedCssLength("-25%", .{ .percentage_base = 200 }));
     try std.testing.expectEqual(@as(?i32, -3), resolveSignedCssLength("-3px", .{}));
     try std.testing.expectEqual(@as(?i32, null), resolveSignedCssLength("auto", .{}));
+
+    try std.testing.expectEqual(@as(i32, 40), constrainDimension(100, 20, 40));
+    try std.testing.expectEqual(@as(i32, 20), constrainDimension(10, 20, 40));
+    // The minimum wins when the constraints conflict, per CSS 2.1.
+    try std.testing.expectEqual(@as(i32, 50), constrainDimension(30, 50, 40));
+}
+
+test "shrink-to-fit measurement uses definite descendant outer widths" {
+    const allocator = std.testing.allocator;
+    var html_parser = try parser.HTMLParser.init(
+        allocator,
+        "<div style='position:absolute'>" ++
+            "<div style='float:right;width:48px;border:2px solid;padding:3px'></div>" ++
+            "</div>",
+    );
+    html_parser.use_implicit_tags = false;
+    defer html_parser.deinit(allocator);
+    var root = try html_parser.parse();
+    defer root.deinit(allocator);
+    try parser.style(allocator, &root, &.{});
+
+    try std.testing.expectEqual(
+        @as(?i32, 58),
+        shrinkToFitSpecifiedContentWidth(&root.element, 400, 16),
+    );
 }
 
 test "CSS zoom composes and scales authored geometry" {

@@ -217,8 +217,22 @@ pub const ImageDisplayItem = struct {
     /// Optional element box used for hit testing independently of the visible
     /// bitmap destination. This keeps contain/none letterbox space targetable.
     hit_rect: ?Rect = null,
+    /// When present, x1..y2 are the background painting clip and this record
+    /// describes one positioned tile within it. Repetition is sampled by the
+    /// rasterizer, so tiny tiles do not expand into enormous display lists or
+    /// intermediate pixel buffers.
+    tiling: ?ImageTiling = null,
     opacity: f64 = 1.0,
     source: ?DisplayItemSource = null,
+};
+
+pub const ImageTiling = struct {
+    width: i32,
+    height: i32,
+    offset_x: i32 = 0,
+    offset_y: i32 = 0,
+    repeat_x: bool = true,
+    repeat_y: bool = true,
 };
 
 /// Validate an RGBA byte buffer before raster code indexes it. A canvas that

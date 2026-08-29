@@ -74,6 +74,10 @@ pub fn isSoftHyphenGrapheme(gme: []const u8) bool {
     return std.mem.eql(u8, gme, "\u{00AD}");
 }
 
+pub fn isNonBreakingSpaceGrapheme(gme: []const u8) bool {
+    return std.mem.eql(u8, gme, "\u{00A0}");
+}
+
 pub fn isWordSeparatorGrapheme(gme: []const u8) bool {
     return gme.len == 1 and std.ascii.isWhitespace(gme[0]);
 }
@@ -177,6 +181,8 @@ test "automatic wrapping respects preformatted runs and empty lines" {
 test "inline separators distinguish soft hyphens and collapsible whitespace" {
     try std.testing.expect(isSoftHyphenGrapheme("\u{00AD}"));
     try std.testing.expect(!isSoftHyphenGrapheme("-"));
+    try std.testing.expect(isNonBreakingSpaceGrapheme("\u{00A0}"));
+    try std.testing.expect(!isNonBreakingSpaceGrapheme(" "));
     try std.testing.expect(isWordSeparatorGrapheme("\t"));
     try std.testing.expect(!isWordSeparatorGrapheme("a"));
 
@@ -208,10 +214,10 @@ test "entities are decoded with the inline text rules" {
     const allocator = std.testing.allocator;
     const decoded = try decodeTextForDisplay(
         allocator,
-        "&lt;div&gt; &amp; &quot;quote&quot; &apos;x&apos; &#x1F642; &unknown;",
+        "&lt;div&gt; &amp; &quot;quote&quot; &apos;x&apos; &nbsp; &#x1F642; &unknown;",
     );
     defer allocator.free(decoded);
-    try std.testing.expectEqualStrings("<div> & \"quote\" 'x' 🙂 &unknown;", decoded);
+    try std.testing.expectEqualStrings("<div> & \"quote\" 'x' \u{00a0} 🙂 &unknown;", decoded);
 
     var buffer: [4]u8 = undefined;
     const soft_hyphen = lexEntityAt("&shy;", 0, &buffer).?;

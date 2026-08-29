@@ -1,9 +1,10 @@
 <!doctype html>
 <!--
 How to verify:
-1. Open this file in Zibra. All four cards should show the colored PPM image
+1. Open this file in Zibra. All five cards should show the colored PPM image
    behind readable text; the pale background color should fill uncovered area.
-2. "Explicit" paints an 80x48 image at its top-left. "Percent" stretches to
+2. "Default repeat" tiles its 4x2 image across the card. "Explicit" paints one
+   80x48 image at its top-left. "Percent" stretches to
    the whole card. "Contain" preserves the 2:1 aspect ratio and leaves space
    to its right. "Cover" fills the rounded square and crops its right half.
 3. The rounded Cover card must not spill image pixels into its corners.
@@ -24,16 +25,17 @@ How to verify:
     background-color: #cbd5e1;
     background-image: url(background-image-pattern.ppm);
   }
-  .explicit { background-size: 80px 48px; }
-  .percent { background-size: 100% 100%; }
-  .contain { background-size: contain; }
-  .cover { width: 80px; background-size: cover; border-radius: 22px; }
+  .explicit { background-size: 80px 48px; background-repeat: no-repeat; }
+  .percent { background-size: 100% 100%; background-repeat: no-repeat; }
+  .contain { background-size: contain; background-repeat: no-repeat; }
+  .cover { width: 80px; background-size: cover; background-repeat: no-repeat; border-radius: 22px; }
   .control { width: 220px; height: 56px; color: white;
     background-image: url(background-image-pattern.ppm);
-    background-size: 100% 100%; }
+    background-size: 100% 100%; background-repeat: no-repeat; }
 </style>
 <h1>CSS background images</h1>
 <div class=grid>
+  <div class="card">Default repeat</div>
   <div class="card explicit">Explicit 80px × 48px</div>
   <div class="card percent">Percentage sizing</div>
   <div class="card contain">Contain</div>

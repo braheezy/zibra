@@ -69,6 +69,8 @@ pub fn characterReferenceAt(text: []const u8, pos: usize) ?CharacterReference {
         '"'
     else if (std.mem.eql(u8, name, "apos"))
         '\''
+    else if (std.mem.eql(u8, name, "nbsp"))
+        0x00a0
     else if (std.mem.eql(u8, name, "shy"))
         0x00ad
     else if (parseNumericCharacterReference(name)) |numeric|
@@ -403,6 +405,31 @@ pub const Element = struct {
     pub fn isInputType(self: *const Element, expected: []const u8) bool {
         if (!std.ascii.eqlIgnoreCase(self.tag, "input")) return false;
         return std.ascii.eqlIgnoreCase(self.inputType(), expected);
+    }
+
+    /// Return whether an HTML attribute contains `expected` as an
+    /// ASCII-whitespace-separated, ASCII-case-insensitive token. Callers use
+    /// this for token-list attributes such as `rel`; the returned slices
+    /// continue to borrow the element's attribute storage.
+    pub fn attributeHasToken(
+        self: *const Element,
+        attribute_name: []const u8,
+        expected: []const u8,
+    ) bool {
+        const attributes = self.attributes orelse return false;
+        const value = attributes.get(attribute_name) orelse return false;
+
+        var start: usize = 0;
+        while (start < value.len) {
+            while (start < value.len and std.ascii.isWhitespace(value[start])) : (start += 1) {}
+            if (start == value.len) break;
+
+            var end = start;
+            while (end < value.len and !std.ascii.isWhitespace(value[end])) : (end += 1) {}
+            if (std.ascii.eqlIgnoreCase(value[start..end], expected)) return true;
+            start = end;
+        }
+        return false;
     }
 
     /// Publish the latest layout overflow for an `overflow: scroll` box and
@@ -997,4 +1024,18 @@ pub fn writeStyledPretty(
             }
         },
     }
+}
+
+test "HTML token-list attributes are whitespace-separated and case-insensitive" {
+    var link = try Element.init(
+        std.testing.allocator,
+        "link rel=\"appendix  StyleSheet\talternate\"",
+        null,
+    );
+    defer link.deinit(std.testing.allocator);
+
+    try std.testing.expect(link.attributeHasToken("rel", "stylesheet"));
+    try std.testing.expect(link.attributeHasToken("rel", "APPENDIX"));
+    try std.testing.expect(!link.attributeHasToken("rel", "style"));
+    try std.testing.expect(!link.attributeHasToken("missing", "stylesheet"));
 }

@@ -81,6 +81,9 @@ const CSS_PROPERTIES = [_]struct { name: []const u8, default_value: []const u8 }
     .{ .name = "background-color", .default_value = "transparent" },
     .{ .name = "background-image", .default_value = "none" },
     .{ .name = "background-size", .default_value = "auto" },
+    .{ .name = "background-repeat", .default_value = "repeat" },
+    .{ .name = "background-position", .default_value = "0 0" },
+    .{ .name = "background-attachment", .default_value = "scroll" },
     .{ .name = "object-fit", .default_value = "fill" },
     .{ .name = "aspect-ratio", .default_value = "auto" },
     .{ .name = "image-rendering", .default_value = "auto" },
@@ -95,7 +98,11 @@ const CSS_PROPERTIES = [_]struct { name: []const u8, default_value: []const u8 }
     .{ .name = "scroll-behavior", .default_value = "auto" },
     .{ .name = "zoom", .default_value = "1" },
     .{ .name = "width", .default_value = "auto" },
+    .{ .name = "min-width", .default_value = "0px" },
+    .{ .name = "max-width", .default_value = "none" },
     .{ .name = "height", .default_value = "auto" },
+    .{ .name = "min-height", .default_value = "0px" },
+    .{ .name = "max-height", .default_value = "none" },
     .{ .name = "float", .default_value = "none" },
     .{ .name = "clear", .default_value = "none" },
 };
@@ -169,6 +176,13 @@ pub fn Application(
                 }
             }
             return "";
+        }
+
+        fn cssInitialValue(property: []const u8) []const u8 {
+            for (INHERITED_PROPERTIES) |prop| {
+                if (std.mem.eql(u8, prop.name, property)) return prop.default_value;
+            }
+            return cssDefaultFor(property);
         }
 
         fn keyframesNamed(
@@ -507,6 +521,7 @@ pub fn Application(
 
             switch (node.*) {
                 .text => |*t| {
+                    const had_style = t.style != null;
                     if (t.style == null) {
                         t.style = try initStyleMap(
                             StyleMap,
@@ -518,7 +533,10 @@ pub fn Application(
                     }
                     var style_map = &t.style.?;
                     std.debug.assert(styleNeedsUpdate(StyleMap, style_map));
-                    markPaintForNodeFn(node);
+                    // Initial style precedes layout and has no retained paint
+                    // commands to invalidate. Only a restyle can stale an
+                    // existing display-list owner.
+                    if (had_style) markPaintForNodeFn(node);
                     if (stats) |pass_stats| pass_stats.recomputed_nodes += 1;
                     errdefer markStyleMapWithoutOwnerFn(style_map);
 
@@ -554,6 +572,7 @@ pub fn Application(
                     return;
                 },
                 .element => |*e| {
+                    const had_style = e.style != null;
                     if (e.style == null) {
                         e.style = try initStyleMap(
                             StyleMap,
@@ -567,7 +586,7 @@ pub fn Application(
                     const needs_style = styleNeedsUpdate(StyleMap, style_map);
 
                     if (needs_style) {
-                        markPaintForNodeFn(node);
+                        if (had_style) markPaintForNodeFn(node);
                         if (stats) |pass_stats| pass_stats.recomputed_nodes += 1;
                         errdefer markStyleMapWithoutOwnerFn(style_map);
                         var new_style = std.StringHashMap([]const u8).init(allocator);
@@ -632,6 +651,35 @@ pub fn Application(
                                         CSSParser.INLINE_STYLE_PRIORITY,
                                     );
                                 }
+                            }
+                        }
+
+                        // Resolve CSS-wide keywords for every supported
+                        // property before focused computed-value transforms.
+                        // Explicit inherit on a normally non-inherited property
+                        // still registers the parent dependency it requests.
+                        for (CSS_PROPERTIES) |prop| {
+                            const authored = new_style.get(prop.name) orelse continue;
+                            const keyword = std.mem.trim(u8, authored, " \t\r\n");
+                            const wants_inherited = std.ascii.eqlIgnoreCase(keyword, "inherit") or
+                                (std.ascii.eqlIgnoreCase(keyword, "unset") and
+                                    isInheritedProperty(prop.name));
+                            if (wants_inherited) {
+                                const child_field = style_map.getPtr(prop.name).?;
+                                const inherited = if (parent_style.getPtr(prop.name)) |parent_field|
+                                    inheritedValue(
+                                        parent_field,
+                                        child_field,
+                                        parent_is_ephemeral_default,
+                                        allocator,
+                                    )
+                                else
+                                    cssInitialValue(prop.name);
+                                try new_style.put(prop.name, inherited);
+                            } else if (std.ascii.eqlIgnoreCase(keyword, "initial") or
+                                std.ascii.eqlIgnoreCase(keyword, "unset"))
+                            {
+                                try new_style.put(prop.name, cssInitialValue(prop.name));
                             }
                         }
 

@@ -16,6 +16,8 @@ pub const BackgroundImagePaint = struct {
     source_width: i32,
     source_height: i32,
     size: background_image.Size,
+    repeat: background_image.Repeat,
+    position: []const u8,
 };
 
 pub fn backgroundImagePaint(element: *const parser.Element) ?BackgroundImagePaint {
@@ -26,11 +28,17 @@ pub fn backgroundImagePaint(element: *const parser.Element) ?BackgroundImagePain
         background_image.parseSize(value) orelse background_image.Size.automatic()
     else
         background_image.Size.automatic();
+    const repeat = if (styleValue(styles, "background-repeat")) |value|
+        background_image.parseRepeat(value) orelse background_image.Repeat{ .x = true, .y = true }
+    else
+        background_image.Repeat{ .x = true, .y = true };
     return .{
         .pixels = data.image.rawBytes(),
         .source_width = @intCast(data.image.width),
         .source_height = @intCast(data.image.height),
         .size = size,
+        .repeat = repeat,
+        .position = styleValue(styles, "background-position") orelse "0 0",
     };
 }
 
@@ -76,8 +84,9 @@ pub fn appendBackgroundBox(
     }
 }
 
-/// Paint one non-repeating background image at the top-left default position.
-/// A larger resolved image is source-cropped at the right or bottom edge.
+/// Paint one positioned background tile clipped to the element's box. The
+/// raster command retains repetition metadata so small images do not produce
+/// one display command per tile.
 pub fn appendBackgroundImageBox(
     commands: *std.ArrayList(DisplayItem),
     allocator: std.mem.Allocator,
@@ -98,27 +107,31 @@ pub fn appendBackgroundImageBox(
         css_scale,
     );
     if (resolved.width <= 0 or resolved.height <= 0) return;
-
-    const clipped_width = @min(width, resolved.width);
-    const clipped_height = @min(height, resolved.height);
-    if (clipped_width <= 0 or clipped_height <= 0) return;
-    const cropped = clipped_width != resolved.width or clipped_height != resolved.height;
-    const source_rect: ?display_list.ImageSourceRect = if (cropped) .{
-        .left = 0,
-        .top = 0,
-        .right = croppedSourceExtent(clipped_width, resolved.width, paint.source_width),
-        .bottom = croppedSourceExtent(clipped_height, resolved.height, paint.source_height),
-    } else null;
+    const position = background_image.resolvePosition(
+        paint.position,
+        width,
+        height,
+        resolved.width,
+        resolved.height,
+        css_scale,
+    );
 
     try commands.append(allocator, .{ .image = .{
         .x1 = x,
         .y1 = y,
-        .x2 = x + clipped_width,
-        .y2 = y + clipped_height,
+        .x2 = x + width,
+        .y2 = y + height,
         .source_width = paint.source_width,
         .source_height = paint.source_height,
         .pixels = paint.pixels,
-        .source_rect = source_rect,
+        .tiling = .{
+            .width = resolved.width,
+            .height = resolved.height,
+            .offset_x = position.x,
+            .offset_y = position.y,
+            .repeat_x = paint.repeat.x,
+            .repeat_y = paint.repeat.y,
+        },
         .source = source,
     } });
 }
@@ -157,13 +170,6 @@ pub fn appendRoundedControlGroup(
     children_owned = false;
 }
 
-fn croppedSourceExtent(clipped: i32, desired: i32, source: i32) f64 {
-    if (clipped >= desired) return @floatFromInt(source);
-    return @as(f64, @floatFromInt(clipped)) *
-        @as(f64, @floatFromInt(source)) /
-        @as(f64, @floatFromInt(desired));
-}
-
 fn styleValue(style_map: *const parser.StyleMap, property: []const u8) ?[]const u8 {
     const field = @constCast(style_map).getPtr(property) orelse return null;
     return field.get().*;
@@ -185,6 +191,8 @@ test "background image paint resolves size and fractional source crop" {
             .source_width = 2,
             .source_height = 1,
             .size = .cover,
+            .repeat = .{ .x = false, .y = false },
+            .position = "0 0",
         },
         10,
         20,
@@ -198,10 +206,8 @@ test "background image paint resolves size and fractional source crop" {
     const image = commands.items[0].image;
     try std.testing.expectEqual(@as(i32, 10), image.x1);
     try std.testing.expectEqual(@as(i32, 110), image.x2);
-    try std.testing.expectEqual(
-        display_list.ImageSourceRect{ .left = 0, .top = 0, .right = 1, .bottom = 1 },
-        image.source_rect.?,
-    );
+    try std.testing.expectEqual(@as(i32, 200), image.tiling.?.width);
+    try std.testing.expect(!image.tiling.?.repeat_x);
 }
 
 test "rounded control group constrains child hits without compositing" {
