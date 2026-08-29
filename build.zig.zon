@@ -13,11 +13,6 @@
             .url = "git+https://github.com/braheezy/ada-zig#18afbfbf56b86d511be356335f7f52f715963b1d",
             .hash = "adazig-4.0.0-t4eT-vJtAAAU96x1U7UJI7fmixUJiJsMfpuZurw9ETaK",
         },
-        // The locations of folders
-        .known_folders = .{
-            .url = "git+https://github.com/ziglibs/known-folders#6da0d0c41b78b9ed2d34fa364fcb81b5ebece6c4",
-            .hash = "known_folders-0.0.0-Fy-PJiDLAAB98m3uYUzatrTb2mO2fpvwx2zpSroEtfbO",
-        },
         // Javascript runtime
         .kiesel = .{
             .url = "git+https://github.com/braheezy/kiesel-fork#26a59948cfa4eae714e73f3dd68fca9fb6806836",

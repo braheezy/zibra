@@ -185,9 +185,6 @@ pub fn build(b: *std.Build) !void {
     sdk.link(io, exe, .static, sdl.Library.SDL2_ttf);
     b.installArtifact(exe);
 
-    const known_folders = b.dependency("known_folders", .{}).module("known-folders");
-    source_module.addImport("known-folders", known_folders);
-
     const zg = b.dependency("zg", .{});
     source_module.addImport("grapheme", zg.module("Graphemes"));
     source_module.addImport("emoji", zg.module("Emoji"));
@@ -274,7 +271,6 @@ pub fn build(b: *std.Build) !void {
             },
             .full => {
                 test_module.addImport("sdl", sdl_mod);
-                test_module.addImport("known-folders", known_folders);
                 test_module.addImport("grapheme", zg.module("Graphemes"));
                 test_module.addImport("emoji", zg.module("Emoji"));
                 test_module.addImport("code_point", zg.module("code_point"));

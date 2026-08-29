@@ -6,7 +6,6 @@
 const std = @import("std");
 const builtin = @import("builtin");
 
-const known_folders = @import("known-folders");
 const code_point = @import("code_point");
 const unicode_emoji = @import("emoji");
 const sdl2 = @import("sdl");
@@ -233,6 +232,11 @@ const system_fonts = switch (builtin.target.os.tag) {
     else => @compileError("Unsupported operating system"),
 };
 
+fn homeDirectory(environ: *const std.process.Environ.Map) ?[]const u8 {
+    const home = environ.get("HOME") orelse return null;
+    return if (home.len == 0) null else home;
+}
+
 fn configuredFontCategory(name: []const u8) FontCategory {
     for (system_fonts.fonts) |font| {
         if (std.mem.eql(u8, font.name, name)) return font.category;
@@ -400,8 +404,7 @@ pub const FontManager = struct {
         }
 
         // Add user font directory first to prefer them.
-        const home_dir = try known_folders.getPath(self.io, self.allocator, self.environ, .home) orelse return error.NoHomeDir;
-        defer self.allocator.free(home_dir);
+        const home_dir = homeDirectory(self.environ) orelse return error.NoHomeDir;
 
         const user_suffixes = switch (builtin.target.os.tag) {
             .macos => &[_][]const u8{"/Library/Fonts"},
@@ -732,6 +735,18 @@ fn sliceToSentinelArray(allocator: std.mem.Allocator, slice: []const u8) ![:0]co
     const arr = try allocator.allocSentinel(u8, len, 0);
     @memcpy(arr, slice);
     return arr;
+}
+
+test "home directory uses a non-empty HOME environment value" {
+    const allocator = std.testing.allocator;
+    var environ = std.process.Environ.Map.init(allocator);
+    defer environ.deinit();
+
+    try std.testing.expect(homeDirectory(&environ) == null);
+    try environ.put("HOME", "");
+    try std.testing.expect(homeDirectory(&environ) == null);
+    try environ.put("HOME", "/home/zibra");
+    try std.testing.expectEqualStrings("/home/zibra", homeDirectory(&environ).?);
 }
 
 pub fn getCategory(codepoint: u21) ?FontCategory {
