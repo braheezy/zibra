@@ -211,10 +211,22 @@ pub const Url = struct {
 
             const data_alloc = if (is_base64) blk: {
                 const decoder = &std.base64.standard.Decoder;
-                const decoded_len = try decoder.calcSizeForSlice(percent_decoded);
+                // Base64 data URLs commonly use MIME-style line wrapping. The
+                // URL percent-decoding above turns encoded spaces/newlines back
+                // into bytes, but Zig's strict decoder rejects that whitespace.
+                // Compact the payload in place before asking the decoder for its
+                // size so valid wrapped data (such as Acid3's scripts) loads.
+                var compact_len: usize = 0;
+                for (percent_decoded) |byte| {
+                    if (std.ascii.isWhitespace(byte)) continue;
+                    percent_decoded[compact_len] = byte;
+                    compact_len += 1;
+                }
+                const compacted = percent_decoded[0..compact_len];
+                const decoded_len = try decoder.calcSizeForSlice(compacted);
                 const decoded = try allocator.alloc(u8, decoded_len);
                 errdefer allocator.free(decoded);
-                try decoder.decode(decoded, percent_decoded);
+                try decoder.decode(decoded, compacted);
                 allocator.free(percent_decoded);
                 break :blk decoded;
             } else blk: {
@@ -990,6 +1002,16 @@ test "data request percent-decodes before base64 decoding" {
     defer url.free(std.testing.allocator);
 
     try expect(std.mem.eql(u8, url.path, "Hello"));
+}
+
+test "data request accepts percent-encoded base64 whitespace" {
+    const url = try Url.init(
+        std.testing.allocator,
+        "data:text/javascript;base64,%20ZD%20Qg%0D%0APS%20An%20Zm91cic%0D%0A%207%20",
+    );
+    defer url.free(std.testing.allocator);
+
+    try expect(std.mem.eql(u8, url.path, "d4 = 'four';"));
 }
 
 test "fetchBody handles data URLs without Browser state" {

@@ -1158,6 +1158,17 @@ pub fn writeStyledPretty(
     node: Node,
     indent: usize,
 ) !void {
+    // Keep formatting-only text in the live DOM while suppressing it in the
+    // compact style inspection output. This avoids noisy blank entries caused
+    // by indentation in the source fixture.
+    switch (node) {
+        .text => |text| {
+            for (text.text) |byte| {
+                if (!std.ascii.isWhitespace(byte)) break;
+            } else return;
+        },
+        .element => {},
+    }
     const spaces = try allocator.alloc(u8, indent);
     defer allocator.free(spaces);
     @memset(spaces, ' ');

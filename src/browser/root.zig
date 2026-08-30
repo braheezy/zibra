@@ -3342,8 +3342,17 @@ pub const Browser = struct {
 
         const frame = try parent.allocator.create(Frame);
         frame.* = Frame.init(parent.allocator, parent.tab, parent, iframe_node);
+        // Resource discovery runs before the style phase for a newly attached
+        // subtree.  Do not read the iframe's computed `zoom` through a dirty
+        // ProtectedField; the next render recomputes inherited zoom once the
+        // parent generation has been published.  Keeping the provisional
+        // value at 1 here still gives the child a valid viewport immediately.
+        const authored_zoom = if (parent.styleNeeded())
+            1.0
+        else
+            Layout.effectiveCssZoomForNode(iframe_node);
         frame.inherited_css_zoom = std.math.clamp(
-            parent.inherited_css_zoom * Layout.effectiveCssZoomForNode(iframe_node),
+            parent.inherited_css_zoom * authored_zoom,
             @as(f32, 0.01),
             @as(f32, 1024.0),
         );

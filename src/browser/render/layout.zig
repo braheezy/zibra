@@ -9060,6 +9060,25 @@ const BlockLayout = struct {
         return previous;
     }
 
+    fn isFormattingWhitespaceNode(node: *const Node) bool {
+        return switch (node.*) {
+            .text => |text| std.mem.trim(u8, text.text, " \t\r\n\x0c").len == 0,
+            .element => false,
+        };
+    }
+
+    fn sourceRangeIsFormattingWhitespace(
+        source: DirectChildSource,
+        start: usize,
+        end: usize,
+    ) bool {
+        if (start == end) return true;
+        for (start..end) |index| {
+            if (!isFormattingWhitespaceNode(source.at(index))) return false;
+        }
+        return true;
+    }
+
     fn appendBlockChildren(self: *BlockLayout, source: DirectChildSource) !void {
         // Tables and real rows place their direct children in a grid, not in
         // the usual vertical predecessor chain. Cells themselves still use
@@ -9131,6 +9150,12 @@ const BlockLayout = struct {
                 source.at(index).*,
                 if (self.persistent_dependencies) &self.children_version else null,
             )) : (index += 1) {}
+            // Source indentation between block-level children is represented
+            // by real DOM text nodes, but it does not establish an anonymous
+            // formatting context. Dropping an all-whitespace run here keeps
+            // those nodes available to DOM/script consumers without creating
+            // zero-height layout boxes (or perturbing retained predecessors).
+            if (sourceRangeIsFormattingWhitespace(source, start, index)) continue;
             const inline_nodes = try self.allocator.alloc(*Node, index - start);
             errdefer self.allocator.free(inline_nodes);
             for (start..index) |source_index| {

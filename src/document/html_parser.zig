@@ -685,6 +685,17 @@ pub fn Parser(
         /// Write a deterministic, indented DOM tree without invoking layout or
         /// rendering. The caller owns the output destination.
         pub fn writePretty(self: *HTMLParser, writer: *std.Io.Writer, node: Node, indent: usize) !void {
+            // Formatting whitespace between elements is retained in the DOM,
+            // but omitting it from the inspection view keeps dumps stable and
+            // readable (and matches the long-standing CLI golden contract).
+            switch (node) {
+                .text => |text| {
+                    for (text.text) |byte| {
+                        if (!std.ascii.isWhitespace(byte)) break;
+                    } else return;
+                },
+                .element => {},
+            }
             // Create a temporary buffer filled with spaces
             const spaces = try self.allocator.alloc(u8, indent);
             defer self.allocator.free(spaces);

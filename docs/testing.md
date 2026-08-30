@@ -37,7 +37,8 @@ Run from the repository root:
   goldens covering the box model, nested CSS zoom, bounded tables, float paint
   phases, and adjoining-margin/clearance flow under SDL dummy mode;
 - `zig build test-docs` for repository Markdown links when documentation
-  changes;
+  changes. The checker intentionally skips the vendored `tests/wpt/upstream`
+  submodule, whose links are resolved by WPT's own documentation tooling;
 - `zig build test-server` after tutorial server routing, topic, session,
   message, or persistence changes (the underlying direct unittest command is
   `python3 -m unittest tests/test_server_message_board.py`).

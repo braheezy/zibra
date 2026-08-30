@@ -18,6 +18,11 @@ EXCLUDED_DIRECTORIES = {
     "zig-cache",
     "zig-out",
     "zig-pkg",
+    # WPT is a vendored submodule. Its documentation intentionally contains
+    # links resolved by the upstream site/build tooling, not repository-local
+    # files, so validating it here produces false failures whenever WPT is
+    # updated independently of Zibra.
+    "upstream",
 }
 INLINE_LINK = re.compile(r"!?\[[^\]]*\]\(\s*(?:<([^>]+)>|([^\s)]+))")
 REFERENCE_LINK = re.compile(

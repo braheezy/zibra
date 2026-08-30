@@ -35,8 +35,9 @@ Focused steps are `test-document`, `test-render`, `test-network`,
 - `zig build test-dump-dom` — DOM CLI output;
 - `zig build test-screenshot` — native macOS visual goldens;
 - `zig build test-server` — tutorial server unittest;
-- `zig build test-docs` and `zig build test-format` — documentation links and
-  formatting.
+- `zig build test-docs` and `zig build test-format` — repository documentation
+  links and formatting. `test-docs` excludes the vendored
+  `tests/wpt/upstream` submodule, which follows WPT's own link/build rules.
 
 Choose the narrowest step while iterating, then run the complete checks
 appropriate to the changed owner before handoff. Report checks that were not

@@ -361,6 +361,21 @@ fn refreshInheritedFrameZoom(frame: *Frame) bool {
     return changed;
 }
 
+/// Update iframe authored zoom only from a clean computed-style generation.
+/// Structural mutations can dirty both the frame tree and the iframe element's
+/// `zoom` field; reading that field before the style pass violates the
+/// ProtectedField phase contract and can abort the animation worker. A dirty
+/// generation is retried after style publication on the next render.
+fn refreshInheritedFrameZoomIfClean(self: *Tab, frame: *Frame) bool {
+    if (frameTreeNeedsStyle(frame)) return false;
+    if (!refreshInheritedFrameZoom(frame)) return false;
+
+    self.media_environment_dirty = true;
+    markFrameStyleDirty(frame);
+    self.needs_paint = true;
+    return true;
+}
+
 fn invalidateFrameTreeForViewportResize(frame: *Frame) void {
     if (frame.document.lastValue().*) |doc| {
         doc.mark();
@@ -1607,13 +1622,9 @@ pub fn render(self: *Tab, b: *Browser) !void {
 
     // Consume inherited iframe zoom from the preceding computed-style
     // generation before deciding which width-dependent media rules to parse.
-    // A zoom change painted during this pass is detected by composition and
-    // schedules the following protected generation.
-    if (refreshInheritedFrameZoom(frame)) {
-        self.media_environment_dirty = true;
-        markFrameStyleDirty(frame);
-        self.needs_paint = true;
-    }
+    // Never inspect a dirty ProtectedField; the clean-generation helper below
+    // retries after style publication when a mutation changed iframe CSS.
+    _ = self.refreshInheritedFrameZoomIfClean(frame);
 
     // JavaScript structural mutations are complete by the time their
     // delayed render task runs. Refresh resources before style so newly
@@ -1656,6 +1667,11 @@ pub fn render(self: *Tab, b: *Browser) !void {
             style_ns = @intCast(std.Io.Clock.awake.now(b.io).nanoseconds - style_start);
         }
     }
+
+    // A dirty pass can now have published the iframe element's new zoom. Defer
+    // its inherited viewport update until these style fields are clean; the
+    // resulting media/layout invalidation is consumed by the next generation.
+    _ = self.refreshInheritedFrameZoomIfClean(frame);
 
     // Geometry dirtiness comes from the retained layout dependency graph.
     // Paint remains independently forceable for colors, focus, and visited
