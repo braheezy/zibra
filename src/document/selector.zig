@@ -50,6 +50,9 @@ pub const Selector = union(enum) {
     attribute: AttributeSelector,
     focus_visible: FocusVisibleSelector,
     hover: HoverSelector,
+    structural: StructuralSelector,
+    not: NotSelector,
+    state: StateSelector,
     pseudo_element: PseudoElementSelector,
     sequence: SelectorSequence,
     has: HasSelector,
@@ -76,6 +79,9 @@ pub const Selector = union(enum) {
             .attribute => |attribute| attribute.matches(node),
             .focus_visible => |focus_visible| focus_visible.matches(node),
             .hover => |hover| hover.matches(node),
+            .structural => |structural| structural.matches(node),
+            .not => |not| not.matches(node, context),
+            .state => |state| state.matches(node),
             .pseudo_element => |pseudo_element| pseudo_element.matches(node),
             .sequence => |s| s.matches(node),
             .has => |h| h.matches(node, context),
@@ -108,6 +114,9 @@ pub const Selector = union(enum) {
             .attribute => |*attribute| attribute.deinit(allocator),
             .focus_visible => {},
             .hover => {},
+            .structural => |*structural| structural.deinit(allocator),
+            .not => |*not| not.deinit(allocator),
+            .state => {},
             .pseudo_element => {},
             .sequence => |*s| s.deinit(allocator),
             .has => |*h| h.deinit(allocator),
@@ -127,6 +136,9 @@ pub const Selector = union(enum) {
             .attribute => |attribute| attribute.priority(),
             .focus_visible => |focus_visible| focus_visible.priority(),
             .hover => |hover| hover.priority(),
+            .structural => |structural| structural.priority(),
+            .not => |not| not.priority(),
+            .state => |state| state.priority(),
             .pseudo_element => |pseudo_element| pseudo_element.priority(),
             .sequence => |s| s.priority(),
             .has => |h| h.priority(),
@@ -159,6 +171,9 @@ pub const SimpleSelector = union(enum) {
     attribute: AttributeSelector,
     focus_visible: FocusVisibleSelector,
     hover: HoverSelector,
+    structural: StructuralSelector,
+    not: NotSelector,
+    state: StateSelector,
     pseudo_element: PseudoElementSelector,
     sequence: SelectorSequence,
     has: HasSelector,
@@ -172,6 +187,9 @@ pub const SimpleSelector = union(enum) {
             .attribute => |attribute| .{ .attribute = attribute },
             .focus_visible => |focus_visible| .{ .focus_visible = focus_visible },
             .hover => |hover| .{ .hover = hover },
+            .structural => |structural| .{ .structural = structural },
+            .not => |not| .{ .not = not },
+            .state => |state| .{ .state = state },
             .pseudo_element => |pseudo_element| .{ .pseudo_element = pseudo_element },
             .sequence => |sequence| .{ .sequence = sequence },
             .has => |has| .{ .has = has },
@@ -187,6 +205,9 @@ pub const SimpleSelector = union(enum) {
             .attribute => |attribute| attribute.matches(node),
             .focus_visible => |focus_visible| focus_visible.matches(node),
             .hover => |hover| hover.matches(node),
+            .structural => |structural| structural.matches(node),
+            .not => |not| not.matches(node, context),
+            .state => |state| state.matches(node),
             .pseudo_element => |pseudo_element| pseudo_element.matches(node),
             .sequence => |sequence| sequence.matches(node),
             .has => |has| has.matches(node, context),
@@ -213,6 +234,9 @@ pub const SimpleSelector = union(enum) {
             .attribute => |*attribute| attribute.deinit(allocator),
             .focus_visible => {},
             .hover => {},
+            .structural => |*structural| structural.deinit(allocator),
+            .not => |*not| not.deinit(allocator),
+            .state => {},
             .pseudo_element => {},
             .sequence => |*sequence| sequence.deinit(allocator),
             .has => |*has| has.deinit(allocator),
@@ -228,6 +252,9 @@ pub const SimpleSelector = union(enum) {
             .attribute => |attribute| attribute.priority(),
             .focus_visible => |focus_visible| focus_visible.priority(),
             .hover => |hover| hover.priority(),
+            .structural => |structural| structural.priority(),
+            .not => |not| not.priority(),
+            .state => |state| state.priority(),
             .pseudo_element => |pseudo_element| pseudo_element.priority(),
             .sequence => |sequence| sequence.priority(),
             .has => |has| has.priority(),
@@ -261,6 +288,7 @@ pub const AttributeMatch = enum {
     presence,
     exact,
     includes,
+    dash_match,
 };
 
 /// A supported HTML attribute selector: presence, exact value, or
@@ -295,6 +323,10 @@ pub const AttributeSelector = struct {
                 }
                 break :blk false;
             },
+            .dash_match => std.mem.eql(u8, actual, self.value.?) or
+                (actual.len > self.value.?.len and
+                    std.mem.startsWith(u8, actual, self.value.?) and
+                    actual[self.value.?.len] == '-'),
         };
     }
 
@@ -405,6 +437,214 @@ pub const HoverSelector = struct {
     }
 };
 
+/// Form/link state pseudo-classes used by Acid3 and ordinary page styling.
+/// State is read from the live Element so attribute and navigation changes are
+/// reflected after the normal style invalidation pass.
+pub const StateKind = enum { link, visited, enabled, disabled, checked };
+
+pub const StateSelector = struct {
+    kind: StateKind,
+
+    fn matches(self: StateSelector, node: *Node) bool {
+        const element = switch (publicHostNode(node).*) {
+            .element => |*value| value,
+            .text => return false,
+        };
+        const attrs = element.attributes;
+        const has_href = if (attrs) |map| map.contains("href") else false;
+        const is_link = (std.ascii.eqlIgnoreCase(element.tag, "a") or
+            std.ascii.eqlIgnoreCase(element.tag, "area")) and has_href;
+        const is_control = std.ascii.eqlIgnoreCase(element.tag, "input") or
+            std.ascii.eqlIgnoreCase(element.tag, "button") or
+            std.ascii.eqlIgnoreCase(element.tag, "select") or
+            std.ascii.eqlIgnoreCase(element.tag, "textarea") or
+            std.ascii.eqlIgnoreCase(element.tag, "option");
+        const is_disabled = if (attrs) |map| map.contains("disabled") else false;
+        return switch (self.kind) {
+            .link => is_link and !element.is_visited,
+            .visited => is_link and element.is_visited,
+            .enabled => is_control and !is_disabled,
+            .disabled => is_control and is_disabled,
+            .checked => element.isChecked(),
+        };
+    }
+
+    fn priority(self: StateSelector) u32 {
+        _ = self;
+        return 10;
+    }
+};
+
+/// Structural pseudo-classes whose result is derived from the element's
+/// current sibling/ancestor relationship. The argument is owned only for
+/// functional forms such as :nth-child() and :lang().
+pub const StructuralKind = enum {
+    root,
+    first_child,
+    last_child,
+    only_child,
+    empty,
+    nth_child,
+    nth_last_child,
+    first_of_type,
+    last_of_type,
+    only_of_type,
+    nth_of_type,
+    nth_last_of_type,
+    lang,
+};
+
+pub const StructuralSelector = struct {
+    kind: StructuralKind,
+    argument: ?[]const u8 = null,
+
+    fn elementNode(node: *Node) ?*parser.Element {
+        return switch (publicHostNode(node).*) {
+            .element => |*element| element,
+            .text => null,
+        };
+    }
+
+    fn parentElement(node: *Node) ?*parser.Element {
+        const element = elementNode(node) orelse return null;
+        const parent = element.parent orelse return null;
+        return switch (parent.*) {
+            .element => |*value| value,
+            .text => null,
+        };
+    }
+
+    fn siblingIndex(node: *Node, from_end: bool, same_type: bool) ?usize {
+        const parent = parentElement(node) orelse return null;
+        const target = elementNode(node) orelse return null;
+        var count: usize = 0;
+        if (!from_end) {
+            for (parent.children.items) |*child| {
+                const child_element = elementNode(child) orelse continue;
+                if (same_type and !std.ascii.eqlIgnoreCase(child_element.tag, target.tag)) continue;
+                count += 1;
+                if (child == publicHostNode(node)) return count;
+            }
+        } else {
+            var i = parent.children.items.len;
+            while (i > 0) {
+                i -= 1;
+                const child = &parent.children.items[i];
+                const child_element = elementNode(child) orelse continue;
+                if (same_type and !std.ascii.eqlIgnoreCase(child_element.tag, target.tag)) continue;
+                count += 1;
+                if (child == publicHostNode(node)) return count;
+            }
+        }
+        return null;
+    }
+
+    fn nthMatches(index: usize, argument: []const u8) bool {
+        const expr = std.mem.trim(u8, argument, " \t\r\n\x0c");
+        if (std.ascii.eqlIgnoreCase(expr, "odd")) return (index & 1) == 1;
+        if (std.ascii.eqlIgnoreCase(expr, "even")) return (index & 1) == 0;
+        const n_pos = std.mem.indexOfScalar(u8, expr, 'n') orelse
+            std.mem.indexOfScalar(u8, expr, 'N') orelse {
+            const value = std.fmt.parseInt(i64, expr, 10) catch return false;
+            return value >= 1 and index == @as(usize, @intCast(value));
+        };
+        const coefficient_text = std.mem.trim(u8, expr[0..n_pos], " \t\r\n\x0c");
+        const coefficient: i64 = if (coefficient_text.len == 0 or std.mem.eql(u8, coefficient_text, "+"))
+            1
+        else if (std.mem.eql(u8, coefficient_text, "-"))
+            -1
+        else
+            std.fmt.parseInt(i64, coefficient_text, 10) catch return false;
+        const offset_text = std.mem.trim(u8, expr[n_pos + 1 ..], " \t\r\n\x0c");
+        const offset: i64 = if (offset_text.len == 0)
+            0
+        else
+            std.fmt.parseInt(i64, offset_text, 10) catch return false;
+        const position: i64 = @intCast(index);
+        const delta = position - offset;
+        if (coefficient == 0) return delta == 0;
+        if ((delta < 0 and coefficient > 0) or (delta > 0 and coefficient < 0)) return false;
+        return @mod(delta, coefficient) == 0;
+    }
+
+    fn matchesLang(node: *Node, argument: []const u8) bool {
+        const requested = std.mem.trim(u8, argument, " \t\r\n\x0c\"'");
+        if (requested.len == 0) return false;
+        var current: ?*Node = publicHostNode(node);
+        while (current) |candidate| {
+            switch (candidate.*) {
+                .text => |text| current = text.parent,
+                .element => |*element| {
+                    if (element.attributes) |attributes| {
+                        const lang = attributes.get("lang") orelse attributes.get("xml:lang");
+                        if (lang) |value| {
+                            if (std.ascii.eqlIgnoreCase(value, requested) or
+                                (value.len > requested.len and
+                                    std.ascii.eqlIgnoreCase(value[0..requested.len], requested) and
+                                    value[requested.len] == '-')) return true;
+                            return false;
+                        }
+                    }
+                    current = element.parent;
+                },
+            }
+        }
+        return false;
+    }
+
+    fn matches(self: StructuralSelector, node: *Node) bool {
+        const element = elementNode(node) orelse return false;
+        return switch (self.kind) {
+            .root => element.parent == null,
+            .first_child => siblingIndex(node, false, false) == 1,
+            .last_child => siblingIndex(node, true, false) == 1,
+            .only_child => siblingIndex(node, false, false) == 1 and siblingIndex(node, true, false) == 1,
+            .empty => blk: {
+                for (element.children.items) |*child| switch (child.*) {
+                    .element => break :blk false,
+                    .text => |text| if (text.text.len != 0) break :blk false,
+                };
+                break :blk true;
+            },
+            .nth_child => siblingIndex(node, false, false) != null and nthMatches(siblingIndex(node, false, false).?, self.argument orelse ""),
+            .nth_last_child => siblingIndex(node, true, false) != null and nthMatches(siblingIndex(node, true, false).?, self.argument orelse ""),
+            .first_of_type => siblingIndex(node, false, true) == 1,
+            .last_of_type => siblingIndex(node, true, true) == 1,
+            .only_of_type => siblingIndex(node, false, true) == 1 and siblingIndex(node, true, true) == 1,
+            .nth_of_type => siblingIndex(node, false, true) != null and nthMatches(siblingIndex(node, false, true).?, self.argument orelse ""),
+            .nth_last_of_type => siblingIndex(node, true, true) != null and nthMatches(siblingIndex(node, true, true).?, self.argument orelse ""),
+            .lang => matchesLang(node, self.argument orelse ""),
+        };
+    }
+
+    fn deinit(self: *StructuralSelector, allocator: std.mem.Allocator) void {
+        if (self.argument) |argument| allocator.free(argument);
+        self.argument = null;
+    }
+
+    fn priority(self: StructuralSelector) u32 {
+        _ = self;
+        return 10;
+    }
+};
+
+pub const NotSelector = struct {
+    selector: *SimpleSelector,
+
+    fn matches(self: NotSelector, node: *Node, context: MatchContext) bool {
+        return !self.selector.matches(node, context);
+    }
+
+    fn deinit(self: *NotSelector, allocator: std.mem.Allocator) void {
+        self.selector.deinit(allocator);
+        allocator.destroy(self.selector);
+    }
+
+    fn priority(self: NotSelector) u32 {
+        return 10 + self.selector.priority();
+    }
+};
+
 /// Tag selector - matches elements by tag name (e.g., "p", "div", "ul")
 pub const TagSelector = struct {
     tag: []const u8,
@@ -462,6 +702,9 @@ pub const SequenceSelector = union(enum) {
     attribute: AttributeSelector,
     focus_visible: FocusVisibleSelector,
     hover: HoverSelector,
+    structural: StructuralSelector,
+    not: NotSelector,
+    state: StateSelector,
     pseudo_element: PseudoElementSelector,
 
     pub fn intoSimpleSelector(self: SequenceSelector) SimpleSelector {
@@ -473,6 +716,9 @@ pub const SequenceSelector = union(enum) {
             .attribute => |attribute| .{ .attribute = attribute },
             .focus_visible => |focus_visible| .{ .focus_visible = focus_visible },
             .hover => |hover| .{ .hover = hover },
+            .structural => |structural| .{ .structural = structural },
+            .not => |not| .{ .not = not },
+            .state => |state| .{ .state = state },
             .pseudo_element => |pseudo_element| .{ .pseudo_element = pseudo_element },
         };
     }
@@ -486,6 +732,9 @@ pub const SequenceSelector = union(enum) {
             .attribute => |attribute| attribute.matches(node),
             .focus_visible => |focus_visible| focus_visible.matches(node),
             .hover => |hover| hover.matches(node),
+            .structural => |structural| structural.matches(node),
+            .not => |not| not.matches(node, .{}),
+            .state => |state| state.matches(node),
             .pseudo_element => |pseudo_element| pseudo_element.matches(node),
         };
     }
@@ -499,6 +748,9 @@ pub const SequenceSelector = union(enum) {
             .attribute => |*attribute| attribute.deinit(allocator),
             .focus_visible => {},
             .hover => {},
+            .structural => |*structural| structural.deinit(allocator),
+            .not => |*not| not.deinit(allocator),
+            .state => {},
             .pseudo_element => {},
         }
     }
@@ -512,6 +764,9 @@ pub const SequenceSelector = union(enum) {
             .attribute => |attribute| attribute.priority(),
             .focus_visible => |focus_visible| focus_visible.priority(),
             .hover => |hover| hover.priority(),
+            .structural => |structural| structural.priority(),
+            .not => |not| not.priority(),
+            .state => |state| state.priority(),
             .pseudo_element => |pseudo_element| pseudo_element.priority(),
         };
     }
@@ -920,3 +1175,51 @@ pub const ComplexSelector = struct {
         return self.selectors.items[self.selectors.items.len - 1].pseudoElementKind();
     }
 };
+
+test "structural selector matching follows element siblings and inherited language" {
+    const allocator = std.testing.allocator;
+    var root = Node{ .element = try parser.Element.init(allocator, "html lang=en-GB", null) };
+    defer root.deinit(allocator);
+    try root.element.children.append(allocator, Node{ .element = try parser.Element.init(allocator, "div", null) });
+    try root.element.children.append(allocator, Node{ .element = try parser.Element.init(allocator, "span", null) });
+    try root.element.children.append(allocator, Node{ .text = parser.Text.init("", null) });
+    parser.fixParentPointers(&root, null);
+
+    const first = &root.element.children.items[0];
+    const second = &root.element.children.items[1];
+    var first_child = StructuralSelector{ .kind = .first_child };
+    var last_child = StructuralSelector{ .kind = .last_child };
+    var only_child = StructuralSelector{ .kind = .only_child };
+    var nth = StructuralSelector{ .kind = .nth_child, .argument = "2n" };
+    var lang = StructuralSelector{ .kind = .lang, .argument = "en" };
+    try std.testing.expect(first_child.matches(first));
+    try std.testing.expect(!last_child.matches(first));
+    try std.testing.expect(last_child.matches(second));
+    try std.testing.expect(!only_child.matches(first));
+    try std.testing.expect(nth.matches(second));
+    try std.testing.expect(lang.matches(second));
+}
+
+test "state selectors observe live link and form attributes" {
+    const allocator = std.testing.allocator;
+    var root = Node{ .element = try parser.Element.init(allocator, "html", null) };
+    defer root.deinit(allocator);
+    try root.element.children.append(allocator, Node{ .element = try parser.Element.init(allocator, "a href=/next", null) });
+    try root.element.children.append(allocator, Node{ .element = try parser.Element.init(allocator, "input type=checkbox", null) });
+    parser.fixParentPointers(&root, null);
+
+    const link = &root.element.children.items[0];
+    const input = &root.element.children.items[1];
+    const link_state = StateSelector{ .kind = .link };
+    const visited_state = StateSelector{ .kind = .visited };
+    const enabled_state = StateSelector{ .kind = .enabled };
+    const checked_state = StateSelector{ .kind = .checked };
+    try std.testing.expect(link_state.matches(link));
+    try std.testing.expect(!visited_state.matches(link));
+    try std.testing.expect(enabled_state.matches(input));
+    try std.testing.expect(!checked_state.matches(input));
+    _ = try input.element.toggleChecked();
+    try std.testing.expect(checked_state.matches(input));
+    try input.element.attributes.?.put("disabled", "");
+    try std.testing.expect(!enabled_state.matches(input));
+}

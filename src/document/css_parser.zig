@@ -24,6 +24,11 @@ const AttributeSelector = selector_mod.AttributeSelector;
 const AttributeMatch = selector_mod.AttributeMatch;
 const FocusVisibleSelector = selector_mod.FocusVisibleSelector;
 const HoverSelector = selector_mod.HoverSelector;
+const StructuralSelector = selector_mod.StructuralSelector;
+const StructuralKind = selector_mod.StructuralKind;
+const NotSelector = selector_mod.NotSelector;
+const StateSelector = selector_mod.StateSelector;
+const StateKind = selector_mod.StateKind;
 const PseudoElementSelector = selector_mod.PseudoElementSelector;
 const SequenceSelector = selector_mod.SequenceSelector;
 const SelectorSequence = selector_mod.SelectorSequence;
@@ -1417,6 +1422,11 @@ fn parseAttributeSelector(
     blk: {
         self.pos += 2;
         break :blk .includes;
+    } else if (self.pos + 1 < self.string.len and
+        self.string[self.pos] == '|' and self.string[self.pos + 1] == '=')
+    blk: {
+        self.pos += 2;
+        break :blk .dash_match;
     } else if (self.pos < self.string.len and self.string[self.pos] == '=') blk: {
         self.pos += 1;
         break :blk .exact;
@@ -1468,6 +1478,45 @@ fn pseudoIdentifier(self: *CSSParser) ![]const u8 {
     }
     if (self.pos == start) return error.InvalidWord;
     return self.string[start..self.pos];
+}
+
+fn structuralKind(name: []const u8) ?StructuralKind {
+    if (std.ascii.eqlIgnoreCase(name, "root")) return .root;
+    if (std.ascii.eqlIgnoreCase(name, "first-child")) return .first_child;
+    if (std.ascii.eqlIgnoreCase(name, "last-child")) return .last_child;
+    if (std.ascii.eqlIgnoreCase(name, "only-child")) return .only_child;
+    if (std.ascii.eqlIgnoreCase(name, "empty")) return .empty;
+    if (std.ascii.eqlIgnoreCase(name, "nth-child")) return .nth_child;
+    if (std.ascii.eqlIgnoreCase(name, "nth-last-child")) return .nth_last_child;
+    if (std.ascii.eqlIgnoreCase(name, "first-of-type")) return .first_of_type;
+    if (std.ascii.eqlIgnoreCase(name, "last-of-type")) return .last_of_type;
+    if (std.ascii.eqlIgnoreCase(name, "only-of-type")) return .only_of_type;
+    if (std.ascii.eqlIgnoreCase(name, "nth-of-type")) return .nth_of_type;
+    if (std.ascii.eqlIgnoreCase(name, "nth-last-of-type")) return .nth_last_of_type;
+    if (std.ascii.eqlIgnoreCase(name, "lang")) return .lang;
+    return null;
+}
+
+fn stateKind(name: []const u8) ?StateKind {
+    if (std.ascii.eqlIgnoreCase(name, "link")) return .link;
+    if (std.ascii.eqlIgnoreCase(name, "visited")) return .visited;
+    if (std.ascii.eqlIgnoreCase(name, "enabled")) return .enabled;
+    if (std.ascii.eqlIgnoreCase(name, "disabled")) return .disabled;
+    if (std.ascii.eqlIgnoreCase(name, "checked")) return .checked;
+    return null;
+}
+
+fn appendStructuralSelector(
+    allocator: std.mem.Allocator,
+    selectors: *std.ArrayList(SequenceSelector),
+    kind: StructuralKind,
+    argument: ?[]const u8,
+) !void {
+    const owned_argument = if (argument) |argument_text| try allocator.dupe(u8, argument_text) else null;
+    try appendSequenceSelector(allocator, selectors, .{ .structural = .{
+        .kind = kind,
+        .argument = owned_argument,
+    } });
 }
 
 fn simpleSelector(self: *CSSParser, allocator: std.mem.Allocator) !SimpleSelector {
@@ -1560,6 +1609,52 @@ fn simpleSelector(self: *CSSParser, allocator: std.mem.Allocator) !SimpleSelecto
         if (explicit_pseudo_element) {
             self.pos = pseudo_start;
             break;
+        }
+        if (std.ascii.eqlIgnoreCase(pseudo_name, "not")) {
+            if (self.pos >= self.string.len or self.string[self.pos] != '(') {
+                self.pos = pseudo_start;
+                break;
+            }
+            self.pos += 1;
+            self.whitespace();
+            const inner = try self.simpleSelector(allocator);
+            var inner_owned = true;
+            errdefer {
+                if (inner_owned) {
+                    var owned_inner = inner;
+                    owned_inner.deinit(allocator);
+                }
+            }
+            self.whitespace();
+            try self.literal(')');
+            const inner_ptr = try allocator.create(SimpleSelector);
+            inner_ptr.* = inner;
+            inner_owned = false;
+            try appendSequenceSelector(allocator, &selectors, .{ .not = NotSelector{ .selector = inner_ptr } });
+            continue;
+        }
+        if (structuralKind(pseudo_name)) |kind| {
+            var argument: ?[]const u8 = null;
+            const requires_argument = kind == .nth_child or kind == .nth_last_child or
+                kind == .nth_of_type or kind == .nth_last_of_type or kind == .lang;
+            if (self.pos < self.string.len and self.string[self.pos] == '(') {
+                self.pos += 1;
+                const start = self.pos;
+                var depth: usize = 1;
+                while (self.pos < self.string.len and depth != 0) : (self.pos += 1) {
+                    if (self.string[self.pos] == '(') depth += 1 else if (self.string[self.pos] == ')') depth -= 1;
+                }
+                if (depth != 0) return error.InvalidSelector;
+                argument = self.string[start .. self.pos - 1];
+            } else if (requires_argument) {
+                return error.InvalidSelector;
+            }
+            try appendStructuralSelector(allocator, &selectors, kind, argument);
+            continue;
+        }
+        if (stateKind(pseudo_name)) |kind| {
+            try appendSequenceSelector(allocator, &selectors, .{ .state = StateSelector{ .kind = kind } });
+            continue;
         }
         const dynamic_selector: SequenceSelector = if (std.ascii.eqlIgnoreCase(
             pseudo_name,
@@ -2191,4 +2286,36 @@ test "z-index retains auto and signed integers while rejecting invalid values" {
     try std.testing.expectEqualStrings("+0", rules[2].properties.get("z-index").?.value);
     try std.testing.expectEqualStrings("-2147483648", rules[3].properties.get("z-index").?.value);
     try std.testing.expect(rules[4].properties.get("z-index") == null);
+}
+
+test "structural selectors and dash-match attributes parse as owned selectors" {
+    const allocator = std.testing.allocator;
+    const css = ":root{} :first-child{} :last-child{} :only-child{} :empty{} " ++
+        ":nth-child(-n+3){} :nth-last-child(2n){} :first-of-type{} " ++
+        ":last-of-type{} :only-of-type{} :nth-of-type(3n+1){} " ++
+        ":nth-last-of-type(-5n+3){} :lang(en){} :not(:root){} [class|=widget]{}";
+    var parser = try CSSParser.init(allocator, css, false);
+    defer parser.deinit(allocator);
+    const rules = try parser.parse(allocator);
+    defer {
+        for (rules) |*rule| rule.deinit(allocator);
+        allocator.free(rules);
+    }
+    try std.testing.expectEqual(@as(usize, 15), rules.len);
+    for (rules[0..13]) |rule| try std.testing.expectEqual(@as(u32, 10), rule.cascadePriority());
+    try std.testing.expectEqual(@as(u32, 20), rules[13].cascadePriority());
+    try std.testing.expectEqual(@as(u32, 10), rules[14].cascadePriority());
+}
+
+test "form and link state pseudo-classes parse as compound selectors" {
+    const allocator = std.testing.allocator;
+    var parser = try CSSParser.init(allocator, ":checked:enabled{} :link{} :visited{} :disabled{}", false);
+    defer parser.deinit(allocator);
+    const rules = try parser.parse(allocator);
+    defer {
+        for (rules) |*rule| rule.deinit(allocator);
+        allocator.free(rules);
+    }
+    try std.testing.expectEqual(@as(usize, 4), rules.len);
+    try std.testing.expectEqual(@as(u32, 20), rules[0].cascadePriority());
 }

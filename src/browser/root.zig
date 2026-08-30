@@ -3429,10 +3429,27 @@ pub const Browser = struct {
             std.ascii.endsWithIgnoreCase(path, ".jpeg") or
             std.ascii.endsWithIgnoreCase(path, ".css");
         if (non_html) {
-            var inert_parser = try parser.HTMLParser.init(self.allocator, body_text);
-            defer inert_parser.deinit(self.allocator);
-            inert_parser.use_implicit_tags = true;
-            frame.current_node = try inert_parser.parse();
+            // Non-HTML iframe responses are documents with no parsed markup.
+            // Keep text/plain readable as a single text node, but never let
+            // tag-looking bytes become executable or queryable HTML. Images
+            // and stylesheets intentionally get an empty document shell.
+            var inert_root = Node{ .element = try parser.Element.init(self.allocator, "html", null) };
+            var inert_root_owned = true;
+            errdefer {
+                if (inert_root_owned) inert_root.deinit(self.allocator);
+            }
+            var inert_body = Node{ .element = try parser.Element.init(self.allocator, "body", null) };
+            var inert_body_owned = true;
+            errdefer {
+                if (inert_body_owned) inert_body.deinit(self.allocator);
+            }
+            if (std.ascii.endsWithIgnoreCase(path, ".txt")) {
+                try inert_body.element.children.append(self.allocator, Node{ .text = parser.Text.init(body_text, null) });
+            }
+            try inert_root.element.children.append(self.allocator, inert_body);
+            inert_body_owned = false;
+            frame.current_node = inert_root;
+            inert_root_owned = false;
         } else {
             var live_context = LiveDocumentLoadContext{
                 .browser = self,

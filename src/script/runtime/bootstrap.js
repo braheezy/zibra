@@ -615,6 +615,45 @@ Object.defineProperty(Node.prototype, "className", {
   set: function(value) { this.setAttribute("class", value == null ? "" : value.toString()); },
   enumerable: true, configurable: true
 });
+
+// Form state properties are reflected into the live attribute map so CSS
+// state selectors (:checked, :enabled, :disabled) and native controls observe
+// script mutations exactly like markup-authored state.
+Object.defineProperty(Node.prototype, "type", {
+  get: function() { return this.getAttribute("type") || "text"; },
+  set: function(value) { this.setAttribute("type", value == null ? "" : value.toString()); },
+  enumerable: true, configurable: true
+});
+Object.defineProperty(Node.prototype, "disabled", {
+  get: function() { return this.hasAttribute("disabled"); },
+  set: function(value) { if (value) this.setAttribute("disabled", ""); else this.removeAttribute("disabled"); },
+  enumerable: true, configurable: true
+});
+Object.defineProperty(Node.prototype, "checked", {
+  get: function() { return this.hasAttribute("checked"); },
+  set: function(value) { if (value) this.setAttribute("checked", ""); else this.removeAttribute("checked"); },
+  enumerable: true, configurable: true
+});
+Node.prototype.click = function() {
+  var event = new Event("click");
+  event.bubbles = true;
+  if (!this.dispatchEvent(event)) return;
+  if (this.nodeType !== Node.ELEMENT_NODE || (this.tagName || "").toLowerCase() !== "input") return;
+  var kind = (this.type || "text").toLowerCase();
+  if (kind === "checkbox") {
+    this.checked = !this.checked;
+  } else if (kind === "radio") {
+    var group = document.getElementsByTagName("input");
+    var name = this.getAttribute("name");
+    for (var i = 0; i < group.length; i++) {
+      var other = group[i];
+      if (other !== this && (other.type || "text").toLowerCase() === "radio" &&
+          ((name === null && other.getAttribute("name") === null) ||
+           (name !== null && other.getAttribute("name") === name))) other.checked = false;
+    }
+    this.checked = true;
+  }
+};
 Node.prototype.getElementsByTagName = function(tagName) {
   var text = tagName == null ? "" : tagName.toString();
   return wrapNodes(__native.getElementsByTagNameFrom(this.handle, text));
@@ -1275,7 +1314,24 @@ globalThis.__runXHROnload = function(body, handle) {
       if (qualifiedName) root.appendChild(document.createElement(qualifiedName));
       return result;
     },
-    createDocumentType: function() { return { nodeType: Node.DOCUMENT_TYPE_NODE, name: 'html' }; }
+    createDocumentType: function(name, publicId, systemId) {
+      var value = name == null ? '' : name.toString();
+      // Qualified doctype names use the same XML name grammar as namespace
+      // APIs; a colon is syntactically well-formed only with one non-empty
+      // prefix and local part. DOMException code 14 is the observable error
+      // Acid3 and standards code expect for malformed namespace names.
+      var firstColon = value.indexOf(':');
+      if (!value || firstColon === 0 || firstColon === value.length - 1 || value.indexOf(':', firstColon + 1) >= 0)
+        throw { code: 14, NAMESPACE_ERR: 14 };
+      if (invalidQualifiedName(value)) throw { code: 5, INVALID_CHARACTER_ERR: 5 };
+      return {
+        nodeType: Node.DOCUMENT_TYPE_NODE,
+        nodeName: value,
+        name: value,
+        publicId: publicId == null ? '' : publicId.toString(),
+        systemId: systemId == null ? '' : systemId.toString()
+      };
+    }
   };
   document.createTextNode = function(text) {
     return wrapNode(__native.createTextNode(text == null ? '' : text.toString()));

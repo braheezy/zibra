@@ -2317,9 +2317,18 @@ test "DOM name validation matches invalid character and namespace errors" {
     const result = try js.evaluate(0,
         \\function codeForCreate(name) { try { document.createElement(name); return 0; } catch (e) { return e.code; } }
         \\function codeForNamespace(ns, name) { try { document.createElementNS(ns, name); return 0; } catch (e) { return e.code; } }
-        \\codeForCreate('0div') === 5 && codeForCreate('di v') === 5 &&
+        \\codeForCreate('<div>') === 5 && codeForCreate('0div') === 5 &&
+        \\codeForCreate('di v') === 5 && codeForCreate('di<v') === 5 &&
+        \\codeForCreate('-div') === 5 && codeForCreate('.div') === 5 &&
         \\codeForNamespace(null, ':div') === 14 &&
+        \\codeForNamespace(null, 'd:iv') === 14 &&
+        \\codeForNamespace('http://example.com/', '<div>') === 5 &&
+        \\codeForNamespace('http://example.com/', '0div') === 5 &&
+        \\codeForNamespace('http://example.com/', 'di<v') === 5 &&
+        \\codeForNamespace('http://example.com/', '-div') === 5 &&
+        \\codeForNamespace('http://example.com/', '.div') === 5 &&
         \\codeForNamespace('http://example.com/', 'xml:test') === 14 &&
+        \\codeForNamespace('http://example.com/', 'xmlns:test') === 14 &&
         \\codeForNamespace('http://www.w3.org/2000/xmlns/', 'x:test') === 14 &&
         \\(function() { var e = document.createElementNS('http://ns.example.com/', 'prefix:localname');
         \\  return e.tagName === 'prefix:localname' && e.nodeName === 'prefix:localname' &&
