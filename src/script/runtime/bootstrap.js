@@ -774,7 +774,17 @@ Object.defineProperty(window, "parent", {
   get: function() {
     var parentId = __native.getParentWindowId(window.__id);
     if (parentId === null || parentId === undefined) return null;
-    return { __id: parentId, postMessage: function(message, targetOrigin) { var payload = message == null ? "null" : message.toString(); var origin = targetOrigin === undefined ? "/" : targetOrigin.toString(); __native.postMessage(payload, parentId, origin); } };
+    return {
+      __id: parentId,
+      postMessage: function(message, targetOrigin) {
+        var payload = message == null ? "null" : message.toString();
+        var origin = targetOrigin === undefined ? "/" : targetOrigin.toString();
+        __native.postMessage(payload, parentId, origin);
+      },
+      // Same-origin parent callbacks are forwarded through a narrow native
+      // capability; arbitrary parent DOM/global access remains unavailable.
+      notify: function(file) { __native.callParent(parentId, "notify", String(file)); }
+    };
   }
 });
 function clearActiveIdGlobals() {

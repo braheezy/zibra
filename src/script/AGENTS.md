@@ -33,6 +33,8 @@ queued work and shutdown are documented in
   `timer_bindings.zig`, `network_bindings.zig`, and
   `document_write_bindings.zig` validate their native APIs
   and call heap-stable narrow host interfaces embedded in `Js`.
+  Network parent-window calls are same-origin-only and limited to the
+  compatibility `notify(string)` callback; they do not expose parent DOM.
 - `native_bindings.zig` installs comptime binding tables; `transitions.zig`
   parses and starts typed DOM transitions.
 

@@ -340,6 +340,7 @@ pub fn init(
         .cookie_set = setBindingCookie,
         .xhr_send = sendBindingXhr,
         .post_message = sendBindingPostMessage,
+        .parent_call = callBindingParent,
     };
     self.timer_host = .{
         .context = self,
@@ -1164,6 +1165,35 @@ fn sendBindingPostMessage(
     );
 }
 
+fn callBindingParent(
+    context: ?*anyopaque,
+    source_window_id: u32,
+    target_window_id: u32,
+    method: []const u8,
+    argument: []const u8,
+) anyerror!void {
+    const self = hostFromBindingContext(context);
+    // Parent access is only exposed when both browsing contexts belong to this
+    // origin's Js host. A cross-origin child has no parent Realm here and is
+    // rejected rather than accidentally gaining a same-process capability.
+    const recorded_parent = self.parent_window_ids.get(source_window_id) orelse return error.CrossOriginParent;
+    if (recorded_parent != target_window_id) return error.CrossOriginParent;
+    const parent = self.windows.get(target_window_id) orelse return error.CrossOriginParent;
+    if (parent.retired) return error.ParentWindowRetired;
+    if (!std.mem.eql(u8, method, "notify")) return error.UnsupportedParentMethod;
+
+    const active = try self.activateWindowLocked(target_window_id);
+    defer active.restore();
+    try self.setActiveWindow(target_window_id, parent);
+    const key = kiesel.types.PropertyKey.from("notify");
+    const callback = try parent.realm.global_object.get(&self.agent, key);
+    if (!callback.isCallable()) return error.ParentMethodUnavailable;
+    const value = try self.stringToJsValue(argument);
+    _ = callback.call(&self.agent, .undefined, &.{value}) catch |err| {
+        return self.translateExecutionError(err);
+    };
+}
+
 fn scheduleBindingTimer(
     context: ?*anyopaque,
     handle: u32,
@@ -1882,6 +1912,39 @@ test "replacing a document creates a fresh realm and retires the old handles" {
     try std.testing.expect(js.resolveAttachedNode(7, old_handle) == null);
 }
 
+test "same-origin parent proxy forwards the compatibility notify callback" {
+    const allocator = std.testing.allocator;
+    var parent_parser = try parser.HTMLParser.init(allocator, "<main></main>");
+    parent_parser.use_implicit_tags = false;
+    defer parent_parser.deinit(allocator);
+    var parent_root = try parent_parser.parse();
+    defer parent_root.deinit(allocator);
+    parser.fixParentPointers(&parent_root, null);
+
+    var child_parser = try parser.HTMLParser.init(allocator, "<main></main>");
+    child_parser.use_implicit_tags = false;
+    defer child_parser.deinit(allocator);
+    var child_root = try child_parser.parse();
+    defer child_root.deinit(allocator);
+    parser.fixParentPointers(&child_root, null);
+
+    var environ = std.process.Environ.Map.init(allocator);
+    defer environ.deinit();
+    var js = try Js.init(allocator, std.testing.io, &environ);
+    defer js.deinit(allocator);
+    js.setNodes(1, &parent_root);
+    js.setNodes(2, &child_root);
+    js.setParentWindow(2, 1);
+    defer js.setNodes(1, null);
+    defer js.setNodes(2, null);
+
+    _ = try js.evaluate(1, "var notices = []; function notify(value) { notices.push(value); }");
+    const child_result = try js.evaluate(2, "parent.notify('from-child'); true");
+    try std.testing.expect(child_result.toBoolean());
+    const parent_result = try js.evaluate(1, "notices.length === 1 && notices[0] === 'from-child'");
+    try std.testing.expect(parent_result.toBoolean());
+}
+
 test "lifecycle events target the current document realm and suppress retired realms" {
     const ReadyStateProbe = struct {
         state: ?DocumentReadyState = .loading,
@@ -2190,6 +2253,8 @@ test "script DOM creates text nodes, exposes computed styles, and isolates ifram
     defer js.setNodes(0, null);
 
     const result = try js.evaluate(0,
+        \\var startTime = new Date();
+        \\var nullInRegexpArgumentResult = 0 < /script/.test('\0script') ? "passed" : "failed";
         \\var div = document.getElementsByTagName('div')[0];
         \\var text = document.createTextNode('hello');
         \\div.appendChild(text);
@@ -2198,6 +2263,7 @@ test "script DOM creates text nodes, exposes computed styles, and isolates ifram
         \\div.textContent === 'hello' && text.parentNode === div &&
         \\  document.defaultView.getComputedStyle(div, '').zIndex === 'auto' &&
         \\  iframeDoc.body !== document.body && iframeDoc.body.tagName === 'BODY' &&
+        \\  nullInRegexpArgumentResult === 'passed' && startTime instanceof Date &&
         \\  document.createNodeIterator(div, NodeFilter.SHOW_ALL, null, true).nextNode() === div &&
         \\  document.createTreeWalker(div, NodeFilter.SHOW_ALL, null, true).currentNode === div
     );

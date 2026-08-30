@@ -89,6 +89,12 @@ control yields. With no active sink, `document.write` is an inert bounded
 operation: it must not retain a parser pointer, queue work, or imply
 `document.open()` replacement semantics.
 
+Same-origin iframe parent access is likewise a narrow capability. The
+`window.parent` proxy can post messages and forward the legacy `notify(string)`
+callback used by compatibility suites; it never exposes a parent DOM object or
+arbitrary global property access. Cross-origin parent realms are rejected by
+the host callback.
+
 `JsRenderContext` is the stable synchronous host-callback identity embedded in
 a Frame. It carries current Browser/Tab/host pointers plus a document
 generation and is cleared before Frame retirement. Asynchronous work never

@@ -233,7 +233,7 @@ const LiveDocumentLoadContext = struct {
         const trace_eval = self.browser.measure.begin("evaljs");
         defer if (trace_eval) self.browser.measure.end("evaljs");
         _ = js_context.evaluate(self.frame.window_id, source) catch |err| {
-            std.log.err("Parser script {s} crashed: {}", .{ label, err });
+            std.log.err("Parser script {s} ({d} bytes) crashed: {}", .{ label, source.len, err });
             return;
         };
     }

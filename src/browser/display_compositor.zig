@@ -38,7 +38,23 @@ pub const Compositor = struct {
 
     fn scalePxWithZoom(_: *const Compositor, value: i32, zoom: f32) i32 {
         const scaled = @as(f64, @floatFromInt(value)) * @as(f64, zoom);
-        return @intFromFloat(@round(scaled));
+        // CSS/script supplied transforms can temporarily contain very large
+        // values (or non-finite values while an animation is being replaced).
+        // Keep bounds arithmetic defined; an off-screen item is still safe to
+        // cull, whereas wrapping an i32 can crash the compositor.
+        if (!std.math.isFinite(scaled)) return if (scaled < 0) std.math.minInt(i32) else std.math.maxInt(i32);
+        const clamped = std.math.clamp(
+            @round(scaled),
+            @as(f64, @floatFromInt(std.math.minInt(i32))),
+            @as(f64, @floatFromInt(std.math.maxInt(i32))),
+        );
+        return @intFromFloat(clamped);
+    }
+
+    fn saturatingAdd(a: i32, b: i32) i32 {
+        const result = @addWithOverflow(a, b);
+        if (result[1] == 0) return result[0];
+        return if (b < 0) std.math.minInt(i32) else std.math.maxInt(i32);
     }
 
     /// Build composited layers from the display list
@@ -332,16 +348,16 @@ pub const Compositor = struct {
             .glyph => |g| Rect{
                 .left = self.scalePxWithZoom(g.x, zoom),
                 .top = self.scalePxWithZoom(g.y, zoom),
-                .right = self.scalePxWithZoom(g.x, zoom) + DisplayItem.scaleRasterPx(
+                .right = saturatingAdd(self.scalePxWithZoom(g.x, zoom), DisplayItem.scaleRasterPx(
                     g.glyph.w,
                     g.page_zoom,
                     zoom,
-                ),
-                .bottom = self.scalePxWithZoom(g.y, zoom) + DisplayItem.scaleRasterPx(
+                )),
+                .bottom = saturatingAdd(self.scalePxWithZoom(g.y, zoom), DisplayItem.scaleRasterPx(
                     g.glyph.h,
                     g.page_zoom,
                     zoom,
-                ),
+                )),
             },
             .rect => |r| Rect{
                 .left = self.scalePxWithZoom(r.x1, zoom),
@@ -385,8 +401,8 @@ pub const Compositor = struct {
             .line => |l| Rect{
                 .left = self.scalePxWithZoom(@min(l.x1, l.x2), zoom),
                 .top = self.scalePxWithZoom(@min(l.y1, l.y2), zoom),
-                .right = self.scalePxWithZoom(@max(l.x1, l.x2), zoom) + self.scalePxWithZoom(l.thickness, zoom),
-                .bottom = self.scalePxWithZoom(@max(l.y1, l.y2), zoom) + self.scalePxWithZoom(l.thickness, zoom),
+                .right = saturatingAdd(self.scalePxWithZoom(@max(l.x1, l.x2), zoom), self.scalePxWithZoom(l.thickness, zoom)),
+                .bottom = saturatingAdd(self.scalePxWithZoom(@max(l.y1, l.y2), zoom), self.scalePxWithZoom(l.thickness, zoom)),
             },
             .outline => |o| Rect{
                 .left = self.scalePxWithZoom(o.rect.left, zoom),
@@ -412,6 +428,7 @@ pub const Compositor = struct {
             },
             .draw_composited_layer => |dcl| dcl.layer.bounds,
             .transform => |t| blk: {
+                if (t.children.len == 0) break :blk Rect{ .left = 0, .top = 0, .right = 0, .bottom = 0 };
                 // Get children bounds and apply translation offset
                 var bounds = Rect{ .left = std.math.maxInt(i32), .top = std.math.maxInt(i32), .right = std.math.minInt(i32), .bottom = std.math.minInt(i32) };
                 for (t.children) |child| {
@@ -422,11 +439,13 @@ pub const Compositor = struct {
                     bounds.bottom = @max(bounds.bottom, child_bounds.bottom);
                 }
                 // Apply translation to get absolute bounds
+                const dx = self.scalePxWithZoom(t.translate_x, zoom);
+                const dy = self.scalePxWithZoom(t.translate_y, zoom);
                 break :blk Rect{
-                    .left = bounds.left + self.scalePxWithZoom(t.translate_x, zoom),
-                    .top = bounds.top + self.scalePxWithZoom(t.translate_y, zoom),
-                    .right = bounds.right + self.scalePxWithZoom(t.translate_x, zoom),
-                    .bottom = bounds.bottom + self.scalePxWithZoom(t.translate_y, zoom),
+                    .left = saturatingAdd(bounds.left, dx),
+                    .top = saturatingAdd(bounds.top, dy),
+                    .right = saturatingAdd(bounds.right, dx),
+                    .bottom = saturatingAdd(bounds.bottom, dy),
                 };
             },
         };
@@ -601,4 +620,40 @@ test "compositor cloning and draw-list building preserve transform scroll attach
         display_commands.ScrollAttachment.frame_viewport,
         compositor.draw_list.items[0].transform.scroll_attachment,
     );
+}
+
+test "compositor bounds tolerate empty and overflowing transforms" {
+    const allocator = std.testing.allocator;
+    var compositor = Compositor.init(allocator);
+    defer compositor.deinit();
+
+    const empty_children = [_]DisplayItem{};
+    const empty = DisplayItem{ .transform = .{
+        .translate_x = std.math.maxInt(i32),
+        .translate_y = std.math.maxInt(i32),
+        .children = &empty_children,
+    } };
+    try std.testing.expectEqual(
+        Rect{ .left = 0, .top = 0, .right = 0, .bottom = 0 },
+        compositor.getDisplayItemBounds(empty, 1.0),
+    );
+
+    const child = DisplayItem{ .rect = .{
+        .x1 = std.math.maxInt(i32),
+        .y1 = std.math.maxInt(i32),
+        .x2 = std.math.maxInt(i32),
+        .y2 = std.math.maxInt(i32),
+        .color = .{ .r = 0, .g = 0, .b = 0 },
+    } };
+    var children = [_]DisplayItem{child};
+    const overflowing = DisplayItem{ .transform = .{
+        .translate_x = std.math.maxInt(i32),
+        .translate_y = std.math.maxInt(i32),
+        .children = &children,
+    } };
+    const bounds = compositor.getDisplayItemBounds(overflowing, 1.0);
+    try std.testing.expectEqual(std.math.maxInt(i32), bounds.left);
+    try std.testing.expectEqual(std.math.maxInt(i32), bounds.top);
+    try std.testing.expectEqual(std.math.maxInt(i32), bounds.right);
+    try std.testing.expectEqual(std.math.maxInt(i32), bounds.bottom);
 }

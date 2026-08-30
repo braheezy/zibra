@@ -44,6 +44,17 @@ pub const PostMessageCallbackFn = *const fn (
     message: []const u8,
 ) anyerror!void;
 
+/// Invoke a small same-origin parent-window method synchronously. This is
+/// intentionally narrower than exposing the parent's DOM: it exists for
+/// legacy pages (and Acid3) that call a parent callback from an iframe.
+pub const ParentCallCallbackFn = *const fn (
+    context: ?*anyopaque,
+    source_window_id: u32,
+    target_window_id: u32,
+    method: []const u8,
+    argument: []const u8,
+) anyerror!void;
+
 pub const Host = struct {
     context: ?*anyopaque,
     allocator: std.mem.Allocator,
@@ -66,6 +77,7 @@ pub const Host = struct {
         []const u8,
         []const u8,
     ) anyerror!void,
+    parent_call: ParentCallCallbackFn,
 };
 
 pub const bindings = [_]native_bindings.Binding{
@@ -75,6 +87,7 @@ pub const bindings = [_]native_bindings.Binding{
     .{ .name = "getWindowId", .length = 0, .function = getWindowId },
     .{ .name = "getParentWindowId", .length = 1, .function = getParentWindowId },
     .{ .name = "postMessage", .length = 3, .function = postMessage },
+    .{ .name = "callParent", .length = 3, .function = callParent },
 };
 
 fn activeHost(agent: *Agent) *Host {
@@ -228,7 +241,8 @@ fn getParentWindowId(agent: *Agent, this_value: Value, arguments: Arguments) Age
     }
     const parent_id = host.parent_window_id(host.context, @intFromFloat(raw_id)) orelse return .null;
     // A cross-origin parent intentionally has no DOM realm here. JavaScript
-    // receives only an opaque numeric proxy exposing postMessage.
+    // receives only an opaque numeric proxy exposing postMessage and the
+    // narrow same-origin notify callback.
     return Value.from(@as(f64, @floatFromInt(parent_id)));
 }
 
@@ -268,6 +282,37 @@ fn postMessage(agent: *Agent, this_value: Value, arguments: Arguments) Agent.Err
             return agent.throwException(.syntax_error, "Invalid postMessage target origin", .{});
         }
         return agent.throwException(.internal_error, "postMessage failed: {any}", .{err});
+    };
+    return .undefined;
+}
+
+fn callParent(agent: *Agent, this_value: Value, arguments: Arguments) Agent.Error!Value {
+    _ = this_value;
+    const host = activeHost(agent);
+    const source_window_id = try requireWindowId(agent, host);
+    const target_id_arg = arguments.get(0);
+    const method_arg = arguments.get(1);
+    const argument_arg = arguments.get(2);
+    if (!target_id_arg.isNumber() or !method_arg.isString() or !argument_arg.isString()) {
+        return agent.throwException(.type_error, "callParent requires (window id, method, string)", .{});
+    }
+    const raw_target_id = target_id_arg.asNumber().asFloat();
+    const max_id = @as(f64, @floatFromInt(std.math.maxInt(u32)));
+    if (!std.math.isFinite(raw_target_id) or raw_target_id < 0 or raw_target_id > max_id) {
+        return agent.throwException(.type_error, "callParent requires a valid target window id", .{});
+    }
+    const method = try method_arg.asString().toUtf8(host.allocator);
+    defer host.allocator.free(method);
+    const argument = try argument_arg.asString().toUtf8(host.allocator);
+    defer host.allocator.free(argument);
+    host.parent_call(
+        host.context,
+        source_window_id,
+        @intFromFloat(raw_target_id),
+        method,
+        argument,
+    ) catch |err| {
+        return agent.throwException(.type_error, "parent call failed: {any}", .{err});
     };
     return .undefined;
 }
