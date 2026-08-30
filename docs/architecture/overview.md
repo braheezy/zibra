@@ -9,9 +9,10 @@ changing a boundary; this overview is not a substitute for those contracts.
 
 | Area | Primary responsibility |
 | --- | --- |
-| `src/main.zig` | CLI parsing, isolated inspection modes, interactive startup, and standalone screenshot startup |
+| `src/main.zig` | CLI parsing, isolated inspection modes, interactive startup, and standalone screenshot/WPT startup |
 | `src/browser/app.zig` | Process-wide SDL event routing, native-window registry, shared session, and shared measurement |
 | `src/browser/root.zig` | One native window, tabs and chrome, render commits, raster coordination, and native presentation |
+| `src/browser/wpt_session.zig` | One-test headless Browser, explicit result/deadline loop, and two-stage cross-thread result mailbox |
 | `src/browser/resource_loader.zig` | Session-backed navigation/subresource dispatch and joined resource batches |
 | `src/browser/software_renderer.zig` | Browser-free z2d command drawing, effects, image sampling, and layer rasterization |
 | `src/browser/presentation_worker.zig` | Per-window raster runner, worker caches/surfaces, result transfer, and teardown |
@@ -81,6 +82,16 @@ their inputs and exclusively performs final SDL upload/presentation.
 `Browser.initAppWindow` borrows App services. Standalone `Browser.init` owns the
 corresponding SDL/session/measurement services for the windowless screenshot
 path. Keep those destruction paths explicit.
+
+`wpt_session.Session` is a separate heap-stable owner around one standalone
+Browser. It registers a generic top-level-Realm observer before tab creation;
+that observer installs the report sink after the document Realm exists and
+before its first script. The Session drives the ordinary Browser/Tab pipeline
+until an explicit harness result or monotonic deadline, then uses ordinary
+Browser teardown. A report arriving on the Tab worker copies only JSON bytes
+into a pending mailbox candidate; the Session thread promotes it after the
+serialized task returns and never joins or destroys browser-owned workers from
+the callback.
 
 The Browser is heap-stable because z2d context state points into it. Browser
 registry growth moves only pointers, never Browser values.
@@ -156,3 +167,9 @@ The CLI modes intentionally stop at different boundaries:
 Do not construct a Browser merely to reuse a helper in a narrower inspection
 mode. These boundaries are diagnostic contracts and should remain independently
 testable.
+
+`--wpt-test` is not an inspection phase. It creates a real standalone Browser,
+requires an explicit JavaScript harness completion report, emits one JSONL
+record on stdout after normal teardown, and reports its per-test deadline as a
+semantic `TIMEOUT`. Process crashes or an outer runner watchdog remain
+infrastructure failures rather than browser-authored test results.

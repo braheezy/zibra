@@ -1,0 +1,11 @@
+{
+  "version": 1,
+  "tests": [
+    {
+      "path": "html/semantics/text-level-semantics/the-b-element/b-usage.html",
+      "mode": "probe",
+      "status": "candidate",
+      "reason": "Exercises the fetch and HTML parser path without JavaScript."
+    }
+  ]
+}

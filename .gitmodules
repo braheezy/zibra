@@ -1,0 +1,3 @@
+[submodule "tests/wpt/upstream"]
+	path = tests/wpt/upstream
+	url = https://github.com/web-platform-tests/wpt.git

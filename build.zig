@@ -1,4 +1,4 @@
-//! Build, run, unit-test, and windowless screenshot-test steps for Zibra.
+//! Build, run, unit-test, WPT, and windowless screenshot steps for Zibra.
 
 const std = @import("std");
 const builtin = @import("builtin");
@@ -152,6 +152,34 @@ const screenshot_fixtures = [_]ScreenshotFixture{
         .fixture = "tests/manual/preformatted.html",
         .golden = "tests/golden/preformatted.macos.png",
         .output_basename = "preformatted-screenshot.png",
+    },
+};
+
+const WptFixture = struct {
+    fixture: []const u8,
+    status: []const u8,
+    timeout_ms: u64,
+    output_basename: []const u8,
+};
+
+const wpt_fixtures = [_]WptFixture{
+    .{
+        .fixture = "tests/wpt/fixtures/harness-pass.html",
+        .status = "PASS",
+        .timeout_ms = 10_000,
+        .output_basename = "wpt-harness-pass.jsonl",
+    },
+    .{
+        .fixture = "tests/wpt/fixtures/harness-promise-microtask-pass.html",
+        .status = "PASS",
+        .timeout_ms = 10_000,
+        .output_basename = "wpt-harness-promise-microtask-pass.jsonl",
+    },
+    .{
+        .fixture = "tests/wpt/fixtures/harness-timeout.html",
+        .status = "TIMEOUT",
+        .timeout_ms = 20,
+        .output_basename = "wpt-harness-timeout.jsonl",
     },
 };
 
@@ -366,6 +394,37 @@ pub fn build(b: *std.Build) !void {
         previous_pipeline_comparison = &compare.step;
     }
 
+    const wpt_test_step = b.step(
+        "test-wpt",
+        "Run local headless WPT result-protocol fixtures",
+    );
+    var previous_wpt_validation: ?*std.Build.Step = null;
+    for (wpt_fixtures) |fixture| {
+        const capture = b.addRunArtifact(exe);
+        if (previous_wpt_validation) |previous| capture.step.dependOn(previous);
+        capture.addArg("--wpt-test");
+        capture.addPrefixedFileArg("file://", b.path(fixture.fixture));
+        capture.addArg("--wpt-timeout-ms");
+        capture.addArg(b.fmt("{d}", .{fixture.timeout_ms}));
+        capture.setEnvironmentVariable("SDL_VIDEODRIVER", "dummy");
+        _ = capture.captureStdErr(.{
+            .basename = b.fmt("{s}.stderr.txt", .{fixture.output_basename}),
+        });
+        const actual = capture.captureStdOut(.{
+            .basename = fixture.output_basename,
+        });
+
+        const validate = b.addSystemCommand(&.{
+            "python3",
+            "tests/wpt/validate_result.py",
+        });
+        validate.addFileArg(actual);
+        validate.addArgs(&.{ "--status", fixture.status });
+        validate.addArgs(&.{ "--test-suffix", fixture.fixture });
+        wpt_test_step.dependOn(&validate.step);
+        previous_wpt_validation = &validate.step;
+    }
+
     const screenshot_test_step = b.step(
         "test-screenshot",
         "Capture and compare the windowless macOS screenshot fixtures",
@@ -425,6 +484,18 @@ pub fn build(b: *std.Build) !void {
     );
     server_test_step.dependOn(&server_tests.step);
 
+    const wpt_runner_tests = b.addSystemCommand(&.{
+        "python3",
+        "-m",
+        "unittest",
+        "tests/wpt/test_run.py",
+    });
+    const wpt_runner_test_step = b.step(
+        "test-wpt-runner",
+        "Run focused WPT manifest-runner tests",
+    );
+    wpt_runner_test_step.dependOn(&wpt_runner_tests.step);
+
     const docs_tests = b.addSystemCommand(&.{
         "python3",
         "tests/check_markdown_links.py",
@@ -447,7 +518,7 @@ pub fn build(b: *std.Build) !void {
 
     const check_step = b.step(
         "check",
-        "Run portable build, formatting, unit, pipeline, server, and docs checks",
+        "Run portable build, format, unit, WPT, pipeline, server, and docs checks",
     );
     check_step.dependOn(b.getInstallStep());
     check_step.dependOn(&format_check.step);
@@ -458,5 +529,7 @@ pub fn build(b: *std.Build) !void {
     check_step.dependOn(dump_dom_test_step);
     check_step.dependOn(pipeline_test_step);
     check_step.dependOn(server_test_step);
+    check_step.dependOn(wpt_runner_test_step);
+    check_step.dependOn(wpt_test_step);
     check_step.dependOn(docs_test_step);
 }

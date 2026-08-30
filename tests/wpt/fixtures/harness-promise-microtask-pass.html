@@ -1,0 +1,20 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>Zibra WPT harness Promise microtask smoke test</title>
+<script>
+Promise.resolve().then(() => {
+  completion_callback(
+    [{
+      name: "the native WPT bridge receives a Promise microtask result",
+      status: 0,
+      message: null,
+      stack: null
+    }],
+    {
+      status: 0,
+      message: null,
+      stack: null
+    }
+  );
+});
+</script>

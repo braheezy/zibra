@@ -9775,6 +9775,7 @@ test "anonymous inline run paints when its representative node is a button" {
 
     var anonymous: BlockLayout = undefined;
     anonymous.node = button;
+    anonymous.node_ptr = null;
     anonymous.inline_nodes = roots[0..];
     try std.testing.expect(anonymous.shouldPaint());
 

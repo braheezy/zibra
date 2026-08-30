@@ -131,6 +131,81 @@ the mutation module access to the realm coordinator. An optional core
 transaction without coupling the mutation module to parser types; an old
 pointer passed to it is an opaque map key and may not be dereferenced.
 
+## WPT testharness result bridge
+
+The first WPT adapter configures its standalone `Browser` with a generic
+top-level-Realm observer before creating the Tab. When the Browser installs a
+document, it calls `Js.setNodes` first and invokes that observer for the
+resulting top-level `WindowRealm` immediately afterward, before the live parser
+can evaluate its first script. The WPT Session's observer attaches
+`Js.setWptReportCallback`; ordinary Browser coordination remains unaware of the
+test protocol. This ordering is required: setting the callback on an earlier
+Realm and then calling non-null `setNodes` would retire that Realm and discard
+the callback. Every replacement document needs a fresh callback installation.
+
+Runtime bootstrap calls the native `wptEnabled` operation exactly once. An
+enabled Realm receives `self === window === globalThis` and the WPT external
+`completion_callback`; an ordinary Realm does not receive those WPT globals.
+Top-level `window.parent` returns `window`, while the existing child proxy
+remains the narrow postMessage/compatibility capability described above. The
+official `testharness.js` external callback supplies the subtests and harness
+status. Bootstrap converts them to one JSON object containing:
+
+- top-level `status`: `PASS`, `FAIL`, `ERROR`, or `TIMEOUT`;
+- `harness`: status name, numeric code, message, and stack;
+- `tests`: each subtest's name, status name, numeric code, message, and stack.
+
+A harness timeout maps to `TIMEOUT`; another non-OK harness status maps to
+`ERROR`. With an OK harness, a timed-out subtest maps the aggregate to
+`TIMEOUT`, another non-passing subtest maps it to `FAIL`, and an all-passing
+set maps it to `PASS`.
+
+`wptReport` converts the JSON string to temporary native bytes and invokes the
+Realm callback synchronously while `JsLock` is held. The callback may not
+retain that slice or re-enter `Js`, DOM, or Frame work. The current Session
+callback copies the first report into a pending candidate in a
+mutex-protected, heap-stable mailbox and returns. The Session thread promotes
+that candidate only after the reporting Tab has returned from its active task
+and its current serialized queue is empty. At or after the monotonic deadline,
+`TIMEOUT` instead retires any undrained candidate. A promoted result or timeout
+seals the mailbox and later completion calls are ignored. The Session remains
+alive through normal Browser teardown, which retires the Realm and clears the
+callback before the callback context or mailbox is freed.
+
+Bootstrap enablement is not dynamic. Clearing a sink after bootstrap does not
+remove the JavaScript `completion_callback`, and installing a sink after
+bootstrap does not add one. Keep the callback and its context live from before
+bootstrap until a terminal report or Realm retirement. A native reporting
+failure yields no valid completion and is handled by the outer session
+deadline rather than inferred as a pass.
+
+This milestone is a result-transport bridge, not complete WPT semantics. Its
+focused script tests invoke a fake external completion callback; they do not
+yet prove an unmodified upstream `testharness.js` test. The bridge does not
+capture assertion metadata beyond subtest message/stack, console output,
+network errors, uncaught exceptions, rejected promises, test/revision
+identity, or lifecycle timestamps. It publishes synchronously at the harness
+callback, then the Session applies a task-return/current-queue barrier before
+accepting the copied candidate. Each outer Browser-to-JavaScript turn drains
+the Agent's Promise job queue to a fixed point while its `ActiveWindow` and
+`JsLock` remain installed, before the Tab task can satisfy that barrier.
+Nested native re-entry relies on the outer turn's checkpoint. Host interruption
+is checked again after the drain so an interrupted Promise chain is reported as
+`ExecutionInterrupted` even though Kiesel's drain operation contains job
+errors.
+
+This checkpoint is not a resource-quiescence predicate. Same-origin document
+Realms also share one Agent: Kiesel changes its running Realm for each queued
+job, but Zibra's native bindings still route through the outer
+`current_window_id`. Promise jobs belonging to another same-origin Realm must
+not be treated as correctly routed until that mapping is explicit. Kiesel also
+has no Zibra rejection-tracker hook, so unhandled rejections are not yet
+structured harness diagnostics. Only the top-level Realm contributes the
+terminal result; child browsing-context aggregation and ordinary-page `self`
+support remain outside this first slice. The Browser Session, not JavaScript
+bootstrap, owns the monotonic deadline, crash/load error classification,
+teardown, and final machine-readable result wrapper.
+
 ## DOM handles and mutation APIs
 
 - `Node.children` returns a fresh JavaScript array of immediate Element child
@@ -327,6 +402,9 @@ one complete block box. The amber screen-reader highlight is separate.
 
 - Stable JavaScript Node identity is not enforced by the type system.
 - Some JavaScript host mutations have only an implicit owner-thread rule.
+- WPT reporting lacks upstream-harness integration coverage, cross-Realm
+  Promise-job routing, unhandled-rejection and other diagnostic capture,
+  resource-quiescence completion, and child-context aggregation.
 - Main-thread accessibility readers do not consume a complete immutable
   document snapshot.
 

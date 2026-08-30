@@ -178,6 +178,30 @@ requirement but creates no window, renderer, texture, or text-input owner. It
 waits for Tab and accounted-helper quiescence, runs software composition, and
 exports the root surface.
 
+## Headless WPT sessions
+
+A one-test WPT Session owns a standalone headless Browser and is heap-stable
+for as long as a top-level WindowRealm can call its report sink. The creating
+thread drives the ordinary nonblocking `Browser.tick` path. The Tab worker's
+native report callback copies callback-scoped JSON into an SMP-allocated,
+mutex-protected mailbox and returns; it must not tear down the Browser or join
+its own TaskRunner. This is initially a pending candidate. The Session thread
+may promote it only after the reporting Tab's active task has returned and its
+current serialized queue is empty. The monotonic deadline takes precedence at
+or after its timestamp and retires an undrained candidate as `TIMEOUT`. This
+barrier follows the JavaScript host's outer-turn Promise-job checkpoint because
+the Tab task remains active until that checkpoint returns. It does not prove
+resource quiescence or correct native routing for jobs from another Realm in a
+shared Agent.
+
+After either terminal value, the creating thread follows ordinary standalone
+Browser teardown and only then destroys the callback context. Semantic
+completion never uses screenshot readiness, Browser idleness, a sleep, or
+`process.exit`. Until navigation and HTTP helpers have complete cancellation
+and transport-deadline coverage, the external runner retains a longer process
+watchdog. A watchdog kill or missing valid record is an infrastructure failure,
+not a semantic WPT `TIMEOUT`.
+
 ## Shutdown order
 
 The enforced process order is:
