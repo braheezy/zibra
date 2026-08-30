@@ -1693,6 +1693,14 @@ pub fn runTimeoutCallback(self: *Js, window_id: u32, handle: u32) !void {
     }
     const handle_value = Value.from(@as(f64, @floatFromInt(handle)));
     _ = fn_value.call(&self.agent, .undefined, &.{handle_value}) catch |err| {
+        if (err == error.ExceptionThrown) {
+            if (self.agent.exception) |exception| {
+                var buffer: [4096]u8 = undefined;
+                var writer = std.Io.Writer.fixed(&buffer);
+                writer.print("{f}", .{exception.fmtPretty(&self.agent, .no_color)}) catch {};
+                std.log.warn("setTimeout JavaScript exception: {s}", .{buffer[0..writer.end]});
+            }
+        }
         return self.finishOuterTurnErrorLocked(err);
     };
     try self.microtaskCheckpointLocked();
@@ -4624,8 +4632,14 @@ fn querySelectorAllFrom(agent: *Agent, this_value: Value, arguments: kiesel.type
         defer ancestors.deinit(js_instance.allocator);
         var current = node;
         while (true) {
-            const parent = switch (current.*) { .element => |e| e.parent, .text => |t| t.parent };
-            if (parent) |p| { try ancestors.append(js_instance.allocator, p); current = p; } else break;
+            const parent = switch (current.*) {
+                .element => |e| e.parent,
+                .text => |t| t.parent,
+            };
+            if (parent) |p| {
+                try ancestors.append(js_instance.allocator, p);
+                current = p;
+            } else break;
         }
         std.mem.reverse(*Node, ancestors.items);
         if (selector.matchesWithContext(node, ancestors.items, match_context)) {

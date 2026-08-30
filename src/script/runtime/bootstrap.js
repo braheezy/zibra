@@ -627,6 +627,24 @@ Object.defineProperty(Node.prototype, "firstChild", {
 Object.defineProperty(Node.prototype, "lastChild", {
   get: function() { return wrapNode(__native.lastChild(this.handle)); }
 });
+Object.defineProperty(Node.prototype, "firstElementChild", {
+  get: function() {
+    var children = this.childNodes;
+    for (var i = 0; i < children.length; i++) {
+      if (children[i].nodeType === Node.ELEMENT_NODE) return children[i];
+    }
+    return null;
+  }
+});
+Object.defineProperty(Node.prototype, "lastElementChild", {
+  get: function() {
+    var children = this.childNodes;
+    for (var i = children.length - 1; i >= 0; i--) {
+      if (children[i].nodeType === Node.ELEMENT_NODE) return children[i];
+    }
+    return null;
+  }
+});
 Object.defineProperty(Node.prototype, "previousSibling", {
   get: function() { return wrapNode(__native.previousSibling(this.handle)); }
 });
@@ -1442,6 +1460,7 @@ window.__id = __native.getWindowId();
 if (__native.wptEnabled()) {
   globalThis.self = globalThis;
   (function() {
+    var wptCompletionHookInstalled = false;
     function nullableString(value) {
       return value === undefined || value === null ? null : String(value);
     }
@@ -1505,6 +1524,19 @@ if (__native.wptEnabled()) {
         },
         tests: serializedTests
       }));
+    };
+
+    // The upstream testharness reports through add_completion_callback rather
+    // than calling a vendor callback directly. Parser-inserted scripts are
+    // evaluated one at a time, so the host invokes this hook after each one;
+    // it becomes active as soon as testharness.js exposes its API.
+    globalThis.__installWptCompletionHook = function() {
+      if (wptCompletionHookInstalled ||
+          typeof globalThis.add_completion_callback !== "function") return;
+      globalThis.add_completion_callback(function(tests, harnessStatus) {
+        globalThis.completion_callback(tests, harnessStatus);
+      });
+      wptCompletionHookInstalled = true;
     };
   })();
 }

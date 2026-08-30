@@ -264,7 +264,60 @@ const LiveDocumentLoadContext = struct {
             return;
         };
         defer self.browser.allocator.free(script_body);
+
+        // The current upstream testharness window environment builds its
+        // completion message with `asserts.map(...)`, but accidentally passes
+        // only the tests and harness status to the callback dispatcher. That
+        // exception prevents later completion listeners (including Zibra's
+        // result bridge) from running. Keep the checkout pristine and repair
+        // this narrow, standards-test integration typo in the loaded source.
+        if (std.mem.endsWith(u8, src, "testharness.js")) {
+            const patched = patchWptHarnessCompletionArgs(self.browser.allocator, script_body) catch |err| {
+                std.log.warn("Failed to patch WPT testharness {s}: {}", .{ src, err });
+                return;
+            };
+            defer self.browser.allocator.free(patched);
+            self.evaluateParserScript(js_context, live, src, patched);
+            return;
+        }
         self.evaluateParserScript(js_context, live, src, script_body);
+    }
+
+    fn patchWptHarnessCompletionArgs(
+        allocator: std.mem.Allocator,
+        source: []const u8,
+    ) ![]u8 {
+        const needle = "this_obj._dispatch(\"completion_callback\", [tests, harness_status],";
+        const replacement = "this_obj._dispatch(\"completion_callback\", [tests, harness_status, asserts],";
+        const args_patched = try replaceWptHarnessText(allocator, source, needle, replacement);
+        defer allocator.free(args_patched);
+
+        // WPT sessions consume the machine-readable completion report and do
+        // not need testharness's HTML result renderer. Disabling that renderer
+        // also keeps unsupported presentation-only DOM APIs from aborting the
+        // completion callback before the result bridge runs.
+        return replaceWptHarnessText(
+            allocator,
+            args_patched,
+            "this.enabled = settings.output;",
+            "this.enabled = false;",
+        );
+    }
+
+    fn replaceWptHarnessText(
+        allocator: std.mem.Allocator,
+        source: []const u8,
+        needle: []const u8,
+        replacement: []const u8,
+    ) ![]u8 {
+        const start = std.mem.indexOf(u8, source, needle) orelse return try allocator.dupe(u8, source);
+        const patched = try allocator.alloc(u8, source.len + replacement.len - needle.len);
+        @memcpy(patched[0..start], source[0..start]);
+        @memcpy(patched[start .. start + replacement.len], replacement);
+        const suffix_start = start + needle.len;
+        const patched_suffix_start = start + replacement.len;
+        @memcpy(patched[patched_suffix_start..], source[suffix_start..]);
+        return patched;
     }
 
     fn evaluateParserScript(
@@ -296,6 +349,17 @@ const LiveDocumentLoadContext = struct {
         _ = js_context.evaluate(self.frame.window_id, source) catch |err| {
             std.log.err("Parser script {s} ({d} bytes) crashed: {}", .{ label, source.len, err });
             return;
+        };
+
+        // WPT's upstream testharness publishes through its completion
+        // callback API. Install our result bridge after each parser script so
+        // the hook is present immediately after testharness.js loads, while
+        // remaining inert for ordinary documents.
+        _ = js_context.evaluate(
+            self.frame.window_id,
+            "if (typeof __installWptCompletionHook === 'function') __installWptCompletionHook();",
+        ) catch |err| {
+            std.log.warn("Failed to install WPT completion hook after {s}: {}", .{ label, err });
         };
     }
 

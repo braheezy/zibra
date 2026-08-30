@@ -7,18 +7,19 @@ the browser can report their completion produces misleading results.
 
 ## Current state
 
-The WPT adapter vertical slice is implemented; executing the first unmodified
-upstream test is the next milestone. The current implementation includes:
+The WPT adapter vertical slice is implemented, including one unmodified
+upstream testharness pass. The current implementation includes:
 
 - `.gitmodules` registers the WPT checkout at `tests/wpt/upstream`;
   contributors initialize it only when doing upstream compatibility work. The
   runner/result protocol does not yet expose the resolved WPT revision.
-  `manifest.json` remains the reviewed compatibility allowlist and currently
-  contains only the legacy `probe`.
+  `manifest.json` remains the reviewed compatibility allowlist and contains the
+  legacy `probe` plus one candidate upstream testharness case.
 - `run.py` preserves `probe` as an explicitly labeled non-conformance fetch and
-  parse smoke test. Its `testharness` mode invokes the WPT CLI protocol, checks
-  exact expectations, and treats malformed output, crashes, and its outer
-  watchdog as infrastructure failures.
+  parse smoke test. Its `testharness` mode starts WPT's own `wptserve` on a
+  worker-local loopback port, invokes the WPT CLI protocol, checks exact
+  expectations, and treats malformed output, crashes, and its outer watchdog
+  as infrastructure failures.
 - `src/browser/wpt_session.zig` owns one standalone headless Browser, drives
   `Browser.tick`, copies the first explicit report, accepts it after the Tab's
   serialized task-return barrier, gives the monotonic deadline precedence over
@@ -33,6 +34,10 @@ upstream test is the next milestone. The current implementation includes:
   hook only when a WPT sink is installed. Outer Browser-to-JavaScript turns
   drain Kiesel Promise jobs to a fixed point before releasing `JsLock` and the
   active WindowRealm.
+- When loading the current upstream `testharness.js` in WPT mode, the browser
+  applies a narrow in-memory compatibility shim for its window completion
+  message's missing `asserts` argument and disables its HTML result renderer;
+  the upstream checkout and test files remain unchanged.
 - `zibra --wpt-test <absolute-url> --wpt-timeout-ms <n>` writes exactly one
   protocol-v1 JSONL result to stdout after teardown. Diagnostics stay on
   stderr. `PASS`, `FAIL`, `ERROR`, and semantic `TIMEOUT` all produce a valid
@@ -43,15 +48,12 @@ upstream test is the next milestone. The current implementation includes:
   covers manifest selection, exact expectations, malformed output, nonzero
   exits, protocol validation, and watchdog classification with fake browsers.
 
-The committed coverage proves the adapter, process protocol, Promise checkpoint,
-deadline race, and runner failure classification. It does not yet prove that
-Zibra can execute an unmodified upstream `testharness.js` test. The runner
-currently constructs file URLs, so an upstream reference such as
-`/resources/testharness.js` cannot resolve correctly. `wptserve` and its origin
-model are not orchestrated, and resource quiescence, cross-Realm Promise-job
-routing, structured navigation/script failures, rejected-promise reporting,
-console/network diagnostics, reftests, persistent sessions, and CI artifact
-publishing remain incomplete.
+The committed coverage proves the adapter, process protocol, Promise
+checkpoint, deadline race, runner failure classification, WPT resource
+resolution, and one unchanged upstream DOM test. Resource quiescence,
+cross-Realm Promise-job routing, structured navigation/script failures,
+rejected-promise reporting, console/network diagnostics, reftests, persistent
+sessions, and CI artifact publishing remain incomplete.
 
 `--dump-dom` still deliberately fetches and parses without constructing a
 Browser, SDL, layout, or JavaScript. A successful probe is never a
@@ -63,34 +65,27 @@ Browser, SDL, layout, or JavaScript. A successful probe is never a
 | --- | --- | --- |
 | 0. Pinning and schema | Partial | Submodule registration and allowlist exist; revision fields and persisted results do not |
 | 1. Headless session | Core implemented | One URL, one Tab, explicit report/deadline, JSONL, and normal teardown work; viewport/UA configuration and structured load errors do not |
-| 2. Harness reporting | Partial | Completion, subtests, Promise jobs, status mapping, and runner expectations work; upstream proof and full diagnostics do not |
+| 2. Harness reporting | Core implemented | Completion, subtests, Promise jobs, status mapping, one upstream proof, and runner expectations work; full diagnostics do not |
 | 3. Scheduling/cancellation | Partial | Task-return barrier, deadline arbitration, and JS interruption work; resource quiescence and complete transport cancellation do not |
 | 4. Web APIs | Ongoing | Grow coherent slices from selected failures rather than attempting the full platform |
-| 5. `wptserve` | Next milestone | Required before unchanged upstream resource URLs, headers, and origins can work |
-| 6. Selection/expectations | Runner ready | Schema and comparison exist, but the allowlist has no `testharness` entry yet |
+| 5. `wptserve` | Core implemented | Worker-local loopback server supplies unchanged root-relative harness resources; richer dynamic handlers remain |
+| 6. Selection/expectations | Runner ready | Schema and exact comparison are exercised by one reviewed `testharness` entry |
 | 7. Reftests | Not started | Keep separate from semantic harness results |
 | 8. Performance/CI | Partial | Local build checks exist; persistence, sharding, artifacts, and a persistent process do not |
 
-## Next milestone: one unmodified upstream test
+## Next milestone: expand focused upstream coverage
 
-Zibra can accurately claim that it runs WPT after one existing upstream
-`testharness.js` test passes unchanged through the reviewed manifest and the
-current result protocol. Reach that milestone in this order:
+Zibra now runs one existing upstream `testharness.js` test unchanged through
+the reviewed manifest and current result protocol. Grow coverage in this order:
 
 1. Initialize the already-registered submodule and record the resolved WPT
    revision in the manifest and result metadata.
-2. Add `wptserve` lifecycle ownership to `run.py`: deterministic configuration,
-   worker-local ports, URL mapping from manifest paths, readiness detection,
-   and unconditional shutdown in a `finally` path.
-3. Select one small synchronous upstream test whose DOM/event dependencies are
-   already implemented. Add it to the allowlist with type, timeout, explicit
-   expectation, reason, and revision; do not modify the upstream file.
-4. Prove that its unchanged `/resources/testharness.js` and
-   `/resources/testharnessreport.js` requests load through `wptserve` and reach
-   Zibra's existing completion bridge.
-5. Preserve the protocol-v1 record, stderr, and server diagnostics for the run,
-   and keep outer watchdog failures classified as infrastructure rather than
-   semantic `TIMEOUT`.
+2. Select small upstream tests whose DOM/event dependencies are already
+   implemented. Add them to the allowlist with type, timeout, explicit
+   expectation, reason, and revision; do not modify upstream files.
+3. Preserve the protocol-v1 record, stderr, and server diagnostics for each
+   run, and keep outer watchdog failures classified as infrastructure rather
+   than semantic `TIMEOUT`.
 
 After that first test, add structured navigation/script exception and
 unhandled-rejection observers, persist per-test records and a run summary, and
@@ -332,9 +327,8 @@ mutation retires or rebinds every affected handle before child storage moves.
 
 ## Phase 5: WPT HTTP server and origin model
 
-Status: next milestone. The current file-URL runner cannot resolve WPT's
-root-relative `/resources/` scripts and therefore cannot prove an unchanged
-upstream test.
+Status: core implemented. The runner starts WPT's own server on a temporary
+loopback port, so unchanged upstream root-relative `/resources/` scripts work.
 
 Use WPT's `wptserve` rather than a generic static server. It is required for
 root-relative harness resources even before tests need headers, redirects,
@@ -362,10 +356,10 @@ cross-origin requests carry an explicit serialized request origin.
 
 ## Phase 6: semantic test selection and expectations
 
-Status: partial. `run.py` supports reviewed `probe` and `testharness` modes,
+Status: runner ready. `run.py` supports reviewed `probe` and `testharness` modes,
 positive per-test timeouts, exact `pass`/`fail`/`error`/`timeout`
 expectations, explicit skips, and infrastructure-failure classification. The
-committed manifest still contains no `testharness` case.
+the committed manifest contains one reviewed upstream `testharness` case.
 
 Start with tests whose dependencies match implemented behavior:
 
@@ -443,19 +437,16 @@ Completed:
 
 Next:
 
-1. Initialize the pinned checkout, expose its revision, and orchestrate
-   `wptserve`.
-2. Execute one reviewed, unmodified upstream `testharness.js` test through the
-   existing protocol.
-3. Add structured navigation, exception, rejection, console, and network
+1. Record the pinned checkout revision in the manifest and result metadata.
+2. Add structured navigation, exception, rejection, console, and network
    failure reporting; verify served PASS, FAIL, ERROR, and TIMEOUT paths.
-4. Persist per-test records, raw diagnostics, revision metadata, and a run
+3. Persist per-test records, raw diagnostics, revision metadata, and a run
    summary.
-5. Grow a small semantic DOM/events/timers shard and promote each discovered
+4. Grow a small semantic DOM/events/timers shard and promote each discovered
    regression into focused native coverage.
-6. Add resource-quiescence and multi-Realm routing contracts before tests that
+5. Add resource-quiescence and multi-Realm routing contracts before tests that
    depend on them.
-7. Add reftest capture, then sharding, parallelism, persistent processes, and
+6. Add reftest capture, then sharding, parallelism, persistent processes, and
    CI artifact publishing.
 
 ## Verification requirements

@@ -6,6 +6,14 @@
       "mode": "probe",
       "status": "candidate",
       "reason": "Exercises the fetch and HTML parser path without JavaScript."
+    },
+    {
+      "path": "dom/nodes/Element-firstElementChild.html",
+      "mode": "testharness",
+      "status": "candidate",
+      "timeout_ms": 10000,
+      "expectation": "pass",
+      "reason": "First upstream testharness smoke case for an already-supported DOM lookup API."
     }
   ]
 }
