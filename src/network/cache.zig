@@ -8,6 +8,15 @@
 
 const std = @import("std");
 
+/// Coarse response media classes retained by the HTTP cache.
+pub const ContentType = enum {
+    unknown,
+    html,
+    plain,
+    css,
+    image,
+};
+
 /// The Referrer-Policy values understood by Zibra. `default` preserves the
 /// tutorial's behavior of sending the source URL to any HTTP(S) destination.
 pub const ReferrerPolicy = enum {
@@ -92,6 +101,7 @@ pub const CacheControl = union(enum) {
 pub const HttpCache = struct {
     const Entry = struct {
         body: []u8,
+        content_type: ContentType,
         csp_header: ?[]u8,
         final_url: ?[]u8,
         policy: CacheControl,
@@ -140,6 +150,7 @@ pub const HttpCache = struct {
         self: *HttpCache,
         url: []const u8,
         body: []const u8,
+        content_type: ContentType,
         csp_header: ?[]const u8,
         final_url: ?[]const u8,
         policy: CacheControl,
@@ -163,6 +174,7 @@ pub const HttpCache = struct {
         };
         const new_entry = Entry{
             .body = body_copy,
+            .content_type = content_type,
             .csp_header = csp_copy,
             .final_url = final_url_copy,
             .policy = policy,
@@ -216,6 +228,7 @@ test "HTTP cache expires max-age entries and retains default entries" {
     try cache.store(
         "https://example.com/default",
         "default",
+        .unknown,
         null,
         null,
         .default,
@@ -230,6 +243,7 @@ test "HTTP cache expires max-age entries and retains default entries" {
     try cache.store(
         "https://example.com/timed",
         "timed",
+        .unknown,
         null,
         null,
         .{ .max_age = 2 },

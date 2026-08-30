@@ -14,6 +14,7 @@ const CacheControl = cache_module.CacheControl;
 const HttpCache = cache_module.HttpCache;
 const ReferrerPolicy = cache_module.ReferrerPolicy;
 const XFrameOptions = cache_module.XFrameOptions;
+const ContentType = cache_module.ContentType;
 const HttpResponse = response_module.Response;
 const CookieEntry = cookie.Entry;
 
@@ -97,6 +98,7 @@ pub fn fetchBodyInternal(
                 }
                 break :cache_lookup .{
                     .body = body,
+                    .content_type = entry.content_type,
                     .csp_header = csp_header,
                     .status = .ok,
                     .cache_control = entry.policy,
@@ -133,6 +135,7 @@ pub fn fetchBodyInternal(
         cache.?.store(
             cache_key,
             fetched.body,
+            fetched.content_type,
             fetched.csp_header,
             final_url_text,
             fetched.cache_control,
@@ -258,6 +261,7 @@ fn httpRequest(
     var cache_control: CacheControl = .default;
     var response_referrer_policy: ReferrerPolicy = .default;
     var response_x_frame_options: XFrameOptions = .none;
+    var response_content_type: ContentType = .unknown;
 
     const max_attempts: usize = 2;
     var attempt: usize = 0;
@@ -353,6 +357,8 @@ fn httpRequest(
                             parsed,
                         );
                     }
+                } else if (std.ascii.eqlIgnoreCase(header.name, "content-type")) {
+                    response_content_type = response_module.classifyContentType(header.value);
                 }
             }
         }
@@ -417,6 +423,7 @@ fn httpRequest(
 
         const result = HttpResponse{
             .body = body,
+            .content_type = response_content_type,
             .csp_header = csp_header,
             .access_control_allow_origin = access_control_allow_origin,
             .status = response.head.status,

@@ -1749,6 +1749,80 @@ test "DOM Range supports boundaries, fragments, and extraction" {
     try std.testing.expect(result.toBoolean());
 }
 
+test "detached documents retain ownerDocument across garbage collection" {
+    const allocator = std.testing.allocator;
+    var html_parser = try parser.HTMLParser.init(allocator, "<main></main>");
+    html_parser.use_implicit_tags = false;
+    defer html_parser.deinit(allocator);
+    var root = try html_parser.parse();
+    defer root.deinit(allocator);
+    parser.fixParentPointers(&root, null);
+    var environ = std.process.Environ.Map.init(allocator);
+    defer environ.deinit();
+    var js = try Js.init(allocator, std.testing.io, &environ);
+    defer js.deinit(allocator);
+    js.setNodes(0, &root);
+    defer js.setNodes(0, null);
+
+    const result = try js.evaluate(0,
+        \\var d = document.implementation.createDocument(null, null, null);
+        \\var e = d.createElement('test');
+        \\d.appendChild(d.createElement('root')); d.documentElement.appendChild(e);
+        \\var e2 = d.createElement('test'); d.createElement('root').appendChild(e2);
+        \\e.parentNode.ownerDocument === d && e2.parentNode.ownerDocument === d &&
+        \\e.parentNode.ownerDocument.nodeType === Node.DOCUMENT_NODE
+    );
+    try std.testing.expect(result.toBoolean());
+}
+
+test "createDocument preserves qualified root, doctype, title, and forms" {
+    const allocator = std.testing.allocator;
+    var html_parser = try parser.HTMLParser.init(allocator, "<main></main>");
+    html_parser.use_implicit_tags = false;
+    defer html_parser.deinit(allocator);
+    var root = try html_parser.parse();
+    defer root.deinit(allocator);
+    parser.fixParentPointers(&root, null);
+    var environ = std.process.Environ.Map.init(allocator);
+    defer environ.deinit();
+    var js = try Js.init(allocator, std.testing.io, &environ);
+    defer js.deinit(allocator);
+    js.setNodes(0, &root);
+    defer js.setNodes(0, null);
+
+    const result = try js.evaluate(0,
+        \\var type = document.implementation.createDocumentType('html', '', '');
+        \\var d = document.implementation.createDocument('http://www.w3.org/1999/xhtml', 'html', type);
+        \\var head = d.createElement('head'); var body = d.createElement('body');
+        \\var title = d.createElement('title'); title.textContent = 'Sparrow';
+        \\head.appendChild(title); d.documentElement.appendChild(head); d.documentElement.appendChild(body);
+        \\body.appendChild(d.createElement('form'));
+        \\d.documentElement.tagName === 'html' && type.ownerDocument === d && d.title === 'Sparrow' && d.forms.length === 1
+    );
+    try std.testing.expect(result.toBoolean());
+}
+
+test "getElementById distinguishes names and preserves whitespace IDs" {
+    const allocator = std.testing.allocator;
+    var html_parser = try parser.HTMLParser.init(allocator, "<html><body><form name='form'></form></body></html>");
+    defer html_parser.deinit(allocator);
+    var root = try html_parser.parse();
+    defer root.deinit(allocator);
+    parser.fixParentPointers(&root, null);
+    var environ = std.process.Environ.Map.init(allocator);
+    defer environ.deinit();
+    var js = try Js.init(allocator, std.testing.io, &environ);
+    defer js.deinit(allocator);
+    js.setNodes(0, &root);
+    defer js.setNodes(0, null);
+    const result = try js.evaluate(0,
+        \\var form = document.getElementsByTagName('form')[0];
+        \\var div = document.createElement('div'); div.id = ' '; document.body.appendChild(div);
+        \\document.getElementById('form') !== form && document.getElementById(' ') === div
+    );
+    try std.testing.expect(result.toBoolean());
+}
+
 test "host interrupt stops an infinite script" {
     const InterruptAfterPolls = struct {
         remaining: usize,

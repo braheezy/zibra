@@ -7,11 +7,38 @@ const std = @import("std");
 const cache = @import("cache.zig");
 
 const CacheControl = cache.CacheControl;
+pub const ContentType = cache.ContentType;
 const ReferrerPolicy = cache.ReferrerPolicy;
 const XFrameOptions = cache.XFrameOptions;
 
+/// Coarse response media classes used by document/resource consumers.  The
+/// full header value is deliberately not retained: callers only need to know
+/// whether a response is HTML, plain text, CSS, or an image when deciding
+/// whether to parse or execute it.
+pub fn classifyContentType(value: []const u8) ContentType {
+    const media_type = std.mem.trim(u8, value, " \t\r\n");
+    const end = std.mem.indexOfScalar(u8, media_type, ';') orelse media_type.len;
+    const token = std.mem.trim(u8, media_type[0..end], " \t");
+    if (std.ascii.eqlIgnoreCase(token, "text/html") or
+        std.ascii.eqlIgnoreCase(token, "application/xhtml+xml")) return .html;
+    if (std.ascii.eqlIgnoreCase(token, "text/plain")) return .plain;
+    if (std.ascii.eqlIgnoreCase(token, "text/css")) return .css;
+    if (token.len >= "image/".len and std.ascii.eqlIgnoreCase(token[0.."image/".len], "image/")) return .image;
+    return .unknown;
+}
+
+test "classify response media types while ignoring parameters" {
+    try std.testing.expectEqual(ContentType.html, classifyContentType("text/html; charset=utf-8"));
+    try std.testing.expectEqual(ContentType.html, classifyContentType("Application/XHTML+XML"));
+    try std.testing.expectEqual(ContentType.plain, classifyContentType(" text/plain "));
+    try std.testing.expectEqual(ContentType.css, classifyContentType("text/css; charset=utf-8"));
+    try std.testing.expectEqual(ContentType.image, classifyContentType("image/png"));
+    try std.testing.expectEqual(ContentType.unknown, classifyContentType("application/xml"));
+}
+
 pub const Response = struct {
     body: []const u8,
+    content_type: ContentType = .unknown,
     csp_header: ?[]u8 = null,
     /// Owned only for requests that supplied an Origin header. Ordinary
     /// navigation/subresource responses leave this null.

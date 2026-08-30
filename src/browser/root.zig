@@ -58,12 +58,12 @@ pub const ResizeGeometry = window_geometry.ResizeGeometry;
 pub const resizeGeometry = window_geometry.resize;
 const url_module = @import("../network/url.zig");
 const Url = url_module.Url;
+const Node = @import("../document/parser.zig").Node;
+const parser = @import("../document/parser.zig");
 const Layout = @import("render/layout.zig");
 const replaced_sizing = @import("render/replaced_sizing.zig");
 const document_loader = @import("document_loader.zig");
-const parser = @import("../document/parser.zig");
 const dom_focus = @import("../document/focus.zig");
-const Node = parser.Node;
 const CSSParser = @import("../document/css_parser.zig").CSSParser;
 const js_module = @import("../script/js.zig");
 pub const JsRenderContext = @import("js_context.zig").JsRenderContext;
@@ -87,6 +87,44 @@ const ResourceLoader = resource_loader.Loader;
 const DocumentResourceKind = resource_loader.Kind;
 const DocumentResourceFetch = resource_loader.Fetch;
 const DocumentResourceBatch = resource_loader.Batch;
+
+fn responseIsNonHtml(response: url_module.HttpResponse, url: *const Url) bool {
+    const path = url.path;
+    const extension_non_html = std.ascii.endsWithIgnoreCase(path, ".txt") or
+        std.ascii.endsWithIgnoreCase(path, ".png") or
+        std.ascii.endsWithIgnoreCase(path, ".gif") or
+        std.ascii.endsWithIgnoreCase(path, ".jpg") or
+        std.ascii.endsWithIgnoreCase(path, ".jpeg") or
+        std.ascii.endsWithIgnoreCase(path, ".css") or
+        std.ascii.endsWithIgnoreCase(path, ".xml") or
+        std.ascii.endsWithIgnoreCase(path, ".svg");
+    return switch (response.content_type) {
+        .html => false,
+        .plain, .css, .image => true,
+        .unknown => extension_non_html,
+    };
+}
+
+fn responseIsPlainText(response: url_module.HttpResponse, url: *const Url) bool {
+    return response.content_type == .plain or
+        (response.content_type == .unknown and std.ascii.endsWithIgnoreCase(url.path, ".txt"));
+}
+
+fn makeInertDocument(allocator: std.mem.Allocator, body: []const u8, plain_text: bool) !Node {
+    var root = Node{ .element = try parser.Element.init(allocator, "html", null) };
+    var root_owned = true;
+    errdefer if (root_owned) root.deinit(allocator);
+    var body_node = Node{ .element = try parser.Element.init(allocator, "body", null) };
+    var body_owned = true;
+    errdefer if (body_owned) body_node.deinit(allocator);
+    if (plain_text) {
+        try body_node.element.children.append(allocator, Node{ .text = parser.Text.init(body, null) });
+    }
+    try root.element.children.append(allocator, body_node);
+    body_owned = false;
+    root_owned = false;
+    return root;
+}
 
 /// Browser-owned hooks for one synchronous initial live parse.
 ///
@@ -2529,18 +2567,26 @@ pub const Browser = struct {
             // parser/resource failure unwinds this load.
             frame.current_url = url;
             frame.current_url_owned = false;
-            var live_context = LiveDocumentLoadContext{
-                .browser = self,
-                .tab = tab,
-                .frame = frame,
-                .page_url = url,
-                .parent_window_id = null,
-            };
-            try document_loader.runIntoSlot(self.allocator, &frame.html_sources, &frame.current_node, .{
-                .context = &live_context,
-                .install_root = LiveDocumentLoadContext.installRoot,
-                .execute_script = LiveDocumentLoadContext.executeScript,
-            });
+            if (responseIsNonHtml(response, url)) {
+                frame.current_node = try makeInertDocument(
+                    self.allocator,
+                    body_text,
+                    responseIsPlainText(response, url),
+                );
+            } else {
+                var live_context = LiveDocumentLoadContext{
+                    .browser = self,
+                    .tab = tab,
+                    .frame = frame,
+                    .page_url = url,
+                    .parent_window_id = null,
+                };
+                try document_loader.runIntoSlot(self.allocator, &frame.html_sources, &frame.current_node, .{
+                    .context = &live_context,
+                    .install_root = LiveDocumentLoadContext.installRoot,
+                    .execute_script = LiveDocumentLoadContext.executeScript,
+                });
+            }
             document_title = try parser.collectDocumentTitle(
                 self.allocator,
                 &frame.current_node.?,
@@ -3417,39 +3463,19 @@ pub const Browser = struct {
         // Only HTML documents execute parser-blocking scripts.  In
         // particular, Acid3 deliberately serves script-looking payloads as
         // text/plain and image/png to verify that MIME type gates execution.
-        // The transport currently exposes URL metadata but not a parsed
-        // Content-Type field, so use the conservative extension fallback for
-        // these non-HTML test resources while treating extensionless URLs as
-        // HTML (the normal navigation case).
-        const path = response_url.path;
-        const non_html = std.ascii.endsWithIgnoreCase(path, ".txt") or
-            std.ascii.endsWithIgnoreCase(path, ".png") or
-            std.ascii.endsWithIgnoreCase(path, ".gif") or
-            std.ascii.endsWithIgnoreCase(path, ".jpg") or
-            std.ascii.endsWithIgnoreCase(path, ".jpeg") or
-            std.ascii.endsWithIgnoreCase(path, ".css");
+        // Prefer the response's parsed Content-Type. Keep the extension
+        // fallback for synthetic/file responses that carry no headers.
+        const non_html = responseIsNonHtml(response, response_url);
         if (non_html) {
             // Non-HTML iframe responses are documents with no parsed markup.
             // Keep text/plain readable as a single text node, but never let
             // tag-looking bytes become executable or queryable HTML. Images
             // and stylesheets intentionally get an empty document shell.
-            var inert_root = Node{ .element = try parser.Element.init(self.allocator, "html", null) };
-            var inert_root_owned = true;
-            errdefer {
-                if (inert_root_owned) inert_root.deinit(self.allocator);
-            }
-            var inert_body = Node{ .element = try parser.Element.init(self.allocator, "body", null) };
-            var inert_body_owned = true;
-            errdefer {
-                if (inert_body_owned) inert_body.deinit(self.allocator);
-            }
-            if (std.ascii.endsWithIgnoreCase(path, ".txt")) {
-                try inert_body.element.children.append(self.allocator, Node{ .text = parser.Text.init(body_text, null) });
-            }
-            try inert_root.element.children.append(self.allocator, inert_body);
-            inert_body_owned = false;
-            frame.current_node = inert_root;
-            inert_root_owned = false;
+            frame.current_node = try makeInertDocument(
+                self.allocator,
+                body_text,
+                responseIsPlainText(response, response_url),
+            );
         } else {
             var live_context = LiveDocumentLoadContext{
                 .browser = self,

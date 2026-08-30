@@ -608,7 +608,7 @@ Object.defineProperty(Node.prototype, "textContent", {
   get: function() { return __native.textContent(this.handle); }
 });
 Object.defineProperty(Node.prototype, "ownerDocument", {
-  get: function() { return document; }, enumerable: true, configurable: true
+  get: function() { return this.__ownerDocument || document; }, enumerable: true, configurable: true
 });
 Object.defineProperty(Node.prototype, "className", {
   get: function() { return this.getAttribute("class") || ""; },
@@ -671,7 +671,7 @@ function makeSyntheticNode(type, name, value) {
     data: value || '', nodeValue: value || '', textContent: value || '', childNodes: [], children: []
   };
   node.firstChild = null; node.lastChild = null; node.parentNode = null;
-  Object.defineProperty(node, 'ownerDocument', { get: function() { return document; }, enumerable: true });
+  Object.defineProperty(node, 'ownerDocument', { get: function() { return this.__ownerDocument || document; }, enumerable: true });
   return node;
 }
 
@@ -884,14 +884,24 @@ Range.START_TO_START = 0; Range.START_TO_END = 1; Range.END_TO_END = 2; Range.EN
 
 function makeDetachedDocument(root) {
   var doc = {};
-  doc.__documentChildren = [root];
-  root.__rangeParent = doc;
+  function adoptOwnerDocument(node) {
+    if (!node) return;
+    node.__ownerDocument = doc;
+    var children = node.childNodes || [];
+    for (var i = 0; i < children.length; i++) adoptOwnerDocument(children[i]);
+  }
+  doc.__documentChildren = root ? [root] : [];
+  adoptOwnerDocument(root);
+  if (root) root.__rangeParent = doc;
   Object.defineProperty(doc, 'documentElement', { get: function() { return root; }, enumerable: true });
   doc.nodeType = Node.DOCUMENT_NODE;
   doc.appendChild = function(child) {
     if (child && child.__fragment) { var moved = child.childNodes.slice(); for (var i = 0; i < moved.length; i++) doc.appendChild(moved[i]); return child; }
     if (child.parentNode && child.parentNode.removeChild) child.parentNode.removeChild(child);
-    doc.__documentChildren.push(child); child.__rangeParent = doc; root = child.nodeType === Node.ELEMENT_NODE ? child : root; return child;
+    doc.__documentChildren.push(child); child.__rangeParent = doc;
+    adoptOwnerDocument(child);
+    root = child.nodeType === Node.ELEMENT_NODE ? child : root;
+    return child;
   };
   doc.removeChild = function(child) { var index = doc.__documentChildren.indexOf(child); if (index < 0) throw new Error('NotFoundError'); doc.__documentChildren.splice(index, 1); child.__rangeParent = null; return child; };
   Object.defineProperty(doc, 'childNodes', { get: function() { return doc.__documentChildren.slice(); }, enumerable: true });
@@ -899,18 +909,35 @@ function makeDetachedDocument(root) {
   Object.defineProperty(doc, 'lastChild', { get: function() { return doc.__documentChildren[doc.__documentChildren.length - 1] || null; }, enumerable: true });
   Object.defineProperty(doc, 'body', {
     get: function() {
+      if (!root) return null;
       var bodies = root.getElementsByTagName('body');
       return bodies.length ? bodies[0] : null;
     }, enumerable: true
   });
-  doc.createElement = function(name) { return document.createElement(name); };
-  doc.createElementNS = function(ns, name) { return document.createElement(name); };
-  doc.createTextNode = function(text) { return document.createTextNode(text); };
-  doc.createComment = function(text) { return document.createComment(text); };
-  doc.createDocumentFragment = function() { return makeDocumentFragment(); };
+  Object.defineProperty(doc, 'title', {
+    get: function() {
+      if (!root) return '';
+      var titles = root.getElementsByTagName('title');
+      return titles.length ? (titles[0].textContent || '') : '';
+    },
+    set: function(value) {
+      if (!root) return;
+      var titles = root.getElementsByTagName('title');
+      if (titles.length) titles[0].textContent = value == null ? '' : value.toString();
+    }, enumerable: true
+  });
+  Object.defineProperty(doc, 'forms', {
+    get: function() { return root ? root.getElementsByTagName('form') : []; }, enumerable: true
+  });
+  doc.createElement = function(name) { var node = document.createElement(name); adoptOwnerDocument(node); return node; };
+  doc.createElementNS = function(ns, name) { var node = document.createElementNS(ns, name); adoptOwnerDocument(node); return node; };
+  doc.createTextNode = function(text) { var node = document.createTextNode(text); adoptOwnerDocument(node); return node; };
+  doc.createComment = function(text) { var node = document.createComment(text); adoptOwnerDocument(node); return node; };
+  doc.createDocumentFragment = function() { var fragment = makeDocumentFragment(); adoptOwnerDocument(fragment); return fragment; };
   doc.createRange = function() { return new Range(); };
-  doc.getElementsByTagName = function(name) { return root.getElementsByTagName(name); };
+  doc.getElementsByTagName = function(name) { return root ? root.getElementsByTagName(name) : []; };
   doc.getElementById = function(id) {
+    if (!root) return null;
     var nodes = root.getElementsByTagName('*');
     for (var i = 0; i < nodes.length; i++) if (nodes[i].id === id) return nodes[i];
     return null;
@@ -1308,10 +1335,18 @@ globalThis.__runXHROnload = function(body, handle) {
     return element;
   };
   document.implementation = {
-    createDocument: function(ns, qualifiedName) {
-      var root = document.createElement('html');
+    createDocument: function(ns, qualifiedName, doctype) {
+      var root = qualifiedName ? document.createElementNS(ns, qualifiedName) : null;
       var result = makeDetachedDocument(root);
-      if (qualifiedName) root.appendChild(document.createElement(qualifiedName));
+      if (doctype) {
+        if (doctype.parentNode && doctype.parentNode.removeChild) doctype.parentNode.removeChild(doctype);
+        doctype.__rangeParent = result;
+        result.__documentChildren.unshift(doctype);
+        if (doctype.ownerDocument === undefined) Object.defineProperty(doctype, 'ownerDocument', {
+          get: function() { return this.__ownerDocument || null; }, enumerable: true, configurable: true
+        });
+        doctype.__ownerDocument = result;
+      }
       return result;
     },
     createDocumentType: function(name, publicId, systemId) {
@@ -1324,13 +1359,17 @@ globalThis.__runXHROnload = function(body, handle) {
       if (!value || firstColon === 0 || firstColon === value.length - 1 || value.indexOf(':', firstColon + 1) >= 0)
         throw { code: 14, NAMESPACE_ERR: 14 };
       if (invalidQualifiedName(value)) throw { code: 5, INVALID_CHARACTER_ERR: 5 };
-      return {
+      var result = {
         nodeType: Node.DOCUMENT_TYPE_NODE,
         nodeName: value,
         name: value,
         publicId: publicId == null ? '' : publicId.toString(),
         systemId: systemId == null ? '' : systemId.toString()
       };
+      Object.defineProperty(result, 'ownerDocument', {
+        get: function() { return this.__ownerDocument || null; }, enumerable: true, configurable: true
+      });
+      return result;
     }
   };
   document.createTextNode = function(text) {

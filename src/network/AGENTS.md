@@ -9,7 +9,7 @@ instead of coupling itself to the implementation leaves.
 The implementation leaves have separate ownership responsibilities:
 
 - `response.zig` defines response metadata plus Referrer-Policy,
-  X-Frame-Options, CORS, and UTF-8 decoding helpers. A response value does not
+  X-Frame-Options, CORS, MIME classification, and UTF-8 decoding helpers. A response value does not
   by itself identify which of its slices are owned.
 - `cookie.zig` defines owning cookie entries and the transactional parser and
   selection rules. The surrounding `BrowserSession` jar owns normalized host
@@ -75,7 +75,8 @@ before changing networking dispatch or teardown.
 - `HttpCache.lookup` returns borrowed entry data that is valid only until cache
   mutation/deinit. The transport must copy a hit's body, headers, and final URL
   while locked before returning through the normal fetch contract, and must
-  reproduce scalar metadata such as Referrer-Policy and X-Frame-Options.
+  reproduce scalar metadata such as Referrer-Policy, X-Frame-Options, and
+  ContentType.
   X-Frame-Options is parsed into scalar `DENY`/`SAMEORIGIN` policy at the HTTP
   boundary; obsolete `ALLOW-FROM` and unknown values are ignored. Interactive
   cache, cookie, and HTTP client state belongs to the shared `BrowserSession`;
