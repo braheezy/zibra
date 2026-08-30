@@ -1721,6 +1721,34 @@ test "__native.style_set is exposed" {
     try std.testing.expect(result.toBoolean());
 }
 
+test "DOM Range supports boundaries, fragments, and extraction" {
+    const allocator = std.testing.allocator;
+    var html_parser = try parser.HTMLParser.init(allocator, "<main></main>");
+    html_parser.use_implicit_tags = false;
+    defer html_parser.deinit(allocator);
+    var root = try html_parser.parse();
+    defer root.deinit(allocator);
+    parser.fixParentPointers(&root, null);
+    var environ = std.process.Environ.Map.init(allocator);
+    defer environ.deinit();
+    var js = try Js.init(allocator, std.testing.io, &environ);
+    defer js.deinit(allocator);
+    js.setNodes(0, &root);
+    defer js.setNodes(0, null);
+
+    const result = try js.evaluate(0,
+        \\var doc = document.implementation.createDocument(null, null, null);
+        \\var p = doc.createElement('p');
+        \\var t = doc.createTextNode('hello world');
+        \\p.appendChild(t); doc.documentElement.appendChild(p);
+        \\var r = doc.createRange(); r.setStart(t, 6); r.setEnd(t, 11);
+        \\var f = r.extractContents();
+        \\f.nodeType === Node.DOCUMENT_FRAGMENT_NODE && f.textContent === 'world' &&
+        \\t.data === 'hello ' && r.collapsed && p.firstChild === t
+    );
+    try std.testing.expect(result.toBoolean());
+}
+
 test "host interrupt stops an infinite script" {
     const InterruptAfterPolls = struct {
         remaining: usize,
@@ -2266,6 +2294,36 @@ test "script DOM creates text nodes, exposes computed styles, and isolates ifram
         \\  nullInRegexpArgumentResult === 'passed' && startTime instanceof Date &&
         \\  document.createNodeIterator(div, NodeFilter.SHOW_ALL, null, true).nextNode() === div &&
         \\  document.createTreeWalker(div, NodeFilter.SHOW_ALL, null, true).currentNode === div
+    );
+    try std.testing.expect(result.toBoolean());
+}
+
+test "DOM name validation matches invalid character and namespace errors" {
+    const allocator = std.testing.allocator;
+    var html_parser = try parser.HTMLParser.init(allocator, "<html><body></body></html>");
+    html_parser.use_implicit_tags = false;
+    defer html_parser.deinit(allocator);
+    var root = try html_parser.parse();
+    defer root.deinit(allocator);
+    parser.fixParentPointers(&root, null);
+
+    var environ = std.process.Environ.Map.init(allocator);
+    defer environ.deinit();
+    var js = try Js.init(allocator, std.testing.io, &environ);
+    defer js.deinit(allocator);
+    js.setNodes(0, &root);
+    defer js.setNodes(0, null);
+
+    const result = try js.evaluate(0,
+        \\function codeForCreate(name) { try { document.createElement(name); return 0; } catch (e) { return e.code; } }
+        \\function codeForNamespace(ns, name) { try { document.createElementNS(ns, name); return 0; } catch (e) { return e.code; } }
+        \\codeForCreate('0div') === 5 && codeForCreate('di v') === 5 &&
+        \\codeForNamespace(null, ':div') === 14 &&
+        \\codeForNamespace('http://example.com/', 'xml:test') === 14 &&
+        \\codeForNamespace('http://www.w3.org/2000/xmlns/', 'x:test') === 14 &&
+        \\(function() { var e = document.createElementNS('http://ns.example.com/', 'prefix:localname');
+        \\  return e.tagName === 'prefix:localname' && e.nodeName === 'prefix:localname' &&
+        \\    e.prefix === 'prefix' && e.localName === 'localname' && e.namespaceURI === 'http://ns.example.com/'; })()
     );
     try std.testing.expect(result.toBoolean());
 }

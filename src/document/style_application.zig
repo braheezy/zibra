@@ -42,6 +42,7 @@ const INHERITED_PROPERTIES = [_]InheritedProperty{
     .{ .name = "text-align", .default_value = "start" },
     .{ .name = "list-style-type", .default_value = "disc" },
     .{ .name = "color", .default_value = "black" },
+    .{ .name = "visibility", .default_value = "visible" },
     .{ .name = "color-scheme", .default_value = "light dark" },
 };
 

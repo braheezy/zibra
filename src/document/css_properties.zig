@@ -23,6 +23,9 @@ pub const computed = [_]Property{
     .{ .name = "text-align", .default_value = "inherit" },
     .{ .name = "list-style-type", .default_value = "inherit" },
     .{ .name = "color", .default_value = "inherit" },
+    // Visibility affects painting but not layout, and follows the inherited
+    // property path so hidden ancestors suppress their descendants.
+    .{ .name = "visibility", .default_value = "visible" },
     .{ .name = "content", .default_value = "normal" },
     .{ .name = "opacity", .default_value = "1.0" },
     .{ .name = "transition", .default_value = "" },

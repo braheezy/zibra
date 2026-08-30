@@ -121,6 +121,9 @@ queued work and shutdown are documented in
   dirty retained paint; path/state-only commands do not. Unsupported z2d
   methods return `error.NotImplemented` and are exposed as nonfatal
   `undefined`.
+- Range boundary points are synchronous Realm borrows. Detached fragments and
+  comments are JavaScript-owned; extraction transfers fully selected native
+  nodes and uses `setNodeData` only for text splitting.
 
 `js.zig` remains large because it owns the realm/window lifecycle and several
 DOM bindings. Continue extracting cohesive binding domains behind narrow host

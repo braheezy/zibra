@@ -1304,6 +1304,17 @@ fn setTestDisplay(allocator: std.mem.Allocator, node: *Node, value: []const u8) 
     return setTestStyleValue(allocator, node, "display", value);
 }
 
+test "visibility hidden suppresses paint without changing style geometry" {
+    const allocator = std.testing.allocator;
+    var element = Node{ .element = try parser.Element.init(allocator, "p", null) };
+    defer element.deinit(allocator);
+
+    try setTestStyleValue(allocator, &element, "visibility", "hidden");
+    try std.testing.expect(styleVisibilityHidden(&element.element.style.?));
+    element.element.style.?.getPtr("visibility").?.set("visible");
+    try std.testing.expect(!styleVisibilityHidden(&element.element.style.?));
+}
+
 test "computed display classifies block children" {
     const allocator = std.testing.allocator;
     var legacy_div = Node{ .element = try parser.Element.init(allocator, "div", null) };
@@ -3306,6 +3317,15 @@ fn styleValueRead(style_map: *const parser.StyleMap, property: []const u8, notif
         return field.read(notify, style_map.allocator).*;
     }
     return null;
+}
+
+/// CSS visibility is inherited and removes an element from painting while
+/// preserving its layout box.  Keeping this check at the paint leaves the
+/// geometry available to hit testing/layout invalidation without emitting
+/// backgrounds, borders, or text for hidden content.
+fn styleVisibilityHidden(style_map: *const parser.StyleMap) bool {
+    const value = styleValue(style_map, "visibility") orelse "visible";
+    return std.ascii.eqlIgnoreCase(std.mem.trim(u8, value, " \t\r\n"), "hidden");
 }
 
 fn verticalAlignForStyle(style_map: *const parser.StyleMap) VerticalAlign {
@@ -5889,6 +5909,7 @@ const TextLayout = struct {
     }
 
     fn paintToList(self: *TextLayout, commands: *std.ArrayList(DisplayItem), engine: *Layout) !void {
+        if (!self.shouldPaint()) return;
         // Paint the word using the stored font properties
         const glyph = try engine.font_manager.getStyledGlyph(
             self.word,
@@ -5944,8 +5965,11 @@ const TextLayout = struct {
     }
 
     fn shouldPaint(self: *const TextLayout) bool {
-        _ = self;
-        return true;
+        const style_map: ?*const parser.StyleMap = switch (self.node) {
+            .text => |text| if (text.style) |*map| map else null,
+            .element => |element| if (element.style) |*map| map else null,
+        };
+        return if (style_map) |map| !styleVisibilityHidden(map) else true;
     }
 };
 
@@ -9251,9 +9275,16 @@ const BlockLayout = struct {
         // node, but their display list contains the replaced control itself.
         // Only suppress a DOM-backed control block's redundant background.
         if (self.inline_nodes != null) return true;
-        switch (self.node) {
+        // `node` is a layout snapshot and can lag behind a style-only
+        // invalidation. Consult the generation-bound DOM borrow when one is
+        // available so visibility changes take effect on the next paint.
+        const node = if (self.node_ptr) |node_ptr| node_ptr.* else self.node;
+        switch (node) {
             .text => return true,
             .element => |e| {
+                if (e.style) |*style_map| {
+                    if (styleVisibilityHidden(style_map)) return false;
+                }
                 // Controls paint their own background in their inline layout.
                 return !std.mem.eql(u8, e.tag, "input") and !std.mem.eql(u8, e.tag, "button");
             },

@@ -1383,7 +1383,12 @@ pub const Browser = struct {
         }
         defer self.finishRunLoop();
 
-        var ready_checks: u8 = 0;
+        // A page can briefly have no active task between two closely spaced
+        // timers (Acid3 advances its suite every 10 ms). Two polling passes
+        // used to mistake that gap for a settled page and capture a partial
+        // score/layout. Require a sustained quiet interval instead.
+        var quiet_since_ns: ?i96 = null;
+        const quiet_window_ns: i96 = 100 * std.time.ns_per_ms;
         const started_ns = std.Io.Clock.awake.now(self.io).nanoseconds;
         while (true) {
             self.scheduleAnimationFrame();
@@ -1396,14 +1401,15 @@ pub const Browser = struct {
             }
 
             if (self.isScreenshotReady()) {
-                ready_checks += 1;
-                if (ready_checks >= 2) {
+                const now_ns = std.Io.Clock.awake.now(self.io).nanoseconds;
+                if (quiet_since_ns == null) quiet_since_ns = now_ns;
+                if (now_ns - quiet_since_ns.? >= quiet_window_ns) {
                     try self.writeScreenshot(path);
                     std.log.info("Screenshot written to {s}", .{path});
                     return;
                 }
             } else {
-                ready_checks = 0;
+                quiet_since_ns = null;
             }
 
             const elapsed_ns = std.Io.Clock.awake.now(self.io).nanoseconds - started_ns;
@@ -1512,7 +1518,18 @@ pub const Browser = struct {
     fn isScreenshotReady(self: *Browser) bool {
         self.lock.lock();
         const tab = self.activeTab();
+        // `phase == .complete` only means that the load event is eligible.
+        // The event itself is queued asynchronously, and pages such as Acid3
+        // install their test driver from that handler.  Capturing at the
+        // eligibility transition races that work and produces a pristine
+        // page (or stale paint) with a zero score.  Wait until the actual
+        // window load dispatch has finished before considering a capture.
+        const lifecycle_ready = if (tab) |active_tab|
+            if (active_tab.root_frame) |root_frame| root_frame.lifecycle.load == .dispatched else false
+        else
+            false;
         const render_ready = tab != null and
+            lifecycle_ready and
             self.active_tab_display_list != null and
             !self.needs_composite and
             !self.needs_raster and
@@ -3397,18 +3414,39 @@ pub const Browser = struct {
         _ = frame.html_sources.adoptAssumeCapacity(body_text);
         body_text_owned = false;
 
-        var live_context = LiveDocumentLoadContext{
-            .browser = self,
-            .tab = parent.tab,
-            .frame = frame,
-            .page_url = frame_url_ptr,
-            .parent_window_id = parent.window_id,
-        };
-        try document_loader.runIntoSlot(self.allocator, &frame.html_sources, &frame.current_node, .{
-            .context = &live_context,
-            .install_root = LiveDocumentLoadContext.installRoot,
-            .execute_script = LiveDocumentLoadContext.executeScript,
-        });
+        // Only HTML documents execute parser-blocking scripts.  In
+        // particular, Acid3 deliberately serves script-looking payloads as
+        // text/plain and image/png to verify that MIME type gates execution.
+        // The transport currently exposes URL metadata but not a parsed
+        // Content-Type field, so use the conservative extension fallback for
+        // these non-HTML test resources while treating extensionless URLs as
+        // HTML (the normal navigation case).
+        const path = response_url.path;
+        const non_html = std.ascii.endsWithIgnoreCase(path, ".txt") or
+            std.ascii.endsWithIgnoreCase(path, ".png") or
+            std.ascii.endsWithIgnoreCase(path, ".gif") or
+            std.ascii.endsWithIgnoreCase(path, ".jpg") or
+            std.ascii.endsWithIgnoreCase(path, ".jpeg") or
+            std.ascii.endsWithIgnoreCase(path, ".css");
+        if (non_html) {
+            var inert_parser = try parser.HTMLParser.init(self.allocator, body_text);
+            defer inert_parser.deinit(self.allocator);
+            inert_parser.use_implicit_tags = true;
+            frame.current_node = try inert_parser.parse();
+        } else {
+            var live_context = LiveDocumentLoadContext{
+                .browser = self,
+                .tab = parent.tab,
+                .frame = frame,
+                .page_url = frame_url_ptr,
+                .parent_window_id = parent.window_id,
+            };
+            try document_loader.runIntoSlot(self.allocator, &frame.html_sources, &frame.current_node, .{
+                .context = &live_context,
+                .install_root = LiveDocumentLoadContext.installRoot,
+                .execute_script = LiveDocumentLoadContext.executeScript,
+            });
+        }
         parser.fixParentPointers(&frame.current_node.?, null);
         try self.annotateVisitedLinks(&frame.current_node.?, frame_url_ptr);
 

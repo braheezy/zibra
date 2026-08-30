@@ -421,6 +421,12 @@ text paint invalidation to its anonymous inline run. Paint-only regeneration
 must not republish content-derived geometry and accidentally leave unprocessed
 layout work.
 
+The computed `visibility` property is inherited and paint-only: `hidden` keeps
+an element's layout box (and therefore its space and descendants' geometry) but
+emits no background, border, or text commands. Paint checks the live DOM node
+when a retained layout snapshot may lag a style invalidation, so a visibility
+toggle is reflected without rebuilding geometry.
+
 ## Display command ownership
 
 `.blend` and `.transform` own their child slices; `.blend` also owns its mode

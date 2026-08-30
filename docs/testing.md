@@ -59,6 +59,9 @@ On macOS, run `zig build test-screenshot`. It exercises the windowless
 software-rendering path and compares platform-specific PNG goldens. A
 screenshot test is appropriate when exact paint, glyph placement, clipping,
 effects, or final composition is the behavior under review.
+Windowless captures wait for the document lifecycle to reach `complete` and
+for a sustained quiet interval, so pages driven by short timers are not
+captured between two updates.
 
 Do not make a cross-platform semantic assertion depend only on font-dependent
 pixels. Prefer a DOM/style/layout/display-list assertion for the portable

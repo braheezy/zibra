@@ -277,6 +277,18 @@ If z2d has no equivalent, the native method returns `error.NotImplemented` and
 the host consumes it as a nonfatal `undefined`, allowing later page script to
 continue.
 
+## DOM ranges and detached content
+
+`document.createRange()` is implemented in the page Realm. Range boundary
+points borrow the Realm's canonical Node wrappers and are evaluated through
+their current parent/child relationships, so a range never retains a native
+DOM pointer across a callback. `DocumentFragment` and comment nodes are
+Realm-owned detached values; appending a fragment transfers its children, and
+extracting content preserves fully selected native node identities while
+cloning only partially selected structure. Text splitting uses the synchronous
+`setNodeData` binding and therefore stays within the active DOM mutation
+phase.
+
 ## Accessibility tree and speech
 
 Accessibility-tree strings belong to their tree generation. During rebuild,

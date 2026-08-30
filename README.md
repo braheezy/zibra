@@ -10,6 +10,9 @@ Where possible, this project takes the most difficult route possible to implemen
 [Acid2:](http://acid2.acidtests.org/#top)
 ![acid2](./docs/images/acid2.png)
 
+[Acid3:](http://acid3.acidtests.org/)
+![acid3](./docs/images/acid3.png)
+
 ## Usage
 
 You'll need Zig installed.

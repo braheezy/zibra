@@ -359,19 +359,83 @@ Object.defineProperty(Node.prototype, "id", {
 });
 
 Node.prototype.appendChild = function(child) {
+  if (child && child.__fragment) {
+    var moved = child.childNodes.slice();
+    for (var fi = 0; fi < moved.length; fi++) this.appendChild(moved[fi]);
+    return child;
+  }
+  if (!child || typeof child.handle !== 'number') {
+    if (this.__documentChildren) {
+      this.__documentChildren.push(child);
+      child.__rangeParent = this;
+      return child;
+    }
+    if (child && child.__synthetic) {
+      if (!this.__syntheticChildren) this.__syntheticChildren = [];
+      this.__syntheticChildren.push(child); child.__rangeParent = this; return child;
+    }
+    throw { code: 3, HIERARCHY_REQUEST_ERR: 3 };
+  }
+  if (child && isAncestorNode(child, this)) throw { code: 3, HIERARCHY_REQUEST_ERR: 3 };
+  if (child.parentNode && child.parentNode.removeChild) child.parentNode.removeChild(child);
   __native.appendChild(this.handle, child && child.handle);
+  child.__rangeParent = this;
   return child;
 };
 
 Node.prototype.insertBefore = function(child, reference) {
+  if (child && child.__fragment) {
+    var moved = child.childNodes.slice();
+    for (var fi = 0; fi < moved.length; fi++) this.insertBefore(moved[fi], reference);
+    return child;
+  }
+  if (!child || typeof child.handle !== 'number') {
+    if (child && child.__synthetic) {
+      if (!this.__syntheticChildren) this.__syntheticChildren = [];
+      var syntheticIndex = reference ? this.__syntheticChildren.indexOf(reference) : -1;
+      if (syntheticIndex < 0) this.__syntheticChildren.push(child); else this.__syntheticChildren.splice(syntheticIndex, 0, child);
+      child.__rangeParent = this; return child;
+    }
+    throw { code: 3, HIERARCHY_REQUEST_ERR: 3 };
+  }
+  if (child.parentNode && child.parentNode.removeChild) child.parentNode.removeChild(child);
   var referenceHandle = reference === null ? null : reference && reference.handle;
   __native.insertBefore(this.handle, child && child.handle, referenceHandle);
+  child.__rangeParent = this;
   return child;
 };
 
 Node.prototype.removeChild = function(child) {
+  if (this.__documentChildren) {
+    var index = this.__documentChildren.indexOf(child);
+    if (index < 0) throw new Error('NotFoundError');
+    this.__documentChildren.splice(index, 1);
+    child.__rangeParent = null;
+    return child;
+  }
+  if (child && child.__synthetic && this.__syntheticChildren) {
+    var syntheticIndex = this.__syntheticChildren.indexOf(child);
+    if (syntheticIndex < 0) throw new Error('NotFoundError');
+    this.__syntheticChildren.splice(syntheticIndex, 1); child.__rangeParent = null; return child;
+  }
   __native.removeChild(this.handle, child && child.handle);
+  child.__rangeParent = null;
   return child;
+};
+
+Node.prototype.cloneNode = function(deep) {
+  var clone = shallowCloneNode(this);
+  if (this.__synthetic) {
+    clone = makeSyntheticNode(this.nodeType, this.nodeName, this.data);
+    clone.localName = this.localName;
+  }
+  if (deep) {
+    var children = this.childNodes;
+    for (var i = 0; i < children.length; i++) {
+      if (children[i].cloneNode) clone.appendChild(children[i].cloneNode(true));
+    }
+  }
+  return clone;
 };
 
 Node.prototype.replaceChildren = function() {
@@ -500,7 +564,10 @@ Object.defineProperty(Node.prototype, "children", {
 // path through this shim uses wrapNode so equivalent DOM references compare by
 // JavaScript object identity within one document realm.
 Object.defineProperty(Node.prototype, "parentNode", {
-  get: function() { return wrapNode(__native.parentNode(this.handle)); }
+  get: function() {
+    if (this.__rangeParent !== undefined) return this.__rangeParent;
+    return wrapNode(__native.parentNode(this.handle));
+  }
 });
 Object.defineProperty(Node.prototype, "firstChild", {
   get: function() { return wrapNode(__native.firstChild(this.handle)); }
@@ -515,7 +582,11 @@ Object.defineProperty(Node.prototype, "nextSibling", {
   get: function() { return wrapNode(__native.nextSibling(this.handle)); }
 });
 Object.defineProperty(Node.prototype, "childNodes", {
-  get: function() { return wrapNodes(__native.childNodes(this.handle)); }
+  get: function() {
+    var result = wrapNodes(__native.childNodes(this.handle));
+    if (this.__syntheticChildren) result = result.concat(this.__syntheticChildren);
+    return result;
+  }
 });
 Object.defineProperty(Node.prototype, "nodeType", {
   get: function() { return __native.nodeType(this.handle); }
@@ -530,7 +601,8 @@ Object.defineProperty(Node.prototype, "nodeValue", {
   get: function() { return __native.nodeValue(this.handle); }
 });
 Object.defineProperty(Node.prototype, "data", {
-  get: function() { return __native.nodeData(this.handle); }
+  get: function() { return __native.nodeData(this.handle); },
+  set: function(value) { __native.setNodeData(this.handle, value == null ? '' : value.toString()); }
 });
 Object.defineProperty(Node.prototype, "textContent", {
   get: function() { return __native.textContent(this.handle); }
@@ -548,13 +620,244 @@ Node.prototype.getElementsByTagName = function(tagName) {
   return wrapNodes(__native.getElementsByTagNameFrom(this.handle, text));
 };
 
+// A bounded DOM Range implementation.  Native nodes remain numeric handles;
+// detached fragments/comments are lightweight JavaScript nodes that can carry
+// existing native children without introducing a second ownership system in
+// the browser.  This covers the boundary and extraction operations used by
+// compatibility pages while preserving the synchronous mutation contract.
+function makeSyntheticNode(type, name, value) {
+  var node = {
+    __synthetic: true, nodeType: type, nodeName: name, tagName: type === Node.ELEMENT_NODE ? name.toUpperCase() : null,
+    localName: type === Node.ELEMENT_NODE ? String(name).toLowerCase() : null,
+    data: value || '', nodeValue: value || '', textContent: value || '', childNodes: [], children: []
+  };
+  node.firstChild = null; node.lastChild = null; node.parentNode = null;
+  Object.defineProperty(node, 'ownerDocument', { get: function() { return document; }, enumerable: true });
+  return node;
+}
+
+function makeDocumentFragment() {
+  var fragment = makeSyntheticNode(Node.DOCUMENT_FRAGMENT_NODE, '#document-fragment', '');
+  fragment.__fragment = true;
+  fragment.appendChild = function(child) {
+    if (child && child.__fragment) {
+      var children = child.childNodes.slice();
+      for (var i = 0; i < children.length; i++) fragment.appendChild(children[i]);
+      return child;
+    }
+    if (child.parentNode && child.parentNode.removeChild) child.parentNode.removeChild(child);
+    fragment.childNodes.push(child); child.parentNode = fragment;
+    fragment.firstChild = fragment.childNodes[0] || null;
+    fragment.lastChild = fragment.childNodes[fragment.childNodes.length - 1] || null;
+    if (child.nodeType === Node.ELEMENT_NODE) fragment.children.push(child);
+    return child;
+  };
+  fragment.insertBefore = function(child, reference) {
+    if (!reference) return fragment.appendChild(child);
+    var index = fragment.childNodes.indexOf(reference);
+    if (index < 0) throw new Error('NotFoundError');
+    if (child.parentNode && child.parentNode.removeChild) child.parentNode.removeChild(child);
+    fragment.childNodes.splice(index, 0, child); child.parentNode = fragment;
+    fragment.firstChild = fragment.childNodes[0] || null;
+    fragment.lastChild = fragment.childNodes[fragment.childNodes.length - 1] || null;
+    fragment.children = fragment.childNodes.filter(function(n) { return n.nodeType === Node.ELEMENT_NODE; });
+    return child;
+  };
+  fragment.removeChild = function(child) {
+    var index = fragment.childNodes.indexOf(child);
+    if (index < 0) throw new Error('NotFoundError');
+    fragment.childNodes.splice(index, 1); child.parentNode = null;
+    fragment.firstChild = fragment.childNodes[0] || null;
+    fragment.lastChild = fragment.childNodes[fragment.childNodes.length - 1] || null;
+    fragment.children = fragment.childNodes.filter(function(n) { return n.nodeType === Node.ELEMENT_NODE; });
+    return child;
+  };
+  Object.defineProperty(fragment, 'textContent', { get: function() {
+    var result = ''; for (var i = 0; i < fragment.childNodes.length; i++) result += fragment.childNodes[i].textContent || '';
+    return result;
+  }});
+  return fragment;
+}
+
+function nodeParentForRange(node) {
+  if (!node) return null;
+  if (node.__rangeParent !== undefined) return node.__rangeParent;
+  return node.parentNode || null;
+}
+function nodeChildrenForRange(node) { return node && node.childNodes ? node.childNodes : []; }
+function nodeIndexInParent(node) {
+  var parent = nodeParentForRange(node); return parent ? nodeChildrenForRange(parent).indexOf(node) : -1;
+}
+function isAncestorNode(ancestor, node) {
+  var current = node;
+  while (current) { if (current === ancestor) return true; current = nodeParentForRange(current); }
+  return false;
+}
+function compareRangePoints(aNode, aOffset, bNode, bOffset) {
+  if (aNode === bNode) return aOffset < bOffset ? -1 : aOffset > bOffset ? 1 : 0;
+  if (isAncestorNode(aNode, bNode)) {
+    var child = bNode;
+    while (nodeParentForRange(child) !== aNode) child = nodeParentForRange(child);
+    var index = nodeChildrenForRange(aNode).indexOf(child);
+    return aOffset <= index ? -1 : 1;
+  }
+  if (isAncestorNode(bNode, aNode)) {
+    var child2 = aNode;
+    while (nodeParentForRange(child2) !== bNode) child2 = nodeParentForRange(child2);
+    var index2 = nodeChildrenForRange(bNode).indexOf(child2);
+    return index2 < bOffset ? -1 : 1;
+  }
+  var aPath = [], bPath = [], current = aNode;
+  while (current) { aPath.unshift(current); current = nodeParentForRange(current); }
+  current = bNode;
+  while (current) { bPath.unshift(current); current = nodeParentForRange(current); }
+  var common = 0;
+  while (common < aPath.length && common < bPath.length && aPath[common] === bPath[common]) common++;
+  if (!common) return 0;
+  var parent = aPath[common - 1];
+  var ai = nodeChildrenForRange(parent).indexOf(aPath[common]);
+  var bi = nodeChildrenForRange(parent).indexOf(bPath[common]);
+  return ai < bi ? -1 : ai > bi ? 1 : 0;
+}
+function rangeNodeStart(node) {
+  var parent = nodeParentForRange(node);
+  return parent ? { node: parent, offset: nodeIndexInParent(node) } : { node: node, offset: 0 };
+}
+function rangeNodeEnd(node) {
+  var parent = nodeParentForRange(node);
+  return parent ? { node: parent, offset: nodeIndexInParent(node) + 1 } : { node: node, offset: nodeChildrenForRange(node).length };
+}
+function rangeIntersects(range, node) {
+  var start = rangeNodeStart(node), end = rangeNodeEnd(node);
+  return compareRangePoints(range.endContainer, range.endOffset, start.node, start.offset) > 0 &&
+    compareRangePoints(range.startContainer, range.startOffset, end.node, end.offset) < 0;
+}
+function rangeFullyContains(range, node) {
+  var start = rangeNodeStart(node), end = rangeNodeEnd(node);
+  return compareRangePoints(range.startContainer, range.startOffset, start.node, start.offset) <= 0 &&
+    compareRangePoints(range.endContainer, range.endOffset, end.node, end.offset) >= 0;
+}
+function shallowCloneNode(node) {
+  if (node.__synthetic) return makeSyntheticNode(node.nodeType, node.nodeName, node.data);
+  if (node.nodeType === Node.TEXT_NODE) return document.createTextNode(node.data || '');
+  var clone = document.createElement(node.tagName || node.nodeName || 'div');
+  // Copy the attributes most commonly observed by DOM compatibility tests.
+  ['id', 'class', 'name', 'value', 'type', 'href', 'style'].forEach(function(name) {
+    var value = node.getAttribute && node.getAttribute(name); if (value !== null) clone.setAttribute(name, value);
+  });
+  return clone;
+}
+function cloneRangeNode(range, node, extract, fragment) {
+  if (!rangeIntersects(range, node)) {
+    // A range ending at an element's start still contributes an empty clone
+    // of that element when the boundary crosses from a previous sibling.
+    return range.endContainer === node && range.endOffset === 0 ? shallowCloneNode(node) : null;
+  }
+  if (rangeFullyContains(range, node)) return node.cloneNode ? node.cloneNode(true) : shallowCloneNode(node);
+  if (node.nodeType === Node.TEXT_NODE) {
+    var start = range.startContainer === node ? range.startOffset : 0;
+    var end = range.endContainer === node ? range.endOffset : (node.data || '').length;
+    if (end <= start) return null;
+    return document.createTextNode((node.data || '').slice(start, end));
+  }
+  var clone = shallowCloneNode(node);
+  var children = nodeChildrenForRange(node);
+  for (var i = 0; i < children.length; i++) {
+    var child = children[i];
+    var selected = cloneRangeNode(range, child, extract, fragment);
+    if (selected) clone.appendChild(selected);
+    if (extract && rangeFullyContains(range, child) && child.parentNode && child.parentNode.removeChild) {
+      child.parentNode.removeChild(child);
+      if (selected && selected.__original) selected = selected.__original;
+    } else if (extract && child.nodeType === Node.TEXT_NODE && selected && child.parentNode) {
+      var from = range.startContainer === child ? range.startOffset : 0;
+      var to = range.endContainer === child ? range.endOffset : (child.data || '').length;
+      __native.setNodeData(child.handle, (child.data || '').slice(0, from) + (child.data || '').slice(to));
+    }
+  }
+  return clone.childNodes.length ? clone : (rangeIntersects(range, node) ? clone : null);
+}
+function extractRangeNode(range, node) {
+  if (!rangeIntersects(range, node)) {
+    return range.endContainer === node && range.endOffset === 0 ? shallowCloneNode(node) : null;
+  }
+  if (rangeFullyContains(range, node)) {
+    if (node.parentNode && node.parentNode.removeChild) node.parentNode.removeChild(node);
+    return node;
+  }
+  if (node.nodeType === Node.TEXT_NODE) {
+    var start = range.startContainer === node ? range.startOffset : 0;
+    var end = range.endContainer === node ? range.endOffset : (node.data || '').length;
+    if (end <= start) return null;
+    var selected = (node.data || '').slice(start, end);
+    if (node.handle) __native.setNodeData(node.handle, (node.data || '').slice(0, start) + (node.data || '').slice(end));
+    else { node.data = (node.data || '').slice(0, start) + (node.data || '').slice(end); node.textContent = node.data; }
+    return document.createTextNode(selected);
+  }
+  var clone = shallowCloneNode(node);
+  var children = nodeChildrenForRange(node).slice();
+  for (var i = 0; i < children.length; i++) {
+    var child = children[i];
+    if (!rangeIntersects(range, child)) continue;
+    var extracted = extractRangeNode(range, child);
+    if (extracted) clone.appendChild(extracted);
+  }
+  return clone.childNodes.length ? clone : null;
+}
+
+function Range() {
+  this.startContainer = document; this.startOffset = 0;
+  this.endContainer = document; this.endOffset = 0;
+}
+Object.defineProperty(Range.prototype, 'collapsed', { get: function() {
+  return this.startContainer === this.endContainer && this.startOffset === this.endOffset;
+}});
+Object.defineProperty(Range.prototype, 'commonAncestorContainer', { get: function() {
+  var a = this.startContainer, b = this.endContainer;
+  if (isAncestorNode(a, b)) return a; if (isAncestorNode(b, a)) return b;
+  var path = [], current = a; while (current) { path.push(current); current = nodeParentForRange(current); }
+  current = b; while (current) { if (path.indexOf(current) >= 0) return current; current = nodeParentForRange(current); }
+  return document;
+}});
+Range.prototype.setStart = function(node, offset) { this.startContainer = node; this.startOffset = Math.max(0, Number(offset) || 0); if (compareRangePoints(this.startContainer, this.startOffset, this.endContainer, this.endOffset) > 0) { this.endContainer = node; this.endOffset = this.startOffset; } };
+Range.prototype.setEnd = function(node, offset) { this.endContainer = node; this.endOffset = Math.max(0, Number(offset) || 0); if (compareRangePoints(this.startContainer, this.startOffset, this.endContainer, this.endOffset) > 0) { this.startContainer = node; this.startOffset = this.endOffset; } };
+Range.prototype.setStartBefore = function(node) { var p = nodeParentForRange(node); if (!p) throw { code: 2, INVALID_NODE_TYPE_ERR: 2 }; this.setStart(p, nodeIndexInParent(node)); };
+Range.prototype.setStartAfter = function(node) { var p = nodeParentForRange(node); if (!p) throw { code: 2, INVALID_NODE_TYPE_ERR: 2 }; this.setStart(p, nodeIndexInParent(node) + 1); };
+Range.prototype.setEndBefore = function(node) { var p = nodeParentForRange(node); if (!p) throw { code: 2, INVALID_NODE_TYPE_ERR: 2 }; this.setEnd(p, nodeIndexInParent(node)); };
+Range.prototype.setEndAfter = function(node) { var p = nodeParentForRange(node); if (!p) throw { code: 2, INVALID_NODE_TYPE_ERR: 2 }; this.setEnd(p, nodeIndexInParent(node) + 1); };
+Range.prototype.selectNode = function(node) { var p = nodeParentForRange(node); if (!p) throw { code: 2, INVALID_NODE_TYPE_ERR: 2 }; this.startContainer = p; this.startOffset = nodeIndexInParent(node); this.endContainer = p; this.endOffset = this.startOffset + 1; };
+Range.prototype.selectNodeContents = function(node) { this.startContainer = node; this.startOffset = 0; this.endContainer = node; this.endOffset = node.nodeType === Node.TEXT_NODE ? (node.data || '').length : nodeChildrenForRange(node).length; };
+Range.prototype.collapse = function(toStart) { if (toStart) { this.endContainer = this.startContainer; this.endOffset = this.startOffset; } else { this.startContainer = this.endContainer; this.startOffset = this.endOffset; } };
+Range.prototype.cloneRange = function() { var r = new Range(); r.startContainer = this.startContainer; r.startOffset = this.startOffset; r.endContainer = this.endContainer; r.endOffset = this.endOffset; return r; };
+Range.prototype.cloneContents = function() { var f = makeDocumentFragment(); var root = this.commonAncestorContainer; if (root.nodeType === Node.TEXT_NODE) { var start = this.startContainer === root ? this.startOffset : 0; var end = this.endContainer === root ? this.endOffset : (root.data || '').length; if (end > start) f.appendChild(document.createTextNode((root.data || '').slice(start, end))); return f; } var children = nodeChildrenForRange(root); for (var i = 0; i < children.length; i++) { var c = cloneRangeNode(this, children[i], false, f); if (c) f.appendChild(c); } return f; };
+Range.prototype.extractContents = function() { var f = makeDocumentFragment(); var root = this.commonAncestorContainer; if (root.nodeType === Node.TEXT_NODE) { var start = this.startContainer === root ? this.startOffset : 0; var end = this.endContainer === root ? this.endOffset : (root.data || '').length; if (end > start) { f.appendChild(document.createTextNode((root.data || '').slice(start, end))); if (root.handle) __native.setNodeData(root.handle, (root.data || '').slice(0, start) + (root.data || '').slice(end)); } this.collapse(true); return f; } var children = nodeChildrenForRange(root).slice(); for (var i = 0; i < children.length; i++) { var extracted = extractRangeNode(this, children[i]); if (extracted) f.appendChild(extracted); } this.collapse(true); return f; };
+Range.prototype.deleteContents = function() { this.extractContents(); };
+Range.prototype.insertNode = function(node) { var container = this.startContainer; if (container.nodeType === Node.TEXT_NODE) { var parent = nodeParentForRange(container); if (!parent) return; var before = container.data.slice(0, this.startOffset), after = container.data.slice(this.startOffset); __native.setNodeData(container.handle, before); var tail = document.createTextNode(after); var reference = container.nextSibling; if (node !== reference) parent.insertBefore(node, reference); var afterNode = node.nextSibling; if (afterNode) parent.insertBefore(tail, afterNode); else parent.appendChild(tail); return; } var children = nodeChildrenForRange(container), reference = children[this.startOffset] || null; if (reference) container.insertBefore(node, reference); else container.appendChild(node); };
+Range.prototype.surroundContents = function(node) {
+  if (this.startContainer && this.startContainer.nodeType === Node.COMMENT_NODE || this.endContainer && this.endContainer.nodeType === Node.COMMENT_NODE) throw { code: 1 };
+  if (this.commonAncestorContainer && this.commonAncestorContainer.nodeType === Node.DOCUMENT_NODE && !this.collapsed) throw { code: 3, HIERARCHY_REQUEST_ERR: 3 };
+  var f = this.extractContents(); node.appendChild(f); this.insertNode(node); this.selectNode(node);
+};
+Range.prototype.toString = function() { return this.cloneContents().textContent || ''; };
+Range.prototype.compareBoundaryPoints = function(how, other) { var aNode = (how === this.START_TO_START || how === this.START_TO_END) ? this.startContainer : this.endContainer; var aOff = (how === this.START_TO_START || how === this.START_TO_END) ? this.startOffset : this.endOffset; var bNode = (how === this.START_TO_START || how === this.END_TO_START) ? other.startContainer : other.endContainer; var bOff = (how === this.START_TO_START || how === this.END_TO_START) ? other.startOffset : other.endOffset; return compareRangePoints(aNode, aOff, bNode, bOff); };
+Range.prototype.START_TO_START = 0; Range.prototype.START_TO_END = 1; Range.prototype.END_TO_END = 2; Range.prototype.END_TO_START = 3;
+Range.START_TO_START = 0; Range.START_TO_END = 1; Range.END_TO_END = 2; Range.END_TO_START = 3;
+
 function makeDetachedDocument(root) {
   var doc = {};
+  doc.__documentChildren = [root];
+  root.__rangeParent = doc;
   Object.defineProperty(doc, 'documentElement', { get: function() { return root; }, enumerable: true });
   doc.nodeType = Node.DOCUMENT_NODE;
-  doc.appendChild = function(child) { root = child; return child; };
-  doc.removeChild = function(child) { return child; };
-  Object.defineProperty(doc, 'firstChild', { get: function() { return { nodeType: Node.DOCUMENT_TYPE_NODE }; }, enumerable: true });
+  doc.appendChild = function(child) {
+    if (child && child.__fragment) { var moved = child.childNodes.slice(); for (var i = 0; i < moved.length; i++) doc.appendChild(moved[i]); return child; }
+    if (child.parentNode && child.parentNode.removeChild) child.parentNode.removeChild(child);
+    doc.__documentChildren.push(child); child.__rangeParent = doc; root = child.nodeType === Node.ELEMENT_NODE ? child : root; return child;
+  };
+  doc.removeChild = function(child) { var index = doc.__documentChildren.indexOf(child); if (index < 0) throw new Error('NotFoundError'); doc.__documentChildren.splice(index, 1); child.__rangeParent = null; return child; };
+  Object.defineProperty(doc, 'childNodes', { get: function() { return doc.__documentChildren.slice(); }, enumerable: true });
+  Object.defineProperty(doc, 'firstChild', { get: function() { return doc.__documentChildren[0] || null; }, enumerable: true });
+  Object.defineProperty(doc, 'lastChild', { get: function() { return doc.__documentChildren[doc.__documentChildren.length - 1] || null; }, enumerable: true });
   Object.defineProperty(doc, 'body', {
     get: function() {
       var bodies = root.getElementsByTagName('body');
@@ -564,6 +867,9 @@ function makeDetachedDocument(root) {
   doc.createElement = function(name) { return document.createElement(name); };
   doc.createElementNS = function(ns, name) { return document.createElement(name); };
   doc.createTextNode = function(text) { return document.createTextNode(text); };
+  doc.createComment = function(text) { return document.createComment(text); };
+  doc.createDocumentFragment = function() { return makeDocumentFragment(); };
+  doc.createRange = function() { return new Range(); };
   doc.getElementsByTagName = function(name) { return root.getElementsByTagName(name); };
   doc.getElementById = function(id) {
     var nodes = root.getElementsByTagName('*');
@@ -666,6 +972,7 @@ __native.dispatchEvent = function(handle, type, bubbles) {
 };
 
 globalThis.Event = Event;
+globalThis.Range = Range;
 globalThis.XMLHttpRequest = XMLHttpRequest;
 globalThis.CanvasRenderingContext2D = CanvasRenderingContext2D;
 
@@ -867,9 +1174,35 @@ globalThis.__runXHROnload = function(body, handle) {
 (function() {
   var originalQuerySelectorAll = document.querySelectorAll;
   document.nodeType = Node.DOCUMENT_NODE;
-  document.firstChild = { nodeType: Node.DOCUMENT_TYPE_NODE, ownerDocument: document };
-  document.appendChild = function(child) { return child; };
-  document.removeChild = function(child) { return child; };
+  document.DOCUMENT_NODE = Node.DOCUMENT_NODE;
+  document.ELEMENT_NODE = Node.ELEMENT_NODE;
+  document.TEXT_NODE = Node.TEXT_NODE;
+  document.COMMENT_NODE = Node.COMMENT_NODE;
+  document.DOCUMENT_FRAGMENT_NODE = Node.DOCUMENT_FRAGMENT_NODE;
+  Node.prototype.ELEMENT_NODE = Node.ELEMENT_NODE;
+  Node.prototype.TEXT_NODE = Node.TEXT_NODE;
+  Node.prototype.COMMENT_NODE = Node.COMMENT_NODE;
+  Node.prototype.DOCUMENT_FRAGMENT_NODE = Node.DOCUMENT_FRAGMENT_NODE;
+  document.__documentChildren = [{ nodeType: Node.DOCUMENT_TYPE_NODE, nodeName: 'html', name: 'html', ownerDocument: document }];
+  document.appendChild = function(child) {
+    if (child && child.__fragment) { var moved = child.childNodes.slice(); for (var i = 0; i < moved.length; i++) document.appendChild(moved[i]); return child; }
+    if (child && child.__synthetic && document.__documentChildren.length && document.__documentChildren[0].nodeType === Node.DOCUMENT_TYPE_NODE) document.__documentChildren.unshift(child);
+    else document.__documentChildren.push(child);
+    child.__rangeParent = document; return child;
+  };
+  document.insertBefore = function(child, reference) {
+    if (child && child.__fragment) { var moved = child.childNodes.slice(); for (var i = 0; i < moved.length; i++) document.insertBefore(moved[i], reference); return child; }
+    var index = document.__documentChildren.indexOf(reference);
+    if (index < 0) return document.appendChild(child);
+    document.__documentChildren.splice(index, 0, child); child.__rangeParent = document; return child;
+  };
+  document.removeChild = function(child) {
+    var index = document.__documentChildren.indexOf(child); if (index < 0) return child;
+    document.__documentChildren.splice(index, 1); child.__rangeParent = null; return child;
+  };
+  Object.defineProperty(document, 'childNodes', { get: function() { return document.__documentChildren.slice(); }, enumerable: true, configurable: true });
+  Object.defineProperty(document, 'firstChild', { get: function() { return document.__documentChildren[0] || null; }, enumerable: true, configurable: true });
+  Object.defineProperty(document, 'lastChild', { get: function() { return document.__documentChildren[document.__documentChildren.length - 1] || null; }, enumerable: true, configurable: true });
   document.createEvent = function(type) {
     var event = new Event('');
     event.initEvent = function(name, bubbles, cancelable) {
@@ -881,12 +1214,59 @@ globalThis.__runXHROnload = function(body, handle) {
     var handles = originalQuerySelectorAll.call(this, selector);
     return wrapNodes(handles);
   };
+  function invalidQualifiedName(name) {
+    if (!name || !/^[A-Za-z_]/.test(name)) return true;
+    for (var i = 0; i < name.length; i++) {
+      var code = name.charCodeAt(i);
+      if (code === 0 || !(code === 45 || code === 46 || code === 95 ||
+          (code >= 48 && code <= 57) || (code >= 65 && code <= 90) ||
+          (code >= 97 && code <= 122))) return true;
+    }
+    return false;
+  }
+  function invalidNamespaceName(namespaceURI, qualifiedName) {
+    var colon = qualifiedName.indexOf(':');
+    if (colon < 0) return false;
+    if (colon === 0 || colon === qualifiedName.length - 1 ||
+        qualifiedName.indexOf(':', colon + 1) >= 0) return true;
+    if (namespaceURI == null) return true;
+    var prefix = qualifiedName.slice(0, colon).toLowerCase();
+    var local = qualifiedName.slice(colon + 1);
+    if (invalidQualifiedName(prefix) || invalidQualifiedName(local)) return true;
+    var xmlNamespace = 'http://www.w3.org/XML/1998/namespace';
+    var xmlnsNamespace = 'http://www.w3.org/2000/xmlns/';
+    if (prefix === 'xml' && namespaceURI !== xmlNamespace) return true;
+    if (prefix === 'xmlns' && namespaceURI !== xmlnsNamespace) return true;
+    if (local.toLowerCase() === 'xmlns' && namespaceURI !== xmlnsNamespace) return true;
+    if (namespaceURI === xmlnsNamespace && prefix !== 'xmlns') return true;
+    return false;
+  }
   document.createElement = function(tagName) {
     var text = tagName == null ? "" : tagName.toString();
+    if (invalidQualifiedName(text)) throw { code: 5, INVALID_CHARACTER_ERR: 5 };
     return wrapNode(__native.createElement(text));
   };
   document.createElementNS = function(ns, tagName) {
-    return document.createElement(tagName == null ? '' : tagName.toString().split(':').pop());
+    var qualified = tagName == null ? '' : tagName.toString();
+    var colon = qualified.indexOf(':');
+    var namespaceURI = ns == null ? null : ns.toString();
+    if (colon < 0) {
+      if (invalidQualifiedName(qualified)) throw { code: 5, INVALID_CHARACTER_ERR: 5 };
+    } else if (invalidNamespaceName(namespaceURI, qualified)) {
+      throw { code: 14, NAMESPACE_ERR: 14 };
+    }
+    // A namespace-qualified name is valid even though the non-namespace
+    // createElement API rejects colons. Call the native constructor directly
+    // after the namespace grammar has been checked.
+    var element = wrapNode(__native.createElement(qualified));
+    var prefix = colon < 0 ? null : qualified.slice(0, colon);
+    var local = colon < 0 ? qualified : qualified.slice(colon + 1);
+    Object.defineProperty(element, 'prefix', { value: prefix, enumerable: true, configurable: true });
+    Object.defineProperty(element, 'localName', { value: local.toLowerCase(), enumerable: true, configurable: true });
+    Object.defineProperty(element, 'namespaceURI', { value: namespaceURI, enumerable: true, configurable: true });
+    Object.defineProperty(element, 'tagName', { value: qualified, enumerable: true, configurable: true });
+    Object.defineProperty(element, 'nodeName', { value: qualified, enumerable: true, configurable: true });
+    return element;
   };
   document.implementation = {
     createDocument: function(ns, qualifiedName) {
@@ -900,8 +1280,14 @@ globalThis.__runXHROnload = function(body, handle) {
   document.createTextNode = function(text) {
     return wrapNode(__native.createTextNode(text == null ? '' : text.toString()));
   };
+  document.createComment = function(text) {
+    return makeSyntheticNode(Node.COMMENT_NODE, '#comment', text == null ? '' : text.toString());
+  };
+  document.createDocumentFragment = function() { return makeDocumentFragment(); };
+  document.createRange = function() { return new Range(); };
   document.getElementById = function(id) {
     var text = id == null ? "" : id.toString();
+    for (var i = 0; i < text.length; i++) if (text.charCodeAt(i) === 0) return null;
     return wrapNode(__native.getElementById(text));
   };
   document.getElementsByTagName = function(tagName) {

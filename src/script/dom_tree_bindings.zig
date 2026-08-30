@@ -55,6 +55,7 @@ pub const bindings = [_]native_bindings.Binding{
     .{ .name = "tagName", .length = 1, .function = tagName },
     .{ .name = "nodeValue", .length = 1, .function = nodeValue },
     .{ .name = "nodeData", .length = 1, .function = nodeData },
+    .{ .name = "setNodeData", .length = 2, .function = setNodeData },
     .{ .name = "textContent", .length = 1, .function = textContent },
     .{ .name = "computedStyleValue", .length = 2, .function = computedStyleValue },
 };
@@ -439,6 +440,30 @@ fn nodeData(agent: *Agent, this_value: Value, arguments: Arguments) Agent.Error!
         .element => .null,
         .text => |text| copiedString(agent, text.text),
     };
+}
+
+/// Replace the bytes of a script-created or parser text node.  Range
+/// extraction uses this to split text nodes without rebuilding their parent
+/// (which would invalidate every handle in the subtree).
+fn setNodeData(agent: *Agent, this_value: Value, arguments: Arguments) Agent.Error!Value {
+    _ = this_value;
+    const host = activeHost(agent);
+    const window = try requireWindow(agent);
+    const node = try requireNode(agent, window, arguments.get(0));
+    const value = arguments.get(1);
+    if (!value.isString()) return agent.throwException(.type_error, "setNodeData requires a string", .{});
+    const bytes = try value.asString().toUtf8(host.allocator);
+    defer host.allocator.free(bytes);
+    switch (node.*) {
+        .element => return agent.throwException(.type_error, "setNodeData requires a text node", .{}),
+        .text => |*text| {
+            const owned = try host.allocator.dupe(u8, bytes);
+            if (text.owned_text) host.allocator.free(text.text);
+            text.text = owned;
+            text.owned_text = true;
+        },
+    }
+    return .undefined;
 }
 
 fn textContent(agent: *Agent, this_value: Value, arguments: Arguments) Agent.Error!Value {
