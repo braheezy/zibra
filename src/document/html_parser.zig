@@ -170,21 +170,11 @@ pub fn Parser(
             return try self.finish();
         }
 
-        // Add text content to the DOM tree
-        // Browsers ignore whitespace-only text nodes in many contexts
+        // Add text content to the DOM tree. Layout decides how CSS whitespace
+        // collapses; DOM traversal must retain every nonempty text node.
         fn addText(self: *HTMLParser, text_slice: []const u8) !void {
-            // Skip empty or whitespace-only text
+            // Empty tokenization ranges do not represent DOM Text nodes.
             if (text_slice.len == 0) return;
-
-            // Skip if the text is all whitespace
-            var all_whitespace = true;
-            for (text_slice) |c| {
-                if (!std.ascii.isWhitespace(c)) {
-                    all_whitespace = false;
-                    break;
-                }
-            }
-            if (all_whitespace) return;
 
             // If we don't have any elements in the stack yet, can't add text
             if (self.unfinished.items.len == 0) return;

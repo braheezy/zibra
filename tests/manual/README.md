@@ -78,6 +78,7 @@ tiers and baseline policy.
 | [`event-bubbling.html`](event-bubbling.html) | Target-to-root delivery, stopPropagation, preventDefault, and ordinary elements |
 | [`html-serialization.html`](html-serialization.html) | Live inner/outer HTML, current attributes, escaping, and void elements |
 | [`dynamic-resources.html`](dynamic-resources.html) | Script/style insertion and stylesheet removal through structural mutation |
+| [`parser-lifecycle.html`](parser-lifecycle.html) | Final-address partial DOM, synchronous inline/external parser scripts, ordered `document.write` input, and body load delivery |
 | [`document-cookie.html`](document-cookie.html) | Native cookie getter/setter, parameters, and HttpOnly visibility boundary |
 | [`cookie-expiration.html`](cookie-expiration.html) | Replaced expiration deadlines and immediate deletion by past dates |
 | [`cors.html`](cors.html) | Cross-origin XHR wildcard opt-in versus fetched-but-hidden response |

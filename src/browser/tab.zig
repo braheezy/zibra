@@ -578,9 +578,34 @@ pub fn activateDocumentGeneration(self: *Tab, frame: *Frame) u64 {
     const generation = self.next_document_generation;
     self.next_document_generation +%= 1;
     if (self.next_document_generation == 0) self.next_document_generation = 1;
+    // This generation is also the lifecycle event identity. A fresh
+    // allocation invalidates claims queued for a prior installed document.
+    frame.lifecycle.resetForGeneration(generation) catch unreachable;
     frame.document_generation = generation;
     frame.js_render_context.setGeneration(generation);
     return generation;
+}
+
+test "activating a document generation resets frame lifecycle identity" {
+    var tab: Tab = undefined;
+    tab.next_document_generation = 17;
+
+    var frame: Frame = undefined;
+    frame.lifecycle = .{};
+    frame.document_generation = 0;
+    frame.js_render_context = .{};
+
+    const first = tab.activateDocumentGeneration(&frame);
+    try std.testing.expectEqual(@as(u64, 17), first);
+    try std.testing.expect(frame.lifecycle.isCurrent(first));
+    try std.testing.expectEqual(.loading, frame.lifecycle.phase);
+    try std.testing.expect(frame.lifecycle.enterInteractive(first));
+
+    const second = tab.activateDocumentGeneration(&frame);
+    try std.testing.expectEqual(@as(u64, 18), second);
+    try std.testing.expect(!frame.lifecycle.isCurrent(first));
+    try std.testing.expect(frame.lifecycle.isCurrent(second));
+    try std.testing.expectEqual(.loading, frame.lifecycle.phase);
 }
 
 pub fn frameForWindowId(self: *Tab, window_id: u32) ?*Frame {
@@ -600,6 +625,9 @@ pub fn invalidateJsContext(self: *Tab) void {
     self.parent_window_ids.clearRetainingCapacity();
     var it = self.frames_by_id.valueIterator();
     while (it.next()) |frame_ptr| {
+        if (frame_ptr.*.document_generation != 0) {
+            _ = frame_ptr.*.lifecycle.retire(frame_ptr.*.document_generation);
+        }
         self.clearIntervalsForDocument(
             frame_ptr.*.window_id,
             frame_ptr.*.document_generation,

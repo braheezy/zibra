@@ -14,7 +14,9 @@ behavior. Navigation-owned stylesheet/resource generations are documented in
 ## Ownership rules
 
 - Parser-created text, lowercase names, undecoded attributes, CSS names, and
-  property values generally borrow document or stylesheet buffers. Element
+  property values generally borrow document or stylesheet buffers. A Frame's
+  `html_source.Store` owns initial and parser-inserted HTML chunks through DOM
+  retirement; never resize a chunk once a Node borrows it. Element
   decoded strings, images, canvas pointers, animations, and detached subtree
   resources are explicit owners. Do not retire backing text first.
 - Children are Node values in resizable arrays. Never retain a child `*Node`
@@ -102,9 +104,26 @@ The document pipeline is split by ownership and algorithm boundaries:
 
 - `dom.zig` owns `Node`, `Element`, and `Text` representation, Element-backed
   resources, parent/style-owner rebinding, and DOM invalidation callbacks.
-- `html_parser.zig` is the stateful tokenizer/tree builder. It borrows the
-  decoded HTML buffer and receives DOM types plus final parent-pointer repair
-  through a comptime boundary, so it does not import the compatibility facade.
+- `html_source.zig` owns stable HTML source chunks for a navigated document;
+  `html_tokenizer.zig` borrows append-only chunks and emits owned lexical
+  tokens across chunk boundaries. `html_parser_session.zig` remains a one-shot
+  inspection/compatibility caller, while initial Browser navigation uses the
+  resumable live parser directly.
+- `node_pins.zig` owns parser-local opaque identities for relocation-prone
+  Nodes. Pins are non-owning and only cross one synchronous storage move as
+  scalars: unpublish before the move, rebind or retire before a callback, and
+  retire all pins before the DOM/source generation ends. Its generic
+  relocation-observer adapter is installed by the caller only around direct
+  parser-script evaluation; it never makes the parser import the script host.
+- `html_live_parser.zig` owns the resumable token-to-DOM path for
+  parser-blocking classic scripts. It installs a final-address root before
+  parsing and carries only parser-local node pins across its pause boundary;
+  its caller owns direct script evaluation and the temporary document.write
+  sink.
+- `html_parser.zig` is the stateful tokenizer/tree builder. It borrows one
+  stable decoded HTML chunk and receives DOM types plus final parent-pointer
+  repair through a comptime boundary, so it does not import the compatibility
+  facade.
 - `html_serialization.zig` is a generic leaf that traverses the live DOM,
   escapes attributes, and applies void-element rules without owning nodes or
   source buffers.

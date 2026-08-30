@@ -25,6 +25,7 @@ The nested [`render/AGENTS.md`](render/AGENTS.md) adds rendering-specific rules.
 | `app.zig` | Sole interactive SDL poller, shared session/measurement, heap-stable Browser registry |
 | `root.zig` | One native window, tab/chrome coordination, committed-frame acceptance, raster scheduling, native presentation |
 | `resource_loader.zig` | Per-window navigation/resource bridge over the shared session runner and joined source-order batches |
+| `document_loader.zig` | Stack-owned live-parser driver with synchronous root/script hooks; it owns no Frame or JS Realm |
 | `display_compositor.zig` | Browser-allocator owner of retained composited layers and their borrowing draw list |
 | `software_renderer.zig` | Browser-free z2d command interpreter, effects, image sampling, and layer rasterization |
 | `presentation_worker.zig` | Raster runner, worker-only surfaces/cache, completed-result transfer, and joined teardown |

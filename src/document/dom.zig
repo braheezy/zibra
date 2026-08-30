@@ -219,8 +219,10 @@ pub const Element = struct {
     scroll_y: i32 = 0,
     scroll_client_height: i32 = 0,
     scroll_content_height: i32 = 0,
-    // Classic scripts are evaluated at most once for the lifetime of this
-    // element, including when a detached node is later re-attached.
+    // Classic script execution is terminal for this Element: true means the
+    // script was claimed for evaluation, already evaluated, or was parsed as
+    // an inert fragment (such as innerHTML). Reattachment never resets that
+    // state, while an explicitly created Element starts eligible.
     script_started: bool = false,
     // Stable identity of the child browsing context currently attached to an
     // iframe element. Node values may move with their containing child array;

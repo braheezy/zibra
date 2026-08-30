@@ -7,6 +7,9 @@
 
 const dom = @import("dom.zig");
 const html_parser = @import("html_parser.zig");
+const html_parser_session = @import("html_parser_session.zig");
+const html_live_parser = @import("html_live_parser.zig");
+const html_source = @import("html_source.zig");
 const style_module = @import("style.zig");
 
 pub const CssColor = dom.CssColor;
@@ -50,6 +53,10 @@ pub const HTMLParser = html_parser.Parser(
     Text,
     fixParentPointers,
 );
+pub const HtmlSourceStore = html_source.Store;
+pub const ParserSession = html_parser_session.Session(HTMLParser, Node);
+pub const LiveParser = html_live_parser.LiveParser;
+pub const LiveParserAdvance = html_live_parser.Advance;
 
 pub const styleTreeNeedsUpdate = dom.styleTreeNeedsUpdate;
 pub const markPaintForNode = dom.markPaintForNode;

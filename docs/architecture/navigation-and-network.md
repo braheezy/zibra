@@ -137,15 +137,21 @@ A successful root navigation transaction follows this order:
 3. invalidate old document generations, JavaScript roots, and host callbacks;
 4. reject/clean queued old-generation work and quiesce relevant helpers;
 5. retire Browser render state under `Browser.lock`;
-6. destroy old frame display/layout before DOM, DOM before CSS/HTML buffers,
+6. destroy old frame display/layout before DOM, DOM before CSS/HTML source
+   chunks and buffers,
    and the owning URL last;
-7. allocate/register the new Frame and install its independently owned URL,
-   decoded HTML, response policy, and stylesheet source/rule/keyframe
-   generation;
-8. assign a fresh document generation, discover resources, evaluate scripts,
+7. allocate/register the new Frame and stage its URL, decoded HTML, response
+   policy, and source store before publishing any script-visible document
+   state;
+8. assign a fresh document generation, publish the final-address root and its
+   Realm, then drive the live parser. Each parser-inserted classic script runs
+   synchronously in source order; `document.write` chunks are copied into the
+   Frame source store ahead of unread input. Fetch/evaluation failures are
+   page errors and parsing continues;
+9. after EOF, discover deferred resources, build stylesheet/rule generations,
    and build style/layout/paint;
-9. apply a final fragment after layout and clamp scroll;
-10. append the already prepared history action only after the replacement and
+10. apply a final fragment after layout and clamp scroll;
+11. append the already prepared history action only after the replacement and
     any nested restoration succeeds.
 
 Before reclaiming old state, no new task may target its generation, no JS or
@@ -159,7 +165,8 @@ Child navigation reuses the heap-stable Frame allocation but resets its
 document generation. Fetch the candidate while the old referrer and policy are
 valid; only then clear JS roots/callbacks and retire display, children, layout,
 DOM, rules/keyframes, stylesheet text, decoded HTML, and URL in dependency
-order. Install a fresh generation.
+order. Stage the new URL/source before publishing the final root, then use the
+same synchronous live-parser script ordering as a root navigation.
 
 Parent CSP checks both requested and final redirect destinations. After final
 response identity is known, apply X-Frame-Options before recording a visit,
@@ -215,7 +222,10 @@ Structural DOM mutation marks attached resources dirty. The next worker pass
 queues each newly attached classic script once and rebuilds the complete live
 stylesheet generation in DOM order. Removing a script never rolls evaluated
 code back; reattaching the same `script_started` Element does not evaluate it
-again. Removing a link retires its stylesheet rules.
+again. Scripts parsed as an `innerHTML` fragment are intentionally inert, even
+when the source came from serializing a previously executed script; only an
+explicitly created-and-attached script remains eligible for this deferred path.
+Removing a link retires its stylesheet rules.
 
 ## Images and background images
 

@@ -691,6 +691,32 @@ pub fn Contexts(comptime Browser: type, comptime DocumentHandle: type) type {
             tab.setNeedsRender();
         }
 
+        /// Read the Frame-owned document phase from a synchronous JavaScript
+        /// callback. The render context's generation stamp prevents an old
+        /// realm from observing a newly navigated Frame that reused its window
+        /// id.
+        pub fn jsDocumentReadyStateCallback(
+            context: ?*anyopaque,
+        ) ?js_module.DocumentReadyState {
+            const ctx_ptr = context orelse return null;
+            const raw_ctx: *align(1) JsRenderContext = @ptrCast(ctx_ptr);
+            const ctx: *JsRenderContext = @alignCast(raw_ctx);
+            const tab_ptr = ctx.tab_ptr orelse return null;
+            const raw_tab: *align(1) Tab = @ptrCast(tab_ptr);
+            const tab: *Tab = @alignCast(raw_tab);
+            const frame = tab.frameForWindowId(ctx.window_id) orelse return null;
+            const generation = frame.document_generation;
+            if (generation == 0 or !ctx.matchesGeneration(generation) or
+                !frame.lifecycle.isCurrent(generation)) return null;
+
+            return switch (frame.lifecycle.phase) {
+                .loading => .loading,
+                .interactive => .interactive,
+                .complete => .complete,
+                .discarded => null,
+            };
+        }
+
         pub fn jsFocusCallback(context: ?*anyopaque, handle: u32) anyerror!void {
             const ctx_ptr = context orelse return;
             const raw_ctx: *align(1) JsRenderContext = @ptrCast(ctx_ptr);

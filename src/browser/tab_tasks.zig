@@ -4,17 +4,34 @@
 //! while keeping task payload ownership and opaque cleanup out of root.zig.
 
 const std = @import("std");
-const parser = @import("../document/parser.zig");
-const js_module = @import("../script/js.zig");
 const Url = @import("../network/url.zig").Url;
+const parser = @import("../document/parser.zig");
+const document_lifecycle = @import("document_lifecycle.zig");
+const js_module = @import("../script/js.zig");
 const tab_module = @import("tab.zig");
 
-const Node = parser.Node;
 const Tab = tab_module.Tab;
 const Frame = tab_module.Frame;
 const ClickButton = tab_module.ClickButton;
 const HoverPosition = tab_module.HoverPosition;
 const HistoryDirection = tab_module.HistoryDirection;
+
+/// Locate the document's first body Element without retaining a Node beyond
+/// the synchronous lifecycle dispatch that uses it. The parser guarantees a
+/// body by EOF, but this stays defensive for an interrupted/partially built
+/// document generation.
+fn documentBody(root: *parser.Node) ?*parser.Node {
+    return switch (root.*) {
+        .text => null,
+        .element => |*element| {
+            if (std.ascii.eqlIgnoreCase(element.tag, "body")) return root;
+            for (element.children.items) |*child| {
+                if (documentBody(child)) |body| return body;
+            }
+            return null;
+        },
+    };
+}
 
 pub fn Contexts(comptime Browser: type) type {
     return struct {
@@ -341,60 +358,176 @@ pub fn Contexts(comptime Browser: type) type {
                 std.log.info("========== Executing script ==========", .{});
                 const trace_eval = self.browser.measure.begin("evaljs");
                 defer if (trace_eval) self.browser.measure.end("evaljs");
-                const result = js_context.evaluate(
+                _ = js_context.evaluate(
                     self.document.window_id,
                     self.script_body,
                 ) catch |err| {
                     std.log.err("Script {s} crashed: {}", .{ self.script_label, err });
                     return;
                 };
-
-                var result_buf: [4096]u8 = undefined;
-                const result_str = js_module.formatValue(result, &result_buf) catch |err| {
-                    std.log.err("Failed to format script result: {}", .{err});
-                    return;
-                };
-                std.log.info("Script result: {s}", .{result_str});
                 std.log.info("======================================", .{});
+            }
+        };
 
-                if (!std.mem.eql(u8, result_str, "undefined")) {
-                    self.injectResult(result_str) catch |err| {
-                        std.log.warn("Failed to inject script result: {}", .{err});
-                    };
-                }
+        /// Runs after the document's already queued static scripts and moves
+        /// its lifecycle from loading to event eligibility. It has no claim to
+        /// release: navigation simply makes its DocumentHandle stale.
+        pub const LifecycleReadyTaskContext = struct {
+            allocator: std.mem.Allocator,
+            browser: *Browser,
+            tab: *Tab,
+            document: DocumentHandle,
+
+            pub fn create(
+                allocator: std.mem.Allocator,
+                browser: *Browser,
+                tab: *Tab,
+                document: DocumentHandle,
+            ) !*@This() {
+                const context = try allocator.create(@This());
+                context.* = .{
+                    .allocator = allocator,
+                    .browser = browser,
+                    .tab = tab,
+                    .document = document,
+                };
+                return context;
             }
 
-            fn injectResult(self: *@This(), result_str: []const u8) anyerror!void {
+            pub fn destroy(self: *@This()) void {
+                self.allocator.destroy(self);
+            }
+
+            pub fn toOpaque(self: *@This()) *anyopaque {
+                return @ptrCast(self);
+            }
+
+            fn fromOpaque(raw: *anyopaque) *@This() {
+                const unaligned: *align(1) @This() = @ptrCast(raw);
+                return @alignCast(unaligned);
+            }
+
+            pub fn runOpaque(raw: *anyopaque) anyerror!void {
+                try fromOpaque(raw).run();
+            }
+
+            pub fn cleanupOpaque(raw: *anyopaque) void {
+                fromOpaque(raw).destroy();
+            }
+
+            fn run(self: *@This()) !void {
                 const frame = self.document.resolve(self.tab) orelse return;
-                if (frame.current_node == null) return;
+                self.browser.markDocumentLifecycleEligible(frame);
+            }
+        };
 
-                const allocator = self.browser.allocator;
-                const result_text = try allocator.dupe(u8, result_str);
-                var nodes = std.ArrayList(*Node).empty;
-                defer nodes.deinit(allocator);
-                try parser.treeToList(allocator, &frame.current_node.?, &nodes);
+        /// Owns one already-claimed document lifecycle delivery. The claim is
+        /// released if the task is discarded before it can run, while a
+        /// successfully reached generation always finishes the event even if
+        /// page JavaScript throws.
+        pub const LifecycleTaskContext = struct {
+            allocator: std.mem.Allocator,
+            browser: *Browser,
+            tab: *Tab,
+            document: DocumentHandle,
+            dispatch: document_lifecycle.Dispatch,
+            claim_pending: bool = true,
 
-                var body_node: ?*Node = null;
-                for (nodes.items) |node| switch (node.*) {
-                    .element => |element| if (std.mem.eql(u8, element.tag, "body")) {
-                        body_node = node;
-                        break;
-                    },
-                    .text => {},
+            pub fn create(
+                allocator: std.mem.Allocator,
+                browser: *Browser,
+                tab: *Tab,
+                document: DocumentHandle,
+                dispatch: document_lifecycle.Dispatch,
+            ) !*@This() {
+                const context = try allocator.create(@This());
+                context.* = .{
+                    .allocator = allocator,
+                    .browser = browser,
+                    .tab = tab,
+                    .document = document,
+                    .dispatch = dispatch,
                 };
+                return context;
+            }
 
-                if (body_node) |body| {
-                    const text_node = Node{ .text = .{
-                        .text = result_text,
-                        .parent = body,
-                    } };
-                    try body.appendChild(allocator, text_node);
-                    try self.tab.dynamic_texts.append(allocator, result_text);
-                    parser.fixParentPointers(&frame.current_node.?, null);
-                    try self.tab.render(self.browser);
-                } else {
-                    allocator.free(result_text);
+            pub fn destroy(self: *@This()) void {
+                if (self.claim_pending) {
+                    if (self.document.resolve(self.tab)) |frame| {
+                        _ = frame.lifecycle.releaseDispatch(self.dispatch);
+                    }
                 }
+                self.allocator.destroy(self);
+            }
+
+            pub fn toOpaque(self: *@This()) *anyopaque {
+                return @ptrCast(self);
+            }
+
+            fn fromOpaque(raw: *anyopaque) *@This() {
+                const unaligned: *align(1) @This() = @ptrCast(raw);
+                return @alignCast(unaligned);
+            }
+
+            pub fn runOpaque(raw: *anyopaque) anyerror!void {
+                try fromOpaque(raw).run();
+            }
+
+            pub fn cleanupOpaque(raw: *anyopaque) void {
+                fromOpaque(raw).destroy();
+            }
+
+            fn run(self: *@This()) !void {
+                const frame = self.document.resolve(self.tab) orelse {
+                    self.claim_pending = false;
+                    return;
+                };
+                if (!frame.lifecycle.isCurrent(self.dispatch.generation)) {
+                    self.claim_pending = false;
+                    return;
+                }
+
+                if (frame.js_context) |js_context| {
+                    const event: js_module.LifecycleEvent = switch (self.dispatch.event) {
+                        .dom_content_loaded => .dom_content_loaded,
+                        .load => .load,
+                    };
+                    js_context.dispatchLifecycleEvent(self.document.window_id, event) catch |err| {
+                        // Browser lifecycle events are exactly once. A listener
+                        // exception is reported by the JS host but does not
+                        // make this document eligible for a second delivery.
+                        std.log.warn("Lifecycle event delivery failed: {}", .{err});
+                    };
+
+                    // HTML maps an authored body onload handler onto document
+                    // load completion. Keep it as a target-only Element event
+                    // in this bounded DOM API, after the window load delivery;
+                    // the native entry point neither retains `body` nor revives
+                    // a stale/missing Realm.
+                    if (self.dispatch.event == .load) {
+                        if (frame.current_node) |*root| {
+                            if (documentBody(root)) |body| {
+                                _ = js_context.dispatchInlineEvent(
+                                    self.document.window_id,
+                                    "load",
+                                    body,
+                                    false,
+                                ) catch |err| {
+                                    std.log.warn("Inline body load handler failed: {}", .{err});
+                                };
+                            }
+                        }
+                    }
+                }
+
+                _ = frame.lifecycle.finishDispatch(self.dispatch);
+                self.claim_pending = false;
+                self.browser.scheduleNextDocumentLifecycleEvent(frame) catch |err| {
+                    // The current event is already complete. Leaving the next
+                    // one eligible lets a later explicit scheduling point retry
+                    // after a transient allocation failure.
+                    std.log.warn("Failed to queue next lifecycle event: {}", .{err});
+                };
             }
         };
     };

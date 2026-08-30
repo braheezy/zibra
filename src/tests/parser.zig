@@ -5,6 +5,42 @@ const document_parser = @import("../document/parser.zig");
 const HTMLParser = document_parser.HTMLParser;
 const CSSParser = @import("../document/css_parser.zig").CSSParser;
 
+test "parser session matches direct parsing and owns a stable source borrow" {
+    const allocator = std.testing.allocator;
+    const html = "<html><body><section><p>session text</p></section></body></html>";
+
+    var source = document_parser.HtmlSourceStore.init(allocator);
+    defer source.deinit();
+    _ = try source.adopt(try allocator.dupe(u8, html));
+
+    var direct_parser = try HTMLParser.init(allocator, source.initial().?);
+    defer direct_parser.deinit(allocator);
+    var direct_root = try direct_parser.parse();
+    defer direct_root.deinit(allocator);
+
+    var session = try document_parser.ParserSession.init(allocator, &source);
+    defer session.deinit();
+    var session_root = try session.parseToEnd();
+    defer session_root.deinit(allocator);
+
+    const direct_html = try document_parser.serializeOuterHtml(allocator, &direct_root);
+    defer allocator.free(direct_html);
+    const session_html = try document_parser.serializeOuterHtml(allocator, &session_root);
+    defer allocator.free(session_html);
+    try std.testing.expectEqualStrings(direct_html, session_html);
+    try std.testing.expectError(error.ParserAlreadyConsumed, session.parseToEnd());
+
+    const session_body = session_root.element.children.items[1].element;
+    const section = session_body.children.items[0].element;
+    const text = section.children.items[0].element.children.items[0].text.text;
+    const source_offset = std.mem.indexOf(u8, source.initial().?, "session text").?;
+    try std.testing.expect(text.ptr == source.initial().?[source_offset..].ptr);
+
+    _ = try source.appendCopy("<p>later parser input</p>");
+    try std.testing.expectEqualStrings("session text", text);
+    try std.testing.expect(text.ptr == source.initial().?[source_offset..].ptr);
+}
+
 test "Parse basic HTML" {
     const allocator = std.testing.allocator;
     const html = "<html><body><p>Hello, world!</p></body></html>";
@@ -29,6 +65,21 @@ test "Parse basic HTML" {
 
     const text = p.children.items[0].text;
     try std.testing.expectEqualStrings("Hello, world!", text.text);
+}
+
+test "parser retains whitespace Text nodes for DOM traversal" {
+    const allocator = std.testing.allocator;
+    var html_parser = try HTMLParser.init(allocator, "<div>\n  <span>one</span>\n</div>");
+    html_parser.use_implicit_tags = false;
+    defer html_parser.deinit(allocator);
+
+    var root = try html_parser.parse();
+    defer root.deinit(allocator);
+
+    try std.testing.expectEqual(@as(usize, 3), root.element.children.items.len);
+    try std.testing.expectEqualStrings("\n  ", root.element.children.items[0].text.text);
+    try std.testing.expectEqualStrings("span", root.element.children.items[1].element.tag);
+    try std.testing.expectEqualStrings("\n", root.element.children.items[2].text.text);
 }
 
 test "input type helpers recognize hidden password and text defaults" {

@@ -8,6 +8,8 @@
 const std = @import("std");
 const url_module = @import("../network/url.zig");
 const parser = @import("../document/parser.zig");
+const HtmlSourceStore = @import("../document/html_source.zig").Store;
+const document_lifecycle = @import("document_lifecycle.zig");
 const Layout = @import("render/layout.zig");
 const CSSParser = @import("../document/css_parser.zig").CSSParser;
 const scroll_model = @import("scroll.zig");
@@ -178,7 +180,9 @@ pub fn FrameType(
         /// Policy received with this document generation. Every navigation and
         /// subresource request originating here consults it before adding Referer.
         referrer_policy: url_module.ReferrerPolicy = .default,
-        current_html_source: ?[]const u8 = null,
+        /// Stable decoded source chunks borrowed by parser-created DOM strings.
+        /// DOM must retire before these chunks on navigation or teardown.
+        html_sources: HtmlSourceStore,
         current_node: ?Node = null,
         /// A dirty document means computed style has not been republished for the
         /// current DOM/rule generation. Layout consumers may use `get()` only
@@ -208,6 +212,10 @@ pub fn FrameType(
         js_context: ?*js_module = null,
         js_render_context: JsRenderContext = .{},
         js_render_context_initialized: bool = false,
+        /// Exact-once lifecycle-event eligibility for this document
+        /// generation. The Browser owns delivery, but every queued dispatch
+        /// must validate through this owner before it can call JavaScript.
+        lifecycle: document_lifecycle.Lifecycle = .{},
         document_generation: u64 = 0,
         rules: std.ArrayList(CSSParser.CSSRule),
         keyframes: std.ArrayList(CSSParser.KeyframesRule),
@@ -245,6 +253,7 @@ pub fn FrameType(
                 .focus_bounds = std.ArrayList(FrameBoundEntry).empty,
                 .accessibility_bounds = std.ArrayList(FrameBoundEntry).empty,
                 .fragment_targets = std.ArrayList(Layout.FragmentTarget).empty,
+                .html_sources = HtmlSourceStore.init(allocator),
                 .document = ProtectedField(?*Layout.DocumentLayout).init(null),
             };
         }
@@ -389,6 +398,7 @@ pub fn FrameType(
             // initialize the Tab-owned interval registry.
             if (self.document_generation != 0) {
                 self.tab.clearIntervalsForDocument(self.window_id, self.document_generation);
+                _ = self.lifecycle.retire(self.document_generation);
             }
             if (self.js_context) |ctx| {
                 ctx.setNodes(self.window_id, null);
@@ -426,10 +436,7 @@ pub fn FrameType(
                 self.current_node = null;
             }
 
-            if (self.current_html_source) |source| {
-                self.allocator.free(source);
-                self.current_html_source = null;
-            }
+            self.html_sources.deinit();
 
             for (self.rules.items) |*rule| {
                 if (rule.owned) {

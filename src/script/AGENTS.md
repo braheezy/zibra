@@ -13,17 +13,25 @@ queued work and shutdown are documented in
 
 ## Source map
 
-- `js.zig` owns the Agent, lock, realms, window contexts, callback registries,
-  active-window switching, evaluation, and public locked entry points.
+- `js.zig` owns the Agent, its neutral host Realm, heap-stable per-document
+  `WindowRealm` owners, callback registries, active-window switching,
+  evaluation, and public locked entry points.
 - `runtime/bootstrap.js` defines the page-visible DOM, event, timer, canvas,
   XHR, cookie, and messaging shims over `__native`; Zig loads it with
   `@embedFile` before evaluating page code.
 - `dom_handles.zig` owns the two-way Node pointer/numeric identity maps for one
   window generation.
+- `dom_tree_bindings.zig` owns read-only document lookup and authored Node
+  topology bindings. It receives a callback-scoped root/handle/issuer borrow,
+  never imports `Js`, and returns only copied strings or numeric snapshots.
 - `dom_mutation.zig` owns synchronous child-array transfer transactions and
   receives only borrowed identity stores plus paired invalidation hooks.
+- `inline_event.zig` identifies authored `on<event>` source and builds the
+  Realm-local invocation expression; it owns neither DOM storage nor Kiesel
+  execution.
 - `event_focus_bindings.zig`, `canvas_bindings.zig`,
-  `timer_bindings.zig`, and `network_bindings.zig` validate their native APIs
+  `timer_bindings.zig`, `network_bindings.zig`, and
+  `document_write_bindings.zig` validate their native APIs
   and call heap-stable narrow host interfaces embedded in `Js`.
 - `native_bindings.zig` installs comptime binding tables; `transitions.zig`
   parses and starts typed DOM transitions.
@@ -37,23 +45,67 @@ queued work and shutdown are documented in
   interfaces embedded in the heap-stable `Js` allocation, synchronous, and
   narrower than the coordinator. A returned Node or Element is a callback-
   scoped borrow and must never be queued.
-- WindowContexts own handle maps, listener/timer registries, named globals, and
-  detached roots. Node wrappers must never silently retarget after child-array
-  relocation or address reuse.
+- Each non-null document installation receives a fresh `WindowRealm`; the
+  preceding realm is retired and null-root invalidation leaves its host maps
+  inert. WindowRealms own handle maps, listener/timer registries, named
+  globals, and detached roots. Node wrappers must never silently retarget
+  after child-array relocation, address reuse, or document replacement.
+- A WindowRealm can temporarily carry one type-erased Node relocation observer
+  for a stack-bound live parser. Install it only immediately around direct
+  parser-blocking evaluation and clear it before parser control yields or the
+  Frame can retire; mutation code may receive old addresses only as opaque
+  identity-map keys and must not dereference them.
+- `Js.nodeHandleRelocationObserver` exposes the inverse, Realm-owned observer
+  for parser-originated child-array moves. It rebinds only already-published
+  JavaScript handles, borrows the live WindowRealm, and must be removed from a
+  parser before that Realm retires. A removed subtree may retain JavaScript
+  wrappers as a detached root while its parser pins are retired: parser pins
+  describe the active document tree, not detached-node retention.
+- Browser lifecycle delivery calls `Js.dispatchLifecycleEvent` only for an
+  already initialized live Realm. Missing or retired realms are inert no-ops,
+  never an excuse to allocate a replacement Realm. `document.readyState`
+  reads a narrow synchronous browser callback when installed; its context is
+  generation-bound and must be cleared before Frame retirement. Lifecycle
+  listeners run against document/window targets in the document Realm, and a
+  page exception must not abort later lifecycle listeners or the load phase.
+- Browser-owned `Js.dispatchInlineEvent` dispatches authored handlers such as
+  `<body onload>` to a Node wrapper with ordinary `this`, `target`, and
+  `currentTarget` semantics. It may initialize an existing live Realm for a
+  document with no ordinary script, but never creates one for stale work; a
+  handler exception is contained and must not block lifecycle completion.
+- `document.write` crosses only the synchronous parser-active callback seam.
+  Its temporary bytes must be copied into Frame-owned HTML source before the
+  native call returns; clear the callback before parser control yields. A
+  missing sink is intentionally inert and must not silently implement
+  `document.open()` or retain a parser pointer.
+- HTML fragments parsed for `innerHTML` are not document-parser input. Mark
+  every script in such a fragment inert before installing its child storage;
+  resource refresh must not turn serialized or newly parsed fragment scripts
+  into deferred executable scripts. Explicitly created-and-attached script
+  Elements remain eligible for the ordinary dynamic-resource path.
+- The active-window guard restores the prior host window id after every public
+  entry point. Do not leave a page realm or window id installed across a
+  callback, task boundary, navigation, or shutdown path.
 - Synchronous DOM mutation validates and stages before invalidation, retires or
-  rebinds every affected handle, and invokes the paired completion callback
-  only after storage, parents, and handles are final. Network/resource loading
-  is deferred until the host call returns.
+  rebinds every affected handle and optional relocation token, and invokes the
+  paired completion callback only after storage, parents, and identities are
+  final. Network/resource loading is deferred until the host call returns.
 - Detached roots are heap-stable owners. `appendChild`, `insertBefore`,
   `removeChild`, and `replaceChildren` transfer ownership rather than
   shallow-copying a subtree.
 - Null-root invalidation may run outside the Kiesel-owning Tab worker. It makes
   wrappers inert by clearing native maps and does not call into JavaScript.
+- Bootstrap owns one Node-wrapper cache per document Realm. Every host-returned
+  numeric Node identity must pass through that cache so query, traversal,
+  events, named IDs, canvas, and mutation results compare by object identity.
+  Read-only tree collections are snapshots, not live HTMLCollections; they
+  expose authored children only and never generated pseudo boxes.
 - Asynchronous callbacks carry copied generation-stamped document handles and
   own every URL, message, policy, body, and string they retain. Never queue a
   Frame, Node, or `JsRenderContext` pointer.
-- Strings returned to JavaScript from serialization, cookies, XHR, or messages
-  move into Kiesel's traced allocator before temporary native storage retires.
+- Strings returned to JavaScript from serialization, DOM topology, cookies,
+  XHR, or messages move into Kiesel's traced allocator before temporary or
+  source-backed native storage retires.
 - Event dispatch snapshots numeric handles target-to-root. Keep `target`
   stable, update `currentTarget`, and keep propagation control separate from
   default prevention.

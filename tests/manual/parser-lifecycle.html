@@ -1,0 +1,11 @@
+<!-- How to verify: run `zig build run -- --screenshot /tmp/parser-lifecycle.png tests/manual/parser-lifecycle.html`. The page must visibly read, in order: before, inline parser write, external parser write, after, load handler. -->
+<!doctype html>
+<title>Parser lifecycle</title>
+<body onload="document.body.innerHTML += '<p>load handler</p>'">
+  <p>before</p>
+  <script>
+    document.write('<p>inline parser write</p>');
+  </script>
+  <script src="parser-lifecycle-script.js"></script>
+  <p>after</p>
+</body>

@@ -1,16 +1,23 @@
 //! Kiesel JavaScript host integration and the minimal DOM-facing Web APIs.
 //!
-//! A `Js` instance owns Kiesel agent state and per-window handle maps. Kiesel
-//! execution is serialized by `JsLock`; DOM pointers and callback contexts are
-//! borrowed and must be invalidated before their owning frame is destroyed.
+//! A `Js` instance owns Kiesel agent state and heap-stable per-document
+//! WindowRealms. Kiesel execution is serialized by `JsLock`; DOM pointers and
+//! callback contexts are borrowed and must be invalidated before their owning
+//! frame is destroyed.
 
 const std = @import("std");
 const Mutex = @import("../runtime/sync.zig").Mutex;
-const DomHandles = @import("dom_handles.zig").Store;
+const dom_handles = @import("dom_handles.zig");
+const DomHandles = dom_handles.Store;
+const IdIssuer = dom_handles.IdIssuer;
+const dom_tree_bindings = @import("dom_tree_bindings.zig");
 const dom_mutation = @import("dom_mutation.zig");
+const relocatable_identity = @import("../core/relocatable_identity.zig");
 const native_bindings = @import("native_bindings.zig");
 const canvas_bindings = @import("canvas_bindings.zig");
 const event_focus_bindings = @import("event_focus_bindings.zig");
+const document_write_bindings = @import("document_write_bindings.zig");
+const inline_event = @import("inline_event.zig");
 const network_bindings = @import("network_bindings.zig");
 const timer_bindings = @import("timer_bindings.zig");
 
@@ -21,11 +28,16 @@ const Script = kiesel.language.Script;
 const Realm = kiesel.execution.Realm;
 const Value = kiesel.types.Value;
 const parser = @import("../document/parser.zig");
+const node_pins = @import("../document/node_pins.zig");
 const Node = parser.Node;
 const CSSParser = @import("../document/css_parser.zig").CSSParser;
 const PixelAnimation = parser.PixelAnimation;
 
 const Js = @This();
+
+/// A parser- or embedder-owned identity map that follows synchronous DOM
+/// child-array moves while one direct script evaluation is active.
+pub const NodeRelocationObserver = relocatable_identity.RelocationObserver;
 
 const transitions = @import("transitions.zig");
 
@@ -33,6 +45,44 @@ pub const RenderCallbackFn = *const fn (context: ?*anyopaque) anyerror!void;
 
 const RenderCallback = struct {
     function: ?RenderCallbackFn = null,
+    context: ?*anyopaque = null,
+};
+
+/// Browser lifecycle events dispatched only after the owning Frame has
+/// generation-checked eligibility. Their delivery targets live entirely in
+/// the active document Realm, not the DOM-node event path.
+pub const LifecycleEvent = enum {
+    dom_content_loaded,
+    load,
+};
+
+/// Page-visible document readiness values. The browser translates its
+/// generation-scoped lifecycle owner to this small host boundary rather than
+/// exposing Frame pointers to the JavaScript subsystem.
+pub const DocumentReadyState = enum {
+    loading,
+    interactive,
+    complete,
+};
+
+/// Reads the current document readiness while JavaScript is synchronously
+/// executing in its owning Tab worker. Returning null makes the runtime use
+/// its conservative loading fallback during standalone tests or setup.
+pub const DocumentReadyStateCallbackFn = *const fn (context: ?*anyopaque) ?DocumentReadyState;
+
+const DocumentReadyStateCallback = struct {
+    function: ?DocumentReadyStateCallbackFn = null,
+    context: ?*anyopaque = null,
+};
+
+/// Called only while a live HTML parser is paused at a parser-inserted script.
+/// The source slice is callback-scoped; the parser must copy it into its
+/// document-owned source store before returning. Outside that narrow scope,
+/// `document.write` is intentionally inert rather than opening a new document.
+pub const DocumentWriteCallbackFn = document_write_bindings.CallbackFn;
+
+const DocumentWriteCallback = struct {
+    function: ?DocumentWriteCallbackFn = null,
     context: ?*anyopaque = null,
 };
 
@@ -155,16 +205,25 @@ const PendingMessage = struct {
     source_window_id: u32,
 };
 
-const WindowContext = struct {
+/// Heap-stable JavaScript state for one document installed in one browsing
+/// context. The realm is intentionally not shared by same-origin Frames:
+/// origin determines which `Js` agent owns the context, while a document
+/// generation determines which global object and wrapper state it receives.
+const WindowRealm = struct {
     realm: *Realm,
+    runtime_initialized: bool = false,
+    // Retirement is deliberately host-only: shutdown and navigation may make
+    // wrappers inert from outside the Tab worker, where re-entering Kiesel to
+    // clear JavaScript state would violate the teardown contract.
+    retired: bool = false,
     handles: DomHandles,
     // Heap-stable owners for createElement results and removeChild subtrees
     // that have not yet been transferred into a DOM child array.
     detached_nodes: std.AutoHashMap(*Node, void),
     current_nodes: ?*Node,
-    // The shared Kiesel realm exposes named element globals for only the
-    // active window. This records whether the JavaScript-side per-window
-    // registry reflects current_nodes.
+    // Bootstrap retains this flag for the named-ID publishing protocol. Once
+    // every document owns its own Realm there is no cross-window registry
+    // swap, but a mutation still needs to replace the document's live names.
     named_globals_synced: bool,
     pending_messages: std.ArrayList(PendingMessage),
     render_callback: RenderCallback,
@@ -180,6 +239,25 @@ const WindowContext = struct {
     xhr_callback: XhrCallback,
     cookie_callback: CookieCallback,
     animation_frame_callback: AnimationFrameCallback,
+    document_ready_state_callback: DocumentReadyStateCallback,
+    document_write_callback: DocumentWriteCallback,
+    // This may borrow a stack-bound live parser, so it is installed only for
+    // direct parser-blocking evaluation and cleared before that parser yields.
+    node_relocation_observer: ?NodeRelocationObserver,
+};
+
+/// Temporarily makes a WindowRealm visible to synchronous native bindings.
+/// JavaScript execution can re-enter host work (for example, a DOM mutation
+/// that tears down an iframe), so restoration is required even though the Tab
+/// worker serializes top-level script tasks.
+const ActiveWindow = struct {
+    js: *Js,
+    previous_window_id: ?u32,
+    window: *WindowRealm,
+
+    fn restore(self: *const ActiveWindow) void {
+        self.js.current_window_id = self.previous_window_id;
+    }
 };
 
 platform: Agent.Platform,
@@ -190,15 +268,26 @@ storage_allocator: std.mem.Allocator,
 // Kiesel retains pointers to these narrow interfaces for the lifetime of the
 // shared realm. `Js` itself is heap-stable and outlives every native function.
 canvas_host: canvas_bindings.Host,
+dom_tree_host: dom_tree_bindings.Host,
 event_focus_host: event_focus_bindings.Host,
 network_host: network_bindings.Host,
 timer_host: timer_bindings.Host,
-windows: std.AutoHashMap(u32, WindowContext),
+document_write_host: document_write_bindings.Host,
+// Window realms must not move after their native functions and callback state
+// are installed. The map owns only stable pointers; each pointed owner uses
+// `storage_allocator` so it remains a Kiesel GC-visible host root.
+windows: std.AutoHashMap(u32, *WindowRealm),
+// Handle identity crosses document and WindowRealm lifetimes. Keeping the
+// issuer at the Js host prevents a stale wrapper's numeric ID from resolving
+// to a node in any later document.
+handle_issuer: IdIssuer,
 parent_window_ids: std.AutoHashMap(u32, u32),
 current_window_id: ?u32 = null,
 lock: JsLock,
-realm: ?*Realm = null,
-runtime_initialized: bool = false,
+// Kiesel requires at least one execution context after a Script returns. This
+// neutral realm stays on the Agent stack; page realms are initialized, set up,
+// and then popped before use by Script.evaluate.
+host_realm: ?*Realm = null,
 
 pub fn init(
     allocator: std.mem.Allocator,
@@ -233,6 +322,11 @@ pub fn init(
         .resolve_element = resolveCanvasBindingElement,
         .request_render = requestBindingRender,
     };
+    self.dom_tree_host = .{
+        .context = self,
+        .allocator = allocator,
+        .active_window = activeDomTreeWindow,
+    };
     self.event_focus_host = .{
         .context = self,
         .active_window = activeEventFocusWindow,
@@ -253,28 +347,43 @@ pub fn init(
         .clear = clearBindingTimer,
         .request_animation_frame = requestBindingAnimationFrame,
     };
-    self.windows = std.AutoHashMap(u32, WindowContext).init(allocator);
+    self.document_write_host = .{
+        .context = self,
+        .allocator = allocator,
+        .write = writeBindingDocument,
+    };
+    self.windows = std.AutoHashMap(u32, *WindowRealm).init(storage_allocator);
+    self.handle_issuer = .{};
     self.parent_window_ids = std.AutoHashMap(u32, u32).init(allocator);
     self.current_window_id = null;
     self.lock = .init(io);
-    self.realm = null;
-    self.runtime_initialized = false;
+    self.host_realm = null;
+
+    // Keep one non-page root context on the Agent. Additional document realms
+    // are popped after installation, just as Kiesel's test262 host does.
+    try Realm.initializeHostDefinedRealm(&self.agent, .{});
+    self.host_realm = self.agent.currentRealm();
 
     return self;
 }
 
-fn ensureWindow(self: *Js, window_id: u32) !void {
-    if (self.windows.contains(window_id)) return;
+fn createWindowRealmLocked(self: *Js) !*WindowRealm {
+    std.debug.assert(self.host_realm != null);
 
-    if (self.realm == null) {
-        try Realm.initializeHostDefinedRealm(&self.agent, .{});
-        self.realm = self.agent.currentRealm();
-        try self.setupConsole(self.realm.?);
-        try self.setupDocument(self.realm.?);
-    }
+    try Realm.initializeHostDefinedRealm(&self.agent, .{});
+    const realm = self.agent.currentRealm();
+    var initialization_context_live = true;
+    errdefer if (initialization_context_live) {
+        _ = self.agent.execution_context_stack.pop().?;
+    };
 
-    const ctx = WindowContext{
-        .realm = self.realm.?,
+    try self.setupConsole(realm);
+    try self.setupDocument(realm);
+
+    const window = try self.storage_allocator.create(WindowRealm);
+    errdefer self.storage_allocator.destroy(window);
+    window.* = .{
+        .realm = realm,
         .handles = DomHandles.init(self.allocator),
         .detached_nodes = std.AutoHashMap(*Node, void).init(self.allocator),
         .current_nodes = null,
@@ -290,21 +399,82 @@ fn ensureWindow(self: *Js, window_id: u32) !void {
         .xhr_callback = .{},
         .cookie_callback = .{},
         .animation_frame_callback = .{},
+        .document_ready_state_callback = .{},
+        .document_write_callback = .{},
+        .node_relocation_observer = null,
     };
 
-    try self.windows.put(window_id, ctx);
+    // `Script.evaluate` pushes the document realm for each execution. Leaving
+    // this initialization context on the stack would make every later-created
+    // document permanently current and leak one root context per navigation.
+    _ = self.agent.execution_context_stack.pop().?;
+    initialization_context_live = false;
+    return window;
 }
 
-fn getWindowContext(self: *Js, window_id: u32) !*WindowContext {
+fn retireWindowRealmLocked(self: *Js, window: *WindowRealm) void {
+    // A parser-owned observer can be stack-bound. Never invoke it while
+    // tearing down a Realm; the parser must retire its own pins and clear this
+    // borrowed callback before navigation/shutdown reaches here.
+    window.node_relocation_observer = null;
+    self.clearDetachedNodes(window);
+    window.handles.clear();
+    for (window.pending_messages.items) |message| {
+        self.allocator.free(message.message);
+        self.allocator.free(message.origin);
+    }
+    window.pending_messages.clearRetainingCapacity();
+    window.current_nodes = null;
+    window.named_globals_synced = false;
+    window.render_callback = .{};
+    window.focus_callback = .{};
+    window.dom_mutation_callback = .{};
+    window.dom_mutation_complete_callback = .{};
+    window.set_timeout_callback = .{};
+    window.clear_interval_callback = .{};
+    window.post_message_callback = .{};
+    window.xhr_callback = .{};
+    window.cookie_callback = .{};
+    window.animation_frame_callback = .{};
+    window.document_ready_state_callback = .{};
+    window.document_write_callback = .{};
+    window.retired = true;
+}
+
+fn destroyWindowRealmLocked(self: *Js, window: *WindowRealm) void {
+    self.retireWindowRealmLocked(window);
+    window.handles.deinit();
+    window.detached_nodes.deinit();
+    window.pending_messages.deinit(self.allocator);
+    self.storage_allocator.destroy(window);
+}
+
+fn ensureWindow(self: *Js, window_id: u32) !void {
+    if (self.windows.contains(window_id)) return;
+
+    const window = try self.createWindowRealmLocked();
+    errdefer self.destroyWindowRealmLocked(window);
+    try self.windows.put(window_id, window);
+}
+
+fn getWindowContext(self: *Js, window_id: u32) !*WindowRealm {
     if (!self.windows.contains(window_id)) {
         try self.ensureWindow(window_id);
     }
-    return self.windows.getPtr(window_id).?;
+    return self.windows.get(window_id).?;
 }
 
-fn setCurrentWindow(self: *Js, window_id: u32) !*WindowContext {
+fn activateWindowLocked(self: *Js, window_id: u32) !ActiveWindow {
+    // Ensure first: failing realm allocation must not leave native callbacks
+    // pointed at a window id whose context does not exist.
+    const window = try self.getWindowContext(window_id);
+    const active = ActiveWindow{
+        .js = self,
+        .previous_window_id = self.current_window_id,
+        .window = window,
+    };
     self.current_window_id = window_id;
-    return self.getWindowContext(window_id);
+    return active;
 }
 
 /// Set up the console object with log function
@@ -376,15 +546,8 @@ pub fn deinit(self: *Js, allocator: std.mem.Allocator) void {
     _ = allocator;
     self.lock.lock();
     var it = self.windows.valueIterator();
-    while (it.next()) |window| {
-        self.clearDetachedNodes(window);
-        window.handles.deinit();
-        window.detached_nodes.deinit();
-        for (window.pending_messages.items) |msg| {
-            self.allocator.free(msg.message);
-            self.allocator.free(msg.origin);
-        }
-        window.pending_messages.deinit(self.allocator);
+    while (it.next()) |window_ptr| {
+        self.destroyWindowRealmLocked(window_ptr.*);
     }
     self.windows.deinit();
     self.parent_window_ids.deinit();
@@ -412,34 +575,50 @@ fn translateExecutionError(self: *Js, err: Agent.Error) anyerror {
     return err;
 }
 
+/// Initialize the page-visible runtime inside an already active, live Realm.
+///
+/// This does not create a Realm: callers must first find an existing document
+/// generation and activate it. Keeping initialization here lets browser-owned
+/// delivery such as an authored `body onload` run even if a page contains no
+/// ordinary script that would otherwise call `evaluate` first.
+fn ensureRuntimeInitializedLocked(
+    self: *Js,
+    window_id: u32,
+    window: *WindowRealm,
+) !void {
+    if (window.runtime_initialized) return;
+
+    const runtime_code = @embedFile("runtime/bootstrap.js");
+    const runtime_script = try Script.parse(
+        runtime_code,
+        window.realm,
+        null,
+        .{},
+    );
+    _ = runtime_script.evaluate("zibra-runtime") catch |err| {
+        return self.translateExecutionError(err);
+    };
+    window.runtime_initialized = true;
+    if (window.pending_messages.items.len > 0) {
+        for (window.pending_messages.items) |msg| {
+            self.dispatchMessageImpl(window, msg.message, msg.origin, msg.source_window_id, window_id) catch |err| {
+                std.log.warn("Failed to dispatch queued postMessage: {}", .{err});
+            };
+            self.allocator.free(msg.message);
+            self.allocator.free(msg.origin);
+        }
+        window.pending_messages.clearRetainingCapacity();
+    }
+}
+
 pub fn evaluate(self: *Js, window_id: u32, code: []const u8) !Value {
     self.lock.lock();
     defer self.lock.unlock();
-    const window = try self.setCurrentWindow(window_id);
-    const runtime_code = @embedFile("runtime/bootstrap.js");
-
-    if (!self.runtime_initialized) {
-        const runtime_script = try Script.parse(
-            runtime_code,
-            window.realm,
-            null,
-            .{},
-        );
-        _ = runtime_script.evaluate("zibra-runtime") catch |err| {
-            return self.translateExecutionError(err);
-        };
-        self.runtime_initialized = true;
-        if (window.pending_messages.items.len > 0) {
-            for (window.pending_messages.items) |msg| {
-                self.dispatchMessageImpl(window, msg.message, msg.origin, msg.source_window_id, window_id) catch |err| {
-                    std.log.warn("Failed to dispatch queued postMessage: {}", .{err});
-                };
-                self.allocator.free(msg.message);
-                self.allocator.free(msg.origin);
-            }
-            window.pending_messages.clearRetainingCapacity();
-        }
-    }
+    const active = try self.activateWindowLocked(window_id);
+    defer active.restore();
+    const window = active.window;
+    if (window.retired) return error.InertWindow;
+    try self.ensureRuntimeInitializedLocked(window_id, window);
     try self.setActiveWindow(window_id, window);
     if (!window.named_globals_synced) try self.syncNamedIdGlobals(window_id, window);
 
@@ -471,44 +650,41 @@ pub fn formatValue(value: Value, buf: []u8) ![]const u8 {
 pub fn setNodes(self: *Js, window_id: u32, nodes: ?*Node) void {
     self.lock.lock();
     defer self.lock.unlock();
-    const window = self.setCurrentWindow(window_id) catch return;
-    if (nodes != null) {
-        self.clearNamedIdGlobals(window_id, window) catch |err| {
-            std.log.warn("Failed to clear named element globals: {}", .{err});
+    if (nodes) |root| {
+        // A non-null install is a new document generation, even when the
+        // browsing-context window id is reused by an iframe navigation. Make
+        // the realm first so allocation failure never leaves the old DOM
+        // pointer published after its Frame has retired it.
+        const fresh = self.createWindowRealmLocked() catch |err| {
+            std.log.err("Failed to create JavaScript realm for window {d}: {}", .{ window_id, err });
+            if (self.windows.fetchRemove(window_id)) |entry| {
+                self.destroyWindowRealmLocked(entry.value);
+            }
+            return;
         };
-    } else {
-        // Shutdown/navigation invalidation can run outside the tab worker.
-        // Do not re-enter Kiesel here: clearing the native handle maps below
-        // makes every retained numeric Node wrapper inert, and a subsequent
-        // non-null install clears the JavaScript registry before reuse.
-        window.named_globals_synced = false;
+        if (self.windows.fetchRemove(window_id)) |entry| {
+            self.destroyWindowRealmLocked(entry.value);
+        }
+        self.windows.put(window_id, fresh) catch |err| {
+            std.log.err("Failed to install JavaScript realm for window {d}: {}", .{ window_id, err });
+            self.destroyWindowRealmLocked(fresh);
+            return;
+        };
+        fresh.current_nodes = root;
+        return;
     }
-    self.clearDetachedNodes(window);
-    window.current_nodes = nodes;
-    // Clear handle mappings when nodes change
-    window.handles.clear();
-    if (nodes == null) {
-        window.render_callback = .{};
-        window.focus_callback = .{};
-        window.dom_mutation_callback = .{};
-        window.dom_mutation_complete_callback = .{};
-        window.xhr_callback = .{};
-        window.cookie_callback = .{};
-        window.set_timeout_callback = .{};
-        window.clear_interval_callback = .{};
-        window.post_message_callback = .{};
-        window.animation_frame_callback = .{};
-    } else {
-        // Reset JavaScript-side listener state when the DOM changes.
-        self.resetEventListenersImpl(window, window_id);
-        self.syncNamedIdGlobals(window_id, window) catch |err| {
-            std.log.warn("Failed to publish named element globals: {}", .{err});
-        };
+
+    // Shutdown/navigation invalidation can run outside the Tab worker. Do not
+    // create a realm or execute JavaScript here; clearing host maps makes all
+    // retained wrappers inert until a later non-null document install.
+    if (self.windows.get(window_id)) |window| {
+        self.retireWindowRealmLocked(window);
     }
 }
 
 pub fn setRenderCallback(self: *Js, window_id: u32, callback: ?RenderCallbackFn, context: ?*anyopaque) void {
-    const window = self.setCurrentWindow(window_id) catch return;
+    const window = self.getWindowContext(window_id) catch return;
+    if (window.retired) return;
     window.render_callback = .{
         .function = callback,
         .context = context,
@@ -516,7 +692,8 @@ pub fn setRenderCallback(self: *Js, window_id: u32, callback: ?RenderCallbackFn,
 }
 
 pub fn setFocusCallback(self: *Js, window_id: u32, callback: ?FocusCallbackFn, context: ?*anyopaque) void {
-    const window = self.setCurrentWindow(window_id) catch return;
+    const window = self.getWindowContext(window_id) catch return;
+    if (window.retired) return;
     window.focus_callback = .{
         .function = callback,
         .context = context,
@@ -524,7 +701,8 @@ pub fn setFocusCallback(self: *Js, window_id: u32, callback: ?FocusCallbackFn, c
 }
 
 pub fn setDomMutationCallback(self: *Js, window_id: u32, callback: ?DomMutationCallbackFn, context: ?*anyopaque) void {
-    const window = self.setCurrentWindow(window_id) catch return;
+    const window = self.getWindowContext(window_id) catch return;
+    if (window.retired) return;
     window.dom_mutation_callback = .{
         .function = callback,
         .context = context,
@@ -537,7 +715,8 @@ pub fn setDomMutationCompleteCallback(
     callback: ?DomMutationCompleteCallbackFn,
     context: ?*anyopaque,
 ) void {
-    const window = self.setCurrentWindow(window_id) catch return;
+    const window = self.getWindowContext(window_id) catch return;
+    if (window.retired) return;
     window.dom_mutation_complete_callback = .{
         .function = callback,
         .context = context,
@@ -545,7 +724,8 @@ pub fn setDomMutationCompleteCallback(
 }
 
 pub fn setXhrCallback(self: *Js, window_id: u32, callback: ?XhrCallbackFn, context: ?*anyopaque) void {
-    const window = self.setCurrentWindow(window_id) catch return;
+    const window = self.getWindowContext(window_id) catch return;
+    if (window.retired) return;
     window.xhr_callback = .{
         .function = callback,
         .context = context,
@@ -559,7 +739,8 @@ pub fn setCookieCallbacks(
     set_callback: ?CookieSetCallbackFn,
     context: ?*anyopaque,
 ) void {
-    const window = self.setCurrentWindow(window_id) catch return;
+    const window = self.getWindowContext(window_id) catch return;
+    if (window.retired) return;
     window.cookie_callback = .{
         .get_function = get_callback,
         .set_function = set_callback,
@@ -568,7 +749,8 @@ pub fn setCookieCallbacks(
 }
 
 pub fn setSetTimeoutCallback(self: *Js, window_id: u32, callback: ?SetTimeoutCallbackFn, context: ?*anyopaque) void {
-    const window = self.setCurrentWindow(window_id) catch return;
+    const window = self.getWindowContext(window_id) catch return;
+    if (window.retired) return;
     window.set_timeout_callback = .{
         .function = callback,
         .context = context,
@@ -581,7 +763,8 @@ pub fn setClearIntervalCallback(
     callback: ?ClearIntervalCallbackFn,
     context: ?*anyopaque,
 ) void {
-    const window = self.setCurrentWindow(window_id) catch return;
+    const window = self.getWindowContext(window_id) catch return;
+    if (window.retired) return;
     window.clear_interval_callback = .{
         .function = callback,
         .context = context,
@@ -589,15 +772,142 @@ pub fn setClearIntervalCallback(
 }
 
 pub fn setAnimationFrameCallback(self: *Js, window_id: u32, callback: ?AnimationFrameCallbackFn, context: ?*anyopaque) void {
-    const window = self.setCurrentWindow(window_id) catch return;
+    const window = self.getWindowContext(window_id) catch return;
+    if (window.retired) return;
     window.animation_frame_callback = .{
         .function = callback,
         .context = context,
     };
 }
 
+/// Install the synchronous browser-owned source of `document.readyState` for
+/// one live document Realm. The callback context is a generation-bound borrow
+/// and must be cleared before its Frame is retired.
+pub fn setDocumentReadyStateCallback(
+    self: *Js,
+    window_id: u32,
+    callback: ?DocumentReadyStateCallbackFn,
+    context: ?*anyopaque,
+) void {
+    const window = self.getWindowContext(window_id) catch return;
+    if (window.retired) return;
+    window.document_ready_state_callback = .{
+        .function = callback,
+        .context = context,
+    };
+}
+
+/// Install or clear one synchronous parser-active `document.write` sink for a
+/// live document Realm. Callers install it around direct parser-script
+/// evaluation and clear it before returning to the event loop; the context
+/// may therefore be a stack-bound parser driver and must never be queued.
+pub fn setDocumentWriteCallback(
+    self: *Js,
+    window_id: u32,
+    callback: ?DocumentWriteCallbackFn,
+    context: ?*anyopaque,
+) void {
+    const window = self.getWindowContext(window_id) catch return;
+    if (window.retired) return;
+    window.document_write_callback = .{
+        .function = callback,
+        .context = context,
+    };
+}
+
+/// Install or clear an observer for relocatable Nodes in one live Realm.
+///
+/// This is intentionally narrower than a normal browser callback: a live
+/// parser may pass a stack-bound context, install it immediately before one
+/// direct `evaluate`, and clear it before parser control yields or the Frame
+/// can retire. The observer is consulted only by synchronous DOM child-array
+/// mutation; a missing observer preserves the ordinary JavaScript-only path.
+pub fn setNodeRelocationObserver(
+    self: *Js,
+    window_id: u32,
+    observer: ?NodeRelocationObserver,
+) void {
+    const window = self.getWindowContext(window_id) catch return;
+    if (window.retired) return;
+    window.node_relocation_observer = observer;
+}
+
+/// Return the current document Realm's JavaScript-handle relocation observer.
+///
+/// A live parser may install this observer around its own by-value child-array
+/// moves so wrappers created by an earlier parser-blocking script keep their
+/// stable numeric identities. The returned value borrows the existing
+/// WindowRealm; it never creates one. It is valid only while that document
+/// generation remains live, and callers must clear it from parser state before
+/// Frame/Realm retirement.
+///
+/// The observer is deliberately distinct from `setNodeRelocationObserver`:
+/// that setter lets JavaScript-originated mutations repair a parser-owned pin
+/// table, while this getter lets parser-originated moves repair JavaScript's
+/// Realm-owned handle table.
+pub fn nodeHandleRelocationObserver(
+    self: *Js,
+    window_id: u32,
+) ?NodeRelocationObserver {
+    self.lock.lock();
+    defer self.lock.unlock();
+    const window = self.windows.get(window_id) orelse return null;
+    if (window.retired) return null;
+    return .{
+        .context = window,
+        .unpublish = unpublishNodeHandleForRelocation,
+        .rebind = rebindNodeHandleAfterRelocation,
+        .retire = retireNodeHandleAfterRelocation,
+    };
+}
+
+fn relocationObserverWindow(context: *anyopaque) *WindowRealm {
+    const unaligned: *align(1) WindowRealm = @ptrCast(context);
+    return @alignCast(unaligned);
+}
+
+fn relocationObserverNode(item: *anyopaque) *Node {
+    const unaligned: *align(1) Node = @ptrCast(item);
+    return @alignCast(unaligned);
+}
+
+fn relocationObserverHandle(token: NodeRelocationObserver.Token) u32 {
+    std.debug.assert(token > 0 and token <= std.math.maxInt(u32));
+    return @intCast(token);
+}
+
+fn unpublishNodeHandleForRelocation(
+    context: *anyopaque,
+    item: *anyopaque,
+) ?NodeRelocationObserver.Token {
+    const window = relocationObserverWindow(context);
+    if (window.retired) return null;
+    const handle = window.handles.unpublishPointer(relocationObserverNode(item)) orelse return null;
+    return handle;
+}
+
+fn rebindNodeHandleAfterRelocation(
+    context: *anyopaque,
+    item: *anyopaque,
+    token: NodeRelocationObserver.Token,
+) void {
+    const window = relocationObserverWindow(context);
+    if (window.retired) return;
+    window.handles.bindAssumeCapacity(relocationObserverNode(item), relocationObserverHandle(token));
+}
+
+fn retireNodeHandleAfterRelocation(
+    context: *anyopaque,
+    token: NodeRelocationObserver.Token,
+) void {
+    const window = relocationObserverWindow(context);
+    if (window.retired) return;
+    window.handles.retireIdentity(relocationObserverHandle(token));
+}
+
 pub fn setPostMessageCallback(self: *Js, window_id: u32, callback: ?PostMessageCallbackFn, context: ?*anyopaque) void {
-    const window = self.setCurrentWindow(window_id) catch return;
+    const window = self.getWindowContext(window_id) catch return;
+    if (window.retired) return;
     window.post_message_callback = .{
         .function = callback,
         .context = context,
@@ -613,13 +923,12 @@ pub fn setParentWindow(self: *Js, child_window_id: u32, parent_window_id: ?u32) 
 }
 
 /// Publish a stable numeric identity in this window's current DOM generation.
-fn getHandle(self: *Js, window: *WindowContext, node: *Node) !u32 {
-    _ = self;
-    return window.handles.getOrCreate(node);
+fn getHandle(self: *Js, window: *WindowRealm, node: *Node) !u32 {
+    return window.handles.getOrCreate(node, &self.handle_issuer);
 }
 
 /// Resolve a handle without asserting that its Node remains attached.
-fn getNode(self: *Js, window: *WindowContext, handle: u32) ?*Node {
+fn getNode(self: *Js, window: *WindowRealm, handle: u32) ?*Node {
     _ = self;
     return window.handles.resolve(handle);
 }
@@ -656,11 +965,11 @@ fn collectNamedElements(
     }
 }
 
-/// Replace one window's JavaScript-side ID registry with wrappers for its
-/// current DOM generation. Only the active window's registry is installed on
-/// globalThis; __setActiveWindow swaps registries when realms are activated.
-fn syncNamedIdGlobals(self: *Js, window_id: u32, window: *WindowContext) Agent.Error!void {
-    if (!self.runtime_initialized) {
+/// Replace this document realm's JavaScript-side ID registry with wrappers for
+/// its current DOM generation. Each document now owns a global object, so no
+/// cross-window activation swap is necessary.
+fn syncNamedIdGlobals(self: *Js, window_id: u32, window: *WindowRealm) Agent.Error!void {
+    if (!window.runtime_initialized or window.retired) {
         window.named_globals_synced = false;
         return;
     }
@@ -704,9 +1013,9 @@ fn syncNamedIdGlobals(self: *Js, window_id: u32, window: *WindowContext) Agent.E
     window.named_globals_synced = true;
 }
 
-fn clearNamedIdGlobals(self: *Js, window_id: u32, window: *WindowContext) Agent.Error!void {
+fn clearNamedIdGlobals(self: *Js, window_id: u32, window: *WindowRealm) Agent.Error!void {
     window.named_globals_synced = false;
-    if (!self.runtime_initialized) return;
+    if (!window.runtime_initialized or window.retired) return;
     const key = kiesel.types.PropertyKey.from("__clearIdGlobals");
     const fn_value = try window.realm.global_object.get(&self.agent, key);
     if (!fn_value.isCallable()) return;
@@ -714,7 +1023,7 @@ fn clearNamedIdGlobals(self: *Js, window_id: u32, window: *WindowContext) Agent.
     _ = try fn_value.call(&self.agent, .undefined, &.{window_value});
 }
 
-fn clearDetachedNodes(self: *Js, window: *WindowContext) void {
+fn clearDetachedNodes(self: *Js, window: *WindowRealm) void {
     var it = window.detached_nodes.keyIterator();
     while (it.next()) |node_ptr| {
         const node = node_ptr.*;
@@ -726,7 +1035,7 @@ fn clearDetachedNodes(self: *Js, window: *WindowContext) void {
 
 fn requestRender(self: *Js) void {
     const window_id = self.current_window_id orelse return;
-    const window = self.windows.getPtr(window_id) orelse return;
+    const window = self.windows.get(window_id) orelse return;
     if (window.render_callback.function) |callback| {
         const context = window.render_callback.context orelse return;
         callback(context) catch |err| {
@@ -745,7 +1054,7 @@ fn hostFromBindingContext(context: ?*anyopaque) *Js {
 fn resolveCanvasBindingElement(context: ?*anyopaque, handle: u32) ?*parser.Element {
     const self = hostFromBindingContext(context);
     const window_id = self.current_window_id orelse return null;
-    const window = self.windows.getPtr(window_id) orelse return null;
+    const window = self.windows.get(window_id) orelse return null;
     const node = window.handles.resolve(handle) orelse return null;
     return switch (node.*) {
         .element => |*element| element,
@@ -756,12 +1065,25 @@ fn resolveCanvasBindingElement(context: ?*anyopaque, handle: u32) ?*parser.Eleme
 fn activeEventFocusWindow(context: ?*anyopaque) ?event_focus_bindings.WindowBorrow {
     const self = hostFromBindingContext(context);
     const window_id = self.current_window_id orelse return null;
-    const window = self.windows.getPtr(window_id) orelse return null;
+    const window = self.windows.get(window_id) orelse return null;
     return .{
         .current_nodes = window.current_nodes,
         .handles = &window.handles,
+        .handle_issuer = &self.handle_issuer,
         .focus_context = window.focus_callback.context,
         .focus = window.focus_callback.function,
+    };
+}
+
+fn activeDomTreeWindow(context: ?*anyopaque) ?dom_tree_bindings.WindowBorrow {
+    const self = hostFromBindingContext(context);
+    const window_id = self.current_window_id orelse return null;
+    const window = self.windows.get(window_id) orelse return null;
+    if (window.retired) return null;
+    return .{
+        .current_nodes = window.current_nodes,
+        .handles = &window.handles,
+        .handle_issuer = &self.handle_issuer,
     };
 }
 
@@ -783,7 +1105,7 @@ fn parentBindingWindowId(context: ?*anyopaque, window_id: u32) ?u32 {
 fn getBindingCookie(context: ?*anyopaque) anyerror!CookieResult {
     const self = hostFromBindingContext(context);
     const window_id = self.current_window_id orelse return error.MissingActiveWindow;
-    const window = self.windows.getPtr(window_id) orelse return error.MissingWindowContext;
+    const window = self.windows.get(window_id) orelse return error.MissingWindowContext;
     const callback = window.cookie_callback.get_function orelse return .{ .data = "" };
     return callback(window.cookie_callback.context);
 }
@@ -791,9 +1113,21 @@ fn getBindingCookie(context: ?*anyopaque) anyerror!CookieResult {
 fn setBindingCookie(context: ?*anyopaque, value: []const u8) anyerror!void {
     const self = hostFromBindingContext(context);
     const window_id = self.current_window_id orelse return error.MissingActiveWindow;
-    const window = self.windows.getPtr(window_id) orelse return error.MissingWindowContext;
+    const window = self.windows.get(window_id) orelse return error.MissingWindowContext;
     const callback = window.cookie_callback.set_function orelse return;
     try callback(window.cookie_callback.context, value);
+}
+
+/// Forward a callback-scoped JavaScript string only while the active document
+/// has an explicitly installed parser-write sink. No sink means post-parse
+/// writes are a bounded no-op rather than an implicit document replacement.
+fn writeBindingDocument(context: ?*anyopaque, source: []const u8) anyerror!void {
+    const self = hostFromBindingContext(context);
+    const window_id = self.current_window_id orelse return error.MissingActiveWindow;
+    const window = self.windows.get(window_id) orelse return error.MissingWindowContext;
+    if (window.retired) return;
+    const callback = window.document_write_callback.function orelse return;
+    try callback(window.document_write_callback.context, source);
 }
 
 fn sendBindingXhr(
@@ -806,7 +1140,7 @@ fn sendBindingXhr(
 ) anyerror!XhrResult {
     const self = hostFromBindingContext(context);
     const window_id = self.current_window_id orelse return error.MissingActiveWindow;
-    const window = self.windows.getPtr(window_id) orelse return error.MissingWindowContext;
+    const window = self.windows.get(window_id) orelse return error.MissingWindowContext;
     const callback = window.xhr_callback.function orelse return error.XmlHttpRequestUnavailable;
     return callback(window.xhr_callback.context, method, url, body, is_async, handle);
 }
@@ -819,7 +1153,7 @@ fn sendBindingPostMessage(
     message: []const u8,
 ) anyerror!void {
     const self = hostFromBindingContext(context);
-    const window = self.windows.getPtr(source_window_id) orelse return error.MissingWindowContext;
+    const window = self.windows.get(source_window_id) orelse return error.MissingWindowContext;
     const callback = window.post_message_callback.function orelse return;
     try callback(
         window.post_message_callback.context,
@@ -838,7 +1172,7 @@ fn scheduleBindingTimer(
 ) anyerror!void {
     const self = hostFromBindingContext(context);
     const window_id = self.current_window_id orelse return error.MissingActiveWindow;
-    const window = self.windows.getPtr(window_id) orelse return error.MissingWindowContext;
+    const window = self.windows.get(window_id) orelse return error.MissingWindowContext;
     const callback = window.set_timeout_callback.function orelse return;
     try callback(window.set_timeout_callback.context, handle, delay_ms, is_interval);
 }
@@ -846,7 +1180,7 @@ fn scheduleBindingTimer(
 fn clearBindingTimer(context: ?*anyopaque, handle: u32) void {
     const self = hostFromBindingContext(context);
     const window_id = self.current_window_id orelse return;
-    const window = self.windows.getPtr(window_id) orelse return;
+    const window = self.windows.get(window_id) orelse return;
     const callback = window.clear_interval_callback.function orelse return;
     callback(window.clear_interval_callback.context, handle);
 }
@@ -854,7 +1188,7 @@ fn clearBindingTimer(context: ?*anyopaque, handle: u32) void {
 fn requestBindingAnimationFrame(context: ?*anyopaque) anyerror!void {
     const self = hostFromBindingContext(context);
     const window_id = self.current_window_id orelse return error.MissingActiveWindow;
-    const window = self.windows.getPtr(window_id) orelse return error.MissingWindowContext;
+    const window = self.windows.get(window_id) orelse return error.MissingWindowContext;
     const callback = window.animation_frame_callback.function orelse return;
     try callback(window.animation_frame_callback.context);
 }
@@ -862,13 +1196,14 @@ fn requestBindingAnimationFrame(context: ?*anyopaque) anyerror!void {
 fn domMutationContext(
     self: *Js,
     window_id: u32,
-    window: *WindowContext,
+    window: *WindowRealm,
 ) dom_mutation.Context {
     return .{
         .allocator = self.allocator,
         .window_id = window_id,
         .current_nodes = window.current_nodes,
         .handles = &window.handles,
+        .relocation_observer = window.node_relocation_observer,
         .detached_nodes = &window.detached_nodes,
         .can_retain_layout_insert = window.dom_mutation_callback.function != null,
         .host_context = self,
@@ -889,7 +1224,7 @@ fn hostFromMutationContext(context: ?*anyopaque) *Js {
 fn prepareDomMutation(context: ?*anyopaque, mutation_root: *Node, kind: DomMutationKind) void {
     const self = hostFromMutationContext(context);
     const window_id = self.current_window_id orelse return;
-    const window = self.windows.getPtr(window_id) orelse return;
+    const window = self.windows.get(window_id) orelse return;
     if (kind == .structural) {
         if (window.current_nodes) |root| parser.clearStyleInvalidations(root);
     }
@@ -901,7 +1236,7 @@ fn prepareDomMutation(context: ?*anyopaque, mutation_root: *Node, kind: DomMutat
 fn completeDomMutation(context: ?*anyopaque, mutation_root: *Node) void {
     const self = hostFromMutationContext(context);
     const window_id = self.current_window_id orelse return;
-    const window = self.windows.getPtr(window_id) orelse return;
+    const window = self.windows.get(window_id) orelse return;
     if (window.dom_mutation_complete_callback.function) |callback| {
         // Retiring a same-origin child Frame clears that child's window in the
         // shared Js host and temporarily changes current_window_id. The native
@@ -914,18 +1249,131 @@ fn completeDomMutation(context: ?*anyopaque, mutation_root: *Node) void {
 
 fn clearDomMutationGlobals(context: ?*anyopaque, window_id: u32) Agent.Error!void {
     const self = hostFromMutationContext(context);
-    const window = self.windows.getPtr(window_id) orelse return;
+    const window = self.windows.get(window_id) orelse return;
     try self.clearNamedIdGlobals(window_id, window);
 }
 
 fn syncDomMutationGlobals(context: ?*anyopaque, window_id: u32) Agent.Error!void {
     const self = hostFromMutationContext(context);
-    const window = self.windows.getPtr(window_id) orelse return;
+    const window = self.windows.get(window_id) orelse return;
     try self.syncNamedIdGlobals(window_id, window);
 }
 
 fn requestDomMutationRender(context: ?*anyopaque) void {
     hostFromMutationContext(context).requestRender();
+}
+
+/// Dispatch one generation-checked document lifecycle event into an already
+/// initialized document Realm. Missing, retired, or not-yet-bootstrapped
+/// realms intentionally suppress delivery: a stale queued task must not
+/// revive a document or allocate a replacement Realm.
+///
+/// JavaScript listener exceptions are reported by the VM but do not make the
+/// browser lifecycle task fail. Allocation, interruption, and other host
+/// failures still reach the caller.
+pub fn dispatchLifecycleEvent(
+    self: *Js,
+    window_id: u32,
+    event: LifecycleEvent,
+) !void {
+    self.lock.lock();
+    defer self.lock.unlock();
+
+    // Do not call `activateWindowLocked` until an existing live Realm has
+    // been found: activation otherwise creates a fresh realm for a stale
+    // window id, which would violate lifecycle-task generation suppression.
+    const existing = self.windows.get(window_id) orelse return;
+    if (existing.retired or !existing.runtime_initialized) return;
+
+    const active = try self.activateWindowLocked(window_id);
+    defer active.restore();
+    const window = active.window;
+    if (window.retired or !window.runtime_initialized) return;
+    try self.setActiveWindow(window_id, window);
+
+    const dispatch_key = kiesel.types.PropertyKey.from("__dispatchLifecycleEvent");
+    const dispatch_value = try window.realm.global_object.get(&self.agent, dispatch_key);
+    if (!dispatch_value.isCallable()) return;
+
+    const event_name = switch (event) {
+        .dom_content_loaded => "DOMContentLoaded",
+        .load => "load",
+    };
+    const event_value = try self.stringToJsValue(event_name);
+    _ = dispatch_value.call(&self.agent, .undefined, &.{event_value}) catch |err| switch (err) {
+        error.ExceptionThrown => {
+            std.log.warn("Lifecycle {s} listener threw; continuing document lifecycle", .{@tagName(event)});
+            return;
+        },
+        else => return self.translateExecutionError(err),
+    };
+}
+
+/// Dispatch an authored `on<event_type>` attribute on one Element.
+///
+/// This is a synchronous, generation-bound Browser entry point: `node` must
+/// belong to the current document for `window_id` for the duration of this
+/// call and is never retained. A missing handler, missing/retired Realm, or
+/// non-Element node is an inert successful dispatch. The runtime initializes
+/// an existing Realm on demand so a document with only `<body onload>` still
+/// gets its first JavaScript execution environment, but this method never
+/// creates a replacement Realm for an absent window id.
+///
+/// The handler receives a normal Event whose `target` and `currentTarget` are
+/// the element's canonical Node wrapper, and `this` is that wrapper. Handler
+/// syntax/runtime exceptions are reported and contained; allocation and VM
+/// interruption failures still reach the caller. Returning false from the
+/// handler prevents the event's default action.
+pub fn dispatchInlineEvent(
+    self: *Js,
+    window_id: u32,
+    event_type: []const u8,
+    node: *Node,
+    bubbles: bool,
+) !bool {
+    const source = try inline_event.sourceFor(self.allocator, node, event_type) orelse return true;
+
+    self.lock.lock();
+    defer self.lock.unlock();
+
+    // Do not activate until we know that a live document Realm exists.
+    // Activating an absent id would allocate a fresh Realm for stale browser
+    // lifecycle work, which is precisely what this delivery seam avoids.
+    const existing = self.windows.get(window_id) orelse return true;
+    if (existing.retired) return true;
+
+    const active = try self.activateWindowLocked(window_id);
+    defer active.restore();
+    const window = active.window;
+    if (window.retired or window.current_nodes == null) return true;
+    try self.ensureRuntimeInitializedLocked(window_id, window);
+    try self.setActiveWindow(window_id, window);
+
+    const handle = try self.getHandle(window, node);
+    const invocation = try inline_event.buildInvocation(self.allocator, .{
+        .handle = handle,
+        .event_type = event_type,
+        .source = source,
+        .bubbles = bubbles,
+    });
+    defer self.allocator.free(invocation);
+
+    const script = Script.parse(invocation, window.realm, null, .{}) catch |err| switch (err) {
+        error.ParseError => {
+            std.log.warn("Ignoring malformed inline {s} handler", .{event_type});
+            return true;
+        },
+        error.OutOfMemory => return err,
+    };
+    const result = script.evaluate("zibra-inline-event") catch |err| switch (err) {
+        error.ExceptionThrown => {
+            if (self.agent.takeExecutionInterrupt()) return error.ExecutionInterrupted;
+            std.log.warn("Inline {s} handler threw; continuing event delivery", .{event_type});
+            return true;
+        },
+        else => return self.translateExecutionError(err),
+    };
+    return result.toBoolean();
 }
 
 /// Dispatch an event to the JavaScript environment for the given node
@@ -985,8 +1433,29 @@ fn dispatchEventWithBubblesLocked(
     bubbles: bool,
     activate_window: bool,
 ) !bool {
-    const window = try self.setCurrentWindow(window_id);
-    if (activate_window) try self.setActiveWindow(window_id, window);
+    if (activate_window) {
+        const active = try self.activateWindowLocked(window_id);
+        defer active.restore();
+        try self.setActiveWindow(window_id, active.window);
+        return self.dispatchEventWithBubblesForWindowLocked(
+            active.window,
+            event_type,
+            node,
+            bubbles,
+        );
+    }
+    const window = self.windows.get(window_id) orelse return error.MissingWindowContext;
+    if (window.retired) return true;
+    return self.dispatchEventWithBubblesForWindowLocked(window, event_type, node, bubbles);
+}
+
+fn dispatchEventWithBubblesForWindowLocked(
+    self: *Js,
+    window: *WindowRealm,
+    event_type: []const u8,
+    node: *Node,
+    bubbles: bool,
+) !bool {
     if (window.current_nodes == null) return true;
 
     const handle = try self.getHandle(window, node);
@@ -1020,6 +1489,8 @@ fn dispatchEventWithBubblesLocked(
 pub fn captureNodeHandle(self: *Js, window_id: u32, node: *Node) !u32 {
     self.lock.lock();
     defer self.lock.unlock();
+    const active = try self.activateWindowLocked(window_id);
+    defer active.restore();
     return self.captureNodeHandleLocked(window_id, node);
 }
 
@@ -1031,7 +1502,8 @@ pub fn captureNodeHandleFromNativeCallback(self: *Js, window_id: u32, node: *Nod
 }
 
 fn captureNodeHandleLocked(self: *Js, window_id: u32, node: *Node) !u32 {
-    const window = try self.setCurrentWindow(window_id);
+    const window = self.windows.get(window_id) orelse return error.MissingWindowContext;
+    if (window.retired) return error.InertWindow;
     if (!dom_mutation.isAttachedToCurrentDocument(window.current_nodes, node)) return error.DetachedNode;
     return self.getHandle(window, node);
 }
@@ -1042,6 +1514,8 @@ fn captureNodeHandleLocked(self: *Js, window_id: u32, node: *Node) !u32 {
 pub fn resolveAttachedNode(self: *Js, window_id: u32, handle: u32) ?*Node {
     self.lock.lock();
     defer self.lock.unlock();
+    const active = self.activateWindowLocked(window_id) catch return null;
+    defer active.restore();
     return self.resolveAttachedNodeLocked(window_id, handle);
 }
 
@@ -1053,7 +1527,8 @@ pub fn resolveAttachedNodeFromNativeCallback(self: *Js, window_id: u32, handle: 
 }
 
 fn resolveAttachedNodeLocked(self: *Js, window_id: u32, handle: u32) ?*Node {
-    const window = self.windows.getPtr(window_id) orelse return null;
+    const window = self.windows.get(window_id) orelse return null;
+    if (window.retired) return null;
     const node = self.getNode(window, handle) orelse return null;
     return if (dom_mutation.isAttachedToCurrentDocument(window.current_nodes, node)) node else null;
 }
@@ -1067,9 +1542,12 @@ pub fn dispatchPostMessage(
 ) !void {
     self.lock.lock();
     defer self.lock.unlock();
-    const window = try self.setCurrentWindow(window_id);
+    const active = try self.activateWindowLocked(window_id);
+    defer active.restore();
+    const window = active.window;
+    if (window.retired) return;
     try self.setActiveWindow(window_id, window);
-    if (!self.runtime_initialized) {
+    if (!window.runtime_initialized) {
         const message_copy = try self.allocator.dupe(u8, message);
         errdefer self.allocator.free(message_copy);
         const origin_copy = try self.allocator.dupe(u8, origin);
@@ -1087,7 +1565,7 @@ pub fn dispatchPostMessage(
 
 fn dispatchMessageImpl(
     self: *Js,
-    window: *WindowContext,
+    window: *WindowRealm,
     message: []const u8,
     origin: []const u8,
     source_window_id: u32,
@@ -1111,7 +1589,10 @@ fn dispatchMessageImpl(
 pub fn runTimeoutCallback(self: *Js, window_id: u32, handle: u32) !void {
     self.lock.lock();
     defer self.lock.unlock();
-    const window = try self.setCurrentWindow(window_id);
+    const active = try self.activateWindowLocked(window_id);
+    defer active.restore();
+    const window = active.window;
+    if (window.retired) return error.InertWindow;
     try self.setActiveWindow(window_id, window);
     const key = kiesel.types.PropertyKey.from("__runSetTimeout");
     const fn_value = window.realm.global_object.get(&self.agent, key) catch {
@@ -1127,7 +1608,10 @@ pub fn runTimeoutCallback(self: *Js, window_id: u32, handle: u32) !void {
 pub fn runAnimationFrameHandlers(self: *Js, window_id: u32) void {
     self.lock.lock();
     defer self.lock.unlock();
-    const window = self.setCurrentWindow(window_id) catch return;
+    const active = self.activateWindowLocked(window_id) catch return;
+    defer active.restore();
+    const window = active.window;
+    if (window.retired) return;
     self.setActiveWindow(window_id, window) catch return;
     const key = kiesel.types.PropertyKey.from("__runRAFHandlers");
     const fn_value = window.realm.global_object.get(&self.agent, key) catch return;
@@ -1137,7 +1621,7 @@ pub fn runAnimationFrameHandlers(self: *Js, window_id: u32) void {
     };
 }
 
-fn resetEventListenersImpl(self: *Js, window: *WindowContext, window_id: u32) void {
+fn resetEventListenersImpl(self: *Js, window: *WindowRealm, window_id: u32) void {
     self.setActiveWindow(window_id, window) catch return;
     const reset_key = kiesel.types.PropertyKey.from("__resetEventListeners");
     const reset_value = window.realm.global_object.get(&self.agent, reset_key) catch return;
@@ -1161,8 +1645,8 @@ fn copiedStringToJsValue(self: *Js, text: []const u8) !Value {
     return self.stringToJsValue(stable_text);
 }
 
-fn setActiveWindow(self: *Js, window_id: u32, window: *WindowContext) !void {
-    if (!self.runtime_initialized) return;
+fn setActiveWindow(self: *Js, window_id: u32, window: *WindowRealm) !void {
+    if (!window.runtime_initialized or window.retired) return;
     const key = kiesel.types.PropertyKey.from("__setActiveWindow");
     const fn_value = try window.realm.global_object.get(&self.agent, key);
     if (!fn_value.isCallable()) return;
@@ -1173,7 +1657,10 @@ fn setActiveWindow(self: *Js, window_id: u32, window: *WindowContext) !void {
 pub fn runXhrOnload(self: *Js, window_id: u32, handle: u32, body: []const u8) !void {
     self.lock.lock();
     defer self.lock.unlock();
-    const window = try self.setCurrentWindow(window_id);
+    const active = try self.activateWindowLocked(window_id);
+    defer active.restore();
+    const window = active.window;
+    if (window.retired) return error.InertWindow;
     try self.setActiveWindow(window_id, window);
     const key = kiesel.types.PropertyKey.from("__runXHROnload");
     const fn_value = try window.realm.global_object.get(&self.agent, key);
@@ -1264,6 +1751,426 @@ fn findTestElementById(root: *Node, id: []const u8) !*Node {
         }
     }
     return error.MissingTestElement;
+}
+
+test "document realms isolate globals listeners and active-window state" {
+    const allocator = std.testing.allocator;
+    var first_parser = try parser.HTMLParser.init(allocator, "<main><button id=first>First</button></main>");
+    first_parser.use_implicit_tags = false;
+    defer first_parser.deinit(allocator);
+    var first_root = try first_parser.parse();
+    defer first_root.deinit(allocator);
+    parser.fixParentPointers(&first_root, null);
+    const first_button = try findTestElementById(&first_root, "first");
+
+    var second_parser = try parser.HTMLParser.init(allocator, "<main><button id=second>Second</button></main>");
+    second_parser.use_implicit_tags = false;
+    defer second_parser.deinit(allocator);
+    var second_root = try second_parser.parse();
+    defer second_root.deinit(allocator);
+    parser.fixParentPointers(&second_root, null);
+    const second_button = try findTestElementById(&second_root, "second");
+
+    var environ = std.process.Environ.Map.init(allocator);
+    defer environ.deinit();
+    var js = try Js.init(allocator, std.testing.io, &environ);
+    defer js.deinit(allocator);
+    js.setNodes(10, &first_root);
+    defer js.setNodes(10, null);
+    js.setNodes(20, &second_root);
+    defer js.setNodes(20, null);
+
+    _ = try js.evaluate(10,
+        \\var realmName = 'first';
+        \\var firstOnly = true;
+        \\var listenerCount = 0;
+        \\document.querySelectorAll('button')[0].addEventListener('probe', function() {
+        \\  listenerCount += 1;
+        \\});
+        \\true
+    );
+    _ = try js.evaluate(20,
+        \\var realmName = 'second';
+        \\var secondOnly = true;
+        \\var listenerCount = 0;
+        \\document.querySelectorAll('button')[0].addEventListener('probe', function() {
+        \\  listenerCount += 1;
+        \\});
+        \\true
+    );
+    try std.testing.expectEqual(@as(?u32, null), js.current_window_id);
+
+    try std.testing.expect(try js.dispatchEvent(10, "probe", first_button));
+    try std.testing.expect(try js.dispatchEvent(20, "probe", second_button));
+    try std.testing.expectEqual(@as(?u32, null), js.current_window_id);
+
+    // Every WindowRealm is a GC-rooted heap owner even though the Agent is
+    // shared. A collection must not drop either global object or its listener
+    // registry.
+    kiesel.gc.collect();
+    kiesel.gc.collect();
+    const first_result = try js.evaluate(
+        10,
+        "realmName === 'first' && listenerCount === 1 && typeof secondOnly === 'undefined'",
+    );
+    try std.testing.expect(first_result.toBoolean());
+    const second_result = try js.evaluate(
+        20,
+        "realmName === 'second' && listenerCount === 1 && typeof firstOnly === 'undefined'",
+    );
+    try std.testing.expect(second_result.toBoolean());
+}
+
+test "replacing a document creates a fresh realm and retires the old handles" {
+    const allocator = std.testing.allocator;
+    var old_parser = try parser.HTMLParser.init(allocator, "<main><button id=old>Old</button></main>");
+    old_parser.use_implicit_tags = false;
+    defer old_parser.deinit(allocator);
+    var old_root = try old_parser.parse();
+    defer old_root.deinit(allocator);
+    parser.fixParentPointers(&old_root, null);
+    const old_button = try findTestElementById(&old_root, "old");
+
+    var new_parser = try parser.HTMLParser.init(allocator, "<main><button id=new>New</button></main>");
+    new_parser.use_implicit_tags = false;
+    defer new_parser.deinit(allocator);
+    var new_root = try new_parser.parse();
+    defer new_root.deinit(allocator);
+    parser.fixParentPointers(&new_root, null);
+    const new_button = try findTestElementById(&new_root, "new");
+
+    var environ = std.process.Environ.Map.init(allocator);
+    defer environ.deinit();
+    var js = try Js.init(allocator, std.testing.io, &environ);
+    defer js.deinit(allocator);
+    js.setNodes(7, &old_root);
+    defer js.setNodes(7, null);
+
+    _ = try js.evaluate(7,
+        \\var staleGlobal = 'old document';
+        \\var staleListenerCount = 0;
+        \\document.querySelectorAll('button')[0].addEventListener('probe', function() {
+        \\  staleListenerCount += 1;
+        \\});
+        \\true
+    );
+    const old_handle = try js.captureNodeHandle(7, old_button);
+
+    js.setNodes(7, &new_root);
+    try std.testing.expect(js.resolveAttachedNode(7, old_handle) == null);
+    try std.testing.expectEqual(@as(?u32, null), js.current_window_id);
+
+    _ = try js.evaluate(7,
+        \\var freshListenerCount = 0;
+        \\document.querySelectorAll('button')[0].addEventListener('probe', function() {
+        \\  freshListenerCount += 1;
+        \\});
+        \\typeof staleGlobal === 'undefined' &&
+        \\typeof staleListenerCount === 'undefined'
+    );
+    const new_handle = try js.captureNodeHandle(7, new_button);
+    try std.testing.expect(new_handle != old_handle);
+    try std.testing.expect(try js.dispatchEvent(7, "probe", new_button));
+    const fresh_result = try js.evaluate(
+        7,
+        "freshListenerCount === 1 && typeof staleListenerCount === 'undefined'",
+    );
+    try std.testing.expect(fresh_result.toBoolean());
+
+    js.setNodes(7, null);
+    try std.testing.expectError(error.InertWindow, js.evaluate(7, "true"));
+    try std.testing.expect(js.resolveAttachedNode(7, old_handle) == null);
+}
+
+test "lifecycle events target the current document realm and suppress retired realms" {
+    const ReadyStateProbe = struct {
+        state: ?DocumentReadyState = .loading,
+
+        fn read(context: ?*anyopaque) ?DocumentReadyState {
+            const raw = context orelse return null;
+            const unaligned: *align(1) @This() = @ptrCast(raw);
+            const self: *@This() = @alignCast(unaligned);
+            return self.state;
+        }
+    };
+
+    const allocator = std.testing.allocator;
+    var html_parser = try parser.HTMLParser.init(allocator, "<html><body><p>ready</p></body></html>");
+    html_parser.use_implicit_tags = false;
+    defer html_parser.deinit(allocator);
+    var root = try html_parser.parse();
+    defer root.deinit(allocator);
+    parser.fixParentPointers(&root, null);
+
+    var environ = std.process.Environ.Map.init(allocator);
+    defer environ.deinit();
+    var js = try Js.init(allocator, std.testing.io, &environ);
+    defer js.deinit(allocator);
+    js.setNodes(13, &root);
+    defer js.setNodes(13, null);
+
+    var ready_state = ReadyStateProbe{};
+    js.setDocumentReadyStateCallback(13, ReadyStateProbe.read, &ready_state);
+    ready_state.state = .complete;
+    try std.testing.expect((try js.evaluate(13, "document.readyState === 'complete'")).toBoolean());
+    ready_state.state = .loading;
+
+    _ = try js.evaluate(13,
+        \\var lifecycleLog = [];
+        \\var documentDelivery = false;
+        \\var windowDomContentLoadedDelivery = false;
+        \\var windowLoadDelivery = false;
+        \\var windowOnloadDelivery = false;
+        \\var throwingLifecycleListenerRan = false;
+        \\document.addEventListener('DOMContentLoaded', function() {
+        \\  throwingLifecycleListenerRan = true;
+        \\  throw 'expected lifecycle listener failure';
+        \\});
+        \\document.addEventListener('DOMContentLoaded', function(event) {
+        \\  documentDelivery = event.target === document && event.currentTarget === document && document.readyState === 'interactive';
+        \\  lifecycleLog.push('document');
+        \\});
+        \\window.addEventListener('DOMContentLoaded', function(event) {
+        \\  windowDomContentLoadedDelivery = event.target === window && event.currentTarget === window && document.readyState === 'interactive';
+        \\  lifecycleLog.push('window-dom');
+        \\});
+        \\window.addEventListener('load', function(event) {
+        \\  windowLoadDelivery = event.target === window && event.currentTarget === window && document.readyState === 'complete';
+        \\  lifecycleLog.push('window-load');
+        \\});
+        \\window.onload = function(event) {
+        \\  windowOnloadDelivery = event.target === window && event.currentTarget === window && document.readyState === 'complete';
+        \\  lifecycleLog.push('window-onload');
+        \\};
+        \\true
+    );
+
+    ready_state.state = .interactive;
+    try js.dispatchLifecycleEvent(13, .dom_content_loaded);
+    ready_state.state = .complete;
+    try js.dispatchLifecycleEvent(13, .load);
+    const delivered = try js.evaluate(
+        13,
+        "throwingLifecycleListenerRan && documentDelivery && windowDomContentLoadedDelivery && windowLoadDelivery && " ++
+            "windowOnloadDelivery && document.readyState === 'complete' && " ++
+            "lifecycleLog.join(',') === 'document,window-dom,window-load,window-onload'",
+    );
+    try std.testing.expect(delivered.toBoolean());
+    try std.testing.expectEqual(@as(?u32, null), js.current_window_id);
+
+    // A queued task resolving after navigation must not recreate the retired
+    // realm or invoke an old callback. A new install receives a clean realm.
+    js.setNodes(13, null);
+    try js.dispatchLifecycleEvent(13, .load);
+    try std.testing.expect(js.windows.get(13).?.retired);
+    js.setNodes(13, &root);
+    const fresh = try js.evaluate(13, "typeof lifecycleLog === 'undefined' && document.readyState === 'loading'");
+    try std.testing.expect(fresh.toBoolean());
+}
+
+test "inline DOM handlers bootstrap their realm and receive normal event targets" {
+    const allocator = std.testing.allocator;
+    var html_parser = try parser.HTMLParser.init(
+        allocator,
+        "<html><body id=body onload=\"inlineHandlerResult = this === document.body && event.target === this && event.currentTarget === this && event.type === 'load' && !event.bubbles; return false;\"></body></html>",
+    );
+    html_parser.use_implicit_tags = false;
+    defer html_parser.deinit(allocator);
+    var root = try html_parser.parse();
+    defer root.deinit(allocator);
+    parser.fixParentPointers(&root, null);
+    const body = try findTestElementById(&root, "body");
+
+    var environ = std.process.Environ.Map.init(allocator);
+    defer environ.deinit();
+    var js = try Js.init(allocator, std.testing.io, &environ);
+    defer js.deinit(allocator);
+    js.setNodes(31, &root);
+    defer js.setNodes(31, null);
+
+    // No ordinary page evaluation happened before delivery. A document with
+    // only an authored body onload must still initialize its live Realm.
+    try std.testing.expect(!js.windows.get(31).?.runtime_initialized);
+    try std.testing.expect(!try js.dispatchInlineEvent(31, "load", body, false));
+    try std.testing.expect(js.windows.get(31).?.runtime_initialized);
+    const result = try js.evaluate(
+        31,
+        "inlineHandlerResult && document.body === document.getElementById('body')",
+    );
+    try std.testing.expect(result.toBoolean());
+    try std.testing.expectEqual(@as(?u32, null), js.current_window_id);
+}
+
+test "inline DOM handler exceptions are contained after same-target listeners" {
+    const allocator = std.testing.allocator;
+    var html_parser = try parser.HTMLParser.init(
+        allocator,
+        "<html><body id=body onload=\"inlineOrder.push('attribute'); inlineEventOk = this === document.body && event.target === this && event.currentTarget === this; throw 'expected inline handler failure';\"></body></html>",
+    );
+    html_parser.use_implicit_tags = false;
+    defer html_parser.deinit(allocator);
+    var root = try html_parser.parse();
+    defer root.deinit(allocator);
+    parser.fixParentPointers(&root, null);
+    const body = try findTestElementById(&root, "body");
+
+    var environ = std.process.Environ.Map.init(allocator);
+    defer environ.deinit();
+    var js = try Js.init(allocator, std.testing.io, &environ);
+    defer js.deinit(allocator);
+    js.setNodes(32, &root);
+    defer js.setNodes(32, null);
+
+    _ = try js.evaluate(32,
+        \\var inlineOrder = [];
+        \\var listenerEventOk = false;
+        \\var inlineEventOk = false;
+        \\document.body.addEventListener('load', function(event) {
+        \\  listenerEventOk = event.target === document.body && event.currentTarget === document.body;
+        \\  inlineOrder.push('listener');
+        \\  event.stopPropagation();
+        \\});
+        \\true
+    );
+
+    // A target listener stopping propagation does not suppress the authored
+    // handler on that same target. The handler exception is caught in the
+    // runtime, so browser lifecycle delivery can continue.
+    try std.testing.expect(try js.dispatchInlineEvent(32, "load", body, false));
+    const result = try js.evaluate(
+        32,
+        "listenerEventOk && inlineEventOk && inlineOrder.join(',') === 'listener,attribute'",
+    );
+    try std.testing.expect(result.toBoolean());
+    try std.testing.expectEqual(@as(?u32, null), js.current_window_id);
+}
+
+test "document write forwards ordered payloads only while a sink is installed" {
+    const WriteProbe = struct {
+        allocator: std.mem.Allocator,
+        bytes: std.ArrayList(u8) = .empty,
+
+        fn write(context: ?*anyopaque, source: []const u8) anyerror!void {
+            const raw = context orelse return;
+            const unaligned: *align(1) @This() = @ptrCast(raw);
+            const self: *@This() = @alignCast(unaligned);
+            try self.bytes.appendSlice(self.allocator, source);
+            try self.bytes.append(self.allocator, '|');
+        }
+    };
+
+    const allocator = std.testing.allocator;
+    var html_parser = try parser.HTMLParser.init(allocator, "<html><body></body></html>");
+    html_parser.use_implicit_tags = false;
+    defer html_parser.deinit(allocator);
+    var root = try html_parser.parse();
+    defer root.deinit(allocator);
+    parser.fixParentPointers(&root, null);
+
+    var environ = std.process.Environ.Map.init(allocator);
+    defer environ.deinit();
+    var js = try Js.init(allocator, std.testing.io, &environ);
+    defer js.deinit(allocator);
+    js.setNodes(27, &root);
+    defer js.setNodes(27, null);
+
+    // A page cannot reopen/replace its document merely because this bounded
+    // implementation has no active parser driver.
+    try std.testing.expect((try js.evaluate(27, "document.write('ignored'); true")).toBoolean());
+
+    var writes = WriteProbe{ .allocator = allocator };
+    defer writes.bytes.deinit(allocator);
+    js.setDocumentWriteCallback(27, WriteProbe.write, &writes);
+    try std.testing.expect((try js.evaluate(
+        27,
+        "document.write('<p>', 'one', '</p>'); document.writeln(null, undefined); true",
+    )).toBoolean());
+    try std.testing.expectEqualStrings("<p>one</p>|nullundefined\n|", writes.bytes.items);
+
+    js.setDocumentWriteCallback(27, null, null);
+    try std.testing.expect((try js.evaluate(27, "document.write('ignored again'); true")).toBoolean());
+    try std.testing.expectEqualStrings("<p>one</p>|nullundefined\n|", writes.bytes.items);
+}
+
+test "document tree APIs preserve wrapper identity and authored text topology" {
+    const allocator = std.testing.allocator;
+    const html =
+        "<html><head></head><body>" ++
+        "<p id=first>one</p> \n <p id=second name=only-name>two<b>bold</b></p>" ++
+        "</body></html>";
+    var html_parser = try parser.HTMLParser.init(allocator, html);
+    html_parser.use_implicit_tags = false;
+    defer html_parser.deinit(allocator);
+    var root = try html_parser.parse();
+    defer root.deinit(allocator);
+    parser.fixParentPointers(&root, null);
+
+    var environ = std.process.Environ.Map.init(allocator);
+    defer environ.deinit();
+    var js = try Js.init(allocator, std.testing.io, &environ);
+    defer js.deinit(allocator);
+    js.setNodes(0, &root);
+    defer js.setNodes(0, null);
+
+    const result = try js.evaluate(0,
+        \\var rootNode = document.documentElement;
+        \\var bodyNode = document.body;
+        \\var first = document.getElementById('first');
+        \\var paragraphs = document.getElementsByTagName('P');
+        \\var second = paragraphs[1];
+        \\var whitespace = second.previousSibling;
+        \\var firstText = first.firstChild;
+        \\var eventIdentity = false;
+        \\first.addEventListener('identity', function(event) {
+        \\  eventIdentity = event.target === first && event.currentTarget === first;
+        \\});
+        \\first.dispatchEvent('identity');
+        \\var created = document.createElement('i');
+        \\bodyNode.appendChild(created);
+        \\var createdFromTag = bodyNode.getElementsByTagName('I')[0];
+        \\var treeCheckStates = [
+        \\  rootNode === document.getElementsByTagName('html')[0],
+        \\  bodyNode === document.querySelectorAll('body')[0],
+        \\  bodyNode === document.getElementsByTagName('body')[0],
+        \\  first === document.querySelectorAll('#first')[0],
+        \\  first.parentNode === bodyNode, bodyNode.parentNode === rootNode,
+        \\  rootNode.parentNode === null, bodyNode.firstChild === first,
+        \\  whitespace.nodeType === Node.TEXT_NODE, whitespace.nodeName === '#text',
+        \\  whitespace.data === ' \n ', whitespace.nodeValue === ' \n ',
+        \\  whitespace.previousSibling === first, whitespace.nextSibling === second,
+        \\  firstText.nodeType === Node.TEXT_NODE, firstText.data === 'one',
+        \\  firstText.parentNode === first, first.nodeType === Node.ELEMENT_NODE,
+        \\  first.nodeName === 'P', first.tagName === 'P', first.nodeValue === null,
+        \\  first.textContent === 'one', second.textContent === 'twobold',
+        \\  bodyNode.childNodes.length === 4, bodyNode.children.length === 3,
+        \\  paragraphs.length === 2, bodyNode.getElementsByTagName('p').length === 2,
+        \\  document.getElementById('only-name') === null, createdFromTag === created,
+        \\  document.defaultView === window, eventIdentity
+        \\];
+        \\var beforeRemove = true;
+        \\for (var checkIndex = 0; checkIndex < treeCheckStates.length; checkIndex++) {
+        \\  beforeRemove = beforeRemove && treeCheckStates[checkIndex];
+        \\}
+        \\bodyNode.removeChild(created);
+        \\beforeRemove && created.parentNode === null && bodyNode.lastChild === second
+    );
+    try std.testing.expect(result.toBoolean());
+}
+
+test "document tree APIs tolerate an empty document root" {
+    var environ = std.process.Environ.Map.init(std.testing.allocator);
+    defer environ.deinit();
+    var js = try Js.init(std.testing.allocator, std.testing.io, &environ);
+    defer js.deinit(std.testing.allocator);
+
+    const result = try js.evaluate(
+        42,
+        "document.documentElement === null && document.body === null && " ++
+            "document.getElementById('missing') === null && " ++
+            "document.getElementsByTagName('p').length === 0 && " ++
+            "document.defaultView === window",
+    );
+    try std.testing.expect(result.toBoolean());
 }
 
 const FocusCallbackTestContext = struct {
@@ -1771,6 +2678,43 @@ test "Node.children reflects a later innerHTML generation" {
     try std.testing.expect(result.toBoolean());
 }
 
+test "innerHTML keeps parsed scripts inert while explicit scripts remain eligible" {
+    const allocator = std.testing.allocator;
+    var html_parser = try parser.HTMLParser.init(
+        allocator,
+        "<main><section id=target></section></main>",
+    );
+    html_parser.use_implicit_tags = false;
+    defer html_parser.deinit(allocator);
+    var root = try html_parser.parse();
+    defer root.deinit(allocator);
+    parser.fixParentPointers(&root, null);
+
+    var environ = std.process.Environ.Map.init(allocator);
+    defer environ.deinit();
+    var js = try Js.init(allocator, std.testing.io, &environ);
+    defer js.deinit(allocator);
+    js.setNodes(0, &root);
+    defer js.setNodes(0, null);
+
+    const result = try js.evaluate(0,
+        \\var target = document.querySelectorAll('section')[0];
+        \\target.innerHTML = '<script>inline()</script><div><script src="later.js"></script></div>';
+        \\var explicit = document.createElement('script');
+        \\target.appendChild(explicit);
+        \\target.children.length === 3
+    );
+    try std.testing.expect(result.toBoolean());
+
+    const target = try findTestElementById(&root, "target");
+    const inline_script = &target.element.children.items[0];
+    const nested_script = &target.element.children.items[1].element.children.items[0];
+    const explicit_script = &target.element.children.items[2];
+    try std.testing.expect(inline_script.element.script_started);
+    try std.testing.expect(nested_script.element.script_started);
+    try std.testing.expect(!explicit_script.element.script_started);
+}
+
 test "innerHTML and outerHTML serialize the live DOM" {
     const allocator = std.testing.allocator;
     var html_parser = try parser.HTMLParser.init(
@@ -1953,7 +2897,9 @@ test "innerHTML completion callback observes installed child generation" {
     try std.testing.expectEqual(@as(usize, 1), mutation_context.count);
     try std.testing.expectEqual(@as(usize, 1), mutation_context.complete_count);
     try std.testing.expectEqual(@as(usize, 2), mutation_context.completed_child_count);
-    try std.testing.expectEqual(@as(?u32, 0), js.current_window_id);
+    // The nested callback briefly installs a child document, but the outer
+    // script activation must restore the neutral host state before it returns.
+    try std.testing.expectEqual(@as(?u32, null), js.current_window_id);
 }
 
 test "replaceChildren empties once, invalidates relational style, and detaches live nodes" {
@@ -2134,7 +3080,7 @@ test "replaceChildren transfers attached and detached elements in argument order
     try std.testing.expectEqual(@as(usize, 4), mutation_context.prepared_child_count);
     try std.testing.expectEqual(@as(usize, 1), mutation_context.complete_count);
     try std.testing.expectEqual(@as(usize, 3), mutation_context.completed_child_count);
-    try std.testing.expectEqual(@as(usize, 1), js.windows.getPtr(0).?.detached_nodes.count());
+    try std.testing.expectEqual(@as(usize, 1), js.windows.get(0).?.detached_nodes.count());
 
     try parser.style(allocator, &root, rules);
     try std.testing.expectEqualStrings("blue", target_element.style.?.getPtr("color").?.get().*);
@@ -2147,7 +3093,7 @@ test "replaceChildren transfers attached and detached elements in argument order
         \\  oldNode.children[0].handle === oldNested.handle
     );
     try std.testing.expect(reattached.toBoolean());
-    try std.testing.expectEqual(@as(usize, 0), js.windows.getPtr(0).?.detached_nodes.count());
+    try std.testing.expectEqual(@as(usize, 0), js.windows.get(0).?.detached_nodes.count());
     try std.testing.expectEqual(@as(usize, 2), mutation_context.count);
     try std.testing.expectEqual(@as(usize, 2), mutation_context.complete_count);
 }
@@ -2435,7 +3381,7 @@ test "removeChild detaches a subtree and preserves handles across reattachment" 
         \\document.querySelectorAll('article').length === 0
     );
     try std.testing.expect(detached_result.toBoolean());
-    try std.testing.expectEqual(@as(usize, 1), js.windows.getPtr(0).?.detached_nodes.count());
+    try std.testing.expectEqual(@as(usize, 1), js.windows.get(0).?.detached_nodes.count());
     try std.testing.expectEqual(@as(usize, 1), mutation_context.count);
     try std.testing.expectEqual(@as(usize, 1), mutation_context.complete_count);
 
@@ -2451,7 +3397,7 @@ test "removeChild detaches a subtree and preserves handles across reattachment" 
         \\document.querySelectorAll('article').length === 1
     );
     try std.testing.expect(reattached_result.toBoolean());
-    try std.testing.expectEqual(@as(usize, 0), js.windows.getPtr(0).?.detached_nodes.count());
+    try std.testing.expectEqual(@as(usize, 0), js.windows.get(0).?.detached_nodes.count());
     try std.testing.expectEqual(@as(usize, 2), mutation_context.count);
     try std.testing.expectEqual(@as(usize, 2), mutation_context.complete_count);
 
@@ -2462,6 +3408,148 @@ test "removeChild detaches a subtree and preserves handles across reattachment" 
     const moved_strong = &moved_article.children.items[0].element;
     try std.testing.expectEqualStrings("green", moved_article.style.?.getPtr("color").?.get().*);
     try std.testing.expectEqualStrings("green", moved_strong.style.?.getPtr("color").?.get().*);
+}
+
+test "parser pins follow direct script mutations and retire removed subtrees" {
+    const allocator = std.testing.allocator;
+    var html_parser = try parser.HTMLParser.init(
+        allocator,
+        "<main>" ++
+            "<section id=insert><i id=first></i><b id=second></b></section>" ++
+            "<section id=discard><em id=discarded><strong id=nested></strong></em></section>" ++
+            "<section id=source><u id=moving></u><small id=stay></small></section>" ++
+            "<aside id=target><em id=old></em></aside>" ++
+            "</main>",
+    );
+    html_parser.use_implicit_tags = false;
+    defer html_parser.deinit(allocator);
+    var root = try html_parser.parse();
+    defer root.deinit(allocator);
+    parser.fixParentPointers(&root, null);
+
+    const insert = try findTestElementById(&root, "insert");
+    const first = try findTestElementById(&root, "first");
+    const second = try findTestElementById(&root, "second");
+    const discarded = try findTestElementById(&root, "discarded");
+    const nested = try findTestElementById(&root, "nested");
+    const source = try findTestElementById(&root, "source");
+    const moving = try findTestElementById(&root, "moving");
+    const stay = try findTestElementById(&root, "stay");
+    const target = try findTestElementById(&root, "target");
+    const old = try findTestElementById(&root, "old");
+
+    var pins = node_pins.Store.init(allocator);
+    defer pins.deinit();
+    const first_pin = try pins.pin(first);
+    const second_pin = try pins.pin(second);
+    const discarded_pin = try pins.pin(discarded);
+    const nested_pin = try pins.pin(nested);
+    const moving_pin = try pins.pin(moving);
+    const stay_pin = try pins.pin(stay);
+    const old_pin = try pins.pin(old);
+
+    var environ = std.process.Environ.Map.init(allocator);
+    defer environ.deinit();
+    var js = try Js.init(allocator, std.testing.io, &environ);
+    defer js.deinit(allocator);
+    js.setNodes(0, &root);
+    defer js.setNodes(0, null);
+    defer js.setNodeRelocationObserver(0, null);
+
+    js.setNodeRelocationObserver(0, pins.relocationObserver());
+    const inserted_and_emptied = try js.evaluate(0,
+        \\var sections = document.querySelectorAll('section');
+        \\var insertNode = sections[0];
+        \\var discardNode = sections[1];
+        \\var discardedNode = discardNode.children[0];
+        \\var nestedDiscardedNode = discardedNode.children[0];
+        \\var appended = document.createElement('u');
+        \\insertNode.appendChild(appended);
+        \\var before = document.createElement('mark');
+        \\insertNode.insertBefore(before, appended);
+        \\discardNode.replaceChildren();
+        \\insertNode.children.length === 4 && discardNode.children.length === 0 &&
+        \\  discardedNode.getAttribute('id') === 'discarded' && discardedNode.parentNode === null &&
+        \\  nestedDiscardedNode.parentNode === discardedNode
+    );
+    js.setNodeRelocationObserver(0, null);
+    try std.testing.expect(inserted_and_emptied.toBoolean());
+    try std.testing.expectEqual(insert, dom_mutation.nodeParent(pins.resolve(first_pin).?));
+    try std.testing.expectEqual(insert, dom_mutation.nodeParent(pins.resolve(second_pin).?));
+    try std.testing.expect(pins.resolve(discarded_pin) == null);
+    try std.testing.expect(pins.resolve(nested_pin) == null);
+
+    js.setNodeRelocationObserver(0, pins.relocationObserver());
+    const removed = try js.evaluate(0,
+        \\var insertNode = document.querySelectorAll('section')[0];
+        \\var firstNode = insertNode.children[0];
+        \\insertNode.removeChild(firstNode) === firstNode && insertNode.children.length === 3
+    );
+    js.setNodeRelocationObserver(0, null);
+    try std.testing.expect(removed.toBoolean());
+    try std.testing.expect(dom_mutation.nodeParent(pins.resolve(first_pin).?) == null);
+
+    js.setNodeRelocationObserver(0, pins.relocationObserver());
+    const transferred = try js.evaluate(0,
+        \\var sections = document.querySelectorAll('section');
+        \\var sourceNode = sections[2];
+        \\var targetNode = document.querySelectorAll('aside')[0];
+        \\var movingNode = sourceNode.children[0];
+        \\targetNode.replaceChildren(movingNode);
+        \\sourceNode.children.length === 1 && targetNode.children.length === 1
+    );
+    js.setNodeRelocationObserver(0, null);
+    try std.testing.expect(transferred.toBoolean());
+    try std.testing.expectEqual(target, dom_mutation.nodeParent(pins.resolve(moving_pin).?));
+    try std.testing.expectEqual(source, dom_mutation.nodeParent(pins.resolve(stay_pin).?));
+    try std.testing.expect(pins.resolve(old_pin) == null);
+
+    js.setNodeRelocationObserver(0, pins.relocationObserver());
+    const html_replaced = try js.evaluate(0,
+        \\document.querySelectorAll('aside')[0].innerHTML = '<span></span>';
+        \\true
+    );
+    js.setNodeRelocationObserver(0, null);
+    try std.testing.expect(html_replaced.toBoolean());
+    try std.testing.expect(pins.resolve(moving_pin) == null);
+}
+
+test "Realm-owned relocation observer preserves JavaScript wrapper identities" {
+    const allocator = std.testing.allocator;
+    var html_parser = try parser.HTMLParser.init(allocator, "<main><span id=tracked></span></main>");
+    html_parser.use_implicit_tags = false;
+    defer html_parser.deinit(allocator);
+    var root = try html_parser.parse();
+    defer root.deinit(allocator);
+    parser.fixParentPointers(&root, null);
+    const tracked = try findTestElementById(&root, "tracked");
+
+    var replacement = Node{ .element = try parser.Element.init(allocator, "span id=rebound", null) };
+    defer replacement.deinit(allocator);
+
+    var environ = std.process.Environ.Map.init(allocator);
+    defer environ.deinit();
+    var js = try Js.init(allocator, std.testing.io, &environ);
+    defer js.deinit(allocator);
+    js.setNodes(33, &root);
+    defer js.setNodes(33, null);
+
+    _ = try js.evaluate(33, "var heldNode = document.getElementById('tracked'); true");
+    const observer = js.nodeHandleRelocationObserver(33) orelse unreachable;
+    const token = observer.unpublishItem(@ptrCast(tracked)) orelse unreachable;
+    observer.rebindItem(@ptrCast(&replacement), token);
+
+    // A wrapper held by a parser-blocking script follows a parser-owned move
+    // without being recreated or retargeting through a new numeric identity.
+    const rebound = try js.evaluate(33, "heldNode.getAttribute('id') === 'rebound'");
+    try std.testing.expect(rebound.toBoolean());
+
+    const retired_token = observer.unpublishItem(@ptrCast(&replacement)) orelse unreachable;
+    observer.retireToken(retired_token);
+    try std.testing.expect(js.windows.get(33).?.handles.resolve(@intCast(token)) == null);
+
+    js.setNodes(33, null);
+    try std.testing.expect(js.nodeHandleRelocationObserver(33) == null);
 }
 
 test "createElement detached ownership is released with the document" {
@@ -2489,10 +3577,10 @@ test "createElement detached ownership is released with the document" {
         \\removed.getAttribute('missing') === null
     );
     try std.testing.expect(result.toBoolean());
-    try std.testing.expectEqual(@as(usize, 2), js.windows.getPtr(0).?.detached_nodes.count());
+    try std.testing.expectEqual(@as(usize, 2), js.windows.get(0).?.detached_nodes.count());
 
     js.setNodes(0, null);
-    try std.testing.expectEqual(@as(usize, 0), js.windows.getPtr(0).?.detached_nodes.count());
+    try std.testing.expectEqual(@as(usize, 0), js.windows.get(0).?.detached_nodes.count());
 }
 
 test "native style_set updates element style attribute" {
@@ -2505,7 +3593,9 @@ test "native style_set updates element style attribute" {
     var node = Node{ .element = element };
     defer node.deinit(std.testing.allocator);
 
-    const window = try js.setCurrentWindow(0);
+    const active = try js.activateWindowLocked(0);
+    defer active.restore();
+    const window = active.window;
     const handle = try js.getHandle(window, &node);
 
     const builtins = kiesel.builtins;
@@ -2713,7 +3803,9 @@ test "native style_set requests render" {
     var node = Node{ .element = element };
     defer node.deinit(std.testing.allocator);
 
-    const window = try js.setCurrentWindow(0);
+    const active = try js.activateWindowLocked(0);
+    defer active.restore();
+    const window = active.window;
     const handle = try js.getHandle(window, &node);
 
     var called = false;
@@ -2764,6 +3856,7 @@ fn setupDocument(self: *Js, realm: *Realm) !void {
             .{ .name = "getInnerHTML", .length = 1, .function = getInnerHTML },
             .{ .name = "getOuterHTML", .length = 1, .function = getOuterHTML },
             .{ .name = "style_set", .length = 2, .function = styleSet },
+            .{ .name = "documentReadyState", .length = 0, .function = documentReadyState },
         },
     );
     try native_bindings.installFunctions(
@@ -2772,6 +3865,13 @@ fn setupDocument(self: *Js, realm: *Realm) !void {
         native,
         &self.canvas_host,
         &canvas_bindings.bindings,
+    );
+    try native_bindings.installFunctions(
+        &self.agent,
+        realm,
+        native,
+        &self.dom_tree_host,
+        &dom_tree_bindings.bindings,
     );
     try native_bindings.installFunctions(
         &self.agent,
@@ -2794,6 +3894,45 @@ fn setupDocument(self: *Js, realm: *Realm) !void {
         &self.timer_host,
         &timer_bindings.bindings,
     );
+    try native_bindings.installFunctions(
+        &self.agent,
+        realm,
+        native,
+        &self.document_write_host,
+        &document_write_bindings.bindings,
+    );
+}
+
+/// Return the browser-owned readiness for the currently active document.
+/// This native function deliberately takes no DOM pointer: its callback
+/// context belongs to the Frame and remains a synchronous, generation-bound
+/// borrow installed by the browser.
+fn documentReadyState(agent: *Agent, this_value: Value, _: kiesel.types.Arguments) Agent.Error!Value {
+    _ = this_value;
+    const function_obj = agent.activeFunctionObject();
+    const builtin_fn = function_obj.as(kiesel.builtins.BuiltinFunction);
+    const js_instance = builtin_fn.fields.additionalFieldsAs(Js);
+    const window_id = js_instance.current_window_id orelse return agent.throwException(
+        .internal_error,
+        "Missing active window",
+        .{},
+    );
+    const window = js_instance.windows.get(window_id) orelse return agent.throwException(
+        .internal_error,
+        "Missing window context",
+        .{},
+    );
+
+    const state = if (window.document_ready_state_callback.function) |callback|
+        callback(window.document_ready_state_callback.context) orelse .loading
+    else
+        .loading;
+    const text = switch (state) {
+        .loading => "loading",
+        .interactive => "interactive",
+        .complete => "complete",
+    };
+    return js_instance.copiedStringToJsValue(text);
 }
 
 /// document.querySelectorAll implementation
@@ -2807,7 +3946,7 @@ fn querySelectorAll(agent: *Agent, this_value: Value, arguments: kiesel.types.Ar
         "Missing active window",
         .{},
     );
-    const window = js_instance.windows.getPtr(window_id) orelse return agent.throwException(
+    const window = js_instance.windows.get(window_id) orelse return agent.throwException(
         .internal_error,
         "Missing window context",
         .{},
@@ -2909,7 +4048,7 @@ fn getAttribute(agent: *Agent, this_value: Value, arguments: kiesel.types.Argume
         "Missing active window",
         .{},
     );
-    const window = js_instance.windows.getPtr(window_id) orelse return agent.throwException(
+    const window = js_instance.windows.get(window_id) orelse return agent.throwException(
         .internal_error,
         "Missing window context",
         .{},
@@ -2981,7 +4120,7 @@ fn getChildren(agent: *Agent, this_value: Value, arguments: kiesel.types.Argumen
         "Missing active window",
         .{},
     );
-    const window = js_instance.windows.getPtr(window_id) orelse return agent.throwException(
+    const window = js_instance.windows.get(window_id) orelse return agent.throwException(
         .internal_error,
         "Missing window context",
         .{},
@@ -3046,7 +4185,7 @@ fn isValidCreatedTagName(tag: []const u8) bool {
 }
 
 /// __native.createElement implementation. A created node is owned by its
-/// WindowContext until appendChild/insertBefore transfers it into a DOM tree.
+/// WindowRealm until appendChild/insertBefore transfers it into a DOM tree.
 fn createElement(agent: *Agent, this_value: Value, arguments: kiesel.types.Arguments) Agent.Error!Value {
     const function_obj = agent.activeFunctionObject();
     const builtin_fn = function_obj.as(kiesel.builtins.BuiltinFunction);
@@ -3056,7 +4195,7 @@ fn createElement(agent: *Agent, this_value: Value, arguments: kiesel.types.Argum
         "Missing active window",
         .{},
     );
-    const window = js_instance.windows.getPtr(window_id) orelse return agent.throwException(
+    const window = js_instance.windows.get(window_id) orelse return agent.throwException(
         .internal_error,
         "Missing window context",
         .{},
@@ -3116,7 +4255,7 @@ fn appendChild(agent: *Agent, this_value: Value, arguments: kiesel.types.Argumen
         "Missing active window",
         .{},
     );
-    const window = js_instance.windows.getPtr(window_id) orelse return agent.throwException(
+    const window = js_instance.windows.get(window_id) orelse return agent.throwException(
         .internal_error,
         "Missing window context",
         .{},
@@ -3164,7 +4303,7 @@ fn insertBefore(agent: *Agent, this_value: Value, arguments: kiesel.types.Argume
         "Missing active window",
         .{},
     );
-    const window = js_instance.windows.getPtr(window_id) orelse return agent.throwException(
+    const window = js_instance.windows.get(window_id) orelse return agent.throwException(
         .internal_error,
         "Missing window context",
         .{},
@@ -3232,7 +4371,7 @@ fn removeChild(agent: *Agent, this_value: Value, arguments: kiesel.types.Argumen
         "Missing active window",
         .{},
     );
-    const window = js_instance.windows.getPtr(window_id) orelse return agent.throwException(
+    const window = js_instance.windows.get(window_id) orelse return agent.throwException(
         .internal_error,
         "Missing window context",
         .{},
@@ -3282,7 +4421,7 @@ fn replaceChildren(agent: *Agent, this_value: Value, arguments: kiesel.types.Arg
         "Missing active window",
         .{},
     );
-    const window = js_instance.windows.getPtr(window_id) orelse return agent.throwException(
+    const window = js_instance.windows.get(window_id) orelse return agent.throwException(
         .internal_error,
         "Missing window context",
         .{},
@@ -3358,7 +4497,7 @@ fn setAttribute(agent: *Agent, this_value: Value, arguments: kiesel.types.Argume
         "Missing active window",
         .{},
     );
-    const window = js_instance.windows.getPtr(window_id) orelse return agent.throwException(
+    const window = js_instance.windows.get(window_id) orelse return agent.throwException(
         .internal_error,
         "Missing window context",
         .{},
@@ -3493,7 +4632,7 @@ fn serializeHTMLProperty(
         "Missing active window",
         .{},
     );
-    const window = js_instance.windows.getPtr(window_id) orelse return agent.throwException(
+    const window = js_instance.windows.get(window_id) orelse return agent.throwException(
         .internal_error,
         "Missing window context",
         .{},
@@ -3550,6 +4689,23 @@ fn getOuterHTML(agent: *Agent, this_value: Value, arguments: kiesel.types.Argume
     return serializeHTMLProperty(agent, arguments, true);
 }
 
+/// HTML parsed for an `innerHTML` replacement does not participate in the
+/// document parser's execution pipeline. In particular, scripts in a parsed
+/// fragment are inert—even if that fragment was produced by serializing
+/// already-executed document content—and a later resource refresh must not
+/// treat them as newly attached executable scripts.
+fn markFragmentScriptsInert(node: *Node) void {
+    switch (node.*) {
+        .text => {},
+        .element => |*element| {
+            if (std.ascii.eqlIgnoreCase(element.tag, "script")) {
+                element.script_started = true;
+            }
+            for (element.children.items) |*child| markFragmentScriptsInert(child);
+        },
+    }
+}
+
 /// __native.innerHTML setter implementation.
 fn innerHTML(agent: *Agent, this_value: Value, arguments: kiesel.types.Arguments) Agent.Error!Value {
     // Get the Js instance from the function's additional_fields
@@ -3561,7 +4717,7 @@ fn innerHTML(agent: *Agent, this_value: Value, arguments: kiesel.types.Arguments
         "Missing active window",
         .{},
     );
-    const window = js_instance.windows.getPtr(window_id) orelse return agent.throwException(
+    const window = js_instance.windows.get(window_id) orelse return agent.throwException(
         .internal_error,
         "Missing window context",
         .{},
@@ -3633,6 +4789,7 @@ fn innerHTML(agent: *Agent, this_value: Value, arguments: kiesel.types.Arguments
         );
     };
     defer parsed_node.deinit(js_instance.allocator);
+    markFragmentScriptsInert(&parsed_node);
 
     var body_children = std.ArrayList(Node).empty;
 
@@ -3660,6 +4817,7 @@ fn innerHTML(agent: *Agent, this_value: Value, arguments: kiesel.types.Arguments
     // Parse the HTML and replace the node's children
     switch (node.*) {
         .element => |*e| {
+            var mutation = js_instance.domMutationContext(window_id, window);
             // Stage the only allocation needed by the installed replacement
             // before exposing any of its source-backed nodes through the DOM.
             if (e.owned_strings == null) {
@@ -3680,7 +4838,7 @@ fn innerHTML(agent: *Agent, this_value: Value, arguments: kiesel.types.Arguments
             if (is_attached) prepareDomMutation(js_instance, node, .structural);
 
             for (e.children.items) |*child| {
-                dom_mutation.removeHandlesForSubtree(&window.handles, child);
+                dom_mutation.retireIdentitiesForSubtree(&mutation, child);
                 child.deinit(js_instance.allocator);
             }
             e.children.deinit(js_instance.allocator);
@@ -3721,7 +4879,7 @@ fn styleSet(agent: *Agent, this_value: Value, arguments: kiesel.types.Arguments)
         "Missing active window",
         .{},
     );
-    const window = js_instance.windows.getPtr(window_id) orelse return agent.throwException(
+    const window = js_instance.windows.get(window_id) orelse return agent.throwException(
         .internal_error,
         "Missing window context",
         .{},

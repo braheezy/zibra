@@ -1,8 +1,27 @@
 // Zibra's page-visible JavaScript shims over the synchronous __native host.
-// Node constructor that wraps a handle
+// Node constructor that wraps a native identity. The cache below is the one
+// canonical JavaScript wrapper for each identity in this document realm.
 function Node(handle) {
   this.handle = handle;
 }
+
+var NODE_WRAPPERS = {};
+
+function wrapNode(handle) {
+  if (handle === null || handle === undefined) return null;
+  var node = NODE_WRAPPERS[handle];
+  if (node) return node;
+  node = new Node(handle);
+  NODE_WRAPPERS[handle] = node;
+  return node;
+}
+
+function wrapNodes(handles) {
+  return handles.map(function(handle) { return wrapNode(handle); });
+}
+
+Node.ELEMENT_NODE = 1;
+Node.TEXT_NODE = 3;
 
 var XHR_REQUESTS = {};
 
@@ -54,6 +73,50 @@ Event.prototype.stopPropagation = function() {
   this.propagation_stopped = true;
 };
 
+// Lifecycle events have document and window targets rather than a DOM-node
+// handle. Keep their listener state in this document Realm: navigation gets a
+// fresh Realm, so an old page's callbacks cannot observe a new document.
+var DOCUMENT_LIFECYCLE_LISTENERS = {};
+var WINDOW_LIFECYCLE_LISTENERS = {};
+var DOCUMENT_READY_STATE = 'loading';
+
+function addLifecycleListener(listenersByType, type, listener) {
+  if (typeof listener !== 'function') return;
+  if (!listenersByType[type]) listenersByType[type] = [];
+  listenersByType[type].push(listener);
+}
+
+function dispatchLifecycleTarget(target, listenersByType, type) {
+  var event = new Event(type);
+  event.target = target;
+  event.currentTarget = target;
+
+  // Snapshot the length so listeners added while dispatching wait for the
+  // next event, while preserving this browser's existing listener ordering.
+  var listeners = listenersByType[type] || [];
+  var listenerCount = listeners.length;
+  for (var i = 0; i < listenerCount; i++) {
+    // Browser-generated lifecycle work must not be aborted by a page
+    // exception. Continue with later listeners and the target's property
+    // handler, matching the event loop's report-and-continue behavior.
+    try {
+      listeners[i].call(target, event);
+    } catch (error) {}
+  }
+
+  // Event handler properties are a separate registration path. They run
+  // after addEventListener listeners on this target, which is sufficient for
+  // the limited document/window lifecycle surface exposed here.
+  var handler = target['on' + type];
+  if (typeof handler === 'function') {
+    try {
+      handler.call(target, event);
+    } catch (error) {}
+  }
+  event.currentTarget = null;
+  return event.do_default;
+}
+
 var WINDOW_NODE_LISTENERS = {};
 
 function listenersForWindow(windowId) {
@@ -70,24 +133,49 @@ Node.prototype.addEventListener = function(type, listener) {
   list.push(listener);
 };
 
-Node.prototype.dispatchEvent = function(evt) {
-  var event = typeof evt === "string" ? new Event(evt) : evt;
-  var path = event.bubbles ? __native.eventPath(this.handle) : [this.handle];
+function dispatchNodeEvent(target, event, inlineHandler) {
+  var path = event.bubbles ? __native.eventPath(target.handle) : [target.handle];
   var listeners = listenersForWindow(window.__id);
   event.propagation_stopped = false;
-  event.target = path.length ? new Node(path[0]) : this;
+  event.target = path.length ? wrapNode(path[0]) : target;
   for (var pathIndex = 0; pathIndex < path.length; pathIndex++) {
-    var currentTarget = new Node(path[pathIndex]);
+    var currentTarget = wrapNode(path[pathIndex]);
     event.currentTarget = currentTarget;
     var dict = listeners[path[pathIndex]];
     var list = (dict && dict[event.type]) || [];
     for (var listenerIndex = 0; listenerIndex < list.length; listenerIndex++) {
       list[listenerIndex].call(currentTarget, event);
     }
+    // An authored handler is an event handler on its element, after ordinary
+    // target listeners. It remains a same-target delivery even when a target
+    // listener stopped propagation, but never runs on bubbling ancestors.
+    if (pathIndex === 0 && typeof inlineHandler === 'function') {
+      try {
+        if (inlineHandler.call(currentTarget, event) === false) event.preventDefault();
+      } catch (error) {}
+    }
     if (event.propagation_stopped) break;
   }
   event.currentTarget = null;
   return event.do_default;
+}
+
+Node.prototype.dispatchEvent = function(evt) {
+  var event = typeof evt === "string" ? new Event(evt) : evt;
+  return dispatchNodeEvent(this, event, null);
+};
+
+// This is called by Js.dispatchInlineEvent after it has resolved the authored
+// on<event> source from the current DOM. Keeping compilation in the document
+// Realm gives the handler normal global lookup, `this`, target/currentTarget,
+// default prevention, and listener ordering without retaining a DOM pointer
+// in the native host.
+globalThis.__dispatchInlineEventHandler = function(handle, type, handler, bubbles) {
+  var target = wrapNode(handle);
+  if (!target || typeof handler !== 'function') return true;
+  var event = new Event(type);
+  event.bubbles = !!bubbles;
+  return dispatchNodeEvent(target, event, handler);
 };
 
 // Add getAttribute method to Node prototype
@@ -159,7 +247,7 @@ function resetCanvasContextState(handle) {
 
 function CanvasRenderingContext2D(handle) {
   this.__canvasHandle = handle;
-  this.canvas = new Node(handle);
+  this.canvas = wrapNode(handle);
   this.fillStyle = '#000000';
   this.strokeStyle = '#000000';
   this.lineWidth = 1;
@@ -244,9 +332,53 @@ Object.defineProperty(Node.prototype, 'height', {
 // Snapshot the immediate element children as wrapped Node objects.
 Object.defineProperty(Node.prototype, "children", {
   get: function() {
-    return __native.children(this.handle).map(function(h) { return new Node(h); });
+    return wrapNodes(__native.children(this.handle));
   }
 });
+
+// Authored DOM topology. Native calls return numeric handle snapshots; every
+// path through this shim uses wrapNode so equivalent DOM references compare by
+// JavaScript object identity within one document realm.
+Object.defineProperty(Node.prototype, "parentNode", {
+  get: function() { return wrapNode(__native.parentNode(this.handle)); }
+});
+Object.defineProperty(Node.prototype, "firstChild", {
+  get: function() { return wrapNode(__native.firstChild(this.handle)); }
+});
+Object.defineProperty(Node.prototype, "lastChild", {
+  get: function() { return wrapNode(__native.lastChild(this.handle)); }
+});
+Object.defineProperty(Node.prototype, "previousSibling", {
+  get: function() { return wrapNode(__native.previousSibling(this.handle)); }
+});
+Object.defineProperty(Node.prototype, "nextSibling", {
+  get: function() { return wrapNode(__native.nextSibling(this.handle)); }
+});
+Object.defineProperty(Node.prototype, "childNodes", {
+  get: function() { return wrapNodes(__native.childNodes(this.handle)); }
+});
+Object.defineProperty(Node.prototype, "nodeType", {
+  get: function() { return __native.nodeType(this.handle); }
+});
+Object.defineProperty(Node.prototype, "nodeName", {
+  get: function() { return __native.nodeName(this.handle); }
+});
+Object.defineProperty(Node.prototype, "tagName", {
+  get: function() { return __native.tagName(this.handle); }
+});
+Object.defineProperty(Node.prototype, "nodeValue", {
+  get: function() { return __native.nodeValue(this.handle); }
+});
+Object.defineProperty(Node.prototype, "data", {
+  get: function() { return __native.nodeData(this.handle); }
+});
+Object.defineProperty(Node.prototype, "textContent", {
+  get: function() { return __native.textContent(this.handle); }
+});
+Node.prototype.getElementsByTagName = function(tagName) {
+  var text = tagName == null ? "" : tagName.toString();
+  return wrapNodes(__native.getElementsByTagNameFrom(this.handle, text));
+};
 
 // Serialize or replace an element's child HTML.
 Object.defineProperty(Node.prototype, "innerHTML", {
@@ -276,7 +408,7 @@ Object.defineProperty(Node.prototype, "style", {
 __native.dispatchEvent = function(handle, type, bubbles) {
   var event = new Event(type);
   event.bubbles = !!bubbles;
-  return new Node(handle).dispatchEvent(event);
+  return wrapNode(handle).dispatchEvent(event);
 };
 
 globalThis.Event = Event;
@@ -291,6 +423,8 @@ globalThis.__resetEventListeners = function(windowId) {
   delete WINDOW_TIMER_REQUESTS[targetId];
   delete WINDOW_NEXT_TIMER_HANDLE[targetId];
   delete WINDOW_CANVAS_CONTEXTS[targetId];
+  DOCUMENT_LIFECYCLE_LISTENERS = {};
+  WINDOW_LIFECYCLE_LISTENERS = {};
 };
 
 var WINDOW_TIMER_REQUESTS = {};
@@ -370,9 +504,12 @@ Object.defineProperty(window, "onmessage", {
   set: function(fn) { WINDOW_ONMESSAGE[window.__id] = fn; }
 });
 window.addEventListener = function(type, listener) {
-  if (type !== "message") return;
-  if (!WINDOW_MESSAGE_LISTENERS[window.__id]) WINDOW_MESSAGE_LISTENERS[window.__id] = [];
-  WINDOW_MESSAGE_LISTENERS[window.__id].push(listener);
+  if (type === "message") {
+    if (!WINDOW_MESSAGE_LISTENERS[window.__id]) WINDOW_MESSAGE_LISTENERS[window.__id] = [];
+    WINDOW_MESSAGE_LISTENERS[window.__id].push(listener);
+    return;
+  }
+  addLifecycleListener(WINDOW_LIFECYCLE_LISTENERS, type, listener);
 };
 window.postMessage = function(message, targetWindowId, targetOrigin) {
   var payload = message == null ? "null" : message.toString();
@@ -411,7 +548,7 @@ globalThis.__clearIdGlobals = function(windowId) {
 globalThis.__setIdGlobals = function(windowId, names, handles) {
   var entries = [];
   for (var i = 0; i < names.length; i++) {
-    entries.push([names[i], new Node(handles[i])]);
+    entries.push([names[i], wrapNode(handles[i])]);
   }
   WINDOW_ID_GLOBALS[windowId] = entries;
   if (window.__id === windowId) {
@@ -436,6 +573,22 @@ globalThis.__dispatchMessageEvent = function(message, origin, sourceId, targetId
   }
 };
 
+// Called only by the browser's generation-checked lifecycle task. The DOM
+// Content Loaded event reaches document first and then window; load is a
+// window event in this bounded implementation.
+globalThis.__dispatchLifecycleEvent = function(type) {
+  if (type === 'DOMContentLoaded') {
+    DOCUMENT_READY_STATE = 'interactive';
+    dispatchLifecycleTarget(document, DOCUMENT_LIFECYCLE_LISTENERS, type);
+    dispatchLifecycleTarget(window, WINDOW_LIFECYCLE_LISTENERS, type);
+    return;
+  }
+  if (type === 'load') {
+    DOCUMENT_READY_STATE = 'complete';
+    dispatchLifecycleTarget(window, WINDOW_LIFECYCLE_LISTENERS, type);
+  }
+};
+
 globalThis.__runXHROnload = function(body, handle) {
   var obj = XHR_REQUESTS[handle];
   if (!obj) return;
@@ -451,12 +604,65 @@ globalThis.__runXHROnload = function(body, handle) {
   var originalQuerySelectorAll = document.querySelectorAll;
   document.querySelectorAll = function(selector) {
     var handles = originalQuerySelectorAll.call(this, selector);
-    return handles.map(function(h) { return new Node(h); });
+    return wrapNodes(handles);
   };
   document.createElement = function(tagName) {
     var text = tagName == null ? "" : tagName.toString();
-    return new Node(__native.createElement(text));
+    return wrapNode(__native.createElement(text));
   };
+  document.getElementById = function(id) {
+    var text = id == null ? "" : id.toString();
+    return wrapNode(__native.getElementById(text));
+  };
+  document.getElementsByTagName = function(tagName) {
+    var text = tagName == null ? "" : tagName.toString();
+    return wrapNodes(__native.getElementsByTagName(text));
+  };
+  Object.defineProperty(document, "documentElement", {
+    get: function() { return wrapNode(__native.getDocumentElement()); },
+    enumerable: true,
+    configurable: true
+  });
+  Object.defineProperty(document, "body", {
+    get: function() { return wrapNode(__native.getDocumentBody()); },
+    enumerable: true,
+    configurable: true
+  });
+  Object.defineProperty(document, "defaultView", {
+    get: function() { return window; },
+    enumerable: true,
+    configurable: true
+  });
+  document.addEventListener = function(type, listener) {
+    addLifecycleListener(DOCUMENT_LIFECYCLE_LISTENERS, type, listener);
+  };
+  document.write = function() {
+    var text = '';
+    for (var i = 0; i < arguments.length; i++) {
+      var value = arguments[i];
+      text += value === null ? 'null' : value === undefined ? 'undefined' : value.toString();
+    }
+    __native.documentWrite(text);
+  };
+  document.writeln = function() {
+    var text = '';
+    for (var i = 0; i < arguments.length; i++) {
+      var value = arguments[i];
+      text += value === null ? 'null' : value === undefined ? 'undefined' : value.toString();
+    }
+    __native.documentWrite(text + '\n');
+  };
+  Object.defineProperty(document, "readyState", {
+    get: function() {
+      // The browser owns the authoritative generation-scoped phase. Keep the
+      // local value as a conservative fallback for standalone host tests that
+      // have not installed the narrow readiness callback yet.
+      var nativeState = __native.documentReadyState();
+      return nativeState === null || nativeState === undefined ? DOCUMENT_READY_STATE : nativeState;
+    },
+    enumerable: true,
+    configurable: true
+  });
   Object.defineProperty(document, "cookie", {
     get: function() { return __native.cookieGet(); },
     set: function(value) {

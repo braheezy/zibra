@@ -1,6 +1,8 @@
 //! Focused unit-test root for browser, tab, frame, input, and worker behavior.
 
 comptime {
+    _ = @import("browser/document_lifecycle.zig");
+    _ = @import("tests/browser_lifecycle.zig");
     _ = @import("tests/browser_input.zig");
     _ = @import("tests/browser_history.zig");
     _ = @import("tests/browser_fragments.zig");

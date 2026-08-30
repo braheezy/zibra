@@ -60,9 +60,9 @@ const url_module = @import("../network/url.zig");
 const Url = url_module.Url;
 const Layout = @import("render/layout.zig");
 const replaced_sizing = @import("render/replaced_sizing.zig");
+const document_loader = @import("document_loader.zig");
 const parser = @import("../document/parser.zig");
 const dom_focus = @import("../document/focus.zig");
-const HTMLParser = parser.HTMLParser;
 const Node = parser.Node;
 const CSSParser = @import("../document/css_parser.zig").CSSParser;
 const js_module = @import("../script/js.zig");
@@ -87,6 +87,171 @@ const ResourceLoader = resource_loader.Loader;
 const DocumentResourceKind = resource_loader.Kind;
 const DocumentResourceFetch = resource_loader.Fetch;
 const DocumentResourceBatch = resource_loader.Batch;
+
+/// Browser-owned hooks for one synchronous initial live parse.
+///
+/// This context is stack-bound to `document_loader.runIntoSlot`: it never
+/// escapes into a task or asynchronous network callback. Its Frame/URL
+/// pointers are therefore valid only until the parse reaches EOF or aborts.
+/// Parser-blocking scripts execute in the freshly installed document Realm,
+/// while ordinary dynamically added scripts retain the existing queued-task
+/// resource path.
+const LiveDocumentLoadContext = struct {
+    browser: *Browser,
+    tab: *Tab,
+    frame: *Frame,
+    page_url: *Url,
+    parent_window_id: ?u32,
+
+    fn fromOpaque(context: ?*anyopaque) !*@This() {
+        const raw = context orelse return error.MissingLiveDocumentLoadContext;
+        const unaligned: *align(1) @This() = @ptrCast(raw);
+        return @alignCast(unaligned);
+    }
+
+    /// Publish the final-address root before parser input can reach a script.
+    /// URL ownership and CSP policy are already installed by the caller, so
+    /// synchronous script APIs such as cookie and XHR observe this document
+    /// generation rather than the retired predecessor.
+    fn installRoot(context: ?*anyopaque, root: *Node) anyerror!void {
+        const self = try fromOpaque(context);
+        const installed = if (self.frame.current_node) |*node| node else return error.MissingLiveDocumentRoot;
+        if (installed != root) return error.LiveDocumentRootMoved;
+
+        self.frame.js_context = try self.tab.getJs(self.page_url);
+        if (self.frame.js_context) |js_context| {
+            self.browser.attachJsCallbacks(self.tab, self.frame, js_context);
+        }
+        self.tab.setParentWindow(self.frame.window_id, self.parent_window_id);
+        if (self.frame.js_context) |js_context| {
+            js_context.setParentWindow(self.frame.window_id, self.parent_window_id);
+        }
+    }
+
+    fn writeParserSource(context: ?*anyopaque, source: []const u8) anyerror!void {
+        const raw = context orelse return error.MissingLiveParser;
+        const unaligned: *align(1) parser.LiveParser = @ptrCast(raw);
+        const live: *parser.LiveParser = @alignCast(unaligned);
+        try live.write(source);
+    }
+
+    /// Run one parser-inserted script while the parser's source and node-pin
+    /// callbacks are live. Script failure is a page error, not a navigation
+    /// failure: HTML parsing resumes just as it does after a failed classic
+    /// script request in a browser.
+    fn executeScript(
+        context: ?*anyopaque,
+        live: *parser.LiveParser,
+        script_pin: @import("../document/node_pins.zig").Pin,
+    ) anyerror!void {
+        const self = try fromOpaque(context);
+        const script = live.resolve(script_pin) orelse return error.ParserScriptNodeRetired;
+        const element = switch (script.*) {
+            .element => |*value| value,
+            .text => return error.ParserScriptNotElement,
+        };
+        if (!std.ascii.eqlIgnoreCase(element.tag, "script")) return error.ParserScriptNotElement;
+
+        // A parser-inserted classic script is considered started even if its
+        // source cannot be fetched or throws. Post-parse discovery must not
+        // schedule a second evaluation of the same element.
+        element.script_started = true;
+        const js_context = self.frame.js_context orelse return;
+
+        // A wrapper retained by this script must keep naming the same Node
+        // while later parser tokens grow by-value child arrays. This Realm-
+        // owned observer is distinct from the temporary parser-pin observer
+        // installed around evaluation below: it follows parser-originated
+        // moves for the rest of this synchronous document load.
+        if (js_context.nodeHandleRelocationObserver(self.frame.window_id)) |observer| {
+            live.setExternalRelocationObserver(observer);
+        }
+
+        if (element.attributes) |attrs| {
+            if (attrs.get("src")) |src| {
+                self.executeExternalScript(js_context, live, src);
+                return;
+            }
+        }
+
+        const script_body = self.browser.collectInlineScriptText(script) orelse return;
+        defer self.browser.allocator.free(script_body);
+        self.evaluateParserScript(js_context, live, "inline", script_body);
+    }
+
+    fn executeExternalScript(
+        self: *@This(),
+        js_context: *js_module,
+        live: *parser.LiveParser,
+        src: []const u8,
+    ) void {
+        var script_url = self.page_url.*.resolve(self.browser.allocator, src) catch |err| {
+            std.log.warn("Failed to resolve parser script {s}: {}", .{ src, err });
+            return;
+        };
+        defer script_url.free(self.browser.allocator);
+
+        if (!self.frame.allowedRequest(script_url, self.page_url)) {
+            std.log.warn("Blocked parser script {s} due to CSP", .{src});
+            return;
+        }
+
+        var response = self.browser.fetchBodyWithReferrerPolicy(
+            script_url,
+            self.page_url.*,
+            null,
+            self.frame.referrer_policy,
+        ) catch |err| {
+            std.log.warn("Failed to load parser script {s}: {}", .{ src, err });
+            return;
+        };
+        defer self.freeSubresourceResponse(script_url, &response);
+
+        const script_body = decodeUtf8Replace(self.browser.allocator, response.body) catch |err| {
+            std.log.warn("Failed to decode parser script {s}: {}", .{ src, err });
+            return;
+        };
+        defer self.browser.allocator.free(script_body);
+        self.evaluateParserScript(js_context, live, src, script_body);
+    }
+
+    fn evaluateParserScript(
+        self: *@This(),
+        js_context: *js_module,
+        live: *parser.LiveParser,
+        label: []const u8,
+        source: []const u8,
+    ) void {
+        // Both temporary callbacks borrow the stack-bound live parser. Clear
+        // them before `document_loader` resumes tokenization or navigation can
+        // retire the current document Realm.
+        js_context.setDocumentWriteCallback(self.frame.window_id, writeParserSource, @ptrCast(live));
+        defer js_context.setDocumentWriteCallback(self.frame.window_id, null, null);
+        js_context.setNodeRelocationObserver(self.frame.window_id, live.relocationObserver());
+        defer js_context.setNodeRelocationObserver(self.frame.window_id, null);
+
+        const trace_eval = self.browser.measure.begin("evaljs");
+        defer if (trace_eval) self.browser.measure.end("evaljs");
+        _ = js_context.evaluate(self.frame.window_id, source) catch |err| {
+            std.log.err("Parser script {s} crashed: {}", .{ label, err });
+            return;
+        };
+    }
+
+    fn freeSubresourceResponse(
+        self: *@This(),
+        resource_url: Url,
+        response: *url_module.HttpResponse,
+    ) void {
+        if (!std.mem.eql(u8, resource_url.scheme, "data") and
+            !std.mem.eql(u8, resource_url.scheme, "about"))
+        {
+            self.browser.allocator.free(response.body);
+        }
+        if (response.csp_header) |header| self.browser.allocator.free(header);
+        if (response.access_control_allow_origin) |header| self.browser.allocator.free(header);
+    }
+};
 
 const BackgroundImageLoadContext = struct {
     browser: *Browser,
@@ -2166,6 +2331,11 @@ pub const Browser = struct {
         frame.js_render_context_initialized = true;
         js_context.setNodes(frame.window_id, &frame.current_node.?);
         js_context.setRenderCallback(frame.window_id, jsRenderCallback, @ptrCast(render_context));
+        js_context.setDocumentReadyStateCallback(
+            frame.window_id,
+            jsDocumentReadyStateCallback,
+            @ptrCast(render_context),
+        );
         js_context.setFocusCallback(frame.window_id, jsFocusCallback, @ptrCast(render_context));
         js_context.setDomMutationCallback(
             frame.window_id,
@@ -2280,6 +2450,11 @@ pub const Browser = struct {
         frame.* = Frame.init(tab.allocator, tab, null, null);
         tab.root_frame = frame;
         tab.registerFrame(frame);
+        // Once the old root has been retired, preserve an internally coherent
+        // empty Frame if any later parse/resource step fails. In particular,
+        // parser publication may have created a Realm that must not retain a
+        // pointer into `document_loader`'s cleaned-up partial DOM.
+        errdefer self.resetFrameForNavigation(frame);
         frame.viewport_width = tab.tab_width;
         frame.viewport_height = tab.tab_height;
         frame.certificate_error = document.certificate_error;
@@ -2303,10 +2478,7 @@ pub const Browser = struct {
             frame.current_node = null;
         }
 
-        if (frame.current_html_source) |old_source| {
-            self.allocator.free(old_source);
-            frame.current_html_source = null;
-        }
+        frame.html_sources.clear();
 
         if (url.*.view_source and !document.certificate_error) {
             // Use the new layoutSourceCode function for view-source mode
@@ -2327,44 +2499,41 @@ pub const Browser = struct {
             frame.display_list = try self.layout_engine.layoutSourceCode(body_text);
             frame.content_height = self.layout_engine.content_height;
         } else {
-            // Parse HTML into a node tree
-            var html_parser = try HTMLParser.init(self.allocator, body_text);
-            defer html_parser.deinit(self.allocator);
+            // Transfer the decoded response into the Frame before parsing: the
+            // resulting DOM borrows this document-owned source generation.
+            try frame.html_sources.ensureUnusedCapacity(1);
+            _ = frame.html_sources.adoptAssumeCapacity(body_text);
+            body_text_owned = false;
 
-            // Clear any previous node tree
-            if (frame.current_node) |node| {
-                var n = node;
-                n.deinit(self.allocator);
-                frame.current_node = null;
-            }
-
-            // Parse the HTML and store the root node
-            frame.current_node = try html_parser.parse();
+            // Script-visible document state has to be installed before the
+            // first parser boundary. The navigation task still owns `url`
+            // until this function returns successfully, so temporarily borrow
+            // it and let the navigation-reset errdefer clear that borrow if a
+            // parser/resource failure unwinds this load.
+            frame.current_url = url;
+            frame.current_url_owned = false;
+            var live_context = LiveDocumentLoadContext{
+                .browser = self,
+                .tab = tab,
+                .frame = frame,
+                .page_url = url,
+                .parent_window_id = null,
+            };
+            try document_loader.runIntoSlot(self.allocator, &frame.html_sources, &frame.current_node, .{
+                .context = &live_context,
+                .install_root = LiveDocumentLoadContext.installRoot,
+                .execute_script = LiveDocumentLoadContext.executeScript,
+            });
             document_title = try parser.collectDocumentTitle(
                 self.allocator,
                 &frame.current_node.?,
             );
 
-            // IMPORTANT: Fix parent pointers after copying the tree
-            // The parse() method returns the tree by value, which copies it,
-            // but the parent pointers still point to the old locations
+            // The live parser constructs directly in the final Frame field,
+            // but this remains the canonical post-parse repair point for
+            // parser-written subtrees and establishes a clear phase boundary.
             parser.fixParentPointers(&frame.current_node.?, null);
             try self.annotateVisitedLinks(&frame.current_node.?, url);
-
-            // Store the HTML source (it contains slices used by the tree)
-            // Only store if it's not an about: URL (those return static strings)
-            frame.current_html_source = body_text;
-            body_text_owned = false;
-
-            // Update the JS engine with the current nodes for DOM API
-            frame.js_context = try tab.getJs(url);
-            if (frame.js_context) |ctx| {
-                self.attachJsCallbacks(tab, frame, ctx);
-            }
-            tab.setParentWindow(frame.window_id, null);
-            if (frame.js_context) |ctx| {
-                ctx.setParentWindow(frame.window_id, null);
-            }
 
             // Find all scripts and stylesheets
             var node_list = std.ArrayList(*parser.Node).empty;
@@ -2503,6 +2672,7 @@ pub const Browser = struct {
         tab.setNeedsPaint();
         // Render and commit immediately to ensure first paint even if animation scheduling stalls.
         tab.runAnimationFrame(frame.scroll);
+        self.completeDocumentLifecycle(frame);
     }
 
     pub fn scheduleLoad(
@@ -2573,6 +2743,9 @@ pub const Browser = struct {
             }
         }
         frame.tab.clearIntervalsForDocument(frame.window_id, frame.document_generation);
+        if (frame.document_generation != 0) {
+            _ = frame.lifecycle.retire(frame.document_generation);
+        }
         if (frame.js_context) |ctx| {
             ctx.setNodes(frame.window_id, null);
         }
@@ -2626,10 +2799,7 @@ pub const Browser = struct {
         }
         frame.css_texts.clearRetainingCapacity();
 
-        if (frame.current_html_source) |old_source| {
-            self.allocator.free(old_source);
-            frame.current_html_source = null;
-        }
+        frame.html_sources.clear();
 
         if (frame.current_url_owned) {
             if (frame.current_url) |url_ptr| {
@@ -2745,6 +2915,9 @@ pub const Browser = struct {
         // retire it before installing the response as the new generation.
         self.retireRenderStateForTab(frame.tab);
         self.resetFrameForNavigation(frame);
+        // Keep a failed replacement frame inert rather than leaving a Realm
+        // pointed at a partial live-parser tree.
+        errdefer self.resetFrameForNavigation(frame);
         frame.certificate_error = document.certificate_error;
         frame.referrer_policy = response.referrer_policy;
 
@@ -2755,29 +2928,34 @@ pub const Browser = struct {
             };
         }
 
-        var html_parser = try HTMLParser.init(self.allocator, body_text);
-        defer html_parser.deinit(self.allocator);
-
-        frame.current_node = try html_parser.parse();
-        parser.fixParentPointers(&frame.current_node.?, null);
-        try self.annotateVisitedLinks(&frame.current_node.?, url);
-        frame.current_html_source = body_text;
+        try frame.html_sources.ensureUnusedCapacity(1);
+        _ = frame.html_sources.adoptAssumeCapacity(body_text);
         body_text_owned = false;
 
+        // `frame_url` remains owned by this stack frame until the parse has
+        // completed. Publish a non-owning borrow first so parser scripts see
+        // their correct current URL; the navigation-reset errdefer clears it
+        // before the stack owner frees the URL on failure.
         frame.current_url = frame_url;
+        frame.current_url_owned = false;
+        const parent_window_id: ?u32 = if (frame.parent) |parent| parent.window_id else null;
+        var live_context = LiveDocumentLoadContext{
+            .browser = self,
+            .tab = frame.tab,
+            .frame = frame,
+            .page_url = frame_url,
+            .parent_window_id = parent_window_id,
+        };
+        try document_loader.runIntoSlot(self.allocator, &frame.html_sources, &frame.current_node, .{
+            .context = &live_context,
+            .install_root = LiveDocumentLoadContext.installRoot,
+            .execute_script = LiveDocumentLoadContext.executeScript,
+        });
+        parser.fixParentPointers(&frame.current_node.?, null);
+        try self.annotateVisitedLinks(&frame.current_node.?, url);
+
         frame.current_url_owned = true;
         frame_url_owned = false;
-
-        frame.js_context = try frame.tab.getJs(url);
-        if (frame.js_context) |ctx| {
-            self.attachJsCallbacks(frame.tab, frame, ctx);
-        }
-
-        const parent_window_id: ?u32 = if (frame.parent) |parent| parent.window_id else null;
-        frame.tab.setParentWindow(frame.window_id, parent_window_id);
-        if (frame.js_context) |ctx| {
-            ctx.setParentWindow(frame.window_id, parent_window_id);
-        }
 
         var node_list = std.ArrayList(*parser.Node).empty;
         defer node_list.deinit(self.allocator);
@@ -2876,6 +3054,7 @@ pub const Browser = struct {
 
         frame.tab.setNeedsPaint();
         frame.tab.runAnimationFrame(frame.scroll);
+        self.completeDocumentLifecycle(frame);
     }
 
     /// CSS background URLs are resolved only after cascade/media evaluation,
@@ -3205,24 +3384,24 @@ pub const Browser = struct {
         var body_text_owned = true;
         errdefer if (body_text_owned) self.allocator.free(body_text);
 
-        var html_parser = try HTMLParser.init(self.allocator, body_text);
-        defer html_parser.deinit(self.allocator);
-
-        frame.current_node = try html_parser.parse();
-        parser.fixParentPointers(&frame.current_node.?, null);
-        try self.annotateVisitedLinks(&frame.current_node.?, frame_url_ptr);
-        frame.current_html_source = body_text;
+        try frame.html_sources.ensureUnusedCapacity(1);
+        _ = frame.html_sources.adoptAssumeCapacity(body_text);
         body_text_owned = false;
 
-        frame.js_context = try parent.tab.getJs(frame_url_ptr);
-        if (frame.js_context) |ctx| {
-            self.attachJsCallbacks(parent.tab, frame, ctx);
-        }
-        const parent_window_id: ?u32 = parent.window_id;
-        parent.tab.setParentWindow(frame.window_id, parent_window_id);
-        if (frame.js_context) |ctx| {
-            ctx.setParentWindow(frame.window_id, parent_window_id);
-        }
+        var live_context = LiveDocumentLoadContext{
+            .browser = self,
+            .tab = parent.tab,
+            .frame = frame,
+            .page_url = frame_url_ptr,
+            .parent_window_id = parent.window_id,
+        };
+        try document_loader.runIntoSlot(self.allocator, &frame.html_sources, &frame.current_node, .{
+            .context = &live_context,
+            .install_root = LiveDocumentLoadContext.installRoot,
+            .execute_script = LiveDocumentLoadContext.executeScript,
+        });
+        parser.fixParentPointers(&frame.current_node.?, null);
+        try self.annotateVisitedLinks(&frame.current_node.?, frame_url_ptr);
 
         var node_list = std.ArrayList(*parser.Node).empty;
         defer node_list.deinit(self.allocator);
@@ -3313,7 +3492,84 @@ pub const Browser = struct {
         std.debug.assert(insert_index <= parent.children.items.len);
         parent.children.insertAssumeCapacity(insert_index, frame);
         iframe_node.element.iframe_window_id = frame.window_id;
+        self.completeDocumentLifecycle(frame);
         return frame;
+    }
+
+    /// Queue the lifecycle transition after initial parsing, synchronous
+    /// parser-script execution, and static resource/style installation have
+    /// completed. The task boundary preserves the ordinary event-loop order:
+    /// `document.readyState` remains `loading` until the serialized Tab worker
+    /// accepts this generation-scoped transition.
+    pub fn completeDocumentLifecycle(self: *Browser, frame: *Frame) void {
+        if (frame.document_generation == 0) return;
+        const context = LifecycleReadyTaskContext.create(
+            self.allocator,
+            self,
+            frame.tab,
+            DocumentHandle.fromFrame(frame),
+        ) catch |err| {
+            std.log.warn("Failed to allocate document lifecycle transition: {}", .{err});
+            return;
+        };
+        const task_instance = Task.init(
+            .normal,
+            "task:document_lifecycle_ready",
+            context.toOpaque(),
+            LifecycleReadyTaskContext.runOpaque,
+            LifecycleReadyTaskContext.cleanupOpaque,
+        );
+        frame.tab.task_runner.schedule(task_instance) catch |err| {
+            context.destroy();
+            std.log.warn("Failed to queue document lifecycle transition: {}", .{err});
+        };
+    }
+
+    /// Advance one current document to event eligibility after static script
+    /// evaluation. This runs only on the serialized Tab worker through
+    /// `LifecycleReadyTaskContext`.
+    pub fn markDocumentLifecycleEligible(self: *Browser, frame: *Frame) void {
+        const generation = frame.document_generation;
+        if (generation == 0) return;
+        _ = frame.lifecycle.enterInteractive(generation);
+        _ = frame.lifecycle.markLoadEligible(generation);
+        self.scheduleNextDocumentLifecycleEvent(frame) catch |err| {
+            std.log.warn("Failed to queue document lifecycle event: {}", .{err});
+        };
+    }
+
+    /// Claim and enqueue the next lifecycle event for `frame`. The task owns
+    /// only scalar generation identity plus a lifecycle claim; it resolves the
+    /// Frame again immediately before calling JavaScript, so navigation turns
+    /// stale queued work into a no-op.
+    pub fn scheduleNextDocumentLifecycleEvent(self: *Browser, frame: *Frame) !void {
+        const generation = frame.document_generation;
+        if (generation == 0) return;
+        const dispatch = frame.lifecycle.claimNextDispatch(generation) orelse return;
+
+        const context = LifecycleTaskContext.create(
+            self.allocator,
+            self,
+            frame.tab,
+            DocumentHandle.fromFrame(frame),
+            dispatch,
+        ) catch |err| {
+            _ = frame.lifecycle.releaseDispatch(dispatch);
+            return err;
+        };
+        errdefer context.destroy();
+
+        const trace_name = switch (dispatch.event) {
+            .dom_content_loaded => "task:dom_content_loaded",
+            .load => "task:window_load",
+        };
+        try frame.tab.task_runner.schedule(Task.init(
+            .normal,
+            trace_name,
+            context.toOpaque(),
+            LifecycleTaskContext.runOpaque,
+            LifecycleTaskContext.cleanupOpaque,
+        ));
     }
 
     /// Resolve every external classic script and linked stylesheet before
@@ -6119,6 +6375,8 @@ const LoadTaskContext = BrowserTaskContexts.LoadTaskContext;
 const FrameLoadTaskContext = BrowserTaskContexts.FrameLoadTaskContext;
 const TabActionTaskContext = BrowserTaskContexts.TabActionTaskContext;
 const ScriptTaskContext = BrowserTaskContexts.ScriptTaskContext;
+const LifecycleReadyTaskContext = BrowserTaskContexts.LifecycleReadyTaskContext;
+const LifecycleTaskContext = BrowserTaskContexts.LifecycleTaskContext;
 const BrowserScriptTaskContexts = script_tasks.Contexts(Browser, DocumentHandle);
 const SetTimeoutThreadContext = BrowserScriptTaskContexts.SetTimeoutThreadContext;
 const runSetTimeoutThread = BrowserScriptTaskContexts.runSetTimeoutThread;
@@ -6127,6 +6385,7 @@ const runAnimationTimerThread = BrowserScriptTaskContexts.runAnimationTimerThrea
 const XhrThreadContext = BrowserScriptTaskContexts.XhrThreadContext;
 const runXhrThread = BrowserScriptTaskContexts.runXhrThread;
 const jsRenderCallback = BrowserScriptTaskContexts.jsRenderCallback;
+const jsDocumentReadyStateCallback = BrowserScriptTaskContexts.jsDocumentReadyStateCallback;
 const jsFocusCallback = BrowserScriptTaskContexts.jsFocusCallback;
 const jsDomMutationCallback = BrowserScriptTaskContexts.jsDomMutationCallback;
 const jsDomMutationCompleteCallback = BrowserScriptTaskContexts.jsDomMutationCompleteCallback;

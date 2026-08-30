@@ -33,13 +33,61 @@ binding modules do not import the `Js` coordinator.
 
 ## Window and document generations
 
-A `WindowContext` stores the current DOM root, its `dom_handles.Store`,
-callbacks, timers, listeners, and named globals. The store owns both pointer-
-to-numeric and numeric-to-pointer directions and reserves both maps before
-publishing an identity. `Js.setNodes` changes the root and clears the store.
-Installing null during teardown must not call back into JavaScript; it
-immediately makes wrappers inert. A later non-null install clears and rebuilds
-on the serialized Tab worker before evaluation resumes.
+Each `Js` keeps one neutral host Realm on Kiesel's execution-context stack and
+owns heap-stable per-document `WindowRealm` values. A non-null `Js.setNodes`
+installation creates a fresh Realm/global object for that browsing-context
+window id, then retires the preceding realm. A null installation is host-only:
+it clears native maps/callbacks and makes wrappers inert without entering
+JavaScript, so it is safe during teardown.
+
+Each `WindowRealm` owns its current DOM root, `dom_handles.Store`, callbacks,
+timers, listeners, named globals, detached roots, and bootstrap state. It can
+also borrow one type-erased Node relocation observer only for a direct,
+parser-blocking evaluation; that observer is cleared before parser control
+yields or Realm retirement. Conversely,
+`Js.nodeHandleRelocationObserver` borrows that live Realm's handle store for
+parser-originated array moves, and the parser clears it before Realm
+retirement. The
+outer `Js` owns one monotonic `dom_handles.IdIssuer`; handle IDs therefore do
+not collide across WindowRealms or document generations. A store owns the
+pointer-to-ID and ID-to-pointer maps and reserves both directions before
+publishing an identity. Structural relocation rebinds an existing ID; document
+retirement never lets an old wrapper resolve to a newer Node.
+
+Every entry into a page realm uses an active-window guard that restores the
+previous active id on return, including error paths and synchronous reentrant
+host callbacks. Page-realm initialization contexts are popped after host
+bindings are installed; bootstrap and page execution each push their own
+temporary Script context. Only the neutral host realm remains installed
+between evaluations.
+
+The Browser owns document lifecycle eligibility and invokes
+`Js.dispatchLifecycleEvent` only through a generation-stamped task. The JS
+host looks up an existing Realm before activation, so missing, retired, or
+not-yet-bootstrapped documents are inert no-ops rather than new Realm
+allocations. `document.readyState` reads a narrow synchronous callback over
+the current Frame lifecycle phase; that callback's `JsRenderContext` is a
+generation-bound borrow and returns null once its Frame is stale. Bootstrap
+delivers `DOMContentLoaded` to document then window and `load` to window,
+including `window.onload`; a page listener exception is contained so it cannot
+prevent later listeners or lifecycle completion.
+
+The Browser can additionally call `Js.dispatchInlineEvent` for an authored
+element event attribute, such as `<body onload>`, after its generation-checked
+load transition. That entry point does not allocate a missing Realm, but can
+bootstrap an existing live Realm when the page has no ordinary script. The
+runtime constructs a normal Event with the element wrapper as `target` and
+`currentTarget`, invokes the handler with that wrapper as `this`, and contains
+handler exceptions so a bad inline handler cannot prevent later lifecycle work.
+
+`document.write` has a deliberately narrower host seam than ordinary DOM
+mutation. The Browser installs a synchronous callback only around evaluation
+of a parser-inserted classic script; the callback copies its temporary string
+into the Frame's append-only HTML source store and gives it to the live parser
+ahead of unconsumed source. The Realm clears that callback before parser
+control yields. With no active sink, `document.write` is an inert bounded
+operation: it must not retain a parser pointer, queue work, or imply
+`document.open()` replacement semantics.
 
 `JsRenderContext` is the stable synchronous host-callback identity embedded in
 a Frame. It carries current Browser/Tab/host pointers plus a document
@@ -49,21 +97,47 @@ live context on the Tab worker.
 
 JavaScript node identity still ultimately maps to addresses of Nodes stored by
 value in resizable child arrays. Supported mutation APIs synchronously retire
-or rebind every affected handle. Future mutation APIs must use the same
-boundary; an old wrapper must never silently retarget when an array address is
-reused.
+or rebind every affected handle and every installed opaque relocation token.
+Future mutation APIs must use the same boundary; an old wrapper or parser pin
+must never silently retarget when an array address is reused.
+
+JavaScript handles and parser pins have deliberately different retention rules
+when `replaceChildren` removes a subtree: a JavaScript wrapper can remain
+valid as a detached root for later reattachment, while a parser pin for that
+removed subtree is retired because it can no longer name an active parser
+insertion point. Parser-originated moves use the Realm-owned observer in the
+opposite direction to preserve wrappers created by an earlier blocking script.
+
+The bootstrap for each document Realm owns a cache from numeric Node ID to its
+one JavaScript `Node` wrapper. Every native API that returns a Node resolves or
+publishes an ID only during its synchronous callback and then passes that ID
+through the cache. Thus a node reached through document lookup, traversal,
+events, named ID globals, canvas, or a mutation result compares by JavaScript
+object identity. The cache is never shared across document Realms.
 
 `dom_mutation.Context` is a synchronous borrow of one window's handle and
 detached-root stores. Its structural transactions stage allocations before
 invalidation, temporarily unpublish pointer keys only during the non-fallible
 move, and repair both handle directions before returning. Paired host hooks
 clear and rebuild ID globals and notify document/layout owners without giving
-the mutation module access to the realm coordinator.
+the mutation module access to the realm coordinator. An optional core
+`RelocationObserver` carries parser-local scalar tokens through the same
+transaction without coupling the mutation module to parser types; an old
+pointer passed to it is an opaque map key and may not be dereferenced.
 
 ## DOM handles and mutation APIs
 
 - `Node.children` returns a fresh JavaScript array of immediate Element child
-  handles in DOM order, excluding Text and deeper descendants.
+  wrappers in DOM order, excluding Text and deeper descendants.
+- Read-only tree bindings provide `document.documentElement`, `document.body`,
+  `getElementById`, document/Element `getElementsByTagName`, and authored Node
+  parent/sibling/child/text traversal. These APIs resolve the live tree rather
+  than named ID globals; tag-query and child arrays are deliberate snapshots,
+  not live HTMLCollections. Generated pseudo boxes remain private.
+- Text topology is readable through `childNodes`, `nodeType`, `nodeName`,
+  `nodeValue`, `data`, and `textContent`. Text mutation and creation remain a
+  separate ownership/invalidation boundary because parser-created text borrows
+  document source storage.
 - `document.createElement` creates a lowercase-tagged, window-owned,
   heap-stable detached root.
 - `appendChild` and `insertBefore` transfer an eligible detached root, preserve
@@ -77,7 +151,10 @@ the mutation module access to the realm coordinator.
   one mutation generation. Published removed subtrees remain detached and
   reattachable. Unsupported non-Element arguments throw before mutation.
 - `innerHTML` removes handles recursively before old children retire; its read
-  path serializes the live DOM. `outerHTML` additionally serializes the element.
+  path serializes the live DOM. Its replacement parser creates an inert HTML
+  fragment: scripts in that fragment are marked started before installation,
+  so a later resource refresh cannot execute scripts resurrected by
+  serialization/reparse. `outerHTML` additionally serializes the element.
 
 The complete structural transaction is documented in
 [`document-and-rendering.md`](document-and-rendering.md). Named ID globals are
@@ -86,10 +163,10 @@ elements remain absent from global lookup until reattached.
 
 ## Named ID globals and returned strings
 
-Only the active window exposes element IDs as named globals. The first nonempty
-ID in document order wins; a pre-existing global wins over an ID. Refresh after
-attached structure changes and attached `id` mutation. Realm activation swaps
-registries and must not expose another window's Nodes.
+Each document Realm exposes its own element IDs as named globals. The first
+nonempty ID in document order wins; a pre-existing page global wins over an
+ID. Refresh after attached structure changes and attached `id` mutation. No
+global-registry swap may expose another frame's Nodes.
 
 DOM serialization, cookie values, XHR response text, message data, and other
 temporary host strings must move into Kiesel's traced allocator before native

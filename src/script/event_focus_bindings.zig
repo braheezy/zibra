@@ -8,7 +8,8 @@ const std = @import("std");
 const kiesel = @import("kiesel");
 const parser = @import("../document/parser.zig");
 const dom_focus = @import("../document/focus.zig");
-const DomHandles = @import("dom_handles.zig").Store;
+const dom_handles = @import("dom_handles.zig");
+const DomHandles = dom_handles.Store;
 const dom_mutation = @import("dom_mutation.zig");
 const native_bindings = @import("native_bindings.zig");
 
@@ -21,6 +22,7 @@ pub const FocusCallbackFn = *const fn (context: ?*anyopaque, handle: u32) anyerr
 pub const WindowBorrow = struct {
     current_nodes: ?*parser.Node,
     handles: *DomHandles,
+    handle_issuer: *dom_handles.IdIssuer,
     focus_context: ?*anyopaque,
     focus: ?FocusCallbackFn,
 };
@@ -69,7 +71,7 @@ fn eventPath(agent: *Agent, this_value: Value, arguments: Arguments) Agent.Error
     var current: ?*parser.Node = target;
     var index: usize = 0;
     while (current) |node| : (current = dom_mutation.nodeParent(node)) {
-        const handle = try window.handles.getOrCreate(node);
+        const handle = try window.handles.getOrCreate(node, window.handle_issuer);
         try result.object.createDataPropertyDirect(
             agent,
             kiesel.types.PropertyKey.from(

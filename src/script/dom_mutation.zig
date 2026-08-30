@@ -7,6 +7,7 @@
 const std = @import("std");
 const kiesel = @import("kiesel");
 const parser = @import("../document/parser.zig");
+const RelocationObserver = @import("../core/relocatable_identity.zig").RelocationObserver;
 const DomHandles = @import("dom_handles.zig").Store;
 
 const Agent = kiesel.execution.Agent;
@@ -32,40 +33,138 @@ pub const Context = struct {
     window_id: u32,
     current_nodes: ?*Node,
     handles: *DomHandles,
+    /// An optional parser- or embedder-owned identity registry. Its callbacks
+    /// are synchronous, type-erased, and must never enter JavaScript.
+    relocation_observer: ?RelocationObserver = null,
     detached_nodes: *std.AutoHashMap(*Node, void),
     can_retain_layout_insert: bool,
     host_context: ?*anyopaque,
     hooks: Hooks,
 };
 
-const DirectChildHandle = struct {
-    old_ptr: *Node,
-    old_index: usize,
-    handle: u32,
+/// Every identity published for one Node before it moves. JavaScript handles
+/// and a parser-owned opaque token must make the same transition together.
+const NodeIdentity = struct {
+    handle: ?u32 = null,
+    observer_token: ?RelocationObserver.Token = null,
 };
 
-fn snapshotDirectChildHandles(
+const DirectChildIdentity = struct {
+    old_ptr: *Node,
+    old_index: usize,
+    identity: NodeIdentity = .{},
+};
+
+/// Reserve storage for every direct child that has a JavaScript handle, and
+/// for every direct child whenever an external relocation observer is active.
+/// The observer is deliberately not consulted until immediately before the
+/// move, so no identity is transiently unpublished while setup can still fail.
+fn snapshotDirectChildIdentities(
     self: *Context,
     parent: *Node,
-) !std.ArrayList(DirectChildHandle) {
-    var bindings = std.ArrayList(DirectChildHandle).empty;
+) !std.ArrayList(DirectChildIdentity) {
+    var bindings = std.ArrayList(DirectChildIdentity).empty;
     errdefer bindings.deinit(self.allocator);
 
     switch (parent.*) {
         .text => {},
         .element => |*element| {
             for (element.children.items, 0..) |*child, index| {
-                if (self.handles.handleFor(child)) |handle| {
-                    try bindings.append(self.allocator, .{
-                        .old_ptr = child,
-                        .old_index = index,
-                        .handle = handle,
-                    });
-                }
+                const handle = self.handles.handleFor(child);
+                if (handle == null and self.relocation_observer == null) continue;
+                try bindings.append(self.allocator, .{
+                    .old_ptr = child,
+                    .old_index = index,
+                    .identity = .{ .handle = handle },
+                });
             }
         },
     }
     return bindings;
+}
+
+fn unpublishNodeIdentity(self: *Context, node: *Node) NodeIdentity {
+    return .{
+        .handle = self.handles.unpublishPointer(node),
+        .observer_token = if (self.relocation_observer) |observer|
+            observer.unpublishItem(@ptrCast(node))
+        else
+            null,
+    };
+}
+
+fn unpublishDirectChildIdentities(
+    self: *Context,
+    bindings: []DirectChildIdentity,
+) void {
+    for (bindings) |*binding| {
+        binding.identity = unpublishNodeIdentity(self, binding.old_ptr);
+    }
+}
+
+fn bindNodeIdentity(self: *Context, node: *Node, identity: NodeIdentity) void {
+    bindHandleIdentity(self, node, identity);
+    if (identity.observer_token) |token| {
+        const observer = self.relocation_observer orelse unreachable;
+        observer.rebindItem(@ptrCast(node), token);
+    }
+}
+
+fn bindHandleIdentity(self: *Context, node: *Node, identity: NodeIdentity) void {
+    if (identity.handle) |handle| self.handles.bindAssumeCapacity(node, handle);
+}
+
+fn retireNodeIdentity(self: *Context, identity: NodeIdentity) void {
+    if (identity.handle) |handle| self.handles.retireIdentity(handle);
+    if (identity.observer_token) |token| {
+        const observer = self.relocation_observer orelse unreachable;
+        observer.retireToken(token);
+    }
+}
+
+/// A JavaScript-visible node can outlive `replaceChildren` as a detached root,
+/// but a parser pin must not. Parser insertion-point pins describe the active
+/// document tree, not JavaScript's detached-node retention. Rebind the JS
+/// root handle while retiring only the observer identities for the removed
+/// subtree; descendant JS handles stay at their existing addresses.
+fn retainDetachedRootAndRetireObserverIdentities(
+    self: *Context,
+    root: *Node,
+    root_identity: NodeIdentity,
+) void {
+    bindHandleIdentity(self, root, root_identity);
+    retireObserverIdentitiesForSubtree(self, root, root_identity.observer_token);
+}
+
+/// Retire optional external identities without affecting JavaScript handles.
+/// `known_root_token` is supplied when the direct root was already unpublished
+/// before its by-value storage was copied to a detached allocation.
+fn retireObserverIdentitiesForSubtree(
+    self: *Context,
+    node: *Node,
+    known_root_token: ?RelocationObserver.Token,
+) void {
+    const observer = self.relocation_observer orelse return;
+    switch (node.*) {
+        .element => |*element| {
+            for (element.children.items) |*child| {
+                retireObserverIdentitiesForSubtree(self, child, null);
+            }
+        },
+        .text => {},
+    }
+    const token = known_root_token orelse observer.unpublishItem(@ptrCast(node)) orelse return;
+    observer.retireToken(token);
+}
+
+fn directChildIdentity(
+    bindings: []const DirectChildIdentity,
+    child_index: usize,
+) ?NodeIdentity {
+    for (bindings) |binding| {
+        if (binding.old_index == child_index) return binding.identity;
+    }
+    return null;
 }
 
 pub fn nodeParent(node: *Node) ?*Node {
@@ -141,12 +240,11 @@ pub fn insertDetachedChild(
     child: *Node,
     insert_index: usize,
 ) !void {
-    var bindings = try snapshotDirectChildHandles(self, parent);
+    var bindings = try snapshotDirectChildIdentities(self, parent);
     defer bindings.deinit(self.allocator);
 
     const parent_is_attached = isAttachedToCurrentDocument(self.current_nodes, parent);
     const parent_parent = nodeParent(parent);
-    const child_handle = self.handles.handleFor(child).?;
     const element = &parent.element;
     const retains_layout_children = parent_is_attached and
         self.can_retain_layout_insert and
@@ -181,10 +279,11 @@ pub fn insertDetachedChild(
 
     // Capacity growth and insertion can relocate or shift every immediate
     // child. Remove all old pointer keys before any new address is installed.
-    for (bindings.items) |binding| {
-        _ = self.handles.unpublishPointer(binding.old_ptr);
-    }
-    _ = self.handles.unpublishPointer(child);
+    // `ensureUnusedCapacity` may already have retired the previous backing
+    // allocation, so observer implementations must treat `old_ptr` as an
+    // opaque key and never dereference it here.
+    unpublishDirectChildIdentities(self, bindings.items);
+    const child_identity = unpublishNodeIdentity(self, child);
 
     mutation_started = true;
     element.children.insertAssumeCapacity(insert_index, child.*);
@@ -194,11 +293,11 @@ pub fn insertDetachedChild(
     for (bindings.items) |binding| {
         const new_index = binding.old_index + @intFromBool(binding.old_index >= insert_index);
         const new_ptr = &element.children.items[new_index];
-        self.handles.bindAssumeCapacity(new_ptr, binding.handle);
+        bindNodeIdentity(self, new_ptr, binding.identity);
     }
 
     const installed_child = &element.children.items[insert_index];
-    self.handles.bindAssumeCapacity(installed_child, child_handle);
+    bindNodeIdentity(self, installed_child, child_identity);
     parser.fixParentPointers(parent, parent_parent);
     parser.dirtyStyleSubtree(installed_child);
 
@@ -233,8 +332,9 @@ pub fn detachChild(
     child: *Node,
     remove_index: usize,
 ) !void {
-    var bindings = try snapshotDirectChildHandles(self, parent);
+    var bindings = try snapshotDirectChildIdentities(self, parent);
     defer bindings.deinit(self.allocator);
+    std.debug.assert(&parent.element.children.items[remove_index] == child);
 
     const detached = try self.allocator.create(Node);
     var detached_owned = true;
@@ -243,7 +343,6 @@ pub fn detachChild(
 
     const parent_is_attached = isAttachedToCurrentDocument(self.current_nodes, parent);
     const parent_parent = nodeParent(parent);
-    const child_handle = self.handles.handleFor(child).?;
     const element = &parent.element;
 
     if (parent_is_attached) try self.hooks.clear_named(self.host_context, self.window_id);
@@ -255,9 +354,7 @@ pub fn detachChild(
 
     // orderedRemove shifts later children, invalidating their pointer keys.
     // Remove every published direct-child address before performing the move.
-    for (bindings.items) |binding| {
-        _ = self.handles.unpublishPointer(binding.old_ptr);
-    }
+    unpublishDirectChildIdentities(self, bindings.items);
 
     detached.* = element.children.orderedRemove(remove_index);
     self.detached_nodes.putAssumeCapacity(detached, {});
@@ -267,10 +364,11 @@ pub fn detachChild(
         if (binding.old_index == remove_index) continue;
         const new_index = binding.old_index - @intFromBool(binding.old_index > remove_index);
         const new_ptr = &element.children.items[new_index];
-        self.handles.bindAssumeCapacity(new_ptr, binding.handle);
+        bindNodeIdentity(self, new_ptr, binding.identity);
     }
 
-    self.handles.bindAssumeCapacity(detached, child_handle);
+    const child_identity = directChildIdentity(bindings.items, remove_index) orelse unreachable;
+    bindNodeIdentity(self, detached, child_identity);
     parser.fixParentPointers(parent, parent_parent);
     parser.fixParentPointers(detached, null);
     clearDetachedLayoutPointers(detached);
@@ -294,6 +392,40 @@ pub fn removeHandlesForSubtree(handles: *DomHandles, node: *Node) void {
     }
 
     handles.retire(node);
+}
+
+/// Retire every JavaScript and optional observer identity in a subtree before
+/// its Node storage is destroyed. The observer is a non-owning participant:
+/// it does not keep an otherwise unobservable subtree alive.
+pub fn retireIdentitiesForSubtree(self: *Context, node: *Node) void {
+    switch (node.*) {
+        .element => |*element| {
+            for (element.children.items) |*child| {
+                retireIdentitiesForSubtree(self, child);
+            }
+        },
+        .text => {},
+    }
+    retireNodeIdentity(self, unpublishNodeIdentity(self, node));
+}
+
+/// As `retireIdentitiesForSubtree`, but the caller has already unpublished the
+/// root while repairing a containing child array. Descendants remain
+/// published and are retired normally.
+fn retireUnpublishedIdentityForSubtree(
+    self: *Context,
+    node: *Node,
+    root_identity: NodeIdentity,
+) void {
+    switch (node.*) {
+        .element => |*element| {
+            for (element.children.items) |*child| {
+                retireIdentitiesForSubtree(self, child);
+            }
+        },
+        .text => {},
+    }
+    retireNodeIdentity(self, root_identity);
 }
 
 fn subtreeHasPublishedHandle(handles: *const DomHandles, node: *Node) bool {
@@ -328,6 +460,9 @@ pub fn emptyElementChildren(
     };
     if (element.children.items.len == 0) return;
 
+    var bindings = try snapshotDirectChildIdentities(self, node);
+    defer bindings.deinit(self.allocator);
+
     var retained_count: usize = 0;
     for (element.children.items) |*child| {
         if (subtreeHasPublishedHandle(self.handles, child)) retained_count += 1;
@@ -360,27 +495,27 @@ pub fn emptyElementChildren(
     markElementLayoutDirty(element);
     if (is_attached) self.hooks.prepare(self.host_context, node, .structural);
 
+    // All direct roots leave this child array, either into detached ownership
+    // or destruction. Unpublish them before any root is copied or destroyed.
+    unpublishDirectChildIdentities(self, bindings.items);
+
     var retained_index: usize = 0;
-    for (element.children.items) |*child| {
+    for (element.children.items, 0..) |*child, child_index| {
+        const root_identity = directChildIdentity(bindings.items, child_index) orelse NodeIdentity{};
         if (retained_index < retained.items.len and
             retained.items[retained_index].old_ptr == child)
         {
             const stable_ptr = retained.items[retained_index].stable_ptr;
             retained_index += 1;
 
-            const root_handle = self.handles.handleFor(child);
-            if (root_handle != null) _ = self.handles.unpublishPointer(child);
-
             stable_ptr.* = child.*;
-            if (root_handle) |handle| {
-                self.handles.bindAssumeCapacity(stable_ptr, handle);
-            }
+            retainDetachedRootAndRetireObserverIdentities(self, stable_ptr, root_identity);
             parser.fixParentPointers(stable_ptr, null);
             clearDetachedLayoutPointers(stable_ptr);
             parser.dirtyStyleSubtree(stable_ptr);
             self.detached_nodes.putAssumeCapacity(stable_ptr, {});
         } else {
-            removeHandlesForSubtree(self.handles, child);
+            retireUnpublishedIdentityForSubtree(self, child, root_identity);
             child.deinit(self.allocator);
         }
     }
@@ -412,7 +547,7 @@ const ReplacementParent = struct {
     node: *Node,
     depth: usize,
     is_target: bool,
-    bindings: std.ArrayList(DirectChildHandle),
+    bindings: std.ArrayList(DirectChildIdentity),
     remaining: std.ArrayList(Node),
 };
 
@@ -452,13 +587,6 @@ fn replacementArgumentAt(
     return null;
 }
 
-fn directChildHandle(bindings: []const DirectChildHandle, child_index: usize) ?u32 {
-    for (bindings) |binding| {
-        if (binding.old_index == child_index) return binding.handle;
-    }
-    return null;
-}
-
 fn selectedChildrenBefore(
     arguments: []const ReplacementArgument,
     parent: *Node,
@@ -483,7 +611,7 @@ fn addReplacementParent(
         return;
     }
 
-    var bindings = try snapshotDirectChildHandles(self, node);
+    var bindings = try snapshotDirectChildIdentities(self, node);
     errdefer bindings.deinit(self.allocator);
     try parents.append(self.allocator, .{
         .node = node,
@@ -641,18 +769,18 @@ pub fn transferElementChildren(
         const parent_parent = nodeParent(parent);
         const element = &parent.element;
 
-        for (parent_state.bindings.items) |binding| {
-            _ = self.handles.unpublishPointer(binding.old_ptr);
-        }
+        unpublishDirectChildIdentities(self, parent_state.bindings.items);
 
         var removed_slot_index: usize = 0;
         for (element.children.items, 0..) |*child, child_index| {
             if (replacementArgumentAt(arguments.items, parent, child_index)) |argument_index| {
                 const argument = &arguments.items[argument_index];
                 std.debug.assert(!argument.has_value);
+                const identity = directChildIdentity(parent_state.bindings.items, child_index) orelse unreachable;
+                std.debug.assert(identity.handle == argument.handle);
                 argument.transfer.* = child.*;
                 argument.has_value = true;
-                self.handles.bindAssumeCapacity(argument.transfer, argument.handle);
+                bindNodeIdentity(self, argument.transfer, identity);
                 parser.fixParentPointers(argument.transfer, null);
                 clearDetachedLayoutPointers(argument.transfer);
                 parser.dirtyStyleSubtree(argument.transfer);
@@ -663,20 +791,18 @@ pub fn transferElementChildren(
                 const removed = &removed_target_children.items[removed_slot_index];
                 removed_slot_index += 1;
                 std.debug.assert(removed.old_index == child_index);
-                const root_handle = directChildHandle(parent_state.bindings.items, child_index);
-                const retain = root_handle != null or subtreeHasPublishedHandle(self.handles, child);
+                const root_identity = directChildIdentity(parent_state.bindings.items, child_index) orelse NodeIdentity{};
+                const retain = root_identity.handle != null or subtreeHasPublishedHandle(self.handles, child);
                 if (retain) {
                     removed.stable_ptr.* = child.*;
-                    if (root_handle) |handle| {
-                        self.handles.bindAssumeCapacity(removed.stable_ptr, handle);
-                    }
+                    retainDetachedRootAndRetireObserverIdentities(self, removed.stable_ptr, root_identity);
                     parser.fixParentPointers(removed.stable_ptr, null);
                     clearDetachedLayoutPointers(removed.stable_ptr);
                     parser.dirtyStyleSubtree(removed.stable_ptr);
                     self.detached_nodes.putAssumeCapacity(removed.stable_ptr, {});
                     removed.consumed = true;
                 } else {
-                    removeHandlesForSubtree(self.handles, child);
+                    retireUnpublishedIdentityForSubtree(self, child, root_identity);
                     child.deinit(self.allocator);
                     self.allocator.destroy(removed.stable_ptr);
                     removed.consumed = true;
@@ -702,7 +828,7 @@ pub fn transferElementChildren(
                     binding.old_index,
                 );
                 const new_ptr = &element.children.items[new_index];
-                self.handles.bindAssumeCapacity(new_ptr, binding.handle);
+                bindNodeIdentity(self, new_ptr, binding.identity);
             }
         }
         parser.fixParentPointers(parent, parent_parent);
@@ -714,13 +840,14 @@ pub fn transferElementChildren(
         std.debug.assert(argument.has_value);
         clearDetachedLayoutPointers(argument.transfer);
         parser.dirtyStyleSubtree(argument.transfer);
-        _ = self.handles.unpublishPointer(argument.transfer);
+        const transfer_identity = unpublishNodeIdentity(self, argument.transfer);
+        std.debug.assert(transfer_identity.handle == argument.handle);
         _ = self.detached_nodes.remove(argument.transfer);
         replacement.appendAssumeCapacity(argument.transfer.*);
         self.allocator.destroy(argument.transfer);
 
         const installed = &replacement.items[replacement.items.len - 1];
-        self.handles.bindAssumeCapacity(installed, argument.handle);
+        bindNodeIdentity(self, installed, transfer_identity);
     }
     transfer_boxes_owned = false;
 

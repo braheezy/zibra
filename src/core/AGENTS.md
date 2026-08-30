@@ -27,6 +27,15 @@ dependency registration or destruction behavior.
   only for ordered retirement; style must republish the field before layout or
   hit testing uses `get`.
 - Keep core primitives independent of Browser, SDL, Kiesel, and URL layers.
+- `relocatable_identity.zig` is the non-owning bidirectional map for values
+  stored at addresses that may move. Its caller owns the pointees and issuer,
+  reserves before a mutation, unpublishes old addresses, and rebinds the same
+  scalar identities synchronously before a foreign callback can run. It must
+  never grow document, JavaScript, or browser policy into this core boundary.
+- `RelocationObserver` is the type-erased synchronous bridge for a second
+  caller-owned identity registry. Its item argument is an opaque address key,
+  not a dereferenceable borrow after storage growth; every returned token must
+  be rebound or retired before control leaves the mutation transaction.
 - Changes here need direct unit coverage plus regression coverage in each
   consuming subsystem where the lifecycle can differ. Run the relevant focused
   tests and `zig build check`.

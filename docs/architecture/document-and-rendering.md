@@ -12,6 +12,17 @@ and CSS values are borrowed slices. Attribute values containing supported
 character references move into `Element.owned_strings`; DOM text stays
 source-backed and escaped because layout decodes it exactly once. Preserve:
 
+- A navigated Frame owns parser input through `html_source.Store`. Its initial
+  decoded response and any future parser-inserted chunks are independently
+  allocated, append-only source segments. Retire the DOM before clearing the
+  store; never resize or replace a segment that an Element/Text slice borrows.
+- `html_live_parser.zig` drives initial navigation directly into the Frame's
+  final root slot. It may publish that partial tree to the new document Realm
+  at a parser-blocking script boundary, but only through parser-local pins;
+  raw child pointers never cross the boundary. The one-shot
+  `html_parser_session.zig` remains an inspection/compatibility caller, not
+  the navigation owner.
+
 1. decoded HTML until the complete DOM retires;
 2. stylesheet text until every rule, keyframe, and computed value borrowing it
    retires;
@@ -51,6 +62,16 @@ split across acyclic modules:
   invalidation callbacks, and DOM traversal helpers;
 - `html_parser.zig` is a stateful, source-borrowing tokenizer/tree builder
   generic over the DOM types and final parent-pointer repair callback;
+- `html_source.zig` owns the stable source chunks for one navigated document,
+  while `html_tokenizer.zig` borrows append-only chunks and produces owned
+  chunk-boundary-independent lexical tokens. `html_live_parser.zig` owns the
+  resumable initial-navigation tree build and pauses only at complete classic
+  script elements; `html_parser_session.zig` owns a separate one-shot
+  compatibility invocation;
+- `node_pins.zig` owns parser-local opaque Node pins over the core relocatable
+  identity registry. Its Store owns maps and a no-reuse local issuer, not
+  Nodes or source chunks; a pin is either rebound synchronously after a move
+  or retired before a callback can observe the document;
 - `html_serialization.zig` generically serializes the current live tree and
   owns only temporary output/sorting allocations;
 - `css_syntax.zig` owns source-buffer scanning for comments, strings, escapes,
@@ -93,6 +114,28 @@ valid only until an operation may relocate, reorder, or remove its siblings.
 DOM handles, parent pointers, layout back-pointers, frame-element pointers,
 focus/hover state, accessibility pointers, and display provenance must be
 rebound or retired synchronously when storage changes.
+
+`core/relocatable_identity.zig` supplies the reusable two-way pointer/scalar
+registry used for address-unstable identity. It owns neither a Node nor the
+scalar issuance policy: a JavaScript host keeps its globally non-reusing
+  handle issuer, while a live parser keeps its document-local opaque-pin
+issuer. A registry repair transaction reserves before mutation, unpublishes
+old pointer keys, and rebinds the same scalar before control can return to
+JavaScript or another foreign observer. It is not permission to retain a raw
+Node pointer across an asynchronous boundary. Its type-erased
+`RelocationObserver` lets the script mutation transaction carry an optional
+second scalar identity map without importing parser code; because capacity
+growth can already have retired old storage, observer callbacks treat the
+provided pointer as an opaque key and never dereference it.
+
+`node_pins.Store` makes that parser policy explicit. It has a local no-reuse
+issuer and exposes a pointer-free relocation token; a parser must retire the
+token if a script mutation discards the node instead of rebinding it. Pin
+resolution is prohibited during the unpublish/rebind gap, and all pins retire
+before the source DOM generation does. The Store adapts itself to the core
+observer contract, while its Browser/loader caller installs that adapter only
+around one direct parser-blocking script evaluation and clears it before the
+parser pauses again.
 
 An attached iframe Element carries only a numeric child-window ID. That scalar
 moves safely with a Node; it is not proof that the browsing context is live.
