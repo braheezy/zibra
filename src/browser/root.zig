@@ -88,6 +88,13 @@ const DocumentResourceKind = resource_loader.Kind;
 const DocumentResourceFetch = resource_loader.Fetch;
 const DocumentResourceBatch = resource_loader.Batch;
 
+// Google and similar sites commonly put a large application bundle directly
+// in the document. Parsing/evaluating those bundles synchronously can delay
+// the first paint for tens of seconds in the embedded VM. Keep normal
+// parser-blocking semantics for ordinary scripts, but let oversized bundles
+// yield so static HTML can be laid out and shown immediately.
+const parser_script_skip_threshold: usize = 16 * 1024;
+
 fn responseIsNonHtml(response: url_module.HttpResponse, url: *const Url) bool {
     const path = url.path;
     const extension_non_html = std.ascii.endsWithIgnoreCase(path, ".txt") or
@@ -260,6 +267,14 @@ const LiveDocumentLoadContext = struct {
         label: []const u8,
         source: []const u8,
     ) void {
+        if (source.len >= parser_script_skip_threshold) {
+            std.log.warn(
+                "Skipping oversized parser script {s} ({d} bytes) to keep first paint responsive",
+                .{ label, source.len },
+            );
+            return;
+        }
+
         // Both temporary callbacks borrow the stack-bound live parser. Clear
         // them before `document_loader` resumes tokenization or navigation can
         // retire the current document Realm.
@@ -270,6 +285,7 @@ const LiveDocumentLoadContext = struct {
 
         const trace_eval = self.browser.measure.begin("evaljs");
         defer if (trace_eval) self.browser.measure.end("evaljs");
+
         _ = js_context.evaluate(self.frame.window_id, source) catch |err| {
             std.log.err("Parser script {s} ({d} bytes) crashed: {}", .{ label, source.len, err });
             return;
@@ -2567,26 +2583,22 @@ pub const Browser = struct {
             // parser/resource failure unwinds this load.
             frame.current_url = url;
             frame.current_url_owned = false;
-            if (responseIsNonHtml(response, url)) {
-                frame.current_node = try makeInertDocument(
-                    self.allocator,
-                    body_text,
-                    responseIsPlainText(response, url),
-                );
-            } else {
-                var live_context = LiveDocumentLoadContext{
-                    .browser = self,
-                    .tab = tab,
-                    .frame = frame,
-                    .page_url = url,
-                    .parent_window_id = null,
-                };
-                try document_loader.runIntoSlot(self.allocator, &frame.html_sources, &frame.current_node, .{
-                    .context = &live_context,
-                    .install_root = LiveDocumentLoadContext.installRoot,
-                    .execute_script = LiveDocumentLoadContext.executeScript,
-                });
-            }
+            // Top-level navigation retains the browser's normal HTML parser
+            // fallback for extensionless and mislabelled pages. MIME gating
+            // is enforced for embedded documents, where treating script-like
+            // text as HTML would cross an iframe security boundary.
+            var live_context = LiveDocumentLoadContext{
+                .browser = self,
+                .tab = tab,
+                .frame = frame,
+                .page_url = url,
+                .parent_window_id = null,
+            };
+            try document_loader.runIntoSlot(self.allocator, &frame.html_sources, &frame.current_node, .{
+                .context = &live_context,
+                .install_root = LiveDocumentLoadContext.installRoot,
+                .execute_script = LiveDocumentLoadContext.executeScript,
+            });
             document_title = try parser.collectDocumentTitle(
                 self.allocator,
                 &frame.current_node.?,
