@@ -35,6 +35,9 @@ queued work and shutdown are documented in
   and call heap-stable narrow host interfaces embedded in `Js`.
   Network parent-window calls are same-origin-only and limited to the
   compatibility `notify(string)` callback; they do not expose parent DOM.
+- `wpt_bindings.zig` exposes only a bootstrap-time enablement check and a
+  synchronous serialized-result sink. It neither owns WPT session state nor
+  decides browser deadlines, process health, or manifest expectations.
 - `native_bindings.zig` installs comptime binding tables; `transitions.zig`
   parses and starts typed DOM transitions.
 
@@ -43,6 +46,18 @@ queued work and shutdown are documented in
 - Preserve Kiesel's traced allocation, GC-root, and `JsLock` assumptions. A
   native callback entered with the lock held uses lock-aware helpers; do not
   add an unlocked cross-thread host mutation.
+- Each outer Browser-to-JavaScript turn drains the Agent Promise-job queue to
+  a fixed point before its active-window guard and `JsLock` are released.
+  Evaluation, lifecycle/inline/browser event delivery, postMessage, timers,
+  animation frames, and XHR are outer turns; native callbacks that re-enter
+  event or parent-window helpers are not and must defer the checkpoint to
+  their caller. Preserve contained page exceptions and surface the Agent's
+  uncatchable host-interrupt flag after draining.
+- One same-origin Agent can own multiple WindowRealms. Kiesel switches its
+  execution Realm for each queued job, but Zibra does not yet switch
+  `current_window_id` with it; do not treat Promise jobs that cross those
+  windows as correctly routed native calls. Kiesel's default rejection tracker
+  is also inert, so draining jobs does not yet report unhandled rejections.
 - Kiesel retains pointers to the binding-domain `Host` interfaces. Keep those
   interfaces embedded in the heap-stable `Js` allocation, synchronous, and
   narrower than the coordinator. A returned Node or Element is a callback-
@@ -80,6 +95,16 @@ queued work and shutdown are documented in
   native call returns; clear the callback before parser control yields. A
   missing sink is intentionally inert and must not silently implement
   `document.open()` or retain a parser pointer.
+- A WPT report callback belongs to one live document Realm. Install it after
+  non-null `setNodes` creates that Realm and before the first evaluation
+  bootstraps it; bootstrap checks enablement only once. Keep its context alive
+  until completion or Realm retirement, and reinstall it for every replacement
+  document. Null-root invalidation and replacement clear the callback.
+- WPT reporting runs synchronously under `JsLock`. The JSON slice is temporary,
+  so the receiver may only copy it into its own result owner and signal that
+  owner; it must not retain the slice, re-enter `Js`, touch DOM/Frame state, or
+  block teardown. The first bridge is top-level and result-only; see the
+  architecture document for unsupported diagnostics and completion semantics.
 - HTML fragments parsed for `innerHTML` are not document-parser input. Mark
   every script in such a fragment inert before installing its child storage;
   resource refresh must not turn serialized or newly parsed fragment scripts

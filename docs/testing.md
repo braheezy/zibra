@@ -36,6 +36,11 @@ Run from the repository root:
 - `zig build test-pipeline` for exact text-free style/layout/display-list
   goldens covering the box model, nested CSS zoom, bounded tables, float paint
   phases, and adjoining-margin/clearance flow under SDL dummy mode;
+- `zig build test-wpt-runner` for the dependency-free WPT manifest runner's
+  protocol, expectation, diagnostic, and infrastructure-failure handling;
+- `zig build test-wpt` for local headless synchronous PASS, Promise-job PASS,
+  and TIMEOUT result-protocol fixtures. This step uses no upstream WPT checkout
+  or network access;
 - `zig build test-docs` for repository Markdown links when documentation
   changes. The checker intentionally skips the vendored `tests/wpt/upstream`
   submodule, whose links are resolved by WPT's own documentation tooling;
@@ -45,8 +50,9 @@ Run from the repository root:
 
 `zig build check` is the agent-oriented portable aggregate: build/install,
 format checking, the unified unit suite, focused-root compilation, DOM and
-pipeline goldens, server tests, and Markdown links. Native visual goldens
-remain separate because they are platform-dependent.
+pipeline goldens, local WPT runner/protocol checks, server tests, and Markdown
+links. Native visual goldens remain separate because they are
+platform-dependent.
 
 For document-pipeline changes, run `test-pipeline`; use
 `tests/manual/dump-pipeline.html` interactively when diagnosing a stage not

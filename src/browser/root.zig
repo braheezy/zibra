@@ -302,6 +302,15 @@ const ImageLoadCallbacks = struct {
 const DEFAULT_STYLE_SHEET = @embedFile("browser.css");
 const default_window_title: [:0]const u8 = "zibra";
 
+/// Observe installation of a fresh top-level document Realm synchronously.
+/// The Js pointer is a callback-scoped borrow; observers may configure that
+/// Realm but must not retain or re-enter Browser/Tab work.
+pub const TopLevelRealmObserverFn = *const fn (
+    context: ?*anyopaque,
+    js_context: *js_module,
+    window_id: u32,
+) void;
+
 // *********************************************************
 // * App Settings
 // *********************************************************
@@ -576,6 +585,11 @@ pub const Browser = struct {
     needs_draw: bool = true,
     needs_animation_frame: bool = false,
     shutting_down: bool = false,
+    // Optional observer installed before the first Tab is created. Only a
+    // top-level document Realm receives it; the callback context must remain
+    // heap-stable until Browser teardown has retired every Realm.
+    top_level_realm_observer: ?TopLevelRealmObserverFn = null,
+    top_level_realm_observer_context: ?*anyopaque = null,
     resize_generation: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
     // Heap-stable because every tab worker and every App window shares it.
     measure: *MeasureTime,
@@ -866,6 +880,21 @@ pub const Browser = struct {
             }
         }
         return null;
+    }
+
+    /// Configure a synchronous observer for each newly installed top-level
+    /// WindowRealm. Call only before creating the first Tab; the context is a
+    /// borrowed heap-stable owner that must outlive this Browser.
+    pub fn setTopLevelRealmObserver(
+        self: *Browser,
+        observer: ?TopLevelRealmObserverFn,
+        context: ?*anyopaque,
+    ) void {
+        self.lock.lock();
+        defer self.lock.unlock();
+        std.debug.assert(self.tabs.items.len == 0);
+        self.top_level_realm_observer = observer;
+        self.top_level_realm_observer_context = context;
     }
 
     /// Input tasks retain their originating tab. Validate it under the
@@ -2347,6 +2376,18 @@ pub const Browser = struct {
 
         frame.js_render_context_initialized = true;
         js_context.setNodes(frame.window_id, &frame.current_node.?);
+        // `setNodes` installs this document's fresh WindowRealm. Notify the
+        // top-level observer immediately afterward, before the live parser can
+        // reach its first script. Child Frames keep their own Realm lifecycle.
+        if (frame.parent == null) {
+            if (self.top_level_realm_observer) |observer| {
+                observer(
+                    self.top_level_realm_observer_context,
+                    js_context,
+                    frame.window_id,
+                );
+            }
+        }
         js_context.setRenderCallback(frame.window_id, jsRenderCallback, @ptrCast(render_context));
         js_context.setDocumentReadyStateCallback(
             frame.window_id,

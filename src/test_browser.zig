@@ -2,6 +2,7 @@
 
 comptime {
     _ = @import("browser/document_lifecycle.zig");
+    _ = @import("browser/wpt_session.zig");
     _ = @import("tests/browser_lifecycle.zig");
     _ = @import("tests/browser_input.zig");
     _ = @import("tests/browser_history.zig");

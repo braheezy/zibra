@@ -755,6 +755,15 @@ pub fn isQuiescent(self: *Tab) bool {
     return self.async_thread_refs == 0;
 }
 
+/// Return whether this Tab's serialized page worker has returned from its
+/// active task and its current queue is empty. This is narrower than
+/// `isQuiescent`: detached helpers and accessibility speech are intentionally
+/// excluded, so embedders may use it as a task-return barrier without waiting
+/// for page-owned timers that can remain live after semantic completion.
+pub fn serializedWorkIdle(self: *Tab) bool {
+    return self.task_runner.isIdle();
+}
+
 fn waitForAsyncThreads(self: *Tab) void {
     self.async_thread_mutex.lock();
     while (self.async_thread_refs != 0) {

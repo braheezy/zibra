@@ -1038,6 +1038,8 @@ globalThis.clearInterval = function(handle) {
   __native.clearInterval(handle);
 };
 
+globalThis.clearTimeout = globalThis.clearInterval;
+
 var RAF_LISTENERS = [];
 
 function __runRAFHandlers() {
@@ -1060,6 +1062,75 @@ var ACTIVE_ID_GLOBALS = [];
 
 globalThis.window = globalThis;
 window.__id = __native.getWindowId();
+if (__native.wptEnabled()) {
+  globalThis.self = globalThis;
+  (function() {
+    function nullableString(value) {
+      return value === undefined || value === null ? null : String(value);
+    }
+
+    function harnessStatusName(code) {
+      if (code === 0) return "OK";
+      if (code === 2) return "TIMEOUT";
+      if (code === 3) return "PRECONDITION_FAILED";
+      return "ERROR";
+    }
+
+    function subtestStatusName(code) {
+      if (code === 0) return "PASS";
+      if (code === 1) return "FAIL";
+      if (code === 2) return "TIMEOUT";
+      if (code === 4) return "PRECONDITION_FAILED";
+      return "NOTRUN";
+    }
+
+    globalThis.completion_callback = function(tests, harnessStatus) {
+      var sourceTests = tests && typeof tests.length === "number" ? tests : [];
+      var harnessCode = harnessStatus && typeof harnessStatus.status === "number"
+        ? harnessStatus.status
+        : 1;
+      var serializedTests = [];
+      var hasFailure = false;
+      var hasTimeout = false;
+
+      for (var i = 0; i < sourceTests.length; i++) {
+        var test = sourceTests[i] || {};
+        var code = typeof test.status === "number" ? test.status : 3;
+        if (code === 2) hasTimeout = true;
+        if (code !== 0) hasFailure = true;
+        serializedTests.push({
+          name: nullableString(test.name) || "",
+          status: subtestStatusName(code),
+          code: code,
+          message: nullableString(test.message),
+          stack: nullableString(test.stack)
+        });
+      }
+
+      var status = "PASS";
+      if (harnessCode === 2) {
+        status = "TIMEOUT";
+      } else if (harnessCode !== 0) {
+        status = "ERROR";
+      } else if (hasTimeout) {
+        status = "TIMEOUT";
+      } else if (hasFailure) {
+        status = "FAIL";
+      }
+
+      __native.wptReport(JSON.stringify({
+        status: status,
+        harness: {
+          status: harnessStatusName(harnessCode),
+          code: harnessCode,
+          message: nullableString(harnessStatus && harnessStatus.message),
+          stack: nullableString(harnessStatus && harnessStatus.stack)
+        },
+        tests: serializedTests
+      }));
+    };
+  })();
+}
 Object.defineProperty(window, "onmessage", {
   get: function() { return WINDOW_ONMESSAGE[window.__id] || null; },
   set: function(fn) { WINDOW_ONMESSAGE[window.__id] = fn; }
@@ -1080,7 +1151,7 @@ window.postMessage = function(message, targetWindowId, targetOrigin) {
 Object.defineProperty(window, "parent", {
   get: function() {
     var parentId = __native.getParentWindowId(window.__id);
-    if (parentId === null || parentId === undefined) return null;
+    if (parentId === null || parentId === undefined) return window;
     return {
       __id: parentId,
       postMessage: function(message, targetOrigin) {

@@ -24,6 +24,7 @@ The nested [`render/AGENTS.md`](render/AGENTS.md) adds rendering-specific rules.
 | --- | --- |
 | `app.zig` | Sole interactive SDL poller, shared session/measurement, heap-stable Browser registry |
 | `root.zig` | One native window, tab/chrome coordination, committed-frame acceptance, raster scheduling, native presentation |
+| `wpt_session.zig` | One-test headless Browser owner, monotonic deadline, two-stage report mailbox, and owner-thread teardown |
 | `resource_loader.zig` | Per-window navigation/resource bridge over the shared session runner and joined source-order batches |
 | `document_loader.zig` | Stack-owned live-parser driver with synchronous root/script hooks; it owns no Frame or JS Realm |
 | `display_compositor.zig` | Browser-allocator owner of retained composited layers and their borrowing draw list |
@@ -58,6 +59,11 @@ into either leaf module.
 - A Browser is heap-stable. Interactive construction borrows App session,
   measurement, text-input, and SDL services; standalone screenshot construction
   owns them. Preserve those distinct teardown paths.
+- A WPT Session is heap-stable while its top-level Realm retains the report
+  callback context. The Tab worker may only copy a pending report; the creating
+  thread promotes it after the Tab's serialized task-return barrier, drives
+  `Browser.tick`, and performs normal Browser teardown before destroying the
+  Session or exposing its result.
 - The embedded resource Loader borrows that stable Browser's session. Its
   synchronous task contexts borrow the Loader only until their completion
   semaphore is posted; linked-resource batches join every transport helper.

@@ -20,6 +20,7 @@ const document_write_bindings = @import("document_write_bindings.zig");
 const inline_event = @import("inline_event.zig");
 const network_bindings = @import("network_bindings.zig");
 const timer_bindings = @import("timer_bindings.zig");
+const wpt_bindings = @import("wpt_bindings.zig");
 
 const bdwgc = @import("bdwgc");
 const kiesel = @import("kiesel");
@@ -83,6 +84,16 @@ pub const DocumentWriteCallbackFn = document_write_bindings.CallbackFn;
 
 const DocumentWriteCallback = struct {
     function: ?DocumentWriteCallbackFn = null,
+    context: ?*anyopaque = null,
+};
+
+/// Consumes one serialized WPT testharness result synchronously. The report
+/// slice is callback-scoped; an embedder that retains it must copy it before
+/// returning. Installation is scoped to one live document WindowRealm.
+pub const WptReportCallbackFn = wpt_bindings.ReportCallbackFn;
+
+const WptReportCallback = struct {
+    function: ?WptReportCallbackFn = null,
     context: ?*anyopaque = null,
 };
 
@@ -241,6 +252,7 @@ const WindowRealm = struct {
     animation_frame_callback: AnimationFrameCallback,
     document_ready_state_callback: DocumentReadyStateCallback,
     document_write_callback: DocumentWriteCallback,
+    wpt_report_callback: WptReportCallback,
     // This may borrow a stack-bound live parser, so it is installed only for
     // direct parser-blocking evaluation and cleared before that parser yields.
     node_relocation_observer: ?NodeRelocationObserver,
@@ -273,6 +285,7 @@ event_focus_host: event_focus_bindings.Host,
 network_host: network_bindings.Host,
 timer_host: timer_bindings.Host,
 document_write_host: document_write_bindings.Host,
+wpt_host: wpt_bindings.Host,
 // Window realms must not move after their native functions and callback state
 // are installed. The map owns only stable pointers; each pointed owner uses
 // `storage_allocator` so it remains a Kiesel GC-visible host root.
@@ -353,6 +366,12 @@ pub fn init(
         .allocator = allocator,
         .write = writeBindingDocument,
     };
+    self.wpt_host = .{
+        .context = self,
+        .allocator = allocator,
+        .enabled = wptBindingEnabled,
+        .report = reportBindingWpt,
+    };
     self.windows = std.AutoHashMap(u32, *WindowRealm).init(storage_allocator);
     self.handle_issuer = .{};
     self.parent_window_ids = std.AutoHashMap(u32, u32).init(allocator);
@@ -402,6 +421,7 @@ fn createWindowRealmLocked(self: *Js) !*WindowRealm {
         .animation_frame_callback = .{},
         .document_ready_state_callback = .{},
         .document_write_callback = .{},
+        .wpt_report_callback = .{},
         .node_relocation_observer = null,
     };
 
@@ -439,6 +459,7 @@ fn retireWindowRealmLocked(self: *Js, window: *WindowRealm) void {
     window.animation_frame_callback = .{};
     window.document_ready_state_callback = .{};
     window.document_write_callback = .{};
+    window.wpt_report_callback = .{};
     window.retired = true;
 }
 
@@ -576,6 +597,26 @@ fn translateExecutionError(self: *Js, err: Agent.Error) anyerror {
     return err;
 }
 
+/// Drain Promise jobs at the end of one outer Browser-to-JavaScript turn.
+///
+/// Callers still own `lock` and an active WindowRealm. Native callbacks that
+/// re-enter this host must leave the checkpoint to their outer entry point.
+fn microtaskCheckpointLocked(self: *Js) !void {
+    self.agent.drainJobQueue();
+    if (self.agent.takeExecutionInterrupt()) return error.ExecutionInterrupted;
+}
+
+/// Finish an abruptly completed outer turn without leaving Kiesel exception
+/// state installed while Promise jobs run. The public API still reports an
+/// ordinary page exception as `ExceptionThrown`; host interruption wins.
+fn finishOuterTurnErrorLocked(self: *Js, err: anyerror) anyerror {
+    if (err != error.ExceptionThrown) return err;
+    if (self.agent.takeExecutionInterrupt()) return error.ExecutionInterrupted;
+    _ = self.agent.clearException();
+    self.microtaskCheckpointLocked() catch |checkpoint_err| return checkpoint_err;
+    return error.ExceptionThrown;
+}
+
 /// Initialize the page-visible runtime inside an already active, live Realm.
 ///
 /// This does not create a Realm: callers must first find an existing document
@@ -631,8 +672,9 @@ pub fn evaluate(self: *Js, window_id: u32, code: []const u8) !Value {
         .{},
     );
     const result = script.evaluate("zibra-script") catch |err| {
-        return self.translateExecutionError(err);
+        return self.finishOuterTurnErrorLocked(err);
     };
+    try self.microtaskCheckpointLocked();
     return result;
 }
 
@@ -811,6 +853,23 @@ pub fn setDocumentWriteCallback(
     const window = self.getWindowContext(window_id) catch return;
     if (window.retired) return;
     window.document_write_callback = .{
+        .function = callback,
+        .context = context,
+    };
+}
+
+/// Install or clear the WPT result sink for one live document Realm. Runtime
+/// bootstrap exposes the testharness completion bridge only when this sink is
+/// present. The callback is cleared automatically when the Realm retires.
+pub fn setWptReportCallback(
+    self: *Js,
+    window_id: u32,
+    callback: ?WptReportCallbackFn,
+    context: ?*anyopaque,
+) void {
+    const window = self.getWindowContext(window_id) catch return;
+    if (window.retired) return;
+    window.wpt_report_callback = .{
         .function = callback,
         .context = context,
     };
@@ -1131,6 +1190,25 @@ fn writeBindingDocument(context: ?*anyopaque, source: []const u8) anyerror!void 
     try callback(window.document_write_callback.context, source);
 }
 
+fn wptBindingEnabled(context: ?*anyopaque) bool {
+    const self = hostFromBindingContext(context);
+    const window_id = self.current_window_id orelse return false;
+    const window = self.windows.get(window_id) orelse return false;
+    return !window.retired and window.wpt_report_callback.function != null;
+}
+
+/// Forward one callback-scoped JSON result only to the active document's
+/// generation-scoped sink. Retirement clears the sink before borrowed browser
+/// owners can be destroyed, making a stale Realm unable to report.
+fn reportBindingWpt(context: ?*anyopaque, report_json: []const u8) anyerror!void {
+    const self = hostFromBindingContext(context);
+    const window_id = self.current_window_id orelse return error.MissingActiveWindow;
+    const window = self.windows.get(window_id) orelse return error.MissingWindowContext;
+    if (window.retired) return error.InertWindow;
+    const callback = window.wpt_report_callback.function orelse return error.WptReportingDisabled;
+    try callback(window.wpt_report_callback.context, report_json);
+}
+
 fn sendBindingXhr(
     context: ?*anyopaque,
     method: []const u8,
@@ -1330,13 +1408,15 @@ pub fn dispatchLifecycleEvent(
         .load => "load",
     };
     const event_value = try self.stringToJsValue(event_name);
-    _ = dispatch_value.call(&self.agent, .undefined, &.{event_value}) catch |err| switch (err) {
-        error.ExceptionThrown => {
+    _ = dispatch_value.call(&self.agent, .undefined, &.{event_value}) catch |err| {
+        const turn_err = self.finishOuterTurnErrorLocked(err);
+        if (turn_err == error.ExceptionThrown) {
             std.log.warn("Lifecycle {s} listener threw; continuing document lifecycle", .{@tagName(event)});
             return;
-        },
-        else => return self.translateExecutionError(err),
+        }
+        return turn_err;
     };
+    try self.microtaskCheckpointLocked();
 }
 
 /// Dispatch an authored `on<event_type>` attribute on one Element.
@@ -1395,14 +1475,15 @@ pub fn dispatchInlineEvent(
         },
         error.OutOfMemory => return err,
     };
-    const result = script.evaluate("zibra-inline-event") catch |err| switch (err) {
-        error.ExceptionThrown => {
-            if (self.agent.takeExecutionInterrupt()) return error.ExecutionInterrupted;
+    const result = script.evaluate("zibra-inline-event") catch |err| {
+        const turn_err = self.finishOuterTurnErrorLocked(err);
+        if (turn_err == error.ExceptionThrown) {
             std.log.warn("Inline {s} handler threw; continuing event delivery", .{event_type});
             return true;
-        },
-        else => return self.translateExecutionError(err),
+        }
+        return turn_err;
     };
+    try self.microtaskCheckpointLocked();
     return result.toBoolean();
 }
 
@@ -1424,13 +1505,17 @@ pub fn dispatchEventWithBubbles(
 ) !bool {
     self.lock.lock();
     defer self.lock.unlock();
-    return self.dispatchEventWithBubblesLocked(
-        window_id,
+    const active = try self.activateWindowLocked(window_id);
+    defer active.restore();
+    try self.setActiveWindow(window_id, active.window);
+    const result = self.dispatchEventWithBubblesForWindowLocked(
+        active.window,
         event_type,
         node,
         bubbles,
-        true,
-    );
+    ) catch |err| return self.finishOuterTurnErrorLocked(err);
+    try self.microtaskCheckpointLocked();
+    return result;
 }
 
 /// Dispatch while a native JavaScript host callback is already running under
@@ -1446,34 +1531,6 @@ pub fn dispatchEventWithBubblesFromNativeCallback(
     bubbles: bool,
 ) !bool {
     if (self.current_window_id != window_id) return error.InactiveJavaScriptWindow;
-    return self.dispatchEventWithBubblesLocked(
-        window_id,
-        event_type,
-        node,
-        bubbles,
-        false,
-    );
-}
-
-fn dispatchEventWithBubblesLocked(
-    self: *Js,
-    window_id: u32,
-    event_type: []const u8,
-    node: *Node,
-    bubbles: bool,
-    activate_window: bool,
-) !bool {
-    if (activate_window) {
-        const active = try self.activateWindowLocked(window_id);
-        defer active.restore();
-        try self.setActiveWindow(window_id, active.window);
-        return self.dispatchEventWithBubblesForWindowLocked(
-            active.window,
-            event_type,
-            node,
-            bubbles,
-        );
-    }
     const window = self.windows.get(window_id) orelse return error.MissingWindowContext;
     if (window.retired) return true;
     return self.dispatchEventWithBubblesForWindowLocked(window, event_type, node, bubbles);
@@ -1590,7 +1647,10 @@ pub fn dispatchPostMessage(
         return;
     }
 
-    try self.dispatchMessageImpl(window, message, origin, source_window_id, window_id);
+    self.dispatchMessageImpl(window, message, origin, source_window_id, window_id) catch |err| {
+        return self.finishOuterTurnErrorLocked(err);
+    };
+    try self.microtaskCheckpointLocked();
 }
 
 fn dispatchMessageImpl(
@@ -1632,7 +1692,10 @@ pub fn runTimeoutCallback(self: *Js, window_id: u32, handle: u32) !void {
         return error.MissingSetTimeout;
     }
     const handle_value = Value.from(@as(f64, @floatFromInt(handle)));
-    _ = try fn_value.call(&self.agent, .undefined, &.{handle_value});
+    _ = fn_value.call(&self.agent, .undefined, &.{handle_value}) catch |err| {
+        return self.finishOuterTurnErrorLocked(err);
+    };
+    try self.microtaskCheckpointLocked();
 }
 
 pub fn runAnimationFrameHandlers(self: *Js, window_id: u32) void {
@@ -1647,7 +1710,11 @@ pub fn runAnimationFrameHandlers(self: *Js, window_id: u32) void {
     const fn_value = window.realm.global_object.get(&self.agent, key) catch return;
     if (!fn_value.isCallable()) return;
     _ = fn_value.call(&self.agent, .undefined, &.{}) catch |err| {
-        std.log.warn("requestAnimationFrame handler failed: {}", .{err});
+        std.log.warn("requestAnimationFrame handler failed: {}", .{self.finishOuterTurnErrorLocked(err)});
+        return;
+    };
+    self.microtaskCheckpointLocked() catch |err| {
+        std.log.warn("requestAnimationFrame microtask checkpoint failed: {}", .{err});
     };
 }
 
@@ -1698,7 +1765,10 @@ pub fn runXhrOnload(self: *Js, window_id: u32, handle: u32, body: []const u8) !v
 
     const body_value = try self.copiedStringToJsValue(body);
     const handle_value = Value.from(@as(f64, @floatFromInt(handle)));
-    _ = try fn_value.call(&self.agent, .undefined, &.{ body_value, handle_value });
+    _ = fn_value.call(&self.agent, .undefined, &.{ body_value, handle_value }) catch |err| {
+        return self.finishOuterTurnErrorLocked(err);
+    };
+    try self.microtaskCheckpointLocked();
 }
 
 test "Node.prototype.style setter is defined" {
@@ -1719,6 +1789,241 @@ test "__native.style_set is exposed" {
 
     const result = try js.evaluate(0, "typeof __native.style_set === 'function'");
     try std.testing.expect(result.toBoolean());
+}
+
+const WptReportProbe = struct {
+    allocator: std.mem.Allocator,
+    reports: std.ArrayList([]u8) = .empty,
+
+    fn deinit(self: *@This()) void {
+        for (self.reports.items) |payload| self.allocator.free(payload);
+        self.reports.deinit(self.allocator);
+    }
+
+    fn report(context: ?*anyopaque, report_json: []const u8) anyerror!void {
+        const unaligned: *align(1) @This() = @ptrCast(context orelse return error.MissingProbe);
+        const self: *@This() = @alignCast(unaligned);
+        const copy = try self.allocator.dupe(u8, report_json);
+        errdefer self.allocator.free(copy);
+        try self.reports.append(self.allocator, copy);
+    }
+};
+
+const TimeoutScheduleProbe = struct {
+    handles: [4]u32 = undefined,
+    count: usize = 0,
+
+    fn schedule(
+        context: ?*anyopaque,
+        handle: u32,
+        delay_ms: u32,
+        is_interval: bool,
+    ) anyerror!void {
+        _ = delay_ms;
+        _ = is_interval;
+        const unaligned: *align(1) @This() = @ptrCast(context orelse return error.MissingProbe);
+        const self: *@This() = @alignCast(unaligned);
+        if (self.count < self.handles.len) self.handles[self.count] = handle;
+        self.count += 1;
+    }
+};
+
+const ParsedWptHarness = struct {
+    status: []const u8,
+    code: i64,
+    message: ?[]const u8,
+    stack: ?[]const u8,
+};
+
+const ParsedWptSubtest = struct {
+    name: []const u8,
+    status: []const u8,
+    code: i64,
+    message: ?[]const u8,
+    stack: ?[]const u8,
+};
+
+const ParsedWptReport = struct {
+    status: []const u8,
+    harness: ParsedWptHarness,
+    tests: []ParsedWptSubtest,
+};
+
+fn expectWptReportStatus(report_json: []const u8, expected: []const u8) !void {
+    const allocator = std.testing.allocator;
+    const parsed = try std.json.parseFromSlice(ParsedWptReport, allocator, report_json, .{});
+    defer parsed.deinit();
+    try std.testing.expectEqualStrings(expected, parsed.value.status);
+}
+
+test "WPT completion bridge reports harness and subtest terminal states" {
+    const allocator = std.testing.allocator;
+    var environ = std.process.Environ.Map.init(allocator);
+    defer environ.deinit();
+    var js = try Js.init(allocator, std.testing.io, &environ);
+    defer js.deinit(allocator);
+
+    var probe = WptReportProbe{ .allocator = allocator };
+    defer probe.deinit();
+    js.setWptReportCallback(41, WptReportProbe.report, &probe);
+
+    const result = try js.evaluate(41,
+        \\completion_callback(
+        \\  [{ name: 'passes', status: 0, message: null, stack: null }],
+        \\  { status: 0, message: null, stack: null }
+        \\);
+        \\completion_callback(
+        \\  [{ name: 'fails', status: 1, message: 'expected true', stack: 'at assertion' }],
+        \\  { status: 0, message: null, stack: null }
+        \\);
+        \\completion_callback([], { status: 1, message: 'harness broke', stack: null });
+        \\completion_callback([], { status: 2, message: 'deadline', stack: null });
+        \\self === window && window === globalThis && parent === window &&
+        \\typeof completion_callback === 'function'
+    );
+    try std.testing.expect(result.toBoolean());
+    try std.testing.expectEqual(@as(usize, 4), probe.reports.items.len);
+    try expectWptReportStatus(probe.reports.items[0], "PASS");
+    try expectWptReportStatus(probe.reports.items[1], "FAIL");
+    try expectWptReportStatus(probe.reports.items[2], "ERROR");
+    try expectWptReportStatus(probe.reports.items[3], "TIMEOUT");
+
+    const pass_report = try std.json.parseFromSlice(
+        ParsedWptReport,
+        allocator,
+        probe.reports.items[0],
+        .{},
+    );
+    defer pass_report.deinit();
+    try std.testing.expectEqualStrings("OK", pass_report.value.harness.status);
+    try std.testing.expectEqual(@as(i64, 0), pass_report.value.harness.code);
+    try std.testing.expectEqual(@as(usize, 1), pass_report.value.tests.len);
+    try std.testing.expectEqualStrings("passes", pass_report.value.tests[0].name);
+    try std.testing.expectEqualStrings("PASS", pass_report.value.tests[0].status);
+    try std.testing.expectEqual(@as(?[]const u8, null), pass_report.value.tests[0].message);
+
+    js.setNodes(41, null);
+    const retired = js.windows.get(41).?;
+    try std.testing.expect(retired.retired);
+    try std.testing.expect(retired.wpt_report_callback.function == null);
+    try std.testing.expect(retired.wpt_report_callback.context == null);
+}
+
+test "ordinary realms do not expose the WPT completion bridge" {
+    var environ = std.process.Environ.Map.init(std.testing.allocator);
+    defer environ.deinit();
+    var js = try Js.init(std.testing.allocator, std.testing.io, &environ);
+    defer js.deinit(std.testing.allocator);
+
+    const result = try js.evaluate(0,
+        \\__native.wptEnabled() === false &&
+        \\typeof completion_callback === 'undefined' &&
+        \\parent === window
+    );
+    try std.testing.expect(result.toBoolean());
+}
+
+test "evaluate drains Promise jobs to a fixed point before returning" {
+    const allocator = std.testing.allocator;
+    var environ = std.process.Environ.Map.init(allocator);
+    defer environ.deinit();
+    var js = try Js.init(allocator, std.testing.io, &environ);
+    defer js.deinit(allocator);
+
+    var probe = WptReportProbe{ .allocator = allocator };
+    defer probe.deinit();
+    js.setWptReportCallback(42, WptReportProbe.report, &probe);
+
+    const synchronous_length = try js.evaluate(42,
+        \\var microtaskOrder = ['script'];
+        \\Promise.resolve().then(function() {
+        \\  microtaskOrder.push('first');
+        \\  Promise.resolve().then(function() {
+        \\    microtaskOrder.push('second');
+        \\    completion_callback(
+        \\      [{ name: microtaskOrder.join(','), status: 0, message: null, stack: null }],
+        \\      { status: 0, message: null, stack: null }
+        \\    );
+        \\  });
+        \\});
+        \\microtaskOrder.length;
+    );
+    try std.testing.expectEqual(@as(f64, 1), synchronous_length.asNumber().asFloat());
+    try std.testing.expectEqual(@as(usize, 1), probe.reports.items.len);
+    try expectWptReportStatus(probe.reports.items[0], "PASS");
+
+    const order = try js.evaluate(42, "microtaskOrder.join(',') === 'script,first,second'");
+    try std.testing.expect(order.toBoolean());
+}
+
+test "timer delivery drains Promise completion before returning" {
+    const allocator = std.testing.allocator;
+    var environ = std.process.Environ.Map.init(allocator);
+    defer environ.deinit();
+    var js = try Js.init(allocator, std.testing.io, &environ);
+    defer js.deinit(allocator);
+
+    var report_probe = WptReportProbe{ .allocator = allocator };
+    defer report_probe.deinit();
+    var timer_probe = TimeoutScheduleProbe{};
+    js.setWptReportCallback(43, WptReportProbe.report, &report_probe);
+    js.setSetTimeoutCallback(43, TimeoutScheduleProbe.schedule, &timer_probe);
+
+    _ = try js.evaluate(43,
+        \\setTimeout(function() {
+        \\  Promise.resolve().then(function() {
+        \\    Promise.resolve().then(function() {
+        \\      completion_callback([], { status: 0, message: null, stack: null });
+        \\    });
+        \\  });
+        \\}, 0);
+    );
+    try std.testing.expectEqual(@as(usize, 1), timer_probe.count);
+    try std.testing.expectEqual(@as(usize, 0), report_probe.reports.items.len);
+
+    try js.runTimeoutCallback(43, timer_probe.handles[0]);
+    try std.testing.expectEqual(@as(usize, 1), report_probe.reports.items.len);
+    try expectWptReportStatus(report_probe.reports.items[0], "PASS");
+}
+
+test "Promise job interruption escapes a swallowed Kiesel job error" {
+    const InterruptProbe = struct {
+        armed: bool = false,
+
+        fn report(context: ?*anyopaque, report_json: []const u8) anyerror!void {
+            _ = report_json;
+            const unaligned: *align(1) @This() = @ptrCast(context orelse return error.MissingProbe);
+            const self: *@This() = @alignCast(unaligned);
+            self.armed = true;
+        }
+
+        fn check(context: ?*anyopaque) bool {
+            const unaligned: *align(1) @This() = @ptrCast(context orelse return false);
+            const self: *@This() = @alignCast(unaligned);
+            return self.armed;
+        }
+    };
+
+    const allocator = std.testing.allocator;
+    var environ = std.process.Environ.Map.init(allocator);
+    defer environ.deinit();
+    var js = try Js.init(allocator, std.testing.io, &environ);
+    defer js.deinit(allocator);
+
+    var probe = InterruptProbe{};
+    js.setWptReportCallback(44, InterruptProbe.report, &probe);
+    js.setInterruptHandler(&probe, InterruptProbe.check);
+
+    try std.testing.expectError(
+        error.ExecutionInterrupted,
+        js.evaluate(44,
+            \\Promise.resolve().then(function spin() {
+            \\  completion_callback([], { status: 0, message: null, stack: null });
+            \\  Promise.resolve().then(spin);
+            \\});
+        ),
+    );
+    try std.testing.expect(probe.armed);
 }
 
 test "DOM Range supports boundaries, fragments, and extraction" {
@@ -4057,6 +4362,13 @@ fn setupDocument(self: *Js, realm: *Realm) !void {
         native,
         &self.document_write_host,
         &document_write_bindings.bindings,
+    );
+    try native_bindings.installFunctions(
+        &self.agent,
+        realm,
+        native,
+        &self.wpt_host,
+        &wpt_bindings.bindings,
     );
 }
 

@@ -3,13 +3,14 @@
 //! The process arena owns application allocations. This module parses the
 //! command line, runs isolated document-inspection modes, creates a
 //! process-wide `BrowserApp` for interactive windows, or owns one standalone
-//! windowless `Browser` for screenshots.
+//! windowless `Browser` for screenshots or one explicit-result WPT session.
 
 const std = @import("std");
 
 const browser = @import("browser/root.zig");
 const Browser = browser.Browser;
 const BrowserApp = @import("browser/app.zig").BrowserApp;
+const wpt_session = @import("browser/wpt_session.zig");
 const url_module = @import("network/url.zig");
 const Url = url_module.Url;
 const parser = @import("document/parser.zig");
@@ -20,6 +21,8 @@ const DisplayItem = browser.DisplayItem;
 const sdl2 = @import("sdl");
 
 const default_html = @embedFile("assets/default.html");
+const default_wpt_timeout_ms: u64 = 10_000;
+const ParsedJsonValue = std.json.Parsed(std.json.Value);
 
 pub fn main(init: std.process.Init) !void {
     // Catch and print errors to prevent ugly stack traces.
@@ -36,6 +39,153 @@ fn deinitCookieJar(allocator: std.mem.Allocator, cookie_jar: *std.StringHashMap(
         allocator.free(entry.key_ptr.*);
     }
     cookie_jar.deinit();
+}
+
+fn parseWptUrl(allocator: std.mem.Allocator, input: []const u8) !Url {
+    if (!Url.hasExplicitScheme(input)) return error.WptUrlMustBeAbsolute;
+    const parsed = try Url.init(allocator, input);
+    errdefer parsed.free(allocator);
+    if (!std.mem.eql(u8, parsed.scheme, "http") and
+        !std.mem.eql(u8, parsed.scheme, "https") and
+        !std.mem.eql(u8, parsed.scheme, "file") and
+        !std.mem.eql(u8, parsed.scheme, "data"))
+    {
+        return error.UnsupportedWptUrlScheme;
+    }
+    return parsed;
+}
+
+fn parseWptTimeout(value: []const u8) !u64 {
+    const timeout_ms = try std.fmt.parseInt(u64, value, 10);
+    if (timeout_ms == 0) return error.InvalidWptTimeout;
+    return timeout_ms;
+}
+
+fn wptReportObjectValid(
+    object: *std.json.ObjectMap,
+    expected_status: []const u8,
+) bool {
+    const status = object.getPtr("status") orelse return false;
+    switch (status.*) {
+        .string => |name| if (!std.mem.eql(u8, name, expected_status)) return false,
+        else => return false,
+    }
+
+    const tests = object.getPtr("tests") orelse return false;
+    switch (tests.*) {
+        .array => {},
+        else => return false,
+    }
+    const harness = object.getPtr("harness") orelse return false;
+    switch (harness.*) {
+        .object => {},
+        else => return false,
+    }
+    if (object.getPtr("message")) |message| switch (message.*) {
+        .string, .null => {},
+        else => return false,
+    };
+    if (object.getPtr("console")) |console| switch (console.*) {
+        .array => {},
+        else => return false,
+    };
+    if (object.getPtr("exception")) |exception| switch (exception.*) {
+        .object, .null => {},
+        else => return false,
+    };
+    return true;
+}
+
+fn wptReportField(
+    object: ?*std.json.ObjectMap,
+    name: []const u8,
+) ?*std.json.Value {
+    const report = object orelse return null;
+    return report.getPtr(name);
+}
+
+fn writeWptResult(
+    init: std.process.Init,
+    allocator: std.mem.Allocator,
+    test_url: []const u8,
+    result: *const wpt_session.Result,
+) !void {
+    var parsed_report: ?ParsedJsonValue = null;
+    if (result.payload.len != 0) {
+        parsed_report = std.json.parseFromSlice(
+            std.json.Value,
+            allocator,
+            result.payload,
+            .{},
+        ) catch null;
+    }
+    defer if (parsed_report) |*parsed| parsed.deinit();
+
+    const report_object: ?*std.json.ObjectMap = if (parsed_report) |*parsed| switch (parsed.value) {
+        .object => |*object| object,
+        else => null,
+    } else null;
+    const report_valid = if (result.payload.len == 0)
+        result.status == .timeout
+    else if (report_object) |object|
+        wptReportObjectValid(object, result.status.jsonName())
+    else
+        false;
+    const status = if (report_valid) result.status.jsonName() else "ERROR";
+
+    var stdout_buffer: [4096]u8 = undefined;
+    var stdout_writer = std.Io.File.stdout().writer(init.io, &stdout_buffer);
+    const stdout = &stdout_writer.interface;
+    var json: std.json.Stringify = .{ .writer = stdout };
+
+    try json.beginObject();
+    try json.objectField("protocol_version");
+    try json.write(@as(u32, 1));
+    try json.objectField("test");
+    try json.write(test_url);
+    try json.objectField("status");
+    try json.write(status);
+    try json.objectField("duration_ms");
+    try json.write(result.duration_ms);
+
+    try json.objectField("tests");
+    if (report_valid and wptReportField(report_object, "tests") != null) {
+        try json.write(wptReportField(report_object, "tests").?.*);
+    } else {
+        try json.beginArray();
+        try json.endArray();
+    }
+
+    try json.objectField("harness");
+    if (report_valid and wptReportField(report_object, "harness") != null) {
+        try json.write(wptReportField(report_object, "harness").?.*);
+    } else {
+        try json.write(null);
+    }
+    try json.objectField("message");
+    if (!report_valid) {
+        try json.write("Invalid harness report JSON");
+    } else if (wptReportField(report_object, "message")) |message| {
+        try json.write(message.*);
+    } else {
+        try json.write(null);
+    }
+    try json.objectField("console");
+    if (report_valid and wptReportField(report_object, "console") != null) {
+        try json.write(wptReportField(report_object, "console").?.*);
+    } else {
+        try json.beginArray();
+        try json.endArray();
+    }
+    try json.objectField("exception");
+    if (report_valid and wptReportField(report_object, "exception") != null) {
+        try json.write(wptReportField(report_object, "exception").?.*);
+    } else {
+        try json.write(null);
+    }
+    try json.endObject();
+    try stdout.writeByte('\n');
+    try stdout.flush();
 }
 
 fn fetchDecodedDocument(
@@ -150,6 +300,10 @@ fn zibra(init: std.process.Init) !void {
     var url: ?Url = null;
     var dump_mode: ?DumpMode = null;
     var screenshot_path: ?[]const u8 = null;
+    var wpt_test = false;
+    var wpt_test_url: ?[]const u8 = null;
+    var wpt_timeout_ms = default_wpt_timeout_ms;
+    var wpt_timeout_set = false;
 
     var arg_index: usize = 1;
     while (arg_index < args.len) : (arg_index += 1) {
@@ -189,6 +343,63 @@ fn zibra(init: std.process.Init) !void {
                 return error.BadArguments;
             }
             screenshot_path = arg["--screenshot=".len..];
+            continue;
+        }
+        if (std.mem.eql(u8, arg, "--wpt-test")) {
+            if (wpt_test or url != null or arg_index + 1 >= args.len) {
+                std.log.err("--wpt-test requires exactly one absolute URL.", .{});
+                return error.BadArguments;
+            }
+            arg_index += 1;
+            const input = args[arg_index];
+            url = parseWptUrl(allocator, input) catch |err| {
+                if (err == error.OutOfMemory) return err;
+                std.log.err("Invalid WPT test URL '{s}': {}", .{ input, err });
+                return error.BadArguments;
+            };
+            wpt_test = true;
+            wpt_test_url = input;
+            continue;
+        }
+        if (std.mem.startsWith(u8, arg, "--wpt-test=")) {
+            const input = arg["--wpt-test=".len..];
+            if (wpt_test or url != null or input.len == 0) {
+                std.log.err("--wpt-test requires exactly one absolute URL.", .{});
+                return error.BadArguments;
+            }
+            url = parseWptUrl(allocator, input) catch |err| {
+                if (err == error.OutOfMemory) return err;
+                std.log.err("Invalid WPT test URL '{s}': {}", .{ input, err });
+                return error.BadArguments;
+            };
+            wpt_test = true;
+            wpt_test_url = input;
+            continue;
+        }
+        if (std.mem.eql(u8, arg, "--wpt-timeout-ms")) {
+            if (wpt_timeout_set or arg_index + 1 >= args.len) {
+                std.log.err("--wpt-timeout-ms requires one positive integer.", .{});
+                return error.BadArguments;
+            }
+            arg_index += 1;
+            wpt_timeout_ms = parseWptTimeout(args[arg_index]) catch |err| {
+                std.log.err("Invalid WPT timeout '{s}': {}", .{ args[arg_index], err });
+                return error.BadArguments;
+            };
+            wpt_timeout_set = true;
+            continue;
+        }
+        if (std.mem.startsWith(u8, arg, "--wpt-timeout-ms=")) {
+            const value = arg["--wpt-timeout-ms=".len..];
+            if (wpt_timeout_set or value.len == 0) {
+                std.log.err("--wpt-timeout-ms requires one positive integer.", .{});
+                return error.BadArguments;
+            }
+            wpt_timeout_ms = parseWptTimeout(value) catch |err| {
+                std.log.err("Invalid WPT timeout '{s}': {}", .{ value, err });
+                return error.BadArguments;
+            };
+            wpt_timeout_set = true;
             continue;
         }
         if (url) |_| {
@@ -231,9 +442,40 @@ fn zibra(init: std.process.Init) !void {
 
     defer if (url) |u| u.free(allocator);
 
-    if (dump_mode != null and screenshot_path != null) {
-        std.log.err("Dump commands and --screenshot cannot be used together.", .{});
+    if ((dump_mode != null and screenshot_path != null) or
+        (wpt_test and (dump_mode != null or screenshot_path != null)))
+    {
+        std.log.err("Dump, screenshot, and WPT test modes cannot be combined.", .{});
         return error.BadArguments;
+    }
+    if (wpt_timeout_set and !wpt_test) {
+        std.log.err("--wpt-timeout-ms requires --wpt-test.", .{});
+        return error.BadArguments;
+    }
+
+    if (wpt_test) {
+        const test_url = wpt_test_url orelse return error.BadArguments;
+        const owned_url = url orelse return error.BadArguments;
+        // Session.init consumes the URL, including on failure.
+        url = null;
+        const session = try wpt_session.Session.init(
+            allocator,
+            init.io,
+            init.environ_map,
+            owned_url,
+            .{ .timeout_ms = wpt_timeout_ms, .rtl = rtl_flag },
+        );
+        var result = session.run() catch |err| {
+            session.deinit();
+            allocator.destroy(session);
+            return err;
+        };
+        // Stop and join the Browser before exposing its copied terminal result.
+        session.deinit();
+        allocator.destroy(session);
+        defer result.deinit();
+        try writeWptResult(init, allocator, test_url, &result);
+        return;
     }
 
     if (dump_mode) |mode| {
