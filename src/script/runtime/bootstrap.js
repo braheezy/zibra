@@ -6,6 +6,7 @@ function Node(handle) {
 }
 
 var NODE_WRAPPERS = {};
+var IFRAME_DOCUMENTS = {};
 
 function wrapNode(handle) {
   if (handle === null || handle === undefined) return null;
@@ -22,6 +23,156 @@ function wrapNodes(handles) {
 
 Node.ELEMENT_NODE = 1;
 Node.TEXT_NODE = 3;
+Node.DOCUMENT_NODE = 9;
+Node.DOCUMENT_TYPE_NODE = 10;
+Node.DOCUMENT_FRAGMENT_NODE = 11;
+Node.COMMENT_NODE = 8;
+
+globalThis.NodeFilter = {
+  SHOW_ALL: 0xFFFFFFFF,
+  SHOW_ELEMENT: 0x1,
+  SHOW_TEXT: 0x4,
+  FILTER_ACCEPT: 1,
+  FILTER_REJECT: 2,
+  FILTER_SKIP: 3
+};
+
+function walkSnapshot(root, output) {
+  output.push(root);
+  var children = root.childNodes || [];
+  for (var i = 0; i < children.length; i++) walkSnapshot(children[i], output);
+}
+
+function nodeShown(node, mask) {
+  if (mask === 0xFFFFFFFF) return true;
+  if (node.nodeType === Node.ELEMENT_NODE) return !!(mask & 0x1);
+  if (node.nodeType === Node.TEXT_NODE) return !!(mask & 0x4);
+  if (node.nodeType === Node.COMMENT_NODE) return !!(mask & 0x80);
+  return !!(mask & 0x20);
+}
+
+function filterResult(filter, node, mask) {
+  if (!nodeShown(node, mask)) return 3;
+  if (typeof filter !== 'function') return 1;
+  var result = filter(node);
+  if (result === true) return 1;
+  var number = Number(result);
+  return number === 1 ? 1 : number === 2 ? 2 : 3;
+}
+
+function NodeIterator(root, mask, filter) {
+  this.root = root; this.mask = mask == null ? 0xFFFFFFFF : Number(mask);
+  this.filter = filter; this.currentNode = null;
+}
+NodeIterator.prototype.nextNode = function() {
+  var nodes = []; walkSnapshot(this.root, nodes);
+  var start = this.currentNode === null ? -1 : nodes.indexOf(this.currentNode);
+  for (var i = start + 1; i < nodes.length; i++) {
+    var result = filterResult(this.filter, nodes[i], this.mask);
+    if (result === 1) { this.currentNode = nodes[i]; return nodes[i]; }
+  }
+  return null;
+};
+NodeIterator.prototype.previousNode = function() {
+  var nodes = []; walkSnapshot(this.root, nodes);
+  var start = this.currentNode === null ? nodes.length : nodes.indexOf(this.currentNode);
+  if (start < 0) start = nodes.length;
+  for (var i = start - 1; i >= 0; i--) {
+    var result = filterResult(this.filter, nodes[i], this.mask);
+    if (result === 1) { this.currentNode = nodes[i]; return nodes[i]; }
+  }
+  return null;
+};
+
+function TreeWalker(root, mask, filter) {
+  this.root = root; this.mask = mask == null ? 0xFFFFFFFF : Number(mask);
+  this.filter = filter; this.currentNode = root;
+}
+TreeWalker.prototype.__children = function(node) { return node.childNodes || []; };
+TreeWalker.prototype.firstChild = function() {
+  var children = this.__children(this.currentNode);
+  for (var i = 0; i < children.length; i++) {
+    var result = filterResult(this.filter, children[i], this.mask);
+    if (result === 1) { this.currentNode = children[i]; return children[i]; }
+    if (result === 3) {
+      var nested = new TreeWalker(children[i], this.mask, this.filter);
+      var found = nested.nextNode();
+      if (found) { this.currentNode = found; return found; }
+    }
+  }
+  return null;
+};
+TreeWalker.prototype.lastChild = function() {
+  var children = this.__children(this.currentNode);
+  for (var i = children.length - 1; i >= 0; i--) {
+    var result = filterResult(this.filter, children[i], this.mask);
+    if (result === 1) { this.currentNode = children[i]; return children[i]; }
+    if (result === 3) {
+      var nested = new TreeWalker(children[i], this.mask, this.filter);
+      var found = nested.lastDescendant();
+      if (found) { this.currentNode = found; return found; }
+    }
+  }
+  return null;
+};
+TreeWalker.prototype.lastDescendant = function() {
+  var children = this.__children(this.currentNode);
+  for (var i = children.length - 1; i >= 0; i--) {
+    var result = filterResult(this.filter, children[i], this.mask);
+    if (result === 1) {
+      var nested = new TreeWalker(children[i], this.mask, this.filter);
+      var deeper = nested.lastDescendant();
+      return deeper || children[i];
+    }
+  }
+  return null;
+};
+TreeWalker.prototype.parentNode = function() {
+  var parent = this.currentNode.parentNode;
+  while (parent && parent !== this.root) {
+    var result = filterResult(this.filter, parent, this.mask);
+    if (result === 1) { this.currentNode = parent; return parent; }
+    parent = parent.parentNode;
+  }
+  if (parent === this.root) { var result = filterResult(this.filter, parent, this.mask); if (result === 1) { this.currentNode = parent; return parent; } }
+  return null;
+};
+TreeWalker.prototype.nextSibling = function() {
+  var sibling = this.currentNode.nextSibling;
+  while (sibling) {
+    var result = filterResult(this.filter, sibling, this.mask);
+    if (result === 1) { this.currentNode = sibling; return sibling; }
+    sibling = sibling.nextSibling;
+  }
+  return null;
+};
+TreeWalker.prototype.previousSibling = function() {
+  var sibling = this.currentNode.previousSibling;
+  while (sibling) {
+    var result = filterResult(this.filter, sibling, this.mask);
+    if (result === 1) { this.currentNode = sibling; return sibling; }
+    sibling = sibling.previousSibling;
+  }
+  return null;
+};
+TreeWalker.prototype.nextNode = function() {
+  var nodes = []; walkSnapshot(this.root, nodes);
+  var index = nodes.indexOf(this.currentNode);
+  for (var i = index + 1; i < nodes.length; i++) {
+    var result = filterResult(this.filter, nodes[i], this.mask);
+    if (result === 1) { this.currentNode = nodes[i]; return nodes[i]; }
+  }
+  return null;
+};
+TreeWalker.prototype.previousNode = function() {
+  var nodes = []; walkSnapshot(this.root, nodes);
+  var index = nodes.indexOf(this.currentNode);
+  for (var i = index - 1; i >= 0; i--) {
+    var result = filterResult(this.filter, nodes[i], this.mask);
+    if (result === 1) { this.currentNode = nodes[i]; return nodes[i]; }
+  }
+  return null;
+};
 
 var XHR_REQUESTS = {};
 
@@ -189,6 +340,15 @@ Node.prototype.setAttribute = function(name, value) {
   if (__native.setAttribute(this.handle, name, text)) {
     resetCanvasContextState(this.handle);
   }
+};
+Node.prototype.hasAttribute = function(name) {
+  return this.getAttribute(name) !== null;
+};
+Node.prototype.removeAttribute = function(name) {
+  __native.removeAttribute(this.handle, name == null ? '' : name.toString());
+};
+Node.prototype.hasChildNodes = function() {
+  return this.childNodes.length !== 0;
 };
 
 Object.defineProperty(Node.prototype, "id", {
@@ -375,10 +535,88 @@ Object.defineProperty(Node.prototype, "data", {
 Object.defineProperty(Node.prototype, "textContent", {
   get: function() { return __native.textContent(this.handle); }
 });
+Object.defineProperty(Node.prototype, "ownerDocument", {
+  get: function() { return document; }, enumerable: true, configurable: true
+});
+Object.defineProperty(Node.prototype, "className", {
+  get: function() { return this.getAttribute("class") || ""; },
+  set: function(value) { this.setAttribute("class", value == null ? "" : value.toString()); },
+  enumerable: true, configurable: true
+});
 Node.prototype.getElementsByTagName = function(tagName) {
   var text = tagName == null ? "" : tagName.toString();
   return wrapNodes(__native.getElementsByTagNameFrom(this.handle, text));
 };
+
+function makeDetachedDocument(root) {
+  var doc = {};
+  Object.defineProperty(doc, 'documentElement', { get: function() { return root; }, enumerable: true });
+  doc.nodeType = Node.DOCUMENT_NODE;
+  doc.appendChild = function(child) { root = child; return child; };
+  doc.removeChild = function(child) { return child; };
+  Object.defineProperty(doc, 'firstChild', { get: function() { return { nodeType: Node.DOCUMENT_TYPE_NODE }; }, enumerable: true });
+  Object.defineProperty(doc, 'body', {
+    get: function() {
+      var bodies = root.getElementsByTagName('body');
+      return bodies.length ? bodies[0] : null;
+    }, enumerable: true
+  });
+  doc.createElement = function(name) { return document.createElement(name); };
+  doc.createElementNS = function(ns, name) { return document.createElement(name); };
+  doc.createTextNode = function(text) { return document.createTextNode(text); };
+  doc.getElementsByTagName = function(name) { return root.getElementsByTagName(name); };
+  doc.getElementById = function(id) {
+    var nodes = root.getElementsByTagName('*');
+    for (var i = 0; i < nodes.length; i++) if (nodes[i].id === id) return nodes[i];
+    return null;
+  };
+  doc.defaultView = window;
+  doc.createNodeIterator = function(node, mask, filter) { return new NodeIterator(node, mask, filter); };
+  doc.createTreeWalker = function(node, mask, filter) { return new TreeWalker(node, mask, filter); };
+  return doc;
+}
+
+Object.defineProperty(Node.prototype, 'contentDocument', {
+  get: function() {
+    if (this.tagName !== 'IFRAME') return null;
+    if (!IFRAME_DOCUMENTS[this.handle]) {
+      var root = document.createElement('html');
+      IFRAME_DOCUMENTS[this.handle] = makeDetachedDocument(root);
+    }
+    return IFRAME_DOCUMENTS[this.handle];
+  }, enumerable: true, configurable: true
+});
+Object.defineProperty(Node.prototype, "elements", {
+  get: function() {
+    return this.getElementsByTagName('input');
+  }, enumerable: true, configurable: true
+});
+
+// CSSOM's computed-style object is intentionally a lightweight live view in
+// this bounded runtime. Property reads route through the native style map,
+// while getPropertyValue accepts the canonical kebab-case spelling.
+function computedStyleObject(node) {
+  var style = {};
+  style.getPropertyValue = function(name) {
+    return __native.computedStyleValue(node.handle, name == null ? '' : name.toString());
+  };
+  var properties = [
+    ['whiteSpace', 'white-space'], ['zIndex', 'z-index'], ['position', 'position'],
+    ['display', 'display'], ['color', 'color'], ['backgroundColor', 'background-color'],
+    ['width', 'width'], ['height', 'height'], ['fontSize', 'font-size'],
+    ['overflow', 'overflow'], ['visibility', 'visibility'], ['opacity', 'opacity'],
+    ['transform', 'transform']
+  ];
+  for (var i = 0; i < properties.length; i++) {
+    (function (camel, cssName) {
+      Object.defineProperty(style, camel, {
+        get: function() { return style.getPropertyValue(cssName); },
+        enumerable: true
+      });
+    })(properties[i][0], properties[i][1]);
+  }
+  return style;
+}
 
 // Serialize or replace an element's child HTML.
 Object.defineProperty(Node.prototype, "innerHTML", {
@@ -399,6 +637,22 @@ Object.defineProperty(Node.prototype, "outerHTML", {
 
 // Add style setter to Node prototype
 Object.defineProperty(Node.prototype, "style", {
+  get: function() {
+    var owner = this;
+    var style = {};
+    style.cssText = owner.getAttribute('style') || '';
+    Object.defineProperty(style, 'cssFloat', {
+      get: function() {
+        var source = owner.getAttribute('style') || '';
+        var match = source.match(/(?:^|;)\s*float\s*:\s*([^;]+)/i);
+        return match ? match[1].trim() : '';
+      },
+      set: function(value) {
+        owner.setAttribute('style', 'float: ' + (value == null ? '' : value.toString()));
+      }, enumerable: true
+    });
+    return style;
+  },
   set: function(value) {
     var text = value == null ? "" : value.toString();
     __native.style_set(this.handle, text);
@@ -602,6 +856,17 @@ globalThis.__runXHROnload = function(body, handle) {
 // Wrap document.querySelectorAll to return Node objects
 (function() {
   var originalQuerySelectorAll = document.querySelectorAll;
+  document.nodeType = Node.DOCUMENT_NODE;
+  document.firstChild = { nodeType: Node.DOCUMENT_TYPE_NODE, ownerDocument: document };
+  document.appendChild = function(child) { return child; };
+  document.removeChild = function(child) { return child; };
+  document.createEvent = function(type) {
+    var event = new Event('');
+    event.initEvent = function(name, bubbles, cancelable) {
+      this.type = name; this.bubbles = !!bubbles; this.cancelable = !!cancelable;
+    };
+    return event;
+  };
   document.querySelectorAll = function(selector) {
     var handles = originalQuerySelectorAll.call(this, selector);
     return wrapNodes(handles);
@@ -609,6 +874,21 @@ globalThis.__runXHROnload = function(body, handle) {
   document.createElement = function(tagName) {
     var text = tagName == null ? "" : tagName.toString();
     return wrapNode(__native.createElement(text));
+  };
+  document.createElementNS = function(ns, tagName) {
+    return document.createElement(tagName == null ? '' : tagName.toString().split(':').pop());
+  };
+  document.implementation = {
+    createDocument: function(ns, qualifiedName) {
+      var root = document.createElement('html');
+      var result = makeDetachedDocument(root);
+      if (qualifiedName) root.appendChild(document.createElement(qualifiedName));
+      return result;
+    },
+    createDocumentType: function() { return { nodeType: Node.DOCUMENT_TYPE_NODE, name: 'html' }; }
+  };
+  document.createTextNode = function(text) {
+    return wrapNode(__native.createTextNode(text == null ? '' : text.toString()));
   };
   document.getElementById = function(id) {
     var text = id == null ? "" : id.toString();
@@ -618,6 +898,26 @@ globalThis.__runXHROnload = function(body, handle) {
     var text = tagName == null ? "" : tagName.toString();
     return wrapNodes(__native.getElementsByTagName(text));
   };
+  document.createNodeIterator = function(node, mask, filter) {
+    return new NodeIterator(node, mask, filter);
+  };
+  document.createTreeWalker = function(node, mask, filter) {
+    return new TreeWalker(node, mask, filter);
+  };
+  Object.defineProperty(document, "forms", {
+    get: function() {
+      var forms = wrapNodes(__native.getElementsByTagName('form'));
+      for (var i = 0; i < forms.length; i++) {
+        var name = forms[i].getAttribute('name');
+        if (name) forms[name] = forms[i];
+      }
+      return forms;
+    }, enumerable: true, configurable: true
+  });
+  Object.defineProperty(document, "links", {
+    get: function() { return wrapNodes(__native.getElementsByTagName('a')); },
+    enumerable: true, configurable: true
+  });
   Object.defineProperty(document, "documentElement", {
     get: function() { return wrapNode(__native.getDocumentElement()); },
     enumerable: true,
@@ -633,6 +933,9 @@ globalThis.__runXHROnload = function(body, handle) {
     enumerable: true,
     configurable: true
   });
+  window.getComputedStyle = function(node) {
+    return computedStyleObject(node);
+  };
   document.addEventListener = function(type, listener) {
     addLifecycleListener(DOCUMENT_LIFECYCLE_LISTENERS, type, listener);
   };

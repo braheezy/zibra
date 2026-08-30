@@ -160,13 +160,22 @@ pub const Text = struct {
     text: []const u8,
     parent: ?*Node = null,
     style: ?StyleMap = null,
+    /// Parser text borrows the document source; script-created text owns its
+    /// duplicated bytes and releases them when its detached subtree dies.
+    owned_text: bool = false,
 
     pub fn init(text: []const u8, parent: ?*Node) Text {
         return .{
             .text = text,
             .parent = parent,
             .style = null,
+            .owned_text = false,
         };
+    }
+
+    pub fn deinit(self: *Text, allocator: std.mem.Allocator) void {
+        if (self.style) |*styles| style_application.deinitStyleMap(StyleMap, styles, allocator);
+        if (self.owned_text) allocator.free(self.text);
     }
 };
 
@@ -762,9 +771,7 @@ pub const Node = union(enum) {
     pub fn deinit(self: *Node, allocator: std.mem.Allocator) void {
         switch (self.*) {
             .text => |*t| {
-                if (t.style) |*styles| {
-                    style_application.deinitStyleMap(StyleMap, styles, allocator);
-                }
+                t.deinit(allocator);
             },
             .element => |*e| e.deinit(allocator),
         }

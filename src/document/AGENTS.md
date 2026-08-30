@@ -19,6 +19,9 @@ behavior. Navigation-owned stylesheet/resource generations are documented in
   retirement; never resize a chunk once a Node borrows it. Element
   decoded strings, images, canvas pointers, animations, and detached subtree
   resources are explicit owners. Do not retire backing text first.
+- Script-created text nodes duplicate their payload and mark it as owned so
+  detached-node teardown can release it without confusing parser-borrowed
+  source slices for allocations.
 - Children are Node values in resizable arrays. Never retain a child `*Node`
   across structural mutation unless the synchronous mutation transaction
   invalidates or rebinds every consumer before control escapes.

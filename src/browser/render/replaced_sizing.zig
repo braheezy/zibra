@@ -100,7 +100,11 @@ pub fn parseAspectRatio(input: []const u8) ?AspectRatio {
 fn styleValue(element: *const parser.Element, property: []const u8) ?[]const u8 {
     const style_map = if (element.style) |*styles| styles else return null;
     const field = @constCast(style_map).getPtr(property) orelse return null;
-    return field.get().*;
+    // Iframe/image resource discovery can run before the style phase has
+    // published this generation.  Use the previous computed snapshot there;
+    // the next layout pass will resolve the fresh value once the field is
+    // clean, and this avoids aborting on a ProtectedField debug assertion.
+    return field.lastValue().*;
 }
 
 fn animatedPixelDimension(element: *const parser.Element, property: []const u8) ?i32 {

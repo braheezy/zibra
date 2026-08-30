@@ -16,8 +16,8 @@ queued work and shutdown are documented in
 - `js.zig` owns the Agent, its neutral host Realm, heap-stable per-document
   `WindowRealm` owners, callback registries, active-window switching,
   evaluation, and public locked entry points.
-- `runtime/bootstrap.js` defines the page-visible DOM, event, timer, canvas,
-  XHR, cookie, and messaging shims over `__native`; Zig loads it with
+- `runtime/bootstrap.js` defines the page-visible DOM, traversal, event, timer,
+  canvas, XHR, cookie, and messaging shims over `__native`; Zig loads it with
   `@embedFile` before evaluating page code.
 - `dom_handles.zig` owns the two-way Node pointer/numeric identity maps for one
   window generation.

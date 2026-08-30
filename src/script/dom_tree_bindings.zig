@@ -56,6 +56,7 @@ pub const bindings = [_]native_bindings.Binding{
     .{ .name = "nodeValue", .length = 1, .function = nodeValue },
     .{ .name = "nodeData", .length = 1, .function = nodeData },
     .{ .name = "textContent", .length = 1, .function = textContent },
+    .{ .name = "computedStyleValue", .length = 2, .function = computedStyleValue },
 };
 
 fn activeHost(agent: *Agent) *Host {
@@ -449,6 +450,31 @@ fn textContent(agent: *Agent, this_value: Value, arguments: Arguments) Agent.Err
     try appendTextContent(node, &text, agent.gc_allocator);
     const owned = try text.toOwnedSlice(agent.gc_allocator);
     return Value.from(try kiesel.types.String.fromUtf8(agent, owned));
+}
+
+/// Return the last published CSS value for an element.  The style phase owns
+/// the authoritative computed map; this synchronous snapshot deliberately
+/// uses `lastValue` so a script cannot crash merely by querying style while a
+/// later invalidation is pending.  Defaults cover the properties commonly
+/// observable through `getComputedStyle` in the bounded DOM.
+fn computedStyleValue(agent: *Agent, this_value: Value, arguments: Arguments) Agent.Error!Value {
+    _ = this_value;
+    const host = activeHost(agent);
+    const window = try requireWindow(agent);
+    const node = try requireNode(agent, window, arguments.get(0));
+    const property = try requireString(agent, host, arguments.get(1), "computed style property requires a string");
+    defer host.allocator.free(property);
+
+    const value: []const u8 = switch (node.*) {
+        .text => "",
+        .element => |*element| blk: {
+            if (element.style) |*styles| {
+                if (styles.getPtr(property)) |field| break :blk field.lastValue().*;
+            }
+            break :blk if (std.mem.eql(u8, property, "z-index")) "auto" else if (std.mem.eql(u8, property, "white-space")) "normal" else "";
+        },
+    };
+    return copiedString(agent, value);
 }
 
 test "DOM tree helpers preserve authored text topology and document order" {

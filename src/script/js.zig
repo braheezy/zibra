@@ -2173,6 +2173,37 @@ test "document tree APIs tolerate an empty document root" {
     try std.testing.expect(result.toBoolean());
 }
 
+test "script DOM creates text nodes, exposes computed styles, and isolates iframe documents" {
+    const allocator = std.testing.allocator;
+    var html_parser = try parser.HTMLParser.init(allocator, "<html><body><iframe src='about:blank'></iframe><div></div></body></html>");
+    html_parser.use_implicit_tags = false;
+    defer html_parser.deinit(allocator);
+    var root = try html_parser.parse();
+    defer root.deinit(allocator);
+    parser.fixParentPointers(&root, null);
+
+    var environ = std.process.Environ.Map.init(allocator);
+    defer environ.deinit();
+    var js = try Js.init(allocator, std.testing.io, &environ);
+    defer js.deinit(allocator);
+    js.setNodes(0, &root);
+    defer js.setNodes(0, null);
+
+    const result = try js.evaluate(0,
+        \\var div = document.getElementsByTagName('div')[0];
+        \\var text = document.createTextNode('hello');
+        \\div.appendChild(text);
+        \\var iframeDoc = document.getElementsByTagName('iframe')[0].contentDocument;
+        \\iframeDoc.documentElement.appendChild(iframeDoc.createElement('body'));
+        \\div.textContent === 'hello' && text.parentNode === div &&
+        \\  document.defaultView.getComputedStyle(div, '').zIndex === 'auto' &&
+        \\  iframeDoc.body !== document.body && iframeDoc.body.tagName === 'BODY' &&
+        \\  document.createNodeIterator(div, NodeFilter.SHOW_ALL, null, true).nextNode() === div &&
+        \\  document.createTreeWalker(div, NodeFilter.SHOW_ALL, null, true).currentNode === div
+    );
+    try std.testing.expect(result.toBoolean());
+}
+
 const FocusCallbackTestContext = struct {
     js: *Js,
     handles: [4]u32 = undefined,
@@ -3847,11 +3878,13 @@ fn setupDocument(self: *Js, realm: *Realm) !void {
             .{ .name = "getAttribute", .length = 2, .function = getAttribute },
             .{ .name = "children", .length = 1, .function = getChildren },
             .{ .name = "createElement", .length = 1, .function = createElement },
+            .{ .name = "createTextNode", .length = 1, .function = createTextNode },
             .{ .name = "appendChild", .length = 2, .function = appendChild },
             .{ .name = "insertBefore", .length = 3, .function = insertBefore },
             .{ .name = "removeChild", .length = 2, .function = removeChild },
             .{ .name = "replaceChildren", .length = 1, .function = replaceChildren },
             .{ .name = "setAttribute", .length = 3, .function = setAttribute },
+            .{ .name = "removeAttribute", .length = 2, .function = removeAttribute },
             .{ .name = "innerHTML", .length = 2, .function = innerHTML },
             .{ .name = "getInnerHTML", .length = 1, .function = getInnerHTML },
             .{ .name = "getOuterHTML", .length = 1, .function = getOuterHTML },
@@ -4246,6 +4279,39 @@ fn createElement(agent: *Agent, this_value: Value, arguments: kiesel.types.Argum
     return Value.from(@as(f64, @floatFromInt(handle)));
 }
 
+/// Create a detached text node owned by the current WindowRealm. Text nodes
+/// use the same numeric-handle and transfer path as elements, so appending
+/// one never exposes a raw DOM pointer to JavaScript.
+fn createTextNode(agent: *Agent, this_value: Value, arguments: kiesel.types.Arguments) Agent.Error!Value {
+    const function_obj = agent.activeFunctionObject();
+    const builtin_fn = function_obj.as(kiesel.builtins.BuiltinFunction);
+    const js_instance = builtin_fn.fields.additionalFieldsAs(Js);
+    const window_id = js_instance.current_window_id orelse return agent.throwException(.internal_error, "Missing active window", .{});
+    const window = js_instance.windows.get(window_id) orelse return agent.throwException(.internal_error, "Missing window context", .{});
+    _ = this_value;
+    const arg = arguments.get(0);
+    const text = if (arg.isString())
+        try arg.asString().toUtf8(js_instance.allocator)
+    else
+        return agent.throwException(.type_error, "createTextNode requires a string", .{});
+    defer js_instance.allocator.free(text);
+    const owned = try js_instance.allocator.dupe(u8, text);
+    var owned_live = true;
+    errdefer if (owned_live) js_instance.allocator.free(owned);
+    const node = try js_instance.allocator.create(Node);
+    var node_owned = true;
+    errdefer if (node_owned) {
+        node.deinit(js_instance.allocator);
+        js_instance.allocator.destroy(node);
+    };
+    node.* = .{ .text = .{ .text = owned, .parent = null, .owned_text = true } };
+    owned_live = false;
+    const handle = try js_instance.getHandle(window, node);
+    try window.detached_nodes.put(node, {});
+    node_owned = false;
+    return Value.from(@as(f64, @floatFromInt(handle)));
+}
+
 fn appendChild(agent: *Agent, this_value: Value, arguments: kiesel.types.Arguments) Agent.Error!Value {
     const function_obj = agent.activeFunctionObject();
     const builtin_fn = function_obj.as(kiesel.builtins.BuiltinFunction);
@@ -4283,7 +4349,7 @@ fn appendChild(agent: *Agent, this_value: Value, arguments: kiesel.types.Argumen
         return agent.throwException(.type_error, "Text nodes do not support appendChild", .{});
     }
     if (!window.detached_nodes.contains(child)) {
-        return agent.throwException(.type_error, "appendChild requires a detached element", .{});
+        return agent.throwException(.type_error, "appendChild requires a detached node", .{});
     }
     if (dom_mutation.isInclusiveAncestor(child, parent)) {
         return agent.throwException(.type_error, "appendChild would create a cycle", .{});
@@ -4331,7 +4397,7 @@ fn insertBefore(agent: *Agent, this_value: Value, arguments: kiesel.types.Argume
         return agent.throwException(.type_error, "Text nodes do not support insertBefore", .{});
     }
     if (!window.detached_nodes.contains(child)) {
-        return agent.throwException(.type_error, "insertBefore requires a detached element", .{});
+        return agent.throwException(.type_error, "insertBefore requires a detached node", .{});
     }
     if (dom_mutation.isInclusiveAncestor(child, parent)) {
         return agent.throwException(.type_error, "insertBefore would create a cycle", .{});
@@ -4463,9 +4529,6 @@ fn replaceChildren(agent: *Agent, this_value: Value, arguments: kiesel.types.Arg
             "Invalid replacement child handle",
             .{},
         );
-        if (child.* != .element) {
-            return agent.throwException(.type_error, "replaceChildren arguments must be Elements", .{});
-        }
         if (dom_mutation.isInclusiveAncestor(child, node)) {
             return agent.throwException(.type_error, "replaceChildren would create a cycle", .{});
         }
@@ -4615,6 +4678,39 @@ fn setAttribute(agent: *Agent, this_value: Value, arguments: kiesel.types.Argume
                 "Text nodes do not support setAttribute",
                 .{},
             );
+        },
+    }
+}
+
+/// Remove an authored attribute while preserving the element's existing
+/// owned-string arena. Retaining old bytes is intentional: style maps may
+/// still reference them until the next style pass retires that generation.
+fn removeAttribute(agent: *Agent, this_value: Value, arguments: kiesel.types.Arguments) Agent.Error!Value {
+    const function_obj = agent.activeFunctionObject();
+    const builtin_fn = function_obj.as(kiesel.builtins.BuiltinFunction);
+    const js_instance = builtin_fn.fields.additionalFieldsAs(Js);
+    const window_id = js_instance.current_window_id orelse return agent.throwException(.internal_error, "Missing active window", .{});
+    const window = js_instance.windows.get(window_id) orelse return agent.throwException(.internal_error, "Missing window context", .{});
+    _ = this_value;
+    const handle_arg = arguments.get(0);
+    if (!handle_arg.isNumber()) return agent.throwException(.type_error, "removeAttribute requires a Node", .{});
+    const node = js_instance.getNode(window, @intFromFloat(handle_arg.asNumber().asFloat())) orelse return agent.throwException(.internal_error, "Invalid node handle", .{});
+    const name_arg = arguments.get(1);
+    if (!name_arg.isString()) return agent.throwException(.type_error, "removeAttribute requires a string name", .{});
+    const name = try name_arg.asString().toUtf8(js_instance.allocator);
+    defer js_instance.allocator.free(name);
+    switch (node.*) {
+        .text => return agent.throwException(.type_error, "Text nodes do not have attributes", .{}),
+        .element => |*element| {
+            const attrs = element.attributes orelse return .undefined;
+            if (!attrs.contains(name)) return .undefined;
+            const refresh_id_globals = std.ascii.eqlIgnoreCase(name, "id") and dom_mutation.isAttachedToCurrentDocument(window.current_nodes, node);
+            if (refresh_id_globals) try js_instance.clearNamedIdGlobals(window_id, window);
+            _ = element.attributes.?.remove(name);
+            parser.dirtyStyleForElement(element);
+            js_instance.requestRender();
+            if (refresh_id_globals) try js_instance.syncNamedIdGlobals(window_id, window);
+            return .undefined;
         },
     }
 }
