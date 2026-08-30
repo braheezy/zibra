@@ -64,6 +64,9 @@ zig build test-pipeline
 zig build check
 # Capture and compare the windowless macOS screenshot fixtures
 zig build test-screenshot
+# Capture an active page after a bounded delay (useful for timers/animations)
+zig build run -- --screenshot /tmp/acid3-slice.png --screenshot-after-ms 3000 \
+  https://acid3.acidtests.org/
 ```
 
 See [Testing and verification](docs/testing.md) for the focused-test map,

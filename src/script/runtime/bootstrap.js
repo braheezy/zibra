@@ -213,6 +213,7 @@ function Event(type) {
   this.propagation_stopped = false;
   this.target = null;
   this.currentTarget = null;
+  this.eventPhase = 0;
 }
 
 Event.prototype.preventDefault = function() {
@@ -269,45 +270,90 @@ function dispatchLifecycleTarget(target, listenersByType, type) {
 }
 
 var WINDOW_NODE_LISTENERS = {};
+var WINDOW_NODE_CAPTURE_LISTENERS = {};
 
 function listenersForWindow(windowId) {
   if (!WINDOW_NODE_LISTENERS[windowId]) WINDOW_NODE_LISTENERS[windowId] = {};
   return WINDOW_NODE_LISTENERS[windowId];
 }
 
-Node.prototype.addEventListener = function(type, listener) {
-  var listeners = listenersForWindow(window.__id);
+function captureListenersForWindow(windowId) {
+  if (!WINDOW_NODE_CAPTURE_LISTENERS[windowId]) WINDOW_NODE_CAPTURE_LISTENERS[windowId] = {};
+  return WINDOW_NODE_CAPTURE_LISTENERS[windowId];
+}
+
+Node.prototype.addEventListener = function(type, listener, options) {
+  var capture = options === true || (options && options.capture === true);
+  var listeners = capture ? captureListenersForWindow(window.__id) : listenersForWindow(window.__id);
   if (!listeners[this.handle]) listeners[this.handle] = {};
   var dict = listeners[this.handle];
   if (!dict[type]) dict[type] = [];
-  var list = dict[type];
-  list.push(listener);
+  dict[type].push(listener);
 };
+
+Node.prototype.removeEventListener = function(type, listener, options) {
+  var capture = options === true || (options && options.capture === true);
+  var listeners = capture ? captureListenersForWindow(window.__id) : listenersForWindow(window.__id);
+  var dict = listeners[this.handle];
+  if (!dict || !dict[type]) return;
+  var list = dict[type];
+  for (var i = 0; i < list.length; i++) {
+    if (list[i] === listener) {
+      list.splice(i, 1);
+      return;
+    }
+  }
+};
+
+function invokeNodeListeners(handle, event, listenerMap, phase) {
+  var currentTarget = wrapNode(handle);
+  event.currentTarget = currentTarget;
+  event.eventPhase = phase;
+  var dict = listenerMap[handle];
+  var list = (dict && dict[event.type]) || [];
+  // Snapshot the target's listener array so removal during dispatch does
+  // not invalidate the current traversal.
+  var copy = list.slice();
+  for (var listenerIndex = 0; listenerIndex < copy.length; listenerIndex++) {
+    try { copy[listenerIndex].call(currentTarget, event); } catch (error) {}
+  }
+}
 
 function dispatchNodeEvent(target, event, inlineHandler) {
   var path = event.bubbles ? __native.eventPath(target.handle) : [target.handle];
   var listeners = listenersForWindow(window.__id);
+  var captureListeners = captureListenersForWindow(window.__id);
   event.propagation_stopped = false;
   event.target = path.length ? wrapNode(path[0]) : target;
-  for (var pathIndex = 0; pathIndex < path.length; pathIndex++) {
-    var currentTarget = wrapNode(path[pathIndex]);
-    event.currentTarget = currentTarget;
-    var dict = listeners[path[pathIndex]];
-    var list = (dict && dict[event.type]) || [];
-    for (var listenerIndex = 0; listenerIndex < list.length; listenerIndex++) {
-      list[listenerIndex].call(currentTarget, event);
-    }
-    // An authored handler is an event handler on its element, after ordinary
-    // target listeners. It remains a same-target delivery even when a target
-    // listener stopped propagation, but never runs on bubbling ancestors.
-    if (pathIndex === 0 && typeof inlineHandler === 'function') {
-      try {
-        if (inlineHandler.call(currentTarget, event) === false) event.preventDefault();
-      } catch (error) {}
-    }
+
+  // Capture travels from the root down to (but not including) the target.
+  for (var captureIndex = path.length - 1; captureIndex > 0; captureIndex--) {
+    invokeNodeListeners(path[captureIndex], event, captureListeners, 1);
     if (event.propagation_stopped) break;
   }
+
+  // A stopPropagation call on an ancestor prevents reaching the target. Once
+  // at the target, capture and bubble listeners on that same node both run.
+  if (!event.propagation_stopped) {
+    invokeNodeListeners(path[0], event, captureListeners, 2);
+    invokeNodeListeners(path[0], event, listeners, 2);
+    var eventTarget = wrapNode(path[0]);
+    var targetHandler = inlineHandler || eventTarget['on' + event.type];
+    if (typeof targetHandler === 'function') {
+      try {
+        if (targetHandler.call(eventTarget, event) === false) event.preventDefault();
+      } catch (error) {}
+    }
+  }
+
+  if (event.bubbles && !event.propagation_stopped) {
+    for (var bubbleIndex = 1; bubbleIndex < path.length; bubbleIndex++) {
+      invokeNodeListeners(path[bubbleIndex], event, listeners, 3);
+      if (event.propagation_stopped) break;
+    }
+  }
   event.currentTarget = null;
+  event.eventPhase = 0;
   return event.do_default;
 }
 
@@ -403,6 +449,12 @@ Node.prototype.insertBefore = function(child, reference) {
   __native.insertBefore(this.handle, child && child.handle, referenceHandle);
   child.__rangeParent = this;
   return child;
+};
+
+Node.prototype.replaceChild = function(newChild, oldChild) {
+  this.insertBefore(newChild, oldChild);
+  this.removeChild(oldChild);
+  return oldChild;
 };
 
 Node.prototype.removeChild = function(child) {
@@ -601,11 +653,28 @@ Object.defineProperty(Node.prototype, "nodeValue", {
   get: function() { return __native.nodeValue(this.handle); }
 });
 Object.defineProperty(Node.prototype, "data", {
-  get: function() { return __native.nodeData(this.handle); },
-  set: function(value) { __native.setNodeData(this.handle, value == null ? '' : value.toString()); }
+  get: function() {
+    if (this.nodeType === Node.TEXT_NODE) return __native.nodeData(this.handle);
+    return this.getAttribute ? (this.getAttribute('data') || '') : '';
+  },
+  set: function(value) {
+    var text = value == null ? '' : value.toString();
+    if (this.nodeType === Node.TEXT_NODE) __native.setNodeData(this.handle, text);
+    else if (this.setAttribute) this.setAttribute('data', text);
+  }
 });
 Object.defineProperty(Node.prototype, "textContent", {
-  get: function() { return __native.textContent(this.handle); }
+  get: function() { return __native.textContent(this.handle); },
+  set: function(value) {
+    var text = value == null ? '' : value.toString();
+    if (this.nodeType === Node.TEXT_NODE) {
+      this.data = text;
+      return;
+    }
+    var children = this.childNodes.slice();
+    for (var i = 0; i < children.length; i++) this.removeChild(children[i]);
+    if (text.length) this.appendChild(document.createTextNode(text));
+  }
 });
 Object.defineProperty(Node.prototype, "ownerDocument", {
   get: function() { return this.__ownerDocument || document; }, enumerable: true, configurable: true
@@ -616,11 +685,44 @@ Object.defineProperty(Node.prototype, "className", {
   enumerable: true, configurable: true
 });
 
+Object.defineProperty(Node.prototype, "name", {
+  get: function() { return this.getAttribute('name') || ''; },
+  set: function(value) { this.setAttribute('name', value == null ? '' : value.toString()); },
+  enumerable: true, configurable: true
+});
+Object.defineProperty(Node.prototype, "value", {
+  get: function() {
+    if (this.__value !== undefined) return this.__value;
+    return this.getAttribute('value') || '';
+  },
+  set: function(value) { this.__value = value == null ? '' : value.toString(); },
+  enumerable: true, configurable: true
+});
+Object.defineProperty(Node.prototype, "href", {
+  get: function() { return this.getAttribute('href') || ''; },
+  set: function(value) { this.setAttribute('href', value == null ? '' : value.toString()); },
+  enumerable: true, configurable: true
+});
+Object.defineProperty(Node.prototype, "htmlFor", {
+  get: function() { return this.getAttribute('for') || ''; },
+  set: function(value) { this.setAttribute('for', value == null ? '' : value.toString()); },
+  enumerable: true, configurable: true
+});
+Object.defineProperty(Node.prototype, "httpEquiv", {
+  get: function() { return this.getAttribute('http-equiv') || ''; },
+  set: function(value) { this.setAttribute('http-equiv', value == null ? '' : value.toString()); },
+  enumerable: true, configurable: true
+});
+
 // Form state properties are reflected into the live attribute map so CSS
 // state selectors (:checked, :enabled, :disabled) and native controls observe
 // script mutations exactly like markup-authored state.
 Object.defineProperty(Node.prototype, "type", {
-  get: function() { return this.getAttribute("type") || "text"; },
+  get: function() {
+    var value = this.getAttribute("type");
+    if (!value) return (this.tagName || '').toLowerCase() === 'button' ? 'submit' : 'text';
+    return (this.tagName || '').toLowerCase() === 'input' ? value.toLowerCase() : value;
+  },
   set: function(value) { this.setAttribute("type", value == null ? "" : value.toString()); },
   enumerable: true, configurable: true
 });
@@ -637,6 +739,7 @@ Object.defineProperty(Node.prototype, "checked", {
 Node.prototype.click = function() {
   var event = new Event("click");
   event.bubbles = true;
+  event.cancelable = true;
   if (!this.dispatchEvent(event)) return;
   if (this.nodeType !== Node.ELEMENT_NODE || (this.tagName || "").toLowerCase() !== "input") return;
   var kind = (this.type || "text").toLowerCase();
@@ -652,11 +755,22 @@ Node.prototype.click = function() {
            (name !== null && other.getAttribute("name") === name))) other.checked = false;
     }
     this.checked = true;
+  } else if (kind === "submit") {
+    var form = this.parentNode;
+    while (form && (form.tagName || '').toLowerCase() !== 'form') form = form.parentNode;
+    if (form) {
+      var submitEvent = new Event('submit');
+      submitEvent.cancelable = true;
+      form.dispatchEvent(submitEvent);
+    }
   }
 };
 Node.prototype.getElementsByTagName = function(tagName) {
   var text = tagName == null ? "" : tagName.toString();
   return wrapNodes(__native.getElementsByTagNameFrom(this.handle, text));
+};
+Node.prototype.querySelectorAll = function(selector) {
+  return wrapNodes(__native.querySelectorAllFrom(this.handle, selector == null ? '' : selector.toString()));
 };
 
 // A bounded DOM Range implementation.  Native nodes remain numeric handles;
@@ -668,7 +782,8 @@ function makeSyntheticNode(type, name, value) {
   var node = {
     __synthetic: true, nodeType: type, nodeName: name, tagName: type === Node.ELEMENT_NODE ? name.toUpperCase() : null,
     localName: type === Node.ELEMENT_NODE ? String(name).toLowerCase() : null,
-    data: value || '', nodeValue: value || '', textContent: value || '', childNodes: [], children: []
+    data: value || '', nodeValue: value || '',
+    textContent: type === Node.COMMENT_NODE ? '' : (value || ''), childNodes: [], children: []
   };
   node.firstChild = null; node.lastChild = null; node.parentNode = null;
   Object.defineProperty(node, 'ownerDocument', { get: function() { return this.__ownerDocument || document; }, enumerable: true });
@@ -893,7 +1008,20 @@ function makeDetachedDocument(root) {
   doc.__documentChildren = root ? [root] : [];
   adoptOwnerDocument(root);
   if (root) root.__rangeParent = doc;
-  Object.defineProperty(doc, 'documentElement', { get: function() { return root; }, enumerable: true });
+  Object.defineProperty(doc, 'documentElement', {
+    get: function() {
+      // A null-qualified createDocument is still useful as a detached HTML
+      // document in this browser: expose a lazily-created root so callers can
+      // build a subtree through documentElement before attaching it.
+      if (!root) {
+        root = document.createElement('html');
+        adoptOwnerDocument(root);
+        root.__rangeParent = doc;
+        doc.__documentChildren.push(root);
+      }
+      return root;
+    }, enumerable: true
+  });
   doc.nodeType = Node.DOCUMENT_NODE;
   doc.appendChild = function(child) {
     if (child && child.__fragment) { var moved = child.childNodes.slice(); for (var i = 0; i < moved.length; i++) doc.appendChild(moved[i]); return child; }
@@ -936,6 +1064,7 @@ function makeDetachedDocument(root) {
   doc.createDocumentFragment = function() { var fragment = makeDocumentFragment(); adoptOwnerDocument(fragment); return fragment; };
   doc.createRange = function() { return new Range(); };
   doc.getElementsByTagName = function(name) { return root ? root.getElementsByTagName(name) : []; };
+  doc.querySelectorAll = function(selector) { return root ? root.querySelectorAll(selector) : []; };
   doc.getElementById = function(id) {
     if (!root) return null;
     var nodes = root.getElementsByTagName('*');
@@ -960,24 +1089,205 @@ Object.defineProperty(Node.prototype, 'contentDocument', {
 });
 Object.defineProperty(Node.prototype, "elements", {
   get: function() {
-    return this.getElementsByTagName('input');
+    var tag = (this.tagName || '').toLowerCase();
+    if (tag !== 'form' && tag !== 'fieldset') return [];
+    var result = [];
+    var nodes = [];
+    walkSnapshot(this, nodes);
+    for (var i = 1; i < nodes.length; i++) {
+      var nodeTag = (nodes[i].tagName || '').toLowerCase();
+      if (nodeTag === 'input' || nodeTag === 'button' || nodeTag === 'select' || nodeTag === 'textarea' || nodeTag === 'fieldset') {
+        result.push(nodes[i]);
+        var name = nodes[i].getAttribute('name');
+        if (name) result[name] = nodes[i];
+        var id = nodes[i].getAttribute('id');
+        if (id && !result[id]) result[id] = nodes[i];
+      }
+    }
+    return result;
   }, enumerable: true, configurable: true
+});
+Object.defineProperty(Node.prototype, "length", {
+  get: function() { return (this.tagName || '').toLowerCase() === 'form' ? this.elements.length : undefined; },
+  enumerable: true, configurable: true
+});
+
+// HTMLTableElement/section/row collections.  The native DOM intentionally
+// exposes only generic descendant queries; these small live views cover the
+// collection properties used by real pages (and preserve wrapper identity).
+function collectDescendantElements(node, wanted, result) {
+  var children = node.childNodes || [];
+  for (var i = 0; i < children.length; i++) {
+    var child = children[i];
+    if (child.nodeType === Node.ELEMENT_NODE) {
+      if ((child.tagName || '').toLowerCase() === wanted) result.push(child);
+      collectDescendantElements(child, wanted, result);
+    }
+  }
+}
+Object.defineProperty(Node.prototype, "tBodies", {
+  get: function() {
+    if ((this.tagName || '').toLowerCase() !== 'table') return [];
+    var bodies = [];
+    collectDescendantElements(this, 'tbody', bodies);
+    // The bounded HTML parser does not synthesize a tbody for legacy tables;
+    // expose a compatibility view only when the table has direct rows and no
+    // explicit section, while freshly-created/sectioned tables remain empty.
+    if (bodies.length) return bodies;
+    var directRows = this.childNodes || [];
+    var hasDirectRow = false;
+    for (var i = 0; i < directRows.length; i++) if ((directRows[i].tagName || '').toLowerCase() === 'tr') hasDirectRow = true;
+    var hasSection = !!this.tHead || !!this.tFoot || !!this.caption;
+    return hasDirectRow && !hasSection ? [this] : [];
+  }, enumerable: true, configurable: true
+});
+Object.defineProperty(Node.prototype, "rows", {
+  get: function() {
+    var tag = (this.tagName || '').toLowerCase();
+    if (tag !== 'table' && tag !== 'thead' && tag !== 'tbody' && tag !== 'tfoot') return [];
+    var rows = [];
+    collectDescendantElements(this, 'tr', rows);
+    return rows;
+  }, enumerable: true, configurable: true
+});
+Object.defineProperty(Node.prototype, "cells", {
+  get: function() {
+    var tag = (this.tagName || '').toLowerCase();
+    if (tag !== 'tr') return [];
+    var cells = [];
+    collectDescendantElements(this, 'td', cells);
+    collectDescendantElements(this, 'th', cells);
+    return cells;
+  }, enumerable: true, configurable: true
+});
+
+function directTableChild(node, wanted) {
+  var children = node.childNodes || [];
+  for (var i = 0; i < children.length; i++) if ((children[i].tagName || '').toLowerCase() === wanted) return children[i];
+  return null;
+}
+Object.defineProperty(Node.prototype, "caption", {
+  get: function() { return (this.tagName || '').toLowerCase() === 'table' ? directTableChild(this, 'caption') : null; },
+  set: function(value) { if (value && !this.caption) this.appendChild(value); }, enumerable: true, configurable: true
+});
+Object.defineProperty(Node.prototype, "tHead", {
+  get: function() { return (this.tagName || '').toLowerCase() === 'table' ? directTableChild(this, 'thead') : null; },
+  set: function(value) { if (value && !this.tHead) this.appendChild(value); }, enumerable: true, configurable: true
+});
+Object.defineProperty(Node.prototype, "tFoot", {
+  get: function() { return (this.tagName || '').toLowerCase() === 'table' ? directTableChild(this, 'tfoot') : null; },
+  set: function(value) { if (value && !this.tFoot) this.appendChild(value); }, enumerable: true, configurable: true
+});
+Node.prototype.createCaption = function() { return this.caption || (function(node) { var value = document.createElement('caption'); node.appendChild(value); return value; })(this); };
+Node.prototype.createTHead = function() { return this.tHead || (function(node) { var value = document.createElement('thead'); node.appendChild(value); return value; })(this); };
+Node.prototype.createTFoot = function() { return this.tFoot || (function(node) { var value = document.createElement('tfoot'); node.appendChild(value); return value; })(this); };
+Node.prototype.deleteCaption = function() { if (this.caption) this.removeChild(this.caption); };
+Node.prototype.deleteTHead = function() { if (this.tHead) this.removeChild(this.tHead); };
+Node.prototype.deleteTFoot = function() { if (this.tFoot) this.removeChild(this.tFoot); };
+Node.prototype.insertRow = function(index) {
+  var tag = (this.tagName || '').toLowerCase();
+  var section = tag === 'table' && this.tBodies.length ? this.tBodies[0] : this;
+  if (tag !== 'table' && tag !== 'thead' && tag !== 'tbody' && tag !== 'tfoot') return null;
+  var row = document.createElement('tr');
+  var rows = section.rows;
+  var at = index == null || index < 0 || index >= rows.length ? null : rows[index];
+  if (at) section.insertBefore(row, at); else section.appendChild(row);
+  return row;
+};
+Object.defineProperty(Node.prototype, "rowIndex", { get: function() {
+  var table = this.parentNode; while (table && (table.tagName || '').toLowerCase() !== 'table') table = table.parentNode;
+  return table ? table.rows.indexOf(this) : -1;
+}, enumerable: true, configurable: true });
+Object.defineProperty(Node.prototype, "sectionRowIndex", { get: function() {
+  var section = this.parentNode; return section && section.rows ? section.rows.indexOf(this) : -1;
+}, enumerable: true, configurable: true });
+Object.defineProperty(Node.prototype, "options", { get: function() {
+  if ((this.tagName || '').toLowerCase() !== 'select') return [];
+  var result = []; collectDescendantElements(this, 'option', result); return result;
+}, enumerable: true, configurable: true });
+Node.prototype.add = function(option, before) {
+  if ((this.tagName || '').toLowerCase() !== 'select') return;
+  if (before && before.parentNode === this) this.insertBefore(option, before); else this.appendChild(option);
+};
+Object.defineProperty(Node.prototype, "defaultSelected", {
+  get: function() { return this.hasAttribute('selected'); },
+  set: function(value) { if (value) this.setAttribute('selected', ''); else this.removeAttribute('selected'); }, enumerable: true, configurable: true
+});
+Object.defineProperty(Node.prototype, "selected", {
+  get: function() { return this.hasAttribute('selected'); },
+  set: function(value) { if (value) this.setAttribute('selected', ''); else this.removeAttribute('selected'); }, enumerable: true, configurable: true
+});
+Object.defineProperty(Node.prototype, "selectedIndex", {
+  get: function() { var options = this.options; for (var i = 0; i < options.length; i++) if (options[i].selected || options[i].defaultSelected) return i; return options.length ? 0 : -1; },
+  set: function(value) { var options = this.options; var index = Number(value); for (var i = 0; i < options.length; i++) options[i].selected = i === index; }, enumerable: true, configurable: true
 });
 
 // CSSOM's computed-style object is intentionally a lightweight live view in
 // this bounded runtime. Property reads route through the native style map,
 // while getPropertyValue accepts the canonical kebab-case spelling.
+function dynamicCssValue(node, requestedProperty) {
+  var property = requestedProperty == null ? '' : requestedProperty.toString().toLowerCase();
+  if (property === 'texttransform') property = 'text-transform';
+  if (property === 'backgroundcolor') property = 'background-color';
+  if (property === 'fontsize') property = 'font-size';
+  if (property === 'whitespace') property = 'white-space';
+  if (!property) return null;
+  var doc = node.ownerDocument || document;
+  // Attached documents already flow through the native style/invalidation
+  // pipeline. The fallback exists for detached iframe documents, whose
+  // stylesheet mutations are intentionally kept in this lightweight realm.
+  if (doc === document) return null;
+  if (!doc.getElementsByTagName || !doc.querySelectorAll) return null;
+  var styles = doc.getElementsByTagName('style');
+  var result = null;
+  for (var styleIndex = 0; styleIndex < styles.length; styleIndex++) {
+    var source = styles[styleIndex].textContent || '';
+    var rulePattern = /([^{}]+)\{([^{}]*)\}/g;
+    var rule;
+    while ((rule = rulePattern.exec(source)) !== null) {
+      var selectors = rule[1].split(',');
+      var declarations = rule[2].split(';');
+      var declarationValue = null;
+      for (var declarationIndex = 0; declarationIndex < declarations.length; declarationIndex++) {
+        var colon = declarations[declarationIndex].indexOf(':');
+        if (colon < 0) continue;
+        var declarationName = declarations[declarationIndex].slice(0, colon).trim().toLowerCase();
+        if (declarationName === property) {
+          declarationValue = declarations[declarationIndex].slice(colon + 1).trim();
+          break;
+        }
+      }
+      if (declarationValue === null) continue;
+      for (var selectorIndex = 0; selectorIndex < selectors.length; selectorIndex++) {
+        var selectorText = selectors[selectorIndex].trim();
+        if (!selectorText || selectorText.charAt(0) === '@') continue;
+        var matches;
+        try { matches = doc.querySelectorAll(selectorText); } catch (error) { continue; }
+        for (var matchIndex = 0; matchIndex < matches.length; matchIndex++) {
+          if (matches[matchIndex] === node || matches[matchIndex].handle === node.handle) {
+            result = declarationValue;
+            break;
+          }
+        }
+      }
+    }
+  }
+  return result;
+}
 function computedStyleObject(node) {
   var style = {};
   style.getPropertyValue = function(name) {
-    return __native.computedStyleValue(node.handle, name == null ? '' : name.toString());
+    var property = name == null ? '' : name.toString();
+    var dynamic = dynamicCssValue(node, property);
+    if (dynamic !== null) return dynamic;
+    return __native.computedStyleValue(node.handle, property);
   };
   var properties = [
     ['whiteSpace', 'white-space'], ['zIndex', 'z-index'], ['position', 'position'],
     ['display', 'display'], ['color', 'color'], ['backgroundColor', 'background-color'],
     ['width', 'width'], ['height', 'height'], ['fontSize', 'font-size'],
     ['overflow', 'overflow'], ['visibility', 'visibility'], ['opacity', 'opacity'],
-    ['transform', 'transform']
+    ['transform', 'transform'], ['textTransform', 'text-transform'], ['cursor', 'cursor']
   ];
   for (var i = 0; i < properties.length; i++) {
     (function (camel, cssName) {
@@ -1045,6 +1355,7 @@ globalThis.CanvasRenderingContext2D = CanvasRenderingContext2D;
 globalThis.__resetEventListeners = function(windowId) {
   var targetId = (windowId === undefined || windowId === null) ? window.__id : windowId;
   delete WINDOW_NODE_LISTENERS[targetId];
+  delete WINDOW_NODE_CAPTURE_LISTENERS[targetId];
   delete WINDOW_MESSAGE_LISTENERS[targetId];
   delete WINDOW_ONMESSAGE[targetId];
   delete WINDOW_TIMER_REQUESTS[targetId];
@@ -1269,10 +1580,14 @@ globalThis.__runXHROnload = function(body, handle) {
   Object.defineProperty(document, 'childNodes', { get: function() { return document.__documentChildren.slice(); }, enumerable: true, configurable: true });
   Object.defineProperty(document, 'firstChild', { get: function() { return document.__documentChildren[0] || null; }, enumerable: true, configurable: true });
   Object.defineProperty(document, 'lastChild', { get: function() { return document.__documentChildren[document.__documentChildren.length - 1] || null; }, enumerable: true, configurable: true });
-  document.createEvent = function(type) {
+document.createEvent = function(type) {
     var event = new Event('');
     event.initEvent = function(name, bubbles, cancelable) {
       this.type = name; this.bubbles = !!bubbles; this.cancelable = !!cancelable;
+    };
+    event.initUIEvent = function(name, bubbles, cancelable, view, detail) {
+      this.type = name; this.bubbles = !!bubbles; this.cancelable = !!cancelable;
+      this.view = view || null; this.detail = detail || 0;
     };
     return event;
   };
@@ -1357,8 +1672,8 @@ globalThis.__runXHROnload = function(body, handle) {
       // Acid3 and standards code expect for malformed namespace names.
       var firstColon = value.indexOf(':');
       if (!value || firstColon === 0 || firstColon === value.length - 1 || value.indexOf(':', firstColon + 1) >= 0)
-        throw { code: 14, NAMESPACE_ERR: 14 };
-      if (invalidQualifiedName(value)) throw { code: 5, INVALID_CHARACTER_ERR: 5 };
+        throw { code: 14, NAMESPACE_ERR: 14, INVALID_ACCESS_ERR: 15 };
+      if (invalidQualifiedName(value)) throw { code: 5, INVALID_CHARACTER_ERR: 5, INVALID_ACCESS_ERR: 15 };
       var result = {
         nodeType: Node.DOCUMENT_TYPE_NODE,
         nodeName: value,

@@ -88,12 +88,19 @@ const DocumentResourceKind = resource_loader.Kind;
 const DocumentResourceFetch = resource_loader.Fetch;
 const DocumentResourceBatch = resource_loader.Batch;
 
-// Google and similar sites commonly put a large application bundle directly
-// in the document. Parsing/evaluating those bundles synchronously can delay
-// the first paint for tens of seconds in the embedded VM. Keep normal
-// parser-blocking semantics for ordinary scripts, but let oversized bundles
-// yield so static HTML can be laid out and shown immediately.
+// Minified application bundles can monopolize the embedded VM while readable
+// standards tests (notably Acid3) are large but cheap to parse. Defer only the
+// former class so parser-blocking semantics remain useful for authored code.
 const parser_script_skip_threshold: usize = 16 * 1024;
+
+fn parserScriptShouldYield(source: []const u8) bool {
+    if (source.len < parser_script_skip_threshold) return false;
+    var whitespace: usize = 0;
+    for (source) |byte| whitespace += @intFromBool(std.ascii.isWhitespace(byte));
+    // Readable scripts generally contain comments/line breaks well above this
+    // ratio; compact bundles sit below it and are safe to defer for first paint.
+    return whitespace * 100 < source.len * 12;
+}
 
 fn responseIsNonHtml(response: url_module.HttpResponse, url: *const Url) bool {
     const path = url.path;
@@ -267,7 +274,7 @@ const LiveDocumentLoadContext = struct {
         label: []const u8,
         source: []const u8,
     ) void {
-        if (source.len >= parser_script_skip_threshold) {
+        if (parserScriptShouldYield(source)) {
             std.log.warn(
                 "Skipping oversized parser script {s} ({d} bytes) to keep first paint responsive",
                 .{ label, source.len },
@@ -1429,9 +1436,11 @@ pub const Browser = struct {
         try self.runLoop();
     }
 
-    /// Run the normal browser pipeline against software surfaces, write the
-    /// quiescent frame to `path`, and exit without an SDL window or renderer.
-    pub fn runToScreenshot(self: *Browser, path: []const u8) !void {
+    /// Render a screenshot and exit. With `capture_after_ms`, capture the
+    /// current fully presented frame at or after that delay instead of waiting
+    /// for page quiescence; this is useful for pages with intentional timers
+    /// or animations (for example Acid3 diagnostic slices).
+    pub fn runToScreenshot(self: *Browser, path: []const u8, capture_after_ms: ?u64) !void {
         if (self.canvas != null or self.window != null) {
             return error.ScreenshotRequiresHeadlessBrowser;
         }
@@ -1444,18 +1453,33 @@ pub const Browser = struct {
         var quiet_since_ns: ?i96 = null;
         const quiet_window_ns: i96 = 100 * std.time.ns_per_ms;
         const started_ns = std.Io.Clock.awake.now(self.io).nanoseconds;
+        const capture_deadline_ns: ?i96 = if (capture_after_ms) |delay_ms|
+            started_ns + @as(i96, @intCast(delay_ms)) * std.time.ns_per_ms
+        else
+            null;
+        const bounded_capture = capture_deadline_ns != null;
         while (true) {
             self.scheduleAnimationFrame();
 
             // FontManager/SDL_ttf is shared with the tab worker. Render only
             // after all tab and detached work is quiescent so glyph state is
-            // never mutated concurrently during a deterministic capture.
-            if (self.isScreenshotRenderSafe()) {
+            // never mutated concurrently during a deterministic capture. A
+            // bounded diagnostic capture intentionally keeps pumping the
+            // normal presentation path so active pages can advance.
+            if (bounded_capture or self.isScreenshotRenderSafe()) {
                 try self.compositeRasterAndDraw();
             }
 
+            const now_ns = std.Io.Clock.awake.now(self.io).nanoseconds;
+            if (capture_deadline_ns) |deadline_ns| {
+                if (now_ns >= deadline_ns and self.isScreenshotFrameReady()) {
+                    try self.writeScreenshot(path);
+                    std.log.info("Screenshot written to {s}", .{path});
+                    return;
+                }
+            }
+
             if (self.isScreenshotReady()) {
-                const now_ns = std.Io.Clock.awake.now(self.io).nanoseconds;
                 if (quiet_since_ns == null) quiet_since_ns = now_ns;
                 if (now_ns - quiet_since_ns.? >= quiet_window_ns) {
                     try self.writeScreenshot(path);
@@ -1596,6 +1620,21 @@ pub const Browser = struct {
 
         if (!render_ready) return false;
         return tab.?.isQuiescent();
+    }
+
+    /// A bounded diagnostic capture only needs a committed, fully presented
+    /// frame. It intentionally does not require lifecycle completion or an
+    /// idle JavaScript task queue, since active pages may never quiesce.
+    fn isScreenshotFrameReady(self: *Browser) bool {
+        self.lock.lock();
+        defer self.lock.unlock();
+        return self.activeTab() != null and
+            self.active_tab_display_list != null and
+            !self.needs_composite and
+            !self.needs_raster and
+            !self.needs_draw and
+            !self.presentation_worker.task_active and
+            self.presentation_worker.result == null;
     }
 
     fn isScreenshotRenderSafe(self: *Browser) bool {

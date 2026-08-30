@@ -4082,6 +4082,7 @@ fn setupDocument(self: *Js, realm: *Realm) !void {
             .{ .name = "querySelectorAll", .length = 1, .function = querySelectorAll },
         },
         &.{
+            .{ .name = "querySelectorAllFrom", .length = 2, .function = querySelectorAllFrom },
             .{ .name = "getAttribute", .length = 2, .function = getAttribute },
             .{ .name = "children", .length = 1, .function = getChildren },
             .{ .name = "createElement", .length = 1, .function = createElement },
@@ -4274,6 +4275,55 @@ fn querySelectorAll(agent: *Agent, this_value: Value, arguments: kiesel.types.Ar
         );
     }
 
+    return Value.from(&result_array.object);
+}
+
+/// Selector matching rooted at a detached native subtree.  Detached iframe
+/// documents are represented by synthetic JavaScript documents but their
+/// elements still live in the owning realm's handle registry, so the regular
+/// parser selector engine can be reused without making the subtree active.
+fn querySelectorAllFrom(agent: *Agent, this_value: Value, arguments: kiesel.types.Arguments) Agent.Error!Value {
+    _ = this_value;
+    const function_obj = agent.activeFunctionObject();
+    const builtin_fn = function_obj.as(kiesel.builtins.BuiltinFunction);
+    const js_instance = builtin_fn.fields.additionalFieldsAs(Js);
+    const window_id = js_instance.current_window_id orelse return agent.throwException(.internal_error, "Missing active window", .{});
+    const window = js_instance.windows.get(window_id) orelse return agent.throwException(.internal_error, "Missing window context", .{});
+    const root = try dom_tree_bindings.requireNodeForHost(agent, .{ .current_nodes = window.current_nodes, .handles = &window.handles, .handle_issuer = &js_instance.handle_issuer }, arguments.get(0));
+    const selector_arg = arguments.get(1);
+    if (!selector_arg.isString()) return agent.throwException(.type_error, "querySelectorAll requires a string argument", .{});
+    const selector_str = try selector_arg.asString().toUtf8(js_instance.allocator);
+    defer js_instance.allocator.free(selector_str);
+    var css_parser = CSSParser.init(js_instance.allocator, selector_str, false) catch return agent.throwException(.syntax_error, "Invalid selector", .{});
+    defer css_parser.deinit(js_instance.allocator);
+    var selector = css_parser.selector(js_instance.allocator) catch return agent.throwException(.syntax_error, "Invalid selector", .{});
+    defer selector.deinit(js_instance.allocator);
+    var has_cache = CSSParser.HasMatchCache.init(js_instance.allocator);
+    defer has_cache.deinit();
+    selector.populateHasMatches(&has_cache, root) catch return agent.throwException(.internal_error, "Could not match selector", .{});
+    const match_context = CSSParser.MatchContext{ .has_cache = &has_cache };
+    var node_list = std.ArrayList(*Node).empty;
+    defer node_list.deinit(js_instance.allocator);
+    try parser.treeToList(js_instance.allocator, root, &node_list);
+    var matching_handles = std.ArrayList(u32).empty;
+    defer matching_handles.deinit(js_instance.allocator);
+    for (node_list.items) |node| {
+        var ancestors = std.ArrayList(*Node).empty;
+        defer ancestors.deinit(js_instance.allocator);
+        var current = node;
+        while (true) {
+            const parent = switch (current.*) { .element => |e| e.parent, .text => |t| t.parent };
+            if (parent) |p| { try ancestors.append(js_instance.allocator, p); current = p; } else break;
+        }
+        std.mem.reverse(*Node, ancestors.items);
+        if (selector.matchesWithContext(node, ancestors.items, match_context)) {
+            try matching_handles.append(js_instance.allocator, try window.handles.getOrCreate(node, &js_instance.handle_issuer));
+        }
+    }
+    const result_array = try kiesel.builtins.arrayCreate(agent, @intCast(matching_handles.items.len), null);
+    for (matching_handles.items, 0..) |handle, i| {
+        try result_array.object.createDataPropertyDirect(agent, kiesel.types.PropertyKey.from(@as(kiesel.types.PropertyKey.IntegerIndex, @intCast(i))), Value.from(@as(f64, @floatFromInt(handle))));
+    }
     return Value.from(&result_array.object);
 }
 

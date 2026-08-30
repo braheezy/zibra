@@ -59,6 +59,12 @@ On macOS, run `zig build test-screenshot`. It exercises the windowless
 software-rendering path and compares platform-specific PNG goldens. A
 screenshot test is appropriate when exact paint, glyph placement, clipping,
 effects, or final composition is the behavior under review.
+
+For pages that intentionally keep timers or animations active, use the CLI's
+bounded diagnostic capture instead of waiting for quiescence:
+`zig build run -- --screenshot /tmp/page.png --screenshot-after-ms 3000 URL`.
+It captures the current fully presented frame at or after the requested delay
+and retains the normal 30-second timeout only as a load-safety fallback.
 Windowless captures wait for the document lifecycle to reach `complete` and
 for a sustained quiet interval, so pages driven by short timers are not
 captured between two updates.

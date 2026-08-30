@@ -209,9 +209,28 @@ fn activeGeneratedNode(element: *const parser.Element, kind: pseudo.Kind) ?*Node
     };
 }
 
+/// Return a generated box using the last published style values. Structural
+/// mutation checks run after style has been dirtied, so they must not read the
+/// current protected fields until the next style pass republishes them.
+fn publishedActiveGeneratedNode(element: *const parser.Element, kind: pseudo.Kind) ?*Node {
+    const node = switch (kind) {
+        .before => element.generated_before,
+        .after => element.generated_after,
+    } orelse return null;
+    return switch (node.*) {
+        .element => |generated| if (generated.generatedPseudoLastActive()) node else null,
+        .text => null,
+    };
+}
+
 fn hasActiveGeneratedChildren(element: *const parser.Element) bool {
     return activeGeneratedNode(element, .before) != null or
         activeGeneratedNode(element, .after) != null;
+}
+
+fn hasPublishedActiveGeneratedChildren(element: *const parser.Element) bool {
+    return publishedActiveGeneratedNode(element, .before) != null or
+        publishedActiveGeneratedNode(element, .after) != null;
 }
 
 fn isRunInHeadingNode(node: Node) bool {
@@ -6810,7 +6829,7 @@ const BlockLayout = struct {
             .element => |*value| value,
             .text => return false,
         };
-        if (hasActiveGeneratedChildren(element)) return false;
+        if (hasPublishedActiveGeneratedChildren(element)) return false;
         if (insert_index > element.children.items.len) return false;
         if (element.children_dirty and !element.children_insertions_only) return false;
         if (self.laid_out_dom_children > element.children.items.len) return false;
@@ -6872,7 +6891,7 @@ const BlockLayout = struct {
             .element => |*value| value,
             .text => return false,
         };
-        if (hasActiveGeneratedChildren(element)) return false;
+        if (hasPublishedActiveGeneratedChildren(element)) return false;
         if (!element.children_dirty or !element.children_insertions_only or
             self.laid_out_dom_children > element.children.items.len) return false;
 
@@ -8732,7 +8751,7 @@ const BlockLayout = struct {
         // a display value changes, so retain-insertion is deliberately kept to
         // ordinary block formatting contexts.
         const preserves_table_topology = self.tableRole() == .ordinary and
-            (live_element == null or !hasActiveGeneratedChildren(live_element.?));
+            (live_element == null or !hasPublishedActiveGeneratedChildren(live_element.?));
         var reused_children = false;
         if (insertions_only and preserves_table_topology) {
             // The host normally performs this rebind synchronously after child

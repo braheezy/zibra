@@ -150,6 +150,7 @@ fn zibra(init: std.process.Init) !void {
     var url: ?Url = null;
     var dump_mode: ?DumpMode = null;
     var screenshot_path: ?[]const u8 = null;
+    var screenshot_after_ms: ?u64 = null;
 
     var arg_index: usize = 1;
     while (arg_index < args.len) : (arg_index += 1) {
@@ -189,6 +190,18 @@ fn zibra(init: std.process.Init) !void {
                 return error.BadArguments;
             }
             screenshot_path = arg["--screenshot=".len..];
+            continue;
+        }
+        if (std.mem.eql(u8, arg, "--screenshot-after-ms")) {
+            if (screenshot_after_ms != null or arg_index + 1 >= args.len) {
+                std.log.err("--screenshot-after-ms requires one non-negative integer.", .{});
+                return error.BadArguments;
+            }
+            arg_index += 1;
+            screenshot_after_ms = std.fmt.parseInt(u64, args[arg_index], 10) catch {
+                std.log.err("--screenshot-after-ms requires one non-negative integer.", .{});
+                return error.BadArguments;
+            };
             continue;
         }
         if (url) |_| {
@@ -261,7 +274,7 @@ fn zibra(init: std.process.Init) !void {
         } else {
             try b.newTab(try Url.blank(allocator));
         }
-        try b.runToScreenshot(path);
+        try b.runToScreenshot(path, screenshot_after_ms);
         return;
     }
 

@@ -92,6 +92,12 @@ fn requireNode(agent: *Agent, window: WindowBorrow, argument: Value) Agent.Error
     );
 }
 
+/// Resolve a numeric DOM handle for host bindings that need to inspect a
+/// detached subtree (for example an iframe's synthetic document).
+pub fn requireNodeForHost(agent: *Agent, window: WindowBorrow, argument: Value) Agent.Error!*Node {
+    return requireNode(agent, window, argument);
+}
+
 fn requireString(agent: *Agent, host: *Host, argument: Value, comptime message: []const u8) Agent.Error![]u8 {
     if (!argument.isString()) return agent.throwException(.type_error, message, .{});
     return argument.asString().toUtf8(host.allocator);
