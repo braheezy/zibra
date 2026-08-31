@@ -93,6 +93,27 @@ print("<html></html>")
         self.assertIn("probe ok (non-conformance)", stdout)
         self.assertEqual("", stderr)
 
+    def test_yaml_allowlist_uses_conventional_sections_and_deviations(self):
+        manifest = self.root / "manifest.yaml"
+        manifest.write_text(
+            """\
+tests:
+  - dom/example.html
+probes:
+  - html/probe.html
+deviations:
+  dom/example.html: fail
+""",
+            encoding="utf-8",
+        )
+
+        cases = runner.load_cases(manifest)
+
+        self.assertEqual(
+            [("dom/example.html", "testharness", "fail"), ("html/probe.html", "probe", None)],
+            [(case.path, case.mode, case.expectation) for case in cases],
+        )
+
     def test_testharness_invocation_accepts_an_exact_expected_timeout(self):
         manifest = self.write_manifest(expectation="timeout", timeout_ms=17)
         browser = self.write_browser(
@@ -228,6 +249,49 @@ print("parse detail", file=sys.stderr)
         self.assertIn("browser watchdog expired", stdout)
         self.assertNotIn(f"ok {self.case_path}: TIMEOUT", stdout)
         self.assertIn("--- browser stdout ---", stderr)
+
+    def test_report_writes_summary_and_subtest_details(self):
+        manifest = self.write_manifest()
+        browser = self.write_browser(
+            """\
+import json
+import sys
+print(json.dumps({
+    "protocol_version": 1,
+    "test": sys.argv[2],
+    "status": "PASS",
+    "duration_ms": 7,
+    "tests": [{"name": "lookup", "status": "PASS", "code": 0}],
+    "harness": {"status": "OK", "code": 0},
+}))
+"""
+        )
+        report = self.root / "results" / "run.json"
+
+        # The test helper does not pass --report by default; exercise the
+        # public entry point directly for the durable artifact option.
+        with mock.patch.object(runner, "ROOT", self.root), mock.patch.object(
+            runner, "UPSTREAM", self.upstream
+        ):
+            status = runner.main(
+                [
+                    str(manifest),
+                    "--mode",
+                    "testharness",
+                    "--browser",
+                    sys.executable,
+                    str(browser),
+                    "--report",
+                    str(report),
+                ]
+            )
+
+        self.assertEqual(0, status)
+        payload = json.loads(report.read_text(encoding="utf-8"))
+        self.assertEqual(1, payload["schema_version"])
+        self.assertEqual(1, payload["summary"]["pass"])
+        self.assertEqual("PASS", payload["tests"][0]["status"])
+        self.assertEqual("lookup", payload["tests"][0]["tests"][0]["name"])
 
 
 if __name__ == "__main__":

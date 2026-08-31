@@ -14,10 +14,11 @@ the helper from the repository root:
 
 ```sh
 python3 tests/wpt/run.py --list
-python3 tests/wpt/run.py --mode probe tests/wpt/manifest.json
-python3 tests/wpt/run.py --mode testharness tests/wpt/manifest.json
+python3 tests/wpt/run.py --mode probe tests/wpt/manifest.yaml
+python3 tests/wpt/run.py --mode testharness tests/wpt/manifest.yaml
 zig build test-wpt-runner
 zig build test-wpt
+docker compose -f tests/wpt/dashboard/docker-compose.yml up --build
 ```
 
 `probe` is intentionally a fetch/parse smoke test. Zibra's `--dump-dom`
@@ -28,14 +29,11 @@ cannot report `testharness.js` results. Its output is labeled
 `testharness` runs each selected file in a real headless browser session. When
 the upstream checkout is initialized, the runner starts WPT's `wptserve` on a
 temporary loopback port so root-relative resources such as
-`/resources/testharness.js` resolve exactly as they do in WPT. A
-manifest entry may add a positive `timeout_ms` (10,000 by default) and an
-`expectation` of `pass`, `fail`, `error`, `timeout`, or `skip`. Expectations
-are exact: an expected `fail` does not accept `ERROR` or `TIMEOUT`. Without an
-expectation, the runner expects `PASS`. The existing `status: "skip"` form is
-also supported. The reviewed manifest contains the legacy `probe` and one
-upstream DOM smoke test; add further cases only after their dependencies are
-verified.
+`/resources/testharness.js` resolve exactly as they do in WPT. The small YAML
+allowlist puts testharness paths under `tests` and fetch/parse smoke tests
+under `probes`; both default to `PASS`. Add a path to the optional
+`deviations` map only when its expected result differs (`fail`, `error`,
+`timeout`, or `skip`). Timeouts use the 10,000 ms default.
 
 For each case the runner invokes:
 
@@ -59,7 +57,35 @@ PASS, Promise-job PASS, and TIMEOUT fixtures through the real executable and
 validates its JSON transport. Those local fixtures are protocol regressions,
 not WPT conformance claims.
 
-The manifest is the compatibility allowlist. It includes one upstream DOM
-smoke test as a starting point. Add tests only with a short reason and an
-explicit mode; keep unsupported tests recorded as `skip` rather than silently
-broadening the run.
+The YAML file is the compatibility allowlist. Add paths to the conventional
+`tests` or `probes` section; keep unsupported tests out of the allowlist and
+record only intentional expected deviations.
+
+For a local visual history, write a report while running the manifest and
+start the self-hosted dashboard:
+
+```sh
+mkdir -p tests/wpt/results
+python3 tests/wpt/run.py tests/wpt/manifest.yaml \
+  --mode testharness --browser ./zig-out/bin/zibra \
+  --report tests/wpt/results/$(date -u +%Y%m%dT%H%M%SZ).json
+docker compose -f tests/wpt/dashboard/docker-compose.yml up --build
+```
+
+See [`dashboard/README.md`](dashboard/README.md) for the read-only API and
+GitHub Pages deployment shape.
+
+From the repository root, the shorter equivalents are:
+
+```sh
+task latest-results
+task dashboard
+```
+
+`latest-results` keeps each run as a timestamped JSON file under
+`tests/wpt/results`; `dashboard` serves that history at
+<http://localhost:8188>.
+
+The runner records `ZIBRA_GIT_SHA` in each report. The Taskfile fills it from
+the current checkout automatically (or uses `working-tree` when no Git
+revision is available), and the dashboard displays it as the browser column.

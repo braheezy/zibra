@@ -6,3 +6,6 @@ message_board.json
 message_board.json.*.tmp
 .zig-global-cache
 .zig-local-cache
+tests/wpt/results/*
+!tests/wpt/results/.gitkeep
+!tests/wpt/results/README.md

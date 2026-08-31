@@ -13,7 +13,7 @@ upstream testharness pass. The current implementation includes:
 - `.gitmodules` registers the WPT checkout at `tests/wpt/upstream`;
   contributors initialize it only when doing upstream compatibility work. The
   runner/result protocol does not yet expose the resolved WPT revision.
-  `manifest.json` remains the reviewed compatibility allowlist and contains the
+  `manifest.yaml` remains the reviewed compatibility allowlist and contains the
   legacy `probe` plus one candidate upstream testharness case.
 - `run.py` preserves `probe` as an explicitly labeled non-conformance fetch and
   parse smoke test. Its `testharness` mode starts WPT's own `wptserve` on a
@@ -50,7 +50,8 @@ upstream testharness pass. The current implementation includes:
 
 The committed coverage proves the adapter, process protocol, Promise
 checkpoint, deadline race, runner failure classification, WPT resource
-resolution, and one unchanged upstream DOM test. Resource quiescence,
+resolution, durable reports, the local dashboard API, and one unchanged
+upstream DOM test. Resource quiescence,
 cross-Realm Promise-job routing, structured navigation/script failures,
 rejected-promise reporting, console/network diagnostics, reftests, persistent
 sessions, and CI artifact publishing remain incomplete.
@@ -63,7 +64,7 @@ Browser, SDL, layout, or JavaScript. A successful probe is never a
 
 | Phase | Status | Current boundary |
 | --- | --- | --- |
-| 0. Pinning and schema | Partial | Submodule registration and allowlist exist; revision fields and persisted results do not |
+| 0. Pinning and schema | Partial | Submodule registration, allowlist, and durable local report schema exist; resolved revision metadata does not |
 | 1. Headless session | Core implemented | One URL, one Tab, explicit report/deadline, JSONL, and normal teardown work; viewport/UA configuration and structured load errors do not |
 | 2. Harness reporting | Core implemented | Completion, subtests, Promise jobs, status mapping, one upstream proof, and runner expectations work; full diagnostics do not |
 | 3. Scheduling/cancellation | Partial | Task-return barrier, deadline arbitration, and JS interruption work; resource quiescence and complete transport cancellation do not |
@@ -71,7 +72,7 @@ Browser, SDL, layout, or JavaScript. A successful probe is never a
 | 5. `wptserve` | Core implemented | Worker-local loopback server supplies unchanged root-relative harness resources; richer dynamic handlers remain |
 | 6. Selection/expectations | Runner ready | Schema and exact comparison are exercised by one reviewed `testharness` entry |
 | 7. Reftests | Not started | Keep separate from semantic harness results |
-| 8. Performance/CI | Partial | Local build checks exist; persistence, sharding, artifacts, and a persistent process do not |
+| 8. Performance/CI | Partial | Local dashboard and report artifacts exist; sharding, CI publishing, and a persistent process do not |
 
 ## Next milestone: expand focused upstream coverage
 
@@ -88,9 +89,9 @@ the reviewed manifest and current result protocol. Grow coverage in this order:
    than semantic `TIMEOUT`.
 
 After that first test, add structured navigation/script exception and
-unhandled-rejection observers, persist per-test records and a run summary, and
-grow one small DOM/events/timers shard with a focused Zibra regression for each
-discovered failure.
+unhandled-rejection observers, add revision metadata to the persisted reports,
+and grow one small DOM/events/timers shard with a focused Zibra regression for
+each discovered failure.
 
 ## Design goals
 
@@ -128,8 +129,9 @@ document-generation state has an explicit reset contract.
 ## Phase 0: repository and WPT pinning
 
 Status: partial. The submodule path and reviewed allowlist exist. The checkout
-must be initialized before an upstream run, the manifest/result do not expose
-the WPT revision, and generated run records are not persisted yet.
+must be initialized before an upstream run, and the manifest/result do not yet
+expose the resolved WPT revision. The runner does persist generated run
+records when `--report` is supplied.
 
 1. Initialize the already-registered WPT checkout at `tests/wpt/upstream` with:
 
@@ -140,10 +142,9 @@ the WPT revision, and generated run records are not persisted yet.
 2. Keep the exact submodule commit in normal Git metadata and copy its resolved
    revision into run metadata. Do not copy WPT into the repository or modify
    upstream tests.
-3. Finish extending the manifest schema with a WPT revision and explicit test
-   type. Path, mode, timeout, and exact expectation (`pass`, `fail`, `error`,
-   `timeout`, `skip`) already exist. Keep reasons for every non-pass
-   expectation.
+3. Keep the small YAML allowlist convention-based: `tests` selects
+   testharness cases, `probes` selects smoke tests, and `deviations` records
+   only paths whose expected result is not `PASS`.
 4. Keep generated output outside committed fixtures, for example
    `tests/wpt/results/<run-id>.json`; ignore it and upload it from CI.
 5. Continue excluding the submodule from Zibra's Markdown and formatting
@@ -241,9 +242,9 @@ Current protocol-v1 result shape:
 
 `tests/wpt/run.py` strictly consumes one record, validates protocol version,
 URL, status, and duration, compares the exact manifest expectation, and
-reproduces raw stdout/stderr for failed or malformed runs. It still needs to
-persist per-test records, revision metadata, raw diagnostics, and a run summary
-outside committed fixtures.
+reproduces raw stdout/stderr for failed or malformed runs. With `--report` it
+persists per-test records, bounded raw diagnostics, and a run summary outside
+committed fixtures. Revision metadata remains to be added.
 
 ## Phase 3: scheduling, quiescence, and cancellation
 
@@ -356,10 +357,10 @@ cross-origin requests carry an explicit serialized request origin.
 
 ## Phase 6: semantic test selection and expectations
 
-Status: runner ready. `run.py` supports reviewed `probe` and `testharness` modes,
-positive per-test timeouts, exact `pass`/`fail`/`error`/`timeout`
-expectations, explicit skips, and infrastructure-failure classification. The
-the committed manifest contains one reviewed upstream `testharness` case.
+Status: runner ready. `run.py` supports the YAML allowlist's reviewed `probe`
+and `testharness` modes, default PASS expectations, optional deviations, and
+infrastructure-failure classification. The committed config contains one
+reviewed upstream `testharness` case.
 
 Start with tests whose dependencies match implemented behavior:
 
@@ -403,9 +404,9 @@ pixels should not be the only evidence for a cross-platform behavior.
 ## Phase 8: runner performance and CI
 
 Status: partial. The process-per-test protocol, local fixture validation,
-runner unit tests, and portable `zig build check` integration exist. WPT server
-groups, persisted reports, shards, artifacts, parallel workers, and a
-persistent Zibra process do not.
+runner unit tests, portable `zig build check` integration, durable reports, and
+the self-hosted dashboard exist. Parallel WPT server groups, CI publishing, shards,
+artifacts, parallel workers, and a persistent Zibra process do not.
 
 The first process-per-test runner is intentionally slow but easy to debug. Once
 results are correct:
@@ -440,8 +441,8 @@ Next:
 1. Record the pinned checkout revision in the manifest and result metadata.
 2. Add structured navigation, exception, rejection, console, and network
    failure reporting; verify served PASS, FAIL, ERROR, and TIMEOUT paths.
-3. Persist per-test records, raw diagnostics, revision metadata, and a run
-   summary.
+3. Add WPT revision metadata and publish report artifacts through CI or GitHub
+   Pages.
 4. Grow a small semantic DOM/events/timers shard and promote each discovered
    regression into focused native coverage.
 5. Add resource-quiescence and multi-Realm routing contracts before tests that

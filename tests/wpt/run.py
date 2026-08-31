@@ -8,6 +8,8 @@ result. ``testharness`` consumes Zibra's machine-readable headless result.
 from __future__ import annotations
 
 import argparse
+from collections import Counter
+from datetime import datetime, timezone
 import json
 import os
 import pathlib
@@ -24,7 +26,7 @@ from typing import Any
 
 
 ROOT = pathlib.Path(__file__).resolve().parents[2]
-DEFAULT_MANIFEST = pathlib.Path(__file__).with_name("manifest.json")
+DEFAULT_MANIFEST = pathlib.Path(__file__).with_name("manifest.yaml")
 UPSTREAM = pathlib.Path(__file__).with_name("upstream")
 DEFAULT_TIMEOUT_MS = 10_000
 WATCHDOG_GRACE_SECONDS = 5.0
@@ -36,6 +38,8 @@ EXPECTATIONS = {
     "error": "ERROR",
     "timeout": "TIMEOUT",
 }
+REPORT_SCHEMA_VERSION = 1
+MAX_DIAGNOSTIC_BYTES = 64 * 1024
 
 
 @dataclass(frozen=True)
@@ -65,6 +69,17 @@ class ProcessOutcome:
     stdout: str
     stderr: str
     infrastructure_error: str | None = None
+
+
+@dataclass(frozen=True)
+class CaseResult:
+    case: Case
+    status: str
+    ok: bool
+    record: dict[str, Any] | None = None
+    infrastructure_error: str | None = None
+    stdout: str = ""
+    stderr: str = ""
 
 
 def _free_loopback_port() -> int:
@@ -224,7 +239,90 @@ def _validate_case(case: Case, index: int) -> None:
             raise ValueError(f"{prefix}.expectation must be one of: {choices}")
 
 
-def load_cases(path: pathlib.Path) -> list[Case]:
+def _yaml_scalar(value: str, line_number: int) -> str | None:
+    value = value.strip()
+    if not value:
+        raise ValueError(f"manifest line {line_number}: expected a value")
+    if value in ("null", "~"):
+        return None
+    if value.startswith('"') and value.endswith('"'):
+        try:
+            decoded = json.loads(value)
+        except json.JSONDecodeError as error:
+            raise ValueError(f"manifest line {line_number}: invalid quoted value") from error
+        if not isinstance(decoded, str):
+            raise ValueError(f"manifest line {line_number}: value must be a string")
+        return decoded
+    if value.startswith("'") and value.endswith("'"):
+        return value[1:-1].replace("''", "'")
+    return value
+
+
+def _strip_yaml_comment(line: str) -> str:
+    quoted = False
+    quote = ""
+    for index, character in enumerate(line):
+        if character in ("'", '"'):
+            if quoted and character == quote:
+                quoted = False
+            elif not quoted:
+                quoted = True
+                quote = character
+        elif character == "#" and not quoted and (index == 0 or line[index - 1].isspace()):
+            return line[:index].rstrip()
+    return line.rstrip()
+
+
+def _load_yaml_config(path: pathlib.Path) -> dict[str, object]:
+    """Parse the intentionally tiny YAML subset used by the WPT allowlist.
+
+    Keeping this parser dependency-free makes the runner usable before WPT's
+    optional Python environment is installed. The supported shape is a few
+    top-level sections containing scalar path lists and a path-to-status map.
+    """
+    sections: dict[str, object] = {}
+    list_sections = {"tests", "probes"}
+    map_sections = {"deviations"}
+    current: str | None = None
+    for line_number, raw_line in enumerate(path.read_text(encoding="utf-8").splitlines(), 1):
+        line = _strip_yaml_comment(raw_line)
+        if not line.strip():
+            continue
+        if "\t" in line:
+            raise ValueError(f"manifest line {line_number}: tabs are not supported")
+        indent = len(line) - len(line.lstrip(" "))
+        content = line.strip()
+        if indent == 0:
+            if not content.endswith(":"):
+                raise ValueError(f"manifest line {line_number}: expected a section")
+            key = content[:-1].strip()
+            if key not in list_sections | map_sections:
+                raise ValueError(f"manifest line {line_number}: unknown section {key!r}")
+            current = key
+            sections[key] = [] if key in list_sections else {}
+            continue
+        if current is None or indent != 2:
+            raise ValueError(f"manifest line {line_number}: expected two-space indentation")
+        if current in list_sections:
+            if not content.startswith("- "):
+                raise ValueError(f"manifest line {line_number}: expected a list item")
+            value = _yaml_scalar(content[2:], line_number)
+            if not isinstance(value, str) or not value:
+                raise ValueError(f"manifest line {line_number}: path must be a string")
+            sections[current].append(value)  # type: ignore[union-attr]
+            continue
+        if ":" not in content:
+            raise ValueError(f"manifest line {line_number}: expected path: status")
+        key, raw_value = content.split(":", 1)
+        key = key.strip()
+        value = _yaml_scalar(raw_value, line_number)
+        if not key or not isinstance(value, str):
+            raise ValueError(f"manifest line {line_number}: deviation must be path: status")
+        sections[current][key] = value  # type: ignore[index]
+    return sections
+
+
+def _load_json_cases(path: pathlib.Path) -> list[Case]:
     data = json.loads(path.read_text(encoding="utf-8"))
     if not isinstance(data, dict) or data.get("version") != 1:
         raise ValueError("unsupported WPT manifest version")
@@ -242,6 +340,39 @@ def load_cases(path: pathlib.Path) -> list[Case]:
             raise ValueError(f"invalid tests[{index}] entry: {error}") from error
         _validate_case(case, index)
         cases.append(case)
+    return cases
+
+
+def load_cases(path: pathlib.Path) -> list[Case]:
+    """Load the minimal YAML allowlist; retain JSON as a migration fallback."""
+    if path.suffix.lower() == ".json":
+        return _load_json_cases(path)
+    config = _load_yaml_config(path)
+    deviations = config.get("deviations", {})
+    if not isinstance(deviations, dict):
+        raise ValueError("manifest deviations must be a path-to-status map")
+    cases: list[Case] = []
+    for section, mode in (("tests", "testharness"), ("probes", "probe")):
+        paths = config.get(section, [])
+        if not isinstance(paths, list):
+            raise ValueError(f"manifest {section} must be a list")
+        for path_value in paths:
+            expectation = deviations.get(path_value)
+            if expectation is not None and not isinstance(expectation, str):
+                raise ValueError(f"manifest deviation for {path_value!r} must be a status")
+            case = Case(
+                path=path_value,
+                mode=mode,
+                status="candidate",
+                reason="Selected by the WPT YAML allowlist.",
+                expectation=expectation,
+            )
+            _validate_case(case, len(cases))
+            cases.append(case)
+    unknown_deviations = set(deviations) - {case.path for case in cases}
+    if unknown_deviations:
+        names = ", ".join(sorted(unknown_deviations))
+        raise ValueError(f"manifest deviations refer to unselected tests: {names}")
     return cases
 
 
@@ -322,18 +453,25 @@ def _write_raw_diagnostics(outcome: ProcessOutcome) -> None:
             print("<empty>", file=sys.stderr)
 
 
-def _run_probe(case: Case, url: str, browser: list[str]) -> bool:
+def _run_probe(case: Case, url: str, browser: list[str]) -> CaseResult:
     watchdog_seconds = case.timeout_ms / 1000 + WATCHDOG_GRACE_SECONDS
     outcome = _invoke([*browser, "--dump-dom", url], watchdog_seconds)
     if outcome.infrastructure_error is not None:
         print(f"INFRA {case.path}: {outcome.infrastructure_error}")
         _write_raw_diagnostics(outcome)
-        return False
+        return CaseResult(
+            case=case,
+            status="INFRA",
+            ok=False,
+            infrastructure_error=outcome.infrastructure_error,
+            stdout=outcome.stdout,
+            stderr=outcome.stderr,
+        )
     print(f"probe ok (non-conformance) {case.path}")
-    return True
+    return CaseResult(case=case, status="PROBE", ok=True)
 
 
-def _run_testharness(case: Case, url: str, browser: list[str]) -> bool:
+def _run_testharness(case: Case, url: str, browser: list[str]) -> CaseResult:
     watchdog_seconds = case.timeout_ms / 1000 + WATCHDOG_GRACE_SECONDS
     outcome = _invoke(
         [
@@ -348,23 +486,127 @@ def _run_testharness(case: Case, url: str, browser: list[str]) -> bool:
     if outcome.infrastructure_error is not None:
         print(f"INFRA {case.path}: {outcome.infrastructure_error}")
         _write_raw_diagnostics(outcome)
-        return False
+        return CaseResult(
+            case=case,
+            status="INFRA",
+            ok=False,
+            infrastructure_error=outcome.infrastructure_error,
+            stdout=outcome.stdout,
+            stderr=outcome.stderr,
+        )
 
     try:
         record = parse_testharness_result(outcome.stdout, url)
     except ValueError as error:
         print(f"INFRA {case.path}: {error}")
         _write_raw_diagnostics(outcome)
-        return False
+        return CaseResult(
+            case=case,
+            status="INFRA",
+            ok=False,
+            infrastructure_error=str(error),
+            stdout=outcome.stdout,
+            stderr=outcome.stderr,
+        )
 
     actual = record["status"]
     expected = case.expected_status
     if actual != expected:
         print(f"FAIL {case.path}: expected {expected}, received {actual}")
         _write_raw_diagnostics(outcome)
-        return False
+        return CaseResult(
+            case=case,
+            status=actual,
+            ok=False,
+            record=record,
+            stdout=outcome.stdout,
+            stderr=outcome.stderr,
+        )
     print(f"ok {case.path}: {actual}")
-    return True
+    return CaseResult(
+        case=case,
+        status=actual,
+        ok=True,
+        record=record,
+        stdout=outcome.stdout,
+        stderr=outcome.stderr,
+    )
+
+
+def _bounded_diagnostic(value: str) -> str:
+    if len(value.encode("utf-8")) <= MAX_DIAGNOSTIC_BYTES:
+        return value
+    encoded = value.encode("utf-8")[:MAX_DIAGNOSTIC_BYTES]
+    return encoded.decode("utf-8", errors="replace") + "\n[truncated]"
+
+
+def _serialize_case_result(result: CaseResult) -> dict[str, Any]:
+    case = result.case
+    item: dict[str, Any] = {
+        "path": case.path,
+        "mode": case.mode,
+        "status": result.status,
+        "ok": result.ok,
+        "expected": case.expected_status if not case.skipped else "SKIP",
+        "expectation": case.expectation,
+        "timeout_ms": case.timeout_ms,
+    }
+    if result.record is not None:
+        for key in ("duration_ms", "tests", "harness", "message", "console", "exception"):
+            if key in result.record:
+                item[key] = result.record[key]
+    if result.infrastructure_error is not None:
+        item["infrastructure_error"] = result.infrastructure_error
+    if not result.ok or result.infrastructure_error is not None:
+        if result.stdout:
+            item["stdout"] = _bounded_diagnostic(result.stdout)
+        if result.stderr:
+            item["stderr"] = _bounded_diagnostic(result.stderr)
+    return item
+
+
+def write_run_report(
+    path: pathlib.Path,
+    *,
+    manifest: pathlib.Path,
+    mode: str,
+    browser: list[str],
+    started_at: datetime,
+    finished_at: datetime,
+    results: list[CaseResult],
+) -> None:
+    serialized = [_serialize_case_result(result) for result in results]
+    counts = Counter(item["status"] for item in serialized)
+    report = {
+        "schema_version": REPORT_SCHEMA_VERSION,
+        "run_id": finished_at.strftime("%Y%m%dT%H%M%S.%fZ"),
+        "started_at": started_at.isoformat().replace("+00:00", "Z"),
+        "finished_at": finished_at.isoformat().replace("+00:00", "Z"),
+        "manifest": str(manifest),
+        "mode": mode,
+        "browser": browser,
+        "browser_revision": (
+            os.environ.get("ZIBRA_GIT_SHA")
+            or os.environ.get("GITHUB_SHA")
+            or os.environ.get("CI_COMMIT_SHA")
+            or "working-tree"
+        ),
+        "summary": {
+            "total": len(serialized),
+            "pass": counts["PASS"],
+            "fail": counts["FAIL"],
+            "error": counts["ERROR"],
+            "timeout": counts["TIMEOUT"],
+            "infra": counts["INFRA"],
+            "probe": counts["PROBE"],
+            "skip": counts["SKIP"],
+        },
+        "tests": serialized,
+    }
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_name(f".{path.name}.tmp")
+    temporary.write_text(json.dumps(report, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    temporary.replace(path)
 
 
 def _parse_args(argv: list[str] | None) -> argparse.Namespace:
@@ -381,6 +623,11 @@ def _parse_args(argv: list[str] | None) -> argparse.Namespace:
         nargs="+",
         default=["zig", "build", "run", "--"],
         help="command prefix used to invoke Zibra (default: zig build run --)",
+    )
+    parser.add_argument(
+        "--report",
+        type=pathlib.Path,
+        help="write a durable JSON run report for the local dashboard",
     )
     return parser.parse_args(argv)
 
@@ -399,6 +646,8 @@ def main(argv: list[str] | None = None) -> int:
             print(f"{claim:9} {case.mode:11} {case.path}  # {case.reason}")
         return 0
 
+    started_at = datetime.now(timezone.utc)
+
     if not UPSTREAM.is_dir():
         print(
             "WPT checkout missing; run the git submodule commands in tests/wpt/README.md.",
@@ -407,9 +656,13 @@ def main(argv: list[str] | None = None) -> int:
         return 2
 
     selected: list[tuple[Case, pathlib.Path]] = []
+    results: list[CaseResult] = []
     failed = 0
     for case in cases:
-        if case.skipped or case.mode != args.mode:
+        if case.skipped:
+            results.append(CaseResult(case=case, status="SKIP", ok=True))
+            continue
+        if case.mode != args.mode:
             continue
         test_path = (UPSTREAM / case.path).resolve()
         if not test_path.is_file():
@@ -418,6 +671,14 @@ def main(argv: list[str] | None = None) -> int:
             else:
                 print(f"INFRA {case.path}: missing from checkout")
                 failed += 1
+                results.append(
+                    CaseResult(
+                        case=case,
+                        status="INFRA",
+                        ok=False,
+                        infrastructure_error="missing from checkout",
+                    )
+                )
             continue
         selected.append((case, test_path))
 
@@ -436,6 +697,16 @@ def main(argv: list[str] | None = None) -> int:
             print(f"INFRA WPT server: {error}")
             if server_context is not None:
                 server_context.__exit__(type(error), error, error.__traceback__)
+            if args.report:
+                write_run_report(
+                    args.report,
+                    manifest=args.manifest,
+                    mode=args.mode,
+                    browser=args.browser,
+                    started_at=started_at,
+                    finished_at=datetime.now(timezone.utc),
+                    results=results,
+                )
             return 1
 
     try:
@@ -446,14 +717,25 @@ def main(argv: list[str] | None = None) -> int:
                 relative_path = test_path.relative_to(UPSTREAM).as_posix()
                 url = f"{server_base_url}/{relative_path}"
             if case.mode == "probe":
-                ok = _run_probe(case, url, args.browser)
+                result = _run_probe(case, url, args.browser)
             else:
-                ok = _run_testharness(case, url, args.browser)
-            if not ok:
+                result = _run_testharness(case, url, args.browser)
+            results.append(result)
+            if not result.ok:
                 failed += 1
     finally:
         if server_context is not None:
             server_context.__exit__(None, None, None)
+        if args.report:
+            write_run_report(
+                args.report,
+                manifest=args.manifest,
+                mode=args.mode,
+                browser=args.browser,
+                started_at=started_at,
+                finished_at=datetime.now(timezone.utc),
+                results=results,
+            )
     return 1 if failed else 0
 
 

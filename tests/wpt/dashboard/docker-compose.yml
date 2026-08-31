@@ -1,0 +1,11 @@
+services:
+  dashboard:
+    build: .
+    ports:
+      - "${DASHBOARD_PORT:-8188}:8188"
+    environment:
+      RESULTS_DIR: /data
+      WPT_DIR: /wpt
+    volumes:
+      - ../results:/data:ro
+      - ../upstream:/wpt:ro

@@ -1,0 +1,10 @@
+# Convention: entries under tests are testharness cases and entries under
+# probes are fetch/parse smoke tests. Omit deviations when PASS is expected.
+tests:
+  - dom/nodes/Element-firstElementChild.html
+probes:
+  - html/semantics/text-level-semantics/the-b-element/b-usage.html
+
+# Only list a path here when its expected result differs from PASS.
+# deviations:
+#   dom/example-known-failure.html: fail
