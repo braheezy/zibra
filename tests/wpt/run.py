@@ -10,6 +10,7 @@ from __future__ import annotations
 import argparse
 from collections import Counter
 from datetime import datetime, timezone
+from dataclasses import dataclass, replace
 import json
 import os
 import pathlib
@@ -21,7 +22,6 @@ import tempfile
 import time
 import urllib.error
 import urllib.request
-from dataclasses import dataclass
 from typing import Any
 
 
@@ -577,6 +577,12 @@ def write_run_report(
 ) -> None:
     serialized = [_serialize_case_result(result) for result in results]
     counts = Counter(item["status"] for item in serialized)
+    subtest_counts = Counter(
+        subtest.get("status")
+        for item in serialized
+        for subtest in item.get("tests", [])
+        if isinstance(subtest, dict)
+    )
     report = {
         "schema_version": REPORT_SCHEMA_VERSION,
         "run_id": finished_at.strftime("%Y%m%dT%H%M%S.%fZ"),
@@ -600,6 +606,14 @@ def write_run_report(
             "infra": counts["INFRA"],
             "probe": counts["PROBE"],
             "skip": counts["SKIP"],
+            # Keep the case-level counts above for ordinary WPT runs, while
+            # also exposing the granular score used by suites such as Acid3,
+            # whose numbered tests are subtests of one harness page.
+            "subtests_total": sum(subtest_counts.values()),
+            "subtests_pass": subtest_counts["PASS"],
+            "subtests_fail": subtest_counts["FAIL"],
+            "subtests_error": subtest_counts["ERROR"],
+            "subtests_timeout": subtest_counts["TIMEOUT"],
         },
         "tests": serialized,
     }
@@ -629,11 +643,19 @@ def _parse_args(argv: list[str] | None) -> argparse.Namespace:
         type=pathlib.Path,
         help="write a durable JSON run report for the local dashboard",
     )
+    parser.add_argument(
+        "--timeout-ms",
+        type=int,
+        help="override the manifest timeout for every selected case",
+    )
     return parser.parse_args(argv)
 
 
 def main(argv: list[str] | None = None) -> int:
     args = _parse_args(argv)
+    if args.timeout_ms is not None and args.timeout_ms <= 0:
+        print("--timeout-ms must be a positive integer", file=sys.stderr)
+        return 2
     try:
         cases = load_cases(args.manifest)
     except (OSError, json.JSONDecodeError, ValueError) as error:
@@ -711,15 +733,16 @@ def main(argv: list[str] | None = None) -> int:
 
     try:
         for case, test_path in selected:
+            run_case = replace(case, timeout_ms=args.timeout_ms) if args.timeout_ms is not None else case
             if server_base_url is None:
                 url = test_path.as_uri()
             else:
                 relative_path = test_path.relative_to(UPSTREAM).as_posix()
                 url = f"{server_base_url}/{relative_path}"
-            if case.mode == "probe":
-                result = _run_probe(case, url, args.browser)
+            if run_case.mode == "probe":
+                result = _run_probe(run_case, url, args.browser)
             else:
-                result = _run_testharness(case, url, args.browser)
+                result = _run_testharness(run_case, url, args.browser)
             results.append(result)
             if not result.ok:
                 failed += 1

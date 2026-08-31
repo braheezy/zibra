@@ -215,6 +215,10 @@ teardown, and final machine-readable result wrapper.
   parent/sibling/child/text traversal. These APIs resolve the live tree rather
   than named ID globals; tag-query and child arrays are deliberate snapshots,
   not live HTMLCollections. Generated pseudo boxes remain private.
+- NodeIterator keeps a reference node plus its before/after pointer state,
+  applies whatToShow and filters in document order, forwards filter exceptions
+  without advancing, and retains the last traversal order so a mutation
+  performed by a filter can still be traversed correctly.
 - Text topology is readable through `childNodes`, `nodeType`, `nodeName`,
   `nodeValue`, `data`, and `textContent`. Text mutation and creation remain a
   separate ownership/invalidation boundary because parser-created text borrows

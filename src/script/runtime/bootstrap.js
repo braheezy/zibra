@@ -110,26 +110,70 @@ function filterResult(filter, node, mask) {
 
 function NodeIterator(root, mask, filter) {
   this.root = root; this.mask = mask == null ? 0xFFFFFFFF : Number(mask);
-  this.filter = filter; this.currentNode = null;
+  this.whatToShow = this.mask; this.filter = filter == null ? null : filter;
+  // NodeIterator's position is between nodes, rather than on the last node
+  // returned.  Keeping the reference and pointer direction separately is
+  // important when a filter throws and when it mutates the tree while it is
+  // being evaluated.
+  this.referenceNode = root; this.pointerBeforeReferenceNode = true;
+  this.currentNode = null;
+  this.__order = null;
+}
+NodeIterator.prototype.toString = function() { return '[object NodeIterator]'; };
+function iteratorNeighbor(nodes, oldOrder, reference, direction) {
+  var index = nodes.indexOf(reference);
+  if (index >= 0) {
+    var adjacent = index + direction;
+    return adjacent >= 0 && adjacent < nodes.length ? nodes[adjacent] : null;
+  }
+  // A filter can detach the reference node. Keep using the last order we
+  // observed so the iterator can still walk past that detached node.
+  if (!oldOrder) return null;
+  index = oldOrder.indexOf(reference);
+  if (index < 0) return null;
+  for (var i = index + direction; i >= 0 && i < oldOrder.length; i += direction) {
+    if (nodes.indexOf(oldOrder[i]) >= 0) return oldOrder[i];
+  }
+  return null;
 }
 NodeIterator.prototype.nextNode = function() {
   var nodes = []; walkSnapshot(this.root, nodes);
-  var start = this.currentNode === null ? -1 : nodes.indexOf(this.currentNode);
-  for (var i = start + 1; i < nodes.length; i++) {
-    var result = filterResult(this.filter, nodes[i], this.mask);
-    if (result === 1) { this.currentNode = nodes[i]; return nodes[i]; }
+  var oldOrder = this.__order;
+  this.__order = nodes;
+  while (true) {
+    var candidate;
+    if (this.pointerBeforeReferenceNode) {
+      candidate = this.referenceNode;
+    } else {
+      candidate = iteratorNeighbor(nodes, oldOrder, this.referenceNode, 1);
+      if (candidate === null) return null;
+    }
+    var result = filterResult(this.filter, candidate, this.mask);
+    // A thrown filter must not move the iterator's reference position.
+    if (this.pointerBeforeReferenceNode) this.pointerBeforeReferenceNode = false;
+    else this.referenceNode = candidate;
+    if (result === 1) { this.currentNode = candidate; return candidate; }
   }
-  return null;
 };
 NodeIterator.prototype.previousNode = function() {
   var nodes = []; walkSnapshot(this.root, nodes);
-  var start = this.currentNode === null ? nodes.length : nodes.indexOf(this.currentNode);
-  if (start < 0) start = nodes.length;
-  for (var i = start - 1; i >= 0; i--) {
-    var result = filterResult(this.filter, nodes[i], this.mask);
-    if (result === 1) { this.currentNode = nodes[i]; return nodes[i]; }
+  var oldOrder = this.__order;
+  this.__order = nodes;
+  while (true) {
+    var candidate;
+    if (this.pointerBeforeReferenceNode) {
+      if (this.referenceNode === this.root) return null;
+      candidate = iteratorNeighbor(nodes, oldOrder, this.referenceNode, -1);
+      if (candidate === null) return null;
+    } else {
+      candidate = this.referenceNode;
+    }
+    var result = filterResult(this.filter, candidate, this.mask);
+    // A thrown filter must not move the iterator's reference position.
+    if (this.pointerBeforeReferenceNode) this.referenceNode = candidate;
+    else this.pointerBeforeReferenceNode = true;
+    if (result === 1) { this.currentNode = candidate; return candidate; }
   }
-  return null;
 };
 
 function TreeWalker(root, mask, filter) {
@@ -1740,8 +1784,19 @@ window.addEventListener = function(type, listener) {
   }
   addLifecycleListener(WINDOW_LIFECYCLE_LISTENERS, type, listener);
 };
+function serializePostMessage(message) {
+  // postMessage uses structured-clone semantics for ordinary JSON-shaped
+  // values. The native boundary transports UTF-8, so preserve those values
+  // as JSON and retain a string fallback for unsupported/cyclic objects.
+  try {
+    var encoded = JSON.stringify(message);
+    if (encoded !== undefined) return encoded;
+  } catch (error) {}
+  return message == null ? "null" : String(message);
+}
+
 window.postMessage = function(message, targetWindowId, targetOrigin) {
-  var payload = message == null ? "null" : message.toString();
+  var payload = serializePostMessage(message);
   var origin = targetOrigin === undefined ? "/" : targetOrigin.toString();
   __native.postMessage(payload, targetWindowId, origin);
 };
@@ -1752,7 +1807,7 @@ Object.defineProperty(window, "parent", {
     return {
       __id: parentId,
       postMessage: function(message, targetOrigin) {
-        var payload = message == null ? "null" : message.toString();
+        var payload = serializePostMessage(message);
         var origin = targetOrigin === undefined ? "/" : targetOrigin.toString();
         __native.postMessage(payload, parentId, origin);
       },
@@ -1801,7 +1856,19 @@ globalThis.__setActiveWindow = function(id) {
   installActiveIdGlobals(WINDOW_ID_GLOBALS[id] || []);
 };
 globalThis.__dispatchMessageEvent = function(message, origin, sourceId, targetId) {
-  var evt = { type: 'message', data: message, origin: origin, source: { __id: sourceId } };
+  var data = message;
+  // Decode structured-clone payloads emitted by serializePostMessage. Plain
+  // legacy string payloads remain strings when they are not valid JSON.
+  if (typeof message === 'string') {
+    try {
+      var first = message.charAt(0);
+      if (first === '{' || first === '[' || first === '"' || message === 'null' ||
+          message === 'true' || message === 'false' || /^-?(?:0|[1-9][0-9]*)(?:\.[0-9]+)?(?:[eE][+-]?[0-9]+)?$/.test(message)) {
+        data = JSON.parse(message);
+      }
+    } catch (error) {}
+  }
+  var evt = { type: 'message', data: data, origin: origin, source: { __id: sourceId } };
   var list = WINDOW_MESSAGE_LISTENERS[targetId] || [];
   for (var i = 0; i < list.length; i++) {
     list[i].call(window, evt);

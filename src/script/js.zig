@@ -2110,6 +2110,71 @@ test "DOM traversal honors filters and mutation edge cases" {
     try std.testing.expect(result.toBoolean());
 }
 
+test "NodeIterator preserves position when a filter throws" {
+    const allocator = std.testing.allocator;
+    var html_parser = try parser.HTMLParser.init(allocator, "<main><iframe></iframe></main>");
+    html_parser.use_implicit_tags = false;
+    defer html_parser.deinit(allocator);
+    var root = try html_parser.parse();
+    defer root.deinit(allocator);
+    parser.fixParentPointers(&root, null);
+    var environ = std.process.Environ.Map.init(allocator);
+    defer environ.deinit();
+    var js = try Js.init(allocator, std.testing.io, &environ);
+    defer js.deinit(allocator);
+    js.setNodes(0, &root);
+    defer js.setNodes(0, null);
+
+    const result = try js.evaluate(0,
+        \\var doc = document.getElementsByTagName('iframe')[0].contentDocument, root = doc.documentElement, calls = 0, iterator = doc.createNodeIterator(root, NodeFilter.SHOW_ALL, function(node) {
+        \\  calls += 1; if (calls === 1) throw "boom"; return true;
+        \\});
+        \\var threw = false; try { iterator.nextNode(); } catch (error) { threw = error === "boom"; }
+        \\var first = iterator.nextNode();
+        \\threw && first === root && calls === 2 && iterator.previousNode() === root
+    );
+    try std.testing.expect(result.toBoolean());
+}
+
+test "NodeIterator supports filtered iframe-document traversal" {
+    const allocator = std.testing.allocator;
+    var html_parser = try parser.HTMLParser.init(allocator, "<main><iframe></iframe></main>");
+    html_parser.use_implicit_tags = false;
+    defer html_parser.deinit(allocator);
+    var root = try html_parser.parse();
+    defer root.deinit(allocator);
+    parser.fixParentPointers(&root, null);
+    var environ = std.process.Environ.Map.init(allocator);
+    defer environ.deinit();
+    var js = try Js.init(allocator, std.testing.io, &environ);
+    defer js.deinit(allocator);
+    js.setNodes(0, &root);
+    defer js.setNodes(0, null);
+
+    const result = try js.evaluate(0,
+        \\var iframe = document.getElementsByTagName('iframe')[0], doc = iframe.contentDocument;
+        \\for (var n = doc.documentElement.childNodes.length - 1; n >= 0; n--) doc.documentElement.removeChild(doc.documentElement.childNodes[n]);
+        \\doc.documentElement.appendChild(doc.createElement('head'));
+        \\doc.documentElement.firstChild.appendChild(doc.createElement('title'));
+        \\doc.documentElement.appendChild(doc.createElement('body'));
+        \\var iteration = 0, exception = "Roses";
+        \\var filter = function(node) {
+        \\  iteration += 1;
+        \\  switch (iteration) {
+        \\    case 1: case 3: case 4: case 6: case 7: case 8: case 9: case 14: case 15: throw exception;
+        \\    case 2: case 5: case 10: case 11: case 12: case 13: return true;
+        \\    default: throw 0;
+        \\  }
+        \\};
+        \\var iterator = doc.createNodeIterator(doc.documentElement, 0xFFFFFFFF, filter, true);
+        \\var firstThrow = false; try { iterator.nextNode(); } catch (error) { firstThrow = error === exception; }
+        \\var rootNode = iterator.nextNode();
+        \\var previousThrow = false; try { iterator.previousNode(); } catch (error) { previousThrow = error === exception; }
+        \\firstThrow && rootNode === doc.documentElement && previousThrow && iteration === 3
+    );
+    try std.testing.expect(result.toBoolean());
+}
+
 test "DOM Range validates offsets and rejects partially selected elements" {
     const allocator = std.testing.allocator;
     var html_parser = try parser.HTMLParser.init(allocator, "<main></main>");

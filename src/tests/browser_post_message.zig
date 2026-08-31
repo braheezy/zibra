@@ -126,11 +126,18 @@ test "postMessage JavaScript binding forwards explicit and same-origin default t
     try std.testing.expectEqual(@as(usize, 2), capture.calls);
     try std.testing.expectEqualStrings("/", capture.target_origin[0..capture.target_origin_len]);
 
+    _ = try js.evaluate(7, "window.postMessage({kind: 'acid3', value: 7}, 12, '*');");
+    try std.testing.expectEqual(@as(usize, 3), capture.calls);
+    try std.testing.expectEqualStrings(
+        "{\"kind\":\"acid3\",\"value\":7}",
+        capture.message[0..capture.message_len],
+    );
+
     // A cross-origin parent has no WindowContext in this Js realm. It must
     // still be represented by the restricted postMessage-only proxy.
     js.setParentWindow(7, 41);
     _ = try js.evaluate(7, "window.parent.postMessage('to parent', '*');");
-    try std.testing.expectEqual(@as(usize, 3), capture.calls);
+    try std.testing.expectEqual(@as(usize, 4), capture.calls);
     try std.testing.expectEqual(@as(u32, 41), capture.target_window_id);
     try std.testing.expectEqualStrings("*", capture.target_origin[0..capture.target_origin_len]);
     try std.testing.expectEqualStrings("to parent", capture.message[0..capture.message_len]);
@@ -144,6 +151,29 @@ test "postMessage JavaScript binding forwards explicit and same-origin default t
             "targetSyntaxError;",
     );
     try std.testing.expect(caught.toBoolean());
+}
+
+test "postMessage restores JSON-shaped event data" {
+    const allocator = std.testing.allocator;
+    var environ = std.process.Environ.Map.init(allocator);
+    defer environ.deinit();
+    var js = try Js.init(allocator, std.testing.io, &environ);
+    defer js.deinit(allocator);
+
+    _ = try js.evaluate(
+        0,
+        "var messageKind = ''; var messageValue = 0;" ++
+            "window.addEventListener('message', function(event) {" ++
+            " messageKind = event.data.kind; messageValue = event.data.value; });",
+    );
+    const message = try allocator.dupe(u8, "{\"kind\":\"acid3\",\"value\":7}");
+    defer allocator.free(message);
+    const origin = try allocator.dupe(u8, "https://source.example");
+    defer allocator.free(origin);
+    try js.dispatchPostMessage(0, message, origin, 23);
+
+    const observed = try js.evaluate(0, "messageKind === 'acid3' && messageValue === 7;");
+    try std.testing.expect(observed.toBoolean());
 }
 
 test "dispatched message strings outlive callback-owned buffers" {

@@ -1,0 +1,5 @@
+# Acid3's numbered harness exposes each of its 100 checks as a WPT subtest.
+# Keep this suite separate from the fast compatibility allowlist: it is a
+# deliberately broad integration run, not a per-commit smoke test.
+tests:
+  - acid/acid3/numbered-tests.html

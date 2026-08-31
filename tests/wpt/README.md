@@ -92,6 +92,13 @@ traversal, and Range work. It stays separate from the default manifest so
 higher-signal checks can evolve without making every fast run depend on the
 entire DOM compatibility surface.
 
+`task acid3-results` runs the upstream `acid/acid3/numbered-tests.html`
+harness. Its single page contains 100 numbered subtests; reports retain each
+failure and the dashboard uses the subtest counts for the Acid3 score and
+history chart. Acid3 includes a deliberately expensive stress test, so this
+task uses a 120-second timeout; use `--timeout-ms` for a different bounded
+window when invoking `run.py` directly.
+
 The runner records `ZIBRA_GIT_SHA` in each report. The Taskfile fills it from
 the current checkout automatically (or uses `working-tree` when no Git
 revision is available), and the dashboard displays it as the browser column.

@@ -290,6 +290,8 @@ print(json.dumps({
         payload = json.loads(report.read_text(encoding="utf-8"))
         self.assertEqual(1, payload["schema_version"])
         self.assertEqual(1, payload["summary"]["pass"])
+        self.assertEqual(1, payload["summary"]["subtests_total"])
+        self.assertEqual(1, payload["summary"]["subtests_pass"])
         self.assertEqual("PASS", payload["tests"][0]["status"])
         self.assertEqual("lookup", payload["tests"][0]["tests"][0]["name"])
 

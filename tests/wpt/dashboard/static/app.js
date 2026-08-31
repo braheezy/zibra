@@ -9,11 +9,12 @@ const esc = (value) => String(value ?? "").replace(/[&<>"']/g, (char) => ({
   "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;",
 }[char]));
 const summary = (run) => run?.summary || {};
-const semanticTotal = (value) => (value.pass || 0) + (value.fail || 0) +
-  (value.error || 0) + (value.timeout || 0);
+const semanticTotal = (value) => value.subtests_total != null ? value.subtests_total :
+  (value.pass || 0) + (value.fail || 0) + (value.error || 0) + (value.timeout || 0);
 const passRate = (value) => {
   const total = semanticTotal(value);
-  return total ? Math.round((value.pass || 0) * 100 / total) : null;
+  const passed = value.subtests_total != null ? (value.subtests_pass || 0) : (value.pass || 0);
+  return total ? Math.round(passed * 100 / total) : null;
 };
 function dateText(value) {
   if (!value) return "unknown time";
@@ -74,10 +75,19 @@ function renderChart() {
   });
 }
 function pathGroup(path) {
-  return String(path || "").split("/").filter(Boolean)[0] || "unknown";
+  const parts = String(path || "").split("/").filter(Boolean);
+  if (!parts.length) return "unknown";
+  // The coverage table is a suite overview, like wpt.fyi's top-level path
+  // list. Individual files remain available in the details table.
+  return parts[0];
 }
 function reportTests(report) {
   return Array.isArray(report?.tests) ? report.tests : [];
+}
+function testScore(test) {
+  const subtests = Array.isArray(test.tests) ? test.tests : [];
+  if (subtests.length) return { passed: subtests.filter((item) => item.status === "PASS").length, total: subtests.length };
+  return { passed: test.status === "PASS" ? 1 : 0, total: 1 };
 }
 function renderCoverage(report) {
   const tests = reportTests(report), query = state.pathQuery.trim().toLowerCase();
@@ -86,9 +96,11 @@ function renderCoverage(report) {
     const path = String(test.path || "");
     if (query && !path.toLowerCase().includes(query)) return;
     const group = pathGroup(path);
-    if (!groups.has(group)) groups.set(group, { tests: [], passed: 0 });
+    if (!groups.has(group)) groups.set(group, { tests: [], passed: 0, total: 0 });
     const item = groups.get(group);
-    item.tests.push(test); item.passed += test.status === "PASS" ? 1 : 0;
+    item.tests.push(test);
+    const result = testScore(test);
+    item.passed += result.passed; item.total += result.total;
   });
   const revision = report?.browser_revision || currentRun()?.browser_revision || "working-tree";
   $("browser-column").innerHTML = `<span class="browser-head">Zibra</span><span class="browser-sha">${esc(revision.slice(0, 12))}</span><span class="browser-date">${esc(dateText(report?.finished_at || currentRun()?.finished_at))}</span>`;
@@ -99,18 +111,20 @@ function renderCoverage(report) {
   }
   const rows = [];
   entries.forEach(([group, item]) => {
-    rows.push(`<tr class="path-group"><td>${esc(group)}/<span class="path-meta">${item.tests.length} test${item.tests.length === 1 ? "" : "s"}</span></td><td>${score(item.passed, item.tests.length)}</td></tr>`);
-    item.tests.sort((a, b) => String(a.path).localeCompare(String(b.path))).forEach((test) => {
-      const path = String(test.path || ""), relative = path.startsWith(`${group}/`) ? path.slice(group.length + 1) : path;
-      const subtests = Array.isArray(test.tests) ? test.tests : [], passed = subtests.filter((item) => item.status === "PASS").length;
-      rows.push(`<tr class="path-test"><td><a href="#details" data-test-path="${esc(path)}">${esc(relative)}</a></td><td>${score(test.status === "PASS" ? 1 : 0, 1)}${subtests.length ? `<span class="path-meta">${passed}/${subtests.length} subtests</span>` : ""}</td></tr>`);
-    });
+    const label = `${group}/`;
+    const checks = item.total === 1 ? "1 check" : `${item.total} checks`;
+    const paths = item.tests.map((test) => String(test.path || "")).join(" ");
+    rows.push(`<tr class="path-group" tabindex="0" data-group-path="${esc(paths)}"><td>${esc(label)}<span class="path-meta">${checks}</span></td><td>${score(item.passed, item.total)}</td></tr>`);
   });
   $("coverage-table").innerHTML = rows.join("");
-  $("coverage-table").querySelectorAll("[data-test-path]").forEach((link) => link.addEventListener("click", () => {
-    state.testQuery = link.dataset.testPath; $("test-search").value = state.testQuery;
+  $("coverage-table").querySelectorAll("[data-group-path]").forEach((row) => {
+    const openDetails = () => {
+      state.testQuery = row.dataset.groupPath; $("test-search").value = state.testQuery;
     renderTests(report); $("details-panel")?.scrollIntoView({ behavior: "smooth", block: "start" });
-  }));
+    };
+    row.addEventListener("click", openDetails);
+    row.addEventListener("keydown", (event) => { if (event.key === "Enter" || event.key === " ") openDetails(); });
+  });
 }
 function diagnosticDetails(test) {
   const pieces = [];
@@ -120,6 +134,8 @@ function diagnosticDetails(test) {
   if (test.stderr) pieces.push(`stderr\n${test.stderr}`);
   if (test.stdout) pieces.push(`stdout\n${test.stdout}`);
   if (test.console?.length) pieces.push(`Console\n${JSON.stringify(test.console, null, 2)}`);
+  const failedSubtests = (Array.isArray(test.tests) ? test.tests : []).filter((item) => item.status !== "PASS");
+  if (failedSubtests.length) pieces.push(`Failed subtests\n${failedSubtests.map((item) => `${item.name || "(unnamed)"}: ${item.message || item.status}`).join("\n")}`);
   return pieces.length ? `<details><summary>Show diagnostics</summary><pre>${esc(pieces.join("\n\n"))}</pre></details>` : "";
 }
 function renderTests(report) {
@@ -137,9 +153,15 @@ function renderTests(report) {
 function renderDetails(report) {
   const run = currentRun(), tests = reportTests(report);
   const subtests = tests.reduce((total, test) => total + (Array.isArray(test.tests) ? test.tests.length : 0), 0);
+  const checks = tests.reduce((result, test) => {
+    const score = testScore(test);
+    result.passed += score.passed; result.total += score.total;
+    return result;
+  }, { passed: 0, total: 0 });
   const revision = report?.browser_revision || run?.browser_revision || "working-tree";
   const runLabel = run?.id === state.runs[0]?.id ? "latest local test run" : "selected local test run";
   $("last-update").textContent = revision.slice(0, 12);
+  $("results-score").textContent = run ? `${checks.passed}/${checks.total}` : "—";
   $("results-description").textContent = run ? `Showing ${tests.length} ${tests.length === 1 ? "test" : "tests"} (${subtests} ${subtests === 1 ? "subtest" : "subtests"}) from the ${runLabel} for zibra[${revision}]` : "No results selected.";
   $("details-title").textContent = run ? `${tests.length} ${tests.length === 1 ? "test" : "tests"} in this run` : "Test details";
   $("details-note").textContent = run ? `${dateText(report?.finished_at || run.finished_at)} · ${run.mode || "unknown mode"} · revision ${revision}` : "Select a path above to inspect its test cases.";
