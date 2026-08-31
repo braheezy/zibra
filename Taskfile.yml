@@ -21,3 +21,14 @@ tasks:
         working-tree)" SDL_VIDEODRIVER=dummy python3 tests/wpt/run.py {{.WPT_MANIFEST}}
         --mode testharness --browser ./zig-out/bin/zibra
         --report {{.WPT_RESULTS}}/$(date -u +%Y%m%dT%H%M%SZ).json
+
+  dom-results:
+    desc: Run focused DOM mutation, traversal, and range WPT cases
+    cmds:
+      - zig build
+      - mkdir -p {{.WPT_RESULTS}}
+      - >-
+        ZIBRA_GIT_SHA="$$(git rev-parse --short HEAD 2>/dev/null || printf
+        working-tree)" SDL_VIDEODRIVER=dummy python3 tests/wpt/run.py
+        tests/wpt/manifest-dom.yaml --mode testharness --browser ./zig-out/bin/zibra
+        --report {{.WPT_RESULTS}}/dom-$(date -u +%Y%m%dT%H%M%SZ).json

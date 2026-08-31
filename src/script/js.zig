@@ -2062,6 +2062,86 @@ test "DOM Range supports boundaries, fragments, and extraction" {
     try std.testing.expect(result.toBoolean());
 }
 
+test "DOM traversal honors filters and mutation edge cases" {
+    const allocator = std.testing.allocator;
+    var html_parser = try parser.HTMLParser.init(allocator, "<main></main>");
+    html_parser.use_implicit_tags = false;
+    defer html_parser.deinit(allocator);
+    var root = try html_parser.parse();
+    defer root.deinit(allocator);
+    parser.fixParentPointers(&root, null);
+    var environ = std.process.Environ.Map.init(allocator);
+    defer environ.deinit();
+    var js = try Js.init(allocator, std.testing.io, &environ);
+    defer js.deinit(allocator);
+    js.setNodes(0, &root);
+    defer js.setNodes(0, null);
+
+    const result = try js.evaluate(0,
+        \\var host = document.querySelectorAll('main')[0];
+        \\var skip = document.createElement('skip');
+        \\var hidden = document.createElement('hidden');
+        \\var keep = document.createElement('keep');
+        \\skip.appendChild(hidden); host.appendChild(skip); host.appendChild(keep);
+        \\var seen = [];
+        \\var walker = document.createTreeWalker(host, NodeFilter.SHOW_ELEMENT, function(node) {
+        \\  return node === skip ? NodeFilter.FILTER_REJECT : NodeFilter.FILTER_ACCEPT;
+        \\}, true);
+        \\var node;
+        \\while ((node = walker.nextNode()) !== null) seen.push(node.tagName);
+        \\var iterator = document.createNodeIterator(host, NodeFilter.SHOW_ELEMENT, function(node) {
+        \\  return node === skip ? NodeFilter.FILTER_REJECT : NodeFilter.FILTER_ACCEPT;
+        \\}, true);
+        \\iterator.nextNode() === host && iterator.nextNode() === hidden &&
+        \\  seen.length === 1 && seen[0] === 'KEEP' &&
+        \\  host.insertBefore(keep, keep) === keep && host.children.length === 2 &&
+        \\  (function() { try { host.insertBefore(host, keep); return false; } catch (error) { return true; } })() &&
+        \\  (function() {
+        \\    var source = document.createElement('source');
+        \\    var moving = document.createElement('moving');
+        \\    var foreignParent = document.createElement('foreign');
+        \\    var foreign = document.createElement('foreign-child');
+        \\    source.appendChild(moving); foreignParent.appendChild(foreign);
+        \\    try { host.insertBefore(moving, foreign); return false; } catch (error) {
+        \\      return error.code === 8 && source.firstChild === moving;
+        \\    }
+        \\  })()
+    );
+    try std.testing.expect(result.toBoolean());
+}
+
+test "DOM Range validates offsets and rejects partially selected elements" {
+    const allocator = std.testing.allocator;
+    var html_parser = try parser.HTMLParser.init(allocator, "<main></main>");
+    html_parser.use_implicit_tags = false;
+    defer html_parser.deinit(allocator);
+    var root = try html_parser.parse();
+    defer root.deinit(allocator);
+    parser.fixParentPointers(&root, null);
+    var environ = std.process.Environ.Map.init(allocator);
+    defer environ.deinit();
+    var js = try Js.init(allocator, std.testing.io, &environ);
+    defer js.deinit(allocator);
+    js.setNodes(0, &root);
+    defer js.setNodes(0, null);
+
+    const result = try js.evaluate(0,
+        \\var host = document.querySelectorAll('main')[0];
+        \\var bold = document.createElement('b'); var text = document.createTextNode('abcd');
+        \\bold.appendChild(text); host.appendChild(bold);
+        \\var invalid = false; var invalidNode = false; var range = document.createRange();
+        \\try { range.setStart(null, 0); } catch (error) { invalidNode = error.code === 3; }
+        \\try { range.setStart(text, 5); } catch (error) { invalid = error.code === 1; }
+        \\range.setStart(text, 1); range.setEnd(text, 3);
+        \\var fragment = range.cloneContents();
+        \\var partial = document.createRange(); partial.setStart(text, 1); partial.setEnd(host, 1);
+        \\var rejected = false;
+        \\try { partial.surroundContents(document.createElement('i')); } catch (error) { rejected = true; }
+        \\invalidNode && invalid && fragment.textContent === 'bc' && rejected && text.data === 'abcd'
+    );
+    try std.testing.expect(result.toBoolean());
+}
+
 test "detached documents retain ownerDocument across garbage collection" {
     const allocator = std.testing.allocator;
     var html_parser = try parser.HTMLParser.init(allocator, "<main></main>");

@@ -1,0 +1,8 @@
+# Focused DOM mutation/traversal/range checks. This suite is intentionally
+# separate from manifest.yaml so the fast default run stays small.
+tests:
+  - dom/nodes/Node-appendChild.html
+  - dom/nodes/Node-removeChild.html
+  - dom/traversal/TreeWalker-traversal-skip.html
+  - dom/ranges/Range-constructor.html
+  - dom/ranges/Range-detach.html

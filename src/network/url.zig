@@ -223,10 +223,21 @@ pub const Url = struct {
                     compact_len += 1;
                 }
                 const compacted = percent_decoded[0..compact_len];
-                const decoded_len = try decoder.calcSizeForSlice(compacted);
+                // RFC 2397 data URLs commonly omit the optional trailing
+                // Base64 padding. Zig's standard decoder is deliberately
+                // strict and only accepts a length divisible by four, so
+                // restore the canonical padding at this transport boundary.
+                const remainder = compacted.len % 4;
+                if (remainder == 1) return error.InvalidBase64;
+                const padding = if (remainder == 0) 0 else 4 - remainder;
+                const padded = try allocator.alloc(u8, compacted.len + padding);
+                defer allocator.free(padded);
+                @memcpy(padded[0..compacted.len], compacted);
+                for (compacted.len..padded.len) |index| padded[index] = '=';
+                const decoded_len = try decoder.calcSizeForSlice(padded);
                 const decoded = try allocator.alloc(u8, decoded_len);
                 errdefer allocator.free(decoded);
-                try decoder.decode(decoded, compacted);
+                try decoder.decode(decoded, padded);
                 allocator.free(percent_decoded);
                 break :blk decoded;
             } else blk: {
@@ -1008,6 +1019,16 @@ test "data request accepts percent-encoded base64 whitespace" {
     const url = try Url.init(
         std.testing.allocator,
         "data:text/javascript;base64,%20ZD%20Qg%0D%0APS%20An%20Zm91cic%0D%0A%207%20",
+    );
+    defer url.free(std.testing.allocator);
+
+    try expect(std.mem.eql(u8, url.path, "d4 = 'four';"));
+}
+
+test "data request accepts unpadded base64" {
+    const url = try Url.init(
+        std.testing.allocator,
+        "data:text/javascript;base64,ZDQgPSAnZm91cic7",
     );
     defer url.free(std.testing.allocator);
 

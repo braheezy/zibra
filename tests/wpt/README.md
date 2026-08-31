@@ -79,12 +79,18 @@ From the repository root, the shorter equivalents are:
 
 ```sh
 task latest-results
+task dom-results
 task dashboard
 ```
 
 `latest-results` keeps each run as a timestamped JSON file under
 `tests/wpt/results`; `dashboard` serves that history at
 <http://localhost:8188>.
+
+`dom-results` uses the focused `manifest-dom.yaml` allowlist for DOM mutation,
+traversal, and Range work. It stays separate from the default manifest so
+higher-signal checks can evolve without making every fast run depend on the
+entire DOM compatibility surface.
 
 The runner records `ZIBRA_GIT_SHA` in each report. The Taskfile fills it from
 the current checkout automatically (or uses `working-tree` when no Git
