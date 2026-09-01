@@ -37,6 +37,7 @@ var DOM_EXCEPTION_CODES = { INDEX_SIZE_ERR: 1, DOMSTRING_SIZE_ERR: 2, HIERARCHY_
   QUOTA_EXCEEDED_ERR: 22, TIMEOUT_ERR: 23, INVALID_NODE_TYPE_ERR: 24,
   DATA_CLONE_ERR: 25 };
 for (var domExceptionName in DOM_EXCEPTION_CODES) DOMException[domExceptionName] = DOM_EXCEPTION_CODES[domExceptionName];
+for (var domExceptionCodeName in DOM_EXCEPTION_CODES) DOMException.prototype[domExceptionCodeName] = DOM_EXCEPTION_CODES[domExceptionCodeName];
 globalThis.DOMException = DOMException;
 
 var NODE_WRAPPERS = {};
@@ -182,15 +183,52 @@ function TreeWalker(root, mask, filter) {
 }
 TreeWalker.prototype.toString = function() { return '[object TreeWalker]'; };
 TreeWalker.prototype.__children = function(node) { return node.childNodes || []; };
+TreeWalker.prototype.__sibling = function(node, direction) {
+  var parent = node && node.parentNode;
+  if (!parent) return null;
+  var children = this.__children(parent), index = children.indexOf(node);
+  if (index < 0) return null;
+  var siblingIndex = index + direction;
+  return siblingIndex >= 0 && siblingIndex < children.length ? children[siblingIndex] : null;
+};
+TreeWalker.prototype.__nextAfterSubtree = function(node) {
+  while (node && node !== this.root) {
+    var sibling = this.__sibling(node, 1);
+    if (sibling) return sibling;
+    node = node.parentNode;
+  }
+  return null;
+};
+TreeWalker.prototype.__lastVisible = function(node) {
+  var result = filterResult(this.filter, node, this.mask);
+  if (result === 2) return null;
+  var children = this.__children(node);
+  for (var i = children.length - 1; i >= 0; i--) {
+    var nested = this.__lastVisible(children[i]);
+    if (nested) return nested;
+  }
+  return result === 1 ? node : null;
+};
 TreeWalker.prototype.firstChild = function() {
   var children = this.__children(this.currentNode);
   for (var i = 0; i < children.length; i++) {
     var result = filterResult(this.filter, children[i], this.mask);
     if (result === 1) { this.currentNode = children[i]; return children[i]; }
     if (result === 3) {
-      var nested = new TreeWalker(children[i], this.mask, this.filter);
-      var found = nested.nextNode();
+      var found = this.__firstVisible(children[i]);
       if (found) { this.currentNode = found; return found; }
+    }
+  }
+  return null;
+};
+TreeWalker.prototype.__firstVisible = function(node) {
+  var children = this.__children(node);
+  for (var i = 0; i < children.length; i++) {
+    var result = filterResult(this.filter, children[i], this.mask);
+    if (result === 1) return children[i];
+    if (result === 3) {
+      var nested = this.__firstVisible(children[i]);
+      if (nested) return nested;
     }
   }
   return null;
@@ -201,92 +239,67 @@ TreeWalker.prototype.lastChild = function() {
     var result = filterResult(this.filter, children[i], this.mask);
     if (result === 1) { this.currentNode = children[i]; return children[i]; }
     if (result === 3) {
-      var nested = new TreeWalker(children[i], this.mask, this.filter);
-      var found = nested.lastDescendant();
+      var found = this.__lastVisible(children[i]);
       if (found) { this.currentNode = found; return found; }
-    }
-  }
-  return null;
-};
-TreeWalker.prototype.lastDescendant = function() {
-  var children = this.__children(this.currentNode);
-  for (var i = children.length - 1; i >= 0; i--) {
-    var result = filterResult(this.filter, children[i], this.mask);
-    if (result === 1) {
-      var nested = new TreeWalker(children[i], this.mask, this.filter);
-      var deeper = nested.lastDescendant();
-      return deeper || children[i];
-    }
-    if (result === 3) {
-      var skipped = new TreeWalker(children[i], this.mask, this.filter);
-      var skippedLast = skipped.lastDescendant();
-      if (skippedLast) return skippedLast;
     }
   }
   return null;
 };
 TreeWalker.prototype.parentNode = function() {
   var parent = this.currentNode.parentNode;
-  while (parent && parent !== this.root) {
+  while (parent) {
     var result = filterResult(this.filter, parent, this.mask);
     if (result === 1) { this.currentNode = parent; return parent; }
+    if (parent === this.root) break;
     parent = parent.parentNode;
   }
-  if (parent === this.root) { var result = filterResult(this.filter, parent, this.mask); if (result === 1) { this.currentNode = parent; return parent; } }
   return null;
 };
 TreeWalker.prototype.nextSibling = function() {
-  var sibling = this.currentNode.nextSibling;
+  var sibling = this.__sibling(this.currentNode, 1);
   while (sibling) {
     var result = filterResult(this.filter, sibling, this.mask);
     if (result === 1) { this.currentNode = sibling; return sibling; }
-    sibling = sibling.nextSibling;
+    sibling = this.__sibling(sibling, 1);
   }
+  // Acid3 and older DOM implementations probe the parent when there is no
+  // sibling. The result is intentionally ignored; currentNode stays put.
+  var parent = this.currentNode.parentNode;
+  if (parent) filterResult(this.filter, parent, this.mask);
   return null;
 };
 TreeWalker.prototype.previousSibling = function() {
-  var sibling = this.currentNode.previousSibling;
+  var sibling = this.__sibling(this.currentNode, -1);
   while (sibling) {
     var result = filterResult(this.filter, sibling, this.mask);
     if (result === 1) { this.currentNode = sibling; return sibling; }
-    sibling = sibling.previousSibling;
+    sibling = this.__sibling(sibling, -1);
   }
   return null;
 };
 TreeWalker.prototype.nextNode = function() {
-  var nodes = [];
-  function appendVisible(node, isRoot, walker) {
-    if (!isRoot) {
-      var result = filterResult(walker.filter, node, walker.mask);
-      if (result === 1) nodes.push(node);
-      if (result === 2) return;
-    }
-    var children = walker.__children(node);
-    for (var childIndex = 0; childIndex < children.length; childIndex++) appendVisible(children[childIndex], false, walker);
-  }
-  appendVisible(this.root, true, this);
-  var index = nodes.indexOf(this.currentNode);
-  for (var i = index + 1; i < nodes.length; i++) {
-    this.currentNode = nodes[i]; return nodes[i];
+  var candidate = this.__children(this.currentNode)[0] || this.__nextAfterSubtree(this.currentNode);
+  while (candidate) {
+    var result = filterResult(this.filter, candidate, this.mask);
+    if (result === 1) { this.currentNode = candidate; return candidate; }
+    candidate = result === 3 ? (this.__children(candidate)[0] || this.__nextAfterSubtree(candidate)) :
+      this.__nextAfterSubtree(candidate);
   }
   return null;
 };
 TreeWalker.prototype.previousNode = function() {
-  var nodes = [];
-  function appendVisible(node, isRoot, walker) {
-    if (!isRoot) {
-      var result = filterResult(walker.filter, node, walker.mask);
-      if (result === 1) nodes.push(node);
-      if (result === 2) return;
+  var node = this.currentNode;
+  while (node && node !== this.root) {
+    var sibling = this.__sibling(node, -1);
+    if (sibling) {
+      var found = this.__lastVisible(sibling);
+      if (found) { this.currentNode = found; return found; }
     }
-    var children = walker.__children(node);
-    for (var childIndex = 0; childIndex < children.length; childIndex++) appendVisible(children[childIndex], false, walker);
-  }
-  appendVisible(this.root, true, this);
-  var index = nodes.indexOf(this.currentNode);
-  for (var i = index - 1; i >= 0; i--) {
-    var result = filterResult(this.filter, nodes[i], this.mask);
-    if (result === 1) { this.currentNode = nodes[i]; return nodes[i]; }
+    var parent = node.parentNode;
+    if (!parent) return null;
+    var result = filterResult(this.filter, parent, this.mask);
+    if (result === 1) { this.currentNode = parent; return parent; }
+    node = parent;
   }
   return null;
 };
@@ -623,9 +636,12 @@ Node.prototype.removeChild = function(child) {
   if (child && child.__synthetic && this.__syntheticChildren) {
     var syntheticIndex = this.__syntheticChildren.indexOf(child);
     if (syntheticIndex < 0) throw domException('NotFoundError');
+    adjustRangesForRemoval(this, child, syntheticIndex);
     this.__syntheticChildren.splice(syntheticIndex, 1); child.__rangeParent = null; child.parentNode = null; return child;
   }
   if (child.parentNode !== this) throw domException('NotFoundError');
+  var childIndex = this.childNodes.indexOf(child);
+  if (childIndex >= 0) adjustRangesForRemoval(this, child, childIndex);
   __native.removeChild(this.handle, child && child.handle);
   child.__rangeParent = null; child.parentNode = null;
   return child;
@@ -1003,6 +1019,7 @@ function makeDocumentFragment() {
   fragment.removeChild = function(child) {
     var index = fragment.childNodes.indexOf(child);
     if (index < 0) throw new Error('NotFoundError');
+    adjustRangesForRemoval(fragment, child, index);
     fragment.childNodes.splice(index, 1); child.parentNode = null;
     fragment.firstChild = fragment.childNodes[0] || null;
     fragment.lastChild = fragment.childNodes[fragment.childNodes.length - 1] || null;
@@ -1022,6 +1039,20 @@ function nodeParentForRange(node) {
   return node.parentNode || null;
 }
 function nodeChildrenForRange(node) { return node && node.childNodes ? node.childNodes : []; }
+var ACTIVE_RANGES = [];
+function adjustRangesForRemoval(parent, child, index) {
+  for (var rangeIndex = 0; rangeIndex < ACTIVE_RANGES.length; rangeIndex++) {
+    var range = ACTIVE_RANGES[rangeIndex];
+    ['start', 'end'].forEach(function(side) {
+      var container = range[side + 'Container'], offset = range[side + 'Offset'];
+      if (container === child || isAncestorNode(child, container)) {
+        range[side + 'Container'] = parent; range[side + 'Offset'] = index;
+      } else if (container === parent && offset > index) {
+        range[side + 'Offset'] = offset - 1;
+      }
+    });
+  }
+}
 function nodeIndexInParent(node) {
   var parent = nodeParentForRange(node); return parent ? nodeChildrenForRange(parent).indexOf(node) : -1;
 }
@@ -1076,7 +1107,10 @@ function rangeFullyContains(range, node) {
 }
 function rangeOffsetLimit(node) {
   if (!node) return 0;
-  return node.nodeType === Node.TEXT_NODE ? (node.data || '').length : nodeChildrenForRange(node).length;
+  if (node.nodeType === Node.TEXT_NODE || node.nodeType === Node.COMMENT_NODE ||
+      node.nodeType === Node.CDATA_SECTION_NODE || node.nodeType === Node.PROCESSING_INSTRUCTION_NODE)
+    return (node.data || '').length;
+  return nodeChildrenForRange(node).length;
 }
 function checkedRangeOffset(node, offset) {
   var numeric = Number(offset);
@@ -1169,6 +1203,7 @@ function extractRangeNode(range, node) {
 function Range() {
   this.startContainer = document; this.startOffset = 0;
   this.endContainer = document; this.endOffset = 0;
+  ACTIVE_RANGES.push(this);
 }
 Object.defineProperty(Range.prototype, 'collapsed', { get: function() {
   return this.startContainer === this.endContainer && this.startOffset === this.endOffset;
@@ -1190,11 +1225,11 @@ Range.prototype.selectNode = function(node) { var p = nodeParentForRange(node); 
 Range.prototype.selectNodeContents = function(node) { node = checkedRangeNode(node); this.startContainer = node; this.startOffset = 0; this.endContainer = node; this.endOffset = rangeOffsetLimit(node); };
 Range.prototype.collapse = function(toStart) { if (toStart) { this.endContainer = this.startContainer; this.endOffset = this.startOffset; } else { this.startContainer = this.endContainer; this.startOffset = this.endOffset; } };
 Range.prototype.cloneRange = function() { var r = new Range(); r.startContainer = this.startContainer; r.startOffset = this.startOffset; r.endContainer = this.endContainer; r.endOffset = this.endOffset; return r; };
-Range.prototype.detach = function() { this.__detached = true; };
+Range.prototype.detach = function() { this.__detached = true; var index = ACTIVE_RANGES.indexOf(this); if (index >= 0) ACTIVE_RANGES.splice(index, 1); };
 Range.prototype.cloneContents = function() { var f = makeDocumentFragment(); var root = this.commonAncestorContainer; if (root.nodeType === Node.TEXT_NODE) { var start = this.startContainer === root ? this.startOffset : 0; var end = this.endContainer === root ? this.endOffset : (root.data || '').length; if (end > start) f.appendChild(document.createTextNode((root.data || '').slice(start, end))); return f; } var children = nodeChildrenForRange(root); for (var i = 0; i < children.length; i++) { var c = cloneRangeNode(this, children[i], false, f); if (c) f.appendChild(c); } return f; };
 Range.prototype.extractContents = function() { var f = makeDocumentFragment(); var root = this.commonAncestorContainer; if (root.nodeType === Node.TEXT_NODE) { var start = this.startContainer === root ? this.startOffset : 0; var end = this.endContainer === root ? this.endOffset : (root.data || '').length; if (end > start) { f.appendChild(document.createTextNode((root.data || '').slice(start, end))); if (root.handle) __native.setNodeData(root.handle, (root.data || '').slice(0, start) + (root.data || '').slice(end)); } this.collapse(true); return f; } var children = nodeChildrenForRange(root).slice(); for (var i = 0; i < children.length; i++) { var extracted = extractRangeNode(this, children[i]); if (extracted) f.appendChild(extracted); } this.collapse(true); return f; };
 Range.prototype.deleteContents = function() { this.extractContents(); };
-Range.prototype.insertNode = function(node) { var container = this.startContainer; if (container.nodeType === Node.TEXT_NODE) { var parent = nodeParentForRange(container); if (!parent) return; var before = container.data.slice(0, this.startOffset), after = container.data.slice(this.startOffset); __native.setNodeData(container.handle, before); var tail = document.createTextNode(after); var reference = container.nextSibling; if (node !== reference) parent.insertBefore(node, reference); var afterNode = node.nextSibling; if (afterNode) parent.insertBefore(tail, afterNode); else parent.appendChild(tail); return; } var children = nodeChildrenForRange(container), reference = children[this.startOffset] || null; if (reference) container.insertBefore(node, reference); else container.appendChild(node); };
+Range.prototype.insertNode = function(node) { var container = this.startContainer; if (container.nodeType === Node.TEXT_NODE) { var parent = nodeParentForRange(container); if (!parent) return; var splitOffset = this.startOffset, before = container.data.slice(0, splitOffset), after = container.data.slice(splitOffset); __native.setNodeData(container.handle, before); var tail = document.createTextNode(after); var reference = container.nextSibling; if (node !== reference) parent.insertBefore(node, reference); var afterNode = node.nextSibling; if (afterNode) parent.insertBefore(tail, afterNode); else parent.appendChild(tail); if (this.startContainer === container) { if (this.startOffset === splitOffset) { this.startContainer = node; this.startOffset = 0; } else if (this.startOffset > splitOffset) { this.startContainer = tail; this.startOffset -= splitOffset; } } if (this.endContainer === container) { if (this.endOffset > splitOffset) { this.endContainer = tail; this.endOffset -= splitOffset; } else if (this.endOffset === splitOffset) { this.endContainer = node; this.endOffset = 0; } } return; } var children = nodeChildrenForRange(container), reference = children[this.startOffset] || null; if (reference) container.insertBefore(node, reference); else container.appendChild(node); };
 Range.prototype.surroundContents = function(node) {
   if (this.startContainer && this.startContainer.nodeType === Node.COMMENT_NODE || this.endContainer && this.endContainer.nodeType === Node.COMMENT_NODE) throw { code: 1 };
   if (this.commonAncestorContainer && this.commonAncestorContainer.nodeType === Node.DOCUMENT_NODE && !this.collapsed) throw { code: 3, HIERARCHY_REQUEST_ERR: 3 };
@@ -1249,7 +1284,7 @@ function makeDetachedDocument(root) {
     doc.__documentChildren.splice(index, 0, child); child.__rangeParent = doc; child.parentNode = doc;
     adoptOwnerDocument(child); return child;
   };
-  doc.removeChild = function(child) { var index = doc.__documentChildren.indexOf(child); if (index < 0) throw domException('NotFoundError'); doc.__documentChildren.splice(index, 1); child.__rangeParent = null; child.parentNode = null; return child; };
+  doc.removeChild = function(child) { var index = doc.__documentChildren.indexOf(child); if (index < 0) throw domException('NotFoundError'); adjustRangesForRemoval(doc, child, index); doc.__documentChildren.splice(index, 1); child.__rangeParent = null; child.parentNode = null; return child; };
   Object.defineProperty(doc, 'childNodes', { get: function() { return doc.__documentChildren.slice(); }, enumerable: true });
   Object.defineProperty(doc, 'firstChild', { get: function() { return doc.__documentChildren[0] || null; }, enumerable: true });
   Object.defineProperty(doc, 'lastChild', { get: function() { return doc.__documentChildren[doc.__documentChildren.length - 1] || null; }, enumerable: true });

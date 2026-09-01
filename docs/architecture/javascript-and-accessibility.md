@@ -219,6 +219,9 @@ teardown, and final machine-readable result wrapper.
   applies whatToShow and filters in document order, forwards filter exceptions
   without advancing, and retains the last traversal order so a mutation
   performed by a filter can still be traversed correctly.
+- TreeWalker keeps currentNode stable until a navigation method succeeds;
+  child/sibling/parent navigation honors filter accept, reject, and skip
+  results, while nextNode and previousNode traverse only within root.
 - Text topology is readable through `childNodes`, `nodeType`, `nodeName`,
   `nodeValue`, `data`, and `textContent`. Text mutation and creation remain a
   separate ownership/invalidation boundary because parser-created text borrows
@@ -366,7 +369,9 @@ Realm-owned detached values; appending a fragment transfers its children, and
 extracting content preserves fully selected native node identities while
 cloning only partially selected structure. Text splitting uses the synchronous
 `setNodeData` binding and therefore stays within the active DOM mutation
-phase.
+phase. Active ranges are adjusted when a containing subtree is removed, and
+text insertion remaps split-text offsets so boundary points continue to denote
+the same content.
 
 ## Accessibility tree and speech
 

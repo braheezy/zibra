@@ -2175,6 +2175,64 @@ test "NodeIterator supports filtered iframe-document traversal" {
     try std.testing.expect(result.toBoolean());
 }
 
+test "TreeWalker preserves position and honors reject and skip filters" {
+    const allocator = std.testing.allocator;
+    var html_parser = try parser.HTMLParser.init(allocator, "<main><skip><hidden></hidden></skip><keep><leaf></leaf></keep><tail></tail></main>");
+    html_parser.use_implicit_tags = false;
+    defer html_parser.deinit(allocator);
+    var root = try html_parser.parse();
+    defer root.deinit(allocator);
+    parser.fixParentPointers(&root, null);
+    var environ = std.process.Environ.Map.init(allocator);
+    defer environ.deinit();
+    var js = try Js.init(allocator, std.testing.io, &environ);
+    defer js.deinit(allocator);
+    js.setNodes(0, &root);
+    defer js.setNodes(0, null);
+
+    const result = try js.evaluate(0,
+        \\var host = document.getElementsByTagName('main')[0];
+        \\var walker = document.createTreeWalker(host, NodeFilter.SHOW_ELEMENT, function(node) {
+        \\  return node.tagName === 'SKIP' ? NodeFilter.FILTER_REJECT : NodeFilter.FILTER_ACCEPT;
+        \\});
+        \\var keep = walker.nextNode(), leaf = walker.nextNode(), back = walker.previousNode();
+        \\var rejected = document.getElementsByTagName('hidden').length === 1 && keep.tagName === 'KEEP' && leaf.tagName === 'LEAF' && back === keep;
+        \\var skipped = document.createElement('skip'); var child = document.createElement('child'); skipped.appendChild(child); host.appendChild(skipped);
+        \\var skipWalker = document.createTreeWalker(host, NodeFilter.SHOW_ELEMENT, function(node) {
+        \\  return node.tagName === 'SKIP' ? NodeFilter.FILTER_SKIP : NodeFilter.FILTER_ACCEPT;
+        \\});
+        \\var skipSeen = [], node; while ((node = skipWalker.nextNode()) !== null) skipSeen.push(node.tagName);
+        \\rejected && skipSeen.indexOf('CHILD') >= 0 && skipSeen.indexOf('HIDDEN') >= 0 && skipSeen.indexOf('SKIP') < 0
+    );
+    try std.testing.expect(result.toBoolean());
+}
+
+test "TreeWalker leaves currentNode unchanged when a filter throws" {
+    const allocator = std.testing.allocator;
+    var html_parser = try parser.HTMLParser.init(allocator, "<main><child></child></main>");
+    html_parser.use_implicit_tags = false;
+    defer html_parser.deinit(allocator);
+    var root = try html_parser.parse();
+    defer root.deinit(allocator);
+    parser.fixParentPointers(&root, null);
+    var environ = std.process.Environ.Map.init(allocator);
+    defer environ.deinit();
+    var js = try Js.init(allocator, std.testing.io, &environ);
+    defer js.deinit(allocator);
+    js.setNodes(0, &root);
+    defer js.setNodes(0, null);
+
+    const result = try js.evaluate(0,
+        \\var host = document.getElementsByTagName('main')[0], calls = 0;
+        \\var walker = document.createTreeWalker(host, NodeFilter.SHOW_ELEMENT, function(node) {
+        \\  calls += 1; if (calls === 1) throw 'boom'; return NodeFilter.FILTER_ACCEPT;
+        \\});
+        \\var threw = false; try { walker.nextNode(); } catch (error) { threw = error === 'boom'; }
+        \\threw && walker.currentNode === host && walker.nextNode() === host.firstChild && calls === 2
+    );
+    try std.testing.expect(result.toBoolean());
+}
+
 test "DOM Range validates offsets and rejects partially selected elements" {
     const allocator = std.testing.allocator;
     var html_parser = try parser.HTMLParser.init(allocator, "<main></main>");
@@ -2202,7 +2260,117 @@ test "DOM Range validates offsets and rejects partially selected elements" {
         \\var partial = document.createRange(); partial.setStart(text, 1); partial.setEnd(host, 1);
         \\var rejected = false;
         \\try { partial.surroundContents(document.createElement('i')); } catch (error) { rejected = true; }
-        \\invalidNode && invalid && fragment.textContent === 'bc' && rejected && text.data === 'abcd'
+        \\var hierarchy = false; try { host.appendChild(host); } catch (error) { hierarchy = error.HIERARCHY_REQUEST_ERR === 3; }
+        \\invalidNode && invalid && fragment.textContent === 'bc' && rejected && hierarchy && text.data === 'abcd'
+    );
+    try std.testing.expect(result.toBoolean());
+}
+
+test "DOM Range extracts cross-element content and preserves boundary mutations" {
+    const allocator = std.testing.allocator;
+    var html_parser = try parser.HTMLParser.init(allocator, "<main></main>");
+    html_parser.use_implicit_tags = false;
+    defer html_parser.deinit(allocator);
+    var root = try html_parser.parse();
+    defer root.deinit(allocator);
+    parser.fixParentPointers(&root, null);
+    var environ = std.process.Environ.Map.init(allocator);
+    defer environ.deinit();
+    var js = try Js.init(allocator, std.testing.io, &environ);
+    defer js.deinit(allocator);
+    js.setNodes(0, &root);
+    defer js.setNodes(0, null);
+
+    const result = try js.evaluate(0,
+        \\var doc = document.implementation.createDocument(null, null, null);
+        \\var h1 = doc.createElement('h1'), t1 = doc.createTextNode('Hello '), em = doc.createElement('em'), t2 = doc.createTextNode('Wonderful'), t3 = doc.createTextNode(' Kitty');
+        \\h1.appendChild(t1); em.appendChild(t2); h1.appendChild(em); h1.appendChild(t3); doc.body.appendChild(h1);
+        \\var p = doc.createElement('p'); p.appendChild(doc.createTextNode('How are you?')); doc.body.appendChild(p);
+        \\var range = doc.createRange(); range.selectNodeContents(doc); var fullText = range.toString(); range.setStart(t2, 6); range.setEnd(p, 0); var ancestorOk = range.commonAncestorContainer === doc.body; var fragment = range.extractContents();
+        \\fragment.childNodes.length === 2 && fragment.childNodes[0].tagName === 'H1' && fragment.childNodes[1].tagName === 'P' &&
+        \\fragment.childNodes[0].childNodes[0].tagName === 'EM' && fragment.childNodes[0].childNodes[0].firstChild.data === 'ful' &&
+        \\fragment.childNodes[0].childNodes[1] === t3 && fragment.childNodes[1].childNodes.length === 0
+    );
+    try std.testing.expect(result.toBoolean());
+}
+
+test "DOM Range extracts the empty end element from an iframe document" {
+    const allocator = std.testing.allocator;
+    var html_parser = try parser.HTMLParser.init(allocator, "<main><iframe></iframe></main>");
+    html_parser.use_implicit_tags = false;
+    defer html_parser.deinit(allocator);
+    var root = try html_parser.parse();
+    defer root.deinit(allocator);
+    parser.fixParentPointers(&root, null);
+    var environ = std.process.Environ.Map.init(allocator);
+    defer environ.deinit();
+    var js = try Js.init(allocator, std.testing.io, &environ);
+    defer js.deinit(allocator);
+    js.setNodes(0, &root);
+    defer js.setNodes(0, null);
+
+    const result = try js.evaluate(0,
+        \\var doc = document.getElementsByTagName('iframe')[0].contentDocument;
+        \\for (var i = doc.documentElement.childNodes.length - 1; i >= 0; i--) doc.documentElement.removeChild(doc.documentElement.childNodes[i]);
+        \\doc.documentElement.appendChild(doc.createElement('head')); doc.documentElement.firstChild.appendChild(doc.createElement('title')); doc.documentElement.appendChild(doc.createElement('body'));
+        \\var h1 = doc.createElement('h1'), t1 = doc.createTextNode('Hello '), em = doc.createElement('em'), t2 = doc.createTextNode('Wonderful'), t3 = doc.createTextNode(' Kitty'); h1.appendChild(t1); em.appendChild(t2); h1.appendChild(em); h1.appendChild(t3); doc.body.appendChild(h1);
+        \\var p = doc.createElement('p'); p.appendChild(doc.createTextNode('How are you?')); doc.body.appendChild(p);
+        \\var range = doc.createRange(); range.setStart(t2, 6); range.setEnd(p, 0); var fragment = range.extractContents();
+        \\fullText === 'Wonderful KittyHow are you?' && ancestorOk && fragment.childNodes.length === 2 && fragment.childNodes[1].tagName === 'P' && fragment.childNodes[1].childNodes.length === 0
+    );
+    try std.testing.expect(result.toBoolean());
+}
+
+test "DOM Range tracks text insertion and removed subtrees" {
+    const allocator = std.testing.allocator;
+    var html_parser = try parser.HTMLParser.init(allocator, "<main></main>");
+    html_parser.use_implicit_tags = false;
+    defer html_parser.deinit(allocator);
+    var root = try html_parser.parse();
+    defer root.deinit(allocator);
+    parser.fixParentPointers(&root, null);
+    var environ = std.process.Environ.Map.init(allocator);
+    defer environ.deinit();
+    var js = try Js.init(allocator, std.testing.io, &environ);
+    defer js.deinit(allocator);
+    js.setNodes(0, &root);
+    defer js.setNodes(0, null);
+
+    const result = try js.evaluate(0,
+        \\var doc = document.implementation.createDocument(null, null, null), p = doc.createElement('p');
+        \\var text = doc.createTextNode('12345'), inserted = doc.createTextNode('ABCDE'); p.appendChild(text); p.appendChild(inserted); doc.body.appendChild(p);
+        \\var insertion = doc.createRange(); insertion.setStart(text, 2); insertion.setEnd(text, 3); insertion.insertNode(p.lastChild);
+        \\var insertionOk = p.childNodes.length === 3 && p.childNodes[0] === text && text.data === '12' && p.childNodes[1] === inserted && p.childNodes[2].data === '345' && insertion.toString().match(/^ABCDE/);
+        \\var removal = doc.createRange(); removal.setEnd(doc.body, 1); removal.setStart(p.lastChild, 1); doc.body.removeChild(p);
+        \\insertionOk && removal.collapsed && removal.startContainer === doc.body && removal.startOffset === 0 && removal.endContainer === doc.body && removal.endOffset === 0
+    );
+    try std.testing.expect(result.toBoolean());
+}
+
+test "DOM Range rejects surrounding comments with hierarchy errors" {
+    const allocator = std.testing.allocator;
+    var html_parser = try parser.HTMLParser.init(allocator, "<main><iframe></iframe></main>");
+    html_parser.use_implicit_tags = false;
+    defer html_parser.deinit(allocator);
+    var root = try html_parser.parse();
+    defer root.deinit(allocator);
+    parser.fixParentPointers(&root, null);
+    var environ = std.process.Environ.Map.init(allocator);
+    defer environ.deinit();
+    var js = try Js.init(allocator, std.testing.io, &environ);
+    defer js.deinit(allocator);
+    js.setNodes(0, &root);
+    defer js.setNodes(0, null);
+
+    const result = try js.evaluate(0,
+        \\var doc = document.getElementsByTagName('iframe')[0].contentDocument, comment = doc.createComment('11111'); doc.appendChild(comment);
+        \\var range = doc.createRange(); range.selectNode(comment); var code = 0;
+        \\try { range.surroundContents(doc.createElement('a')); } catch (error) { code = error.code; }
+        \\code === 3 && (function() {
+        \\  var c2 = doc.createComment('22222'), c3 = doc.createComment('33333'); doc.body.appendChild(c2); doc.body.appendChild(c3);
+        \\  range.setStart(c2, 2); range.setEnd(c3, 3);
+        \\  try { range.surroundContents(doc.createElement('a')); return false; } catch (error) { return true; }
+        \\})() && range.toString() === ''
     );
     try std.testing.expect(result.toBoolean());
 }
