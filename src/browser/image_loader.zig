@@ -42,6 +42,17 @@ fn dataUrlHasImageMediaType(source: []const u8) bool {
     return std.ascii.startsWithIgnoreCase(metadata, "image/");
 }
 
+/// Image decoders must not be fed error documents or responses with a
+/// non-image MIME type.  Keeping this check here also makes `<object>` fall
+/// back to its children when its primary resource fails, as browsers do.
+fn responseCanDecodeImage(response: url_module.HttpResponse) bool {
+    if (response.status) |status| {
+        const code = @intFromEnum(status);
+        if (code < 200 or code >= 300) return false;
+    }
+    return response.content_type == .image or response.content_type == .unknown;
+}
+
 /// Return the image source selected by an HTML replaced element. `<object>`
 /// participates only when its declared or data-URL media type is image-like;
 /// unsupported object resources keep rendering their fallback children.
@@ -184,6 +195,18 @@ fn loadOne(
     };
     defer if (response.csp_header) |header| allocator.free(header);
     defer if (response.access_control_allow_origin) |header| allocator.free(header);
+
+    if (!responseCanDecodeImage(response)) {
+        // Network responses transfer their body to this loader. Synthetic
+        // data/about URLs are borrowed from the URL object and must not be
+        // freed here, matching the ownership path below.
+        if (!std.mem.eql(u8, image_url.scheme, "data") and
+            !std.mem.eql(u8, image_url.scheme, "about"))
+        {
+            allocator.free(response.body);
+        }
+        return brokenImage(allocator);
+    }
 
     var encoded_bytes = response.body;
     if (std.mem.eql(u8, image_url.scheme, "data") or std.mem.eql(u8, image_url.scheme, "about")) {
@@ -335,4 +358,25 @@ test "broken image visibility requires non-empty alternate text" {
     try std.testing.expect(!shouldShowBrokenImage(&missing));
     try std.testing.expect(!shouldShowBrokenImage(&empty));
     try std.testing.expect(shouldShowBrokenImage(&described));
+}
+
+test "image responses reject HTTP errors and non-image MIME types" {
+    try std.testing.expect(responseCanDecodeImage(.{
+        .body = &.{},
+        .content_type = .image,
+        .status = .ok,
+    }));
+    try std.testing.expect(!responseCanDecodeImage(.{
+        .body = &.{},
+        .content_type = .image,
+        .status = .not_found,
+    }));
+    try std.testing.expect(!responseCanDecodeImage(.{
+        .body = &.{},
+        .content_type = .html,
+        .status = .ok,
+    }));
+    // Synthetic data/about responses have no HTTP status or MIME metadata;
+    // the decoder remains the authority for those resources.
+    try std.testing.expect(responseCanDecodeImage(.{ .body = &.{} }));
 }

@@ -1572,7 +1572,11 @@ pub const Browser = struct {
                 }
             }
 
-            if (self.isScreenshotReady()) {
+            // A bounded capture is explicitly used for pages whose state
+            // advances through timer/animation work (Acid3 is one example).
+            // Do not let a transient quiet gap between timer tasks defeat the
+            // requested delay and capture an intermediate frame.
+            if (!bounded_capture and self.isScreenshotReady()) {
                 if (quiet_since_ns == null) quiet_since_ns = now_ns;
                 if (now_ns - quiet_since_ns.? >= quiet_window_ns) {
                     try self.writeScreenshot(path);
@@ -4230,6 +4234,19 @@ pub const Browser = struct {
                 continue;
             }
             const css_response = completed.response orelse continue;
+
+            // A stylesheet link is only applied when the response is CSS.
+            // Acid3 deliberately serves an HTML document from `empty.css`;
+            // parsing that payload as CSS would incorrectly turn the test's
+            // heading red and diverge from browser behavior. Unknown MIME
+            // types remain accepted for local/file-style fixtures without
+            // response headers, while explicit non-CSS types are rejected.
+            if (css_response.content_type == .html or
+                css_response.content_type == .plain or
+                css_response.content_type == .image)
+            {
+                continue;
+            }
 
             const css_text = try decodeUtf8Replace(self.allocator, css_response.body);
             var css_text_owned = true;

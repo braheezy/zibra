@@ -1028,11 +1028,11 @@ pub const DescendantSelector = struct {
     }
 };
 
-    pub const Combinator = enum {
-        descendant,
-        child,
-        adjacent,
-        general_sibling,
+pub const Combinator = enum {
+    descendant,
+    child,
+    adjacent,
+    general_sibling,
 };
 
 /// A selector chain containing at least one explicit child or adjacent-sibling
