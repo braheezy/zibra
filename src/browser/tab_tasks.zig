@@ -517,6 +517,28 @@ pub fn Contexts(comptime Browser: type) type {
                                 };
                             }
                         }
+                        // Completing a child browsing context also fires the
+                        // load event on its embedding iframe element. This
+                        // lets script-assigned `iframe.onload` handlers see
+                        // resource completion in the parent Realm.
+                        if (frame.parent) |parent| {
+                            // Parent child arrays are by-value and may have
+                            // relocated the iframe element while this child
+                            // was loading. Rebind the scalar frame marker
+                            // before borrowing it for event dispatch.
+                            parent.reconcileAttachedChildFrames();
+                            if (frame.frame_element) |iframe_element| {
+                                if (parent.js_context) |parent_js| {
+                                    _ = parent_js.dispatchEvent(
+                                        parent.window_id,
+                                        "load",
+                                        iframe_element,
+                                    ) catch |err| {
+                                        std.log.warn("Iframe load event delivery failed: {}", .{err});
+                                    };
+                                }
+                            }
+                        }
                     }
                 }
 

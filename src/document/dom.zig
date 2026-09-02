@@ -233,6 +233,12 @@ pub const Element = struct {
     // an inert fragment (such as innerHTML). Reattachment never resets that
     // state, while an explicitly created Element starts eligible.
     script_started: bool = false,
+    /// The live checkedness of checkbox/radio controls. A null value means
+    /// that no activation has overridden the markup default, so selectors
+    /// still fall back to the presence of the `checked` content attribute.
+    /// Keeping this separate is required because setting `checked` as an
+    /// attribute changes `defaultChecked`, not the live control state.
+    checked_state: ?bool = null,
     // Stable identity of the child browsing context currently attached to an
     // iframe element. Node values may move with their containing child array;
     // the Browser uses this scalar to rebind the Frame's raw frame_element
@@ -599,6 +605,7 @@ pub const Element = struct {
 
     pub fn isChecked(self: *const Element) bool {
         if (!self.isCheckbox() and !self.isInputType("radio")) return false;
+        if (self.checked_state) |state| return state;
         const attributes = self.attributes orelse return false;
         return attributes.get("checked") != null;
     }
@@ -620,15 +627,25 @@ pub const Element = struct {
         return .{ .width = width, .height = height };
     }
 
-    /// Toggle a checkbox's boolean `checked` attribute and return its new
-    /// state. Attribute keys and values borrow either document storage or the
-    /// static strings inserted here; the map never takes string ownership.
+    /// Toggle a checkbox/radio's live state and return its new state.
+    /// Attribute keys and values borrow either document storage or the static
+    /// strings inserted here; the map never takes string ownership.
     pub fn toggleChecked(self: *Element) !bool {
         if (!self.isCheckbox() and !self.isInputType("radio")) return false;
-        if (self.attributes) |*attributes| {
-            if (attributes.remove("checked")) return false;
-            try attributes.put("checked", "");
+        if (self.isInputType("radio")) {
+            self.checked_state = true;
+            if (self.attributes) |*attributes| try attributes.put("checked", "");
             return true;
+        }
+        const next = !self.isChecked();
+        self.checked_state = next;
+        if (self.attributes) |*attributes| {
+            if (next) {
+                try attributes.put("checked", "");
+            } else {
+                _ = attributes.remove("checked");
+            }
+            return next;
         }
         unreachable;
     }

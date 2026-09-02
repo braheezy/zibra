@@ -58,6 +58,8 @@ pub const bindings = [_]native_bindings.Binding{
     .{ .name = "nodeValue", .length = 1, .function = nodeValue },
     .{ .name = "nodeData", .length = 1, .function = nodeData },
     .{ .name = "setNodeData", .length = 2, .function = setNodeData },
+    .{ .name = "setChecked", .length = 2, .function = setChecked },
+    .{ .name = "getChecked", .length = 1, .function = getChecked },
     .{ .name = "textContent", .length = 1, .function = textContent },
     .{ .name = "computedStyleValue", .length = 2, .function = computedStyleValue },
 };
@@ -472,6 +474,37 @@ fn setNodeData(agent: *Agent, this_value: Value, arguments: Arguments) Agent.Err
         },
     }
     return .undefined;
+}
+
+/// Set live checkbox/radio state without changing the content attribute.
+/// JavaScript's `checked` setter updates the attribute separately so style
+/// invalidation still follows the normal mutation path; setAttribute itself
+/// deliberately does not call this binding.
+fn setChecked(agent: *Agent, this_value: Value, arguments: Arguments) Agent.Error!Value {
+    _ = this_value;
+    const window = try requireWindow(agent);
+    const node = try requireNode(agent, window, arguments.get(0));
+    const checked = arguments.get(1).toBoolean();
+    switch (node.*) {
+        .element => |*element| {
+            if (!element.isCheckbox() and !element.isInputType("radio")) {
+                return agent.throwException(.type_error, "setChecked requires a checkbox or radio input", .{});
+            }
+            element.checked_state = checked;
+        },
+        .text => return agent.throwException(.type_error, "setChecked requires an element", .{}),
+    }
+    return .undefined;
+}
+
+fn getChecked(agent: *Agent, this_value: Value, arguments: Arguments) Agent.Error!Value {
+    _ = this_value;
+    const window = try requireWindow(agent);
+    const node = try requireNode(agent, window, arguments.get(0));
+    return switch (node.*) {
+        .element => |*element| Value.from(element.isChecked()),
+        .text => agent.throwException(.type_error, "getChecked requires an element", .{}),
+    };
 }
 
 fn textContent(agent: *Agent, this_value: Value, arguments: Arguments) Agent.Error!Value {

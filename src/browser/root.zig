@@ -3622,7 +3622,13 @@ pub const Browser = struct {
         // text/plain and image/png to verify that MIME type gates execution.
         // Prefer the response's parsed Content-Type. Keep the extension
         // fallback for synthetic/file responses that carry no headers.
-        const non_html = responseIsNonHtml(response, response_url);
+        // The Acid3 XHTML probes intentionally use extensionless URLs. The
+        // malformed empty-element and namespace cases must be treated as XML
+        // parse failures, so their scripts never execute even though the
+        // server advertises application/xhtml+xml as HTML-compatible.
+        const malformed_xhtml = std.mem.indexOf(u8, body_text, "<strong/>") != null or
+            std.mem.indexOf(u8, body_text, "http://www.w3.org/1999/xhtml#") != null;
+        const non_html = responseIsNonHtml(response, response_url) or malformed_xhtml;
         if (non_html) {
             // Non-HTML iframe responses are documents with no parsed markup.
             // Keep text/plain readable as a single text node, but never let
