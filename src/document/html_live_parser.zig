@@ -488,6 +488,21 @@ pub const LiveParser = struct {
         if (index > body_index) _ = self.popThrough(index);
     }
 
+    /// HTML tables have an implicit `tbody` insertion mode: a `tr` directly
+    /// under `table` is reparented below a generated section.  Acid3 and
+    /// ordinary DOM code observe that section as a real element, so it must be
+    /// inserted into the live tree (rather than merely exposed as a collection
+    /// compatibility shim).
+    fn ensureImplicitTableBody(self: *LiveParser, tag: []const u8) !void {
+        if (!tagEquals(tag, "tr")) return;
+        const parent = try self.current();
+        const is_table = switch (parent.*) {
+            .element => |element| tagEquals(element.tag, "table"),
+            .text => false,
+        };
+        if (is_table) _ = try self.appendElement(parent, "tbody", true);
+    }
+
     fn replaceImplicitRoot(self: *LiveParser, tag: []const u8) !void {
         if (self.saw_explicit_html or self.head_found or self.body_found) return;
         const root_element = switch (self.root.*) {
@@ -539,6 +554,8 @@ pub const LiveParser = struct {
         if (tagEquals(info.name, "li") or tagEquals(info.name, "button")) {
             try self.closeSameOpen(info.name);
         }
+
+        try self.ensureImplicitTableBody(info.name);
 
         const parent = try self.current();
         const void_tag = html_serialization.isVoidElementTag(info.name) or info.self_closing;

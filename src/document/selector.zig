@@ -1028,10 +1028,11 @@ pub const DescendantSelector = struct {
     }
 };
 
-pub const Combinator = enum {
-    descendant,
-    child,
-    adjacent,
+    pub const Combinator = enum {
+        descendant,
+        child,
+        adjacent,
+        general_sibling,
 };
 
 /// A selector chain containing at least one explicit child or adjacent-sibling
@@ -1135,6 +1136,29 @@ pub const ComplexSelector = struct {
                 )
             else
                 false,
+            .general_sibling => if (ancestors.len == 0)
+                false
+            else blk: {
+                const parent = ancestors[ancestors.len - 1];
+                const parent_element = switch (parent.*) {
+                    .element => |*element| element,
+                    .text => break :blk false,
+                };
+                for (parent_element.children.items, 0..) |*sibling, sibling_index| {
+                    if (sibling != publicHostNode(node)) continue;
+                    var previous_index = sibling_index;
+                    while (previous_index > 0) {
+                        previous_index -= 1;
+                        const previous = &parent_element.children.items[previous_index];
+                        if (previous.* != .element) continue;
+                        if (self.matchesAt(selector_index - 1, previous, ancestors, context)) {
+                            break :blk true;
+                        }
+                    }
+                    break;
+                }
+                break :blk false;
+            },
             .descendant => blk: {
                 var ancestor_index = ancestors.len;
                 while (ancestor_index > 0) {

@@ -19,6 +19,8 @@ pub const computed = [_]Property{
     .{ .name = "font-variant", .default_value = "inherit" },
     .{ .name = "font-stretch", .default_value = "inherit" },
     .{ .name = "line-height", .default_value = "inherit" },
+    .{ .name = "white-space", .default_value = "normal" },
+    .{ .name = "cursor", .default_value = "auto" },
     .{ .name = "vertical-align", .default_value = "inherit" },
     .{ .name = "text-align", .default_value = "inherit" },
     .{ .name = "list-style-type", .default_value = "inherit" },

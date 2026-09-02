@@ -131,6 +131,12 @@ fn viewportWidthInCssPixels(device_width: i32, zoom_value: f32) f64 {
     return @as(f64, @floatFromInt(safe_width)) / @as(f64, safe_zoom);
 }
 
+fn viewportDimensionInCssPixels(device_dimension: i32, zoom_value: f32) f64 {
+    const safe_dimension = @max(device_dimension, 0);
+    const safe_zoom = if (std.math.isFinite(zoom_value) and zoom_value > 0) zoom_value else 1.0;
+    return @as(f64, @floatFromInt(safe_dimension)) / @as(f64, safe_zoom);
+}
+
 /// Instantiate the recursive Frame owner without importing the Browser
 /// coordinator back into this leaf module.
 pub fn FrameType(
@@ -348,7 +354,7 @@ pub fn FrameType(
         /// accessibility zoom but includes authored CSS zoom inherited from the
         /// iframe element, so remove only the latter.
         pub fn mediaViewportWidthCssPixels(self: *const Frame) f64 {
-            if (self.parent != null and self.viewport_width > 0) {
+            if (self.parent != null) {
                 const css_zoom = if (std.math.isFinite(self.inherited_css_zoom) and
                     self.inherited_css_zoom > 0)
                     self.inherited_css_zoom
@@ -361,6 +367,21 @@ pub fn FrameType(
                 self.tab.tab_width,
                 self.tab.accessibility.zoom,
             );
+        }
+
+        /// Return the browsing context's viewport height in CSS pixels for
+        /// media queries. Nested frames preserve an explicitly zero height;
+        /// this matters for hidden Acid3 selector test frames.
+        pub fn mediaViewportHeightCssPixels(self: *const Frame) f64 {
+            if (self.parent != null) {
+                const css_zoom = if (std.math.isFinite(self.inherited_css_zoom) and
+                    self.inherited_css_zoom > 0)
+                    self.inherited_css_zoom
+                else
+                    1.0;
+                return viewportDimensionInCssPixels(self.viewport_height, css_zoom);
+            }
+            return viewportDimensionInCssPixels(self.tab.tab_height, self.tab.accessibility.zoom);
         }
 
         pub const ViewportChange = struct {

@@ -691,6 +691,26 @@ pub fn Contexts(comptime Browser: type, comptime DocumentHandle: type) type {
             tab.setNeedsRender();
         }
 
+        pub fn jsStyleFlushCallback(context: ?*anyopaque) anyerror!void {
+            const ctx_ptr = context orelse return;
+            const raw_ctx: *align(1) JsRenderContext = @ptrCast(ctx_ptr);
+            const ctx: *JsRenderContext = @alignCast(raw_ctx);
+            const browser_ptr = ctx.browser_ptr orelse return;
+            const tab_ptr = ctx.tab_ptr orelse return;
+            const raw_browser: *align(1) Browser = @ptrCast(browser_ptr);
+            const browser: *Browser = @alignCast(raw_browser);
+            const raw_tab: *align(1) Tab = @ptrCast(tab_ptr);
+            const tab: *Tab = @alignCast(raw_tab);
+            const frame = tab.frameForWindowId(ctx.window_id) orelse return;
+            if (frame.document_generation == 0 or !ctx.matchesGeneration(frame.document_generation)) return;
+            // A synchronous computed-style read after script inserts a
+            // stylesheet must observe that sheet immediately, just as a
+            // navigation render would. Resource refresh is idempotent and
+            // remains generation-bound to this frame.
+            try browser.refreshFrameResources(frame);
+            try frame.renderStyle(browser);
+        }
+
         /// Read the Frame-owned document phase from a synchronous JavaScript
         /// callback. The render context's generation stamp prevents an old
         /// realm from observing a newly navigated Frame that reused its window

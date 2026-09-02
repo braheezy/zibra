@@ -371,7 +371,10 @@ cloning only partially selected structure. Text splitting uses the synchronous
 `setNodeData` binding and therefore stays within the active DOM mutation
 phase. Active ranges are adjusted when a containing subtree is removed, and
 text insertion remaps split-text offsets so boundary points continue to denote
-the same content.
+the same content. Structural mutation dirties sibling-sensitive selectors;
+`getComputedStyle` readback invokes a Realm-scoped style-flush callback so a
+script observes the new computed value synchronously, while layout and paint
+remain scheduled work.
 
 ## Accessibility tree and speech
 

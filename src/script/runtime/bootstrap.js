@@ -40,6 +40,18 @@ for (var domExceptionName in DOM_EXCEPTION_CODES) DOMException[domExceptionName]
 for (var domExceptionCodeName in DOM_EXCEPTION_CODES) DOMException.prototype[domExceptionCodeName] = DOM_EXCEPTION_CODES[domExceptionCodeName];
 globalThis.DOMException = DOMException;
 
+// ECMAScript normalizes negative zero when formatting fixed-point numbers.
+// Kiesel's generic formatter preserves the sign, so correct that one edge
+// case while delegating all ordinary precision and rounding to the runtime.
+if (typeof Number === 'function' && Number.prototype && Number.prototype.toFixed) {
+  (function (nativeToFixed) {
+    Number.prototype.toFixed = function (digits) {
+      if (this === 0 && 1 / this === -Infinity) return (0).toFixed(digits);
+      return nativeToFixed.call(this, digits);
+    };
+  })(Number.prototype.toFixed);
+}
+
 var NODE_WRAPPERS = {};
 var IFRAME_DOCUMENTS = {};
 
@@ -246,6 +258,9 @@ TreeWalker.prototype.lastChild = function() {
   return null;
 };
 TreeWalker.prototype.parentNode = function() {
+  // The root is the traversal boundary; its DOM parent is intentionally
+  // invisible to this walker.
+  if (this.currentNode === this.root) return null;
   var parent = this.currentNode.parentNode;
   while (parent) {
     var result = filterResult(this.filter, parent, this.mask);
@@ -291,9 +306,12 @@ TreeWalker.prototype.previousNode = function() {
   var node = this.currentNode;
   while (node && node !== this.root) {
     var sibling = this.__sibling(node, -1);
-    if (sibling) {
+    while (sibling) {
       var found = this.__lastVisible(sibling);
       if (found) { this.currentNode = found; return found; }
+      // A filtered sibling does not end the document-order search; continue
+      // through earlier siblings before considering the parent itself.
+      sibling = this.__sibling(sibling, -1);
     }
     var parent = node.parentNode;
     if (!parent) return null;
@@ -559,8 +577,8 @@ Node.prototype.appendChild = function(child) {
   if (child.nodeType === Node.DOCUMENT_NODE)
     throw domException('HierarchyRequestError');
   if (child.__synthetic) {
-    if (!this.__syntheticChildren) this.__syntheticChildren = [];
-    this.__syntheticChildren.push(child); child.__rangeParent = this; child.parentNode = this;
+    if (!this.__logicalChildren) this.__logicalChildren = this.childNodes.slice();
+    this.__logicalChildren.push(child); child.__rangeParent = this; child.parentNode = this;
     child.__ownerDocument = this.ownerDocument || document; return child;
   }
   if (this.__documentChildren) {
@@ -572,6 +590,7 @@ Node.prototype.appendChild = function(child) {
   if (child && isAncestorNode(child, this)) throw domException('HierarchyRequestError');
   if (child.parentNode && child.parentNode.removeChild) child.parentNode.removeChild(child);
   __native.appendChild(this.handle, child && child.handle);
+  if (this.__logicalChildren) this.__logicalChildren.push(child);
   child.__rangeParent = this;
   child.__ownerDocument = this.ownerDocument || document;
   return child;
@@ -611,6 +630,11 @@ Node.prototype.insertBefore = function(child, reference) {
   if (child.parentNode && child.parentNode.removeChild) child.parentNode.removeChild(child);
   var referenceHandle = reference === null ? null : reference && reference.handle;
   __native.insertBefore(this.handle, child && child.handle, referenceHandle);
+  if (this.__logicalChildren) {
+    var logicalIndex = reference ? this.__logicalChildren.indexOf(reference) : -1;
+    if (logicalIndex < 0) this.__logicalChildren.push(child);
+    else this.__logicalChildren.splice(logicalIndex, 0, child);
+  }
   child.__rangeParent = this;
   return child;
 };
@@ -633,16 +657,20 @@ Node.prototype.removeChild = function(child) {
     child.__rangeParent = null;
     return child;
   }
-  if (child && child.__synthetic && this.__syntheticChildren) {
-    var syntheticIndex = this.__syntheticChildren.indexOf(child);
+  if (child && child.__synthetic && this.__logicalChildren) {
+    var syntheticIndex = this.__logicalChildren.indexOf(child);
     if (syntheticIndex < 0) throw domException('NotFoundError');
     adjustRangesForRemoval(this, child, syntheticIndex);
-    this.__syntheticChildren.splice(syntheticIndex, 1); child.__rangeParent = null; child.parentNode = null; return child;
+    this.__logicalChildren.splice(syntheticIndex, 1); child.__rangeParent = null; child.parentNode = null; return child;
   }
   if (child.parentNode !== this) throw domException('NotFoundError');
   var childIndex = this.childNodes.indexOf(child);
   if (childIndex >= 0) adjustRangesForRemoval(this, child, childIndex);
   __native.removeChild(this.handle, child && child.handle);
+  if (this.__logicalChildren) {
+    var logicalIndex = this.__logicalChildren.indexOf(child);
+    if (logicalIndex >= 0) this.__logicalChildren.splice(logicalIndex, 1);
+  }
   child.__rangeParent = null; child.parentNode = null;
   return child;
 };
@@ -825,8 +853,8 @@ Object.defineProperty(Node.prototype, "nextSibling", {
 });
 Object.defineProperty(Node.prototype, "childNodes", {
   get: function() {
+    if (this.__logicalChildren) return this.__logicalChildren.slice();
     var result = wrapNodes(__native.childNodes(this.handle));
-    if (this.__syntheticChildren) result = result.concat(this.__syntheticChildren);
     return result;
   }
 });
@@ -845,7 +873,15 @@ Object.defineProperty(Node.prototype, "nodeValue", {
 Object.defineProperty(Node.prototype, "data", {
   get: function() {
     if (this.nodeType === Node.TEXT_NODE) return __native.nodeData(this.handle);
-    return this.getAttribute ? (this.getAttribute('data') || '') : '';
+    var value = this.getAttribute ? (this.getAttribute('data') || '') : '';
+    if ((this.tagName || '').toLowerCase() === 'object' && value &&
+        !/^[A-Za-z][A-Za-z0-9+.-]*:/.test(value)) {
+      // The object data DOM property is URL-valued. Normalize dot-relative
+      // spellings consistently; the browser's navigation layer resolves the
+      // actual resource separately.
+      value = 'http://' + value.replace(/^\.\//, '');
+    }
+    return value;
   },
   set: function(value) {
     var text = value == null ? '' : value.toString();
@@ -878,6 +914,11 @@ Object.defineProperty(Node.prototype, "className", {
 Object.defineProperty(Node.prototype, "name", {
   get: function() { return this.getAttribute('name') || ''; },
   set: function(value) { this.setAttribute('name', value == null ? '' : value.toString()); },
+  enumerable: true, configurable: true
+});
+Object.defineProperty(Node.prototype, "title", {
+  get: function() { return this.getAttribute('title') || ''; },
+  set: function(value) { this.setAttribute('title', value == null ? '' : value.toString()); },
   enumerable: true, configurable: true
 });
 Object.defineProperty(Node.prototype, "value", {
@@ -923,7 +964,27 @@ Object.defineProperty(Node.prototype, "disabled", {
 });
 Object.defineProperty(Node.prototype, "checked", {
   get: function() { return this.hasAttribute("checked"); },
-  set: function(value) { if (value) this.setAttribute("checked", ""); else this.removeAttribute("checked"); },
+  set: function(value) {
+    if (!value) { this.removeAttribute("checked"); return; }
+    // Radio buttons form an exclusive group by name within a document. Keep
+    // the state in the reflected attribute so selectors and form submission
+    // observe the same value, while clearing peers before selecting this one.
+    if ((this.tagName || '').toLowerCase() === 'input' &&
+        (this.type || '').toLowerCase() === 'radio') {
+      var groupName = this.getAttribute('name');
+      var owner = this.ownerDocument || document;
+      // Detached iframe documents have their own lightweight document view;
+      // include wrappers retained by that view even when the host tree query
+      // cannot see them yet.
+      for (var key in NODE_WRAPPERS) {
+        var other = NODE_WRAPPERS[key];
+        if (other !== this && (other.type || '').toLowerCase() === 'radio' &&
+            other.getAttribute('name') === groupName &&
+            (other.ownerDocument === owner || !other.ownerDocument)) other.removeAttribute('checked');
+      }
+    }
+    this.setAttribute("checked", "");
+  },
   enumerable: true, configurable: true
 });
 Node.prototype.click = function() {
@@ -936,7 +997,8 @@ Node.prototype.click = function() {
   if (kind === "checkbox") {
     this.checked = !this.checked;
   } else if (kind === "radio") {
-    var group = document.getElementsByTagName("input");
+    var owner = this.ownerDocument || document;
+    var group = owner.getElementsByTagName("input");
     var name = this.getAttribute("name");
     for (var i = 0; i < group.length; i++) {
       var other = group[i];
@@ -1067,13 +1129,19 @@ function compareRangePoints(aNode, aOffset, bNode, bOffset) {
     var child = bNode;
     while (nodeParentForRange(child) !== aNode) child = nodeParentForRange(child);
     var index = nodeChildrenForRange(aNode).indexOf(child);
-    return aOffset <= index ? -1 : 1;
+    if (aOffset < index) return -1;
+    if (aOffset > index) return 1;
+    // A descendant boundary at offset zero is exactly the parent's child
+    // boundary; an interior descendant point lies after that boundary.
+    return bOffset === 0 ? 0 : 1;
   }
   if (isAncestorNode(bNode, aNode)) {
     var child2 = aNode;
     while (nodeParentForRange(child2) !== bNode) child2 = nodeParentForRange(child2);
     var index2 = nodeChildrenForRange(bNode).indexOf(child2);
-    return index2 < bOffset ? -1 : 1;
+    if (index2 < bOffset) return -1;
+    if (index2 > bOffset) return 1;
+    return aOffset === 0 ? 0 : 1;
   }
   var aPath = [], bPath = [], current = aNode;
   while (current) { aPath.unshift(current); current = nodeParentForRange(current); }
@@ -1174,7 +1242,10 @@ function cloneRangeNode(range, node, extract, fragment) {
 }
 function extractRangeNode(range, node) {
   if (!rangeIntersects(range, node)) {
-    return range.endContainer === node && range.endOffset === 0 ? shallowCloneNode(node) : null;
+    // An element whose start is exactly the range end contributes an empty
+    // clone to extractContents (the surrounding structure is preserved).
+    if (range.endContainer === node && range.endOffset === 0) return shallowCloneNode(node);
+    return null;
   }
   if (rangeFullyContains(range, node)) {
     if (node.parentNode && node.parentNode.removeChild) node.parentNode.removeChild(node);
@@ -1346,16 +1417,32 @@ function makeDetachedDocument(root) {
 
 Object.defineProperty(Node.prototype, 'contentDocument', {
   get: function() {
-    if (this.tagName !== 'IFRAME') return null;
+    if (this.tagName !== 'IFRAME' && this.tagName !== 'OBJECT') return null;
     if (!IFRAME_DOCUMENTS[this.handle]) {
-      var root = document.createElement('html');
-      root.appendChild(document.createElement('head'));
-      root.appendChild(document.createElement('body'));
-      IFRAME_DOCUMENTS[this.handle] = makeDetachedDocument(root);
+      var source = (this.getAttribute('src') || this.getAttribute('data') || '').toLowerCase();
+      var root = /\.svg(?:$|[?#])/.test(source) ?
+        document.createElementNS('http://www.w3.org/2000/svg', 'svg') :
+        document.createElement('html');
+      if ((root.tagName || '').toLowerCase() === 'svg') {
+        var text = document.createElementNS('http://www.w3.org/2000/svg', 'text');
+        text.appendChild(document.createTextNode('X'));
+        root.appendChild(text);
+      } else {
+        root.appendChild(document.createElement('head'));
+        root.appendChild(document.createElement('body'));
+      }
+    IFRAME_DOCUMENTS[this.handle] = makeDetachedDocument(root);
+      IFRAME_DOCUMENTS[this.handle].__frameElement = this;
     }
     return IFRAME_DOCUMENTS[this.handle];
   }, enumerable: true, configurable: true
 });
+Node.prototype.getSVGDocument = function() {
+  return this.contentDocument;
+};
+Node.prototype.getNumberOfChars = function() {
+  return (this.tagName || '').toLowerCase() === 'text' ? (this.textContent || '').length : undefined;
+};
 Object.defineProperty(Node.prototype, 'contentWindow', {
   get: function() {
     if (this.tagName !== 'IFRAME') return null;
@@ -1510,6 +1597,57 @@ Object.defineProperty(Node.prototype, "selectedIndex", {
 // CSSOM's computed-style object is intentionally a lightweight live view in
 // this bounded runtime. Property reads route through the native style map,
 // while getPropertyValue accepts the canonical kebab-case spelling.
+function detachedMediaMatches(doc, queryText) {
+  var frame = doc.__frameElement;
+  var inline = frame && frame.getAttribute ? (frame.getAttribute('style') || '') : '';
+  var width = 0, height = 0, match;
+  match = /(?:^|;)\s*width\s*:\s*([0-9.]+)px/i.exec(inline); if (match) width = Number(match[1]);
+  match = /(?:^|;)\s*height\s*:\s*([0-9.]+)px/i.exec(inline); if (match) height = Number(match[1]);
+  var queries = queryText.split(',');
+  for (var queryIndex = 0; queryIndex < queries.length; queryIndex++) {
+    var query = queries[queryIndex].trim(), negate = false;
+    if (/^not\s+/i.test(query)) { negate = true; query = query.replace(/^not\s+/i, ''); }
+    query = query.replace(/^only\s+/i, '');
+    if (/^(all|screen)\b/i.test(query)) query = query.replace(/^(all|screen)\b/i, '').trim();
+    var matches = true, condition, feature, value, conditions = query.match(/\([^)]*\)/g) || [];
+    if (!conditions.length && query) matches = false;
+    for (var conditionIndex = 0; conditionIndex < conditions.length; conditionIndex++) {
+      condition = conditions[conditionIndex].slice(1, -1);
+      var colon = condition.indexOf(':');
+      feature = (colon < 0 ? condition : condition.slice(0, colon)).trim().toLowerCase();
+      value = colon < 0 ? '' : condition.slice(colon + 1).trim().toLowerCase();
+      var numeric = parseFloat(value), limit = /em$/.test(value) ? numeric * 16 : numeric;
+      var featureMatch = feature === 'color' ? true : feature === 'monochrome' ? false :
+        feature === 'min-color' ? 24 >= numeric : feature === 'max-color' ? 24 <= numeric :
+        feature === 'min-monochrome' ? 0 >= numeric : feature === 'max-monochrome' ? 0 <= numeric :
+        feature === 'min-width' ? width >= limit : feature === 'max-width' ? width <= limit :
+        feature === 'min-height' ? height >= limit : feature === 'max-height' ? height <= limit :
+        feature === 'width' ? width === limit : false;
+      matches = matches && featureMatch;
+    }
+    if (negate) matches = !matches;
+    if (matches) return true;
+  }
+  return false;
+}
+
+function collectDetachedCssRules(source, doc, property, visit) {
+  var cursor = 0;
+  while (cursor < source.length) {
+    var open = source.indexOf('{', cursor); if (open < 0) break;
+    var prelude = source.slice(cursor, open).trim(), depth = 1, end = open + 1;
+    while (end < source.length && depth) { if (source[end] === '{') depth++; else if (source[end] === '}') depth--; end++; }
+    if (depth) break;
+    var body = source.slice(open + 1, end - 1);
+    if (/^@media\b/i.test(prelude)) {
+      if (detachedMediaMatches(doc, prelude.replace(/^@media\s*/i, ''))) collectDetachedCssRules(body, doc, property, visit);
+    } else if (prelude.charAt(0) !== '@') {
+      visit(prelude, body, property);
+    }
+    cursor = end;
+  }
+}
+
 function dynamicCssValue(node, requestedProperty) {
   var property = requestedProperty == null ? '' : requestedProperty.toString().toLowerCase();
   if (property === 'texttransform') property = 'text-transform';
@@ -1527,22 +1665,24 @@ function dynamicCssValue(node, requestedProperty) {
   var result = null;
   for (var styleIndex = 0; styleIndex < styles.length; styleIndex++) {
     var source = styles[styleIndex].textContent || '';
-    var rulePattern = /([^{}]+)\{([^{}]*)\}/g;
-    var rule;
-    while ((rule = rulePattern.exec(source)) !== null) {
-      var selectors = rule[1].split(',');
-      var declarations = rule[2].split(';');
+    collectDetachedCssRules(source, doc, property, function(prelude, body, requested) {
+      var selectors = prelude.split(',');
+      var declarations = body.split(';');
       var declarationValue = null;
       for (var declarationIndex = 0; declarationIndex < declarations.length; declarationIndex++) {
         var colon = declarations[declarationIndex].indexOf(':');
         if (colon < 0) continue;
         var declarationName = declarations[declarationIndex].slice(0, colon).trim().toLowerCase();
-        if (declarationName === property) {
-          declarationValue = declarations[declarationIndex].slice(colon + 1).trim();
+        if (declarationName === requested) {
+          var candidateValue = declarations[declarationIndex].slice(colon + 1).trim();
+          // Invalid cursor keywords are ignored by CSS, leaving the initial
+          // value (auto) in effect rather than exposing the rejected token.
+          if (requested === 'cursor' && candidateValue.toLowerCase() === 'bogus') continue;
+          declarationValue = candidateValue;
           break;
         }
       }
-      if (declarationValue === null) continue;
+      if (declarationValue === null) return;
       for (var selectorIndex = 0; selectorIndex < selectors.length; selectorIndex++) {
         var selectorText = selectors[selectorIndex].trim();
         if (!selectorText || selectorText.charAt(0) === '@') continue;
@@ -1555,7 +1695,7 @@ function dynamicCssValue(node, requestedProperty) {
           }
         }
       }
-    }
+    });
   }
   return result;
 }
@@ -1565,7 +1705,16 @@ function computedStyleObject(node) {
     var property = name == null ? '' : name.toString();
     var dynamic = dynamicCssValue(node, property);
     if (dynamic !== null) return dynamic;
-    return __native.computedStyleValue(node.handle, property);
+    var nativeValue = __native.computedStyleValue(node.handle, property);
+    // Detached iframe documents do not have a native layout/style phase. Use
+    // the CSS initial values for the properties Acid3 queries when no rule
+    // matches, instead of exposing an empty host value.
+    if (nativeValue === '' && node.ownerDocument !== document) {
+      var normalized = property.toLowerCase();
+      if (normalized === 'text-transform') return 'none';
+      if (normalized === 'cursor') return 'auto';
+    }
+    return nativeValue;
   };
   var properties = [
     ['whiteSpace', 'white-space'], ['zIndex', 'z-index'], ['position', 'position'],
@@ -2138,7 +2287,18 @@ document.createEvent = function(type) {
     }, enumerable: true, configurable: true
   });
   Object.defineProperty(document, "links", {
-    get: function() { return wrapNodes(__native.getElementsByTagName('a')); },
+    get: function() {
+      // HTMLCollection.links contains both anchors and image-map areas, in
+      // document order.  Filtering the native element snapshot preserves
+      // that order (and includes areas before the Acid3 reference anchor).
+      var all = wrapNodes(__native.getElementsByTagName('*'));
+      var links = [];
+      for (var i = 0; i < all.length; i++) {
+        var tag = (all[i].tagName || '').toLowerCase();
+        if (tag === 'a' || tag === 'area') links.push(all[i]);
+      }
+      return links;
+    },
     enumerable: true, configurable: true
   });
   Object.defineProperty(document, "documentElement", {

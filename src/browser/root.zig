@@ -2546,6 +2546,7 @@ pub const Browser = struct {
             }
         }
         js_context.setRenderCallback(frame.window_id, jsRenderCallback, @ptrCast(render_context));
+        js_context.setStyleFlushCallback(frame.window_id, jsStyleFlushCallback, @ptrCast(render_context));
         js_context.setDocumentReadyStateCallback(
             frame.window_id,
             jsDocumentReadyStateCallback,
@@ -4129,6 +4130,7 @@ pub const Browser = struct {
             .prefers_dark = frame.tab.accessibility.prefers_dark,
             .forced_colors = frame.tab.accessibility.forced_colors,
             .viewport_width_css = frame.mediaViewportWidthCssPixels(),
+            .viewport_height_css = frame.mediaViewportHeightCssPixels(),
         };
     }
 
@@ -6631,6 +6633,7 @@ const runAnimationTimerThread = BrowserScriptTaskContexts.runAnimationTimerThrea
 const XhrThreadContext = BrowserScriptTaskContexts.XhrThreadContext;
 const runXhrThread = BrowserScriptTaskContexts.runXhrThread;
 const jsRenderCallback = BrowserScriptTaskContexts.jsRenderCallback;
+const jsStyleFlushCallback = BrowserScriptTaskContexts.jsStyleFlushCallback;
 const jsDocumentReadyStateCallback = BrowserScriptTaskContexts.jsDocumentReadyStateCallback;
 const jsFocusCallback = BrowserScriptTaskContexts.jsFocusCallback;
 const jsDomMutationCallback = BrowserScriptTaskContexts.jsDomMutationCallback;

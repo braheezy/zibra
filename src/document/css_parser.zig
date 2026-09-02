@@ -51,6 +51,12 @@ pub const MediaEnvironment = struct {
     prefers_dark: bool = false,
     forced_colors: bool = false,
     viewport_width_css: ?f64 = null,
+    viewport_height_css: ?f64 = null,
+    // Desktop screens are color displays. Keep these explicit rather than
+    // deriving them from the viewport so media queries remain deterministic
+    // in headless and screenshot modes.
+    color_depth: u8 = 24,
+    monochrome_depth: u8 = 0,
 };
 
 /// One parsed property value. The value borrows the stylesheet or inline-style
@@ -174,6 +180,47 @@ fn word(self: *CSSParser) ![]const u8 {
         return error.InvalidWord;
     }
     return self.string[start..self.pos];
+}
+
+/// Decode the CSS escape sequences retained by `word` into the identifier's
+/// actual Unicode value. Selectors compare against DOM attribute strings, so
+/// retaining the source spelling (for example `\\2003`) would make escaped
+/// class and ID selectors miss their elements.
+fn decodeIdentifier(allocator: std.mem.Allocator, raw: []const u8) ![]u8 {
+    var decoded = std.ArrayList(u8).empty;
+    errdefer decoded.deinit(allocator);
+    var cursor: usize = 0;
+    while (cursor < raw.len) {
+        if (raw[cursor] != '\\') {
+            try decoded.append(allocator, raw[cursor]);
+            cursor += 1;
+            continue;
+        }
+        cursor += 1;
+        if (cursor >= raw.len) return error.InvalidWord;
+        var codepoint: u32 = 0;
+        var digits: usize = 0;
+        while (cursor < raw.len and digits < 6) {
+            const byte = raw[cursor];
+            const digit: u32 = if (byte >= '0' and byte <= '9') byte - '0' else if (byte >= 'a' and byte <= 'f') byte - 'a' + 10 else if (byte >= 'A' and byte <= 'F') byte - 'A' + 10 else break;
+            codepoint = codepoint * 16 + digit;
+            cursor += 1;
+            digits += 1;
+        }
+        if (digits == 0) {
+            try decoded.append(allocator, raw[cursor]);
+            cursor += 1;
+            continue;
+        }
+        if (cursor < raw.len and std.ascii.isWhitespace(raw[cursor])) cursor += 1;
+        if (codepoint == 0 or codepoint > 0x10ffff or (codepoint >= 0xd800 and codepoint <= 0xdfff)) {
+            codepoint = 0xfffd;
+        }
+        var encoded: [4]u8 = undefined;
+        const encoded_len = try std.unicode.utf8Encode(@intCast(codepoint), &encoded);
+        try decoded.appendSlice(allocator, encoded[0..encoded_len]);
+    }
+    return decoded.toOwnedSlice(allocator);
 }
 
 fn literal(self: *CSSParser, lit: u8) !void {
@@ -447,6 +494,22 @@ fn isSupportedListStyleType(raw_value: []const u8) bool {
         std.ascii.eqlIgnoreCase(style_type, "none");
 }
 
+fn isCursorValue(raw_value: []const u8) bool {
+    const cursor_value = std.mem.trim(u8, raw_value, " \t\r\n\x0c");
+    const supported = [_][]const u8{
+        "auto",       "default",    "none",      "context-menu", "help",        "pointer",
+        "progress",   "wait",       "cell",      "crosshair",    "text",        "vertical-text",
+        "alias",      "copy",       "move",      "no-drop",      "not-allowed", "e-resize",
+        "n-resize",   "ne-resize",  "nw-resize", "s-resize",     "se-resize",   "sw-resize",
+        "w-resize",   "ew-resize",  "ns-resize", "nesw-resize",  "nwse-resize", "col-resize",
+        "row-resize", "all-scroll",
+    };
+    for (supported) |candidate| {
+        if (std.ascii.eqlIgnoreCase(cursor_value, candidate)) return true;
+    }
+    return false;
+}
+
 fn splitValueTokens(raw_value: []const u8, tokens: *[4][]const u8) ?usize {
     var count: usize = 0;
     var iterator = std.mem.tokenizeAny(u8, raw_value, " \t\r\n\x0c");
@@ -515,6 +578,7 @@ fn isValidLonghandValue(property: []const u8, raw_value: []const u8) bool {
         return isAutomaticOrSignedLength(raw_value);
     }
     if (std.mem.eql(u8, property, "z-index")) return isZIndex(raw_value);
+    if (std.mem.eql(u8, property, "cursor")) return isCursorValue(raw_value);
     if (std.mem.startsWith(u8, property, "margin-")) return isAutomaticOrSignedLength(raw_value);
     if (std.mem.startsWith(u8, property, "padding-")) return isNonnegativeLength(raw_value);
     if (std.mem.endsWith(u8, property, "-width") and std.mem.startsWith(u8, property, "border-")) {
@@ -539,6 +603,14 @@ fn isValidLonghandValue(property: []const u8, raw_value: []const u8) bool {
     if (std.mem.eql(u8, property, "background-attachment")) return isBackgroundAttachment(raw_value);
     if (std.mem.eql(u8, property, "font-size")) return isNonnegativeLength(raw_value);
     if (std.mem.eql(u8, property, "line-height")) return isSupportedFontLineHeight(raw_value);
+    if (std.mem.eql(u8, property, "white-space")) {
+        const trimmed_value = std.mem.trim(u8, raw_value, " \t\r\n\x0c");
+        return std.ascii.eqlIgnoreCase(trimmed_value, "normal") or
+            std.ascii.eqlIgnoreCase(trimmed_value, "pre") or
+            std.ascii.eqlIgnoreCase(trimmed_value, "pre-wrap") or
+            std.ascii.eqlIgnoreCase(trimmed_value, "pre-line") or
+            std.ascii.eqlIgnoreCase(trimmed_value, "nowrap");
+    }
     if (std.mem.eql(u8, property, "vertical-align")) {
         const alignment = std.mem.trim(u8, raw_value, " \t\r\n\x0c");
         return std.ascii.eqlIgnoreCase(alignment, "baseline") or
@@ -1130,8 +1202,19 @@ fn parseMediaPixelLength(raw_value: []const u8) ?f64 {
     const parsed_length = css_length.parse(value_text) orelse return null;
     return switch (parsed_length.unit) {
         .px, .mm => css_length.resolveLength(parsed_length, .{}),
-        .em, .percent => null,
+        // Media-query em units are resolved against the initial font size.
+        // The browser's default is 16 CSS px; unlike element em values this
+        // does not depend on the matched element's inherited style.
+        .em => parsed_length.value * 16.0,
+        .percent => null,
     };
+}
+
+fn parseMediaInteger(raw_value: []const u8) ?u8 {
+    const value_text = std.mem.trim(u8, raw_value, " \t\r\n");
+    const parsed = std.fmt.parseInt(u16, value_text, 10) catch return null;
+    if (parsed > std.math.maxInt(u8)) return null;
+    return @intCast(parsed);
 }
 
 fn mediaWidthsEqual(actual: f64, expected: f64) bool {
@@ -1144,6 +1227,10 @@ fn mediaWidthsEqual(actual: f64, expected: f64) bool {
 
 fn mediaFeatureMatches(self: *const CSSParser, raw_feature: []const u8) ?bool {
     const feature = std.mem.trim(u8, raw_feature, " \t\r\n");
+    // Boolean media features omit a colon and value entirely.
+    if (std.ascii.eqlIgnoreCase(feature, "color")) return self.media.color_depth > 0;
+    if (std.ascii.eqlIgnoreCase(feature, "monochrome")) return self.media.monochrome_depth > 0;
+
     const colon = std.mem.indexOfScalar(u8, feature, ':') orelse return null;
     const name = std.mem.trim(u8, feature[0..colon], " \t\r\n");
     const media_value = std.mem.trim(u8, feature[colon + 1 ..], " \t\r\n");
@@ -1164,6 +1251,39 @@ fn mediaFeatureMatches(self: *const CSSParser, raw_feature: []const u8) ?bool {
         const limit = parseMediaPixelLength(media_value) orelse return null;
         const viewport_width = self.media.viewport_width_css orelse return false;
         return viewport_width <= limit;
+    }
+
+    if (std.ascii.eqlIgnoreCase(name, "min-width")) {
+        const limit = parseMediaPixelLength(media_value) orelse return null;
+        const viewport_width = self.media.viewport_width_css orelse return false;
+        return viewport_width >= limit;
+    }
+
+    if (std.ascii.eqlIgnoreCase(name, "min-height") or
+        std.ascii.eqlIgnoreCase(name, "max-height"))
+    {
+        const limit = parseMediaPixelLength(media_value) orelse return null;
+        const viewport_height = self.media.viewport_height_css orelse return false;
+        if (std.ascii.eqlIgnoreCase(name, "min-height")) return viewport_height >= limit;
+        return viewport_height <= limit;
+    }
+
+    if (std.ascii.eqlIgnoreCase(name, "min-color") or
+        std.ascii.eqlIgnoreCase(name, "max-color"))
+    {
+        const limit = parseMediaInteger(media_value) orelse return null;
+        const depth = self.media.color_depth;
+        if (std.ascii.eqlIgnoreCase(name, "min-color")) return depth >= limit;
+        return depth <= limit;
+    }
+
+    if (std.ascii.eqlIgnoreCase(name, "min-monochrome") or
+        std.ascii.eqlIgnoreCase(name, "max-monochrome"))
+    {
+        const limit = parseMediaInteger(media_value) orelse return null;
+        const depth = self.media.monochrome_depth;
+        if (std.ascii.eqlIgnoreCase(name, "min-monochrome")) return depth >= limit;
+        return depth <= limit;
     }
 
     if (std.ascii.eqlIgnoreCase(name, "width")) {
@@ -1290,6 +1410,11 @@ pub fn selector(self: *CSSParser, allocator: std.mem.Allocator) !Selector {
             self.pos += 1;
             self.whitespace();
             break :blk .adjacent;
+        } else if (self.string[self.pos] == '~') blk: {
+            has_explicit_combinator = true;
+            self.pos += 1;
+            self.whitespace();
+            break :blk .general_sibling;
         } else if (self.pos != before_whitespace)
             .descendant
         else
@@ -1548,7 +1673,9 @@ fn simpleSelector(self: *CSSParser, allocator: std.mem.Allocator) !SimpleSelecto
         var cursor: usize = 0;
         if (raw[0] != '.' and raw[0] != '#') {
             const tag_end = std.mem.indexOfAny(u8, raw, ".#") orelse raw.len;
-            const lower_tag = try std.ascii.allocLowerString(allocator, raw[0..tag_end]);
+            const decoded_tag = try decodeIdentifier(allocator, raw[0..tag_end]);
+            defer allocator.free(decoded_tag);
+            const lower_tag = try std.ascii.allocLowerString(allocator, decoded_tag);
             try appendSequenceSelector(
                 allocator,
                 &selectors,
@@ -1567,7 +1694,7 @@ fn simpleSelector(self: *CSSParser, allocator: std.mem.Allocator) !SimpleSelecto
             const name_len = std.mem.indexOfAny(u8, remaining, ".#") orelse remaining.len;
             if (name_len == 0) return error.InvalidSelector;
 
-            const name = try allocator.dupe(u8, remaining[0..name_len]);
+            const name = try decodeIdentifier(allocator, remaining[0..name_len]);
             if (marker == '.') {
                 try appendSequenceSelector(
                     allocator,
@@ -2024,6 +2151,31 @@ test "width media queries match the exact CSS viewport width" {
     }
 }
 
+test "Acid3 color and height media features use iframe viewport values" {
+    const allocator = std.testing.allocator;
+    const css =
+        "@media (min-color: 1) { p { color: red; } }" ++
+        "@media (max-color: 0) { p { color: blue; } }" ++
+        "@media color { p { background-color: red; } }" ++
+        "@media (min-monochrome: 0) { p { border-color: green; } }" ++
+        "@media monochrome { p { border-color: blue; } }" ++
+        "@media (min-height: 1em) and (min-width: 1em) { p { color: purple; } }";
+
+    var parser = try CSSParser.initWithMedia(allocator, css, .{
+        .viewport_width_css = 20,
+        .viewport_height_css = 20,
+    });
+    defer parser.deinit(allocator);
+    const rules = try parser.parse(allocator);
+    defer {
+        for (rules) |*rule| rule.deinit(allocator);
+        allocator.free(rules);
+    }
+
+    // 24-bit color, non-monochrome, and 20px >= the 16px default em.
+    try std.testing.expectEqual(@as(usize, 3), rules.len);
+}
+
 test "millimeter lengths remain valid CSS dimensions" {
     const allocator = std.testing.allocator;
     const css =
@@ -2061,7 +2213,7 @@ test "vertical-align accepts bounded inline alignment values" {
     try std.testing.expectEqualStrings("bottom", rules[0].properties.get("vertical-align").?.value);
 }
 
-test "width and color media features compose and reject unsupported lengths" {
+test "width and color media features compose with relative lengths" {
     const allocator = std.testing.allocator;
     const css =
         "@media (max-width: 640px) and (prefers-color-scheme: dark) { p { color: green; } }" ++
@@ -2079,7 +2231,7 @@ test "width and color media features compose and reject unsupported lengths" {
         for (matching_rules) |*rule| rule.deinit(allocator);
         allocator.free(matching_rules);
     }
-    try std.testing.expectEqual(@as(usize, 1), matching_rules.len);
+    try std.testing.expectEqual(@as(usize, 3), matching_rules.len);
     try std.testing.expectEqualStrings("green", matching_rules[0].properties.get("color").?.value);
 
     var light_parser = try CSSParser.initWithMedia(
@@ -2093,7 +2245,7 @@ test "width and color media features compose and reject unsupported lengths" {
         for (light_rules) |*rule| rule.deinit(allocator);
         allocator.free(light_rules);
     }
-    try std.testing.expectEqual(@as(usize, 0), light_rules.len);
+    try std.testing.expectEqual(@as(usize, 2), light_rules.len);
 }
 
 test "forced-colors media feature selects active and none rules" {

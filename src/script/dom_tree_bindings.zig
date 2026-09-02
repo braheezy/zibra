@@ -35,6 +35,8 @@ pub const Host = struct {
     context: ?*anyopaque,
     allocator: std.mem.Allocator,
     active_window: *const fn (?*anyopaque) ?WindowBorrow,
+    /// Flush computed style for synchronous getComputedStyle readback.
+    style_flush: ?*const fn (?*anyopaque) anyerror!void = null,
 };
 
 /// Native functions installed on the private `__native` object.
@@ -500,6 +502,17 @@ fn computedStyleValue(agent: *Agent, this_value: Value, arguments: Arguments) Ag
         .text => "",
         .element => |*element| blk: {
             if (element.style) |*styles| {
+                var style_dirty = false;
+                var style_it = styles.iterator();
+                while (style_it.next()) |entry| {
+                    if (entry.value_ptr.dirty) {
+                        style_dirty = true;
+                        break;
+                    }
+                }
+                if (style_dirty) if (host.style_flush) |flush| flush(host.context) catch |err| {
+                    std.log.warn("Computed-style flush failed: {}", .{err});
+                };
                 if (styles.getPtr(property)) |field| break :blk field.lastValue().*;
             }
             break :blk if (std.mem.eql(u8, property, "z-index")) "auto" else if (std.mem.eql(u8, property, "white-space")) "normal" else "";

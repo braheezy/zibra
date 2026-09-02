@@ -238,6 +238,7 @@ const WindowRealm = struct {
     named_globals_synced: bool,
     pending_messages: std.ArrayList(PendingMessage),
     render_callback: RenderCallback,
+    style_flush_callback: RenderCallback,
     focus_callback: FocusCallback,
     dom_mutation_callback: DomMutationCallback,
     dom_mutation_complete_callback: DomMutationCompleteCallback,
@@ -339,6 +340,7 @@ pub fn init(
         .context = self,
         .allocator = allocator,
         .active_window = activeDomTreeWindow,
+        .style_flush = flushBindingStyle,
     };
     self.event_focus_host = .{
         .context = self,
@@ -410,6 +412,7 @@ fn createWindowRealmLocked(self: *Js) !*WindowRealm {
         .named_globals_synced = false,
         .pending_messages = std.ArrayList(PendingMessage).empty,
         .render_callback = .{},
+        .style_flush_callback = .{},
         .focus_callback = .{},
         .dom_mutation_callback = .{},
         .dom_mutation_complete_callback = .{},
@@ -448,6 +451,7 @@ fn retireWindowRealmLocked(self: *Js, window: *WindowRealm) void {
     window.current_nodes = null;
     window.named_globals_synced = false;
     window.render_callback = .{};
+    window.style_flush_callback = .{};
     window.focus_callback = .{};
     window.dom_mutation_callback = .{};
     window.dom_mutation_complete_callback = .{};
@@ -729,6 +733,15 @@ pub fn setRenderCallback(self: *Js, window_id: u32, callback: ?RenderCallbackFn,
     const window = self.getWindowContext(window_id) catch return;
     if (window.retired) return;
     window.render_callback = .{
+        .function = callback,
+        .context = context,
+    };
+}
+
+pub fn setStyleFlushCallback(self: *Js, window_id: u32, callback: ?RenderCallbackFn, context: ?*anyopaque) void {
+    const window = self.getWindowContext(window_id) catch return;
+    if (window.retired) return;
+    window.style_flush_callback = .{
         .function = callback,
         .context = context,
     };
@@ -1149,6 +1162,16 @@ fn activeDomTreeWindow(context: ?*anyopaque) ?dom_tree_bindings.WindowBorrow {
 
 fn requestBindingRender(context: ?*anyopaque) void {
     hostFromBindingContext(context).requestRender();
+}
+
+fn flushBindingStyle(context: ?*anyopaque) anyerror!void {
+    const self = hostFromBindingContext(context);
+    const window_id = self.current_window_id orelse return;
+    const window = self.windows.get(window_id) orelse return;
+    if (window.retired) return;
+    if (window.style_flush_callback.function) |callback| {
+        try callback(window.style_flush_callback.context);
+    }
 }
 
 fn currentBindingWindowId(context: ?*anyopaque) ?u32 {

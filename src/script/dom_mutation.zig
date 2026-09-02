@@ -230,6 +230,18 @@ pub fn directChildIndex(parent: *Node, child: *Node) ?usize {
     };
 }
 
+/// Structural selectors such as `:last-child` and `:nth-child` depend on the
+/// sibling list, not only on the element being removed. Dirty the affected
+/// siblings before an ordered removal shifts their by-value addresses.
+fn dirtyAffectedSiblingStyles(parent: *parser.Element, first_index: usize) void {
+    for (parent.children.items[first_index..]) |*child| {
+        switch (child.*) {
+            .element => |*element| parser.dirtyStyleForElement(element),
+            .text => {},
+        }
+    }
+}
+
 /// Move a window-owned detached root into an element's by-value child array.
 /// All mutation-related allocations happen before handle maps or detached
 /// ownership change. Republishing named globals can still fail afterward, but
@@ -244,6 +256,7 @@ pub fn insertDetachedChild(
     defer bindings.deinit(self.allocator);
 
     const parent_is_attached = isAttachedToCurrentDocument(self.current_nodes, parent);
+    const refresh_named = parent_is_attached and subtreeHasId(child);
     const parent_parent = nodeParent(parent);
     const element = &parent.element;
     const retains_layout_children = parent_is_attached and
@@ -267,9 +280,9 @@ pub fn insertDetachedChild(
         }
     }
 
-    if (parent_is_attached) try self.hooks.clear_named(self.host_context, self.window_id);
+    if (refresh_named) try self.hooks.clear_named(self.host_context, self.window_id);
     var mutation_started = false;
-    errdefer if (parent_is_attached and !mutation_started) {
+    errdefer if (refresh_named and !mutation_started) {
         self.hooks.sync_named(self.host_context, self.window_id) catch {};
     };
 
@@ -307,7 +320,7 @@ pub fn insertDetachedChild(
 
     if (parent_is_attached) {
         self.hooks.complete(self.host_context, parent);
-        try self.hooks.sync_named(self.host_context, self.window_id);
+        if (refresh_named) try self.hooks.sync_named(self.host_context, self.window_id);
         self.hooks.request_render(self.host_context);
     }
 }
@@ -342,11 +355,13 @@ pub fn detachChild(
     try self.detached_nodes.ensureUnusedCapacity(1);
 
     const parent_is_attached = isAttachedToCurrentDocument(self.current_nodes, parent);
+    const refresh_named = parent_is_attached and subtreeHasId(child);
     const parent_parent = nodeParent(parent);
     const element = &parent.element;
 
-    if (parent_is_attached) try self.hooks.clear_named(self.host_context, self.window_id);
+    if (refresh_named) try self.hooks.clear_named(self.host_context, self.window_id);
 
+    dirtyAffectedSiblingStyles(element, if (remove_index > 0) remove_index - 1 else 0);
     element.markChildrenDirty();
     parser.dirtyStyleForElement(element);
     markElementLayoutDirty(element);
@@ -376,7 +391,7 @@ pub fn detachChild(
 
     if (parent_is_attached) {
         self.hooks.complete(self.host_context, parent);
-        try self.hooks.sync_named(self.host_context, self.window_id);
+        if (refresh_named) try self.hooks.sync_named(self.host_context, self.window_id);
         self.hooks.request_render(self.host_context);
     }
 }
@@ -437,6 +452,17 @@ fn subtreeHasPublishedHandle(handles: *const DomHandles, node: *Node) bool {
                 if (subtreeHasPublishedHandle(handles, child)) break :child_handle true;
             }
             break :child_handle false;
+        },
+    };
+}
+
+fn subtreeHasId(node: *const Node) bool {
+    return switch (node.*) {
+        .text => false,
+        .element => |*element| blk: {
+            if (element.attributes) |attributes| if (attributes.contains("id")) break :blk true;
+            for (element.children.items) |*child| if (subtreeHasId(child)) break :blk true;
+            break :blk false;
         },
     };
 }
@@ -757,6 +783,7 @@ pub fn transferElementChildren(
 
     for (parents.items) |parent| {
         const element = &parent.node.element;
+        dirtyAffectedSiblingStyles(element, 0);
         element.markChildrenDirty();
         parser.dirtyStyleForElement(element);
         markElementLayoutDirty(element);

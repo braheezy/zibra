@@ -598,7 +598,7 @@ pub const Element = struct {
     }
 
     pub fn isChecked(self: *const Element) bool {
-        if (!self.isCheckbox()) return false;
+        if (!self.isCheckbox() and !self.isInputType("radio")) return false;
         const attributes = self.attributes orelse return false;
         return attributes.get("checked") != null;
     }
@@ -624,7 +624,7 @@ pub const Element = struct {
     /// state. Attribute keys and values borrow either document storage or the
     /// static strings inserted here; the map never takes string ownership.
     pub fn toggleChecked(self: *Element) !bool {
-        if (!self.isCheckbox()) return false;
+        if (!self.isCheckbox() and !self.isInputType("radio")) return false;
         if (self.attributes) |*attributes| {
             if (attributes.remove("checked")) return false;
             try attributes.put("checked", "");

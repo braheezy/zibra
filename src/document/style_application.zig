@@ -38,6 +38,8 @@ const INHERITED_PROPERTIES = [_]InheritedProperty{
     .{ .name = "font-weight", .default_value = "normal" },
     .{ .name = "font-stretch", .default_value = "normal" },
     .{ .name = "line-height", .default_value = "normal" },
+    .{ .name = "white-space", .default_value = "normal" },
+    .{ .name = "cursor", .default_value = "auto" },
     .{ .name = "vertical-align", .default_value = "baseline" },
     .{ .name = "text-align", .default_value = "start" },
     .{ .name = "list-style-type", .default_value = "disc" },
