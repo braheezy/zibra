@@ -161,6 +161,11 @@ fn nodeClearSide(node: Node) ClearSide {
 fn isContainerNode(node: Node, dependency_target: ?*ProtectedField(u64)) bool {
     return switch (node) {
         .element => |element| blk: {
+            // Metadata-only elements (including image maps) stay in the
+            // surrounding inline run so their descendants can be suppressed
+            // together; promoting them to a block would allow retained
+            // out-of-flow descendants to escape the hidden subtree.
+            if (isNonRenderedElement(&element)) break :blk false;
             if (isOutOfFlowPosition(nodePositionMode(node, dependency_target))) break :blk true;
             if (nodeFloatSide(node, dependency_target) != .none) break :blk true;
             if (table_format.establishesFormattingContext(nodeTableRole(node, dependency_target))) {
@@ -1062,12 +1067,13 @@ const LineItemPayload = union(enum) {
     }
 };
 
-/// The bounded inline alignment modes retained on replaced line items.
-/// Full `vertical-align` needs inline-box construction, but baseline and
-/// bottom cover normal replaced content without changing glyph layout.
-const VerticalAlign = enum {
+/// Inline alignment retained on replaced line items. Length values are stored
+/// in layout pixels and raise (positive) or lower (negative) the item relative
+/// to the shared text baseline.
+const VerticalAlign = union(enum) {
     baseline,
     bottom,
+    offset: i32,
 };
 
 const LineItem = struct {
@@ -1461,6 +1467,12 @@ test "computed display classifies block children" {
     try std.testing.expect(isBlockDisplay("list-item"));
     try std.testing.expect(!isBlockDisplay("inline"));
     try std.testing.expect(!isBlockDisplay("unsupported"));
+}
+
+test "image-map metadata suppresses descendants from rendering" {
+    try std.testing.expect(isNonRenderTag("map"));
+    try std.testing.expect(isNonRenderTag("AREA"));
+    try std.testing.expect(!isNonRenderTag("object"));
 }
 
 test "used border styles control border-only block geometry" {
@@ -3120,20 +3132,22 @@ pub fn deinit(self: *Layout) void {
 }
 
 fn recurseNode(self: *Layout, node: Node, node_ptr: ?*Node, line_buffer: *std.ArrayList(LineItem)) !void {
+    // Non-rendered metadata containers (notably <map>) suppress their entire
+    // descendant subtree. Checking ancestors is necessary because an object
+    // fallback can be several levels below the map element.
+    var ancestor = node_ptr;
+    while (ancestor) |ptr| {
+        if (ptr.* == .element and isNonRenderedElement(&ptr.element)) return;
+        ancestor = switch (ptr.*) {
+            .element => |*element| element.parent,
+            .text => |*text| text.parent,
+        };
+    }
     switch (node) {
         .text => |t| {
-            if (t.parent) |parent| {
-                switch (parent.*) {
-                    .element => |e| {
-                        if (isNonRenderedElement(&e)) return;
-                    },
-                    else => {},
-                }
-            }
             try self.handleTextToken(t.text, line_buffer, node_ptr);
         },
         .element => |e| {
-            if (isNonRenderedElement(&e)) return;
             // Empty inline anchors have no glyph from which to derive a
             // position, so retain their insertion point explicitly.
             if (self.collect_hit_test_bounds and e.children.items.len == 0) {
@@ -3217,7 +3231,11 @@ fn isNonRenderTag(tag: []const u8) bool {
         std.ascii.eqlIgnoreCase(tag, "head") or
         std.ascii.eqlIgnoreCase(tag, "meta") or
         std.ascii.eqlIgnoreCase(tag, "link") or
-        std.ascii.eqlIgnoreCase(tag, "title");
+        std.ascii.eqlIgnoreCase(tag, "title") or
+        // Image maps are metadata for an <img>; neither the map nor its
+        // fallback/object children participate in document painting.
+        std.ascii.eqlIgnoreCase(tag, "map") or
+        std.ascii.eqlIgnoreCase(tag, "area");
 }
 
 fn isNonRenderedElement(element: *const parser.Element) bool {
@@ -3285,7 +3303,7 @@ fn handleImageElement(self: *Layout, node: Node, node_ptr: ?*Node, line_buffer: 
     } else null;
     if (style_map) |styles| registerReplacedSizeDependencies(self, styles);
     const vertical_align = if (style_map) |styles|
-        verticalAlignForStyle(styles)
+        verticalAlignForStyle(styles, self.font_size_css)
     else
         .baseline;
 
@@ -3461,13 +3479,19 @@ fn styleVisibilityHidden(style_map: *const parser.StyleMap) bool {
     return std.ascii.eqlIgnoreCase(std.mem.trim(u8, value, " \t\r\n"), "hidden");
 }
 
-fn verticalAlignForStyle(style_map: *const parser.StyleMap) VerticalAlign {
+fn verticalAlignForStyle(style_map: *const parser.StyleMap, font_size_css: f64) VerticalAlign {
     const value = std.mem.trim(
         u8,
         styleValue(style_map, "vertical-align") orelse "baseline",
         " \t\r\n",
     );
-    return if (std.ascii.eqlIgnoreCase(value, "bottom")) .bottom else .baseline;
+    if (std.ascii.eqlIgnoreCase(value, "bottom")) return .bottom;
+    if (std.ascii.eqlIgnoreCase(value, "baseline")) return .baseline;
+    if (box_model.resolveCssLength(value, .{
+        .font_size = font_size_css,
+        .percentage_base = font_size_css,
+    })) |offset| return .{ .offset = offset };
+    return .baseline;
 }
 
 fn isInlineBlockDisplay(style_map: *const parser.StyleMap) bool {
@@ -3497,7 +3521,10 @@ fn appendInlineBlock(
         .line_height = self.lineHeightForNatural(block.height),
         .width = block.width,
         .height = block.height,
-        .vertical_align = if (element.style) |*styles| verticalAlignForStyle(styles) else .baseline,
+        .vertical_align = if (element.style) |*styles|
+            verticalAlignForStyle(styles, self.font_size_css)
+        else
+            .baseline,
         .node_ptr = node_ptr,
         .payload = .{ .inline_block = block },
     });
@@ -3918,6 +3945,7 @@ fn alignedLineItemY(
             baseline - baseline_ascent
         else
             baseline - item_ascent,
+        .offset => |offset| baseline - item_ascent - offset,
     };
 }
 
@@ -3927,6 +3955,10 @@ test "bottom-aligned replaced inline uses the completed line box" {
     try std.testing.expectEqual(@as(i32, 6), baseline_y);
     try std.testing.expectEqual(@as(i32, 10), bottom_y);
     try std.testing.expectEqual(@as(i32, 10), alignedLineItemY(.baseline, true, 10, 24, 30, 20, 7, 7));
+    try std.testing.expectEqual(
+        @as(i32, -30),
+        alignedLineItemY(.{ .offset = 40 }, false, 10, 24, 30, 20, 20, 20),
+    );
 }
 
 fn flushLine(self: *Layout, line_buffer: *std.ArrayList(LineItem)) !void {
@@ -3982,13 +4014,20 @@ fn flushLine(self: *Layout, line_buffer: *std.ArrayList(LineItem)) !void {
             .canvas => false,
             .iframe => false,
         };
+        const alignment_offset: i32 = switch (item.vertical_align) {
+            .offset => |offset| offset,
+            .baseline, .bottom => 0,
+        };
         if (is_superscript) {
             max_superscript_ascent = @max(max_superscript_ascent, item.ascent);
             max_superscript_descent = @max(max_superscript_descent, item.descent);
         } else {
             has_normal_item = true;
-            max_normal_ascent = @max(max_normal_ascent, item.ascent);
-            max_normal_descent = @max(max_normal_descent, item.descent);
+            if (alignment_offset >= 0) {
+                max_normal_ascent = @max(max_normal_ascent, item.ascent + alignment_offset);
+            } else {
+                max_normal_descent = @max(max_normal_descent, item.descent - alignment_offset);
+            }
         }
     }
 
@@ -8577,7 +8616,11 @@ const BlockLayout = struct {
             0,
         );
         const auto_width = if (shrink_to_fit_width) |width|
-            @min(width, auto_content_width)
+            // A zero-width containing block (common for absolutely
+            // positioned overlays) still permits the positioned child to
+            // size itself to its contents. Clamping its preferred width to
+            // zero would collapse text such as Acid3's score into a column.
+            if (auto_content_width <= 0) width else @min(width, auto_content_width)
         else
             auto_content_width;
         const used_content_width = specified_width orelse

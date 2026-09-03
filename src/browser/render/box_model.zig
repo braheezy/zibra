@@ -369,6 +369,17 @@ pub fn resolvedPixelDimension(
         if (styleValue(style_map, property)) |value| resolveCssLength(value, context) else null;
 }
 
+fn intrinsicTextWidth(text: []const u8, font_size: f64) ?i32 {
+    if (std.mem.trim(u8, text, " \t\r\n\x0c").len == 0) return null;
+    const codepoints = std.unicode.utf8CountCodepoints(text) catch text.len;
+    if (codepoints == 0) return null;
+    // This is a pre-layout estimate used only to resolve positioned
+    // shrink-to-fit boxes. The real inline pass measures each glyph; a
+    // 0.6em average keeps common proportional text close enough for the
+    // containing-block and right-inset calculation.
+    return @max(@as(i32, @intFromFloat(@as(f64, @floatFromInt(codepoints)) * font_size * 0.6)), 1);
+}
+
 fn intrinsicOuterWidth(
     element: *const parser.Element,
     containing_width_css: f64,
@@ -407,8 +418,24 @@ fn intrinsicOuterWidth(
     }
     if (content_width == null) {
         for (element.children.items) |*child| {
+            // Out-of-flow descendants do not contribute to their parent's
+            // shrink-to-fit width. Their own containing block still performs
+            // an independent shrink-to-fit calculation. This distinction is
+            // important for an absolutely positioned child inside a zero-
+            // width anchor such as Acid3's score container.
+            switch (child.*) {
+                .element => |*child_element| {
+                    if (child_element.style) |*child_styles| {
+                        const child_position = parsePositionMode(
+                            styleValue(child_styles, "position") orelse "static",
+                        );
+                        if (child_position == .absolute or child_position == .fixed) continue;
+                    }
+                },
+                .text => {},
+            }
             const child_width = switch (child.*) {
-                .text => null,
+                .text => |text| intrinsicTextWidth(text.text, font_size),
                 .element => |*child_element| intrinsicOuterWidth(
                     child_element,
                     containing_width_css,
@@ -441,7 +468,7 @@ pub fn shrinkToFitSpecifiedContentWidth(
     var width: ?i32 = null;
     for (element.children.items) |*child| {
         const child_width = switch (child.*) {
-            .text => null,
+            .text => |text| intrinsicTextWidth(text.text, inherited_font_size),
             .element => |*child_element| intrinsicOuterWidth(
                 child_element,
                 containing_width_css,
@@ -649,6 +676,26 @@ test "shrink-to-fit measurement uses definite descendant outer widths" {
     try std.testing.expectEqual(
         @as(?i32, 58),
         shrinkToFitSpecifiedContentWidth(&root.element, 400, 16),
+    );
+}
+
+test "shrink-to-fit measurement includes direct text content" {
+    const allocator = std.testing.allocator;
+    var html_parser = try parser.HTMLParser.init(
+        allocator,
+        "<div style='position:absolute'><div style='position:absolute'>100/100</div></div>",
+    );
+    html_parser.use_implicit_tags = false;
+    defer html_parser.deinit(allocator);
+    var root = try html_parser.parse();
+    defer root.deinit(allocator);
+    try parser.style(allocator, &root, &.{});
+
+    // Seven characters at the inherited 16px font produce a non-zero
+    // preferred width, even though the containing block itself is zero wide.
+    try std.testing.expectEqual(
+        @as(?i32, 67),
+        shrinkToFitSpecifiedContentWidth(&root.element, 0, 16),
     );
 }
 

@@ -2155,6 +2155,14 @@ function serializePostMessage(message) {
 }
 
 window.postMessage = function(message, targetWindowId, targetOrigin) {
+  // The page-facing Window API is postMessage(message, targetOrigin). The
+  // native bridge additionally accepts an explicit numeric target id for
+  // cross-frame delivery; use the current window when the standard two-
+  // argument form is used (notably window.parent === window at top level).
+  if (arguments.length < 3) {
+    targetOrigin = targetWindowId;
+    targetWindowId = window.__id;
+  }
   var payload = serializePostMessage(message);
   var origin = targetOrigin === undefined ? "/" : targetOrigin.toString();
   __native.postMessage(payload, targetWindowId, origin);
