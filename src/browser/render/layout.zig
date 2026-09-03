@@ -552,6 +552,106 @@ const EmbedLayout = struct {
     }
 };
 
+/// A compact inline formatting box for `display:inline-block` elements.
+///
+/// The normal layout tree intentionally groups inline DOM runs into one
+/// anonymous BlockLayout.  Inline-blocks are atomic participants in that
+/// run, however, so they need a small retained line item of their own.  The
+/// item owns only resolved paint values; it borrows the DOM node through the
+/// line item's source while the synchronous paint pass is assembling the
+/// display list.
+const InlineBlockLayout = struct {
+    width: i32,
+    height: i32,
+    margin_left: i32,
+    margin_right: i32,
+    background: ?browser.Color,
+    border: BoxEdges,
+    border_visible: [4]bool,
+    border_colors: [4]browser.Color,
+    visible: bool,
+
+    fn init(engine: *Layout, element: *const parser.Element) InlineBlockLayout {
+        const styles = element.style orelse return .{
+            .width = 0,
+            .height = 0,
+            .margin_left = 0,
+            .margin_right = 0,
+            .background = null,
+            .border = .{},
+            .border_visible = .{ false, false, false, false },
+            .border_colors = .{ .{ .r = 0, .g = 0, .b = 0, .a = 0 }, .{ .r = 0, .g = 0, .b = 0, .a = 0 }, .{ .r = 0, .g = 0, .b = 0, .a = 0 }, .{ .r = 0, .g = 0, .b = 0, .a = 0 } },
+            .visible = true,
+        };
+        const containing_width = engine.containingBlockCssDimension(false) orelse
+            cssPixelsFromLayout(engine.line_right -| engine.line_left, engine.effectiveZoom(), engine.zoom());
+        const edges = resolveBoxEdges(
+            &styles,
+            engine.font_size_css,
+            containing_width,
+            engine.effectiveZoom(),
+            engine.zoom(),
+        );
+        const context = parser.CssLengthResolutionContext{
+            .font_size = engine.font_size_css,
+            .percentage_base = containing_width,
+        };
+        const content_width = if (styleValue(&styles, "width")) |value|
+            if (resolveCssLength(value, context)) |pixels|
+                engine.scaleActiveCssFloat(pixels)
+            else
+                0
+        else
+            0;
+        const content_height = if (styleValue(&styles, "height")) |value|
+            if (resolveCssLength(value, context)) |pixels|
+                engine.scaleActiveCssFloat(pixels)
+            else
+                0
+        else
+            0;
+        const background = if (styleValue(&styles, "background-color")) |value|
+            if (std.ascii.eqlIgnoreCase(std.mem.trim(u8, value, " \t\r\n"), "transparent"))
+                null
+            else
+                parseColor(value)
+        else
+            null;
+        const style_names = [_][]const u8{
+            "border-top-style", "border-right-style", "border-bottom-style", "border-left-style",
+        };
+        const color_names = [_][]const u8{
+            "border-top-color", "border-right-color", "border-bottom-color", "border-left-color",
+        };
+        var border_visible = [4]bool{ false, false, false, false };
+        var border_colors = [4]browser.Color{ .{ .r = 0, .g = 0, .b = 0, .a = 0 }, .{ .r = 0, .g = 0, .b = 0, .a = 0 }, .{ .r = 0, .g = 0, .b = 0, .a = 0 }, .{ .r = 0, .g = 0, .b = 0, .a = 0 } };
+        for (style_names, color_names, 0..) |style_name, color_name, index| {
+            const style = styleValue(&styles, style_name) orelse "none";
+            const border_width = switch (index) {
+                0 => edges.border.top,
+                1 => edges.border.right,
+                2 => edges.border.bottom,
+                else => edges.border.left,
+            };
+            border_visible[index] = !std.ascii.eqlIgnoreCase(std.mem.trim(u8, style, " \t\r\n"), "none") and
+                !std.ascii.eqlIgnoreCase(std.mem.trim(u8, style, " \t\r\n"), "hidden") and
+                border_width > 0;
+            border_colors[index] = borderColorForSide(engine, &styles, element, color_name);
+        }
+        return .{
+            .width = @max(@as(i32, @intFromFloat(content_width)) +| edges.padding.horizontal() +| edges.border.horizontal(), 0),
+            .height = @max(@as(i32, @intFromFloat(content_height)) +| edges.padding.vertical() +| edges.border.vertical(), 0),
+            .margin_left = edges.margin.left,
+            .margin_right = edges.margin.right,
+            .background = background,
+            .border = edges.border,
+            .border_visible = border_visible,
+            .border_colors = border_colors,
+            .visible = !styleVisibilityHidden(&styles),
+        };
+    }
+};
+
 const ImageLayout = struct {
     embed: EmbedLayout,
     pixels: []const u8,
@@ -942,6 +1042,7 @@ const LineItemPayload = union(enum) {
         glyph: font.Glyph,
         color: browser.Color,
     },
+    inline_block: InlineBlockLayout,
     input: InputLayout,
     button: ButtonLayout,
     image: ImageLayout,
@@ -951,6 +1052,7 @@ const LineItemPayload = union(enum) {
     fn deinit(self: *LineItemPayload) void {
         switch (self.*) {
             .glyph => {},
+            .inline_block => {},
             .input => |*input_payload| input_payload.deinit(),
             .button => |*button_payload| button_payload.deinit(),
             .image => |*image_payload| image_payload.deinit(),
@@ -3055,6 +3157,18 @@ fn recurseNode(self: *Layout, node: Node, node_ptr: ?*Node, line_buffer: *std.Ar
             if (isPreformattedElement(&e)) self.is_preformatted = true;
             defer self.is_preformatted = previous_preformatted;
 
+            // Inline-blocks are atomic line participants. Their box is
+            // painted by the completed line item instead of being flattened
+            // into the anonymous inline run (which would otherwise lose an
+            // empty element's width, padding, border, and background).
+            if (e.style) |*styles| {
+                if (isInlineBlockDisplay(styles)) {
+                    try appendInlineBlock(self, &e, node_ptr, line_buffer);
+                    try self.restoreNodeStyles(line_buffer);
+                    return;
+                }
+            }
+
             // Handle br tag for line breaks
             if (std.mem.eql(u8, e.tag, "br")) {
                 try self.breakExplicitLine(line_buffer);
@@ -3354,6 +3468,41 @@ fn verticalAlignForStyle(style_map: *const parser.StyleMap) VerticalAlign {
         " \t\r\n",
     );
     return if (std.ascii.eqlIgnoreCase(value, "bottom")) .bottom else .baseline;
+}
+
+fn isInlineBlockDisplay(style_map: *const parser.StyleMap) bool {
+    const value = styleValue(style_map, "display") orelse return false;
+    return std.ascii.eqlIgnoreCase(std.mem.trim(u8, value, " \t\r\n"), "inline-block");
+}
+
+fn appendInlineBlock(
+    self: *Layout,
+    element: *const parser.Element,
+    node_ptr: ?*Node,
+    line_buffer: *std.ArrayList(LineItem),
+) !void {
+    const block = InlineBlockLayout.init(self, element);
+    if (block.width == 0 and block.height == 0) return;
+    const outer_width = block.margin_left +| block.width +| block.margin_right;
+    if (self.cursor_x +| outer_width > self.line_right and self.cursor_x > self.line_left) {
+        try self.flushLine(line_buffer);
+        self.cursor_x = self.line_left;
+    }
+    try line_buffer.append(self.allocator, .{
+        .x = self.cursor_x +| block.margin_left,
+        .hit_offset_x = self.transform_offset_x,
+        .hit_offset_y = self.transform_offset_y,
+        .ascent = block.height,
+        .descent = 0,
+        .line_height = self.lineHeightForNatural(block.height),
+        .width = block.width,
+        .height = block.height,
+        .vertical_align = if (element.style) |*styles| verticalAlignForStyle(styles) else .baseline,
+        .node_ptr = node_ptr,
+        .payload = .{ .inline_block = block },
+    });
+    self.cursor_x += outer_width;
+    self.last_was_collapsible_space = false;
 }
 
 fn registerStyleDependencies(
@@ -3826,6 +3975,7 @@ fn flushLine(self: *Layout, line_buffer: *std.ArrayList(LineItem)) !void {
         if (item.vertical_align == .bottom) continue;
         const is_superscript = switch (item.payload) {
             .glyph => |glyph_payload| glyph_payload.glyph.is_superscript,
+            .inline_block => false,
             .input => false,
             .button => false,
             .image => false,
@@ -3878,6 +4028,7 @@ fn flushLine(self: *Layout, line_buffer: *std.ArrayList(LineItem)) !void {
 
         const is_superscript = switch (item.payload) {
             .glyph => |glyph_payload| glyph_payload.glyph.is_superscript,
+            .inline_block => false,
             .input => false,
             .button => false,
             .image => false,
@@ -3955,6 +4106,54 @@ fn flushLine(self: *Layout, line_buffer: *std.ArrayList(LineItem)) !void {
                         .source = source,
                     },
                 });
+            },
+            .inline_block => |box| {
+                if (!box.visible) continue;
+                const x = item.x;
+                const y = final_y;
+                const box_source = if (self.inline_block) |parent|
+                    displaySource(parent, item.node_ptr)
+                else
+                    null;
+                if (box.background) |color| {
+                    try self.current_display_target.append(self.allocator, .{ .rect = .{
+                        .x1 = x,
+                        .y1 = y,
+                        .x2 = x +| box.width,
+                        .y2 = y +| box.height,
+                        .color = self.remapColor(color, .background),
+                        .source = box_source,
+                    } });
+                }
+                const border_values = [_]struct { side: border_geometry.Side, width: i32, visible: bool }{
+                    .{ .side = .top, .width = box.border.top, .visible = box.border_visible[0] },
+                    .{ .side = .right, .width = box.border.right, .visible = box.border_visible[1] },
+                    .{ .side = .bottom, .width = box.border.bottom, .visible = box.border_visible[2] },
+                    .{ .side = .left, .width = box.border.left, .visible = box.border_visible[3] },
+                };
+                const border_box = border_geometry.Box{ .x = x, .y = y, .width = box.width, .height = box.height };
+                const border_edges = border_geometry.Edges{
+                    .top = box.border.top,
+                    .right = box.border.right,
+                    .bottom = box.border.bottom,
+                    .left = box.border.left,
+                };
+                for (border_values, 0..) |border_value, index| {
+                    if (!border_value.visible or border_value.width <= 0) continue;
+                    const quad = border_geometry.sideQuad(border_box, border_edges, border_value.side) orelse continue;
+                    try self.current_display_target.append(self.allocator, .{ .quad = .{
+                        .x1 = quad.points[0].x,
+                        .y1 = quad.points[0].y,
+                        .x2 = quad.points[1].x,
+                        .y2 = quad.points[1].y,
+                        .x3 = quad.points[2].x,
+                        .y3 = quad.points[2].y,
+                        .x4 = quad.points[3].x,
+                        .y4 = quad.points[3].y,
+                        .color = self.remapColor(box.border_colors[index], .border),
+                        .source = box_source,
+                    } });
+                }
             },
             .input => |input_payload| {
                 try input_payload.paintAt(self.current_display_target, self, item.x, final_y, source);

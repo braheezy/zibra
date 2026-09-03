@@ -620,10 +620,27 @@ pub const FontManager = struct {
         const sentinel_gme = try sliceToSentinelArray(self.allocator, gme);
         defer self.allocator.free(sentinel_gme);
 
-        var glyph_surface = try font.font_handle.renderUtf8Blended(
+        // SDL_ttf can reject an otherwise valid UTF-8 grapheme when a page
+        // supplies a glyph that the selected platform face cannot rasterize
+        // (this is common in compatibility suites, which intentionally feed
+        // malformed/unsupported text).  A single rejected glyph must not
+        // abort the whole layout task and leave the browser with a blank
+        // frame. Keep a stable size-based advance and emit an invisible
+        // fallback instead.
+        var glyph_surface = font.font_handle.renderUtf8Blended(
             sentinel_gme,
             .{ .r = 255, .g = 255, .b = 255, .a = 255 },
-        );
+        ) catch |err| {
+            if (err != error.TtfError and err != error.InvalidGlyphDimensions) return err;
+            const fallback_width = @max(@divTrunc(size, 2), 1);
+            return Glyph{
+                .w = fallback_width,
+                .h = @max(size, 1),
+                .ascent = @max(@divTrunc(size * 3, 4), 1),
+                .descent = @max(size - @divTrunc(size * 3, 4), 1),
+                .pixels = null,
+            };
+        };
         defer glyph_surface.destroy();
 
         if (synthetic_bold) {
