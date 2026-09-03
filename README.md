@@ -11,6 +11,7 @@ Where possible, this project takes the most difficult route possible to implemen
 ![acid2](./docs/images/acid2.png)
 
 [Acid3:](http://acid3.acidtests.org/)
+
 ![acid3](./docs/images/acid3.png)
 
 ## Usage
