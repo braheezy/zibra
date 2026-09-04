@@ -614,7 +614,11 @@ fn isValidLonghandValue(property: []const u8, raw_value: []const u8) bool {
     if (std.mem.eql(u8, property, "vertical-align")) {
         const alignment = std.mem.trim(u8, raw_value, " \t\r\n\x0c");
         return std.ascii.eqlIgnoreCase(alignment, "baseline") or
-            std.ascii.eqlIgnoreCase(alignment, "bottom");
+            std.ascii.eqlIgnoreCase(alignment, "bottom") or
+            // Inline-level boxes may be shifted by a signed length, which is
+            // used by Acid3 to place its bucket blocks relative to the text
+            // baseline.
+            isSignedLength(alignment);
     }
     if (std.mem.eql(u8, property, "list-style-type")) return isSupportedListStyleType(raw_value);
     if (std.mem.eql(u8, property, "content")) {
@@ -2211,6 +2215,15 @@ test "vertical-align accepts bounded inline alignment values" {
 
     try std.testing.expectEqual(@as(usize, 1), rules.len);
     try std.testing.expectEqualStrings("bottom", rules[0].properties.get("vertical-align").?.value);
+
+    var length_parser = try CSSParser.init(allocator, "img { vertical-align: 2em; }", false);
+    defer length_parser.deinit(allocator);
+    const length_rules = try length_parser.parse(allocator);
+    defer {
+        for (length_rules) |*rule| rule.deinit(allocator);
+        allocator.free(length_rules);
+    }
+    try std.testing.expectEqualStrings("2em", length_rules[0].properties.get("vertical-align").?.value);
 }
 
 test "width and color media features compose with relative lengths" {

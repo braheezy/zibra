@@ -41,6 +41,12 @@ Run from the repository root:
 - `zig build test-wpt` for local headless synchronous PASS, Promise-job PASS,
   and TIMEOUT result-protocol fixtures. This step uses no upstream WPT checkout
   or network access;
+- `task wpt-all` for a long-running local compatibility sweep. It builds once,
+  discovers upstream testharness cases, and runs bounded browser workers in
+  parallel; use `WPT_JOBS=N` to tune concurrency and inspect its checkpointed
+  report under `tests/wpt/results`. The runner keeps normal output compact,
+  records completion for each top-level WPT folder, and accepts `--verbose`
+  for per-failure browser diagnostics;
 - `zig build test-docs` for repository Markdown links when documentation
   changes. The checker intentionally skips the vendored `tests/wpt/upstream`
   submodule, whose links are resolved by WPT's own documentation tooling;

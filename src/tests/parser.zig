@@ -921,6 +921,29 @@ test "Apply tag and class CSS selectors" {
     try std.testing.expectEqualStrings("blue", styles.getPtr("color").?.get().*);
 }
 
+test "text-shadow is retained as a paint-only computed property" {
+    const allocator = std.testing.allocator;
+    var html_parser = try HTMLParser.init(allocator, "<h1 class=title>Acid3</h1>");
+    html_parser.use_implicit_tags = false;
+    defer html_parser.deinit(allocator);
+    var root = try html_parser.parse();
+    defer root.deinit(allocator);
+
+    var css_parser = try CSSParser.init(allocator, ".title { text-shadow: rgba(192, 192, 192, 1) 3px 3px; }", false);
+    defer css_parser.deinit(allocator);
+    const rules = try css_parser.parse(allocator);
+    defer {
+        for (rules) |*rule| rule.deinit(allocator);
+        allocator.free(rules);
+    }
+
+    try document_parser.style(allocator, &root, rules);
+    try std.testing.expectEqualStrings(
+        "rgba(192, 192, 192, 1) 3px 3px",
+        root.element.style.?.getPtr("text-shadow").?.get().*,
+    );
+}
+
 test "generated pseudo boxes style privately and invalidate with their host" {
     const allocator = std.testing.allocator;
     const html = "<main><div class=host><span id=authored></span></div></main>";

@@ -25,6 +25,10 @@ pub const computed = [_]Property{
     .{ .name = "text-align", .default_value = "inherit" },
     .{ .name = "list-style-type", .default_value = "inherit" },
     .{ .name = "color", .default_value = "inherit" },
+    // Paint-only text decoration. The renderer currently consumes the
+    // single-shadow form (color plus x/y offsets), while retaining the
+    // authored value for future blur/list support.
+    .{ .name = "text-shadow", .default_value = "none" },
     // Visibility affects painting but not layout, and follows the inherited
     // property path so hidden ancestors suppress their descendants.
     .{ .name = "visibility", .default_value = "visible" },

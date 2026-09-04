@@ -6176,6 +6176,31 @@ const TextLayout = struct {
             self.font_family,
         );
 
+        // text-shadow belongs to the element containing this text node rather
+        // than to the text node's own non-inherited computed style. Emit the
+        // hard-edged single-shadow form before the foreground glyph so normal
+        // source-over painting gives the expected halo behind the text.
+        if (self.node_ptr) |node_ptr| switch (node_ptr.*) {
+            .text => |text_node| if (text_node.parent) |parent| switch (parent.*) {
+                .element => |*element| if (element.style) |*style_map| {
+                    if (styleValue(style_map, "text-shadow")) |shadow_value| {
+                        if (parseTextShadow(shadow_value, engine.zoom())) |shadow| {
+                            try commands.append(self.allocator, DisplayItem{ .glyph = .{
+                                .x = self.x.get().* + shadow.x,
+                                .y = self.y.get().* + shadow.y,
+                                .glyph = glyph,
+                                .color = engine.remapTextColor(node_ptr, shadow.color),
+                                .page_zoom = engine.zoom(),
+                                .source = displaySource(self, self.node_ptr),
+                            } });
+                        }
+                    }
+                },
+                .text => {},
+            },
+            .element => {},
+        };
+
         try commands.append(self.allocator, DisplayItem{
             .glyph = .{
                 .x = self.x.get().*,
@@ -10464,6 +10489,53 @@ fn layoutInlineBlock(self: *Layout, block: *BlockLayout, publish_geometry: bool)
 fn parseColor(color_str: []const u8) ?browser.Color {
     const color = parser.parseCssColor(color_str) orelse return null;
     return .{ .r = color.r, .g = color.g, .b = color.b, .a = color.a };
+}
+
+const TextShadow = struct {
+    color: browser.Color,
+    x: i32,
+    y: i32,
+};
+
+/// Parse the compact, single-layer text-shadow form used by Acid3 and common
+/// pages. Blur and comma-separated shadow lists are intentionally ignored
+/// until the display-list primitive can represent them without changing glyph
+/// metrics; unsupported forms simply fall back to the unshadowed glyph.
+fn parseTextShadow(value: []const u8, scale: f32) ?TextShadow {
+    const trimmed = std.mem.trim(u8, value, " \t\r\n");
+    if (trimmed.len == 0 or std.ascii.eqlIgnoreCase(trimmed, "none")) return null;
+
+    var color_end: usize = 0;
+    if (std.mem.indexOfScalar(u8, trimmed, '(')) |open| {
+        const close = std.mem.indexOfScalarPos(u8, trimmed, open, ')') orelse return null;
+        color_end = close + 1;
+    } else {
+        color_end = std.mem.indexOfAny(u8, trimmed, " \t\r\n") orelse return null;
+    }
+    const color = parseColor(trimmed[0..color_end]) orelse return null;
+    var offsets = std.mem.tokenizeAny(u8, trimmed[color_end..], " \t\r\n");
+    const x_token = offsets.next() orelse return null;
+    const y_token = offsets.next() orelse return null;
+    // A nonzero blur radius is not representable by a glyph command yet.
+    // Reject it rather than painting a misleading hard-edged approximation.
+    if (offsets.next() != null) return null;
+    const x_px = parser.resolveCssLength(x_token, .{}) orelse return null;
+    const y_px = parser.resolveCssLength(y_token, .{}) orelse return null;
+    if (!std.math.isFinite(x_px) or !std.math.isFinite(y_px)) return null;
+    return .{
+        .color = color,
+        .x = @intFromFloat(@round(x_px * @as(f64, scale))),
+        .y = @intFromFloat(@round(y_px * @as(f64, scale))),
+    };
+}
+
+test "single text shadows parse into an offset paint glyph" {
+    const shadow = parseTextShadow("rgba(192, 192, 192, 1.0) 3px 3px", 1.0).?;
+    try std.testing.expectEqual(@as(i32, 3), shadow.x);
+    try std.testing.expectEqual(@as(i32, 3), shadow.y);
+    try std.testing.expectEqual(@as(u8, 192), shadow.color.r);
+    try std.testing.expect(parseTextShadow("none", 1.0) == null);
+    try std.testing.expect(parseTextShadow("#888 3px 3px 2px", 1.0) == null);
 }
 
 fn animatedBackgroundColor(element: parser.Element) ?browser.Color {
