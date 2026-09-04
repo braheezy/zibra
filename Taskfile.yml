@@ -4,6 +4,7 @@ vars:
   WPT_MANIFEST: tests/wpt/manifest.yaml
   WPT_RESULTS: tests/wpt/results
   DASHBOARD_COMPOSE: tests/wpt/dashboard/docker-compose.yml
+  WPT_JOBS: 4
 
 tasks:
   dashboard:
@@ -21,6 +22,17 @@ tasks:
         working-tree)" SDL_VIDEODRIVER=dummy python3 tests/wpt/run.py {{.WPT_MANIFEST}}
         --mode testharness --browser ./zig-out/bin/zibra
         --report {{.WPT_RESULTS}}/$(date -u +%Y%m%dT%H%M%SZ).json
+
+  wpt-all:
+    desc: Run all discovered testharness WPT cases with isolated parallel workers
+    cmds:
+      - zig build
+      - mkdir -p {{.WPT_RESULTS}}
+      - >-
+        ZIBRA_GIT_SHA="$$(git rev-parse --short HEAD 2>/dev/null || printf
+        working-tree)" SDL_VIDEODRIVER=dummy python3 tests/wpt/run.py --all
+        --mode testharness --jobs {{.WPT_JOBS}} --browser ./zig-out/bin/zibra
+        --report {{.WPT_RESULTS}}/all-$(date -u +%Y%m%dT%H%M%SZ).json
 
   dom-results:
     desc: Run focused DOM mutation, traversal, and range WPT cases

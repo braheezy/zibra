@@ -8,45 +8,28 @@
 </head>
 <body>
   <div class="app-shell">
-    <aside class="sidebar">
+    <header class="topbar">
       <a class="brand" href="/">wpt<span>.zibra</span></a>
       <p class="side-intro">Web Platform Tests results for the Zibra browser engine.</p>
-
-      <div class="side-section">
-        <h2>Channel</h2>
-        <div class="segmented"><button class="selected" type="button">Experimental</button><button type="button" disabled>Stable</button></div>
-      </div>
-      <div class="side-section">
-        <h2>Test scope</h2>
-        <div class="segmented"><button class="selected" type="button">WPT</button><button type="button" disabled>WPT + Test262</button></div>
-      </div>
-      <div class="side-section side-run">
-        <label for="run-select">Run</label>
-        <select id="run-select"><option value="">No reports</option></select>
-      </div>
-      <div class="side-section side-update">
-        <h2>Last update</h2>
-        <strong id="last-update">—</strong>
-      </div>
-      <p class="side-help">Results are generated locally from the reviewed allowlist. Run <code>task latest-results</code> to update this view.</p>
-      <button id="refresh" class="refresh" type="button">↻ Refresh results</button>
-    </aside>
+      <label class="run-picker" for="run-select">Run <select id="run-select"><option value="">No reports</option></select></label>
+      <button id="refresh" class="refresh" type="button">↻ Refresh</button>
+    </header>
 
     <main class="main-content">
       <section class="chart-panel">
-        <div class="chart-copy"><strong>Test pass history</strong><span>Passing checks across recorded runs</span></div>
+        <div class="chart-copy"><strong>Overall suite history</strong><span>Full-suite runs only</span></div>
         <div class="chart-legend"><span><i></i> zibra</span></div>
-        <svg id="history-chart" role="img" aria-label="Zibra pass-rate history" viewBox="0 0 900 300" preserveAspectRatio="none">
+        <svg id="history-chart" role="img" aria-label="Zibra overall suite pass-rate history" viewBox="0 0 900 300" preserveAspectRatio="none">
           <g class="grid-lines"><line x1="55" y1="25" x2="875" y2="25"></line><line x1="55" y1="85" x2="875" y2="85"></line><line x1="55" y1="145" x2="875" y2="145"></line><line x1="55" y1="205" x2="875" y2="205"></line><line x1="55" y1="265" x2="875" y2="265"></line></g>
           <g class="axis-labels"><text x="16" y="29">100%</text><text x="28" y="149">50%</text><text x="36" y="269">0%</text><text x="465" y="295">Date</text></g>
           <polyline id="history-line" points=""></polyline><g id="history-points"></g><g id="history-dates"></g>
         </svg>
-        <p id="chart-empty" class="chart-empty">No run history yet.</p>
+        <p id="chart-empty" class="chart-empty">No full-suite history yet.</p>
       </section>
 
       <section class="results-summary">
         <span class="summary-copy"><strong id="results-score">—</strong><span id="results-description">No results selected.</span></span>
-        <span class="summary-links"><button id="about-link" type="button">ABOUT</button><a href="https://github.com/braheezy/zibra" target="_blank" rel="noreferrer">SOURCE</a></span>
+        <span class="summary-links"><a href="https://github.com/braheezy/zibra" target="_blank" rel="noreferrer">SOURCE</a></span>
       </section>
 
       <section class="results-panel">
@@ -54,10 +37,6 @@
         <div class="table-wrap"><table class="results-table"><thead><tr><th scope="col">Path</th><th id="browser-column" scope="col">Zibra</th></tr></thead><tbody id="coverage-table"><tr><td colspan="2" class="empty">No reports yet.</td></tr></tbody></table></div>
       </section>
 
-      <section id="details-panel" class="details-panel">
-        <div class="details-heading"><div><h2 id="details-title">Test details</h2><p id="details-note">Select a path above to inspect its test cases.</p></div><div class="detail-controls"><input id="test-search" type="search" placeholder="Filter tests" autocomplete="off"><select id="status-filter" aria-label="Filter status"><option value="ALL">All</option><option value="FAIL">Failures</option><option value="ERROR">Errors</option><option value="TIMEOUT">Timeouts</option><option value="INFRA">Infrastructure</option><option value="PASS">Passing</option></select></div></div>
-        <div class="table-wrap"><table class="detail-table"><thead><tr><th scope="col">Test</th><th scope="col">Result</th><th scope="col">Expected</th><th scope="col">Subtests</th><th scope="col">Duration</th></tr></thead><tbody id="test-table"><tr><td colspan="5" class="empty">Select a run to inspect tests.</td></tr></tbody></table></div>
-      </section>
     </main>
   </div>
   <footer>Local WPT results · <code>tests/wpt/results</code> · nothing is uploaded</footer>

@@ -1,8 +1,7 @@
 // The dashboard keeps its client state small: the server owns reports, while
 // this module renders the selected report and the local history.
 const state = {
-  runs: [], selected: null, selectedId: null, status: "ALL",
-  pathQuery: "", testQuery: "",
+  runs: [], selected: null, selectedId: null, pathQuery: "",
 };
 const $ = (id) => document.getElementById(id);
 const esc = (value) => String(value ?? "").replace(/[&<>"']/g, (char) => ({
@@ -47,7 +46,10 @@ function renderRunSelect() {
   if (state.selectedId) select.value = state.selectedId;
 }
 function renderChart() {
-  const runs = state.runs.slice(0, 24).reverse();
+  // Keep the timeline comparable: focused runs may contain a tiny or
+  // intentionally curated subset and would make a percentage score jump to
+  // 100% without representing suite-wide progress.
+  const runs = state.runs.filter((run) => run.full_suite && run.complete !== false).slice(0, 24).reverse();
   const line = $("history-line");
   const points = $("history-points");
   const dates = $("history-dates");
@@ -68,111 +70,51 @@ function renderChart() {
   points.innerHTML = plotted.map(({ run, x, y, rate }) => `<circle cx="${x}" cy="${y}" r="4" tabindex="0" data-run="${esc(run.id)}" aria-label="${esc(run.run_id || run.id)}: ${rate == null ? "no semantic results" : `${rate}% passing`}"></circle>`).join("");
   dates.innerHTML = plotted.map(({ run, x }) => `<text x="${x}" y="283">${esc(shortDate(run.finished_at))}</text>`).join("");
   points.querySelectorAll("[data-run]").forEach((point) => {
-    point.addEventListener("click", () => showDetails(point.dataset.run));
+    point.addEventListener("click", () => selectRun(point.dataset.run));
     point.addEventListener("keydown", (event) => {
-      if (event.key === "Enter" || event.key === " ") showDetails(point.dataset.run);
+      if (event.key === "Enter" || event.key === " ") selectRun(point.dataset.run);
     });
   });
 }
-function pathGroup(path) {
-  const parts = String(path || "").split("/").filter(Boolean);
-  if (!parts.length) return "unknown";
-  // The coverage table is a suite overview, like wpt.fyi's top-level path
-  // list. Individual files remain available in the details table.
-  return parts[0];
-}
-function reportTests(report) {
-  return Array.isArray(report?.tests) ? report.tests : [];
-}
-function testScore(test) {
-  const subtests = Array.isArray(test.tests) ? test.tests : [];
-  if (subtests.length) return { passed: subtests.filter((item) => item.status === "PASS").length, total: subtests.length };
-  return { passed: test.status === "PASS" ? 1 : 0, total: 1 };
-}
 function renderCoverage(report) {
-  const tests = reportTests(report), query = state.pathQuery.trim().toLowerCase();
-  const groups = new Map();
-  tests.forEach((test) => {
-    const path = String(test.path || "");
-    if (query && !path.toLowerCase().includes(query)) return;
-    const group = pathGroup(path);
-    if (!groups.has(group)) groups.set(group, { tests: [], passed: 0, total: 0 });
-    const item = groups.get(group);
-    item.tests.push(test);
-    const result = testScore(test);
-    item.passed += result.passed; item.total += result.total;
-  });
+  const directories = Array.isArray(report?.directories) ? report.directories : [];
+  const query = state.pathQuery.trim().toLowerCase();
+  const groups = directories.filter((directory) =>
+    !query || String(directory.path || "").toLowerCase().includes(query)
+  );
   const revision = report?.browser_revision || currentRun()?.browser_revision || "working-tree";
   $("browser-column").innerHTML = `<span class="browser-head">Zibra</span><span class="browser-sha">${esc(revision.slice(0, 12))}</span><span class="browser-date">${esc(dateText(report?.finished_at || currentRun()?.finished_at))}</span>`;
-  const entries = [...groups.entries()].sort(([a], [b]) => a.localeCompare(b));
+  const entries = groups.sort((a, b) => String(a.path || "").localeCompare(String(b.path || "")));
   if (!entries.length) {
-    $("coverage-table").innerHTML = `<tr><td colspan="2" class="empty">${tests.length ? "No test paths match the search." : "No test records in this run."}</td></tr>`;
+    $("coverage-table").innerHTML = `<tr><td colspan="2" class="empty">${directories.length ? "No directories match the search." : "No directory scores in this run."}</td></tr>`;
     return;
   }
   const rows = [];
-  entries.forEach(([group, item]) => {
-    const label = `${group}/`;
+  entries.forEach((item) => {
+    const label = String(item.path || "(root)");
     const checks = item.total === 1 ? "1 check" : `${item.total} checks`;
-    const paths = item.tests.map((test) => String(test.path || "")).join(" ");
-    rows.push(`<tr class="path-group" tabindex="0" data-group-path="${esc(paths)}"><td>${esc(label)}<span class="path-meta">${checks}</span></td><td>${score(item.passed, item.total)}</td></tr>`);
+    rows.push(`<tr><td>${esc(label)}<span class="path-meta">${checks}</span></td><td>${score(item.passed || 0, item.total || 0)}</td></tr>`);
   });
   $("coverage-table").innerHTML = rows.join("");
-  $("coverage-table").querySelectorAll("[data-group-path]").forEach((row) => {
-    const openDetails = () => {
-      state.testQuery = row.dataset.groupPath; $("test-search").value = state.testQuery;
-    renderTests(report); $("details-panel")?.scrollIntoView({ behavior: "smooth", block: "start" });
-    };
-    row.addEventListener("click", openDetails);
-    row.addEventListener("keydown", (event) => { if (event.key === "Enter" || event.key === " ") openDetails(); });
-  });
 }
-function diagnosticDetails(test) {
-  const pieces = [];
-  if (test.message) pieces.push(`Message\n${test.message}`);
-  if (test.infrastructure_error) pieces.push(`Infrastructure\n${test.infrastructure_error}`);
-  if (test.exception) pieces.push(`Exception\n${JSON.stringify(test.exception, null, 2)}`);
-  if (test.stderr) pieces.push(`stderr\n${test.stderr}`);
-  if (test.stdout) pieces.push(`stdout\n${test.stdout}`);
-  if (test.console?.length) pieces.push(`Console\n${JSON.stringify(test.console, null, 2)}`);
-  const failedSubtests = (Array.isArray(test.tests) ? test.tests : []).filter((item) => item.status !== "PASS");
-  if (failedSubtests.length) pieces.push(`Failed subtests\n${failedSubtests.map((item) => `${item.name || "(unnamed)"}: ${item.message || item.status}`).join("\n")}`);
-  return pieces.length ? `<details><summary>Show diagnostics</summary><pre>${esc(pieces.join("\n\n"))}</pre></details>` : "";
-}
-function renderTests(report) {
-  const tests = reportTests(report), query = state.testQuery.trim().toLowerCase();
-  const rows = tests.filter((test) => {
-    const status = String(test.status || "").toUpperCase();
-    return (state.status === "ALL" || status === state.status) && (!query || `${test.path} ${test.message || ""} ${test.infrastructure_error || ""}`.toLowerCase().includes(query));
-  });
-  $("test-table").innerHTML = rows.length ? rows.map((test) => {
-    const subtests = Array.isArray(test.tests) ? test.tests : [], passed = subtests.filter((item) => item.status === "PASS").length;
-    const status = String(test.status || "UNKNOWN").toUpperCase();
-    return `<tr class="result-${esc(status.toLowerCase())}"><td>${esc(test.path)}${diagnosticDetails(test)}</td><td><span class="status status-${esc(status)}">${esc(status)}</span></td><td>${esc(test.expected || "—")}</td><td>${subtests.length ? `<span class="subtests"><strong>${passed}/${subtests.length}</strong> passed</span>` : "—"}</td><td>${test.duration_ms == null ? "—" : `${esc(test.duration_ms)} ms`}</td></tr>`;
-  }).join("") : `<tr><td colspan="5" class="empty">${tests.length ? "No tests match these filters." : "No run selected."}</td></tr>`;
-}
-function renderDetails(report) {
-  const run = currentRun(), tests = reportTests(report);
-  const subtests = tests.reduce((total, test) => total + (Array.isArray(test.tests) ? test.tests.length : 0), 0);
-  const checks = tests.reduce((result, test) => {
-    const score = testScore(test);
-    result.passed += score.passed; result.total += score.total;
+function renderRun(report) {
+  const run = currentRun();
+  const directories = Array.isArray(report?.directories) ? report.directories : [];
+  const checks = directories.reduce((result, directory) => {
+    result.passed += Number(directory.passed || 0); result.total += Number(directory.total || 0);
     return result;
   }, { passed: 0, total: 0 });
   const revision = report?.browser_revision || run?.browser_revision || "working-tree";
   const runLabel = run?.id === state.runs[0]?.id ? "latest local test run" : "selected local test run";
-  $("last-update").textContent = revision.slice(0, 12);
   $("results-score").textContent = run ? `${checks.passed}/${checks.total}` : "—";
-  $("results-description").textContent = run ? `Showing ${tests.length} ${tests.length === 1 ? "test" : "tests"} (${subtests} ${subtests === 1 ? "subtest" : "subtests"}) from the ${runLabel} for zibra[${revision}]` : "No results selected.";
-  $("details-title").textContent = run ? `${tests.length} ${tests.length === 1 ? "test" : "tests"} in this run` : "Test details";
-  $("details-note").textContent = run ? `${dateText(report?.finished_at || run.finished_at)} · ${run.mode || "unknown mode"} · revision ${revision}` : "Select a path above to inspect its test cases.";
-  renderCoverage(report); renderTests(report);
+  $("results-description").textContent = run ? `Showing ${directories.length} directory scores from the ${runLabel} for zibra[${revision}]` : "No results selected.";
+  renderCoverage(report);
 }
-async function showDetails(id) {
-  if (!id) return;
-  const response = await fetch(`/api/runs/${encodeURIComponent(id)}.json`, { cache: "no-store" });
-  if (!response.ok) return;
-  state.selectedId = id; state.selected = await response.json();
-  renderRunSelect(); renderDetails(state.selected);
+function selectRun(id) {
+  const run = state.runs.find((candidate) => candidate.id === id);
+  if (!run) return;
+  state.selectedId = id; state.selected = run;
+  renderRunSelect(); renderRun(state.selected);
 }
 async function load() {
   try {
@@ -183,16 +125,13 @@ async function load() {
     $("health").textContent = `${info.run_count || 0} local report${info.run_count === 1 ? "" : "s"}`;
     renderRunSelect(); renderChart();
     const selected = state.selectedId && state.runs.some((run) => run.id === state.selectedId) ? state.selectedId : state.runs[0]?.id;
-    if (selected) await showDetails(selected); else renderDetails(null);
+    if (selected) selectRun(selected); else renderRun(null);
   } catch (error) {
     $("health").textContent = "Unable to load"; $("results-description").textContent = error.message;
     $("coverage-table").innerHTML = `<tr><td colspan="2" class="empty">${esc(error.message)}</td></tr>`;
   }
 }
-$("run-select").addEventListener("change", (event) => showDetails(event.target.value));
-$("status-filter").addEventListener("change", (event) => { state.status = event.target.value; if (state.selected) renderTests(state.selected); });
-$("test-search").addEventListener("input", (event) => { state.testQuery = event.target.value; if (state.selected) renderTests(state.selected); });
+$("run-select").addEventListener("change", (event) => selectRun(event.target.value));
 $("path-search").addEventListener("input", (event) => { state.pathQuery = event.target.value; if (state.selected) renderCoverage(state.selected); });
 $("refresh").addEventListener("click", load);
-$("about-link").addEventListener("click", () => document.querySelector(".side-help")?.scrollIntoView({ behavior: "smooth", block: "center" }));
 load();

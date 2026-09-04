@@ -16,6 +16,9 @@ the helper from the repository root:
 python3 tests/wpt/run.py --list
 python3 tests/wpt/run.py --mode probe tests/wpt/manifest.yaml
 python3 tests/wpt/run.py --mode testharness tests/wpt/manifest.yaml
+python3 tests/wpt/run.py --all --jobs 4 --mode testharness \
+  --browser ./zig-out/bin/zibra \
+  --report tests/wpt/results/all.json
 zig build test-wpt-runner
 zig build test-wpt
 docker compose -f tests/wpt/dashboard/docker-compose.yml up --build
@@ -47,8 +50,11 @@ The object must contain integer `protocol_version: 1`, the requested URL as
 non-negative integer `duration_ms`. Diagnostics belong on stderr. A JSON
 `TIMEOUT` is a semantic test result; a runner watchdog expiry, nonzero browser
 exit, malformed result, or extra stdout line is an infrastructure failure.
-Failed cases reproduce the browser's raw stdout and stderr in the runner
-diagnostics.
+Normal output is intentionally compact: it shows bounded progress and leaves a
+durable `done <folder>/ ...` line when each top-level WPT folder finishes. Raw
+browser output is retained in the JSON report for failed cases; pass
+`--verbose` when interactively diagnosing a failure to echo that output to
+stderr.
 
 The two build steps need neither the upstream checkout nor network access.
 `test-wpt-runner` exercises manifest selection and process/result failure
@@ -60,6 +66,45 @@ not WPT conformance claims.
 The YAML file is the compatibility allowlist. Add paths to the conventional
 `tests` or `probes` section; keep unsupported tests out of the allowlist and
 record only intentional expected deviations.
+
+## Full local runs
+
+`--all` discovers HTML/XHTML/XML files in the checkout that reference WPT's
+`testharness.js` or `testharnessreport.js`. It deliberately leaves reftests,
+manual tests, WebDriver tests, and support resources out: those need a
+different protocol than Zibra's headless JSON result. The discovered set is
+the largest useful automated slice of WPT and will grow as upstream adds
+testharness files.
+
+Build Zibra once, then run several independent browser processes against one
+temporary WPT server:
+
+```sh
+zig build
+mkdir -p tests/wpt/results
+python3 tests/wpt/run.py --all --mode testharness --jobs 4 \
+  --browser ./zig-out/bin/zibra \
+  --report tests/wpt/results/all-$(date -u +%Y%m%dT%H%M%SZ).json
+```
+
+`--jobs` defaults to one to preserve focused-run behavior; increase it to
+match available CPU and memory. Every case has its own watchdog. A crash,
+malformed result, non-zero exit, or watchdog expiry is recorded as `INFRA` and
+does not abort the remaining cases. Watchdog cleanup kills the whole browser
+process group, preventing a stuck page from leaking children into later
+runs. The runner prints one live progress line on a terminal (or roughly one
+checkpoint per percent when redirected), followed by a per-folder summary and
+an overall total. Reports are atomically checkpointed every 25 completed cases
+by default;
+use `--checkpoint-every 0` to disable checkpoints. A checkpoint is still a
+valid dashboard report and is replaced by the complete report at the end.
+
+The Taskfile provides the same workflow and uses four workers by default:
+
+```sh
+task wpt-all
+WPT_JOBS=8 task wpt-all
+```
 
 For a local visual history, write a report while running the manifest and
 start the self-hosted dashboard:

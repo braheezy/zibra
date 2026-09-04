@@ -52,7 +52,17 @@ class WptRunnerTests(unittest.TestCase):
         browser.write_text(source, encoding="utf-8")
         return browser
 
-    def run_main(self, manifest, browser, mode="testharness", grace_seconds=5.0):
+    def run_main(
+        self,
+        manifest,
+        browser,
+        mode="testharness",
+        grace_seconds=5.0,
+        jobs=1,
+        report=None,
+        checkpoint_every=None,
+        verbose=False,
+    ):
         stdout = io.StringIO()
         stderr = io.StringIO()
         argv = [
@@ -62,7 +72,15 @@ class WptRunnerTests(unittest.TestCase):
             "--browser",
             sys.executable,
             str(browser),
+            "--jobs",
+            str(jobs),
         ]
+        if report is not None:
+            argv.extend(("--report", str(report)))
+        if checkpoint_every is not None:
+            argv.extend(("--checkpoint-every", str(checkpoint_every)))
+        if verbose:
+            argv.append("--verbose")
         with (
             mock.patch.object(runner, "ROOT", self.root),
             mock.patch.object(runner, "UPSTREAM", self.upstream),
@@ -73,6 +91,155 @@ class WptRunnerTests(unittest.TestCase):
             contextlib.redirect_stderr(stderr),
         ):
             return runner.main(argv), stdout.getvalue(), stderr.getvalue()
+
+    def test_discovery_uses_harness_marker_and_skips_support_files(self):
+        harness = self.upstream / "dom" / "discovered.html"
+        harness.write_text(
+            '<script src="/resources/testharness.js"></script>', encoding="utf-8"
+        )
+        support = self.upstream / "resources" / "support.html"
+        support.parent.mkdir()
+        support.write_text(
+            '<script src="/resources/testharness.js"></script>', encoding="utf-8"
+        )
+
+        with mock.patch.object(runner, "UPSTREAM", self.upstream):
+            cases = runner.discover_testharness_cases()
+
+        self.assertEqual(["dom/discovered.html"], [case.path for case in cases])
+        self.assertEqual("testharness", cases[0].mode)
+
+    def test_parallel_workers_keep_all_results_and_isolate_processes(self):
+        second_path = "dom/second.html"
+        (self.upstream / second_path).write_text(
+            "<!doctype html>", encoding="utf-8"
+        )
+        manifest = self.root / "parallel.json"
+        entries = [
+            {
+                "path": path,
+                "mode": "testharness",
+                "status": "candidate",
+                "reason": "parallel fixture",
+                "timeout_ms": 100,
+                "expectation": "pass",
+            }
+            for path in (self.case_path, second_path)
+        ]
+        manifest.write_text(json.dumps({"version": 1, "tests": entries}), encoding="utf-8")
+        browser = self.write_browser(
+            """\
+import json
+import sys
+print(json.dumps({
+    "protocol_version": 1,
+    "test": sys.argv[2],
+    "status": "PASS",
+    "duration_ms": 1,
+}))
+"""
+        )
+        report = self.root / "parallel-report.json"
+
+        status, stdout, stderr = self.run_main(
+            manifest, browser, jobs=2, report=report, checkpoint_every=1
+        )
+
+        self.assertEqual(0, status)
+        self.assertIn("WPT testharness: 2 cases (2 workers)", stdout)
+        self.assertIn("done dom/ 2/2", stdout)
+        self.assertIn("WPT complete: 2/2 cases", stdout)
+        self.assertEqual("", stderr)
+        payload = json.loads(report.read_text(encoding="utf-8"))
+        self.assertEqual(2, payload["summary"]["total"])
+        self.assertEqual(2, payload["summary"]["pass"])
+
+    def test_progress_records_each_folder_without_case_diagnostic_noise(self):
+        second_path = "html/second.html"
+        (self.upstream / second_path).parent.mkdir()
+        (self.upstream / second_path).write_text(
+            "<!doctype html>", encoding="utf-8"
+        )
+        manifest = self.root / "folders.json"
+        entries = [
+            {
+                "path": path,
+                "mode": "testharness",
+                "status": "candidate",
+                "reason": "folder progress fixture",
+                "timeout_ms": 100,
+                "expectation": "pass",
+            }
+            for path in (self.case_path, second_path)
+        ]
+        manifest.write_text(json.dumps({"version": 1, "tests": entries}), encoding="utf-8")
+        browser = self.write_browser(
+            """\
+import json
+import sys
+print(json.dumps({
+    "protocol_version": 1,
+    "test": sys.argv[2],
+    "status": "PASS",
+    "duration_ms": 1,
+}))
+"""
+        )
+
+        status, stdout, stderr = self.run_main(manifest, browser)
+
+        self.assertEqual(0, status)
+        self.assertEqual(1, stdout.count("done dom/ 1/1"))
+        self.assertEqual(1, stdout.count("done html/ 1/1"))
+        self.assertIn("WPT complete: 2/2 cases — 2 pass", stdout)
+        self.assertNotIn("--- browser stdout ---", stderr)
+        self.assertNotIn("--- browser stderr ---", stderr)
+
+    def test_all_mode_runs_discovered_cases_without_a_manifest(self):
+        for name in ("first.html", "second.html"):
+            path = self.upstream / "dom" / name
+            path.write_text(
+                '<script src="/resources/testharness.js"></script>',
+                encoding="utf-8",
+            )
+        browser = self.write_browser(
+            """\
+import json
+import sys
+print(json.dumps({
+    "protocol_version": 1,
+    "test": sys.argv[2],
+    "status": "PASS",
+    "duration_ms": 1,
+}))
+"""
+        )
+        stdout = io.StringIO()
+        stderr = io.StringIO()
+        with (
+            mock.patch.object(runner, "ROOT", self.root),
+            mock.patch.object(runner, "UPSTREAM", self.upstream),
+            contextlib.redirect_stdout(stdout),
+            contextlib.redirect_stderr(stderr),
+        ):
+            status = runner.main(
+                [
+                    "--all",
+                    "--jobs",
+                    "2",
+                    "--checkpoint-every",
+                    "0",
+                    "--browser",
+                    sys.executable,
+                    str(browser),
+                ]
+            )
+
+        self.assertEqual(0, status)
+        self.assertIn("Discovered 2 testharness cases", stdout.getvalue())
+        self.assertIn("done dom/ 2/2", stdout.getvalue())
+        self.assertIn("WPT complete: 2/2 cases", stdout.getvalue())
+        self.assertEqual("", stderr.getvalue())
 
     def test_probe_stays_an_explicit_non_conformance_smoke_test(self):
         manifest = self.write_manifest(
@@ -90,7 +257,8 @@ print("<html></html>")
         status, stdout, stderr = self.run_main(manifest, browser, mode="probe")
 
         self.assertEqual(0, status)
-        self.assertIn("probe ok (non-conformance)", stdout)
+        self.assertIn("WPT probe: 1 cases", stdout)
+        self.assertIn("done dom/ 1/1 — 1 probe", stdout)
         self.assertEqual("", stderr)
 
     def test_yaml_allowlist_uses_conventional_sections_and_deviations(self):
@@ -136,7 +304,7 @@ print(json.dumps({
         status, stdout, stderr = self.run_main(manifest, browser)
 
         self.assertEqual(0, status)
-        self.assertIn(f"ok {self.case_path}: TIMEOUT", stdout)
+        self.assertIn(f"TIMEOUT {self.case_path}", stdout)
         self.assertEqual("", stderr)
 
     def test_expectation_mismatch_preserves_raw_stdout_and_stderr(self):
@@ -155,10 +323,10 @@ print("assertion detail", file=sys.stderr)
 """
         )
 
-        status, stdout, stderr = self.run_main(manifest, browser)
+        status, stdout, stderr = self.run_main(manifest, browser, verbose=True)
 
         self.assertEqual(1, status)
-        self.assertIn("expected PASS, received FAIL", stdout)
+        self.assertIn("FAIL (expected PASS)", stdout)
         self.assertIn('"status": "FAIL"', stderr)
         self.assertIn("assertion detail", stderr)
         self.assertIn("--- browser stdout ---", stderr)
@@ -181,11 +349,11 @@ raise SystemExit(7)
 """
         )
 
-        status, stdout, stderr = self.run_main(manifest, browser)
+        status, stdout, stderr = self.run_main(manifest, browser, verbose=True)
 
         self.assertEqual(1, status)
         self.assertIn("INFRA", stdout)
-        self.assertIn("browser exited with status 7", stdout)
+        self.assertIn("browser exited with status 7", stderr)
         self.assertIn('"status": "FAIL"', stderr)
         self.assertIn("crash detail", stderr)
 
@@ -199,11 +367,11 @@ print("parse detail", file=sys.stderr)
 """
         )
 
-        status, stdout, stderr = self.run_main(manifest, browser)
+        status, stdout, stderr = self.run_main(manifest, browser, verbose=True)
 
         self.assertEqual(1, status)
         self.assertIn("INFRA", stdout)
-        self.assertIn("invalid JSON result", stdout)
+        self.assertIn("invalid JSON result", stderr)
         self.assertIn("not JSON", stderr)
         self.assertIn("parse detail", stderr)
 
@@ -241,12 +409,12 @@ print("parse detail", file=sys.stderr)
         browser = self.write_browser("while True:\n    pass\n")
 
         status, stdout, stderr = self.run_main(
-            manifest, browser, grace_seconds=0.0
+            manifest, browser, grace_seconds=0.0, verbose=True
         )
 
         self.assertEqual(1, status)
         self.assertIn("INFRA", stdout)
-        self.assertIn("browser watchdog expired", stdout)
+        self.assertIn("browser watchdog expired", stderr)
         self.assertNotIn(f"ok {self.case_path}: TIMEOUT", stdout)
         self.assertIn("--- browser stdout ---", stderr)
 
@@ -270,8 +438,10 @@ print(json.dumps({
 
         # The test helper does not pass --report by default; exercise the
         # public entry point directly for the durable artifact option.
-        with mock.patch.object(runner, "ROOT", self.root), mock.patch.object(
-            runner, "UPSTREAM", self.upstream
+        with (
+            mock.patch.object(runner, "ROOT", self.root),
+            mock.patch.object(runner, "UPSTREAM", self.upstream),
+            contextlib.redirect_stdout(io.StringIO()),
         ):
             status = runner.main(
                 [
@@ -289,6 +459,8 @@ print(json.dumps({
         self.assertEqual(0, status)
         payload = json.loads(report.read_text(encoding="utf-8"))
         self.assertEqual(1, payload["schema_version"])
+        self.assertTrue(payload["complete"])
+        self.assertEqual(1, payload["expected_cases"])
         self.assertEqual(1, payload["summary"]["pass"])
         self.assertEqual(1, payload["summary"]["subtests_total"])
         self.assertEqual(1, payload["summary"]["subtests_pass"])

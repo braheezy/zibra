@@ -21,7 +21,11 @@ Open <http://localhost:8188>. Override the host port with
 Reports are intentionally plain JSON so they can be retained as CI artifacts
 or copied to a GitHub Pages branch later. The server is read-only: it exposes
 `/api/runs` and `/api/runs/<file>.json`, plus the static frontend. No WPT
-credentials or external service are required.
+credentials or external service are required. The frontend deliberately shows
+the run history and top-level directory scores only; individual test records
+remain available in the JSON artifact for offline investigation. The history
+chart includes only `--all` full-suite runs, so focused manifests cannot make
+the long-term percentage look artificially better.
 
 The host-side `tests/wpt/results` directory is the local history store. It is
 mounted read-only into the container, survives `docker compose down`, and is

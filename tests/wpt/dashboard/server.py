@@ -35,17 +35,55 @@ def _read_run(path: Path) -> dict:
     return value if isinstance(value, dict) else {}
 
 
+def _directory_scores(report: dict) -> list[dict[str, object]]:
+    """Collapse case records into the directory scores used by the UI."""
+    groups: dict[str, dict[str, int]] = {}
+    tests = report.get("tests", [])
+    if not isinstance(tests, list):
+        return []
+    for test in tests:
+        if not isinstance(test, dict):
+            continue
+        path = str(test.get("path", ""))
+        parts = [part for part in path.split("/") if part]
+        group = f"{parts[0]}/" if len(parts) > 1 else "(root)"
+        item = groups.setdefault(group, {"passed": 0, "total": 0})
+        subtests = test.get("tests", [])
+        if isinstance(subtests, list) and subtests:
+            item["passed"] += sum(
+                1
+                for subtest in subtests
+                if isinstance(subtest, dict) and subtest.get("status") == "PASS"
+            )
+            item["total"] += len(subtests)
+        else:
+            item["passed"] += int(test.get("status") == "PASS")
+            item["total"] += 1
+    return [
+        {"path": path, **groups[path]}
+        for path in sorted(groups)
+    ]
+
+
 def _run_summary(path: Path) -> dict:
     report = _read_run(path)
     summary = report.get("summary", {})
+    manifest = report.get("manifest")
+    suite = report.get("suite")
     return {
         "id": path.stem,
         "run_id": report.get("run_id", path.stem),
         "started_at": report.get("started_at"),
         "finished_at": report.get("finished_at"),
         "mode": report.get("mode"),
+        "manifest": manifest,
+        # Focused manifests are useful for debugging, but mixing their scores
+        # into the history makes progress look artificially better as the
+        # selected set changes. The chart therefore consumes full-suite runs.
+        "full_suite": suite == "all" or manifest == "<all-testharness>",
         "browser_revision": report.get("browser_revision", "working-tree"),
         "summary": summary if isinstance(summary, dict) else {},
+        "directories": _directory_scores(report),
     }
 
 
@@ -71,10 +109,22 @@ class DashboardHandler(SimpleHTTPRequestHandler):
         # is launched from a copied container filesystem or through a URL
         # that omits the trailing slash.
         if parsed.path in ("", "/"):
-            self.path = "/index.html"
-            if parsed.query:
-                self.path += "?" + parsed.query
-            super().do_GET()
+            # Serve the entry point directly instead of delegating to
+            # SimpleHTTPRequestHandler, whose directory-listing fallback can
+            # appear when a stale/copy-mounted static directory is missing
+            # its index metadata.
+            index = STATIC / "index.html"
+            try:
+                payload = index.read_bytes()
+            except OSError:
+                self._json({"error": "dashboard index unavailable"}, HTTPStatus.INTERNAL_SERVER_ERROR)
+                return
+            self.send_response(HTTPStatus.OK)
+            self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.send_header("Content-Length", str(len(payload)))
+            self.send_header("Cache-Control", "no-store")
+            self.end_headers()
+            self.wfile.write(payload)
             return
         if parsed.path == "/api/health":
             self._json({"ok": True})
