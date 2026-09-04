@@ -313,6 +313,7 @@ const animatedPixelDimension = box_model.animatedPixelDimension;
 const resolvedPixelDimension = box_model.resolvedPixelDimension;
 const parseCssPixelRadius = box_model.parseCssPixelRadius;
 const appendBackgroundBox = replaced_paint.appendBackgroundBox;
+const BackgroundImagePaint = replaced_paint.BackgroundImagePaint;
 const backgroundImagePaint = replaced_paint.backgroundImagePaint;
 const backgroundImagePaintForSource = replaced_paint.backgroundImagePaintForSource;
 const appendBackgroundImageBox = replaced_paint.appendBackgroundImageBox;
@@ -1089,6 +1090,7 @@ const LineItem = struct {
     width: i32,
     height: i32,
     vertical_align: VerticalAlign = .baseline,
+    is_word_separator: bool = false,
     /// Pointer to the DOM node that produced this item (if available)
     node_ptr: ?*Node,
     payload: LineItemPayload,
@@ -3873,6 +3875,41 @@ fn recordSoftHyphenBreak(
     });
 }
 
+/// Break at the latest whitespace boundary before the current word. The
+/// separator itself belongs to the previous line's collapsing whitespace and
+/// is discarded at the break; a word that is wider than the line falls back to
+/// the existing character-level overflow handling.
+fn tryWordBreak(self: *Layout, line_buffer: *std.ArrayList(LineItem)) !bool {
+    var separator_index: ?usize = null;
+    for (line_buffer.items, 0..) |item, index| {
+        if (item.is_word_separator) separator_index = index;
+    }
+    const index = separator_index orelse return false;
+    if (index + 1 >= line_buffer.items.len) return false;
+
+    const break_x = line_buffer.items[index].x + line_buffer.items[index].width;
+    var suffix = std.ArrayList(LineItem).empty;
+    defer {
+        for (suffix.items) |*item| item.payload.deinit();
+        suffix.deinit(self.allocator);
+    }
+    try suffix.appendSlice(self.allocator, line_buffer.items[index + 1 ..]);
+    line_buffer.shrinkRetainingCapacity(index);
+    try self.flushLine(line_buffer);
+
+    for (suffix.items) |*item| {
+        item.x = self.line_left + (item.x - break_x);
+        item.is_word_separator = false;
+    }
+    try line_buffer.appendSlice(self.allocator, suffix.items);
+    suffix.clearRetainingCapacity();
+    self.cursor_x = if (line_buffer.items.len > 0) blk: {
+        const last = line_buffer.items[line_buffer.items.len - 1];
+        break :blk last.x + last.width;
+    } else self.line_left;
+    return true;
+}
+
 /// Break at the latest recorded soft hyphen whose visible hyphen fits. The
 /// suffix is transferred out of the current line before flushing its prefix,
 /// then rebased onto the next line without duplicating payload ownership.
@@ -4494,6 +4531,7 @@ fn processGrapheme(
         self.line_right,
         line_buffer.items.len > 0,
     )) {
+        if (try self.tryWordBreak(line_buffer)) continue;
         if (try self.trySoftHyphenBreak(line_buffer)) continue;
         try self.flushLine(line_buffer);
     }
@@ -4508,6 +4546,7 @@ fn processGrapheme(
         .line_height = self.lineHeightForNatural(glyph_ascent + glyph_descent),
         .width = glyph_width,
         .height = glyph_height,
+        .is_word_separator = separates_word,
         .node_ptr = node_ptr,
         .payload = .{
             .glyph = .{
@@ -7014,6 +7053,16 @@ const BlockLayout = struct {
         return self.rebindAfterInsert(node);
     }
 
+    fn canReuseRemoveOpaque(ptr: *anyopaque, remove_index: usize) bool {
+        const self: *BlockLayout = @ptrCast(@alignCast(ptr));
+        return self.canReuseRemove(remove_index);
+    }
+
+    fn rebindAfterRemoveOpaque(ptr: *anyopaque, node: *Node) bool {
+        const self: *BlockLayout = @ptrCast(@alignCast(ptr));
+        return self.rebindAfterRemove(node);
+    }
+
     fn bindDomNode(self: *BlockLayout, node: *Node) void {
         self.node = node.*;
         self.node_ptr = node;
@@ -7024,6 +7073,8 @@ const BlockLayout = struct {
                 element.layout_paint_mark = markPaintOpaque;
                 element.layout_can_reuse_insert = canReuseInsertOpaque;
                 element.layout_rebind_after_insert = rebindAfterInsertOpaque;
+                element.layout_can_reuse_remove = canReuseRemoveOpaque;
+                element.layout_rebind_after_remove = rebindAfterRemoveOpaque;
             },
             .text => {},
         }
@@ -7184,6 +7235,82 @@ const BlockLayout = struct {
             if (!ownsNode(block, dom_child)) continue;
             block.bindDomNode(dom_child);
             retained_index += 1;
+        }
+        return true;
+    }
+
+    /// A removal can retain this ordinary one-to-one block list when the
+    /// removed DOM child is still only an insertion gap. Removing a child with
+    /// a layout owner would require deleting an owned layout subtree, so that
+    /// case remains on the full structural path.
+    fn canReuseRemove(self: *BlockLayout, remove_index: usize) bool {
+        if (publishedNodeTableRole(self.node) != .ordinary) return false;
+        if (!self.persistent_dependencies or self.inline_nodes != null) return false;
+        if (self.children_version.dirty or self.laid_out_dom_children == 0) return false;
+
+        const node = self.node_ptr orelse return false;
+        const element = switch (node.*) {
+            .element => |*value| value,
+            .text => return false,
+        };
+        if (remove_index >= element.children.items.len) return false;
+        if (!element.children_dirty or !element.children_insertions_only) return false;
+        if (self.children.items.len != self.laid_out_dom_children) return false;
+        if (nodeLayoutOwner(&element.children.items[remove_index]) != null) return false;
+
+        var retained_index: usize = 0;
+        for (element.children.items, 0..) |*dom_child, index| {
+            if (index == remove_index) continue;
+            if (retained_index >= self.children.items.len) return false;
+            const block = switch (self.children.items[retained_index]) {
+                .block => |value| value,
+                .line => return false,
+            };
+            if (!ownsNode(block, dom_child) or block.inline_nodes != null or
+                block.parent_block != self)
+            {
+                return false;
+            }
+            retained_index += 1;
+        }
+        return retained_index == self.children.items.len;
+    }
+
+    /// Rebind the retained parent and surviving direct block children after a
+    /// removal whose layout object was never published. No layout child is
+    /// destroyed because the removed DOM node was only an insertion gap.
+    fn rebindAfterRemove(self: *BlockLayout, node: *Node) bool {
+        if (self.node_ptr != node) return false;
+        const element = switch (node.*) {
+            .element => |*value| value,
+            .text => return false,
+        };
+        if (!element.children_dirty or !element.children_insertions_only or
+            element.children.items.len != self.laid_out_dom_children or
+            self.children.items.len != self.laid_out_dom_children)
+        {
+            return false;
+        }
+
+        var retained_index: usize = 0;
+        for (element.children.items) |*dom_child| {
+            if (retained_index >= self.children.items.len) return false;
+            const block = switch (self.children.items[retained_index]) {
+                .block => |value| value,
+                .line => return false,
+            };
+            if (!ownsNode(block, dom_child) or block.inline_nodes != null or
+                block.parent_block != self)
+            {
+                return false;
+            }
+            retained_index += 1;
+        }
+        if (retained_index != self.children.items.len) return false;
+
+        self.bindDomNode(node);
+        for (self.children.items, element.children.items) |child, *dom_child| {
+            child.block.bindDomNode(dom_child);
         }
         return true;
     }
@@ -7550,6 +7677,8 @@ const BlockLayout = struct {
                     e.layout_paint_mark = markPaintOpaque;
                     e.layout_can_reuse_insert = canReuseInsertOpaque;
                     e.layout_rebind_after_insert = rebindAfterInsertOpaque;
+                    e.layout_can_reuse_remove = canReuseRemoveOpaque;
+                    e.layout_rebind_after_remove = rebindAfterRemoveOpaque;
                 },
                 else => {},
             }
@@ -10548,14 +10677,56 @@ fn animatedBackgroundColor(element: parser.Element) ?browser.Color {
     return .{ .r = color.r, .g = color.g, .b = color.b, .a = color.a };
 }
 
+const CanvasBackground = struct {
+    node: *Node,
+    element: *const parser.Element,
+};
+
+fn hasCanvasBackground(element: *const parser.Element) bool {
+    if (animatedBackgroundColor(element.*) != null) return true;
+    const styles = if (element.style) |*style_map| style_map else return false;
+    if (backgroundImagePaint(element) != null) return true;
+    const value = styleValue(styles, "background-color") orelse return false;
+    if (std.ascii.eqlIgnoreCase(std.mem.trim(u8, value, " \t\r\n"), "transparent")) return false;
+    return parseColor(value) != null;
+}
+
+/// CSS propagates the body background to the canvas when the root element has
+/// no background of its own. Keep the selected Node alongside the Element so
+/// the image command can retain correct provenance and generation lifetime.
+fn rootCanvasBackground(document: *const DocumentLayout) ?CanvasBackground {
+    const root = document.node_ptr;
+    const root_element = switch (root.*) {
+        .element => |*element| element,
+        .text => return null,
+    };
+    if (hasCanvasBackground(root_element)) {
+        return .{ .node = root, .element = root_element };
+    }
+    for (root_element.children.items) |*child| {
+        switch (child.*) {
+            .element => |*element| if (std.ascii.eqlIgnoreCase(element.tag, "body")) {
+                if (hasCanvasBackground(element)) return .{ .node = child, .element = element };
+                break;
+            },
+            .text => {},
+        }
+    }
+    return null;
+}
+
 fn rootCanvasBackgroundColor(document: *const DocumentLayout) ?browser.Color {
-    if (document.children.items.len == 0) return null;
-    const element = liveBlockElement(document.children.items[0]) orelse return null;
-    if (animatedBackgroundColor(element.*)) |color| return color;
-    const styles = if (element.style) |*style_map| style_map else return null;
+    const background = rootCanvasBackground(document) orelse return null;
+    if (animatedBackgroundColor(background.element.*)) |color| return color;
+    const styles = if (background.element.style) |*style_map| style_map else return null;
     const value = styleValue(styles, "background-color") orelse return null;
     if (std.ascii.eqlIgnoreCase(std.mem.trim(u8, value, " \t\r\n"), "transparent")) return null;
     return parseColor(value);
+}
+
+fn rootCanvasBackgroundImage(document: *const DocumentLayout) ?BackgroundImagePaint {
+    const background = rootCanvasBackground(document) orelse return null;
+    return backgroundImagePaint(background.element);
 }
 
 test "layout reads the current background color animation value" {
@@ -10594,6 +10765,27 @@ test "root background color propagates to the canvas" {
 
     try std.testing.expectEqual(
         browser.Color{ .r = 0, .g = 0, .b = 255, .a = 255 },
+        rootCanvasBackgroundColor(document).?,
+    );
+}
+
+test "body background color propagates when html is transparent" {
+    const allocator = std.testing.allocator;
+    var root_node = Node{ .element = try parser.Element.init(allocator, "html", null) };
+    defer root_node.deinit(allocator);
+    var body = Node{ .element = try parser.Element.init(allocator, "body", &root_node) };
+    try setTestStyleValue(allocator, &body, "background-color", "silver");
+    try root_node.element.children.append(allocator, body);
+    const document = try DocumentLayout.init(allocator, &root_node);
+    defer {
+        document.deinit();
+        allocator.destroy(document);
+    }
+    const root = try BlockLayout.init(allocator, root_node, &root_node, document, null, null);
+    try document.children.append(allocator, root);
+
+    try std.testing.expectEqual(
+        browser.Color{ .r = 192, .g = 192, .b = 192, .a = 255 },
         rootCanvasBackgroundColor(document).?,
     );
 }
@@ -10666,6 +10858,24 @@ pub fn paintDocument(self: *Layout, document: *DocumentLayout) ![]DisplayItem {
                 .color = bg_color,
                 .source = displaySource(document, document.node_ptr),
             } });
+        }
+
+        if (!self.accessibility.forced_colors) {
+            if (rootCanvasBackgroundImage(document)) |paint| {
+                try appendBackgroundImageBox(
+                    &commands,
+                    self.allocator,
+                    paint,
+                    0,
+                    0,
+                    self.layoutWindowWidth(),
+                    @max(content_height, self.toLayoutPx(self.window_height)),
+                    self.layoutWindowWidth(),
+                    self.layoutWindowHeight(),
+                    @floatCast(self.zoom()),
+                    displaySource(document, rootCanvasBackground(document).?.node),
+                );
+            }
         }
 
         for (document.children.items) |child| {
@@ -11591,7 +11801,8 @@ fn addBackgroundIfNeededToList(self: *Layout, commands: *std.ArrayList(DisplayIt
     // block's content-sized border box.
     if (color != null and
         block.parent_block == null and
-        rootCanvasBackgroundColor(block.document) != null)
+        (rootCanvasBackgroundColor(block.document) != null or
+            rootCanvasBackgroundImage(block.document) != null))
     {
         color = null;
     }
@@ -11618,19 +11829,21 @@ fn addBackgroundIfNeededToList(self: *Layout, commands: *std.ArrayList(DisplayIt
     // backgrounds so the semantic high-contrast palette remains legible.
     if (!self.accessibility.forced_colors) {
         if (backgroundImagePaint(element)) |paint| {
-            try appendBackgroundImageBox(
-                commands,
-                self.allocator,
-                paint,
-                block_x,
-                block_y,
-                block_width,
-                block_height,
-                self.layoutWindowWidth(),
-                self.layoutWindowHeight(),
-                scaleBlockCssFloat(block, 1.0),
-                source,
-            );
+            if (!(block.parent_block == null and rootCanvasBackgroundImage(block.document) != null)) {
+                try appendBackgroundImageBox(
+                    commands,
+                    self.allocator,
+                    paint,
+                    block_x,
+                    block_y,
+                    block_width,
+                    block_height,
+                    self.layoutWindowWidth(),
+                    self.layoutWindowHeight(),
+                    scaleBlockCssFloat(block, 1.0),
+                    source,
+                );
+            }
         }
     }
 

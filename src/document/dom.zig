@@ -208,6 +208,11 @@ pub const Element = struct {
     // borrow the opaque layout owner synchronously.
     layout_can_reuse_insert: ?*const fn (*anyopaque, usize) bool = null,
     layout_rebind_after_insert: ?*const fn (*anyopaque, *Node) bool = null,
+    // A removal may use the narrow path only when the removed direct child has
+    // no published layout owner and the retained parent can still match every
+    // surviving child to its existing layout object.
+    layout_can_reuse_remove: ?*const fn (*anyopaque, usize) bool = null,
+    layout_rebind_after_remove: ?*const fn (*anyopaque, *Node) bool = null,
     // Track strings we've allocated (like resolved relative font sizes) so we can free them
     owned_strings: ?std.ArrayList([]const u8) = null,
     is_focused: bool = false,
@@ -372,12 +377,31 @@ pub const Element = struct {
         return callback(owner, node);
     }
 
+    /// Ask the current layout owner whether a direct child can be removed
+    /// without destroying the retained layout tree.
+    pub fn canReuseLayoutForRemove(self: *Element, remove_index: usize) bool {
+        const owner = self.layout_ptr orelse return false;
+        const callback = self.layout_can_reuse_remove orelse return false;
+        return callback(owner, remove_index);
+    }
+
+    /// Repair retained layout-to-DOM pointers after a direct child removal.
+    /// The caller must invoke this before another host callback or JavaScript
+    /// statement can observe the new child storage.
+    pub fn rebindLayoutAfterRemove(self: *Element, node: *Node) bool {
+        const owner = self.layout_ptr orelse return false;
+        const callback = self.layout_rebind_after_remove orelse return false;
+        return callback(owner, node);
+    }
+
     pub fn clearLayoutOwner(self: *Element) void {
         self.layout_ptr = null;
         self.layout_mark = null;
         self.layout_paint_mark = null;
         self.layout_can_reuse_insert = null;
         self.layout_rebind_after_insert = null;
+        self.layout_can_reuse_remove = null;
+        self.layout_rebind_after_remove = null;
     }
 
     pub fn deinit(self: *Element, allocator: std.mem.Allocator) void {

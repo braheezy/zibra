@@ -178,14 +178,18 @@ heap-stable detached ownership; an unobserved removed subtree can be reclaimed.
 An insertion-only mutation may preserve the style dependency graph and
 `DocumentLayout` only when the layout owner verifies a one-to-one mapping from
 every represented direct DOM child to a DOM-backed block layout. Anonymous
-inline runs, run-in merging, style/link-bearing inserts, removal, reorder, or
-ambiguous classification use the general transaction.
+inline runs, run-in merging, style/link-bearing inserts, reorder, or ambiguous
+classification use the general transaction. A removal may use the same narrow
+boundary only when it removes a newly inserted gap that has no layout owner;
+removing an already-laid-out child still uses the general transaction.
 
 The retained path must reserve first, move Nodes, and synchronously rebind both
 JavaScript handles and every matched layout `node_ptr` before control escapes.
-Layout creates owners only for unmatched gaps. Each block's protected
+Layout creates owners only for unmatched insertion gaps. Each block's protected
 `previous` field is rewired for its new in-flow predecessor so vertical
-invalidation propagates without reallocating unaffected siblings.
+invalidation propagates without reallocating unaffected siblings. A retained
+gap removal rebinds the surviving direct children after the child array shifts;
+it does not destroy or retain the removed subtree's layout.
 
 ## ProtectedField and style invalidation
 

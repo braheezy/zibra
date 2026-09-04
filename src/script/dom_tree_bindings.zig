@@ -26,6 +26,57 @@ pub const WindowBorrow = struct {
     current_nodes: ?*Node,
     handles: *DomHandles,
     handle_issuer: *IdIssuer,
+    id_cache: *IdCache,
+};
+
+/// A small document-local lookup cache for repeated ID queries. Entries keep
+/// numeric Node identities rather than raw pointers, so child-array relocation
+/// does not make the cache unsafe. Callers still validate attachment and the
+/// current ID before using an entry; DOM mutation code clears it whenever an
+/// ID-bearing subtree can change tree order.
+pub const IdCache = struct {
+    const Entry = struct {
+        hash: u64 = 0,
+        length: usize = 0,
+        handle: ?u32 = null,
+    };
+
+    entries: [8]Entry = [_]Entry{.{}} ** 8,
+    next: usize = 0,
+
+    pub fn clear(self: *IdCache) void {
+        self.* = .{};
+    }
+
+    fn remember(self: *IdCache, id: []const u8, handle: u32) void {
+        self.entries[self.next] = .{
+            .hash = std.hash.Wyhash.hash(0, id),
+            .length = id.len,
+            .handle = handle,
+        };
+        self.next = (self.next + 1) % self.entries.len;
+    }
+
+    fn cachedNode(
+        self: *IdCache,
+        id: []const u8,
+        window: WindowBorrow,
+    ) ?*Node {
+        const hash = std.hash.Wyhash.hash(0, id);
+        for (self.entries) |entry| {
+            if (entry.handle == null or entry.hash != hash or entry.length != id.len) continue;
+            const node = window.handles.resolve(entry.handle.?) orelse continue;
+            if (!dom_mutation.isAttachedToCurrentDocument(window.current_nodes, node)) continue;
+            const element = switch (node.*) {
+                .element => |*value| value,
+                .text => continue,
+            };
+            if (idForElement(element)) |current_id| {
+                if (std.mem.eql(u8, current_id, id)) return node;
+            }
+        }
+        return null;
+    }
 };
 
 /// Heap-stable host data retained by Kiesel native functions. `allocator` is
@@ -308,7 +359,13 @@ fn getElementById(agent: *Agent, this_value: Value, arguments: Arguments) Agent.
     const id = try requireString(agent, host, arguments.get(0), "getElementById requires a string");
     defer host.allocator.free(id);
     const root = window.current_nodes orelse return .null;
-    return nodeValueFor(window, findElementById(root, id));
+    if (window.id_cache.cachedNode(id, window)) |cached| {
+        return nodeValueFor(window, cached);
+    }
+    const found = findElementById(root, id) orelse return .null;
+    const handle = try window.handles.getOrCreate(found, window.handle_issuer);
+    window.id_cache.remember(id, handle);
+    return Value.from(@as(f64, @floatFromInt(handle)));
 }
 
 fn getElementsByTagName(agent: *Agent, this_value: Value, arguments: Arguments) Agent.Error!Value {

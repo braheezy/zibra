@@ -16,6 +16,7 @@ const Node = parser.Node;
 pub const Kind = enum {
     structural,
     retained_insert,
+    retained_remove,
 };
 
 pub const Hooks = struct {
@@ -358,14 +359,28 @@ pub fn detachChild(
     const refresh_named = parent_is_attached and subtreeHasId(child);
     const parent_parent = nodeParent(parent);
     const element = &parent.element;
+    const retains_layout_children = parent_is_attached and
+        self.can_retain_layout_insert and
+        !subtreeCanChangeAuthorStyleRules(child) and
+        element.canReuseLayoutForRemove(remove_index);
 
     if (refresh_named) try self.hooks.clear_named(self.host_context, self.window_id);
 
     dirtyAffectedSiblingStyles(element, if (remove_index > 0) remove_index - 1 else 0);
-    element.markChildrenDirty();
+    if (retains_layout_children) {
+        // The removed child is an insertion gap, so the existing layout child
+        // list still describes the final DOM after the removal.
+        element.markChildInserted();
+    } else {
+        element.markChildrenDirty();
+    }
     parser.dirtyStyleForElement(element);
     markElementLayoutDirty(element);
-    if (parent_is_attached) self.hooks.prepare(self.host_context, parent, .structural);
+    if (parent_is_attached) self.hooks.prepare(
+        self.host_context,
+        parent,
+        if (retains_layout_children) .retained_remove else .structural,
+    );
 
     // orderedRemove shifts later children, invalidating their pointer keys.
     // Remove every published direct-child address before performing the move.
@@ -388,6 +403,10 @@ pub fn detachChild(
     parser.fixParentPointers(detached, null);
     clearDetachedLayoutPointers(detached);
     parser.dirtyStyleSubtree(detached);
+
+    if (retains_layout_children and !element.rebindLayoutAfterRemove(parent)) {
+        @panic("verified retained layout children could not be rebound after removal");
+    }
 
     if (parent_is_attached) {
         self.hooks.complete(self.host_context, parent);

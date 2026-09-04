@@ -228,6 +228,7 @@ const WindowRealm = struct {
     // clear JavaScript state would violate the teardown contract.
     retired: bool = false,
     handles: DomHandles,
+    id_cache: dom_tree_bindings.IdCache,
     // Heap-stable owners for createElement results and removeChild subtrees
     // that have not yet been transferred into a DOM child array.
     detached_nodes: std.AutoHashMap(*Node, void),
@@ -407,6 +408,7 @@ fn createWindowRealmLocked(self: *Js) !*WindowRealm {
     window.* = .{
         .realm = realm,
         .handles = DomHandles.init(self.allocator),
+        .id_cache = .{},
         .detached_nodes = std.AutoHashMap(*Node, void).init(self.allocator),
         .current_nodes = null,
         .named_globals_synced = false,
@@ -1087,6 +1089,11 @@ fn syncNamedIdGlobals(self: *Js, window_id: u32, window: *WindowRealm) Agent.Err
 }
 
 fn clearNamedIdGlobals(self: *Js, window_id: u32, window: *WindowRealm) Agent.Error!void {
+    // The same DOM changes that require named-global rebuilding can change
+    // which duplicate ID is first in tree order. Numeric cache entries remain
+    // safe across ordinary child-array relocation, but not across that class
+    // of topology change.
+    window.id_cache.clear();
     window.named_globals_synced = false;
     if (!window.runtime_initialized or window.retired) return;
     const key = kiesel.types.PropertyKey.from("__clearIdGlobals");
@@ -1157,6 +1164,7 @@ fn activeDomTreeWindow(context: ?*anyopaque) ?dom_tree_bindings.WindowBorrow {
         .current_nodes = window.current_nodes,
         .handles = &window.handles,
         .handle_issuer = &self.handle_issuer,
+        .id_cache = &window.id_cache,
     };
 }
 
@@ -4945,7 +4953,12 @@ fn querySelectorAllFrom(agent: *Agent, this_value: Value, arguments: kiesel.type
     const js_instance = builtin_fn.fields.additionalFieldsAs(Js);
     const window_id = js_instance.current_window_id orelse return agent.throwException(.internal_error, "Missing active window", .{});
     const window = js_instance.windows.get(window_id) orelse return agent.throwException(.internal_error, "Missing window context", .{});
-    const root = try dom_tree_bindings.requireNodeForHost(agent, .{ .current_nodes = window.current_nodes, .handles = &window.handles, .handle_issuer = &js_instance.handle_issuer }, arguments.get(0));
+    const root = try dom_tree_bindings.requireNodeForHost(agent, .{
+        .current_nodes = window.current_nodes,
+        .handles = &window.handles,
+        .handle_issuer = &js_instance.handle_issuer,
+        .id_cache = &window.id_cache,
+    }, arguments.get(0));
     const selector_arg = arguments.get(1);
     if (!selector_arg.isString()) return agent.throwException(.type_error, "querySelectorAll requires a string argument", .{});
     const selector_str = try selector_arg.asString().toUtf8(js_instance.allocator);

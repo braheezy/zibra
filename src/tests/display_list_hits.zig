@@ -768,6 +768,11 @@ test "verified insertBefore mutation retains document and matched block layouts"
                     context.frame,
                     mutation_root,
                 ),
+                .retained_remove => context.tab.prepareForDomInsert(
+                    context.browser,
+                    context.frame,
+                    mutation_root,
+                ),
             }
         }
 

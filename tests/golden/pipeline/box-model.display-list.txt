@@ -1,3 +1,4 @@
+rect x1=0 y1=0 x2=800 y2=600 color=#f0f0f0ff
 rect x1=23 y1=28 x2=301 y2=215 color=#f0f0f0ff
 quad x1=23 y1=28 x2=301 y2=28 x3=298 y3=30 x4=30 y4=30 color=#111111ff
 quad x1=301 y1=28 x2=301 y2=215 x3=298 y3=210 x4=298 y4=30 color=#222222ff
