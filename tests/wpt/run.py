@@ -16,6 +16,7 @@ import math
 import json
 import os
 import pathlib
+import re
 import signal
 import socket
 import subprocess
@@ -710,6 +711,20 @@ def _bounded_diagnostic(value: str) -> str:
     return encoded.decode("utf-8", errors="replace") + "\n[truncated]"
 
 
+def _browser_revision() -> str:
+    """Return a display-safe revision, tolerating old task-shell artifacts."""
+    value = (
+        os.environ.get("ZIBRA_GIT_SHA")
+        or os.environ.get("GITHUB_SHA")
+        or os.environ.get("CI_COMMIT_SHA")
+        or "working-tree"
+    ).strip()
+    if "git rev-parse" in value or "printf working-tree" in value:
+        match = re.match(r"^([0-9a-f]{4,40})", value, re.IGNORECASE)
+        return match.group(1) if match else "working-tree"
+    return value
+
+
 def _serialize_case_result(result: CaseResult) -> dict[str, Any]:
     case = result.case
     item: dict[str, Any] = {
@@ -766,12 +781,7 @@ def write_run_report(
         "suite": "all" if str(manifest) == "<all-testharness>" else "focused",
         "mode": mode,
         "browser": browser,
-        "browser_revision": (
-            os.environ.get("ZIBRA_GIT_SHA")
-            or os.environ.get("GITHUB_SHA")
-            or os.environ.get("CI_COMMIT_SHA")
-            or "working-tree"
-        ),
+        "browser_revision": _browser_revision(),
         "summary": {
             "total": len(serialized),
             "pass": counts["PASS"],

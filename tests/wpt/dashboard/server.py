@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 from http import HTTPStatus
 from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -15,6 +16,15 @@ ROOT = Path(__file__).resolve().parent
 STATIC = ROOT / "static"
 RESULTS = Path(os.environ.get("RESULTS_DIR", "/data"))
 WPT_CHECKOUT = Path(os.environ.get("WPT_DIR", "/wpt"))
+
+
+def _revision_label(value: object) -> str:
+    """Keep shell fragments from old reports out of dashboard metadata."""
+    text = str(value or "working-tree").strip()
+    if "git rev-parse" in text or "printf working-tree" in text:
+        match = re.match(r"^([0-9a-f]{4,40})", text, re.IGNORECASE)
+        return match.group(1) if match else "working-tree"
+    return text
 
 
 def _run_files() -> list[Path]:
@@ -81,7 +91,7 @@ def _run_summary(path: Path) -> dict:
         # into the history makes progress look artificially better as the
         # selected set changes. The chart therefore consumes full-suite runs.
         "full_suite": suite == "all" or manifest == "<all-testharness>",
-        "browser_revision": report.get("browser_revision", "working-tree"),
+        "browser_revision": _revision_label(report.get("browser_revision")),
         "summary": summary if isinstance(summary, dict) else {},
         "directories": _directory_scores(report),
     }

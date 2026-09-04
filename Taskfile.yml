@@ -5,6 +5,8 @@ vars:
   WPT_RESULTS: tests/wpt/results
   DASHBOARD_COMPOSE: tests/wpt/dashboard/docker-compose.yml
   WPT_JOBS: 4
+  GIT_SHA:
+    sh: git rev-parse --short HEAD 2>/dev/null || printf working-tree
 
 tasks:
   dashboard:
@@ -18,8 +20,7 @@ tasks:
       - zig build
       - mkdir -p {{.WPT_RESULTS}}
       - >-
-        ZIBRA_GIT_SHA="$$(git rev-parse --short HEAD 2>/dev/null || printf
-        working-tree)" SDL_VIDEODRIVER=dummy python3 tests/wpt/run.py {{.WPT_MANIFEST}}
+        ZIBRA_GIT_SHA="{{.GIT_SHA}}" SDL_VIDEODRIVER=dummy python3 tests/wpt/run.py {{.WPT_MANIFEST}}
         --mode testharness --browser ./zig-out/bin/zibra
         --report {{.WPT_RESULTS}}/$(date -u +%Y%m%dT%H%M%SZ).json
 
@@ -29,8 +30,7 @@ tasks:
       - zig build
       - mkdir -p {{.WPT_RESULTS}}
       - >-
-        ZIBRA_GIT_SHA="$$(git rev-parse --short HEAD 2>/dev/null || printf
-        working-tree)" SDL_VIDEODRIVER=dummy python3 tests/wpt/run.py --all
+        ZIBRA_GIT_SHA="{{.GIT_SHA}}" SDL_VIDEODRIVER=dummy python3 tests/wpt/run.py --all
         --mode testharness --jobs {{.WPT_JOBS}} --browser ./zig-out/bin/zibra
         --report {{.WPT_RESULTS}}/all-$(date -u +%Y%m%dT%H%M%SZ).json
 
@@ -40,8 +40,7 @@ tasks:
       - zig build
       - mkdir -p {{.WPT_RESULTS}}
       - >-
-        ZIBRA_GIT_SHA="$$(git rev-parse --short HEAD 2>/dev/null || printf
-        working-tree)" SDL_VIDEODRIVER=dummy python3 tests/wpt/run.py
+        ZIBRA_GIT_SHA="{{.GIT_SHA}}" SDL_VIDEODRIVER=dummy python3 tests/wpt/run.py
         tests/wpt/manifest-dom.yaml --mode testharness --browser ./zig-out/bin/zibra
         --report {{.WPT_RESULTS}}/dom-$(date -u +%Y%m%dT%H%M%SZ).json
 
@@ -51,8 +50,7 @@ tasks:
       - zig build
       - mkdir -p {{.WPT_RESULTS}}
       - >-
-        ZIBRA_GIT_SHA="$$(git rev-parse --short HEAD 2>/dev/null || printf
-        working-tree)" SDL_VIDEODRIVER=dummy python3 tests/wpt/run.py
+        ZIBRA_GIT_SHA="{{.GIT_SHA}}" SDL_VIDEODRIVER=dummy python3 tests/wpt/run.py
         tests/wpt/manifest-acid3.yaml --mode testharness --browser ./zig-out/bin/zibra
         --timeout-ms 120000
         --report {{.WPT_RESULTS}}/acid3-$(date -u +%Y%m%dT%H%M%SZ).json

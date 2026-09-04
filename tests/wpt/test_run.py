@@ -31,6 +31,14 @@ class WptRunnerTests(unittest.TestCase):
     def tearDown(self):
         self.temporary_directory.cleanup()
 
+    def test_browser_revision_strips_task_shell_artifacts(self):
+        with mock.patch.dict(
+            runner.os.environ,
+            {"ZIBRA_GIT_SHA": "9476(git rev-parse --short HEAD 2>/dev/null || printf working-tree)"},
+            clear=False,
+        ):
+            self.assertEqual("9476", runner._browser_revision())
+
     def write_manifest(self, **overrides):
         case = {
             "path": self.case_path,

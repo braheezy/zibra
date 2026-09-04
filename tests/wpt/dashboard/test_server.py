@@ -63,6 +63,18 @@ class DashboardServerTests(unittest.TestCase):
             )
             self.assertFalse(server._run_summary(path)["full_suite"])
 
+    def test_run_summary_sanitizes_legacy_revision_text(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "legacy.json"
+            path.write_text(
+                json.dumps({
+                    "browser_revision": "9476(git rev-parse --short HEAD)",
+                    "tests": [],
+                }),
+                encoding="utf-8",
+            )
+            self.assertEqual("9476", server._run_summary(path)["browser_revision"])
+
 
 if __name__ == "__main__":
     unittest.main()

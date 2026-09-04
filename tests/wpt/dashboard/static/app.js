@@ -7,6 +7,13 @@ const $ = (id) => document.getElementById(id);
 const esc = (value) => String(value ?? "").replace(/[&<>"']/g, (char) => ({
   "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;",
 }[char]));
+const revisionLabel = (value) => {
+  const text = String(value || "working-tree").trim();
+  if (text.includes("git rev-parse") || text.includes("printf working-tree")) {
+    return text.match(/^[0-9a-f]{4,40}/i)?.[0] || "working-tree";
+  }
+  return text;
+};
 const summary = (run) => run?.summary || {};
 const semanticTotal = (value) => value.subtests_total != null ? value.subtests_total :
   (value.pass || 0) + (value.fail || 0) + (value.error || 0) + (value.timeout || 0);
@@ -40,7 +47,7 @@ function currentRun() {
 function renderRunSelect() {
   const select = $("run-select");
   select.innerHTML = state.runs.length ? state.runs.map((run) => {
-    const label = `${dateText(run.finished_at)} · ${run.browser_revision || "working-tree"}`;
+    const label = `${dateText(run.finished_at)} · ${revisionLabel(run.browser_revision)}`;
     return `<option value="${esc(run.id)}">${esc(label)}</option>`;
   }).join("") : '<option value="">No reports</option>';
   if (state.selectedId) select.value = state.selectedId;
@@ -82,7 +89,7 @@ function renderCoverage(report) {
   const groups = directories.filter((directory) =>
     !query || String(directory.path || "").toLowerCase().includes(query)
   );
-  const revision = report?.browser_revision || currentRun()?.browser_revision || "working-tree";
+  const revision = revisionLabel(report?.browser_revision || currentRun()?.browser_revision);
   $("browser-column").innerHTML = `<span class="browser-head">Zibra</span><span class="browser-sha">${esc(revision.slice(0, 12))}</span><span class="browser-date">${esc(dateText(report?.finished_at || currentRun()?.finished_at))}</span>`;
   const entries = groups.sort((a, b) => String(a.path || "").localeCompare(String(b.path || "")));
   if (!entries.length) {
@@ -104,7 +111,7 @@ function renderRun(report) {
     result.passed += Number(directory.passed || 0); result.total += Number(directory.total || 0);
     return result;
   }, { passed: 0, total: 0 });
-  const revision = report?.browser_revision || run?.browser_revision || "working-tree";
+  const revision = revisionLabel(report?.browser_revision || run?.browser_revision);
   const runLabel = run?.id === state.runs[0]?.id ? "latest local test run" : "selected local test run";
   $("results-score").textContent = run ? `${checks.passed}/${checks.total}` : "—";
   $("results-description").textContent = run ? `Showing ${directories.length} directory scores from the ${runLabel} for zibra[${revision}]` : "No results selected.";
