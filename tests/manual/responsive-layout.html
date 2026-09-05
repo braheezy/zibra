@@ -1,0 +1,114 @@
+<!--
+How to verify:
+1. Open this page at the default window size. The header controls fit on one
+   row, the cards use three columns, and the status says "tall viewport".
+2. Make the window narrower than 650 CSS pixels. The header wraps and the
+   cards become one column without horizontal overflow.
+3. Click "Change accent". The page's CSS custom property changes and the
+   accent border, button, and status badge update together.
+4. Make the window shorter than 500 CSS pixels. The height status changes to
+   "short viewport" without changing the width layout.
+-->
+<!doctype html>
+<html>
+  <head>
+    <meta charset="utf-8">
+    <title>Responsive layout</title>
+    <style>
+      :root {
+        --accent: #265dab;
+        --panel: #e8f0ff;
+        --space: 16px;
+      }
+
+      * { box-sizing: border-box; }
+      body {
+        margin: var(--space);
+        color: #172033;
+        font: 16px sans-serif;
+      }
+
+      header {
+        align-items: center;
+        border-bottom: 4px solid var(--accent);
+        display: flex;
+        flex-wrap: wrap;
+        gap: var(--space);
+        padding-bottom: var(--space);
+      }
+
+      h1 {
+        color: var(--accent);
+        flex: 1 1 14rem;
+        margin: 0;
+      }
+
+      nav {
+        display: flex;
+        flex: 0 1 auto;
+        gap: 8px;
+      }
+
+      button {
+        background: var(--accent);
+        border: 0;
+        color: white;
+        padding: 8px 12px;
+      }
+
+      main { margin-top: var(--space); }
+      .grid {
+        display: grid;
+        gap: var(--space);
+        grid-template-columns: repeat(3, minmax(0, 1fr));
+      }
+
+      article {
+        background: var(--panel);
+        border-left: 6px solid var(--accent);
+        min-height: 100px;
+        padding: var(--space);
+      }
+
+      article h2 { margin-top: 0; }
+      .short { display: none; }
+      .status {
+        background: var(--accent);
+        color: white;
+        display: inline-block;
+        padding: 4px 8px;
+      }
+
+      @media (max-width: 650px) {
+        .grid { grid-template-columns: 1fr; }
+      }
+
+      @media (max-height: 500px) {
+        .tall { display: none; }
+        .short { display: inline; }
+      }
+    </style>
+  </head>
+  <body>
+    <header>
+      <h1>Responsive layout</h1>
+      <nav aria-label="Page controls">
+        <a href="#cards">Cards</a>
+        <button id="accent" type="button">Change accent</button>
+      </nav>
+    </header>
+    <main id="cards">
+      <p class="status"><span class="tall">tall viewport</span><span class="short">short viewport</span></p>
+      <section class="grid">
+        <article><h2>Flexible header</h2><p>The heading and controls wrap as available width changes.</p></article>
+        <article><h2>Responsive grid</h2><p>These cards use three tracks, then one track below the width breakpoint.</p></article>
+        <article><h2>Dynamic theme</h2><p>The button updates one custom property shared by the accents.</p></article>
+      </section>
+    </main>
+    <script>
+      document.getElementById("accent").addEventListener("click", function () {
+        document.documentElement.style.setProperty("--accent", "#a33a52");
+      });
+    </script>
+  </body>
+</html>

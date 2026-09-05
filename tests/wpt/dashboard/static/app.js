@@ -16,7 +16,8 @@ const revisionLabel = (value) => {
 };
 const summary = (run) => run?.summary || {};
 const semanticTotal = (value) => value.subtests_total != null ? value.subtests_total :
-  (value.pass || 0) + (value.fail || 0) + (value.error || 0) + (value.timeout || 0);
+  (value.pass || 0) + (value.fail || 0) + (value.error || 0) + (value.timeout || 0) +
+  (value.crash || 0);
 const passRate = (value) => {
   const total = value.coverage_total != null ? value.coverage_total : semanticTotal(value);
   const passed = value.coverage_total != null ? (value.coverage_pass || 0) :

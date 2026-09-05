@@ -20,6 +20,12 @@ task wpt
 python3 tests/wpt/run.py --all --jobs 4 --mode testharness \
   --browser ./zig-out/bin/zibra \
   --report tests/wpt/results/all.json
+python3 tests/wpt/run.py --all --mode reftest --jobs 4 \
+  --browser ./zig-out/bin/zibra \
+  --report tests/wpt/results/reftest.json
+python3 tests/wpt/run.py --all --mode crashtest --jobs 4 \
+  --browser ./zig-out/bin/zibra \
+  --report tests/wpt/results/crashtest.json
 zig build test-wpt-runner
 zig build test-wpt
 docker compose -f tests/wpt/dashboard/docker-compose.yml up --build
@@ -66,9 +72,9 @@ validates its JSON transport. Those local fixtures are protocol regressions,
 not WPT conformance claims.
 
 The YAML file is the compatibility allowlist. Add supported directory prefixes
-to `directories`, individual cases to `tests`, and fetch/parse smoke tests to
-`probes`; keep unsupported areas out of execution and record only intentional
-expected deviations.
+to `directories`, individual semantic cases to `tests`, individual visual
+cases to `reftests`, and fetch/parse smoke tests to `probes`; keep unsupported
+areas out of execution and record only intentional expected deviations.
 
 ## Full local runs
 
@@ -86,11 +92,32 @@ them.
 metadata rules locally. This includes generated `.any.js`, `.window.js`, and
 `.worker.js` variants. The report classifies testharness, reftest, manual,
 visual, WebDriver, crash, accessibility, conformance-checker, and Test262
-entries separately. Only testharness entries are currently runnable by
-Zibra's JSON protocol; the others increase the honest discovered total but
-remain unsupported and are not executed. Support files are not counted as
-tests. A full inventory run therefore reports both the total discovered WPT
-tests and its smaller runnable testharness subset.
+entries separately. Testharness, reftest, and markup crashtest entries are
+runnable in their respective modes; manual, visual, WebDriver, accessibility,
+conformance-checker, and Test262 entries remain discovery-only. Test262 is
+intentionally out of scope for this runner and belongs to Kiesel's JavaScript
+compatibility work. Support files are not counted as tests. A full inventory
+run therefore reports the total discovered WPT tests and the runnable count by
+category.
+
+Reftests are available as a separate visual harness with `--all --mode
+reftest` or `task wpt-reftest`. Each test page and its WPT `match`/`mismatch`
+references are captured through Zibra's windowless `--screenshot` mode. The
+runner compares RGB/RGBA PNG page pixels after the stable 70-pixel chrome
+strip, applies basic WPT fuzzy limits when present, and records per-reference
+diagnostics. Missing references, screenshot failures, malformed PNGs, and
+dimension mismatches are `INFRA`; a `mismatch` relation passes when the images
+are different. This provides the harness boundary without claiming rendering
+parity with the upstream browser.
+
+Crashtests are available as a separate process-health harness with
+`--all --mode crashtest` or `task wpt-crashtest`. Each case is loaded through Zibra's
+windowless screenshot lifecycle, which waits for a complete/quiescent document
+and requires a successful browser exit plus a captured frame. A healthy load is
+`PASS`; a browser process crash is `CRASH`; a completion watchdog expiry is
+`TIMEOUT`; launch and output problems are `INFRA`. This is intentionally an
+early boundary: WPT's optional `class=test-wait` testdriver completion bridge
+is not implemented yet, so tests requiring that automation remain unsupported.
 
 Build Zibra once, then run several independent browser processes against one
 temporary WPT server:

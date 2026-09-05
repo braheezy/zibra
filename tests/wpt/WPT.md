@@ -20,6 +20,11 @@ upstream testharness pass. The current implementation includes:
   worker-local loopback port, invokes the WPT CLI protocol, checks exact
   expectations, and treats malformed output, crashes, and its outer watchdog
   as infrastructure failures.
+- `run.py` also has separate reftest and crashtest adapters. Reftests capture
+  test/reference PNGs and apply match/mismatch comparison; crashtests drive the
+  headless lifecycle and classify healthy completion, browser crashes, and
+  watchdog expiry independently of testharness JSON. WPT `test-wait`
+  automation is not wired yet.
 - `src/browser/wpt_session.zig` owns one standalone headless Browser, drives
   `Browser.tick`, copies the first explicit report, accepts it after the Tab's
   serialized task-return barrier, gives the monotonic deadline precedence over
@@ -53,8 +58,10 @@ checkpoint, deadline race, runner failure classification, WPT resource
 resolution, durable reports, the local dashboard API, and one unchanged
 upstream DOM test. Resource quiescence,
 cross-Realm Promise-job routing, structured navigation/script failures,
-rejected-promise reporting, console/network diagnostics, reftests, persistent
-sessions, and CI artifact publishing remain incomplete.
+rejected-promise reporting, persistent sessions, and CI artifact publishing
+remain incomplete. Reftest discovery and screenshot-comparison harness
+support now exists, but broad rendering compatibility and stable WPT
+viewport/font configuration remain incomplete.
 
 `--dump-dom` still deliberately fetches and parses without constructing a
 Browser, SDL, layout, or JavaScript. A successful probe is never a
@@ -70,8 +77,8 @@ Browser, SDL, layout, or JavaScript. A successful probe is never a
 | 3. Scheduling/cancellation | Partial | Task-return barrier, deadline arbitration, and JS interruption work; resource quiescence and complete transport cancellation do not |
 | 4. Web APIs | Ongoing | Grow coherent slices from selected failures rather than attempting the full platform |
 | 5. `wptserve` | Core implemented | Worker-local loopback server supplies unchanged root-relative harness resources; richer dynamic handlers remain |
-| 6. Selection/expectations | Runner ready | Directory expansion, exact comparison, and full-suite zero coverage are supported |
-| 7. Reftests | Not started | Keep separate from semantic harness results |
+| 6. Selection/expectations | Runner ready | Directory expansion, exact comparison, full-suite zero coverage, and separate crashtest selection are supported |
+| 7. Reftests | Harness partial | Screenshot capture, match/mismatch relations, PNG diagnostics, and basic fuzzy limits work; rendering parity and full WPT metadata do not |
 | 8. Performance/CI | Partial | Local dashboard and report artifacts exist; sharding, CI publishing, and a persistent process do not |
 
 ## Next milestone: expand focused upstream coverage
@@ -358,11 +365,12 @@ cross-origin requests carry an explicit serialized request origin.
 
 ## Phase 6: semantic test selection and expectations
 
-Status: runner ready. `run.py` supports the YAML allowlist's reviewed `probe`
-and `testharness` modes, directory expansion, default PASS expectations,
-optional deviations, and infrastructure-failure classification. `task wpt`
-runs the allowlisted directories while scoring omitted discovered directories
-as zero coverage and failing the suite until those areas are implemented.
+Status: runner ready. `run.py` supports the YAML allowlist's reviewed `probe`,
+`testharness`, and `crashtest` modes, directory expansion, default PASS
+expectations, optional deviations, and infrastructure-failure classification.
+`task wpt` runs the allowlisted directories while scoring omitted discovered
+directories as zero coverage and failing the suite until those areas are
+implemented. `task wpt-crashtest` uses the separate process-health adapter.
 
 Start with tests whose dependencies match implemented behavior:
 
@@ -385,15 +393,17 @@ allowlist as the compatibility claim. Discovery prefers WPT's generated
 `MANIFEST.json` and has a dependency-free source-scan fallback. It classifies
 testharness (including generated `.any/.window/.worker` variants), reftest,
 visual, manual, WebDriver, crash, accessibility, conformance-checker, and
-Test262 entries. Only testharness entries currently have a Zibra result
-protocol; classification makes the larger WPT inventory visible without
-pretending unsupported categories passed. A failure should normally become
+Test262 entries. Testharness, reftest, and markup crashtests have separate
+Zibra adapters; Test262 remains intentionally out of scope for Kiesel to solve,
+and the other categories remain discovery-only. Classification makes the
+larger WPT inventory visible without pretending unsupported categories passed.
+A failure should normally become
 both a WPT result and a focused Zibra regression (unit test, pipeline golden,
 or manual fixture) according to `docs/testing.md`.
 
 ## Phase 7: rendering and reftests
 
-Status: not started. Do not reuse semantic harness status as pixel evidence.
+Status: harness partial. Do not reuse semantic harness status as pixel evidence.
 
 Rendering tests are a separate adapter, building on
 `Browser.runToScreenshot` and `tests/screenshot_compare.zig`:
@@ -405,6 +415,10 @@ Rendering tests are a separate adapter, building on
 - compare against a reference image with useful diff coordinates and a
   controlled tolerance policy;
 - record platform, font inventory, renderer, and scale in the result.
+
+The current adapter provides the screenshot, match/mismatch, PNG diagnostic,
+and basic fuzzy boundaries. It intentionally leaves viewport/font/timing
+normalization and WPT's full reference graph/fuzzy metadata for follow-up.
 
 Keep semantic assertions as the portable contract. Platform-font-dependent
 pixels should not be the only evidence for a cross-platform behavior.
@@ -457,8 +471,8 @@ Next:
    regression into focused native coverage.
 5. Add resource-quiescence and multi-Realm routing contracts before tests that
    depend on them.
-6. Add reftest capture, then sharding, parallelism, persistent processes, and
-   CI artifact publishing.
+6. Improve reftest viewport/font/timing controls and WPT fuzzy metadata, then
+   add sharding, parallelism, persistent processes, and CI artifact publishing.
 
 ## Verification requirements
 
@@ -475,10 +489,11 @@ For each browser-side phase, run the narrowest suite first:
 - `zig build test-screenshot` for native final-pixel behavior;
 - `zig build check` before integration changes are merged.
 
-At this progress snapshot, `zig build check --summary all` passed all 82 build
-steps and 557 tests. The focused baselines were 111 `test-script` tests, 463
-`test-browser` tests, three real `test-wpt` fixtures, and eight
-`test-wpt-runner` cases.
+At the previous progress snapshot, `zig build check --summary all` passed all
+82 build steps and 557 tests. The focused baselines were 111 `test-script`
+tests, 463 `test-browser` tests, and three real `test-wpt` fixtures. The
+current runner tests also cover reftest capture and comparison through
+`test-wpt-runner`.
 
 Every WPT failure used to guide development should include the WPT URL,
 revision, result JSON, relevant logs, and the promoted native regression. Never
