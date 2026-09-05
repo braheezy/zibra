@@ -1,14 +1,34 @@
 //! Dependency-tracked fields that propagate style and layout invalidation.
 //!
 //! Owners and dependents must remain at stable addresses after registration.
-//! The current implementation has no unsubscribe operation and is not thread
-//! safe; callers must destroy an entire dependency graph in a compatible order.
+//! Edges unlink from both endpoints on destruction. Registered fields must not
+//! move, and graph mutation remains synchronous and single-threaded.
 
 const std = @import("std");
 const builtin = @import("builtin");
 
 // Debug flag: set to true to enable invalidation logging
 const DEBUG_PROTECTED_FIELDS = false;
+
+/// One source-allocated edge, indexed by its publisher and linked into its
+/// subscriber. Intrusive reverse links keep field construction allocation-free
+/// and let different source allocators coexist without an allocator per field.
+const Edge = struct {
+    allocator: std.mem.Allocator,
+    source: *anyopaque,
+    target: *anyopaque,
+    mark: *const fn (*anyopaque) void,
+    remove_source: *const fn (*anyopaque, *anyopaque) void,
+    target_head: *?*Edge,
+    previous: ?*Edge = null,
+    next: ?*Edge = null,
+
+    fn destroy(self: *Edge) void {
+        if (self.previous) |previous| previous.next = self.next else self.target_head.* = self.next;
+        if (self.next) |next| next.previous = self.previous;
+        self.allocator.destroy(self);
+    }
+};
 
 pub fn ProtectedField(comptime T: type) type {
     // The generic is a comptime type factory: values and dirty state live
@@ -17,7 +37,7 @@ pub fn ProtectedField(comptime T: type) type {
     // not carry another allocator interface. Callers already know the owning
     // allocator at the graph construction/destruction boundary and pass it to
     // the operations that can allocate.
-    const Invalidations = std.AutoHashMapUnmanaged(*anyopaque, *const fn (*anyopaque) void);
+    const Invalidations = std.AutoHashMapUnmanaged(*anyopaque, *Edge);
     const DebugInfo = if (builtin.mode == .Debug)
         struct {
             obj: []const u8,
@@ -30,6 +50,7 @@ pub fn ProtectedField(comptime T: type) type {
         value: T,
         dirty: bool,
         invalidations: Invalidations,
+        dependencies_head: ?*Edge = null,
         debug_info: DebugInfo,
         owner_mark: ?*const fn (*anyopaque) void = null,
         owner_ptr: ?*anyopaque = null,
@@ -66,6 +87,11 @@ pub fn ProtectedField(comptime T: type) type {
         }
 
         pub fn deinit(self: *@This(), allocator: std.mem.Allocator) void {
+            self.clearInvalidations();
+            while (self.dependencies_head) |edge| {
+                edge.remove_source(edge.source, edge.target);
+                edge.destroy();
+            }
             self.invalidations.deinit(allocator);
         }
 
@@ -104,6 +130,8 @@ pub fn ProtectedField(comptime T: type) type {
         /// alive. Callers that use this coarse structural-mutation boundary
         /// must force a complete recomputation so dependencies are rebuilt.
         pub fn clearInvalidations(self: *@This()) void {
+            var it = self.invalidations.valueIterator();
+            while (it.next()) |edge| edge.*.destroy();
             self.invalidations.clearRetainingCapacity();
         }
 
@@ -113,8 +141,8 @@ pub fn ProtectedField(comptime T: type) type {
             }
             var it = self.invalidations.iterator();
             while (it.next()) |entry| {
-                const mark_fn = entry.value_ptr.*;
-                mark_fn(entry.key_ptr.*);
+                const edge = entry.value_ptr.*;
+                edge.mark(edge.target);
             }
         }
 
@@ -135,7 +163,28 @@ pub fn ProtectedField(comptime T: type) type {
                 }
             };
 
-            self.invalidations.put(allocator, notify_ptr, MarkFn.mark) catch {};
+            // Reserve before publishing either endpoint so allocation failure
+            // cannot leave a half-edge in the graph.
+            self.invalidations.ensureUnusedCapacity(allocator, 1) catch return;
+            const edge = allocator.create(Edge) catch return;
+            edge.* = .{
+                .allocator = allocator,
+                .source = self_ptr,
+                .target = notify_ptr,
+                .mark = MarkFn.mark,
+                .remove_source = removeInvalidationOpaque,
+                .target_head = &target.dependencies_head,
+                .next = target.dependencies_head,
+            };
+            if (target.dependencies_head) |next| next.previous = edge;
+            target.dependencies_head = edge;
+            self.invalidations.putAssumeCapacity(notify_ptr, edge);
+        }
+
+        fn removeInvalidationOpaque(raw: *anyopaque, target: *anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            const removed = self.invalidations.remove(target);
+            std.debug.assert(removed);
         }
 
         pub inline fn read(
@@ -208,6 +257,32 @@ pub fn ProtectedField(comptime T: type) type {
             self.dirty = false;
         }
     };
+}
+
+test "subscriber destruction unregisters every source and source destruction unlinks survivors" {
+    const allocator = std.testing.allocator;
+    var first = ProtectedField(i32).init(1);
+    var second = ProtectedField([]const u8).init("x");
+    defer second.deinit(allocator);
+    const child = try allocator.create(ProtectedField(f64));
+    child.* = ProtectedField(f64).init(2);
+    child.addDependency(&first, allocator);
+    child.addDependency(&second, allocator);
+    child.addDependency(&first, allocator);
+    try std.testing.expectEqual(@as(usize, 1), first.invalidations.count());
+    child.deinit(allocator);
+    allocator.destroy(child);
+    try std.testing.expectEqual(@as(usize, 0), first.invalidations.count());
+    try std.testing.expectEqual(@as(usize, 0), second.invalidations.count());
+    first.set(3);
+    second.set("y");
+    var survivor = ProtectedField(u64).init(0);
+    defer survivor.deinit(allocator);
+    survivor.addDependency(&first, allocator);
+    survivor.addDependency(&second, allocator);
+    first.deinit(allocator);
+    second.clearInvalidations();
+    try std.testing.expect(survivor.dependencies_head == null);
 }
 
 test "clearInvalidations detaches subscribers before their lifetime ends" {

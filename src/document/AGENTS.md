@@ -27,6 +27,9 @@ behavior. Navigation-owned stylesheet/resource generations are documented in
   invalidates or rebinds every consumer before control escapes.
 - `fixParentPointers` must also rebind computed-style field owners because
   inherited invalidation callbacks retain those owner pointers.
+- Custom-property environments own their computed strings. Their protected
+  version publisher is separately heap-stable because registered fields cannot
+  move with Node values. Clear dependencies at the structural mutation boundary.
 - `HTMLParser.parse` returns its root by value. Store it in its final owner,
   then call `fixParentPointers(&root, null)` before style, layout, DOM
   ancestry, or JavaScript uses it; the parser cannot repair pointers after
@@ -75,7 +78,7 @@ behavior. Navigation-owned stylesheet/resource generations are documented in
   string; used-value validation belongs in the focused helper/layout owner.
 - Conditional parsing receives an explicit media environment. Root and iframe
   callers must rebuild source-backed rule/keyframe generations when width,
-  zoom, or forced-colors environment changes.
+  height, zoom, or forced-colors environment changes.
 - Descendant selectors receive ancestors in document-root-to-parent order.
   `:has` caches are ephemeral synchronous borrows and selector-relevant
   changes invalidate ancestor matches.
@@ -136,6 +139,11 @@ The document pipeline is split by ownership and algorithm boundaries:
 - `css_syntax.zig` is a pure source-buffer scanner for CSS comments, escapes,
   strings, and structural delimiters; `css_properties.zig` is the shared
   static registry of computed longhand names and defaults.
+- `css_value_tokens.zig` scans borrowed value tokens and rewrites rem
+  dimensions without touching strings/URLs. `custom_properties.zig` owns
+  immutable computed variable environments and bounded substitution/cycle
+  resolution. `css_flex.zig` and `grid_tracks.zig` own the supported sizing
+  grammar; they do not traverse DOM or register dependencies.
 - `pseudo.zig` owns the shared before/after identity used by DOM storage,
   selector matching, and style application; it owns neither Nodes nor styles.
 - `animation.zig` owns pure CSS transition/keyframe value objects stored by

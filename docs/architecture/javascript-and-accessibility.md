@@ -380,6 +380,16 @@ the same content. Structural mutation dirties sibling-sensitive selectors;
 script observes the new computed value synchronously, while layout and paint
 remain scheduled work.
 
+The bounded inline-style declaration lives in `runtime/css_style.js` and is
+cached per Node wrapper. Its reads parse the current style attribute; writes
+use the wrapper's attribute mutation boundary and preserve unrelated
+declarations, including custom-property case and declaration-local priority.
+Computed readback flushes before resolving the target, even when only an
+ancestor was dirty, so inherited variables and root-relative font sizes are
+current. Custom values are copied from the Element's computed environment into
+Kiesel strings; no environment-backed slice crosses the callback. This is not
+a complete stylesheet CSSOM or native declaration-normalization API.
+
 ## Accessibility tree and speech
 
 Accessibility-tree strings belong to their tree generation. During rebuild,

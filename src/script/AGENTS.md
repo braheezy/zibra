@@ -19,6 +19,10 @@ queued work and shutdown are documented in
 - `runtime/bootstrap.js` defines the page-visible DOM, traversal, event, timer,
   canvas, XHR, cookie, and messaging shims over `__native`; Zig loads it with
   `@embedFile` before evaluating page code.
+- `runtime/css_style.js` supplies cached live inline-style declarations over
+  the Node wrapper's attribute APIs. It preserves unrelated declarations and
+  custom-property case; native computed-style readback flushes pending ancestor
+  style work and copies values before returning to Kiesel.
 - `dom_handles.zig` owns the two-way Node pointer/numeric identity maps for one
   window generation.
 - `dom_tree_bindings.zig` owns read-only document lookup and authored Node

@@ -134,7 +134,7 @@ test "page zoom crosses a max-width media query in CSS pixels" {
     try std.testing.expectEqualStrings("red", root.element.style.?.getPtr("color").?.get().*);
 }
 
-test "iframe width queries follow parent-published viewport changes" {
+test "iframe width and height resize queries follow parent-published viewport changes" {
     const allocator = std.testing.allocator;
 
     var tab: tab_module.Tab = undefined;
@@ -159,7 +159,8 @@ test "iframe width queries follow parent-published viewport changes" {
     const css =
         "p { color: red; }" ++
         "@media (width: 300px) { p { color: green; } }" ++
-        "@media (width: 420px) { p { color: blue; } }";
+        "@media (width: 420px) { p { color: blue; } }" ++
+        "@media (min-height: 400px) { p { color: purple; } }";
     var child_parser = try document_parser.HTMLParser.init(allocator, "<p>child</p>");
     child_parser.use_implicit_tags = false;
     defer child_parser.deinit(allocator);
@@ -212,6 +213,22 @@ test "iframe width queries follow parent-published viewport changes" {
     child.inherited_css_zoom = 1.5;
     _ = child.updateViewportFromParent(450, 180);
     try std.testing.expectEqual(@as(f64, 300), child.mediaViewportWidthCssPixels());
+    const taller = child.updateViewportFromParent(450, 750);
+    try std.testing.expect(!taller.width_changed and taller.height_changed and taller.any());
+    try std.testing.expectEqual(@as(f64, 500), child.mediaViewportHeightCssPixels());
+    var height_parser = try CSSParser.initWithMedia(allocator, css, .{
+        .viewport_width_css = child.mediaViewportWidthCssPixels(),
+        .viewport_height_css = child.mediaViewportHeightCssPixels(),
+    });
+    defer height_parser.deinit(allocator);
+    const height_rules = try height_parser.parse(allocator);
+    defer {
+        for (height_rules) |*rule| rule.deinit(allocator);
+        allocator.free(height_rules);
+    }
+    document_parser.dirtyStyleSubtree(&child_root);
+    try document_parser.style(allocator, &child_root, height_rules);
+    try std.testing.expectEqualStrings("purple", child_root.element.style.?.getPtr("color").?.get().*);
 }
 
 test "tab resize updates root viewport and invalidates layout" {
@@ -273,4 +290,48 @@ test "tab resize updates root viewport and invalidates layout" {
     try std.testing.expectEqual(@as(i32, 200), frame.scroll);
     try std.testing.expect(tab.scroll_changed_in_tab);
     try std.testing.expect(tab.media_environment_dirty);
+
+    tab.media_environment_dirty = false;
+    tab.resizeViewport(420, 900);
+    try std.testing.expect(tab.media_environment_dirty);
+    try std.testing.expectEqual(@as(i32, 900), frame.viewport_height);
+}
+
+test "resized viewport actually reflows retained document and centered content" {
+    const allocator = std.testing.allocator;
+    var html = try document_parser.HTMLParser.init(allocator, "<html style='display:block'><body style='display:block'><div style='display:block;height:20px'></div><section style='display:block;width:400px;margin:0 auto;height:20px'></section></body></html>");
+    defer html.deinit(allocator);
+    html.use_implicit_tags = false;
+    var root = try html.parse();
+    defer root.deinit(allocator);
+    document_parser.fixParentPointers(&root, null);
+    try document_parser.style(allocator, &root, &.{});
+    var environ = std.process.Environ.Map.init(allocator);
+    defer environ.deinit();
+    try environ.put("HOME", "/tmp");
+    const engine = try Layout.init(allocator, std.testing.io, &environ, 800, 600, false);
+    defer engine.deinit();
+    const doc = try engine.buildDocument(&root);
+    defer {
+        doc.deinit();
+        allocator.destroy(doc);
+    }
+    const initial_width = doc.width.get().*;
+    const body = doc.children.items[0].children.items[0].block;
+    const full = body.children.items[0].block;
+    const centered = body.children.items[1].block;
+    const initial_x = centered.x.get().*;
+    engine.window_width = 2560;
+    engine.window_height = 1374;
+    doc.mark();
+    try doc.layout(engine);
+    try std.testing.expectEqual(initial_width + 1760, doc.width.get().*);
+    try std.testing.expectEqual(body.content_width, full.width.get().*);
+    try std.testing.expectEqual(initial_x + 880, centered.x.get().*);
+    try std.testing.expectEqual(@as(i32, 400), centered.width.get().*);
+    engine.window_width = 800;
+    doc.mark();
+    try doc.layout(engine);
+    try std.testing.expectEqual(initial_x, centered.x.get().*);
+    try std.testing.expect(!doc.layoutNeeded());
 }

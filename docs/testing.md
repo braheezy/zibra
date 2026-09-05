@@ -21,6 +21,11 @@ compile a smaller test root and make it harder to miss the direct regression:
 The root `build.zig` remains authoritative and `zig build --help` displays the
 steps.
 
+Add `-Dtest-filter=substring` for a narrow Zig unit-test iteration, for example
+`zig build test-render -Dtest-filter=responsive`. This filters test names, not
+pipeline or screenshot cases. Remove the filter for broader verification and
+report filtered runs separately from complete subsystem checks.
+
 When changing one pure helper, run its focused subsystem test first. Add a unit
 test close to the owner or in the matching `src/tests/` module. Tests should
 force the state transition under review rather than depend on process exit,

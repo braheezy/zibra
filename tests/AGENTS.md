@@ -45,6 +45,9 @@ Choose the narrowest step while iterating, then run the complete checks
 appropriate to the changed owner before handoff. Report checks that were not
 available on the current platform.
 
+`-Dtest-filter=substring` narrows Zig unit-test names during iteration; it does
+not filter pipeline/screenshot cases or replace an unfiltered handoff run.
+
 ## Baselines
 
 `manual/acid1-box-model.html`, `manual/css-zoom.html`, and

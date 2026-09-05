@@ -10,6 +10,30 @@ pub const Property = struct {
     default_value: []const u8,
 };
 
+pub const Shorthand = struct { name: []const u8, longhands: []const []const u8 };
+
+/// Reset targets shared by CSS-wide keywords and pending var() shorthands.
+pub const shorthands = [_]Shorthand{
+    .{ .name = "flex", .longhands = &.{ "flex-grow", "flex-shrink", "flex-basis" } },
+    .{ .name = "flex-flow", .longhands = &.{ "flex-direction", "flex-wrap" } },
+    .{ .name = "gap", .longhands = &.{ "row-gap", "column-gap" } },
+    .{ .name = "place-items", .longhands = &.{ "align-items", "justify-items" } },
+    .{ .name = "place-content", .longhands = &.{ "align-content", "justify-content" } },
+    .{ .name = "font", .longhands = &.{ "font-style", "font-variant", "font-weight", "font-stretch", "font-size", "line-height", "font-family" } },
+    .{ .name = "background", .longhands = &.{ "background-color", "background-image", "background-size", "background-repeat", "background-position", "background-attachment" } },
+    .{ .name = "margin", .longhands = &.{ "margin-top", "margin-right", "margin-bottom", "margin-left" } },
+    .{ .name = "padding", .longhands = &.{ "padding-top", "padding-right", "padding-bottom", "padding-left" } },
+    .{ .name = "border-width", .longhands = &.{ "border-top-width", "border-right-width", "border-bottom-width", "border-left-width" } },
+    .{ .name = "border-style", .longhands = &.{ "border-top-style", "border-right-style", "border-bottom-style", "border-left-style" } },
+    .{ .name = "border-color", .longhands = &.{ "border-top-color", "border-right-color", "border-bottom-color", "border-left-color" } },
+    .{ .name = "border-top", .longhands = &.{ "border-top-width", "border-top-style", "border-top-color" } },
+    .{ .name = "border-right", .longhands = &.{ "border-right-width", "border-right-style", "border-right-color" } },
+    .{ .name = "border-bottom", .longhands = &.{ "border-bottom-width", "border-bottom-style", "border-bottom-color" } },
+    .{ .name = "border-left", .longhands = &.{ "border-left-width", "border-left-style", "border-left-color" } },
+    .{ .name = "border", .longhands = &.{ "border-top-width", "border-right-width", "border-bottom-width", "border-left-width", "border-top-style", "border-right-style", "border-bottom-style", "border-left-style", "border-top-color", "border-right-color", "border-bottom-color", "border-left-color" } },
+    .{ .name = "list-style", .longhands = &.{"list-style-type"} },
+};
+
 /// Static longhand registry used to initialize and recognize computed styles.
 pub const computed = [_]Property{
     .{ .name = "font-family", .default_value = "inherit" },
@@ -73,6 +97,24 @@ pub const computed = [_]Property{
     .{ .name = "image-rendering", .default_value = "auto" },
     .{ .name = "color-scheme", .default_value = "light dark" },
     .{ .name = "display", .default_value = "inline" },
+    .{ .name = "box-sizing", .default_value = "content-box" },
+    .{ .name = "flex-direction", .default_value = "row" },
+    .{ .name = "flex-wrap", .default_value = "nowrap" },
+    .{ .name = "flex-grow", .default_value = "0" },
+    .{ .name = "flex-shrink", .default_value = "1" },
+    .{ .name = "flex-basis", .default_value = "auto" },
+    .{ .name = "order", .default_value = "0" },
+    .{ .name = "row-gap", .default_value = "normal" },
+    .{ .name = "column-gap", .default_value = "normal" },
+    .{ .name = "justify-content", .default_value = "normal" },
+    .{ .name = "align-content", .default_value = "normal" },
+    .{ .name = "align-items", .default_value = "normal" },
+    .{ .name = "align-self", .default_value = "auto" },
+    .{ .name = "justify-items", .default_value = "normal" },
+    .{ .name = "justify-self", .default_value = "auto" },
+    .{ .name = "grid-template-columns", .default_value = "none" },
+    .{ .name = "grid-template-rows", .default_value = "none" },
+    .{ .name = "grid-auto-rows", .default_value = "auto" },
     .{ .name = "position", .default_value = "static" },
     .{ .name = "top", .default_value = "auto" },
     .{ .name = "right", .default_value = "auto" },

@@ -111,9 +111,9 @@ into either leaf module.
 - `tab_animation.zig` mutates Element-owned animation tracks synchronously and
   reports phase work through its small Sink. Tab remains responsible for
   scheduling and publishing the resulting composited updates.
-- Child Frame media width divides authored-zoom-scaled geometry by its inherited
-  authored factor. Parent viewport changes dirty child layout before the
-  follow-up media/style pass.
+- Child Frame media dimensions divide authored-zoom-scaled geometry by its
+  inherited authored factor. Changes to either axis or that factor dirty child
+  layout and schedule the follow-up media/style pass.
 
 ## Input and accessibility rules
 

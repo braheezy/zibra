@@ -237,6 +237,9 @@ pub fn collapseAdjoiningMargins(first: i32, second: i32) i32 {
 
 /// Resolve the supported px/em/percentage subset while permitting a sign.
 pub fn resolveSignedCssLength(value: []const u8, context: parser.CssLengthResolutionContext) ?i32 {
+    if (@import("../../document/length.zig").resolveMath(value, context)) |pixels| {
+        return @intFromFloat(std.math.clamp(pixels, std.math.minInt(i32), std.math.maxInt(i32)));
+    }
     const trimmed = std.mem.trim(u8, value, " \t\r\n\x0c");
     if (trimmed.len == 0 or std.ascii.eqlIgnoreCase(trimmed, "auto")) return null;
     const negative = trimmed[0] == '-';
@@ -261,6 +264,7 @@ pub fn resolveBoxCssLength(
     allow_negative: bool,
 ) ?f64 {
     const trimmed = std.mem.trim(u8, value, " \t\r\n\x0c");
+    if (@import("../../document/length.zig").resolveMath(trimmed, context)) |pixels| return if (allow_negative) pixels else @max(pixels, 0);
     if (std.ascii.eqlIgnoreCase(trimmed, "auto")) return if (allow_negative) 0.0 else null;
     if (trimmed.len == 0) return null;
     if (std.mem.eql(u8, trimmed, "0")) return 0.0;

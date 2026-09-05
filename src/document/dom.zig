@@ -204,6 +204,10 @@ pub const Element = struct {
     tag: []const u8,
     attributes: ?std.StringHashMap([]const u8) = null,
     style: ?StyleMap = null,
+    custom_properties: ?*@import("custom_properties.zig").Environment = null,
+    /// One stable publisher for the entire immutable variable environment.
+    /// Dynamic property names never resize the dependency-bearing StyleMap.
+    custom_version: ?*ProtectedField(u64) = null,
     parent: ?*Node = null,
     children: std.ArrayList(Node),
     /// Heap-stable generated boxes for CSS `::before` and `::after`. These
@@ -485,6 +489,11 @@ pub const Element = struct {
 
         if (self.style) |*styles| {
             style_application.deinitStyleMap(StyleMap, styles, allocator);
+        }
+        if (self.custom_properties) |environment| environment.destroy(allocator);
+        if (self.custom_version) |version| {
+            version.deinit(allocator);
+            allocator.destroy(version);
         }
 
         // Free any strings we allocated (like resolved relative font sizes)
@@ -1153,6 +1162,7 @@ pub fn clearStyleInvalidations(node: *Node) void {
             }
         },
         .element => |*element| {
+            if (element.custom_version) |version| version.clearInvalidations();
             if (element.style) |*style_map| {
                 clearStyleMapInvalidations(style_map);
                 markStyleMapWithoutOwner(style_map);

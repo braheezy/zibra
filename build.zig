@@ -184,6 +184,7 @@ const wpt_fixtures = [_]WptFixture{
 };
 
 pub fn build(b: *std.Build) !void {
+    const test_filter = b.option([]const u8, "test-filter", "Run unit tests whose names contain this substring");
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
     const io = b.graph.io;
@@ -313,6 +314,7 @@ pub fn build(b: *std.Build) !void {
         const unit_tests = b.addTest(.{
             .root_module = test_module,
             .use_llvm = use_llvm,
+            .filters = if (test_filter) |filter| &.{filter} else &.{},
         });
         if (suite.dependencies == .full) {
             // Browser input tests exercise real frame activation paths, whose

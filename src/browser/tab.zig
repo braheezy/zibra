@@ -390,6 +390,7 @@ fn invalidateFrameTreeForViewportResize(frame: *Frame) void {
 pub fn resizeViewport(self: *Tab, width: i32, height: i32) void {
     const new_width = @max(width, 1);
     const width_changed = self.tab_width != new_width;
+    const height_changed = self.tab_height != @max(height, 0);
     self.tab_width = new_width;
     self.tab_height = @max(height, 0);
 
@@ -405,7 +406,7 @@ pub fn resizeViewport(self: *Tab, width: i32, height: i32) void {
         }
     }
 
-    if (width_changed) {
+    if (width_changed or height_changed) {
         self.media_environment_dirty = true;
         if (self.root_frame) |frame| markFrameStyleDirty(frame);
     }
@@ -1405,22 +1406,16 @@ fn appendIframeContent(
 
     const child_width = iframe_data.rect.right - iframe_data.rect.left;
     const child_height = iframe_data.rect.bottom - iframe_data.rect.top;
-    if (cssZoomFactorsDiffer(child_frame.?.inherited_css_zoom, iframe_data.css_zoom)) {
+    const zoom_changed = cssZoomFactorsDiffer(child_frame.?.inherited_css_zoom, iframe_data.css_zoom);
+    if (zoom_changed) {
         child_frame.?.inherited_css_zoom = iframe_data.css_zoom;
         markFrameLayoutDirty(child_frame.?);
-        self.browser.setNeedsAnimationFrame(self);
-        self.browser.scheduleAnimationFrame();
     }
     const viewport_change = child_frame.?.updateViewportFromParent(child_width, child_height);
-    if (viewport_change.width_changed) {
-        // Reparse retained child stylesheets under the iframe's new width.
+    if (viewport_change.any() or zoom_changed) {
+        // Both viewport axes and inherited CSS zoom affect the child's media
+        // environment, including a height-only native/parent resize.
         self.mediaEnvironmentChanged();
-    } else if (viewport_change.height_changed) {
-        // Height is not a supported media feature yet, but child layout and
-        // scroll geometry still consume the containing viewport.
-        self.needs_paint = true;
-        self.browser.setNeedsAnimationFrame(self);
-        self.browser.scheduleAnimationFrame();
     }
 
     const child_list = child_frame.?.display_list.?;
@@ -1630,7 +1625,7 @@ pub fn render(self: *Tab, b: *Browser) !void {
     }
 
     // Consume inherited iframe zoom from the preceding computed-style
-    // generation before deciding which width-dependent media rules to parse.
+    // generation before deciding which viewport-dependent media rules to parse.
     // Never inspect a dirty ProtectedField; the clean-generation helper below
     // retries after style publication when a mutation changed iframe CSS.
     _ = self.refreshInheritedFrameZoomIfClean(frame);

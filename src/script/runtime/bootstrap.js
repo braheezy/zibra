@@ -2677,20 +2677,8 @@ Object.defineProperty(Node.prototype, "outerHTML", {
 // Add style setter to Node prototype
 Object.defineProperty(Node.prototype, "style", {
   get: function() {
-    var owner = this;
-    var style = {};
-    style.cssText = owner.getAttribute('style') || '';
-    Object.defineProperty(style, 'cssFloat', {
-      get: function() {
-        var source = owner.getAttribute('style') || '';
-        var match = source.match(/(?:^|;)\s*float\s*:\s*([^;]+)/i);
-        return match ? match[1].trim() : '';
-      },
-      set: function(value) {
-        owner.setAttribute('style', 'float: ' + (value == null ? '' : value.toString()));
-      }, enumerable: true
-    });
-    return style;
+    if (!this.__inlineStyle) Object.defineProperty(this, '__inlineStyle', { value: createInlineStyleDeclaration(this) });
+    return this.__inlineStyle;
   },
   set: function(value) {
     var text = value == null ? "" : value.toString();

@@ -28,14 +28,6 @@ the representation does not make arbitrary future mutation safe. Prefer stable
 node allocation or `(document_generation, node_id)` identity over expanding
 the set of persistent raw pointers.
 
-### ProtectedField has no edge-specific unsubscription
-
-Dependency sources retain raw subscriber pointers. A dependent cannot remove
-itself from each source during teardown. General structural mutation currently
-clears all style publishers and rebuilds the graph, while retained insertion
-avoids destroying endpoints. A reverse edge or subscription token is still
-needed for safe arbitrary incremental teardown.
-
 ### Browser display clones still borrow leaf resources
 
 Browser command clones own recursive containers, while image/glyph pixels,
@@ -97,6 +89,9 @@ DOM/layout/accessibility graph.
 - Dynamic iframe completion validates numeric markers, rebinds survivors, and
   stops removed child contexts before JavaScript resumes.
 - Raster worker snapshots copy every leaf they use and call no SDL APIs.
+- `ProtectedField` source-owned bidirectional edges unlink during either
+  endpoint's destruction. Registered fields must remain address-stable;
+  relocation still requires the structural clear/rebind boundary.
 
 ## Hypotheses needing focused tests
 
@@ -104,8 +99,6 @@ Do not cite these as root causes without evidence:
 
 - a Browser display list observes retired image bytes or DOM identity after an
   unsupported mutation path;
-- `ProtectedField.notify` reaches a destroyed dependent outside the supported
-  clear-and-rebuild boundary;
 - accessibility input races a worker rebuild and sees a retired tree;
 - concurrent page layout/font access corrupts SDL_ttf or a glyph map;
 - an arena-backed run hides a defect exposed immediately by a reclaiming
@@ -177,9 +170,8 @@ Until stronger types enforce the contracts, do not:
    objects.
 2. Introduce stable DOM identity and centralize mutation invalidation.
 3. Make Browser render generations self-contained or explicitly retained.
-4. Add dependency unsubscribe semantics.
-5. Encode response ownership and add HTTP cancellation/deadlines.
-6. Add forced-interleaving tests and debug assertions for every chosen
+4. Encode response ownership and add HTTP cancellation/deadlines.
+5. Add forced-interleaving tests and debug assertions for every chosen
    contract.
 
 When a type, join, assertion, or snapshot enforces an item, move it from the

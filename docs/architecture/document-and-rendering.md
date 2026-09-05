@@ -115,6 +115,33 @@ At stylesheet top level, invalid qualified-rule starts recover through the
 matching block terminator; a stray semicolon is not silently discarded ahead
 of a later rule.
 
+`custom_properties.zig` owns one immutable, heap-stable computed environment
+per styled Element. Inherited entries copy their parent's already-computed
+values; local declarations resolve forward references, fallback dependencies,
+and cycles after cascade. Ordinary declarations containing `var()` defer
+validation, and shorthands publish pending longhands so substitution cannot
+change cascade order. Invalid winning substitutions use `unset`, not an older
+declaration. Expansion is depth/size bounded. Computed replacement strings are
+retained by the Element, independently of the environment's replacement.
+
+`css_value_tokens.zig` scans borrowed tokens without changing strings, comments,
+URLs, or identifiers. Style resolves `rem` dimensions against the document
+root's computed font size; the root's own font-size uses the initial 16px.
+Descendants subscribe to that root field, and computed values consumed by
+layout contain pixel dimensions even inside functions. `length.zig` evaluates
+bounded typed `calc`, `min`, `max`, and `clamp` expressions with explicit font
+and percentage bases. An indefinite percentage basis stays unresolved.
+Supported keyframe endpoints undergo variable/rem computation in a temporary
+arena before scalar track construction. Their signature includes computed
+endpoints, and root-relative tracks subscribe through the Element's animation
+field so a root-font change refreshes them without retaining temporary strings.
+
+Custom-property changes publish through a separate heap-stable protected
+version field, not additional entries in the fixed StyleMap. Descendants
+subscribe to their parent's version so newly introduced names also invalidate
+them. Heap storage keeps this publisher stable when its owning Node moves;
+structural mutation still clears the graph before moving Node storage.
+
 ## Address-unstable Node storage
 
 Element children are `Node` values in resizable arrays. A child pointer is
@@ -206,11 +233,14 @@ subscriber table allocates only when a dependency is added. Pass the source
 field owner's allocator to `read`/`addDependency` and the same allocator to
 `deinit`; do not embed a managed allocator in every property.
 
-A dependency table stores raw subscriber pointers. Field destruction does not
-unsubscribe it from its sources. Supported structural mutation therefore
-clears all style publishers before destroying or relocating endpoints and
-forces a complete style/layout rebuild. General edge-specific unsubscription
-remains unresolved.
+A dependency is a source-allocated edge indexed by its publisher and linked
+into its subscriber. Destruction unlinks both endpoints: destroying a layout
+subscriber removes it from every surviving style publisher, and destroying a
+publisher removes its edges from surviving subscribers. Field construction is
+allocation-free. Registered fields must remain at stable addresses, including
+their reverse-list heads; owner callback rebinding alone does not repair a
+moved registered field. Supported structural mutation still clears style
+publishers before relocation and forces a complete style/layout rebuild.
 
 `lastValue` is a non-subscribing historical read. It is allowed while dirty for
 ordered teardown or an interrupted animation's prior visual value. It is not a
@@ -258,10 +288,16 @@ callbacks on Elements. Clear those callbacks before the layout owner retires.
 Important geometry contracts:
 
 - Block `x`, `y`, `width`, and `height` are used border-box values; CSS width
-  and height are content-box inputs resolved before/after descendants as
-  appropriate. Per-side box edges are used values too: a `none` or `hidden`
+  and height are content-box inputs unless `box-sizing: border-box` requests
+  subtraction of padding/borders before content sizing. Min/max dimensions
+  follow the same sizing convention. Per-side box edges are used values too:
+  a `none` or `hidden`
   border has zero geometry as well as no paint, while transparent solid
   borders still reserve their resolved width.
+- A definite parent height, including zero, remains a percentage basis while
+  that parent's serialized layout traversal is active. Earlier child
+  measurements may dirty its height dependency without making the published
+  containing-block height indefinite for later siblings.
 - Authored CSS `zoom` is multiplicative and layout-inducing. Fixed lengths,
   fonts, natural replaced sizes, radii, transforms, and filters incorporate
   authored zoom in page coordinates. Accessibility zoom is applied once at
@@ -277,6 +313,16 @@ Important geometry contracts:
   than using retained insertion. Inline tables, captions, columns, row
   groups, spans, collapse/spacing, and vertical alignment are not part of
   this context.
+- Block `flex` and `grid` containers keep DOM-backed item boxes and anonymous
+  text runs. Flex sizing supports grow/shrink with min/max freezing, wrapping,
+  direction/order, gaps, main-axis auto margins, and basic axis alignment.
+  Grid sizing supports fixed, fractional, `minmax`, integer `repeat`, and
+  bounded definite-minimum `auto-fill`/`auto-fit` tracks, row-major placement,
+  gaps, and basic item alignment. Measurement passes do not publish hit-test
+  bounds; only final allocated boxes do. Child topology changes rebuild these
+  contexts conservatively. Inline flex/grid, explicit grid placement/spans,
+  subgrid, baseline alignment, and complete intrinsic track sizing remain
+  outside this bounded implementation.
 - A `display: list-item` reserves the browser's bounded marker indent and
   paints its square marker unless the inherited `list-style-type` is `none`.
   The supported `list-style` shorthand currently maps the bounded `disc` and
@@ -287,7 +333,7 @@ Important geometry contracts:
   owner includes floats in auto height. Ordinary normal-flow block border
   boxes retain their containing-block geometry beneath external floats; only
   their inline line ranges are excluded. Floats themselves and bounded
-  formatting contexts (currently non-visible overflow and `display: table`)
+  formatting contexts (non-visible overflow and block table/flex/grid)
   avoid the external float area as whole boxes.
 - Direct ordinary block children use a synchronous, pointer-free vertical
   margin cursor. Its pure strut retains the largest positive and most-negative
@@ -332,7 +378,9 @@ Important geometry contracts:
 - Normal inline text collapses ASCII whitespace across nested inline elements;
   `pre` retains line endings and spaces. Temporary embed and rich-button
   layouts must not subscribe short-lived fields to persistent style/layout
-  owners.
+  owners. Inline embed metrics are plain scalars because their records move by
+  value into growable line buffers; even self-contained dependency edges would
+  retain stale field addresses. Their persistent block owns invalidation.
 
 Images and iframes share `render/replaced_sizing.zig` for unscaled CSS used
 size. CSS dimensions override matching HTML attributes, a usable aspect ratio
@@ -357,6 +405,11 @@ Pure layout leaves are intentionally separated from retained object state:
 - `render/table_format.zig` resolves bounded table roles, single-span column
   widths, row heights, and scalar cell rectangles after `layout.zig` has
   normalized the current DOM-backed grid;
+- `render/flex_format.zig` and `render/grid_format.zig` solve scalar item and
+  track sizing without DOM/layout pointers; `document/css_flex.zig` and
+  `document/grid_tracks.zig` own their borrowed CSS grammar;
+- `render/intrinsic_width.zig` synchronously borrows DOM and FontManager to
+  estimate intrinsic content widths; it retains no DOM or glyph pointers;
 - `render/control_geometry.zig` computes control leaf geometry, while the
   `InputLayout` and `ButtonLayout` objects retain DOM/font/collector
   invariants in `layout.zig`;

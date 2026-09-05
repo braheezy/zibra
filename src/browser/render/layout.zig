@@ -22,6 +22,9 @@ const inline_format = @import("inline_format.zig");
 const layout_hit = @import("layout_hit.zig");
 const paint_order = @import("paint_order.zig");
 const table_format = @import("table_format.zig");
+const flex_format = @import("flex_format.zig");
+const grid_format = @import("grid_format.zig");
+const intrinsic_measure = @import("intrinsic_width.zig");
 const paint_effects = @import("paint_effects.zig");
 const replaced_paint = @import("replaced_paint.zig");
 const retained_commands = @import("retained_commands.zig");
@@ -66,6 +69,8 @@ pub fn documentScrollHeight(document_height_css: i32) i32 {
 fn isBlockDisplay(value: []const u8) bool {
     const display = std.mem.trim(u8, value, " \t\r\n");
     return std.ascii.eqlIgnoreCase(display, "block") or
+        std.ascii.eqlIgnoreCase(display, "flex") or
+        std.ascii.eqlIgnoreCase(display, "grid") or
         std.ascii.eqlIgnoreCase(display, "list-item");
 }
 
@@ -414,71 +419,22 @@ fn parseTranslate(value: []const u8) ?struct { x: i32, y: i32 } {
 
 pub const parseBlurFilter = paint_effects.parseBlurFilter;
 
+/// Measured inline records move by value into growable line buffers. They
+/// must contain no self-references or dependency edges; their persistent block
+/// subscribes to styles and rebuilds the complete record when invalidated.
 const EmbedLayout = struct {
-    allocator: std.mem.Allocator,
-    deps_initialized: bool = false,
-    zoom: ProtectedField(f32),
-    font_stub: ProtectedField(i32),
-    width: ProtectedField(i32),
-    height: ProtectedField(i32),
-    ascent: ProtectedField(i32),
-    descent: ProtectedField(i32),
+    zoom: f32 = 1,
+    width: i32 = 0,
+    height: i32 = 0,
+    ascent: i32 = 0,
+    descent: i32 = 0,
 
-    fn init(allocator: std.mem.Allocator) EmbedLayout {
-        return .{
-            .allocator = allocator,
-            .deps_initialized = false,
-            .zoom = ProtectedField(f32).init(1.0),
-            .font_stub = ProtectedField(i32).init(0),
-            .width = ProtectedField(i32).init(0),
-            .height = ProtectedField(i32).init(0),
-            .ascent = ProtectedField(i32).init(0),
-            .descent = ProtectedField(i32).init(0),
-        };
-    }
-
-    fn deinit(self: *EmbedLayout) void {
-        self.zoom.deinit(self.allocator);
-        self.font_stub.deinit(self.allocator);
-        self.width.deinit(self.allocator);
-        self.height.deinit(self.allocator);
-        self.ascent.deinit(self.allocator);
-        self.descent.deinit(self.allocator);
-    }
-
-    /// Inline embed records are destroyed as soon as their completed line is
-    /// painted. Keep their dependency graph entirely self-contained: a
-    /// persistent BlockLayout is responsible for subscribing to DOM styles.
-    fn setupDependencies(self: *EmbedLayout) void {
-        if (self.deps_initialized) return;
-        self.deps_initialized = true;
-
-        self.zoom.freezeDependencies();
-
-        self.font_stub.addDependency(&self.zoom, self.allocator);
-        self.font_stub.freezeDependencies();
-
-        self.width.addDependency(&self.zoom, self.allocator);
-        self.width.freezeDependencies();
-
-        self.height.addDependency(&self.zoom, self.allocator);
-        self.height.addDependency(&self.font_stub, self.allocator);
-        self.height.addDependency(&self.width, self.allocator);
-        self.height.freezeDependencies();
-
-        self.ascent.addDependency(&self.height, self.allocator);
-        self.ascent.freezeDependencies();
-
-        self.descent.freezeDependencies();
-    }
-
-    fn setMetrics(self: *EmbedLayout, width_value: i32, height_value: i32, ascent_value: i32, descent_value: i32, zoom_value: f32, font_value: i32) void {
-        self.zoom.set(zoom_value);
-        self.font_stub.set(font_value);
-        self.width.set(width_value);
-        self.height.set(height_value);
-        self.ascent.set(ascent_value);
-        self.descent.set(descent_value);
+    fn setMetrics(self: *EmbedLayout, width_value: i32, height_value: i32, ascent_value: i32, descent_value: i32, zoom_value: f32) void {
+        self.zoom = zoom_value;
+        self.width = width_value;
+        self.height = height_value;
+        self.ascent = ascent_value;
+        self.descent = descent_value;
     }
 
     fn appendInline(
@@ -521,8 +477,8 @@ const EmbedLayout = struct {
         allow_single_zero_axis: bool,
         vertical_align: VerticalAlign,
     ) !void {
-        const width_value = self.width.get().*;
-        const height_value = self.height.get().*;
+        const width_value = self.width;
+        const height_value = self.height;
         if (width_value < 0 or height_value < 0) return;
         if (allow_single_zero_axis) {
             if (width_value == 0 and height_value == 0) return;
@@ -537,10 +493,10 @@ const EmbedLayout = struct {
             .x = engine.cursor_x,
             .hit_offset_x = engine.transform_offset_x,
             .hit_offset_y = engine.transform_offset_y,
-            .ascent = self.ascent.get().*,
-            .descent = self.descent.get().*,
+            .ascent = self.ascent,
+            .descent = self.descent,
             .line_height = engine.lineHeightForNatural(@max(
-                self.ascent.get().* + self.descent.get().*,
+                self.ascent + self.descent,
                 height_value,
             )),
             .width = width_value,
@@ -659,7 +615,7 @@ const InlineBlockLayout = struct {
 };
 
 const ImageLayout = struct {
-    embed: EmbedLayout,
+    embed: EmbedLayout = .{},
     pixels: []const u8,
     source_width: i32,
     source_height: i32,
@@ -674,7 +630,6 @@ const ImageLayout = struct {
     opacity: f64 = 1.0,
 
     fn init(
-        allocator: std.mem.Allocator,
         layout_width: i32,
         layout_height: i32,
         natural_width: i32,
@@ -690,7 +645,6 @@ const ImageLayout = struct {
         const src_width: i32 = if (image_data) |data| @intCast(data.image.width) else 0;
         const src_height: i32 = if (image_data) |data| @intCast(data.image.height) else 0;
         var layout = ImageLayout{
-            .embed = EmbedLayout.init(allocator),
             .pixels = if (image_data) |data| data.image.rawBytes() else empty_pixels,
             .source_width = src_width,
             .source_height = src_height,
@@ -711,7 +665,6 @@ const ImageLayout = struct {
             .opacity = 1.0,
         };
         _ = parent_block;
-        layout.embed.setupDependencies();
         const outer_width = @max(
             layout_width + edges.padding.horizontal() + edges.border.horizontal(),
             0,
@@ -720,7 +673,7 @@ const ImageLayout = struct {
             layout_height + edges.padding.vertical() + edges.border.vertical(),
             0,
         );
-        layout.embed.setMetrics(outer_width, outer_height, outer_height, 0, zoom_value, 0);
+        layout.embed.setMetrics(outer_width, outer_height, outer_height, 0, zoom_value);
         return layout;
     }
 
@@ -762,8 +715,8 @@ const ImageLayout = struct {
             .hit_rect = .{
                 .left = box_x,
                 .top = box_y,
-                .right = box_x +| self.embed.width.get().*,
-                .bottom = box_y +| self.embed.height.get().*,
+                .right = box_x +| self.embed.width,
+                .bottom = box_y +| self.embed.height,
             },
             .opacity = self.opacity,
             .source = source,
@@ -778,8 +731,8 @@ const ImageLayout = struct {
         y: i32,
         source: ?browser.DisplayItemSource,
     ) !void {
-        const width = self.embed.width.get().*;
-        const height = self.embed.height.get().*;
+        const width = self.embed.width;
+        const height = self.embed.height;
         const element: ?*const parser.Element = if (source) |item_source|
             if (item_source.node) |node| switch (node.*) {
                 .element => |*value| value,
@@ -847,16 +800,10 @@ const ImageLayout = struct {
             .image = self.displayItem(x, y, source),
         });
     }
-
-    fn deinit(self: *ImageLayout) void {
-        self.embed.deinit();
-    }
 };
 
 test "object-fit separates fitted image paint from the replaced element hit box" {
-    const allocator = std.testing.allocator;
     var image = ImageLayout.init(
-        allocator,
         100,
         100,
         200,
@@ -868,7 +815,6 @@ test "object-fit separates fitted image paint from the replaced element hit box"
         .{ .margin = .{}, .padding = .{}, .border = .{} },
         1.0,
     );
-    defer image.deinit();
     image.source_width = 200;
     image.source_height = 100;
 
@@ -897,9 +843,7 @@ test "object-fit separates fitted image paint from the replaced element hit box"
 }
 
 test "inline replaced image boxes include padding and borders" {
-    const allocator = std.testing.allocator;
     var image = ImageLayout.init(
-        allocator,
         100,
         50,
         100,
@@ -915,12 +859,11 @@ test "inline replaced image boxes include padding and borders" {
         },
         1.0,
     );
-    defer image.deinit();
     image.source_width = 100;
     image.source_height = 50;
 
-    try std.testing.expectEqual(@as(i32, 120), image.embed.width.get().*);
-    try std.testing.expectEqual(@as(i32, 60), image.embed.height.get().*);
+    try std.testing.expectEqual(@as(i32, 120), image.embed.width);
+    try std.testing.expectEqual(@as(i32, 60), image.embed.height);
     const item = image.displayItem(10, 20, null);
     try std.testing.expectEqual(@as(i32, 17), item.x1);
     try std.testing.expectEqual(@as(i32, 24), item.y1);
@@ -933,7 +876,7 @@ test "inline replaced image boxes include padding and borders" {
 }
 
 const CanvasLayout = struct {
-    embed: EmbedLayout,
+    embed: EmbedLayout = .{},
     /// The backing object is allocated lazily by getContext("2d"), after the
     /// initial layout may already exist. Borrow the owning element so repaint
     /// observes a backing store created without requiring a geometry rebuild.
@@ -942,7 +885,6 @@ const CanvasLayout = struct {
     source_height: i32,
 
     fn init(
-        allocator: std.mem.Allocator,
         layout_width: i32,
         layout_height: i32,
         source_width: i32,
@@ -951,30 +893,23 @@ const CanvasLayout = struct {
         zoom_value: f32,
     ) CanvasLayout {
         var layout = CanvasLayout{
-            .embed = EmbedLayout.init(allocator),
             .element = element,
             .source_width = source_width,
             .source_height = source_height,
         };
-        layout.embed.setupDependencies();
-        layout.embed.setMetrics(layout_width, layout_height, layout_height, 0, zoom_value, 0);
+        layout.embed.setMetrics(layout_width, layout_height, layout_height, 0, zoom_value);
         return layout;
-    }
-
-    fn deinit(self: *CanvasLayout) void {
-        self.embed.deinit();
     }
 };
 
 const IframeLayout = struct {
-    embed: EmbedLayout,
+    embed: EmbedLayout = .{},
     bgcolor: browser.Color,
     border_color: browser.Color,
     border_thickness: i32 = 1,
     css_zoom: f32 = 1.0,
 
     fn init(
-        allocator: std.mem.Allocator,
         layout_width: i32,
         layout_height: i32,
         parent_block: ?*BlockLayout,
@@ -983,7 +918,6 @@ const IframeLayout = struct {
         page_zoom: f32,
     ) IframeLayout {
         var layout = IframeLayout{
-            .embed = EmbedLayout.init(allocator),
             .bgcolor = .{ .r = 0xf2, .g = 0xf2, .b = 0xf2, .a = 0xff },
             .border_color = .{ .r = 0x33, .g = 0x33, .b = 0x33, .a = 0xff },
             .border_thickness = @max(scaleCssPixel(1, zoom_value, page_zoom), 1),
@@ -991,13 +925,8 @@ const IframeLayout = struct {
         };
         _ = parent_block;
         _ = style_map;
-        layout.embed.setupDependencies();
-        layout.embed.setMetrics(layout_width, layout_height, layout_height, 0, zoom_value, 0);
+        layout.embed.setMetrics(layout_width, layout_height, layout_height, 0, zoom_value);
         return layout;
-    }
-
-    fn deinit(self: *IframeLayout) void {
-        self.embed.deinit();
     }
 
     fn paintAt(
@@ -1008,8 +937,8 @@ const IframeLayout = struct {
         y: i32,
         source: ?browser.DisplayItemSource,
     ) !void {
-        const width_value = self.embed.width.get().*;
-        const height_value = self.embed.height.get().*;
+        const width_value = self.embed.width;
+        const height_value = self.embed.height;
         const bg = engine.remapColor(self.bgcolor, .background);
         if (bg.a > 0) {
             try commands.append(engine.allocator, DisplayItem{
@@ -1057,13 +986,8 @@ const LineItemPayload = union(enum) {
 
     fn deinit(self: *LineItemPayload) void {
         switch (self.*) {
-            .glyph => {},
-            .inline_block => {},
-            .input => |*input_payload| input_payload.deinit(),
             .button => |*button_payload| button_payload.deinit(),
-            .image => |*image_payload| image_payload.deinit(),
-            .canvas => |*canvas_payload| canvas_payload.deinit(),
-            .iframe => |*iframe_payload| iframe_payload.deinit(),
+            else => {},
         }
     }
 };
@@ -2854,9 +2778,9 @@ fn containingBlockCssDimension(self: *const Layout, height: bool) ?f64 {
     else
         inline_block;
     if (height and !block.content_height_definite) return null;
-    if (height and block.height.dirty) return null;
+    if (height and block.height.dirty and !block.in_layout) return null;
     const layout_value = if (height) block.content_height else block.content_width;
-    if (layout_value < 0 or (height and layout_value <= 0)) return null;
+    if (layout_value < 0) return null;
     return cssPixelsFromLayout(layout_value, block.zoom.get().*, block.document.page_zoom);
 }
 
@@ -3262,7 +3186,7 @@ fn handleInputElement(self: *Layout, node: Node, node_ptr: ?*Node, line_buffer: 
     if (element.isHiddenInput()) return;
     self.resetSoftHyphenWord();
 
-    var input_layout = InputLayout.init(self.allocator);
+    var input_layout: InputLayout = .{};
     try input_layout.measure(self, element);
 
     try input_layout.embed.appendInline(self, line_buffer, node_ptr, .{
@@ -3358,7 +3282,6 @@ fn handleImageElement(self: *Layout, node: Node, node_ptr: ?*Node, line_buffer: 
     }
 
     var image_layout = ImageLayout.init(
-        self.allocator,
         layout_width,
         layout_height,
         intrinsic_width,
@@ -3399,7 +3322,6 @@ fn handleIframeElement(self: *Layout, node: Node, node_ptr: ?*Node, line_buffer:
     if (layout_width <= 0 or layout_height <= 0) return;
 
     var iframe_layout = IframeLayout.init(
-        self.allocator,
         layout_width,
         layout_height,
         self.inline_block,
@@ -3430,7 +3352,6 @@ fn handleCanvasElement(
     if (layout_width <= 0 or layout_height <= 0) return;
 
     var canvas_layout = CanvasLayout.init(
-        self.allocator,
         layout_width,
         layout_height,
         dimensions.width,
@@ -3607,6 +3528,7 @@ fn blockPaintZIndex(block: *const BlockLayout) paint_order.ZIndex {
 /// non-visible overflow boxes instead establish a bounded formatting context,
 /// so their border boxes avoid the surrounding float area.
 fn blockAvoidsExternalFloats(block: *const BlockLayout) bool {
+    if (block.formattingKind() != null) return true;
     if (block.tableRole() == .table) return true;
     const element = liveBlockElement(block) orelse return false;
     const styles = if (element.style) |*style_map| style_map else return false;
@@ -5086,7 +5008,7 @@ const INPUT_WIDTH_PX: i32 = 200;
 // Replaced input-control layout. Buttons use ButtonLayout below so their
 // descendant boxes participate in size and paint.
 const InputLayout = struct {
-    embed: EmbedLayout,
+    embed: EmbedLayout = .{},
     font_size: i32 = 16,
     font_weight: FontWeight = .Normal,
     font_slant: FontSlant = .Roman,
@@ -5100,16 +5022,6 @@ const InputLayout = struct {
     is_radio: bool = false,
     is_checked: bool = false,
     is_password: bool = false,
-
-    fn init(allocator: std.mem.Allocator) InputLayout {
-        return .{
-            .embed = EmbedLayout.init(allocator),
-        };
-    }
-
-    fn deinit(self: *InputLayout) void {
-        self.embed.deinit();
-    }
 
     fn measure(self: *InputLayout, engine: *Layout, element: parser.Element) !void {
         self.font_weight = if (engine.is_bold) .Bold else .Normal;
@@ -5189,14 +5101,12 @@ const InputLayout = struct {
             self.border_radius,
         );
         self.border_radius = metrics.border_radius;
-        self.embed.setupDependencies();
         self.embed.setMetrics(
             metrics.width,
             metrics.height,
             ascent_value,
             descent_value,
             engine.effectiveZoom(),
-            self.font_size,
         );
         self.is_focused = element.is_focused;
     }
@@ -5209,9 +5119,9 @@ const InputLayout = struct {
         y: i32,
         source: ?browser.DisplayItemSource,
     ) !void {
-        const width_value = self.embed.width.get().*;
-        const height_value = self.embed.height.get().*;
-        const ascent_value = self.embed.ascent.get().*;
+        const width_value = self.embed.width;
+        const height_value = self.embed.height;
+        const ascent_value = self.embed.ascent;
         var rounded_items = std.ArrayList(DisplayItem).empty;
         defer {
             DisplayItem.freeItems(engine.allocator, rounded_items.items);
@@ -5242,7 +5152,7 @@ const InputLayout = struct {
                     height_value,
                     engine.layoutWindowWidth(),
                     engine.layoutWindowHeight(),
-                    scaleCssFloat(1.0, self.embed.zoom.get().*, engine.zoom()),
+                    scaleCssFloat(1.0, self.embed.zoom, engine.zoom()),
                     source,
                 );
             }
@@ -5257,7 +5167,7 @@ const InputLayout = struct {
                     .bottom = y + height_value,
                 },
                 .color = forced_colors.text,
-                .thickness = @max(scaleCssPixel(1, self.embed.zoom.get().*, engine.zoom()), 1),
+                .thickness = @max(scaleCssPixel(1, self.embed.zoom, engine.zoom()), 1),
                 .source = source,
             } });
         }
@@ -5276,7 +5186,7 @@ const InputLayout = struct {
                         .bottom = y + height_value,
                     },
                     .color = ink,
-                    .thickness = @max(scaleCssPixel(1, self.embed.zoom.get().*, engine.zoom()), 1),
+                    .thickness = @max(scaleCssPixel(1, self.embed.zoom, engine.zoom()), 1),
                     .source = source,
                 },
             });
@@ -5380,7 +5290,7 @@ const InputLayout = struct {
             return;
         }
 
-        var text_x = x + scaleCssPixel(2, self.embed.zoom.get().*, engine.zoom());
+        var text_x = x + scaleCssPixel(2, self.embed.zoom, engine.zoom());
         const baseline_y = y + ascent_value;
         if (self.text.len > 0) {
             var g_iter = grapheme.iterator(self.text);
@@ -5471,14 +5381,13 @@ test "radio inputs use compact circular control metrics" {
     const engine = try Layout.init(allocator, std.testing.io, &environ, 800, 600, false);
     defer engine.deinit();
 
-    var input = InputLayout.init(allocator);
-    defer input.deinit();
+    var input: InputLayout = .{};
     try input.measure(engine, radio);
     try std.testing.expect(input.is_radio);
     try std.testing.expect(input.is_checked);
     try std.testing.expectEqualStrings("", input.text);
-    try std.testing.expectEqual(input.embed.height.get().*, input.embed.width.get().*);
-    try std.testing.expect(input.embed.width.get().* < engine.scaleActiveCssPixel(INPUT_WIDTH_PX));
+    try std.testing.expectEqual(input.embed.height, input.embed.width);
+    try std.testing.expect(input.embed.width < engine.scaleActiveCssPixel(INPUT_WIDTH_PX));
     try std.testing.expect(input.border_radius > 0);
 }
 
@@ -5487,7 +5396,8 @@ test "radio inputs use compact circular control metrics" {
 /// commands are rebased onto the persistent outer BlockLayout before the
 /// temporary layout objects are retired.
 const ButtonLayout = struct {
-    embed: EmbedLayout,
+    allocator: std.mem.Allocator,
+    embed: EmbedLayout = .{},
     root: ?*BlockLayout = null,
     commands: std.ArrayList(DisplayItem),
     bgcolor: browser.Color = .{ .r = 255, .g = 165, .b = 0, .a = 255 },
@@ -5504,7 +5414,7 @@ const ButtonLayout = struct {
 
     fn init(allocator: std.mem.Allocator) ButtonLayout {
         return .{
-            .embed = EmbedLayout.init(allocator),
+            .allocator = allocator,
             .commands = std.ArrayList(DisplayItem).empty,
             .input_bounds = std.AutoHashMap(*Node, Bounds).init(allocator),
             .image_bounds = std.AutoHashMap(*Node, Bounds).init(allocator),
@@ -5517,7 +5427,7 @@ const ButtonLayout = struct {
     }
 
     fn deinit(self: *ButtonLayout) void {
-        const allocator = self.embed.allocator;
+        const allocator = self.allocator;
         DisplayItem.freeItems(allocator, self.commands.items);
         self.commands.deinit(allocator);
         if (self.root) |root| {
@@ -5532,7 +5442,6 @@ const ButtonLayout = struct {
         self.focus_bounds.deinit(allocator);
         self.accessibility_bounds.deinit(allocator);
         self.fragment_targets.deinit(allocator);
-        self.embed.deinit();
     }
 
     fn swapCollectors(self: *ButtonLayout, engine: *Layout) void {
@@ -5591,9 +5500,15 @@ const ButtonLayout = struct {
             })) |pixels|
                 requested_height = @max(engine.scaleActiveCssPixel(pixels), 1);
         }
+        // A blockified flex/grid button already has an allocated content box.
+        // Its temporary inline payload must not fall back to the legacy 200px
+        // width and overflow that item during measurement or final placement.
+        if (parent_block.node_ptr == button_node and parent_block.allocated_box != null) {
+            requested_width = @max(parent_block.content_width, 1);
+        }
         const content_width = @max(requested_width - 2 * padding, 1);
         const root = try BlockLayout.initRichButton(
-            self.embed.allocator,
+            self.allocator,
             button_node,
             parent_block.document,
             parent_block,
@@ -5646,14 +5561,12 @@ const ButtonLayout = struct {
         const box_metrics = buttonBoxMetrics(content_bounds, padding);
         self.content_offset_x = box_metrics.content_offset_x;
         self.content_offset_y = box_metrics.content_offset_y;
-        self.embed.setupDependencies();
         self.embed.setMetrics(
             box_metrics.width,
             box_metrics.height,
             box_metrics.height,
             0,
             engine.effectiveZoom(),
-            engine.size,
         );
     }
 
@@ -5681,8 +5594,8 @@ const ButtonLayout = struct {
             engine.allocator,
             x,
             y,
-            self.embed.width.get().*,
-            self.embed.height.get().*,
+            self.embed.width,
+            self.embed.height,
             self.border_radius,
             engine.remapColor(self.bgcolor, .control_background),
             source,
@@ -5695,11 +5608,11 @@ const ButtonLayout = struct {
                     paint,
                     x,
                     y,
-                    self.embed.width.get().*,
-                    self.embed.height.get().*,
+                    self.embed.width,
+                    self.embed.height,
                     engine.layoutWindowWidth(),
                     engine.layoutWindowHeight(),
-                    scaleCssFloat(1.0, self.embed.zoom.get().*, engine.zoom()),
+                    scaleCssFloat(1.0, self.embed.zoom, engine.zoom()),
                     source,
                 );
             }
@@ -5710,11 +5623,11 @@ const ButtonLayout = struct {
                 .rect = .{
                     .left = x,
                     .top = y,
-                    .right = x + self.embed.width.get().*,
-                    .bottom = y + self.embed.height.get().*,
+                    .right = x + self.embed.width,
+                    .bottom = y + self.embed.height,
                 },
                 .color = forced_colors.text,
-                .thickness = @max(scaleCssPixel(1, self.embed.zoom.get().*, engine.zoom()), 1),
+                .thickness = @max(scaleCssPixel(1, self.embed.zoom, engine.zoom()), 1),
                 .source = source,
             } });
         }
@@ -5739,8 +5652,8 @@ const ButtonLayout = struct {
                 &rounded_items,
                 x,
                 y,
-                self.embed.width.get().*,
-                self.embed.height.get().*,
+                self.embed.width,
+                self.embed.height,
                 self.border_radius,
                 source,
             );
@@ -6837,11 +6750,11 @@ fn layoutChildPaintEntry(child: LayoutChild, document_index: usize) paint_order.
     };
 }
 
-/// A synchronous table-grid placement constraint for one existing DOM-backed
-/// block. It never owns or outlives the `layoutWithTableBox` call that installs
+/// A synchronous table/flex/grid allocation for one existing DOM-backed
+/// block. It never owns or outlives the `layoutWithAllocatedBox` call that installs
 /// it; the layout object still owns its style, children, paint cache, and DOM
 /// callback identity.
-const TableBox = struct {
+const AllocatedBox = struct {
     x: i32,
     y: i32,
     width: i32,
@@ -6928,10 +6841,11 @@ const BlockLayout = struct {
     embedded_box: ?EmbeddedBlockBox = null,
     rich_button_root: bool = false,
     effective_zoom_override: ?f32 = null,
-    /// Present only during a table parent's synchronous child-layout pass.
+    /// Present only during a formatting parent's synchronous child-layout pass.
     /// Unlike `embedded_box`, this preserves the child element's CSS edges,
     /// effects, and content dimensions while forcing its grid border box.
-    table_box: ?TableBox = null,
+    allocated_box: ?AllocatedBox = null,
+    used_formatting_context: bool = false,
     /// Ephemeral direct-parent normal-flow state. The parent updates this
     /// before calling `layout`; `normal_flow_result` is then read before it
     /// visits the next sibling. Neither field survives a layout phase as an
@@ -6944,8 +6858,8 @@ const BlockLayout = struct {
     table_row_columns: ?[]const i32 = null,
     /// False for rich-button layout trees, which are destroyed after their
     /// paint commands are rebased into the persistent surrounding block.
-    /// ProtectedField has no unsubscribe operation, so those temporary trees
-    /// must never register callbacks with longer-lived DOM/layout fields.
+    /// They copy already-computed values instead of registering needless
+    /// transient dependencies with longer-lived DOM/layout fields.
     persistent_dependencies: bool = true,
     /// Rich-button descendants route every DOM-style invalidation to this
     /// persistent containing-block field instead of their temporary fields.
@@ -7130,6 +7044,7 @@ const BlockLayout = struct {
     /// Previously inserted, not-yet-laid-out nodes may appear as gaps between
     /// those owners. Anonymous inline runs retain the conservative path.
     fn canReuseInsert(self: *BlockLayout, insert_index: usize) bool {
+        if (self.used_formatting_context) return false;
         // A table's direct-child sequence defines its anonymous rows and cells,
         // so even an append can change the formatting topology. Rebuild this
         // bounded formatting context conservatively rather than retaining an
@@ -7244,6 +7159,7 @@ const BlockLayout = struct {
     /// a layout owner would require deleting an owned layout subtree, so that
     /// case remains on the full structural path.
     fn canReuseRemove(self: *BlockLayout, remove_index: usize) bool {
+        if (self.used_formatting_context) return false;
         if (publishedNodeTableRole(self.node) != .ordinary) return false;
         if (!self.persistent_dependencies or self.inline_nodes != null) return false;
         if (self.children_version.dirty or self.laid_out_dom_children == 0) return false;
@@ -7540,7 +7456,7 @@ const BlockLayout = struct {
             .embedded_box = null,
             .rich_button_root = false,
             .effective_zoom_override = null,
-            .table_box = null,
+            .allocated_box = null,
             .table_row_columns = null,
             .persistent_dependencies = persistent_dependencies,
             .temporary_dependency_target = if (!persistent_dependencies and parent_block != null)
@@ -7625,6 +7541,8 @@ const BlockLayout = struct {
                     .element => |*element| {
                         if (element.style) |*style_map| {
                             if (style_map.getPtr("zoom")) |field| block.zoom.addDependency(field, style_map.allocator);
+                            if (style_map.getPtr("display")) |field| block.children_version.addDependency(field, style_map.allocator);
+                            if (style_map.getPtr("box-sizing")) |field| block.width.addDependency(field, style_map.allocator);
                             if (style_map.getPtr("width")) |field| block.width.addDependency(field, style_map.allocator);
                             if (style_map.getPtr("min-width")) |field| block.width.addDependency(field, style_map.allocator);
                             if (style_map.getPtr("max-width")) |field| block.width.addDependency(field, style_map.allocator);
@@ -7968,6 +7886,7 @@ const BlockLayout = struct {
 
     fn isBlockContainer(self: *BlockLayout) bool {
         if (self.inline_nodes != null) return false;
+        if (self.formattingKind() != null) return true;
         if (table_format.establishesFormattingContext(self.tableRole())) return true;
         switch (self.node) {
             .text => return false,
@@ -8004,6 +7923,16 @@ const BlockLayout = struct {
 
     fn tableRole(self: *const BlockLayout) table_format.Role {
         return nodeTableRole(self.node, null);
+    }
+
+    fn formattingKind(self: *const BlockLayout) ?enum { flex, grid } {
+        if (self.inline_nodes != null) return null;
+        const element = liveBlockElement(self) orelse return null;
+        const styles = if (element.style) |*map| map else return null;
+        const display = styleValue(styles, "display") orelse return null;
+        if (flex_format.eq(display, "flex")) return .flex;
+        if (flex_format.eq(display, "grid")) return .grid;
+        return null;
     }
 
     fn floatSide(self: *const BlockLayout) FloatSide {
@@ -8075,7 +8004,7 @@ const BlockLayout = struct {
         if (self.parent_block == null or self.inline_nodes != null or self.embedded_box != null) {
             return false;
         }
-        if (self.table_box != null or self.tableRole() != .ordinary) return false;
+        if (self.allocated_box != null or self.tableRole() != .ordinary) return false;
         if (self.floatSide() != .none or isOutOfFlowPosition(self.positionMode())) return false;
         if (blockAvoidsExternalFloats(self)) return false;
         if (specified_height) |height| {
@@ -8134,7 +8063,7 @@ const BlockLayout = struct {
         if (self.parent_block == null or self.inline_nodes != null or self.embedded_box != null) {
             return false;
         }
-        if (self.table_box != null or self.tableRole() != .ordinary) return false;
+        if (self.allocated_box != null or self.tableRole() != .ordinary) return false;
         if (self.floatSide() != .none or isOutOfFlowPosition(self.positionMode())) return false;
         if (blockAvoidsExternalFloats(self)) return false;
         if (self.padding.top != 0 or self.border.top != 0) return false;
@@ -8162,7 +8091,7 @@ const BlockLayout = struct {
             return null;
         }
         if (!child.isBlockContainer()) return null;
-        if (child.table_box != null or child.tableRole() != .ordinary) return null;
+        if (child.allocated_box != null or child.tableRole() != .ordinary) return null;
         if (child.floatSide() != .none or isOutOfFlowPosition(child.positionMode())) return null;
         if (child.clearSide() != .none or blockAvoidsExternalFloats(child)) return null;
 
@@ -8363,6 +8292,8 @@ const BlockLayout = struct {
             self.node = ptr.*;
         }
 
+        self.used_formatting_context = self.formattingKind() != null;
+
         // This subtree is rebuilt and destroyed inside one surrounding line
         // layout. Its live DOM styles must invalidate the persistent outer
         // block, never a ProtectedField owned by this temporary tree.
@@ -8383,7 +8314,7 @@ const BlockLayout = struct {
         // through raster so page scrolling does not move them.
         const position_mode = self.positionMode();
         const fixed_to_viewport = position_mode == .fixed and self.embedded_box == null;
-        const table_box = self.table_box;
+        const allocated_box = self.allocated_box;
         // Use .read() to register invalidation dependencies on parent/document/previous fields
         const parent_zoom = if (self.parent_block) |pb|
             if (self.persistent_dependencies) pb.zoom.read(&self.zoom, self.allocator).* else pb.zoom.get().*
@@ -8413,9 +8344,11 @@ const BlockLayout = struct {
             self.document.page_zoom,
         );
         var containing_height_css = if (self.parent_block) |pb| blk: {
-            if (pb.height.dirty or !pb.content_height_definite) break :blk null;
+            // A definite content height is published before children run.
+            // A preceding child's metric can dirty the parent's final height
+            // publisher during this traversal without invalidating that base.
+            if ((!pb.in_layout and pb.height.dirty) or !pb.content_height_definite) break :blk null;
             const height = pb.content_height;
-            if (height <= 0) break :blk null;
             break :blk cssPixelsFromLayout(height, pb.zoom.get().*, self.document.page_zoom);
         } else null;
         if (fixed_to_viewport) {
@@ -8431,7 +8364,7 @@ const BlockLayout = struct {
                 self.document.zoom.get().*,
                 self.document.page_zoom,
             );
-        } else if (table_box) |box| {
+        } else if (allocated_box) |box| {
             // A table pass supplies a grid border box. It replaces normal
             // predecessor/float placement, but the child retains its own
             // padding, borders, descendants, effects, and paint cache.
@@ -8474,7 +8407,7 @@ const BlockLayout = struct {
             self.previous.get().*;
         const parent_content_y = if (fixed_to_viewport)
             0
-        else if (table_box) |box|
+        else if (allocated_box) |box|
             box.y
         else if (previous == null) blk: {
             if (self.parent_block) |pb| {
@@ -8491,7 +8424,7 @@ const BlockLayout = struct {
         } else 0;
         const prev_y = if (fixed_to_viewport)
             self.margin.top
-        else if (table_box) |box|
+        else if (allocated_box) |box|
             box.y
         else if (previous) |prev|
             (if (self.persistent_dependencies)
@@ -8509,7 +8442,7 @@ const BlockLayout = struct {
             else
                 0;
 
-        if (self.tableRole() == .table and table_box == null) {
+        if (self.tableRole() == .table and allocated_box == null) {
             // The intrinsic table width depends on its actual DOM-backed
             // descendants. Build that child tree before the outer box picks a
             // shrink-to-fit used width; ordinary blocks remain lazy below.
@@ -8519,23 +8452,26 @@ const BlockLayout = struct {
             .font_size = self.computedFontSizeCss(),
             .percentage_base = containing_width_css,
         };
-        const unconstrained_width = if (self.embedded_box == null)
+        const sizing_border_box = flex_format.eq(self.formatStyle("box-sizing", "content-box"), "border-box");
+        const sizing_width_edges = if (sizing_border_box) self.padding.horizontal() + self.border.horizontal() else 0;
+        const sizing_height_edges = if (sizing_border_box) self.padding.vertical() + self.border.vertical() else 0;
+        const unconstrained_width: ?i32 = if (self.embedded_box == null)
             if (self.specifiedPixelDimension("width", &self.width, width_context)) |width|
-                scaleCssPixel(width, zoom_value, engine.zoom())
+                @max(scaleCssPixel(width, zoom_value, engine.zoom()) -| sizing_width_edges, 0)
             else
                 null
         else
             null;
-        const min_width = if (self.embedded_box == null)
+        const min_width: ?i32 = if (self.embedded_box == null)
             if (self.specifiedPixelDimension("min-width", &self.width, width_context)) |width|
-                scaleCssPixel(width, zoom_value, engine.zoom())
+                @max(scaleCssPixel(width, zoom_value, engine.zoom()) -| sizing_width_edges, 0)
             else
                 null
         else
             null;
-        const max_width = if (self.embedded_box == null)
+        const max_width: ?i32 = if (self.embedded_box == null)
             if (self.specifiedPixelDimension("max-width", &self.width, width_context)) |width|
-                scaleCssPixel(width, zoom_value, engine.zoom())
+                @max(scaleCssPixel(width, zoom_value, engine.zoom()) -| sizing_width_edges, 0)
             else
                 null
         else
@@ -8545,7 +8481,7 @@ const BlockLayout = struct {
         else
             null;
         const specified_width = style_specified_width orelse
-            if (self.tableRole() == .table and table_box == null)
+            if (self.tableRole() == .table and allocated_box == null)
                 try self.preferredTableWidth(zoom_value, engine.zoom(), containing_width_css)
             else
                 null;
@@ -8553,7 +8489,7 @@ const BlockLayout = struct {
             ContentBounds{ .x = embedded.x, .width = embedded.width }
         else if (fixed_to_viewport)
             ContentBounds{ .x = 0, .width = parent_width }
-        else if (table_box) |box|
+        else if (allocated_box) |box|
             ContentBounds{ .x = box.x, .width = box.width }
         else
             contentBoundsForNode(
@@ -8566,23 +8502,23 @@ const BlockLayout = struct {
             .font_size = self.computedFontSizeCss(),
             .percentage_base = containing_height_css,
         };
-        const unconstrained_height = if (self.embedded_box == null)
+        const unconstrained_height: ?i32 = if (self.embedded_box == null)
             if (self.specifiedPixelDimension("height", &self.height, height_context)) |height|
-                scaleCssPixel(height, zoom_value, engine.zoom())
+                @max(scaleCssPixel(height, zoom_value, engine.zoom()) -| sizing_height_edges, 0)
             else
                 null
         else
             null;
-        const min_height = if (self.embedded_box == null)
+        const min_height: ?i32 = if (self.embedded_box == null)
             if (self.specifiedPixelDimension("min-height", &self.height, height_context)) |height|
-                scaleCssPixel(height, zoom_value, engine.zoom())
+                @max(scaleCssPixel(height, zoom_value, engine.zoom()) -| sizing_height_edges, 0)
             else
                 null
         else
             null;
-        const max_height = if (self.embedded_box == null)
+        const max_height: ?i32 = if (self.embedded_box == null)
             if (self.specifiedPixelDimension("max-height", &self.height, height_context)) |height|
-                scaleCssPixel(height, zoom_value, engine.zoom())
+                @max(scaleCssPixel(height, zoom_value, engine.zoom()) -| sizing_height_edges, 0)
             else
                 null
         else
@@ -8591,7 +8527,7 @@ const BlockLayout = struct {
             constrainDimension(height, min_height, max_height)
         else
             null;
-        const specified_height = if (table_box) |box|
+        const specified_height = if (allocated_box) |box|
             if (box.height) |height|
                 @max(height -| self.padding.vertical() -| self.border.vertical(), 0)
             else
@@ -8601,8 +8537,8 @@ const BlockLayout = struct {
         const horizontal_insets = self.padding.horizontal() + self.border.horizontal();
         // Table grid placement supplies the border box directly. A cell or
         // row must not independently enter the surrounding float context.
-        const float_side: FloatSide = if (table_box == null) self.floatSide() else .none;
-        const normal_flow_placement = if (table_box == null and
+        const float_side: FloatSide = if (allocated_box == null) self.floatSide() else .none;
+        const normal_flow_placement = if (allocated_box == null and
             !isOutOfFlowPosition(position_mode) and float_side == .none)
             self.normal_flow_placement
         else
@@ -8671,7 +8607,7 @@ const BlockLayout = struct {
         var float_x: ?i32 = null;
         var clearance_applied = false;
 
-        if (table_box == null) {
+        if (allocated_box == null) {
             if (self.parent_block) |parent| {
                 if (!isOutOfFlowPosition(position_mode)) {
                     const float_context = parent.floatContextForChildren();
@@ -8751,7 +8687,7 @@ const BlockLayout = struct {
         // border box clear of external floats. An ordinary in-flow block does
         // neither: its background spans the containing block underneath the
         // float while inlineContentBounds narrows only its line boxes.
-        const content_bounds = if (table_box != null)
+        const content_bounds = if (allocated_box != null)
             base_content_bounds
         else if (self.parent_block) |parent|
             if (!isOutOfFlowPosition(position_mode) and
@@ -8787,7 +8723,7 @@ const BlockLayout = struct {
         if (specified_width != null and
             !isOutOfFlowPosition(position_mode) and
             float_side == .none and
-            table_box == null and
+            allocated_box == null and
             self.isBlockContainer() and
             (auto_margins.left or auto_margins.right))
         {
@@ -8806,7 +8742,7 @@ const BlockLayout = struct {
         }
         self.x.set(if (self.embedded_box) |embedded|
             embedded.x
-        else if (table_box) |box|
+        else if (allocated_box) |box|
             box.x
         else if (float_x) |x|
             x
@@ -8814,13 +8750,13 @@ const BlockLayout = struct {
             content_bounds.x + self.margin.left);
         self.y.set(if (self.embedded_box) |embedded|
             embedded.y
-        else if (table_box) |box|
+        else if (allocated_box) |box|
             box.y
         else
             layout_y);
         self.width.set(if (self.embedded_box) |embedded|
             embedded.width
-        else if (table_box) |box|
+        else if (allocated_box) |box|
             box.width
         else
             border_box_width);
@@ -8883,7 +8819,12 @@ const BlockLayout = struct {
             }
 
             const table_role = self.tableRole();
-            if (table_role == .table) {
+            if (self.formattingKind() != null) {
+                const auto_height = try self.layoutFormattingChildren(engine, specified_height);
+                natural_height = auto_height;
+                self.content_height = specified_height orelse constrainDimension(auto_height, min_height, max_height);
+                self.height.set(@max(self.content_height + self.padding.vertical() + self.border.vertical(), 0));
+            } else if (table_role == .table) {
                 const auto_height = try self.layoutTableChildren(engine);
                 natural_height = auto_height;
                 self.content_height = specified_height orelse
@@ -9146,7 +9087,7 @@ const BlockLayout = struct {
         // nodes. Their direct-child topology can therefore change meaning when
         // a display value changes, so retain-insertion is deliberately kept to
         // ordinary block formatting contexts.
-        const preserves_table_topology = self.tableRole() == .ordinary and
+        const preserves_table_topology = self.tableRole() == .ordinary and self.formattingKind() == null and
             (live_element == null or !hasPublishedActiveGeneratedChildren(live_element.?));
         var reused_children = false;
         if (insertions_only and preserves_table_topology) {
@@ -9350,7 +9291,7 @@ const BlockLayout = struct {
         defer self.allocator.free(metrics);
         var cursor_x = x;
         for (cells, 0..) |cell, column| {
-            try cell.layoutWithTableBox(engine, .{
+            try cell.layoutWithAllocatedBox(engine, .{
                 .x = cursor_x,
                 .y = y,
                 .width = columns[column],
@@ -9366,7 +9307,7 @@ const BlockLayout = struct {
         cursor_x = x;
         for (cells, 0..) |cell, column| {
             if (cell.height.get().* != used_height) {
-                try cell.layoutWithTableBox(engine, .{
+                try cell.layoutWithAllocatedBox(engine, .{
                     .x = cursor_x,
                     .y = y,
                     .width = columns[column],
@@ -9378,10 +9319,285 @@ const BlockLayout = struct {
         return used_height;
     }
 
-    fn layoutWithTableBox(self: *BlockLayout, engine: *Layout, box: TableBox) !void {
-        const previous_box = self.table_box;
-        self.table_box = box;
-        defer self.table_box = previous_box;
+    fn formatStyle(self: *BlockLayout, property: []const u8, default: []const u8) []const u8 {
+        const element = liveBlockElement(self) orelse return default;
+        const styles = if (element.style) |*map| map else return default;
+        const field = @constCast(styles).getPtr(property) orelse return default;
+        if (self.persistent_dependencies) {
+            self.width.addDependency(field, styles.allocator);
+            return field.read(&self.width, styles.allocator).*;
+        }
+        return field.get().*;
+    }
+
+    fn formatLength(self: *BlockLayout, property: []const u8, base: ?f64, scale: f64) ?f64 {
+        return if (parser.resolveCssLength(self.formatStyle(property, "auto"), .{
+            .font_size = self.computedFontSizeCss(),
+            .percentage_base = if (base) |size| size / scale else null,
+        })) |size| size * scale else null;
+    }
+
+    const FormatItem = struct {
+        block: *BlockLayout,
+        main: flex_format.Item,
+        width: f64,
+        height: f64 = 0,
+        min_cross: f64 = 0,
+        max_cross: f64 = std.math.inf(f64),
+        cross_before: f64 = 0,
+        cross_after: f64 = 0,
+        cross_auto: bool = true,
+        cross_align: []const u8 = "stretch",
+        scale: f64,
+    };
+
+    fn formatItem(self: *BlockLayout, child: *BlockLayout, engine: *Layout, column: bool, definite_height: ?i32) !FormatItem {
+        const effective = child.effectiveZoomFromParent(self.zoom.get().*);
+        const scale = @as(f64, effective) / self.document.page_zoom;
+        const width_base: f64 = @floatFromInt(self.content_width);
+        const height_base: ?f64 = if (definite_height) |h| @floatFromInt(h) else null;
+        const edges = child.resolvedBoxEdges(width_base / scale, effective, engine.zoom());
+        const x_edges: f64 = @floatFromInt(edges.padding.horizontal() + edges.border.horizontal());
+        const y_edges: f64 = @floatFromInt(edges.padding.vertical() + edges.border.vertical());
+        const border_box = flex_format.eq(child.formatStyle("box-sizing", "content-box"), "border-box");
+        var intrinsic: intrinsic_measure.Width = .{};
+        if (child.inline_nodes) |nodes| {
+            for (nodes) |node| {
+                const measured = try intrinsic_measure.measure(node, &engine.font_manager, scale);
+                intrinsic.min = @max(intrinsic.min, measured.min);
+                intrinsic.max += measured.max;
+            }
+        } else if (child.node_ptr) |node| intrinsic = try intrinsic_measure.measure(node, &engine.font_manager, scale);
+        const authored_width = child.formatLength("width", width_base, scale);
+        const authored_height = child.formatLength("height", height_base, scale);
+        const width = if (authored_width) |w| @max(w + if (border_box) @as(f64, 0) else x_edges, x_edges) else intrinsic.max + x_edges;
+        const height = if (authored_height) |h| @max(h + if (border_box) @as(f64, 0) else y_edges, y_edges) else y_edges;
+        const main_edges = if (column) y_edges else x_edges;
+        const cross_edges = if (column) x_edges else y_edges;
+        const main_base = if (column) height_base else width_base;
+        const cross_base = if (column) width_base else height_base;
+        const main_min = child.formatLength(if (column) "min-height" else "min-width", main_base, scale);
+        const main_max = child.formatLength(if (column) "max-height" else "max-width", main_base, scale);
+        const cross_min = child.formatLength(if (column) "min-width" else "min-height", cross_base, scale);
+        const cross_max = child.formatLength(if (column) "max-width" else "max-height", cross_base, scale);
+        const basis = child.formatLength("flex-basis", main_base, scale);
+        const alignment = child.formatStyle("align-self", "auto");
+        return .{
+            .block = child,
+            .scale = scale,
+            .width = width,
+            .height = height,
+            .main = .{
+                .basis = if (basis) |size| @max(size + if (border_box) @as(f64, 0) else main_edges, main_edges) else if (column) height else width,
+                .min = @max(main_edges, if (main_min) |m| m + if (border_box) @as(f64, 0) else main_edges else if (!column and flex_format.eq(child.formatStyle("overflow", "visible"), "visible")) @min(intrinsic.min + x_edges, width) else 0),
+                .max = if (main_max) |m| @max(main_edges, m + if (border_box) @as(f64, 0) else main_edges) else std.math.inf(f64),
+                .grow = @import("../../document/css_flex.zig").factor(child.formatStyle("flex-grow", "0")) orelse 0,
+                .shrink = @import("../../document/css_flex.zig").factor(child.formatStyle("flex-shrink", "1")) orelse 1,
+                .before = @floatFromInt(if (column) edges.margin.top else edges.margin.left),
+                .after = @floatFromInt(if (column) edges.margin.bottom else edges.margin.right),
+                .auto_before = flex_format.eq(child.formatStyle(if (column) "margin-top" else "margin-left", "0px"), "auto"),
+                .auto_after = flex_format.eq(child.formatStyle(if (column) "margin-bottom" else "margin-right", "0px"), "auto"),
+            },
+            .min_cross = @max(cross_edges, if (cross_min) |m| m + if (border_box) @as(f64, 0) else cross_edges else 0),
+            .max_cross = if (cross_max) |m| @max(cross_edges, m + if (border_box) @as(f64, 0) else cross_edges) else std.math.inf(f64),
+            .cross_before = @floatFromInt(if (column) edges.margin.left else edges.margin.top),
+            .cross_after = @floatFromInt(if (column) edges.margin.right else edges.margin.bottom),
+            .cross_auto = if (column) authored_width == null else authored_height == null,
+            .cross_align = if (flex_format.eq(alignment, "auto")) self.formatStyle("align-items", "normal") else alignment,
+        };
+    }
+
+    fn formatCoordinate(value: f64) i32 {
+        return @intFromFloat(std.math.clamp(@round(value), std.math.minInt(i32), std.math.maxInt(i32)));
+    }
+
+    fn placeFormatItem(self: *BlockLayout, engine: *Layout, item: *FormatItem, x: f64, y: f64, width: f64, height: ?f64) !void {
+        const origin_x = self.x.get().* + self.padding.left + self.border.left;
+        const origin_y = self.y.get().* + self.padding.top + self.border.top;
+        try item.block.layoutWithAllocatedBox(engine, .{
+            .x = origin_x +| formatCoordinate(x),
+            .y = origin_y +| formatCoordinate(y),
+            .width = @max(formatCoordinate(x + width) -| formatCoordinate(x), 0),
+            .height = if (height) |h| @max(formatCoordinate(y + h) -| formatCoordinate(y), 0) else null,
+        });
+        item.width = @floatFromInt(item.block.width.get().*);
+        item.height = @floatFromInt(item.block.height.get().*);
+    }
+
+    fn layoutFormattingChildren(self: *BlockLayout, engine: *Layout, definite_height: ?i32) !i32 {
+        const column = flex_format.eq(self.formatStyle("flex-direction", "row"), "column") or flex_format.eq(self.formatStyle("flex-direction", "row"), "column-reverse");
+        const grid = self.formattingKind().? == .grid;
+        var items: std.ArrayList(FormatItem) = .empty;
+        defer items.deinit(self.allocator);
+        for (self.children.items) |child| {
+            const block = child.block;
+            if (isOutOfFlowPosition(block.positionMode())) continue;
+            try items.append(self.allocator, try self.formatItem(block, engine, if (grid) false else column, definite_height));
+        }
+        // CSS order is a visual ordering only; never reorder the DOM children.
+        std.mem.sort(FormatItem, items.items, {}, struct {
+            fn less(_: void, a: FormatItem, b: FormatItem) bool {
+                const left = std.fmt.parseInt(i32, a.block.formatStyle("order", "0"), 10) catch 0;
+                const right = std.fmt.parseInt(i32, b.block.formatStyle("order", "0"), 10) catch 0;
+                return left < right;
+            }
+        }.less);
+        const scale = @as(f64, self.zoom.get().*) / self.document.page_zoom;
+        const column_gap = self.formatLength("column-gap", @floatFromInt(self.content_width), scale) orelse 0;
+        const row_gap = self.formatLength("row-gap", if (definite_height) |h| @as(f64, @floatFromInt(h)) else null, scale) orelse 0;
+        const height = if (grid)
+            try self.layoutGridItems(engine, items.items, definite_height, column_gap, row_gap)
+        else
+            try self.layoutFlexItems(engine, items.items, definite_height, column, column_gap, row_gap);
+        for (self.children.items) |child| if (isOutOfFlowPosition(child.block.positionMode())) {
+            child.block.mark();
+            try child.block.layout(engine);
+        };
+        return @max(formatCoordinate(height), 0);
+    }
+
+    fn layoutFlexItems(self: *BlockLayout, engine: *Layout, items: []FormatItem, definite_height: ?i32, column: bool, column_gap: f64, row_gap: f64) !f64 {
+        if (items.len == 0) return 0;
+        const main_gap = if (column) row_gap else column_gap;
+        const cross_gap = if (column) column_gap else row_gap;
+        const collect = engine.collect_hit_test_bounds;
+        defer engine.collect_hit_test_bounds = collect;
+        engine.collect_hit_test_bounds = false;
+        if (column) {
+            for (items) |*item| {
+                const width = if (item.cross_auto) @as(f64, @floatFromInt(self.content_width)) - item.cross_before - item.cross_after else item.width;
+                try self.placeFormatItem(engine, item, 0, 0, @max(item.min_cross, @min(width, item.max_cross)), null);
+                if (item.block.formatLength("flex-basis", if (definite_height) |h| @as(f64, @floatFromInt(h)) else null, item.scale) == null) item.main.basis = item.height;
+            }
+        }
+        const main_items = try self.allocator.alloc(flex_format.Item, items.len);
+        defer self.allocator.free(main_items);
+        var natural_main = main_gap * @as(f64, @floatFromInt(items.len - 1));
+        for (items, main_items) |item, *main| {
+            main.* = item.main;
+            natural_main += flex_format.clamp(item.main, item.main.basis) + item.main.before + item.main.after;
+        }
+        const main_size = if (column) if (definite_height) |h| @as(f64, @floatFromInt(h)) else natural_main else @as(f64, @floatFromInt(self.content_width));
+        const cross_size: ?f64 = if (column) @floatFromInt(self.content_width) else if (definite_height) |h| @floatFromInt(h) else null;
+        const used = try self.allocator.alloc(flex_format.Used, items.len);
+        defer self.allocator.free(used);
+        const Line = struct { start: usize, end: usize, cross: f64 };
+        var lines: std.ArrayList(Line) = .empty;
+        defer lines.deinit(self.allocator);
+        const wrap = !flex_format.eq(self.formatStyle("flex-wrap", "nowrap"), "nowrap");
+        const reverse = std.mem.endsWith(u8, self.formatStyle("flex-direction", "row"), "reverse");
+        var start: usize = 0;
+        var total_cross: f64 = 0;
+        while (start < items.len) {
+            const end = start + flex_format.lineEnd(main_items[start..], main_size, main_gap, wrap);
+            flex_format.resolve(main_items[start..end], main_size, main_gap, self.formatStyle("justify-content", "normal"), reverse, used[start..end]);
+            var cross: f64 = 0;
+            for (items[start..end], used[start..end]) |*item, placement| {
+                if (!column) try self.placeFormatItem(engine, item, 0, 0, placement.size, null);
+                cross = @max(cross, (if (column) item.width else item.height) + item.cross_before + item.cross_after);
+            }
+            try lines.append(self.allocator, .{ .start = start, .end = end, .cross = cross });
+            total_cross += cross + if (start > 0) cross_gap else @as(f64, 0);
+            start = end;
+        }
+        const free_cross = @max((cross_size orelse total_cross) - total_cross, 0);
+        const align_content = self.formatStyle("align-content", "normal");
+        const stretch_lines = (!wrap or flex_format.eq(align_content, "normal") or flex_format.eq(align_content, "stretch"));
+        const distribution = flex_format.distribute(align_content, if (stretch_lines) 0 else free_cross, lines.items.len);
+        var cursor = distribution.offset;
+        engine.collect_hit_test_bounds = collect;
+        for (lines.items) |line| {
+            const line_cross = line.cross + if (stretch_lines) free_cross / @as(f64, @floatFromInt(lines.items.len)) else @as(f64, 0);
+            for (items[line.start..line.end], used[line.start..line.end]) |*item, placement| {
+                const available = @max(line_cross - item.cross_before - item.cross_after, 0);
+                const stretch = item.cross_auto and (flex_format.eq(item.cross_align, "normal") or flex_format.eq(item.cross_align, "stretch"));
+                const cross = @max(item.min_cross, @min(if (stretch) available else if (column) item.width else item.height, item.max_cross));
+                var cross_offset = cursor + item.cross_before + flex_format.distribute(item.cross_align, available - cross, 1).offset;
+                if (flex_format.eq(self.formatStyle("flex-wrap", "nowrap"), "wrap-reverse")) cross_offset = (cross_size orelse total_cross) - cross_offset - cross;
+                try self.placeFormatItem(engine, item, if (column) cross_offset else placement.offset, if (column) placement.offset else cross_offset, if (column) cross else placement.size, if (column) placement.size else cross);
+            }
+            cursor += line_cross + cross_gap + distribution.between;
+        }
+        return if (column) main_size else cross_size orelse total_cross;
+    }
+
+    fn layoutGridItems(self: *BlockLayout, engine: *Layout, items: []FormatItem, definite_height: ?i32, column_gap: f64, row_gap: f64) !f64 {
+        if (items.len == 0) return 0;
+        const scale = @as(f64, self.zoom.get().*) / self.document.page_zoom;
+        var columns: [grid_format.tracks.max_tracks]grid_format.Track = undefined;
+        var column_count = grid_format.tracks.parse(self.formatStyle("grid-template-columns", "none"), .{ .font_size = self.computedFontSizeCss(), .percentage_base = @as(f64, @floatFromInt(self.content_width)) / scale }, column_gap / scale, items.len, &columns) orelse 0;
+        if (column_count == 0) {
+            column_count = 1;
+            columns[0] = .{};
+        }
+        for (columns[0..column_count]) |*track| {
+            track.min *= scale;
+            if (track.max) |max| track.max = max * scale;
+        }
+        var intrinsic: [grid_format.tracks.max_tracks]f64 = @splat(0);
+        for (items, 0..) |item, i| intrinsic[i % column_count] = @max(intrinsic[i % column_count], item.main.min + item.main.before + item.main.after);
+        var widths: [grid_format.tracks.max_tracks]f64 = undefined;
+        grid_format.resolve(columns[0..column_count], intrinsic[0..column_count], @floatFromInt(self.content_width), column_gap, true, widths[0..column_count]);
+        const row_count = (items.len + column_count - 1) / column_count;
+        const rows = try self.allocator.alloc(grid_format.Track, row_count);
+        defer self.allocator.free(rows);
+        const heights = try self.allocator.alloc(f64, row_count);
+        defer self.allocator.free(heights);
+        const natural = try self.allocator.alloc(f64, row_count);
+        defer self.allocator.free(natural);
+        @memset(natural, 0);
+        const height_context = parser.CssLengthResolutionContext{ .font_size = self.computedFontSizeCss(), .percentage_base = if (definite_height) |h| @as(f64, @floatFromInt(h)) / scale else null };
+        var explicit: [grid_format.tracks.max_tracks]grid_format.Track = undefined;
+        const explicit_count = grid_format.tracks.parse(self.formatStyle("grid-template-rows", "none"), height_context, row_gap / scale, row_count, &explicit) orelse 0;
+        const auto_row = grid_format.tracks.parseTrack(self.formatStyle("grid-auto-rows", "auto"), height_context) orelse grid_format.Track{};
+        for (rows, 0..) |*track, i| {
+            track.* = if (i < explicit_count) explicit[i] else auto_row;
+            track.min *= scale;
+            if (track.max) |max| track.max = max * scale;
+        }
+        const collect = engine.collect_hit_test_bounds;
+        defer engine.collect_hit_test_bounds = collect;
+        engine.collect_hit_test_bounds = false;
+        for (items, 0..) |*item, i| {
+            const available = @max(widths[i % column_count] - item.main.before - item.main.after, 0);
+            const width = if (flex_format.eq(item.block.formatStyle("width", "auto"), "auto")) available else @min(item.width, available);
+            try self.placeFormatItem(engine, item, 0, 0, flex_format.clamp(item.main, width), null);
+            natural[i / column_count] = @max(natural[i / column_count], item.height + item.cross_before + item.cross_after);
+        }
+        // Resolve rows in bounded batches only for the scalar solver's scratch;
+        // the DOM may have arbitrarily many implicit auto rows.
+        if (row_count <= grid_format.tracks.max_tracks) {
+            grid_format.resolve(rows, natural, if (definite_height) |h| @as(f64, @floatFromInt(h)) else null, row_gap, true, heights);
+        } else {
+            for (rows, natural, heights) |track, measured, *height| height.* = @max(track.min, measured);
+        }
+        engine.collect_hit_test_bounds = collect;
+        var x: f64 = 0;
+        var y: f64 = 0;
+        for (items, 0..) |*item, i| {
+            const col = i % column_count;
+            const row = i / column_count;
+            if (col == 0) {
+                x = 0;
+                if (row > 0) y += heights[row - 1] + row_gap;
+            }
+            const available = @max(heights[row] - item.cross_before - item.cross_after, 0);
+            const stretch = item.cross_auto and (flex_format.eq(item.cross_align, "normal") or flex_format.eq(item.cross_align, "stretch"));
+            const height = @max(item.min_cross, @min(if (stretch) available else item.height, item.max_cross));
+            const alignment = item.block.formatStyle("justify-self", "auto");
+            const justify = if (flex_format.eq(alignment, "auto")) self.formatStyle("justify-items", "normal") else alignment;
+            const x_offset = item.main.before + flex_format.distribute(justify, widths[col] - item.width - item.main.before - item.main.after, 1).offset;
+            const y_offset = item.cross_before + flex_format.distribute(item.cross_align, available - height, 1).offset;
+            try self.placeFormatItem(engine, item, x + x_offset, y + y_offset, item.width, height);
+            x += widths[col] + column_gap;
+        }
+        return y + heights[row_count - 1];
+    }
+
+    fn layoutWithAllocatedBox(self: *BlockLayout, engine: *Layout, box: AllocatedBox) !void {
+        const previous_box = self.allocated_box;
+        self.allocated_box = box;
+        defer self.allocated_box = previous_box;
         self.mark();
         try self.layout(engine);
     }
@@ -9389,16 +9605,16 @@ const BlockLayout = struct {
     fn layoutWithTableRowBox(
         self: *BlockLayout,
         engine: *Layout,
-        box: TableBox,
+        box: AllocatedBox,
         columns: []const i32,
     ) !void {
-        const previous_box = self.table_box;
+        const previous_box = self.allocated_box;
         const previous_columns = self.table_row_columns;
-        self.table_box = box;
+        self.allocated_box = box;
         self.table_row_columns = columns;
         defer {
             self.table_row_columns = previous_columns;
-            self.table_box = previous_box;
+            self.allocated_box = previous_box;
         }
         self.mark();
         try self.layout(engine);
@@ -9519,6 +9735,45 @@ const BlockLayout = struct {
     }
 
     fn appendBlockChildren(self: *BlockLayout, source: DirectChildSource) !void {
+        if (self.formattingKind() != null) {
+            // Flex/grid blockify direct elements, but anonymous items wrap only
+            // consecutive text nodes. Whitespace and display:none create no item.
+            var index: usize = 0;
+            while (index < source.len()) {
+                const node = source.at(index);
+                if (node.* == .element) {
+                    index += 1;
+                    if (isNonRenderedElement(&node.element)) continue;
+                    if (node.element.style) |*styles| {
+                        const display = styles.getPtr("display").?;
+                        if (self.persistent_dependencies) self.children_version.addDependency(display, styles.allocator);
+                        if (flex_format.eq(display.get().*, "none")) continue;
+                    }
+                    const child = try BlockLayout.init(self.allocator, node.*, node, self.document, self, null);
+                    errdefer {
+                        child.deinit();
+                        self.allocator.destroy(child);
+                    }
+                    try self.children.append(self.allocator, .{ .block = child });
+                } else {
+                    const start = index;
+                    while (index < source.len() and source.at(index).* == .text) : (index += 1) {}
+                    if (sourceRangeIsFormattingWhitespace(source, start, index)) continue;
+                    const nodes = try self.allocator.alloc(*Node, index - start);
+                    for (start..index) |i| nodes[i - start] = source.at(i);
+                    const child = BlockLayout.initAnonymous(self.allocator, nodes, self.document, self, null) catch |err| {
+                        self.allocator.free(nodes);
+                        return err;
+                    };
+                    errdefer {
+                        child.deinit();
+                        self.allocator.destroy(child);
+                    }
+                    try self.children.append(self.allocator, .{ .block = child });
+                }
+            }
+            return;
+        }
         // Tables and real rows place their direct children in a grid, not in
         // the usual vertical predecessor chain. Cells themselves still use
         // normal block flow for their contents.
@@ -9688,7 +9943,7 @@ const BlockLayout = struct {
     fn shouldPaint(self: *const BlockLayout) bool {
         // Anonymous blocks may use an input or button as their representative
         // node, but their display list contains the replaced control itself.
-        // Only suppress a DOM-backed control block's redundant background.
+        // DOM-backed controls also retain inline paint commands when blockified.
         if (self.inline_nodes != null) return true;
         // `node` is a layout snapshot and can lag behind a style-only
         // invalidation. Consult the generation-bound DOM borrow when one is
@@ -9700,8 +9955,7 @@ const BlockLayout = struct {
                 if (e.style) |*style_map| {
                     if (styleVisibilityHidden(style_map)) return false;
                 }
-                // Controls paint their own background in their inline layout.
-                return !std.mem.eql(u8, e.tag, "input") and !std.mem.eql(u8, e.tag, "button");
+                return true;
             },
         }
     }
@@ -10163,7 +10417,7 @@ test "block display provenance rejects fragments outside its DOM origin" {
     try std.testing.expect(displaySource(&block, paragraph.?).originatingNode() == null);
 }
 
-test "anonymous inline run paints when its representative node is a button" {
+test "anonymous and blockified controls retain their inline paint contents" {
     const allocator = std.testing.allocator;
     var button = Node{ .element = try parser.Element.init(allocator, "button", null) };
     defer button.deinit(allocator);
@@ -10176,7 +10430,7 @@ test "anonymous inline run paints when its representative node is a button" {
     try std.testing.expect(anonymous.shouldPaint());
 
     anonymous.inline_nodes = null;
-    try std.testing.expect(!anonymous.shouldPaint());
+    try std.testing.expect(anonymous.shouldPaint());
 }
 
 fn findLastTextLayout(block: *BlockLayout) ?*TextLayout {
@@ -11776,6 +12030,9 @@ fn addBackgroundIfNeededToList(self: *Layout, commands: *std.ArrayList(DisplayIt
     // not to the full-width wrapper.
     if (block.inline_nodes != null) return;
     const element = liveBlockElement(block) orelse return;
+    // A control's inline payload paints its shell. Suppress only the redundant
+    // outer background, never the block's complete retained content subtree.
+    if (std.ascii.eqlIgnoreCase(element.tag, "input") or std.ascii.eqlIgnoreCase(element.tag, "button")) return;
     const block_width = block.width.get().*;
     const block_height = block.height.get().*;
     if (block_width <= 0 or block_height <= 0) return;

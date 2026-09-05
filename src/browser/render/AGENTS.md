@@ -44,6 +44,10 @@ boundaries.
   track math for the bounded CSS table context. `layout.zig` retains all
   DOM-backed boxes and keeps its temporary row/cell plan synchronous; do not
   move DOM pointers, style subscriptions, or anonymous-box lifetime here.
+- `flex_format.zig` and `grid_format.zig` own pointer-free item and track
+  sizing. `intrinsic_width.zig` synchronously borrows DOM and FontManager for
+  bounded intrinsic measurement. None retains DOM/layout/glyph pointers;
+  `layout.zig` owns item boxes, subscriptions, and final hit-test collection.
 - `control_geometry.zig` computes input/button leaf geometry and password
   display text. `InputLayout` and `ButtonLayout` remain with their DOM, font,
   collector, and display-command invariants in `layout.zig`.

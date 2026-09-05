@@ -8,6 +8,8 @@ const std = @import("std");
 const ProtectedField = @import("../core/protected_field.zig").ProtectedField;
 const CSSParser = @import("css_parser.zig").CSSParser;
 const css_length = @import("length.zig");
+const value_tokens = @import("css_value_tokens.zig");
+const custom_properties = @import("custom_properties.zig");
 const css_animation = @import("css_animation.zig");
 const animation = @import("animation.zig");
 const css_properties = @import("css_properties.zig");
@@ -113,6 +115,31 @@ pub fn Application(
     comptime markLayoutForNodeFn: anytype,
 ) type {
     return struct {
+        /// Generated computed strings can be inherited by clean descendants.
+        /// Intern them in the Element generation, never in a temporary pass.
+        fn retainComputed(element: *Element, allocator: std.mem.Allocator, owned: []const u8) ![]const u8 {
+            if (element.owned_strings) |strings| {
+                for (strings.items) |existing| {
+                    if (std.mem.eql(u8, owned, existing)) {
+                        allocator.free(owned);
+                        return existing;
+                    }
+                }
+            }
+            errdefer allocator.free(owned);
+            if (element.owned_strings == null) element.owned_strings = .empty;
+            try element.owned_strings.?.append(allocator, owned);
+            return owned;
+        }
+
+        fn rootFontSize(allocator: std.mem.Allocator, ancestors: []const *Node, field: *ProtectedField([]const u8)) f64 {
+            if (ancestors.len == 0) return 16;
+            const root_style = &ancestors[0].element.style.?;
+            const root_field = root_style.getPtr("font-size").?;
+            field.addDependency(root_field, allocator);
+            return css_length.parsePixel(root_field.read(field, allocator).*) orelse 16;
+        }
+
         fn cssDefaultFor(property: []const u8) []const u8 {
             for (CSS_PROPERTIES) |prop| {
                 if (std.mem.eql(u8, prop.name, property)) {
@@ -197,20 +224,42 @@ pub fn Application(
             return null;
         }
 
-        fn cssAnimationSignature(
-            raw_animation: []const u8,
-            start: *const CSSParser.Keyframe,
-            end: *const CSSParser.Keyframe,
-        ) u64 {
-            var signature = std.hash.Wyhash.hash(0, std.mem.trim(u8, raw_animation, " \t\r\n"));
-            for (css_animation_properties) |property| {
-                const start_declaration = start.properties.get(property) orelse continue;
-                const end_declaration = end.properties.get(property) orelse continue;
-                signature = std.hash.Wyhash.hash(signature, property);
-                signature = std.hash.Wyhash.hash(signature, start_declaration.value);
-                signature = std.hash.Wyhash.hash(signature, end_declaration.value);
+        /// Temporary computed keyframe strings never enter animation storage:
+        /// tracks retain scalar endpoints. Dependency edges use the persistent
+        /// style allocator, not the temporary value arena.
+        fn computedKeyframeValue(
+            values_allocator: std.mem.Allocator,
+            element: *Element,
+            ancestors: []const *Node,
+            property: []const u8,
+            declaration: CSSParser.Declaration,
+        ) !?[]const u8 {
+            var value = declaration.value;
+            if (value_tokens.hasVariable(value)) {
+                var empty = custom_properties.Environment{ .backing = std.heap.ArenaAllocator.init(values_allocator) };
+                defer empty.backing.deinit();
+                const environment = element.custom_properties orelse &empty;
+                value = (try environment.substitute(values_allocator, value)) orelse return null;
+                var expanded = CSSParser.DeclarationMap.init(values_allocator);
+                defer expanded.deinit();
+                try CSSParser.putDeclaration(&expanded, declaration.pending_shorthand orelse property, value);
+                value = (expanded.get(property) orelse return null).value;
+                if (!CSSParser.isValidLonghandValue(property, value)) return null;
             }
-            return signature;
+            if (value_tokens.hasRem(value)) {
+                const styles = &element.style.?;
+                const root_size = if (ancestors.len == 0)
+                    css_length.parsePixel(styles.getPtr("font-size").?.get().*) orelse 16
+                else
+                    rootFontSize(styles.allocator, ancestors, styles.getPtr("animation").?);
+                value = (try value_tokens.resolveRem(values_allocator, value, root_size)) orelse value;
+            }
+            if (css_length.isMath(value) and (std.mem.eql(u8, property, "width") or std.mem.eql(u8, property, "height"))) {
+                const font_size = css_length.parsePixel(element.style.?.getPtr("font-size").?.get().*) orelse 16;
+                const size = css_length.resolve(value, .{ .font_size = font_size }) orelse return null;
+                value = try std.fmt.allocPrint(values_allocator, "{d:.6}px", .{size});
+            }
+            return value;
         }
 
         fn cssAnimationTracksPresent(element: *const Element, state: CssAnimationState) bool {
@@ -246,6 +295,7 @@ pub fn Application(
         fn syncCssAnimation(
             allocator: std.mem.Allocator,
             element: *Element,
+            ancestors: []const *Node,
             raw_animation: []const u8,
             keyframes: []const CSSParser.KeyframesRule,
         ) !void {
@@ -266,20 +316,23 @@ pub fn Application(
                 return;
             };
 
-            const signature = cssAnimationSignature(raw_animation, start, end);
-            if (element.css_animation) |state| {
-                if (state.signature == signature and cssAnimationTracksPresent(element, state)) return;
-            }
-
+            var values = std.heap.ArenaAllocator.init(allocator);
+            defer values.deinit();
+            var signature = std.hash.Wyhash.hash(0, std.mem.trim(u8, raw_animation, " \t\r\n"));
             var tracks = [_]?Animation{ null, null, null, null, null };
             var property_mask: u8 = 0;
             for (css_animation_properties, 0..) |property, index| {
                 const start_declaration = start.properties.get(property) orelse continue;
                 const end_declaration = end.properties.get(property) orelse continue;
+                const start_value = (try computedKeyframeValue(values.allocator(), element, ancestors, property, start_declaration)) orelse continue;
+                const end_value = (try computedKeyframeValue(values.allocator(), element, ancestors, property, end_declaration)) orelse continue;
+                signature = std.hash.Wyhash.hash(signature, property);
+                signature = std.hash.Wyhash.hash(signature, start_value);
+                signature = std.hash.Wyhash.hash(signature, end_value);
                 tracks[index] = keyframeAnimationForProperty(
                     property,
-                    start_declaration.value,
-                    end_declaration.value,
+                    start_value,
+                    end_value,
                     spec,
                 ) orelse continue;
                 property_mask |= cssAnimationPropertyBit(property);
@@ -287,6 +340,9 @@ pub fn Application(
             if (property_mask == 0) {
                 removeCssAnimationTracks(element);
                 return;
+            }
+            if (element.css_animation) |state| {
+                if (state.signature == signature and cssAnimationTracksPresent(element, state)) return;
             }
 
             if (element.animations == null) {
@@ -415,6 +471,7 @@ pub fn Application(
         fn applyCascadedDeclaration(
             values: *std.StringHashMap([]const u8),
             priorities: *std.StringHashMap(u32),
+            pending_shorthands: *std.StringHashMap([]const u8),
             property: []const u8,
             declaration: CSSParser.Declaration,
             base_priority: u32,
@@ -427,6 +484,9 @@ pub fn Application(
             }
             try values.put(property, declaration.value);
             try priorities.put(property, priority);
+            if (declaration.pending_shorthand) |shorthand| {
+                try pending_shorthands.put(property, shorthand);
+            } else _ = pending_shorthands.remove(property);
         }
 
         fn inheritedValue(
@@ -440,8 +500,8 @@ pub fn Application(
             if (parent_is_ephemeral_default) return parent_field.get().*;
 
             // A retained style map can move between parents through removeChild.
-            // Register the current edge before a frozen dependency read. Former edges
-            // remain registered under ProtectedField's current no-unsubscribe model.
+            // Register the current edge before a frozen dependency read; the
+            // structural mutation boundary cleared the old publisher edges.
             child_field.addDependency(parent_field, allocator);
             return parent_field.read(child_field, allocator).*;
         }
@@ -594,6 +654,11 @@ pub fn Application(
                 },
                 .element => |*e| {
                     const had_style = e.style != null;
+                    if (e.custom_version == null) {
+                        const version = try allocator.create(ProtectedField(u64));
+                        version.* = ProtectedField(u64).init(0);
+                        e.custom_version = version;
+                    }
                     if (e.style == null) {
                         e.style = try initStyleMap(
                             StyleMap,
@@ -614,6 +679,8 @@ pub fn Application(
                         defer new_style.deinit();
                         var cascade_priorities = std.StringHashMap(u32).init(allocator);
                         defer cascade_priorities.deinit();
+                        var pending_shorthands = std.StringHashMap([]const u8).init(allocator);
+                        defer pending_shorthands.deinit();
 
                         for (CSS_PROPERTIES) |prop| {
                             try new_style.put(prop.name, prop.default_value);
@@ -646,6 +713,7 @@ pub fn Application(
                                     try applyCascadedDeclaration(
                                         &new_style,
                                         &cascade_priorities,
+                                        &pending_shorthands,
                                         entry.key_ptr.*,
                                         entry.value_ptr.*,
                                         rule.cascadePriority(),
@@ -669,12 +737,56 @@ pub fn Application(
                                     try applyCascadedDeclaration(
                                         &new_style,
                                         &cascade_priorities,
+                                        &pending_shorthands,
                                         entry.key_ptr.*,
                                         entry.value_ptr.*,
                                         CSSParser.INLINE_STYLE_PRIORITY,
                                     );
                                 }
                             }
+                        }
+
+                        const parent_environment = if (ancestor_chain.len > 0) blk: {
+                            const parent = &ancestor_chain[ancestor_chain.len - 1].element;
+                            // Any environment change recomputes this element,
+                            // even when a previously missing name is introduced.
+                            style_map.getPtr("color").?.addDependency(parent.custom_version.?, allocator);
+                            break :blk parent.custom_properties;
+                        } else null;
+                        const environment = try custom_properties.Environment.create(allocator, parent_environment, &new_style);
+                        if (environment.eql(e.custom_properties)) {
+                            environment.destroy(allocator);
+                            e.custom_version.?.set(e.custom_version.?.lastValue().*);
+                        } else {
+                            if (e.custom_properties) |old| old.destroy(allocator);
+                            e.custom_properties = environment;
+                            e.custom_version.?.set(e.custom_version.?.lastValue().* +% 1);
+                        }
+
+                        // Substitution follows the cascade. A failed winning
+                        // declaration becomes unset, never an earlier declaration.
+                        // Pending shorthands expand now, but only publish the
+                        // longhands they actually won in the original cascade.
+                        for (CSS_PROPERTIES) |prop| {
+                            const authored = new_style.get(prop.name).?;
+                            if (!value_tokens.hasVariable(authored)) continue;
+                            var empty_environment = custom_properties.Environment{ .backing = std.heap.ArenaAllocator.init(allocator) };
+                            defer empty_environment.backing.deinit();
+                            const env = e.custom_properties orelse &empty_environment;
+                            const substituted = try env.substitute(allocator, authored);
+                            if (substituted) |owned| {
+                                const value = try retainComputed(e, allocator, owned);
+                                var expanded = CSSParser.DeclarationMap.init(allocator);
+                                defer expanded.deinit();
+                                try CSSParser.putDeclaration(&expanded, pending_shorthands.get(prop.name) orelse prop.name, value);
+                                var valid = expanded.count() > 0;
+                                var it = expanded.iterator();
+                                while (it.next()) |entry| {
+                                    valid = valid and CSSParser.isValidLonghandValue(entry.key_ptr.*, entry.value_ptr.value);
+                                }
+                                const resolved = expanded.get(prop.name);
+                                try new_style.put(prop.name, if (valid and resolved != null) resolved.?.value else "unset");
+                            } else try new_style.put(prop.name, "unset");
                         }
 
                         // Resolve CSS-wide keywords for every supported
@@ -750,7 +862,21 @@ pub fn Application(
                         // Computed font-size values are kept in px so inherited
                         // descendants can use them as the base for their own `em`
                         // and percentage lengths.
-                        if (new_style.get("font-size")) |font_size| {
+                        if (new_style.get("font-size")) |authored_font_size| {
+                            const rem_size = if (value_tokens.hasRem(authored_font_size)) rootFontSize(allocator, ancestor_chain, style_map.getPtr("font-size").?) else 16;
+                            var font_size = if (try value_tokens.resolveRem(allocator, authored_font_size, rem_size)) |owned|
+                                try retainComputed(e, allocator, owned)
+                            else
+                                authored_font_size;
+                            if (css_length.isMath(font_size)) {
+                                const parent_field = parent_style.getPtr("font-size").?;
+                                const parent_value = inheritedValue(parent_field, style_map.getPtr("font-size").?, parent_is_ephemeral_default, allocator);
+                                const base = css_length.parsePixel(parent_value) orelse 16;
+                                if (css_length.resolve(font_size, .{ .font_size = base, .percentage_base = base, .root_font_size = rem_size })) |size| {
+                                    font_size = try retainComputed(e, allocator, try std.fmt.allocPrint(allocator, "{d:.6}px", .{size}));
+                                }
+                            }
+                            try new_style.put("font-size", font_size);
                             const font_size_length = css_length.parse(font_size);
                             if (font_size_length) |length| {
                                 const child_field = style_map.getPtr("font-size").?;
@@ -784,11 +910,34 @@ pub fn Application(
                             }
                         }
 
+                        // Resolve every rem dimension, including those in compound
+                        // values, against the root's computed size. Used-value
+                        // helpers then receive ordinary CSS pixels, without a
+                        // global font-size or an iframe-unsafe renderer setting.
+                        for (CSS_PROPERTIES) |prop| {
+                            if (std.mem.eql(u8, prop.name, "font-size")) continue;
+                            const authored = new_style.get(prop.name).?;
+                            if (!value_tokens.hasRem(authored)) continue;
+                            const root_size = if (ancestor_chain.len == 0)
+                                css_length.parsePixel(new_style.get("font-size").?) orelse 16
+                            else
+                                rootFontSize(allocator, ancestor_chain, style_map.getPtr(prop.name).?);
+                            if (try value_tokens.resolveRem(allocator, authored, root_size)) |owned| {
+                                try new_style.put(prop.name, try retainComputed(e, allocator, owned));
+                            }
+                        }
+
                         // Length and percentage line-heights compute to an absolute
                         // value at the element's font size. Unitless numbers remain
                         // unitless so descendants inherit the multiplier and apply it
                         // to their own font size, matching CSS's useful distinction.
                         if (new_style.get("line-height")) |line_height| {
+                            if (css_length.isMath(line_height)) {
+                                const size = css_length.parsePixel(new_style.get("font-size").?) orelse 16;
+                                if (css_length.resolve(line_height, .{ .font_size = size, .percentage_base = size })) |absolute_px| {
+                                    try new_style.put("line-height", try retainComputed(e, allocator, try std.fmt.allocPrint(allocator, "{d:.6}px", .{absolute_px})));
+                                }
+                            }
                             if (css_length.parse(line_height)) |length| {
                                 if (length.unit != .px) {
                                     const font_size = css_length.resolve(
@@ -827,6 +976,7 @@ pub fn Application(
                         try syncCssAnimation(
                             allocator,
                             e,
+                            ancestor_chain,
                             new_style.get("animation") orelse "none",
                             keyframes,
                         );

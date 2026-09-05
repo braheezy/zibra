@@ -66,7 +66,7 @@ fn parseComponent(input: []const u8) ?SizeComponent {
     if (std.mem.eql(u8, input, "0")) return .{ .pixels = 0 };
     if (length.parsePixel(input)) |pixels| return .{ .pixels = pixels };
     if (length.parse(input)) |parsed| switch (parsed.unit) {
-        .mm => return .{ .pixels = length.resolveLength(parsed, .{}) orelse return null },
+        .mm, .rem => return .{ .pixels = length.resolveLength(parsed, .{}) orelse return null },
         .px, .em, .percent => {},
     };
 
@@ -125,6 +125,7 @@ fn positionComponent(
         .mm => length.toLayoutPixels((length.resolveLength(parsed, .{}) orelse return null) * css_scale),
         .percent => @intFromFloat(@as(f64, @floatFromInt(available)) * parsed.value / 100.0),
         .em => null,
+        .rem => length.toLayoutPixels((length.resolveLength(parsed, .{}) orelse return null) * css_scale),
     };
 }
 

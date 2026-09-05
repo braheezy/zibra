@@ -14,6 +14,10 @@ const css_color = @import("color.zig");
 const background_image = @import("background_image.zig");
 const css_syntax = @import("css_syntax.zig");
 const css_properties = @import("css_properties.zig");
+const value_tokens = @import("css_value_tokens.zig");
+const custom_properties = @import("custom_properties.zig");
+const css_flex = @import("css_flex.zig");
+const grid_tracks = @import("grid_tracks.zig");
 const Selector = selector_mod.Selector;
 const SimpleSelector = selector_mod.SimpleSelector;
 const UniversalSelector = selector_mod.UniversalSelector;
@@ -64,6 +68,9 @@ pub const MediaEnvironment = struct {
 pub const Declaration = struct {
     value: []const u8,
     important: bool = false,
+    /// A var()-containing shorthand participates in the longhand cascade now,
+    /// but cannot be expanded until the winning custom environment is known.
+    pending_shorthand: ?[]const u8 = null,
 
     pub fn priority(self: Declaration, base_priority: u32) u32 {
         return base_priority + if (self.important) IMPORTANT_PRIORITY else 0;
@@ -250,7 +257,7 @@ fn pair(self: *CSSParser) !struct { property: []const u8, value: []const u8 } {
     self.whitespace();
     try self.literal(':');
     self.whitespace();
-    const val = try self.value();
+    const val = self.value() catch |err| if (custom_properties.isName(property)) "" else return err;
     return .{ .property = property, .value = val };
 }
 
@@ -265,11 +272,13 @@ const FontShorthand = struct {
 };
 
 fn isSupportedFontSize(font_size: []const u8) bool {
+    if (css_length.isMath(font_size)) return css_length.resolveMath(font_size, .{ .percentage_base = 16 }) != null;
     const length = css_length.parse(font_size) orelse return false;
-    return length.unit == .px or length.unit == .mm or length.unit == .em or length.unit == .percent;
+    return length.unit == .px or length.unit == .mm or length.unit == .em or length.unit == .rem or length.unit == .percent;
 }
 
 fn isSupportedFontLineHeight(line_height: []const u8) bool {
+    if (css_length.isMath(line_height)) return css_length.resolveMath(line_height, .{ .percentage_base = 16 }) != null;
     if (std.ascii.eqlIgnoreCase(line_height, "normal")) return true;
     if (css_length.parse(line_height) != null) return true;
     const number = std.fmt.parseFloat(f64, line_height) catch return false;
@@ -423,20 +432,16 @@ fn parseDeclarationValue(raw_value: []const u8) ?Declaration {
 // the subset of names whose grammar it can validate before cascade. Keeping
 // this table here lets escaped identifiers resolve without allocating a
 // normalized copy, so rule and inline-style values keep borrowing source.
-const supported_shorthand_names = [_][]const u8{
-    "font",   "background", "margin",       "padding",       "border-width", "border-style", "border-color",
-    "border", "border-top", "border-right", "border-bottom", "border-left",  "list-style",
-};
-
 /// Return the canonical static property spelling for a supported CSS name.
 /// CSS property identifiers are ASCII-case-insensitive and may contain CSS
 /// escapes, but unsupported names intentionally have no effect in Zibra.
 fn canonicalPropertyName(raw_property: []const u8) ?[]const u8 {
+    if (custom_properties.isName(raw_property)) return raw_property;
     for (css_properties.computed) |property| {
         if (css_syntax.identifierEquals(raw_property, property.name)) return property.name;
     }
-    for (supported_shorthand_names) |candidate| {
-        if (css_syntax.identifierEquals(raw_property, candidate)) return candidate;
+    for (css_properties.shorthands) |candidate| {
+        if (css_syntax.identifierEquals(raw_property, candidate.name)) return candidate.name;
     }
     return null;
 }
@@ -455,6 +460,7 @@ fn isUnitlessZero(raw_value: []const u8) bool {
 }
 
 fn isNonnegativeLength(raw_value: []const u8) bool {
+    if (css_length.isMath(raw_value)) return css_length.resolveMath(raw_value, .{ .percentage_base = 100 }) != null;
     return isUnitlessZero(raw_value) or css_length.parse(raw_value) != null;
 }
 
@@ -512,7 +518,7 @@ fn isCursorValue(raw_value: []const u8) bool {
 
 fn splitValueTokens(raw_value: []const u8, tokens: *[4][]const u8) ?usize {
     var count: usize = 0;
-    var iterator = std.mem.tokenizeAny(u8, raw_value, " \t\r\n\x0c");
+    var iterator = grid_tracks.Components{ .input = raw_value };
     while (iterator.next()) |token| {
         if (count == tokens.len) return null;
         tokens[count] = token;
@@ -559,8 +565,24 @@ fn isQuotedContentString(raw_value: []const u8) bool {
 /// Validate values whose unsupported grammar would otherwise replace a valid
 /// earlier declaration in the cascade. Other supported values stay permissive
 /// until a focused feature owns their used-value grammar.
-fn isValidLonghandValue(property: []const u8, raw_value: []const u8) bool {
+pub fn isValidLonghandValue(property: []const u8, raw_value: []const u8) bool {
     if (isCssWideKeyword(raw_value)) return true;
+    if (std.mem.eql(u8, property, "flex-grow") or std.mem.eql(u8, property, "flex-shrink")) return css_flex.factor(raw_value) != null;
+    if (std.mem.eql(u8, property, "flex-basis")) return css_flex.basis(raw_value);
+    if (std.mem.eql(u8, property, "order")) {
+        _ = std.fmt.parseInt(i32, raw_value, 10) catch return false;
+        return true;
+    }
+    if (std.mem.eql(u8, property, "row-gap") or std.mem.eql(u8, property, "column-gap")) return std.ascii.eqlIgnoreCase(raw_value, "normal") or isNonnegativeLength(raw_value);
+    if (std.mem.startsWith(u8, property, "grid-template-")) {
+        var tracks: [grid_tracks.max_tracks]grid_tracks.Track = undefined;
+        return grid_tracks.parse(raw_value, .{ .percentage_base = 800 }, 0, 1, &tracks) != null;
+    }
+    if (std.mem.eql(u8, property, "grid-auto-rows")) return grid_tracks.parseTrack(raw_value, .{ .percentage_base = 600 }) != null;
+    if (std.mem.eql(u8, property, "flex-direction")) return keywordIn(raw_value, &.{ "row", "row-reverse", "column", "column-reverse" });
+    if (std.mem.eql(u8, property, "flex-wrap")) return keywordIn(raw_value, &.{ "nowrap", "wrap", "wrap-reverse" });
+    if (std.mem.eql(u8, property, "box-sizing")) return keywordIn(raw_value, &.{ "content-box", "border-box" });
+    if (std.mem.startsWith(u8, property, "align-") or std.mem.startsWith(u8, property, "justify-")) return keywordIn(raw_value, &.{ "normal", "auto", "start", "end", "flex-start", "flex-end", "center", "stretch", "space-between", "space-around", "space-evenly" });
 
     if (std.mem.eql(u8, property, "width") or std.mem.eql(u8, property, "height")) {
         return isAutomaticOrNonnegativeLength(raw_value);
@@ -630,6 +652,11 @@ fn isValidLonghandValue(property: []const u8, raw_value: []const u8) bool {
     return std.mem.trim(u8, raw_value, " \t\r\n\x0c").len != 0;
 }
 
+fn keywordIn(value_text: []const u8, choices: []const []const u8) bool {
+    for (choices) |choice| if (std.ascii.eqlIgnoreCase(std.mem.trim(u8, value_text, " \t\r\n"), choice)) return true;
+    return false;
+}
+
 fn putLonghand(map: *DeclarationMap, property: []const u8, declaration: Declaration) !void {
     if (map.get(property)) |existing| {
         // Within one declaration block, an earlier important longhand cannot
@@ -652,7 +679,7 @@ fn boxSideProperty(prefix: []const u8, side: BoxSide) []const u8 {
 
 fn splitShorthand(raw_value: []const u8, tokens: *[4][]const u8) ?usize {
     var count: usize = 0;
-    var iterator = std.mem.tokenizeAny(u8, raw_value, " \t\r\n\x0c");
+    var iterator = grid_tracks.Components{ .input = raw_value };
     while (iterator.next()) |token| {
         if (count == tokens.len) return null;
         tokens[count] = token;
@@ -677,6 +704,9 @@ fn expandBoxShorthand(
         else => return false,
     };
     const sides = [_]BoxSide{ .top, .right, .bottom, .left };
+    for (sides, values) |side, side_value| {
+        if (!isValidLonghandValue(boxSideProperty(prefix, side), side_value)) return false;
+    }
     for (sides, values) |side, side_value| {
         try putLonghand(map, boxSideProperty(prefix, side), .{
             .value = side_value,
@@ -985,13 +1015,74 @@ fn expandBackground(
 /// Apply one declaration in source order. Shorthands expand here so inline
 /// attributes and stylesheet rules share identical precedence behavior and
 /// every generated longhand retains the shorthand's importance.
-fn putDeclaration(
+/// Parse/expand one declaration into source-borrowing cascade entries.
+pub fn putDeclaration(
     map: *DeclarationMap,
     raw_property: []const u8,
     raw_value: []const u8,
 ) !void {
     const property = canonicalPropertyName(raw_property) orelse return;
     const declaration = parseDeclarationValue(raw_value) orelse return;
+    if (custom_properties.isName(property)) {
+        try putLonghand(map, property, declaration);
+        return;
+    }
+    const pending = value_tokens.hasVariable(declaration.value);
+    if (pending or isCssWideKeyword(declaration.value)) {
+        for (css_properties.shorthands) |shorthand| {
+            if (!std.mem.eql(u8, property, shorthand.name)) continue;
+            for (shorthand.longhands) |longhand| {
+                try putLonghand(map, longhand, .{
+                    .value = declaration.value,
+                    .important = declaration.important,
+                    .pending_shorthand = if (pending) property else null,
+                });
+            }
+            return;
+        }
+        if (pending) {
+            try putLonghand(map, property, declaration);
+            return;
+        }
+    }
+    if (std.mem.eql(u8, property, "flex")) {
+        const flex = css_flex.parse(declaration.value) orelse return;
+        try putLonghand(map, "flex-grow", .{ .value = flex.grow, .important = declaration.important });
+        try putLonghand(map, "flex-shrink", .{ .value = flex.shrink, .important = declaration.important });
+        try putLonghand(map, "flex-basis", .{ .value = flex.basis, .important = declaration.important });
+        return;
+    }
+    if (std.mem.eql(u8, property, "gap") or std.mem.eql(u8, property, "place-items") or std.mem.eql(u8, property, "place-content")) {
+        var parts = grid_tracks.Components{ .input = declaration.value };
+        const first = parts.next() orelse return;
+        const second = parts.next() orelse first;
+        if (parts.next() != null) return;
+        const names: [2][]const u8 = if (std.mem.eql(u8, property, "gap")) .{ "row-gap", "column-gap" } else if (std.mem.eql(u8, property, "place-items")) .{ "align-items", "justify-items" } else .{ "align-content", "justify-content" };
+        if (!isValidLonghandValue(names[0], first) or !isValidLonghandValue(names[1], second)) return;
+        try putLonghand(map, names[0], .{ .value = first, .important = declaration.important });
+        try putLonghand(map, names[1], .{ .value = second, .important = declaration.important });
+        return;
+    }
+    if (std.mem.eql(u8, property, "flex-flow")) {
+        var parts = grid_tracks.Components{ .input = declaration.value };
+        var direction: []const u8 = "row";
+        var wrap: []const u8 = "nowrap";
+        var seen_direction = false;
+        var seen_wrap = false;
+        while (parts.next()) |part| {
+            if (!seen_direction and isValidLonghandValue("flex-direction", part)) {
+                direction = part;
+                seen_direction = true;
+            } else if (!seen_wrap and isValidLonghandValue("flex-wrap", part)) {
+                wrap = part;
+                seen_wrap = true;
+            } else return;
+        }
+        if (!seen_direction and !seen_wrap) return;
+        try putLonghand(map, "flex-direction", .{ .value = direction, .important = declaration.important });
+        try putLonghand(map, "flex-wrap", .{ .value = wrap, .important = declaration.important });
+        return;
+    }
     if (std.ascii.eqlIgnoreCase(property, "font")) {
         const font = parseFontShorthand(declaration.value) orelse return;
         try putLonghand(map, "font-style", .{ .value = font.style, .important = declaration.important });
@@ -1209,7 +1300,7 @@ fn parseMediaPixelLength(raw_value: []const u8) ?f64 {
         // Media-query em units are resolved against the initial font size.
         // The browser's default is 16 CSS px; unlike element em values this
         // does not depend on the matched element's inherited style.
-        .em => parsed_length.value * 16.0,
+        .em, .rem => parsed_length.value * 16.0,
         .percent => null,
     };
 }

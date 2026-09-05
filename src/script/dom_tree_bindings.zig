@@ -584,6 +584,11 @@ fn computedStyleValue(agent: *Agent, this_value: Value, arguments: Arguments) Ag
     _ = this_value;
     const host = activeHost(agent);
     const window = try requireWindow(agent);
+    // An ancestor may be dirty while this descendant is still clean: custom
+    // properties and root-font dependencies publish during the parent pass.
+    if (host.style_flush) |flush| flush(host.context) catch |err| {
+        std.log.warn("Computed-style flush failed: {}", .{err});
+    };
     const node = try requireNode(agent, window, arguments.get(0));
     const property = try requireString(agent, host, arguments.get(1), "computed style property requires a string");
     defer host.allocator.free(property);
@@ -591,19 +596,11 @@ fn computedStyleValue(agent: *Agent, this_value: Value, arguments: Arguments) Ag
     const value: []const u8 = switch (node.*) {
         .text => "",
         .element => |*element| blk: {
+            if (@import("../document/custom_properties.zig").isName(property)) {
+                break :blk if (element.custom_properties) |environment| environment.get(property) orelse "" else "";
+            }
             if (element.style) |*styles| {
-                var style_dirty = false;
-                var style_it = styles.iterator();
-                while (style_it.next()) |entry| {
-                    if (entry.value_ptr.dirty) {
-                        style_dirty = true;
-                        break;
-                    }
-                }
-                if (style_dirty) if (host.style_flush) |flush| flush(host.context) catch |err| {
-                    std.log.warn("Computed-style flush failed: {}", .{err});
-                };
-                if (styles.getPtr(property)) |field| break :blk field.lastValue().*;
+                if (styles.getPtr(property)) |field| break :blk if (field.dirty) "" else field.get().*;
             }
             break :blk if (std.mem.eql(u8, property, "z-index")) "auto" else if (std.mem.eql(u8, property, "white-space")) "normal" else "";
         },

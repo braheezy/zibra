@@ -8,10 +8,10 @@ Read the
 and [risk registry](../../docs/architecture/risks-and-review.md) before changing
 dependency registration or destruction behavior.
 
-- Dependency maps retain raw subscriber pointers. A subscriber must be removed
-  before its address becomes invalid. Supported structural DOM mutation uses a
-  coarse pre-mutation clear of all style publishers and forces full style and
-  layout recomputation; general per-edge unsubscription remains unresolved.
+- Source-owned edges are indexed by the publisher and linked into the
+  subscriber. Destruction unlinks either endpoint. Registered fields, including
+  their reverse-list heads, must never move. Structural DOM mutation retains
+  its coarse pre-mutation clear and full style/layout recomputation boundary.
 - `ProtectedField(T)` is a comptime-generated inline value, not a heap object.
   Its dependency table is unmanaged: `init` is allocation-free, while
   `addDependency`/`read` receive the dependency source's allocator and

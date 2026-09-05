@@ -643,7 +643,7 @@ fn ensureRuntimeInitializedLocked(
 ) !void {
     if (window.runtime_initialized) return;
 
-    const runtime_code = @embedFile("runtime/bootstrap.js");
+    const runtime_code = @embedFile("runtime/bootstrap.js") ++ "\n" ++ @embedFile("runtime/css_style.js");
     const runtime_script = try Script.parse(
         runtime_code,
         window.realm,
