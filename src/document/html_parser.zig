@@ -14,7 +14,10 @@ const formatting_elements = [_][]const u8{
 
 const raw_text_elements = [_][]const u8{
     "script",
+    "style",
 };
+
+const RawTextKind = enum { script, style };
 
 pub fn Parser(
     comptime Node: type,
@@ -31,8 +34,10 @@ pub fn Parser(
         // Track if <head> tag has been found
         head_found: bool = false,
         use_implicit_tags: bool = true,
-        // Track if we're inside a script tag
-        in_script_tag: bool = false,
+        // Track parser state for HTML raw-text elements. CSS and JavaScript
+        // must remain text until their matching end tag; otherwise a '<' in
+        // either language can be mistaken for an HTML tag.
+        raw_text_kind: ?RawTextKind = null,
 
         pub fn init(allocator: std.mem.Allocator, body: []const u8) !*HTMLParser {
             const parser = try allocator.create(HTMLParser);
@@ -42,7 +47,7 @@ pub fn Parser(
                 .allocator = allocator,
                 .head_found = false,
                 .use_implicit_tags = true,
-                .in_script_tag = false,
+                .raw_text_kind = null,
             };
             return parser;
         }
@@ -68,32 +73,43 @@ pub fn Parser(
             var start_idx: usize = 0;
             var in_tag = false;
             var attribute_quote: ?u8 = null;
-            var script_content_start: ?usize = null;
+            var raw_text_content_start: ?usize = null;
 
             while (pos < self.body.len) {
                 const c = self.body[pos];
 
-                if (self.in_script_tag) {
-                    // Special handling for script tag content
-                    if (c == '<' and pos + 8 < self.body.len and
-                        std.ascii.eqlIgnoreCase(self.body[pos + 1 .. pos + 9], "/script>"))
+                if (self.raw_text_kind) |raw_kind| {
+                    // Raw-text elements only recognize their own closing tag.
+                    const closing_tag = switch (raw_kind) {
+                        .script => "/script>",
+                        .style => "/style>",
+                    };
+                    if (c == '<' and pos + closing_tag.len < self.body.len and
+                        std.ascii.eqlIgnoreCase(
+                            self.body[pos + 1 .. pos + 1 + closing_tag.len],
+                            closing_tag,
+                        ))
                     {
-                        // Found </script> closing tag
+                        // Found the matching raw-text closing tag.
 
-                        // Add all content up to this point as a script node
-                        if (pos > start_idx and script_content_start != null) {
-                            const script_content = self.body[script_content_start.?..pos];
-                            try self.addText(script_content); // Add as text node to the script element
+                        // Add all content up to this point as a raw-text node
+                        if (pos > start_idx and raw_text_content_start != null) {
+                            const raw_text = self.body[raw_text_content_start.?..pos];
+                            try self.addText(raw_text);
                         }
 
-                        // Process the closing script tag
-                        try self.addTag("/script");
+                        // Process the closing raw-text tag.
+                        const closing_name = switch (raw_kind) {
+                            .script => "/script",
+                            .style => "/style",
+                        };
+                        try self.addTag(closing_name);
 
                         // Skip past the closing tag
-                        pos += 9;
+                        pos += closing_tag.len + 1;
                         start_idx = pos;
-                        self.in_script_tag = false;
-                        script_content_start = null;
+                        self.raw_text_kind = null;
+                        raw_text_content_start = null;
                     } else {
                         // Continue to next character if we're still in script tag
                         pos += 1;
@@ -140,11 +156,14 @@ pub fn Parser(
                     const tag_slice = self.body[start_idx..pos];
                     try self.addTag(tag_slice);
 
-                    // Check if we just entered a script tag
+                    // Check if we just entered a raw-text element.
                     const tag_info = parseTagInfo(tag_slice);
                     if (!tag_info.is_closing and isRawTextElement(tag_info.name)) {
-                        self.in_script_tag = true;
-                        script_content_start = pos + 1; // Start capturing script content
+                        self.raw_text_kind = if (std.ascii.eqlIgnoreCase(tag_info.name, "style"))
+                            .style
+                        else
+                            .script;
+                        raw_text_content_start = pos + 1;
                     }
                     // Skip the '>'
                     start_idx = pos + 1;
@@ -719,7 +738,7 @@ pub fn Parser(
             }
         }
 
-        // Check if a tag is a raw text element (like script)
+        // Check if a tag is a raw text element (like script or style).
         fn isRawTextElement(tag_name: []const u8) bool {
             return for (raw_text_elements) |raw_text_element| {
                 if (std.ascii.eqlIgnoreCase(tag_name, raw_text_element)) break true;

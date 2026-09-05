@@ -3,7 +3,7 @@
 //! `Stream` borrows immutable source chunks supplied by its caller and emits
 //! independently owned token bytes. That deliberate copy boundary makes the
 //! lexical result independent of network chunking: a text run, tag, comment,
-//! or raw-text script body can cross any number of chunks without changing the
+//! or raw-text script/style body can cross any number of chunks without changing the
 //! token sequence. A future live tree builder can transfer each token's bytes
 //! into its document-owned `html_source.Store` before storing a DOM borrow.
 
@@ -37,9 +37,11 @@ const State = enum {
     tag,
     comment,
     raw_script,
+    raw_style,
 };
 
 const raw_script_end = "</script>";
+const raw_style_end = "</style>";
 
 /// Tokenizes an append-only sequence of stable source chunks.
 ///
@@ -177,7 +179,8 @@ pub const Stream = struct {
             .data => try self.consumeData(byte),
             .tag => try self.consumeTag(byte),
             .comment => try self.consumeComment(byte),
-            .raw_script => try self.consumeRawScript(byte),
+            .raw_script => try self.consumeRawText(byte, raw_script_end, "/script"),
+            .raw_style => try self.consumeRawText(byte, raw_style_end, "/style"),
         }
     }
 
@@ -227,15 +230,15 @@ pub const Stream = struct {
         self.state = .data;
     }
 
-    fn consumeRawScript(self: *Stream, byte: u8) !void {
-        if (std.ascii.toLower(byte) == raw_script_end[self.raw_match_len]) {
+    fn consumeRawText(self: *Stream, byte: u8, end_tag: []const u8, closing_token: []const u8) !void {
+        if (self.raw_match_len < end_tag.len and std.ascii.toLower(byte) == end_tag[self.raw_match_len]) {
             self.raw_match[self.raw_match_len] = byte;
             self.raw_match_len += 1;
-            if (self.raw_match_len != raw_script_end.len) return;
+            if (self.raw_match_len != end_tag.len) return;
 
             self.raw_match_len = 0;
             try self.queueText();
-            try self.queueCopy(.end_tag, "/script");
+            try self.queueCopy(.end_tag, closing_token);
             self.state = .data;
             return;
         }
@@ -256,13 +259,14 @@ pub const Stream = struct {
     fn finishTag(self: *Stream) !void {
         const kind: Kind = if (isClosingTag(self.tag.items)) .end_tag else .start_tag;
         const begins_raw_script = kind == .start_tag and isScriptStartTag(self.tag.items);
+        const begins_raw_style = kind == .start_tag and isStyleStartTag(self.tag.items);
         // Do not emit text before knowing that '<' starts a completed tag:
         // otherwise a chunk ending in an unfinished tag would create a
         // different text-node sequence from the same source in one chunk.
         try self.queueText();
         try self.queueBuffer(kind, &self.tag);
         self.tag_quote = null;
-        self.state = if (begins_raw_script) .raw_script else .data;
+        self.state = if (begins_raw_script) .raw_script else if (begins_raw_style) .raw_style else .data;
     }
 
     fn finishInput(self: *Stream) !void {
@@ -283,7 +287,7 @@ pub const Stream = struct {
                 self.comment.clearRetainingCapacity();
                 self.state = .data;
             },
-            .raw_script => {
+            .raw_script, .raw_style => {
                 if (self.raw_match_len != 0) {
                     try self.text.appendSlice(self.allocator, self.raw_match[0..self.raw_match_len]);
                     self.raw_match_len = 0;
@@ -327,6 +331,17 @@ fn isScriptStartTag(tag: []const u8) bool {
     return last == 0 or tag[last - 1] != '/';
 }
 
+fn isStyleStartTag(tag: []const u8) bool {
+    if (isClosingTag(tag)) return false;
+    var end: usize = 0;
+    while (end < tag.len and !std.ascii.isWhitespace(tag[end]) and tag[end] != '/') : (end += 1) {}
+    if (!std.ascii.eqlIgnoreCase(tag[0..end], "style")) return false;
+
+    var last = tag.len;
+    while (last > 0 and std.ascii.isWhitespace(tag[last - 1])) : (last -= 1) {}
+    return last == 0 or tag[last - 1] != '/';
+}
+
 fn expectToken(
     stream: *Stream,
     kind: Kind,
@@ -359,6 +374,24 @@ test "chunked tokenizer preserves text, tags, and raw script input" {
     try expectToken(&stream, .end_tag, "/p");
     try expectToken(&stream, .eof, "");
     try std.testing.expect((try stream.next()) == null);
+}
+
+test "chunked tokenizer preserves style text containing markup-like CSS" {
+    var stream = Stream.init(std.testing.allocator);
+    defer stream.deinit();
+
+    try stream.appendChunk("<style>.x:before { content: '<'; }");
+    try stream.appendChunk("</sty");
+    try stream.appendChunk("LE><p>ok</p>");
+    stream.finish();
+
+    try expectToken(&stream, .start_tag, "style");
+    try expectToken(&stream, .text, ".x:before { content: '<'; }");
+    try expectToken(&stream, .end_tag, "/style");
+    try expectToken(&stream, .start_tag, "p");
+    try expectToken(&stream, .text, "ok");
+    try expectToken(&stream, .end_tag, "/p");
+    try expectToken(&stream, .eof, "");
 }
 
 test "chunked tokenizer respects quoted tag delimiters and comments" {

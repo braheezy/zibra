@@ -39,6 +39,19 @@ legend { display: block; }
 details { display: block; }
 summary { display: block; }
 
+/* Metadata and executable containers participate in the DOM and stylesheet
+   phases, but their contents are not rendered as document flow.  Keeping
+   these defaults in the user-agent sheet prevents large inline styles (as on
+   Wikipedia) from becoming visible text before author CSS is applied. */
+head { display: none; }
+title { display: none; }
+base { display: none; }
+link { display: none; }
+meta { display: none; }
+style { display: none; }
+script { display: none; }
+template { display: none; }
+
 pre {
     background-color: gray;
 }

@@ -5,6 +5,7 @@
 //! emits live markup, and style.zig binds the computed-style application.
 //! Existing callers keep one stable import while those owners remain acyclic.
 
+const std = @import("std");
 const dom = @import("dom.zig");
 const html_parser = @import("html_parser.zig");
 const html_parser_session = @import("html_parser_session.zig");
@@ -81,3 +82,38 @@ pub const treeToList = dom.treeToList;
 pub const collectInlineStyleText = dom.collectInlineStyleText;
 pub const collectDocumentTitle = dom.collectDocumentTitle;
 pub const writeStyledPretty = dom.writeStyledPretty;
+
+test "HTML parsing keeps CSS containing angle brackets in one style text node" {
+    var document_parser = try HTMLParser.init(
+        std.testing.allocator,
+        "<html><head><style>.x::before { content: '<'; }</style></head>" ++
+            "<body><p>visible</p></body></html>",
+    );
+    defer document_parser.deinit(std.testing.allocator);
+    var root = try document_parser.parse();
+    defer root.deinit(std.testing.allocator);
+
+    var nodes = std.ArrayList(*Node).empty;
+    defer nodes.deinit(std.testing.allocator);
+    try treeToList(std.testing.allocator, &root, &nodes);
+
+    var found_style = false;
+    var found_paragraph = false;
+    for (nodes.items) |node| {
+        const element = switch (node.*) {
+            .element => |*value| value,
+            .text => continue,
+        };
+        if (std.ascii.eqlIgnoreCase(element.tag, "style")) {
+            found_style = true;
+            try std.testing.expectEqual(@as(usize, 1), element.children.items.len);
+            try std.testing.expectEqualStrings(
+                ".x::before { content: '<'; }",
+                element.children.items[0].text.text,
+            );
+        }
+        if (std.ascii.eqlIgnoreCase(element.tag, "p")) found_paragraph = true;
+    }
+    try std.testing.expect(found_style);
+    try std.testing.expect(found_paragraph);
+}

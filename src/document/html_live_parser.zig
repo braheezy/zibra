@@ -679,6 +679,35 @@ test "live parser preserves multiple writes and can pause again in injected sour
     try std.testing.expectEqualStrings("p", body.element.children.items[3].element.tag);
 }
 
+test "live parser keeps style text containing angle brackets intact" {
+    var source = html_source.Store.init(std.testing.allocator);
+    defer source.deinit();
+    _ = try source.adopt(try std.testing.allocator.dupe(
+        u8,
+        "<head><style>.x::before { content: '<'; }</styLE></head>" ++
+            "<body><p>visible</p></body>",
+    ));
+
+    var root: Node = undefined;
+    var parser = try LiveParser.init(std.testing.allocator, &source, &root);
+    defer parser.deinit();
+    defer root.deinit(std.testing.allocator);
+    parser.finishInput();
+    try std.testing.expectEqual(Advance{ .eof = {} }, try parser.advance());
+
+    const head = childElementByTag(&root, "head").?;
+    try std.testing.expectEqual(@as(usize, 1), head.element.children.items.len);
+    const style = &head.element.children.items[0];
+    try std.testing.expectEqualStrings("style", style.element.tag);
+    try std.testing.expectEqual(@as(usize, 1), style.element.children.items.len);
+    try std.testing.expectEqualStrings(
+        ".x::before { content: '<'; }",
+        textOf(&style.element.children.items[0]),
+    );
+    const body = childElementByTag(&root, "body").?;
+    try std.testing.expectEqualStrings("p", body.element.children.items[0].element.tag);
+}
+
 test "live parser keeps authored body attributes after a whitespace prologue" {
     var source = html_source.Store.init(std.testing.allocator);
     defer source.deinit();
