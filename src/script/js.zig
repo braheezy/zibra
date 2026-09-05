@@ -5087,6 +5087,7 @@ fn getAttribute(agent: *Agent, this_value: Value, arguments: kiesel.types.Argume
 }
 
 /// Return a snapshot of an element's NamedNodeMap-compatible attribute
+/// Return a snapshot of an element's NamedNodeMap-compatible attribute
 /// entries. The page shim adds the live collection facade; this host function
 /// keeps attribute storage and string ownership on the native DOM side.
 fn getAttributes(agent: *Agent, this_value: Value, arguments: kiesel.types.Arguments) Agent.Error!Value {

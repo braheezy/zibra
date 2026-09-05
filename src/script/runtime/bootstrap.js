@@ -23,7 +23,14 @@ globalThis.DocumentFragment = Node;
 globalThis.DocumentType = Node;
 globalThis.ProcessingInstruction = Node;
 globalThis.NodeList = Array;
-globalThis.HTMLCollection = Array;
+function HTMLCollection() {}
+function NamedNodeMap() {}
+function Attr() {}
+globalThis.HTMLCollection = HTMLCollection;
+globalThis.NamedNodeMap = NamedNodeMap;
+globalThis.Attr = Attr;
+Attr.prototype = Object.create(Node.prototype);
+Attr.prototype.constructor = Attr;
 ['HTMLHtmlElement', 'HTMLHeadElement', 'HTMLBodyElement', 'HTMLParagraphElement',
  'HTMLDivElement', 'HTMLSpanElement', 'HTMLFormElement', 'HTMLInputElement',
  'HTMLButtonElement', 'HTMLSelectElement', 'HTMLOptionElement', 'HTMLTableElement',
@@ -167,6 +174,197 @@ function wrapNode(handle) {
 function wrapNodes(handles) {
   return handles.map(function(handle) { return wrapNode(handle); });
 }
+
+// HTMLCollection and NamedNodeMap are live, named property-bearing views. A
+// Proxy keeps their virtual indexed/named properties out of the wrapper's
+// own storage while still giving Object.getOwnPropertyNames and assignment the
+// Web IDL surface expected by page code.
+var COLLECTION_STATES = new WeakMap();
+var HTML_NAMESPACE = 'http://www.w3.org/1999/xhtml';
+
+function collectionIndex(property) {
+  if (typeof property !== 'string' || !/^(0|[1-9][0-9]*)$/.test(property)) return -1;
+  var number = Number(property);
+  return number < 4294967295 && String(number) === property ? number : -1;
+}
+
+function collectionState(collection) {
+  return COLLECTION_STATES.get(collection);
+}
+
+function collectionValues(collection) {
+  var state = collectionState(collection);
+  if (!state) return [];
+  var values = state.query() || [];
+  // Attribute records remain intentionally lightweight until the native
+  // Attr identity/ordering contract is completed.
+  return values;
+}
+
+function collectionNamedValues(collection) {
+  var state = collectionState(collection), values = collectionValues(collection), result = [];
+  if (!state) return result;
+  for (var i = 0; i < values.length; i++) {
+    var value = values[i], names = state.kind === 'attributes' ?
+      [value.name || value.nodeName || ''] :
+      (value && value.nodeType === Node.ELEMENT_NODE && value.namespaceURI === HTML_NAMESPACE ?
+        [value.id || '', value.getAttribute ? (value.getAttribute('name') || '') : ''] : []);
+    for (var j = 0; j < names.length; j++) {
+      var name = names[j];
+      if (!name || (state.kind === 'html' && collectionIndex(name) >= 0)) continue;
+      if (result.indexOf(name) < 0) result.push(name);
+    }
+  }
+  return result;
+}
+
+function collectionLookupNamed(collection, name) {
+  var state = collectionState(collection), values = collectionValues(collection);
+  if (!state || name == null || name === '') return null;
+  var text = String(name);
+  for (var i = 0; i < values.length; i++) {
+    var value = values[i];
+    if (state.kind === 'attributes') {
+      if ((value.name || value.nodeName) === text) return value;
+    } else if (value.nodeType === Node.ELEMENT_NODE && value.namespaceURI === HTML_NAMESPACE) {
+      if (value.id === text) return value;
+    }
+  }
+  if (state.kind === 'html') {
+    for (var j = 0; j < values.length; j++) {
+      var candidate = values[j];
+      if (candidate.nodeType === Node.ELEMENT_NODE && candidate.namespaceURI === HTML_NAMESPACE &&
+          candidate.getAttribute && candidate.getAttribute('name') === text) return candidate;
+    }
+  }
+  return null;
+}
+
+function collectionProperty(collection, property) {
+  var index = collectionIndex(property), values = collectionValues(collection);
+  if (index >= 0) return index < values.length ? values[index] : undefined;
+  return collectionLookupNamed(collection, property);
+}
+
+function collectionOwnPropertyNames(collection, target) {
+  var own = Object.getOwnPropertyNames(target), names = [], i;
+  for (i = 0; i < own.length; i++) if (collectionIndex(own[i]) >= 0) names.push(own[i]);
+  var values = collectionValues(collection);
+  for (i = 0; i < values.length; i++) if (names.indexOf(String(i)) < 0) names.push(String(i));
+  for (i = 0; i < own.length; i++) if (collectionIndex(own[i]) < 0) names.push(own[i]);
+  var named = collectionNamedValues(collection);
+  for (i = 0; i < named.length; i++) if (names.indexOf(named[i]) < 0) names.push(named[i]);
+  return names;
+}
+
+function collectionDescriptor(collection, target, property) {
+  // Kiesel's Object.getOwnPropertyDescriptor path historically cannot turn a
+  // missing descriptor into a JavaScript undefined while inside another
+  // Proxy trap. Avoid that host edge by asking hasOwnProperty first.
+  var own = Object.prototype.hasOwnProperty.call(target, property) ?
+    Object.getOwnPropertyDescriptor(target, property) : undefined;
+  if (own && !own.configurable) return own;
+  var index = collectionIndex(property), values = collectionValues(collection);
+  if (index >= 0 && index < values.length) return {
+    value: values[index], writable: false, enumerable: true, configurable: true
+  };
+  if (index < 0 && collectionLookupNamed(collection, property)) return {
+    value: collectionLookupNamed(collection, property), writable: false,
+    enumerable: false, configurable: true
+  };
+  return own;
+}
+
+function makeLiveCollection(query, kind, owner) {
+  var target = Object.create(kind === 'attributes' ? NamedNodeMap.prototype : HTMLCollection.prototype);
+  var state = { query: query, kind: kind, owner: owner || null, attributeCache: {} };
+  var proxy = new Proxy(target, {
+    get: function(targetObject, property) {
+      if (property === 'length') return collectionValues(proxy).length;
+      if (typeof property === 'string') {
+        if (Object.prototype.hasOwnProperty.call(targetObject, property)) return targetObject[property];
+        var value = collectionProperty(proxy, property);
+        if (value !== null && value !== undefined) return value;
+      }
+      return targetObject[property];
+    },
+    has: function(targetObject, property) {
+      if (property === 'length') return true;
+      if (typeof property === 'string') {
+        var value = collectionProperty(proxy, property);
+        if (value !== null && value !== undefined) return true;
+      }
+      return property in targetObject;
+    },
+    ownKeys: function(targetObject) { return collectionOwnPropertyNames(proxy, targetObject); },
+    getOwnPropertyDescriptor: function(targetObject, property) {
+      return collectionDescriptor(proxy, targetObject, property);
+    },
+    set: function(targetObject, property, value) {
+      if (typeof property === 'string' && collectionIndex(property) >= 0) return false;
+      if (typeof property === 'string' && Object.prototype.hasOwnProperty.call(targetObject, property)) {
+        targetObject[property] = value;
+        return true;
+      }
+      if (typeof property === 'string' && collectionProperty(proxy, property) !== null &&
+          collectionProperty(proxy, property) !== undefined) return false;
+      targetObject[property] = value;
+      return true;
+    },
+    defineProperty: function(targetObject, property, descriptor) {
+      if (typeof property === 'string' && collectionIndex(property) >= 0) return false;
+      if (typeof property === 'string' && Object.prototype.hasOwnProperty.call(targetObject, property)) {
+        Object.defineProperty(targetObject, property, descriptor);
+        return true;
+      }
+      if (typeof property === 'string' && collectionProperty(proxy, property) !== null &&
+          collectionProperty(proxy, property) !== undefined) return false;
+      Object.defineProperty(targetObject, property, descriptor);
+      return true;
+    },
+    deleteProperty: function(targetObject, property) {
+      if (typeof property === 'string' && collectionIndex(property) >= 0) {
+        return collectionIndex(property) >= 0 && collectionProperty(proxy, property) === undefined;
+      }
+      if (typeof property === 'string' && Object.prototype.hasOwnProperty.call(targetObject, property)) {
+        var descriptor = Object.getOwnPropertyDescriptor(targetObject, property);
+        return descriptor.configurable ? delete targetObject[property] : false;
+      }
+      if (typeof property === 'string' && collectionProperty(proxy, property) !== null &&
+          collectionProperty(proxy, property) !== undefined) return false;
+      return delete targetObject[property];
+    }
+  });
+  COLLECTION_STATES.set(target, state);
+  COLLECTION_STATES.set(proxy, state);
+  return proxy;
+}
+
+function defineCollectionMethod(prototype, name, method) {
+  Object.defineProperty(prototype, name, { value: method, writable: true, configurable: true });
+}
+Object.defineProperty(HTMLCollection.prototype, 'length', {
+  get: function() { return collectionValues(this).length; }, configurable: true
+});
+defineCollectionMethod(HTMLCollection.prototype, 'item', function(index) {
+  var values = collectionValues(this), number = Number(index);
+  if (!isFinite(number) || Math.floor(number) !== number) return null;
+  number = ((number % 4294967296) + 4294967296) % 4294967296;
+  return number < values.length ? values[number] : null;
+});
+defineCollectionMethod(HTMLCollection.prototype, 'namedItem', function(name) {
+  return collectionLookupNamed(this, name);
+});
+defineCollectionMethod(HTMLCollection.prototype, Symbol.iterator, function() {
+  return collectionValues(this)[Symbol.iterator]();
+});
+Object.defineProperty(NamedNodeMap.prototype, 'length', {
+  get: function() { return collectionValues(this).length; }, configurable: true
+});
+defineCollectionMethod(NamedNodeMap.prototype, 'item', HTMLCollection.prototype.item);
+defineCollectionMethod(NamedNodeMap.prototype, 'getNamedItem', HTMLCollection.prototype.namedItem);
+defineCollectionMethod(NamedNodeMap.prototype, 'getNamedItemNS', HTMLCollection.prototype.namedItem);
+defineCollectionMethod(NamedNodeMap.prototype, Symbol.iterator, HTMLCollection.prototype[Symbol.iterator]);
 
 Node.ELEMENT_NODE = 1;
 Node.ATTRIBUTE_NODE = 2;
@@ -687,6 +885,8 @@ Node.prototype.appendChild = function(child) {
     throw domException('HierarchyRequestError', 'This node type cannot have children');
   if (child.nodeType === Node.DOCUMENT_NODE)
     throw domException('HierarchyRequestError');
+  if (child.nodeType === Node.ATTRIBUTE_NODE)
+    throw domException('HierarchyRequestError');
   if (child.__synthetic) {
     if (!this.__logicalChildren) this.__logicalChildren = this.childNodes.slice();
     this.__logicalChildren.push(child); child.__rangeParent = this; child.parentNode = this;
@@ -726,6 +926,8 @@ Node.prototype.insertBefore = function(child, reference) {
     throw new TypeError('insertBefore requires a Node');
   }
   if (this.nodeType === Node.TEXT_NODE || this.nodeType === Node.COMMENT_NODE || this.nodeType === Node.DOCUMENT_TYPE_NODE)
+    throw domException('HierarchyRequestError');
+  if (child.nodeType === Node.ATTRIBUTE_NODE)
     throw domException('HierarchyRequestError');
   // The DOM operation is a no-op when the reference is the node itself. Do
   // this before detaching it, or the now-detached reference would fail the
@@ -925,17 +1127,30 @@ Object.defineProperty(Node.prototype, 'height', {
   set: function(value) { this.setAttribute('height', Number(value).toString()); }
 });
 
-// Snapshot the immediate element children as wrapped Node objects.
+// Live view of immediate element children as wrapped Node objects.
 Object.defineProperty(Node.prototype, "children", {
   get: function() {
-    return wrapNodes(__native.children(this.handle));
+    var node = this;
+    return makeLiveCollection(function() {
+      if (node.handle !== undefined) return wrapNodes(__native.children(node.handle));
+      var result = [], children = node.childNodes || [];
+      for (var i = 0; i < children.length; i++) {
+        if (children[i].nodeType === Node.ELEMENT_NODE) result.push(children[i]);
+      }
+      return result;
+    }, 'html', node);
   }
 });
 Object.defineProperty(Node.prototype, "attributes", {
   get: function() {
-    if (this.nodeType !== Node.ELEMENT_NODE) return [];
+    if (this.nodeType !== Node.ELEMENT_NODE) return null;
     var entries = __native.attributes(this.handle) || [];
-    entries.item = function(index) { return this[index] || null; };
+    // Keep this established lightweight snapshot while the host-side
+    // attribute identity/ordering contract is completed separately.
+    Object.defineProperty(entries, 'item', {
+      value: function(index) { return this[index] || null; },
+      enumerable: false, configurable: true
+    });
     return entries;
   }, enumerable: true, configurable: true
 });
@@ -1292,7 +1507,48 @@ Node.prototype.click = function() {
 };
 Node.prototype.getElementsByTagName = function(tagName) {
   var text = tagName == null ? "" : tagName.toString();
-  return wrapNodes(__native.getElementsByTagNameFrom(this.handle, text));
+  var node = this;
+  return makeLiveCollection(function() {
+    if (node.handle !== undefined) return wrapNodes(__native.getElementsByTagNameFrom(node.handle, text));
+    var all = [], result = [];
+    walkSnapshot(node, all);
+    for (var i = 1; i < all.length; i++) {
+      if (all[i].nodeType === Node.ELEMENT_NODE &&
+          (text === '*' || (all[i].tagName || '').toLowerCase() === text.toLowerCase())) result.push(all[i]);
+    }
+    return result;
+  }, 'html', node);
+};
+Node.prototype.getElementsByClassName = function(classNames) {
+  var node = this, wanted = String(classNames == null ? '' : classNames).split(/\s+/).filter(function(token) { return token; });
+  return makeLiveCollection(function() {
+    var all = [], result = [];
+    walkSnapshot(node, all);
+    for (var i = 0; i < all.length; i++) {
+      var candidate = all[i];
+      if (candidate.nodeType !== Node.ELEMENT_NODE || candidate === node) continue;
+      var classes = (candidate.getAttribute && candidate.getAttribute('class') || '').split(/\s+/);
+      var matches = true;
+      for (var j = 0; j < wanted.length; j++) if (classes.indexOf(wanted[j]) < 0) matches = false;
+      if (matches) result.push(candidate);
+    }
+    return result;
+  }, 'html', node);
+};
+Node.prototype.getElementsByTagNameNS = function(namespaceURI, localName) {
+  var node = this, namespace = namespaceURI == null ? null : String(namespaceURI), wanted = String(localName == null ? '' : localName).toLowerCase();
+  return makeLiveCollection(function() {
+    var all = [], result = [];
+    walkSnapshot(node, all);
+    for (var i = 0; i < all.length; i++) {
+      var candidate = all[i];
+      if (candidate.nodeType !== Node.ELEMENT_NODE || candidate === node) continue;
+      if (candidate.namespaceURI !== namespace) continue;
+      if (wanted !== '*' && String(candidate.localName || candidate.tagName || '').toLowerCase() !== wanted) continue;
+      result.push(candidate);
+    }
+    return result;
+  }, 'html', node);
 };
 Node.prototype.querySelectorAll = function(selector) {
   return wrapNodes(__native.querySelectorAllFrom(this.handle, selector == null ? '' : selector.toString()));
@@ -1333,6 +1589,23 @@ function makeSyntheticNode(type, name, value) {
   node.compareDocumentPosition = Node.prototype.compareDocumentPosition;
   Object.defineProperty(node, 'ownerDocument', { get: function() { return this.__ownerDocument || document; }, enumerable: true });
   return node;
+}
+
+function makeAttribute(name, value, owner) {
+  // Build the synthetic record before installing Attr's Node-derived
+  // prototype so inherited handle-backed setters cannot see the writes.
+  var attribute = {
+    __synthetic: true, nodeType: Node.ATTRIBUTE_NODE, nodeName: name, name: name,
+    value: value, nodeValue: value, data: value, textContent: value,
+    childNodes: [], children: [], parentNode: null, ownerElement: owner || null,
+    specified: true
+  };
+  if (Object.setPrototypeOf) Object.setPrototypeOf(attribute, Attr.prototype);
+  attribute.__ownerDocument = owner && owner.ownerDocument ? owner.ownerDocument : document;
+  attribute.appendChild = function() { throw domException('HierarchyRequestError'); };
+  attribute.insertBefore = attribute.appendChild;
+  attribute.replaceChild = attribute.appendChild;
+  return attribute;
 }
 
 function makeDocumentFragment() {
@@ -1798,15 +2071,20 @@ function makeDetachedDocument(root) {
     }, enumerable: true
   });
   Object.defineProperty(doc, 'forms', {
-    get: function() { return root ? root.getElementsByTagName('form') : []; }, enumerable: true
+    get: function() { return root ? root.getElementsByTagName('form') : makeLiveCollection(function() { return []; }, 'html', doc); }, enumerable: true
   });
   Object.defineProperty(doc, 'images', {
-    get: function() { return root ? root.getElementsByTagName('img') : []; }, enumerable: true
+    get: function() { return root ? root.getElementsByTagName('img') : makeLiveCollection(function() { return []; }, 'html', doc); }, enumerable: true
   });
   doc.createElement = function(name) { var node = document.createElement(name); adoptOwnerDocument(node); return node; };
   doc.createElementNS = function(ns, name) { var node = document.createElementNS(ns, name); adoptOwnerDocument(node); return node; };
   doc.createTextNode = function(text) { var node = document.createTextNode(text); adoptOwnerDocument(node); return node; };
   doc.createComment = function(text) { var node = document.createComment(text); adoptOwnerDocument(node); return node; };
+  doc.createAttribute = function(name) {
+    var text = name == null ? '' : String(name);
+    if (!/^[A-Za-z_][A-Za-z0-9_.:-]*$/.test(text)) throw domException('InvalidCharacterError');
+    return makeAttribute(text, '', null);
+  };
   doc.createProcessingInstruction = function(target, data) {
     var node = makeSyntheticNode(7, target == null ? '' : target.toString(), data == null ? '' : data.toString());
     adoptOwnerDocument(node); return node;
@@ -1828,7 +2106,21 @@ function makeDetachedDocument(root) {
     };
     return event;
   };
-  doc.getElementsByTagName = function(name) { return root ? root.getElementsByTagName(name) : []; };
+  doc.getElementsByTagName = function(name) {
+    var text = name == null ? '' : String(name);
+    return makeLiveCollection(function() {
+      var all = [], result = [];
+      if (root) walkSnapshot(root, all);
+      for (var i = 0; i < all.length; i++) {
+        var candidate = all[i];
+        if (candidate.nodeType === Node.ELEMENT_NODE &&
+            (text === '*' || String(candidate.tagName || '').toLowerCase() === text.toLowerCase())) result.push(candidate);
+      }
+      return result;
+    }, 'html', doc);
+  };
+  doc.getElementsByClassName = Node.prototype.getElementsByClassName;
+  doc.getElementsByTagNameNS = Node.prototype.getElementsByTagNameNS;
   doc.querySelectorAll = function(selector) {
     if (!root) return [];
     var text = selector == null ? '' : String(selector), matches;
@@ -2821,6 +3113,11 @@ document.createEvent = function(type) {
   document.createTextNode = function(text) {
     return wrapNode(__native.createTextNode(text == null ? '' : text.toString()));
   };
+  document.createAttribute = function(name) {
+    var text = name == null ? '' : name.toString();
+    if (!/^[A-Za-z_][A-Za-z0-9_.:-]*$/.test(text)) throw domException('InvalidCharacterError');
+    return makeAttribute(text, '', null);
+  };
   document.createComment = function(text) {
     return makeSyntheticNode(Node.COMMENT_NODE, '#comment', text == null ? '' : text.toString());
   };
@@ -2849,8 +3146,10 @@ document.createEvent = function(type) {
   };
   document.getElementsByTagName = function(tagName) {
     var text = tagName == null ? "" : tagName.toString();
-    return wrapNodes(__native.getElementsByTagName(text));
+    return makeLiveCollection(function() { return wrapNodes(__native.getElementsByTagName(text)); }, 'html', document);
   };
+  document.getElementsByClassName = Node.prototype.getElementsByClassName;
+  document.getElementsByTagNameNS = Node.prototype.getElementsByTagNameNS;
   document.createNodeIterator = function(node, mask, filter) {
     return new NodeIterator(node, mask, filter);
   };
@@ -2861,12 +3160,7 @@ document.createEvent = function(type) {
   };
   Object.defineProperty(document, "forms", {
     get: function() {
-      var forms = wrapNodes(__native.getElementsByTagName('form'));
-      for (var i = 0; i < forms.length; i++) {
-        var name = forms[i].getAttribute('name');
-        if (name) forms[name] = forms[i];
-      }
-      return forms;
+      return document.getElementsByTagName('form');
     }, enumerable: true, configurable: true
   });
   Object.defineProperty(document, "links", {
@@ -2874,13 +3168,14 @@ document.createEvent = function(type) {
       // HTMLCollection.links contains both anchors and image-map areas, in
       // document order.  Filtering the native element snapshot preserves
       // that order (and includes areas before the Acid3 reference anchor).
-      var all = wrapNodes(__native.getElementsByTagName('*'));
-      var links = [];
-      for (var i = 0; i < all.length; i++) {
-        var tag = (all[i].tagName || '').toLowerCase();
-        if (tag === 'a' || tag === 'area') links.push(all[i]);
-      }
-      return links;
+      return makeLiveCollection(function() {
+        var all = wrapNodes(__native.getElementsByTagName('*')), links = [];
+        for (var i = 0; i < all.length; i++) {
+          var tag = (all[i].tagName || '').toLowerCase();
+          if (tag === 'a' || tag === 'area') links.push(all[i]);
+        }
+        return links;
+      }, 'html', document);
     },
     enumerable: true, configurable: true
   });

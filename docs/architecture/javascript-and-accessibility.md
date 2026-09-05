@@ -208,13 +208,15 @@ teardown, and final machine-readable result wrapper.
 
 ## DOM handles and mutation APIs
 
-- `Node.children` returns a fresh JavaScript array of immediate Element child
-  wrappers in DOM order, excluding Text and deeper descendants.
+- `Node.children` returns a Realm-local live `HTMLCollection` of immediate
+  Element wrappers in DOM order, excluding Text and deeper descendants.
 - Read-only tree bindings provide `document.documentElement`, `document.body`,
   `getElementById`, document/Element `getElementsByTagName`, and authored Node
-  parent/sibling/child/text traversal. These APIs resolve the live tree rather
-  than named ID globals; tag-query and child arrays are deliberate snapshots,
-  not live HTMLCollections. Generated pseudo boxes remain private.
+  parent/sibling/child/text traversal. `getElementsByTagName`,
+  `getElementsByClassName`, and `getElementsByTagNameNS` expose live
+  `HTMLCollection` views whose indexed and named properties are virtual;
+  `NodeList`, selector results, and the current lightweight `attributes`
+  records remain snapshots. Generated pseudo boxes remain private.
 - NodeIterator keeps a reference node plus its before/after pointer state,
   applies whatToShow and filters in document order, forwards filter exceptions
   without advancing, and retains the last traversal order so a mutation
