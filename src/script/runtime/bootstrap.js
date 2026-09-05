@@ -6,25 +6,36 @@ function Node(handle) {
 }
 function domException(name, message) {
   var codes = { IndexSizeError: 1, HierarchyRequestError: 3, NotFoundError: 8,
-    InvalidCharacterError: 5, NamespaceError: 14, InvalidNodeTypeError: 24 };
+    InvalidCharacterError: 5, NamespaceError: 14, InvalidNodeTypeError: 24, SyntaxError: 12 };
   return new DOMException(message || name, name);
 }
 // The host exposes one handle-backed Node type; aliases keep common
 // constructor checks from failing without changing the native representation.
+globalThis.Node = Node;
 globalThis.Element = Node;
+globalThis.HTMLElement = Node;
 globalThis.Text = Node;
 globalThis.Comment = Node;
 globalThis.Document = function Document() { return makeDetachedDocument(null); };
+globalThis.HTMLDocument = Document;
+globalThis.XMLDocument = function XMLDocument() {};
 globalThis.DocumentFragment = Node;
 globalThis.DocumentType = Node;
 globalThis.ProcessingInstruction = Node;
 globalThis.NodeList = Array;
 globalThis.HTMLCollection = Array;
+['HTMLHtmlElement', 'HTMLHeadElement', 'HTMLBodyElement', 'HTMLParagraphElement',
+ 'HTMLDivElement', 'HTMLSpanElement', 'HTMLFormElement', 'HTMLInputElement',
+ 'HTMLButtonElement', 'HTMLSelectElement', 'HTMLOptionElement', 'HTMLTableElement',
+ 'HTMLTableSectionElement', 'HTMLTableRowElement', 'HTMLTableCellElement',
+ 'HTMLCanvasElement', 'HTMLImageElement', 'HTMLIFrameElement', 'HTMLObjectElement',
+ 'HTMLScriptElement', 'HTMLStyleElement', 'HTMLLinkElement', 'HTMLMetaElement']
+  .forEach(function(name) { globalThis[name] = Node; });
 function DOMException(message, name) {
   this.message = message == null ? '' : String(message);
   this.name = name == null || name === '' ? 'Error' : String(name);
   var codes = { IndexSizeError: 1, HierarchyRequestError: 3, NotFoundError: 8,
-    InvalidCharacterError: 5, NamespaceError: 14, InvalidNodeTypeError: 24 };
+    InvalidCharacterError: 5, NamespaceError: 14, InvalidNodeTypeError: 24, SyntaxError: 12 };
   this.code = codes[this.name] || 0;
 }
 DOMException.prototype = { constructor: DOMException };
@@ -110,6 +121,12 @@ Node.DOCUMENT_NODE = 9;
 Node.DOCUMENT_TYPE_NODE = 10;
 Node.DOCUMENT_FRAGMENT_NODE = 11;
 Node.COMMENT_NODE = 8;
+Node.DOCUMENT_POSITION_DISCONNECTED = 1;
+Node.DOCUMENT_POSITION_PRECEDING = 2;
+Node.DOCUMENT_POSITION_FOLLOWING = 4;
+Node.DOCUMENT_POSITION_CONTAINS = 8;
+Node.DOCUMENT_POSITION_CONTAINED_BY = 16;
+Node.DOCUMENT_POSITION_IMPLEMENTATION_SPECIFIC = 32;
 
 globalThis.NodeFilter = {
   SHOW_ALL: 0xFFFFFFFF,
@@ -589,6 +606,11 @@ Node.prototype.append = function() {
   }
 };
 
+Node.prototype.contains = function(other) {
+  if (other === null || other === undefined) return false;
+  return isAncestorNode(this, other);
+};
+
 Object.defineProperty(Node.prototype, "id", {
   get: function() { return this.getAttribute("id") || ""; },
   set: function(value) {
@@ -626,6 +648,7 @@ Node.prototype.appendChild = function(child) {
   if (this.__logicalChildren) this.__logicalChildren.push(child);
   child.__rangeParent = this;
   child.__ownerDocument = this.ownerDocument || document;
+  queueEmbeddedLoad(child);
   return child;
 };
 
@@ -669,6 +692,7 @@ Node.prototype.insertBefore = function(child, reference) {
     else this.__logicalChildren.splice(logicalIndex, 0, child);
   }
   child.__rangeParent = this;
+  queueEmbeddedLoad(child);
   return child;
 };
 
@@ -907,6 +931,15 @@ Object.defineProperty(Node.prototype, "nodeName", {
 Object.defineProperty(Node.prototype, "tagName", {
   get: function() { return __native.tagName(this.handle); }
 });
+Object.defineProperty(Node.prototype, "localName", {
+  get: function() {
+    var tag = this.tagName || this.nodeName;
+    return tag == null ? null : String(tag).toLowerCase();
+  }, enumerable: true, configurable: true
+});
+Object.defineProperty(Node.prototype, "namespaceURI", {
+  get: function() { return 'http://www.w3.org/1999/xhtml'; }, enumerable: true, configurable: true
+});
 Object.defineProperty(Node.prototype, "nodeValue", {
   get: function() { return __native.nodeValue(this.handle); }
 });
@@ -948,6 +981,119 @@ Object.defineProperty(Node.prototype, "ownerDocument", {
 Object.defineProperty(Node.prototype, "className", {
   get: function() { return this.getAttribute("class") || ""; },
   set: function(value) { this.setAttribute("class", value == null ? "" : value.toString()); },
+  enumerable: true, configurable: true
+});
+
+function classTokens(node) {
+  var value = node.getAttribute('class');
+  if (value === null || value === '') return [];
+  var source = value.split(/[\t\n\f\r ]+/), result = [];
+  for (var i = 0; i < source.length; i++) {
+    if (source[i] !== '' && result.indexOf(source[i]) < 0) result.push(source[i]);
+  }
+  return result;
+}
+function checkedClassToken(value) {
+  var token = value == null ? String(value) : String(value);
+  if (token === '') throw domException('SyntaxError', 'The token must not be empty.');
+  if (/[\t\n\f\r ]/.test(token)) throw domException('InvalidCharacterError', 'The token must not contain whitespace.');
+  return token;
+}
+function writeClassTokens(list, tokens) {
+  var value = tokens.join(' '), old = list.__element.getAttribute('class');
+  // A missing class attribute stays missing when an operation has no tokens
+  // to write. This distinction is observable through getAttribute().
+  if (old === null && value === '') return;
+  if (old !== value) list.__element.setAttribute('class', value);
+}
+function DOMTokenList(element) {
+  this.__element = element;
+  for (var index = 0; index < 32; index++) {
+    (function(itemIndex) {
+      Object.defineProperty(this, String(itemIndex), {
+        get: function() {
+          var value = this.item(itemIndex);
+          return value === null ? undefined : value;
+        }, enumerable: true, configurable: true
+      });
+    }).call(this, index);
+  }
+}
+Object.defineProperty(DOMTokenList.prototype, 'length', {
+  get: function() { return classTokens(this.__element).length; }, enumerable: true
+});
+Object.defineProperty(DOMTokenList.prototype, 'value', {
+  get: function() {
+    var value = this.__element.getAttribute('class');
+    return value === null ? '' : value;
+  },
+  set: function(value) { this.__element.setAttribute('class', value == null ? String(value) : String(value)); },
+  enumerable: true
+});
+DOMTokenList.prototype.item = function(index) {
+  var numeric = Number(index);
+  if (!isFinite(numeric) || numeric < 0 || Math.floor(numeric) !== numeric) return null;
+  var tokens = classTokens(this.__element);
+  return numeric < tokens.length ? tokens[numeric] : null;
+};
+DOMTokenList.prototype.contains = function(token) {
+  var checked = token == null ? String(token) : String(token);
+  if (checked === '' || /[\t\n\f\r ]/.test(checked)) return false;
+  var tokens = classTokens(this.__element);
+  return tokens.indexOf(checked) >= 0;
+};
+DOMTokenList.prototype.add = function() {
+  var tokens = classTokens(this.__element), raw = [];
+  for (var i = 0; i < arguments.length; i++) raw.push(checkedClassToken(arguments[i]));
+  for (var tokenIndex = 0; tokenIndex < raw.length; tokenIndex++) {
+    if (tokens.indexOf(raw[tokenIndex]) < 0) tokens.push(raw[tokenIndex]);
+  }
+  writeClassTokens(this, tokens);
+};
+DOMTokenList.prototype.remove = function() {
+  var tokens = classTokens(this.__element), raw = [];
+  for (var i = 0; i < arguments.length; i++) raw.push(checkedClassToken(arguments[i]));
+  for (var tokenIndex = 0; tokenIndex < raw.length; tokenIndex++) {
+    for (var classIndex = tokens.length - 1; classIndex >= 0; classIndex--) {
+      if (tokens[classIndex] === raw[tokenIndex]) tokens.splice(classIndex, 1);
+    }
+  }
+  writeClassTokens(this, tokens);
+};
+DOMTokenList.prototype.toggle = function(token, force) {
+  var checked = checkedClassToken(token), tokens = classTokens(this.__element), index = tokens.indexOf(checked);
+  var present = index >= 0, shouldAdd = arguments.length > 1 ? !!force : !present;
+  var changed = shouldAdd !== present;
+  if (shouldAdd && !present) tokens.push(checked);
+  if (!shouldAdd && present) {
+    for (var i = tokens.length - 1; i >= 0; i--) if (tokens[i] === checked) tokens.splice(i, 1);
+  }
+  if (changed) writeClassTokens(this, tokens);
+  return shouldAdd;
+};
+DOMTokenList.prototype.replace = function(token, newToken) {
+  var replacementText = newToken == null ? String(newToken) : String(newToken);
+  if (replacementText === '') throw domException('SyntaxError', 'The token must not be empty.');
+  var oldToken = checkedClassToken(token), replacement = checkedClassToken(replacementText);
+  var tokens = classTokens(this.__element), index = tokens.indexOf(oldToken);
+  if (index < 0) return false;
+  tokens[index] = replacement;
+  var unique = [];
+  for (var uniqueIndex = 0; uniqueIndex < tokens.length; uniqueIndex++) {
+    if (unique.indexOf(tokens[uniqueIndex]) < 0) unique.push(tokens[uniqueIndex]);
+  }
+  writeClassTokens(this, unique);
+  return true;
+};
+DOMTokenList.prototype.supports = function() { throw new TypeError('This token list does not define supported tokens.'); };
+DOMTokenList.prototype.toString = function() { return this.value; };
+
+Object.defineProperty(Node.prototype, 'classList', {
+  get: function() {
+    if (!this.__classList) this.__classList = new DOMTokenList(this);
+    return this.__classList;
+  },
+  set: function() {},
   enumerable: true, configurable: true
 });
 
@@ -1105,11 +1251,22 @@ function makeSyntheticNode(type, name, value) {
     textContent: type === Node.COMMENT_NODE ? '' : (value || ''), childNodes: [], children: []
   };
   node.firstChild = null; node.lastChild = null; node.parentNode = null;
+  Object.defineProperty(node, 'previousSibling', { get: function() {
+    var parent = nodeParentForRange(this), children = nodeChildrenForRange(parent), index = children.indexOf(this);
+    return index > 0 ? children[index - 1] : null;
+  }, enumerable: true });
+  Object.defineProperty(node, 'nextSibling', { get: function() {
+    var parent = nodeParentForRange(this), children = nodeChildrenForRange(parent), index = children.indexOf(this);
+    return index >= 0 && index + 1 < children.length ? children[index + 1] : null;
+  }, enumerable: true });
   node.appendChild = Node.prototype.appendChild;
   node.insertBefore = Node.prototype.insertBefore;
   node.removeChild = Node.prototype.removeChild;
   node.cloneNode = Node.prototype.cloneNode;
   node.remove = Node.prototype.remove;
+  node.hasChildNodes = Node.prototype.hasChildNodes;
+  node.contains = Node.prototype.contains;
+  node.compareDocumentPosition = Node.prototype.compareDocumentPosition;
   Object.defineProperty(node, 'ownerDocument', { get: function() { return this.__ownerDocument || document; }, enumerable: true });
   return node;
 }
@@ -1186,6 +1343,49 @@ function isAncestorNode(ancestor, node) {
   while (current) { if (current === ancestor) return true; current = nodeParentForRange(current); }
   return false;
 }
+var COMPARE_ROOTS = [];
+function compareRoot(node) {
+  var root = node;
+  while (nodeParentForRange(root)) root = nodeParentForRange(root);
+  return root;
+}
+function compareRootOrder(root) {
+  var index = COMPARE_ROOTS.indexOf(root);
+  if (index < 0) { COMPARE_ROOTS.push(root); index = COMPARE_ROOTS.length - 1; }
+  return index;
+}
+function compareDocumentPosition(reference, other) {
+  if (reference === other) return 0;
+  var referenceRoot = compareRoot(reference), otherRoot = compareRoot(other);
+  if (referenceRoot !== otherRoot) {
+    var rootOrder = compareRootOrder(referenceRoot), otherOrder = compareRootOrder(otherRoot);
+    return Node.DOCUMENT_POSITION_DISCONNECTED |
+      Node.DOCUMENT_POSITION_IMPLEMENTATION_SPECIFIC |
+      (rootOrder < otherOrder ? Node.DOCUMENT_POSITION_FOLLOWING : Node.DOCUMENT_POSITION_PRECEDING);
+  }
+  if (isAncestorNode(other, reference)) {
+    return Node.DOCUMENT_POSITION_CONTAINS | Node.DOCUMENT_POSITION_PRECEDING;
+  }
+  if (isAncestorNode(reference, other)) {
+    return Node.DOCUMENT_POSITION_CONTAINED_BY | Node.DOCUMENT_POSITION_FOLLOWING;
+  }
+  var referencePath = [], otherPath = [], current = reference;
+  while (current) { referencePath.unshift(current); current = nodeParentForRange(current); }
+  current = other;
+  while (current) { otherPath.unshift(current); current = nodeParentForRange(current); }
+  var common = 0;
+  while (common < referencePath.length && common < otherPath.length &&
+         referencePath[common] === otherPath[common]) common++;
+  if (!common) return Node.DOCUMENT_POSITION_FOLLOWING;
+  var parent = referencePath[common - 1];
+  var referenceIndex = nodeChildrenForRange(parent).indexOf(referencePath[common]);
+  var otherIndex = nodeChildrenForRange(parent).indexOf(otherPath[common]);
+  return referenceIndex < otherIndex ? Node.DOCUMENT_POSITION_FOLLOWING : Node.DOCUMENT_POSITION_PRECEDING;
+}
+Node.prototype.compareDocumentPosition = function(other) {
+  if (!other || typeof other.nodeType !== 'number') throw new TypeError('Argument is not a Node');
+  return compareDocumentPosition(this, other);
+};
 function compareRangePoints(aNode, aOffset, bNode, bOffset) {
   if (aNode === bNode) return aOffset < bOffset ? -1 : aOffset > bOffset ? 1 : 0;
   if (isAncestorNode(aNode, bNode)) {
@@ -1375,8 +1575,84 @@ Range.prototype.compareBoundaryPoints = function(how, other) { var aNode = (how 
 Range.prototype.START_TO_START = 0; Range.prototype.START_TO_END = 1; Range.prototype.END_TO_END = 2; Range.prototype.END_TO_START = 3;
 Range.START_TO_START = 0; Range.START_TO_END = 1; Range.END_TO_END = 2; Range.END_TO_START = 3;
 
+var WINDOW_SELECTIONS = {};
+function selectionForWindow(windowId) {
+  var key = windowId == null ? 0 : windowId;
+  if (!WINDOW_SELECTIONS[key]) WINDOW_SELECTIONS[key] = new Selection();
+  return WINDOW_SELECTIONS[key];
+}
+function Selection() {
+  this.__range = null;
+  this.anchorNode = null; this.anchorOffset = 0;
+  this.focusNode = null; this.focusOffset = 0;
+  this.direction = 'forward';
+}
+Object.defineProperty(Selection.prototype, 'rangeCount', { get: function() { return this.__range ? 1 : 0; } });
+Object.defineProperty(Selection.prototype, 'isCollapsed', { get: function() { return !this.__range || this.__range.collapsed; } });
+Object.defineProperty(Selection.prototype, 'type', { get: function() { return this.__range ? 'Range' : 'None'; } });
+Selection.prototype.getRangeAt = function(index) {
+  if (Number(index) !== 0 || !this.__range) throw domException('IndexSizeError');
+  return this.__range;
+};
+Selection.prototype.addRange = function(range) {
+  if (!range || typeof range.startContainer !== 'object') throw new TypeError('addRange requires a Range');
+  if (this.__range) return;
+  this.__range = range;
+  this.anchorNode = range.startContainer; this.anchorOffset = range.startOffset;
+  this.focusNode = range.endContainer; this.focusOffset = range.endOffset;
+  this.direction = 'forward';
+};
+Selection.prototype.removeAllRanges = function() {
+  this.__range = null;
+  this.anchorNode = null; this.anchorOffset = 0;
+  this.focusNode = null; this.focusOffset = 0;
+};
+Selection.prototype.removeRange = function(range) {
+  if (this.__range !== range) throw domException('NotFoundError');
+  this.removeAllRanges();
+};
+Selection.prototype.collapse = function(node, offset) {
+  node = checkedRangeNode(node);
+  var range = node.ownerDocument && node.ownerDocument.createRange ? node.ownerDocument.createRange() : new Range();
+  range.setStart(node, offset == null ? 0 : offset); range.collapse(true);
+  this.removeAllRanges(); this.addRange(range);
+};
+Selection.prototype.setPosition = Selection.prototype.collapse;
+Selection.prototype.selectAllChildren = function(node) {
+  node = checkedRangeNode(node);
+  if (node.nodeType === Node.DOCUMENT_TYPE_NODE) throw domException('InvalidNodeTypeError');
+  var owner = node.ownerDocument || document;
+  if (owner !== document || !document.contains(node)) return;
+  var range = owner.createRange ? owner.createRange() : new Range();
+  range.selectNodeContents(node);
+  this.removeAllRanges(); this.addRange(range);
+};
+Selection.prototype.extend = function(node, offset) {
+  node = checkedRangeNode(node);
+  if (!this.__range) { this.collapse(node, offset); return; }
+  this.__range.setEnd(node, offset == null ? 0 : offset);
+  this.focusNode = node; this.focusOffset = Number(offset == null ? 0 : offset);
+};
+Selection.prototype.collapseToStart = function() {
+  if (!this.__range) return;
+  this.collapse(this.__range.startContainer, this.__range.startOffset);
+};
+Selection.prototype.collapseToEnd = function() {
+  if (!this.__range) return;
+  this.collapse(this.__range.endContainer, this.__range.endOffset);
+};
+Selection.prototype.containsNode = function(node, partialContainment) {
+  if (!this.__range || !node) return false;
+  return partialContainment ? rangeIntersects(this.__range, node) : rangeFullyContains(this.__range, node);
+};
+Selection.prototype.deleteFromDocument = function() { if (this.__range) this.__range.deleteContents(); };
+Selection.prototype.toString = function() { return this.__range ? this.__range.toString() : ''; };
+globalThis.Selection = Selection;
+globalThis.getSelection = function() { return selectionForWindow(window.__id); };
+
 function makeDetachedDocument(root) {
   var doc = {};
+  if (Object.setPrototypeOf) Object.setPrototypeOf(doc, Document.prototype);
   function adoptOwnerDocument(node) {
     if (!node) return;
     node.__ownerDocument = doc;
@@ -1387,7 +1663,7 @@ function makeDetachedDocument(root) {
   doc.__writeBuffer = '';
   doc.__styleSheets = null;
   adoptOwnerDocument(root);
-  if (root) root.__rangeParent = doc;
+  if (root) { root.__rangeParent = doc; root.parentNode = doc; }
   Object.defineProperty(doc, 'documentElement', {
     get: function() {
       // A null-qualified createDocument is still useful as a detached HTML
@@ -1397,6 +1673,7 @@ function makeDetachedDocument(root) {
         root = document.createElement('html');
         adoptOwnerDocument(root);
         root.__rangeParent = doc;
+        root.parentNode = doc;
         doc.__documentChildren.push(root);
       }
       return root;
@@ -1406,7 +1683,7 @@ function makeDetachedDocument(root) {
   doc.appendChild = function(child) {
     if (child && child.__fragment) { var moved = child.childNodes.slice(); for (var i = 0; i < moved.length; i++) doc.appendChild(moved[i]); return child; }
     if (child.parentNode && child.parentNode.removeChild) child.parentNode.removeChild(child);
-    doc.__documentChildren.push(child); child.__rangeParent = doc;
+    doc.__documentChildren.push(child); child.__rangeParent = doc; child.parentNode = doc;
     adoptOwnerDocument(child);
     root = child.nodeType === Node.ELEMENT_NODE ? child : root;
     return child;
@@ -1422,6 +1699,12 @@ function makeDetachedDocument(root) {
   };
   doc.removeChild = function(child) { var index = doc.__documentChildren.indexOf(child); if (index < 0) throw domException('NotFoundError'); adjustRangesForRemoval(doc, child, index); doc.__documentChildren.splice(index, 1); child.__rangeParent = null; child.parentNode = null; return child; };
   Object.defineProperty(doc, 'childNodes', { get: function() { return doc.__documentChildren.slice(); }, enumerable: true });
+  Object.defineProperty(doc, 'doctype', { get: function() {
+    for (var i = 0; i < doc.__documentChildren.length; i++) {
+      if (doc.__documentChildren[i].nodeType === Node.DOCUMENT_TYPE_NODE) return doc.__documentChildren[i];
+    }
+    return null;
+  }, enumerable: true });
   doc.hasChildNodes = function() { return doc.__documentChildren.length !== 0; };
   Object.defineProperty(doc, 'firstChild', { get: function() { return doc.__documentChildren[0] || null; }, enumerable: true });
   Object.defineProperty(doc, 'lastChild', { get: function() { return doc.__documentChildren[doc.__documentChildren.length - 1] || null; }, enumerable: true });
@@ -1429,7 +1712,13 @@ function makeDetachedDocument(root) {
     get: function() {
       if (!root) return null;
       var bodies = root.getElementsByTagName('body');
-      return bodies.length ? bodies[0] : null;
+      if (bodies.length) return bodies[0];
+      var nodes = [], tag = (root.tagName || '').toLowerCase();
+      walkSnapshot(root, nodes);
+      for (var i = 0; i < nodes.length; i++) {
+        if ((nodes[i].tagName || '').toLowerCase() === 'body') return nodes[i];
+      }
+      return tag === 'body' ? root : null;
     }, enumerable: true
   });
   Object.defineProperty(doc, 'title', {
@@ -1476,7 +1765,22 @@ function makeDetachedDocument(root) {
     return event;
   };
   doc.getElementsByTagName = function(name) { return root ? root.getElementsByTagName(name) : []; };
-  doc.querySelectorAll = function(selector) { return root ? root.querySelectorAll(selector) : []; };
+  doc.querySelectorAll = function(selector) {
+    if (!root) return [];
+    var text = selector == null ? '' : String(selector), matches;
+    if (/^[A-Za-z][A-Za-z0-9:-]*$/.test(text)) {
+      var nodes = [], simpleMatches = [], wanted = text.toLowerCase();
+      walkSnapshot(root, nodes);
+      for (var nodeIndex = 0; nodeIndex < nodes.length; nodeIndex++) {
+        if ((nodes[nodeIndex].tagName || '').toLowerCase() === wanted) simpleMatches.push(nodes[nodeIndex]);
+      }
+      if (simpleMatches.length) return simpleMatches;
+    }
+    try { matches = root.querySelectorAll(text); } catch (error) { matches = null; }
+    if (matches) return matches;
+    if (/^[A-Za-z][A-Za-z0-9:-]*$/.test(text)) return root.getElementsByTagName(text);
+    return [];
+  };
   doc.querySelector = function(selector) { var matches = doc.querySelectorAll(selector); return matches.length ? matches[0] : null; };
   doc.getElementById = function(id) {
     if (!root) return null;
@@ -1484,7 +1788,8 @@ function makeDetachedDocument(root) {
     for (var i = 0; i < nodes.length; i++) if (nodes[i].id === id) return nodes[i];
     return null;
   };
-  doc.defaultView = window;
+  doc.defaultView = null;
+  doc.getSelection = function() { return doc.defaultView && doc.defaultView.getSelection ? doc.defaultView.getSelection() : null; };
   Object.defineProperty(doc, 'styleSheets', {
     get: function() {
       if (doc.__styleSheets) return doc.__styleSheets;
@@ -1538,11 +1843,12 @@ function makeDetachedDocument(root) {
       }
       var match = /^<\s*([A-Za-z][A-Za-z0-9:-]*)\b([^>]*)>/i.exec(token[0]);
       if (!match) continue;
-      var name = match[1].toLowerCase(), element = name === 'head' ? head : name === 'body' ? body : doc.createElement(name);
+      var name = match[1].toLowerCase(), element = name === 'html' ? root : name === 'head' ? head : name === 'body' ? body : doc.createElement(name);
       var attrs = match[2], attrRe = /([A-Za-z_:][-A-Za-z0-9_:.]*)(?:\s*=\s*(?:"([^"]*)"|'([^']*)'|([^\s>]+)))?/g, attr;
       while ((attr = attrRe.exec(attrs)) !== null) element.setAttribute(attr[1], attr[2] !== undefined ? attr[2] : attr[3] !== undefined ? attr[3] : attr[4] !== undefined ? attr[4] : '');
       var parent = (name === 'head' || name === 'body') ? root : ((name === 'title' || name === 'style' || name === 'meta' || name === 'link') && stack.length === 1 ? head : stack[stack.length - 1]);
-      if (name === 'head' || name === 'body') { if (element.parentNode !== root) root.appendChild(element); stack.length = 1; stack[0] = element; }
+      if (name === 'html') { stack.length = 1; stack[0] = body; }
+      else if (name === 'head' || name === 'body') { stack.length = 1; stack[0] = element; }
       else parent.appendChild(element);
       if (!/^(?:area|base|br|col|embed|hr|img|input|link|meta|param|source|track|wbr)$/.test(name) && !/\/\s*>$/.test(token[0]) && name !== 'head' && name !== 'body') stack.push(element);
     }
@@ -1556,8 +1862,21 @@ function makeDetachedDocument(root) {
     else if (mask === null) mask = 0;
     return new TreeWalker(node, mask, filter);
   };
+  doc.contains = Node.prototype.contains;
+  doc.compareDocumentPosition = Node.prototype.compareDocumentPosition;
   doc.implementation = document.implementation;
   return doc;
+}
+
+function frameWindowForElement(element, doc) {
+  if (element.__contentWindow) return element.__contentWindow;
+  var frame = { document: doc, window: null, Selection: Selection, DOMException: DOMException, Node: Node };
+  frame.window = frame;
+  frame.getSelection = function() { return selectionForWindow(element.handle); };
+  doc.defaultView = frame;
+  doc.getSelection = frame.getSelection;
+  element.__contentWindow = frame;
+  return frame;
 }
 
 Object.defineProperty(Node.prototype, 'contentDocument', {
@@ -1577,7 +1896,8 @@ Object.defineProperty(Node.prototype, 'contentDocument', {
         root.appendChild(document.createElement('body'));
       }
     IFRAME_DOCUMENTS[this.handle] = makeDetachedDocument(root);
-      IFRAME_DOCUMENTS[this.handle].__frameElement = this;
+    IFRAME_DOCUMENTS[this.handle].__frameElement = this;
+      frameWindowForElement(this, IFRAME_DOCUMENTS[this.handle]);
     }
     return IFRAME_DOCUMENTS[this.handle];
   }, enumerable: true, configurable: true
@@ -1591,9 +1911,7 @@ Node.prototype.getNumberOfChars = function() {
 Object.defineProperty(Node.prototype, 'contentWindow', {
   get: function() {
     if (this.tagName !== 'IFRAME') return null;
-    var frame = { document: this.contentDocument, window: null };
-    frame.window = frame;
-    return frame;
+    return frameWindowForElement(this, this.contentDocument);
   }, enumerable: true, configurable: true
 });
 Object.defineProperty(globalThis, 'frames', {
@@ -2293,19 +2611,25 @@ globalThis.__runXHROnload = function(body, handle) {
     if (child && child.__fragment) { var moved = child.childNodes.slice(); for (var i = 0; i < moved.length; i++) document.appendChild(moved[i]); return child; }
     if (child && child.__synthetic && document.__documentChildren.length && document.__documentChildren[0].nodeType === Node.DOCUMENT_TYPE_NODE) document.__documentChildren.unshift(child);
     else document.__documentChildren.push(child);
-    child.__rangeParent = document; return child;
+    child.__rangeParent = document; child.parentNode = document; return child;
   };
   document.insertBefore = function(child, reference) {
     if (child && child.__fragment) { var moved = child.childNodes.slice(); for (var i = 0; i < moved.length; i++) document.insertBefore(moved[i], reference); return child; }
     var index = document.__documentChildren.indexOf(reference);
     if (index < 0) return document.appendChild(child);
-    document.__documentChildren.splice(index, 0, child); child.__rangeParent = document; return child;
+    document.__documentChildren.splice(index, 0, child); child.__rangeParent = document; child.parentNode = document; return child;
   };
   document.removeChild = function(child) {
     var index = document.__documentChildren.indexOf(child); if (index < 0) return child;
     document.__documentChildren.splice(index, 1); child.__rangeParent = null; return child;
   };
   Object.defineProperty(document, 'childNodes', { get: function() { return document.__documentChildren.slice(); }, enumerable: true, configurable: true });
+  Object.defineProperty(document, 'doctype', { get: function() {
+    for (var i = 0; i < document.__documentChildren.length; i++) {
+      if (document.__documentChildren[i].nodeType === Node.DOCUMENT_TYPE_NODE) return document.__documentChildren[i];
+    }
+    return null;
+  }, enumerable: true, configurable: true });
   Object.defineProperty(document, 'firstChild', { get: function() { return document.__documentChildren[0] || null; }, enumerable: true, configurable: true });
   Object.defineProperty(document, 'lastChild', { get: function() { return document.__documentChildren[document.__documentChildren.length - 1] || null; }, enumerable: true, configurable: true });
 document.createEvent = function(type) {
@@ -2391,7 +2715,6 @@ document.createEvent = function(type) {
       var result = makeDetachedDocument(root);
       if (doctype) {
         if (doctype.parentNode && doctype.parentNode.removeChild) doctype.parentNode.removeChild(doctype);
-        doctype.__rangeParent = result;
         result.__documentChildren.unshift(doctype);
         if (doctype.ownerDocument === undefined) Object.defineProperty(doctype, 'ownerDocument', {
           get: function() { return this.__ownerDocument || null; }, enumerable: true, configurable: true
@@ -2426,7 +2749,6 @@ document.createEvent = function(type) {
       var result = makeDetachedDocument(html);
       var doctype = this.createDocumentType('html', '', '');
       doctype.__ownerDocument = result;
-      doctype.__rangeParent = result;
       result.__documentChildren.unshift(doctype);
       if (title != null && String(title).length) result.title = String(title);
       return result;
@@ -2453,6 +2775,9 @@ document.createEvent = function(type) {
   };
   document.createDocumentFragment = function() { return makeDocumentFragment(); };
   document.createRange = function() { return new Range(); };
+  document.contains = Node.prototype.contains;
+  document.compareDocumentPosition = Node.prototype.compareDocumentPosition;
+  document.getSelection = function() { return selectionForWindow(window.__id); };
   document.getElementById = function(id) {
     var text = id == null ? "" : id.toString();
     for (var i = 0; i < text.length; i++) if (text.charCodeAt(i) === 0) return null;
