@@ -22,7 +22,30 @@ globalThis.XMLDocument = function XMLDocument() {};
 globalThis.DocumentFragment = Node;
 globalThis.DocumentType = Node;
 globalThis.ProcessingInstruction = Node;
-globalThis.NodeList = Array;
+// NodeList uses an Array-shaped backing object so the JavaScript engine can
+// provide the standard indexed storage and iterator implementations.  The
+// prototype is distinct from Array.prototype, which makes selector results
+// and childNodes pass the DOM interface checks while retaining cheap ordered
+// snapshots at the native boundary.
+function NodeList() {}
+NodeList.prototype = Object.create(Array.prototype);
+Object.defineProperty(NodeList.prototype, 'constructor', {
+  value: NodeList, writable: true, configurable: true
+});
+if (typeof Symbol !== 'undefined' && Symbol.species) {
+  Object.defineProperty(NodeList, Symbol.species, {
+    value: Array, configurable: true
+  });
+}
+Object.defineProperty(NodeList.prototype, 'item', {
+  value: function(index) {
+    var number = Number(index);
+    if (!isFinite(number) || number !== number) number = 0;
+    number = number >>> 0;
+    return number < this.length ? this[number] : null;
+  }, writable: true, configurable: true
+});
+globalThis.NodeList = NodeList;
 function HTMLCollection() {}
 function NamedNodeMap() {}
 function Attr() {}
@@ -173,6 +196,44 @@ function wrapNode(handle) {
 
 function wrapNodes(handles) {
   return handles.map(function(handle) { return wrapNode(handle); });
+}
+
+function wrapNodeList(handles) {
+  var nodes = [];
+  for (var i = 0; i < handles.length; i++) nodes.push(wrapNode(handles[i]));
+  return makeNodeList(nodes);
+}
+
+function makeNodeList(nodes) {
+  var result = [];
+  for (var i = 0; i < nodes.length; i++) result.push(nodes[i]);
+  if (Object.setPrototypeOf) Object.setPrototypeOf(result, NodeList.prototype);
+  return result;
+}
+
+function refreshNodeList(list, values) {
+  var length = values ? values.length : 0;
+  for (var i = 0; i < length; i++) list[i] = values[i];
+  list.length = length;
+  return list;
+}
+
+function childNodeValues(node) {
+  if (node.__logicalChildren) return node.__logicalChildren;
+  if (node.__documentChildren) return node.__documentChildren;
+  if (typeof node.handle === 'number') return wrapNodes(__native.childNodes(node.handle));
+  return [];
+}
+
+function childNodeList(node) {
+  var list = node.__childNodeList;
+  if (!list) {
+    list = wrapNodeList([]);
+    Object.defineProperty(node, '__childNodeList', {
+      value: list, writable: true, configurable: true
+    });
+  }
+  return refreshNodeList(list, childNodeValues(node));
 }
 
 // HTMLCollection and NamedNodeMap are live, named property-bearing views. A
@@ -888,14 +949,17 @@ Node.prototype.appendChild = function(child) {
   if (child.nodeType === Node.ATTRIBUTE_NODE)
     throw domException('HierarchyRequestError');
   if (child.__synthetic) {
-    if (!this.__logicalChildren) this.__logicalChildren = this.childNodes.slice();
+    if (!this.__logicalChildren) this.__logicalChildren = this.childNodes;
     this.__logicalChildren.push(child); child.__rangeParent = this; child.parentNode = this;
-    child.__ownerDocument = this.ownerDocument || document; return child;
+    child.__ownerDocument = this.ownerDocument || document;
+    if (this.__childNodeList) refreshNodeList(this.__childNodeList, this.__logicalChildren);
+    return child;
   }
   if (this.__documentChildren) {
     this.__documentChildren.push(child);
     child.__rangeParent = this;
     child.parentNode = this;
+    if (this.__childNodeList) refreshNodeList(this.__childNodeList, this.__documentChildren);
     return child;
   }
   if (child && isAncestorNode(child, this)) throw domException('HierarchyRequestError');
@@ -904,6 +968,7 @@ Node.prototype.appendChild = function(child) {
   if (this.__logicalChildren) this.__logicalChildren.push(child);
   child.__rangeParent = this;
   child.__ownerDocument = this.ownerDocument || document;
+  if (this.__childNodeList) refreshNodeList(this.__childNodeList, childNodeValues(this));
   queueEmbeddedLoad(child);
   return child;
 };
@@ -950,6 +1015,7 @@ Node.prototype.insertBefore = function(child, reference) {
     else this.__logicalChildren.splice(logicalIndex, 0, child);
   }
   child.__rangeParent = this;
+  if (this.__childNodeList) refreshNodeList(this.__childNodeList, childNodeValues(this));
   queueEmbeddedLoad(child);
   return child;
 };
@@ -970,13 +1036,16 @@ Node.prototype.removeChild = function(child) {
     if (index < 0) throw domException('NotFoundError');
     this.__documentChildren.splice(index, 1);
     child.__rangeParent = null;
+    if (this.__childNodeList) refreshNodeList(this.__childNodeList, this.__documentChildren);
     return child;
   }
   if (child && child.__synthetic && this.__logicalChildren) {
     var syntheticIndex = this.__logicalChildren.indexOf(child);
     if (syntheticIndex < 0) throw domException('NotFoundError');
     adjustRangesForRemoval(this, child, syntheticIndex);
-    this.__logicalChildren.splice(syntheticIndex, 1); child.__rangeParent = null; child.parentNode = null; return child;
+    this.__logicalChildren.splice(syntheticIndex, 1); child.__rangeParent = null; child.parentNode = null;
+    if (this.__childNodeList) refreshNodeList(this.__childNodeList, this.__logicalChildren);
+    return child;
   }
   if (child.parentNode !== this) throw domException('NotFoundError');
   var childIndex = this.childNodes.indexOf(child);
@@ -987,6 +1056,7 @@ Node.prototype.removeChild = function(child) {
     if (logicalIndex >= 0) this.__logicalChildren.splice(logicalIndex, 1);
   }
   child.__rangeParent = null; child.parentNode = null;
+  if (this.__childNodeList) refreshNodeList(this.__childNodeList, childNodeValues(this));
   return child;
 };
 
@@ -1196,9 +1266,7 @@ Object.defineProperty(Node.prototype, "nextSibling", {
 });
 Object.defineProperty(Node.prototype, "childNodes", {
   get: function() {
-    if (this.__logicalChildren) return this.__logicalChildren.slice();
-    var result = wrapNodes(__native.childNodes(this.handle));
-    return result;
+    return childNodeList(this);
   }
 });
 Object.defineProperty(Node.prototype, "nodeType", {
@@ -1551,7 +1619,7 @@ Node.prototype.getElementsByTagNameNS = function(namespaceURI, localName) {
   }, 'html', node);
 };
 Node.prototype.querySelectorAll = function(selector) {
-  return wrapNodes(__native.querySelectorAllFrom(this.handle, selector == null ? '' : selector.toString()));
+  return wrapNodeList(__native.querySelectorAllFrom(this.handle, selector == null ? '' : selector.toString()));
 };
 Node.prototype.querySelector = function(selector) {
   var matches = this.querySelectorAll(selector);
@@ -1568,7 +1636,7 @@ function makeSyntheticNode(type, name, value) {
     __synthetic: true, nodeType: type, nodeName: name, tagName: type === Node.ELEMENT_NODE ? name.toUpperCase() : null,
     localName: type === Node.ELEMENT_NODE ? String(name).toLowerCase() : null,
     data: value || '', nodeValue: value || '',
-    textContent: type === Node.COMMENT_NODE ? '' : (value || ''), childNodes: [], children: []
+    textContent: type === Node.COMMENT_NODE ? '' : (value || ''), childNodes: wrapNodeList([]), children: []
   };
   node.firstChild = null; node.lastChild = null; node.parentNode = null;
   Object.defineProperty(node, 'previousSibling', { get: function() {
@@ -1597,7 +1665,7 @@ function makeAttribute(name, value, owner) {
   var attribute = {
     __synthetic: true, nodeType: Node.ATTRIBUTE_NODE, nodeName: name, name: name,
     value: value, nodeValue: value, data: value, textContent: value,
-    childNodes: [], children: [], parentNode: null, ownerElement: owner || null,
+    childNodes: wrapNodeList([]), children: [], parentNode: null, ownerElement: owner || null,
     specified: true
   };
   if (Object.setPrototypeOf) Object.setPrototypeOf(attribute, Attr.prototype);
@@ -2023,6 +2091,7 @@ function makeDetachedDocument(root) {
     doc.__documentChildren.push(child); child.__rangeParent = doc; child.parentNode = doc;
     adoptOwnerDocument(child);
     root = child.nodeType === Node.ELEMENT_NODE ? child : root;
+    if (doc.__childNodeList) refreshNodeList(doc.__childNodeList, doc.__documentChildren);
     return child;
   };
   doc.insertBefore = function(child, reference) {
@@ -2032,10 +2101,12 @@ function makeDetachedDocument(root) {
     if (index < 0) throw domException('NotFoundError');
     if (child.parentNode && child.parentNode.removeChild) child.parentNode.removeChild(child);
     doc.__documentChildren.splice(index, 0, child); child.__rangeParent = doc; child.parentNode = doc;
-    adoptOwnerDocument(child); return child;
+    adoptOwnerDocument(child);
+    if (doc.__childNodeList) refreshNodeList(doc.__childNodeList, doc.__documentChildren);
+    return child;
   };
-  doc.removeChild = function(child) { var index = doc.__documentChildren.indexOf(child); if (index < 0) throw domException('NotFoundError'); adjustRangesForRemoval(doc, child, index); doc.__documentChildren.splice(index, 1); child.__rangeParent = null; child.parentNode = null; return child; };
-  Object.defineProperty(doc, 'childNodes', { get: function() { return doc.__documentChildren.slice(); }, enumerable: true });
+  doc.removeChild = function(child) { var index = doc.__documentChildren.indexOf(child); if (index < 0) throw domException('NotFoundError'); adjustRangesForRemoval(doc, child, index); doc.__documentChildren.splice(index, 1); child.__rangeParent = null; child.parentNode = null; if (doc.__childNodeList) refreshNodeList(doc.__childNodeList, doc.__documentChildren); return child; };
+  Object.defineProperty(doc, 'childNodes', { get: function() { return childNodeList(doc); }, enumerable: true });
   Object.defineProperty(doc, 'doctype', { get: function() {
     for (var i = 0; i < doc.__documentChildren.length; i++) {
       if (doc.__documentChildren[i].nodeType === Node.DOCUMENT_TYPE_NODE) return doc.__documentChildren[i];
@@ -2122,7 +2193,7 @@ function makeDetachedDocument(root) {
   doc.getElementsByClassName = Node.prototype.getElementsByClassName;
   doc.getElementsByTagNameNS = Node.prototype.getElementsByTagNameNS;
   doc.querySelectorAll = function(selector) {
-    if (!root) return [];
+    if (!root) return wrapNodeList([]);
     var text = selector == null ? '' : String(selector), matches;
     if (/^[A-Za-z][A-Za-z0-9:-]*$/.test(text)) {
       var nodes = [], simpleMatches = [], wanted = text.toLowerCase();
@@ -2130,12 +2201,15 @@ function makeDetachedDocument(root) {
       for (var nodeIndex = 0; nodeIndex < nodes.length; nodeIndex++) {
         if ((nodes[nodeIndex].tagName || '').toLowerCase() === wanted) simpleMatches.push(nodes[nodeIndex]);
       }
-      if (simpleMatches.length) return simpleMatches;
+      if (simpleMatches.length) return makeNodeList(simpleMatches);
     }
     try { matches = root.querySelectorAll(text); } catch (error) { matches = null; }
+    // Element.querySelectorAll already returns wrapped Node objects. Reusing
+    // that list is important: treating its Node objects as native numeric
+    // handles would create wrappers whose handle is another wrapper.
     if (matches) return matches;
     if (/^[A-Za-z][A-Za-z0-9:-]*$/.test(text)) return root.getElementsByTagName(text);
-    return [];
+    return wrapNodeList([]);
   };
   doc.querySelector = function(selector) { var matches = doc.querySelectorAll(selector); return matches.length ? matches[0] : null; };
   doc.getElementById = function(id) {
@@ -2967,19 +3041,25 @@ globalThis.__runXHROnload = function(body, handle) {
     if (child && child.__fragment) { var moved = child.childNodes.slice(); for (var i = 0; i < moved.length; i++) document.appendChild(moved[i]); return child; }
     if (child && child.__synthetic && document.__documentChildren.length && document.__documentChildren[0].nodeType === Node.DOCUMENT_TYPE_NODE) document.__documentChildren.unshift(child);
     else document.__documentChildren.push(child);
-    child.__rangeParent = document; child.parentNode = document; return child;
+    child.__rangeParent = document; child.parentNode = document;
+    if (document.__childNodeList) refreshNodeList(document.__childNodeList, document.__documentChildren);
+    return child;
   };
   document.insertBefore = function(child, reference) {
     if (child && child.__fragment) { var moved = child.childNodes.slice(); for (var i = 0; i < moved.length; i++) document.insertBefore(moved[i], reference); return child; }
     var index = document.__documentChildren.indexOf(reference);
     if (index < 0) return document.appendChild(child);
-    document.__documentChildren.splice(index, 0, child); child.__rangeParent = document; child.parentNode = document; return child;
+    document.__documentChildren.splice(index, 0, child); child.__rangeParent = document; child.parentNode = document;
+    if (document.__childNodeList) refreshNodeList(document.__childNodeList, document.__documentChildren);
+    return child;
   };
   document.removeChild = function(child) {
     var index = document.__documentChildren.indexOf(child); if (index < 0) return child;
-    document.__documentChildren.splice(index, 1); child.__rangeParent = null; return child;
+    document.__documentChildren.splice(index, 1); child.__rangeParent = null;
+    if (document.__childNodeList) refreshNodeList(document.__childNodeList, document.__documentChildren);
+    return child;
   };
-  Object.defineProperty(document, 'childNodes', { get: function() { return document.__documentChildren.slice(); }, enumerable: true, configurable: true });
+  Object.defineProperty(document, 'childNodes', { get: function() { return childNodeList(document); }, enumerable: true, configurable: true });
   Object.defineProperty(document, 'doctype', { get: function() {
     for (var i = 0; i < document.__documentChildren.length; i++) {
       if (document.__documentChildren[i].nodeType === Node.DOCUMENT_TYPE_NODE) return document.__documentChildren[i];
@@ -3001,7 +3081,7 @@ document.createEvent = function(type) {
   };
   document.querySelectorAll = function(selector) {
     var handles = originalQuerySelectorAll.call(this, selector);
-    return wrapNodes(handles);
+    return wrapNodeList(handles);
   };
   document.querySelector = function(selector) {
     var matches = document.querySelectorAll(selector);

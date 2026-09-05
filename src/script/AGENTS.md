@@ -126,11 +126,12 @@ queued work and shutdown are documented in
 - Bootstrap owns one Node-wrapper cache per document Realm. Every host-returned
   numeric Node identity must pass through that cache so query, traversal,
   events, named IDs, canvas, and mutation results compare by object identity.
-  `NodeList` and selector results are snapshots; `HTMLCollection` is a
-  Realm-local live Proxy view over fresh native snapshots. The current
-  `attributes` records remain lightweight snapshots until native Attr identity
-  and ordering are complete. These views expose authored children only and
-  never generated pseudo boxes.
+  Selector results are static `NodeList` snapshots; `Node.childNodes` is a
+  cached live `NodeList` refreshed at the JavaScript mutation boundaries.
+  `HTMLCollection` is a Realm-local live Proxy view over fresh native
+  snapshots. The current `attributes` records remain lightweight snapshots
+  until native Attr identity and ordering are complete. These views expose
+  authored children only and never generated pseudo boxes.
 - Asynchronous callbacks carry copied generation-stamped document handles and
   own every URL, message, policy, body, and string they retain. Never queue a
   Frame, Node, or `JsRenderContext` pointer.

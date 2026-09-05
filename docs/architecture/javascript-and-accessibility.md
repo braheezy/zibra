@@ -215,8 +215,10 @@ teardown, and final machine-readable result wrapper.
   parent/sibling/child/text traversal. `getElementsByTagName`,
   `getElementsByClassName`, and `getElementsByTagNameNS` expose live
   `HTMLCollection` views whose indexed and named properties are virtual;
-  `NodeList`, selector results, and the current lightweight `attributes`
-  records remain snapshots. Generated pseudo boxes remain private.
+  selector results are static `NodeList` snapshots, while `Node.childNodes`
+  is a cached live `NodeList` refreshed by JavaScript mutation boundaries.
+  The current lightweight `attributes` records remain snapshots. Generated
+  pseudo boxes remain private.
 - NodeIterator keeps a reference node plus its before/after pointer state,
   applies whatToShow and filters in document order, forwards filter exceptions
   without advancing, and retains the last traversal order so a mutation

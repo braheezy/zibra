@@ -5,6 +5,8 @@ tests:
   - dom/nodes/Node-removeChild.html
   - dom/nodes/Node-contains.html
   - dom/nodes/Node-compareDocumentPosition.html
+  - dom/nodes/NodeList-Iterable.html
+  - dom/nodes/Node-childNodes.html
   - dom/nodes/Element-classlist.html
   - selection/getSelection.html
   - dom/traversal/TreeWalker-traversal-skip.html
