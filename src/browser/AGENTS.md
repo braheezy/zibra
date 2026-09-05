@@ -87,7 +87,9 @@ into either leaf module.
 
 - UI ticks reconcile the native window dimensions. Native size events and
   headless diagnostic sizes share `Browser.resizeViewport`; it replaces
-  presentation targets transactionally and queues generation-stamped Tab work.
+  presentation targets transactionally and publishes each Tab's atomic latest
+  viewport before queuing a wake-up. Navigation may clear that task, not the
+  viewport request. Apply requests on the worker before Frame setup/render.
 - `Frame.document` is a protected style-phase guard. A dirty value cannot be
   read by layout or hit testing. Successful style/resource processing
   republishes it before `DocumentLayout.layoutNeeded()` gates geometry.
@@ -137,7 +139,7 @@ into either leaf module.
 Run `zig build test-browser` while iterating. Use `zig build test-render` for
 layout/paint ownership, `zig build test-network` for loading/session changes,
 and `zig build test-script` for callback or DOM integration. Before handoff run
-`zig build check`; run `zig build test-pipeline` for document rendering and
+`zig build verify`; run `zig build test-pipeline` for document rendering and
 native macOS `zig build test-screenshot` for final pixels. Add/update a primary
 manual fixture and its [catalog entry](../../tests/manual/README.md) when
 interaction cannot be expressed deterministically in an automated test.

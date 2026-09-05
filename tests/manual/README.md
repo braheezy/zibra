@@ -54,7 +54,7 @@ tiers and baseline policy.
 | [`style-descendant-invalidation.html`](style-descendant-invalidation.html) | Dirty ancestor path traversal while clean sibling subtrees are skipped |
 | [`paint-invalidation.html`](paint-invalidation.html) | Retained display-list mutation and clean sibling reuse |
 | [`protected-layout-phases.html`](protected-layout-phases.html) | Protected style/layout phases versus paint/compositor-only animation |
-| [`window-resize.html`](window-resize.html) | Horizontal/vertical native resize, viewport invalidation, and rerender |
+| [`window-resize.html`](window-resize.html) | Horizontal/vertical native resize, automatic startup tiling, resize during navigation, and viewport reflow |
 | [`responsive-layout.html`](responsive-layout.html) | Root-relative type, dynamic CSS variables, flex wrapping, responsive grid tracks, and height-only media updates |
 | [`atomic-inline.html`](atomic-inline.html) | Content-bearing inline-blocks, nested controls, floated footer columns, CSS pixel fonts, closed dialogs, and wide native reflow |
 | [`max-width-media.html`](max-width-media.html) | Inclusive max-width query under page zoom and native resize |

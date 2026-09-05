@@ -412,7 +412,7 @@ pixels should not be the only evidence for a cross-platform behavior.
 ## Phase 8: runner performance and CI
 
 Status: partial. The process-per-test protocol, local fixture validation,
-runner unit tests, portable `zig build check` integration, durable reports,
+runner unit tests, portable `zig build verify` integration, durable reports,
 self-hosted dashboard, and bounded parallel workers exist. Parallel WPT server
 groups, CI publishing, shards, and a persistent Zibra process do not.
 
@@ -473,10 +473,11 @@ For each browser-side phase, run the narrowest suite first:
 - `zig build test-browser` for Tab, navigation, lifecycle, and shutdown;
 - `zig build test-pipeline` for layout/display-list behavior;
 - `zig build test-screenshot` for native final-pixel behavior;
-- `zig build check` before integration changes are merged.
+- `zig build verify` before integration changes are merged.
 
-At this progress snapshot, `zig build check --summary all` passed all 82 build
-steps and 557 tests. The focused baselines were 111 `test-script` tests, 463
+At this progress snapshot, the portable aggregate—now run with
+`zig build verify --summary all`—passed all 82 build steps and 557 tests.
+The focused baselines were 111 `test-script` tests, 463
 `test-browser` tests, three real `test-wpt` fixtures, and eight
 `test-wpt-runner` cases.
 

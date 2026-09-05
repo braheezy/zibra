@@ -206,11 +206,8 @@ pub fn Contexts(comptime Browser: type) type {
                         history_generation: u64,
                     },
                 },
-                resize: struct {
-                    width: i32,
-                    height: i32,
-                    generation: u64,
-                },
+                // A wake-up only; dimensions live in the Tab's atomic mailbox.
+                resize,
             };
 
             allocator: std.mem.Allocator,
@@ -267,10 +264,9 @@ pub fn Contexts(comptime Browser: type) type {
                             request.history_generation,
                         ),
                     },
-                    .resize => |resize| {
+                    .resize => {
                         if (self.tab.isShuttingDown()) return;
-                        if (resize.generation != self.browser.resize_generation.load(.seq_cst)) return;
-                        self.tab.resizeViewport(resize.width, resize.height);
+                        if (!self.tab.applyRequestedViewport()) return;
                         self.browser.setNeedsAnimationFrame(self.tab);
                         self.browser.scheduleAnimationFrame();
                     },

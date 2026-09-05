@@ -177,6 +177,6 @@ from the DOM/style invariants they maintain.
 
 Run `zig build test-document` while iterating. Run `zig build test-pipeline`
 for exact style/layout/display output and `zig build test-dump-dom` for parser
-serialization. Before handoff run `zig build check`; use native macOS
+serialization. Before handoff run `zig build verify`; use native macOS
 screenshots only for final pixel behavior. Add/update a primary fixture in the
 [manual catalog](../../tests/manual/README.md) for visible interaction.

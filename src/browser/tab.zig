@@ -98,6 +98,9 @@ accessibility: AccessibilitySettings = .{},
 // Available height for tab content (window height minus chrome height)
 tab_width: i32 = 0,
 tab_height: i32 = 0,
+// UI-published latest content viewport, retained across document/queue clears.
+// High/low 32-bit halves hold width/height together; zero means no request.
+requested_viewport: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
 // Standalone replayable joint root/iframe history owner. It contains no live
 // Frame pointers; UI-thread readers observe only its atomic availability bits.
 history: history_module.State,
@@ -383,6 +386,28 @@ fn invalidateFrameTreeForViewportResize(frame: *Frame) void {
     for (frame.children.items) |child| {
         invalidateFrameTreeForViewportResize(child);
     }
+}
+
+/// Publish validated content dimensions from the UI thread without borrowing
+/// worker-owned DOM. One atomic pair prevents mixed width/height observations;
+/// this request survives discarded wake-up tasks and document replacement.
+pub fn requestViewport(self: *Tab, width: i32, height: i32) void {
+    std.debug.assert(width > 0 and height >= 0);
+    const packed_size = (@as(u64, @intCast(width)) << 32) | @as(u32, @intCast(height));
+    self.requested_viewport.store(packed_size, .release);
+}
+
+/// Reconcile the latest request on the serialized Tab worker, before the
+/// style/layout dirty gate. Returns whether dimensions changed. Do not clear
+/// the mailbox: a concurrent newer publication must remain available.
+pub fn applyRequestedViewport(self: *Tab) bool {
+    const packed_size = self.requested_viewport.load(.acquire);
+    if (packed_size == 0) return false;
+    const width: i32 = @intCast(packed_size >> 32);
+    const height: i32 = @intCast(packed_size & 0xffffffff);
+    if (self.tab_width == width and self.tab_height == height) return false;
+    self.resizeViewport(width, height);
+    return true;
 }
 
 /// Apply a native viewport change on the tab worker. The next animation frame
@@ -1596,6 +1621,7 @@ pub fn requestActivationCommit(self: *Tab) void {
 }
 
 pub fn render(self: *Tab, b: *Browser) !void {
+    _ = self.applyRequestedViewport();
     const visited_generation = b.session_state.currentVisitedGeneration();
     if (self.visitedLinksNeedRefresh(visited_generation)) self.needs_paint = true;
 
@@ -1744,6 +1770,7 @@ pub fn runAnimationFrameForGeneration(
     scroll: i32,
     animation_generation: ?u64,
 ) void {
+    _ = self.applyRequestedViewport();
     const frame = self.root_frame orelse return;
     const activation_commit = self.activation_commit_requested.swap(false, .acq_rel);
     var frame_it = self.frames_by_id.valueIterator();

@@ -715,7 +715,6 @@ pub const Browser = struct {
     // heap-stable until Browser teardown has retired every Realm.
     top_level_realm_observer: ?TopLevelRealmObserverFn = null,
     top_level_realm_observer_context: ?*anyopaque = null,
-    resize_generation: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
     // Heap-stable because every tab worker and every App window shares it.
     measure: *MeasureTime,
     lock: Mutex,
@@ -1940,8 +1939,8 @@ pub const Browser = struct {
     }
 
     /// Apply presentation dimensions on the Browser/UI thread. Both native
-    /// size events and headless diagnostics use this transaction; DOM reflow
-    /// remains queued on each tab's serialized worker.
+    /// size events and headless diagnostics use this transaction. Publish each
+    /// Tab's durable dimensions before queuing a disposable worker wake-up.
     pub fn resizeViewport(self: *Browser, width: i32, height: i32) !void {
         self.lock.lock();
         const active_tab_height = self.active_tab_height;
@@ -1975,14 +1974,9 @@ pub const Browser = struct {
         self.lock.unlock();
         self.chrome.resizeDocument(geometry.window_width);
 
-        const generation = self.resize_generation.fetchAdd(1, .seq_cst) +% 1;
         for (self.tabs.items) |tab| {
-            self.scheduleTabResizeTask(
-                tab,
-                geometry.window_width,
-                geometry.tab_viewport_height,
-                generation,
-            );
+            tab.requestViewport(geometry.window_width, geometry.tab_viewport_height);
+            self.scheduleTabAction(tab, .resize, "task:resize");
         }
 
         // Draw the previous display list at the new native size while
@@ -2507,24 +2501,6 @@ pub const Browser = struct {
         self.scheduleTabAction(tab, .blur, "task:blur");
     }
 
-    fn scheduleTabResizeTask(
-        self: *Browser,
-        tab: *Tab,
-        width: i32,
-        height: i32,
-        generation: u64,
-    ) void {
-        self.scheduleTabAction(
-            tab,
-            .{ .resize = .{
-                .width = width,
-                .height = height,
-                .generation = generation,
-            } },
-            "task:resize",
-        );
-    }
-
     /// Fetch an ordinary resource through the Browser session loader.
     pub fn fetchBody(
         self: *Browser,
@@ -2685,6 +2661,10 @@ pub const Browser = struct {
         payload: ?[]const u8,
         history_navigation: HistoryNavigation,
     ) !void {
+        // Scheduling or committing navigation may discard a resize wake-up.
+        // On failure, reflow the surviving page; on success, catch any request
+        // published after the navigation's final render.
+        defer if (tab.applyRequestedViewport()) tab.setNeedsRender();
         std.log.info("Loading: {s}", .{url.*.path});
 
         var referrer_value: ?Url = null;
@@ -2747,6 +2727,9 @@ pub const Browser = struct {
             tab.root_frame = null;
         }
 
+        // The old document is gone, but the UI's latest dimensions belong to
+        // the Tab lifetime. Consume them before parser/media initialization.
+        _ = tab.applyRequestedViewport();
         const frame = try tab.allocator.create(Frame);
         frame.* = Frame.init(tab.allocator, tab, null, null);
         tab.root_frame = frame;
@@ -4674,6 +4657,10 @@ pub const Browser = struct {
         new_keyframes = .empty;
         frame.default_rules_count = default_rules_count;
         if (frame.current_node) |*root| parser.dirtyStyleSubtree(root);
+        // A resize may predate this document's initial style pass. Rebuilding
+        // its media rules must invalidate the phase guard as well as the DOM
+        // fields, even when the new Frame was already published clean.
+        frame.markDocumentStyleDirty();
     }
 
     // Layout a tab's HTML nodes with the tree-based layout

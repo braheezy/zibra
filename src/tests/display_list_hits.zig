@@ -547,6 +547,7 @@ fn deinitQueueBrowser(test_browser: *browser.Browser) void {
 fn initClickTab(tab: *tab_module.Tab, allocator: std.mem.Allocator) void {
     tab.allocator = allocator;
     tab.accessibility = .{};
+    tab.requested_viewport = .init(0);
     tab.root_frame = null;
     tab.focused_frame = null;
     tab.focus_modality = .keyboard;

@@ -279,6 +279,11 @@ Each Frame owns a `ProtectedField(?*DocumentLayout)` named `document`.
 Do not reintroduce tab-wide `needs_style` or `needs_layout` flags. Teardown may
 read the last published document only to destroy it in the correct order.
 
+Rebuilding viewport-dependent stylesheet rules must mark both the DOM style
+fields and `Frame.document` dirty. A startup resize can survive navigation and
+reach a newly styled Frame; that Frame must re-enter style before layout reads
+the rebuilt generation.
+
 Layout fields form dependencies among document, parent, previous sibling, and
 child geometry. During one serialized layout traversal, document/block/line
 `in_layout` guards suppress only reentrant owner-wide notification caused by a

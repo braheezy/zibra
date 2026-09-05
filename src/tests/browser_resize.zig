@@ -8,6 +8,233 @@ const Layout = @import("../browser/render/layout.zig");
 const ProtectedField = @import("../core/protected_field.zig").ProtectedField;
 const CSSParser = @import("../document/css_parser.zig").CSSParser;
 const document_parser = @import("../document/parser.zig");
+const tasks = @import("../runtime/task.zig");
+const Url = @import("../network/url.zig").Url;
+
+// A task-return barrier keeps this stack context alive through runner cleanup.
+// It also lets the test force queue clearing without timing a network response.
+const ResizeGate = struct {
+    entered: std.Io.Semaphore = .{},
+    proceed: std.Io.Semaphore = .{},
+    returned: std.Io.Semaphore = .{},
+    released: bool = false,
+
+    fn run(raw: *anyopaque) !void {
+        const self: *@This() = @ptrCast(@alignCast(raw));
+        self.entered.post(std.testing.io);
+        self.proceed.waitUncancelable(std.testing.io);
+    }
+    fn cleanup(raw: *anyopaque) void {
+        const self: *@This() = @ptrCast(@alignCast(raw));
+        self.returned.post(std.testing.io);
+    }
+    fn task(self: *@This()) tasks.Task {
+        return tasks.Task.init(.user_input, "task:test_resize_gate", self, run, cleanup);
+    }
+    fn release(self: *@This()) void {
+        if (self.released) return;
+        self.released = true;
+        self.proceed.post(std.testing.io);
+        self.returned.waitUncancelable(std.testing.io);
+    }
+};
+
+fn waitForQueuedNavigation(runner: *tasks.TaskRunner) !void {
+    const deadline = std.Io.Clock.awake.now(std.testing.io).nanoseconds + 10 * std.time.ns_per_s;
+    while (std.Io.Clock.awake.now(std.testing.io).nanoseconds < deadline) {
+        const queued = blk: {
+            runner.mutex.lock();
+            defer runner.mutex.unlock();
+            for (runner.tasks.items) |task| {
+                if (std.mem.eql(u8, task.trace_name, "task:network_navigation")) break :blk true;
+            }
+            break :blk false;
+        };
+        // The blocked networking worker cannot consume this request. Observing
+        // it proves navigation is inside the fetch, before its queue clear.
+        if (queued) return;
+        try std.testing.io.sleep(.fromMilliseconds(1), .awake);
+    }
+    return error.NavigationDidNotReachFetch;
+}
+
+const resize_page = "data:text/html,<html><head><style>" ++
+    ".resize-target{width:200px;margin:0 auto;height:40px;background-color:red}" ++
+    "@media(min-width:2000px) and (min-height:1000px){.resize-target{width:400px;background-color:green}}" ++
+    "</style></head><body><div id='resize-target' class='resize-target'></div></body></html>";
+
+// Catch the intentional load error on the worker instead of reporting it as
+// an unhandled Task error. Cleanup is the barrier for all stack-owned borrows.
+const FailedNavigation = struct {
+    browser_ptr: *browser.Browser,
+    tab: *tab_module.Tab,
+    url: *Url,
+    failure: ?anyerror = null,
+    returned: std.Io.Semaphore = .{},
+
+    fn run(raw: *anyopaque) !void {
+        const self: *@This() = @ptrCast(@alignCast(raw));
+        self.browser_ptr.loadInTab(self.tab, self.url, null, .push) catch |err| {
+            self.failure = err;
+        };
+    }
+
+    fn cleanup(raw: *anyopaque) void {
+        const self: *@This() = @ptrCast(@alignCast(raw));
+        if (self.failure != null) {
+            self.url.free(self.browser_ptr.allocator);
+            self.browser_ptr.allocator.destroy(self.url);
+        }
+        self.returned.post(std.testing.io);
+    }
+};
+
+test "resize mailbox coalesces whole dimensions and ignores duplicate requests" {
+    // No DOM is installed: applying a request updates Tab geometry/media state
+    // without needing a Browser, renderer, or owning document generation.
+    var tab: tab_module.Tab = undefined;
+    tab.requested_viewport = .init(0);
+    tab.tab_width = 800;
+    tab.tab_height = 534;
+    tab.root_frame = null;
+    tab.media_environment_dirty = false;
+    tab.needs_paint = false;
+    try std.testing.expect(!tab.applyRequestedViewport());
+    tab.requestViewport(1024, 702);
+    tab.requestViewport(2560, 1374);
+    try std.testing.expect(tab.applyRequestedViewport());
+    try std.testing.expectEqual(@as(i32, 2560), tab.tab_width);
+    try std.testing.expectEqual(@as(i32, 1374), tab.tab_height);
+    try std.testing.expect(tab.media_environment_dirty and tab.needs_paint);
+
+    tab.media_environment_dirty = false;
+    tab.needs_paint = false;
+    tab.requestViewport(2560, 1374);
+    try std.testing.expect(!tab.applyRequestedViewport());
+    try std.testing.expect(!tab.media_environment_dirty and !tab.needs_paint);
+    // A zero-height content viewport is valid for a window shorter than chrome.
+    tab.requestViewport(2560, 0);
+    try std.testing.expect(tab.applyRequestedViewport());
+    try std.testing.expectEqual(@as(i32, 0), tab.tab_height);
+}
+
+fn expectWidePage(b: *browser.Browser) !void {
+    const tab = b.activeTab().?;
+    try std.testing.expectEqual(@as(i32, 2560), tab.tab_width);
+    try std.testing.expectEqual(@as(i32, 1440 - b.chrome.bottom), tab.tab_height);
+    const frame = tab.root_frame.?;
+    try std.testing.expectEqual(tab.tab_width, frame.viewport_width);
+    try std.testing.expectEqual(tab.tab_height, frame.viewport_height);
+    const doc = frame.documentLayout().?;
+    try std.testing.expectEqual(@as(i32, 2560 - 2 * browser.h_offset - browser.scrollbar_width), doc.width.get().*);
+    const target = resizeTarget(doc.children.items[0]).?;
+    try std.testing.expectEqual(@as(i32, 400), target.width.get().*);
+    try std.testing.expectEqualStrings("green", target.node_ptr.?.element.style.?.getPtr("background-color").?.get().*);
+    try std.testing.expectEqual(2 * doc.x.get().* + doc.width.get().*, 2 * target.x.get().* + target.width.get().*);
+    try std.testing.expect(!doc.layoutNeeded());
+}
+
+test "startup resize survives navigation clearing its queued notification" {
+    const allocator = std.testing.allocator;
+    var environ = std.process.Environ.Map.init(allocator);
+    defer environ.deinit();
+    try environ.put("HOME", "/tmp");
+    const b = try browser.Browser.init(allocator, std.testing.io, &environ, false, true);
+    defer {
+        b.deinit();
+        allocator.destroy(b);
+    }
+    const sdl = @import("sdl");
+    b.window = try sdl.createWindow("startup resize regression", .default, .default, 800, 600, .{ .vis = .hidden, .resizable = true });
+
+    var gate: ResizeGate = .{};
+    try b.session_state.scheduleNetworkTask(gate.task());
+    defer gate.release();
+    gate.entered.waitUncancelable(std.testing.io);
+    try b.newTab(try Url.init(allocator, resize_page));
+    try waitForQueuedNavigation(b.session_state.network_runner.?);
+
+    // Model a tiling manager resizing during the first fetch. No SDL event is
+    // delivered: tick must discover the actual size, and only the last wins.
+    try b.window.?.setSize(.{ .width = 1024, .height = 768 });
+    _ = try b.tick();
+    try b.window.?.setSize(.{ .width = 2560, .height = 1440 });
+    _ = try b.tick();
+    try std.testing.expectEqual(@as(i32, 2560), b.window_width);
+
+    gate.release();
+    try settleBrowser(b);
+    try expectWidePage(b);
+}
+
+test "startup resize survives scheduling a replacement navigation" {
+    const allocator = std.testing.allocator;
+    var environ = std.process.Environ.Map.init(allocator);
+    defer environ.deinit();
+    try environ.put("HOME", "/tmp");
+    const b = try browser.Browser.init(allocator, std.testing.io, &environ, false, true);
+    defer {
+        b.deinit();
+        allocator.destroy(b);
+    }
+    try b.newTab(try Url.init(allocator, resize_page));
+    try settleBrowser(b);
+    const tab = b.activeTab().?;
+
+    var gate: ResizeGate = .{};
+    try tab.task_runner.schedule(gate.task());
+    defer gate.release();
+    gate.entered.waitUncancelable(std.testing.io);
+    try b.resizeViewport(2560, 900);
+    // A height-only final change must select the new media environment too.
+    try b.resizeViewport(2560, 1440);
+    const url = try allocator.create(Url);
+    url.* = Url.init(allocator, resize_page) catch |err| {
+        allocator.destroy(url);
+        return err;
+    };
+    b.scheduleLoad(tab, url, null) catch |err| {
+        url.free(allocator);
+        allocator.destroy(url);
+        return err;
+    };
+
+    gate.release();
+    try settleBrowser(b);
+    try expectWidePage(b);
+
+    // Losing the notification must not strand the old page when the pending
+    // navigation fails before it can install a replacement document.
+    const surviving_frame = tab.root_frame.?;
+    var failure_gate: ResizeGate = .{};
+    try tab.task_runner.schedule(failure_gate.task());
+    defer failure_gate.release();
+    failure_gate.entered.waitUncancelable(std.testing.io);
+    try b.resizeViewport(800, 600);
+    const missing = try allocator.create(Url);
+    missing.* = Url.init(allocator, "file:///dev/null/zibra-missing-resize-page.html") catch |err| {
+        allocator.destroy(missing);
+        return err;
+    };
+    var failure: FailedNavigation = .{ .browser_ptr = b, .tab = tab, .url = missing };
+    // Match scheduleLoad's queue-discard boundary, but capture the deliberate
+    // fetch failure instead of letting the task runner log it as a test error.
+    tab.task_runner.clear();
+    tab.task_runner.schedule(tasks.Task.init(.user_input, "task:test_failed_resize_navigation", &failure, FailedNavigation.run, FailedNavigation.cleanup)) catch |err| {
+        missing.free(allocator);
+        allocator.destroy(missing);
+        return err;
+    };
+    failure_gate.release();
+    failure.returned.waitUncancelable(std.testing.io);
+    try std.testing.expect(failure.failure != null);
+    try settleBrowser(b);
+    try std.testing.expectEqual(surviving_frame, tab.root_frame.?);
+    try std.testing.expectEqual(@as(i32, 800), tab.tab_width);
+    const restored = resizeTarget(surviving_frame.documentLayout().?.children.items[0]).?;
+    try std.testing.expectEqual(@as(i32, 200), restored.width.get().*);
+    try std.testing.expectEqualStrings("red", restored.node_ptr.?.element.style.?.getPtr("background-color").?.get().*);
+}
 
 fn settleBrowser(b: *browser.Browser) !void {
     const deadline = std.Io.Clock.awake.now(std.testing.io).nanoseconds + 10 * std.time.ns_per_s;

@@ -518,20 +518,21 @@ pub fn build(b: *std.Build) !void {
     );
     format_test_step.dependOn(&format_check.step);
 
-    const check_step = b.step(
-        "check",
+    // Language servers may run a step named "check" automatically.
+    const verify_step = b.step(
+        "verify",
         "Run portable build, format, unit, WPT, pipeline, server, and docs checks",
     );
-    check_step.dependOn(b.getInstallStep());
-    check_step.dependOn(&format_check.step);
-    check_step.dependOn(comprehensive_unit_tests);
+    verify_step.dependOn(b.getInstallStep());
+    verify_step.dependOn(&format_check.step);
+    verify_step.dependOn(comprehensive_unit_tests);
     for (focused_test_compilations) |compilation| {
-        check_step.dependOn(compilation);
+        verify_step.dependOn(compilation);
     }
-    check_step.dependOn(dump_dom_test_step);
-    check_step.dependOn(pipeline_test_step);
-    check_step.dependOn(server_test_step);
-    check_step.dependOn(wpt_runner_test_step);
-    check_step.dependOn(wpt_test_step);
-    check_step.dependOn(docs_test_step);
+    verify_step.dependOn(dump_dom_test_step);
+    verify_step.dependOn(pipeline_test_step);
+    verify_step.dependOn(server_test_step);
+    verify_step.dependOn(wpt_runner_test_step);
+    verify_step.dependOn(wpt_test_step);
+    verify_step.dependOn(docs_test_step);
 }

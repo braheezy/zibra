@@ -38,4 +38,4 @@ dependency registration or destruction behavior.
   be rebound or retired before control leaves the mutation transaction.
 - Changes here need direct unit coverage plus regression coverage in each
   consuming subsystem where the lifecycle can differ. Run the relevant focused
-  tests and `zig build check`.
+  tests and `zig build verify`.

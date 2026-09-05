@@ -49,4 +49,4 @@ jobs:
           sudo apt-get install --no-install-recommends --yes libsdl2-dev libsdl2-ttf-dev fonts-dejavu-core
 
       - name: Portable checks
-        run: zig build check
+        run: zig build verify

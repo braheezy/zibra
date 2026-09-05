@@ -181,7 +181,7 @@ modules over forwarding wrappers.
 ## Verification
 
 Run `zig build test-render`, then `zig build test-pipeline` for semantic
-style/layout/display output. Run `zig build check` before handoff and native
+style/layout/display output. Run `zig build verify` before handoff and native
 macOS `zig build test-screenshot` for pixel-sensitive changes. Add a focused
 unit regression for ownership/cleanup and update the relevant
 [manual fixture](../../../tests/manual/README.md) for interaction or visual

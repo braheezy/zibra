@@ -168,6 +168,6 @@ interfaces. Do not create a cycle where helpers import or receive the complete
 
 Run `zig build test-script` while iterating and the relevant
 `test-document`/`test-browser` step for DOM or callback integration. Run
-`zig build check` before handoff. Add a deterministic in-page result and update
+`zig build verify` before handoff. Add a deterministic in-page result and update
 the [manual fixture catalog](../../tests/manual/README.md) for interactive
 JavaScript behavior.

@@ -75,7 +75,7 @@ Use the narrowest relevant step while iterating:
 
 Before handoff, run the relevant broader checks:
 
-- `zig build check` — portable aggregate;
+- `zig build verify` — portable aggregate;
 - `zig build test-pipeline` — exact style/layout/display-list goldens,
   including box model and nested CSS zoom;
 - `zig build test-screenshot` — native macOS visual goldens;

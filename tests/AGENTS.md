@@ -29,7 +29,7 @@ changing coverage. The complete primary-page inventory lives in the
 Focused steps are `test-document`, `test-render`, `test-network`,
 `test-script`, and `test-browser`. Broader steps include:
 
-- `zig build check` — portable aggregate;
+- `zig build verify` — portable aggregate;
 - `zig build test-pipeline` — exact box-model and nested-zoom
   style/layout/display-list goldens;
 - `zig build test-dump-dom` — DOM CLI output;

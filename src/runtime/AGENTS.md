@@ -37,4 +37,4 @@ priority, or trace ownership.
   that can borrow them has stopped.
 - Add focused concurrency tests that force the ordering being changed; do not
   rely on sleeps or process exit as proof of safety. Run the consuming focused
-  test and `zig build check`.
+  test and `zig build verify`.

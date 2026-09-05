@@ -128,6 +128,12 @@ batch can be consumed or destroyed.
 
 ## Root document replacement
 
+Queued resize notifications may be discarded with document work, but each
+Tab's atomic latest-viewport mailbox survives queue clearing. Consume it before
+initializing the replacement Frame's viewport, and reconcile again at render
+boundaries for changes arriving during resource loading. A failed navigation
+must still deliver pending viewport state to the surviving document.
+
 A successful root navigation transaction follows this order:
 
 1. keep the old Frame URL/document alive while deriving Referer policy and
@@ -213,8 +219,11 @@ generation. Rules and declaration slices borrow those texts. Stage and validate
 the complete replacement before retiring the old generation.
 
 Media-environment changes rebuild all retained author sheets on the serialized
-render path, then dirty computed style. Root media width/height are native
-content-viewport dimensions divided by accessibility zoom. Iframe media
+render path, then dirty both computed style and the Frame document phase guard.
+This also applies when the resize preceded a new Frame's first style pass;
+dirty DOM fields alone must never reach layout through a clean document gate.
+Root media width/height are native content-viewport dimensions divided by
+accessibility zoom. Iframe media
 dimensions divide authored-zoom-scaled published geometry by the inherited
 authored factor. Changes to either axis or that inherited factor dirty child
 layout and schedule the follow-up media/style pass; a height-only resize must

@@ -62,7 +62,7 @@ zig build test-browser
 # Compare deterministic style, layout, and display-list output
 zig build test-pipeline
 # Run every portable build, test, formatting, pipeline, server, and docs check
-zig build check
+zig build verify
 # Capture and compare the windowless macOS screenshot fixtures
 zig build test-screenshot
 # Inspect a large-screen layout instead of the default 800x600 capture

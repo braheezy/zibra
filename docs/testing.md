@@ -62,11 +62,14 @@ Run from the repository root:
   message, or persistence changes (the underlying direct unittest command is
   `python3 -m unittest tests/test_server_message_board.py`).
 
-`zig build check` is the agent-oriented portable aggregate: build/install,
+`zig build verify` is the agent-oriented portable aggregate: build/install,
 format checking, the unified unit suite, focused-root compilation, DOM and
 pipeline goldens, local WPT runner/protocol checks, server tests, and Markdown
 links. Native visual goldens remain separate because they are
 platform-dependent.
+
+The aggregate is intentionally not named `check`: language servers may run
+that step automatically, which would launch the full test suite on edits.
 
 For document-pipeline changes, run `test-pipeline`; use
 `tests/manual/dump-pipeline.html` interactively when diagnosing a stage not

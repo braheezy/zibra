@@ -111,4 +111,4 @@ before changing networking dispatch or teardown.
   an HttpOnly entry.
 - Add data/file tests for ownership changes; use a local fixture/server for
   HTTP, redirects, cookies, compression, or CSP behavior. Run
-  `zig build test-network` while iterating and `zig build check` before handoff.
+  `zig build test-network` while iterating and `zig build verify` before handoff.

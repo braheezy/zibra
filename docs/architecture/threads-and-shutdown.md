@@ -23,8 +23,11 @@ The UI tick samples the native window size as well as accepting SDL size
 events, so startup/fullscreen event coalescing cannot leave an old document
 viewport installed. `Browser.resizeViewport` allocates all replacement native
 or windowless presentation targets before retiring the previous generation.
-It then queues scalar, generation-stamped dimensions to every Tab; it never
-changes worker-owned DOM/layout state on the UI thread.
+It publishes the latest content dimensions into each Tab's atomic viewport
+mailbox, then queues a resize wake-up. The dimensions are one coherent packed
+width/height pair, not owned by the disposable task. Navigation queue clearing
+cannot erase them, and an old wake-up always consumes the latest pair. Only
+the Tab worker applies it to DOM/layout state.
 
 ### Tab worker
 
@@ -33,6 +36,13 @@ JavaScript, DOM mutation, style, layout, paint, focus, and most page input run
 there. Queued work that can cross a document replacement carries a copied
 `DocumentHandle` `(window_id, document_generation)`, not a `*Frame`, `*Node`,
 or callback-context pointer.
+
+Viewport requests belong to the Tab lifetime, not a document generation.
+The worker reconciles them before constructing a replacement root Frame,
+before the animation-frame dirty gate, and before a direct render. A request
+arriving during a failed navigation also schedules reflow of the surviving
+page. Equal dimensions are a no-op; width and height changes invalidate media
+selection and retained layout through the existing resize boundary.
 
 ### Raster-and-draw worker
 
