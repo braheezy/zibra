@@ -1,18 +1,10 @@
 # zibra
 
-This repo holds my Zig code for the browser implemented in [Web Browser Engineering](https://browser.engineering/).
+A web browser, almost written in pure Zig.
 
-Where possible, this project takes the most difficult route possible to implement features that are implemented quite easily in the book. The book benefits from Python and mature third-party libraries and bindings. We get no such benefits.
+The core of the implementation was built by following the [Web Browser Engineering](https://browser.engineering/) book.
 
-[Acid1:](https://www.w3.org/Style/CSS/Test/CSS1/current/test5526c.htm)
-![acid1](./docs/images/acid1.png)
-
-[Acid2:](http://acid2.acidtests.org/#top)
-![acid2](./docs/images/acid2.png)
-
-[Acid3:](http://acid3.acidtests.org/)
-
-![acid3](./docs/images/acid3.png)
+![wiki](./docs/images/wikipedia.png)
 
 ## Usage
 
@@ -72,29 +64,16 @@ zig build run -- --screenshot /tmp/acid3-slice.png --screenshot-after-ms 3000 \
   https://acid3.acidtests.org/
 ```
 
-See [Testing and verification](docs/testing.md) for the focused-test map,
-golden policy, native visual checks, and manual-fixture catalog.
-
-To test chunked gzip responses, run `gzipServer.py` locally.
-
-The tutorial server is now a small topic-based message board. Start it with:
-
-```sh
-python3 server.py
-```
-
-Then open `http://127.0.0.1:8005/`. Sign in with one of the tutorial accounts
-(for example `a` / `b`) to create topics and post messages. Each topic has its
-own root-level URL, such as `/cooking` or `/cars`. The server atomically saves
-the whole board to `message_board.json`, so topics and messages survive a
-restart. Set `ZIBRA_BOARD_DATA` to use a different data-file path:
-
-```sh
-ZIBRA_BOARD_DATA=/path/to/my-board.json python3 server.py
-```
-
 See [Architecture and lifetimes](docs/architecture-and-lifetimes.md) for the source map, ownership contracts, threading model, and known lifetime risks.
 
-## Known Issues
+## [Acid Tests](https://www.acidtests.org/)
 
-- On Mac, the content is stretched while the window is being resized. Apparently this is known behavior in SDL2 because Mac blocks the main thread while the mouse is being held down to resize windows, preventing SDL from rendering the content properly...I think.
+[Acid1:](https://www.w3.org/Style/CSS/Test/CSS1/current/test5526c.htm)
+![acid1](./docs/images/acid1.png)
+
+[Acid2:](http://acid2.acidtests.org/#top)
+![acid2](./docs/images/acid2.png)
+
+[Acid3:](http://acid3.acidtests.org/)
+
+![acid3](./docs/images/acid3.png)
