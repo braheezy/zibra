@@ -22,9 +22,10 @@ const chrome_row_height: i32 = 33;
 const control_height: i32 = 24;
 const control_width: i32 = 32;
 const toolbar_padding_left: i32 = 6;
-const control_gap: i32 = 2;
+const bookmark_gap: i32 = 8;
 const address_gap: i32 = 8;
 const tab_width: i32 = 112;
+const tab_close_size: i32 = 18;
 
 const palette = struct {
     const tabbar = Color{ .r = 190, .g = 190, .b = 190, .a = 255 };
@@ -32,13 +33,20 @@ const palette = struct {
     const active_tab = Color{ .r = 248, .g = 247, .b = 242, .a = 255 };
     const inactive_tab = Color{ .r = 190, .g = 190, .b = 190, .a = 255 };
     const control = Color{ .r = 224, .g = 224, .b = 224, .a = 255 };
+    const control_hover = Color{ .r = 232, .g = 232, .b = 232, .a = 255 };
+    const control_pressed = Color{ .r = 178, .g = 178, .b = 178, .a = 255 };
     const control_disabled = Color{ .r = 196, .g = 196, .b = 196, .a = 255 };
     const address = Color{ .r = 250, .g = 249, .b = 244, .a = 255 };
+    const address_focus = Color{ .r = 255, .g = 255, .b = 252, .a = 255 };
     const ink = Color{ .r = 42, .g = 42, .b = 42, .a = 255 };
     const muted_ink = Color{ .r = 116, .g = 116, .b = 116, .a = 255 };
     const shadow = Color{ .r = 104, .g = 104, .b = 104, .a = 255 };
+    const tab_separator = Color{ .r = 166, .g = 166, .b = 166, .a = 255 };
+    const tab_hover = Color{ .r = 215, .g = 214, .b = 208, .a = 255 };
+    const tab_pressed = Color{ .r = 178, .g = 178, .b = 172, .a = 255 };
     const highlight = Color{ .r = 255, .g = 255, .b = 255, .a = 255 };
     const accent = Color{ .r = 49, .g = 93, .b = 156, .a = 255 };
+    const accent_hover = Color{ .r = 65, .g = 108, .b = 170, .a = 255 };
 };
 
 // Chrome represents the browser UI (tab bar, buttons, etc.). Its widget
@@ -56,6 +64,7 @@ back_rect: Rect = undefined,
 forward_rect: Rect = undefined,
 bookmark_rect: Rect = undefined,
 address_rect: Rect = undefined,
+clear_address_rect: Rect = undefined,
 bottom: i32 = 0,
 // Address bar editing state
 focus: ?[]const u8 = null,
@@ -66,6 +75,8 @@ address_cursor: usize = 0,
 allocator: std.mem.Allocator = undefined,
 font_manager: font.FontManager = undefined,
 display_list: ?[]DisplayItem = null,
+hovered_action: ?ChromeAction = null,
+pressed_action: ?ChromeAction = null,
 
 pub fn init(
     io: std.Io,
@@ -99,16 +110,22 @@ pub fn init(
 
 fn updateGeometry(self: *Chrome, window_width: i32) void {
     const toolbar_top = chrome_row_height + @divTrunc(chrome_row_height - control_height, 2);
-    const button_step = control_width + control_gap;
+    const navigation_step = control_width;
     self.newtab_rect = .{ .left = toolbar_padding_left, .top = 4, .right = toolbar_padding_left + control_width, .bottom = 4 + control_height };
     self.back_rect = .{ .left = toolbar_padding_left, .top = toolbar_top, .right = toolbar_padding_left + control_width, .bottom = toolbar_top + control_height };
-    self.forward_rect = .{ .left = toolbar_padding_left + button_step, .top = toolbar_top, .right = toolbar_padding_left + button_step + control_width, .bottom = toolbar_top + control_height };
-    self.bookmark_rect = .{ .left = toolbar_padding_left + 2 * button_step, .top = toolbar_top, .right = toolbar_padding_left + 2 * button_step + control_width, .bottom = toolbar_top + control_height };
+    self.forward_rect = .{ .left = toolbar_padding_left + navigation_step, .top = toolbar_top, .right = toolbar_padding_left + navigation_step + control_width, .bottom = toolbar_top + control_height };
+    self.bookmark_rect = .{ .left = self.forward_rect.right + bookmark_gap, .top = toolbar_top, .right = self.forward_rect.right + bookmark_gap + control_width, .bottom = toolbar_top + control_height };
     self.address_rect = .{
         .left = self.bookmark_rect.right + address_gap,
         .top = toolbar_top,
         .right = @max(self.bookmark_rect.right + address_gap, window_width - browser.scrollbar_width - 2 * browser.h_offset),
         .bottom = toolbar_top + control_height,
+    };
+    self.clear_address_rect = .{
+        .left = @max(self.address_rect.left, self.address_rect.right - 26),
+        .top = self.address_rect.top + 3,
+        .right = self.address_rect.right - 5,
+        .bottom = self.address_rect.bottom - 3,
     };
 }
 
@@ -247,14 +264,32 @@ fn tabRect(self: *const Chrome, i: usize) Rect {
     };
 }
 
+fn tabCloseRect(self: *const Chrome, i: usize) Rect {
+    const tab = self.tabRect(i);
+    const center_x = tab.right - 15;
+    const center_y = @divTrunc(tab.top + tab.bottom, 2);
+    return .{
+        .left = center_x - @divTrunc(tab_close_size, 2),
+        .top = center_y - @divTrunc(tab_close_size, 2),
+        .right = center_x + @divTrunc(tab_close_size, 2),
+        .bottom = center_y + @divTrunc(tab_close_size, 2),
+    };
+}
+
 const ChromeAction = union(enum) {
     new_tab,
     back,
     forward,
     bookmark,
     address,
+    clear_address,
+    close_tab: usize,
     tab: usize,
 };
+
+fn actionsEqual(left: ?ChromeAction, right: ?ChromeAction) bool {
+    return std.meta.eql(left, right);
+}
 
 const ButtonKind = enum {
     plus,
@@ -315,6 +350,28 @@ fn appendBeveledBox(
     try appendLine(self.allocator, commands, rect.left, rect.top, rect.left, rect.bottom - 1, top_left, 1);
     try appendLine(self.allocator, commands, rect.left, rect.bottom - 1, rect.right - 1, rect.bottom - 1, bottom_right, 1);
     try appendLine(self.allocator, commands, rect.right - 1, rect.top, rect.right - 1, rect.bottom - 1, bottom_right, 1);
+}
+
+fn appendConnectedTab(
+    self: *const Chrome,
+    commands: *std.ArrayList(DisplayItem),
+    rect: Rect,
+    fill: Color,
+) !void {
+    try appendRect(self.allocator, commands, rect, fill);
+    try appendLine(self.allocator, commands, rect.left, rect.top, rect.right - 1, rect.top, palette.highlight, 1);
+    try appendLine(self.allocator, commands, rect.left, rect.top, rect.left, rect.bottom - 1, palette.highlight, 1);
+    try appendLine(self.allocator, commands, rect.right - 1, rect.top, rect.right - 1, rect.bottom - 1, palette.shadow, 1);
+}
+
+fn appendQuietTab(
+    self: *const Chrome,
+    commands: *std.ArrayList(DisplayItem),
+    rect: Rect,
+    fill: Color,
+) !void {
+    try appendRect(self.allocator, commands, rect, fill);
+    try appendLine(self.allocator, commands, rect.right - 1, rect.top + 6, rect.right - 1, rect.bottom - 3, palette.tab_separator, 1);
 }
 
 fn appendText(
@@ -395,6 +452,15 @@ fn appendBookmark(self: *const Chrome, commands: *std.ArrayList(DisplayItem), re
     try appendLine(self.allocator, commands, right, bottom, @divTrunc(left + right, 2), bottom - 4, color, 2);
 }
 
+fn appendClose(self: *const Chrome, commands: *std.ArrayList(DisplayItem), rect: Rect, color: Color) !void {
+    const left = rect.left + 5;
+    const right = rect.right - 5;
+    const top = rect.top + 5;
+    const bottom = rect.bottom - 5;
+    try appendLine(self.allocator, commands, left, top, right, bottom, color, 1);
+    try appendLine(self.allocator, commands, right, top, left, bottom, color, 1);
+}
+
 fn appendLock(self: *const Chrome, commands: *std.ArrayList(DisplayItem), rect: Rect, color: Color) !void {
     const body = Rect{
         .left = rect.left + 2,
@@ -416,9 +482,26 @@ fn appendButton(
     enabled: bool,
     selected: bool,
 ) !void {
-    const fill = if (!enabled) palette.control_disabled else if (selected) palette.accent else palette.control;
+    const action: ChromeAction = switch (kind) {
+        .plus => .new_tab,
+        .back => .back,
+        .forward => .forward,
+        .bookmark => .bookmark,
+    };
+    const hovered = actionsEqual(self.hovered_action, action);
+    const pressed = actionsEqual(self.pressed_action, action);
+    const fill = if (!enabled)
+        palette.control_disabled
+    else if (selected)
+        palette.accent
+    else if (pressed)
+        palette.control_pressed
+    else if (hovered)
+        palette.control_hover
+    else
+        palette.control;
     const ink = if (!enabled) palette.muted_ink else if (selected) palette.highlight else palette.ink;
-    try appendBeveledBox(self, commands, rect, fill, true);
+    try appendBeveledBox(self, commands, rect, fill, !pressed);
     switch (kind) {
         .plus => try appendPlus(self, commands, rect, ink),
         .back => try appendChevron(self, commands, rect, ink, false),
@@ -430,23 +513,38 @@ fn appendButton(
 fn paintTab(self: *Chrome, commands: *std.ArrayList(DisplayItem), b: *const Browser, index: usize) !void {
     const rect = self.tabRect(index);
     const active = b.active_tab_index != null and b.active_tab_index.? == index;
+    const action: ChromeAction = .{ .tab = index };
+    const close_action: ChromeAction = .{ .close_tab = index };
+    const show_close = b.tabs.items.len > 1 and
+        (active or actionsEqual(self.hovered_action, action) or actionsEqual(self.hovered_action, close_action));
+    const hovered = actionsEqual(self.hovered_action, action) or actionsEqual(self.hovered_action, close_action);
+    const pressed = actionsEqual(self.pressed_action, action) or actionsEqual(self.pressed_action, close_action);
     const panel = Rect{
         .left = rect.left,
-        .top = rect.top + 2,
+        .top = if (active) rect.top + 1 else rect.top + 2,
         .right = rect.right,
-        .bottom = rect.bottom,
+        .bottom = if (active) rect.bottom + 1 else rect.bottom,
     };
-    try appendBeveledBox(self, commands, panel, if (active) palette.active_tab else palette.inactive_tab, active);
+    if (active) {
+        try appendConnectedTab(self, commands, panel, palette.active_tab);
+    } else if (pressed) {
+        try appendBeveledBox(self, commands, panel, palette.tab_pressed, false);
+    } else if (hovered) {
+        try appendBeveledBox(self, commands, panel, palette.tab_hover, true);
+    } else {
+        try appendQuietTab(self, commands, panel, palette.inactive_tab);
+    }
     var fallback: [32]u8 = undefined;
     const fallback_title = std.fmt.bufPrint(&fallback, "Tab {d}", .{index}) catch "Tab";
     const title = if (b.tabs.items[index].title) |value| if (value.len > 0) value else fallback_title else fallback_title;
+    const title_right = if (show_close) self.tabCloseRect(index).left - 3 else rect.right - 9;
     _ = try appendText(
         self,
         commands,
         title,
         rect.left + 9,
         rect.top + 3,
-        rect.right - 9,
+        title_right,
         rect.height() - 5,
         self.font_size,
         .proportional,
@@ -454,13 +552,20 @@ fn paintTab(self: *Chrome, commands: *std.ArrayList(DisplayItem), b: *const Brow
         if (active) palette.accent else palette.ink,
         true,
     );
+    if (show_close) {
+        const close_hovered = actionsEqual(self.hovered_action, close_action);
+        const close_pressed = actionsEqual(self.pressed_action, close_action);
+        const close_color = if (close_pressed) palette.accent else if (close_hovered) palette.ink else palette.muted_ink;
+        try appendClose(self, commands, self.tabCloseRect(index), close_color);
+    }
 }
 
 fn paintAddress(self: *Chrome, commands: *std.ArrayList(DisplayItem), b: *const Browser) !void {
     const focused = self.isAddressBarFocused();
-    const fill = if (focused) palette.highlight else palette.address;
-    const border = if (focused) palette.accent else palette.shadow;
-    try appendBeveledBox(self, commands, self.address_rect, fill, false);
+    const fill = if (focused) palette.address_focus else palette.address;
+    const hovered = actionsEqual(self.hovered_action, .address);
+    const border = if (focused) palette.accent else if (hovered) palette.ink else palette.shadow;
+    try appendRect(self.allocator, commands, self.address_rect, fill);
     const text = if (focused) self.address_bar.items else b.active_tab_url orelse "";
     var text_left = self.address_rect.left + 7;
     if (!focused and shouldShowPadlock(
@@ -476,20 +581,71 @@ fn paintAddress(self: *Chrome, commands: *std.ArrayList(DisplayItem), b: *const 
         }, palette.accent);
         text_left += 16;
     }
-    _ = try appendText(
-        self,
-        commands,
-        text,
-        text_left,
-        self.address_rect.top,
-        self.address_rect.right - 7,
-        self.address_rect.height(),
-        self.font_size,
-        .monospace,
-        .Normal,
-        palette.ink,
-        true,
-    );
+    const has_clear = focused and text.len > 0;
+    const text_right = if (has_clear) self.clear_address_rect.left - 4 else self.address_rect.right - 7;
+    if (!focused) {
+        if (std.mem.indexOf(u8, text, "://")) |separator| {
+            const scheme_end = separator + 3;
+            text_left = try appendText(
+                self,
+                commands,
+                text[0..scheme_end],
+                text_left,
+                self.address_rect.top,
+                text_right,
+                self.address_rect.height(),
+                self.font_size,
+                .proportional,
+                .Normal,
+                palette.muted_ink,
+                true,
+            );
+            _ = try appendText(
+                self,
+                commands,
+                text[scheme_end..],
+                text_left,
+                self.address_rect.top,
+                text_right,
+                self.address_rect.height(),
+                self.font_size,
+                .proportional,
+                .Normal,
+                palette.ink,
+                true,
+            );
+        } else {
+            _ = try appendText(
+                self,
+                commands,
+                text,
+                text_left,
+                self.address_rect.top,
+                text_right,
+                self.address_rect.height(),
+                self.font_size,
+                .proportional,
+                .Normal,
+                palette.ink,
+                true,
+            );
+        }
+    } else {
+        _ = try appendText(
+            self,
+            commands,
+            text,
+            text_left,
+            self.address_rect.top,
+            text_right,
+            self.address_rect.height(),
+            self.font_size,
+            .proportional,
+            .Normal,
+            palette.ink,
+            true,
+        );
+    }
     if (focused) {
         std.debug.assert(self.address_cursor <= self.address_bar.items.len);
         const prefix = self.address_bar.items[0..self.address_cursor];
@@ -499,15 +655,21 @@ fn paintAddress(self: *Chrome, commands: *std.ArrayList(DisplayItem), b: *const 
             prefix,
             text_left,
             self.address_rect.top,
-            self.address_rect.right - 7,
+            text_right,
             self.address_rect.height(),
             self.font_size,
-            .monospace,
+            .proportional,
             .Normal,
             palette.accent,
             false,
         );
         try appendLine(self.allocator, commands, cursor_x, self.address_rect.top + 3, cursor_x, self.address_rect.bottom - 3, palette.accent, 1);
+        if (has_clear) {
+            const clear_hovered = actionsEqual(self.hovered_action, .clear_address);
+            const clear_pressed = actionsEqual(self.pressed_action, .clear_address);
+            const clear_color = if (clear_pressed) palette.accent else if (clear_hovered) palette.ink else palette.muted_ink;
+            try appendClose(self, commands, self.clear_address_rect, clear_color);
+        }
     }
     const border_thickness: i32 = if (focused) 2 else 1;
     try appendLine(self.allocator, commands, self.address_rect.left, self.address_rect.top, self.address_rect.right - 1, self.address_rect.top, border, border_thickness);
@@ -575,6 +737,16 @@ fn rebuildDisplayList(self: *Chrome, b: *const Browser) !void {
         active_tab != null and active_tab.?.canGoForward(),
         false,
     );
+    try appendLine(
+        self.allocator,
+        &commands,
+        self.forward_rect.left,
+        self.forward_rect.top + 2,
+        self.forward_rect.left,
+        self.forward_rect.bottom - 3,
+        palette.shadow,
+        1,
+    );
     try appendButton(self, &commands, self.bookmark_rect, .bookmark, true, b.activePageIsBookmarked());
     try self.paintAddress(&commands, b);
 
@@ -593,11 +765,44 @@ fn actionAt(self: *const Chrome, b: *const Browser, x: i32, y: i32) ?ChromeActio
     if (self.back_rect.containsPoint(x, y)) return .back;
     if (self.forward_rect.containsPoint(x, y)) return .forward;
     if (self.bookmark_rect.containsPoint(x, y)) return .bookmark;
-    if (self.address_rect.containsPoint(x, y)) return .address;
+    if (self.address_rect.containsPoint(x, y)) {
+        if (self.isAddressBarFocused() and self.address_bar.items.len > 0 and
+            self.clear_address_rect.containsPoint(x, y)) return .clear_address;
+        return .address;
+    }
     for (0..b.tabs.items.len) |index| {
-        if (self.tabRect(index).containsPoint(x, y)) return .{ .tab = index };
+        if (self.tabRect(index).containsPoint(x, y)) {
+            if (b.tabs.items.len > 1 and self.tabCloseRect(index).containsPoint(x, y)) {
+                return .{ .close_tab = index };
+            }
+            return .{ .tab = index };
+        }
     }
     return null;
+}
+
+/// Update the chrome pointer target and report whether the visual state changed.
+/// Coordinates are native-window coordinates owned by the UI thread.
+pub fn pointerMove(self: *Chrome, b: *const Browser, x: i32, y: i32) bool {
+    const next = self.actionAt(b, x, y);
+    if (actionsEqual(self.hovered_action, next)) return false;
+    self.hovered_action = next;
+    return true;
+}
+
+/// Begin a pressed visual state for the widget under the pointer.
+pub fn pointerDown(self: *Chrome, b: *const Browser, x: i32, y: i32) bool {
+    const next = self.actionAt(b, x, y);
+    if (actionsEqual(self.pressed_action, next)) return false;
+    self.pressed_action = next;
+    return true;
+}
+
+/// Clear the pressed visual state after a mouse button is released.
+pub fn pointerUp(self: *Chrome) bool {
+    if (self.pressed_action == null) return false;
+    self.pressed_action = null;
+    return true;
 }
 
 fn activateAction(self: *Chrome, b: *Browser, action: ChromeAction) !bool {
@@ -625,6 +830,13 @@ fn activateAction(self: *Chrome, b: *Browser, action: ChromeAction) !bool {
             self.focusAddressBar();
             return true;
         },
+        .clear_address => {
+            self.focus = "address bar";
+            self.address_bar.clearRetainingCapacity();
+            self.address_cursor = 0;
+            return true;
+        },
+        .close_tab => |index| return b.closeTab(index),
         .tab => |index| {
             if (index >= b.tabs.items.len) return false;
             if (b.active_tab_index == null or b.active_tab_index.? != index) {
