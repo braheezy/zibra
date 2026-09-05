@@ -1,0 +1,8 @@
+# Small, unchanged upstream cases exercising all three conformance adapters.
+# These static visual/crash cases need no testdriver or test-wait automation.
+tests:
+  - dom/nodes/Element-firstElementChild.html
+reftests:
+  - css/CSS2/backgrounds/background-color-174.xht
+crashtests:
+  - css/css-flexbox/flex-shrink-large-value-crash.html

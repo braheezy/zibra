@@ -4,8 +4,10 @@
 from __future__ import annotations
 
 import argparse
-import json
 import pathlib
+
+from protocol import parse_json_record
+from diagnostics import analyze_testharness
 
 
 def main() -> int:
@@ -15,14 +17,13 @@ def main() -> int:
         "--status", required=True, choices=("PASS", "FAIL", "ERROR", "TIMEOUT")
     )
     parser.add_argument("--test-suffix", required=True)
+    parser.add_argument("--stderr", type=pathlib.Path)
+    parser.add_argument("--diagnostic-reason")
+    parser.add_argument("--error-kind")
+    parser.add_argument("--partial-subtests", type=int)
     args = parser.parse_args()
 
-    lines = args.result.read_text(encoding="utf-8").splitlines()
-    if len(lines) != 1 or not lines[0].strip():
-        raise ValueError(f"expected exactly one JSONL record, found {len(lines)}")
-    record = json.loads(lines[0])
-    if not isinstance(record, dict):
-        raise ValueError("WPT result must be a JSON object")
+    record = parse_json_record(args.result.read_text(encoding="utf-8"))
 
     protocol_version = record.get("protocol_version")
     if type(protocol_version) is not int or protocol_version != 1:
@@ -38,6 +39,20 @@ def main() -> int:
         raise ValueError("tests must be an array")
     if not isinstance(record.get("console"), list):
         raise ValueError("console must be an array")
+    if args.stderr is not None:
+        diagnostics = analyze_testharness(
+            args.test_suffix, record["test"], args.stderr.read_text(encoding="utf-8"), record,
+        )
+        if args.diagnostic_reason is not None and diagnostics["reason"] != args.diagnostic_reason:
+            raise ValueError(f"expected diagnosis {args.diagnostic_reason}, got {diagnostics}")
+        if args.error_kind is not None and not any(
+            error.get("error_kind") == args.error_kind for error in diagnostics["script_errors"]
+        ):
+            raise ValueError(f"missing script error {args.error_kind}: {diagnostics}")
+        if args.partial_subtests is not None and diagnostics["completed_subtests_observed"] != args.partial_subtests:
+            raise ValueError(f"expected {args.partial_subtests} observed subtests, got {diagnostics}")
+        if args.status == "PASS" and diagnostics["script_errors"]:
+            raise ValueError(f"caught exceptions should not become uncaught diagnostics: {diagnostics}")
     return 0
 
 

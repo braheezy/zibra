@@ -39,9 +39,10 @@ queued work and shutdown are documented in
   and call heap-stable narrow host interfaces embedded in `Js`.
   Network parent-window calls are same-origin-only and limited to the
   compatibility `notify(string)` callback; they do not expose parent DOM.
-- `wpt_bindings.zig` exposes only a bootstrap-time enablement check and a
-  synchronous serialized-result sink. It neither owns WPT session state nor
-  decides browser deadlines, process health, or manifest expectations.
+- `wpt_bindings.zig` exposes bootstrap-time enablement, a synchronous result
+  sink, and each Realm's bounded stderr diagnostic log. Diagnostics retain no
+  borrowed source or Kiesel value and never decide terminal results, browser
+  deadlines, process health, or manifest expectations.
 - `native_bindings.zig` installs comptime binding tables; `transitions.zig`
   parses and starts typed DOM transitions.
 
@@ -108,8 +109,9 @@ queued work and shutdown are documented in
 - WPT reporting runs synchronously under `JsLock`. The JSON slice is temporary,
   so the receiver may only copy it into its own result owner and signal that
   owner; it must not retain the slice, re-enter `Js`, touch DOM/Frame state, or
-  block teardown. The first bridge is top-level and result-only; see the
-  architecture document for unsupported diagnostics and completion semantics.
+  block teardown. The bridge is top-level; its separate bounded diagnostic
+  stream cannot override a harness result. See the architecture document for
+  unsupported diagnostics and completion semantics.
 - HTML fragments parsed for `innerHTML` are not document-parser input. Mark
   every script in such a fragment inert before installing its child storage;
   resource refresh must not turn serialized or newly parsed fragment scripts

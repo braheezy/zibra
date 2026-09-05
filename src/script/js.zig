@@ -259,6 +259,7 @@ const WindowRealm = struct {
     document_ready_state_callback: DocumentReadyStateCallback,
     document_write_callback: DocumentWriteCallback,
     wpt_report_callback: WptReportCallback,
+    wpt_diagnostics: wpt_bindings.DiagnosticLog = .{},
     // This may borrow a stack-bound live parser, so it is installed only for
     // direct parser-blocking evaluation and cleared before that parser yields.
     node_relocation_observer: ?NodeRelocationObserver,
@@ -377,6 +378,7 @@ pub fn init(
         .context = self,
         .allocator = allocator,
         .enabled = wptBindingEnabled,
+        .diagnostic = diagnosticBindingWpt,
         .report = reportBindingWpt,
     };
     self.windows = std.AutoHashMap(u32, *WindowRealm).init(storage_allocator);
@@ -616,18 +618,32 @@ fn translateExecutionError(self: *Js, err: Agent.Error) anyerror {
 /// re-enter this host must leave the checkpoint to their outer entry point.
 fn microtaskCheckpointLocked(self: *Js) !void {
     self.agent.drainJobQueue();
-    if (self.agent.takeExecutionInterrupt()) return error.ExecutionInterrupted;
+    if (self.agent.takeExecutionInterrupt()) {
+        self.observeWptScriptErrorLocked("microtask checkpoint", error.ExecutionInterrupted);
+        return error.ExecutionInterrupted;
+    }
 }
 
 /// Finish an abruptly completed outer turn without leaving Kiesel exception
 /// state installed while Promise jobs run. The public API still reports an
 /// ordinary page exception as `ExceptionThrown`; host interruption wins.
-fn finishOuterTurnErrorLocked(self: *Js, err: anyerror) anyerror {
+fn finishOuterTurnErrorLocked(self: *Js, err: anyerror, source: []const u8) anyerror {
     if (err != error.ExceptionThrown) return err;
-    if (self.agent.takeExecutionInterrupt()) return error.ExecutionInterrupted;
+    if (self.agent.takeExecutionInterrupt()) {
+        self.observeWptScriptErrorLocked(source, error.ExecutionInterrupted);
+        return error.ExecutionInterrupted;
+    }
+    self.observeWptScriptErrorLocked(source, err);
     _ = self.agent.clearException();
     self.microtaskCheckpointLocked() catch |checkpoint_err| return checkpoint_err;
     return error.ExceptionThrown;
+}
+
+fn observeWptScriptErrorLocked(self: *Js, source: []const u8, err: anyerror) void {
+    const window_id = self.current_window_id orelse return;
+    const window = self.windows.get(window_id) orelse return;
+    if (window.retired or window.wpt_report_callback.function == null) return;
+    window.wpt_diagnostics.scriptError(self.allocator, &self.agent, source, err);
 }
 
 /// Initialize the page-visible runtime inside an already active, live Realm.
@@ -667,25 +683,37 @@ fn ensureRuntimeInitializedLocked(
 }
 
 pub fn evaluate(self: *Js, window_id: u32, code: []const u8) !Value {
+    return self.evaluateNamed(window_id, code, "zibra-script");
+}
+
+/// Evaluate in a live Realm with a callback-scoped diagnostic source label.
+/// Neither the diagnostic log nor WindowRealm retains the label or code.
+pub fn evaluateNamed(self: *Js, window_id: u32, code: []const u8, source: []const u8) !Value {
     self.lock.lock();
     defer self.lock.unlock();
     const active = try self.activateWindowLocked(window_id);
     defer active.restore();
     const window = active.window;
     if (window.retired) return error.InertWindow;
-    try self.ensureRuntimeInitializedLocked(window_id, window);
+    self.ensureRuntimeInitializedLocked(window_id, window) catch |err| {
+        self.observeWptScriptErrorLocked("zibra-runtime", err);
+        return err;
+    };
     try self.setActiveWindow(window_id, window);
     if (!window.named_globals_synced) try self.syncNamedIdGlobals(window_id, window);
 
     // Now evaluate the user's code
-    const script = try Script.parse(
+    const script = Script.parse(
         code,
         window.realm,
         null,
         .{},
-    );
+    ) catch |err| {
+        self.observeWptScriptErrorLocked(source, err);
+        return err;
+    };
     const result = script.evaluate("zibra-script") catch |err| {
-        return self.finishOuterTurnErrorLocked(err);
+        return self.finishOuterTurnErrorLocked(err, source);
     };
     try self.microtaskCheckpointLocked();
     return result;
@@ -1249,6 +1277,14 @@ fn reportBindingWpt(context: ?*anyopaque, report_json: []const u8) anyerror!void
     try callback(window.wpt_report_callback.context, report_json);
 }
 
+fn diagnosticBindingWpt(context: ?*anyopaque, json: []const u8) anyerror!void {
+    const self = hostFromBindingContext(context);
+    const window_id = self.current_window_id orelse return;
+    const window = self.windows.get(window_id) orelse return;
+    if (window.retired or window.wpt_report_callback.function == null) return;
+    window.wpt_diagnostics.emit(json);
+}
+
 fn sendBindingXhr(
     context: ?*anyopaque,
     method: []const u8,
@@ -1449,7 +1485,7 @@ pub fn dispatchLifecycleEvent(
     };
     const event_value = try self.stringToJsValue(event_name);
     _ = dispatch_value.call(&self.agent, .undefined, &.{event_value}) catch |err| {
-        const turn_err = self.finishOuterTurnErrorLocked(err);
+        const turn_err = self.finishOuterTurnErrorLocked(err, event_name);
         if (turn_err == error.ExceptionThrown) {
             std.log.warn("Lifecycle {s} listener threw; continuing document lifecycle", .{@tagName(event)});
             return;
@@ -1516,7 +1552,7 @@ pub fn dispatchInlineEvent(
         error.OutOfMemory => return err,
     };
     const result = script.evaluate("zibra-inline-event") catch |err| {
-        const turn_err = self.finishOuterTurnErrorLocked(err);
+        const turn_err = self.finishOuterTurnErrorLocked(err, "inline event handler");
         if (turn_err == error.ExceptionThrown) {
             std.log.warn("Inline {s} handler threw; continuing event delivery", .{event_type});
             return true;
@@ -1553,7 +1589,7 @@ pub fn dispatchEventWithBubbles(
         event_type,
         node,
         bubbles,
-    ) catch |err| return self.finishOuterTurnErrorLocked(err);
+    ) catch |err| return self.finishOuterTurnErrorLocked(err, event_type);
     try self.microtaskCheckpointLocked();
     return result;
 }
@@ -1688,7 +1724,7 @@ pub fn dispatchPostMessage(
     }
 
     self.dispatchMessageImpl(window, message, origin, source_window_id, window_id) catch |err| {
-        return self.finishOuterTurnErrorLocked(err);
+        return self.finishOuterTurnErrorLocked(err, "postMessage handler");
     };
     try self.microtaskCheckpointLocked();
 }
@@ -1741,7 +1777,7 @@ pub fn runTimeoutCallback(self: *Js, window_id: u32, handle: u32) !void {
                 std.log.warn("setTimeout JavaScript exception: {s}", .{buffer[0..writer.end]});
             }
         }
-        return self.finishOuterTurnErrorLocked(err);
+        return self.finishOuterTurnErrorLocked(err, "timer callback");
     };
     try self.microtaskCheckpointLocked();
 }
@@ -1758,7 +1794,7 @@ pub fn runAnimationFrameHandlers(self: *Js, window_id: u32) void {
     const fn_value = window.realm.global_object.get(&self.agent, key) catch return;
     if (!fn_value.isCallable()) return;
     _ = fn_value.call(&self.agent, .undefined, &.{}) catch |err| {
-        std.log.warn("requestAnimationFrame handler failed: {}", .{self.finishOuterTurnErrorLocked(err)});
+        std.log.warn("requestAnimationFrame handler failed: {}", .{self.finishOuterTurnErrorLocked(err, "animation callback")});
         return;
     };
     self.microtaskCheckpointLocked() catch |err| {
@@ -1814,7 +1850,7 @@ pub fn runXhrOnload(self: *Js, window_id: u32, handle: u32, body: []const u8) !v
     const body_value = try self.copiedStringToJsValue(body);
     const handle_value = Value.from(@as(f64, @floatFromInt(handle)));
     _ = fn_value.call(&self.agent, .undefined, &.{ body_value, handle_value }) catch |err| {
-        return self.finishOuterTurnErrorLocked(err);
+        return self.finishOuterTurnErrorLocked(err, "XHR callback");
     };
     try self.microtaskCheckpointLocked();
 }
@@ -1969,6 +2005,31 @@ test "ordinary realms do not expose the WPT completion bridge" {
         \\parent === window
     );
     try std.testing.expect(result.toBoolean());
+}
+
+test "WPT diagnostic errors neither complete the harness nor change caught exceptions" {
+    const allocator = std.testing.allocator;
+    var environ = std.process.Environ.Map.init(allocator);
+    defer environ.deinit();
+    const js = try Js.init(allocator, std.testing.io, &environ);
+    defer js.deinit(allocator);
+    var probe = WptReportProbe{ .allocator = allocator };
+    defer probe.deinit();
+    js.setWptReportCallback(41, WptReportProbe.report, &probe);
+    _ = try js.evaluate(41, "true");
+    const window = js.windows.get(41).?;
+    const before = window.wpt_diagnostics.bytes;
+    _ = try js.evaluate(41, "try { throw new Error('expected'); } catch (e) {} true");
+    try std.testing.expectEqual(before, window.wpt_diagnostics.bytes);
+    try std.testing.expectError(error.ExceptionThrown, js.evaluateNamed(41, "throw new Error('setup failed')", "fixture.js"));
+    try std.testing.expect(window.wpt_diagnostics.bytes > before);
+    try std.testing.expectEqual(@as(usize, 0), probe.reports.items.len);
+    _ = try js.evaluate(41, "completion_callback([], {status: 0}); true");
+    try std.testing.expectEqual(@as(usize, 1), probe.reports.items.len);
+    try expectWptReportStatus(probe.reports.items[0], "PASS");
+    const before_parse = window.wpt_diagnostics.bytes;
+    try std.testing.expectError(error.ParseError, js.evaluateNamed(41, "let = ;", "syntax.js"));
+    try std.testing.expect(window.wpt_diagnostics.bytes > before_parse);
 }
 
 test "evaluate drains Promise jobs to a fixed point before returning" {

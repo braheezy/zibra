@@ -1,0 +1,9 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>Caught exceptions and Unicode separators do not corrupt WPT results</title>
+<script>
+try { throw new Error("expected by this test"); } catch (error) {}
+completion_callback([
+  { name: "Unicode separators: \u0085 \u2028 \u2029", status: 0, message: null, stack: null }
+], { status: 0, message: null, stack: null });
+</script>

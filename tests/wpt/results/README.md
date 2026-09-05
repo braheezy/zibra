@@ -7,7 +7,7 @@ ones:
 
 ```sh
 python3 tests/wpt/run.py tests/wpt/manifest.yaml \
-  --mode testharness --browser ./zig-out/bin/zibra \
+  --mode all --browser ./zig-out/bin/zibra \
   --report tests/wpt/results/$(date -u +%Y%m%dT%H%M%SZ).json
 ```
 

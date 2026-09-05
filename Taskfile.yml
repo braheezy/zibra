@@ -1,4 +1,4 @@
-version: '3'
+version: "3"
 
 vars:
   WPT_MANIFEST: tests/wpt/manifest.yaml
@@ -21,27 +21,37 @@ tasks:
       - mkdir -p {{.WPT_RESULTS}}
       - >-
         ZIBRA_GIT_SHA="{{.GIT_SHA}}" SDL_VIDEODRIVER=dummy python3 tests/wpt/run.py {{.WPT_MANIFEST}}
-        --mode testharness --browser ./zig-out/bin/zibra
+        --mode all --jobs {{.WPT_JOBS}} --browser ./zig-out/bin/zibra
         --report {{.WPT_RESULTS}}/$(date -u +%Y%m%dT%H%M%SZ).json
 
   wpt:
-    desc: Run the reviewed WPT directory allowlist and score skipped suites as failures
+    desc: Run all allowlisted WPT categories and score skipped suites as failures
     cmds:
-      - zig build
+      - zig build -Doptimize=ReleaseSafe
       - mkdir -p {{.WPT_RESULTS}}
       - >-
         ZIBRA_GIT_SHA="{{.GIT_SHA}}" SDL_VIDEODRIVER=dummy python3 tests/wpt/run.py {{.WPT_MANIFEST}}
-        --mode testharness --full-suite --jobs {{.WPT_JOBS}} --browser ./zig-out/bin/zibra
+        --mode all --full-suite --jobs {{.WPT_JOBS}} --browser ./zig-out/bin/zibra
         --report {{.WPT_RESULTS}}/wpt-$(date -u +%Y%m%dT%H%M%SZ).json
 
+  wpt-smoke:
+    desc: Run one upstream testharness, reftest, and crashtest serially
+    cmds:
+      - zig build -Doptimize=ReleaseSafe
+      - mkdir -p {{.WPT_RESULTS}}
+      - >-
+        ZIBRA_GIT_SHA="{{.GIT_SHA}}" SDL_VIDEODRIVER=dummy python3 tests/wpt/run.py tests/wpt/manifest-smoke.yaml
+        --mode all --jobs 1 --browser ./zig-out/bin/zibra
+        --report {{.WPT_RESULTS}}/smoke-$(date -u +%Y%m%dT%H%M%SZ).json
+
   wpt-all:
-    desc: Run all discovered testharness WPT cases with isolated parallel workers
+    desc: Run all discovered testharness, reftest, and crashtest cases
     cmds:
       - zig build
       - mkdir -p {{.WPT_RESULTS}}
       - >-
         ZIBRA_GIT_SHA="{{.GIT_SHA}}" SDL_VIDEODRIVER=dummy python3 tests/wpt/run.py --all
-        --mode testharness --jobs {{.WPT_JOBS}} --browser ./zig-out/bin/zibra
+        --mode all --jobs {{.WPT_JOBS}} --browser ./zig-out/bin/zibra
         --report {{.WPT_RESULTS}}/all-$(date -u +%Y%m%dT%H%M%SZ).json
 
   wpt-reftest:

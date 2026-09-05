@@ -34,7 +34,11 @@ Focused steps are `test-document`, `test-render`, `test-network`,
   style/layout/display-list goldens;
 - `zig build test-dump-dom` — DOM CLI output;
 - `zig build test-wpt-runner` — WPT manifest-runner protocol and failure paths;
-- `zig build test-wpt` — local headless WPT PASS/TIMEOUT protocol fixtures;
+- `zig build test-wpt` — serial, watchdog-bounded local WPT protocol and
+  startup/error/progress diagnostic fixtures;
+- `task wpt-smoke` — one upstream testharness, reftest, and crashtest run
+  serially; requires the WPT checkout and server dependencies described in the
+  [WPT guide](wpt/README.md);
 - `zig build test-screenshot` — native macOS visual goldens;
 - `zig build test-server` — tutorial server unittest;
 - `zig build test-docs` and `zig build test-format` — repository documentation

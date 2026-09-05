@@ -6,6 +6,7 @@ result. ``testharness`` consumes Zibra's machine-readable headless result.
 ``reftest`` captures the test and reference pages through Zibra's screenshot
 mode and compares their page pixels.
 ``crashtest`` drives the same headless lifecycle and reports browser health.
+``all`` runs all three conformance adapters, excluding opt-in smoke probes.
 """
 
 from __future__ import annotations
@@ -35,16 +36,21 @@ from urllib.parse import urljoin
 
 try:
     from reftest import compare_png
+    from protocol import parse_json_record
+    from diagnostics import analyze_testharness
 except ModuleNotFoundError:
     # The runner is also imported directly by its dependency-free unit tests.
     sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
     from reftest import compare_png
+    from protocol import parse_json_record
+    from diagnostics import analyze_testharness
 
 
 ROOT = pathlib.Path(__file__).resolve().parents[2]
 DEFAULT_MANIFEST = pathlib.Path(__file__).with_name("manifest.yaml")
 UPSTREAM = pathlib.Path(__file__).with_name("upstream")
 DEFAULT_TIMEOUT_MS = 10_000
+CONFORMANCE_MODES = ("testharness", "reftest", "crashtest")
 WATCHDOG_GRACE_SECONDS = 5.0
 WPT_SERVER_STARTUP_TIMEOUT_SECONDS = 15.0
 RESULT_STATUSES = frozenset(("PASS", "FAIL", "ERROR", "TIMEOUT"))
@@ -150,6 +156,7 @@ class CaseResult:
     infrastructure_error: str | None = None
     stdout: str = ""
     stderr: str = ""
+    diagnostics: dict[str, Any] | None = None
 
 
 def _case_scope_path(case: Case) -> str:
@@ -200,6 +207,7 @@ class ProgressReporter:
         self.folder_totals = Counter(_folder_for_path(case.path) for case in cases)
         self.folder_done = Counter()
         self.folder_status: dict[str, Counter[str]] = {}
+        self.timeout_reasons: Counter[str] = Counter()
         self.done = 0
         self._line_width = 0
         self._line_active = False
@@ -215,12 +223,19 @@ class ProgressReporter:
     @staticmethod
     def _label(result: CaseResult) -> str:
         if result.infrastructure_error is not None:
-            return "CRASH" if result.status == "CRASH" else "INFRA"
+            label = result.status if result.status in ("CRASH", "TIMEOUT") else "INFRA"
+            if result.diagnostics and result.diagnostics.get("timeout_kind") == "watchdog":
+                label += " (watchdog)"
+            return label
         if not result.ok and result.status not in ("SKIP", "PROBE"):
-            return f"{result.status} (expected {result.case.expected_status})"
+            reason = result.diagnostics.get("reason") if result.diagnostics else None
+            detail = f"; {reason}" if reason else ""
+            return f"{result.status} (expected {result.case.expected_status}{detail})"
         return result.status
 
     def record(self, result: CaseResult) -> None:
+        if result.diagnostics and result.diagnostics.get("reason"):
+            self.timeout_reasons[result.diagnostics["reason"]] += 1
         folder = _folder_for_path(result.case.path)
         self.done += 1
         self.folder_done[folder] += 1
@@ -263,6 +278,12 @@ class ProgressReporter:
             )
 
     def finish(self, complete: bool) -> None:
+        if self.timeout_reasons:
+            if self._line_active:
+                print(file=self.stream)
+                self._line_active = False
+            details = ", ".join(f"{reason}={count}" for reason, count in sorted(self.timeout_reasons.items()))
+            print(f"WPT timeout diagnostics: {details}", file=self.stream)
         if self._line_active:
             print(file=self.stream)
             self._line_active = False
@@ -552,7 +573,9 @@ def _load_json_cases(path: pathlib.Path) -> list[Case]:
     return cases
 
 
-def load_cases(path: pathlib.Path) -> list[Case]:
+def load_cases(
+    path: pathlib.Path, *, inventory: list[InventoryItem] | None = None
+) -> list[Case]:
     """Load the minimal YAML allowlist; retain JSON as a migration fallback."""
     if path.suffix.lower() == ".json":
         return _load_json_cases(path)
@@ -560,6 +583,14 @@ def load_cases(path: pathlib.Path) -> list[Case]:
     deviations = config.get("deviations", {})
     if not isinstance(deviations, dict):
         raise ValueError("manifest deviations must be a path-to-status map")
+
+    def discovered_items() -> list[InventoryItem]:
+        nonlocal inventory
+        if inventory is None:
+            inventory = discover_wpt_inventory()
+        return inventory
+
+    discovered_by_key: dict[tuple[str, str], InventoryItem] | None = None
     cases: list[Case] = []
     for section, mode in (
         ("tests", "testharness"),
@@ -582,11 +613,11 @@ def load_cases(path: pathlib.Path) -> list[Case]:
                 expectation=expectation,
             )
             if mode in ("reftest", "crashtest"):
-                discovered = {
-                    item.path: item
-                    for item in discover_wpt_inventory()
-                    if item.category == mode
-                }.get(path_value)
+                if discovered_by_key is None:
+                    discovered_by_key = {
+                        (item.category, item.path): item for item in discovered_items()
+                    }
+                discovered = discovered_by_key.get((mode, path_value))
                 if discovered is not None:
                     case = replace(
                         case,
@@ -606,9 +637,14 @@ def load_cases(path: pathlib.Path) -> list[Case]:
         raise ValueError("manifest directories must be a list")
     normalized_directories = [_normalize_directory(value) for value in directories]
     if normalized_directories:
-        existing_paths = {case.path for case in cases}
-        for discovered in discover_testharness_cases(normalized_directories):
-            if discovered.path in existing_paths:
+        existing_keys = {(case.mode, case.path) for case in cases}
+        directory_items = [
+            item for item in discovered_items()
+            if _inventory_directories_match(item.source_path, normalized_directories)
+        ]
+        for discovered in _cases_from_inventory(directory_items, mode="all"):
+            key = (discovered.mode, discovered.path)
+            if key in existing_keys:
                 continue
             expectation = deviations.get(discovered.path)
             case = replace(
@@ -618,6 +654,7 @@ def load_cases(path: pathlib.Path) -> list[Case]:
             )
             _validate_case(case, len(cases))
             cases.append(case)
+            existing_keys.add(key)
     unknown_deviations = set(deviations) - {case.path for case in cases}
     if unknown_deviations:
         names = ", ".join(sorted(unknown_deviations))
@@ -941,34 +978,31 @@ def inventory_summary(items: list[InventoryItem]) -> dict[str, Any]:
     }
 
 
-def _cases_from_inventory(items: list[InventoryItem]) -> list[Case]:
+def _mode_matches(category: str, mode: str) -> bool:
+    return category in CONFORMANCE_MODES if mode == "all" else category == mode
+
+
+def _cases_from_inventory(
+    items: list[InventoryItem], mode: str = "testharness"
+) -> list[Case]:
     return [
         Case(
             path=item.path,
             source_path=item.source_path if item.source_path != item.path else None,
-            mode="testharness",
+            mode=item.category,
             status="discovered",
             reason=f"Discovered as a WPT {item.category} entry.",
             references=item.references,
             fuzzy=item.fuzzy,
         )
         for item in items
-        if item.category == "testharness" and item.runnable
+        # Missing reftest references must produce INFRA, not silently disappear.
+        if _mode_matches(item.category, mode) and (item.runnable or item.category == "reftest")
     ]
 
 
 def _crashtest_cases_from_inventory(items: list[InventoryItem]) -> list[Case]:
-    return [
-        Case(
-            path=item.path,
-            source_path=item.source_path if item.source_path != item.path else None,
-            mode="crashtest",
-            status="discovered",
-            reason="Discovered as a WPT crashtest entry.",
-        )
-        for item in items
-        if item.category == "crashtest" and item.runnable
-    ]
+    return _cases_from_inventory(items, mode="crashtest")
 
 
 def discover_testharness_cases(directories: list[str] | None = None) -> list[Case]:
@@ -977,19 +1011,7 @@ def discover_testharness_cases(directories: list[str] | None = None) -> list[Cas
 
 
 def _reftest_cases_from_inventory(items: list[InventoryItem]) -> list[Case]:
-    return [
-        Case(
-            path=item.path,
-            source_path=item.source_path if item.source_path != item.path else None,
-            mode="reftest",
-            status="discovered",
-            reason="Discovered as a WPT reftest entry.",
-            references=item.references,
-            fuzzy=item.fuzzy,
-        )
-        for item in items
-        if item.category == "reftest"
-    ]
+    return _cases_from_inventory(items, mode="reftest")
 
 
 def discover_reftest_cases(directories: list[str] | None = None) -> list[Case]:
@@ -1062,17 +1084,7 @@ def _invoke(command: list[str], watchdog_seconds: float) -> ProcessOutcome:
 
 
 def parse_testharness_result(stdout: str, expected_url: str) -> dict[str, Any]:
-    lines = stdout.splitlines()
-    if len(lines) != 1 or not lines[0].strip():
-        raise ValueError(
-            f"expected exactly one JSON result line, received {len(lines)}"
-        )
-    try:
-        record = json.loads(lines[0])
-    except json.JSONDecodeError as error:
-        raise ValueError(f"invalid JSON result: {error.msg}") from error
-    if not isinstance(record, dict):
-        raise ValueError("JSON result must be an object")
+    record = parse_json_record(stdout)
 
     protocol_version = record.get("protocol_version")
     if type(protocol_version) is not int or protocol_version != 1:
@@ -1146,6 +1158,9 @@ def _run_testharness(case: Case, url: str, browser: list[str]) -> CaseResult:
             infrastructure_error=outcome.infrastructure_error,
             stdout=outcome.stdout,
             stderr=outcome.stderr,
+            diagnostics=analyze_testharness(
+                case.path, url, outcome.stderr, watchdog=outcome.watchdog_expired,
+            ),
         )
 
     try:
@@ -1158,26 +1173,19 @@ def _run_testharness(case: Case, url: str, browser: list[str]) -> CaseResult:
             infrastructure_error=str(error),
             stdout=outcome.stdout,
             stderr=outcome.stderr,
+            diagnostics=analyze_testharness(case.path, url, outcome.stderr),
         )
 
     actual = record["status"]
     expected = case.expected_status
-    if actual != expected:
-        return CaseResult(
-            case=case,
-            status=actual,
-            ok=False,
-            record=record,
-            stdout=outcome.stdout,
-            stderr=outcome.stderr,
-        )
     return CaseResult(
         case=case,
         status=actual,
-        ok=True,
+        ok=actual == expected,
         record=record,
         stdout=outcome.stdout,
         stderr=outcome.stderr,
+        diagnostics=analyze_testharness(case.path, url, outcome.stderr, record),
     )
 
 
@@ -1384,6 +1392,8 @@ def _serialize_case_result(result: CaseResult) -> dict[str, Any]:
     }
     if case.source_path is not None:
         item["source_path"] = case.source_path
+    if result.diagnostics is not None:
+        item["diagnostics"] = result.diagnostics
     if case.references:
         item["references"] = [
             {"path": path, "relation": relation}
@@ -1397,6 +1407,7 @@ def _serialize_case_result(result: CaseResult) -> dict[str, Any]:
     if result.record is not None:
         for key in (
             "duration_ms",
+            "completion",
             "tests",
             "comparisons",
             "harness",
@@ -1430,19 +1441,20 @@ def _coverage_scores(
     if coverage_cases is None:
         return None
 
-    result_by_path = {result.case.path: result for result in results}
+    result_by_key = {(result.case.mode, result.case.path): result for result in results}
     groups: dict[str, dict[str, int | str]] = {}
-    seen_paths: set[str] = set()
+    seen_keys: set[tuple[str, str]] = set()
     for case in coverage_cases:
-        if case.path in seen_paths:
+        key = (case.mode, case.path)
+        if key in seen_keys:
             continue
-        seen_paths.add(case.path)
+        seen_keys.add(key)
         directory = _folder_for_path(case.path)
         item = groups.setdefault(
             directory,
             {"path": directory, "passed": 0, "total": 0, "skipped": 0},
         )
-        result = result_by_path.get(case.path)
+        result = result_by_key.get(key)
         if result is None or result.status == "SKIP":
             item["total"] = int(item["total"]) + 1
             item["skipped"] = int(item["skipped"]) + 1
@@ -1534,6 +1546,11 @@ def write_run_report(
         "suite_failed": skipped_cases > 0 or counts["INFRA"] > 0 or any(
             not result.ok for result in results
         ),
+        "timeout_diagnostics": dict(sorted(Counter(
+            result.diagnostics["reason"]
+            for result in results
+            if result.diagnostics and result.diagnostics.get("reason")
+        ).items())),
     }
     if coverage_total is not None:
         summary["coverage_total"] = coverage_total
@@ -1581,8 +1598,8 @@ def _parse_args(argv: list[str] | None) -> argparse.Namespace:
     )
     parser.add_argument("--list", action="store_true", help="list manifest entries")
     parser.add_argument(
-        "--mode", choices=("probe", "testharness", "reftest", "crashtest"),
-        help="manifest case mode (defaults to testharness with --all, probe otherwise)",
+        "--mode", choices=("all", "probe", *CONFORMANCE_MODES),
+        help="case category; all runs testharness, reftest, and crashtest (default)",
     )
     parser.add_argument(
         "--all", action="store_true",
@@ -1594,7 +1611,7 @@ def _parse_args(argv: list[str] | None) -> argparse.Namespace:
     )
     parser.add_argument(
         "--full-suite", action="store_true",
-        help="score unselected discovered testharness directories as zero coverage",
+        help="score unselected discovered cases in the selected categories as zero coverage",
     )
     parser.add_argument(
         "--jobs", type=int, default=1,
@@ -1629,7 +1646,7 @@ def _parse_args(argv: list[str] | None) -> argparse.Namespace:
 
 def main(argv: list[str] | None = None) -> int:
     args = _parse_args(argv)
-    mode = args.mode or ("testharness" if args.all else "probe")
+    mode = args.mode or "all"
     if args.all and args.mode == "probe":
         print("--all does not support --mode probe", file=sys.stderr)
         return 2
@@ -1638,8 +1655,8 @@ def main(argv: list[str] | None = None) -> int:
     except (AttributeError, ValueError) as error:
         print(f"Invalid WPT directory: {error}", file=sys.stderr)
         return 2
-    if args.full_suite and mode != "testharness":
-        print("--full-suite only supports --mode testharness", file=sys.stderr)
+    if args.full_suite and mode == "probe":
+        print("--full-suite does not support --mode probe", file=sys.stderr)
         return 2
     if args.jobs <= 0:
         print("--jobs must be a positive integer", file=sys.stderr)
@@ -1652,21 +1669,16 @@ def main(argv: list[str] | None = None) -> int:
         return 2
     manifest_for_report = args.manifest
     coverage_cases: list[Case] | None = None
-    inventory: list[InventoryItem] | None = None
+    inventory = discover_wpt_inventory() if args.all or args.full_suite else None
     if args.all:
-        inventory = discover_wpt_inventory()
-        if mode == "reftest":
-            coverage_cases = _reftest_cases_from_inventory(inventory)
-            cases = coverage_cases
-        elif mode == "crashtest":
-            coverage_cases = _crashtest_cases_from_inventory(inventory)
-            cases = coverage_cases
-        else:
-            coverage_cases = _cases_from_inventory(inventory)
-            cases = coverage_cases
+        coverage_cases = _cases_from_inventory(inventory, mode=mode)
+        cases = coverage_cases
         manifest_for_report = pathlib.Path(f"<all-{mode}>")
         inventory_data = inventory_summary(inventory)
-        runnable_category = inventory_data["runnable_by_category"].get(mode, 0)
+        runnable_category = sum(
+            count for category, count in inventory_data["runnable_by_category"].items()
+            if _mode_matches(category, mode)
+        )
         categories = ", ".join(
             f"{name}={count}"
             for name, count in inventory_data["categories"].items()
@@ -1677,7 +1689,7 @@ def main(argv: list[str] | None = None) -> int:
         )
     else:
         try:
-            cases = load_cases(args.manifest)
+            cases = load_cases(args.manifest, inventory=inventory)
         except (OSError, json.JSONDecodeError, ValueError) as error:
             print(f"Failed to load WPT manifest: {error}", file=sys.stderr)
             return 2
@@ -1692,8 +1704,11 @@ def main(argv: list[str] | None = None) -> int:
             )
         ]
     if args.full_suite and coverage_cases is None:
-        inventory = discover_wpt_inventory()
-        coverage_cases = _cases_from_inventory(inventory)
+        coverage_cases = _cases_from_inventory(inventory, mode=mode)
+
+    # Apply category selection before listing or recording skips as well as
+    # execution. Mixed runs never turn non-conformance probes into WPT passes.
+    cases = [case for case in cases if _mode_matches(case.mode, mode)]
 
     if args.list:
         try:
@@ -1722,8 +1737,6 @@ def main(argv: list[str] | None = None) -> int:
         if case.skipped:
             results.append(CaseResult(case=case, status="SKIP", ok=True))
             continue
-        if case.mode != mode:
-            continue
         test_path = (UPSTREAM / _case_scope_path(case)).resolve()
         if not test_path.is_file():
             if case.mode == "probe":
@@ -1745,6 +1758,9 @@ def main(argv: list[str] | None = None) -> int:
     progress_cases.extend(case for case, _ in selected)
     reporter = ProgressReporter(progress_cases, mode, args.jobs)
     reporter.start()
+    if mode == "all":
+        counts = Counter(case.mode for case in progress_cases)
+        print("Categories: " + ", ".join(f"{category}={counts[category]}" for category in CONFORMANCE_MODES))
     for result in results:
         reporter.record(result)
 
@@ -1755,7 +1771,7 @@ def main(argv: list[str] | None = None) -> int:
     # so they retain the deterministic file-URL path.
     server_context: WptServer | None = None
     server_base_url: str | None = None
-    if mode in ("testharness", "reftest", "crashtest") and selected and (UPSTREAM / "wpt").is_file():
+    if mode != "probe" and selected and (UPSTREAM / "wpt").is_file():
         server_context = WptServer()
         try:
             server_base_url = server_context.__enter__()
@@ -1787,8 +1803,7 @@ def main(argv: list[str] | None = None) -> int:
         if server_base_url is None:
             url = test_path.as_uri()
         else:
-            relative_path = test_path.relative_to(UPSTREAM).as_posix()
-            url = f"{server_base_url}/{relative_path}"
+            url = f"{server_base_url}/{run_case.path.lstrip('/')}"
         try:
             if run_case.mode == "probe":
                 return _run_probe(run_case, url, args.browser)
@@ -1920,9 +1935,10 @@ def main(argv: list[str] | None = None) -> int:
                 inventory=inventory,
             )
         reporter.finish(run_complete)
+    result_keys = {(result.case.mode, result.case.path) for result in results}
     skipped_from_coverage = (
         coverage_cases is not None
-        and any(case.path not in {result.case.path for result in results} for case in coverage_cases)
+        and any((case.mode, case.path) not in result_keys for case in coverage_cases)
     )
     return 1 if failed or skipped_from_coverage else 0
 

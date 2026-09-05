@@ -1,0 +1,9 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>Uncaught setup error after partial harness progress</title>
+<script src="diagnostic-harness.js"></script>
+<script>
+fixtureStart();
+fixtureResult({ name: "finished before the error", status: 0 });
+throw new Error("diagnostic fixture setup failed");
+</script>

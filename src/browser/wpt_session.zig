@@ -274,6 +274,7 @@ pub const Session = struct {
         browser.setTopLevelRealmObserver(installRealmBridge, @ptrCast(self));
 
         self.started_ns = std.Io.Clock.awake.now(io).nanoseconds;
+        std.log.info("ZIBRA_WPT_DIAGNOSTIC {{\"kind\":\"session-started\"}}", .{});
         const timeout_ns: i96 = @as(i96, @intCast(options.timeout_ms)) * std.time.ns_per_ms;
         self.deadline_ns = self.started_ns + timeout_ns;
 

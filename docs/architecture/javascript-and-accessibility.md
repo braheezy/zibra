@@ -179,12 +179,10 @@ bootstrap until a terminal report or Realm retirement. A native reporting
 failure yields no valid completion and is handled by the outer session
 deadline rather than inferred as a pass.
 
-This milestone is a result-transport bridge, not complete WPT semantics. Its
-focused script tests invoke a fake external completion callback; they do not
-yet prove an unmodified upstream `testharness.js` test. The bridge does not
-capture assertion metadata beyond subtest message/stack, console output,
-network errors, uncaught exceptions, rejected promises, test/revision
-identity, or lifecycle timestamps. It publishes synchronously at the harness
+The bridge is not complete WPT semantics. Local protocol fixtures and focused
+upstream cases cover result transport, while console output, structured
+network failures, rejected promises, and child-context aggregation remain
+incomplete. It publishes synchronously at the harness
 callback, then the Session applies a task-return/current-queue barrier before
 accepting the copied candidate. Each outer Browser-to-JavaScript turn drains
 the Agent's Promise job queue to a fixed point while its `ActiveWindow` and
@@ -193,6 +191,22 @@ Nested native re-entry relies on the outer turn's checkpoint. Host interruption
 is checked again after the drain so an interrupted Promise chain is reported as
 `ExecutionInterrupted` even though Kiesel's drain operation contains job
 errors.
+
+WPT-enabled Realms additionally own `wpt_bindings.DiagnosticLog`, a bounded
+stderr side channel independent of the result mailbox. Runtime hooks observe
+harness startup and sparse subtest progress; outer evaluation/callback failure
+paths record source labels and the VM exception before it is cleared. These
+operations run synchronously under the existing JsLock, retain no source or
+Kiesel value, and never re-enter JavaScript or publish a terminal result.
+Ordinary and retired Realms do not emit WPT diagnostics. The per-Realm byte
+budget bounds progress and reserves space for errors. Source labels supplied
+to `evaluateNamed` are diagnostic-only, callback-scoped borrows; they are not
+installed in retained VM executable metadata. The external runner consumes
+these optional JSON stderr events, preserving evidence even on watchdog kills.
+Missing startup observations and partial results do not prove a stall, and
+diagnostic errors cannot override valid harness completion. Caught exceptions
+remain caught; reporting errors swallowed by runtime listeners and tracking
+rejected promises require separate event-delivery work.
 
 This checkpoint is not a resource-quiescence predicate. Same-origin document
 Realms also share one Agent: Kiesel changes its running Realm for each queued

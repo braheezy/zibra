@@ -1,6 +1,7 @@
-# Convention: entries under directories expand to testharness cases and entries
-# under tests are individual testharness cases. Entries under probes are
-# fetch/parse smoke tests. Omit deviations when PASS is expected.
+# Convention: directories expand to testharness, reftest, and crashtest cases.
+# Individual paths go under tests, reftests, or crashtests respectively.
+# Probes are separate opt-in fetch/parse smoke tests, excluded by --mode all.
+# Omit deviations when PASS is expected.
 #
 # These are the WPT areas for which Zibra has at least a meaningful initial
 # implementation. `task wpt` runs these directories; the full-suite report
@@ -15,6 +16,10 @@ directories:
   - uievents
 tests:
   - dom/nodes/Element-firstElementChild.html
+reftests:
+  - css/CSS2/backgrounds/background-color-174.xht
+crashtests:
+  - css/css-flexbox/flex-shrink-large-value-crash.html
 probes:
   - html/semantics/text-level-semantics/the-b-element/b-usage.html
 

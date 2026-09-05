@@ -7,8 +7,9 @@ the browser can report their completion produces misleading results.
 
 ## Current state
 
-The WPT adapter vertical slice is implemented, including one unmodified
-upstream testharness pass. The current implementation includes:
+The WPT adapter vertical slice is implemented, with real-browser passes for
+unchanged upstream testharness, reftest, and crashtest cases in
+[manifest-smoke.yaml](manifest-smoke.yaml). The current implementation includes:
 
 - `.gitmodules` registers the WPT checkout at `tests/wpt/upstream`;
   contributors initialize it only when doing upstream compatibility work. The
@@ -25,6 +26,11 @@ upstream testharness pass. The current implementation includes:
   headless lifecycle and classify healthy completion, browser crashes, and
   watchdog expiry independently of testharness JSON. WPT `test-wait`
   automation is not wired yet.
+- The default `all` mode and `task wpt` run all three adapters from the same
+  allowlist. Directory expansion preserves categories, generated URLs, and
+  reference metadata; `--full-suite` scores omissions across the selected
+  categories. Probes remain an explicit non-conformance mode. `task wpt-smoke`
+  exercises one unchanged upstream case per adapter serially.
 - `src/browser/wpt_session.zig` owns one standalone headless Browser, drives
   `Browser.tick`, copies the first explicit report, accepts it after the Tab's
   serialized task-return barrier, gives the monotonic deadline precedence over
@@ -48,15 +54,22 @@ upstream testharness pass. The current implementation includes:
   stderr. `PASS`, `FAIL`, `ERROR`, and semantic `TIMEOUT` all produce a valid
   result record; a crash, nonzero exit, malformed record, or outer watchdog is
   an infrastructure failure.
+- WPT-only, byte-bounded stderr observations record startup, sparse subtest
+  progress, and uncaught outer-script/callback errors. The runner reports
+  timeout reasons separately from results and retains diagnostic partial
+  subtests without inflating coverage. It uses LF JSONL framing so Unicode
+  line separators in assertion text cannot become false infrastructure errors.
 - `zig build test-wpt` runs synchronous PASS, Promise-job PASS, and semantic
   TIMEOUT pages through the real executable. `zig build test-wpt-runner`
   covers manifest selection, exact expectations, malformed output, nonzero
-  exits, protocol validation, and watchdog classification with fake browsers.
+  exits, protocol validation, diagnostics, and watchdog classification with fake
+  browsers. The real local fixtures also cover parse/setup errors, partial
+  progress, caught exceptions, and Unicode records under serial watchdogs.
 
 The committed coverage proves the adapter, process protocol, Promise
 checkpoint, deadline race, runner failure classification, WPT resource
-resolution, durable reports, the local dashboard API, and one unchanged
-upstream DOM test. Resource quiescence,
+resolution, durable reports, the local dashboard API, and unchanged upstream
+DOM, transparent-background, and large-flex-shrink cases. Resource quiescence,
 cross-Realm Promise-job routing, structured navigation/script failures,
 rejected-promise reporting, persistent sessions, and CI artifact publishing
 remain incomplete. Reftest discovery and screenshot-comparison harness
@@ -77,7 +90,7 @@ Browser, SDL, layout, or JavaScript. A successful probe is never a
 | 3. Scheduling/cancellation | Partial | Task-return barrier, deadline arbitration, and JS interruption work; resource quiescence and complete transport cancellation do not |
 | 4. Web APIs | Ongoing | Grow coherent slices from selected failures rather than attempting the full platform |
 | 5. `wptserve` | Core implemented | Worker-local loopback server supplies unchanged root-relative harness resources; richer dynamic handlers remain |
-| 6. Selection/expectations | Runner ready | Directory expansion, exact comparison, full-suite zero coverage, and separate crashtest selection are supported |
+| 6. Selection/expectations | Runner ready | Mixed-category allowlist expansion, category filtering, exact comparison, and full-suite zero coverage are supported |
 | 7. Reftests | Harness partial | Screenshot capture, match/mismatch relations, PNG diagnostics, and basic fuzzy limits work; rendering parity and full WPT metadata do not |
 | 8. Performance/CI | Partial | Local dashboard and report artifacts exist; sharding, CI publishing, and a persistent process do not |
 

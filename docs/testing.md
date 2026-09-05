@@ -44,16 +44,22 @@ Run from the repository root:
 - `zig build test-wpt-runner` for the dependency-free WPT manifest runner's
   protocol, expectation, diagnostic, and infrastructure-failure handling;
 - `zig build test-wpt` for local headless synchronous PASS, Promise-job PASS,
-  and TIMEOUT result-protocol fixtures. This step uses no upstream WPT checkout
+  TIMEOUT, startup/error diagnostics, partial results, and Unicode JSONL
+  fixtures. Captures are serial and process-watchdog bounded.
+  This step uses no upstream WPT checkout
   or network access;
 - `task wpt-all` for a long-running local compatibility sweep. It builds once,
-  discovers upstream testharness cases, and runs bounded browser workers in
-  parallel; use `WPT_JOBS=N` to tune concurrency and inspect its checkpointed
+  discovers upstream testharness, reftest, and crashtest cases, and runs bounded
+  browser workers in parallel; use `WPT_JOBS=N` to tune concurrency and inspect its checkpointed
   report under `tests/wpt/results`. The runner keeps normal output compact,
   records completion for each top-level WPT folder, and accepts `--verbose`
   for per-failure browser diagnostics;
-- `task wpt` for the reviewed directory allowlist. It runs only selected WPT
-  directories, but scores every discovered directory in the report; omitted
+- `task wpt-smoke` for one unchanged upstream case per adapter, run serially
+  through the real executable. This requires the initialized WPT checkout and
+  its server dependencies; see the [WPT guide](../tests/wpt/README.md).
+- `task wpt` for the reviewed allowlist across all three runnable categories.
+  It runs selected directories and explicit cases, but scores every discovered
+  directory in the report; omitted
   directories appear as `0/N` and keep the suite failing until implemented;
 - `zig build test-docs` for repository Markdown links when documentation
   changes. The checker intentionally skips the vendored `tests/wpt/upstream`

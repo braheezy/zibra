@@ -160,6 +160,9 @@ const WptFixture = struct {
     status: []const u8,
     timeout_ms: u64,
     output_basename: []const u8,
+    diagnostic_reason: ?[]const u8 = null,
+    error_kind: ?[]const u8 = null,
+    partial_subtests: ?usize = null,
 };
 
 const wpt_fixtures = [_]WptFixture{
@@ -180,6 +183,39 @@ const wpt_fixtures = [_]WptFixture{
         .status = "TIMEOUT",
         .timeout_ms = 20,
         .output_basename = "wpt-harness-timeout.jsonl",
+        .diagnostic_reason = "runtime-not-observed",
+    },
+    .{
+        .fixture = "tests/wpt/fixtures/harness-diagnostics-error.html",
+        .status = "TIMEOUT",
+        .timeout_ms = 2000,
+        .output_basename = "wpt-diagnostics-error.jsonl",
+        .diagnostic_reason = "script-error",
+        .error_kind = "ExceptionThrown",
+        .partial_subtests = 1,
+    },
+    .{
+        .fixture = "tests/wpt/fixtures/harness-diagnostics-pending.html",
+        .status = "TIMEOUT",
+        .timeout_ms = 2000,
+        .output_basename = "wpt-diagnostics-pending.jsonl",
+        .diagnostic_reason = "completion-pending",
+        .partial_subtests = 1,
+    },
+    .{
+        .fixture = "tests/wpt/fixtures/harness-diagnostics-parse-error.html",
+        .status = "TIMEOUT",
+        .timeout_ms = 2000,
+        .output_basename = "wpt-diagnostics-parse-error.jsonl",
+        .diagnostic_reason = "script-error",
+        .error_kind = "ParseError",
+    },
+    .{
+        .fixture = "tests/wpt/fixtures/harness-diagnostics-caught-pass.html",
+        .status = "PASS",
+        .timeout_ms = 10_000,
+        .output_basename = "wpt-diagnostics-caught-pass.jsonl",
+        .partial_subtests = 0,
     },
 };
 
@@ -402,14 +438,15 @@ pub fn build(b: *std.Build) !void {
     );
     var previous_wpt_validation: ?*std.Build.Step = null;
     for (wpt_fixtures) |fixture| {
-        const capture = b.addRunArtifact(exe);
+        const capture = b.addSystemCommand(&.{ "python3", "tests/wpt/capture.py" });
+        capture.addArtifactArg(exe);
         if (previous_wpt_validation) |previous| capture.step.dependOn(previous);
         capture.addArg("--wpt-test");
         capture.addPrefixedFileArg("file://", b.path(fixture.fixture));
         capture.addArg("--wpt-timeout-ms");
         capture.addArg(b.fmt("{d}", .{fixture.timeout_ms}));
         capture.setEnvironmentVariable("SDL_VIDEODRIVER", "dummy");
-        _ = capture.captureStdErr(.{
+        const diagnostics = capture.captureStdErr(.{
             .basename = b.fmt("{s}.stderr.txt", .{fixture.output_basename}),
         });
         const actual = capture.captureStdOut(.{
@@ -423,6 +460,11 @@ pub fn build(b: *std.Build) !void {
         validate.addFileArg(actual);
         validate.addArgs(&.{ "--status", fixture.status });
         validate.addArgs(&.{ "--test-suffix", fixture.fixture });
+        validate.addArg("--stderr");
+        validate.addFileArg(diagnostics);
+        if (fixture.diagnostic_reason) |reason| validate.addArgs(&.{ "--diagnostic-reason", reason });
+        if (fixture.error_kind) |kind| validate.addArgs(&.{ "--error-kind", kind });
+        if (fixture.partial_subtests) |count| validate.addArgs(&.{ "--partial-subtests", b.fmt("{d}", .{count}) });
         wpt_test_step.dependOn(&validate.step);
         previous_wpt_validation = &validate.step;
     }

@@ -2788,6 +2788,12 @@ if (__native.wptEnabled()) {
   globalThis.self = globalThis;
   (function() {
     var wptCompletionHookInstalled = false;
+    var wptCompletedSubtests = 0;
+    function diagnostic(value) {
+      // Observations must never interfere with assertions or completion.
+      try { __native.wptDiagnostic(JSON.stringify(value)); } catch (error) {}
+    }
+    diagnostic({ kind: "runtime-ready" });
     function nullableString(value) {
       return value === undefined || value === null ? null : String(value);
     }
@@ -2864,6 +2870,28 @@ if (__native.wptEnabled()) {
         globalThis.completion_callback(tests, harnessStatus);
       });
       wptCompletionHookInstalled = true;
+      diagnostic({ kind: "harness-ready" });
+      if (typeof globalThis.add_start_callback === "function") {
+        globalThis.add_start_callback(function() {
+          diagnostic({ kind: "harness-started" });
+        });
+      }
+      if (typeof globalThis.add_result_callback === "function") {
+        globalThis.add_result_callback(function(test) {
+          wptCompletedSubtests++;
+          // Keep a small partial-result sample and sparse progress checkpoints.
+          // The final completion report remains the authoritative full result.
+          if (wptCompletedSubtests <= 8 || wptCompletedSubtests % 100 === 0) {
+            diagnostic({
+              kind: "subtest-complete",
+              completed: wptCompletedSubtests,
+              name: (nullableString(test.name) || "").slice(0, 256),
+              status: subtestStatusName(test.status),
+              message: (nullableString(test.message) || "").slice(0, 512)
+            });
+          }
+        });
+      }
     };
   })();
 }
