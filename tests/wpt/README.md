@@ -16,6 +16,7 @@ the helper from the repository root:
 python3 tests/wpt/run.py --list
 python3 tests/wpt/run.py --mode probe tests/wpt/manifest.yaml
 python3 tests/wpt/run.py --mode testharness tests/wpt/manifest.yaml
+task wpt
 python3 tests/wpt/run.py --all --jobs 4 --mode testharness \
   --browser ./zig-out/bin/zibra \
   --report tests/wpt/results/all.json
@@ -32,9 +33,10 @@ cannot report `testharness.js` results. Its output is labeled
 `testharness` runs each selected file in a real headless browser session. When
 the upstream checkout is initialized, the runner starts WPT's `wptserve` on a
 temporary loopback port so root-relative resources such as
-`/resources/testharness.js` resolve exactly as they do in WPT. The small YAML
-allowlist puts testharness paths under `tests` and fetch/parse smoke tests
-under `probes`; both default to `PASS`. Add a path to the optional
+`/resources/testharness.js` resolve exactly as they do in WPT. The YAML
+allowlist expands testharness directories from `directories`, accepts
+individual cases under `tests`, and puts fetch/parse smoke tests under
+`probes`; all default to `PASS`. Add a path to the optional
 `deviations` map only when its expected result differs (`fail`, `error`,
 `timeout`, or `skip`). Timeouts use the 10,000 ms default.
 
@@ -63,12 +65,21 @@ PASS, Promise-job PASS, and TIMEOUT fixtures through the real executable and
 validates its JSON transport. Those local fixtures are protocol regressions,
 not WPT conformance claims.
 
-The YAML file is the compatibility allowlist. Add paths to the conventional
-`tests` or `probes` section; keep unsupported tests out of the allowlist and
-record only intentional expected deviations.
+The YAML file is the compatibility allowlist. Add supported directory prefixes
+to `directories`, individual cases to `tests`, and fetch/parse smoke tests to
+`probes`; keep unsupported areas out of execution and record only intentional
+expected deviations.
 
 ## Full local runs
 
+`directories` entries in the reviewed YAML manifest expand to all
+testharness-marked files below those WPT directories. `task wpt` runs that
+allowlist with `--full-suite`: directories outside the allowlist are not
+executed, but remain in the report as `0/N` and make the suite fail. This keeps
+unsupported areas such as `accelerometer` visible without spending time on
+them.
+
+`--directory DIR` (repeatable) provides the same narrowing for ad-hoc runs.
 `--all` discovers HTML/XHTML/XML files in the checkout that reference WPT's
 `testharness.js` or `testharnessreport.js`. It deliberately leaves reftests,
 manual tests, WebDriver tests, and support resources out: those need a
@@ -105,6 +116,9 @@ The Taskfile provides the same workflow and uses four workers by default:
 task wpt-all
 WPT_JOBS=8 task wpt-all
 ```
+
+Use `task wpt` for the reviewed compatibility suite and `task wpt-all` only
+when deliberately auditing the complete discovered testharness corpus.
 
 For a local visual history, write a report while running the manifest and
 start the self-hosted dashboard:

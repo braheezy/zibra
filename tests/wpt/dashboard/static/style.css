@@ -40,6 +40,7 @@ code { color: var(--blue); font: .9em ui-monospace, SFMono-Regular, Menlo, monos
 .summary-copy { display: flex; align-items: baseline; gap: 14px; min-width: 0; }
 .summary-copy > span { min-width: 0; }
 .summary-copy strong { color: var(--green); font: 26px ui-monospace, SFMono-Regular, Menlo, monospace; white-space: nowrap; }
+.summary-copy strong.failed { color: var(--red); }
 .summary-links { display: flex; gap: 36px; align-items: center; font-size: 12px; font-weight: 400; }
 .summary-links a, .summary-links button { border: 0; background: transparent; color: #d5d6d4; text-decoration: none; }
 .summary-links a:hover, .summary-links button:hover { color: var(--blue); }

@@ -24,6 +24,16 @@ tasks:
         --mode testharness --browser ./zig-out/bin/zibra
         --report {{.WPT_RESULTS}}/$(date -u +%Y%m%dT%H%M%SZ).json
 
+  wpt:
+    desc: Run the reviewed WPT directory allowlist and score skipped suites as failures
+    cmds:
+      - zig build
+      - mkdir -p {{.WPT_RESULTS}}
+      - >-
+        ZIBRA_GIT_SHA="{{.GIT_SHA}}" SDL_VIDEODRIVER=dummy python3 tests/wpt/run.py {{.WPT_MANIFEST}}
+        --mode testharness --full-suite --jobs {{.WPT_JOBS}} --browser ./zig-out/bin/zibra
+        --report {{.WPT_RESULTS}}/wpt-$(date -u +%Y%m%dT%H%M%SZ).json
+
   wpt-all:
     desc: Run all discovered testharness WPT cases with isolated parallel workers
     cmds:

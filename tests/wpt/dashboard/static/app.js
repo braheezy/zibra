@@ -18,8 +18,9 @@ const summary = (run) => run?.summary || {};
 const semanticTotal = (value) => value.subtests_total != null ? value.subtests_total :
   (value.pass || 0) + (value.fail || 0) + (value.error || 0) + (value.timeout || 0);
 const passRate = (value) => {
-  const total = semanticTotal(value);
-  const passed = value.subtests_total != null ? (value.subtests_pass || 0) : (value.pass || 0);
+  const total = value.coverage_total != null ? value.coverage_total : semanticTotal(value);
+  const passed = value.coverage_total != null ? (value.coverage_pass || 0) :
+    (value.subtests_total != null ? (value.subtests_pass || 0) : (value.pass || 0));
   return total ? Math.round(passed * 100 / total) : null;
 };
 function dateText(value) {
@@ -74,7 +75,7 @@ function renderChart() {
     return { run, x, y: rate == null ? 265 : 265 - rate * 2.4, rate };
   });
   line.setAttribute("points", plotted.map(({ x, y }) => `${x},${y}`).join(" "));
-  points.innerHTML = plotted.map(({ run, x, y, rate }) => `<circle cx="${x}" cy="${y}" r="4" tabindex="0" data-run="${esc(run.id)}" aria-label="${esc(run.run_id || run.id)}: ${rate == null ? "no semantic results" : `${rate}% passing`}"></circle>`).join("");
+  points.innerHTML = plotted.map(({ run, x, y, rate }) => `<circle cx="${x}" cy="${y}" r="4" tabindex="0" data-run="${esc(run.id)}" aria-label="${esc(run.run_id || run.id)}: ${rate == null ? "no semantic results" : `${rate}% passing${summary(run).suite_failed ? ", suite failing" : ""}`}"></circle>`).join("");
   dates.innerHTML = plotted.map(({ run, x }) => `<text x="${x}" y="283">${esc(shortDate(run.finished_at))}</text>`).join("");
   points.querySelectorAll("[data-run]").forEach((point) => {
     point.addEventListener("click", () => selectRun(point.dataset.run));
@@ -99,8 +100,10 @@ function renderCoverage(report) {
   const rows = [];
   entries.forEach((item) => {
     const label = String(item.path || "(root)");
+    const skipped = Number(item.skipped || 0);
     const checks = item.total === 1 ? "1 check" : `${item.total} checks`;
-    rows.push(`<tr><td>${esc(label)}<span class="path-meta">${checks}</span></td><td>${score(item.passed || 0, item.total || 0)}</td></tr>`);
+    const status = skipped ? `${skipped} skipped` : "";
+    rows.push(`<tr><td>${esc(label)}<span class="path-meta">${checks}${status ? ` · ${status}` : ""}</span></td><td>${score(item.passed || 0, item.total || 0)}</td></tr>`);
   });
   $("coverage-table").innerHTML = rows.join("");
 }
@@ -113,8 +116,10 @@ function renderRun(report) {
   }, { passed: 0, total: 0 });
   const revision = revisionLabel(report?.browser_revision || run?.browser_revision);
   const runLabel = run?.id === state.runs[0]?.id ? "latest local test run" : "selected local test run";
+  const failing = Boolean(run?.summary?.suite_failed);
   $("results-score").textContent = run ? `${checks.passed}/${checks.total}` : "—";
-  $("results-description").textContent = run ? `Showing ${directories.length} directory scores from the ${runLabel} for zibra[${revision}]` : "No results selected.";
+  $("results-score").classList.toggle("failed", failing);
+  $("results-description").textContent = run ? `Showing ${directories.length} directory scores from the ${runLabel} for zibra[${revision}]${failing ? " — suite failing" : ""}` : "No results selected.";
   renderCoverage(report);
 }
 function selectRun(id) {

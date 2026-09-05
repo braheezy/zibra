@@ -47,6 +47,9 @@ def _read_run(path: Path) -> dict:
 
 def _directory_scores(report: dict) -> list[dict[str, object]]:
     """Collapse case records into the directory scores used by the UI."""
+    explicit = report.get("directory_scores")
+    if isinstance(explicit, list):
+        return [item for item in explicit if isinstance(item, dict)]
     groups: dict[str, dict[str, int]] = {}
     tests = report.get("tests", [])
     if not isinstance(tests, list):
@@ -85,6 +88,7 @@ def _run_summary(path: Path) -> dict:
         "run_id": report.get("run_id", path.stem),
         "started_at": report.get("started_at"),
         "finished_at": report.get("finished_at"),
+        "complete": report.get("complete", True),
         "mode": report.get("mode"),
         "manifest": manifest,
         # Focused manifests are useful for debugging, but mixing their scores

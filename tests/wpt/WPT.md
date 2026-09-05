@@ -13,8 +13,8 @@ upstream testharness pass. The current implementation includes:
 - `.gitmodules` registers the WPT checkout at `tests/wpt/upstream`;
   contributors initialize it only when doing upstream compatibility work. The
   runner/result protocol does not yet expose the resolved WPT revision.
-  `manifest.yaml` remains the reviewed compatibility allowlist and contains the
-  legacy `probe` plus one candidate upstream testharness case.
+  `manifest.yaml` remains the reviewed compatibility allowlist and contains
+  supported WPT directories plus the legacy `probe` and candidate test case.
 - `run.py` preserves `probe` as an explicitly labeled non-conformance fetch and
   parse smoke test. Its `testharness` mode starts WPT's own `wptserve` on a
   worker-local loopback port, invokes the WPT CLI protocol, checks exact
@@ -70,7 +70,7 @@ Browser, SDL, layout, or JavaScript. A successful probe is never a
 | 3. Scheduling/cancellation | Partial | Task-return barrier, deadline arbitration, and JS interruption work; resource quiescence and complete transport cancellation do not |
 | 4. Web APIs | Ongoing | Grow coherent slices from selected failures rather than attempting the full platform |
 | 5. `wptserve` | Core implemented | Worker-local loopback server supplies unchanged root-relative harness resources; richer dynamic handlers remain |
-| 6. Selection/expectations | Runner ready | Schema and exact comparison are exercised by one reviewed `testharness` entry |
+| 6. Selection/expectations | Runner ready | Directory expansion, exact comparison, and full-suite zero coverage are supported |
 | 7. Reftests | Not started | Keep separate from semantic harness results |
 | 8. Performance/CI | Partial | Local dashboard and report artifacts exist; sharding, CI publishing, and a persistent process do not |
 
@@ -142,9 +142,10 @@ records when `--report` is supplied.
 2. Keep the exact submodule commit in normal Git metadata and copy its resolved
    revision into run metadata. Do not copy WPT into the repository or modify
    upstream tests.
-3. Keep the small YAML allowlist convention-based: `tests` selects
-   testharness cases, `probes` selects smoke tests, and `deviations` records
-   only paths whose expected result is not `PASS`.
+3. Keep the YAML allowlist convention-based: `directories` expands selected
+   testharness directories, `tests` selects individual cases, `probes` selects
+   smoke tests, and `deviations` records only paths whose expected result is
+   not `PASS`.
 4. Keep generated output outside committed fixtures, for example
    `tests/wpt/results/<run-id>.json`; ignore it and upload it from CI.
 5. Continue excluding the submodule from Zibra's Markdown and formatting
@@ -358,9 +359,10 @@ cross-origin requests carry an explicit serialized request origin.
 ## Phase 6: semantic test selection and expectations
 
 Status: runner ready. `run.py` supports the YAML allowlist's reviewed `probe`
-and `testharness` modes, default PASS expectations, optional deviations, and
-infrastructure-failure classification. The committed config contains one
-reviewed upstream `testharness` case.
+and `testharness` modes, directory expansion, default PASS expectations,
+optional deviations, and infrastructure-failure classification. `task wpt`
+runs the allowlisted directories while scoring omitted discovered directories
+as zero coverage and failing the suite until those areas are implemented.
 
 Start with tests whose dependencies match implemented behavior:
 
@@ -404,9 +406,9 @@ pixels should not be the only evidence for a cross-platform behavior.
 ## Phase 8: runner performance and CI
 
 Status: partial. The process-per-test protocol, local fixture validation,
-runner unit tests, portable `zig build check` integration, durable reports, and
-the self-hosted dashboard exist. Parallel WPT server groups, CI publishing, shards,
-artifacts, parallel workers, and a persistent Zibra process do not.
+runner unit tests, portable `zig build check` integration, durable reports,
+self-hosted dashboard, and bounded parallel workers exist. Parallel WPT server
+groups, CI publishing, shards, and a persistent Zibra process do not.
 
 The first process-per-test runner is intentionally slow but easy to debug. Once
 results are correct:
@@ -421,9 +423,11 @@ results are correct:
    failures with retries.
 6. Publish JSON, logs, screenshots, and diffs as CI artifacts.
 
-WPT contains tens of thousands of test files and far more subtests. A serial
+WPT contains tens of thousands of test files and far more subtests. A
 process-per-test implementation can take many hours or days; a useful early
-milestone is a small, stable feature shard, not an attempted full-suite run.
+milestone is a small, stable feature shard. `task wpt` deliberately executes
+only the reviewed feature directories while scoring the rest as zero coverage;
+`task wpt-all` is the exhaustive execution audit.
 
 ## Updated implementation order
 

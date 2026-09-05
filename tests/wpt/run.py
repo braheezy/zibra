@@ -46,6 +46,7 @@ MAX_DIAGNOSTIC_BYTES = 64 * 1024
 MAX_CONSOLE_DIAGNOSTIC_BYTES = 8 * 1024
 DISCOVERY_EXTENSIONS = frozenset((".html", ".htm", ".xhtml", ".xht", ".xml"))
 DISCOVERY_SKIP_PREFIXES = ("resources/", "tools/", "_venv3/")
+MANUAL_NAME = re.compile(r"(?:^|[-_])manual(?:\.|$)", re.IGNORECASE)
 
 
 @dataclass(frozen=True)
@@ -96,8 +97,10 @@ def _folder_for_path(path: str) -> str:
 
 def _normalize_directory(value: str) -> str:
     """Normalize and validate a relative WPT directory prefix."""
+    if not isinstance(value, str):
+        raise ValueError(f"invalid WPT directory {value!r}")
     directory = value.strip().strip("/")
-    if not directory or directory == "." or directory.startswith("../") or "/../" in directory or directory == "..":
+    if not directory or directory == "." or any(part == ".." for part in directory.split("/")):
         raise ValueError(f"invalid WPT directory {value!r}")
     if "\\" in directory or directory.startswith("/"):
         raise ValueError(f"invalid WPT directory {value!r}")
@@ -543,6 +546,8 @@ def discover_testharness_cases(directories: list[str] | None = None) -> list[Cas
         relative = path.relative_to(UPSTREAM).as_posix()
         if relative.startswith(DISCOVERY_SKIP_PREFIXES):
             continue
+        if "manual" in relative.lower().split("/") or MANUAL_NAME.search(path.name):
+            continue
         if normalized_directories and not any(
             _path_in_directory(relative, directory)
             for directory in normalized_directories
@@ -874,6 +879,15 @@ def write_run_report(
         if directory_scores is not None
         else 0
     )
+    skipped_directories = (
+        sum(
+            1
+            for item in directory_scores
+            if int(item["skipped"]) == int(item["total"]) and int(item["total"]) > 0
+        )
+        if directory_scores is not None
+        else 0
+    )
     summary = {
         "total": len(serialized),
         "pass": counts["PASS"],
@@ -891,6 +905,7 @@ def write_run_report(
         "subtests_error": subtest_counts["ERROR"],
         "subtests_timeout": subtest_counts["TIMEOUT"],
         "skipped_cases": skipped_cases,
+        "skipped_directories": skipped_directories,
         "suite_failed": skipped_cases > 0 or counts["INFRA"] > 0 or any(
             not result.ok for result in results
         ),
@@ -937,6 +952,14 @@ def _parse_args(argv: list[str] | None) -> argparse.Namespace:
         help="discover and run all upstream testharness cases (no manifest needed)",
     )
     parser.add_argument(
+        "--directory", "--dir", dest="directories", action="append", default=[],
+        help="restrict the selected cases to this WPT directory prefix (repeatable)",
+    )
+    parser.add_argument(
+        "--full-suite", action="store_true",
+        help="score unselected discovered testharness directories as zero coverage",
+    )
+    parser.add_argument(
         "--jobs", type=int, default=1,
         help="maximum browser processes to run concurrently (default: 1)",
     )
@@ -973,6 +996,14 @@ def main(argv: list[str] | None = None) -> int:
     if args.all and args.mode == "probe":
         print("--all only supports --mode testharness", file=sys.stderr)
         return 2
+    try:
+        requested_directories = [_normalize_directory(value) for value in args.directories]
+    except (AttributeError, ValueError) as error:
+        print(f"Invalid WPT directory: {error}", file=sys.stderr)
+        return 2
+    if args.full_suite and mode != "testharness":
+        print("--full-suite only supports --mode testharness", file=sys.stderr)
+        return 2
     if args.jobs <= 0:
         print("--jobs must be a positive integer", file=sys.stderr)
         return 2
@@ -983,8 +1014,10 @@ def main(argv: list[str] | None = None) -> int:
         print("--timeout-ms must be a positive integer", file=sys.stderr)
         return 2
     manifest_for_report = args.manifest
+    coverage_cases: list[Case] | None = None
     if args.all:
-        cases = discover_testharness_cases()
+        coverage_cases = discover_testharness_cases()
+        cases = coverage_cases
         manifest_for_report = pathlib.Path("<all-testharness>")
         print(f"Discovered {len(cases)} testharness cases")
     else:
@@ -993,6 +1026,15 @@ def main(argv: list[str] | None = None) -> int:
         except (OSError, json.JSONDecodeError, ValueError) as error:
             print(f"Failed to load WPT manifest: {error}", file=sys.stderr)
             return 2
+
+    if requested_directories:
+        cases = [
+            case
+            for case in cases
+            if any(_path_in_directory(case.path, directory) for directory in requested_directories)
+        ]
+    if args.full_suite and coverage_cases is None:
+        coverage_cases = discover_testharness_cases()
 
     if args.list:
         try:
@@ -1072,7 +1114,9 @@ def main(argv: list[str] | None = None) -> int:
                     finished_at=datetime.now(timezone.utc),
                     results=results,
                     complete=False,
-                    expected_cases=len(results) + len(selected),
+                    expected_cases=len(coverage_cases) if coverage_cases is not None else len(results) + len(selected),
+                    coverage_cases=coverage_cases,
+                    suite="all" if coverage_cases is not None else None,
                 )
             reporter.finish(False)
             return 1
@@ -1128,7 +1172,13 @@ def main(argv: list[str] | None = None) -> int:
             finished_at=datetime.now(timezone.utc),
             results=[*results, *(completed[index] for index in sorted(completed))],
             complete=False,
-            expected_cases=len(results) + len(selected),
+            expected_cases=(
+                len(coverage_cases)
+                if coverage_cases is not None
+                else len(results) + len(selected)
+            ),
+            coverage_cases=coverage_cases,
+            suite="all" if coverage_cases is not None else None,
         )
 
     try:
@@ -1194,13 +1244,21 @@ def main(argv: list[str] | None = None) -> int:
                 results=report_results,
                 complete=run_complete,
                 expected_cases=(
-                    len(report_results)
+                    len(coverage_cases)
+                    if coverage_cases is not None
+                    else len(report_results)
                     if run_complete
                     else len(results) + len(selected)
                 ),
+                coverage_cases=coverage_cases,
+                suite="all" if coverage_cases is not None else None,
             )
         reporter.finish(run_complete)
-    return 1 if failed else 0
+    skipped_from_coverage = (
+        coverage_cases is not None
+        and any(case.path not in {result.case.path for result in results} for case in coverage_cases)
+    )
+    return 1 if failed or skipped_from_coverage else 0
 
 
 if __name__ == "__main__":

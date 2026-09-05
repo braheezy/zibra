@@ -63,6 +63,34 @@ class DashboardServerTests(unittest.TestCase):
             )
             self.assertFalse(server._run_summary(path)["full_suite"])
 
+    def test_explicit_scores_preserve_unselected_directories(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "coverage.json"
+            path.write_text(
+                json.dumps(
+                    {
+                        "manifest": "tests/wpt/manifest.yaml",
+                        "suite": "all",
+                        "summary": {"suite_failed": True},
+                        "directory_scores": [
+                            {
+                                "path": "accelerometer/",
+                                "passed": 0,
+                                "total": 4,
+                                "skipped": 4,
+                            }
+                        ],
+                    }
+                ),
+                encoding="utf-8",
+            )
+            summary = server._run_summary(path)
+            self.assertTrue(summary["full_suite"])
+            self.assertEqual(
+                [{"path": "accelerometer/", "passed": 0, "total": 4, "skipped": 4}],
+                summary["directories"],
+            )
+
     def test_run_summary_sanitizes_legacy_revision_text(self):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "legacy.json"

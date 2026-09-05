@@ -70,6 +70,8 @@ class WptRunnerTests(unittest.TestCase):
         report=None,
         checkpoint_every=None,
         verbose=False,
+        full_suite=False,
+        directories=None,
     ):
         stdout = io.StringIO()
         stderr = io.StringIO()
@@ -89,6 +91,10 @@ class WptRunnerTests(unittest.TestCase):
             argv.extend(("--checkpoint-every", str(checkpoint_every)))
         if verbose:
             argv.append("--verbose")
+        if full_suite:
+            argv.append("--full-suite")
+        for directory in directories or []:
+            argv.extend(("--directory", directory))
         with (
             mock.patch.object(runner, "ROOT", self.root),
             mock.patch.object(runner, "UPSTREAM", self.upstream),
@@ -108,6 +114,10 @@ class WptRunnerTests(unittest.TestCase):
         support = self.upstream / "resources" / "support.html"
         support.parent.mkdir()
         support.write_text(
+            '<script src="/resources/testharness.js"></script>', encoding="utf-8"
+        )
+        manual = self.upstream / "dom" / "case-manual.html"
+        manual.write_text(
             '<script src="/resources/testharness.js"></script>', encoding="utf-8"
         )
 
@@ -248,6 +258,121 @@ print(json.dumps({
         self.assertIn("done dom/ 2/2", stdout.getvalue())
         self.assertIn("WPT complete: 2/2 cases", stdout.getvalue())
         self.assertEqual("", stderr.getvalue())
+
+    def test_yaml_directory_allowlist_expands_harness_cases(self):
+        for path in ("dom/one.html", "dom/two.html", "accelerometer/one.html"):
+            test_file = self.upstream / path
+            test_file.parent.mkdir(parents=True, exist_ok=True)
+            test_file.write_text(
+                '<script src="/resources/testharness.js"></script>',
+                encoding="utf-8",
+            )
+        manifest = self.root / "directories.yaml"
+        manifest.write_text(
+            "directories:\n  - dom\n",
+            encoding="utf-8",
+        )
+
+        with mock.patch.object(runner, "UPSTREAM", self.upstream):
+            cases = runner.load_cases(manifest)
+
+        self.assertEqual(["dom/one.html", "dom/two.html"], [case.path for case in cases])
+
+    def test_full_suite_scores_unselected_directories_as_zero_and_fails(self):
+        harness = self.upstream / self.case_path
+        harness.write_text(
+            '<script src="/resources/testharness.js"></script>',
+            encoding="utf-8",
+        )
+        skipped = self.upstream / "accelerometer" / "one.html"
+        skipped.parent.mkdir()
+        skipped.write_text(
+            '<script src="/resources/testharness.js"></script>',
+            encoding="utf-8",
+        )
+        manifest = self.write_manifest()
+        browser = self.write_browser(
+            """\
+import json
+import sys
+print(json.dumps({
+    "protocol_version": 1,
+    "test": sys.argv[2],
+    "status": "PASS",
+    "duration_ms": 1,
+}))
+"""
+        )
+        report = self.root / "coverage-report.json"
+
+        status, stdout, stderr = self.run_main(
+            manifest, browser, report=report, full_suite=True
+        )
+
+        self.assertEqual(1, status)
+        self.assertEqual("", stderr)
+        payload = json.loads(report.read_text(encoding="utf-8"))
+        self.assertTrue(payload["summary"]["suite_failed"])
+        self.assertEqual(1, payload["summary"]["skipped_cases"])
+        scores = {item["path"]: item for item in payload["directory_scores"]}
+        self.assertEqual(
+            {"path": "accelerometer/", "passed": 0, "total": 1, "skipped": 1},
+            scores["accelerometer/"],
+        )
+
+    def test_directory_filter_keeps_unselected_cases_out_of_execution(self):
+        for path in ("dom/one.html", "html/one.html"):
+            test_file = self.upstream / path
+            test_file.parent.mkdir(parents=True, exist_ok=True)
+            test_file.write_text("<html></html>", encoding="utf-8")
+        manifest = self.root / "filter.json"
+        manifest.write_text(
+            json.dumps(
+                {
+                    "version": 1,
+                    "tests": [
+                        {
+                            "path": "dom/one.html",
+                            "mode": "testharness",
+                            "status": "candidate",
+                            "reason": "filter fixture",
+                            "timeout_ms": 100,
+                            "expectation": "pass",
+                        },
+                        {
+                            "path": "html/one.html",
+                            "mode": "testharness",
+                            "status": "candidate",
+                            "reason": "filter fixture",
+                            "timeout_ms": 100,
+                            "expectation": "pass",
+                        },
+                    ],
+                }
+            ),
+            encoding="utf-8",
+        )
+        browser = self.write_browser(
+            """\
+import json
+import sys
+print(json.dumps({
+    "protocol_version": 1,
+    "test": sys.argv[2],
+    "status": "PASS",
+    "duration_ms": 1,
+}))
+"""
+        )
+
+        status, stdout, stderr = self.run_main(
+            manifest, browser, directories=["dom"]
+        )
+
+        self.assertEqual(0, status)
+        self.assertIn("WPT complete: 1/1 cases", stdout)
+        self.assertNotIn("html/one.html", stdout)
+        self.assertEqual("", stderr)
 
     def test_probe_stays_an_explicit_non_conformance_smoke_test(self):
         manifest = self.write_manifest(
