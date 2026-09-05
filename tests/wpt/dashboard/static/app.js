@@ -132,9 +132,12 @@ function renderRun(report) {
   const revision = revisionLabel(report?.browser_revision || run?.browser_revision);
   const runLabel = run?.id === state.runs[0]?.id ? "latest local test run" : "selected local test run";
   const failing = Boolean(run?.summary?.suite_failed);
+  const inventory = run?.inventory || {};
+  const inventoryText = inventory.total != null ?
+    ` · ${Number(inventory.total).toLocaleString()} discovered WPT tests, ${Number(inventory.runnable || 0).toLocaleString()} runnable` : "";
   $("results-score").textContent = run ? `${checks.passed}/${checks.total}` : "—";
   $("results-score").classList.toggle("failed", failing);
-  $("results-description").textContent = run ? `Showing ${directories.length} directory scores from the ${runLabel} for zibra[${revision}]${failing ? " — suite failing" : ""}` : "No results selected.";
+  $("results-description").textContent = run ? `Showing ${directories.length} directory scores from the ${runLabel} for zibra[${revision}]${inventoryText}${failing ? " — suite failing" : ""}` : "No results selected.";
   renderCoverage(report);
 }
 function selectRun(id) {

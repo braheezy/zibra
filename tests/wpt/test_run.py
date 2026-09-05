@@ -127,6 +127,75 @@ class WptRunnerTests(unittest.TestCase):
         self.assertEqual(["dom/discovered.html"], [case.path for case in cases])
         self.assertEqual("testharness", cases[0].mode)
 
+    def test_discovery_classifies_generated_and_unsupported_entries(self):
+        generated = self.upstream / "dom" / "generated.any.js"
+        generated.write_text("// META: global=window,dedicatedworker\n", encoding="utf-8")
+        reftest = self.upstream / "css" / "reference.html"
+        reftest.parent.mkdir()
+        reftest.write_text(
+            '<link rel="match" href="reference-ref.html">', encoding="utf-8"
+        )
+        manual = self.upstream / "html" / "example-manual.html"
+        manual.parent.mkdir()
+        manual.write_text("<p>operator test</p>", encoding="utf-8")
+
+        with mock.patch.object(runner, "UPSTREAM", self.upstream):
+            inventory = runner.discover_wpt_inventory()
+
+        self.assertEqual(
+            [
+                ("css/reference.html", "reftest", False),
+                ("dom/generated.any.html", "testharness", True),
+                ("dom/generated.any.worker.html", "testharness", True),
+                ("html/example-manual.html", "manual", False),
+            ],
+            [(item.path, item.category, item.runnable) for item in inventory],
+        )
+        summary = runner.inventory_summary(inventory)
+        self.assertEqual(4, summary["total"])
+        self.assertEqual(2, summary["runnable"])
+        self.assertEqual(
+            {"manual": 1, "reftest": 1, "testharness": 2},
+            summary["categories"],
+        )
+
+    def test_discovery_prefers_wpt_manifest_and_keeps_generated_source_path(self):
+        manifest = self.upstream / "MANIFEST.json"
+        manifest.write_text(
+            json.dumps(
+                {
+                    "version": 9,
+                    "items": {
+                        "testharness": {
+                            "dom": {
+                                "generated.any.js": [
+                                    "hash",
+                                    ["dom/generated.any.html", {}],
+                                    ["dom/generated.any.worker.html", {}],
+                                ]
+                            }
+                        },
+                        "reftest": {
+                            "css": {"case.html": ["hash", [None, {}]]}
+                        },
+                    },
+                }
+            ),
+            encoding="utf-8",
+        )
+
+        with mock.patch.object(runner, "UPSTREAM", self.upstream):
+            inventory = runner.discover_wpt_inventory()
+            self.assertEqual("wpt-manifest", runner.inventory_summary(inventory)["source"])
+        self.assertEqual(
+            [
+                ("css/case.html", "css/case.html", "reftest"),
+                ("dom/generated.any.html", "dom/generated.any.js", "testharness"),
+                ("dom/generated.any.worker.html", "dom/generated.any.js", "testharness"),
+            ],
+            [(item.path, item.source_path, item.category) for item in inventory],
+        )
+
     def test_parallel_workers_keep_all_results_and_isolate_processes(self):
         second_path = "dom/second.html"
         (self.upstream / second_path).write_text(
@@ -254,7 +323,7 @@ print(json.dumps({
             )
 
         self.assertEqual(0, status)
-        self.assertIn("Discovered 2 testharness cases", stdout.getvalue())
+        self.assertIn("Discovered 2 WPT tests (2 runnable testharness cases", stdout.getvalue())
         self.assertIn("done dom/ 2/2", stdout.getvalue())
         self.assertIn("WPT complete: 2/2 cases", stdout.getvalue())
         self.assertEqual("", stderr.getvalue())

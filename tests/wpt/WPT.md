@@ -381,9 +381,15 @@ Maintain separate buckets:
 - unsupported: recorded skip with a reason.
 
 Use WPT metadata and test manifests to select files, but keep Zibra's reviewed
-allowlist as the compatibility claim. A failure should normally become both a
-WPT result and a focused Zibra regression (unit test, pipeline golden, or
-manual fixture) according to `docs/testing.md`.
+allowlist as the compatibility claim. Discovery prefers WPT's generated
+`MANIFEST.json` and has a dependency-free source-scan fallback. It classifies
+testharness (including generated `.any/.window/.worker` variants), reftest,
+visual, manual, WebDriver, crash, accessibility, conformance-checker, and
+Test262 entries. Only testharness entries currently have a Zibra result
+protocol; classification makes the larger WPT inventory visible without
+pretending unsupported categories passed. A failure should normally become
+both a WPT result and a focused Zibra regression (unit test, pipeline golden,
+or manual fixture) according to `docs/testing.md`.
 
 ## Phase 7: rendering and reftests
 

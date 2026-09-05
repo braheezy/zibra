@@ -97,6 +97,7 @@ def _run_summary(path: Path) -> dict:
         "full_suite": suite == "all" or manifest == "<all-testharness>",
         "browser_revision": _revision_label(report.get("browser_revision")),
         "summary": summary if isinstance(summary, dict) else {},
+        "inventory": report.get("inventory", {}),
         "directories": _directory_scores(report),
     }
 

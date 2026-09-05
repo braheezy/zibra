@@ -55,6 +55,7 @@ tiers and baseline policy.
 | [`paint-invalidation.html`](paint-invalidation.html) | Retained display-list mutation and clean sibling reuse |
 | [`protected-layout-phases.html`](protected-layout-phases.html) | Protected style/layout phases versus paint/compositor-only animation |
 | [`window-resize.html`](window-resize.html) | Horizontal/vertical native resize, viewport invalidation, and rerender |
+| [`responsive-layout.html`](responsive-layout.html) | Root-relative type, dynamic CSS variables, flex wrapping, responsive grid tracks, and height-only media updates |
 | [`max-width-media.html`](max-width-media.html) | Inclusive max-width query under page zoom and native resize |
 | [`width-media-iframes.html`](width-media-iframes.html) | Exact iframe media width and parent-driven viewport changes |
 | [`css-zoom.html`](css-zoom.html) | Authored subtree zoom composed with accessibility zoom, frames, focus, and hit testing |

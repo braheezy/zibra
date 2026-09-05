@@ -72,20 +72,25 @@ expected deviations.
 
 ## Full local runs
 
-`directories` entries in the reviewed YAML manifest expand to all
-testharness-marked files below those WPT directories. `task wpt` runs that
+`directories` entries in the reviewed YAML manifest expand to all discovered
+testharness entries below those WPT directories, including generated variants.
+`task wpt` runs that
 allowlist with `--full-suite`: directories outside the allowlist are not
 executed, but remain in the report as `0/N` and make the suite fail. This keeps
 unsupported areas such as `accelerometer` visible without spending time on
 them.
 
 `--directory DIR` (repeatable) provides the same narrowing for ad-hoc runs.
-`--all` discovers HTML/XHTML/XML files in the checkout that reference WPT's
-`testharness.js` or `testharnessreport.js`. It deliberately leaves reftests,
-manual tests, WebDriver tests, and support resources out: those need a
-different protocol than Zibra's headless JSON result. The discovered set is
-the largest useful automated slice of WPT and will grow as upstream adds
-testharness files.
+`--all` discovers the WPT test inventory, preferring WPT's generated
+`MANIFEST.json` when present and otherwise applying the same source naming and
+metadata rules locally. This includes generated `.any.js`, `.window.js`, and
+`.worker.js` variants. The report classifies testharness, reftest, manual,
+visual, WebDriver, crash, accessibility, conformance-checker, and Test262
+entries separately. Only testharness entries are currently runnable by
+Zibra's JSON protocol; the others increase the honest discovered total but
+remain unsupported and are not executed. Support files are not counted as
+tests. A full inventory run therefore reports both the total discovered WPT
+tests and its smaller runnable testharness subset.
 
 Build Zibra once, then run several independent browser processes against one
 temporary WPT server:

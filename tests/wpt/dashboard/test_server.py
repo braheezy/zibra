@@ -28,6 +28,11 @@ class DashboardServerTests(unittest.TestCase):
                 "mode": "testharness",
                 "manifest": "<all-testharness>",
                 "browser_revision": "abc1234",
+                "inventory": {
+                    "total": 118858,
+                    "runnable": 33982,
+                    "categories": {"testharness": 33982},
+                },
                 "summary": {"total": 1, "pass": 1},
                 "tests": [
                     {"path": "dom/example.html", "status": "PASS"},
@@ -49,6 +54,7 @@ class DashboardServerTests(unittest.TestCase):
                 self.assertEqual("run-1", summary["id"])
                 self.assertEqual("abc1234", summary["browser_revision"])
                 self.assertTrue(summary["full_suite"])
+                self.assertEqual(118858, summary["inventory"]["total"])
                 self.assertEqual(
                     [{"path": "dom/", "passed": 2, "total": 3}],
                     summary["directories"],

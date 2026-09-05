@@ -47,6 +47,49 @@ MAX_CONSOLE_DIAGNOSTIC_BYTES = 8 * 1024
 DISCOVERY_EXTENSIONS = frozenset((".html", ".htm", ".xhtml", ".xht", ".xml"))
 DISCOVERY_SKIP_PREFIXES = ("resources/", "tools/", "_venv3/")
 MANUAL_NAME = re.compile(r"(?:^|[-_])manual(?:\.|$)", re.IGNORECASE)
+GENERATED_GLOBALS = {
+    "window": (".any.html",),
+    "window-module": (".any.window-module.html",),
+    "dedicatedworker": (".any.worker.html",),
+    "dedicatedworker-module": (".any.dedicatedworker-module.html",),
+    "sharedworker": (".any.sharedworker.html",),
+    "sharedworker-module": (".any.sharedworker-module.html",),
+    "serviceworker": (".https.any.serviceworker.html",),
+    "serviceworker-module": (".https.any.serviceworker-module.html",),
+    "shadowrealm-in-window": (".any.shadowrealm-in-window.html",),
+    "shadowrealm-in-dedicatedworker": (".any.shadowrealm-in-dedicatedworker.html",),
+    "shadowrealm-in-shadowrealm": (".any.shadowrealm-in-shadowrealm.html",),
+    "shadowrealm-in-sharedworker": (".any.shadowrealm-in-sharedworker.html",),
+    "shadowrealm-in-serviceworker": (".https.any.shadowrealm-in-serviceworker.html",),
+    "shadowrealm-in-audioworklet": (".https.any.shadowrealm-in-audioworklet.html",),
+    "audioworklet": (".any.audioworklet.html",),
+    "worker-module": (".any.worker-module.html",),
+    "jsshell": (".any.js",),
+}
+INVENTORY_CATEGORIES = (
+    "testharness",
+    "reftest",
+    "manual",
+    "visual",
+    "wdspec",
+    "crashtest",
+    "aamtest",
+    "conformancechecker",
+    "test262",
+)
+INVENTORY_TEST_EXTENSIONS = frozenset(
+    (*DISCOVERY_EXTENSIONS, ".svg", ".js", ".py")
+)
+
+
+@dataclass(frozen=True)
+class InventoryItem:
+    """One WPT manifest test entry, including generated test variants."""
+
+    path: str
+    source_path: str
+    category: str
+    runnable: bool
 
 
 @dataclass(frozen=True)
@@ -57,6 +100,7 @@ class Case:
     status: str = "candidate"
     timeout_ms: int = DEFAULT_TIMEOUT_MS
     expectation: str | None = None
+    source_path: str | None = None
 
     @property
     def skipped(self) -> bool:
@@ -87,6 +131,11 @@ class CaseResult:
     infrastructure_error: str | None = None
     stdout: str = ""
     stderr: str = ""
+
+
+def _case_scope_path(case: Case) -> str:
+    """Return the source path used for directory selection and file lookup."""
+    return case.source_path or case.path
 
 
 def _folder_for_path(path: str) -> str:
@@ -361,6 +410,10 @@ def _validate_case(case: Case, index: int) -> None:
         raise ValueError(f"{prefix}.status must be a string")
     if not isinstance(case.reason, str) or not case.reason:
         raise ValueError(f"{prefix}.reason must be a non-empty string")
+    if case.source_path is not None and (
+        not isinstance(case.source_path, str) or not case.source_path
+    ):
+        raise ValueError(f"{prefix}.source_path must be a non-empty string")
     if type(case.timeout_ms) is not int or case.timeout_ms <= 0:
         raise ValueError(f"{prefix}.timeout_ms must be a positive integer")
     if case.expectation is not None:
@@ -527,47 +580,217 @@ def load_cases(path: pathlib.Path) -> list[Case]:
     return cases
 
 
-def discover_testharness_cases(directories: list[str] | None = None) -> list[Case]:
-    """Discover upstream files that embed the WPT testharness protocol.
+def _inventory_directories_match(source_path: str, directories: list[str]) -> bool:
+    return not directories or any(
+        _path_in_directory(source_path, directory) for directory in directories
+    )
 
-    This intentionally excludes WPT support files and non-test resources. It
-    does not claim that every discovered file is runnable: an individual test
-    can still fail or be classified as ``INFRA`` by the browser protocol.
-    Keeping discovery convention-based means the full corpus needs no
-    hand-maintained manifest.
-    """
+
+def _generated_paths(source_path: str, source: str) -> list[str]:
+    """Return WPT URL paths generated from an ``*.any/window/worker.js`` file."""
+    name = pathlib.PurePosixPath(source_path).name
+    if not name.endswith(".js"):
+        return []
+    if name.endswith(".any.js"):
+        stem = source_path[: -len(".any.js")]
+        globals_value = ""
+        for line in source.splitlines()[:20]:
+            match = re.match(r"\s*//\s*META:\s*global\s*=\s*(.*)\s*$", line)
+            if match:
+                globals_value = match.group(1).strip()
+                break
+        globals_list = [item.strip() for item in globals_value.split(",") if item.strip()]
+        if not globals_list:
+            globals_list = ["window", "dedicatedworker"]
+        expanded: list[str] = []
+        for global_name in globals_list:
+            if global_name == "worker":
+                expanded.extend(
+                    suffix
+                    for worker in ("dedicatedworker", "sharedworker", "serviceworker")
+                    for suffix in GENERATED_GLOBALS[worker]
+                )
+            elif global_name == "shadowrealm":
+                expanded.extend(
+                    suffix
+                    for shadowrealm in (
+                        "shadowrealm-in-window",
+                        "shadowrealm-in-shadowrealm",
+                        "shadowrealm-in-dedicatedworker",
+                        "shadowrealm-in-sharedworker",
+                        "shadowrealm-in-serviceworker",
+                        "shadowrealm-in-audioworklet",
+                    )
+                    for suffix in GENERATED_GLOBALS[shadowrealm]
+                )
+            else:
+                expanded.extend(GENERATED_GLOBALS.get(global_name, ()))
+        variants = [
+            match.group(1).strip()
+            for line in source.splitlines()[:20]
+            if (match := re.match(r"\s*//\s*META:\s*variant\s*=\s*(.*)\s*$", line))
+        ] or [""]
+        return [stem + suffix + variant for suffix in dict.fromkeys(expanded) for variant in variants]
+    for suffix in (".window", ".worker", ".sharedworker", ".serviceworker", ".extension"):
+        if name.endswith(suffix + ".js"):
+            base = source_path[: -len(suffix + ".js")] + suffix + ".html"
+            variants = [
+                match.group(1).strip()
+                for line in source.splitlines()[:20]
+                if (match := re.match(r"\s*//\s*META:\s*variant\s*=\s*(.*)\s*$", line))
+            ] or [""]
+            return [base + variant for variant in variants]
+    return []
+
+
+def _source_inventory_items(relative: str, source: str) -> list[InventoryItem]:
+    """Classify a source file using the same filename/content concepts as WPT."""
+    path = pathlib.PurePosixPath(relative)
+    name = path.name.lower()
+    lower_source = source.lower()
+    if relative.startswith(DISCOVERY_SKIP_PREFIXES):
+        return []
+    if "webdriver/" in relative and path.suffix == ".py" and name not in {"__init__.py", "conftest.py"}:
+        return [InventoryItem(relative, relative, "wdspec", False)]
+    if "aamtests/" in relative and path.suffix == ".py" and name not in {"__init__.py", "conftest.py"}:
+        return [InventoryItem(relative, relative, "aamtest", False)]
+    if "conformance-checkers/" in relative:
+        category = "conformancechecker" if "-is-valid." in name or "-no-valid." in name else None
+        return [InventoryItem(relative, relative, category, False)] if category else []
+    if "test262/" in relative and path.suffix == ".js":
+        return [InventoryItem(relative, relative, "test262", False)]
+    if MANUAL_NAME.search(path.name) or "/manual/" in f"/{relative.lower()}/":
+        return [InventoryItem(relative, relative, "manual", False)]
+    if re.search(r"-visual(?:\.|$)", name):
+        return [InventoryItem(relative, relative, "visual", False)]
+    if path.suffix in DISCOVERY_EXTENSIONS or path.suffix == ".svg":
+        is_reftest = bool(
+            re.search(r"rel\s*=\s*['\"][^'\"]*(?:match|mismatch)", lower_source)
+            or re.search(r"meta[^>]+name\s*=\s*['\"]reftest", lower_source)
+        )
+        if is_reftest:
+            return [InventoryItem(relative, relative, "reftest", False)]
+        if "testharness.js" in lower_source or "testharnessreport.js" in lower_source:
+            return [InventoryItem(relative, relative, "testharness", True)]
+        return []
+    generated = _generated_paths(relative, source)
+    if generated:
+        return [
+            InventoryItem(item, relative, "testharness", item != relative)
+            for item in generated
+        ]
+    return []
+
+
+def _manifest_inventory_items(path: pathlib.Path) -> list[InventoryItem]:
+    """Read WPT's generated MANIFEST.json without importing WPT dependencies."""
+    data = json.loads(path.read_text(encoding="utf-8"))
+    if not isinstance(data, dict) or not isinstance(data.get("items"), dict):
+        raise ValueError("invalid WPT MANIFEST.json")
+    supported = set(INVENTORY_CATEGORIES)
+    items: list[InventoryItem] = []
+
+    def walk(node: object, parts: list[str], category: str) -> None:
+        if isinstance(node, dict):
+            for key, value in node.items():
+                walk(value, [*parts, str(key)], category)
+            return
+        if not isinstance(node, list) or not node or not isinstance(node[0], str):
+            return
+        source_path = "/".join(parts)
+        for raw_item in node[1:]:
+            test_path = source_path
+            runnable = category == "testharness"
+            if isinstance(raw_item, list) and raw_item and isinstance(raw_item[0], str):
+                test_path = raw_item[0] or source_path
+                if (
+                    category == "testharness"
+                    and len(raw_item) > 1
+                    and isinstance(raw_item[1], dict)
+                    and raw_item[1].get("jsshell")
+                ):
+                    runnable = False
+            items.append(
+                InventoryItem(
+                    path=test_path.lstrip("/"),
+                    source_path=source_path,
+                    category=category,
+                    runnable=runnable,
+                )
+            )
+
+    for category, value in data["items"].items():
+        if category in supported:
+            walk(value, [], category)
+    return sorted(items, key=lambda item: (item.source_path, item.path, item.category))
+
+
+def discover_wpt_inventory(directories: list[str] | None = None) -> list[InventoryItem]:
+    """Discover and classify WPT tests, preferring WPT's generated manifest."""
     if not UPSTREAM.is_dir():
         return []
-    normalized_directories = [_normalize_directory(value) for value in directories or []]
-    cases: list[Case] = []
+    normalized = [_normalize_directory(value) for value in directories or []]
+    manifest_path = UPSTREAM / "MANIFEST.json"
+    if manifest_path.is_file():
+        try:
+            items = _manifest_inventory_items(manifest_path)
+            return [
+                item for item in items
+                if _inventory_directories_match(item.source_path, normalized)
+            ]
+        except (OSError, ValueError, json.JSONDecodeError):
+            pass
+
+    items: list[InventoryItem] = []
     for path in sorted(UPSTREAM.rglob("*")):
-        if not path.is_file() or path.suffix.lower() not in DISCOVERY_EXTENSIONS:
+        if not path.is_file() or path.suffix.lower() not in INVENTORY_TEST_EXTENSIONS:
             continue
         relative = path.relative_to(UPSTREAM).as_posix()
-        if relative.startswith(DISCOVERY_SKIP_PREFIXES):
-            continue
-        if "manual" in relative.lower().split("/") or MANUAL_NAME.search(path.name):
-            continue
-        if normalized_directories and not any(
-            _path_in_directory(relative, directory)
-            for directory in normalized_directories
-        ):
+        if not _inventory_directories_match(relative, normalized):
             continue
         try:
             source = path.read_text(encoding="utf-8", errors="ignore")
         except OSError:
             continue
-        if "testharness.js" not in source and "testharnessreport.js" not in source:
-            continue
-        cases.append(
-            Case(
-                path=relative,
-                mode="testharness",
-                status="discovered",
-                reason="Discovered by testharness convention.",
-            )
+        items.extend(_source_inventory_items(relative, source))
+    return sorted(items, key=lambda item: (item.source_path, item.path, item.category))
+
+
+def inventory_summary(items: list[InventoryItem]) -> dict[str, Any]:
+    """Summarize test entries without conflating them with runnable cases."""
+    categories = Counter(item.category for item in items)
+    directories: dict[str, Counter[str]] = {}
+    for item in items:
+        directories.setdefault(_folder_for_path(item.source_path), Counter())[item.category] += 1
+    return {
+        "source": "wpt-manifest" if (UPSTREAM / "MANIFEST.json").is_file() else "source-scan",
+        "total": len(items),
+        "runnable": sum(item.runnable for item in items),
+        "categories": dict(sorted(categories.items())),
+        "directories": {
+            path: dict(sorted(counts.items()))
+            for path, counts in sorted(directories.items())
+        },
+    }
+
+
+def _cases_from_inventory(items: list[InventoryItem]) -> list[Case]:
+    return [
+        Case(
+            path=item.path,
+            source_path=item.source_path if item.source_path != item.path else None,
+            mode="testharness",
+            status="discovered",
+            reason=f"Discovered as a WPT {item.category} entry.",
         )
-    return cases
+        for item in items
+        if item.category == "testharness" and item.runnable
+    ]
+
+
+def discover_testharness_cases(directories: list[str] | None = None) -> list[Case]:
+    """Return only testharness entries, including generated WPT variants."""
+    return _cases_from_inventory(discover_wpt_inventory(directories))
 
 
 def _invoke(command: list[str], watchdog_seconds: float) -> ProcessOutcome:
@@ -779,6 +1002,8 @@ def _serialize_case_result(result: CaseResult) -> dict[str, Any]:
         "expectation": case.expectation,
         "timeout_ms": case.timeout_ms,
     }
+    if case.source_path is not None:
+        item["source_path"] = case.source_path
     if result.record is not None:
         for key in ("duration_ms", "tests", "harness", "message", "console", "exception"):
             if key in result.record:
@@ -854,6 +1079,7 @@ def write_run_report(
     expected_cases: int | None = None,
     coverage_cases: list[Case] | None = None,
     suite: str | None = None,
+    inventory: list[InventoryItem] | None = None,
 ) -> None:
     serialized = [_serialize_case_result(result) for result in results]
     counts = Counter(item["status"] for item in serialized)
@@ -913,6 +1139,16 @@ def write_run_report(
     if coverage_total is not None:
         summary["coverage_total"] = coverage_total
         summary["coverage_pass"] = coverage_pass or 0
+    inventory_data = inventory_summary(inventory) if inventory is not None else None
+    if inventory_data is not None:
+        summary["discovered_tests"] = inventory_data["total"]
+        summary["runnable_tests"] = inventory_data["runnable"]
+        summary["unsupported_tests"] = (
+            inventory_data["total"] - inventory_data["runnable"]
+        )
+        summary["suite_failed"] = bool(
+            summary["suite_failed"] or inventory_data["total"] > inventory_data["runnable"]
+        )
 
     report = {
         "schema_version": REPORT_SCHEMA_VERSION,
@@ -931,6 +1167,8 @@ def write_run_report(
     }
     if directory_scores is not None:
         report["directory_scores"] = directory_scores
+    if inventory_data is not None:
+        report["inventory"] = inventory_data
     path.parent.mkdir(parents=True, exist_ok=True)
     temporary = path.with_name(f".{path.name}.tmp")
     temporary.write_text(json.dumps(report, indent=2, sort_keys=True) + "\n", encoding="utf-8")
@@ -1015,11 +1253,21 @@ def main(argv: list[str] | None = None) -> int:
         return 2
     manifest_for_report = args.manifest
     coverage_cases: list[Case] | None = None
+    inventory: list[InventoryItem] | None = None
     if args.all:
-        coverage_cases = discover_testharness_cases()
+        inventory = discover_wpt_inventory()
+        coverage_cases = _cases_from_inventory(inventory)
         cases = coverage_cases
         manifest_for_report = pathlib.Path("<all-testharness>")
-        print(f"Discovered {len(cases)} testharness cases")
+        inventory_data = inventory_summary(inventory)
+        categories = ", ".join(
+            f"{name}={count}"
+            for name, count in inventory_data["categories"].items()
+        )
+        print(
+            f"Discovered {inventory_data['total']} WPT tests "
+            f"({inventory_data['runnable']} runnable testharness cases; {categories})"
+        )
     else:
         try:
             cases = load_cases(args.manifest)
@@ -1031,10 +1279,14 @@ def main(argv: list[str] | None = None) -> int:
         cases = [
             case
             for case in cases
-            if any(_path_in_directory(case.path, directory) for directory in requested_directories)
+            if any(
+                _path_in_directory(_case_scope_path(case), directory)
+                for directory in requested_directories
+            )
         ]
     if args.full_suite and coverage_cases is None:
-        coverage_cases = discover_testharness_cases()
+        inventory = discover_wpt_inventory()
+        coverage_cases = _cases_from_inventory(inventory)
 
     if args.list:
         try:
@@ -1065,7 +1317,7 @@ def main(argv: list[str] | None = None) -> int:
             continue
         if case.mode != mode:
             continue
-        test_path = (UPSTREAM / case.path).resolve()
+        test_path = (UPSTREAM / _case_scope_path(case)).resolve()
         if not test_path.is_file():
             if case.mode == "probe":
                 results.append(CaseResult(case=case, status="SKIP", ok=True))
@@ -1117,6 +1369,7 @@ def main(argv: list[str] | None = None) -> int:
                     expected_cases=len(coverage_cases) if coverage_cases is not None else len(results) + len(selected),
                     coverage_cases=coverage_cases,
                     suite="all" if coverage_cases is not None else None,
+                    inventory=inventory,
                 )
             reporter.finish(False)
             return 1
@@ -1179,6 +1432,7 @@ def main(argv: list[str] | None = None) -> int:
             ),
             coverage_cases=coverage_cases,
             suite="all" if coverage_cases is not None else None,
+            inventory=inventory,
         )
 
     try:
@@ -1252,6 +1506,7 @@ def main(argv: list[str] | None = None) -> int:
                 ),
                 coverage_cases=coverage_cases,
                 suite="all" if coverage_cases is not None else None,
+                inventory=inventory,
             )
         reporter.finish(run_complete)
     skipped_from_coverage = (
