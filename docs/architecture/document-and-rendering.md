@@ -16,6 +16,10 @@ source-backed and escaped because layout decodes it exactly once. Preserve:
   decoded response and any future parser-inserted chunks are independently
   allocated, append-only source segments. Retire the DOM before clearing the
   store; never resize or replace a segment that an Element/Text slice borrows.
+- A detached `DOMParser` result owns a duplicated source buffer in its
+  `WindowRealm.detached_sources` list. Both the HTML tree builder and the
+  bounded XML tree builder borrow that buffer, so detached nodes are retired
+  before the source list is cleared with the Realm.
 - `html_live_parser.zig` drives initial navigation directly into the Frame's
   final root slot. It may publish that partial tree to the new document Realm
   at a parser-blocking script boundary, but only through parser-local pins;
@@ -62,6 +66,10 @@ split across acyclic modules:
   invalidation callbacks, and DOM traversal helpers;
 - `html_parser.zig` is a stateful, source-borrowing tokenizer/tree builder
   generic over the DOM types and final parent-pointer repair callback;
+- `xml_parser.zig` owns the bounded well-formed XML tree builder used only by
+  detached `DOMParser` documents. It preserves qualified-name case, requires
+  quoted attributes, decodes the XML entity subset, and leaves malformed-input
+  parser-error construction to the script host boundary;
 - `html_source.zig` owns the stable source chunks for one navigated document,
   while `html_tokenizer.zig` borrows append-only chunks and produces owned
   chunk-boundary-independent lexical tokens. `html_live_parser.zig` owns the

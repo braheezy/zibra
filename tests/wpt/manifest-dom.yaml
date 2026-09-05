@@ -10,3 +10,6 @@ tests:
   - dom/traversal/TreeWalker-traversal-skip.html
   - dom/ranges/Range-constructor.html
   - dom/ranges/Range-detach.html
+  - domparsing/DOMParser-parseFromString-html.html
+  - domparsing/DOMParser-parseFromString-xml.html
+  - domparsing/domparser-spurious-attributes.html

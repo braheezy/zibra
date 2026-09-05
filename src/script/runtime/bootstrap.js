@@ -51,6 +51,62 @@ for (var domExceptionName in DOM_EXCEPTION_CODES) DOMException[domExceptionName]
 for (var domExceptionCodeName in DOM_EXCEPTION_CODES) DOMException.prototype[domExceptionCodeName] = DOM_EXCEPTION_CODES[domExceptionCodeName];
 globalThis.DOMException = DOMException;
 
+// DOMParser is a document-producing API, so parsing stays on the host parser
+// boundary. The shim validates the Web IDL enum and supplies the detached
+// Document metadata; it never tokenizes or reparents parser output itself.
+function DOMParser() {}
+DOMParser.prototype.parseFromString = function(source, mimeType) {
+  var type = mimeType == null ? String(mimeType) : String(mimeType);
+  var isHTML = type === 'text/html';
+  var isXML = type === 'text/xml' || type === 'application/xml' ||
+      type === 'application/xhtml+xml' || type === 'image/svg+xml';
+  if (!isHTML && !isXML) throw new TypeError('Unsupported DOMParser MIME type');
+
+  var input = source == null ? String(source) : String(source);
+  var rawHandle = isHTML ? __native.parseHTMLDocument(input) : __native.parseXMLDocument(input);
+  var parserError = isXML && rawHandle < 0;
+  var root = wrapNode(parserError ? -rawHandle : rawHandle);
+  var result = makeDetachedDocument(root);
+  result.contentType = type;
+  if (isHTML) result.compatMode = /^\s*<!doctype\s+html(?:\s|>)/i.test(input) ? 'CSS1Compat' : 'BackCompat';
+  result.location = null;
+  result.URL = document.URL;
+  result.documentURI = document.URL;
+  result.baseURI = document.URL;
+  result.characterSet = 'UTF-8';
+  result.charset = 'UTF-8';
+  result.inputEncoding = 'UTF-8';
+  if (isXML) {
+    function markXml(node) {
+      if (!node) return;
+      Object.defineProperty(node, 'namespaceURI', {
+        value: parserError ? 'http://www.mozilla.org/newlayout/xml/parsererror.xml' : null,
+        enumerable: true, configurable: true
+      });
+      var xmlName = __native.rawTagName(node.handle) || node.tagName || node.nodeName;
+      Object.defineProperty(node, 'tagName', {
+        value: xmlName, enumerable: true, configurable: true
+      });
+      Object.defineProperty(node, 'nodeName', {
+        value: xmlName, enumerable: true, configurable: true
+      });
+      Object.defineProperty(node, 'localName', {
+        value: xmlName, enumerable: true, configurable: true
+      });
+      var children = node.childNodes || [];
+      for (var i = 0; i < children.length; i++) markXml(children[i]);
+    }
+    markXml(root);
+  }
+  if (isHTML && /^\s*<!doctype\s+html(?:\s|>)/i.test(input)) {
+    var doctype = document.implementation.createDocumentType('html', '', '');
+    result.__documentChildren.unshift(doctype);
+    doctype.__ownerDocument = result;
+  }
+  return result;
+};
+globalThis.DOMParser = DOMParser;
+
 // ECMAScript normalizes negative zero when formatting fixed-point numbers.
 // Kiesel's generic formatter preserves the sign, so correct that one edge
 // case while delegating all ordinary precision and rounding to the runtime.
@@ -874,6 +930,14 @@ Object.defineProperty(Node.prototype, "children", {
   get: function() {
     return wrapNodes(__native.children(this.handle));
   }
+});
+Object.defineProperty(Node.prototype, "attributes", {
+  get: function() {
+    if (this.nodeType !== Node.ELEMENT_NODE) return [];
+    var entries = __native.attributes(this.handle) || [];
+    entries.item = function(index) { return this[index] || null; };
+    return entries;
+  }, enumerable: true, configurable: true
 });
 
 // Authored DOM topology. Native calls return numeric handle snapshots; every

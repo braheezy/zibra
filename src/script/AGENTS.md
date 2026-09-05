@@ -65,7 +65,8 @@ queued work and shutdown are documented in
 - Each non-null document installation receives a fresh `WindowRealm`; the
   preceding realm is retired and null-root invalidation leaves its host maps
   inert. WindowRealms own handle maps, listener/timer registries, named
-  globals, and detached roots. Node wrappers must never silently retarget
+  globals, detached roots, and source buffers retained by detached DOMParser
+  trees. Node wrappers must never silently retarget
   after child-array relocation, address reuse, or document replacement.
 - A WindowRealm can temporarily carry one type-erased Node relocation observer
   for a stack-bound live parser. Install it only immediately around direct

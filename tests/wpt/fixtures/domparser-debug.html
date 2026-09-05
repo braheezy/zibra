@@ -1,0 +1,12 @@
+<!doctype html>
+<script src="/resources/testharness.js"></script>
+<script src="/resources/testharnessreport.js"></script>
+<script>
+test(function() {
+  var d = new DOMParser().parseFromString('<html><body><style>@import url(/dummy.css)</style><scr' + 'ipt>document.x = 8</scr' + 'ipt></body></html>', 'text/html');
+  var result = '';
+  try { result += 'q=' + d.querySelector('script'); } catch (e) { result += 'qerr=' + e; }
+  try { result += ',x=' + d.x; } catch (e) { result += ',xerr=' + e; }
+  assert_true(false, result);
+}, 'debug');
+</script>

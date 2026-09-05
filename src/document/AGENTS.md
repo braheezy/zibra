@@ -31,6 +31,9 @@ behavior. Navigation-owned stylesheet/resource generations are documented in
   then call `fixParentPointers(&root, null)` before style, layout, DOM
   ancestry, or JavaScript uses it; the parser cannot repair pointers after
   that return-value move.
+- `xml_parser.zig` is the detached DOMParser XML owner. Its successful tree
+  borrows the caller-owned source buffer, preserves XML name case, and must be
+  retired before that source buffer is released.
 - Rules, named keyframes, and the source text they borrow move and retire as
   one generation. Stage a complete replacement before dropping the prior one.
 - Live HTML serialization reads current attributes/tree, sorts attribute names,

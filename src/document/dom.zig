@@ -124,27 +124,48 @@ fn decodeAttributeCharacterReferences(
     allocator: std.mem.Allocator,
     input: []const u8,
 ) !?[]u8 {
-    if (std.mem.indexOfScalar(u8, input, '&') == null) return null;
+    if (std.mem.indexOfScalar(u8, input, '&') == null and
+        std.mem.indexOfScalar(u8, input, '\r') == null) return null;
 
     var output = std.ArrayList(u8).empty;
     errdefer output.deinit(allocator);
     var changed = false;
     var cursor: usize = 0;
     while (cursor < input.len) {
-        const amp = std.mem.indexOfScalarPos(u8, input, cursor, '&') orelse {
+        if (input[cursor] == '\r') {
+            try output.append(allocator, '\n');
+            cursor += 1;
+            if (cursor < input.len and input[cursor] == '\n') cursor += 1;
+            changed = true;
+            continue;
+        }
+        const amp = std.mem.indexOfScalarPos(u8, input, cursor, '&');
+        if (amp == null) {
+            if (std.mem.indexOfScalarPos(u8, input, cursor, '\r')) |carriage_return| {
+                try output.appendSlice(allocator, input[cursor..carriage_return]);
+                cursor = carriage_return;
+                continue;
+            }
             try output.appendSlice(allocator, input[cursor..]);
             break;
-        };
-        try output.appendSlice(allocator, input[cursor..amp]);
-        if (characterReferenceAt(input, amp)) |reference| {
+        }
+        if (std.mem.indexOfScalarPos(u8, input, cursor, '\r')) |carriage_return| {
+            if (carriage_return < amp.?) {
+                try output.appendSlice(allocator, input[cursor..carriage_return]);
+                cursor = carriage_return;
+                continue;
+            }
+        }
+        try output.appendSlice(allocator, input[cursor..amp.?]);
+        if (characterReferenceAt(input, amp.?)) |reference| {
             var encoded: [4]u8 = undefined;
             const encoded_len = try std.unicode.utf8Encode(reference.codepoint, &encoded);
             try output.appendSlice(allocator, encoded[0..encoded_len]);
-            cursor = amp + reference.len;
+            cursor = amp.? + reference.len;
             changed = true;
         } else {
             try output.append(allocator, '&');
-            cursor = amp + 1;
+            cursor = amp.? + 1;
         }
     }
 
@@ -316,6 +337,47 @@ pub const Element = struct {
         }
 
         return e;
+    }
+
+    /// Create an XML element with a case-preserving, owned qualified name.
+    /// HTML elements normalize names for the HTML tree builder; XML parsing
+    /// must keep the source spelling independent of the borrowed input.
+    pub fn initXml(allocator: std.mem.Allocator, tag: []const u8, parent: ?*Node) !Element {
+        var element = try Element.init(allocator, "xml", parent);
+        errdefer element.deinit(allocator);
+        const owned_tag = try allocator.dupe(u8, tag);
+        var tag_live = true;
+        errdefer if (tag_live) allocator.free(owned_tag);
+        element.owned_strings = std.ArrayList([]const u8).empty;
+        try element.owned_strings.?.append(allocator, owned_tag);
+        tag_live = false;
+        element.tag = owned_tag;
+        return element;
+    }
+
+    /// Add one case-preserving XML attribute. The caller must have performed
+    /// duplicate-name validation because XML rejects duplicate attributes.
+    pub fn putXmlAttribute(
+        self: *Element,
+        allocator: std.mem.Allocator,
+        name: []const u8,
+        value: []const u8,
+    ) !void {
+        const owned_name = try allocator.dupe(u8, name);
+        var name_live = true;
+        errdefer if (name_live) allocator.free(owned_name);
+        const owned_value = try allocator.dupe(u8, value);
+        var value_live = true;
+        errdefer if (value_live) allocator.free(owned_value);
+
+        if (self.attributes == null) self.attributes = std.StringHashMap([]const u8).init(allocator);
+        if (self.owned_strings == null) self.owned_strings = std.ArrayList([]const u8).empty;
+        try self.owned_strings.?.append(allocator, owned_name);
+        name_live = false;
+        errdefer _ = self.owned_strings.?.pop();
+        try self.owned_strings.?.append(allocator, owned_value);
+        value_live = false;
+        try self.attributes.?.put(owned_name, owned_value);
     }
 
     /// HTML element and attribute names are ASCII case-insensitive. Borrow an
@@ -1265,4 +1327,10 @@ test "HTML token-list attributes are whitespace-separated and case-insensitive" 
     try std.testing.expect(link.attributeHasToken("rel", "APPENDIX"));
     try std.testing.expect(!link.attributeHasToken("rel", "style"));
     try std.testing.expect(!link.attributeHasToken("missing", "stylesheet"));
+}
+
+test "HTML attributes normalize CR newlines" {
+    var element = try Element.init(std.testing.allocator, "div title=\"a\rb\"", null);
+    defer element.deinit(std.testing.allocator);
+    try std.testing.expectEqualStrings("a\nb", element.attributes.?.get("title").?);
 }

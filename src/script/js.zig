@@ -232,6 +232,10 @@ const WindowRealm = struct {
     // Heap-stable owners for createElement results and removeChild subtrees
     // that have not yet been transferred into a DOM child array.
     detached_nodes: std.AutoHashMap(*Node, void),
+    // Parser-created names, attributes, and text borrow their source. A
+    // detached DOMParser tree keeps that source alive for the lifetime of its
+    // WindowRealm instead of copying every parser slice into each Node.
+    detached_sources: std.ArrayList([]u8),
     current_nodes: ?*Node,
     // Bootstrap retains this flag for the named-ID publishing protocol. Once
     // every document owns its own Realm there is no cross-window registry
@@ -410,6 +414,7 @@ fn createWindowRealmLocked(self: *Js) !*WindowRealm {
         .handles = DomHandles.init(self.allocator),
         .id_cache = .{},
         .detached_nodes = std.AutoHashMap(*Node, void).init(self.allocator),
+        .detached_sources = std.ArrayList([]u8).empty,
         .current_nodes = null,
         .named_globals_synced = false,
         .pending_messages = std.ArrayList(PendingMessage).empty,
@@ -473,6 +478,8 @@ fn destroyWindowRealmLocked(self: *Js, window: *WindowRealm) void {
     self.retireWindowRealmLocked(window);
     window.handles.deinit();
     window.detached_nodes.deinit();
+    for (window.detached_sources.items) |source| self.allocator.free(source);
+    window.detached_sources.deinit(self.allocator);
     window.pending_messages.deinit(self.allocator);
     self.storage_allocator.destroy(window);
 }
@@ -1111,6 +1118,8 @@ fn clearDetachedNodes(self: *Js, window: *WindowRealm) void {
         self.allocator.destroy(node);
     }
     window.detached_nodes.clearRetainingCapacity();
+    for (window.detached_sources.items) |source| self.allocator.free(source);
+    window.detached_sources.clearRetainingCapacity();
 }
 
 fn requestRender(self: *Js) void {
@@ -4740,7 +4749,11 @@ fn setupDocument(self: *Js, realm: *Realm) !void {
         },
         &.{
             .{ .name = "querySelectorAllFrom", .length = 2, .function = querySelectorAllFrom },
+            .{ .name = "parseHTMLDocument", .length = 1, .function = parseHTMLDocument },
+            .{ .name = "parseXMLDocument", .length = 1, .function = parseXMLDocument },
             .{ .name = "getAttribute", .length = 2, .function = getAttribute },
+            .{ .name = "attributes", .length = 1, .function = getAttributes },
+            .{ .name = "rawTagName", .length = 1, .function = rawTagName },
             .{ .name = "children", .length = 1, .function = getChildren },
             .{ .name = "createElement", .length = 1, .function = createElement },
             .{ .name = "createTextNode", .length = 1, .function = createTextNode },
@@ -5073,6 +5086,72 @@ fn getAttribute(agent: *Agent, this_value: Value, arguments: kiesel.types.Argume
     }
 }
 
+/// Return a snapshot of an element's NamedNodeMap-compatible attribute
+/// entries. The page shim adds the live collection facade; this host function
+/// keeps attribute storage and string ownership on the native DOM side.
+fn getAttributes(agent: *Agent, this_value: Value, arguments: kiesel.types.Arguments) Agent.Error!Value {
+    const function_obj = agent.activeFunctionObject();
+    const builtin_fn = function_obj.as(kiesel.builtins.BuiltinFunction);
+    const js_instance = builtin_fn.fields.additionalFieldsAs(Js);
+    const window_id = js_instance.current_window_id orelse return agent.throwException(.internal_error, "Missing active window", .{});
+    const window = js_instance.windows.get(window_id) orelse return agent.throwException(.internal_error, "Missing window context", .{});
+    _ = this_value;
+    const handle_arg = arguments.get(0);
+    if (!handle_arg.isNumber()) return agent.throwException(.type_error, "attributes requires a numeric handle", .{});
+    const handle: u32 = @intFromFloat(handle_arg.asNumber().asFloat());
+    const node = js_instance.getNode(window, handle) orelse return agent.throwException(.internal_error, "Invalid node handle", .{});
+
+    var count: usize = 0;
+    switch (node.*) {
+        .text => {},
+        .element => |element| {
+            if (element.attributes) |attrs| count = attrs.count();
+        },
+    }
+    const result = try kiesel.builtins.arrayCreate(agent, @intCast(count), null);
+    var index: usize = 0;
+    switch (node.*) {
+        .text => {},
+        .element => |element| if (element.attributes) |attrs| {
+            var iterator = attrs.iterator();
+            while (iterator.next()) |entry| : (index += 1) {
+                const attr = try kiesel.builtins.ordinaryObjectCreate(agent, null);
+                const name = try kiesel.types.String.fromUtf8(agent, entry.key_ptr.*);
+                const value = try kiesel.types.String.fromUtf8(agent, entry.value_ptr.*);
+                try attr.createDataPropertyDirect(agent, kiesel.types.PropertyKey.from("name"), Value.from(name));
+                try attr.createDataPropertyDirect(agent, kiesel.types.PropertyKey.from("nodeName"), Value.from(name));
+                try attr.createDataPropertyDirect(agent, kiesel.types.PropertyKey.from("value"), Value.from(value));
+                try attr.createDataPropertyDirect(agent, kiesel.types.PropertyKey.from("specified"), Value.from(true));
+                try result.object.createDataPropertyDirect(
+                    agent,
+                    kiesel.types.PropertyKey.from(@as(kiesel.types.PropertyKey.IntegerIndex, @intCast(index))),
+                    Value.from(attr),
+                );
+            }
+        },
+    }
+    return Value.from(&result.object);
+}
+
+/// Expose an element's stored qualified-name spelling to the XML wrapper.
+/// HTML-facing `tagName` remains the historical uppercase view.
+fn rawTagName(agent: *Agent, this_value: Value, arguments: kiesel.types.Arguments) Agent.Error!Value {
+    const function_obj = agent.activeFunctionObject();
+    const builtin_fn = function_obj.as(kiesel.builtins.BuiltinFunction);
+    const js_instance = builtin_fn.fields.additionalFieldsAs(Js);
+    const window_id = js_instance.current_window_id orelse return agent.throwException(.internal_error, "Missing active window", .{});
+    const window = js_instance.windows.get(window_id) orelse return agent.throwException(.internal_error, "Missing window context", .{});
+    _ = this_value;
+    const handle_arg = arguments.get(0);
+    if (!handle_arg.isNumber()) return agent.throwException(.type_error, "rawTagName requires a numeric handle", .{});
+    const handle: u32 = @intFromFloat(handle_arg.asNumber().asFloat());
+    const node = js_instance.getNode(window, handle) orelse return agent.throwException(.internal_error, "Invalid node handle", .{});
+    return switch (node.*) {
+        .text => .null,
+        .element => |element| Value.from(try kiesel.types.String.fromUtf8(agent, element.tag)),
+    };
+}
+
 /// __native.children implementation. The returned handle array is a snapshot
 /// of immediate element children; text nodes and deeper descendants are not
 /// exposed by this property.
@@ -5147,6 +5226,126 @@ fn isValidCreatedTagName(tag: []const u8) bool {
         }) return false;
     }
     return true;
+}
+
+/// Parse one complete HTML document for a detached DOMParser result.
+///
+/// The returned root is owned by the current WindowRealm. The source buffer
+/// is retained beside that root because the document parser intentionally
+/// borrows source slices for names, attributes, and text. No parser callback
+/// or live-document state is involved in this synchronous boundary.
+fn parseHTMLDocument(agent: *Agent, this_value: Value, arguments: kiesel.types.Arguments) Agent.Error!Value {
+    const function_obj = agent.activeFunctionObject();
+    const builtin_fn = function_obj.as(kiesel.builtins.BuiltinFunction);
+    const js_instance = builtin_fn.fields.additionalFieldsAs(Js);
+    const window_id = js_instance.current_window_id orelse return agent.throwException(
+        .internal_error,
+        "Missing active window",
+        .{},
+    );
+    const window = js_instance.windows.get(window_id) orelse return agent.throwException(
+        .internal_error,
+        "Missing window context",
+        .{},
+    );
+    _ = this_value;
+
+    const source_arg = arguments.get(0);
+    if (!source_arg.isString()) {
+        return agent.throwException(.type_error, "parseHTMLDocument requires a string", .{});
+    }
+    const source_value = try source_arg.asString().toUtf8(js_instance.allocator);
+    defer js_instance.allocator.free(source_value);
+
+    const owned_source = try js_instance.allocator.dupe(u8, source_value);
+    var source_live = true;
+    errdefer if (source_live) js_instance.allocator.free(owned_source);
+
+    var html_parser = parser.HTMLParser.init(js_instance.allocator, owned_source) catch |err| {
+        std.log.err("Failed to initialize DOMParser HTML parser: {}", .{err});
+        return agent.throwException(.internal_error, "Could not create HTML parser", .{});
+    };
+    defer html_parser.deinit(js_instance.allocator);
+
+    const parsed_node = html_parser.parse() catch |err| {
+        std.log.err("Failed to parse DOMParser HTML: {}", .{err});
+        return agent.throwException(.syntax_error, "Could not parse HTML", .{});
+    };
+    const result = try installDetachedParsedRoot(js_instance, window, owned_source, parsed_node, false);
+    source_live = false;
+    return result;
+}
+
+/// Parse one XML document for DOMParser. XML well-formedness errors produce a
+/// parsererror root and a negative handle marker; DOMParser itself still
+/// returns a Document, matching the browser API's error-document contract.
+fn parseXMLDocument(agent: *Agent, this_value: Value, arguments: kiesel.types.Arguments) Agent.Error!Value {
+    const function_obj = agent.activeFunctionObject();
+    const builtin_fn = function_obj.as(kiesel.builtins.BuiltinFunction);
+    const js_instance = builtin_fn.fields.additionalFieldsAs(Js);
+    const window_id = js_instance.current_window_id orelse return agent.throwException(.internal_error, "Missing active window", .{});
+    const window = js_instance.windows.get(window_id) orelse return agent.throwException(.internal_error, "Missing window context", .{});
+    _ = this_value;
+    const source_arg = arguments.get(0);
+    if (!source_arg.isString()) return agent.throwException(.type_error, "parseXMLDocument requires a string", .{});
+    const source_value = try source_arg.asString().toUtf8(js_instance.allocator);
+    defer js_instance.allocator.free(source_value);
+    const owned_source = try js_instance.allocator.dupe(u8, source_value);
+    var source_live = true;
+    errdefer if (source_live) js_instance.allocator.free(owned_source);
+
+    var xml_parser = parser.XMLParser.init(js_instance.allocator, owned_source);
+    const parsed_node = xml_parser.parse() catch |err| {
+        xml_parser.deinit();
+        if (err == error.OutOfMemory) return error.OutOfMemory;
+        const error_element = parser.Element.initXml(js_instance.allocator, "parsererror", null) catch |init_err| {
+            if (init_err == error.OutOfMemory) return error.OutOfMemory;
+            return agent.throwException(.internal_error, "Could not create XML parser error", .{});
+        };
+        const error_node = Node{ .element = error_element };
+        const result = try installDetachedParsedRoot(js_instance, window, owned_source, error_node, true);
+        source_live = false;
+        return result;
+    };
+    defer xml_parser.deinit();
+    const result = try installDetachedParsedRoot(js_instance, window, owned_source, parsed_node, false);
+    source_live = false;
+    return result;
+}
+
+/// Transfer a parsed root and its borrowed source into detached realm-owned
+/// storage. The negative marker is an internal XML parser-error signal; the
+/// page-visible API converts it into the standard parsererror namespace.
+fn installDetachedParsedRoot(
+    js_instance: *Js,
+    window: *WindowRealm,
+    owned_source: []u8,
+    parsed_node: Node,
+    parser_error: bool,
+) !Value {
+    var node = parsed_node;
+    var node_live = true;
+    errdefer if (node_live) node.deinit(js_instance.allocator);
+    const root = try js_instance.allocator.create(Node);
+    var root_live = true;
+    errdefer if (root_live) {
+        root.deinit(js_instance.allocator);
+        js_instance.allocator.destroy(root);
+    };
+    root.* = node;
+    node_live = false;
+    parser.fixParentPointers(root, null);
+    const handle = try js_instance.getHandle(window, root);
+    try window.detached_nodes.put(root, {});
+    var root_stored = true;
+    errdefer {
+        if (root_stored) _ = window.detached_nodes.remove(root);
+    }
+    try window.detached_sources.append(js_instance.allocator, owned_source);
+    root_stored = false;
+    root_live = false;
+    const numeric = @as(f64, @floatFromInt(handle));
+    return Value.from(if (parser_error) -numeric else numeric);
 }
 
 /// __native.createElement implementation. A created node is owned by its
