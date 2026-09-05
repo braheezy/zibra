@@ -1493,7 +1493,7 @@ pub fn selector(self: *CSSParser, allocator: std.mem.Allocator) !Selector {
     while (self.pos < self.string.len) {
         const before_whitespace = self.pos;
         self.whitespace();
-        if (self.pos >= self.string.len or self.string[self.pos] == '{') break;
+        if (self.pos >= self.string.len or self.string[self.pos] == '{' or self.string[self.pos] == ',') break;
 
         const combinator: Combinator = if (self.string[self.pos] == '>') blk: {
             has_explicit_combinator = true;
@@ -2037,91 +2037,90 @@ pub fn parseWithKeyframes(
             }
         }
 
-        // Try to parse a complete rule, but catch errors and skip the rule
-        const rule_result = blk: {
-            // Parse selector
-            const sel = self.selector(allocator) catch {
-                // If selector parsing failed, skip to closing brace
-                const why = self.ignoreUntil("}");
-                if (why) |char| {
-                    if (char == '}') {
-                        _ = self.literal('}') catch {};
-                        self.whitespace();
-                    }
-                } else {
-                    // Reached end of string
-                    break;
-                }
-                continue;
-            };
-
-            // Expect '{'
-            self.literal('{') catch {
-                // Free the selector before skipping
-                var sel_mut = sel;
-                sel_mut.deinit(allocator);
-
-                // Skip to closing brace
-                const why = self.ignoreUntil("}");
-                if (why) |char| {
-                    if (char == '}') {
-                        _ = self.literal('}') catch {};
-                        self.whitespace();
-                    }
-                } else {
-                    break;
-                }
-                continue;
-            };
-            self.whitespace();
-
-            // Parse properties
-            const properties = self.body(allocator) catch {
-                // Free the selector before skipping
-                var sel_mut = sel;
-                sel_mut.deinit(allocator);
-
-                // Skip to closing brace
-                const why = self.ignoreUntil("}");
-                if (why) |char| {
-                    if (char == '}') {
-                        _ = self.literal('}') catch {};
-                        self.whitespace();
-                    }
-                } else {
-                    break;
-                }
-                continue;
-            };
-
-            // Expect '}'
-            self.literal('}') catch {
-                // Free the selector and properties before skipping
-                var sel_mut = sel;
-                sel_mut.deinit(allocator);
-                var props = properties;
-                props.deinit();
-
-                // Already at end or past it, just continue
-                continue;
-            };
-
-            break :blk CSSRule{
-                .selector = sel,
-                .properties = properties,
-                .owned = true,
-            };
-        };
-
-        // Add rule if we successfully parsed one
-        rules.append(allocator, rule_result) catch |err| {
-            var owned_rule = rule_result;
-            owned_rule.deinit(allocator);
-            return err;
+        self.appendQualifiedRule(allocator, &rules) catch |err| {
+            if (err == error.OutOfMemory) return err;
+            // Ordinary selector lists are unforgiving: one invalid member
+            // invalidates the entire declaration block, not just that member.
+            _ = self.ignoreUntil("}") orelse break;
+            self.pos += 1;
         };
     }
 
     return rules.toOwnedSlice(allocator);
+}
+
+/// Expand a selector list into independently owned rules in source order.
+/// Each member retains its own specificity. Declaration strings still borrow
+/// the stylesheet, but every rule owns its map and selector storage.
+fn appendQualifiedRule(self: *CSSParser, allocator: std.mem.Allocator, rules: *std.ArrayList(CSSRule)) !void {
+    var selectors = std.ArrayList(Selector).empty;
+    var transferred: usize = 0;
+    defer {
+        for (selectors.items[transferred..]) |*sel| sel.deinit(allocator);
+        selectors.deinit(allocator);
+    }
+    while (true) {
+        var sel = try self.selector(allocator);
+        selectors.append(allocator, sel) catch |err| {
+            sel.deinit(allocator);
+            return err;
+        };
+        self.whitespace();
+        if (self.pos >= self.string.len or self.string[self.pos] != ',') break;
+        self.pos += 1;
+        self.whitespace();
+    }
+    try self.literal('{');
+    self.whitespace();
+    var properties = try self.body(allocator);
+    defer properties.deinit();
+    try self.literal('}');
+    try rules.ensureUnusedCapacity(allocator, selectors.items.len);
+    for (selectors.items) |sel| {
+        const cloned = try properties.clone();
+        rules.appendAssumeCapacity(.{ .selector = sel, .properties = cloned, .owned = true });
+        transferred += 1;
+    }
+}
+
+test "selector lists preserve member specificity declarations and nested commas" {
+    const allocator = std.testing.allocator;
+    var parser = try CSSParser.init(allocator, ".pair strong, .pair small { display:block; color:red !important }" ++
+        "[data-name='a,b'], #selected { color:green }" ++
+        "@media (min-width:0px) { b, i { color:blue } }", false);
+    defer parser.deinit(allocator);
+    parser.media.viewport_width_css = 800;
+    const rules = try parser.parse(allocator);
+    defer {
+        for (rules) |*rule| rule.deinit(allocator);
+        allocator.free(rules);
+    }
+    try std.testing.expectEqual(@as(usize, 6), rules.len);
+    try std.testing.expectEqualStrings("block", rules[0].properties.get("display").?.value);
+    try std.testing.expectEqualStrings("block", rules[1].properties.get("display").?.value);
+    try std.testing.expect(rules[1].properties.get("color").?.important);
+    try std.testing.expect(rules[2].cascadePriority() < rules[3].cascadePriority());
+    try std.testing.expectEqualStrings("blue", rules[5].properties.get("color").?.value);
+    // Tables are independent owners even though declaration values are borrows.
+    _ = rules[0].properties.remove("color");
+    try std.testing.expect(rules[1].properties.contains("color"));
+}
+
+test "invalid selector list members discard the whole rule and recover" {
+    const allocator = std.testing.allocator;
+    var parser = try CSSParser.init(allocator, "b, :unknown { color:red }" ++
+        "b, { color:red }" ++
+        ", b { color:red }" ++
+        "b,,i { color:red }" ++
+        "b, i { color:green }", false);
+    defer parser.deinit(allocator);
+    const rules = try parser.parse(allocator);
+    defer {
+        for (rules) |*rule| rule.deinit(allocator);
+        allocator.free(rules);
+    }
+    try std.testing.expectEqual(@as(usize, 2), rules.len);
+    for (rules) |rule| try std.testing.expectEqualStrings("green", rule.properties.get("color").?.value);
 }
 
 test "keyframes parse beside selector rules and normalize offsets" {

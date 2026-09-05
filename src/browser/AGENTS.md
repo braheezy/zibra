@@ -85,6 +85,9 @@ into either leaf module.
 
 ## Frame and render-phase rules
 
+- UI ticks reconcile the native window dimensions. Native size events and
+  headless diagnostic sizes share `Browser.resizeViewport`; it replaces
+  presentation targets transactionally and queues generation-stamped Tab work.
 - `Frame.document` is a protected style-phase guard. A dirty value cannot be
   read by layout or hit testing. Successful style/resource processing
   republishes it before `DocumentLayout.layoutNeeded()` gates geometry.

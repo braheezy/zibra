@@ -1,0 +1,46 @@
+<!doctype html>
+<!-- How to verify: Start at 800px then maximize and resize repeatedly. The
+green bar spans the viewport; the heading stays centered; the three project
+columns stay beside the sidebar. Nested text, article counts, links and inputs
+must remain visible and clickable. No red closed-dialog message should appear.
+Capture without a window: --viewport 2560x1440 --screenshot /tmp/inline.png. -->
+<html lang="en">
+<meta charset="utf-8">
+<title>Atomic inline layout and readable typography</title>
+<style>
+html { font-size: 16px; }
+body { margin: 0; font-size: 1rem; line-height: 1.5; color: #24374a; }
+.viewport { background: #187655; height: 8px; }
+h1 { font-size: 2rem; text-align: center; }
+main { max-width: 72rem; margin: 0 auto; padding: 2rem; }
+.pair { display: inline-block; padding: 1rem; margin: .5rem; background: #e8f3ef; vertical-align: bottom; }
+.pair strong, .pair small { display: block; }
+.pair bdi { display: inline-block; }
+.footer { overflow: hidden; margin-top: 2rem; }
+.sidebar { float: left; width: 35%; }
+.projects { display: inline-block; width: 65%; }
+.project { float: left; width: 33%; height: 6rem; }
+.project a { display: inline-block; width: 90%; }
+.project strong, .project span { display: block; }
+.controls { display: inline-block; width: 26rem; padding: 1rem; border: 2px solid #187655; }
+.controls span { display: inline-block; }
+input { width: 10rem; font-size: 1rem; }
+dialog { color: red; }
+</style>
+<body>
+<div class="viewport"></div>
+<h1>Nested boxes must keep their content</h1>
+<main>
+<p>This paragraph is 16 CSS pixels, without an extra pixels-to-points reduction.</p>
+<span class="pair"><strong>English</strong><small><bdi>7,189,000+</bdi> articles</small></span>
+<span class="pair"><strong>Deutsch</strong><small><bdi>3,125,000+</bdi> Artikel</small></span>
+<div class="controls"><span><a href="#target">Jump to target</a> <input value="Editable input"></span></div>
+<div class="footer">
+<aside class="sidebar"><strong>Sidebar: 35%</strong><p>All three project columns belong to the remaining 65%.</p></aside>
+<section class="projects"><div class="project"><a href="#target"><strong>Project one</strong><span>First column</span></a></div><div class="project"><a href="#target"><strong>Project two</strong><span>Second column</span></a></div><div class="project"><a href="#target"><strong>Project three</strong><span>Third column</span></a></div><div class="project"><a href="#target"><strong>Project four</strong><span>Second row</span></a></div></section>
+</div>
+<dialog>FAIL: a closed dialog must not be rendered.</dialog>
+<p id="target">Target: links and input bounds must follow the inline boxes after resizing.</p>
+</main>
+</body>
+</html>

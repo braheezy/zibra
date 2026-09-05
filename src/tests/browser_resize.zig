@@ -9,6 +9,78 @@ const ProtectedField = @import("../core/protected_field.zig").ProtectedField;
 const CSSParser = @import("../document/css_parser.zig").CSSParser;
 const document_parser = @import("../document/parser.zig");
 
+fn settleBrowser(b: *browser.Browser) !void {
+    const deadline = std.Io.Clock.awake.now(std.testing.io).nanoseconds + 10 * std.time.ns_per_s;
+    while (std.Io.Clock.awake.now(std.testing.io).nanoseconds < deadline) {
+        _ = try b.tick();
+        b.lock.lock();
+        const animation_quiet = !b.needs_animation_frame and !b.animation_timer_active;
+        b.lock.unlock();
+        const tab = b.activeTab().?;
+        if (animation_quiet and b.isIdle() and tab.isQuiescent()) return;
+        try std.testing.io.sleep(.fromMilliseconds(1), .awake);
+    }
+    return error.BrowserDidNotSettle;
+}
+
+fn resizeTarget(block: anytype) ?@TypeOf(block) {
+    if (block.node_ptr) |node| {
+        if (node.* == .element) {
+            if (node.element.attributes) |attrs| {
+                if (attrs.get("id")) |id| {
+                    if (std.mem.eql(u8, id, "resize-target")) return block;
+                }
+            }
+        }
+    }
+    for (block.children.items) |child| switch (child) {
+        .block => |nested| if (resizeTarget(nested)) |found| return found,
+        .line => {},
+    };
+    return null;
+}
+
+test "native resize event reflows a loaded browser through the tab worker" {
+    // Use the actual Browser scheduling and presentation owners. Quiescence
+    // (not a delay) is the barrier before borrowing the worker-owned geometry.
+    const allocator = std.testing.allocator;
+    var environ = std.process.Environ.Map.init(allocator);
+    defer environ.deinit();
+    try environ.put("HOME", "/tmp");
+    const b = try browser.Browser.init(allocator, std.testing.io, &environ, false, true);
+    defer {
+        b.deinit();
+        allocator.destroy(b);
+    }
+    try b.newTab(try @import("../network/url.zig").Url.init(allocator, "data:text/html,<html><body><div id='resize-target' style='width:400px;margin:0 auto;height:40px;background:green'></div></body></html>"));
+    try settleBrowser(b);
+    const tab = b.activeTab().?;
+    const frame = tab.root_frame.?;
+    const initial_document = frame.documentLayout().?;
+    const initial_width = initial_document.width.get().*;
+    const initial_x = resizeTarget(initial_document.children.items[0]).?.x.get().*;
+    try b.handleWindowEvent(.{ .window_id = 1, .timestamp = 0, .type = .{ .size_changed = .{ .width = 2560, .height = 1440 } } });
+    try settleBrowser(b);
+    const wide = frame.documentLayout().?;
+    try std.testing.expectEqual(@as(i32, 2560), tab.tab_width);
+    try std.testing.expectEqual(initial_width + 1760, wide.width.get().*);
+    try std.testing.expectEqual(initial_x + 880, resizeTarget(wide.children.items[0]).?.x.get().*);
+    try std.testing.expect(!wide.layoutNeeded());
+    try b.handleWindowEvent(.{ .window_id = 1, .timestamp = 0, .type = .{ .resized = .{ .width = 800, .height = 600 } } });
+    try settleBrowser(b);
+    try std.testing.expectEqual(initial_width, frame.documentLayout().?.width.get().*);
+
+    // A hidden SDL window tests native-size sampling without requiring a GPU
+    // renderer or presenting UI. Deliberately do not deliver its size events.
+    const sdl = @import("sdl");
+    b.window = try sdl.createWindow("resize regression", .default, .default, 800, 600, .{ .vis = .hidden, .resizable = true });
+    try b.window.?.setSize(.{ .width = 2560, .height = 1440 });
+    try settleBrowser(b);
+    try std.testing.expectEqual(@as(i32, 2560), b.window_width);
+    try std.testing.expectEqual(@as(i32, 2560), tab.tab_width);
+    try std.testing.expectEqual(initial_width + 1760, frame.documentLayout().?.width.get().*);
+}
+
 fn createCleanDocument(allocator: std.mem.Allocator) !*Layout.DocumentLayout {
     const document = try allocator.create(Layout.DocumentLayout);
     document.* = .{

@@ -68,6 +68,9 @@ behavior. Navigation-owned stylesheet/resource generations are documented in
 
 ## CSS rules
 
+- Stylesheet selector lists are unforgiving and expand into independent rule
+  owners; retain each member's specificity and source order. Do not shallow-copy
+  declaration maps when sharing borrowed value strings.
 - Declaration values borrow the parsed source. Preserve quotes, escapes,
   comments, and parenthesis depth while scanning; stop only at top-level
   separators.
@@ -162,6 +165,9 @@ The document pipeline is split by ownership and algorithm boundaries:
 `inspection.Page.load` returns the root by value. Repair parent pointers after
 the returned page reaches its final address before any ancestry-dependent
 style/layout/paint operation.
+`loadWithMedia` takes an explicit viewport environment for inspection; its
+conditional rules and the caller's layout dimensions must describe the same
+viewport. Neither inspection entry point constructs Browser or native state.
 
 Add new grammar/data owners in focused modules rather than putting logic in
 the compatibility entry point. Avoid facade cycles or splitting methods away

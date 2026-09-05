@@ -512,7 +512,7 @@ const ResizeTargets = struct {
     root_surface: z2d.Surface,
     chrome_surface: z2d.Surface,
     tab_surface: ?z2d.Surface,
-    cached_texture: sdl2.Texture,
+    cached_texture: ?sdl2.Texture,
 };
 
 const WindowPos = struct {
@@ -1706,6 +1706,13 @@ pub const Browser = struct {
     /// Perform one nonblocking iteration of one native window. BrowserApp is
     /// responsible for SDL polling and calls this for every registered window.
     pub fn tick(self: *Browser) !bool {
+        // Events can be coalesced around native maximize/fullscreen and initial
+        // window creation. Reconcile against the window itself before queuing
+        // page work; receiving a particular event is not the geometry owner.
+        if (self.window) |window| {
+            const size = window.getSize();
+            try self.resizeViewport(size.width, size.height);
+        }
         self.applyPendingContentFocus();
         self.openPendingTabs();
         self.processPendingPostResubmission();
@@ -1921,69 +1928,72 @@ pub const Browser = struct {
     }
 
     pub fn handleWindowEvent(self: *Browser, window_event: sdl2.WindowEvent) !void {
-        const canvas = self.canvas orelse return;
         switch (window_event.type) {
             .focus_lost => {
                 self.touch_tracker.clear();
                 if (self.activeTab()) |tab| self.scheduleTabHoverTask(tab, null);
             },
             .leave => if (self.activeTab()) |tab| self.scheduleTabHoverTask(tab, null),
-            .resized, .size_changed => |size| {
-                self.lock.lock();
-                const active_tab_height = self.active_tab_height;
-                const active_tab_zoom = self.activeZoom();
-                self.lock.unlock();
-                const geometry = resizeGeometry(
-                    size.width,
-                    size.height,
-                    self.chrome.bottom,
-                    active_tab_height,
-                    active_tab_zoom,
-                    self.tab_surface != null,
-                ) orelse return;
-                if (geometry.window_width == self.window_width and
-                    geometry.window_height == self.window_height)
-                {
-                    return;
-                }
-
-                try canvas.setViewport(null);
-                const targets = try self.createResizeTargets(geometry);
-                self.installResizeTargets(targets);
-
-                self.lock.lock();
-                self.window_width = geometry.window_width;
-                self.window_height = geometry.window_height;
-                self.invalidateInterestRegion();
-                self.needs_composite = true;
-                self.needs_raster = true;
-                self.needs_draw = true;
-                self.lock.unlock();
-                self.chrome.resizeDocument(geometry.window_width);
-
-                const generation = self.resize_generation.fetchAdd(1, .seq_cst) +% 1;
-                for (self.tabs.items) |tab| {
-                    self.scheduleTabResizeTask(
-                        tab,
-                        geometry.window_width,
-                        geometry.tab_viewport_height,
-                        generation,
-                    );
-                }
-
-                // Draw the previous display list at the new native size while
-                // the tab worker prepares the reflowed replacement.
-                self.setNeedsCompositeRasterDraw();
-            },
+            .resized, .size_changed => |size| try self.resizeViewport(size.width, size.height),
             else => {},
         }
+    }
+
+    /// Apply presentation dimensions on the Browser/UI thread. Both native
+    /// size events and headless diagnostics use this transaction; DOM reflow
+    /// remains queued on each tab's serialized worker.
+    pub fn resizeViewport(self: *Browser, width: i32, height: i32) !void {
+        self.lock.lock();
+        const active_tab_height = self.active_tab_height;
+        const active_tab_zoom = self.activeZoom();
+        self.lock.unlock();
+        const geometry = resizeGeometry(
+            width,
+            height,
+            self.chrome.bottom,
+            active_tab_height,
+            active_tab_zoom,
+            self.tab_surface != null,
+        ) orelse return;
+        if (geometry.window_width == self.window_width and
+            geometry.window_height == self.window_height)
+        {
+            return;
+        }
+
+        if (self.canvas) |canvas| try canvas.setViewport(null);
+        const targets = try self.createResizeTargets(geometry);
+        self.installResizeTargets(targets);
+
+        self.lock.lock();
+        self.window_width = geometry.window_width;
+        self.window_height = geometry.window_height;
+        self.invalidateInterestRegion();
+        self.needs_composite = true;
+        self.needs_raster = true;
+        self.needs_draw = true;
+        self.lock.unlock();
+        self.chrome.resizeDocument(geometry.window_width);
+
+        const generation = self.resize_generation.fetchAdd(1, .seq_cst) +% 1;
+        for (self.tabs.items) |tab| {
+            self.scheduleTabResizeTask(
+                tab,
+                geometry.window_width,
+                geometry.tab_viewport_height,
+                generation,
+            );
+        }
+
+        // Draw the previous display list at the new native size while
+        // the tab worker prepares the reflowed replacement.
+        self.setNeedsCompositeRasterDraw();
     }
 
     /// Allocate a complete replacement generation before retiring any live
     /// SDL or z2d target. An allocation failure therefore leaves the current
     /// render generation usable.
     fn createResizeTargets(self: *Browser, geometry: ResizeGeometry) !ResizeTargets {
-        const canvas = self.canvas orelse return error.HeadlessBrowserCannotResize;
         var root_surface = try z2d.Surface.init(
             .image_surface_rgba,
             self.allocator,
@@ -2011,15 +2021,15 @@ pub const Browser = struct {
             );
         }
 
-        const cached_texture = try sdl2.createTexture(
+        const cached_texture = if (self.canvas) |canvas| try sdl2.createTexture(
             canvas,
             .abgr8888,
             .streaming,
             @intCast(geometry.window_width),
             @intCast(geometry.window_height),
-        );
-        errdefer cached_texture.destroy();
-        try cached_texture.setBlendMode(.blend);
+        ) else null;
+        errdefer if (cached_texture) |texture| texture.destroy();
+        if (cached_texture) |texture| try texture.setBlendMode(.blend);
 
         return .{
             .root_surface = root_surface,

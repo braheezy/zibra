@@ -2,6 +2,166 @@
 const std = @import("std");
 const Layout = @import("../browser/render/layout.zig");
 const document = @import("../document/parser.zig");
+const display = @import("../browser/render/display_list.zig");
+
+fn coloredGlyphBounds(items: []const display.DisplayItem, color: display.Color, dx: i32, dy: i32) ?display.Rect {
+    var result: ?display.Rect = null;
+    for (items) |item| {
+        const found: ?display.Rect = switch (item) {
+            .cached_subtree => |value| coloredGlyphBounds(value.list.items, color, dx, dy),
+            .transform => |value| coloredGlyphBounds(value.children, color, dx + value.translate_x, dy + value.translate_y),
+            .blend => |value| if (value.opacity > 0) coloredGlyphBounds(value.children, color, dx, dy) else null,
+            .glyph => |value| if (std.meta.eql(value.color, color)) .{
+                .left = dx + value.x,
+                .top = dy + value.y,
+                .right = dx + value.x + value.glyph.w,
+                .bottom = dy + value.y + value.glyph.h,
+            } else null,
+            else => null,
+        };
+        if (found) |rect| result = if (result) |old| old.unionWith(rect) else rect;
+    }
+    return result;
+}
+
+test "atomic inline blocks retain nested text and block line breaks" {
+    var page = try Page.init("<main style='display:block;width:600px'><span style='display:inline-block;width:200px;padding:10px;vertical-align:bottom'><span style='display:block;font-size:24px;color:red'>A</span><span style='display:block;color:green'>B</span></span><span style='display:inline-block;width:100px;vertical-align:bottom;color:blue'>C</span></main>");
+    defer page.deinit();
+    try page.render();
+    const commands = try page.engine.?.paintDocument(page.layout.?);
+    defer display.DisplayItem.freeList(std.testing.allocator, commands);
+    const red = coloredGlyphBounds(commands, .{ .r = 255, .g = 0, .b = 0 }, 0, 0).?;
+    const green = coloredGlyphBounds(commands, .{ .r = 0, .g = 128, .b = 0 }, 0, 0).?;
+    const blue = coloredGlyphBounds(commands, .{ .r = 0, .g = 0, .b = 255 }, 0, 0).?;
+    try std.testing.expect(green.top > red.top);
+    try std.testing.expectEqual(red.left, green.left);
+    try std.testing.expect(blue.left >= red.left + 210);
+    const glyph = try page.engine.?.font_manager.getStyledGlyph("A", .Normal, .Roman, 24, .proportional);
+    try std.testing.expectEqual(glyph.h, red.height());
+    try std.testing.expectEqual(glyph.w, red.width());
+    try std.testing.expect(!page.layout.?.layoutNeeded());
+}
+
+test "atomic inline auto width includes adjacent inline boxes and collapsed spaces" {
+    var page = try Page.init("<main style='display:block;width:600px;font-size:16px'><small style='display:inline-block'>7,189,000+ <span style='display:inline-block;color:red'>articles</span></small><span style='display:inline-block;width:40px;color:blue'>next</span></main>");
+    defer page.deinit();
+    try page.render();
+    const commands = try page.engine.?.paintDocument(page.layout.?);
+    defer display.DisplayItem.freeList(std.testing.allocator, commands);
+    const number = coloredGlyphBounds(commands, .{ .r = 0, .g = 0, .b = 0 }, 0, 0).?;
+    const articles = coloredGlyphBounds(commands, .{ .r = 255, .g = 0, .b = 0 }, 0, 0).?;
+    const next = coloredGlyphBounds(commands, .{ .r = 0, .g = 0, .b = 255 }, 0, 0).?;
+    try std.testing.expectEqual(number.top, articles.top);
+    try std.testing.expectEqual(number.top, next.top);
+    // The black glyph range includes the collapsed trailing space.
+    try std.testing.expect(articles.left >= number.right);
+    try std.testing.expect(next.left >= articles.right);
+}
+
+test "atomic inline footer retains floated columns at wide and narrow viewports" {
+    var page = try Page.init("<main style='display:block;width:100%'><aside style='display:block;float:left;width:35%;height:100px'></aside><section style='display:inline-block;width:65%;vertical-align:bottom'><div style='display:block;float:left;width:33%;height:50px;color:red'>A</div><div style='display:block;float:left;width:33%;height:50px;color:green'>B</div><div style='display:block;float:left;width:33%;height:50px;color:blue'>C</div></section></main>");
+    defer page.deinit();
+    try page.render();
+    for ([_]i32{ 2560, 800, 400, 2560 }) |width| {
+        page.engine.?.window_width = width;
+        page.layout.?.mark();
+        try page.layout.?.layout(page.engine.?);
+        const commands = try page.engine.?.paintDocument(page.layout.?);
+        defer display.DisplayItem.freeList(std.testing.allocator, commands);
+        const a = coloredGlyphBounds(commands, .{ .r = 255, .g = 0, .b = 0 }, 0, 0).?;
+        const b = coloredGlyphBounds(commands, .{ .r = 0, .g = 128, .b = 0 }, 0, 0).?;
+        const c = coloredGlyphBounds(commands, .{ .r = 0, .g = 0, .b = 255 }, 0, 0).?;
+        try std.testing.expectEqual(a.top, b.top);
+        try std.testing.expectEqual(a.top, c.top);
+        try std.testing.expect(a.left < b.left and b.left < c.left);
+        try std.testing.expect(a.left > @divTrunc(width, 3));
+        try std.testing.expect(c.right < width);
+        try std.testing.expect(!page.layout.?.layoutNeeded());
+    }
+}
+
+test "atomic inline nested controls keep final bounds and persistent invalidation" {
+    var page = try Page.init("<main style='display:block;width:600px'><span style='display:inline-block;width:200px'>prefix</span><span style='display:inline-block;width:220px'><span style='display:inline-block;width:200px'><a href='/target' style='color:red'>link</a><input style='width:80px'></span></span></main>");
+    defer page.deinit();
+    try page.render();
+    const outer = &page.root.element.children.items[1];
+    const inner = &outer.element.children.items[0];
+    const anchor = &inner.element.children.items[0];
+    const input = &inner.element.children.items[1];
+    for (0..5) |iteration| {
+        try anchor.element.attributes.?.put("style", if (iteration % 2 == 0) "color:red;font-size:18px" else "color:blue;font-size:24px");
+        @import("../document/dom.zig").dirtyStyleForElement(&anchor.element);
+        try page.render();
+        const commands = try page.engine.?.paintDocument(page.layout.?);
+        defer display.DisplayItem.freeList(std.testing.allocator, commands);
+        try std.testing.expect(commands.len > 0);
+        const input_box = page.engine.?.input_bounds.get(input).?;
+        try std.testing.expect(input_box.x >= 213);
+        try std.testing.expect(input_box.x + input_box.width < 600);
+        try std.testing.expect(anchor.element.layout_ptr == null);
+        try std.testing.expect(!page.layout.?.layoutNeeded());
+        var found_link = false;
+        for (page.engine.?.link_bounds.items) |link| {
+            if (link.node == anchor and link.bounds.x >= 213) found_link = true;
+        }
+        try std.testing.expect(found_link);
+    }
+}
+
+test "atomic inline block descendants repaint after an opacity reveal" {
+    var page = try Page.init("<main style='display:block;width:600px'><a style='display:block;overflow:hidden;width:300px'><div style='display:inline-block;width:50px;height:40px'></div><div style='display:inline-block;max-width:65%'><span style='display:block;color:blue;opacity:0'>Project name</span><span style='display:block;color:green'>Project description</span></div></a></main>");
+    defer page.deinit();
+    try page.render();
+    const title = &page.root.element.children.items[0].element.children.items[1].element.children.items[0];
+    for (0..4) |iteration| {
+        const shown = iteration % 2 != 0;
+        try title.element.attributes.?.put("style", if (shown) "display:block;color:blue;opacity:1" else "display:block;color:blue;opacity:0");
+        @import("../document/dom.zig").dirtyStyleForElement(&title.element);
+        try page.render();
+        const commands = try page.engine.?.paintDocument(page.layout.?);
+        defer display.DisplayItem.freeList(std.testing.allocator, commands);
+        try std.testing.expectEqual(shown, coloredGlyphBounds(commands, .{ .r = 0, .g = 0, .b = 255 }, 0, 0) != null);
+        try std.testing.expect(coloredGlyphBounds(commands, .{ .r = 0, .g = 128, .b = 0 }, 0, 0) != null);
+        try std.testing.expect(!page.layout.?.layoutNeeded());
+    }
+}
+
+test "responsive max-width auto blocks center after viewport changes" {
+    var page = try Page.init("<main style='display:block;max-width:400px;padding:20px;margin:0 auto;height:20px'>Centered text</main>");
+    defer page.deinit();
+    try page.render();
+    for ([_]i32{ 800, 2560, 300, 800 }) |width| {
+        page.engine.?.window_width = width;
+        page.layout.?.mark();
+        try page.render();
+        const main = page.layout.?.children.items[0];
+        const containing = page.layout.?;
+        const center_twice = 2 * containing.x.get().* + containing.width.get().*;
+        try std.testing.expect(@abs(2 * main.x.get().* + main.width.get().* - center_twice) <= 1);
+        try std.testing.expect(main.width.get().* <= 440);
+        try std.testing.expect(!page.layout.?.layoutNeeded());
+    }
+}
+
+test "responsive display none suppresses blocks inline text and controls across restyles" {
+    var page = try Page.init("<main style='display:block;width:600px'><span style='display:none;color:red'><span style='display:block;position:absolute'>Hidden block</span><input style='width:80px'>Hidden text</span><div style='display:block;color:blue'>Visible</div></main>");
+    defer page.deinit();
+    try page.render();
+    const hidden = &page.root.element.children.items[0];
+    const input = &hidden.element.children.items[1];
+    for (0..5) |iteration| {
+        const shown = iteration % 2 != 0;
+        try hidden.element.attributes.?.put("style", if (shown) "display:block;color:red" else "display:none;color:red");
+        @import("../document/dom.zig").dirtyStyleForElement(&hidden.element);
+        try page.render();
+        const commands = try page.engine.?.paintDocument(page.layout.?);
+        defer display.DisplayItem.freeList(std.testing.allocator, commands);
+        try std.testing.expectEqual(shown, coloredGlyphBounds(commands, .{ .r = 255, .g = 0, .b = 0 }, 0, 0) != null);
+        try std.testing.expectEqual(shown, page.engine.?.input_bounds.contains(input));
+        try std.testing.expect(coloredGlyphBounds(commands, .{ .r = 0, .g = 0, .b = 255 }, 0, 0) != null);
+        try std.testing.expect(!page.layout.?.layoutNeeded());
+    }
+}
 
 const Page = struct {
     root: document.Node,
@@ -138,7 +298,6 @@ test "responsive direct flex buttons retain visible paint and current hit bounds
     defer page.deinit();
     try page.render();
     const commands = try page.engine.?.paintDocument(page.layout.?);
-    const display = @import("../browser/render/display_list.zig");
     defer display.DisplayItem.freeList(std.testing.allocator, commands);
     const first = page.layout.?.children.items[0].children.items[0].block;
     const hit = display.DisplayItem.hitTest(commands, first.x.get().* + 1, first.y.get().* + 5, 1.0);

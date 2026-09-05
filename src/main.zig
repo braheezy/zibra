@@ -240,14 +240,29 @@ fn dumpDom(init: std.process.Init, allocator: std.mem.Allocator, url: ?Url) !voi
 
 const DumpMode = enum { dom, style, layout, display_list };
 
+const Viewport = struct { width: i32 = 800, height: i32 = 600 };
+
+fn parseViewport(input: []const u8) !Viewport {
+    const separator = std.mem.indexOfScalar(u8, input, 'x') orelse return error.InvalidViewport;
+    const width = std.fmt.parseInt(u16, input[0..separator], 10) catch return error.InvalidViewport;
+    const height = std.fmt.parseInt(u16, input[separator + 1 ..], 10) catch return error.InvalidViewport;
+    // Bound software surface allocation for accidental or hostile CLI input.
+    if (width == 0 or height == 0 or width > 8192 or height > 8192) return error.InvalidViewport;
+    return .{ .width = width, .height = height };
+}
+
 fn dumpPipeline(
     init: std.process.Init,
     allocator: std.mem.Allocator,
     url: ?Url,
     mode: DumpMode,
     rtl_text: bool,
+    viewport: Viewport,
 ) !void {
-    var page = try inspection.Page.load(init, allocator, url);
+    var page = try inspection.Page.loadWithMedia(init, allocator, url, .{
+        .viewport_width_css = @floatFromInt(viewport.width),
+        .viewport_height_css = @floatFromInt(viewport.height),
+    });
     defer page.deinit();
     // Page.load returns the DOM by value. Repair parent pointers after the
     // returned page reaches its stable inspection-stack address before paint
@@ -268,7 +283,7 @@ fn dumpPipeline(
     // inspection path deliberately creates neither a window nor a renderer.
     try sdl2.init(.{ .video = true });
     defer sdl2.quit();
-    const layout = try Layout.init(allocator, init.io, init.environ_map, 800, 600, rtl_text);
+    const layout = try Layout.init(allocator, init.io, init.environ_map, viewport.width, viewport.height, rtl_text);
     defer layout.deinit();
     layout.collect_hit_test_bounds = false;
     const document = try layout.buildDocument(&page.root);
@@ -301,6 +316,7 @@ fn zibra(init: std.process.Init) !void {
     var dump_mode: ?DumpMode = null;
     var screenshot_path: ?[]const u8 = null;
     var screenshot_after_ms: ?u64 = null;
+    var viewport: ?Viewport = null;
     var wpt_test = false;
     var wpt_test_url: ?[]const u8 = null;
     var wpt_timeout_ms = default_wpt_timeout_ms;
@@ -309,6 +325,19 @@ fn zibra(init: std.process.Init) !void {
     var arg_index: usize = 1;
     while (arg_index < args.len) : (arg_index += 1) {
         const arg = args[arg_index];
+        if (std.mem.eql(u8, arg, "--viewport") or std.mem.startsWith(u8, arg, "--viewport=")) {
+            if (viewport != null) return error.BadArguments;
+            const value = if (std.mem.startsWith(u8, arg, "--viewport=")) arg["--viewport=".len..] else blk: {
+                if (arg_index + 1 >= args.len) return error.BadArguments;
+                arg_index += 1;
+                break :blk args[arg_index];
+            };
+            viewport = parseViewport(value) catch {
+                std.log.err("--viewport requires WIDTHxHEIGHT, each between 1 and 8192.", .{});
+                return error.BadArguments;
+            };
+            continue;
+        }
         if (std.mem.eql(u8, arg, "-rtl")) {
             rtl_flag = true;
             continue;
@@ -465,6 +494,10 @@ fn zibra(init: std.process.Init) !void {
         std.log.err("--wpt-timeout-ms requires --wpt-test.", .{});
         return error.BadArguments;
     }
+    if (viewport != null and (wpt_test or (dump_mode == null and screenshot_path == null))) {
+        std.log.err("--viewport requires a dump or screenshot mode.", .{});
+        return error.BadArguments;
+    }
 
     if (wpt_test) {
         const test_url = wpt_test_url orelse return error.BadArguments;
@@ -495,7 +528,7 @@ fn zibra(init: std.process.Init) !void {
         if (mode == .dom) {
             try dumpDom(init, allocator, url);
         } else {
-            try dumpPipeline(init, allocator, url, mode, rtl_flag);
+            try dumpPipeline(init, allocator, url, mode, rtl_flag, viewport orelse .{});
         }
         return;
     }
@@ -508,6 +541,8 @@ fn zibra(init: std.process.Init) !void {
             b.deinit();
             allocator.destroy(b);
         }
+
+        if (viewport) |size| try b.resizeViewport(size.width, size.height);
 
         if (url) |u| {
             // Browser.newTab consumes the URL even on failure.

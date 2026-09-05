@@ -168,6 +168,11 @@ Do not construct a Browser merely to reuse a helper in a narrower inspection
 mode. These boundaries are diagnostic contracts and should remain independently
 testable.
 
+`--viewport WIDTHxHEIGHT` supplies explicit dimensions to dump/screenshot
+diagnostics. The inspection Page receives the same width/height media
+environment as its layout engine, without constructing a Browser. Screenshots
+resize the standalone presentation owner before creating the first Tab.
+
 `--wpt-test` is not an inspection phase. It creates a real standalone Browser,
 requires an explicit JavaScript harness completion report, emits one JSONL
 record on stdout after normal teardown, and reports its per-test deadline as a

@@ -73,6 +73,14 @@ For document-pipeline changes, run `test-pipeline`; use
 represented by the box-model or nested-zoom goldens. The inspection stages
 deliberately stop before Browser construction; preserve that isolation.
 
+Dump and screenshot modes accept `--viewport WIDTHxHEIGHT` (default 800x600,
+each dimension 1–8192). Dumps use the entire size for document geometry and
+width/height media queries. Screenshots use that presentation size, with the
+browser chrome subtracted from the document's height, just like a native
+window. For example:
+`zig build run -- --viewport 2560x1440 --screenshot /tmp/wide.png URL`.
+Always verify a wide viewport when diagnosing content stuck in a narrow window.
+
 ### Native macOS visual checks
 
 On macOS, run `zig build test-screenshot`. It exercises the windowless

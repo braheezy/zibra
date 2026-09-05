@@ -258,6 +258,11 @@ cache. It borrows both DOM and selector pointers and cannot cross a DOM or rule
 mutation. Selector-relevant mutation dirties the changed element and its
 ancestor chain.
 
+Stylesheet selector lists expand into independently owned rules in source
+order, with member-specific specificity. Map tables and selector storage are
+independent owners; declaration strings continue to borrow the stylesheet.
+An invalid member rejects the whole ordinary list before any rule is published.
+
 ## Render phases
 
 Each Frame owns a `ProtectedField(?*DocumentLayout)` named `document`.
@@ -287,6 +292,23 @@ callbacks on Elements. Clear those callbacks before the layout owner retires.
 
 Important geometry contracts:
 
+- `display:none` suppresses the whole subtree before block classification or
+  inline painting, including positioned descendants and interaction bounds.
+  Parent tree/line fields stay subscribed to the hidden element's display so
+  showing it can rebuild the appropriate formatting context.
+- Content-bearing `inline-block` boxes establish an atomic inline participant
+  and an independent float context. Their synchronous temporary BlockLayout
+  trees handle normal child layout, used box edges, percentage bases, and
+  effects. `inline_snapshot.zig` owns the materialized commands and local
+  interaction bounds after that tree retires; command provenance and style
+  subscriptions target the persistent outer block, including nested atomic
+  boxes. Final line placement translates those bounds once. Auto widths use
+  bounded intrinsic measurement, including collapsed whitespace across inline
+  siblings; baseline alignment uses the last in-flow line or bottom edge.
+- CSS font sizes remain pixel em sizes through measurement and rasterization.
+  SDL_ttf's default 72-DPI API must not receive a second pixels-to-points
+  reduction. Emoji follow the same pixel em size; authored/accessibility zoom
+  retain their separate existing roles.
 - Block `x`, `y`, `width`, and `height` are used border-box values; CSS width
   and height are content-box inputs unless `box-sizing: border-box` requests
   subtraction of padding/borders before content sizing. Min/max dimensions
@@ -294,6 +316,8 @@ Important geometry contracts:
   a `none` or `hidden`
   border has zero geometry as well as no paint, while transparent solid
   borders still reserve their resolved width.
+- Normal-flow block auto margins distribute remaining space after min/max
+  width constraints, including `width:auto; max-width:...` centering.
 - A definite parent height, including zero, remains a percentage basis while
   that parent's serialized layout traversal is active. Earlier child
   measurements may dirty its height dependency without making the published

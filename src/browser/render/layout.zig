@@ -19,6 +19,7 @@ const margin_collapse = @import("margin_collapse.zig");
 const control_geometry = @import("control_geometry.zig");
 const border_geometry = @import("border_geometry.zig");
 const inline_format = @import("inline_format.zig");
+const inline_snapshot = @import("inline_snapshot.zig");
 const layout_hit = @import("layout_hit.zig");
 const paint_order = @import("paint_order.zig");
 const table_format = @import("table_format.zig");
@@ -170,7 +171,7 @@ fn isContainerNode(node: Node, dependency_target: ?*ProtectedField(u64)) bool {
             // surrounding inline run so their descendants can be suppressed
             // together; promoting them to a block would allow retained
             // out-of-flow descendants to escape the hidden subtree.
-            if (isNonRenderedElement(&element)) break :blk false;
+            if (isNonRenderedElement(&element, dependency_target)) break :blk false;
             if (isOutOfFlowPosition(nodePositionMode(node, dependency_target))) break :blk true;
             if (nodeFloatSide(node, dependency_target) != .none) break :blk true;
             if (table_format.establishesFormattingContext(nodeTableRole(node, dependency_target))) {
@@ -184,6 +185,9 @@ fn isContainerNode(node: Node, dependency_target: ?*ProtectedField(u64)) bool {
                         break :value field.read(target, style_map.allocator).*;
                     } else field.get().*;
                     if (isBlockDisplay(value)) break :blk true;
+                    // Its descendants belong to the atomic box's own context,
+                    // not to this surrounding block-child classification.
+                    if (flex_format.eq(value, "inline-block")) break :blk false;
                 }
             }
 
@@ -514,103 +518,18 @@ const EmbedLayout = struct {
     }
 };
 
-/// A compact inline formatting box for `display:inline-block` elements.
-///
-/// The normal layout tree intentionally groups inline DOM runs into one
-/// anonymous BlockLayout.  Inline-blocks are atomic participants in that
-/// run, however, so they need a small retained line item of their own.  The
-/// item owns only resolved paint values; it borrows the DOM node through the
-/// line item's source while the synchronous paint pass is assembling the
-/// display list.
+/// One atomic inline formatting context. Commands own their containers and
+/// borrow only the persistent outer layout/DOM generation, never its temporary
+/// measurement tree. The payload can move safely with the line buffer.
 const InlineBlockLayout = struct {
+    snapshot: inline_snapshot.Snapshot,
     width: i32,
     height: i32,
-    margin_left: i32,
-    margin_right: i32,
-    background: ?browser.Color,
-    border: BoxEdges,
-    border_visible: [4]bool,
-    border_colors: [4]browser.Color,
-    visible: bool,
+    ascent: i32,
+    margin: BoxEdges,
 
-    fn init(engine: *Layout, element: *const parser.Element) InlineBlockLayout {
-        const styles = element.style orelse return .{
-            .width = 0,
-            .height = 0,
-            .margin_left = 0,
-            .margin_right = 0,
-            .background = null,
-            .border = .{},
-            .border_visible = .{ false, false, false, false },
-            .border_colors = .{ .{ .r = 0, .g = 0, .b = 0, .a = 0 }, .{ .r = 0, .g = 0, .b = 0, .a = 0 }, .{ .r = 0, .g = 0, .b = 0, .a = 0 }, .{ .r = 0, .g = 0, .b = 0, .a = 0 } },
-            .visible = true,
-        };
-        const containing_width = engine.containingBlockCssDimension(false) orelse
-            cssPixelsFromLayout(engine.line_right -| engine.line_left, engine.effectiveZoom(), engine.zoom());
-        const edges = resolveBoxEdges(
-            &styles,
-            engine.font_size_css,
-            containing_width,
-            engine.effectiveZoom(),
-            engine.zoom(),
-        );
-        const context = parser.CssLengthResolutionContext{
-            .font_size = engine.font_size_css,
-            .percentage_base = containing_width,
-        };
-        const content_width = if (styleValue(&styles, "width")) |value|
-            if (resolveCssLength(value, context)) |pixels|
-                engine.scaleActiveCssFloat(pixels)
-            else
-                0
-        else
-            0;
-        const content_height = if (styleValue(&styles, "height")) |value|
-            if (resolveCssLength(value, context)) |pixels|
-                engine.scaleActiveCssFloat(pixels)
-            else
-                0
-        else
-            0;
-        const background = if (styleValue(&styles, "background-color")) |value|
-            if (std.ascii.eqlIgnoreCase(std.mem.trim(u8, value, " \t\r\n"), "transparent"))
-                null
-            else
-                parseColor(value)
-        else
-            null;
-        const style_names = [_][]const u8{
-            "border-top-style", "border-right-style", "border-bottom-style", "border-left-style",
-        };
-        const color_names = [_][]const u8{
-            "border-top-color", "border-right-color", "border-bottom-color", "border-left-color",
-        };
-        var border_visible = [4]bool{ false, false, false, false };
-        var border_colors = [4]browser.Color{ .{ .r = 0, .g = 0, .b = 0, .a = 0 }, .{ .r = 0, .g = 0, .b = 0, .a = 0 }, .{ .r = 0, .g = 0, .b = 0, .a = 0 }, .{ .r = 0, .g = 0, .b = 0, .a = 0 } };
-        for (style_names, color_names, 0..) |style_name, color_name, index| {
-            const style = styleValue(&styles, style_name) orelse "none";
-            const border_width = switch (index) {
-                0 => edges.border.top,
-                1 => edges.border.right,
-                2 => edges.border.bottom,
-                else => edges.border.left,
-            };
-            border_visible[index] = !std.ascii.eqlIgnoreCase(std.mem.trim(u8, style, " \t\r\n"), "none") and
-                !std.ascii.eqlIgnoreCase(std.mem.trim(u8, style, " \t\r\n"), "hidden") and
-                border_width > 0;
-            border_colors[index] = borderColorForSide(engine, &styles, element, color_name);
-        }
-        return .{
-            .width = @max(@as(i32, @intFromFloat(content_width)) +| edges.padding.horizontal() +| edges.border.horizontal(), 0),
-            .height = @max(@as(i32, @intFromFloat(content_height)) +| edges.padding.vertical() +| edges.border.vertical(), 0),
-            .margin_left = edges.margin.left,
-            .margin_right = edges.margin.right,
-            .background = background,
-            .border = edges.border,
-            .border_visible = border_visible,
-            .border_colors = border_colors,
-            .visible = !styleVisibilityHidden(&styles),
-        };
+    fn deinit(self: *InlineBlockLayout) void {
+        self.snapshot.deinit();
     }
 };
 
@@ -986,6 +905,7 @@ const LineItemPayload = union(enum) {
 
     fn deinit(self: *LineItemPayload) void {
         switch (self.*) {
+            .inline_block => |*box| box.deinit(),
             .button => |*button_payload| button_payload.deinit(),
             else => {},
         }
@@ -1084,30 +1004,11 @@ pub const Bounds = layout_hit.Bounds;
 pub const LayoutHitResult = layout_hit.Result;
 const HitPoint = layout_hit.Point;
 
-const LinkBoundEntry = struct {
-    node: *Node,
-    bounds: Bounds,
-};
-
-const IframeBoundEntry = struct {
-    node: *Node,
-    bounds: Bounds,
-};
-
-const FocusBoundEntry = struct {
-    node: *Node,
-    bounds: Bounds,
-};
-
-const AccessibilityBoundEntry = struct {
-    node: *Node,
-    bounds: Bounds,
-};
-
-pub const FragmentTarget = struct {
-    node: *Node,
-    y: i32,
-};
+const LinkBoundEntry = inline_snapshot.BoundEntry;
+const IframeBoundEntry = inline_snapshot.BoundEntry;
+const FocusBoundEntry = inline_snapshot.BoundEntry;
+const AccessibilityBoundEntry = inline_snapshot.BoundEntry;
+pub const FragmentTarget = inline_snapshot.FragmentTarget;
 
 pub const Layout = @This();
 
@@ -2728,7 +2629,7 @@ fn lineHeightForNatural(self: *const Layout, natural_height: i32) i32 {
             0.0,
             @as(f64, @floatFromInt(std.math.maxInt(i32))),
         ));
-        return @max(scaled_layout, natural);
+        return scaled_layout;
     }
 
     const extra_leading: i32 = @intFromFloat(@as(f32, @floatFromInt(natural)) * 0.25);
@@ -2760,13 +2661,7 @@ fn captureInlineStrut(self: *Layout) !void {
 
 const resolveLineHeightCss = inline_format.resolveLineHeightCss;
 
-fn fontWeightIsBold(value: []const u8) bool {
-    const trimmed = std.mem.trim(u8, value, " \t\r\n");
-    if (std.ascii.eqlIgnoreCase(trimmed, "bold") or
-        std.ascii.eqlIgnoreCase(trimmed, "bolder")) return true;
-    const numeric = std.fmt.parseInt(u16, trimmed, 10) catch return false;
-    return numeric >= 600;
-}
+const fontWeightIsBold = font.isBoldWeight;
 
 fn containingBlockCssDimension(self: *const Layout, height: bool) ?f64 {
     const inline_block = self.inline_block orelse return null;
@@ -3058,12 +2953,22 @@ pub fn deinit(self: *Layout) void {
 }
 
 fn recurseNode(self: *Layout, node: Node, node_ptr: ?*Node, line_buffer: *std.ArrayList(LineItem)) !void {
-    // Non-rendered metadata containers (notably <map>) suppress their entire
-    // descendant subtree. Checking ancestors is necessary because an object
+    // Non-rendered containers suppress their entire descendant subtree.
+    // Checking ancestors is necessary because an object
     // fallback can be several levels below the map element.
     var ancestor = node_ptr;
     while (ancestor) |ptr| {
-        if (ptr.* == .element and isNonRenderedElement(&ptr.element)) return;
+        if (ptr.* == .element) {
+            // Hidden inline descendants have no layout owner of their own.
+            // Keep the containing line subscribed so showing them reflows it.
+            if (ptr.element.style) |*styles| {
+                if (self.inline_block) |block| {
+                    const target = if (block.persistent_dependencies) &block.height else block.temporary_dependency_target;
+                    if (target) |notify| _ = styleValueRead(styles, "display", notify);
+                }
+            }
+            if (isNonRenderedElement(&ptr.element, null)) return;
+        }
         ancestor = switch (ptr.*) {
             .element => |*element| element.parent,
             .text => |*text| text.parent,
@@ -3102,7 +3007,12 @@ fn recurseNode(self: *Layout, node: Node, node_ptr: ?*Node, line_buffer: *std.Ar
             // into the anonymous inline run (which would otherwise lose an
             // empty element's width, padding, border, and background).
             if (e.style) |*styles| {
-                if (isInlineBlockDisplay(styles)) {
+                if (isInlineBlockDisplay(styles) and !elementUsesImageLayout(&e) and
+                    !std.ascii.eqlIgnoreCase(e.tag, "input") and
+                    !std.ascii.eqlIgnoreCase(e.tag, "button") and
+                    !std.ascii.eqlIgnoreCase(e.tag, "canvas") and
+                    !std.ascii.eqlIgnoreCase(e.tag, "iframe"))
+                {
                     try appendInlineBlock(self, &e, node_ptr, line_buffer);
                     try self.restoreNodeStyles(line_buffer);
                     return;
@@ -3164,8 +3074,12 @@ fn isNonRenderTag(tag: []const u8) bool {
         std.ascii.eqlIgnoreCase(tag, "area");
 }
 
-fn isNonRenderedElement(element: *const parser.Element) bool {
-    return isNonRenderTag(element.tag) or element.isHiddenInput();
+fn isNonRenderedElement(element: *const parser.Element, dependency_target: ?*ProtectedField(u64)) bool {
+    if (isNonRenderTag(element.tag) or element.isHiddenInput()) return true;
+    const styles = if (element.style) |*map| map else return false;
+    const field = @constCast(styles).getPtr("display") orelse return false;
+    if (dependency_target) |target| target.addDependency(field, styles.allocator);
+    return flex_format.eq(field.get().*, "none");
 }
 
 /// `<img>` always establishes an atomic replaced box, including while its
@@ -3428,22 +3342,24 @@ fn appendInlineBlock(
     node_ptr: ?*Node,
     line_buffer: *std.ArrayList(LineItem),
 ) !void {
-    const block = InlineBlockLayout.init(self, element);
-    if (block.width == 0 and block.height == 0) return;
-    const outer_width = block.margin_left +| block.width +| block.margin_right;
+    const node = node_ptr orelse return;
+    const parent = self.inline_block orelse return;
+    var block = try self.measureInlineBlock(node, element, parent);
+    errdefer block.deinit();
+    const outer_width = block.margin.horizontal() +| block.width;
     if (self.cursor_x +| outer_width > self.line_right and self.cursor_x > self.line_left) {
         try self.flushLine(line_buffer);
         self.cursor_x = self.line_left;
     }
     try line_buffer.append(self.allocator, .{
-        .x = self.cursor_x +| block.margin_left,
+        .x = self.cursor_x +| block.margin.left,
         .hit_offset_x = self.transform_offset_x,
         .hit_offset_y = self.transform_offset_y,
-        .ascent = block.height,
-        .descent = 0,
-        .line_height = self.lineHeightForNatural(block.height),
+        .ascent = block.ascent +| block.margin.top,
+        .descent = block.height -| block.ascent +| block.margin.bottom,
+        .line_height = self.lineHeightForNatural(block.height +| block.margin.vertical()),
         .width = block.width,
-        .height = block.height,
+        .height = block.height +| block.margin.vertical(),
         .vertical_align = if (element.style) |*styles|
             verticalAlignForStyle(styles, self.font_size_css)
         else
@@ -3453,6 +3369,82 @@ fn appendInlineBlock(
     });
     self.cursor_x += outer_width;
     self.last_was_collapsible_space = false;
+}
+
+fn measureInlineBlock(self: *Layout, node: *Node, element: *const parser.Element, parent: *BlockLayout) !InlineBlockLayout {
+    const styles = if (element.style) |*map| map else return error.MissingComputedStyle;
+    const containing_width = self.containingBlockCssDimension(false) orelse 0;
+    const containing_height = self.containingBlockCssDimension(true);
+    const effective_zoom = self.effectiveZoom();
+    const edges = resolveBoxEdges(styles, self.font_size_css, containing_width, effective_zoom, self.zoom());
+    const context = parser.CssLengthResolutionContext{ .font_size = self.font_size_css, .percentage_base = containing_width };
+    const insets = edges.padding.horizontal() +| edges.border.horizontal();
+    const border_box = flex_format.eq(styleValue(styles, "box-sizing") orelse "content-box", "border-box");
+    const adjustment: f64 = if (border_box) @floatFromInt(insets) else 0;
+    const available: f64 = @floatFromInt(@max(parent.content_width -| insets -| edges.margin.horizontal(), 0));
+    const intrinsic = try intrinsic_measure.measure(node, &self.font_manager, @as(f64, effective_zoom) / self.zoom());
+    var content_width = if (parser.resolveCssLength(styleValue(styles, "width") orelse "auto", context)) |css|
+        @max(self.scaleActiveCssFloat(css) - adjustment, 0)
+    else
+        @min(@max(intrinsic.min, available), intrinsic.max);
+    if (parser.resolveCssLength(styleValue(styles, "max-width") orelse "none", context)) |css|
+        content_width = @min(content_width, @max(self.scaleActiveCssFloat(css) - adjustment, 0));
+    if (parser.resolveCssLength(styleValue(styles, "min-width") orelse "0px", context)) |css|
+        content_width = @max(content_width, @max(self.scaleActiveCssFloat(css) - adjustment, 0));
+
+    const root = try BlockLayout.initWithDependencyTracking(self.allocator, node.*, node, parent.document, parent, null, false);
+    defer {
+        root.deinit();
+        self.allocator.destroy(root);
+    }
+    root.inline_formatting_root = true;
+    root.effective_zoom_override = effective_zoom;
+    root.temporary_dependency_target = if (parent.persistent_dependencies) &parent.height else parent.temporary_dependency_target.?;
+    registerStyleDependencies(styles, root.temporary_dependency_target.?);
+    root.allocated_box = .{
+        .x = 0,
+        .y = 0,
+        .width = @as(i32, @intFromFloat(@round(content_width))) +| insets,
+        .containing_width_css = containing_width,
+        .containing_height_css = containing_height,
+    };
+    var result = InlineBlockLayout{
+        .snapshot = inline_snapshot.Snapshot.init(self.allocator),
+        .width = 0,
+        .height = 0,
+        .ascent = 0,
+        .margin = edges.margin,
+    };
+    errdefer result.deinit();
+    {
+        result.snapshot.swapCollectors(self);
+        defer result.snapshot.swapCollectors(self);
+        try root.layout(self);
+        try paintBlockTreeRecursive(&result.snapshot.commands, self, root);
+        rebaseDisplaySources(result.snapshot.commands.items, parent);
+    }
+    result.width = root.width.get().*;
+    result.height = root.height.get().*;
+    result.ascent = if (flex_format.eq(styleValue(styles, "overflow") orelse "visible", "visible"))
+        inlineBlockBaseline(root) orelse result.height
+    else
+        result.height;
+    return result;
+}
+
+fn inlineBlockBaseline(block: *const BlockLayout) ?i32 {
+    if (block.used_inline_layout) return block.last_line_baseline;
+    var index = block.children.items.len;
+    while (index > 0) {
+        index -= 1;
+        const child = switch (block.children.items[index]) {
+            .block => |value| value,
+            .line => continue,
+        };
+        if (child.floatSide() != .none or isOutOfFlowPosition(child.positionMode())) continue;
+        if (inlineBlockBaseline(child)) |baseline| return baseline;
+    }
+    return null;
 }
 
 fn registerStyleDependencies(
@@ -3668,9 +3660,7 @@ fn applyNodeStyles(
                 .percentage_base = self.font_size_css,
             })) |size_float| {
                 self.font_size_css = size_float;
-                // Convert CSS pixels to our historical font-raster unit
-                // (multiply by 0.75 for points).
-                self.size = @intFromFloat(size_float * 0.75);
+                self.size = font.rasterSizeForCssPixels(size_float);
             }
         }
 
@@ -4012,6 +4002,7 @@ fn flushLine(self: *Layout, line_buffer: *std.ArrayList(LineItem)) !void {
         max_item_line_height,
     );
     const baseline = self.cursor_y + baseline_ascent;
+    if (self.inline_block) |block| block.last_line_baseline = baseline;
     const line_top = self.cursor_y;
     const line_box_height = line_height;
 
@@ -4105,53 +4096,11 @@ fn flushLine(self: *Layout, line_buffer: *std.ArrayList(LineItem)) !void {
                     },
                 });
             },
-            .inline_block => |box| {
-                if (!box.visible) continue;
+            .inline_block => |*box| {
                 const x = item.x;
-                const y = final_y;
-                const box_source = if (self.inline_block) |parent|
-                    displaySource(parent, item.node_ptr)
-                else
-                    null;
-                if (box.background) |color| {
-                    try self.current_display_target.append(self.allocator, .{ .rect = .{
-                        .x1 = x,
-                        .y1 = y,
-                        .x2 = x +| box.width,
-                        .y2 = y +| box.height,
-                        .color = self.remapColor(color, .background),
-                        .source = box_source,
-                    } });
-                }
-                const border_values = [_]struct { side: border_geometry.Side, width: i32, visible: bool }{
-                    .{ .side = .top, .width = box.border.top, .visible = box.border_visible[0] },
-                    .{ .side = .right, .width = box.border.right, .visible = box.border_visible[1] },
-                    .{ .side = .bottom, .width = box.border.bottom, .visible = box.border_visible[2] },
-                    .{ .side = .left, .width = box.border.left, .visible = box.border_visible[3] },
-                };
-                const border_box = border_geometry.Box{ .x = x, .y = y, .width = box.width, .height = box.height };
-                const border_edges = border_geometry.Edges{
-                    .top = box.border.top,
-                    .right = box.border.right,
-                    .bottom = box.border.bottom,
-                    .left = box.border.left,
-                };
-                for (border_values, 0..) |border_value, index| {
-                    if (!border_value.visible or border_value.width <= 0) continue;
-                    const quad = border_geometry.sideQuad(border_box, border_edges, border_value.side) orelse continue;
-                    try self.current_display_target.append(self.allocator, .{ .quad = .{
-                        .x1 = quad.points[0].x,
-                        .y1 = quad.points[0].y,
-                        .x2 = quad.points[1].x,
-                        .y2 = quad.points[1].y,
-                        .x3 = quad.points[2].x,
-                        .y3 = quad.points[2].y,
-                        .x4 = quad.points[3].x,
-                        .y4 = quad.points[3].y,
-                        .color = self.remapColor(box.border_colors[index], .border),
-                        .source = box_source,
-                    } });
-                }
+                const y = final_y +| box.margin.top;
+                if (self.collect_hit_test_bounds) try box.snapshot.mergeBounds(self, x, y);
+                try box.snapshot.paintAt(self.current_display_target, x, y, source);
             },
             .input => |input_payload| {
                 try input_payload.paintAt(self.current_display_target, self, item.x, final_y, source);
@@ -4881,7 +4830,10 @@ pub fn layoutSourceCode(self: *Layout, source: []const u8) ![]DisplayItem {
     try self.captureInlineStrut();
 
     var line_buffer = std.ArrayList(LineItem).empty;
-    defer line_buffer.deinit(self.allocator);
+    defer {
+        for (line_buffer.items) |*item| item.payload.deinit();
+        line_buffer.deinit(self.allocator);
+    }
 
     // Process the source character by character to apply different styles to tags and content
     var i: usize = 0;
@@ -5398,68 +5350,17 @@ test "radio inputs use compact circular control metrics" {
 const ButtonLayout = struct {
     allocator: std.mem.Allocator,
     embed: EmbedLayout = .{},
-    root: ?*BlockLayout = null,
-    commands: std.ArrayList(DisplayItem),
+    snapshot: inline_snapshot.Snapshot,
     bgcolor: browser.Color = .{ .r = 255, .g = 165, .b = 0, .a = 255 },
     border_radius: f64 = 0,
     content_offset_x: i32 = button_padding,
     content_offset_y: i32 = button_padding,
-    input_bounds: std.AutoHashMap(*Node, Bounds),
-    image_bounds: std.AutoHashMap(*Node, Bounds),
-    link_bounds: std.ArrayList(LinkBoundEntry),
-    iframe_bounds: std.ArrayList(IframeBoundEntry),
-    focus_bounds: std.ArrayList(FocusBoundEntry),
-    accessibility_bounds: std.ArrayList(AccessibilityBoundEntry),
-    fragment_targets: std.ArrayList(FragmentTarget),
-
     fn init(allocator: std.mem.Allocator) ButtonLayout {
-        return .{
-            .allocator = allocator,
-            .commands = std.ArrayList(DisplayItem).empty,
-            .input_bounds = std.AutoHashMap(*Node, Bounds).init(allocator),
-            .image_bounds = std.AutoHashMap(*Node, Bounds).init(allocator),
-            .link_bounds = std.ArrayList(LinkBoundEntry).empty,
-            .iframe_bounds = std.ArrayList(IframeBoundEntry).empty,
-            .focus_bounds = std.ArrayList(FocusBoundEntry).empty,
-            .accessibility_bounds = std.ArrayList(AccessibilityBoundEntry).empty,
-            .fragment_targets = std.ArrayList(FragmentTarget).empty,
-        };
+        return .{ .allocator = allocator, .snapshot = inline_snapshot.Snapshot.init(allocator) };
     }
 
     fn deinit(self: *ButtonLayout) void {
-        const allocator = self.allocator;
-        DisplayItem.freeItems(allocator, self.commands.items);
-        self.commands.deinit(allocator);
-        if (self.root) |root| {
-            root.deinit();
-            allocator.destroy(root);
-            self.root = null;
-        }
-        self.input_bounds.deinit();
-        self.image_bounds.deinit();
-        self.link_bounds.deinit(allocator);
-        self.iframe_bounds.deinit(allocator);
-        self.focus_bounds.deinit(allocator);
-        self.accessibility_bounds.deinit(allocator);
-        self.fragment_targets.deinit(allocator);
-    }
-
-    fn swapCollectors(self: *ButtonLayout, engine: *Layout) void {
-        std.mem.swap(@TypeOf(self.input_bounds), &self.input_bounds, &engine.input_bounds);
-        std.mem.swap(@TypeOf(self.image_bounds), &self.image_bounds, &engine.image_bounds);
-        std.mem.swap(@TypeOf(self.link_bounds), &self.link_bounds, &engine.link_bounds);
-        std.mem.swap(@TypeOf(self.iframe_bounds), &self.iframe_bounds, &engine.iframe_bounds);
-        std.mem.swap(@TypeOf(self.focus_bounds), &self.focus_bounds, &engine.focus_bounds);
-        std.mem.swap(
-            @TypeOf(self.accessibility_bounds),
-            &self.accessibility_bounds,
-            &engine.accessibility_bounds,
-        );
-        std.mem.swap(
-            @TypeOf(self.fragment_targets),
-            &self.fragment_targets,
-            &engine.fragment_targets,
-        );
+        self.snapshot.deinit();
     }
 
     fn measure(
@@ -5515,21 +5416,24 @@ const ButtonLayout = struct {
             content_width,
             engine.effectiveZoom(),
         );
-        self.root = root;
+        defer {
+            root.deinit();
+            self.allocator.destroy(root);
+        }
 
         // Nested layout coordinates and interactive bounds are local to the
         // button until its final baseline position is known.
-        self.swapCollectors(engine);
-        defer self.swapCollectors(engine);
+        self.snapshot.swapCollectors(engine);
+        defer self.snapshot.swapCollectors(engine);
         try root.layout(engine);
 
         // The rich-button root contributes no independent outer background:
         // ButtonLayout paints that control shell. Reuse the same after-
         // background phase helper as ordinary blocks so positioned or floating
         // descendants cannot escape the button in stale DOM order.
-        try appendBlockPaintContents(&self.commands, engine, root);
+        try appendBlockPaintContents(&self.snapshot.commands, engine, root);
 
-        rebaseDisplaySources(self.commands.items, parent_block);
+        rebaseDisplaySources(self.snapshot.commands.items, parent_block);
 
         const reference = try engine.font_manager.getStyledGlyph(
             "X",
@@ -5554,7 +5458,7 @@ const ButtonLayout = struct {
                 ),
             ),
         };
-        if (displayListLayoutBounds(engine, self.commands.items, 0, 0)) |paint_bounds| {
+        if (displayListLayoutBounds(engine, self.snapshot.commands.items, 0, 0)) |paint_bounds| {
             content_bounds = content_bounds.unionWith(paint_bounds);
         }
 
@@ -5580,7 +5484,7 @@ const ButtonLayout = struct {
     ) !void {
         const translate_x = x + self.content_offset_x;
         const translate_y = y + self.content_offset_y;
-        try self.mergeBounds(engine, translate_x, translate_y);
+        try self.snapshot.mergeBounds(engine, translate_x, translate_y);
 
         var rounded_items = std.ArrayList(DisplayItem).empty;
         defer {
@@ -5632,8 +5536,8 @@ const ButtonLayout = struct {
             } });
         }
 
-        if (self.commands.items.len > 0) {
-            const children = try self.commands.toOwnedSlice(engine.allocator);
+        if (self.snapshot.commands.items.len > 0) {
+            const children = try self.snapshot.commands.toOwnedSlice(engine.allocator);
             var children_owned = true;
             errdefer if (children_owned) DisplayItem.freeList(engine.allocator, children);
             try target.append(engine.allocator, .{ .transform = .{
@@ -5659,47 +5563,7 @@ const ButtonLayout = struct {
             );
         }
     }
-
-    fn mergeBounds(self: *ButtonLayout, engine: *Layout, dx: i32, dy: i32) !void {
-        var input_iterator = self.input_bounds.iterator();
-        while (input_iterator.next()) |entry| {
-            try engine.input_bounds.put(entry.key_ptr.*, offsetBounds(entry.value_ptr.*, dx, dy));
-        }
-        var image_iterator = self.image_bounds.iterator();
-        while (image_iterator.next()) |entry| {
-            try engine.image_bounds.put(entry.key_ptr.*, offsetBounds(entry.value_ptr.*, dx, dy));
-        }
-        for (self.link_bounds.items) |entry| try engine.link_bounds.append(engine.allocator, .{
-            .node = entry.node,
-            .bounds = offsetBounds(entry.bounds, dx, dy),
-        });
-        for (self.iframe_bounds.items) |entry| try engine.iframe_bounds.append(engine.allocator, .{
-            .node = entry.node,
-            .bounds = offsetBounds(entry.bounds, dx, dy),
-        });
-        for (self.focus_bounds.items) |entry| try engine.focus_bounds.append(engine.allocator, .{
-            .node = entry.node,
-            .bounds = offsetBounds(entry.bounds, dx, dy),
-        });
-        for (self.accessibility_bounds.items) |entry| try engine.accessibility_bounds.append(engine.allocator, .{
-            .node = entry.node,
-            .bounds = offsetBounds(entry.bounds, dx, dy),
-        });
-        for (self.fragment_targets.items) |entry| try engine.fragment_targets.append(engine.allocator, .{
-            .node = entry.node,
-            .y = entry.y + dy,
-        });
-    }
 };
-
-fn offsetBounds(bounds: Bounds, dx: i32, dy: i32) Bounds {
-    return .{
-        .x = bounds.x + dx,
-        .y = bounds.y + dy,
-        .width = bounds.width,
-        .height = bounds.height,
-    };
-}
 
 const buttonBoxMetrics = control_geometry.buttonBoxMetrics;
 
@@ -6761,6 +6625,10 @@ const AllocatedBox = struct {
     /// A forced border-box height for the row-stretch pass. Null permits a
     /// first natural-height measurement pass.
     height: ?i32 = null,
+    /// Optional original containing block for atomic inline used values;
+    /// percentages must not become relative to the allocated box itself.
+    containing_width_css: ?f64 = null,
+    containing_height_css: ?f64 = null,
 };
 
 /// A parent supplies this synchronous, scalar-only cursor immediately before
@@ -6840,6 +6708,8 @@ const BlockLayout = struct {
     // commands are later translated into the surrounding inline line box.
     embedded_box: ?EmbeddedBlockBox = null,
     rich_button_root: bool = false,
+    inline_formatting_root: bool = false,
+    last_line_baseline: ?i32 = null,
     effective_zoom_override: ?f32 = null,
     /// Present only during a formatting parent's synchronous child-layout pass.
     /// Unlike `embedded_box`, this preserves the child element's CSS edges,
@@ -7625,11 +7495,12 @@ const BlockLayout = struct {
         block.embedded_box = .{ .x = 0, .y = 0, .width = content_width };
         block.rich_button_root = true;
         block.effective_zoom_override = effective_zoom;
-        block.temporary_dependency_target = &parent_block.height;
+        const target = if (parent_block.persistent_dependencies) &parent_block.height else parent_block.temporary_dependency_target.?;
+        block.temporary_dependency_target = target;
         switch (node_ptr.*) {
             .element => |*element| {
                 if (element.style) |*style_map| {
-                    registerStyleDependencies(style_map, &parent_block.height);
+                    registerStyleDependencies(style_map, target);
                 }
             },
             .text => {},
@@ -8116,7 +7987,7 @@ const BlockLayout = struct {
     }
 
     fn establishesFloatContext(self: *const BlockLayout) bool {
-        if (self.parent_block == null or self.embedded_box != null) return true;
+        if (self.parent_block == null or self.embedded_box != null or self.inline_formatting_root) return true;
         if (self.floatSide() != .none or isOutOfFlowPosition(self.positionMode())) return true;
         return blockAvoidsExternalFloats(self);
     }
@@ -8379,6 +8250,10 @@ const BlockLayout = struct {
                 cssPixelsFromLayout(height, self.document.zoom.get().*, self.document.page_zoom)
             else
                 null;
+            if (box.containing_width_css) |width| {
+                containing_width_css = width;
+                containing_height_css = box.containing_height_css;
+            }
         }
 
         const edge_values = self.resolvedBoxEdges(
@@ -8720,11 +8595,10 @@ const BlockLayout = struct {
         // normal-flow block boxes. Floats and absolutely positioned boxes use
         // separate CSS sizing rules and keep auto margins at their resolved
         // zero value here.
-        if (specified_width != null and
-            !isOutOfFlowPosition(position_mode) and
+        if (!isOutOfFlowPosition(position_mode) and
             float_side == .none and
             allocated_box == null and
-            self.isBlockContainer() and
+            isBlockDisplay(self.formatStyle("display", "inline")) and
             (auto_margins.left or auto_margins.right))
         {
             const remaining = @max(
@@ -9743,12 +9617,7 @@ const BlockLayout = struct {
                 const node = source.at(index);
                 if (node.* == .element) {
                     index += 1;
-                    if (isNonRenderedElement(&node.element)) continue;
-                    if (node.element.style) |*styles| {
-                        const display = styles.getPtr("display").?;
-                        if (self.persistent_dependencies) self.children_version.addDependency(display, styles.allocator);
-                        if (flex_format.eq(display.get().*, "none")) continue;
-                    }
+                    if (isNonRenderedElement(&node.element, if (self.persistent_dependencies) &self.children_version else null)) continue;
                     const child = try BlockLayout.init(self.allocator, node.*, node, self.document, self, null);
                     errdefer {
                         child.deinit();
@@ -10684,6 +10553,7 @@ test "block focus boxes replace line fragments without hiding descendants" {
 }
 
 fn layoutInlineBlock(self: *Layout, block: *BlockLayout, publish_geometry: bool) !void {
+    block.last_line_baseline = null;
     const snapshot = snapshotInlineState(self);
     const previous_target = self.current_display_target;
     const previous_inline_block = self.inline_block;
@@ -10790,7 +10660,7 @@ fn layoutInlineBlock(self: *Layout, block: *BlockLayout, publish_geometry: bool)
                                 .percentage_base = self.font_size_css,
                             })) |size_css| {
                                 self.font_size_css = size_css;
-                                self.size = @intFromFloat(size_css * 0.75);
+                                self.size = font.rasterSizeForCssPixels(size_css);
                             }
                         }
 
@@ -10818,7 +10688,10 @@ fn layoutInlineBlock(self: *Layout, block: *BlockLayout, publish_geometry: bool)
     self.current_display_target = &block.display_list;
 
     var line_buffer = std.ArrayList(LineItem).empty;
-    defer line_buffer.deinit(self.allocator);
+    defer {
+        for (line_buffer.items) |*item| item.payload.deinit();
+        line_buffer.deinit(self.allocator);
+    }
 
     if (block.inline_nodes) |nodes| {
         for (nodes) |node| {

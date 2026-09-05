@@ -19,6 +19,13 @@ committed page and chrome command trees while `Browser.lock` stabilizes their bo
 resources. Input handlers should publish state or enqueue Tab work and return;
 they must not synchronously perform slow raster work.
 
+The UI tick samples the native window size as well as accepting SDL size
+events, so startup/fullscreen event coalescing cannot leave an old document
+viewport installed. `Browser.resizeViewport` allocates all replacement native
+or windowless presentation targets before retiring the previous generation.
+It then queues scalar, generation-stamped dimensions to every Tab; it never
+changes worker-owned DOM/layout state on the UI thread.
+
 ### Tab worker
 
 Every Tab owns one named serialized `TaskRunner`. Navigation, parsing,

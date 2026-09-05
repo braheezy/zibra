@@ -15,6 +15,28 @@ fn value(node: *document.Node, property: []const u8) []const u8 {
     return node.element.style.?.getPtr(property).?.get().*;
 }
 
+test "user agent sheet hides closed dialogs and emphasizes strong text" {
+    const allocator = std.testing.allocator;
+    var css = try @import("../document/css_parser.zig").CSSParser.init(allocator, @embedFile("../browser/browser.css"), false);
+    defer css.deinit(allocator);
+    const rules = try css.parse(allocator);
+    defer {
+        for (rules) |*rule| rule.deinit(allocator);
+        allocator.free(rules);
+    }
+    var root = try parsed("<main><dialog id='closed'>closed</dialog><dialog open>open</dialog><strong>emphasis</strong></main>");
+    defer root.deinit(allocator);
+    document.fixParentPointers(&root, null);
+    try document.style(allocator, &root, rules);
+    try std.testing.expectEqualStrings("none", value(&root.element.children.items[0], "display"));
+    try std.testing.expectEqualStrings("block", value(&root.element.children.items[1], "display"));
+    try std.testing.expectEqualStrings("bold", value(&root.element.children.items[2], "font-weight"));
+    try root.element.children.items[0].element.attributes.?.put("open", "");
+    dom.dirtyStyleForElement(&root.element.children.items[0].element);
+    try document.style(allocator, &root, rules);
+    try std.testing.expectEqualStrings("block", value(&root.element.children.items[0], "display"));
+}
+
 test "root rem sizes use initial font then compute all descendant dimensions" {
     const allocator = std.testing.allocator;
     var root = try parsed("<html style='font-size:2rem;padding:1rem'><div style='font-size:0.5rem;width:3rem;line-height:1.25rem;transform:translate(-2rem, 1rem)'><span style='font-size:200%;height:2rem'></span></div></html>");

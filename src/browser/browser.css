@@ -38,6 +38,8 @@ fieldset { display: block; }
 legend { display: block; }
 details { display: block; }
 summary { display: block; }
+dialog { display: block; }
+dialog:not([open]) { display: none; }
 
 /* Metadata and executable containers participate in the DOM and stylesheet
    phases, but their contents are not rendered as document flow.  Keeping
@@ -60,6 +62,7 @@ nav.links { background-color: lightgray; }
 a { color: blue; }
 i { font-style: italic; }
 b { font-weight: bold; }
+strong { font-weight: bold; }
 small { font-size: 90%; }
 big { font-size: 110%; }
 input {

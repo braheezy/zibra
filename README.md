@@ -65,6 +65,8 @@ zig build test-pipeline
 zig build check
 # Capture and compare the windowless macOS screenshot fixtures
 zig build test-screenshot
+# Inspect a large-screen layout instead of the default 800x600 capture
+zig build run -- --viewport 2560x1440 --screenshot /tmp/wide.png https://www.wikipedia.org/
 # Capture an active page after a bounded delay (useful for timers/animations)
 zig build run -- --screenshot /tmp/acid3-slice.png --screenshot-after-ms 3000 \
   https://acid3.acidtests.org/

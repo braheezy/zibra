@@ -11,7 +11,6 @@ const Url = url_module.Url;
 
 const default_html = @embedFile("../assets/default.html");
 const default_style_sheet = @embedFile("../browser/browser.css");
-const inspection_viewport_width_css: f64 = 800;
 
 pub const Page = struct {
     allocator: std.mem.Allocator,
@@ -20,8 +19,15 @@ pub const Page = struct {
     rules: std.ArrayList(CSSParser.CSSRule),
     keyframes: std.ArrayList(CSSParser.KeyframesRule),
     css_texts: std.ArrayList([]u8),
+    media: CSSParser.MediaEnvironment = .{ .viewport_width_css = 800, .viewport_height_css = 600 },
 
     pub fn load(init: std.process.Init, allocator: std.mem.Allocator, source_url: ?Url) !Page {
+        return loadWithMedia(init, allocator, source_url, .{ .viewport_width_css = 800, .viewport_height_css = 600 });
+    }
+
+    /// Load a browser-free inspection generation using the caller's viewport
+    /// for conditional stylesheet selection. The returned root moves by value.
+    pub fn loadWithMedia(init: std.process.Init, allocator: std.mem.Allocator, source_url: ?Url, media: CSSParser.MediaEnvironment) !Page {
         const body = if (source_url) |url|
             try fetchDecoded(init, allocator, url, null, null)
         else
@@ -40,6 +46,7 @@ pub const Page = struct {
             .rules = std.ArrayList(CSSParser.CSSRule).empty,
             .keyframes = std.ArrayList(CSSParser.KeyframesRule).empty,
             .css_texts = std.ArrayList([]u8).empty,
+            .media = media,
         };
         errdefer page.deinit();
         // `root` moved into `page.root`; selectors may walk ancestors while
@@ -86,7 +93,7 @@ pub const Page = struct {
         var css_parser = try CSSParser.initWithMedia(
             self.allocator,
             stylesheet,
-            .{ .viewport_width_css = inspection_viewport_width_css },
+            self.media,
         );
         defer css_parser.deinit(self.allocator);
         var keyframes = std.ArrayList(CSSParser.KeyframesRule).empty;

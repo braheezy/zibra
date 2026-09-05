@@ -269,10 +269,31 @@ fn emojiWidthForHeight(source_width: i32, source_height: i32, target_height: i32
     return @intCast(@min(@max(scaled, 1), @as(i64, std.math.maxInt(i32))));
 }
 
+/// SDL_ttf's default 72-DPI face size maps one input unit to one pixel.
+/// CSS lengths are already pixels; converting them to points would shrink
+/// every authored font by 25%. Native display density is separate.
+pub fn rasterSizeForCssPixels(pixels: f64) i32 {
+    if (!std.math.isFinite(pixels)) return 16;
+    return @intFromFloat(std.math.clamp(@round(pixels), 1, 4096));
+}
+
+/// Shared face selection for intrinsic measurement and final glyph layout.
+pub fn isBoldWeight(value: []const u8) bool {
+    const trimmed = std.mem.trim(u8, value, " \t\r\n");
+    if (std.ascii.eqlIgnoreCase(trimmed, "bold") or std.ascii.eqlIgnoreCase(trimmed, "bolder")) return true;
+    const numeric = std.fmt.parseInt(u16, trimmed, 10) catch return false;
+    return numeric >= 600;
+}
+
+test "CSS font pixels are not converted to typographic points" {
+    try std.testing.expectEqual(@as(i32, 16), rasterSizeForCssPixels(16));
+    try std.testing.expectEqual(@as(i32, 13), rasterSizeForCssPixels(13));
+    try std.testing.expectEqual(@as(i32, 24), rasterSizeForCssPixels(24));
+    try std.testing.expectEqual(@as(i32, 14), rasterSizeForCssPixels(13.6));
+}
+
 fn emojiHeightForFontSize(font_size: i32) i32 {
-    if (font_size <= 0) return 0;
-    const scaled = @divTrunc(@as(i64, font_size) * 4 + 2, 3);
-    return @intCast(@min(scaled, @as(i64, std.math.maxInt(i32))));
+    return @max(font_size, 0);
 }
 
 fn copySurfaceRgba(
@@ -948,7 +969,7 @@ test "CSS font families select monospace without replacing Unicode fallbacks" {
 }
 
 test "emoji bitmap scaling preserves aspect ratio and validates dimensions" {
-    try std.testing.expectEqual(@as(i32, 16), emojiHeightForFontSize(12));
+    try std.testing.expectEqual(@as(i32, 12), emojiHeightForFontSize(12));
     try std.testing.expectEqual(@as(i32, 0), emojiHeightForFontSize(0));
     try std.testing.expectEqual(@as(i32, 16), emojiWidthForHeight(128, 128, 16));
     try std.testing.expectEqual(@as(i32, 32), emojiWidthForHeight(256, 128, 16));

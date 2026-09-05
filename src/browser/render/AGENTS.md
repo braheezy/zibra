@@ -51,6 +51,10 @@ boundaries.
 - `control_geometry.zig` computes input/button leaf geometry and password
   display text. `InputLayout` and `ButtonLayout` remain with their DOM, font,
   collector, and display-command invariants in `layout.zig`.
+- `inline_snapshot.zig` owns movable atomic-inline paint containers and local
+  interaction bounds shared by buttons and inline-blocks. Materialize and
+  rebase all commands before retiring the temporary layout tree; nested
+  temporary trees subscribe only through the persistent containing block.
 - `replaced_paint.zig` appends background-image and rounded-control command
   leaves/groups without owning layout objects. Background attachment selects
   an element-local or viewport-local tile phase while the command rectangle
@@ -152,6 +156,8 @@ modules over forwarding wrappers.
 - Layout coordinates contain authored CSS zoom. Raster applies accessibility
   zoom once. Preserve that distinction for geometry, glyphs, replaced
   elements, effects, focus, and hit testing.
+- FontManager sizes are pixel em sizes, including emoji. Do not insert a
+  CSS-pixel-to-point conversion before SDL_ttf's default 72-DPI font API.
 - Replaced size resolution happens before authored zoom and keeps the element
   box separate from object-fit image geometry and fractional source crop.
 
