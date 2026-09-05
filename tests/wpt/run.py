@@ -94,6 +94,20 @@ def _folder_for_path(path: str) -> str:
     return f"{component}/" if "/" in path else "(root)"
 
 
+def _normalize_directory(value: str) -> str:
+    """Normalize and validate a relative WPT directory prefix."""
+    directory = value.strip().strip("/")
+    if not directory or directory == "." or directory.startswith("../") or "/../" in directory or directory == "..":
+        raise ValueError(f"invalid WPT directory {value!r}")
+    if "\\" in directory or directory.startswith("/"):
+        raise ValueError(f"invalid WPT directory {value!r}")
+    return directory
+
+
+def _path_in_directory(path: str, directory: str) -> bool:
+    return path == directory or path.startswith(directory + "/")
+
+
 class ProgressReporter:
     """Keep normal runner output compact while retaining folder milestones.
 
@@ -397,7 +411,7 @@ def _load_yaml_config(path: pathlib.Path) -> dict[str, object]:
     top-level sections containing scalar path lists and a path-to-status map.
     """
     sections: dict[str, object] = {}
-    list_sections = {"tests", "probes"}
+    list_sections = {"tests", "probes", "directories"}
     map_sections = {"deviations"}
     current: str | None = None
     for line_number, raw_line in enumerate(path.read_text(encoding="utf-8").splitlines(), 1):
@@ -485,6 +499,24 @@ def load_cases(path: pathlib.Path) -> list[Case]:
             )
             _validate_case(case, len(cases))
             cases.append(case)
+
+    directories = config.get("directories", [])
+    if not isinstance(directories, list):
+        raise ValueError("manifest directories must be a list")
+    normalized_directories = [_normalize_directory(value) for value in directories]
+    if normalized_directories:
+        existing_paths = {case.path for case in cases}
+        for discovered in discover_testharness_cases(normalized_directories):
+            if discovered.path in existing_paths:
+                continue
+            expectation = deviations.get(discovered.path)
+            case = replace(
+                discovered,
+                reason=f"Selected by WPT directory allowlist: {normalized_directories!r}.",
+                expectation=expectation,
+            )
+            _validate_case(case, len(cases))
+            cases.append(case)
     unknown_deviations = set(deviations) - {case.path for case in cases}
     if unknown_deviations:
         names = ", ".join(sorted(unknown_deviations))
@@ -492,7 +524,7 @@ def load_cases(path: pathlib.Path) -> list[Case]:
     return cases
 
 
-def discover_testharness_cases() -> list[Case]:
+def discover_testharness_cases(directories: list[str] | None = None) -> list[Case]:
     """Discover upstream files that embed the WPT testharness protocol.
 
     This intentionally excludes WPT support files and non-test resources. It
@@ -503,12 +535,18 @@ def discover_testharness_cases() -> list[Case]:
     """
     if not UPSTREAM.is_dir():
         return []
+    normalized_directories = [_normalize_directory(value) for value in directories or []]
     cases: list[Case] = []
     for path in sorted(UPSTREAM.rglob("*")):
         if not path.is_file() or path.suffix.lower() not in DISCOVERY_EXTENSIONS:
             continue
         relative = path.relative_to(UPSTREAM).as_posix()
         if relative.startswith(DISCOVERY_SKIP_PREFIXES):
+            continue
+        if normalized_directories and not any(
+            _path_in_directory(relative, directory)
+            for directory in normalized_directories
+        ):
             continue
         try:
             source = path.read_text(encoding="utf-8", errors="ignore")
@@ -750,6 +788,54 @@ def _serialize_case_result(result: CaseResult) -> dict[str, Any]:
     return item
 
 
+def _coverage_scores(
+    coverage_cases: list[Case] | None,
+    results: list[CaseResult],
+) -> list[dict[str, int | str]] | None:
+    """Return scores for the complete discovered corpus, including omissions.
+
+    A case absent from ``results`` was intentionally not run. It contributes a
+    zero to its directory rather than disappearing from the suite denominator.
+    This keeps a focused compatibility run honest while still allowing the
+    runner to avoid known-unsupported directories.
+    """
+    if coverage_cases is None:
+        return None
+
+    result_by_path = {result.case.path: result for result in results}
+    groups: dict[str, dict[str, int | str]] = {}
+    seen_paths: set[str] = set()
+    for case in coverage_cases:
+        if case.path in seen_paths:
+            continue
+        seen_paths.add(case.path)
+        directory = _folder_for_path(case.path)
+        item = groups.setdefault(
+            directory,
+            {"path": directory, "passed": 0, "total": 0, "skipped": 0},
+        )
+        result = result_by_path.get(case.path)
+        if result is None or result.status == "SKIP":
+            item["total"] = int(item["total"]) + 1
+            item["skipped"] = int(item["skipped"]) + 1
+            continue
+
+        record = result.record
+        subtests = record.get("tests") if record is not None else None
+        if isinstance(subtests, list) and subtests:
+            item["total"] = int(item["total"]) + len(subtests)
+            item["passed"] = int(item["passed"]) + sum(
+                1
+                for subtest in subtests
+                if isinstance(subtest, dict) and subtest.get("status") == "PASS"
+            )
+        else:
+            item["total"] = int(item["total"]) + 1
+            item["passed"] = int(item["passed"]) + int(result.status == "PASS")
+
+    return [groups[path] for path in sorted(groups)]
+
+
 def write_run_report(
     path: pathlib.Path,
     *,
@@ -761,6 +847,8 @@ def write_run_report(
     results: list[CaseResult],
     complete: bool = True,
     expected_cases: int | None = None,
+    coverage_cases: list[Case] | None = None,
+    suite: str | None = None,
 ) -> None:
     serialized = [_serialize_case_result(result) for result in results]
     counts = Counter(item["status"] for item in serialized)
@@ -770,6 +858,47 @@ def write_run_report(
         for subtest in item.get("tests", [])
         if isinstance(subtest, dict)
     )
+    directory_scores = _coverage_scores(coverage_cases, results)
+    coverage_total = (
+        sum(int(item["total"]) for item in directory_scores)
+        if directory_scores is not None
+        else None
+    )
+    coverage_pass = (
+        sum(int(item["passed"]) for item in directory_scores)
+        if directory_scores is not None
+        else None
+    )
+    skipped_cases = (
+        sum(int(item["skipped"]) for item in directory_scores)
+        if directory_scores is not None
+        else 0
+    )
+    summary = {
+        "total": len(serialized),
+        "pass": counts["PASS"],
+        "fail": counts["FAIL"],
+        "error": counts["ERROR"],
+        "timeout": counts["TIMEOUT"],
+        "infra": counts["INFRA"],
+        "probe": counts["PROBE"],
+        "skip": counts["SKIP"],
+        # Keep the case-level counts above for ordinary WPT runs, while also
+        # exposing the granular score used by suites such as Acid3.
+        "subtests_total": sum(subtest_counts.values()),
+        "subtests_pass": subtest_counts["PASS"],
+        "subtests_fail": subtest_counts["FAIL"],
+        "subtests_error": subtest_counts["ERROR"],
+        "subtests_timeout": subtest_counts["TIMEOUT"],
+        "skipped_cases": skipped_cases,
+        "suite_failed": skipped_cases > 0 or counts["INFRA"] > 0 or any(
+            not result.ok for result in results
+        ),
+    }
+    if coverage_total is not None:
+        summary["coverage_total"] = coverage_total
+        summary["coverage_pass"] = coverage_pass or 0
+
     report = {
         "schema_version": REPORT_SCHEMA_VERSION,
         "run_id": finished_at.strftime("%Y%m%dT%H%M%S.%fZ"),
@@ -778,30 +907,15 @@ def write_run_report(
         "complete": complete,
         "expected_cases": expected_cases if expected_cases is not None else len(serialized),
         "manifest": str(manifest),
-        "suite": "all" if str(manifest) == "<all-testharness>" else "focused",
+        "suite": suite or ("all" if str(manifest) == "<all-testharness>" else "focused"),
         "mode": mode,
         "browser": browser,
         "browser_revision": _browser_revision(),
-        "summary": {
-            "total": len(serialized),
-            "pass": counts["PASS"],
-            "fail": counts["FAIL"],
-            "error": counts["ERROR"],
-            "timeout": counts["TIMEOUT"],
-            "infra": counts["INFRA"],
-            "probe": counts["PROBE"],
-            "skip": counts["SKIP"],
-            # Keep the case-level counts above for ordinary WPT runs, while
-            # also exposing the granular score used by suites such as Acid3,
-            # whose numbered tests are subtests of one harness page.
-            "subtests_total": sum(subtest_counts.values()),
-            "subtests_pass": subtest_counts["PASS"],
-            "subtests_fail": subtest_counts["FAIL"],
-            "subtests_error": subtest_counts["ERROR"],
-            "subtests_timeout": subtest_counts["TIMEOUT"],
-        },
+        "summary": summary,
         "tests": serialized,
     }
+    if directory_scores is not None:
+        report["directory_scores"] = directory_scores
     path.parent.mkdir(parents=True, exist_ok=True)
     temporary = path.with_name(f".{path.name}.tmp")
     temporary.write_text(json.dumps(report, indent=2, sort_keys=True) + "\n", encoding="utf-8")
