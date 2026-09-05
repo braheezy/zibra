@@ -1,7 +1,7 @@
 // The dashboard keeps its client state small: the server owns reports, while
 // this module renders the selected report and the local history.
 const state = {
-  runs: [], selected: null, selectedId: null, pathQuery: "",
+  runs: [], selected: null, selectedId: null, pathQuery: "", directorySort: "pass-desc",
 };
 const $ = (id) => document.getElementById(id);
 const esc = (value) => String(value ?? "").replace(/[&<>"']/g, (char) => ({
@@ -40,7 +40,22 @@ function scoreClass(passed, total) {
   return !total ? "empty" : passed === total ? "pass" : passed ? "partial" : "fail";
 }
 function score(passed, total) {
-  return `<span class="score ${scoreClass(passed, total)}">${passed}/${total}</span>`;
+  const rate = total ? Math.round(passed * 100 / total) : null;
+  return `<span class="score ${scoreClass(passed, total)}">${passed}/${total}<span class="score-percent">${rate == null ? "—" : `${rate}%`}</span></span>`;
+}
+function directoryRate(directory) {
+  const total = Number(directory.total || 0);
+  return total ? Number(directory.passed || 0) / total : -1;
+}
+function sortDirectories(directories) {
+  return [...directories].sort((a, b) => {
+    if (state.directorySort === "path") {
+      return String(a.path || "").localeCompare(String(b.path || ""));
+    }
+    const difference = directoryRate(a) - directoryRate(b);
+    if (difference) return state.directorySort === "pass-desc" ? -difference : difference;
+    return String(a.path || "").localeCompare(String(b.path || ""));
+  });
 }
 function currentRun() {
   return state.runs.find((run) => run.id === state.selectedId) || state.runs[0] || null;
@@ -92,7 +107,7 @@ function renderCoverage(report) {
   );
   const revision = revisionLabel(report?.browser_revision || currentRun()?.browser_revision);
   $("browser-column").innerHTML = `<span class="browser-head">Zibra</span><span class="browser-sha">${esc(revision.slice(0, 12))}</span><span class="browser-date">${esc(dateText(report?.finished_at || currentRun()?.finished_at))}</span>`;
-  const entries = groups.sort((a, b) => String(a.path || "").localeCompare(String(b.path || "")));
+  const entries = sortDirectories(groups);
   if (!entries.length) {
     $("coverage-table").innerHTML = `<tr><td colspan="2" class="empty">${directories.length ? "No directories match the search." : "No directory scores in this run."}</td></tr>`;
     return;
@@ -145,5 +160,6 @@ async function load() {
 }
 $("run-select").addEventListener("change", (event) => selectRun(event.target.value));
 $("path-search").addEventListener("input", (event) => { state.pathQuery = event.target.value; if (state.selected) renderCoverage(state.selected); });
+$("directory-sort").addEventListener("change", (event) => { state.directorySort = event.target.value; if (state.selected) renderCoverage(state.selected); });
 $("refresh").addEventListener("click", load);
 load();

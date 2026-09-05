@@ -50,6 +50,9 @@ code { color: var(--blue); font: .9em ui-monospace, SFMono-Regular, Menlo, monos
 .search input { width: 190px; border: 1px solid var(--line); border-radius: 3px; padding: 8px 10px; background: #222526; color: var(--text); }
 .search input::placeholder { color: #878a89; }
 .search input:focus { border-color: var(--blue); outline: 1px solid #2c5c86; }
+.sort { display: flex; align-items: center; gap: 7px; color: var(--muted); font-size: 12px; }
+.sort select { border: 1px solid var(--line); border-radius: 3px; padding: 8px 10px; background: #222526; }
+.sort select:focus { border-color: var(--blue); outline: 1px solid #2c5c86; }
 .table-wrap { overflow-x: auto; }
 table { width: 100%; border-collapse: collapse; }
 th, td { padding: 12px 13px; text-align: left; vertical-align: middle; }
@@ -70,6 +73,7 @@ th, td { padding: 12px 13px; text-align: left; vertical-align: middle; }
 .score.fail { color: var(--red); }
 .score.partial { color: var(--yellow); }
 .score.empty { color: var(--muted); }
+.score-percent { display: block; margin-top: 2px; color: var(--muted); font: 11px Arial, sans-serif; }
 .empty { padding: 27px 13px !important; color: var(--muted) !important; font-family: Arial, sans-serif !important; }
 footer { padding: 16px 24px 35px; border-top: 1px solid #2e3031; background: #17191a; color: var(--muted); font-size: 12px; text-align: center; }
 footer a { color: var(--blue); }

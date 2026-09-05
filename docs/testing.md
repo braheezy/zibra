@@ -47,6 +47,9 @@ Run from the repository root:
   report under `tests/wpt/results`. The runner keeps normal output compact,
   records completion for each top-level WPT folder, and accepts `--verbose`
   for per-failure browser diagnostics;
+- `task wpt` for the reviewed directory allowlist. It runs only selected WPT
+  directories, but scores every discovered directory in the report; omitted
+  directories appear as `0/N` and keep the suite failing until implemented;
 - `zig build test-docs` for repository Markdown links when documentation
   changes. The checker intentionally skips the vendored `tests/wpt/upstream`
   submodule, whose links are resolved by WPT's own documentation tooling;

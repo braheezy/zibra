@@ -23,9 +23,13 @@ or copied to a GitHub Pages branch later. The server is read-only: it exposes
 `/api/runs` and `/api/runs/<file>.json`, plus the static frontend. No WPT
 credentials or external service are required. The frontend deliberately shows
 the run history and top-level directory scores only; individual test records
-remain available in the JSON artifact for offline investigation. The history
-chart includes only `--all` full-suite runs, so focused manifests cannot make
-the long-term percentage look artificially better.
+remain available in the JSON artifact for offline investigation. `task wpt`
+uses a reviewed directory allowlist but records the complete discovered corpus
+for coverage, so omitted directories appear as `0/N` and the run is visibly
+failing. The history chart includes only full-suite-scored runs, so focused
+manifests cannot make the long-term percentage look artificially better.
+The directory table defaults to descending pass percentage, with path and
+ascending-percentage alternatives.
 
 The host-side `tests/wpt/results` directory is the local history store. It is
 mounted read-only into the container, survives `docker compose down`, and is
