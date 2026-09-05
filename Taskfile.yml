@@ -44,6 +44,26 @@ tasks:
         --mode testharness --jobs {{.WPT_JOBS}} --browser ./zig-out/bin/zibra
         --report {{.WPT_RESULTS}}/all-$(date -u +%Y%m%dT%H%M%SZ).json
 
+  wpt-reftest:
+    desc: Run discovered WPT reftests through Zibra screenshot comparison
+    cmds:
+      - zig build
+      - mkdir -p {{.WPT_RESULTS}}
+      - >-
+        ZIBRA_GIT_SHA="{{.GIT_SHA}}" SDL_VIDEODRIVER=dummy python3 tests/wpt/run.py --all
+        --mode reftest --jobs {{.WPT_JOBS}} --browser ./zig-out/bin/zibra
+        --report {{.WPT_RESULTS}}/reftest-$(date -u +%Y%m%dT%H%M%SZ).json
+
+  wpt-crashtest:
+    desc: Run discovered WPT crashtests through Zibra's headless lifecycle
+    cmds:
+      - zig build
+      - mkdir -p {{.WPT_RESULTS}}
+      - >-
+        ZIBRA_GIT_SHA="{{.GIT_SHA}}" SDL_VIDEODRIVER=dummy python3 tests/wpt/run.py --all
+        --mode crashtest --jobs {{.WPT_JOBS}} --browser ./zig-out/bin/zibra
+        --report {{.WPT_RESULTS}}/crashtest-$(date -u +%Y%m%dT%H%M%SZ).json
+
   dom-results:
     desc: Run focused DOM mutation, traversal, and range WPT cases
     cmds:

@@ -3,10 +3,12 @@ import importlib.util
 import io
 import json
 from pathlib import Path
+import struct
 import sys
 import tempfile
 import unittest
 from unittest import mock
+import zlib
 
 
 SPEC = importlib.util.spec_from_file_location(
@@ -127,6 +129,80 @@ class WptRunnerTests(unittest.TestCase):
         self.assertEqual(["dom/discovered.html"], [case.path for case in cases])
         self.assertEqual("testharness", cases[0].mode)
 
+    def test_reftest_captures_test_and_reference_and_applies_relation(self):
+        test = runner.Case(
+            path="css/test.html",
+            mode="reftest",
+            reason="reftest fixture",
+            references=(("/css/ref.html", "!="),),
+        )
+
+        def png(color):
+            width, height = 2, 80
+            raw = b"".join(b"\0" + color * width for _ in range(height))
+
+            def chunk(name, data):
+                checksum = zlib.crc32(name + data) & 0xFFFFFFFF
+                return struct.pack(">I", len(data)) + name + data + struct.pack(">I", checksum)
+
+            return (
+                b"\x89PNG\r\n\x1a\n"
+                + chunk(b"IHDR", struct.pack(">IIBBBBB", width, height, 8, 6, 0, 0, 0))
+                + chunk(b"IDAT", zlib.compress(raw))
+                + chunk(b"IEND", b"")
+            )
+
+        def capture(command, _watchdog):
+            output = Path(command[command.index("--screenshot") + 1])
+            color = bytes((255, 0, 0, 255)) if "ref.html" not in command[-1] else bytes((0, 255, 0, 255))
+            output.write_bytes(png(color))
+            return runner.ProcessOutcome(stdout="", stderr="")
+
+        with mock.patch.object(runner, "_invoke", side_effect=capture) as invoke:
+            result = runner._run_reftest(
+                test, "file:///wpt/css/test.html", ["fake-browser"]
+            )
+
+        self.assertTrue(result.ok)
+        self.assertEqual("PASS", result.status)
+        self.assertEqual("!=", result.record["comparisons"][0]["relation"])
+        self.assertEqual(2, invoke.call_count)
+
+    def test_crashtest_requires_a_healthy_browser_completion(self):
+        test = runner.Case(
+            path="html/crashtests/loads.html",
+            mode="crashtest",
+            reason="crashtest fixture",
+        )
+
+        def healthy_browser(command, _watchdog):
+            output = Path(command[command.index("--screenshot") + 1])
+            output.write_bytes(b"PNG fixture")
+            return runner.ProcessOutcome(stdout="", stderr="", returncode=0)
+
+        with mock.patch.object(runner, "_invoke", side_effect=healthy_browser):
+            result = runner._run_crashtest(
+                test, "file:///wpt/html/crashtests/loads.html", ["fake-browser"]
+            )
+
+        self.assertTrue(result.ok)
+        self.assertEqual("PASS", result.status)
+        self.assertEqual("windowless-screenshot", result.record["completion"])
+
+        with mock.patch.object(
+            runner,
+            "_invoke",
+            return_value=runner.ProcessOutcome(
+                stdout="", stderr="crashed", infrastructure_error="browser exited with status -11", returncode=-11
+            ),
+        ):
+            result = runner._run_crashtest(
+                test, "file:///wpt/html/crashtests/loads.html", ["fake-browser"]
+            )
+
+        self.assertFalse(result.ok)
+        self.assertEqual("CRASH", result.status)
+
     def test_discovery_classifies_generated_and_unsupported_entries(self):
         generated = self.upstream / "dom" / "generated.any.js"
         generated.write_text("// META: global=window,dedicatedworker\n", encoding="utf-8")
@@ -135,8 +211,11 @@ class WptRunnerTests(unittest.TestCase):
         reftest.write_text(
             '<link rel="match" href="reference-ref.html">', encoding="utf-8"
         )
+        crash = self.upstream / "html" / "crashtests" / "loads.html"
+        crash.parent.mkdir(parents=True)
+        crash.write_text("<!doctype html>", encoding="utf-8")
         manual = self.upstream / "html" / "example-manual.html"
-        manual.parent.mkdir()
+        manual.parent.mkdir(parents=True, exist_ok=True)
         manual.write_text("<p>operator test</p>", encoding="utf-8")
 
         with mock.patch.object(runner, "UPSTREAM", self.upstream):
@@ -144,18 +223,27 @@ class WptRunnerTests(unittest.TestCase):
 
         self.assertEqual(
             [
-                ("css/reference.html", "reftest", False),
+                ("css/reference.html", "reftest", True),
                 ("dom/generated.any.html", "testharness", True),
                 ("dom/generated.any.worker.html", "testharness", True),
+                ("html/crashtests/loads.html", "crashtest", True),
                 ("html/example-manual.html", "manual", False),
             ],
             [(item.path, item.category, item.runnable) for item in inventory],
         )
-        summary = runner.inventory_summary(inventory)
-        self.assertEqual(4, summary["total"])
-        self.assertEqual(2, summary["runnable"])
         self.assertEqual(
-            {"manual": 1, "reftest": 1, "testharness": 2},
+            (("/css/reference-ref.html", "=="),),
+            next(item.references for item in inventory if item.category == "reftest"),
+        )
+        summary = runner.inventory_summary(inventory)
+        self.assertEqual(5, summary["total"])
+        self.assertEqual(4, summary["runnable"])
+        self.assertEqual(
+            {"crashtest": 1, "reftest": 1, "testharness": 2},
+            summary["runnable_by_category"],
+        )
+        self.assertEqual(
+            {"crashtest": 1, "manual": 1, "reftest": 1, "testharness": 2},
             summary["categories"],
         )
 
@@ -469,6 +557,8 @@ print("<html></html>")
             """\
 tests:
   - dom/example.html
+crashtests:
+  - html/crashtests/loads.html
 probes:
   - html/probe.html
 deviations:
@@ -480,7 +570,11 @@ deviations:
         cases = runner.load_cases(manifest)
 
         self.assertEqual(
-            [("dom/example.html", "testharness", "fail"), ("html/probe.html", "probe", None)],
+            [
+                ("dom/example.html", "testharness", "fail"),
+                ("html/crashtests/loads.html", "crashtest", None),
+                ("html/probe.html", "probe", None),
+            ],
             [(case.path, case.mode, case.expectation) for case in cases],
         )
 

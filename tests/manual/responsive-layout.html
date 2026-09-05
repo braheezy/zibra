@@ -1,53 +1,160 @@
+<!--
+How to verify:
+1. Open this page at the default window size. The top bar spans the viewport,
+   the page stays centered, and the height badge says "tall viewport".
+2. Resize wide/narrow. The header controls and flexible cards wrap; the
+   auto-fit grid changes column count as space allows. At 650 CSS pixels or
+   narrower, the separate breakpoint grid changes from three columns to one.
+3. Click "Larger root font", then "Reset root font". Type, spacing, and
+   rem-based card sizes update together without a reload.
+4. Click "Change accent". The top bar, heading, card borders, buttons, inset
+   bar, and height badge update from the shared custom property.
+5. Make the content viewport 500 CSS pixels tall or shorter without changing
+   its width. The badge says "short viewport" and the top bar turns orange.
+6. The inset bar uses calc(100% - 2rem). Scroll and click after resizing;
+   links and button click targets must follow their visible boxes.
+-->
 <!doctype html>
-<!-- How to verify: Resize the native window wide/narrow. The green bar follows
-the content viewport, the page stays centered, flex cards wrap, and grid cards
-change column count. Toggle the buttons: text/spacing and colors update together
-without reload. Scroll and click after resizing; click targets must follow boxes. -->
 <html lang="en">
-<head>
-<meta charset="utf-8">
-<title>Responsive layout and readable type</title>
-<style>
-:root { font-size: 16px; --ink: #18334a; --accent: #186859; --space: 1rem; }
-body { margin: 0; color: var(--ink); font-size: 1rem; line-height: 1.6; }
-main { display: block; max-width: 72rem; margin: 0 auto; padding: 2rem; }
-h1 { font-size: 2rem; line-height: 1.2; }
-h2 { font-size: 1.4rem; margin: 2rem 0 1rem; }
-button { padding: .7rem 1rem; font-size: 1rem; color: white; background-color: var(--accent); }
-.viewport { height: .6rem; background-color: var(--accent); }
-.flex { display: flex; flex-wrap: wrap; gap: var(--space); }
-.flex article { flex: 1 1 15rem; min-width: 0; padding: 1rem; background-color: #e5f2ee; }
-.grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(14rem, 1fr)); gap: var(--space); }
-.grid article { padding: 1rem; background-color: #e9eff7; }
-.controls { display: flex; flex-wrap: wrap; gap: 1rem; }
-.measure { width: calc(100% - 2rem); margin: 1rem; height: 1rem; background-color: var(--accent); }
-@media (max-width: 700px) { main { padding: 1rem; } }
-@media (max-height: 500px) { .viewport { background-color: #bb5500; } }
-</style>
-</head>
-<body>
-<div class="viewport"></div>
-<main>
-<h1>Readable at every window size</h1>
-<p>This page uses root-relative type, inherited CSS variables, constrained flex sizing, and responsive grid tracks.</p>
-<div class="controls">
-<button onclick="document.documentElement.style.fontSize = '20px'">Larger root font</button>
-<button onclick="document.documentElement.style.fontSize = '16px'">Reset root font</button>
-<button onclick="document.documentElement.style.setProperty('--accent', '#7840a0')">Change accent</button>
-</div>
-<h2>Flexible cards</h2>
-<div class="flex">
-<article><h2>Grow</h2><p>Free width is shared between the cards.</p></article>
-<article><h2>Wrap</h2><p>Narrow the window and the cards move to new lines.</p></article>
-<article><h2>Read</h2><p>Text and spacing follow the root font size.</p></article>
-</div>
-<h2>Responsive grid</h2>
-<div class="grid">
-<article>One: a minimum-width track</article><article>Two: an equal share of free space</article>
-<article>Three: a new row when needed</article><article>Four: aligned without fixed positions</article>
-</div>
-<div class="measure"></div>
-<p>The inset bar above uses <code>calc(100% - 2rem)</code>. The top bar turns orange in a short window, testing height-only media updates.</p>
-</main>
-</body>
+  <head>
+    <meta charset="utf-8">
+    <title>Responsive layout and readable type</title>
+    <style>
+      :root {
+        font-size: 16px;
+        --ink: #18334a;
+        --accent: #186859;
+        --panel: #e8f0ff;
+        --space: 1rem;
+      }
+
+      * { box-sizing: border-box; }
+      body {
+        margin: 0;
+        color: var(--ink);
+        font-size: 1rem;
+        line-height: 1.6;
+      }
+
+      main {
+        display: block;
+        max-width: 72rem;
+        margin: 0 auto;
+        padding: 2rem;
+      }
+
+      header {
+        display: flex;
+        align-items: center;
+        flex-wrap: wrap;
+        gap: var(--space);
+        border-bottom: 4px solid var(--accent);
+        padding-bottom: var(--space);
+      }
+
+      h1 {
+        flex: 1 1 14rem;
+        margin: 0;
+        color: var(--accent);
+        font-size: 2rem;
+        line-height: 1.2;
+      }
+
+      h2 { font-size: 1.4rem; margin: 2rem 0 1rem; }
+      .controls { display: flex; flex: 0 1 auto; flex-wrap: wrap; gap: var(--space); }
+      button {
+        padding: .7rem 1rem;
+        font-size: 1rem;
+        color: white;
+        background-color: var(--accent);
+        border: 0;
+      }
+
+      .viewport { height: .6rem; background-color: var(--accent); }
+      .flex { display: flex; flex-wrap: wrap; gap: var(--space); }
+      .flex article { flex: 1 1 15rem; min-width: 0; background-color: #e5f2ee; }
+      .grid {
+        display: grid;
+        grid-template-columns: repeat(auto-fit, minmax(14rem, 1fr));
+        gap: var(--space);
+      }
+      .grid article { background-color: #e9eff7; }
+      .breakpoint-grid {
+        display: grid;
+        grid-template-columns: repeat(3, minmax(0, 1fr));
+        gap: var(--space);
+      }
+
+      article {
+        background-color: var(--panel);
+        border-left: 6px solid var(--accent);
+        min-height: 100px;
+        padding: var(--space);
+      }
+      article h2 { margin-top: 0; }
+      .short { display: none; }
+      .status {
+        display: inline-block;
+        background-color: var(--accent);
+        color: white;
+        padding: .25rem .5rem;
+      }
+      .measure {
+        width: calc(100% - 2rem);
+        margin: 1rem;
+        height: 1rem;
+        background-color: var(--accent);
+      }
+
+      @media (max-width: 700px) { main { padding: 1rem; } }
+      @media (max-width: 650px) { .breakpoint-grid { grid-template-columns: 1fr; } }
+      @media (max-height: 500px) {
+        .viewport { background-color: #bb5500; }
+        .tall { display: none; }
+        .short { display: inline; }
+      }
+    </style>
+  </head>
+  <body>
+    <div class="viewport"></div>
+    <main>
+      <header>
+        <h1>Readable at every window size</h1>
+        <nav class="controls" aria-label="Page controls">
+          <a href="#cards">Cards</a>
+          <button type="button" onclick="document.documentElement.style.fontSize = '20px'">Larger root font</button>
+          <button type="button" onclick="document.documentElement.style.fontSize = '16px'">Reset root font</button>
+          <button id="accent" type="button">Change accent</button>
+        </nav>
+      </header>
+      <p>This page uses root-relative type, inherited CSS variables, constrained flex sizing, and responsive grid tracks.</p>
+      <p class="status"><span class="tall">tall viewport</span><span class="short">short viewport</span></p>
+      <h2 id="cards">Flexible cards</h2>
+      <div class="flex">
+        <article><h2>Grow</h2><p>Free width is shared between the cards.</p></article>
+        <article><h2>Wrap</h2><p>Narrow the window and the cards move to new lines.</p></article>
+        <article><h2>Read</h2><p>Text and spacing follow the root font size.</p></article>
+      </div>
+      <h2>Auto-fit grid</h2>
+      <div class="grid">
+        <article>One: a minimum-width track</article>
+        <article>Two: an equal share of free space</article>
+        <article>Three: a new row when needed</article>
+        <article>Four: aligned without fixed positions</article>
+      </div>
+      <h2>Breakpoint grid</h2>
+      <section class="breakpoint-grid">
+        <article><h2>Flexible header</h2><p>The heading and controls wrap as available width changes.</p></article>
+        <article><h2>Responsive grid</h2><p>These cards use three tracks, then one track at 650 CSS pixels or narrower.</p></article>
+        <article><h2>Dynamic theme</h2><p>The button updates one custom property shared by the accents.</p></article>
+      </section>
+      <div class="measure"></div>
+      <p>The inset bar above uses <code>calc(100% - 2rem)</code>. The top bar turns orange in a short window, testing height-only media updates.</p>
+    </main>
+    <script>
+      document.getElementById("accent").addEventListener("click", function () {
+        document.documentElement.style.setProperty("--accent", "#a33a52");
+      });
+    </script>
+  </body>
 </html>

@@ -1,8 +1,11 @@
 #!/usr/bin/env python3
-"""Run Zibra's reviewed WPT probes and testharness cases.
+"""Run Zibra's reviewed WPT probes, testharness cases, reftests, and crashtests.
 
 ``probe`` remains a fetch/parse smoke test and is never a WPT conformance
 result. ``testharness`` consumes Zibra's machine-readable headless result.
+``reftest`` captures the test and reference pages through Zibra's screenshot
+mode and compares their page pixels.
+``crashtest`` drives the same headless lifecycle and reports browser health.
 """
 
 from __future__ import annotations
@@ -12,6 +15,7 @@ from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from collections import Counter
 from datetime import datetime, timezone
 from dataclasses import dataclass, replace
+from html.parser import HTMLParser
 import math
 import json
 import os
@@ -25,7 +29,16 @@ import tempfile
 import time
 import urllib.error
 import urllib.request
+import zlib
 from typing import Any
+from urllib.parse import urljoin
+
+try:
+    from reftest import compare_png
+except ModuleNotFoundError:
+    # The runner is also imported directly by its dependency-free unit tests.
+    sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
+    from reftest import compare_png
 
 
 ROOT = pathlib.Path(__file__).resolve().parents[2]
@@ -90,6 +103,8 @@ class InventoryItem:
     source_path: str
     category: str
     runnable: bool
+    references: tuple[tuple[str, str], ...] = ()
+    fuzzy: tuple[int, int] | None = None
 
 
 @dataclass(frozen=True)
@@ -101,6 +116,8 @@ class Case:
     timeout_ms: int = DEFAULT_TIMEOUT_MS
     expectation: str | None = None
     source_path: str | None = None
+    references: tuple[tuple[str, str], ...] = ()
+    fuzzy: tuple[int, int] | None = None
 
     @property
     def skipped(self) -> bool:
@@ -120,6 +137,8 @@ class ProcessOutcome:
     stdout: str
     stderr: str
     infrastructure_error: str | None = None
+    returncode: int | None = None
+    watchdog_expired: bool = False
 
 
 @dataclass(frozen=True)
@@ -169,7 +188,9 @@ class ProgressReporter:
     plus one durable completion line per top-level WPT folder.
     """
 
-    _SUMMARY_ORDER = ("PASS", "FAIL", "ERROR", "TIMEOUT", "INFRA", "PROBE", "SKIP")
+    _SUMMARY_ORDER = (
+        "PASS", "FAIL", "ERROR", "TIMEOUT", "CRASH", "INFRA", "PROBE", "SKIP"
+    )
 
     def __init__(self, cases: list[Case], mode: str, jobs: int, stream: Any = None) -> None:
         self.stream = stream if stream is not None else sys.stdout
@@ -194,7 +215,7 @@ class ProgressReporter:
     @staticmethod
     def _label(result: CaseResult) -> str:
         if result.infrastructure_error is not None:
-            return "INFRA"
+            return "CRASH" if result.status == "CRASH" else "INFRA"
         if not result.ok and result.status not in ("SKIP", "PROBE"):
             return f"{result.status} (expected {result.case.expected_status})"
         return result.status
@@ -404,8 +425,10 @@ def _validate_case(case: Case, index: int) -> None:
     prefix = f"tests[{index}]"
     if not isinstance(case.path, str) or not case.path:
         raise ValueError(f"{prefix}.path must be a non-empty string")
-    if case.mode not in ("probe", "testharness"):
-        raise ValueError(f"{prefix}.mode must be probe or testharness")
+    if case.mode not in ("probe", "testharness", "reftest", "crashtest"):
+        raise ValueError(
+            f"{prefix}.mode must be probe, testharness, reftest, or crashtest"
+        )
     if not isinstance(case.status, str):
         raise ValueError(f"{prefix}.status must be a string")
     if not isinstance(case.reason, str) or not case.reason:
@@ -467,7 +490,7 @@ def _load_yaml_config(path: pathlib.Path) -> dict[str, object]:
     top-level sections containing scalar path lists and a path-to-status map.
     """
     sections: dict[str, object] = {}
-    list_sections = {"tests", "probes", "directories"}
+    list_sections = {"tests", "reftests", "crashtests", "probes", "directories"}
     map_sections = {"deviations"}
     current: str | None = None
     for line_number, raw_line in enumerate(path.read_text(encoding="utf-8").splitlines(), 1):
@@ -538,7 +561,12 @@ def load_cases(path: pathlib.Path) -> list[Case]:
     if not isinstance(deviations, dict):
         raise ValueError("manifest deviations must be a path-to-status map")
     cases: list[Case] = []
-    for section, mode in (("tests", "testharness"), ("probes", "probe")):
+    for section, mode in (
+        ("tests", "testharness"),
+        ("reftests", "reftest"),
+        ("crashtests", "crashtest"),
+        ("probes", "probe"),
+    ):
         paths = config.get(section, [])
         if not isinstance(paths, list):
             raise ValueError(f"manifest {section} must be a list")
@@ -553,6 +581,23 @@ def load_cases(path: pathlib.Path) -> list[Case]:
                 reason="Selected by the WPT YAML allowlist.",
                 expectation=expectation,
             )
+            if mode in ("reftest", "crashtest"):
+                discovered = {
+                    item.path: item
+                    for item in discover_wpt_inventory()
+                    if item.category == mode
+                }.get(path_value)
+                if discovered is not None:
+                    case = replace(
+                        case,
+                        source_path=(
+                            discovered.source_path
+                            if discovered.source_path != discovered.path
+                            else None
+                        ),
+                        references=discovered.references,
+                        fuzzy=discovered.fuzzy,
+                    )
             _validate_case(case, len(cases))
             cases.append(case)
 
@@ -643,6 +688,68 @@ def _generated_paths(source_path: str, source: str) -> list[str]:
     return []
 
 
+class _ReftestLinkParser(HTMLParser):
+    def __init__(self) -> None:
+        super().__init__(convert_charrefs=True)
+        self.references: list[tuple[str, str]] = []
+
+    def handle_starttag(self, _tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        values = {name.lower(): value for name, value in attrs}
+        relation = values.get("rel", "") or ""
+        href = values.get("href")
+        if href is None:
+            return
+        for token, comparison in (("match", "=="), ("mismatch", "!=")):
+            if token in relation.lower().split():
+                self.references.append((href.strip(), comparison))
+
+
+def _reftest_references(source_path: str, source: str) -> tuple[tuple[str, str], ...]:
+    parser = _ReftestLinkParser()
+    try:
+        parser.feed(source)
+        parser.close()
+    except Exception:
+        return ()
+    resolved: list[tuple[str, str]] = []
+    for reference, relation in parser.references:
+        value = urljoin(source_path, reference)
+        if "://" not in value:
+            value = "/" + value.lstrip("/")
+        resolved.append((value, relation))
+    return tuple(resolved)
+
+
+def _reftest_fuzzy(source: str) -> tuple[int, int] | None:
+    """Read the common unkeyed WPT fuzzy meta form."""
+    meta = re.search(
+        r"<meta\b[^>]*\bname\s*=\s*['\"]fuzzy['\"][^>]*>",
+        source,
+        re.IGNORECASE,
+    )
+    if meta is None:
+        return None
+    content = re.search(
+        r"\bcontent\s*=\s*['\"]([^'\"]+)['\"]", meta.group(0), re.IGNORECASE
+    )
+    if content is None:
+        return None
+    values: dict[str, int] = {}
+    for part in content.group(1).split(";"):
+        if "=" not in part:
+            continue
+        name, value = (piece.strip() for piece in part.split("=", 1))
+        if name not in {"maxDifference", "totalPixels"}:
+            continue
+        try:
+            values[name] = max(int(piece.strip()) for piece in value.split("-"))
+        except ValueError:
+            return None
+    if "maxDifference" not in values or "totalPixels" not in values:
+        return None
+    return values["maxDifference"], values["totalPixels"]
+
+
 def _source_inventory_items(relative: str, source: str) -> list[InventoryItem]:
     """Classify a source file using the same filename/content concepts as WPT."""
     path = pathlib.PurePosixPath(relative)
@@ -664,12 +771,26 @@ def _source_inventory_items(relative: str, source: str) -> list[InventoryItem]:
     if re.search(r"-visual(?:\.|$)", name):
         return [InventoryItem(relative, relative, "visual", False)]
     if path.suffix in DISCOVERY_EXTENSIONS or path.suffix == ".svg":
+        path_parts = set(path.parts[:-1])
+        crash_named = bool(re.search(r"-crash(?:\.|$)", path.stem, re.IGNORECASE))
+        if "crashtests" in path_parts or crash_named:
+            return [InventoryItem(relative, relative, "crashtest", True)]
         is_reftest = bool(
             re.search(r"rel\s*=\s*['\"][^'\"]*(?:match|mismatch)", lower_source)
             or re.search(r"meta[^>]+name\s*=\s*['\"]reftest", lower_source)
         )
         if is_reftest:
-            return [InventoryItem(relative, relative, "reftest", False)]
+            references = _reftest_references(relative, source)
+            return [
+                InventoryItem(
+                    relative,
+                    relative,
+                    "reftest",
+                    bool(references),
+                    references,
+                    _reftest_fuzzy(source),
+                )
+            ]
         if "testharness.js" in lower_source or "testharnessreport.js" in lower_source:
             return [InventoryItem(relative, relative, "testharness", True)]
         return []
@@ -700,9 +821,16 @@ def _manifest_inventory_items(path: pathlib.Path) -> list[InventoryItem]:
         source_path = "/".join(parts)
         for raw_item in node[1:]:
             test_path = source_path
-            runnable = category == "testharness"
-            if isinstance(raw_item, list) and raw_item and isinstance(raw_item[0], str):
-                test_path = raw_item[0] or source_path
+            runnable = category in ("testharness", "crashtest")
+            references: tuple[tuple[str, str], ...] = ()
+            fuzzy: tuple[int, int] | None = None
+            if (
+                isinstance(raw_item, list)
+                and raw_item
+                and (raw_item[0] is None or isinstance(raw_item[0], str))
+            ):
+                if isinstance(raw_item[0], str):
+                    test_path = raw_item[0] or source_path
                 if (
                     category == "testharness"
                     and len(raw_item) > 1
@@ -710,18 +838,53 @@ def _manifest_inventory_items(path: pathlib.Path) -> list[InventoryItem]:
                     and raw_item[1].get("jsshell")
                 ):
                     runnable = False
+                if category == "reftest" and len(raw_item) > 1 and isinstance(raw_item[1], list):
+                    references = tuple(
+                        (str(reference[0]), str(reference[1]))
+                        for reference in raw_item[1]
+                        if isinstance(reference, list)
+                        and len(reference) >= 2
+                        and isinstance(reference[0], str)
+                        and reference[1] in ("==", "!=")
+                    )
+                    runnable = bool(references)
+                if category == "reftest" and len(raw_item) > 2 and isinstance(raw_item[2], dict):
+                    raw_fuzzy = raw_item[2].get("fuzzy")
+                    if (
+                        isinstance(raw_fuzzy, list)
+                        and len(raw_fuzzy) == 2
+                        and all(type(value) is int and value >= 0 for value in raw_fuzzy)
+                    ):
+                        fuzzy = (raw_fuzzy[0], raw_fuzzy[1])
+                    elif isinstance(raw_fuzzy, list):
+                        for fuzzy_entry in raw_fuzzy:
+                            if (
+                                isinstance(fuzzy_entry, list)
+                                and len(fuzzy_entry) == 2
+                                and isinstance(fuzzy_entry[1], list)
+                                and len(fuzzy_entry[1]) == 2
+                                and all(
+                                    type(value) is int and value >= 0
+                                    for value in fuzzy_entry[1]
+                                )
+                            ):
+                                fuzzy = (fuzzy_entry[1][0], fuzzy_entry[1][1])
+                                break
             items.append(
                 InventoryItem(
                     path=test_path.lstrip("/"),
                     source_path=source_path,
                     category=category,
                     runnable=runnable,
+                    references=references,
+                    fuzzy=fuzzy,
                 )
             )
 
     for category, value in data["items"].items():
-        if category in supported:
-            walk(value, [], category)
+        normalized_category = "reftest" if category == "print-reftest" else category
+        if normalized_category in supported:
+            walk(value, [], normalized_category)
     return sorted(items, key=lambda item: (item.source_path, item.path, item.category))
 
 
@@ -759,6 +922,9 @@ def discover_wpt_inventory(directories: list[str] | None = None) -> list[Invento
 def inventory_summary(items: list[InventoryItem]) -> dict[str, Any]:
     """Summarize test entries without conflating them with runnable cases."""
     categories = Counter(item.category for item in items)
+    runnable_by_category = Counter(
+        item.category for item in items if item.runnable
+    )
     directories: dict[str, Counter[str]] = {}
     for item in items:
         directories.setdefault(_folder_for_path(item.source_path), Counter())[item.category] += 1
@@ -766,6 +932,7 @@ def inventory_summary(items: list[InventoryItem]) -> dict[str, Any]:
         "source": "wpt-manifest" if (UPSTREAM / "MANIFEST.json").is_file() else "source-scan",
         "total": len(items),
         "runnable": sum(item.runnable for item in items),
+        "runnable_by_category": dict(sorted(runnable_by_category.items())),
         "categories": dict(sorted(categories.items())),
         "directories": {
             path: dict(sorted(counts.items()))
@@ -782,15 +949,57 @@ def _cases_from_inventory(items: list[InventoryItem]) -> list[Case]:
             mode="testharness",
             status="discovered",
             reason=f"Discovered as a WPT {item.category} entry.",
+            references=item.references,
+            fuzzy=item.fuzzy,
         )
         for item in items
         if item.category == "testharness" and item.runnable
     ]
 
 
+def _crashtest_cases_from_inventory(items: list[InventoryItem]) -> list[Case]:
+    return [
+        Case(
+            path=item.path,
+            source_path=item.source_path if item.source_path != item.path else None,
+            mode="crashtest",
+            status="discovered",
+            reason="Discovered as a WPT crashtest entry.",
+        )
+        for item in items
+        if item.category == "crashtest" and item.runnable
+    ]
+
+
 def discover_testharness_cases(directories: list[str] | None = None) -> list[Case]:
     """Return only testharness entries, including generated WPT variants."""
     return _cases_from_inventory(discover_wpt_inventory(directories))
+
+
+def _reftest_cases_from_inventory(items: list[InventoryItem]) -> list[Case]:
+    return [
+        Case(
+            path=item.path,
+            source_path=item.source_path if item.source_path != item.path else None,
+            mode="reftest",
+            status="discovered",
+            reason="Discovered as a WPT reftest entry.",
+            references=item.references,
+            fuzzy=item.fuzzy,
+        )
+        for item in items
+        if item.category == "reftest"
+    ]
+
+
+def discover_reftest_cases(directories: list[str] | None = None) -> list[Case]:
+    """Return discovered visual tests with their match/mismatch references."""
+    return _reftest_cases_from_inventory(discover_wpt_inventory(directories))
+
+
+def discover_crashtest_cases(directories: list[str] | None = None) -> list[Case]:
+    """Return discovered markup crashtests for the process-health runner."""
+    return _crashtest_cases_from_inventory(discover_wpt_inventory(directories))
 
 
 def _invoke(command: list[str], watchdog_seconds: float) -> ProcessOutcome:
@@ -824,6 +1033,7 @@ def _invoke(command: list[str], watchdog_seconds: float) -> ProcessOutcome:
             infrastructure_error=(
                 f"browser watchdog expired after {watchdog_seconds:.3f} seconds"
             ),
+            watchdog_expired=True,
         )
     except OSError as error:
         if process is not None and process.poll() is None:
@@ -846,8 +1056,9 @@ def _invoke(command: list[str], watchdog_seconds: float) -> ProcessOutcome:
             stdout=stdout,
             stderr=stderr,
             infrastructure_error=f"browser exited with status {process.returncode}",
+            returncode=process.returncode,
         )
-    return ProcessOutcome(stdout=stdout, stderr=stderr)
+    return ProcessOutcome(stdout=stdout, stderr=stderr, returncode=process.returncode)
 
 
 def parse_testharness_result(stdout: str, expected_url: str) -> dict[str, Any]:
@@ -970,6 +1181,175 @@ def _run_testharness(case: Case, url: str, browser: list[str]) -> CaseResult:
     )
 
 
+def _reference_url(test_url: str, reference: str) -> str:
+    """Resolve a manifest reference URL against the WPT test URL."""
+    if "://" in reference:
+        return reference
+    if test_url.startswith("file://") and reference.startswith("/"):
+        return (UPSTREAM / reference.lstrip("/")).resolve().as_uri()
+    return urljoin(test_url, reference)
+
+
+def _run_reftest(case: Case, url: str, browser: list[str]) -> CaseResult:
+    """Capture the test and references, then apply match/mismatch relations."""
+    if not case.references:
+        return CaseResult(
+            case=case,
+            status="INFRA",
+            ok=False,
+            infrastructure_error="reftest has no match or mismatch reference",
+        )
+
+    watchdog_seconds = case.timeout_ms / 1000 + WATCHDOG_GRACE_SECONDS
+    diagnostics: list[str] = []
+    comparisons: list[dict[str, Any]] = []
+    started = time.monotonic()
+    with tempfile.TemporaryDirectory(prefix="zibra-reftest-") as directory:
+        test_png = pathlib.Path(directory) / "test.png"
+        outcome = _invoke(
+            [*browser, "--screenshot", str(test_png), url], watchdog_seconds
+        )
+        diagnostics.extend(value for value in (outcome.stdout, outcome.stderr) if value)
+        if outcome.infrastructure_error is not None:
+            return CaseResult(
+                case=case,
+                status="INFRA",
+                ok=False,
+                infrastructure_error=f"test screenshot: {outcome.infrastructure_error}",
+                stdout=outcome.stdout,
+                stderr=outcome.stderr,
+            )
+        if not test_png.is_file():
+            return CaseResult(
+                case=case,
+                status="INFRA",
+                ok=False,
+                infrastructure_error="browser exited without creating test screenshot",
+                stdout=outcome.stdout,
+                stderr=outcome.stderr,
+            )
+
+        for index, (reference, relation) in enumerate(case.references):
+            reference_png = pathlib.Path(directory) / f"reference-{index}.png"
+            reference_url = _reference_url(url, reference)
+            outcome = _invoke(
+                [*browser, "--screenshot", str(reference_png), reference_url],
+                watchdog_seconds,
+            )
+            diagnostics.extend(value for value in (outcome.stdout, outcome.stderr) if value)
+            if outcome.infrastructure_error is not None:
+                return CaseResult(
+                    case=case,
+                    status="INFRA",
+                    ok=False,
+                    infrastructure_error=(
+                        f"reference screenshot {reference}: {outcome.infrastructure_error}"
+                    ),
+                    stdout="\n".join(diagnostics),
+                )
+            if not reference_png.is_file():
+                return CaseResult(
+                    case=case,
+                    status="INFRA",
+                    ok=False,
+                    infrastructure_error=(
+                        f"browser exited without creating reference screenshot {reference}"
+                    ),
+                    stdout="\n".join(diagnostics),
+                )
+            try:
+                comparison = compare_png(
+                    str(test_png),
+                    str(reference_png),
+                    max_difference=case.fuzzy[0] if case.fuzzy else 0,
+                    max_different_pixels=case.fuzzy[1] if case.fuzzy else 0,
+                )
+            except (OSError, ValueError, zlib.error) as error:
+                return CaseResult(
+                    case=case,
+                    status="INFRA",
+                    ok=False,
+                    infrastructure_error=f"PNG comparison failed for {reference}: {error}",
+                    stdout="\n".join(diagnostics),
+                )
+            relation_passed = bool(comparison["passed"])
+            if relation == "!=":
+                relation_passed = not relation_passed
+            comparisons.append(
+                {
+                    "path": reference,
+                    "url": reference_url,
+                    "relation": relation,
+                    "status": "PASS" if relation_passed else "FAIL",
+                    "comparison": comparison,
+                }
+            )
+
+    passed = all(item["status"] == "PASS" for item in comparisons)
+    return CaseResult(
+        case=case,
+        status="PASS" if passed else "FAIL",
+        ok=passed,
+        record={
+            "duration_ms": int((time.monotonic() - started) * 1000),
+            "comparisons": comparisons,
+        },
+        stdout="\n".join(diagnostics),
+    )
+
+
+def _run_crashtest(case: Case, url: str, browser: list[str]) -> CaseResult:
+    """Load a crashtest and pass only when Zibra reaches a healthy completion.
+
+    Zibra does not yet expose WPT's ``test-wait`` automation bridge. Its
+    windowless screenshot lifecycle is nevertheless a useful first crashtest
+    boundary: it drives the real browser, waits for a complete/quiescent
+    document, and requires the browser to export a frame before exiting.
+    """
+    watchdog_seconds = case.timeout_ms / 1000 + WATCHDOG_GRACE_SECONDS
+    started = time.monotonic()
+    with tempfile.TemporaryDirectory(prefix="zibra-crashtest-") as directory:
+        screenshot = pathlib.Path(directory) / "completion.png"
+        outcome = _invoke(
+            [*browser, "--screenshot", str(screenshot), url], watchdog_seconds
+        )
+        duration_ms = int((time.monotonic() - started) * 1000)
+        if outcome.infrastructure_error is not None:
+            if outcome.watchdog_expired:
+                status = "TIMEOUT"
+            elif outcome.returncode is not None:
+                status = "CRASH"
+            else:
+                status = "INFRA"
+            return CaseResult(
+                case=case,
+                status=status,
+                ok=False,
+                record={"duration_ms": duration_ms},
+                infrastructure_error=outcome.infrastructure_error,
+                stdout=outcome.stdout,
+                stderr=outcome.stderr,
+            )
+        if not screenshot.is_file():
+            return CaseResult(
+                case=case,
+                status="INFRA",
+                ok=False,
+                record={"duration_ms": duration_ms},
+                infrastructure_error="browser exited without reaching crashtest completion",
+                stdout=outcome.stdout,
+                stderr=outcome.stderr,
+            )
+    return CaseResult(
+        case=case,
+        status="PASS",
+        ok=True,
+        record={"duration_ms": duration_ms, "completion": "windowless-screenshot"},
+        stdout=outcome.stdout,
+        stderr=outcome.stderr,
+    )
+
+
 def _bounded_diagnostic(value: str) -> str:
     if len(value.encode("utf-8")) <= MAX_DIAGNOSTIC_BYTES:
         return value
@@ -1004,8 +1384,26 @@ def _serialize_case_result(result: CaseResult) -> dict[str, Any]:
     }
     if case.source_path is not None:
         item["source_path"] = case.source_path
+    if case.references:
+        item["references"] = [
+            {"path": path, "relation": relation}
+            for path, relation in case.references
+        ]
+    if case.fuzzy is not None:
+        item["fuzzy"] = {
+            "max_difference": case.fuzzy[0],
+            "max_different_pixels": case.fuzzy[1],
+        }
     if result.record is not None:
-        for key in ("duration_ms", "tests", "harness", "message", "console", "exception"):
+        for key in (
+            "duration_ms",
+            "tests",
+            "comparisons",
+            "harness",
+            "message",
+            "console",
+            "exception",
+        ):
             if key in result.record:
                 item[key] = result.record[key]
     if result.infrastructure_error is not None:
@@ -1120,6 +1518,7 @@ def write_run_report(
         "fail": counts["FAIL"],
         "error": counts["ERROR"],
         "timeout": counts["TIMEOUT"],
+        "crash": counts["CRASH"],
         "infra": counts["INFRA"],
         "probe": counts["PROBE"],
         "skip": counts["SKIP"],
@@ -1182,12 +1581,12 @@ def _parse_args(argv: list[str] | None) -> argparse.Namespace:
     )
     parser.add_argument("--list", action="store_true", help="list manifest entries")
     parser.add_argument(
-        "--mode", choices=("probe", "testharness"),
+        "--mode", choices=("probe", "testharness", "reftest", "crashtest"),
         help="manifest case mode (defaults to testharness with --all, probe otherwise)",
     )
     parser.add_argument(
         "--all", action="store_true",
-        help="discover and run all upstream testharness cases (no manifest needed)",
+        help="discover and run all upstream cases for the selected mode (no manifest needed)",
     )
     parser.add_argument(
         "--directory", "--dir", dest="directories", action="append", default=[],
@@ -1232,7 +1631,7 @@ def main(argv: list[str] | None = None) -> int:
     args = _parse_args(argv)
     mode = args.mode or ("testharness" if args.all else "probe")
     if args.all and args.mode == "probe":
-        print("--all only supports --mode testharness", file=sys.stderr)
+        print("--all does not support --mode probe", file=sys.stderr)
         return 2
     try:
         requested_directories = [_normalize_directory(value) for value in args.directories]
@@ -1256,17 +1655,25 @@ def main(argv: list[str] | None = None) -> int:
     inventory: list[InventoryItem] | None = None
     if args.all:
         inventory = discover_wpt_inventory()
-        coverage_cases = _cases_from_inventory(inventory)
-        cases = coverage_cases
-        manifest_for_report = pathlib.Path("<all-testharness>")
+        if mode == "reftest":
+            coverage_cases = _reftest_cases_from_inventory(inventory)
+            cases = coverage_cases
+        elif mode == "crashtest":
+            coverage_cases = _crashtest_cases_from_inventory(inventory)
+            cases = coverage_cases
+        else:
+            coverage_cases = _cases_from_inventory(inventory)
+            cases = coverage_cases
+        manifest_for_report = pathlib.Path(f"<all-{mode}>")
         inventory_data = inventory_summary(inventory)
+        runnable_category = inventory_data["runnable_by_category"].get(mode, 0)
         categories = ", ".join(
             f"{name}={count}"
             for name, count in inventory_data["categories"].items()
         )
         print(
             f"Discovered {inventory_data['total']} WPT tests "
-            f"({inventory_data['runnable']} runnable testharness cases; {categories})"
+            f"({runnable_category} runnable {mode} cases; {categories})"
         )
     else:
         try:
@@ -1348,7 +1755,7 @@ def main(argv: list[str] | None = None) -> int:
     # so they retain the deterministic file-URL path.
     server_context: WptServer | None = None
     server_base_url: str | None = None
-    if mode == "testharness" and selected and (UPSTREAM / "wpt").is_file():
+    if mode in ("testharness", "reftest", "crashtest") and selected and (UPSTREAM / "wpt").is_file():
         server_context = WptServer()
         try:
             server_base_url = server_context.__enter__()
@@ -1368,7 +1775,7 @@ def main(argv: list[str] | None = None) -> int:
                     complete=False,
                     expected_cases=len(coverage_cases) if coverage_cases is not None else len(results) + len(selected),
                     coverage_cases=coverage_cases,
-                    suite="all" if coverage_cases is not None else None,
+                    suite="all" if args.all or coverage_cases is not None else None,
                     inventory=inventory,
                 )
             reporter.finish(False)
@@ -1385,6 +1792,10 @@ def main(argv: list[str] | None = None) -> int:
         try:
             if run_case.mode == "probe":
                 return _run_probe(run_case, url, args.browser)
+            if run_case.mode == "reftest":
+                return _run_reftest(run_case, url, args.browser)
+            if run_case.mode == "crashtest":
+                return _run_crashtest(run_case, url, args.browser)
             return _run_testharness(run_case, url, args.browser)
         except Exception as error:
             # A malformed browser response is handled above. This catches
@@ -1431,7 +1842,7 @@ def main(argv: list[str] | None = None) -> int:
                 else len(results) + len(selected)
             ),
             coverage_cases=coverage_cases,
-            suite="all" if coverage_cases is not None else None,
+            suite="all" if args.all or coverage_cases is not None else None,
             inventory=inventory,
         )
 
@@ -1505,7 +1916,7 @@ def main(argv: list[str] | None = None) -> int:
                     else len(results) + len(selected)
                 ),
                 coverage_cases=coverage_cases,
-                suite="all" if coverage_cases is not None else None,
+                suite="all" if args.all or coverage_cases is not None else None,
                 inventory=inventory,
             )
         reporter.finish(run_complete)
