@@ -379,8 +379,10 @@ continue.
 
 ## DOM ranges and detached content
 
-`document.createRange()` is implemented in the page Realm. Range boundary
-points borrow the Realm's canonical Node wrappers and are evaluated through
+`runtime/range.js` implements `document.createRange()` in the page Realm and
+is embedded with bootstrap before page evaluation. The constructor starts in
+the current document; a detached document's factory starts in that document.
+Range boundary points borrow the Realm's canonical Node wrappers and are evaluated through
 their current parent/child relationships, so a range never retains a native
 DOM pointer across a callback. `DocumentFragment` and comment nodes are
 Realm-owned detached values; appending a fragment transfers its children, and
@@ -393,6 +395,27 @@ the same content. Structural mutation dirties sibling-sensitive selectors;
 `getComputedStyle` readback invokes a Realm-scoped style-flush callback so a
 script observes the new computed value synchronously, while layout and paint
 remain scheduled work.
+
+Boundary setters convert Web IDL offsets and validate before changing either
+endpoint. Moving an endpoint to another root collapses both endpoints there;
+ordering never equates a parent child-index with a descendant's offset zero.
+Point/node queries establish common-root membership before validating DOM
+offsets, with distinct false/exception behavior for each API. Comparison modes
+use the same strict ordering. `detach()` is inert and does not stop live
+removal adjustment. The current active-range list retains ranges until Realm
+retirement; it is not yet a weak live-range registry. Selection accepts only
+ranges rooted in its current document. This is still bounded Range support:
+complete CharacterData mutation repair, shadow trees, editing algorithms, and
+the full Web IDL interface surface remain separate work.
+
+The native DOM begins at an Element; bootstrap publishes that Element's
+canonical wrapper as a child of the Realm's Document, with a logical parent
+back to the same Document. Synthetic doctypes use the same parent/child
+relationship. Detached-document factories likewise pair child storage with
+parent links. Range and Selection root checks must observe this shared DOM
+topology, not invent their own document membership heuristic. A non-retaining
+Realm-local Node brand covers native wrappers, synthetic nodes, and documents
+so Range arguments cannot impersonate Nodes with a `nodeType` property.
 
 The bounded inline-style declaration lives in `runtime/css_style.js` and is
 cached per Node wrapper. Its reads parse the current style attribute; writes

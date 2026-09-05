@@ -70,6 +70,7 @@ tiers and baseline policy.
 | [`checkboxes.html`](checkboxes.html) | Attribute-backed toggle state and successful-control encoding |
 | [`new-input-types.html`](new-input-types.html) | Hidden layout/focus suppression and password masking with real submission value |
 | [`node-children.html`](node-children.html) | Fresh immediate Element-only `Node.children` arrays |
+| [`dom-range-boundaries.html`](dom-range-boundaries.html) | Range ordering, containment, atomic validation, detached roots, and Selection document membership |
 | [`create-element.html`](create-element.html) | `createElement`, detached ownership, append, and insert-before ordering |
 | [`matching-children.html`](matching-children.html) | Append-only retained block-layout child matching |
 | [`invalidating-previous.html`](invalidating-previous.html) | Middle insertion with retained owners and protected predecessor invalidation |

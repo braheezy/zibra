@@ -25,6 +25,11 @@ queued work and shutdown are documented in
   style work and copies values before returning to Kiesel.
 - `dom_handles.zig` owns the two-way Node pointer/numeric identity maps for one
   window generation.
+- `runtime/range.js` owns live Range state, boundary validation/comparison,
+  containment queries, and bounded content algorithms over Realm-local Node
+  wrappers. Shared bootstrap tree helpers also serve traversal and Selection.
+  `runtime/range_test.js` is shared unit/manual regression code, not part of
+  the browser's embedded runtime.
 - `dom_tree_bindings.zig` owns read-only document lookup and authored Node
   topology bindings. It receives a callback-scoped root/handle/issuer borrow,
   never imports `Js`, and returns only copied strings or numeric snapshots.

@@ -659,7 +659,8 @@ fn ensureRuntimeInitializedLocked(
 ) !void {
     if (window.runtime_initialized) return;
 
-    const runtime_code = @embedFile("runtime/bootstrap.js") ++ "\n" ++ @embedFile("runtime/css_style.js");
+    const runtime_code = @embedFile("runtime/bootstrap.js") ++ "\n" ++
+        @embedFile("runtime/range.js") ++ "\n" ++ @embedFile("runtime/css_style.js");
     const runtime_script = try Script.parse(
         runtime_code,
         window.realm,
@@ -2135,6 +2136,26 @@ test "Promise job interruption escapes a swallowed Kiesel job error" {
     try std.testing.expect(probe.armed);
 }
 
+test "DOM Range boundary ordering validation queries and selection roots" {
+    const allocator = std.testing.allocator;
+    var html_parser = try parser.HTMLParser.init(allocator, "<html><head></head><body></body></html>");
+    defer html_parser.deinit(allocator);
+    var root = try html_parser.parse();
+    defer root.deinit(allocator);
+    parser.fixParentPointers(&root, null);
+    var environ = std.process.Environ.Map.init(allocator);
+    defer environ.deinit();
+    var js = try Js.init(allocator, std.testing.io, &environ);
+    defer js.deinit(allocator);
+    js.setNodes(0, &root);
+    defer js.setNodes(0, null);
+
+    const result = try js.evaluate(0, @embedFile("runtime/range_test.js") ++ "\ncheckRangeBoundaries()");
+    const message = try result.asString().toUtf8(allocator);
+    defer allocator.free(message);
+    try std.testing.expectEqualStrings("PASS", message);
+}
+
 test "DOM Range supports boundaries, fragments, and extraction" {
     const allocator = std.testing.allocator;
     var html_parser = try parser.HTMLParser.init(allocator, "<main></main>");
@@ -2354,7 +2375,7 @@ test "DOM Range validates offsets and rejects partially selected elements" {
         \\var bold = document.createElement('b'); var text = document.createTextNode('abcd');
         \\bold.appendChild(text); host.appendChild(bold);
         \\var invalid = false; var invalidNode = false; var range = document.createRange();
-        \\try { range.setStart(null, 0); } catch (error) { invalidNode = error.code === 3; }
+        \\try { range.setStart(null, 0); } catch (error) { invalidNode = error instanceof TypeError; }
         \\try { range.setStart(text, 5); } catch (error) { invalid = error.code === 1; }
         \\range.setStart(text, 1); range.setEnd(text, 3);
         \\var fragment = range.cloneContents();
@@ -2383,7 +2404,7 @@ test "DOM Range extracts cross-element content and preserves boundary mutations"
     defer js.setNodes(0, null);
 
     const result = try js.evaluate(0,
-        \\var doc = document.implementation.createDocument(null, null, null);
+        \\var doc = document.implementation.createHTMLDocument('');
         \\var h1 = doc.createElement('h1'), t1 = doc.createTextNode('Hello '), em = doc.createElement('em'), t2 = doc.createTextNode('Wonderful'), t3 = doc.createTextNode(' Kitty');
         \\h1.appendChild(t1); em.appendChild(t2); h1.appendChild(em); h1.appendChild(t3); doc.body.appendChild(h1);
         \\var p = doc.createElement('p'); p.appendChild(doc.createTextNode('How are you?')); doc.body.appendChild(p);
@@ -2416,8 +2437,10 @@ test "DOM Range extracts the empty end element from an iframe document" {
         \\doc.documentElement.appendChild(doc.createElement('head')); doc.documentElement.firstChild.appendChild(doc.createElement('title')); doc.documentElement.appendChild(doc.createElement('body'));
         \\var h1 = doc.createElement('h1'), t1 = doc.createTextNode('Hello '), em = doc.createElement('em'), t2 = doc.createTextNode('Wonderful'), t3 = doc.createTextNode(' Kitty'); h1.appendChild(t1); em.appendChild(t2); h1.appendChild(em); h1.appendChild(t3); doc.body.appendChild(h1);
         \\var p = doc.createElement('p'); p.appendChild(doc.createTextNode('How are you?')); doc.body.appendChild(p);
-        \\var range = doc.createRange(); range.setStart(t2, 6); range.setEnd(p, 0); var fragment = range.extractContents();
-        \\fullText === 'Wonderful KittyHow are you?' && ancestorOk && fragment.childNodes.length === 2 && fragment.childNodes[1].tagName === 'P' && fragment.childNodes[1].childNodes.length === 0
+        \\var range = doc.createRange(); range.setStart(t2, 6); range.setEnd(p, 0);
+        \\var fullText = range.toString(), ancestorOk = range.commonAncestorContainer === doc.body;
+        \\var fragment = range.extractContents();
+        \\fullText === 'ful Kitty' && ancestorOk && fragment.childNodes.length === 2 && fragment.childNodes[1].tagName === 'P' && fragment.childNodes[1].childNodes.length === 0
     );
     try std.testing.expect(result.toBoolean());
 }
@@ -2438,7 +2461,7 @@ test "DOM Range tracks text insertion and removed subtrees" {
     defer js.setNodes(0, null);
 
     const result = try js.evaluate(0,
-        \\var doc = document.implementation.createDocument(null, null, null), p = doc.createElement('p');
+        \\var doc = document.implementation.createHTMLDocument(''), p = doc.createElement('p');
         \\var text = doc.createTextNode('12345'), inserted = doc.createTextNode('ABCDE'); p.appendChild(text); p.appendChild(inserted); doc.body.appendChild(p);
         \\var insertion = doc.createRange(); insertion.setStart(text, 2); insertion.setEnd(text, 3); insertion.insertNode(p.lastChild);
         \\var insertionOk = p.childNodes.length === 3 && p.childNodes[0] === text && text.data === '12' && p.childNodes[1] === inserted && p.childNodes[2].data === '345' && insertion.toString().match(/^ABCDE/);
@@ -3026,7 +3049,7 @@ test "document tree APIs preserve wrapper identity and authored text topology" {
         \\  bodyNode === document.getElementsByTagName('body')[0],
         \\  first === document.querySelectorAll('#first')[0],
         \\  first.parentNode === bodyNode, bodyNode.parentNode === rootNode,
-        \\  rootNode.parentNode === null, bodyNode.firstChild === first,
+        \\  rootNode.parentNode === document, bodyNode.firstChild === first,
         \\  whitespace.nodeType === Node.TEXT_NODE, whitespace.nodeName === '#text',
         \\  whitespace.data === ' \n ', whitespace.nodeValue === ' \n ',
         \\  whitespace.previousSibling === first, whitespace.nextSibling === second,

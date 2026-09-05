@@ -1,0 +1,18 @@
+<!doctype html>
+<!-- How to verify: Open in Zibra or a reference browser. The result must read
+     PASS. Reloading reruns the same boundary, error, and selection checks.
+     This checks DOM APIs, not native mouse-selection painting. -->
+<meta charset="utf-8">
+<title>DOM Range boundary checks</title>
+<h1>DOM Range boundary checks</h1>
+<p id="result">RUNNING</p>
+<script src="../../src/script/runtime/range_test.js"></script>
+<script>
+var result = checkRangeBoundaries();
+document.getElementById('result').textContent = result;
+// The local CLI can exercise this same fixture without an upstream checkout.
+if (typeof completion_callback === 'function') {
+  completion_callback([{ name: 'Range boundary regression', status: result === 'PASS' ? 0 : 1, message: result }],
+    { status: 0, message: null, stack: null });
+}
+</script>

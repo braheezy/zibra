@@ -3,10 +3,11 @@
 // canonical JavaScript wrapper for each identity in this document realm.
 function Node(handle) {
   this.handle = handle;
+  DOM_NODE_BRAND.add(this);
 }
+// Non-retaining identity shared by native wrappers and JS-owned node kinds.
+var DOM_NODE_BRAND = new WeakSet();
 function domException(name, message) {
-  var codes = { IndexSizeError: 1, HierarchyRequestError: 3, NotFoundError: 8,
-    InvalidCharacterError: 5, NamespaceError: 14, InvalidNodeTypeError: 24, SyntaxError: 12 };
   return new DOMException(message || name, name);
 }
 // The host exposes one handle-backed Node type; aliases keep common
@@ -64,7 +65,8 @@ Attr.prototype.constructor = Attr;
 function DOMException(message, name) {
   this.message = message == null ? '' : String(message);
   this.name = name == null || name === '' ? 'Error' : String(name);
-  var codes = { IndexSizeError: 1, HierarchyRequestError: 3, NotFoundError: 8,
+  var codes = { IndexSizeError: 1, HierarchyRequestError: 3, WrongDocumentError: 4,
+    NotSupportedError: 9, NotFoundError: 8,
     InvalidCharacterError: 5, NamespaceError: 14, InvalidNodeTypeError: 24, SyntaxError: 12 };
   this.code = codes[this.name] || 0;
 }
@@ -132,6 +134,7 @@ DOMParser.prototype.parseFromString = function(source, mimeType) {
     var doctype = document.implementation.createDocumentType('html', '', '');
     result.__documentChildren.unshift(doctype);
     doctype.__ownerDocument = result;
+    doctype.__rangeParent = result; doctype.parentNode = result;
   }
   return result;
 };
@@ -1235,10 +1238,16 @@ Object.defineProperty(Node.prototype, "parentNode", {
   }
 });
 Object.defineProperty(Node.prototype, "firstChild", {
-  get: function() { return wrapNode(__native.firstChild(this.handle)); }
+  get: function() {
+    if (this.__logicalChildren) return this.__logicalChildren[0] || null;
+    return wrapNode(__native.firstChild(this.handle));
+  }
 });
 Object.defineProperty(Node.prototype, "lastChild", {
-  get: function() { return wrapNode(__native.lastChild(this.handle)); }
+  get: function() {
+    if (this.__logicalChildren) return this.__logicalChildren[this.__logicalChildren.length - 1] || null;
+    return wrapNode(__native.lastChild(this.handle));
+  }
 });
 Object.defineProperty(Node.prototype, "firstElementChild", {
   get: function() {
@@ -1259,11 +1268,20 @@ Object.defineProperty(Node.prototype, "lastElementChild", {
   }
 });
 Object.defineProperty(Node.prototype, "previousSibling", {
-  get: function() { return wrapNode(__native.previousSibling(this.handle)); }
+  get: function() { return nodeSibling(this, -1); }
 });
 Object.defineProperty(Node.prototype, "nextSibling", {
-  get: function() { return wrapNode(__native.nextSibling(this.handle)); }
+  get: function() { return nodeSibling(this, 1); }
 });
+function nodeSibling(node, direction) {
+  var parent = nodeParentForRange(node);
+  if (!parent) return null;
+  if (parent.__documentChildren || parent.__logicalChildren || parent.__fragment) {
+    var children = parent.childNodes, index = children.indexOf(node);
+    return index < 0 ? null : children[index + direction] || null;
+  }
+  return wrapNode(direction < 0 ? __native.previousSibling(node.handle) : __native.nextSibling(node.handle));
+}
 Object.defineProperty(Node.prototype, "childNodes", {
   get: function() {
     return childNodeList(this);
@@ -1638,6 +1656,11 @@ function makeSyntheticNode(type, name, value) {
     data: value || '', nodeValue: value || '',
     textContent: type === Node.COMMENT_NODE ? '' : (value || ''), childNodes: wrapNodeList([]), children: []
   };
+  DOM_NODE_BRAND.add(node);
+  if (type === 3 || type === 4 || type === 7 || type === 8) {
+    Object.defineProperty(node, 'length', { get: function() { return this.data.length; }, enumerable: true });
+  }
+  if (type === 7) Object.defineProperty(node, 'target', { value: name, enumerable: true });
   node.firstChild = null; node.lastChild = null; node.parentNode = null;
   Object.defineProperty(node, 'previousSibling', { get: function() {
     var parent = nodeParentForRange(this), children = nodeChildrenForRange(parent), index = children.indexOf(this);
@@ -1668,6 +1691,7 @@ function makeAttribute(name, value, owner) {
     childNodes: wrapNodeList([]), children: [], parentNode: null, ownerElement: owner || null,
     specified: true
   };
+  DOM_NODE_BRAND.add(attribute);
   if (Object.setPrototypeOf) Object.setPrototypeOf(attribute, Attr.prototype);
   attribute.__ownerDocument = owner && owner.ownerDocument ? owner.ownerDocument : document;
   attribute.appendChild = function() { throw domException('HierarchyRequestError'); };
@@ -1686,18 +1710,20 @@ function makeDocumentFragment() {
       return child;
     }
     if (child.parentNode && child.parentNode.removeChild) child.parentNode.removeChild(child);
-    fragment.childNodes.push(child); child.parentNode = fragment;
+    fragment.childNodes.push(child); child.__rangeParent = fragment; child.parentNode = fragment;
     fragment.firstChild = fragment.childNodes[0] || null;
     fragment.lastChild = fragment.childNodes[fragment.childNodes.length - 1] || null;
     if (child.nodeType === Node.ELEMENT_NODE) fragment.children.push(child);
     return child;
   };
   fragment.insertBefore = function(child, reference) {
+    if (child === reference) return child;
     if (!reference) return fragment.appendChild(child);
     var index = fragment.childNodes.indexOf(reference);
     if (index < 0) throw new Error('NotFoundError');
     if (child.parentNode && child.parentNode.removeChild) child.parentNode.removeChild(child);
-    fragment.childNodes.splice(index, 0, child); child.parentNode = fragment;
+    index = fragment.childNodes.indexOf(reference);
+    fragment.childNodes.splice(index, 0, child); child.__rangeParent = fragment; child.parentNode = fragment;
     fragment.firstChild = fragment.childNodes[0] || null;
     fragment.lastChild = fragment.childNodes[fragment.childNodes.length - 1] || null;
     fragment.children = fragment.childNodes.filter(function(n) { return n.nodeType === Node.ELEMENT_NODE; });
@@ -1707,7 +1733,7 @@ function makeDocumentFragment() {
     var index = fragment.childNodes.indexOf(child);
     if (index < 0) throw new Error('NotFoundError');
     adjustRangesForRemoval(fragment, child, index);
-    fragment.childNodes.splice(index, 1); child.parentNode = null;
+    fragment.childNodes.splice(index, 1); child.__rangeParent = null; child.parentNode = null;
     fragment.firstChild = fragment.childNodes[0] || null;
     fragment.lastChild = fragment.childNodes[fragment.childNodes.length - 1] || null;
     fragment.children = fragment.childNodes.filter(function(n) { return n.nodeType === Node.ELEMENT_NODE; });
@@ -1726,20 +1752,6 @@ function nodeParentForRange(node) {
   return node.parentNode || null;
 }
 function nodeChildrenForRange(node) { return node && node.childNodes ? node.childNodes : []; }
-var ACTIVE_RANGES = [];
-function adjustRangesForRemoval(parent, child, index) {
-  for (var rangeIndex = 0; rangeIndex < ACTIVE_RANGES.length; rangeIndex++) {
-    var range = ACTIVE_RANGES[rangeIndex];
-    ['start', 'end'].forEach(function(side) {
-      var container = range[side + 'Container'], offset = range[side + 'Offset'];
-      if (container === child || isAncestorNode(child, container)) {
-        range[side + 'Container'] = parent; range[side + 'Offset'] = index;
-      } else if (container === parent && offset > index) {
-        range[side + 'Offset'] = offset - 1;
-      }
-    });
-  }
-}
 function nodeIndexInParent(node) {
   var parent = nodeParentForRange(node); return parent ? nodeChildrenForRange(parent).indexOf(node) : -1;
 }
@@ -1791,202 +1803,15 @@ Node.prototype.compareDocumentPosition = function(other) {
   if (!other || typeof other.nodeType !== 'number') throw new TypeError('Argument is not a Node');
   return compareDocumentPosition(this, other);
 };
-function compareRangePoints(aNode, aOffset, bNode, bOffset) {
-  if (aNode === bNode) return aOffset < bOffset ? -1 : aOffset > bOffset ? 1 : 0;
-  if (isAncestorNode(aNode, bNode)) {
-    var child = bNode;
-    while (nodeParentForRange(child) !== aNode) child = nodeParentForRange(child);
-    var index = nodeChildrenForRange(aNode).indexOf(child);
-    if (aOffset < index) return -1;
-    if (aOffset > index) return 1;
-    // A descendant boundary at offset zero is exactly the parent's child
-    // boundary; an interior descendant point lies after that boundary.
-    return bOffset === 0 ? 0 : 1;
-  }
-  if (isAncestorNode(bNode, aNode)) {
-    var child2 = aNode;
-    while (nodeParentForRange(child2) !== bNode) child2 = nodeParentForRange(child2);
-    var index2 = nodeChildrenForRange(bNode).indexOf(child2);
-    if (index2 < bOffset) return -1;
-    if (index2 > bOffset) return 1;
-    return aOffset === 0 ? 0 : 1;
-  }
-  var aPath = [], bPath = [], current = aNode;
-  while (current) { aPath.unshift(current); current = nodeParentForRange(current); }
-  current = bNode;
-  while (current) { bPath.unshift(current); current = nodeParentForRange(current); }
-  var common = 0;
-  while (common < aPath.length && common < bPath.length && aPath[common] === bPath[common]) common++;
-  if (!common) return 0;
-  var parent = aPath[common - 1];
-  var ai = nodeChildrenForRange(parent).indexOf(aPath[common]);
-  var bi = nodeChildrenForRange(parent).indexOf(bPath[common]);
-  return ai < bi ? -1 : ai > bi ? 1 : 0;
-}
-function rangeNodeStart(node) {
-  var parent = nodeParentForRange(node);
-  return parent ? { node: parent, offset: nodeIndexInParent(node) } : { node: node, offset: 0 };
-}
-function rangeNodeEnd(node) {
-  var parent = nodeParentForRange(node);
-  return parent ? { node: parent, offset: nodeIndexInParent(node) + 1 } : { node: node, offset: nodeChildrenForRange(node).length };
-}
-function rangeIntersects(range, node) {
-  var start = rangeNodeStart(node), end = rangeNodeEnd(node);
-  return compareRangePoints(range.endContainer, range.endOffset, start.node, start.offset) > 0 &&
-    compareRangePoints(range.startContainer, range.startOffset, end.node, end.offset) < 0;
-}
-function rangeFullyContains(range, node) {
-  var start = rangeNodeStart(node), end = rangeNodeEnd(node);
-  return compareRangePoints(range.startContainer, range.startOffset, start.node, start.offset) <= 0 &&
-    compareRangePoints(range.endContainer, range.endOffset, end.node, end.offset) >= 0;
-}
-function rangeOffsetLimit(node) {
-  if (!node) return 0;
-  if (node.nodeType === Node.TEXT_NODE || node.nodeType === Node.COMMENT_NODE ||
-      node.nodeType === Node.CDATA_SECTION_NODE || node.nodeType === Node.PROCESSING_INSTRUCTION_NODE)
-    return (node.data || '').length;
-  return nodeChildrenForRange(node).length;
-}
-function checkedRangeOffset(node, offset) {
-  var numeric = Number(offset);
-  if (!isFinite(numeric) || numeric < 0 || Math.floor(numeric) !== numeric || numeric > rangeOffsetLimit(node)) {
-    throw { code: 1, INDEX_SIZE_ERR: 1, name: 'IndexSizeError' };
-  }
-  return numeric;
-}
-function checkedRangeNode(node) {
-  if (!node || typeof node.nodeType !== 'number') throw { code: 3, HIERARCHY_REQUEST_ERR: 3 };
-  return node;
-}
-function hasPartiallyContainedElement(range, node, isRoot) {
-  var children = nodeChildrenForRange(node);
-  for (var i = 0; i < children.length; i++) {
-    var child = children[i];
-    if (child.nodeType === Node.ELEMENT_NODE && rangeIntersects(range, child) && !rangeFullyContains(range, child)) return true;
-    if (hasPartiallyContainedElement(range, child, false)) return true;
-  }
-  return false;
-}
-function shallowCloneNode(node) {
-  if (node.__synthetic) return makeSyntheticNode(node.nodeType, node.nodeName, node.data);
-  if (node.nodeType === Node.TEXT_NODE) return document.createTextNode(node.data || '');
-  var clone = document.createElement(node.tagName || node.nodeName || 'div');
-  // Copy the attributes most commonly observed by DOM compatibility tests.
-  ['id', 'class', 'name', 'value', 'type', 'href', 'style'].forEach(function(name) {
-    var value = node.getAttribute && node.getAttribute(name); if (value !== null) clone.setAttribute(name, value);
-  });
-  return clone;
-}
-function cloneRangeNode(range, node, extract, fragment) {
-  if (!rangeIntersects(range, node)) {
-    // A range ending at an element's start still contributes an empty clone
-    // of that element when the boundary crosses from a previous sibling.
-    return range.endContainer === node && range.endOffset === 0 ? shallowCloneNode(node) : null;
-  }
-  if (rangeFullyContains(range, node)) return node.cloneNode ? node.cloneNode(true) : shallowCloneNode(node);
-  if (node.nodeType === Node.TEXT_NODE) {
-    var start = range.startContainer === node ? range.startOffset : 0;
-    var end = range.endContainer === node ? range.endOffset : (node.data || '').length;
-    if (end <= start) return null;
-    return document.createTextNode((node.data || '').slice(start, end));
-  }
-  var clone = shallowCloneNode(node);
-  var children = nodeChildrenForRange(node);
-  for (var i = 0; i < children.length; i++) {
-    var child = children[i];
-    var selected = cloneRangeNode(range, child, extract, fragment);
-    if (selected) clone.appendChild(selected);
-    if (extract && rangeFullyContains(range, child) && child.parentNode && child.parentNode.removeChild) {
-      child.parentNode.removeChild(child);
-      if (selected && selected.__original) selected = selected.__original;
-    } else if (extract && child.nodeType === Node.TEXT_NODE && selected && child.parentNode) {
-      var from = range.startContainer === child ? range.startOffset : 0;
-      var to = range.endContainer === child ? range.endOffset : (child.data || '').length;
-      __native.setNodeData(child.handle, (child.data || '').slice(0, from) + (child.data || '').slice(to));
-    }
-  }
-  return clone.childNodes.length ? clone : (rangeIntersects(range, node) ? clone : null);
-}
-function extractRangeNode(range, node) {
-  if (!rangeIntersects(range, node)) {
-    // An element whose start is exactly the range end contributes an empty
-    // clone to extractContents (the surrounding structure is preserved).
-    if (range.endContainer === node && range.endOffset === 0) return shallowCloneNode(node);
-    return null;
-  }
-  if (rangeFullyContains(range, node)) {
-    if (node.parentNode && node.parentNode.removeChild) node.parentNode.removeChild(node);
-    return node;
-  }
-  if (node.nodeType === Node.TEXT_NODE) {
-    var start = range.startContainer === node ? range.startOffset : 0;
-    var end = range.endContainer === node ? range.endOffset : (node.data || '').length;
-    if (end <= start) return null;
-    var selected = (node.data || '').slice(start, end);
-    if (node.handle) __native.setNodeData(node.handle, (node.data || '').slice(0, start) + (node.data || '').slice(end));
-    else { node.data = (node.data || '').slice(0, start) + (node.data || '').slice(end); node.textContent = node.data; }
-    return document.createTextNode(selected);
-  }
-  var clone = shallowCloneNode(node);
-  var children = nodeChildrenForRange(node).slice();
-  for (var i = 0; i < children.length; i++) {
-    var child = children[i];
-    if (!rangeIntersects(range, child)) continue;
-    var extracted = extractRangeNode(range, child);
-    if (extracted) clone.appendChild(extracted);
-  }
-  return clone.childNodes.length ? clone : null;
-}
-
-function Range() {
-  this.startContainer = document; this.startOffset = 0;
-  this.endContainer = document; this.endOffset = 0;
-  ACTIVE_RANGES.push(this);
-}
-Object.defineProperty(Range.prototype, 'collapsed', { get: function() {
-  return this.startContainer === this.endContainer && this.startOffset === this.endOffset;
-}});
-Object.defineProperty(Range.prototype, 'commonAncestorContainer', { get: function() {
-  var a = this.startContainer, b = this.endContainer;
-  if (isAncestorNode(a, b)) return a; if (isAncestorNode(b, a)) return b;
-  var path = [], current = a; while (current) { path.push(current); current = nodeParentForRange(current); }
-  current = b; while (current) { if (path.indexOf(current) >= 0) return current; current = nodeParentForRange(current); }
-  return document;
-}});
-Range.prototype.setStart = function(node, offset) { node = checkedRangeNode(node); this.startContainer = node; this.startOffset = checkedRangeOffset(node, offset); if (compareRangePoints(this.startContainer, this.startOffset, this.endContainer, this.endOffset) > 0) { this.endContainer = node; this.endOffset = this.startOffset; } };
-Range.prototype.setEnd = function(node, offset) { node = checkedRangeNode(node); this.endContainer = node; this.endOffset = checkedRangeOffset(node, offset); if (compareRangePoints(this.startContainer, this.startOffset, this.endContainer, this.endOffset) > 0) { this.startContainer = node; this.startOffset = this.endOffset; } };
-Range.prototype.setStartBefore = function(node) { var p = nodeParentForRange(node); if (!p) throw { code: 2, INVALID_NODE_TYPE_ERR: 2 }; this.setStart(p, nodeIndexInParent(node)); };
-Range.prototype.setStartAfter = function(node) { var p = nodeParentForRange(node); if (!p) throw { code: 2, INVALID_NODE_TYPE_ERR: 2 }; this.setStart(p, nodeIndexInParent(node) + 1); };
-Range.prototype.setEndBefore = function(node) { var p = nodeParentForRange(node); if (!p) throw { code: 2, INVALID_NODE_TYPE_ERR: 2 }; this.setEnd(p, nodeIndexInParent(node)); };
-Range.prototype.setEndAfter = function(node) { var p = nodeParentForRange(node); if (!p) throw { code: 2, INVALID_NODE_TYPE_ERR: 2 }; this.setEnd(p, nodeIndexInParent(node) + 1); };
-Range.prototype.selectNode = function(node) { var p = nodeParentForRange(node); if (!p) throw { code: 2, INVALID_NODE_TYPE_ERR: 2 }; this.startContainer = p; this.startOffset = nodeIndexInParent(node); this.endContainer = p; this.endOffset = this.startOffset + 1; };
-Range.prototype.selectNodeContents = function(node) { node = checkedRangeNode(node); this.startContainer = node; this.startOffset = 0; this.endContainer = node; this.endOffset = rangeOffsetLimit(node); };
-Range.prototype.collapse = function(toStart) { if (toStart) { this.endContainer = this.startContainer; this.endOffset = this.startOffset; } else { this.startContainer = this.endContainer; this.startOffset = this.endOffset; } };
-Range.prototype.cloneRange = function() { var r = new Range(); r.startContainer = this.startContainer; r.startOffset = this.startOffset; r.endContainer = this.endContainer; r.endOffset = this.endOffset; return r; };
-Range.prototype.detach = function() { this.__detached = true; var index = ACTIVE_RANGES.indexOf(this); if (index >= 0) ACTIVE_RANGES.splice(index, 1); };
-Range.prototype.cloneContents = function() { var f = makeDocumentFragment(); var root = this.commonAncestorContainer; if (root.nodeType === Node.TEXT_NODE) { var start = this.startContainer === root ? this.startOffset : 0; var end = this.endContainer === root ? this.endOffset : (root.data || '').length; if (end > start) f.appendChild(document.createTextNode((root.data || '').slice(start, end))); return f; } var children = nodeChildrenForRange(root); for (var i = 0; i < children.length; i++) { var c = cloneRangeNode(this, children[i], false, f); if (c) f.appendChild(c); } return f; };
-Range.prototype.extractContents = function() { var f = makeDocumentFragment(); var root = this.commonAncestorContainer; if (root.nodeType === Node.TEXT_NODE) { var start = this.startContainer === root ? this.startOffset : 0; var end = this.endContainer === root ? this.endOffset : (root.data || '').length; if (end > start) { f.appendChild(document.createTextNode((root.data || '').slice(start, end))); if (root.handle) __native.setNodeData(root.handle, (root.data || '').slice(0, start) + (root.data || '').slice(end)); } this.collapse(true); return f; } var children = nodeChildrenForRange(root).slice(); for (var i = 0; i < children.length; i++) { var extracted = extractRangeNode(this, children[i]); if (extracted) f.appendChild(extracted); } this.collapse(true); return f; };
-Range.prototype.deleteContents = function() { this.extractContents(); };
-Range.prototype.insertNode = function(node) { var container = this.startContainer; if (container.nodeType === Node.TEXT_NODE) { var parent = nodeParentForRange(container); if (!parent) return; var splitOffset = this.startOffset, before = container.data.slice(0, splitOffset), after = container.data.slice(splitOffset); __native.setNodeData(container.handle, before); var tail = document.createTextNode(after); var reference = container.nextSibling; if (node !== reference) parent.insertBefore(node, reference); var afterNode = node.nextSibling; if (afterNode) parent.insertBefore(tail, afterNode); else parent.appendChild(tail); if (this.startContainer === container) { if (this.startOffset === splitOffset) { this.startContainer = node; this.startOffset = 0; } else if (this.startOffset > splitOffset) { this.startContainer = tail; this.startOffset -= splitOffset; } } if (this.endContainer === container) { if (this.endOffset > splitOffset) { this.endContainer = tail; this.endOffset -= splitOffset; } else if (this.endOffset === splitOffset) { this.endContainer = node; this.endOffset = 0; } } return; } var children = nodeChildrenForRange(container), reference = children[this.startOffset] || null; if (reference) container.insertBefore(node, reference); else container.appendChild(node); };
-Range.prototype.surroundContents = function(node) {
-  if (this.startContainer && this.startContainer.nodeType === Node.COMMENT_NODE || this.endContainer && this.endContainer.nodeType === Node.COMMENT_NODE) throw { code: 1 };
-  if (this.commonAncestorContainer && this.commonAncestorContainer.nodeType === Node.DOCUMENT_NODE && !this.collapsed) throw { code: 3, HIERARCHY_REQUEST_ERR: 3 };
-  if (hasPartiallyContainedElement(this, this.commonAncestorContainer, true)) throw { code: 1, BAD_BOUNDARYPOINTS_ERR: 1 };
-  var f = this.extractContents(); node.appendChild(f); this.insertNode(node); this.selectNode(node);
-};
-Range.prototype.toString = function() { return this.cloneContents().textContent || ''; };
-Range.prototype.compareBoundaryPoints = function(how, other) { var aNode = (how === this.START_TO_START || how === this.START_TO_END) ? this.startContainer : this.endContainer; var aOff = (how === this.START_TO_START || how === this.START_TO_END) ? this.startOffset : this.endOffset; var bNode = (how === this.START_TO_START || how === this.END_TO_START) ? other.startContainer : other.endContainer; var bOff = (how === this.START_TO_START || how === this.END_TO_START) ? other.startOffset : other.endOffset; return compareRangePoints(aNode, aOff, bNode, bOff); };
-Range.prototype.START_TO_START = 0; Range.prototype.START_TO_END = 1; Range.prototype.END_TO_END = 2; Range.prototype.END_TO_START = 3;
-Range.START_TO_START = 0; Range.START_TO_END = 1; Range.END_TO_END = 2; Range.END_TO_START = 3;
 
 var WINDOW_SELECTIONS = {};
-function selectionForWindow(windowId) {
+function selectionForWindow(windowId, doc) {
   var key = windowId == null ? 0 : windowId;
-  if (!WINDOW_SELECTIONS[key]) WINDOW_SELECTIONS[key] = new Selection();
+  if (!WINDOW_SELECTIONS[key]) WINDOW_SELECTIONS[key] = new Selection(doc);
   return WINDOW_SELECTIONS[key];
 }
-function Selection() {
+function Selection(doc) {
+  this.__document = doc || document;
   this.__range = null;
   this.anchorNode = null; this.anchorOffset = 0;
   this.focusNode = null; this.focusOffset = 0;
@@ -1994,13 +1819,14 @@ function Selection() {
 }
 Object.defineProperty(Selection.prototype, 'rangeCount', { get: function() { return this.__range ? 1 : 0; } });
 Object.defineProperty(Selection.prototype, 'isCollapsed', { get: function() { return !this.__range || this.__range.collapsed; } });
-Object.defineProperty(Selection.prototype, 'type', { get: function() { return this.__range ? 'Range' : 'None'; } });
+Object.defineProperty(Selection.prototype, 'type', { get: function() { return !this.__range ? 'None' : this.__range.collapsed ? 'Caret' : 'Range'; } });
 Selection.prototype.getRangeAt = function(index) {
   if (Number(index) !== 0 || !this.__range) throw domException('IndexSizeError');
   return this.__range;
 };
 Selection.prototype.addRange = function(range) {
-  if (!range || typeof range.startContainer !== 'object') throw new TypeError('addRange requires a Range');
+  checkedRange(range);
+  if (compareRoot(range.startContainer) !== this.__document) return;
   if (this.__range) return;
   this.__range = range;
   this.anchorNode = range.startContainer; this.anchorOffset = range.startOffset;
@@ -2017,17 +1843,22 @@ Selection.prototype.removeRange = function(range) {
   this.removeAllRanges();
 };
 Selection.prototype.collapse = function(node, offset) {
-  node = checkedRangeNode(node);
-  var range = node.ownerDocument && node.ownerDocument.createRange ? node.ownerDocument.createRange() : new Range();
-  range.setStart(node, offset == null ? 0 : offset); range.collapse(true);
+  if (arguments.length === 0) throw new TypeError('A Node is required');
+  if (node != null) checkedRangeNode(node);
+  offset = (+offset) >>> 0;
+  if (node == null) { this.removeAllRanges(); return; }
+  checkedRangeOffset(node, offset);
+  if (compareRoot(node) !== this.__document) return;
+  var range = createRangeForDocument(this.__document);
+  range.setStart(node, offset); range.collapse(true);
   this.removeAllRanges(); this.addRange(range);
 };
 Selection.prototype.setPosition = Selection.prototype.collapse;
 Selection.prototype.selectAllChildren = function(node) {
   node = checkedRangeNode(node);
   if (node.nodeType === Node.DOCUMENT_TYPE_NODE) throw domException('InvalidNodeTypeError');
-  var owner = node.ownerDocument || document;
-  if (owner !== document || !document.contains(node)) return;
+  var owner = this.__document;
+  if (compareRoot(node) !== owner) return;
   var range = owner.createRange ? owner.createRange() : new Range();
   range.selectNodeContents(node);
   this.removeAllRanges(); this.addRange(range);
@@ -2057,6 +1888,7 @@ globalThis.getSelection = function() { return selectionForWindow(window.__id); }
 
 function makeDetachedDocument(root) {
   var doc = {};
+  DOM_NODE_BRAND.add(doc);
   if (Object.setPrototypeOf) Object.setPrototypeOf(doc, Document.prototype);
   function adoptOwnerDocument(node) {
     if (!node) return;
@@ -2085,6 +1917,11 @@ function makeDetachedDocument(root) {
     }, enumerable: true
   });
   doc.nodeType = Node.DOCUMENT_NODE;
+  doc.nodeName = '#document';
+  doc.nodeValue = null;
+  doc.textContent = null;
+  doc.parentNode = null;
+  doc.ownerDocument = null;
   doc.appendChild = function(child) {
     if (child && child.__fragment) { var moved = child.childNodes.slice(); for (var i = 0; i < moved.length; i++) doc.appendChild(moved[i]); return child; }
     if (child.parentNode && child.parentNode.removeChild) child.parentNode.removeChild(child);
@@ -2129,6 +1966,12 @@ function makeDetachedDocument(root) {
       return tag === 'body' ? root : null;
     }, enumerable: true
   });
+  Object.defineProperty(doc, 'head', {
+    get: function() {
+      var heads = root ? root.getElementsByTagName('head') : [];
+      return heads.length ? heads[0] : null;
+    }, enumerable: true
+  });
   Object.defineProperty(doc, 'title', {
     get: function() {
       if (!root) return '';
@@ -2165,7 +2008,7 @@ function makeDetachedDocument(root) {
     adoptOwnerDocument(node); return node;
   };
   doc.createDocumentFragment = function() { var fragment = makeDocumentFragment(); adoptOwnerDocument(fragment); return fragment; };
-  doc.createRange = function() { return new Range(); };
+  doc.createRange = function() { return createRangeForDocument(doc); };
   doc.createEvent = function(type) {
     var event = new Event('');
     event.initEvent = function(name, bubbles, cancelable) {
@@ -2302,7 +2145,7 @@ function frameWindowForElement(element, doc) {
   if (element.__contentWindow) return element.__contentWindow;
   var frame = { document: doc, window: null, Selection: Selection, DOMException: DOMException, Node: Node };
   frame.window = frame;
-  frame.getSelection = function() { return selectionForWindow(element.handle); };
+  frame.getSelection = function() { return selectionForWindow(element.handle, doc); };
   doc.defaultView = frame;
   doc.getSelection = frame.getSelection;
   element.__contentWindow = frame;
@@ -2373,7 +2216,10 @@ Object.defineProperty(Node.prototype, "elements", {
   }, enumerable: true, configurable: true
 });
 Object.defineProperty(Node.prototype, "length", {
-  get: function() { return (this.tagName || '').toLowerCase() === 'form' ? this.elements.length : undefined; },
+  get: function() {
+    if (this.nodeType === Node.TEXT_NODE) return this.data.length;
+    return (this.tagName || '').toLowerCase() === 'form' ? this.elements.length : undefined;
+  },
   enumerable: true, configurable: true
 });
 
@@ -3039,7 +2885,13 @@ globalThis.__runXHROnload = function(body, handle) {
 // Wrap document.querySelectorAll to return Node objects
 (function() {
   var originalQuerySelectorAll = document.querySelectorAll;
+  DOM_NODE_BRAND.add(document);
+  Object.setPrototypeOf(document, Document.prototype);
   document.nodeType = Node.DOCUMENT_NODE;
+  document.nodeName = '#document';
+  document.nodeValue = null;
+  document.textContent = null;
+  document.ownerDocument = null;
   document.DOCUMENT_NODE = Node.DOCUMENT_NODE;
   document.ELEMENT_NODE = Node.ELEMENT_NODE;
   document.TEXT_NODE = Node.TEXT_NODE;
@@ -3052,7 +2904,17 @@ globalThis.__runXHROnload = function(body, handle) {
   var initialDoctype = makeSyntheticNode(Node.DOCUMENT_TYPE_NODE, 'html', '');
   initialDoctype.name = 'html';
   initialDoctype.__ownerDocument = document;
+  initialDoctype.__rangeParent = document; initialDoctype.parentNode = document;
   document.__documentChildren = [initialDoctype];
+  // The native tree starts at the root element, but JS document topology must
+  // include that element below Document. Publish the canonical handle wrapper
+  // once for this Realm, including during parser-blocking evaluation.
+  var initialDocumentElement = wrapNode(__native.getDocumentElement());
+  if (initialDocumentElement) {
+    initialDocumentElement.__rangeParent = document;
+    document.__documentChildren.push(initialDocumentElement);
+  }
+  document.parentNode = null;
   document.appendChild = function(child) {
     if (child && child.__fragment) { var moved = child.childNodes.slice(); for (var i = 0; i < moved.length; i++) document.appendChild(moved[i]); return child; }
     if (child && child.__synthetic && document.__documentChildren.length && document.__documentChildren[0].nodeType === Node.DOCUMENT_TYPE_NODE) document.__documentChildren.unshift(child);
@@ -3168,6 +3030,7 @@ document.createEvent = function(type) {
       if (doctype) {
         if (doctype.parentNode && doctype.parentNode.removeChild) doctype.parentNode.removeChild(doctype);
         result.__documentChildren.unshift(doctype);
+        doctype.__rangeParent = result; doctype.parentNode = result;
         if (doctype.ownerDocument === undefined) Object.defineProperty(doctype, 'ownerDocument', {
           get: function() { return this.__ownerDocument || null; }, enumerable: true, configurable: true
         });
@@ -3202,7 +3065,12 @@ document.createEvent = function(type) {
       var doctype = this.createDocumentType('html', '', '');
       doctype.__ownerDocument = result;
       result.__documentChildren.unshift(doctype);
-      if (title != null && String(title).length) result.title = String(title);
+      doctype.__rangeParent = result; doctype.parentNode = result;
+      if (title !== undefined) {
+        var titleElement = result.createElement('title');
+        titleElement.appendChild(result.createTextNode(String(title)));
+        head.appendChild(titleElement);
+      }
       return result;
     }
   };
