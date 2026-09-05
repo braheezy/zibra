@@ -686,7 +686,7 @@ pub const Browser = struct {
     chrome: Chrome = undefined,
     // Focus tracking: null means nothing focused, "content" means page content
     focus: ?[]const u8 = null,
-    // Tab workers cannot mutate Chrome's UI-thread-owned DOM/layout. A
+    // Tab workers cannot mutate Chrome's UI-thread-owned widget surface. A
     // JavaScript focus() request publishes stable tab identity here; the next
     // UI tick blurs chrome only if that tab is still active.
     pending_content_focus_tab: ?*Tab = null,
@@ -5639,8 +5639,8 @@ pub const Browser = struct {
         var chrome_snapshot: ?RasterSnapshot = null;
         errdefer if (chrome_snapshot) |*snapshot| snapshot.deinit();
         if (raster) {
-            // Chrome owns a separate UI-thread-only DOM/layout/font generation.
-            // Paint it before cloning, while Browser.lock provides the same
+            // Chrome owns a separate UI-thread-only widget/font/display
+            // generation. Paint it before cloning, while Browser.lock provides the same
             // stable active-URL/tab view the former synchronous pass used.
             const chrome_items = self.chrome.paint(self) catch |err| {
                 self.lock.unlock();

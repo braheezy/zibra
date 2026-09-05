@@ -46,7 +46,8 @@ leaves owned/reference-counted or retain the producing generation explicitly.
 
 ### Page Layout and FontManager lack one asserted mutation thread
 
-Chrome has a private UI-only layout/font pair and raster uses copied leaves,
+Chrome has a private UI-only widget/font/display state and raster uses copied
+leaves,
 but interactive page input and resizing can still reach page layout/font state
 while Tab work uses it. There is no complete lock or owner-thread assertion.
 

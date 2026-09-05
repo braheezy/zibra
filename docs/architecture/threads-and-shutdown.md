@@ -14,8 +14,8 @@ routes each addressed event to a live Browser by native window ID, broadcasts
 shared session generations, ticks windows, creates or removes windows, uploads
 completed software surfaces, updates titles, and calls SDL presentation APIs.
 
-It also rebuilds the Browser's private HTML chrome and snapshots committed page
-and chrome command trees while `Browser.lock` stabilizes their borrowed leaf
+It also rebuilds the Browser's private chrome widget surface and snapshots
+committed page and chrome command trees while `Browser.lock` stabilizes their borrowed leaf
 resources. Input handlers should publish state or enqueue Tab work and return;
 they must not synchronously perform slow raster work.
 
@@ -217,7 +217,7 @@ The enforced process order is:
    cleaned by the stopped Tab runner;
 6. retire Browser render snapshots, then destroy Frame layout, DOM, scripts,
    and source owners;
-7. destroy each Browser's page/chrome layouts, font caches, z2d state, texture,
+7. destroy each Browser's page layout, chrome widget, font caches, z2d state, texture,
    renderer, and window in reverse dependency order;
 8. after the final Browser, stop/join the session networking runner, destroy
    HTTP/cookie/cache/session state, and finish shared measurement;

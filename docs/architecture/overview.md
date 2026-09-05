@@ -74,7 +74,7 @@ window-addressed events cannot reach retired storage.
 ### Browser
 
 One `Browser` owns a native window's renderer, texture and z2d presentation
-surfaces; its tabs; its private HTML chrome and chrome layout/font state; and
+surfaces; its tabs; its private chrome widget and font/display state; and
 the window's page layout/font engine. Concrete embedded owners hold committed
 display/compositor state, session-backed loading, the pure software command
 interpreter, and raster runner/cache/result state. Browser still coordinates
