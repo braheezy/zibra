@@ -686,7 +686,7 @@ pub const Browser = struct {
     chrome: Chrome = undefined,
     // Focus tracking: null means nothing focused, "content" means page content
     focus: ?[]const u8 = null,
-    // Tab workers cannot mutate Chrome's UI-thread-owned DOM/layout. A
+    // Tab workers cannot mutate Chrome's UI-thread-owned widget surface. A
     // JavaScript focus() request publishes stable tab identity here; the next
     // UI tick blurs chrome only if that tab is still active.
     pending_content_focus_tab: ?*Tab = null,
@@ -1381,6 +1381,66 @@ pub const Browser = struct {
         }
     }
 
+    /// Close one UI-owned tab and activate the nearest remaining tab. The tab
+    /// leaves the Browser collection before its worker is stopped so no new
+    /// commit can be accepted for it; shutdown and destruction happen without
+    /// holding Browser.lock.
+    pub fn closeTab(self: *Browser, index: usize) bool {
+        var tab: *Tab = undefined;
+        var replacement: ?*Tab = null;
+        var was_active = false;
+
+        self.lock.lock();
+        if (index >= self.tabs.items.len) {
+            self.lock.unlock();
+            return false;
+        }
+
+        tab = self.tabs.items[index];
+        was_active = self.active_tab_index != null and self.active_tab_index.? == index;
+        _ = self.tabs.orderedRemove(index);
+
+        if (self.pending_content_focus_tab == tab) self.pending_content_focus_tab = null;
+        if (self.pending_post_resubmission) |pending| {
+            if (pending.tab == tab) self.pending_post_resubmission = null;
+        }
+
+        if (was_active) {
+            self.active_tab_index = null;
+            self.retireActiveRenderStateLocked();
+            self.active_tab_scroll = 0;
+            self.active_tab_show_scrollbar = true;
+            self.active_tab_zoom = 1.0;
+            self.active_tab_prefers_dark = false;
+            self.active_tab_committed_security = .none;
+            self.window_title_dirty = true;
+            self.needs_composite = true;
+            self.needs_raster = true;
+            self.needs_draw = true;
+            self.needs_animation_frame = false;
+
+            if (self.tabs.items.len > 0) {
+                const next_index = @min(index, self.tabs.items.len - 1);
+                replacement = self.tabs.items[next_index];
+            } else {
+                if (self.active_tab_url) |url| self.allocator.free(url);
+                self.active_tab_url = null;
+                if (self.active_tab_committed_url) |url| self.allocator.free(url);
+                self.active_tab_committed_url = null;
+            }
+        } else if (self.active_tab_index) |active_index| {
+            if (active_index > index) self.active_tab_index = active_index - 1;
+        }
+        self.lock.unlock();
+
+        tab.shutdown();
+        tab.deinit();
+        self.allocator.destroy(tab);
+
+        if (replacement) |next_tab| self.setActiveTab(next_tab);
+        return true;
+    }
+
     /// Replace a tab's owned root-document title. Native window mutation
     /// remains on the interactive main loop.
     pub fn updateTabTitle(self: *Browser, tab: *Tab, title: ?[:0]u8) void {
@@ -1805,6 +1865,12 @@ pub const Browser = struct {
                     else => {},
                 }
             },
+            .mouse_button_up => |button_event| {
+                if (touch_input.isSyntheticMouse(button_event.mouse_instance_id)) return false;
+                if (button_event.button == .left and self.chrome.pointerUp()) {
+                    self.setNeedsRasterDraw();
+                }
+            },
             .mouse_motion => |motion_event| {
                 if (touch_input.isSyntheticMouse(motion_event.mouse_instance_id)) return false;
                 try self.handleHover(motion_event.x, motion_event.y);
@@ -2223,7 +2289,8 @@ pub const Browser = struct {
             self.focus = null;
             self.pending_content_focus_tab = null;
             self.lock.unlock();
-            var chrome_changed = try self.chrome.click(self, screen_x, screen_y);
+            var chrome_changed = self.chrome.pointerDown(self, screen_x, screen_y);
+            chrome_changed = (try self.chrome.click(self, screen_x, screen_y)) or chrome_changed;
             if (!chrome_changed) {
                 // Fallback: focus address bar if click lands in the URL bar region.
                 if (screen_y >= self.chrome.urlbar_top and screen_y < self.chrome.urlbar_bottom and
@@ -2289,6 +2356,10 @@ pub const Browser = struct {
         const tab = self.activeTab();
         const chrome_bottom = self.chrome.bottom;
         self.lock.unlock();
+
+        if (self.chrome.pointerMove(self, screen_x, screen_y)) {
+            self.setNeedsRasterDraw();
+        }
 
         const active_tab = tab orelse return;
         if (screen_y < chrome_bottom) {
@@ -5639,8 +5710,8 @@ pub const Browser = struct {
         var chrome_snapshot: ?RasterSnapshot = null;
         errdefer if (chrome_snapshot) |*snapshot| snapshot.deinit();
         if (raster) {
-            // Chrome owns a separate UI-thread-only DOM/layout/font generation.
-            // Paint it before cloning, while Browser.lock provides the same
+            // Chrome owns a separate UI-thread-only widget/font/display
+            // generation. Paint it before cloning, while Browser.lock provides the same
             // stable active-URL/tab view the former synchronous pass used.
             const chrome_items = self.chrome.paint(self) catch |err| {
                 self.lock.unlock();

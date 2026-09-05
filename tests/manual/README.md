@@ -120,7 +120,7 @@ tiers and baseline policy.
 | [`rounded-hit-testing.html`](rounded-hit-testing.html) | Rounded-corner misses for blocks, rich buttons, and text inputs |
 | [`hover.html`](hover.html) | Deferred `:hover`, ancestor matching, clearing, and layout-changing hover |
 | [`rich-buttons.html`](rich-buttons.html) | Contained arbitrary children, height growth, nested interactions, and parser recovery |
-| [`html-chrome.html`](html-chrome.html) | HTML-based chrome controls, tab links, editing, and stable viewport boundary |
+| [`html-chrome.html`](html-chrome.html) | Chrome widget hover/pressed states, connected tabs, editing, navigation, and stable viewport boundary |
 | [`mouse-wheel-scroll.html`](mouse-wheel-scroll.html) | Immediate wheel scrolling and clamping |
 | [`scrollbar.html`](scrollbar.html) | Scroll range and native scrollbar-thumb geometry |
 | [`overflow-scroll.html`](overflow-scroll.html) | Focused nested element scrolling, clipping, and boundary fallback |
