@@ -45,6 +45,8 @@ pub const CSSParser = @This();
 
 pub const IMPORTANT_PRIORITY: u32 = 10_000;
 pub const INLINE_STYLE_PRIORITY: u32 = 1_000;
+pub const PRESENTATIONAL_HINT_PRIORITY: u32 = 20_000;
+pub const AUTHOR_ORIGIN_PRIORITY: u32 = 40_000;
 pub const MatchContext = selector_mod.MatchContext;
 pub const HasMatchCache = selector_mod.HasMatchCache;
 
@@ -1922,6 +1924,15 @@ pub const CSSRule = struct {
     selector: Selector,
     properties: DeclarationMap,
     owned: bool = true,
+    origin: enum { user_agent, author } = .author,
+
+    /// Origin precedes specificity; important UA rules precede author rules.
+    pub fn declarationPriorityBase(self: CSSRule, important: bool) u32 {
+        return self.cascadePriority() + switch (self.origin) {
+            .author => AUTHOR_ORIGIN_PRIORITY,
+            .user_agent => if (important) @as(u32, 60_000) else 0,
+        };
+    }
 
     pub fn deinit(self: *CSSRule, allocator: std.mem.Allocator) void {
         // Free the selector's allocated memory (pass pointer since deinit expects *Selector)

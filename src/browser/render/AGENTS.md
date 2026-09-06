@@ -48,13 +48,18 @@ boundaries.
   traversal, glyph ownership, and retained line objects remain in
   `layout.zig`.
 - `table_format.zig` owns allocation-free scalar roles and single-span grid
-  track math for the bounded CSS table context. `layout.zig` retains all
+  track math, including automatic min/max-content and percentage constraints,
+  for the bounded CSS table context. `layout.zig` retains all
   DOM-backed boxes and keeps its temporary row/cell plan synchronous; do not
   move DOM pointers, style subscriptions, or anonymous-box lifetime here.
+  Row groups retain real boxes but share their table's columns, including
+  `tbody` inserted by the live parser; do not flatten them out of the DOM.
 - `flex_format.zig` and `grid_format.zig` own pointer-free item and track
   sizing. `intrinsic_width.zig` synchronously borrows DOM and FontManager for
   bounded intrinsic measurement. None retains DOM/layout/glyph pointers;
   `layout.zig` owns item boxes, subscriptions, and final hit-test collection.
+  Native input natural widths must agree between intrinsic and final layout;
+  table measurements subscribe through persistent owners, not temporary cells.
 - `control_geometry.zig` computes input/button leaf geometry and password
   display text. Its pointer-free text-editor used box and client insets must
   agree across border-box paint, editable-content clips, and CSSOM snapshots.

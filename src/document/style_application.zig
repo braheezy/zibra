@@ -5,6 +5,7 @@
 //! style-pass algorithm, but never owns a Node or layout object.
 
 const std = @import("std");
+const presentational_hints = @import("presentational_hints.zig");
 const ProtectedField = @import("../core/protected_field.zig").ProtectedField;
 const CSSParser = @import("css_parser.zig").CSSParser;
 const css_length = @import("length.zig");
@@ -716,6 +717,22 @@ pub fn Application(
                             }
                         }
 
+                        // HTML hints are author-origin declarations before all
+                        // authored CSS, but after normal user-agent defaults.
+                        var hint_arena = std.heap.ArenaAllocator.init(allocator);
+                        defer hint_arena.deinit();
+                        var hints = std.StringHashMap([]const u8).init(hint_arena.allocator());
+                        try presentational_hints.collect(hint_arena.allocator(), e.tag, e.attributes, &hints);
+                        var hint_it = hints.iterator();
+                        while (hint_it.next()) |hint| try applyCascadedDeclaration(
+                            &new_style,
+                            &cascade_priorities,
+                            &pending_shorthands,
+                            hint.key_ptr.*,
+                            .{ .value = hint.value_ptr.* },
+                            CSSParser.PRESENTATIONAL_HINT_PRIORITY,
+                        );
+
                         // Second, apply styles from CSS rules (can override inherited values)
                         for (rules) |rule| {
                             if (ruleAppliesToNode(rule, node) and
@@ -729,7 +746,7 @@ pub fn Application(
                                         &pending_shorthands,
                                         entry.key_ptr.*,
                                         entry.value_ptr.*,
-                                        rule.cascadePriority(),
+                                        rule.declarationPriorityBase(entry.value_ptr.important),
                                     );
                                 }
                             }
@@ -753,7 +770,7 @@ pub fn Application(
                                         &pending_shorthands,
                                         entry.key_ptr.*,
                                         entry.value_ptr.*,
-                                        CSSParser.INLINE_STYLE_PRIORITY,
+                                        CSSParser.AUTHOR_ORIGIN_PRIORITY + CSSParser.INLINE_STYLE_PRIORITY,
                                     );
                                 }
                             }

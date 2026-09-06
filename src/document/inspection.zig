@@ -55,6 +55,7 @@ pub const Page = struct {
         page.repairParentPointers();
 
         try page.appendRules(default_style_sheet, false);
+        for (page.rules.items) |*rule| rule.origin = .user_agent;
         try page.loadDocumentStylesheets(init, source_url);
 
         std.mem.sort(CSSParser.CSSRule, page.rules.items, {}, struct {

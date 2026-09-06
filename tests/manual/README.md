@@ -23,6 +23,7 @@ tiers and baseline policy.
 | [`border-geometry.html`](border-geometry.html) | Asymmetric mitered solid-border joins and zero-content border triangles |
 | [`display.html`](display.html) | Computed display classification and anonymous runs |
 | [`css-tables.html`](css-tables.html) | Bounded table/table-row/table-cell grid tracks, anonymous direct cells, and row-height stretch |
+| [`html-search-layout.html`](html-search-layout.html) | Content-sized table search form, HTML alignment/width/nowrap hints, atomic controls, and wide-viewport centering |
 | [`inline-stylesheet.html`](inline-stylesheet.html) | Inline/linked stylesheet DOM order, hidden style content, and shared inspection stages |
 | [`links-bar.html`](links-bar.html) | User-agent class selector styling for repeated navigation bars |
 | [`table-of-contents.html`](table-of-contents.html) | User-agent ID selector and generated table-of-contents bar styling |

@@ -74,6 +74,12 @@ pub const cases = [_]Case{
         .golden = "tests/golden/pipeline/table-format.display-list.txt",
     },
     .{
+        .name = "html-table-sizing-layout",
+        .mode = .layout,
+        .fixture = "tests/pipeline/html-table-sizing.html",
+        .golden = "tests/golden/pipeline/html-table-sizing.layout.txt",
+    },
+    .{
         .name = "float-paint-phases-layout",
         .mode = .layout,
         .fixture = "tests/pipeline/float-paint-phases.html",

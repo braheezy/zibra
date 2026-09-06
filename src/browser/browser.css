@@ -29,7 +29,11 @@ figure { display: block; }
 figcaption { display: block; }
 main { display: block; }
 div { display: block; }
+center { display: block; text-align: -zibra-center; }
 table { display: table; }
+tbody { display: table-row-group; }
+thead { display: table-header-group; }
+tfoot { display: table-footer-group; }
 tr { display: table-row; }
 td { display: table-cell; }
 th { display: table-cell; }

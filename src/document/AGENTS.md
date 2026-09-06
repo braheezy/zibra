@@ -144,6 +144,9 @@ The document pipeline is split by ownership and algorithm boundaries:
 - `css_syntax.zig` is a pure source-buffer scanner for CSS comments, escapes,
   strings, and structural delimiters; `css_properties.zig` is the shared
   static registry of computed longhand names and defaults.
+- `presentational_hints.zig` translates supported HTML presentation attributes
+  into temporary low-priority author declarations. Intern winners before its
+  arena ends; keep stylesheet cascade origin separate from source ownership.
 - `css_value_tokens.zig` scans borrowed value tokens and rewrites rem
   dimensions without touching strings/URLs. `custom_properties.zig` owns
   immutable computed variable environments and bounded substitution/cycle

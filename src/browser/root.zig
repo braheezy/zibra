@@ -918,6 +918,7 @@ pub const Browser = struct {
         }
         for (default_rules) |*rule| {
             rule.owned = false;
+            rule.origin = .user_agent;
         }
 
         const layout_engine = try Layout.init(

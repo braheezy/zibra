@@ -163,6 +163,119 @@ test "responsive display none suppresses blocks inline text and controls across 
     }
 }
 
+test "automatic table live parser row groups share columns and retain centered boxes" {
+    const allocator = std.testing.allocator;
+    var source = document.HtmlSourceStore.init(allocator);
+    defer source.deinit();
+    _ = try source.appendCopy("<body><table style='margin:0 auto'><tr><td><div style='width:40px;height:10px'></div></td><td><div style='width:60px;height:10px'></div></td></tr></tbody><tbody><tr><td><div style='width:80px;height:20px'></div></td><td><div style='width:20px;height:20px'></div></td></tr></tbody></table></body>");
+    var root: document.Node = undefined;
+    var live = try @import("../document/html_live_parser.zig").LiveParser.init(allocator, &source, &root);
+    defer root.deinit(allocator);
+    defer live.deinit();
+    live.finishInput();
+    try std.testing.expect((try live.advance()) == .eof);
+    var css = try @import("../document/css_parser.zig").CSSParser.init(allocator, @embedFile("../browser/browser.css"), false);
+    defer css.deinit(allocator);
+    const rules = try css.parse(allocator);
+    defer {
+        for (rules) |*rule| rule.deinit(allocator);
+        allocator.free(rules);
+    }
+    for (rules) |*rule| rule.origin = .user_agent;
+    try document.style(allocator, &root, rules);
+    var environ = std.process.Environ.Map.init(allocator);
+    defer environ.deinit();
+    try environ.put("HOME", "/tmp");
+    var engine = try Layout.init(allocator, std.testing.io, &environ, 800, 600, false);
+    defer engine.deinit();
+    const layout = try engine.buildDocument(&root);
+    defer {
+        layout.deinit();
+        allocator.destroy(layout);
+    }
+    for ([_]i32{ 800, 1600, 600 }) |viewport| {
+        engine.window_width = viewport;
+        layout.mark();
+        try layout.layout(engine);
+        const body = layout.children.items[0].children.items[1].block;
+        const table = body.children.items[0].block;
+        try std.testing.expectEqual(@as(i32, 140), table.width.get().*);
+        try std.testing.expect(@abs(2 * table.x.get().* + table.width.get().* - 2 * body.x.get().* - body.width.get().*) <= 1);
+        const first_group = table.children.items[0].block;
+        const second_group = table.children.items[1].block;
+        const first_row = first_group.children.items[0].block;
+        const second_row = second_group.children.items[0].block;
+        try std.testing.expectEqual(@as(i32, 10), first_group.height.get().*);
+        try std.testing.expectEqual(@as(i32, 20), second_group.height.get().*);
+        try std.testing.expectEqual(first_group.y.get().* + 10, second_group.y.get().*);
+        try std.testing.expectEqual(@as(i32, 80), first_row.children.items[0].block.width.get().*);
+        try std.testing.expectEqual(first_row.children.items[1].block.x.get().*, second_row.children.items[1].block.x.get().*);
+        try std.testing.expect(!layout.layoutNeeded());
+    }
+}
+
+test "automatic table search form measures controls and centers through resize and restyle" {
+    var page = try Page.init("<div align=center style='display:block'><table style='display:table'><tr style='display:table-row'><td width='25%' style='display:table-cell'>&nbsp;</td><td align=center nowrap style='display:table-cell'><div style='display:inline-block'><input style='width:300px;padding:5px 8px 0 6px'></div><br><span style='display:inline-block'><input type=submit value='Search'></span> <span style='display:inline-block'><input type=submit value='Lucky'></span></td><td width='25%' nowrap style='display:table-cell'><a href='/advanced' style='display:block;color:blue;margin-left:13px'>Advanced search</a></td></tr></table></div>");
+    defer page.deinit();
+    try page.render();
+    const table_node = &page.root.element.children.items[0];
+    const cell = &table_node.element.children.items[0].element.children.items[1];
+    const input = &cell.element.children.items[0].element.children.items[0];
+    for ([_]i32{ 1600, 800, 600, 1600 }, 0..) |viewport, index| {
+        page.engine.?.window_width = viewport;
+        page.layout.?.mark();
+        try input.element.attributes.?.put("style", if (index == 3) "width:420px;padding:5px 8px 0 6px" else "width:300px;padding:5px 8px 0 6px");
+        @import("../document/dom.zig").dirtyStyleForElement(&input.element);
+        try page.render();
+        const container = page.layout.?.children.items[0];
+        const table = container.children.items[0].block;
+        const input_box = page.engine.?.input_bounds.get(input).?;
+        try std.testing.expectEqual(@as(i32, if (index == 3) 434 else 314), input_box.width);
+        const first_button = page.engine.?.input_bounds.get(&cell.element.children.items[2].element.children.items[0]).?;
+        const last_button = page.engine.?.input_bounds.get(&cell.element.children.items[4].element.children.items[0]).?;
+        try std.testing.expectEqual(first_button.y, last_button.y);
+        try std.testing.expect(@abs(first_button.x + last_button.x + last_button.width - 2 * input_box.x - input_box.width) <= 1);
+        try std.testing.expect(table.width.get().* >= input_box.width + 80);
+        try std.testing.expect(table.width.get().* <= container.width.get().*);
+        try std.testing.expect(@abs(2 * table.x.get().* + table.width.get().* - 2 * container.x.get().* - container.width.get().*) <= 1);
+        const commands = try page.engine.?.paintDocument(page.layout.?);
+        defer display.DisplayItem.freeList(std.testing.allocator, commands);
+        const advanced = coloredGlyphBounds(commands, .{ .r = 0, .g = 0, .b = 255 }, 0, 0).?;
+        try std.testing.expect(advanced.width() > 70 and advanced.height() < 40);
+        try std.testing.expect(!page.layout.?.layoutNeeded());
+    }
+}
+
+test "automatic table width follows text changes without explicit cell widths" {
+    var page = try Page.init("<table style='display:table'><tr style='display:table-row'><td style='display:table-cell'><span style='font-size:12px'>Measured words</span></td><td style='display:table-cell'>neighbor</td></tr></table>");
+    defer page.deinit();
+    try page.render();
+    const table = page.layout.?.children.items[0];
+    const initial = table.width.get().*;
+    try std.testing.expect(initial > 60);
+    const label = &page.root.element.children.items[0].element.children.items[0].element.children.items[0];
+    try label.element.attributes.?.put("style", "font-size:30px");
+    @import("../document/dom.zig").dirtyStyleForElement(&label.element);
+    try page.render();
+    try std.testing.expect(table.width.get().* > initial);
+    try std.testing.expect(!page.layout.?.layoutNeeded());
+}
+
+test "automatic table legacy block alignment differs from CSS text alignment" {
+    var page = try Page.init("<div align=right style='display:block;width:400px'><div style='display:block;width:100px;height:10px'></div><div align=center style='display:block;width:200px;height:20px;margin:0 auto'></div></div>");
+    defer page.deinit();
+    try page.render();
+    const parent = page.layout.?.children.items[0];
+    const child = parent.children.items[0].block;
+    const centered = parent.children.items[1].block;
+    try std.testing.expectEqual(parent.x.get().* + 300, child.x.get().*);
+    try std.testing.expectEqual(parent.x.get().* + 100, centered.x.get().*);
+    try page.root.element.attributes.?.put("style", "display:block;width:400px;text-align:center");
+    @import("../document/dom.zig").dirtyStyleForElement(&page.root.element);
+    try page.render();
+    try std.testing.expectEqual(parent.x.get().*, child.x.get().*);
+}
+
 const Page = struct {
     root: document.Node,
     environ: std.process.Environ.Map,

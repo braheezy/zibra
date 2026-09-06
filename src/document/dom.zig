@@ -74,6 +74,8 @@ pub fn characterReferenceAt(text: []const u8, pos: usize) ?CharacterReference {
         0x00a0
     else if (std.mem.eql(u8, name, "shy"))
         0x00ad
+    else if (std.mem.eql(u8, name, "copy"))
+        0x00a9
     else if (parseNumericCharacterReference(name)) |numeric|
         numeric
     else

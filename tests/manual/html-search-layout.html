@@ -1,0 +1,39 @@
+<!doctype html>
+<!-- How to verify: resize between 800px and a wide desktop window. The logo,
+     search table and footer remain centered. The input is visible and accepts
+     text; both submit buttons share one line. Advanced search stays horizontal.
+     The second table sizes from its text, not explicit widths. -->
+<html lang="en">
+<head>
+<title>Content-sized HTML search layout</title>
+<style>
+body { margin: 0; font-family: sans-serif; color: #202124; }
+.masthead { text-align: right; padding: 20px; }
+.logo { font-size: 64px; margin: 60px 0 24px; }
+form { margin-bottom: 30px; }
+.query { width: 396px; height: 30px; padding: 4px 8px; background: white; border: 1px solid #888; }
+.atomic { display: inline-block; }
+.buttons { display: inline-block; margin: 12px 4px 0; }
+.buttons input { background: #eee; border: 1px solid #888; padding: 4px 10px; height: 30px; }
+.advanced { margin-left: 13px; font-size: 12px; }
+.sample { margin: 30px auto; }
+.sample td { padding: 6px; border: 1px solid #999; }
+</style>
+</head>
+<body>
+<div class="masthead"><a href="#footer">About</a></div>
+<center>
+<div class="logo"><span style="color:#4285f4">S</span><span style="color:#ea4335">e</span><span style="color:#fbbc05">a</span><span style="color:#4285f4">r</span><span style="color:#34a853">c</span><span style="color:#ea4335">h</span></div>
+<form action="about:blank">
+<table cellpadding="0" cellspacing="0"><tr>
+<td width="25%">&nbsp;</td>
+<td align="center" nowrap><div class="atomic"><input name="q" class="query" aria-label="Search"></div><br>
+<span class="buttons"><input type="submit" value="Search"></span><span class="buttons"><input type="submit" value="Feeling lucky"></span></td>
+<td width="25%" nowrap align="left"><a class="advanced" href="#sample">Advanced search</a></td>
+</tr></table>
+</form>
+<table class="sample" id="sample"><tr><td>Content-sized column</td><td>Neighbor</td></tr><tr><td>Short</td><td>A longer second column</td></tr></table>
+<p id="footer">&copy; 2026 — <a href="#sample">Table details</a></p>
+</center>
+</body>
+</html>

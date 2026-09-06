@@ -5,6 +5,8 @@ const dom = @import("../../document/dom.zig");
 const length = @import("../../document/length.zig");
 const font = @import("font.zig");
 const grapheme = @import("grapheme");
+const box_model = @import("box_model.zig");
+const inline_format = @import("inline_format.zig");
 
 pub const Width = struct {
     min: f64 = 0,
@@ -19,7 +21,46 @@ fn value(styles: ?dom.StyleMap, name: []const u8, default: []const u8) []const u
     return default;
 }
 
+/// Native input natural content width, shared with final control layout.
+/// CSS preferred/min/max sizes and box edges are applied by the caller.
+pub fn inputNaturalWidth(element: dom.Element, fonts: *font.FontManager, scale: f64) !f64 {
+    const size = length.parsePixel(value(element.style, "font-size", "16px")) orelse 16;
+    const weight: font.FontWeight = if (font.isBoldWeight(value(element.style, "font-weight", "normal"))) .Bold else .Normal;
+    const slant: font.FontSlant = if (std.ascii.eqlIgnoreCase(value(element.style, "font-style", "normal"), "italic")) .Italic else .Roman;
+    const family = font.familyFromCss(value(element.style, "font-family", "sans-serif"));
+    const raster_size = font.rasterSizeForCssPixels(size * scale);
+    if (element.isInputType("submit") or element.isInputType("reset") or element.isInputType("button")) {
+        const fallback: []const u8 = if (element.isInputType("submit")) "Submit" else if (element.isInputType("reset")) "Reset" else "";
+        const label = if (element.attributes) |attrs| attrs.get("value") orelse fallback else fallback;
+        var width: f64 = 8 * scale;
+        var characters = grapheme.iterator(label);
+        while (characters.next()) |character| {
+            const glyph = try fonts.getStyledGlyph(character.bytes(label), weight, slant, raster_size, family);
+            width += @floatFromInt(glyph.w);
+        }
+        return width;
+    }
+    if (element.attributes) |attrs| if (attrs.get("size")) |raw| {
+        const count = std.fmt.parseInt(u32, std.mem.trim(u8, raw, " \t\r\n"), 10) catch 0;
+        if (count > 0) {
+            const glyph = try fonts.getStyledGlyph("0", weight, slant, raster_size, family);
+            return @as(f64, @floatFromInt(glyph.w)) * @as(f64, @floatFromInt(@min(count, 100_000)));
+        }
+    };
+    return 200 * scale;
+}
+
+/// Intrinsic widths describe content, not the root's authored width or edges.
+/// Descendant boxes contribute their full outer size, including controls.
+pub fn measureContent(node: *const dom.Node, fonts: *font.FontManager, scale: f64) anyerror!Width {
+    return measureImpl(node, fonts, scale, false);
+}
+
 pub fn measure(node: *const dom.Node, fonts: *font.FontManager, scale: f64) anyerror!Width {
+    return measureImpl(node, fonts, scale, true);
+}
+
+fn measureImpl(node: *const dom.Node, fonts: *font.FontManager, scale: f64, include_specified: bool) anyerror!Width {
     return switch (node.*) {
         .text => |text| blk: {
             if (text.text.len == 0) break :blk .{};
@@ -30,7 +71,9 @@ pub fn measure(node: *const dom.Node, fonts: *font.FontManager, scale: f64) anye
             const family = font.familyFromCss(value(text.style, "font-family", "sans-serif"));
             const raster_size = font.rasterSizeForCssPixels(size * scale);
             const space = try fonts.getStyledGlyph(" ", weight, slant, raster_size, family);
-            var words = std.mem.tokenizeAny(u8, text.text, " \t\r\n");
+            const decoded = try inline_format.decodeTextForDisplay(fonts.allocator, text.text);
+            defer fonts.allocator.free(decoded);
+            var words = std.mem.tokenizeAny(u8, decoded, " \t\r\n\x0c");
             var result: Width = .{};
             if (std.ascii.isWhitespace(text.text[0])) result.leading_space = @floatFromInt(space.w);
             if (std.ascii.isWhitespace(text.text[text.text.len - 1])) result.trailing_space = @floatFromInt(space.w);
@@ -51,20 +94,53 @@ pub fn measure(node: *const dom.Node, fonts: *font.FontManager, scale: f64) anye
             break :blk result;
         },
         .element => |element| blk: {
-            if (std.ascii.eqlIgnoreCase(value(element.style, "display", "inline"), "none")) break :blk .{};
+            if (element.isHiddenInput() or std.ascii.eqlIgnoreCase(value(element.style, "display", "inline"), "none")) break :blk .{};
+            const position = value(element.style, "position", "static");
+            if (std.ascii.eqlIgnoreCase(position, "absolute") or std.ascii.eqlIgnoreCase(position, "fixed")) break :blk .{};
             const size = length.parsePixel(value(element.style, "font-size", "16px")) orelse 16;
-            if (length.resolve(value(element.style, "width", "auto"), .{ .font_size = size })) |width| break :blk .{ .min = width * scale, .max = width * scale };
+            if (include_specified) if (length.resolve(value(element.style, "width", "auto"), .{ .font_size = size })) |width| break :blk .{ .min = width * scale, .max = width * scale };
+            if (std.ascii.eqlIgnoreCase(element.tag, "input") or std.ascii.eqlIgnoreCase(element.tag, "textarea")) {
+                const width = if (element.isCheckbox() or element.isInputType("radio")) size * scale else try inputNaturalWidth(element, fonts, scale);
+                break :blk .{ .min = width, .max = width };
+            }
+            if (std.ascii.eqlIgnoreCase(element.tag, "img")) if (element.attributes) |attrs| if (attrs.get("width")) |raw| {
+                const width = std.fmt.parseFloat(f64, raw) catch 0;
+                if (std.math.isFinite(width) and width > 0) break :blk .{ .min = width * scale, .max = width * scale };
+            };
             if (element.image_data) |image| break :blk .{ .min = @as(f64, @floatFromInt(image.image.width)) * scale, .max = @as(f64, @floatFromInt(image.image.width)) * scale };
             var result: Width = .{};
             var inline_run: f64 = 0;
             var pending_space: f64 = 0;
             for (element.children.items) |*child| {
-                const measured = try measure(child, fonts, scale);
+                if (child.* == .element) {
+                    const child_position = value(child.element.style, "position", "static");
+                    if (std.ascii.eqlIgnoreCase(child_position, "absolute") or std.ascii.eqlIgnoreCase(child_position, "fixed")) continue;
+                }
+                if (child.* == .element and std.ascii.eqlIgnoreCase(child.element.tag, "br")) {
+                    result.max = @max(result.max, inline_run);
+                    inline_run = 0;
+                    pending_space = 0;
+                    continue;
+                }
+                const child_scale = if (child.* == .element) scale * box_model.parseCssZoom(value(child.element.style, "zoom", "1")) else scale;
+                var measured = try measure(child, fonts, child_scale);
                 const child_display = if (child.* == .element) value(child.element.style, "display", "inline") else "inline";
-                const block = !std.ascii.eqlIgnoreCase(child_display, "inline") and
+                if (child.* == .element and !child.element.isHiddenInput() and !std.ascii.eqlIgnoreCase(child_display, "none")) {
+                    if (child.element.style) |styles| {
+                        const child_size = length.parsePixel(value(child.element.style, "font-size", "16px")) orelse 16;
+                        const edges = box_model.resolveBoxEdges(&styles, child_size, null, @floatCast(child_scale), 1);
+                        const border_box = std.ascii.eqlIgnoreCase(value(child.element.style, "box-sizing", "content-box"), "border-box");
+                        const specified = length.resolve(value(child.element.style, "width", "auto"), .{ .font_size = child_size }) != null;
+                        const extra: f64 = @floatFromInt(edges.margin.horizontal() + if (border_box and specified) @as(i32, 0) else edges.padding.horizontal() + edges.border.horizontal());
+                        measured.min = @max(measured.min + extra, 0);
+                        measured.max = @max(measured.max + extra, measured.min);
+                    }
+                }
+                const table_row = std.ascii.eqlIgnoreCase(value(element.style, "display", "inline"), "table-row");
+                const block = !table_row and !std.ascii.eqlIgnoreCase(child_display, "inline") and
                     !std.ascii.eqlIgnoreCase(child_display, "inline-block") and
                     !std.ascii.eqlIgnoreCase(child_display, "none");
-                result.min = @max(result.min, measured.min);
+                if (table_row) result.min += measured.min else result.min = @max(result.min, measured.min);
                 if (block) {
                     result.max = @max(result.max, @max(inline_run, measured.max));
                     inline_run = 0;

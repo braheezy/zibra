@@ -42,6 +42,18 @@ crashtest cases to their respective adapters. It excludes non-conformance
 probes; use `--mode probe` explicitly for those. A category-specific `--mode`
 filters both execution and `--list` output.
 
+For the bounded HTML table sizing work, run the unchanged upstream reftests
+in `manifest-html-tables.yaml`:
+
+```sh
+python3 tests/wpt/run.py tests/wpt/manifest-html-tables.yaml --mode reftest \
+  --jobs 1 --browser ./zig-out/bin/zibra --report /tmp/html-tables.json
+```
+
+This targets content-sized and percentage table/cell widths and `nowrap`,
+including the live parser's implicit row groups, not spanning cells or
+collapsed-border conformance.
+
 `testharness` runs each selected file in a real headless browser session. When
 the upstream checkout is initialized, the runner starts WPT's `wptserve` on a
 temporary loopback port so root-relative resources such as

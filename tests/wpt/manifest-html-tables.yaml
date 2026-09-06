@@ -1,0 +1,6 @@
+# Content-sized HTML tables and presentational width/nowrap constraints.
+reftests:
+  - html/rendering/non-replaced-elements/tables/table-width.html
+  - html/rendering/non-replaced-elements/tables/table-cell-width.html
+  - html/rendering/non-replaced-elements/tables/table-width-150percent.html
+  - html/rendering/non-replaced-elements/tables/table-cell-nowrap-with-fixed-width.html

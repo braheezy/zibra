@@ -257,10 +257,10 @@ test "entities are decoded with the inline text rules" {
     const allocator = std.testing.allocator;
     const decoded = try decodeTextForDisplay(
         allocator,
-        "&lt;div&gt; &amp; &quot;quote&quot; &apos;x&apos; &nbsp; &#x1F642; &unknown;",
+        "&lt;div&gt; &amp; &quot;quote&quot; &apos;x&apos; &nbsp; &#x1F642; &copy; &unknown;",
     );
     defer allocator.free(decoded);
-    try std.testing.expectEqualStrings("<div> & \"quote\" 'x' \u{00a0} 🙂 &unknown;", decoded);
+    try std.testing.expectEqualStrings("<div> & \"quote\" 'x' \u{00a0} 🙂 © &unknown;", decoded);
 
     var buffer: [4]u8 = undefined;
     const soft_hyphen = lexEntityAt("&shy;", 0, &buffer).?;

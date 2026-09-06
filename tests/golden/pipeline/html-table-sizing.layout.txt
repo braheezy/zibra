@@ -1,0 +1,19 @@
+document x=13 y=18 width=764 height=40
+  block x=13 y=18 width=764 height=40
+    block x=13 y=18 width=764 height=0
+    block x=13 y=18 width=764 height=40
+      block x=13 y=18 width=764 height=20
+        block x=345 y=18 width=100 height=20
+          block x=345 y=18 width=100 height=20
+            block x=345 y=18 width=100 height=20
+              block x=345 y=18 width=40 height=20
+                block x=345 y=18 width=40 height=20
+              block x=385 y=18 width=60 height=20
+                block x=385 y=18 width=60 height=20
+      block x=13 y=38 width=200 height=20
+        block x=13 y=38 width=300 height=20
+          block x=13 y=38 width=300 height=20
+            block x=13 y=38 width=100 height=20
+              block x=13 y=38 width=40 height=20
+            block x=113 y=38 width=200 height=20
+              block x=113 y=38 width=60 height=20

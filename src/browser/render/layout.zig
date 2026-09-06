@@ -489,7 +489,7 @@ const EmbedLayout = struct {
             if (width_value == 0 and height_value == 0) return;
         } else if ((width_value == 0 or height_value == 0) and payload != .input) return;
 
-        if (engine.cursor_x + width_value > engine.line_right) {
+        if (!engine.nowrap and engine.cursor_x + width_value > engine.line_right and lineHasContent(line_buffer.items)) {
             try engine.flushLine(line_buffer);
             engine.cursor_x = engine.line_left;
         }
@@ -1132,22 +1132,28 @@ fn textDirectionForBlock(block: *const BlockLayout, fallback: TextDirection) Tex
 }
 
 fn lineAlignmentForBlock(
-    block: *const BlockLayout,
+    block: *BlockLayout,
     direction: TextDirection,
     centered_title: bool,
 ) LineAlignment {
     if (centered_title) return .center;
-    const element = liveBlockElement(block) orelse
+    // Anonymous inline runs inherit their container's alignment. They have no
+    // Element of their own, but still subscribe through their retained owner.
+    const style_owner = if (block.inline_nodes != null) block.parent_block orelse block else block;
+    const element = liveBlockElement(style_owner) orelse
         return if (direction == .right_to_left) .end else .start;
     const styles = if (element.style) |*style_map| style_map else return if (direction == .right_to_left) .end else .start;
+    if (block.persistent_dependencies) {
+        if (@constCast(styles).getPtr("text-align")) |field| block.width.addDependency(field, styles.allocator);
+    }
     const value = std.mem.trim(
         u8,
-        styleValue(styles, "text-align") orelse "start",
+        (if (block.persistent_dependencies) styleValueRead(styles, "text-align", &block.width) else styleValue(styles, "text-align")) orelse "start",
         " \t\r\n",
     );
-    if (std.ascii.eqlIgnoreCase(value, "center")) return .center;
-    if (std.ascii.eqlIgnoreCase(value, "right")) return .end;
-    if (std.ascii.eqlIgnoreCase(value, "left")) return .start;
+    if (std.ascii.eqlIgnoreCase(value, "center") or std.mem.eql(u8, value, "-zibra-center")) return .center;
+    if (std.ascii.eqlIgnoreCase(value, "right") or std.mem.eql(u8, value, "-zibra-right")) return .end;
+    if (std.ascii.eqlIgnoreCase(value, "left") or std.mem.eql(u8, value, "-zibra-left")) return .start;
     if (std.ascii.eqlIgnoreCase(value, "start")) {
         return if (direction == .right_to_left) .end else .start;
     }
@@ -2509,6 +2515,7 @@ transform_offset_x: i32 = 0,
 transform_offset_y: i32 = 0,
 
 is_preformatted: bool = false,
+nowrap: bool = false,
 last_was_collapsible_space: bool = false,
 prev_font_category: ?FontCategory = null,
 current_font_category: FontCategory = .latin,
@@ -2530,6 +2537,7 @@ const InlineSnapshot = struct {
     is_superscript: bool,
     is_small_caps: bool,
     is_preformatted: bool,
+    nowrap: bool,
     last_was_collapsible_space: bool,
     prev_font_category: ?FontCategory,
     current_font_category: FontCategory,
@@ -2557,6 +2565,7 @@ fn snapshotInlineState(self: *const Layout) InlineSnapshot {
         .is_superscript = self.is_superscript,
         .is_small_caps = self.is_small_caps,
         .is_preformatted = self.is_preformatted,
+        .nowrap = self.nowrap,
         .last_was_collapsible_space = self.last_was_collapsible_space,
         .prev_font_category = self.prev_font_category,
         .current_font_category = self.current_font_category,
@@ -2584,6 +2593,7 @@ fn restoreInlineState(self: *Layout, snapshot: InlineSnapshot) void {
     self.is_superscript = snapshot.is_superscript;
     self.is_small_caps = snapshot.is_small_caps;
     self.is_preformatted = snapshot.is_preformatted;
+    self.nowrap = snapshot.nowrap;
     self.last_was_collapsible_space = snapshot.last_was_collapsible_space;
     self.prev_font_category = snapshot.prev_font_category;
     self.current_font_category = snapshot.current_font_category;
@@ -3311,6 +3321,7 @@ fn handleCanvasElement(
 }
 
 const StyleSnapshot = struct {
+    nowrap: bool,
     is_bold: bool,
     is_italic: bool,
     font_family: FontFamily,
@@ -3488,6 +3499,39 @@ fn registerStyleDependencies(
     while (iterator.next()) |entry| target.addDependency(entry.value_ptr, style_map.allocator);
 }
 
+fn registerIntrinsicDependencies(node: *Node, target: *ProtectedField(i32)) void {
+    const styles = switch (node.*) {
+        .element => |*e| if (e.style) |*s| s else null,
+        .text => |*t| if (t.style) |*s| s else null,
+    };
+    if (styles) |map| {
+        var it = map.iterator();
+        while (it.next()) |entry| {
+            const name = entry.key_ptr.*;
+            if (std.mem.startsWith(u8, name, "font-") or std.mem.startsWith(u8, name, "padding-") or
+                std.mem.startsWith(u8, name, "margin-") or
+                (std.mem.startsWith(u8, name, "border-") and (std.mem.endsWith(u8, name, "-width") or std.mem.endsWith(u8, name, "-style"))) or
+                std.mem.eql(u8, name, "display") or std.mem.eql(u8, name, "width") or
+                std.mem.eql(u8, name, "white-space") or std.mem.eql(u8, name, "zoom") or
+                std.mem.eql(u8, name, "position") or std.mem.eql(u8, name, "box-sizing"))
+                target.addDependency(entry.value_ptr, map.allocator);
+        }
+    }
+    if (node.* == .element) for (node.element.children.items) |*child| registerIntrinsicDependencies(child, target);
+}
+
+// Legacy HTML alignment centers/right-aligns block children as well as lines.
+// Ordinary CSS text-align does not. Explicit auto margins retain precedence.
+fn legacyBlockAlignmentOffset(block: *BlockLayout, available: i32, width: i32, auto: box_model.HorizontalAutoMargins, allocated: bool, float: FloatSide, position: PositionMode) i32 {
+    if (allocated or block.embedded_box != null or auto.left or auto.right or float != .none or isOutOfFlowPosition(position)) return 0;
+    const parent = block.parent_block orelse return 0;
+    const alignment = parent.formatStyle("text-align", "start");
+    const remaining = @max(available -| width -| block.margin.horizontal(), 0);
+    if (std.mem.eql(u8, alignment, "-zibra-center")) return @divTrunc(remaining, 2);
+    if (std.mem.eql(u8, alignment, "-zibra-right")) return remaining;
+    return 0;
+}
+
 fn registerReplacedSizeDependencies(self: *Layout, style_map: *const parser.StyleMap) void {
     const block = self.inline_block orelse return;
     const target = if (block.persistent_dependencies)
@@ -3611,6 +3655,7 @@ fn applyNodeStyles(
         .is_italic = self.is_italic,
         .font_family = self.font_family,
         .size = self.size,
+        .nowrap = self.nowrap,
         .font_size_css = self.font_size_css,
         .line_height_css = self.line_height_css,
         .css_small_caps = self.css_small_caps,
@@ -3707,6 +3752,8 @@ fn applyNodeStyles(
         if (line_height_value) |line_height_str| {
             self.line_height_css = resolveLineHeightCss(line_height_str, self.font_size_css);
         }
+        const whitespace = if (notify_target) |target| styleValueRead(style_map, "white-space", target) else styleValue(style_map, "white-space");
+        self.nowrap = flex_format.eq(whitespace orelse "normal", "nowrap");
 
         const variant_value = if (notify_target) |target|
             styleValueRead(style_map, "font-variant", target)
@@ -3748,6 +3795,7 @@ fn restoreNodeStyles(self: *Layout, _: *std.ArrayList(LineItem)) !void {
     if (self.style_stack.items.len > 0) {
         const snapshot = self.style_stack.pop() orelse return;
         self.is_bold = snapshot.is_bold;
+        self.nowrap = snapshot.nowrap;
         self.is_italic = snapshot.is_italic;
         self.font_family = snapshot.font_family;
         self.size = snapshot.size;
@@ -3779,7 +3827,7 @@ fn recordSoftHyphenBreak(
 ) !void {
     // Soft hyphens at the start of a visual line have no prefix to break, and
     // preformatted text deliberately does not wrap.
-    if (self.is_preformatted or !self.soft_hyphen_word_has_content) return;
+    if (self.is_preformatted or self.nowrap or !self.soft_hyphen_word_has_content) return;
 
     const weight: font.FontWeight = if (self.is_bold) .Bold else .Normal;
     const slant: font.FontSlant = if (self.is_italic) .Italic else .Roman;
@@ -4481,7 +4529,7 @@ fn processGrapheme(
     // A collapsed source-space at the right edge is trailing whitespace, not
     // the first glyph of the next line.
     if (options.is_collapsed_space and shouldAutomaticallyWrap(
-        self.is_preformatted,
+        self.is_preformatted or self.nowrap,
         self.cursor_x,
         glyph_width,
         self.line_right,
@@ -4493,7 +4541,7 @@ fn processGrapheme(
 
     // Check if we need to wrap (only at window edge)
     while (permits_automatic_wrap and shouldAutomaticallyWrap(
-        self.is_preformatted,
+        self.is_preformatted or self.nowrap,
         self.cursor_x,
         glyph_width,
         self.line_right,
@@ -5177,7 +5225,8 @@ const InputLayout = struct {
                         @field(vertical, property[1]) = engine.scaleActiveCssPixel(pixels);
                 }
             }
-            self.box = control_geometry.textBox(engine.scaleActiveCssPixel(INPUT_WIDTH_PX), if (self.is_multiline) self.text_line_height * 2 else natural_height, horizontal, vertical, edges.padding, edges.border, border_box);
+            const natural_width: i32 = @intFromFloat(try intrinsic_measure.inputNaturalWidth(element, &engine.font_manager, @as(f64, engine.effectiveZoom()) / engine.zoom()));
+            self.box = control_geometry.textBox(natural_width, if (self.is_multiline) self.text_line_height * 2 else natural_height, horizontal, vertical, edges.padding, edges.border, border_box);
             if (own_block) |block| self.box.content_width = block.content_width;
             const baseline = if (self.is_multiline) self.box.height() else self.box.border.top + self.box.padding.top + @max(@divTrunc(self.box.content_height - self.text_line_height, 2), 0) + self.text_ascent;
             self.embed.setMetrics(self.box.width(), self.box.height(), baseline, @max(self.box.height() - baseline, 0), engine.effectiveZoom());
@@ -6890,8 +6939,8 @@ const BlockLayout = struct {
     /// owned cross-object reference.
     normal_flow_placement: ?NormalFlowPlacement = null,
     normal_flow_result: ?NormalFlowResult = null,
-    /// Borrowed column widths used only while a real `table-row` lays out its
-    /// direct cells. `layoutWithTableRowBox` clears this before its caller's
+    /// Borrowed column widths used only while a real row/group lays out its
+    /// descendants. `layoutWithTableRowBox` clears this before its caller's
     /// temporary table plan is released.
     table_row_columns: ?[]const i32 = null,
     /// False for rich-button layout trees, which are destroyed after their
@@ -6966,6 +7015,7 @@ const BlockLayout = struct {
     /// synthetic DOM node or retained anonymous layout object is created.
     const TableRowPlan = struct {
         owner: ?*BlockLayout,
+        group: ?*BlockLayout = null,
         first_cell: usize,
         cell_count: usize,
     };
@@ -8530,13 +8580,14 @@ const BlockLayout = struct {
         const native_text_control = self.inline_nodes == null and self.node == .element and
             (std.ascii.eqlIgnoreCase(self.node.element.tag, "textarea") or
                 (std.ascii.eqlIgnoreCase(self.node.element.tag, "input") and !self.node.element.isCheckbox() and !self.node.element.isInputType("radio")));
-        const specified_width = style_specified_width orelse
-            if (native_text_control and allocated_box == null)
-                constrainDimension(scaleCssPixel(INPUT_WIDTH_PX, zoom_value, engine.zoom()), min_width, max_width)
-            else if (self.tableRole() == .table and allocated_box == null)
-                try self.preferredTableWidth(zoom_value, engine.zoom(), containing_width_css)
-            else
-                null;
+        const specified_width = if (self.tableRole() == .table and allocated_box == null)
+            try self.preferredTableWidth(engine, zoom_value, engine.zoom(), containing_width_css, style_specified_width)
+        else
+            style_specified_width orelse
+                if (native_text_control and allocated_box == null)
+                    constrainDimension(@intFromFloat(try intrinsic_measure.inputNaturalWidth(self.node.element, &engine.font_manager, @as(f64, zoom_value) / engine.zoom())), min_width, max_width)
+                else
+                    null;
         const base_content_bounds = if (self.embedded_box) |embedded|
             ContentBounds{ .x = embedded.x, .width = embedded.width }
         else if (fixed_to_viewport)
@@ -8776,7 +8827,7 @@ const BlockLayout = struct {
         if (!isOutOfFlowPosition(position_mode) and
             float_side == .none and
             allocated_box == null and
-            isBlockDisplay(self.formatStyle("display", "inline")) and
+            (isBlockDisplay(self.formatStyle("display", "inline")) or self.tableRole() == .table) and
             (auto_margins.left or auto_margins.right))
         {
             const remaining = @max(
@@ -8799,7 +8850,7 @@ const BlockLayout = struct {
         else if (float_x) |x|
             x
         else
-            content_bounds.x + self.margin.left);
+            content_bounds.x + self.margin.left + legacyBlockAlignmentOffset(self, content_bounds.width, border_box_width, auto_margins, allocated_box != null, float_side, position_mode));
         self.y.set(if (self.embedded_box) |embedded|
             embedded.y
         else if (allocated_box) |box|
@@ -8878,7 +8929,7 @@ const BlockLayout = struct {
                 natural_height = auto_height;
                 self.content_height = specified_height orelse constrainDimension(auto_height, min_height, max_height);
                 self.height.set(@max(self.content_height + self.padding.vertical() + self.border.vertical(), 0));
-            } else if (table_role == .table) {
+            } else if (table_role == .table or (table_role == .row_group and self.table_row_columns != null)) {
                 const auto_height = try self.layoutTableChildren(engine);
                 natural_height = auto_height;
                 self.content_height = specified_height orelse
@@ -9199,11 +9250,11 @@ const BlockLayout = struct {
     }
 
     /// Build the temporary logical grid inputs for this table. A direct real
-    /// row remains the owner of its own box; every other non-whitespace direct
-    /// child participates in one anonymous row, which is sufficient for the
-    /// CSS anonymous-table-box cases this bounded context supports.
-    fn buildTablePlan(self: *BlockLayout) !TablePlan {
-        std.debug.assert(self.tableRole() == .table);
+    /// row/group remains the owner of its box. The plan traverses groups for
+    /// shared track measurement; other non-whitespace children participate in
+    /// anonymous rows without changing the DOM or layout ancestry.
+    fn buildTablePlan(self: *BlockLayout) anyerror!TablePlan {
+        std.debug.assert(self.tableRole() == .table or self.tableRole() == .row_group);
         try self.rebuildChildrenIfNeeded();
 
         var plan = TablePlan.init(self.allocator);
@@ -9216,6 +9267,21 @@ const BlockLayout = struct {
                 .line => continue,
             };
             if (block.isIgnorableTableWhitespace()) continue;
+
+            if (block.tableRole() == .row_group) {
+                anonymous_row = null;
+                var group_plan = try block.buildTablePlan();
+                defer group_plan.deinit();
+                const first_cell = plan.cells.items.len;
+                try plan.cells.appendSlice(plan.allocator, group_plan.cells.items);
+                for (group_plan.rows.items) |row| try plan.rows.append(plan.allocator, .{
+                    .owner = row.owner,
+                    .group = block,
+                    .first_cell = first_cell + row.first_cell,
+                    .cell_count = row.cell_count,
+                });
+                continue;
+            }
 
             if (block.tableRole() == .row) {
                 anonymous_row = null;
@@ -9265,54 +9331,65 @@ const BlockLayout = struct {
         });
     }
 
-    fn preferredTableCellWidth(
+    fn tableCellMetrics(
         self: *BlockLayout,
+        engine: *Layout,
         parent_zoom: f32,
         engine_zoom: f32,
         containing_width_css: f64,
-    ) std.mem.Allocator.Error!i32 {
-        const element = liveBlockElement(self) orelse return 0;
-        const styles = element.style orelse return 0;
-        const local_zoom = parseCssZoom(styleValue(&styles, "zoom") orelse "1");
+    ) anyerror!table_format.Cell {
+        const element = liveBlockElement(self);
+        const styles = if (element) |e| e.style else null;
+        const local_zoom = if (styles) |s| parseCssZoom(styleValue(&s, "zoom") orelse "1") else 1;
         const effective_zoom = combinedEffectiveZoom(parent_zoom, local_zoom);
         const context = parser.CssLengthResolutionContext{
             .font_size = self.computedFontSizeCss(),
-            .percentage_base = containing_width_css,
+            .percentage_base = null,
         };
-        const edges = resolveBoxEdges(
-            &styles,
+        const edges = if (styles) |s| resolveBoxEdges(
+            &s,
             self.computedFontSizeCss(),
             containing_width_css,
             effective_zoom,
             engine_zoom,
-        );
-        const raw_width = styleValue(&styles, "width") orelse "auto";
-        var content_width: i32 = if (resolveCssLength(raw_width, context)) |width|
-            scaleCssPixel(width, effective_zoom, engine_zoom)
-        else
-            0;
-        if (self.tableRole() == .table and content_width == 0) {
-            content_width = try self.preferredTableWidth(
-                effective_zoom,
-                engine_zoom,
-                containing_width_css,
-            );
+        ) else BoxModelEdges{ .margin = .{}, .padding = .{}, .border = .{} };
+        const scale = @as(f64, effective_zoom) / engine_zoom;
+        var measured = intrinsic_measure.Width{};
+        if (self.inline_nodes) |nodes| {
+            for (nodes) |node| {
+                const part = try intrinsic_measure.measure(node, &engine.font_manager, scale);
+                measured.min = @max(measured.min, part.min);
+                measured.max += part.max;
+            }
+        } else if (self.node_ptr) |node| measured = try intrinsic_measure.measureContent(node, &engine.font_manager, scale);
+        const insets = edges.padding.horizontal() + edges.border.horizontal();
+        var minimum: i32 = @intFromFloat(@min(@ceil(measured.min), 1_000_000_000));
+        var preferred: i32 = @intFromFloat(@min(@ceil(measured.max), 1_000_000_000));
+        const raw_width = if (styles) |s| styleValue(&s, "width") orelse "auto" else "auto";
+        if (resolveCssLength(raw_width, context)) |width| {
+            const border_box = if (styles) |s| flex_format.eq(styleValue(&s, "box-sizing") orelse "content-box", "border-box") else false;
+            const specified = @max(scaleCssPixel(width, effective_zoom, engine_zoom) - if (border_box) insets else 0, 0);
+            minimum = @max(minimum, specified);
+            preferred = @max(preferred, specified);
         }
-        return @max(content_width +| edges.padding.horizontal() +| edges.border.horizontal(), 0);
+        const percentage: f64 = if (parser.parseCssLength(raw_width)) |dimension| if (dimension.unit == .percent) dimension.value / 100 else 0 else 0;
+        return .{ .min_width = minimum +| insets, .preferred_width = @max(preferred, minimum) +| insets, .percentage = percentage, .constrained = resolveCssLength(raw_width, context) != null };
     }
 
     /// Return the bounded intrinsic table content width. The table format
     /// helper owns track math; this method only maps current DOM-backed boxes
-    /// to scalar preferred widths.
+    /// to scalar min/max-content and percentage constraints.
     fn preferredTableWidth(
         self: *BlockLayout,
+        engine: *Layout,
         zoom_value: f32,
         engine_zoom: f32,
         containing_width_css: f64,
-    ) std.mem.Allocator.Error!i32 {
+        requested: ?i32,
+    ) anyerror!i32 {
         var plan = try self.buildTablePlan();
         defer plan.deinit();
-        if (plan.rows.items.len == 0) return 0;
+        if (plan.rows.items.len == 0) return requested orelse 0;
 
         var rows = std.ArrayList(table_format.Row).empty;
         defer rows.deinit(self.allocator);
@@ -9323,17 +9400,21 @@ const BlockLayout = struct {
         const metrics = try self.allocator.alloc(table_format.Cell, plan.cells.items.len);
         defer self.allocator.free(metrics);
         for (plan.cells.items, metrics) |cell, *metric| {
-            metric.* = .{
-                .preferred_width = try cell.preferredTableCellWidth(
-                    zoom_value,
-                    engine_zoom,
-                    containing_width_css,
-                ),
-            };
+            if (self.persistent_dependencies) {
+                if (cell.node_ptr) |node| registerIntrinsicDependencies(node, &self.width);
+            } else if (self.temporary_dependency_target) |target| {
+                if (cell.node_ptr) |node| registerIntrinsicDependencies(node, target);
+            }
+            metric.* = try cell.tableCellMetrics(
+                engine,
+                zoom_value,
+                engine_zoom,
+                containing_width_css,
+            );
         }
         const columns = try self.allocator.alloc(i32, column_count);
         defer self.allocator.free(columns);
-        return table_format.resolveColumnWidths(rows.items, metrics, 0, columns);
+        return table_format.resolveWidths(rows.items, metrics, @intFromFloat(scaleCssFloat(containing_width_css, zoom_value, engine_zoom)), requested, columns);
     }
 
     /// Place one logical row in a resolved grid. A first pass measures natural
@@ -9689,6 +9770,12 @@ const BlockLayout = struct {
         defer plan.deinit();
         if (plan.rows.items.len == 0) return 0;
 
+        // A group uses its table's columns. Its real box and child rows stay
+        // retained for geometry, paint, and invalidation; no DOM is flattened.
+        if (self.tableRole() == .row_group) {
+            if (self.table_row_columns) |columns| return self.layoutPlannedTableRows(engine, &plan, columns);
+        }
+
         var rows = std.ArrayList(table_format.Row).empty;
         defer rows.deinit(self.allocator);
         try self.appendTableMetricRows(&rows, &plan);
@@ -9703,22 +9790,38 @@ const BlockLayout = struct {
             self.document.page_zoom,
         );
         for (plan.cells.items, metrics) |cell, *metric| {
-            metric.* = .{
-                .preferred_width = try cell.preferredTableCellWidth(
-                    self.zoom.get().*,
-                    engine.zoom(),
-                    containing_width_css,
-                ),
-            };
+            metric.* = try cell.tableCellMetrics(
+                engine,
+                self.zoom.get().*,
+                engine.zoom(),
+                containing_width_css,
+            );
         }
         const columns = try self.allocator.alloc(i32, column_count);
         defer self.allocator.free(columns);
-        _ = table_format.resolveColumnWidths(rows.items, metrics, self.content_width, columns);
+        _ = table_format.resolveWidths(rows.items, metrics, self.content_width, self.content_width, columns);
 
+        return self.layoutPlannedTableRows(engine, &plan, columns);
+    }
+
+    fn layoutPlannedTableRows(self: *BlockLayout, engine: *Layout, plan: *const TablePlan, columns: []const i32) anyerror!i32 {
         const content_x = self.x.get().* + self.border.left + self.padding.left;
         var row_y = self.y.get().* + self.border.top + self.padding.top;
         const first_y = row_y;
-        for (plan.rows.items) |row| {
+        var index: usize = 0;
+        while (index < plan.rows.items.len) {
+            const row = plan.rows.items[index];
+            if (row.group) |group| {
+                try group.layoutWithTableRowBox(engine, .{
+                    .x = content_x,
+                    .y = row_y,
+                    .width = self.content_width,
+                }, columns);
+                row_y +|= group.height.get().*;
+                while (index < plan.rows.items.len and plan.rows.items[index].group == group) : (index += 1) {}
+                continue;
+            }
+            index += 1;
             const row_cells = plan.cells.items[row.first_cell .. row.first_cell + row.cell_count];
             const row_height = if (row.owner) |owner| row_height: {
                 try owner.layoutWithTableRowBox(engine, .{
@@ -9837,7 +9940,7 @@ const BlockLayout = struct {
         // the usual vertical predecessor chain. Cells themselves still use
         // normal block flow for their contents.
         const grid_children = switch (self.tableRole()) {
-            .table, .row => true,
+            .table, .row_group, .row => true,
             .ordinary, .cell => false,
         };
         var previous: ?*BlockLayout = null;
@@ -10777,6 +10880,7 @@ fn layoutInlineBlock(self: *Layout, block: *BlockLayout, publish_geometry: bool)
     self.is_small_caps = isWithinSmallCapsBlock(block);
     self.text_color = .{ .r = 0, .g = 0, .b = 0, .a = 255 }; // Reset to black
     self.is_preformatted = isWithinPreformattedBlock(block);
+    self.nowrap = flex_format.eq(block.formatStyle("white-space", "normal"), "nowrap");
     self.last_was_collapsible_space = false;
     self.prev_font_category = null;
     self.current_font_category = .latin;

@@ -120,6 +120,16 @@ pass compares old and new values. Text inheritance borrows its ancestor's
 stable computed storage. Interned values retire with the Element, not after
 each style pass; repeated equal values reuse the same allocation.
 
+Stylesheet rules carry their cascade origin independently of source ownership.
+Browser and isolated inspection mark their default sheet as user-agent rules;
+document sheets remain author rules. `presentational_hints.zig` maps supported
+HTML table/cell widths, cell `nowrap`, and legacy `align` attributes into
+temporary declarations below author rules and above normal UA rules. Winning
+hint strings are interned with other computed values before the temporary
+arena retires. Legacy alignment has distinct internal values: it aligns block
+children as well as lines, unlike ordinary CSS `text-align`. Explicit auto
+margins and authored alignment retain precedence.
+
 `custom_properties.zig` owns one immutable, heap-stable computed environment
 per styled Element. Inherited entries copy their parent's already-computed
 values; local declarations resolve forward references, fallback dependencies,
@@ -336,16 +346,27 @@ Important geometry contracts:
   fonts, natural replaced sizes, radii, transforms, and filters incorporate
   authored zoom in page coordinates. Accessibility zoom is applied once at
   raster and must not be baked twice.
-- The bounded table context recognizes `table`, `table-row`, and `table-cell`.
+- The bounded table context recognizes `table`, row/header/footer groups,
+  `table-row`, and `table-cell`.
   `layout.zig` keeps real DOM-backed boxes, creates only a synchronous
   normalized row/cell plan, and delegates scalar single-span track math to
-  `render/table_format.zig`. Direct non-row table children occupy anonymous
+  `render/table_format.zig`. Automatic widths use descendant min/max-content
+  measurements (including native controls and box edges), with min-content
+  floors and percentage-column constraints. Definite columns keep their
+  preferred widths when unconstrained columns can absorb surplus space.
+  Descendant metric dependencies publish to the persistent table width or the
+  containing atomic snapshot's dependency target, never a temporary cell.
+  Groups retain their DOM-backed boxes and use the table's shared columns;
+  this includes `tbody` inserted by the live parser. Only the synchronous
+  measurement plan flattens groups into rows. Header/footer groups currently
+  remain in source order, without special reordering or pagination behavior.
+  Direct non-row table children occupy anonymous
   row/cell slots without synthetic DOM nodes; whitespace-only anonymous
   blocks do not create slots. Grid children have no normal-flow `previous`
   link, because their positions come from table tracks. Structural mutation
   and display-role changes rebuild table/row children conservatively rather
-  than using retained insertion. Inline tables, captions, columns, row
-  groups, spans, collapse/spacing, and vertical alignment are not part of
+  than using retained insertion. Inline tables, captions, columns,
+  spans, collapse/spacing, and vertical alignment are not part of
   this context.
 - Block `flex` and `grid` containers keep DOM-backed item boxes and anonymous
   text runs. Flex sizing supports grow/shrink with min/max freezing, wrapping,
@@ -445,7 +466,13 @@ Pure layout leaves are intentionally separated from retained object state:
   track sizing without DOM/layout pointers; `document/css_flex.zig` and
   `document/grid_tracks.zig` own their borrowed CSS grammar;
 - `render/intrinsic_width.zig` synchronously borrows DOM and FontManager to
-  estimate intrinsic content widths; it retains no DOM or glyph pointers;
+  estimate intrinsic content widths; it retains no DOM or glyph pointers.
+  Native input label/size measurement is shared with final control layout.
+  Decoded entities, explicit line breaks, `nowrap`, descendant box edges, and
+  out-of-flow exclusion participate in the bounded measurement. Inline layout
+  preserves `nowrap` across text and atomic boxes. Anonymous inline runs use
+  their container's text alignment while keeping dependencies on retained
+  layout fields;
 - `render/control_geometry.zig` computes control leaf geometry, while the
   `InputLayout` and `ButtonLayout` objects retain DOM/font/collector
   invariants in `layout.zig`;

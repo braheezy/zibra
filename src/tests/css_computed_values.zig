@@ -15,6 +15,46 @@ fn value(node: *document.Node, property: []const u8) []const u8 {
     return node.element.style.?.getPtr(property).?.get().*;
 }
 
+test "HTML hints cascade between user agent and author rules and survive attribute replacement" {
+    const allocator = std.testing.allocator;
+    const CSSParser = @import("../document/css_parser.zig").CSSParser;
+    var css = try CSSParser.init(allocator, "td { width:999px;text-align:left;white-space:normal } * { width:77px }", false);
+    defer css.deinit(allocator);
+    const rules = try css.parse(allocator);
+    defer {
+        for (rules) |*rule| rule.deinit(allocator);
+        allocator.free(rules);
+    }
+    rules[0].origin = .user_agent;
+    var root = try parsed("<td width='25%' align=center nowrap></td>");
+    defer root.deinit(allocator);
+    document.fixParentPointers(&root, null);
+    try document.style(allocator, &root, rules[0..1]);
+    try std.testing.expectEqual(@as(?f64, 100), lengths.resolve(value(&root, "width"), .{ .percentage_base = 400 }));
+    try std.testing.expectEqualStrings("-zibra-center", value(&root, "text-align"));
+    try std.testing.expectEqualStrings("nowrap", value(&root, "white-space"));
+    dom.dirtyStyleForElement(&root.element);
+    try document.style(allocator, &root, rules);
+    try std.testing.expectEqualStrings("77px", value(&root, "width"));
+    try root.element.attributes.?.put("width", "160");
+    try root.element.attributes.?.put("style", "width:80px;text-align:left;white-space:normal");
+    dom.dirtyStyleForElement(&root.element);
+    try document.style(allocator, &root, rules);
+    try std.testing.expectEqualStrings("80px", value(&root, "width"));
+    try std.testing.expectEqualStrings("left", value(&root, "text-align"));
+    try std.testing.expectEqualStrings("normal", value(&root, "white-space"));
+    _ = root.element.attributes.?.remove("style");
+    _ = root.element.attributes.?.remove("nowrap");
+    dom.dirtyStyleForElement(&root.element);
+    try document.style(allocator, &root, &.{});
+    try std.testing.expectEqual(@as(?f64, 160), lengths.parsePixel(value(&root, "width")));
+    try std.testing.expectEqualStrings("normal", value(&root, "white-space"));
+    try root.element.attributes.?.put("width", "0");
+    dom.dirtyStyleForElement(&root.element);
+    try document.style(allocator, &root, &.{});
+    try std.testing.expectEqualStrings("auto", value(&root, "width"));
+}
+
 test "computed values survive stylesheet source retirement before geometry restyle" {
     const allocator = std.testing.allocator;
     var root = try parsed("<main><span>inherited</span></main>");
