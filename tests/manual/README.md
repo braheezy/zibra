@@ -57,6 +57,7 @@ tiers and baseline policy.
 | [`protected-layout-phases.html`](protected-layout-phases.html) | Protected style/layout phases versus paint/compositor-only animation |
 | [`window-resize.html`](window-resize.html) | Horizontal/vertical native resize, automatic startup tiling, resize during navigation, and viewport reflow |
 | [`responsive-layout.html`](responsive-layout.html) | Root-relative type, dynamic CSS variables, header/card flex wrapping, auto-fit and breakpoint grid tracks, calc sizing, and visible height-only media status |
+| [`media-ranges.html`](media-ranges.html) | Range/chained width breakpoints, initial-font rem units, responsive navigation, and height-only resize without reloading |
 | [`atomic-inline.html`](atomic-inline.html) | Content-bearing inline-blocks, nested controls, floated footer columns, CSS pixel fonts, closed dialogs, and wide native reflow |
 | [`max-width-media.html`](max-width-media.html) | Inclusive max-width query under page zoom and native resize |
 | [`width-media-iframes.html`](width-media-iframes.html) | Exact iframe media width and parent-driven viewport changes |

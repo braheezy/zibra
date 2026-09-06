@@ -64,6 +64,21 @@ geometry has local assertions, but transparent GIF painting and CDATA styles
 in navigated XHTML references remain unsupported. Do not count those local
 geometry assertions as upstream reftest passes.
 
+For media-query range and condition grammar, use
+[`manifest-media-ranges.yaml`](manifest-media-ranges.yaml) with `--jobs 1`.
+It includes unchanged range/negation reftests and the larger upstream
+self-contained media-query suite. The latter additionally depends on
+style-element `media` attributes, CSSOM serialization and iframe script APIs;
+do not count its timeout as evidence of a parser hang. Pure evaluator and
+live resize regressions cover range operands/boundaries independently of
+those prerequisites. This chunk supports width, height, color and monochrome,
+not all device features or media-value units/functions.
+The current bounded run remains two reftest failures and one timeout. Both
+test pages paint the intended green square, but the shared XHTML reference's
+CDATA stylesheet does not paint its square. The harness case reaches harness
+readiness without starting subtests. Keep the PASS expectations and report
+these remaining prerequisites separately from local range/resize assertions.
+
 `manifest-csp.yaml` tracks external-style CSP tests. The response-header URL
 gate has deterministic coverage in `zig build test-csp`; these unchanged
 upstream cases also require meta-delivered policies and violation events.

@@ -1,0 +1,7 @@
+# Range/condition grammar and the upstream self-contained media-query suite.
+# The latter also needs style.media, CSSOM serialization, and iframe script APIs.
+tests:
+  - css/mediaqueries/test_media_queries.html
+reftests:
+  - css/mediaqueries/mq-range-001.html
+  - css/mediaqueries/negation-001.html

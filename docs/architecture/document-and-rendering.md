@@ -299,6 +299,21 @@ fields and `Frame.document` dirty. A startup resize can survive navigation and
 reach a newly styled Frame; that Frame must re-enter style before layout reads
 the rebuilt generation.
 
+`document/media_query.zig` evaluates borrowed conditional preludes without
+allocation or retained state. Width, height, color and monochrome support
+boolean, colon/min/max, and range comparisons (either operand order and
+same-direction chained bounds). Logical conditions support grouped `and`,
+`or`, and `not`; unknown features remain unknown under negation, and malformed
+top-level queries recover at the next comma. Condition recursion is bounded.
+Absolute lengths and em/rem resolve to CSS pixels; media em/rem use the initial
+16px font, never the styled root font. Comparisons share the existing small
+zoom-normalization tolerance for lengths so equality and strict/inclusive
+complements agree. Source-backed rules and keyframes still rebuild as a unit
+when either viewport axis or zoom changes. This does not add `matchMedia`,
+style/link `media` attribute handling, CSSOM media serialization, or new device
+features such as resolution/aspect-ratio; font-metric/viewport units and CSS
+math in media values remain unsupported.
+
 Layout fields form dependencies among document, parent, previous sibling, and
 child geometry. During one serialized layout traversal, document/block/line
 `in_layout` guards suppress only reentrant owner-wide notification caused by a

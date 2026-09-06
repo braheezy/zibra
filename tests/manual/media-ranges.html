@@ -1,0 +1,44 @@
+<!doctype html>
+<!-- How to verify: Resize across 1012 and 1280 CSS pixels. Exactly one size
+     label is visible: narrow/red, desktop/green, or wide/blue. The navigation
+     switches from stacked to horizontal at 1012px. Make only the content
+     height less than 500px: the height label changes. Return to each size and
+     verify styles update without reloading. Root font is deliberately 32px;
+     63.25rem in a media query must still mean 1012px (initial 16px font). -->
+<meta charset="utf-8">
+<title>Range media queries</title>
+<style>
+  html { font-size:32px; }
+  body { font:16px sans-serif; margin:24px; }
+  header { padding:24px; background:#922; color:white; }
+  .desktop, .wide, .short { display:none; }
+  nav { display:block; margin-top:20px; }
+  nav a { display:block; padding:12px; color:white; }
+  @media (63.25rem <= width < 80rem) {
+    header { background:#176938; }
+    .narrow { display:none; }
+    .desktop { display:block; }
+  }
+  @media (width >= 1280px) {
+    header { background:#235eb5; }
+    .narrow { display:none; }
+    .wide { display:block; }
+  }
+  @media (1012px <= width) {
+    nav { display:flex; gap:16px; }
+  }
+  @media not (height >= 500px) {
+    .tall { display:none; }
+    .short { display:block; }
+  }
+</style>
+<header>
+  <h1>Responsive range breakpoints</h1>
+  <p class="narrow">Narrow: width &lt; 1012px</p>
+  <p class="desktop">Desktop: 1012px &lt;= width &lt; 1280px</p>
+  <p class="wide">Wide: width &gt;= 1280px</p>
+  <nav><a href="#content">Platform</a><a href="#content">Solutions</a><a href="#content">Resources</a></nav>
+</header>
+<p class="tall">Content viewport is at least 500px tall.</p>
+<p class="short">Content viewport is less than 500px tall.</p>
+<p id="content">Resize repeatedly. Exactly one size label and one height label must remain visible.</p>

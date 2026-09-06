@@ -267,6 +267,47 @@ fn resizeTarget(block: anytype) ?@TypeOf(block) {
     return null;
 }
 
+test "media range breakpoints rebuild live stylesheet generations on both resize axes" {
+    const allocator = std.testing.allocator;
+    var environ = std.process.Environ.Map.init(allocator);
+    defer environ.deinit();
+    try environ.put("HOME", "/tmp");
+    const b = try browser.Browser.init(allocator, std.testing.io, &environ, false, true);
+    defer {
+        b.deinit();
+        allocator.destroy(b);
+    }
+    // A 32px authored root font must not change media-query rem (initial 16px).
+    try b.newTab(try Url.init(allocator, "data:text/html,<html><head><style>html{font-size:32px}" ++
+        ".target{width:100px;height:20px;background-color:red}" ++
+        "@media(63.25rem <= width < 80rem){.target{width:200px;background-color:green}}" ++
+        "@media(width >= 1280px){.target{width:300px;background-color:blue}}" ++
+        "@media(width >= 1012px) and (height < 500px){.target{height:40px}}" ++
+        "</style></head><body><div id='resize-target' class='target'></div></body></html>"));
+    try settleBrowser(b);
+    const frame = b.activeTab().?.root_frame.?;
+    for ([_]struct { width: i32, height: i32, box_width: i32, box_height: i32, color: []const u8 }{
+        .{ .width = 1011, .height = 600, .box_width = 100, .box_height = 20, .color = "red" },
+        .{ .width = 1012, .height = 600, .box_width = 200, .box_height = 20, .color = "green" },
+        .{ .width = 1279, .height = 600, .box_width = 200, .box_height = 20, .color = "green" },
+        .{ .width = 1280, .height = 600, .box_width = 300, .box_height = 20, .color = "blue" },
+        .{ .width = 1280, .height = 400, .box_width = 300, .box_height = 40, .color = "blue" },
+        .{ .width = 1280, .height = 600, .box_width = 300, .box_height = 20, .color = "blue" },
+        .{ .width = 1012, .height = 600, .box_width = 200, .box_height = 20, .color = "green" },
+        .{ .width = 1011, .height = 600, .box_width = 100, .box_height = 20, .color = "red" },
+    }) |case| {
+        try b.resizeViewport(case.width, case.height + b.chrome.bottom);
+        try settleBrowser(b);
+        try std.testing.expectEqual(frame, b.activeTab().?.root_frame.?);
+        const doc = frame.documentLayout().?;
+        const target = resizeTarget(doc.children.items[0]).?;
+        try std.testing.expectEqual(case.box_width, target.width.get().*);
+        try std.testing.expectEqual(case.box_height, target.height.get().*);
+        try std.testing.expectEqualStrings(case.color, target.node_ptr.?.element.style.?.getPtr("background-color").?.get().*);
+        try std.testing.expect(!doc.layoutNeeded());
+    }
+}
+
 test "native resize event reflows a loaded browser through the tab worker" {
     // Use the actual Browser scheduling and presentation owners. Quiescence
     // (not a delay) is the barrier before borrowing the worker-owned geometry.

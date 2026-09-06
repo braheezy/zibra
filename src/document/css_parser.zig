@@ -13,6 +13,7 @@ const css_length = @import("length.zig");
 const css_color = @import("color.zig");
 const background_image = @import("background_image.zig");
 const css_syntax = @import("css_syntax.zig");
+const media_query = @import("media_query.zig");
 const css_properties = @import("css_properties.zig");
 const value_tokens = @import("css_value_tokens.zig");
 const custom_properties = @import("custom_properties.zig");
@@ -50,20 +51,8 @@ pub const AUTHOR_ORIGIN_PRIORITY: u32 = 40_000;
 pub const MatchContext = selector_mod.MatchContext;
 pub const HasMatchCache = selector_mod.HasMatchCache;
 
-/// Values supplied by the browsing context while parsing conditional rules.
-/// A null width is used by parser-only consumers that have no viewport; width
-/// media features are then recognized but inactive.
-pub const MediaEnvironment = struct {
-    prefers_dark: bool = false,
-    forced_colors: bool = false,
-    viewport_width_css: ?f64 = null,
-    viewport_height_css: ?f64 = null,
-    // Desktop screens are color displays. Keep these explicit rather than
-    // deriving them from the viewport so media queries remain deterministic
-    // in headless and screenshot modes.
-    color_depth: u8 = 24,
-    monochrome_depth: u8 = 0,
-};
+/// Explicit browsing-context values used while parsing conditional rules.
+pub const MediaEnvironment = media_query.Environment;
 
 /// One parsed property value. The value borrows the stylesheet or inline-style
 /// buffer; `important` is declaration-local cascade metadata.
@@ -1266,212 +1255,13 @@ fn startsWithKeyframesRule(self: *const CSSParser) bool {
     return next == self.string.len or std.ascii.isWhitespace(self.string[next]);
 }
 
-fn mediaIdentifierChar(char: u8) bool {
-    return std.ascii.isAlphanumeric(char) or char == '-' or char == '_';
-}
-
-fn skipMediaWhitespace(text: []const u8, cursor: *usize) void {
-    while (cursor.* < text.len and std.ascii.isWhitespace(text[cursor.*])) {
-        cursor.* += 1;
-    }
-}
-
-fn consumeMediaKeyword(text: []const u8, cursor: *usize, keyword: []const u8) bool {
-    if (text.len - cursor.* < keyword.len) return false;
-    if (!std.ascii.eqlIgnoreCase(text[cursor.* .. cursor.* + keyword.len], keyword)) return false;
-    const end = cursor.* + keyword.len;
-    if (end < text.len and mediaIdentifierChar(text[end])) return false;
-    cursor.* = end;
-    return true;
-}
-
-fn mediaIdentifier(text: []const u8, cursor: *usize) ?[]const u8 {
-    const start = cursor.*;
-    while (cursor.* < text.len and mediaIdentifierChar(text[cursor.*])) {
-        cursor.* += 1;
-    }
-    if (cursor.* == start) return null;
-    return text[start..cursor.*];
-}
-
-fn parseMediaPixelLength(raw_value: []const u8) ?f64 {
-    const value_text = std.mem.trim(u8, raw_value, " \t\r\n");
-    const parsed_length = css_length.parse(value_text) orelse return null;
-    return switch (parsed_length.unit) {
-        .px, .mm => css_length.resolveLength(parsed_length, .{}),
-        // Media-query em units are resolved against the initial font size.
-        // The browser's default is 16 CSS px; unlike element em values this
-        // does not depend on the matched element's inherited style.
-        .em, .rem => parsed_length.value * 16.0,
-        .percent => null,
-    };
-}
-
-fn parseMediaInteger(raw_value: []const u8) ?u8 {
-    const value_text = std.mem.trim(u8, raw_value, " \t\r\n");
-    const parsed = std.fmt.parseInt(u16, value_text, 10) catch return null;
-    if (parsed > std.math.maxInt(u8)) return null;
-    return @intCast(parsed);
-}
-
-fn mediaWidthsEqual(actual: f64, expected: f64) bool {
-    const magnitude = @max(@max(@abs(actual), @abs(expected)), 1.0);
-    // Viewport zoom is stored as f32, so values such as 800 / 1.6 carry a
-    // small representation error. This tolerance is far below one device
-    // pixel while preserving the author-visible equality boundary.
-    return @abs(actual - expected) <= magnitude * 0.000001;
-}
-
-fn mediaFeatureMatches(self: *const CSSParser, raw_feature: []const u8) ?bool {
-    const feature = std.mem.trim(u8, raw_feature, " \t\r\n");
-    // Boolean media features omit a colon and value entirely.
-    if (std.ascii.eqlIgnoreCase(feature, "color")) return self.media.color_depth > 0;
-    if (std.ascii.eqlIgnoreCase(feature, "monochrome")) return self.media.monochrome_depth > 0;
-
-    const colon = std.mem.indexOfScalar(u8, feature, ':') orelse return null;
-    const name = std.mem.trim(u8, feature[0..colon], " \t\r\n");
-    const media_value = std.mem.trim(u8, feature[colon + 1 ..], " \t\r\n");
-
-    if (std.ascii.eqlIgnoreCase(name, "prefers-color-scheme")) {
-        if (std.ascii.eqlIgnoreCase(media_value, "dark")) return self.media.prefers_dark;
-        if (std.ascii.eqlIgnoreCase(media_value, "light")) return !self.media.prefers_dark;
-        return null;
-    }
-
-    if (std.ascii.eqlIgnoreCase(name, "forced-colors")) {
-        if (std.ascii.eqlIgnoreCase(media_value, "active")) return self.media.forced_colors;
-        if (std.ascii.eqlIgnoreCase(media_value, "none")) return !self.media.forced_colors;
-        return null;
-    }
-
-    if (std.ascii.eqlIgnoreCase(name, "max-width")) {
-        const limit = parseMediaPixelLength(media_value) orelse return null;
-        const viewport_width = self.media.viewport_width_css orelse return false;
-        return viewport_width <= limit;
-    }
-
-    if (std.ascii.eqlIgnoreCase(name, "min-width")) {
-        const limit = parseMediaPixelLength(media_value) orelse return null;
-        const viewport_width = self.media.viewport_width_css orelse return false;
-        return viewport_width >= limit;
-    }
-
-    if (std.ascii.eqlIgnoreCase(name, "min-height") or
-        std.ascii.eqlIgnoreCase(name, "max-height"))
-    {
-        const limit = parseMediaPixelLength(media_value) orelse return null;
-        const viewport_height = self.media.viewport_height_css orelse return false;
-        if (std.ascii.eqlIgnoreCase(name, "min-height")) return viewport_height >= limit;
-        return viewport_height <= limit;
-    }
-
-    if (std.ascii.eqlIgnoreCase(name, "min-color") or
-        std.ascii.eqlIgnoreCase(name, "max-color"))
-    {
-        const limit = parseMediaInteger(media_value) orelse return null;
-        const depth = self.media.color_depth;
-        if (std.ascii.eqlIgnoreCase(name, "min-color")) return depth >= limit;
-        return depth <= limit;
-    }
-
-    if (std.ascii.eqlIgnoreCase(name, "min-monochrome") or
-        std.ascii.eqlIgnoreCase(name, "max-monochrome"))
-    {
-        const limit = parseMediaInteger(media_value) orelse return null;
-        const depth = self.media.monochrome_depth;
-        if (std.ascii.eqlIgnoreCase(name, "min-monochrome")) return depth >= limit;
-        return depth <= limit;
-    }
-
-    if (std.ascii.eqlIgnoreCase(name, "width")) {
-        const expected = parseMediaPixelLength(media_value) orelse return null;
-        const viewport_width = self.media.viewport_width_css orelse return false;
-        return mediaWidthsEqual(viewport_width, expected);
-    }
-
-    return null;
-}
-
-fn singleMediaQueryMatches(self: *const CSSParser, raw_query: []const u8) bool {
-    const query = std.mem.trim(u8, raw_query, " \t\r\n");
-    if (query.len == 0) return false;
-
-    var cursor: usize = 0;
-    var negate = false;
-    var matches = true;
-    var saw_condition = false;
-
-    if (consumeMediaKeyword(query, &cursor, "only")) skipMediaWhitespace(query, &cursor);
-    if (consumeMediaKeyword(query, &cursor, "not")) {
-        negate = true;
-        skipMediaWhitespace(query, &cursor);
-    }
-
-    // A media type is optional when the query begins with a parenthesized
-    // feature. Zibra is a screen user agent, so `screen` and `all` match.
-    if (cursor < query.len and query[cursor] != '(') {
-        const media_type = mediaIdentifier(query, &cursor) orelse return false;
-        if (std.ascii.eqlIgnoreCase(media_type, "screen") or
-            std.ascii.eqlIgnoreCase(media_type, "all"))
-        {
-            matches = true;
-        } else if (std.ascii.eqlIgnoreCase(media_type, "print")) {
-            matches = false;
-        } else {
-            return false;
-        }
-        skipMediaWhitespace(query, &cursor);
-        if (cursor == query.len) return if (negate) !matches else matches;
-        if (!consumeMediaKeyword(query, &cursor, "and")) return false;
-        skipMediaWhitespace(query, &cursor);
-    }
-
-    while (cursor < query.len) {
-        if (query[cursor] != '(') return false;
-        const feature_start = cursor + 1;
-        const close = std.mem.indexOfScalarPos(u8, query, feature_start, ')') orelse return false;
-        if (std.mem.indexOfScalar(u8, query[feature_start..close], '(') != null) return false;
-        const feature_matches = self.mediaFeatureMatches(query[feature_start..close]) orelse return false;
-        matches = matches and feature_matches;
-        saw_condition = true;
-        cursor = close + 1;
-        skipMediaWhitespace(query, &cursor);
-        if (cursor == query.len) break;
-        if (!consumeMediaKeyword(query, &cursor, "and")) return false;
-        skipMediaWhitespace(query, &cursor);
-    }
-
-    if (!saw_condition) return false;
-    return if (negate) !matches else matches;
-}
-
-fn mediaQueryMatches(self: *const CSSParser, prelude: []const u8) bool {
-    var depth: usize = 0;
-    var query_start: usize = 0;
-    for (prelude, 0..) |char, index| {
-        switch (char) {
-            '(' => depth += 1,
-            ')' => {
-                if (depth == 0) return false;
-                depth -= 1;
-            },
-            ',' => if (depth == 0) {
-                if (self.singleMediaQueryMatches(prelude[query_start..index])) return true;
-                query_start = index + 1;
-            },
-            else => {},
-        }
-    }
-    if (depth != 0) return false;
-    return self.singleMediaQueryMatches(prelude[query_start..]);
-}
-
 fn startsWithMediaRule(self: *const CSSParser) bool {
     const keyword = "@media";
     if (self.string.len - self.pos < keyword.len) return false;
     if (!std.ascii.eqlIgnoreCase(self.string[self.pos .. self.pos + keyword.len], keyword)) return false;
     const next = self.pos + keyword.len;
-    return next == self.string.len or std.ascii.isWhitespace(self.string[next]) or self.string[next] == '(';
+    return next == self.string.len or css_syntax.isWhitespace(self.string[next]) or self.string[next] == '(' or
+        std.mem.startsWith(u8, self.string[next..], "/*");
 }
 
 /// Parse supported compound selectors, relational selectors, and descendant,
@@ -2001,11 +1791,16 @@ pub fn parseWithKeyframes(
             }
             if (self.startsWithMediaRule()) {
                 const prelude_start = self.pos + "@media".len;
-                const brace_idx = std.mem.indexOfPos(u8, self.string, prelude_start, "{") orelse break;
+                const delimiter = css_syntax.scanToTopLevel(self.string, prelude_start, "{;");
+                if (delimiter.delimiter != '{') {
+                    self.pos = delimiter.end + @as(usize, if (delimiter.delimiter == ';') 1 else 0);
+                    continue;
+                }
+                const brace_idx = delimiter.end;
                 const prelude = self.string[prelude_start..brace_idx];
                 const block_end = self.findMatchingBrace(brace_idx) orelse break;
 
-                if (self.mediaQueryMatches(prelude)) {
+                if (media_query.matches(prelude, self.media)) {
                     var media_parser = try CSSParser.initWithMedia(
                         allocator,
                         self.string[brace_idx + 1 .. block_end],
@@ -2169,6 +1964,49 @@ test "keyframes parse beside selector rules and normalize offsets" {
     try std.testing.expectEqualStrings("0.1", pulse.frameAt(0).?.properties.get("opacity").?.value);
     try std.testing.expectEqualStrings("0.5", pulse.frameAt(0.5).?.properties.get("opacity").?.value);
     try std.testing.expectEqualStrings("0.9", pulse.frameAt(1).?.properties.get("opacity").?.value);
+}
+
+test "media range conditional rules and keyframes retain source order and recover after invalid queries" {
+    const allocator = std.testing.allocator;
+    const source =
+        "p{color:red}" ++
+        "@media/* brace { inside comment */(width>=1012px) and (width<=1279px){" ++
+        "p{color:green}@media (height>500px){p{width:300px}@keyframes pulse{from{opacity:0}to{opacity:1}}}}" ++
+        "@media not (1px < width > 2px){p{color:orange}}" ++
+        "@media not ((color) and){p{color:orange}}" ++
+        "@media screen; p{height:40px}" ++
+        "@media (width>=1280px){p{color:blue}}";
+    for ([_]struct { width: f64, height: f64, count: usize, color: []const u8, animation: bool }{
+        .{ .width = 1011, .height = 600, .count = 2, .color = "red", .animation = false },
+        .{ .width = 1012, .height = 600, .count = 4, .color = "green", .animation = true },
+        .{ .width = 1012, .height = 500, .count = 3, .color = "green", .animation = false },
+        .{ .width = 1279, .height = 600, .count = 4, .color = "green", .animation = true },
+        .{ .width = 1280, .height = 600, .count = 3, .color = "blue", .animation = false },
+    }) |case| {
+        const parser = try CSSParser.initWithMedia(allocator, source, .{
+            .viewport_width_css = case.width,
+            .viewport_height_css = case.height,
+        });
+        defer parser.deinit(allocator);
+        var keyframes = std.ArrayList(KeyframesRule).empty;
+        defer {
+            for (keyframes.items) |*rule| rule.deinit(allocator);
+            keyframes.deinit(allocator);
+        }
+        const rules = try parser.parseWithKeyframes(allocator, &keyframes);
+        defer {
+            for (rules) |*rule| rule.deinit(allocator);
+            allocator.free(rules);
+        }
+        try std.testing.expectEqual(case.count, rules.len);
+        var color: []const u8 = "";
+        for (rules) |rule| if (rule.properties.get("color")) |declaration| {
+            color = declaration.value;
+        };
+        try std.testing.expectEqualStrings(case.color, color);
+        try std.testing.expectEqual(@as(usize, if (case.animation) 1 else 0), keyframes.items.len);
+        if (case.animation) try std.testing.expectEqualStrings("pulse", keyframes.items[0].name);
+    }
 }
 
 test "max-width media queries use CSS viewport pixels and inclusive bounds" {
