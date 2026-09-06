@@ -56,14 +56,16 @@ boundaries.
   bounded intrinsic measurement. None retains DOM/layout/glyph pointers;
   `layout.zig` owns item boxes, subscriptions, and final hit-test collection.
 - `control_geometry.zig` computes input/button leaf geometry and password
-  display text. `InputLayout` and `ButtonLayout` remain with their DOM, font,
+  display text. Its pointer-free text-editor used box and client insets must
+  agree across border-box paint, editable-content clips, and CSSOM snapshots.
+  `InputLayout` and `ButtonLayout` remain with their DOM, font,
   collector, and display-command invariants in `layout.zig`.
 - `inline_snapshot.zig` owns movable atomic-inline paint containers and local
   interaction bounds shared by buttons and inline-blocks. Materialize and
   rebase all commands before retiring the temporary layout tree; nested
   temporary trees subscribe only through the persistent containing block.
 - `replaced_paint.zig` appends background-image and rounded-control command
-  leaves/groups without owning layout objects. Background attachment selects
+  leaves/groups and owning editor clips without owning layout objects. Background attachment selects
   an element-local or viewport-local tile phase while the command rectangle
   remains the element clip. Its image pixels and provenance are still
   generation-scoped borrows until snapshot.

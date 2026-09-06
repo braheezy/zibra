@@ -72,6 +72,7 @@ tiers and baseline policy.
 | [`node-children.html`](node-children.html) | Fresh immediate Element-only `Node.children` arrays |
 | [`dom-range-boundaries.html`](dom-range-boundaries.html) | Range ordering, containment, atomic validation, detached roots, and Selection document membership |
 | [`js-geometry.html`](js-geometry.html) | Synchronous layout readback, rectangle snapshots, hidden/detached boxes, CSS zoom, inline fragments, and measure-to-position interaction |
+| [`js-control-inline-geometry.html`](js-control-inline-geometry.html) | Native editor border/client boxes, clipping, zero sizes, zoom, and empty/whitespace-only inline insertion points |
 | [`js-box-metrics.html`](js-box-metrics.html) | Client padding-box metrics, offset-parent identity, hidden/detached nodes, used borders, zoom, atomic snapshots, and container-relative marker placement |
 | [`create-element.html`](create-element.html) | `createElement`, detached ownership, append, and insert-before ordering |
 | [`matching-children.html`](matching-children.html) | Append-only retained block-layout child matching |

@@ -484,6 +484,25 @@ Fragments distinguish ordinary inline boxes from atomic/block boxes and retain
 used border widths. Client padding sizes subtract these used edges after
 layout, and offset positions use the first fragment rather than the union.
 
+Text inputs and textareas share a pointer-free `control_geometry.TextBox`
+containing used content dimensions, padding, and borders. Inline controls
+resolve sizing and subscribe through the containing block; a block control
+uses its allocated content width and paints one shell without an extra inline
+line box. The editor clip retains separate client insets: single-line inputs
+clip to the content box horizontally and padding box vertically, while
+textareas expose the padding box in both axes. These numeric insets travel
+with atomic snapshots; borders remain separate for offset-parent origins.
+`replaced_paint.appendEditorClip` transfers glyph/caret containers into an
+owning raster-and-hit clip, leaving the control shell outside it.
+
+Undecorated empty and collapsible-whitespace-only inline subtrees retain
+non-painting line items. Their fragments use the completed line's baseline
+and alignment. Trailing collapsed spaces have zero advance; a line containing
+only such insertion points is a zero-height phantom line unless a preserved
+break ends it. Phantom lines do not establish inline-block baselines. These
+items contain no protected fields or owned glyph resources, and paint-only
+regeneration never republishes their geometry.
+
 Temporary subtree placement invalidation stops at its persistent containing
 block boundary. Recreating an atomic subtree during paint must not mark the
 document's retained geometry dirty; live style subscriptions independently

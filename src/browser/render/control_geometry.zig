@@ -6,8 +6,74 @@
 
 const std = @import("std");
 const display_list = @import("display_list.zig");
+const BoxEdges = @import("box_model.zig").BoxEdges;
 
-pub const InputBoxMetrics = struct {
+/// Resolved layout-coordinate sizes. Min wins over max, including when the
+/// authored border box is smaller than its padding and borders.
+pub const Axis = struct {
+    preferred: ?i32 = null,
+    min: ?i32 = null,
+    max: ?i32 = null,
+
+    fn content(self: Axis, natural: i32, edges: i32, border_box: bool) i32 {
+        const subtract = if (border_box) edges else 0;
+        var value = if (self.preferred) |v| @max(v -| subtract, 0) else natural;
+        if (self.max) |v| value = @min(value, @max(v -| subtract, 0));
+        if (self.min) |v| value = @max(value, @max(v -| subtract, 0));
+        return @max(value, 0);
+    }
+};
+
+/// Pointer-free used box shared by native-control paint and CSSOM snapshots.
+pub const TextBox = struct {
+    content_width: i32 = 0,
+    content_height: i32 = 0,
+    padding: BoxEdges = .{},
+    border: BoxEdges = .{},
+
+    pub fn width(self: TextBox) i32 {
+        return self.content_width +| self.padding.horizontal() +| self.border.horizontal();
+    }
+    pub fn height(self: TextBox) i32 {
+        return self.content_height +| self.padding.vertical() +| self.border.vertical();
+    }
+};
+
+pub fn textBox(natural_width: i32, natural_height: i32, horizontal: Axis, vertical: Axis, padding: BoxEdges, border: BoxEdges, border_box: bool) TextBox {
+    return .{
+        .content_width = horizontal.content(natural_width, padding.horizontal() + border.horizontal(), border_box),
+        .content_height = vertical.content(natural_height, padding.vertical() + border.vertical(), border_box),
+        .padding = padding,
+        .border = border,
+    };
+}
+
+/// Single-line editors clip to the content box horizontally and padding box
+/// vertically. Multiline editors expose the padding box in both axes.
+pub fn clientInsets(border: BoxEdges, padding: BoxEdges, single_line: bool) BoxEdges {
+    var result = border;
+    if (single_line) {
+        result.left += padding.left;
+        result.right += padding.right;
+    }
+    return result;
+}
+
+test "geometry text control used boxes honor constraints and editor clipping" {
+    const padding = BoxEdges{ .top = 2, .right = 2, .bottom = 2, .left = 2 };
+    const border = BoxEdges{ .top = 10, .right = 20, .bottom = 10, .left = 20 };
+    const content = textBox(200, 18, .{ .preferred = 300 }, .{ .preferred = 200 }, padding, border, false);
+    try std.testing.expectEqual(@as(i32, 344), content.width());
+    try std.testing.expectEqual(@as(i32, 224), content.height());
+    try std.testing.expectEqual(@as(i32, 22), clientInsets(border, padding, true).left);
+    try std.testing.expectEqual(@as(i32, 20), clientInsets(border, padding, false).left);
+    const constrained = textBox(200, 18, .{ .preferred = 300, .min = 120, .max = 100 }, .{ .preferred = 0 }, padding, border, true);
+    try std.testing.expectEqual(@as(i32, 120), constrained.width());
+    try std.testing.expectEqual(@as(i32, 24), constrained.height());
+    try std.testing.expectEqual(@as(i32, 0), constrained.content_height);
+}
+
+pub const ChoiceBoxMetrics = struct {
     width: i32,
     height: i32,
     border_radius: f64,
@@ -20,36 +86,20 @@ pub const ButtonBoxMetrics = struct {
     content_offset_y: i32,
 };
 
-/// Resolve the atomic box of a text input, checkbox, or radio button.
+/// Resolve the atomic box of a checkbox or radio button.
 /// Choice controls deliberately use the line's natural height in both axes;
-/// authored dimensions apply only to text/password inputs in Zibra's subset.
-pub fn inputBoxMetrics(
+/// CSS sizing for these themed widgets remains outside the text-editor subset.
+pub fn choiceBoxMetrics(
     natural_height: i32,
-    default_text_width: i32,
-    is_choice: bool,
     is_radio: bool,
-    authored_width: ?i32,
-    authored_height: ?i32,
     border_radius: f64,
-) InputBoxMetrics {
+) ChoiceBoxMetrics {
     const natural = @max(natural_height, 1);
-    const width = if (is_choice)
-        natural
-    else if (authored_width) |value|
-        @max(value, 1)
-    else
-        @max(default_text_width, 1);
-    const height = if (is_choice)
-        natural
-    else if (authored_height) |value|
-        @max(value, natural)
-    else
-        natural;
     const radius = if (is_radio and border_radius <= 0)
         @as(f64, @floatFromInt(natural)) / 2.0
     else
         @max(border_radius, 0);
-    return .{ .width = width, .height = height, .border_radius = radius };
+    return .{ .width = natural, .height = natural, .border_radius = radius };
 }
 
 pub fn inputDisplayGrapheme(is_password: bool, source: []const u8) []const u8 {
@@ -70,18 +120,13 @@ pub fn buttonBoxMetrics(
     };
 }
 
-test "choice and text input metrics honor their sizing contracts" {
-    const text = inputBoxMetrics(18, 200, false, false, 120, 10, 6);
-    try std.testing.expectEqual(@as(i32, 120), text.width);
-    try std.testing.expectEqual(@as(i32, 18), text.height);
-    try std.testing.expectEqual(@as(f64, 6), text.border_radius);
-
-    const checkbox = inputBoxMetrics(18, 200, true, false, 120, 40, 0);
+test "choice input metrics honor their sizing contracts" {
+    const checkbox = choiceBoxMetrics(18, false, 0);
     try std.testing.expectEqual(@as(i32, 18), checkbox.width);
     try std.testing.expectEqual(@as(i32, 18), checkbox.height);
     try std.testing.expectEqual(@as(f64, 0), checkbox.border_radius);
 
-    const radio = inputBoxMetrics(18, 200, true, true, null, null, 0);
+    const radio = choiceBoxMetrics(18, true, 0);
     try std.testing.expectEqual(@as(i32, 18), radio.width);
     try std.testing.expectEqual(@as(i32, 18), radio.height);
     try std.testing.expectEqual(@as(f64, 9), radio.border_radius);

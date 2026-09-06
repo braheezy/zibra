@@ -1,0 +1,87 @@
+<!doctype html>
+<!-- How to verify: expect PASS (9 checks). The long input text must stay
+     inside its blue border, and textarea lines inside their green border.
+     The empty-span marker must sit at the start of "reference", with no gap.
+     Assertions also run through the serial local WPT adapter. -->
+<html><head><title>Native control and empty inline geometry</title><style>
+body { font: 16px sans-serif; }
+input, textarea { width: 180px; height: 48px; border: 4px solid blue; padding: 6px; background: #eef; }
+textarea { border-color: green; background: #efe; }
+#line { position: relative; margin-top: 24px; }
+#marker { position: absolute; width: 2px; height: 20px; background: red; }
+</style></head><body>
+<h1>Native control and empty inline geometry</h1><p id="result">Running…</p>
+<input id="input" value="A long input value that must never overflow its editable box">
+<textarea id="textarea">First line
+Second line
+Third line outside the editor</textarea>
+<div id="line"><span id="empty"> </span><span id="reference">reference</span><span id="trailing"> </span><div id="marker"></div></div>
+<script>
+(function() {
+  var results = [];
+  function check(name, run) {
+    try { run(); results.push({name:name, status:0}); }
+    catch(e) { results.push({name:name, status:1, message:String(e)}); }
+  }
+  function equal(a, b) { if (a !== b) throw new Error(String(a) + ' !== ' + String(b)); }
+  var input = document.getElementById('input'), textarea = document.getElementById('textarea');
+  check('Inline input exposes content width and padding height', function() {
+    equal(input.offsetWidth, 200); equal(input.offsetHeight, 68);
+    equal(input.clientWidth, 180); equal(input.clientHeight, 60);
+    equal(input.clientLeft, 10); equal(input.clientTop, 4);
+  });
+  check('Inline textarea exposes the padding box', function() {
+    equal(textarea.offsetWidth, 200); equal(textarea.offsetHeight, 68);
+    equal(textarea.clientWidth, 192); equal(textarea.clientHeight, 60);
+    equal(textarea.clientLeft, 4); equal(textarea.clientTop, 4);
+  });
+  check('Block controls have only one border box', function() {
+    input.style.display = 'block'; textarea.style.display = 'block';
+    equal(input.offsetWidth, 200); equal(input.offsetHeight, 68);
+    equal(textarea.offsetWidth, 200); equal(textarea.offsetHeight, 68);
+    equal(input.clientWidth, 180); equal(textarea.clientWidth, 192);
+    input.style.display = 'inline'; textarea.style.display = 'inline';
+  });
+  check('Border-box mutation flushes current geometry', function() {
+    input.style.boxSizing = 'border-box';
+    equal(input.offsetWidth, 180); equal(input.offsetHeight, 48);
+    equal(input.clientWidth, 160); equal(input.clientHeight, 40);
+    input.style.boxSizing = 'content-box';
+  });
+  check('Zero content dimensions remain zero', function() {
+    input.style.width = '0px'; input.style.height = '0px';
+    equal(input.clientWidth, 0); equal(input.clientHeight, 12);
+    equal(input.offsetWidth, 20); equal(input.offsetHeight, 20);
+    input.style.width = '180px'; input.style.height = '48px';
+  });
+  check('CSS zoom scales rectangles but not client metrics', function() {
+    input.style.zoom = '2';
+    equal(input.getBoundingClientRect().width, 400); equal(input.clientWidth, 180);
+    input.style.zoom = '1';
+  });
+  var empty = document.getElementById('empty'), reference = document.getElementById('reference');
+  check('Leading empty inline box shares the following baseline and insertion point', function() {
+    equal(empty.getClientRects().length, 1); equal(empty.offsetWidth, 0);
+    equal(empty.offsetLeft, reference.offsetLeft); equal(empty.offsetTop, reference.offsetTop);
+    equal(empty.offsetHeight, reference.offsetHeight);
+  });
+  check('Trailing collapsed inline space has zero advance', function() {
+    var trailing = document.getElementById('trailing');
+    equal(trailing.offsetWidth, 0); equal(trailing.offsetLeft, reference.offsetLeft + reference.offsetWidth);
+    equal(trailing.offsetTop, reference.offsetTop);
+  });
+  check('An otherwise empty line has no height, including nested empty spans', function() {
+    var host = document.createElement('div');
+    host.innerHTML = '<span><i></i> </span>';
+    document.body.appendChild(host);
+    equal(host.offsetHeight, 0); equal(host.firstChild.getClientRects().length, 1);
+    equal(host.firstChild.offsetHeight, 0); equal(host.firstChild.firstChild.offsetWidth, 0);
+    host.remove();
+  });
+  var marker = document.getElementById('marker');
+  marker.style.left = empty.offsetLeft + 'px'; marker.style.top = empty.offsetTop + 'px';
+  var failed = results.filter(function(r) { return r.status !== 0; });
+  document.getElementById('result').textContent = failed.length ? 'FAIL: ' + failed.map(function(r) { return r.name + ': ' + r.message; }).join('; ') : 'PASS (' + results.length + ' checks)';
+  if (typeof completion_callback === 'function') completion_callback(results, {status:0});
+})();
+</script></body></html>

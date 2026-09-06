@@ -56,6 +56,120 @@ fn setStyle(node: *parser.Node, value: []const u8) !void {
     @import("../document/dom.zig").dirtyStyleForElement(&node.element);
 }
 
+fn editorClip(items: []const DisplayItem, node: *parser.Node) ?Rect {
+    for (items) |item| switch (item) {
+        .blend => |group| {
+            if (group.hit_clip) |clip| if (group.source) |source| {
+                if (source.node == node and group.needs_compositing) return geometry.box(clip.x1, clip.y1, clip.x2 - clip.x1, clip.y2 - clip.y1);
+            };
+            if (editorClip(group.children, node)) |clip| return clip;
+        },
+        .transform => |group| if (editorClip(group.children, node)) |clip| return clip.translated(@floatFromInt(group.translate_x), @floatFromInt(group.translate_y)),
+        .cached_subtree => |cached| if (editorClip(cached.list.items, node)) |clip| return clip,
+        else => {},
+    };
+    return null;
+}
+
+test "geometry native editor clipping uses the same insets as CSSOM" {
+    var page = try Page.init("<main style='display:block'><input value='text overflowing a narrow field' style='width:25px;height:20px;padding:4px;border:3px solid'><textarea style='display:block;width:60px;height:30px;padding:5px;border:2px solid'>one\ntwo\nthree</textarea></main>");
+    defer page.deinit();
+    try page.render();
+    for (page.root.element.children.items) |*node| {
+        var rects = try page.rects(node, 0, false);
+        defer rects.deinit(allocator);
+        const expected = (try page.metrics(node)).client.translated(rects.items[0].x, rects.items[0].y);
+        const commands = try page.engine.paintDocument(page.document.?);
+        defer DisplayItem.freeList(allocator, commands);
+        try std.testing.expectEqual(expected, editorClip(commands, node).?);
+    }
+    const input = &page.root.element.children.items[0];
+    try setStyle(input, "width:0;height:0;padding:0;border:0");
+    try page.render();
+    var zero = try page.rects(input, 0, false);
+    defer zero.deinit(allocator);
+    try std.testing.expectEqual(@as(usize, 1), zero.items.len);
+    try std.testing.expectEqual(@as(f64, 0), zero.items[0].width);
+    try std.testing.expectEqual(@as(f64, 0), zero.items[0].height);
+    try std.testing.expectEqual(Rect{}, (try page.metrics(input)).client);
+}
+
+test "geometry an anonymous run beginning with a control keeps the containing width" {
+    var page = try Page.init("<main style='display:block;width:600px'><div style='display:block;height:10px'></div><input style='width:250px;height:30px'><input style='width:250px;height:30px'></main>");
+    defer page.deinit();
+    try page.render();
+    var first = try page.rects(&page.root.element.children.items[1], 0, false);
+    defer first.deinit(allocator);
+    var second = try page.rects(&page.root.element.children.items[2], 0, false);
+    defer second.deinit(allocator);
+    try std.testing.expectEqual(first.items[0].y, second.items[0].y);
+    try std.testing.expectEqual(first.items[0].x + 250, second.items[0].x);
+}
+
+test "geometry empty inline anchors preserve phantom lines and collapsed whitespace" {
+    var page = try Page.init("<main style='display:block;position:relative'><div style='display:block'><span><i></i> </span></div><div style='display:block'><br><span> </span><span>ref</span><span> </span></div></main>");
+    defer page.deinit();
+    try page.render();
+    const phantom = &page.root.element.children.items[0];
+    const empty = &phantom.element.children.items[0];
+    var phantom_rects = try page.rects(phantom, 0, false);
+    defer phantom_rects.deinit(allocator);
+    var empty_rects = try page.rects(empty, 0, false);
+    defer empty_rects.deinit(allocator);
+    try std.testing.expectEqual(@as(usize, 1), empty_rects.items.len);
+    try std.testing.expectEqual(@as(f64, 0), phantom_rects.items[0].height);
+    try std.testing.expectEqual(Rect{ .x = phantom_rects.items[0].x, .y = phantom_rects.items[0].y }, empty_rects.items[0]);
+    const line = &page.root.element.children.items[1];
+    var before = try page.rects(&line.element.children.items[1], 0, false);
+    defer before.deinit(allocator);
+    var reference = try page.rects(&line.element.children.items[2], 0, false);
+    defer reference.deinit(allocator);
+    var after = try page.rects(&line.element.children.items[3], 0, false);
+    defer after.deinit(allocator);
+    try std.testing.expectEqual(@as(usize, 1), before.items.len);
+    try std.testing.expectEqual(reference.items[0].x, before.items[0].x);
+    try std.testing.expectEqual(reference.items[0].y, before.items[0].y);
+    try std.testing.expect(reference.items[0].y > phantom_rects.items[0].y);
+    try std.testing.expectEqual(reference.items[0].height, before.items[0].height);
+    try std.testing.expectEqual(reference.items[0].x + reference.items[0].width, after.items[0].x);
+    try std.testing.expectEqual(reference.items[0].y, after.items[0].y);
+    try std.testing.expectEqual(@as(f64, 0), after.items[0].width);
+    const display = try page.engine.paintDocument(page.document.?);
+    DisplayItem.freeList(allocator, display);
+    page.document.?.markPaintSubtree();
+    const repainted = try page.engine.paintDocument(page.document.?);
+    DisplayItem.freeList(allocator, repainted);
+    try std.testing.expect(!page.document.?.layoutNeeded());
+    var retained = try page.rects(empty, 0, false);
+    defer retained.deinit(allocator);
+    try std.testing.expectEqualSlices(Rect, empty_rects.items, retained.items);
+}
+
+test "geometry native editors share used boxes across inline block and atomic snapshots" {
+    for ([_][]const u8{ "input", "textarea" }) |tag| {
+        for ([_][]const u8{ "inline", "block" }) |display| {
+            const source = try std.fmt.allocPrint(allocator, "<main style='display:block'><div style='display:inline-block;zoom:2;width:500px'><{s} style='display:{s};width:300px;height:200px;border:solid;border-width:10px 20px;padding:2px;box-sizing:content-box'></{s}></div></main>", .{ tag, display, tag });
+            defer allocator.free(source);
+            var page = try Page.init(source);
+            defer page.deinit();
+            try page.render();
+            const node = &page.root.element.children.items[0].element.children.items[0];
+            const single_line = std.mem.eql(u8, tag, "input");
+            try std.testing.expectEqual(Rect{ .x = if (single_line) 22 else 20, .y = 10, .width = if (single_line) 300 else 304, .height = 204 }, (try page.metrics(node)).client);
+            var rects = try page.rects(node, 0, false);
+            defer rects.deinit(allocator);
+            try std.testing.expectEqual(@as(usize, 1), rects.items.len);
+            try std.testing.expectEqual(@as(f64, 688), rects.items[0].width);
+            try std.testing.expectEqual(@as(f64, 448), rects.items[0].height);
+            const style = try std.fmt.allocPrint(allocator, "display:{s};width:120px;height:30px;padding:4px;border:2px solid;box-sizing:border-box", .{display});
+            defer allocator.free(style);
+            try setStyle(node, style);
+            try page.render();
+            try std.testing.expectEqual(Rect{ .x = if (single_line) 6 else 2, .y = 2, .width = if (single_line) 108 else 116, .height = 26 }, (try page.metrics(node)).client);
+        }
+    }
+}
+
 test "geometry border boxes update after style changes and resize without paint" {
     var page = try Page.init("<main style='display:block;width:400px'><div style='display:block;width:50%;height:40px;padding:5px;border:2px solid black;margin:3px'></div></main>");
     defer page.deinit();

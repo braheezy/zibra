@@ -466,7 +466,11 @@ Kiesel numbers before the callback buffer is freed; returned rectangle/list
 objects never update when the DOM changes.
 
 Client dimensions use the used padding box (border box minus used borders),
-not authored width strings. Ordinary inline fragments have zero client metrics.
+not authored width strings. Native single-line inputs instead expose their
+content-box inline clip; textareas expose the padding box. Their client insets
+come from the same used edges as painting, including box-sizing and CSS zoom.
+Ordinary inline fragments have zero client metrics, including retained empty
+and whitespace-only insertion points.
 The root uses the current scrollbar-excluded viewport dimensions; document
 insets are not viewport gutters. Element-local clipping does not invent a
 scrollbar reservation where the renderer draws none. Offset positions use the
@@ -481,8 +485,9 @@ produce zero metrics and a null parent without calling into a retired Frame.
 
 This is an initial HTML box-geometry slice, not complete CSSOM View. Geometry
 inherits layout's integer precision, bounded formatting, and translation-only
-transform support. Empty-inline/complex fragmentation, SVG boxes, Range text
-rectangles, quirks-mode body viewport rules, native control clipping details,
+transform support. Decorated inline boxes and complex/vertical fragmentation,
+SVG boxes, Range text rectangles, quirks-mode body viewport rules, themed
+choice/select/button sizing, textarea editing/scrollbars and intrinsic rows/cols,
 transformed fixed containing blocks, and scroll APIs need separate coverage.
 Do not claim meaningful rendering benchmark scores from merely exposing the
 property names: verify the layout work and supported workload first.

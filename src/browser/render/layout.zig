@@ -487,7 +487,7 @@ const EmbedLayout = struct {
         if (width_value < 0 or height_value < 0) return;
         if (allow_single_zero_axis) {
             if (width_value == 0 and height_value == 0) return;
-        } else if (width_value == 0 or height_value == 0) return;
+        } else if ((width_value == 0 or height_value == 0) and payload != .input) return;
 
         if (engine.cursor_x + width_value > engine.line_right) {
             try engine.flushLine(line_buffer);
@@ -893,6 +893,8 @@ const IframeLayout = struct {
 };
 
 const LineItemPayload = union(enum) {
+    /// A non-painting inline insertion point, aligned with the completed line.
+    empty_inline,
     glyph: struct {
         glyph: font.Glyph,
         color: browser.Color,
@@ -923,6 +925,7 @@ const VerticalAlign = union(enum) {
 };
 
 const LineItem = struct {
+    preserves_line: bool = false,
     x: i32,
     hit_offset_x: i32,
     hit_offset_y: i32,
@@ -936,6 +939,7 @@ const LineItem = struct {
     height: i32,
     vertical_align: VerticalAlign = .baseline,
     is_word_separator: bool = false,
+    is_collapsed_space: bool = false,
     /// Pointer to the DOM node that produced this item (if available)
     node_ptr: ?*Node,
     payload: LineItemPayload,
@@ -3010,6 +3014,7 @@ fn recurseNode(self: *Layout, node: Node, node_ptr: ?*Node, line_buffer: *std.Ar
             if (e.style) |*styles| {
                 if (isInlineBlockDisplay(styles) and !elementUsesImageLayout(&e) and
                     !std.ascii.eqlIgnoreCase(e.tag, "input") and
+                    !std.ascii.eqlIgnoreCase(e.tag, "textarea") and
                     !std.ascii.eqlIgnoreCase(e.tag, "button") and
                     !std.ascii.eqlIgnoreCase(e.tag, "canvas") and
                     !std.ascii.eqlIgnoreCase(e.tag, "iframe"))
@@ -3023,7 +3028,7 @@ fn recurseNode(self: *Layout, node: Node, node_ptr: ?*Node, line_buffer: *std.Ar
             // Handle br tag for line breaks
             if (std.mem.eql(u8, e.tag, "br")) {
                 try self.breakExplicitLine(line_buffer);
-            } else if (std.mem.eql(u8, e.tag, "input")) {
+            } else if (std.mem.eql(u8, e.tag, "input") or std.mem.eql(u8, e.tag, "textarea")) {
                 try self.handleInputElement(node, node_ptr, line_buffer);
             } else if (std.mem.eql(u8, e.tag, "button")) {
                 try self.handleButtonElement(node, node_ptr, line_buffer);
@@ -3034,6 +3039,9 @@ fn recurseNode(self: *Layout, node: Node, node_ptr: ?*Node, line_buffer: *std.Ar
             } else if (std.ascii.eqlIgnoreCase(e.tag, "iframe")) {
                 try self.handleIframeElement(node, node_ptr, line_buffer);
             } else {
+                if (!self.is_preformatted) if (node_ptr) |ptr| {
+                    if (element_geometry.needsInlineAnchor(ptr)) try self.appendEmptyInline(ptr, line_buffer, false);
+                };
                 try self.recurseElementChildren(&e, line_buffer);
             }
 
@@ -3041,6 +3049,29 @@ fn recurseNode(self: *Layout, node: Node, node_ptr: ?*Node, line_buffer: *std.Ar
             try self.restoreNodeStyles(line_buffer);
         },
     }
+}
+
+fn appendEmptyInline(self: *Layout, node: ?*Node, line_buffer: *std.ArrayList(LineItem), preserves_line: bool) !void {
+    const reference = try self.font_manager.getStyledGlyph(
+        "M",
+        if (self.is_bold) .Bold else .Normal,
+        if (self.is_italic) .Italic else .Roman,
+        self.scaledFontSize(textSizeForSuperscript(self.size, self.is_superscript)),
+        self.activeFontFamily(),
+    );
+    try line_buffer.append(self.allocator, .{
+        .x = self.cursor_x,
+        .hit_offset_x = self.transform_offset_x,
+        .hit_offset_y = self.transform_offset_y,
+        .ascent = self.toLayoutPx(reference.ascent),
+        .descent = self.toLayoutPx(reference.descent),
+        .line_height = self.lineHeightForNatural(self.toLayoutPx(reference.ascent + reference.descent)),
+        .width = 0,
+        .height = self.toLayoutPx(reference.h),
+        .node_ptr = node,
+        .payload = .empty_inline,
+        .preserves_line = preserves_line,
+    });
 }
 
 /// Recurse the layout-only direct-child sequence for an inline element. CSS
@@ -3102,7 +3133,7 @@ fn handleInputElement(self: *Layout, node: Node, node_ptr: ?*Node, line_buffer: 
     self.resetSoftHyphenWord();
 
     var input_layout: InputLayout = .{};
-    try input_layout.measure(self, element);
+    try input_layout.measure(self, element, null);
 
     try input_layout.embed.appendInline(self, line_buffer, node_ptr, .{
         .input = input_layout,
@@ -3922,6 +3953,40 @@ fn flushLine(self: *Layout, line_buffer: *std.ArrayList(LineItem)) !void {
     }
     defer self.resetSoftHyphenWord();
 
+    // Trailing collapsed spaces contribute neither advance nor ink. Retain
+    // their insertion points so an otherwise whitespace-only span still has
+    // geometry, without shifting later empty siblings past the removed space.
+    var trailing_start = line_buffer.items.len;
+    var trailing_x: ?i32 = null;
+    while (trailing_start > 0) {
+        const item = &line_buffer.items[trailing_start - 1];
+        if (item.payload != .empty_inline and !item.is_collapsed_space) break;
+        trailing_start -= 1;
+        if (item.is_collapsed_space) {
+            trailing_x = item.x;
+            item.width = 0;
+            item.payload = .empty_inline;
+        }
+    }
+    if (trailing_x) |x| for (line_buffer.items[trailing_start..]) |*item| {
+        item.x = @min(item.x, x);
+    };
+    if (trailing_start == 0 and !lineHasContent(line_buffer.items)) {
+        // A phantom line has insertion points but no height or baseline. It
+        // must not create space or change inline-block baseline selection.
+        if (self.collect_hit_test_bounds) if (self.inline_block) |block| {
+            const start = block.geometry_fragments.items.len;
+            for (line_buffer.items) |item| if (item.node_ptr) |node| {
+                const rect = element_geometry.box(item.x, self.cursor_y, 0, 0);
+                try element_geometry.recordInline(self.allocator, &block.geometry_fragments, start, node, block.node_ptr, rect, rect, true, null, null);
+            };
+        };
+        line_buffer.clearRetainingCapacity();
+        self.updateInlineBounds();
+        self.cursor_x = self.line_left;
+        return;
+    }
+
     // Build every line in logical source order from the left, then align the
     // completed run. This preserves English LTR glyph order under `dir=rtl`
     // while making the line grow inward from the right edge.
@@ -3957,6 +4022,7 @@ fn flushLine(self: *Layout, line_buffer: *std.ArrayList(LineItem)) !void {
         // only after all baseline-aligned content has established that box.
         if (item.vertical_align == .bottom) continue;
         const is_superscript = switch (item.payload) {
+            .empty_inline => false,
             .glyph => |glyph_payload| glyph_payload.glyph.is_superscript,
             .inline_block => false,
             .input => false,
@@ -4019,6 +4085,7 @@ fn flushLine(self: *Layout, line_buffer: *std.ArrayList(LineItem)) !void {
         var final_y: i32 = undefined;
 
         const is_superscript = switch (item.payload) {
+            .empty_inline => false,
             .glyph => |glyph_payload| glyph_payload.glyph.is_superscript,
             .inline_block => false,
             .input => false,
@@ -4046,16 +4113,18 @@ fn flushLine(self: *Layout, line_buffer: *std.ArrayList(LineItem)) !void {
             if (self.inline_block) |block| {
                 if (item.node_ptr) |node| {
                     const own = element_geometry.box(item.x, final_y, item.width, item.height);
-                    const ancestor = if (item.payload == .glyph) own else if (self.inline_strut) |strut|
+                    const ancestor = if (item.payload == .glyph or item.payload == .empty_inline) own else if (self.inline_strut) |strut|
                         element_geometry.box(item.x, baseline - strut.ascent, item.width, strut.ascent + strut.descent)
                     else
                         own;
                     const border: ?BoxEdges = switch (item.payload) {
-                        .glyph, .inline_block => null,
+                        .glyph, .empty_inline, .inline_block => null,
                         .image => |image| image.border,
+                        .input => |input| input.box.border,
                         else => .{},
                     };
-                    try element_geometry.recordInline(self.allocator, &block.geometry_fragments, geometry_line_start, node, block.node_ptr, own, ancestor, item.payload != .inline_block, border);
+                    const client_insets: ?BoxEdges = if (item.payload == .input) item.payload.input.clientInsets() else null;
+                    try element_geometry.recordInline(self.allocator, &block.geometry_fragments, geometry_line_start, node, block.node_ptr, own, ancestor, item.payload != .inline_block, border, client_insets);
                 }
             }
         }
@@ -4105,6 +4174,7 @@ fn flushLine(self: *Layout, line_buffer: *std.ArrayList(LineItem)) !void {
             null;
 
         switch (item.payload) {
+            .empty_inline => {},
             .glyph => |glyph_payload| {
                 try self.current_display_target.append(self.allocator, DisplayItem{
                     .glyph = .{
@@ -4289,6 +4359,9 @@ fn breakExplicitLine(self: *Layout, line_buffer: *std.ArrayList(LineItem)) !void
     if (self.is_preformatted) {
         try self.breakPreformattedLine(line_buffer);
     } else {
+        // A preserved break creates a line even when its only other contents
+        // are empty insertion points. Source whitespace alone never does.
+        if (!lineHasContent(line_buffer.items)) try self.appendEmptyInline(null, line_buffer, true);
         try self.flushLine(line_buffer);
     }
     self.cursor_x = self.line_left;
@@ -4412,7 +4485,7 @@ fn processGrapheme(
         self.cursor_x,
         glyph_width,
         self.line_right,
-        line_buffer.items.len > 0,
+        lineHasContent(line_buffer.items),
     )) {
         try self.flushLine(line_buffer);
         return;
@@ -4424,7 +4497,7 @@ fn processGrapheme(
         self.cursor_x,
         glyph_width,
         self.line_right,
-        line_buffer.items.len > 0,
+        lineHasContent(line_buffer.items),
     )) {
         if (try self.tryWordBreak(line_buffer)) continue;
         if (try self.trySoftHyphenBreak(line_buffer)) continue;
@@ -4442,6 +4515,7 @@ fn processGrapheme(
         .width = glyph_width,
         .height = glyph_height,
         .is_word_separator = separates_word,
+        .is_collapsed_space = options.is_collapsed_space,
         .node_ptr = node_ptr,
         .payload = .{
             .glyph = .{
@@ -4745,6 +4819,11 @@ fn handlePreformattedText(
 const lineBreakLengthAt = inline_format.lineBreakLengthAt;
 const isCollapsibleWhitespaceGrapheme = inline_format.isCollapsibleWhitespaceGrapheme;
 
+fn lineHasContent(items: []const LineItem) bool {
+    for (items) |item| if (item.payload != .empty_inline or item.preserves_line) return true;
+    return false;
+}
+
 fn processNormalGrapheme(
     self: *Layout,
     gme: []const u8,
@@ -4754,7 +4833,7 @@ fn processNormalGrapheme(
     if (isCollapsibleWhitespaceGrapheme(gme)) {
         if (self.last_was_collapsible_space) return;
         self.last_was_collapsible_space = true;
-        if (line_buffer.items.len == 0 and self.cursor_x == self.line_left) return;
+        if (!lineHasContent(line_buffer.items) and self.cursor_x == self.line_left) return;
         try self.processGrapheme(" ", line_buffer, node_ptr, .{
             .is_collapsed_space = true,
             .is_superscript = self.is_superscript,
@@ -4985,6 +5064,10 @@ const INPUT_WIDTH_PX: i32 = 200;
 // descendant boxes participate in size and paint.
 const InputLayout = struct {
     embed: EmbedLayout = .{},
+    box: control_geometry.TextBox = .{},
+    is_multiline: bool = false,
+    text_ascent: i32 = 0,
+    text_line_height: i32 = 0,
     font_size: i32 = 16,
     font_weight: FontWeight = .Normal,
     font_slant: FontSlant = .Roman,
@@ -4999,7 +5082,13 @@ const InputLayout = struct {
     is_checked: bool = false,
     is_password: bool = false,
 
-    fn measure(self: *InputLayout, engine: *Layout, element: parser.Element) !void {
+    fn clientInsets(self: *const InputLayout) BoxEdges {
+        return control_geometry.clientInsets(self.box.border, self.box.padding, !self.is_multiline and !self.is_checkbox and !self.is_radio);
+    }
+
+    // An own block supplies its already-constrained content width. Inline
+    // controls resolve percentages against their containing block instead.
+    fn measure(self: *InputLayout, engine: *Layout, element: parser.Element, own_block: ?*BlockLayout) !void {
         self.font_weight = if (engine.is_bold) .Bold else .Normal;
         self.font_slant = if (engine.is_italic) .Italic else .Roman;
         self.font_family = engine.activeFontFamily();
@@ -5012,6 +5101,7 @@ const InputLayout = struct {
         else
             element.isChecked();
         self.is_password = element.isPasswordInput();
+        self.is_multiline = std.ascii.eqlIgnoreCase(element.tag, "textarea");
         const is_choice = self.is_checkbox or self.is_radio;
         if (is_choice) {
             self.bgcolor = .{ .r = 255, .g = 255, .b = 255, .a = 255 };
@@ -5034,6 +5124,11 @@ const InputLayout = struct {
 
         if (is_choice) {
             self.text = "";
+        } else if (self.is_multiline) {
+            for (element.children.items) |child| if (child == .text) {
+                self.text = child.text.text;
+                break;
+            };
         } else if (std.mem.eql(u8, element.tag, "input")) {
             if (element.attributes) |attrs| {
                 self.text = attrs.get("value") orelse "";
@@ -5051,29 +5146,47 @@ const InputLayout = struct {
         const ascent_value = engine.toLayoutPx(glyph.ascent);
         const descent_value = engine.toLayoutPx(glyph.descent);
         const natural_height = ascent_value + descent_value;
-        var authored_width: ?i32 = null;
-        var authored_height: ?i32 = null;
+        self.text_ascent = ascent_value;
+        self.text_line_height = engine.lineHeightForNatural(natural_height);
+        var horizontal = control_geometry.Axis{};
+        var vertical = control_geometry.Axis{};
+        var edges = BoxModelEdges{ .margin = .{}, .padding = .{}, .border = .{} };
+        var border_box = false;
         if (!is_choice) {
             if (element.style) |*style_map| {
-                if (resolvedPixelDimension(&element, style_map, "width", .{
-                    .font_size = engine.font_size_css,
-                    .percentage_base = engine.containingBlockCssDimension(false),
-                })) |pixels|
-                    authored_width = @max(engine.scaleActiveCssPixel(pixels), 1);
-                if (resolvedPixelDimension(&element, style_map, "height", .{
-                    .font_size = engine.font_size_css,
-                    .percentage_base = engine.containingBlockCssDimension(true),
-                })) |pixels|
-                    authored_height = @max(engine.scaleActiveCssPixel(pixels), natural_height);
+                if (engine.inline_block) |block| {
+                    const target = if (block.persistent_dependencies) &block.height else block.temporary_dependency_target;
+                    if (target) |notify| registerStyleDependencies(style_map, notify);
+                }
+                const width_base = if (own_block) |block|
+                    if (block.parent_block) |parent| cssPixelsFromLayout(parent.content_width, parent.zoom.get().*, engine.zoom()) else engine.containingBlockCssDimension(false)
+                else
+                    engine.containingBlockCssDimension(false);
+                const height_base = if (own_block) |block|
+                    if (block.parent_block) |parent| if (parent.content_height_definite) cssPixelsFromLayout(parent.content_height, parent.zoom.get().*, engine.zoom()) else null else null
+                else
+                    engine.containingBlockCssDimension(true);
+                edges = resolveBoxEdges(style_map, engine.font_size_css, width_base, engine.effectiveZoom(), engine.zoom());
+                border_box = flex_format.eq(styleValue(style_map, "box-sizing") orelse "content-box", "border-box");
+                inline for (.{ .{ "width", "preferred" }, .{ "min-width", "min" }, .{ "max-width", "max" } }) |property| {
+                    if (resolvedPixelDimension(&element, style_map, property[0], .{ .font_size = engine.font_size_css, .percentage_base = width_base })) |pixels|
+                        @field(horizontal, property[1]) = engine.scaleActiveCssPixel(pixels);
+                }
+                inline for (.{ .{ "height", "preferred" }, .{ "min-height", "min" }, .{ "max-height", "max" } }) |property| {
+                    if (resolvedPixelDimension(&element, style_map, property[0], .{ .font_size = engine.font_size_css, .percentage_base = height_base })) |pixels|
+                        @field(vertical, property[1]) = engine.scaleActiveCssPixel(pixels);
+                }
             }
+            self.box = control_geometry.textBox(engine.scaleActiveCssPixel(INPUT_WIDTH_PX), if (self.is_multiline) self.text_line_height * 2 else natural_height, horizontal, vertical, edges.padding, edges.border, border_box);
+            if (own_block) |block| self.box.content_width = block.content_width;
+            const baseline = if (self.is_multiline) self.box.height() else self.box.border.top + self.box.padding.top + @max(@divTrunc(self.box.content_height - self.text_line_height, 2), 0) + self.text_ascent;
+            self.embed.setMetrics(self.box.width(), self.box.height(), baseline, @max(self.box.height() - baseline, 0), engine.effectiveZoom());
+            self.is_focused = element.is_focused;
+            return;
         }
-        const metrics = control_geometry.inputBoxMetrics(
+        const metrics = control_geometry.choiceBoxMetrics(
             natural_height,
-            engine.scaleActiveCssPixel(INPUT_WIDTH_PX),
-            is_choice,
             self.is_radio,
-            authored_width,
-            authored_height,
             self.border_radius,
         );
         self.border_radius = metrics.border_radius;
@@ -5097,7 +5210,6 @@ const InputLayout = struct {
     ) !void {
         const width_value = self.embed.width;
         const height_value = self.embed.height;
-        const ascent_value = self.embed.ascent;
         var rounded_items = std.ArrayList(DisplayItem).empty;
         defer {
             DisplayItem.freeItems(engine.allocator, rounded_items.items);
@@ -5266,13 +5378,33 @@ const InputLayout = struct {
             return;
         }
 
-        var text_x = x + scaleCssPixel(2, self.embed.zoom, engine.zoom());
-        const baseline_y = y + ascent_value;
-        if (self.text.len > 0) {
-            var g_iter = grapheme.iterator(self.text);
+        if (source) |provenance| if (provenance.node) |node| if (node.* == .element) {
+            if (node.element.style) |*styles|
+                try appendBorderBoxes(engine, target, x, y, width_value, height_value, self.box.border, styles, &node.element, source);
+        };
+
+        var editor_items = std.ArrayList(DisplayItem).empty;
+        defer {
+            DisplayItem.freeItems(engine.allocator, editor_items.items);
+            editor_items.deinit(engine.allocator);
+        }
+        const content_x = x + self.box.border.left + self.box.padding.left;
+        const content_y = y + self.box.border.top + self.box.padding.top;
+        var text_x = content_x;
+        var text_y = content_y + if (self.is_multiline) @as(i32, 0) else @max(@divTrunc(self.box.content_height - self.text_line_height, 2), 0);
+        const decoded = if (self.is_multiline) try inline_format.decodeTextForDisplay(engine.allocator, self.text) else null;
+        defer if (decoded) |value| engine.allocator.free(value);
+        const text = decoded orelse self.text;
+        if (text.len > 0) {
+            var g_iter = grapheme.iterator(text);
 
             while (g_iter.next()) |gc| {
-                const gme = gc.bytes(self.text);
+                const gme = gc.bytes(text);
+                if (self.is_multiline and (std.mem.eql(u8, gme, "\n") or std.mem.eql(u8, gme, "\r") or std.mem.eql(u8, gme, "\r\n"))) {
+                    text_x = content_x;
+                    text_y += self.text_line_height;
+                    continue;
+                }
                 const glyph_text = inputDisplayGrapheme(self.is_password, gme);
                 const glyph = try engine.font_manager.getStyledGlyph(
                     glyph_text,
@@ -5282,10 +5414,14 @@ const InputLayout = struct {
                     self.font_family,
                 );
 
-                try target.append(engine.allocator, DisplayItem{
+                if (self.is_multiline and text_x > content_x and text_x + engine.toLayoutPx(glyph.w) > content_x + self.box.content_width) {
+                    text_x = content_x;
+                    text_y += self.text_line_height;
+                }
+                try editor_items.append(engine.allocator, DisplayItem{
                     .glyph = .{
                         .x = text_x,
-                        .y = baseline_y - engine.toLayoutPx(glyph.ascent),
+                        .y = text_y + self.text_ascent - engine.toLayoutPx(glyph.ascent),
                         .glyph = glyph,
                         .color = engine.remapColor(self.color, .control_text),
                         .page_zoom = engine.zoom(),
@@ -5298,11 +5434,11 @@ const InputLayout = struct {
 
         if (self.is_focused) {
             try drawCursor(
-                target,
+                &editor_items,
                 engine.allocator,
                 text_x,
-                y,
-                height_value,
+                text_y,
+                self.text_line_height,
                 engine.remapColor(
                     .{ .r = 255, .g = 0, .b = 0, .a = 255 },
                     .accent,
@@ -5310,6 +5446,14 @@ const InputLayout = struct {
                 source,
             );
         }
+
+        const clip = self.clientInsets();
+        try replaced_paint.appendEditorClip(target, engine.allocator, &editor_items, .{
+            .left = x + clip.left,
+            .top = y + clip.top,
+            .right = x + @max(width_value - clip.right, clip.left),
+            .bottom = y + @max(height_value - clip.bottom, clip.top),
+        }, source);
 
         if (self.border_radius > 0) {
             try appendRoundedControlGroup(
@@ -5358,7 +5502,7 @@ test "radio inputs use compact circular control metrics" {
     defer engine.deinit();
 
     var input: InputLayout = .{};
-    try input.measure(engine, radio);
+    try input.measure(engine, radio, null);
     try std.testing.expect(input.is_radio);
     try std.testing.expect(input.is_checked);
     try std.testing.expectEqualStrings("", input.text);
@@ -8383,8 +8527,13 @@ const BlockLayout = struct {
             constrainDimension(width, min_width, max_width)
         else
             null;
+        const native_text_control = self.inline_nodes == null and self.node == .element and
+            (std.ascii.eqlIgnoreCase(self.node.element.tag, "textarea") or
+                (std.ascii.eqlIgnoreCase(self.node.element.tag, "input") and !self.node.element.isCheckbox() and !self.node.element.isInputType("radio")));
         const specified_width = style_specified_width orelse
-            if (self.tableRole() == .table and allocated_box == null)
+            if (native_text_control and allocated_box == null)
+                constrainDimension(scaleCssPixel(INPUT_WIDTH_PX, zoom_value, engine.zoom()), min_width, max_width)
+            else if (self.tableRole() == .table and allocated_box == null)
                 try self.preferredTableWidth(zoom_value, engine.zoom(), containing_width_css)
             else
                 null;
@@ -8466,6 +8615,7 @@ const BlockLayout = struct {
             const element = &self.node.element;
             const tag = element.tag;
             if (std.ascii.eqlIgnoreCase(tag, "input") or
+                std.ascii.eqlIgnoreCase(tag, "textarea") or
                 (std.ascii.eqlIgnoreCase(tag, "button") and !self.rich_button_root) or
                 elementUsesImageLayout(element) or
                 std.ascii.eqlIgnoreCase(tag, "canvas") or
@@ -10752,7 +10902,23 @@ fn layoutInlineBlock(self: *Layout, block: *BlockLayout, publish_geometry: bool)
                 try self.breakExplicitLine(&line_buffer);
             }
 
-            if (std.ascii.eqlIgnoreCase(e.tag, "input")) {
+            if ((std.ascii.eqlIgnoreCase(e.tag, "input") and !e.isCheckbox() and !e.isInputType("radio")) or std.ascii.eqlIgnoreCase(e.tag, "textarea")) {
+                // This block is the control itself, not an anonymous line.
+                // Paint its used border box once, without a second line box
+                // adding padding, border, or font leading to its dimensions.
+                var control = InputLayout{};
+                try control.measure(self, e, block);
+                const x = block.x.get().*;
+                const y = block.y.get().*;
+                try control.paintAt(self.current_display_target, self, x, y, displaySource(block, block.node_ptr));
+                if (self.collect_hit_test_bounds) if (block.node_ptr) |node| {
+                    const bounds = Bounds{ .x = x + self.transform_offset_x, .y = y + self.transform_offset_y, .width = control.embed.width, .height = control.embed.height };
+                    try self.input_bounds.put(node, bounds);
+                    try self.recordLinkBounds(node, bounds.x, bounds.y, bounds.width, bounds.height);
+                    if (findAccessibleNode(node)) |accessible| try self.accessibility_bounds.append(self.allocator, .{ .node = accessible, .bounds = bounds });
+                };
+                self.cursor_y += control.box.content_height;
+            } else if (std.ascii.eqlIgnoreCase(e.tag, "input")) {
                 try self.handleInputElement(block.node, block.node_ptr, &line_buffer);
             } else if (std.ascii.eqlIgnoreCase(e.tag, "button") and !block.rich_button_root) {
                 try self.handleButtonElement(block.node, block.node_ptr, &line_buffer);
@@ -11945,7 +12111,7 @@ fn addBackgroundIfNeededToList(self: *Layout, commands: *std.ArrayList(DisplayIt
     const element = liveBlockElement(block) orelse return;
     // A control's inline payload paints its shell. Suppress only the redundant
     // outer background, never the block's complete retained content subtree.
-    if (std.ascii.eqlIgnoreCase(element.tag, "input") or std.ascii.eqlIgnoreCase(element.tag, "button")) return;
+    if (std.ascii.eqlIgnoreCase(element.tag, "input") or std.ascii.eqlIgnoreCase(element.tag, "textarea") or std.ascii.eqlIgnoreCase(element.tag, "button")) return;
     const block_width = block.width.get().*;
     const block_height = block.height.get().*;
     if (block_width <= 0 or block_height <= 0) return;

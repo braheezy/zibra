@@ -27,6 +27,12 @@ tests:
   - css/cssom-view/offsetParent-body-and-html.html
   - css/cssom-view/offsetTopLeftInScrollableParent.html
   - css/cssom-view/client-props-zoom.html
+  - css/cssom-view/client-props-input.html
+  # These compare empty-inline insertion points with adjacent text; passing
+  # their writing-mode variants does not establish vertical layout support.
+  - css/cssom-view/offsetTopLeft-empty-inline.html
+  - css/cssom-view/offsetTopLeft-empty-inline-offset.html
+  - css/cssom-view/offsetTopLeft-leading-space-inline.html
 reftests:
   - css/CSS2/backgrounds/background-color-174.xht
 crashtests:

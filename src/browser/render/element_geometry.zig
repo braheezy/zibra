@@ -6,6 +6,7 @@ const std = @import("std");
 const dom = @import("../../document/dom.zig");
 const box_model = @import("box_model.zig");
 const effects = @import("paint_effects.zig");
+const controls = @import("control_geometry.zig");
 pub const Rect = @import("../../core/rect.zig").Rect;
 
 pub const Fragment = struct {
@@ -14,6 +15,7 @@ pub const Fragment = struct {
     // null denotes an ordinary inline fragment, whose client metrics are zero.
     // Used edges travel with temporary atomic boxes, not their retired layout.
     border: ?box_model.BoxEdges = null,
+    client_insets: ?box_model.BoxEdges = null,
 
     pub fn translated(self: Fragment, x: f64, y: f64) Fragment {
         var result = self;
@@ -56,6 +58,24 @@ fn hidden(node: *dom.Node) bool {
     return false;
 }
 
+/// True when an ordinary inline subtree needs an insertion-point fragment
+/// even though collapsing its text produces no visible glyph. Atomic boxes,
+/// explicit breaks, preformatted text and generated content use their own
+/// formatter paths instead. This is a synchronous clean-style DOM borrow.
+pub fn needsInlineAnchor(node: *dom.Node) bool {
+    if (node.* == .text) return std.mem.trim(u8, node.text.text, " \t\r\n\x0c").len == 0;
+    const element = &node.element;
+    if (std.mem.eql(u8, style(element, "display"), "none")) return true;
+    const display = style(element, "display");
+    if (display.len != 0 and !std.mem.eql(u8, display, "inline")) return false;
+    if (element.generated_before != null or element.generated_after != null) return false;
+    for ([_][]const u8{ "br", "img", "input", "textarea", "button", "canvas", "iframe", "object" }) |tag|
+        if (std.ascii.eqlIgnoreCase(element.tag, tag)) return false;
+    if (std.mem.startsWith(u8, style(element, "white-space"), "pre")) return false;
+    for (element.children.items) |*child| if (!needsInlineAnchor(child)) return false;
+    return true;
+}
+
 /// Coalesce ordinary inline descendants once per visual line, in content
 /// order. The containing block has its own border box and must not be widened
 /// by overflowing descendants. Atomic participants keep a separate own box.
@@ -69,6 +89,7 @@ pub fn recordInline(
     ancestor_rect: Rect,
     include_self: bool,
     border: ?box_model.BoxEdges,
+    client_insets: ?box_model.BoxEdges,
 ) !void {
     var current: ?*dom.Node = node;
     while (current) |value| : (current = parent(value)) {
@@ -83,7 +104,7 @@ pub fn recordInline(
             found = true;
             break;
         }
-        if (!found) try fragments.append(allocator, .{ .node = value, .rect = rect, .border = if (value == node) border else null });
+        if (!found) try fragments.append(allocator, .{ .node = value, .rect = rect, .border = if (value == node) border else null, .client_insets = if (value == node) client_insets else null });
     }
 }
 
@@ -95,7 +116,8 @@ pub fn captureBlock(block: anytype, target: ?*dom.Node, dx: f64, dy: f64, alloca
     const y = dy + @as(f64, @floatFromInt(block.position_offset.y));
     if (block.node_ptr) |node| {
         if (node.* == .element and (target == null or target == node)) {
-            try out.append(allocator, .{ .node = node, .rect = box(block.x.get().*, block.y.get().*, block.width.get().*, block.height.get().*).translated(x, y), .border = block.border });
+            const single_line = std.ascii.eqlIgnoreCase(node.element.tag, "input") and !node.element.isCheckbox() and !node.element.isInputType("radio");
+            try out.append(allocator, .{ .node = node, .rect = box(block.x.get().*, block.y.get().*, block.width.get().*, block.height.get().*).translated(x, y), .border = block.border, .client_insets = controls.clientInsets(block.border, block.padding, single_line) });
             if (target != null) return;
         }
     }
@@ -137,7 +159,7 @@ pub fn measureMetrics(document: anytype, target: *dom.Node, frame_zoom: f32, vie
     const own = (try firstBox(document, target, allocator)) orelse return result;
     const zoom = box_model.effectiveCssZoomForNode(target);
     const scale: f64 = 1.0 / (frame_zoom * zoom);
-    if (own.border) |border| {
+    if (own.client_insets orelse own.border) |border| {
         result.client = .{
             .x = @as(f64, @floatFromInt(border.left)) * scale,
             .y = @as(f64, @floatFromInt(border.top)) * scale,

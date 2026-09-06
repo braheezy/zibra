@@ -8,6 +8,7 @@ const std = @import("std");
 const parser = @import("../../document/parser.zig");
 const background_image = @import("../../document/background_image.zig");
 const display_list = @import("display_list.zig");
+const paint_effects = @import("paint_effects.zig");
 
 const DisplayItem = display_list.DisplayItem;
 
@@ -188,6 +189,16 @@ pub fn appendRoundedControlGroup(
         .source = source,
     } });
     children_owned = false;
+}
+
+/// Consume an editor's glyph/caret commands into a real raster and hit clip.
+/// The control shell stays outside this group. `items` is empty after transfer,
+/// including on failure; the returned command containers belong to destination.
+pub fn appendEditorClip(destination: *std.ArrayList(DisplayItem), allocator: std.mem.Allocator, items: *std.ArrayList(DisplayItem), bounds: display_list.Rect, source: ?display_list.DisplayItemSource) !void {
+    const wrapped = try paint_effects.wrapOwned(allocator, try items.toOwnedSlice(allocator), .{ .clips_overflow = true }, .{ .bounds = bounds, .source = source });
+    errdefer DisplayItem.freeList(allocator, wrapped);
+    try destination.appendSlice(allocator, wrapped);
+    allocator.free(wrapped);
 }
 
 fn styleValue(style_map: *const parser.StyleMap, property: []const u8) ?[]const u8 {

@@ -79,7 +79,8 @@ Run from the repository root:
 - `zig build test-wpt` for local headless synchronous PASS, Promise-job PASS,
   TIMEOUT, startup/error diagnostics, partial results, and Unicode JSONL
   fixtures, plus live JavaScript rectangles, client/offset box metrics,
-  measure-to-position interaction, and parser-boundary regressions.
+  measure-to-position interaction, native-editor client clips, empty inline
+  insertion points, and parser-boundary regressions.
   Captures are serial and process-watchdog bounded.
   This step uses no upstream WPT checkout
   or network access;
