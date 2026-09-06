@@ -27,6 +27,8 @@ const kiesel = @import("kiesel");
 const geometry_bindings = @import("geometry_bindings.zig");
 pub const GeometryCallbackFn = geometry_bindings.Callback;
 pub const GeometryRect = geometry_bindings.Rect;
+pub const GeometryQuery = geometry_bindings.Query;
+pub const GeometryResult = geometry_bindings.Result;
 const Agent = kiesel.execution.Agent;
 const Script = kiesel.language.Script;
 const Realm = kiesel.execution.Realm;
@@ -1238,7 +1240,7 @@ fn flushBindingStyle(context: ?*anyopaque) anyerror!void {
     }
 }
 
-fn measureBindingGeometry(context: ?*anyopaque, handle: u32, unscaled: bool, allocator: std.mem.Allocator, rects: *std.ArrayList(GeometryRect)) anyerror!void {
+fn measureBindingGeometry(context: ?*anyopaque, handle: u32, query: GeometryQuery, allocator: std.mem.Allocator, output: *GeometryResult) anyerror!void {
     const self = hostFromBindingContext(context);
     const window = self.windows.get(self.current_window_id orelse return) orelse return;
     if (window.retired) return;
@@ -1247,7 +1249,7 @@ fn measureBindingGeometry(context: ?*anyopaque, handle: u32, unscaled: bool, all
     // Only the numeric identity crosses the flush: layout/resource work may
     // invalidate earlier borrows. The browser resolves it again afterward.
     if (window.geometry_callback.function) |callback|
-        try callback(window.geometry_callback.context, handle, unscaled, allocator, rects);
+        try callback(window.geometry_callback.context, handle, query, allocator, output);
 }
 
 fn currentBindingWindowId(context: ?*anyopaque) ?u32 {
@@ -2181,10 +2183,13 @@ test "geometry bindings return static rectangle objects and retire callbacks" {
     defer js.setNodes(0, null);
     const Probe = struct {
         calls: usize = 0,
-        fn measure(ctx: ?*anyopaque, _: u32, unscaled: bool, alloc: std.mem.Allocator, output: *std.ArrayList(GeometryRect)) !void {
+        fn measure(ctx: ?*anyopaque, _: u32, query: GeometryQuery, alloc: std.mem.Allocator, output: *GeometryResult) !void {
             const self: *@This() = @ptrCast(@alignCast(ctx.?));
             self.calls += 1;
-            try output.append(alloc, .{ .x = 10, .y = 20, .width = if (unscaled) 30.5 else 61, .height = 40 });
+            if (query == .box_metrics) {
+                output.client = .{ .x = 2, .y = 3, .width = 30.5, .height = 40 };
+                output.offset_x = -2.5;
+            } else try output.rects.append(alloc, .{ .x = 10, .y = 20, .width = if (query == .offset_rects) 30.5 else 61, .height = 40 });
         }
     };
     var probe = Probe{};
@@ -2209,10 +2214,17 @@ test "geometry bindings return static rectangle objects and retire callbacks" {
     );
     try std.testing.expect(result.toBoolean());
     try std.testing.expectEqual(@as(usize, 4), probe.calls);
+    const metrics = try js.evaluate(0,
+        \\box.clientLeft === 2 && box.clientTop === 3 && box.clientWidth === 31 &&
+        \\box.clientHeight === 40 && box.offsetLeft === -2 && box.offsetTop === 0 && box.offsetParent === null &&
+        \\detached.clientWidth === 0 && detached.offsetParent === null;
+    );
+    try std.testing.expect(metrics.toBoolean());
+    try std.testing.expectEqual(@as(usize, 11), probe.calls);
     js.setNodes(0, &root);
-    const retired = try js.evaluate(0, "document.getElementById('box').getBoundingClientRect().width === 0");
+    const retired = try js.evaluate(0, "document.getElementById('box').getBoundingClientRect().width === 0 && document.getElementById('box').clientWidth === 0 && document.getElementById('box').offsetParent === null");
     try std.testing.expect(retired.toBoolean());
-    try std.testing.expectEqual(@as(usize, 4), probe.calls);
+    try std.testing.expectEqual(@as(usize, 11), probe.calls);
 }
 
 test "DOM Range boundary ordering validation queries and selection roots" {

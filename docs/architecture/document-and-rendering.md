@@ -381,8 +381,10 @@ Important geometry contracts:
   the complete leading strut is retained before the block is placed below the
   relevant float margin box.
 - Relative position preserves the flow slot and stores a separate visual
-  offset. Absolute blocks use the containing block's content box, have no
-  in-flow predecessor, and do not extend normal height. Fixed blocks use the
+  offset. Absolute blocks use their layout parent's padding box for used
+  dimensions and offsets, have no in-flow predecessor, and do not extend normal
+  height. Selecting a more distant positioned containing block through static
+  layout wrappers remains a limitation. Fixed blocks use the
   owning frame viewport as their containing block, likewise have no in-flow
   predecessor, and retain an outer `frame_viewport` display-transform wrapper
   so their entire paint subtree ignores document scroll.
@@ -471,12 +473,16 @@ never borrows the mutable backing surface.
 ## Element geometry snapshots
 
 `render/element_geometry.zig` borrows a clean DocumentLayout synchronously and
-returns scalar rectangles. Persistent block border boxes come from protected
-used geometry; inline fragments are recorded in content order at final line
+returns scalar rectangles and used box metrics, plus a synchronous borrowed
+offset-parent Node for the host to convert to a stable handle. Persistent block
+border boxes come from protected used geometry; inline fragments are recorded in content order at final line
 placement and retained in the owning BlockLayout. Ordinary inline ancestors
 coalesce once per line, while the containing block keeps its own border box.
 Paint-only regeneration preserves these records instead of appending duplicate
 geometry. Hidden/offscreen paint suppression must not erase layout boxes.
+Fragments distinguish ordinary inline boxes from atomic/block boxes and retain
+used border widths. Client padding sizes subtract these used edges after
+layout, and offset positions use the first fragment rather than the union.
 
 Temporary subtree placement invalidation stops at its persistent containing
 block boundary. Recreating an atomic subtree during paint must not mark the

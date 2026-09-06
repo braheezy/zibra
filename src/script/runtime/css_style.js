@@ -79,7 +79,9 @@ function createInlineStyleDeclaration(owner) {
   var properties = ['color', 'backgroundColor', 'background', 'display', 'font', 'fontSize', 'fontFamily',
     'fontWeight', 'fontStyle', 'lineHeight', 'width', 'height', 'minWidth', 'maxWidth', 'minHeight', 'maxHeight',
     'margin', 'marginTop', 'marginRight', 'marginBottom', 'marginLeft', 'padding', 'paddingTop', 'paddingRight',
-    'paddingBottom', 'paddingLeft', 'border', 'boxSizing', 'position', 'top', 'right', 'bottom', 'left',
+    'paddingBottom', 'paddingLeft', 'border', 'borderTop', 'borderRight', 'borderBottom', 'borderLeft',
+    'borderWidth', 'borderTopWidth', 'borderRightWidth', 'borderBottomWidth', 'borderLeftWidth',
+    'borderStyle', 'borderColor', 'boxSizing', 'position', 'top', 'right', 'bottom', 'left',
     'opacity', 'visibility', 'overflow', 'transform', 'zoom', 'flex', 'flexBasis', 'flexGrow', 'flexShrink',
     'flexDirection', 'flexWrap', 'gap', 'rowGap', 'columnGap', 'alignItems', 'justifyContent',
     'gridTemplateColumns', 'gridTemplateRows', 'cssFloat'];

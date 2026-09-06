@@ -430,12 +430,14 @@ a complete stylesheet CSSOM or native declaration-normalization API.
 ## JavaScript element geometry
 
 `runtime/geometry.js` supplies `getBoundingClientRect`, `getClientRects`,
-`offsetWidth`, and `offsetHeight`, plus DOMRectReadOnly/DOMRect/DOMRectList
-snapshot values. `geometry_bindings.zig` retains only a narrow Host embedded
+`offsetWidth`/`offsetHeight`, `offsetLeft`/`offsetTop`/`offsetParent`, and
+`clientWidth`/`clientHeight`/`clientLeft`/`clientTop`, plus
+DOMRectReadOnly/DOMRect/DOMRectList snapshot values.
+`geometry_bindings.zig` retains only a narrow Host embedded
 in `Js`. Each WindowRealm has a synchronous geometry callback installed after
 document creation and cleared on replacement or retirement, like computed
 style readback. The callback receives a numeric Node handle, not a Node or
-layout pointer.
+layout pointer, and a typed rectangle/offset/box-metrics query.
 
 `browser/script_geometry.zig` validates the Frame generation, reconciles the
 latest native viewport request, and brings ancestor/target Frames through
@@ -463,10 +465,25 @@ chrome or raster/accessibility scale. Temporary native results are copied to
 Kiesel numbers before the callback buffer is freed; returned rectangle/list
 objects never update when the DOM changes.
 
+Client dimensions use the used padding box (border box minus used borders),
+not authored width strings. Ordinary inline fragments have zero client metrics.
+The root uses the current scrollbar-excluded viewport dimensions; document
+insets are not viewport gutters. Element-local clipping does not invent a
+scrollbar reservation where the renderer draws none. Offset positions use the
+first fragment relative to the offset parent's padding edge, ignoring both
+scrolling and transforms and removing the target's effective authored zoom.
+Root/body and viewport-fixed boxes have no offset parent; positioned ancestors,
+transform containers, static table ancestors, and effective-zoom boundaries
+participate in parent selection. The selected Node is a synchronous borrow:
+the adapter captures its handle with the non-lock-taking active-window helper,
+then JavaScript uses the canonical wrapper cache. Detached/retired handles
+produce zero metrics and a null parent without calling into a retired Frame.
+
 This is an initial HTML box-geometry slice, not complete CSSOM View. Geometry
 inherits layout's integer precision, bounded formatting, and translation-only
 transform support. Empty-inline/complex fragmentation, SVG boxes, Range text
-rectangles, and the remaining offset/client/scroll APIs need separate coverage.
+rectangles, quirks-mode body viewport rules, native control clipping details,
+transformed fixed containing blocks, and scroll APIs need separate coverage.
 Do not claim meaningful rendering benchmark scores from merely exposing the
 property names: verify the layout work and supported workload first.
 

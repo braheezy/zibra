@@ -1,13 +1,35 @@
 //! Synchronous CSSOM box queries over clean layout, independent of paint.
 //! Retained inline fragments borrow the same DOM generation as their owning
-//! BlockLayout or atomic-inline snapshot. Public query output owns only numbers.
+//! BlockLayout or atomic-inline snapshot. Rectangles own only numbers; metrics
+//! may additionally borrow an offset-parent Node until the host captures its ID.
 const std = @import("std");
 const dom = @import("../../document/dom.zig");
 const box_model = @import("box_model.zig");
 const effects = @import("paint_effects.zig");
 pub const Rect = @import("../../core/rect.zig").Rect;
 
-pub const Fragment = struct { node: *dom.Node, rect: Rect };
+pub const Fragment = struct {
+    node: *dom.Node,
+    rect: Rect,
+    // null denotes an ordinary inline fragment, whose client metrics are zero.
+    // Used edges travel with temporary atomic boxes, not their retired layout.
+    border: ?box_model.BoxEdges = null,
+
+    pub fn translated(self: Fragment, x: f64, y: f64) Fragment {
+        var result = self;
+        result.rect = self.rect.translated(x, y);
+        return result;
+    }
+};
+
+pub const Metrics = struct {
+    client: Rect = .{},
+    offset_x: f64 = 0,
+    offset_y: f64 = 0,
+    /// Synchronous generation-bound borrow; the host must export a stable
+    /// numeric identity before returning to script, never this pointer.
+    offset_parent: ?*dom.Node = null,
+};
 
 pub fn box(x: i32, y: i32, width: i32, height: i32) Rect {
     return .{ .x = @floatFromInt(x), .y = @floatFromInt(y), .width = @floatFromInt(width), .height = @floatFromInt(height) };
@@ -46,6 +68,7 @@ pub fn recordInline(
     own_rect: Rect,
     ancestor_rect: Rect,
     include_self: bool,
+    border: ?box_model.BoxEdges,
 ) !void {
     var current: ?*dom.Node = node;
     while (current) |value| : (current = parent(value)) {
@@ -60,7 +83,7 @@ pub fn recordInline(
             found = true;
             break;
         }
-        if (!found) try fragments.append(allocator, .{ .node = value, .rect = rect });
+        if (!found) try fragments.append(allocator, .{ .node = value, .rect = rect, .border = if (value == node) border else null });
     }
 }
 
@@ -72,13 +95,13 @@ pub fn captureBlock(block: anytype, target: ?*dom.Node, dx: f64, dy: f64, alloca
     const y = dy + @as(f64, @floatFromInt(block.position_offset.y));
     if (block.node_ptr) |node| {
         if (node.* == .element and (target == null or target == node)) {
-            try out.append(allocator, .{ .node = node, .rect = box(block.x.get().*, block.y.get().*, block.width.get().*, block.height.get().*).translated(x, y) });
+            try out.append(allocator, .{ .node = node, .rect = box(block.x.get().*, block.y.get().*, block.width.get().*, block.height.get().*).translated(x, y), .border = block.border });
             if (target != null) return;
         }
     }
     for (block.geometry_fragments.items) |entry| {
         if (target == null or target == entry.node)
-            try out.append(allocator, .{ .node = entry.node, .rect = entry.rect.translated(x, y) });
+            try out.append(allocator, entry.translated(x, y));
     }
     for (block.children.items) |child| switch (child) {
         .block => |value| try captureBlock(value, target, x, y, allocator, out),
@@ -86,6 +109,66 @@ pub fn captureBlock(block: anytype, target: ?*dom.Node, dx: f64, dy: f64, alloca
         // placement. Legacy TextLayout-only trees have no CSSOM fragments.
         .line => {},
     };
+}
+
+fn firstBox(document: anytype, node: *dom.Node, allocator: std.mem.Allocator) !?Fragment {
+    var fragments = std.ArrayList(Fragment).empty;
+    defer fragments.deinit(allocator);
+    for (document.children.items) |child| try captureBlock(child, node, 0, 0, allocator, &fragments);
+    return if (fragments.items.len == 0) null else fragments.items[0];
+}
+
+fn isTag(node: *dom.Node, tag: []const u8) bool {
+    return node.* == .element and std.ascii.eqlIgnoreCase(node.element.tag, tag);
+}
+
+fn nonStatic(node: *dom.Node) bool {
+    const position = style(&node.element, "position");
+    return position.len != 0 and !std.mem.eql(u8, position, "static");
+}
+
+/// Used padding-box metrics and first-fragment offsets. Coordinates exclude
+/// transforms and scrolling; CSS zoom is removed in the target's coordinate
+/// space. viewport is the caller's scrollbar-excluded CSS viewport size.
+pub fn measureMetrics(document: anytype, target: *dom.Node, frame_zoom: f32, viewport: Rect, allocator: std.mem.Allocator) !Metrics {
+    std.debug.assert(!document.layoutNeeded());
+    var result = Metrics{};
+    if (hidden(target)) return result;
+    const own = (try firstBox(document, target, allocator)) orelse return result;
+    const zoom = box_model.effectiveCssZoomForNode(target);
+    const scale: f64 = 1.0 / (frame_zoom * zoom);
+    if (own.border) |border| {
+        result.client = .{
+            .x = @as(f64, @floatFromInt(border.left)) * scale,
+            .y = @as(f64, @floatFromInt(border.top)) * scale,
+            .width = @max(own.rect.width - @as(f64, @floatFromInt(border.horizontal())), 0) * scale,
+            .height = @max(own.rect.height - @as(f64, @floatFromInt(border.vertical())), 0) * scale,
+        };
+        if (target == document.node_ptr) {
+            result.client.width = viewport.width;
+            result.client.height = viewport.height;
+        }
+    }
+    if (isTag(target, "body")) return result;
+    result.offset_x = own.rect.x * scale;
+    result.offset_y = own.rect.y * scale;
+    // Fixed boxes currently attach only to the viewport in the layout engine.
+    if (target == document.node_ptr or std.mem.eql(u8, style(&target.element, "position"), "fixed")) return result;
+    var current = parent(target);
+    while (current) |node| : (current = parent(node)) {
+        if (node.* != .element) continue;
+        const transform = style(&node.element, "transform");
+        const establishes_containing_block = nonStatic(node) or (transform.len != 0 and !std.mem.eql(u8, transform, "none"));
+        const table_ancestor = !nonStatic(target) and (isTag(node, "td") or isTag(node, "th") or isTag(node, "table"));
+        if (!establishes_containing_block and !isTag(node, "body") and !table_ancestor and box_model.effectiveCssZoomForNode(node) == zoom) continue;
+        const ancestor = (try firstBox(document, node, allocator)) orelse continue;
+        const border = ancestor.border orelse box_model.BoxEdges{};
+        result.offset_parent = node;
+        result.offset_x = (own.rect.x - ancestor.rect.x - @as(f64, @floatFromInt(border.left))) * scale;
+        result.offset_y = (own.rect.y - ancestor.rect.y - @as(f64, @floatFromInt(border.top))) * scale;
+        break;
+    }
+    return result;
 }
 
 /// Read current boxes after the caller completes style and layout. The output

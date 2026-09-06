@@ -1,0 +1,113 @@
+<!doctype html>
+<!-- How to verify: expect PASS, then click Resize / place marker. The green
+     marker must remain just below the target inside the bordered container.
+     Resize the native window and click again; the measurements must update.
+     Assertions also run through the serial local WPT adapter. -->
+<html><head><title>JavaScript box metrics</title><style>
+  body { font: 16px sans-serif; }
+  #container { position: relative; width: 60%; height: 180px; padding: 12px; border: 4px solid navy; }
+  #target { width: 100px; height: 40px; padding: 5px; border: 2px solid blue; }
+  #marker { position: absolute; width: 60px; height: 12px; background: green; }
+</style></head><body>
+<h1>JavaScript box metrics</h1><p id="result">Running…</p>
+<button id="resize">Resize / place marker</button><p id="measurement"></p>
+<div id="container"><div id="target">Target</div><div id="marker"></div></div>
+<script>
+(function() {
+  var results = [];
+  function check(name, run) {
+    try { run(); results.push({name:name, status:0}); }
+    catch(e) { results.push({name:name, status:1, message:String(e)}); }
+  }
+  function equal(actual, expected) {
+    if (actual !== expected) throw new Error(String(actual) + ' !== ' + String(expected));
+  }
+  var container = document.getElementById('container');
+  var target = document.getElementById('target');
+  var marker = document.getElementById('marker');
+  function place() {
+    marker.style.left = target.offsetLeft + 'px';
+    marker.style.top = (target.offsetTop + target.offsetHeight + 6) + 'px';
+    document.getElementById('measurement').textContent = 'Padding box: ' + target.clientWidth + ' × ' + target.clientHeight + '; offset: ' + target.offsetLeft + ', ' + target.offsetTop;
+  }
+  check('Client sizes are numeric padding boxes, not border or content sizes', function() {
+    equal(target.clientWidth, 110); equal(target.clientHeight, 50);
+    equal(target.clientLeft, 2); equal(target.clientTop, 2);
+    equal(target.offsetWidth, 114); equal(target.offsetHeight, 54);
+    target.style.boxSizing = 'border-box';
+    equal(target.clientWidth, 96); equal(target.clientHeight, 36);
+    target.style.boxSizing = 'content-box';
+    target.style.borderLeft = '7px solid blue'; equal(target.clientLeft, 7);
+    equal(target.clientWidth, 110);
+    target.style.borderLeft = '2px solid blue';
+  });
+  check('Offset parent has canonical wrapper identity and padding origin', function() {
+    equal(target.offsetParent, container); equal(marker.offsetParent, container);
+    equal(target.offsetLeft, 12); equal(target.offsetTop, 12);
+    place();
+    var t = target.getBoundingClientRect(), m = marker.getBoundingClientRect();
+    equal(m.left, t.left); equal(m.top, t.bottom + 6);
+    container.style.padding = '20px';
+    equal(target.offsetTop, 20); equal(target.offsetLeft, 20);
+    place(); equal(marker.getBoundingClientRect().left, target.getBoundingClientRect().left);
+    container.style.padding = '12px';
+  });
+  check('Offset parent follows ancestor mutations and DOM relocation', function() {
+    var wrapper = document.createElement('div');
+    wrapper.style.cssText = 'display:block;position:relative';
+    container.appendChild(wrapper); wrapper.appendChild(target);
+    equal(target.offsetParent, wrapper);
+    wrapper.style.position = 'static'; equal(target.offsetParent, container);
+    for (var i = 0; i < 20; i++) container.appendChild(document.createElement('div'));
+    equal(target.offsetParent, container);
+    container.insertBefore(target, marker); wrapper.remove();
+  });
+  check('Root, body, fixed, detached and hidden cases', function() {
+    equal(document.documentElement.offsetParent, null); equal(document.body.offsetParent, null);
+    equal(document.body.offsetLeft, 0); equal(document.body.offsetTop, 0);
+    equal(document.documentElement.clientWidth > container.clientWidth, true);
+    target.style.position = 'fixed'; equal(target.offsetParent, null);
+    target.style.position = 'static';
+    target.style.visibility = 'hidden'; equal(target.clientWidth, 110);
+    target.style.visibility = 'visible';
+    container.style.display = 'none'; equal(target.clientWidth, 0); equal(target.offsetParent, null);
+    container.style.display = 'block';
+    target.remove(); equal(target.offsetParent, null); equal(target.offsetLeft, 0); equal(target.clientWidth, 0);
+    container.insertBefore(target, marker); equal(target.offsetParent, container);
+  });
+  check('Zoom and transforms do not inflate client or offset values', function() {
+    var left = target.offsetLeft, top = target.offsetTop;
+    container.style.zoom = '2'; container.style.transform = 'translate(7px,9px)';
+    equal(target.clientWidth, 110); equal(target.clientLeft, 2);
+    equal(target.offsetLeft, left); equal(target.offsetTop, top);
+    target.style.zoom = '2'; equal(target.offsetParent, container); equal(target.clientWidth, 110);
+    equal(target.offsetLeft, left / 2); equal(target.offsetTop, top / 2);
+    target.style.zoom = '1'; container.style.zoom = '1'; container.style.transform = 'none';
+  });
+  check('Atomic snapshots retain borders; ordinary inline client metrics are zero', function() {
+    var host = document.createElement('div');
+    host.innerHTML = '<span id="inline">one<br>two</span><span id="atomic" style="display:inline-block;position:relative;width:80px;height:50px;padding:5px;border:3px solid"><div id="nested" style="width:30px;height:20px;padding:4px;border:2px solid"></div></span>';
+    document.body.appendChild(host);
+    var inline = document.getElementById('inline'), atomic = document.getElementById('atomic'), nested = document.getElementById('nested');
+    equal(inline.clientWidth, 0); equal(inline.clientTop, 0);
+    equal(inline.offsetTop, Math.round(inline.getClientRects()[0].top - document.body.getBoundingClientRect().top));
+    equal(atomic.clientWidth, 90); equal(atomic.clientLeft, 3);
+    equal(nested.clientWidth, 38); equal(nested.clientTop, 2); equal(nested.offsetParent, atomic);
+    equal(nested.offsetLeft, 5); equal(nested.offsetTop, 5);
+    host.remove();
+  });
+  check('Geometry accessors reject forged receivers', function() {
+    var getter = Object.getOwnPropertyDescriptor(Node.prototype, 'clientWidth').get;
+    var threw = false;
+    try { getter.call({nodeType:1, handle:target.handle}); } catch(e) { threw = e instanceof TypeError; }
+    equal(threw, true);
+  });
+  document.getElementById('resize').onclick = function() {
+    target.style.width = target.clientWidth > 150 ? '100px' : '200px'; place();
+  };
+  var failed = results.filter(function(r) { return r.status !== 0; });
+  document.getElementById('result').textContent = failed.length ? 'FAIL: ' + failed.map(function(r) { return r.name + ': ' + r.message; }).join('; ') : 'PASS (' + results.length + ' checks)';
+  place();
+  if (typeof completion_callback === 'function') completion_callback(results, {status:0});
+})();
+</script></body></html>

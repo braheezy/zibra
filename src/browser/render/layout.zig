@@ -4050,7 +4050,12 @@ fn flushLine(self: *Layout, line_buffer: *std.ArrayList(LineItem)) !void {
                         element_geometry.box(item.x, baseline - strut.ascent, item.width, strut.ascent + strut.descent)
                     else
                         own;
-                    try element_geometry.recordInline(self.allocator, &block.geometry_fragments, geometry_line_start, node, block.node_ptr, own, ancestor, item.payload != .inline_block);
+                    const border: ?BoxEdges = switch (item.payload) {
+                        .glyph, .inline_block => null,
+                        .image => |image| image.border,
+                        else => .{},
+                    };
+                    try element_geometry.recordInline(self.allocator, &block.geometry_fragments, geometry_line_start, node, block.node_ptr, own, ancestor, item.payload != .inline_block, border);
                 }
             }
         }
@@ -4117,10 +4122,7 @@ fn flushLine(self: *Layout, line_buffer: *std.ArrayList(LineItem)) !void {
                 const y = final_y +| box.margin.top;
                 if (self.collect_hit_test_bounds) try box.snapshot.mergeBounds(self, x, y);
                 if (self.collect_hit_test_bounds) if (self.inline_block) |block| {
-                    for (box.snapshot.geometry_fragments.items) |entry| try block.geometry_fragments.append(self.allocator, .{
-                        .node = entry.node,
-                        .rect = entry.rect.translated(@floatFromInt(x), @floatFromInt(y)),
-                    });
+                    for (box.snapshot.geometry_fragments.items) |entry| try block.geometry_fragments.append(self.allocator, entry.translated(@floatFromInt(x), @floatFromInt(y)));
                 };
                 try box.snapshot.paintAt(self.current_display_target, x, y, source);
             },
@@ -8228,6 +8230,13 @@ const BlockLayout = struct {
             self.document.width.read(&self.width, self.allocator).*
         else
             self.document.width.get().*;
+        // Absolute used values are based on the padding box, unlike normal
+        // flow's content box. Keep the layout parent relationship unchanged.
+        if (position_mode == .absolute and self.embedded_box == null) {
+            if (self.parent_block) |pb| {
+                parent_width += pb.padding.horizontal();
+            }
+        }
         var containing_width_css = cssPixelsFromLayout(
             parent_width,
             parent_zoom,
@@ -8238,7 +8247,7 @@ const BlockLayout = struct {
             // A preceding child's metric can dirty the parent's final height
             // publisher during this traversal without invalidating that base.
             if ((!pb.in_layout and pb.height.dirty) or !pb.content_height_definite) break :blk null;
-            const height = pb.content_height;
+            const height = pb.content_height + if (position_mode == .absolute) pb.padding.vertical() else @as(i32, 0);
             break :blk cssPixelsFromLayout(height, pb.zoom.get().*, self.document.page_zoom);
         } else null;
         if (fixed_to_viewport) {
@@ -8896,12 +8905,22 @@ const BlockLayout = struct {
         const position_containing_height = if (fixed_to_viewport)
             engine.layoutWindowHeight()
         else if (self.parent_block) |parent|
-            if (parent.content_height_definite) parent.content_height else null
+            if (parent.content_height_definite) parent.content_height + if (position_mode == .absolute) parent.padding.vertical() else @as(i32, 0) else null
         else
             null;
+        const position_origin_y = if (position_mode == .absolute and self.parent_block != null and self.embedded_box == null)
+            self.parent_block.?.y.get().* + self.parent_block.?.border.top
+        else
+            parent_content_y;
+        // Only resolved insets use the padding edge. With auto left/right,
+        // preserve the hypothetical normal-flow (content-edge) x position.
+        const position_origin_x = if (position_mode == .absolute and self.parent_block != null and self.embedded_box == null)
+            parent_x - self.parent_block.?.padding.left
+        else
+            parent_x;
         self.updatePositionOffset(
-            parent_x,
-            parent_content_y,
+            position_origin_x,
+            position_origin_y,
             parent_width,
             position_containing_height,
             containing_width_css,

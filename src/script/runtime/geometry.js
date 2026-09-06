@@ -110,4 +110,13 @@
       }, enumerable: true, configurable: true
     });
   });
+  ['clientLeft', 'clientTop', 'clientWidth', 'clientHeight', 'offsetLeft', 'offsetTop', 'offsetParent'].forEach(function(name, index) {
+    Object.defineProperty(Node.prototype, name, {
+      get: function() {
+        if (!DOM_NODE_BRAND.has(this) || this.nodeType !== 1) throw new TypeError('Geometry requires an Element');
+        var values = __native.elementMetrics(this.handle);
+        return index === 6 ? (values[6] ? wrapNode(values[6]) : null) : Math.round(values[index]);
+      }, enumerable: true, configurable: true
+    });
+  });
 })();

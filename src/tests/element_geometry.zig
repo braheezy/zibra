@@ -45,6 +45,10 @@ const Page = struct {
         try geometry.collect(self.document.?, node, 1, scroll, unscaled, allocator, &result);
         return result;
     }
+
+    fn metrics(self: *Page, node: *parser.Node) !geometry.Metrics {
+        return geometry.measureMetrics(self.document.?, node, 1, .{ .width = 790, .height = 600 }, allocator);
+    }
 };
 
 fn setStyle(node: *parser.Node, value: []const u8) !void {
@@ -167,4 +171,56 @@ test "geometry subtracts nested scroll without clipping the border box" {
     var parent_rect = try page.rects(&page.root, 25, false);
     defer parent_rect.deinit(allocator);
     try std.testing.expectEqual(@as(f64, 60), parent_rect.items[0].height);
+}
+
+test "geometry client metrics use used edges and survive atomic snapshot retirement" {
+    var page = try Page.init("<main style='display:block'><span style='display:inline-block;zoom:2;width:100px;height:80px;border:3px solid;padding:5px'><div style='display:block;width:50%;height:30px;border:2px solid;padding:4px'></div></span><span>inline</span></main>");
+    defer page.deinit();
+    try page.render();
+    const atomic = &page.root.element.children.items[0];
+    const nested = &atomic.element.children.items[0];
+    const outer = try page.metrics(atomic);
+    try std.testing.expectEqual(Rect{ .x = 3, .y = 3, .width = 110, .height = 90 }, outer.client);
+    try std.testing.expectEqual(Rect{ .x = 2, .y = 2, .width = 58, .height = 38 }, (try page.metrics(nested)).client);
+    try std.testing.expectEqual(Rect{}, (try page.metrics(&page.root.element.children.items[1])).client);
+    try std.testing.expectEqual(@as(f64, 790), (try page.metrics(&page.root)).client.width);
+    try setStyle(atomic, "display:inline-block;zoom:2;width:100px;height:80px;border:3px solid;padding:5px;box-sizing:border-box");
+    try page.render();
+    try std.testing.expectEqual(@as(f64, 94), (try page.metrics(atomic)).client.width);
+    try std.testing.expectEqual(@as(f64, 110), outer.client.width);
+}
+
+test "geometry offsets use padding origin and ignore transforms and scroll" {
+    var page = try Page.init("<main style='display:block;position:relative;zoom:2;border:3px solid;padding:5px;height:100px;overflow:scroll;transform:translate(10px,20px)'><div style='display:block;height:30px'></div><div style='display:block;width:40px;height:50px;margin-left:7px'></div><div style='display:block;position:absolute;left:11px;top:13px;width:10px;height:20px'></div></main>");
+    defer page.deinit();
+    try page.render();
+    const normal = &page.root.element.children.items[1];
+    const absolute = &page.root.element.children.items[2];
+    const normal_metrics = try page.metrics(normal);
+    try std.testing.expectEqual(&page.root, normal_metrics.offset_parent.?);
+    try std.testing.expectEqual(@as(f64, 12), normal_metrics.offset_x);
+    try std.testing.expectEqual(@as(f64, 35), normal_metrics.offset_y);
+    const absolute_metrics = try page.metrics(absolute);
+    try std.testing.expectEqual(&page.root, absolute_metrics.offset_parent.?);
+    try std.testing.expectEqual(@as(f64, 11), absolute_metrics.offset_x);
+    try std.testing.expectEqual(@as(f64, 13), absolute_metrics.offset_y);
+    try setStyle(absolute, "display:block;position:absolute;width:10px;height:20px");
+    try page.render();
+    try std.testing.expectEqual(@as(f64, 5), (try page.metrics(absolute)).offset_x);
+    try setStyle(absolute, "display:block;position:absolute;right:10%;bottom:10%;width:10px;height:20px");
+    try page.render();
+    try std.testing.expectEqual(@as(f64, 79), (try page.metrics(absolute)).offset_y);
+    try setStyle(absolute, "display:block;position:absolute;right:20px;bottom:15px;width:10px;height:20px;zoom:2;margin:1px");
+    try page.render();
+    // Parent height is 100 + 2*5 padding; the child's 2x zoom removes
+    // half that span from each returned offset coordinate.
+    try std.testing.expectEqual(@as(f64, 19), (try page.metrics(absolute)).offset_y);
+    page.root.element.scroll_y = 40;
+    const scrolled = try page.metrics(normal);
+    try std.testing.expectEqual(normal_metrics.offset_parent, scrolled.offset_parent);
+    try std.testing.expectEqual(normal_metrics.offset_x, scrolled.offset_x);
+    try std.testing.expectEqual(normal_metrics.offset_y, scrolled.offset_y);
+    try setStyle(&page.root, "display:none");
+    try page.render();
+    try std.testing.expectEqual(geometry.Metrics{}, try page.metrics(normal));
 }

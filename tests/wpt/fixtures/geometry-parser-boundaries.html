@@ -9,7 +9,9 @@ function geometryCheck(name, actual, expected) {
 }
 var retainedElement = document.getElementById('measured');
 var retainedRectangle = retainedElement.getBoundingClientRect();
+var retainedOffsetParent = retainedElement.offsetParent;
 geometryCheck('Styles installed before first parser script', retainedRectangle.width, 137);
+geometryCheck('Client metrics available in parser script', retainedElement.clientWidth, 137);
 document.write('<section><div>inserted</div></section><style>#measured { width:211px; }</style>');
 </script>
 <!-- Grow the parser's child arrays after layout has installed DOM borrows. -->
@@ -17,10 +19,12 @@ document.write('<section><div>inserted</div></section><style>#measured { width:2
 <div>g</div><div>h</div><div>i</div><div>j</div><div>k</div><div>l</div>
 <script>
 geometryCheck('Retained handle survives parser relocation', retainedElement === document.getElementById('measured'), true);
+geometryCheck('Offset parent wrapper survives parser relocation', retainedElement.offsetParent === retainedOffsetParent, true);
 geometryCheck('Parser-inserted stylesheet applies at next boundary', retainedElement.offsetWidth, 211);
 geometryCheck('Earlier rectangle remains a snapshot', retainedRectangle.width, 137);
 document.getElementById('sheet').textContent = '#measured {display:block;width:137px;height:48px}';
 geometryCheck('Replacing stylesheet text preserves live computed values', retainedElement.offsetHeight, 48);
+geometryCheck('Client metrics refresh after stylesheet replacement', retainedElement.clientHeight, 48);
 var insertedFrame = document.createElement('iframe');
 insertedFrame.src = 'about:blank';
 document.body.appendChild(insertedFrame);

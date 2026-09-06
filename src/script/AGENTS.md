@@ -24,9 +24,11 @@ queued work and shutdown are documented in
   custom-property case; native computed-style readback flushes pending ancestor
   style work and copies values before returning to Kiesel.
 - `runtime/geometry.js` owns static DOMRect/DOMRectList values and Element
-  geometry entry points. `geometry_bindings.zig` copies numeric rectangles
-  through a generation-scoped browser callback; never derive geometry from
-  authored style strings or retain a native rectangle buffer in JavaScript.
+  geometry entry points. `geometry_bindings.zig` copies numeric rectangles,
+  used box metrics, and optional offset-parent handles through a typed,
+  generation-scoped browser callback. Wrap returned handles through the
+  canonical Node cache; never export a native pointer, derive geometry from
+  authored style strings, or retain a native result buffer in JavaScript.
 - `dom_handles.zig` owns the two-way Node pointer/numeric identity maps for one
   window generation.
 - `runtime/range.js` owns live Range state, boundary validation/comparison,

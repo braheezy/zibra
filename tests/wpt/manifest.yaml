@@ -16,7 +16,7 @@ directories:
   - uievents
 tests:
   - dom/nodes/Element-firstElementChild.html
-  # First element-geometry slice; do not opt into all of CSSOM View yet.
+  # Element rectangles and box metrics; do not opt into all of CSSOM View yet.
   - css/cssom-view/cssom-getBoundingClientRect-001.html
   - css/cssom-view/cssom-getBoundingClientRect-002.html
   - css/cssom-view/cssom-getClientRects.html
@@ -24,6 +24,9 @@ tests:
   - css/cssom-view/GetBoundingRect.html
   - css/cssom-view/htmlelement-offset-width-001.html
   - css/cssom-view/ttwf-js-cssomview-getclientrects-length.html
+  - css/cssom-view/offsetParent-body-and-html.html
+  - css/cssom-view/offsetTopLeftInScrollableParent.html
+  - css/cssom-view/client-props-zoom.html
 reftests:
   - css/CSS2/backgrounds/background-color-174.xht
 crashtests:
