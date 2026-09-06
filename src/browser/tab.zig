@@ -1797,7 +1797,7 @@ pub fn runAnimationFrameForGeneration(
     // Advance CSS transition animations
     var animations_running = false;
     if (frame.current_node) |*root| {
-        animations_running = self.advanceAnimations(root);
+        animations_running = self.advanceAnimations(root, now_ns);
     }
 
     // If animations are running, schedule the next frame
@@ -1966,8 +1966,10 @@ fn requestAnimationPaint(context: *anyopaque) void {
     self.needs_paint = true;
 }
 
-fn animationSink(self: *Tab) tab_animation.Sink {
+fn animationSink(self: *Tab, now_ns: i96) tab_animation.Sink {
     return .{
+        .now_seconds = @as(f64, @floatFromInt(now_ns)) / 1e9,
+        .allocator = self.allocator,
         .context = self,
         .publish_composited = publishAnimationComposited,
         .mark_layout = markAnimationLayoutFromSink,
@@ -1976,8 +1978,8 @@ fn animationSink(self: *Tab) tab_animation.Sink {
 }
 
 /// Advance transitions and named keyframe animations in the node tree.
-fn advanceAnimations(self: *Tab, node: *parser.Node) bool {
-    return tab_animation.advance(self.animationSink(), node);
+fn advanceAnimations(self: *Tab, node: *parser.Node, now_ns: i96) bool {
+    return tab_animation.advance(self.animationSink(now_ns), node);
 }
 
 fn createCleanPhaseTestDocument(
@@ -2065,7 +2067,7 @@ test "opacity and transform animations stay compositor-only" {
     try initAnimationPhaseTest(&tab, &frame, allocator);
     defer deinitAnimationPhaseTest(&tab, &frame);
 
-    try std.testing.expect(tab.advanceAnimations(&root));
+    try std.testing.expect(tab.advanceAnimations(&root, 0));
     try std.testing.expectEqual(@as(usize, 2), tab.composited_updates.items.len);
     try std.testing.expect(!frame.styleNeeded());
     try std.testing.expect(!frame.documentLayout().?.layoutNeeded());
@@ -2092,7 +2094,7 @@ test "background color animation requests layout and paint" {
     try initAnimationPhaseTest(&tab, &frame, allocator);
     defer deinitAnimationPhaseTest(&tab, &frame);
 
-    try std.testing.expect(tab.advanceAnimations(&root));
+    try std.testing.expect(tab.advanceAnimations(&root, 0));
     try std.testing.expect(!frame.styleNeeded());
     try std.testing.expect(frame.documentLayout().?.layoutNeeded());
     try std.testing.expect(tab.needs_paint);
@@ -2121,7 +2123,7 @@ test "pixel dimension animation requests layout and produces px values" {
     try initAnimationPhaseTest(&tab, &frame, allocator);
     defer deinitAnimationPhaseTest(&tab, &frame);
 
-    try std.testing.expect(tab.advanceAnimations(&root));
+    try std.testing.expect(tab.advanceAnimations(&root, 0));
     try std.testing.expect(!frame.styleNeeded());
     try std.testing.expect(frame.documentLayout().?.layoutNeeded());
     try std.testing.expect(tab.renderPhasesNeeded());
@@ -2163,7 +2165,7 @@ test "alternate keyframe cycles preserve endpoints and relayout dimensions" {
     try initAnimationPhaseTest(&tab, &frame, allocator);
     defer deinitAnimationPhaseTest(&tab, &frame);
 
-    try std.testing.expect(tab.advanceAnimations(&root));
+    try std.testing.expect(tab.advanceAnimations(&root, 0));
     try std.testing.expectApproxEqAbs(
         @as(f64, 0.5),
         root.element.animations.?.get("opacity").?.numeric.getValue(),
@@ -2176,7 +2178,7 @@ test "alternate keyframe cycles preserve endpoints and relayout dimensions" {
     );
     try std.testing.expect(frame.documentLayout().?.layoutNeeded());
 
-    try std.testing.expect(tab.advanceAnimations(&root));
+    try std.testing.expect(tab.advanceAnimations(&root, 0));
     try std.testing.expect(root.element.css_animation.?.restart_pending);
     try std.testing.expectApproxEqAbs(
         @as(f64, 1),
@@ -2184,7 +2186,7 @@ test "alternate keyframe cycles preserve endpoints and relayout dimensions" {
         0.000001,
     );
 
-    try std.testing.expect(tab.advanceAnimations(&root));
+    try std.testing.expect(tab.advanceAnimations(&root, 0));
     try std.testing.expectEqual(@as(u32, 1), root.element.css_animation.?.completed_iterations);
     try std.testing.expectApproxEqAbs(
         @as(f64, 1),
@@ -2197,8 +2199,8 @@ test "alternate keyframe cycles preserve endpoints and relayout dimensions" {
         0.000001,
     );
 
-    try std.testing.expect(tab.advanceAnimations(&root));
-    try std.testing.expect(tab.advanceAnimations(&root));
+    try std.testing.expect(tab.advanceAnimations(&root, 0));
+    try std.testing.expect(tab.advanceAnimations(&root, 0));
     try std.testing.expectApproxEqAbs(
         @as(f64, 0),
         root.element.animations.?.get("opacity").?.numeric.getValue(),
@@ -2231,9 +2233,9 @@ test "finite keyframe animation restores its underlying property" {
     try initAnimationPhaseTest(&tab, &frame, allocator);
     defer deinitAnimationPhaseTest(&tab, &frame);
 
-    try std.testing.expect(tab.advanceAnimations(&root));
+    try std.testing.expect(tab.advanceAnimations(&root, 0));
     try std.testing.expect(root.element.css_animation.?.restart_pending);
-    try std.testing.expect(!tab.advanceAnimations(&root));
+    try std.testing.expect(!tab.advanceAnimations(&root, 0));
     try std.testing.expect(root.element.css_animation.?.finished);
     try std.testing.expect(root.element.animations.?.get("width") == null);
     try std.testing.expect(frame.documentLayout().?.layoutNeeded());

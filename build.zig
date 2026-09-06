@@ -103,6 +103,16 @@ const ScreenshotFixture = struct {
 
 const screenshot_fixtures = [_]ScreenshotFixture{
     .{
+        .fixture = "tests/manual/svg-inline.html",
+        .golden = "tests/golden/svg-inline.macos.png",
+        .output_basename = "svg-inline-screenshot.png",
+    },
+    .{
+        .fixture = "tests/manual/svg-images.html",
+        .golden = "tests/golden/svg-images.macos.png",
+        .output_basename = "svg-images-screenshot.png",
+    },
+    .{
         .fixture = "tests/manual/native-screenshot.html",
         .golden = "tests/golden/native-screenshot.macos.png",
         .output_basename = "native-screenshot.png",

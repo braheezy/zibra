@@ -174,6 +174,13 @@ must not publish state or clear a newer generation. The UI tick schedules the
 next Tab animation before snapshotting the prior commit for raster so both
 workers can overlap.
 
+Inline SVG uses this same chain. The Tab supplies monotonic seconds to its SVG
+sampler, which updates Element-owned values and marks retained paint, plus
+layout when the outer viewport dimensions animate. Nested SVG shares its
+outer root's timeline. SVG does
+not create independent timer helpers or queue raw DOM pointers. Image decodes
+sample only time zero; their pixels have no animation worker.
+
 `setInterval` uses generation-stamped one-shot helpers, not one permanently
 looping thread. After a live callback finishes, the JavaScript wrapper schedules
 exactly one next delivery. The Tab cancellation key includes window,

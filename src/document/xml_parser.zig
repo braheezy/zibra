@@ -1,9 +1,9 @@
-//! Bounded XML tree builder for detached DOMParser documents.
+//! XML tree builder for detached DOMParser documents and static SVG images.
 //!
 //! This is deliberately separate from the HTML tree builder: XML has no tag
 //! soup recovery, preserves qualified-name case, requires quoted attributes,
 //! and reports malformed input through a parser-error document at the host
-//! boundary. Nodes borrow the parser input; the WindowRealm owns that buffer.
+//! boundary. Nodes borrow the parser input; the caller owns that buffer.
 
 const std = @import("std");
 const dom = @import("dom.zig");
@@ -18,6 +18,11 @@ pub const Parser = struct {
     body: []const u8,
     stack: std.ArrayList(Node),
     root: ?Node = null,
+    // Callers parsing resource images can bound recursive DOM teardown and
+    // allocation before the tree is published. Defaults preserve DOMParser.
+    max_depth: usize = std.math.maxInt(usize),
+    max_elements: usize = std.math.maxInt(usize),
+    element_count: usize = 0,
 
     pub fn init(allocator: std.mem.Allocator, body: []const u8) Parser {
         return .{ .allocator = allocator, .body = body, .stack = std.ArrayList(Node).empty };
@@ -94,6 +99,8 @@ pub const Parser = struct {
     }
 
     fn openElement(self: *Parser, raw: []const u8) !void {
+        if (self.stack.items.len >= self.max_depth or self.element_count >= self.max_elements) return error.XmlLimitExceeded;
+        self.element_count += 1;
         var source = std.mem.trim(u8, raw, " \t\r\n");
         var self_closing = false;
         if (std.mem.endsWith(u8, source, "/")) {

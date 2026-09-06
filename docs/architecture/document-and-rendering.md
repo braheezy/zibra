@@ -65,8 +65,9 @@ split across acyclic modules:
   invalidation callbacks, and DOM traversal helpers;
 - `html_parser.zig` is a stateful, source-borrowing tokenizer/tree builder
   generic over the DOM types and final parent-pointer repair callback;
-- `xml_parser.zig` owns the bounded well-formed XML tree builder used only by
-  detached `DOMParser` documents. It preserves qualified-name case, requires
+- `xml_parser.zig` owns the XML tree builder shared by detached `DOMParser`
+  documents and temporary SVG image decoding. Image callers opt into depth and
+  element-count limits. It preserves qualified-name case, requires
   quoted attributes, decodes the XML entity subset, and leaves malformed-input
   parser-error construction to the script host boundary;
 - `html_source.zig` owns the stable source chunks for one navigated document,
@@ -739,6 +740,79 @@ descendants union into one rectangle per visual line for their nearest
 focusable ancestor; a focusable block replaces only its own fragments with one
 block box. Focus-ring commands are pointer-free and paint a 4px white outline
 beneath a 2px black outline only when `is_focus_visible` is active.
+
+## SVG
+
+Inline SVG is an atomic replaced layout leaf. Its used viewport follows CSS
+dimensions, SVG dimension attributes, viewBox ratio, containing-block
+percentages, and authored zoom. The HTML parser keeps its authored children in
+the ordinary live DOM and honors self-closing SVG shapes. Presentation hints
+enter the normal cascade below author rules. Paint reads the resulting live
+styles; an Element-owned declaration bitmask distinguishes explicit paint
+from inherited paint on use instances and animated ancestors.
+
+The layout leaf borrows its root only within the normal DOM/layout generation.
+Each paint invokes `render/svg.zig` synchronously and transfers an independent
+straight-alpha RGBA bitmap into an owning canvas display command. Retained
+clones and raster snapshots own their pixel copies. A block SVG's outer opacity
+is applied by its display-command wrapper; its bitmap omits that outer opacity
+to avoid applying it twice. Child attribute/style changes mark the nearest
+persistent layout/paint owner through DOM ancestry.
+Structural mutation and navigation use the existing borrower retirement order.
+No SVG XML tree, ID index, gradient, font buffer, filter surface, or network
+response borrow crosses a worker boundary.
+
+SVG image decoding uses the same renderer over a bounded temporary XML tree.
+The supported subset is:
+
+- basic shapes, paths, fill/stroke, transforms, nested viewBox mappings, group
+  opacity, currentColor and inherited presentation values;
+- linear/radial gradients with stops, opacity, object/user units, transforms,
+  local href inheritance, and pad extension; local URL fragments are percent
+  decoded and a missing paint server may use a solid fallback;
+- local use references to shapes/groups/symbols, with instance sizing and
+  bounded reference recursion;
+- geometric clipPath coverage in user or object-box coordinates, including
+  group clips and clip-rule;
+- feGaussianBlur (equal x/y deviation), feOffset, feFlood, feColorMatrix
+  (matrix/saturate/luminanceToAlpha), feComposite (over/in/out/atop/xor),
+  feBlend (normal/multiply/screen/darken/lighten), and feMerge, with named
+  results and SourceGraphic/SourceAlpha inputs;
+- basic left-to-right text chunks, baseline x/y/dx/dy positioning, font-size,
+  solid fill, and nested textual tspan content through z2d TrueType outlines;
+- inline external image href resources loaded by the Browser, with meet/none
+  fitting and transformed raster sampling;
+- clock-based animate, animateTransform and finite-duration set tracks for
+  the supported geometry/paint/transform properties, from/to or values,
+  linear/discrete interpolation, repeatCount and freeze/remove end behavior.
+
+Element-owned animation samples contain independent strings, not mutations of
+authored attributes. The Tab supplies monotonic time, samples on its existing
+animation frame chain, and dirties SVG paint (and layout for viewport dimension
+tracks). Nested SVG shares its outer root's timeline. DOM-triggered frames
+resample completed timelines so removed tracks release their sampled values.
+Finite tracks stop requesting frames after publishing their terminal sample;
+no SVG timer retains a DOM pointer. Navigation retires the timeline scalars and
+samples with the Element.
+
+This is a bounded subset, not general SVG conformance. Masks, markers,
+patterns, gradient repeat/reflect, precise nested viewport overflow clipping,
+complex text shaping, text anchoring/paths, per-tspan styling/positioning,
+font-family/weight selection, cross-root or external use/paint references,
+event-based SMIL, keyTimes/splines, additive/motion animation, and animated image
+resources remain unsupported. Filter processing currently uses premultiplied
+sRGB channels; linearRGB interpolation and primitive subregions/units are not
+implemented.
+The HTML DOM does not yet implement full SVG namespace/IDL semantics.
+
+Raster limits are 4,096 pixels per axis and 4 Mi pixels per viewport. Reference
+collection is bounded to 16,384 elements/128 levels. Drawing permits 64 nested
+calls and shares a 65,536-visit budget with object-box traversal. Clip/opacity
+layers and filter graphs each cap live storage at 16 Mi pixels; filter graphs
+permit 16 primitives. Text chunks are
+limited to 8 KiB and font files to 16 MiB. Failed allocation propagates; invalid
+or oversized inline SVG produces empty paint. Unsupported rendering subtrees
+are inert.
 
 ## Destruction order
 

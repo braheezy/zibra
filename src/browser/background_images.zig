@@ -6,6 +6,7 @@
 
 const std = @import("std");
 const zigimg = @import("zigimg");
+const image_decoder = @import("image_decoder.zig");
 
 const background = @import("../document/background_image.zig");
 const parser = @import("../document/parser.zig");
@@ -68,6 +69,7 @@ fn cloneCachedImage(allocator: std.mem.Allocator, entry: CacheEntry) !parser.Ima
 
 fn loadOne(
     allocator: std.mem.Allocator,
+    io: std.Io,
     page_url: *const Url,
     referrer_policy: url_module.ReferrerPolicy,
     source: []const u8,
@@ -115,18 +117,13 @@ fn loadOne(
     var encoded_owned = true;
     defer if (encoded_owned) allocator.free(encoded_bytes);
 
-    var image = zigimg.Image.fromMemory(allocator, encoded_bytes) catch |err| {
+    var image = image_decoder.decode(allocator, io, encoded_bytes) catch |err| {
         if (err == error.OutOfMemory) return err;
         std.log.warn("Failed to decode CSS background image {s}: {}", .{ source, err });
         return result;
     };
     var image_owned = true;
     defer if (image_owned) image.deinit(allocator);
-    image.convert(allocator, .rgba32) catch |err| {
-        if (err == error.OutOfMemory) return err;
-        std.log.warn("Failed to convert CSS background image {s} to RGBA: {}", .{ source, err });
-        return result;
-    };
 
     const cached_pixels = try allocator.dupe(u8, image.rawBytes());
     var cached_pixels_owned = true;
@@ -151,6 +148,7 @@ fn loadOne(
 /// display commands never outlive the pixel buffer they borrow.
 pub fn loadUsed(
     allocator: std.mem.Allocator,
+    io: std.Io,
     root: *Node,
     page_url: *const Url,
     referrer_policy: url_module.ReferrerPolicy,
@@ -194,6 +192,7 @@ pub fn loadUsed(
 
             var replacement = try loadOne(
                 allocator,
+                io,
                 page_url,
                 referrer_policy,
                 source.?,

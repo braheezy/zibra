@@ -1,0 +1,26 @@
+<!-- How to verify:
+Open in Zibra. The file image, object, and CSS background must show the same
+blue triangle/square icon. The data image must be a red circle. The last row
+must have a purple square of uniform opacity, including its overlap. The
+malformed object must show its fallback text. No broken icons should appear.
+-->
+<!doctype html>
+<html>
+<head>
+  <title>SVG image resources</title>
+  <style>
+    body { background: white; color: black; }
+    .row { height: 90px; }
+    .background { width: 120px; height: 80px; background-image: url(svg-images-icon.svg); background-repeat: no-repeat; }
+  </style>
+</head>
+<body>
+  <h1>SVG image resources</h1>
+  <div class="row"><img src="svg-images-icon.svg" alt="Blue shapes"> File image</div>
+  <div class="row"><object data="svg-images-icon.svg" type="image/svg+xml" width="120" height="80">FAIL: SVG object fallback</object> Image object</div>
+  <div class="background"></div>
+  <div class="row"><img width="80" height="80" alt="Red circle" src="data:image/svg+xml,%3Csvg%20xmlns='http://www.w3.org/2000/svg'%20width='80'%20height='80'%3E%3Ccircle%20cx='40'%20cy='40'%20r='30'%20fill='red'/%3E%3C/svg%3E"> Data URL</div>
+  <div class="row"><img alt="Uniform purple square" src="data:image/svg+xml,%3Csvg%20width='80'%20height='80'%3E%3Cg%20opacity='.5'%20fill='purple'%3E%3Crect%20width='50'%20height='80'/%3E%3Crect%20x='30'%20width='50'%20height='80'/%3E%3C/g%3E%3C/svg%3E"> Group opacity</div>
+  <object data="data:image/svg+xml,%3Csvg%3E" type="image/svg+xml">PASS: malformed SVG fallback</object>
+</body>
+</html>

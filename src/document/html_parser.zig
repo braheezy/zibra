@@ -237,7 +237,9 @@ pub fn Parser(
 
             if (tag_info.is_closing) {
                 try self.handleClosingTag(tag_info.name);
-            } else if (isTagSelfClosing(tag_info.name)) {
+            } else if (isTagSelfClosing(tag_info.name) or
+                (self.hasOpenElement("svg") and std.mem.endsWith(u8, std.mem.trimEnd(u8, tag_slice, " \t\r\n"), "/")))
+            {
                 try self.handleSelfClosingTag(tag_slice);
             } else {
                 try self.handleOpeningTag(tag_slice, tag_info.name);
@@ -434,7 +436,8 @@ pub fn Parser(
                 null,
             );
 
-            const node = Node{ .element = element };
+            var node = Node{ .element = element };
+            errdefer node.deinit(self.allocator);
             try parent.appendChild(self.allocator, node);
         }
 

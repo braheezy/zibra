@@ -1,6 +1,8 @@
 //! Focused unit-test root for browser, tab, frame, input, and worker behavior.
 
 comptime {
+    _ = @import("tests/svg_inline.zig");
+    _ = @import("browser/render/svg.zig");
     _ = @import("kiesel").builtins.reg_exp;
     _ = @import("browser/root.zig");
     _ = @import("browser/document_lifecycle.zig");

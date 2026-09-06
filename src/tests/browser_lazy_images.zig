@@ -12,11 +12,13 @@ const TestContext = struct {
     allocator: std.mem.Allocator,
     fetch_count: usize = 0,
     fail_fetch: bool = false,
+    encoded_image: ?[]const u8 = null,
+    block_fetch: bool = false,
 };
 
 const TestCallbacks = struct {
-    pub fn allowed(_: *TestContext, _: Url, _: *const Url) bool {
-        return true;
+    pub fn allowed(context: *TestContext, _: Url, _: *const Url) bool {
+        return !context.block_fetch;
     }
 
     pub fn fetch(
@@ -27,6 +29,7 @@ const TestCallbacks = struct {
     ) !url_module.HttpResponse {
         context.fetch_count += 1;
         if (context.fail_fetch) return error.TestImageFetchFailed;
+        if (context.encoded_image) |bytes| return .{ .body = try context.allocator.dupe(u8, bytes) };
         const header = "P6\n30 12\n255\n";
         const body = try context.allocator.alloc(u8, header.len + 30 * 12 * 3);
         @memcpy(body[0..header.len], header);
@@ -34,6 +37,88 @@ const TestCallbacks = struct {
         return .{ .body = body };
     }
 };
+
+test "SVG external image references refresh href, remove pixels and respect policy" {
+    const allocator = std.testing.allocator;
+    var html = try document.HTMLParser.init(allocator, "<svg width='30' height='12'><image id='external' href='one.ppm' width='30' height='12'/></svg>");
+    defer html.deinit(allocator);
+    var root = try html.parse();
+    defer root.deinit(allocator);
+    document.fixParentPointers(&root, null);
+    var page_url = try Url.init(allocator, "https://example.test/page.html");
+    defer page_url.free(allocator);
+    var context = TestContext{ .allocator = allocator };
+    const element = &findNodeById(&root, "external").?.element;
+    try image_loader.loadSvgTree(allocator, std.testing.io, &root, &page_url, .default, &context, TestCallbacks);
+    try std.testing.expectEqual(@as(usize, 1), context.fetch_count);
+    try std.testing.expect(!element.image_data.?.is_broken);
+    try element.attributes.?.put("href", "two.ppm");
+    try image_loader.loadSvgTree(allocator, std.testing.io, &root, &page_url, .default, &context, TestCallbacks);
+    try std.testing.expectEqual(@as(usize, 2), context.fetch_count);
+    context.block_fetch = true;
+    try element.attributes.?.put("href", "blocked.ppm");
+    try image_loader.loadSvgTree(allocator, std.testing.io, &root, &page_url, .default, &context, TestCallbacks);
+    try std.testing.expectEqual(@as(usize, 2), context.fetch_count);
+    try std.testing.expect(element.image_data.?.is_broken);
+    _ = element.attributes.?.remove("href");
+    try image_loader.loadSvgTree(allocator, std.testing.io, &root, &page_url, .default, &context, TestCallbacks);
+    try std.testing.expect(element.image_data == null);
+    try std.testing.expect(element.svg_image_source == null);
+}
+
+test "SVG HTML image and object share decode but own independent cached pixels" {
+    const allocator = std.testing.allocator;
+    var first = try document.Element.init(allocator, "img src=icon.svg alt=Icon", null);
+    defer first.deinit(allocator);
+    var second = try document.Element.init(allocator, "object data=icon.svg type=image/svg+xml", null);
+    defer second.deinit(allocator);
+    var page_url = try Url.init(allocator, "https://example.test/page.html");
+    defer page_url.free(allocator);
+    var context = TestContext{ .allocator = allocator, .encoded_image = "<svg width='8' height='4'><rect width='8' height='4' fill='red'/></svg>" };
+    const candidates = [_]image_loader.Candidate{ .{ .element = &first }, .{ .element = &second } };
+    try std.testing.expectEqual(@as(usize, 2), try image_loader.loadCandidates(
+        allocator,
+        std.testing.io,
+        &candidates,
+        .eager,
+        &page_url,
+        .default,
+        &context,
+        TestCallbacks,
+    ));
+    try std.testing.expectEqual(@as(usize, 1), context.fetch_count);
+    try std.testing.expect(!first.image_data.?.is_broken);
+    try std.testing.expect(!second.image_data.?.is_broken);
+    try std.testing.expectEqual(@as(usize, 8), first.image_data.?.image.width);
+    try std.testing.expectEqual(@as(usize, 4), first.image_data.?.image.height);
+    try std.testing.expect(first.image_data.?.image.rawBytes().ptr != second.image_data.?.image.rawBytes().ptr);
+    first.image_data.?.deinit(allocator);
+    first.image_data = null;
+    try std.testing.expectEqualSlices(u8, &.{ 255, 0, 0, 255 }, second.image_data.?.image.rawBytes()[0..4]);
+}
+
+test "SVG malformed resources install terminal HTML fallback" {
+    const allocator = std.testing.allocator;
+    var element = try document.Element.init(allocator, "img src=broken.svg alt=Icon", null);
+    defer element.deinit(allocator);
+    var page_url = try Url.init(allocator, "https://example.test/page.html");
+    defer page_url.free(allocator);
+    var context = TestContext{ .allocator = allocator, .encoded_image = "<svg><path></svg>" };
+    const candidates = [_]image_loader.Candidate{.{ .element = &element }};
+    _ = try image_loader.loadCandidates(allocator, std.testing.io, &candidates, .eager, &page_url, .default, &context, TestCallbacks);
+    try std.testing.expect(element.image_data.?.is_broken);
+    try std.testing.expectEqual(@as(usize, 0), try image_loader.loadCandidates(
+        allocator,
+        std.testing.io,
+        &candidates,
+        .eager,
+        &page_url,
+        .default,
+        &context,
+        TestCallbacks,
+    ));
+    try std.testing.expectEqual(@as(usize, 1), context.fetch_count);
+}
 
 fn findNodeById(node: *document.Node, id: []const u8) ?*document.Node {
     return switch (node.*) {
@@ -97,6 +182,7 @@ test "failed lazy image installs one stable broken-image result" {
 
     try std.testing.expectEqual(@as(usize, 1), try image_loader.loadCandidates(
         allocator,
+        std.testing.io,
         &candidates,
         selection,
         &page_url,
@@ -109,6 +195,7 @@ test "failed lazy image installs one stable broken-image result" {
     try std.testing.expectEqual(@as(usize, 16), image.image_data.?.image.height);
     try std.testing.expectEqual(@as(usize, 0), try image_loader.loadCandidates(
         allocator,
+        std.testing.io,
         &candidates,
         selection,
         &page_url,
@@ -197,6 +284,7 @@ test "unloaded and decorative broken images preserve only authored placeholder a
     }
     try std.testing.expectEqual(@as(usize, expected_nodes.len), try image_loader.loadCandidates(
         allocator,
+        std.testing.io,
         &candidates,
         .{ .lazy_near = .{ .scroll = 0, .height = 600, .preload_margin = 600 } },
         &page_url,
@@ -248,6 +336,7 @@ test "eager and lazy image batches fetch only their selected candidates" {
 
     try std.testing.expectEqual(@as(usize, 1), try image_loader.loadCandidates(
         allocator,
+        std.testing.io,
         &candidates,
         .eager,
         &page_url,
@@ -261,6 +350,7 @@ test "eager and lazy image batches fetch only their selected candidates" {
 
     try std.testing.expectEqual(@as(usize, 1), try image_loader.loadCandidates(
         allocator,
+        std.testing.io,
         &candidates,
         .{ .lazy_near = .{ .scroll = 0, .height = 600, .preload_margin = 600 } },
         &page_url,
@@ -273,6 +363,7 @@ test "eager and lazy image batches fetch only their selected candidates" {
 
     try std.testing.expectEqual(@as(usize, 1), try image_loader.loadCandidates(
         allocator,
+        std.testing.io,
         &candidates,
         .{ .lazy_near = .{ .scroll = 1800, .height = 600, .preload_margin = 600 } },
         &page_url,
@@ -361,6 +452,7 @@ test "lazy image layout preserves authored and fallback ratios then reflows intr
     };
     try std.testing.expectEqual(@as(usize, 4), try image_loader.loadCandidates(
         allocator,
+        std.testing.io,
         &candidates,
         .{ .lazy_near = .{ .scroll = 0, .height = 600, .preload_margin = 600 } },
         &page_url,

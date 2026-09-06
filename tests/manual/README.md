@@ -144,6 +144,8 @@ tiers and baseline policy.
 | Primary fixture | Contract exercised |
 | --- | --- |
 | [`background-images.html`](background-images.html) | Post-cascade loading, size modes, source crop, and rounded clipping |
+| [`svg-images.html`](svg-images.html) | Static SVG file/data images, image objects, CSS backgrounds, alpha, and malformed fallback |
+| [`svg-inline.html`](svg-inline.html) | Live SVG sizing, CSS/DOM repaint, gradients, clip paths, filters, symbols, external images, text, and declarative animation |
 | [`fixed-background.html`](fixed-background.html) | Viewport-phased fixed background tiles clipped by moving element boxes |
 | [`object-fit.html`](object-fit.html) | Fill, contain, and fractional cover crop within a replaced box |
 | [`lazy-loading.html`](lazy-loading.html) | Eager/near/far requests and post-decode layout change without refetch |

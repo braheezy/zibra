@@ -34,7 +34,7 @@ The nested [`render/AGENTS.md`](render/AGENTS.md) adds rendering-specific rules.
 | `frame.zig` | One document generation: DOM/style/layout/display ownership, child Frames, hit testing, and default actions |
 | `content_security_policy.zig` | Frame-owned response policy list, source parsing, and destination-specific URL checks |
 | `history.zig` | Pointer-free owning joint root/iframe session history and traversal preparation |
-| `tab_animation.zig` | Transition/keyframe advancement and compositor-versus-layout/paint phase classification |
+| `tab_animation.zig` | CSS track advancement, SVG timeline sampling, and compositor-versus-layout/paint phase classification |
 | `session_state.zig` | Window-independent HTTP/cookie/cache and visited/bookmark state plus networking runner |
 | `tab_tasks.zig` | Owned payloads transferred from UI/Browser to a Tab runner |
 | `js_context.zig` | Stable synchronous generation-stamped host-callback identity embedded in a Frame |
@@ -42,7 +42,9 @@ The nested [`render/AGENTS.md`](render/AGENTS.md) adds rendering-specific rules.
 | `script_geometry.zig` | Synchronous generation-checked layout flush and scalar JavaScript geometry readback |
 | `chrome.zig` | UI-thread-only internal chrome widgets, font/display generation, and address-entry state |
 | `navigation.zig` | Generated warning pages and transport-security classification |
-| `image_loader.zig` | Eager/lazy HTML-image selection, fetch/decode ownership, fallback state |
+| `image_loader.zig` | HTML/SVG image selection, fetch/decode ownership, fallback state, and SVG href refresh |
+| `image_decoder.zig` | Shared SVG/z2d and raster/zigimg decode into owned straight-alpha RGBA |
+| `background_images.zig` | Post-cascade CSS background discovery and resource retirement |
 | `frame_timing.zig` | Frame estimator and absolute animation deadlines |
 | `window_geometry.zig` | Pure replacement geometry for native resize |
 | `scroll.zig` | Scroll ranges, interest-region geometry, and viewport scroll animation |

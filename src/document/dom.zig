@@ -228,6 +228,15 @@ pub const Element = struct {
     /// controls, canvas pixels, colors, and other visual-only state can reuse
     /// geometry while refreshing the retained display-list cache.
     layout_paint_mark: ?*const fn (*anyopaque) void = null,
+    /// SVG samples own strings independently of authored attributes. Timeline
+    /// scalars belong to the outer SVG root and retire with its DOM generation.
+    svg_animation: ?@import("svg_animation.zig").State = null,
+    svg_epoch_seconds: ?f64 = null,
+    svg_time_seconds: f64 = 0,
+    /// Cascaded declarations distinguish authored paint from inherited values
+    /// when a use instance inherits from its instance parent.
+    svg_specified_properties: u16 = 0,
+    svg_image_source: ?[]const u8 = null,
     // Block-mode layout owners can opt into matching already-laid-out direct
     // children across insertion-only child-array relocation. The compatibility
     // callback runs before storage can move; the rebind callback runs
@@ -370,20 +379,19 @@ pub const Element = struct {
         value: []const u8,
     ) !void {
         const owned_name = try allocator.dupe(u8, name);
-        var name_live = true;
-        errdefer if (name_live) allocator.free(owned_name);
+        errdefer allocator.free(owned_name);
         const owned_value = try allocator.dupe(u8, value);
-        var value_live = true;
-        errdefer if (value_live) allocator.free(owned_value);
+        errdefer allocator.free(owned_value);
 
         if (self.attributes == null) self.attributes = std.StringHashMap([]const u8).init(allocator);
         if (self.owned_strings == null) self.owned_strings = std.ArrayList([]const u8).empty;
-        try self.owned_strings.?.append(allocator, owned_name);
-        name_live = false;
-        errdefer _ = self.owned_strings.?.pop();
-        try self.owned_strings.?.append(allocator, owned_value);
-        value_live = false;
-        try self.attributes.?.put(owned_name, owned_value);
+        // Reserve both containers before transferring either string; a map
+        // growth failure must not pop a value whose cleanup already moved.
+        try self.owned_strings.?.ensureUnusedCapacity(allocator, 2);
+        try self.attributes.?.ensureUnusedCapacity(1);
+        self.owned_strings.?.appendAssumeCapacity(owned_name);
+        self.owned_strings.?.appendAssumeCapacity(owned_value);
+        self.attributes.?.putAssumeCapacity(owned_name, owned_value);
     }
 
     /// HTML element and attribute names are ASCII case-insensitive. Borrow an
@@ -473,6 +481,8 @@ pub const Element = struct {
     }
 
     pub fn deinit(self: *Element, allocator: std.mem.Allocator) void {
+        if (self.svg_image_source) |source| allocator.free(source);
+        if (self.svg_animation) |*state| state.deinit();
         for (self.children.items) |*child| {
             child.deinit(allocator);
         }

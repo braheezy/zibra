@@ -5954,6 +5954,11 @@ fn setAttribute(agent: *Agent, this_value: Value, arguments: kiesel.types.Argume
             e.attributes.?.putAssumeCapacity(owned_name, owned_value);
             parser.dirtyStyleForElement(e);
 
+            if (@import("../document/svg.zig").contains(e)) {
+                dom_mutation.markElementLayoutDirty(e);
+                parser.markPaintForElement(e);
+            }
+
             const canvas_dimension = std.ascii.eqlIgnoreCase(e.tag, "canvas") and
                 (std.ascii.eqlIgnoreCase(attr_name, "width") or
                     std.ascii.eqlIgnoreCase(attr_name, "height"));
@@ -6024,6 +6029,10 @@ fn removeAttribute(agent: *Agent, this_value: Value, arguments: kiesel.types.Arg
             if (refresh_id_globals) try js_instance.clearNamedIdGlobals(window_id, window);
             _ = element.attributes.?.remove(name);
             parser.dirtyStyleForElement(element);
+            if (@import("../document/svg.zig").contains(element)) {
+                dom_mutation.markElementLayoutDirty(element);
+                parser.markPaintForElement(element);
+            }
             js_instance.requestRender();
             if (refresh_id_globals) try js_instance.syncNamedIdGlobals(window_id, window);
             return .undefined;

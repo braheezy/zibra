@@ -651,6 +651,13 @@ const ImageLayout = struct {
         y: i32,
         source: ?browser.DisplayItemSource,
     ) !void {
+        try self.paintBoxAt(commands, engine, x, y, source);
+        try commands.append(engine.allocator, .{
+            .image = self.displayItem(x, y, source),
+        });
+    }
+
+    fn paintBoxAt(self: *const ImageLayout, commands: *std.ArrayList(DisplayItem), engine: *Layout, x: i32, y: i32, source: ?browser.DisplayItemSource) !void {
         const width = self.embed.width;
         const height = self.embed.height;
         const element: ?*const parser.Element = if (source) |item_source|
@@ -715,10 +722,6 @@ const ImageLayout = struct {
                 source,
             );
         };
-
-        try commands.append(engine.allocator, .{
-            .image = self.displayItem(x, y, source),
-        });
     }
 };
 
@@ -796,6 +799,9 @@ test "inline replaced image boxes include padding and borders" {
 }
 
 const CanvasLayout = struct {
+    is_svg: bool = false,
+    root_opacity_in_paint: bool = false,
+    svg_box: ?ImageLayout = null,
     embed: EmbedLayout = .{},
     /// The backing object is allocated lazily by getContext("2d"), after the
     /// initial layout may already exist. Borrow the owning element so repaint
@@ -3027,6 +3033,7 @@ fn recurseNode(self: *Layout, node: Node, node_ptr: ?*Node, line_buffer: *std.Ar
                     !std.ascii.eqlIgnoreCase(e.tag, "textarea") and
                     !std.ascii.eqlIgnoreCase(e.tag, "button") and
                     !std.ascii.eqlIgnoreCase(e.tag, "canvas") and
+                    !std.ascii.eqlIgnoreCase(e.tag, "svg") and
                     !std.ascii.eqlIgnoreCase(e.tag, "iframe"))
                 {
                     try appendInlineBlock(self, &e, node_ptr, line_buffer);
@@ -3044,7 +3051,7 @@ fn recurseNode(self: *Layout, node: Node, node_ptr: ?*Node, line_buffer: *std.Ar
                 try self.handleButtonElement(node, node_ptr, line_buffer);
             } else if (elementUsesImageLayout(&e)) {
                 try self.handleImageElement(node, node_ptr, line_buffer);
-            } else if (std.ascii.eqlIgnoreCase(e.tag, "canvas")) {
+            } else if (std.ascii.eqlIgnoreCase(e.tag, "canvas") or std.ascii.eqlIgnoreCase(e.tag, "svg")) {
                 try self.handleCanvasElement(node_ptr, line_buffer);
             } else if (std.ascii.eqlIgnoreCase(e.tag, "iframe")) {
                 try self.handleIframeElement(node, node_ptr, line_buffer);
@@ -3325,8 +3332,14 @@ fn handleCanvasElement(
     const element = &canvas_node.element;
     self.resetSoftHyphenWord();
 
-    const dimensions = element.canvasDimensions();
-    if (element.canvas) |canvas| try canvas.resize(dimensions.width, dimensions.height);
+    const is_svg = std.ascii.eqlIgnoreCase(element.tag, "svg");
+    const canvas_dimensions = element.canvasDimensions();
+    const dimensions = if (is_svg) @import("svg_inline.zig").size(element, .{
+        .font_size = self.font_size_css,
+        .percentage_width = self.containingBlockCssDimension(false),
+        .percentage_height = self.containingBlockCssDimension(true),
+    }) else replaced_sizing.Size{ .width = canvas_dimensions.width, .height = canvas_dimensions.height };
+    if (!is_svg) if (element.canvas) |canvas| try canvas.resize(dimensions.width, dimensions.height);
 
     const layout_width = self.scaleActiveCssPixel(dimensions.width);
     const layout_height = self.scaleActiveCssPixel(dimensions.height);
@@ -3340,6 +3353,14 @@ fn handleCanvasElement(
         element,
         self.effectiveZoom(),
     );
+    canvas_layout.is_svg = is_svg;
+    canvas_layout.root_opacity_in_paint = if (self.inline_block) |block| block.node_ptr == canvas_node else false;
+    if (is_svg) {
+        const styles = if (element.style) |*map| map else null;
+        const edges = if (styles) |map| resolveBoxEdges(map, self.font_size_css, self.containingBlockCssDimension(false), self.effectiveZoom(), self.zoom()) else BoxModelEdges{ .margin = .{}, .padding = .{}, .border = .{} };
+        canvas_layout.svg_box = ImageLayout.init(layout_width, layout_height, layout_width, layout_height, null, self.inline_block, styles, self.effectiveZoom(), edges, self.scaleActiveCssFloat(1));
+        canvas_layout.embed = canvas_layout.svg_box.?.embed;
+    }
     try canvas_layout.embed.appendInline(self, line_buffer, canvas_node, .{
         .canvas = canvas_layout,
     });
@@ -4297,7 +4318,20 @@ fn flushLine(self: *Layout, line_buffer: *std.ArrayList(LineItem)) !void {
                 );
             },
             .canvas => |canvas_payload| {
-                const pixels = if (canvas_payload.element.canvas) |canvas|
+                var canvas_x = item.x;
+                var canvas_y = final_y;
+                var canvas_width = item.width;
+                var canvas_height = item.height;
+                if (canvas_payload.svg_box) |box| {
+                    try box.paintBoxAt(self.current_display_target, self, item.x, final_y, source);
+                    canvas_x += box.border.left + box.padding.left;
+                    canvas_y += box.border.top + box.padding.top;
+                    canvas_width = box.content_width;
+                    canvas_height = box.content_height;
+                }
+                const pixels = if (canvas_payload.is_svg)
+                    try @import("svg_inline.zig").snapshot(self.allocator, self.font_manager.io, canvas_payload.element, canvas_payload.source_width, canvas_payload.source_height, canvas_payload.root_opacity_in_paint)
+                else if (canvas_payload.element.canvas) |canvas|
                     try canvas.snapshot(self.allocator)
                 else
                     try self.allocator.alloc(u8, 0);
@@ -4305,10 +4339,10 @@ fn flushLine(self: *Layout, line_buffer: *std.ArrayList(LineItem)) !void {
                 errdefer if (pixels_owned) self.allocator.free(pixels);
                 try self.current_display_target.append(self.allocator, DisplayItem{
                     .canvas = .{
-                        .x1 = item.x,
-                        .y1 = final_y,
-                        .x2 = item.x + item.width,
-                        .y2 = final_y + item.height,
+                        .x1 = canvas_x,
+                        .y1 = canvas_y,
+                        .x2 = canvas_x + canvas_width,
+                        .y2 = canvas_y + canvas_height,
                         .source_width = canvas_payload.source_width,
                         .source_height = canvas_payload.source_height,
                         .pixels = pixels,
@@ -8017,6 +8051,7 @@ const BlockLayout = struct {
                     (std.ascii.eqlIgnoreCase(e.tag, "button") and !self.rich_button_root) or
                     elementUsesImageLayout(&e) or
                     std.ascii.eqlIgnoreCase(e.tag, "canvas") or
+                    std.ascii.eqlIgnoreCase(e.tag, "svg") or
                     std.ascii.eqlIgnoreCase(e.tag, "iframe"))
                 {
                     return false;
@@ -8751,6 +8786,7 @@ const BlockLayout = struct {
                 (std.ascii.eqlIgnoreCase(tag, "button") and !self.rich_button_root) or
                 elementUsesImageLayout(element) or
                 std.ascii.eqlIgnoreCase(tag, "canvas") or
+                std.ascii.eqlIgnoreCase(tag, "svg") or
                 std.ascii.eqlIgnoreCase(tag, "iframe"))
             {
                 is_block = false;
@@ -11113,7 +11149,7 @@ fn layoutInlineBlock(self: *Layout, block: *BlockLayout, publish_geometry: bool)
                 try self.handleButtonElement(block.node, block.node_ptr, &line_buffer);
             } else if (elementUsesImageLayout(&e)) {
                 try self.handleImageElement(block.node, block.node_ptr, &line_buffer);
-            } else if (std.ascii.eqlIgnoreCase(e.tag, "canvas")) {
+            } else if (std.ascii.eqlIgnoreCase(e.tag, "canvas") or std.ascii.eqlIgnoreCase(e.tag, "svg")) {
                 try self.handleCanvasElement(block.node_ptr, &line_buffer);
             } else if (std.ascii.eqlIgnoreCase(e.tag, "iframe")) {
                 try self.handleIframeElement(block.node, block.node_ptr, &line_buffer);

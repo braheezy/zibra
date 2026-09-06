@@ -1,6 +1,8 @@
 //! Focused unit-test root for layout, paint, compositing, and hit testing.
 
 comptime {
+    _ = @import("tests/svg_inline.zig");
+    _ = @import("browser/render/svg.zig");
     // Filtered pure-layout runs still link libregexp's C object. Keep its
     // host exports reachable even when no JavaScript test is selected.
     _ = @import("kiesel").builtins.reg_exp;

@@ -5,6 +5,7 @@
 
 const std = @import("std");
 const zigimg = @import("zigimg");
+const image_decoder = @import("image_decoder.zig");
 
 const parser = @import("../document/parser.zig");
 const url_module = @import("../network/url.zig");
@@ -58,6 +59,10 @@ fn responseCanDecodeImage(response: url_module.HttpResponse) bool {
 /// unsupported object resources keep rendering their fallback children.
 pub fn resourceSource(element: *const parser.Element) ?[]const u8 {
     const attributes = element.attributes orelse return null;
+    if (std.ascii.eqlIgnoreCase(element.tag, "image") and @import("../document/svg.zig").contains(element)) {
+        const source = attributes.get("href") orelse attributes.get("xlink:href") orelse return null;
+        return if (source.len == 0 or source[0] == '#') null else source;
+    }
     if (std.ascii.eqlIgnoreCase(element.tag, "img")) {
         const source = attributes.get("src") orelse return null;
         return if (source.len == 0) null else source;
@@ -104,7 +109,11 @@ pub fn isNearViewport(bounds: Bounds, viewport: Viewport) bool {
 }
 
 fn selected(candidate: Candidate, selection: Selection) bool {
-    if (candidate.element.image_data != null) return false;
+    if (candidate.element.image_data != null) {
+        if (!std.ascii.eqlIgnoreCase(candidate.element.tag, "image")) return false;
+        const source = resourceSource(candidate.element) orelse return false;
+        if (std.mem.eql(u8, candidate.element.svg_image_source orelse "", source)) return false;
+    }
     return switch (selection) {
         .eager => !isLazy(candidate.element),
         .lazy_near => |viewport| isLazy(candidate.element) and
@@ -164,6 +173,7 @@ fn cloneCachedImage(allocator: std.mem.Allocator, entry: CacheEntry) !parser.Ima
 
 fn loadOne(
     allocator: std.mem.Allocator,
+    io: std.Io,
     page_url: *const Url,
     referrer_policy: url_module.ReferrerPolicy,
     source: []const u8,
@@ -215,18 +225,13 @@ fn loadOne(
     var encoded_owned = true;
     defer if (encoded_owned) allocator.free(encoded_bytes);
 
-    var image = zigimg.Image.fromMemory(allocator, encoded_bytes) catch |err| {
+    var image = image_decoder.decode(allocator, io, encoded_bytes) catch |err| {
         if (err == error.OutOfMemory) return err;
         std.log.warn("Failed to decode image {s}: {}", .{ source, err });
         return brokenImage(allocator);
     };
     var image_owned = true;
     defer if (image_owned) image.deinit(allocator);
-    image.convert(allocator, .rgba32) catch |err| {
-        if (err == error.OutOfMemory) return err;
-        std.log.warn("Failed to convert image {s} to RGBA: {}", .{ source, err });
-        return brokenImage(allocator);
-    };
 
     const cached_pixels = try allocator.dupe(u8, image.rawBytes());
     var cached_pixels_owned = true;
@@ -251,6 +256,7 @@ fn loadOne(
 /// independent ImageData ownership.
 pub fn loadCandidates(
     allocator: std.mem.Allocator,
+    io: std.Io,
     candidates: []const Candidate,
     selection: Selection,
     page_url: *const Url,
@@ -275,6 +281,7 @@ pub fn loadCandidates(
 
         var data = try loadOne(
             allocator,
+            io,
             page_url,
             referrer_policy,
             source,
@@ -284,11 +291,45 @@ pub fn loadCandidates(
         );
         var data_owned = true;
         errdefer if (data_owned) data.deinit(allocator);
+        if (std.ascii.eqlIgnoreCase(candidate.element.tag, "image")) {
+            const identity = try allocator.dupe(u8, source);
+            // SVG image pixels only cross paint as independent snapshots.
+            if (candidate.element.svg_image_source) |previous| allocator.free(previous);
+            candidate.element.svg_image_source = identity;
+            if (candidate.element.image_data) |*previous| previous.deinit(allocator);
+            parser.markPaintForElement(candidate.element);
+        }
         candidate.element.image_data = data;
         data_owned = false;
         loaded += 1;
     }
     return loaded;
+}
+
+/// Refresh external SVG images after live style/attribute changes. Pixel
+/// replacement is safe because SVG paint exports owned canvas snapshots.
+pub fn loadSvgTree(allocator: std.mem.Allocator, io: std.Io, root: *parser.Node, page_url: *const Url, referrer_policy: url_module.ReferrerPolicy, context: anytype, comptime callbacks: type) !void {
+    var candidates = std.ArrayList(Candidate).empty;
+    defer candidates.deinit(allocator);
+    try collectSvg(allocator, root, &candidates);
+    _ = try loadCandidates(allocator, io, candidates.items, .eager, page_url, referrer_policy, context, callbacks);
+}
+
+fn collectSvg(allocator: std.mem.Allocator, node: *parser.Node, candidates: *std.ArrayList(Candidate)) anyerror!void {
+    if (node.* != .element) return;
+    const element = &node.element;
+    if (std.ascii.eqlIgnoreCase(element.tag, "image") and @import("../document/svg.zig").contains(element)) {
+        if (resourceSource(element) != null) {
+            try candidates.append(allocator, .{ .element = element });
+        } else if (element.image_data) |*data| {
+            data.deinit(allocator);
+            element.image_data = null;
+            if (element.svg_image_source) |previous| allocator.free(previous);
+            element.svg_image_source = null;
+            parser.markPaintForElement(element);
+        }
+    }
+    for (element.children.items) |*child| try collectSvg(allocator, child, candidates);
 }
 
 test "lazy image selection is case-insensitive and uses a viewport margin" {

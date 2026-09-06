@@ -65,6 +65,10 @@ pub fn resolveElement(
             .pixel, .color, .transform => {},
         };
     }
+    if (value.svg_animation) |sample| if (sample.values.get("opacity")) |raw| {
+        result.opacity = std.math.clamp(std.fmt.parseFloat(f64, raw) catch 1, 0, 1);
+        result.opacity_animated = true;
+    };
     if (!result.opacity_animated) {
         if (styleValue(styles, "opacity")) |raw| {
             result.opacity = std.math.clamp(

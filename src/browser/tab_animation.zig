@@ -7,6 +7,7 @@
 
 const std = @import("std");
 const document = @import("../document/parser.zig");
+const svg_animation = @import("../document/svg_animation.zig");
 
 pub const CompositedUpdate = struct {
     node: *anyopaque,
@@ -19,6 +20,8 @@ pub const CompositedUpdate = struct {
 /// Narrow host boundary for effects owned by the Tab/layout/compositor. The
 /// callbacks are synchronous and may borrow `Element` only for their duration.
 pub const Sink = struct {
+    now_seconds: f64 = 0,
+    allocator: std.mem.Allocator = std.heap.smp_allocator,
     context: *anyopaque,
     publish_composited: *const fn (*anyopaque, CompositedUpdate) void,
     mark_layout: *const fn (*anyopaque, *document.Element) void,
@@ -41,6 +44,7 @@ pub fn hasActive(node: *const document.Node) bool {
     return switch (node.*) {
         .text => false,
         .element => |*element| blk: {
+            if (svg_animation.isRoot(element) and svg_animation.active(element, element.svg_time_seconds)) break :blk true;
             if (element.css_animation) |state| {
                 if (!state.finished) break :blk true;
             }
@@ -167,6 +171,21 @@ pub fn advance(sink: Sink, node: *document.Node) bool {
 
     switch (node.*) {
         .element => |*element| {
+            if (svg_animation.isRoot(element) and (element.svg_epoch_seconds != null or svg_animation.hasTracks(element))) svg: {
+                if (element.svg_epoch_seconds == null) element.svg_epoch_seconds = sink.now_seconds;
+                element.svg_time_seconds = @max(0, sink.now_seconds - element.svg_epoch_seconds.?);
+                const had_size = svg_animation.hasSampledSize(element);
+                svg_animation.sample(sink.allocator, element, element.svg_time_seconds) catch {
+                    any_running = true;
+                    break :svg;
+                };
+                // Resample completed timelines on a DOM-triggered frame too:
+                // removing a track must restore its underlying authored value.
+                if (had_size or svg_animation.hasSampledSize(element)) sink.markLayout(element);
+                document.markPaintForElement(element);
+                sink.requestPaint();
+                if (svg_animation.active(element, element.svg_time_seconds)) any_running = true;
+            }
             var skip_css_tracks = false;
             if (element.css_animation) |*state| {
                 if (state.restart_pending) {

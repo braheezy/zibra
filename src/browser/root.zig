@@ -3370,9 +3370,12 @@ pub const Browser = struct {
     /// declarations from causing network work.
     pub fn loadUsedBackgroundImages(self: *Browser, frame: *Frame, page_url: *Url) !void {
         const root = if (frame.current_node) |*node| node else return;
+        var image_context = ImageLoadContext{ .browser = self, .frame = frame };
+        try image_loader.loadSvgTree(self.allocator, self.io, root, page_url, frame.referrer_policy, &image_context, ImageLoadCallbacks);
         var context = BackgroundImageLoadContext{ .browser = self, .frame = frame };
         try background_images.loadUsed(
             self.allocator,
+            self.io,
             root,
             page_url,
             frame.referrer_policy,
@@ -3399,6 +3402,7 @@ pub const Browser = struct {
         var context = ImageLoadContext{ .browser = self, .frame = frame };
         _ = try image_loader.loadCandidates(
             self.allocator,
+            self.io,
             candidates.items,
             .eager,
             page_url,
@@ -3454,6 +3458,7 @@ pub const Browser = struct {
         }
         const loaded = try image_loader.loadCandidates(
             self.allocator,
+            self.io,
             candidates.items,
             .{ .lazy_near = .{
                 .scroll = frame.scroll,

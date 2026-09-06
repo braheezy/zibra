@@ -1,0 +1,6 @@
+# SVG image resources and inline paint-server/viewBox rendering.
+reftests:
+  - css/css-images/object-fit-contain-svg-001i.html
+  - css/css-images/object-fit-fill-svg-001i.html
+  - svg/pservers/reftests/percent-encoded-fragment-fill-stroke.html
+  - svg/painting/reftests/small-nested-viewbox.html

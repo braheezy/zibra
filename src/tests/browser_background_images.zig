@@ -66,6 +66,37 @@ fn parseRules(allocator: std.mem.Allocator, css: []const u8) ![]CSSParser.CSSRul
     return css_parser.parse(allocator);
 }
 
+test "SVG data URL backgrounds own cached pixels and retire before source replacement" {
+    const allocator = std.testing.allocator;
+    var html_parser = try document.HTMLParser.init(allocator, "<main><div id=first></div><div id=second></div></main>");
+    defer html_parser.deinit(allocator);
+    var root = try html_parser.parse();
+    defer root.deinit(allocator);
+    document.fixParentPointers(&root, null);
+    const rules = try parseRules(allocator, "div { background-image: url(\"data:image/svg+xml,%3Csvg%20width='4'%20height='4'%3E%3Crect%20width='4'%20height='4'%20fill='blue'/%3E%3C/svg%3E\"); }");
+    defer freeRules(allocator, rules);
+    try document.style(allocator, &root, rules);
+    var page_url = try Url.init(allocator, "https://example.test/page.html");
+    defer page_url.free(allocator);
+    var context = TestLoadContext{ .allocator = allocator };
+    try background_images.loadUsed(allocator, std.testing.io, &root, &page_url, .default, true, &context, TestLoadCallbacks);
+    try std.testing.expectEqual(@as(usize, 1), context.fetch_count);
+    try std.testing.expectEqual(@as(usize, 1), context.retire_count);
+    const first = findById(&root, "first").?;
+    const second = findById(&root, "second").?;
+    const first_pixels = first.background_image.?.data.?.image.rawBytes();
+    const second_pixels = second.background_image.?.data.?.image.rawBytes();
+    try std.testing.expect(first_pixels.ptr != second_pixels.ptr);
+    try std.testing.expectEqualSlices(u8, &.{ 0, 0, 255, 255 }, first_pixels[0..4]);
+    try std.testing.expectEqualSlices(u8, first_pixels, second_pixels);
+    try background_images.loadUsed(allocator, std.testing.io, &root, &page_url, .default, true, &context, TestLoadCallbacks);
+    try std.testing.expectEqual(@as(usize, 1), context.fetch_count);
+    try background_images.loadUsed(allocator, std.testing.io, &root, &page_url, .default, false, &context, TestLoadCallbacks);
+    try std.testing.expectEqual(@as(usize, 2), context.retire_count);
+    try std.testing.expect(first.background_image == null);
+    try std.testing.expect(second.background_image == null);
+}
+
 test "disabled and blocked background images perform no unnecessary fetch" {
     const allocator = std.testing.allocator;
     var html_parser = try document.HTMLParser.init(allocator, "<div class=used>blocked</div>");
@@ -83,6 +114,7 @@ test "disabled and blocked background images perform no unnecessary fetch" {
     var context = TestLoadContext{ .allocator = allocator };
     try background_images.loadUsed(
         allocator,
+        std.testing.io,
         &root,
         &page_url,
         .no_referrer,
@@ -97,6 +129,7 @@ test "disabled and blocked background images perform no unnecessary fetch" {
     context.allow = false;
     try background_images.loadUsed(
         allocator,
+        std.testing.io,
         &root,
         &page_url,
         .no_referrer,
@@ -111,6 +144,7 @@ test "disabled and blocked background images perform no unnecessary fetch" {
 
     try background_images.loadUsed(
         allocator,
+        std.testing.io,
         &root,
         &page_url,
         .no_referrer,
@@ -173,6 +207,7 @@ test "background images load only after final computed style selects them" {
     var context = TestLoadContext{ .allocator = allocator };
     try background_images.loadUsed(
         allocator,
+        std.testing.io,
         &root,
         &page_url,
         .default,
@@ -195,6 +230,7 @@ test "background images load only after final computed style selects them" {
     // causes neither another fetch nor another display-list retirement.
     try background_images.loadUsed(
         allocator,
+        std.testing.io,
         &root,
         &page_url,
         .default,
@@ -211,6 +247,7 @@ test "background images load only after final computed style selects them" {
     try document.style(allocator, &root, clear_rules);
     try background_images.loadUsed(
         allocator,
+        std.testing.io,
         &root,
         &page_url,
         .default,

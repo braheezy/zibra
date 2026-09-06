@@ -117,6 +117,11 @@ fn measureImpl(node: *const dom.Node, fonts: *font.FontManager, scale: f64, incl
                 const width = if (element.isCheckbox() or element.isInputType("radio")) size * scale else try inputNaturalWidth(element, fonts, scale);
                 break :blk .{ .min = width, .max = width };
             }
+            if (std.ascii.eqlIgnoreCase(element.tag, "svg")) {
+                const dimensions = @import("svg_inline.zig").size(&element, .{ .font_size = size });
+                const width = @as(f64, @floatFromInt(dimensions.width)) * scale;
+                break :blk .{ .min = width, .max = width };
+            }
             var result: Width = .{};
             var inline_run: f64 = 0;
             var pending_space: f64 = 0;

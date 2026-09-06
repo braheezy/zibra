@@ -86,6 +86,18 @@ The wildcard case passes even without meta enforcement, while the deny case
 still times out waiting for a violation event. Do not interpret that partial
 result as full CSP conformance.
 
+For static SVG image decoding, use `manifest-svg-images.yaml` with the same
+reftest command. It compares SVG-backed `img` elements against CSS background
+references. The shared resource covers XML declarations, CSS units, inline
+paint styles, and `preserveAspectRatio="none"`. These pages also depend on float
+layout, borders, and object/background positioning, so inspect mismatches before
+attributing them to decoding. Decoder pixel and allocation-failure regressions
+run independently with `zig build test-render -Dtest-filter=SVG`.
+The same manifest also covers inline SVG encoded fill/stroke references and a
+nested viewBox with CSS sizing/padding. Live cascade, resource refresh,
+animation sampling and snapshot isolation have focused engine tests in that
+SVG-filtered run; the manual live SVG page exercises their combined paint.
+
 `testharness` runs each selected file in a real headless browser session. When
 the upstream checkout is initialized, the runner starts WPT's `wptserve` on a
 temporary loopback port so root-relative resources such as

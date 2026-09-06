@@ -35,7 +35,7 @@ pub const shorthands = [_]Shorthand{
 };
 
 /// Static longhand registry used to initialize and recognize computed styles.
-pub const computed = [_]Property{
+pub const computed = svgProperties() ++ [_]Property{
     .{ .name = "font-family", .default_value = "inherit" },
     .{ .name = "font-size", .default_value = "inherit" },
     .{ .name = "font-weight", .default_value = "inherit" },
@@ -135,3 +135,11 @@ pub const computed = [_]Property{
     .{ .name = "float", .default_value = "none" },
     .{ .name = "clear", .default_value = "none" },
 };
+
+fn svgProperties() [@import("svg.zig").inherited.len + @import("svg.zig").local.len]Property {
+    var result: [@import("svg.zig").inherited.len + @import("svg.zig").local.len]Property = undefined;
+    inline for (@import("svg.zig").inherited ++ @import("svg.zig").local, 0..) |entry, i| {
+        result[i] = .{ .name = entry[0], .default_value = entry[1] };
+    }
+    return result;
+}

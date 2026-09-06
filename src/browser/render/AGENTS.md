@@ -96,6 +96,13 @@ boundaries.
   opacity/translation updates.
 - `effects.zig` owns pixel-only effects and must state premultiplication,
   sampling, and temporary-allocation behavior explicitly.
+- `svg.zig` rasterizes a synchronous live/temporary SVG DOM borrow with z2d.
+  `svg_inline.zig` resolves used sizes and exports owning paint snapshots;
+  `svg_values.zig` and `svg_path.zig` resolve values and bounded path grammar;
+  `svg_paint.zig` owns per-render reference indexes and gradient stops;
+  `svg_filter.zig` owns filter intermediates; `svg_text.zig` owns temporary
+  font buffers. Rendering never fetches, schedules animation, or retains DOM
+  pointers. See the SVG contract in document and rendering for subset limits.
 - `replaced_sizing.zig`, `focus_ring.zig`, and `forced_colors.zig` are other
   pure focused helpers. Keep Browser orchestration out of all leaf modules.
 

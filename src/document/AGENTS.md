@@ -34,9 +34,10 @@ behavior. Navigation-owned stylesheet/resource generations are documented in
   then call `fixParentPointers(&root, null)` before style, layout, DOM
   ancestry, or JavaScript uses it; the parser cannot repair pointers after
   that return-value move.
-- `xml_parser.zig` is the detached DOMParser XML owner. Its successful tree
+- `xml_parser.zig` builds detached DOMParser and temporary SVG image trees. Its successful tree
   borrows the caller-owned source buffer, preserves XML name case, and must be
-  retired before that source buffer is released.
+  retired before that source buffer is released. Image callers set explicit
+  depth/element limits before parsing to bound allocation and recursive teardown.
 - Rules, named keyframes, and the source text they borrow move and retire as
   one generation. Stage a complete replacement before dropping the prior one.
 - Live HTML serialization reads current attributes/tree, sorts attribute names,
@@ -160,6 +161,10 @@ The document pipeline is split by ownership and algorithm boundaries:
 - `animation.zig` owns pure CSS transition/keyframe value objects stored by
   Elements. It does not decide whether an animation dirties compositor,
   paint, or layout; the Tab driver owns that phase decision.
+- `svg.zig` supplies synchronous SVG membership and presentation hints;
+  `svg_animation.zig` samples bounded declarative animation into Element-owned
+  strings without changing authored attributes. Neither schedules work nor
+  keeps node pointers across a callback.
 - `style_application.zig` owns computed-property defaults, cascade,
   inheritance, animation-track updates, and the style-pass algorithm behind a
   narrow comptime DOM/callback interface. It never owns a Node or layout

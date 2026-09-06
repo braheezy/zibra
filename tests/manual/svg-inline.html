@@ -1,0 +1,49 @@
+<!-- How to verify:
+Open in Zibra. The first row shows a red-to-blue gradient, a circular crop,
+and a red square with a black shadow. The second row shows red and blue
+instances of the same symbol, an external blue SVG icon, and SVG text.
+The third row's circle moves right and turns blue over two seconds, then
+stops. Click Change circle: the cropped circle turns green immediately.
+Resize the window: the SVG width follows its containing block. Navigate away
+while it animates and return; no stale drawing or crash should occur.
+-->
+<!doctype html>
+<html>
+<head>
+  <title>Live SVG rendering</title>
+  <style>
+    body { background: white; color: black; font-family: sans-serif; }
+    svg { width: 100%; height: 310px; }
+    #cropped { fill: orange; }
+  </style>
+</head>
+<body>
+  <h1>Live SVG rendering</h1>
+  <p>Gradients, clipping, filters, reusable symbols, external images, text and animation.</p>
+  <svg width="640" height="310" viewBox="0 0 640 310">
+    <defs>
+      <linearGradient id="spectrum"><stop stop-color="red"/><stop offset="1" stop-color="blue"/></linearGradient>
+      <clipPath id="circle"><circle cx="245" cy="50" r="40"/></clipPath>
+      <filter id="shadow" x="-50%" y="-50%" width="250%" height="250%">
+        <feGaussianBlur in="SourceAlpha" stdDeviation="2" result="blur"/>
+        <feOffset in="blur" dx="10" dy="10" result="offset"/>
+        <feMerge><feMergeNode in="offset"/><feMergeNode in="SourceGraphic"/></feMerge>
+      </filter>
+      <symbol id="tile" viewBox="0 0 10 10"><path d="M0 0H10V10H0Z M2 2V8H8V2Z" fill-rule="evenodd"/></symbol>
+    </defs>
+    <rect x="10" y="10" width="160" height="80" fill="url(#spectrum)"/>
+    <rect id="cropped" x="195" y="0" width="100" height="100" clip-path="url(#circle)"/>
+    <rect x="345" y="15" width="65" height="65" fill="red" filter="url(#shadow)"/>
+    <use href="#tile" x="10" y="120" width="60" height="60" fill="red"/>
+    <use href="#tile" x="85" y="120" width="60" height="60" fill="blue"/>
+    <image href="svg-images-icon.svg" x="190" y="110" width="120" height="80"/>
+    <text x="345" y="155" fill="navy" font-size="25">SVG text</text>
+    <path d="M10 250H440" stroke="#cccccc" stroke-width="2"/>
+    <circle cx="25" cy="250" r="15" fill="red">
+      <animate attributeName="cx" from="25" to="425" dur="2s" fill="freeze"/>
+      <animate attributeName="fill" from="red" to="blue" dur="2s" fill="freeze"/>
+    </circle>
+  </svg>
+  <button onclick="document.getElementById('cropped').setAttribute('style', 'fill: green')">Change circle</button>
+</body>
+</html>

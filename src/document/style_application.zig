@@ -33,7 +33,7 @@ const InheritedProperty = struct {
     default_value: []const u8,
 };
 
-const INHERITED_PROPERTIES = [_]InheritedProperty{
+const INHERITED_PROPERTIES = svgInherited() ++ [_]InheritedProperty{
     .{ .name = "font-family", .default_value = "sans-serif" },
     .{ .name = "font-size", .default_value = "16px" },
     .{ .name = "font-style", .default_value = "normal" },
@@ -52,6 +52,12 @@ const INHERITED_PROPERTIES = [_]InheritedProperty{
 };
 
 const CSS_PROPERTIES = css_properties.computed;
+
+fn svgInherited() [@import("svg.zig").inherited.len]InheritedProperty {
+    var result: [@import("svg.zig").inherited.len]InheritedProperty = undefined;
+    inline for (@import("svg.zig").inherited, 0..) |entry, i| result[i] = .{ .name = entry[0], .default_value = entry[1] };
+    return result;
+}
 
 /// Stable property order and defaults shared with DOM inspection output.
 /// The cascade remains the owner; consumers must not duplicate this table.
@@ -723,6 +729,7 @@ pub fn Application(
                         defer hint_arena.deinit();
                         var hints = std.StringHashMap([]const u8).init(hint_arena.allocator());
                         try presentational_hints.collect(hint_arena.allocator(), e.tag, e.attributes, &hints);
+                        try @import("svg.zig").collect(e, &hints);
                         var hint_it = hints.iterator();
                         while (hint_it.next()) |hint| try applyCascadedDeclaration(
                             &new_style,
@@ -821,6 +828,11 @@ pub fn Application(
 
                         // Resolve CSS-wide keywords for every supported
                         // property before focused computed-value transforms.
+                        e.svg_specified_properties = 0;
+                        inline for (@import("svg.zig").instance_properties, 0..) |name, i| {
+                            if (cascade_priorities.contains(name)) e.svg_specified_properties |= @as(u16, 1) << i;
+                        }
+
                         // Explicit inherit on a normally non-inherited property
                         // still registers the parent dependency it requests.
                         for (CSS_PROPERTIES) |prop| {

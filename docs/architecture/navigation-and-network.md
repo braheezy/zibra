@@ -259,6 +259,41 @@ layout and paint because natural dimensions may change flow. Terminal state is
 stored on the Element to avoid repeated requests. Broken fallback pixels paint
 only when `alt` is non-empty.
 
+`image_decoder.zig` is shared by HTML image/object and CSS background loaders.
+It detects XML image bodies independently of URL suffixes (including file,
+HTTP, and decoded data URLs). Raster formats still use zigimg; static SVG uses
+`render/svg.zig` and z2d, then exports straight-alpha RGBA in the existing
+`ImageData` owner. Temporary XML trees, paths, and premultiplied surfaces retire
+before decode returns. Batch cache hits duplicate pixels; display generations
+and raster snapshots retain the same borrowing/copying contracts as raster
+images. Malformed or resource-limit failures use the existing terminal fallback;
+allocation failures propagate.
+
+The SVG image subset covers basic shapes, absolute/relative paths including
+curves and arcs, solid fill/stroke, inherited presentation values and inline
+style, `currentColor`, transforms, group opacity, root `viewBox`, and
+`preserveAspectRatio`. Root absolute dimensions use CSS units; missing dimensions
+use the viewBox ratio fitted into 300×150. Rasterization happens once at this
+intrinsic size; CSS image sizing subsequently samples those pixels. Decode is
+bounded to 2 MiB source, 128 levels, 16,384 elements, 4,096 pixels per axis, and
+4 Mi pixels, with bounded path and opacity-layer work.
+
+Image SVG also uses the paint servers, clip paths, filters, symbols and basic
+text described in the [SVG rendering contract](document-and-rendering.md#svg).
+Image resources sample declarative animation at time zero and do not run a
+timeline, execute scripts, or fetch external dependencies. Inline SVG images
+are different: `image_loader.loadSvgTree` refreshes attached `image href` and
+`xlink:href` resources during the style/resource phase, through the same
+URL, CSP and referrer callbacks as HTML images. Their Element owns the attempted
+href identity and terminal ImageData. A changed/removed href replaces/retires
+those owners and dirties paint. This is safe without retiring image command
+borrows because inline SVG exports independent canvas snapshots.
+
+External `use` documents, external paint servers, and top-level SVG document
+navigation remain unsupported. See the
+[image fixture](../../tests/manual/svg-images.html) and
+[live SVG fixture](../../tests/manual/svg-inline.html).
+
 CSS background resources are discovered only after final cascade. Do not fetch
 an overridden, unmatched, `display:none`, hidden-input, unsupported, or
 forced-colors-suppressed image. The Element owns attempted-source identity and
