@@ -29,6 +29,10 @@ priority, or trace ownership.
   whose tasks own complete speech text. Both must stop before the shared
   `MeasureTime` they borrow. Stop the Tab's serialized producer before its
   accessibility runner so no new utterance can race speaker shutdown.
+- Worker entry points call `MeasureTime.registerThread` themselves, even when
+  tracing is disabled. `thread_name.zig` owns native self-naming and platform
+  label limits; do not name child threads from the spawning thread (macOS
+  cannot do that).
 - `thread_batch.zig` is a synchronous join boundary for caller-owned job/result
   slots. Construct the complete slice before starting it; every native thread
   must be joined before return, and a spawn failure must retain correct

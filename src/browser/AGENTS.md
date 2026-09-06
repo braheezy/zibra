@@ -75,6 +75,8 @@ into either leaf module.
   borrow remain valid until the presentation worker has joined.
 - Every Tab task or helper that can cross navigation carries a copied document
   identity. Never queue a borrowed `*Frame`, `*Node`, or `JsRenderContext`.
+- Timer/XHR helpers register their native and trace names inside their entry
+  points through `MeasureTime.registerThread`, never from the spawning thread.
 - Tab workers do not mutate Browser tab/chrome collections. Cross-thread new
   tabs transfer an owning `Url`; ownership moves only after successful queueing.
 - Stop the presentation worker before tabs/fonts/surfaces/native handles. Stop a Tab's

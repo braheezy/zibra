@@ -1,4 +1,4 @@
-//! Chrome trace-event recording for browser work and worker threads.
+//! Native thread labels and Chrome trace-event recording for browser work.
 //!
 //! Tracing is enabled by a nonempty `ZIBRA_TRACE` value other than `0` and is
 //! written to `browser.trace`. The environment and I/O objects are borrowed for
@@ -7,6 +7,7 @@
 
 const std = @import("std");
 const Mutex = @import("sync.zig").Mutex;
+const thread_name = @import("thread_name.zig");
 
 pub const MeasureTime = struct {
     const ThreadInfo = struct {
@@ -83,7 +84,11 @@ pub const MeasureTime = struct {
         };
     }
 
+    /// Register the calling thread's native name even with tracing disabled.
+    /// Enabled trace metadata owns a copy of the full label. Call from the
+    /// worker entry point, never from the thread that spawned it.
     pub fn registerThread(self: *MeasureTime, name: []const u8) !void {
+        thread_name.setCurrent(name);
         if (!self.enabled) return;
         const tid = std.Thread.getCurrentId();
         self.lock.lock();
@@ -194,3 +199,52 @@ pub const MeasureTime = struct {
         return !std.mem.eql(u8, env, "0");
     }
 };
+
+test "native thread labels are registered without tracing and safely bounded" {
+    if (std.Thread.max_name_len == 0) return error.SkipZigTest;
+    const Context = struct {
+        measure: *MeasureTime,
+        name: []const u8,
+        ready: std.Io.Semaphore = .{},
+        release: std.Io.Semaphore = .{},
+        result: anyerror!void = {},
+
+        fn run(context: *@This()) void {
+            context.result = context.measure.registerThread(context.name);
+            context.ready.post(context.measure.io);
+            context.release.waitUncancelable(context.measure.io);
+        }
+    };
+
+    var environ = std.process.Environ.Map.init(std.testing.allocator);
+    defer environ.deinit();
+    var measure = try MeasureTime.init(std.testing.allocator, std.testing.io, &environ);
+    defer measure.finish();
+    try std.testing.expect(!measure.enabled);
+
+    // The multibyte character straddles the native byte limit; omit it whole.
+    const prefix = "x" ** (@max(1, std.Thread.max_name_len) - 1);
+    const labels = [_][]const u8{
+        "SetTimeout thread",
+        "Animation timer thread",
+        "XHR thread",
+        prefix ++ "é suffix",
+    };
+    for (labels, 0..) |label, index| {
+        var context = Context{ .measure = &measure, .name = label };
+        const thread = try std.Thread.spawn(.{}, Context.run, .{&context});
+        defer {
+            context.release.post(std.testing.io);
+            thread.join();
+        }
+        context.ready.waitUncancelable(std.testing.io);
+        try context.result;
+
+        var buffer: [std.Thread.max_name_len:0]u8 = undefined;
+        const actual = (try thread.getName(&buffer)) orelse return error.MissingNativeThreadName;
+        const expected = if (index == labels.len - 1) prefix else label[0..@min(label.len, std.Thread.max_name_len)];
+        try std.testing.expectEqualStrings(expected, actual);
+        try std.testing.expect(std.unicode.utf8ValidateSlice(actual));
+        try std.testing.expectEqual(@as(usize, 0), measure.thread_infos.items.len);
+    }
+}

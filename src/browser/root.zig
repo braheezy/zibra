@@ -4472,9 +4472,6 @@ pub const Browser = struct {
             tab.releaseAsyncThread();
             return err;
         };
-        _ = thread.setName(self.io, "SetTimeout thread") catch |err| {
-            std.log.warn("Failed to name setTimeout thread: {}", .{err});
-        };
         thread.detach();
     }
 
@@ -4580,9 +4577,6 @@ pub const Browser = struct {
             tab.releaseAsyncThread();
             return;
         };
-        _ = thread.setName(self.io, "Animation timer thread") catch |err| {
-            std.log.warn("Failed to name animation timer thread: {}", .{err});
-        };
         thread.detach();
     }
 
@@ -4632,9 +4626,6 @@ pub const Browser = struct {
             ctx.destroy();
             tab.releaseAsyncThread();
             return err;
-        };
-        _ = thread.setName(self.io, "XHR thread") catch |err| {
-            std.log.warn("Failed to name XHR thread: {}", .{err});
         };
         thread.detach();
     }

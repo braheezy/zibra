@@ -125,9 +125,6 @@ pub const TaskRunner = struct {
         if (self.thread != null) return error.TaskRunnerAlreadyStarted;
 
         const thread = try std.Thread.spawn(.{}, runThread, .{self});
-        _ = thread.setName(self.measure.io, self.worker_name) catch |err| {
-            std.log.warn("Failed to name {s}: {}", .{ self.worker_name, err });
-        };
         self.thread = thread;
     }
 
@@ -306,6 +303,45 @@ const TestTaskContext = struct {
         context.recorder.completed.post(context.recorder.io);
     }
 };
+
+test "native thread labels are set before a task runner executes work" {
+    if (std.Thread.max_name_len == 0) return error.SkipZigTest;
+    const Context = struct {
+        started: std.Io.Semaphore = .{},
+        release: std.Io.Semaphore = .{},
+
+        fn run(raw_context: *anyopaque) !void {
+            const context: *@This() = @ptrCast(@alignCast(raw_context));
+            context.started.post(std.testing.io);
+            context.release.waitUncancelable(std.testing.io);
+        }
+    };
+
+    var environ = std.process.Environ.Map.init(std.testing.allocator);
+    defer environ.deinit();
+    var measure = try MeasureTime.init(std.testing.allocator, std.testing.io, &environ);
+    defer measure.finish();
+    try std.testing.expect(!measure.enabled);
+
+    for ([_][]const u8{
+        "Networking thread",
+        "Raster and draw thread",
+        "Tab main thread",
+        "Accessibility thread",
+    }) |label| {
+        var context = Context{};
+        var runner = TaskRunner.initNamed(std.testing.allocator, &measure, label);
+        defer runner.deinit();
+        try runner.schedule(.init(.normal, "task:test_native_name", &context, Context.run, null));
+        try runner.start();
+        defer context.release.post(std.testing.io);
+        context.started.waitUncancelable(std.testing.io);
+
+        var buffer: [std.Thread.max_name_len:0]u8 = undefined;
+        const actual = (try runner.thread.?.getName(&buffer)) orelse return error.MissingNativeThreadName;
+        try std.testing.expectEqualStrings(label[0..@min(label.len, std.Thread.max_name_len)], actual);
+    }
+}
 
 test "task runner prioritizes rendering and input while preserving priority FIFO" {
     var environ = std.process.Environ.Map.init(std.testing.allocator);

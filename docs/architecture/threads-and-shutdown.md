@@ -112,6 +112,20 @@ Async HTTP currently has no cancellation token, so shutdown can wait for
 network I/O indefinitely. This is a responsiveness gap, not permission to
 retire its owners early.
 
+## Diagnostic thread names
+
+Worker entry points call `MeasureTime.registerThread` on the worker itself.
+It applies the native name through `runtime/thread_name.zig` even when tracing
+is disabled; enabled trace metadata retains the full label. Native labels are
+bounded to the platform's byte limit without splitting a UTF-8 character.
+Unsupported native naming is optional, while other failures remain warnings.
+
+Do not call `Thread.setName` from the spawning thread: macOS only permits
+self-naming. TaskRunner workers register before executing tasks, and detached
+timer/animation/XHR helpers register inside their accounted entry points.
+Naming does not transfer a thread handle or change scheduling, helper
+accounting, or teardown.
+
 ## Task contract
 
 A queued `Task` owns its opaque context until exactly one cleanup callback
