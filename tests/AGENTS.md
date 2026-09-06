@@ -51,6 +51,15 @@ Choose the narrowest step while iterating, then run the complete checks
 appropriate to the changed owner before handoff. Report checks that were not
 available on the current platform.
 
+WPT collection commands use completion-based exit status, not a compatibility
+gate. Inspect their JSON results; exit 0 does not mean tests passed. Use
+`--fail-on-unexpected` for strict gates (`task wpt-smoke` already does); see the
+[exit-status contract](wpt/README.md#run-completion-versus-compatibility-results).
+
+For dashboard changes, run its [API and frontend checks](wpt/dashboard/README.md#verification).
+The frontend checks use Node.js without npm dependencies; no browser engine
+build or WPT sweep is needed for dashboard-only sorting/rendering logic.
+
 `-Dtest-filter=substring` narrows Zig unit-test names during iteration; it does
 not filter pipeline/screenshot cases or replace an unfiltered handoff run.
 

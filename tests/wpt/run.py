@@ -7,6 +7,8 @@ result. ``testharness`` consumes Zibra's machine-readable headless result.
 mode and compares their page pixels.
 ``crashtest`` drives the same headless lifecycle and reports browser health.
 ``all`` runs all three conformance adapters, excluding opt-in smoke probes.
+Completed runs exit successfully regardless of case results. Use
+``--fail-on-unexpected`` to make compatibility results an exit-status gate.
 """
 
 from __future__ import annotations
@@ -1614,6 +1616,11 @@ def _parse_args(argv: list[str] | None) -> argparse.Namespace:
         help="score unselected discovered cases in the selected categories as zero coverage",
     )
     parser.add_argument(
+        "--fail-on-unexpected", action="store_true",
+        help="exit 1 for unexpected case results or unselected full-suite coverage; "
+             "by default, completed runs exit 0 regardless of case results",
+    )
+    parser.add_argument(
         "--jobs", type=int, default=1,
         help="maximum browser processes to run concurrently (default: 1)",
     )
@@ -1940,7 +1947,11 @@ def main(argv: list[str] | None = None) -> int:
         coverage_cases is not None
         and any((case.mode, case.path) not in result_keys for case in coverage_cases)
     )
-    return 1 if failed or skipped_from_coverage else 0
+    # A completed compatibility survey is a successful runner invocation, even
+    # when individual browser sessions failed or produced INFRA records. Keep
+    # those results and coverage gaps in the report; only gate on them when
+    # explicitly requested (for example, by the known-supported smoke suite).
+    return 1 if args.fail_on_unexpected and (failed or skipped_from_coverage) else 0
 
 
 if __name__ == "__main__":

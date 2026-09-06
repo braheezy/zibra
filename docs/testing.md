@@ -105,12 +105,16 @@ Run from the repository root:
   records completion for each top-level WPT folder, and accepts `--verbose`
   for per-failure browser diagnostics;
 - `task wpt-smoke` for one unchanged upstream case per adapter, run serially
-  through the real executable. This requires the initialized WPT checkout and
+  through the real executable with `--fail-on-unexpected` as a strict result
+  gate. This requires the initialized WPT checkout and
   its server dependencies; see the [WPT guide](../tests/wpt/README.md).
 - `task wpt` for the reviewed allowlist across all three runnable categories.
   It runs selected directories and explicit cases, but scores every discovered
-  directory in the report; omitted
-  directories appear as `0/N` and keep the suite failing until implemented;
+  directory in the report; omitted directories appear as `0/N`. Completed
+  result-collection runs exit 0 regardless of test failures or missing coverage;
+  compatibility scores and per-case infrastructure failures remain in the
+  report. Runner setup, report-writing, and interruption failures still exit
+  nonzero. See the [WPT exit-status contract](../tests/wpt/README.md#run-completion-versus-compatibility-results);
 - `zig build test-docs` for repository Markdown links when documentation
   changes. The checker intentionally skips the vendored `tests/wpt/upstream`
   submodule, whose links are resolved by WPT's own documentation tooling;

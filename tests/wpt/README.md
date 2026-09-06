@@ -42,6 +42,27 @@ crashtest cases to their respective adapters. It excludes non-conformance
 probes; use `--mode probe` explicitly for those. A category-specific `--mode`
 filters both execution and `--list` output.
 
+### Run completion versus compatibility results
+
+By default, a completed run exits **0**, regardless of its case-level `FAIL`,
+`ERROR`, `TIMEOUT`, `CRASH`, or `INFRA` results. Missing coverage under
+`--full-suite` also does not fail the command. These results remain unchanged
+in the console and JSON report: `complete` describes run completion, while
+`summary.suite_failed` describes compatibility/coverage, not runner success.
+
+Invalid arguments/manifests, a missing checkout, server startup failure,
+report-writing failure, and interruptions still exit nonzero. An isolated
+browser/session failure recorded as `INFRA` is different from a failure that
+prevents the runner from completing its work or saving the requested report.
+
+Use `--fail-on-unexpected` for a strict gate: it exits 1 for unexpected case
+results (including `INFRA`) or unselected full-suite coverage. Reviewed
+expected deviations still match normally. `task wpt-smoke` uses this flag;
+the result-collection tasks (`wpt`, `wpt-all`, `latest-results`, category runs,
+`dom-results`, and `acid3-results`) use the default completion-based status.
+
+### Focused compatibility manifests
+
 For the bounded HTML table sizing work, run the unchanged upstream reftests
 in `manifest-html-tables.yaml`:
 
@@ -209,7 +230,8 @@ including generated variants and reference metadata. Explicit entries and
 directory matches are deduplicated by category and test URL.
 `task wpt` runs that mixed-category
 allowlist with `--full-suite`: directories outside the allowlist are not
-executed, but remain in the report as `0/N` and make the suite fail. This keeps
+executed, but remain in the report as `0/N` and mark its compatibility summary
+as failing without failing the completed command. This keeps
 unsupported areas such as `accelerometer` visible without spending time on
 them.
 

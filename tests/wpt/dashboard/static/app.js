@@ -53,8 +53,10 @@ function sortDirectories(directories) {
     if (state.directorySort === "path") {
       return String(a.path || "").localeCompare(String(b.path || ""));
     }
-    const difference = directoryRate(a) - directoryRate(b);
-    if (difference) return state.directorySort === "pass-desc" ? -difference : difference;
+    const byTotal = state.directorySort === "total-desc" || state.directorySort === "total-asc";
+    const difference = byTotal ? Number(a.total || 0) - Number(b.total || 0) :
+      directoryRate(a) - directoryRate(b);
+    if (difference) return state.directorySort.endsWith("-desc") ? -difference : difference;
     return String(a.path || "").localeCompare(String(b.path || ""));
   });
 }

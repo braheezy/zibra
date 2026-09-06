@@ -25,7 +25,7 @@ tasks:
         --report {{.WPT_RESULTS}}/$(date -u +%Y%m%dT%H%M%SZ).json
 
   wpt:
-    desc: Run all allowlisted WPT categories and score skipped suites as failures
+    desc: Collect allowlisted WPT results and report omitted coverage
     cmds:
       - zig build -Doptimize=ReleaseSafe
       - mkdir -p {{.WPT_RESULTS}}
@@ -35,13 +35,13 @@ tasks:
         --report {{.WPT_RESULTS}}/wpt-$(date -u +%Y%m%dT%H%M%SZ).json
 
   wpt-smoke:
-    desc: Run one upstream testharness, reftest, and crashtest serially
+    desc: Check one upstream testharness, reftest, and crashtest serially
     cmds:
       - zig build -Doptimize=ReleaseSafe
       - mkdir -p {{.WPT_RESULTS}}
       - >-
         ZIBRA_GIT_SHA="{{.GIT_SHA}}" SDL_VIDEODRIVER=dummy python3 tests/wpt/run.py tests/wpt/manifest-smoke.yaml
-        --mode all --jobs 1 --browser ./zig-out/bin/zibra
+        --mode all --fail-on-unexpected --jobs 1 --browser ./zig-out/bin/zibra
         --report {{.WPT_RESULTS}}/smoke-$(date -u +%Y%m%dT%H%M%SZ).json
 
   wpt-all:

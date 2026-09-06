@@ -218,6 +218,7 @@ class WptRunnerTests(unittest.TestCase):
         checkpoint_every=None,
         verbose=False,
         full_suite=False,
+        fail_on_unexpected=False,
         directories=None,
     ):
         stdout = io.StringIO()
@@ -240,6 +241,8 @@ class WptRunnerTests(unittest.TestCase):
             argv.append("--verbose")
         if full_suite:
             argv.append("--full-suite")
+        if fail_on_unexpected:
+            argv.append("--fail-on-unexpected")
         for directory in directories or []:
             argv.extend(("--directory", directory))
         with (
@@ -638,7 +641,7 @@ print(json.dumps({
         ):
             status, stdout, stderr = self.run_main(manifest, "unused", mode="all", report=report)
 
-        self.assertEqual(1, status)
+        self.assertEqual(0, status)
         self.assertEqual("", stderr)
         self.assertEqual(list(runner.CONFORMANCE_MODES), [mode for mode, _url in called])
         probe.assert_not_called()
@@ -676,7 +679,7 @@ print(json.dumps({
         ):
             status, _stdout, stderr = self.run_main(manifest, "unused", mode="all", full_suite=True, report=report)
         discover.assert_called_once_with()
-        self.assertEqual(1, status)
+        self.assertEqual(0, status)
         self.assertEqual("", stderr)
         payload = json.loads(report.read_text(encoding="utf-8"))
         self.assertEqual(4, payload["expected_cases"])
@@ -709,7 +712,7 @@ print(json.dumps({
         self.assertEqual("http://127.0.0.1:8000/dom/generated.any.html?variant", run.call_args.args[1])
         server.return_value.__exit__.assert_called_once_with(None, None, None)
 
-    def test_full_suite_scores_unselected_directories_as_zero_and_fails(self):
+    def test_full_suite_scores_unselected_directories_without_failing_collection(self):
         harness = self.upstream / self.case_path
         harness.write_text(
             '<script src="/resources/testharness.js"></script>',
@@ -736,12 +739,17 @@ print(json.dumps({
         )
         report = self.root / "coverage-report.json"
 
-        status, stdout, stderr = self.run_main(
-            manifest, browser, report=report, full_suite=True
-        )
-
-        self.assertEqual(1, status)
-        self.assertEqual("", stderr)
+        for strict, expected_exit in ((False, 0), (True, 1)):
+            with self.subTest(strict=strict):
+                status, stdout, stderr = self.run_main(
+                    manifest, browser, report=report, full_suite=True,
+                    fail_on_unexpected=strict,
+                )
+                self.assertEqual(expected_exit, status)
+                self.assertEqual("", stderr)
+                payload = json.loads(report.read_text(encoding="utf-8"))
+                self.assertTrue(payload["complete"])
+                self.assertTrue(payload["summary"]["suite_failed"])
         payload = json.loads(report.read_text(encoding="utf-8"))
         self.assertTrue(payload["summary"]["suite_failed"])
         self.assertEqual(1, payload["summary"]["skipped_cases"])
@@ -871,11 +879,98 @@ print(json.dumps({
 """
         )
 
-        status, stdout, stderr = self.run_main(manifest, browser)
+        status, stdout, stderr = self.run_main(manifest, browser, fail_on_unexpected=True)
 
         self.assertEqual(0, status)
         self.assertIn(f"TIMEOUT {self.case_path}", stdout)
         self.assertEqual("", stderr)
+
+    def test_completed_runs_preserve_results_and_only_gate_when_requested(self):
+        manifest = self.mixed_allowlist()
+        report = self.root / "exit-policy.json"
+        for jobs in (1, 2):
+            for outcome in ("PASS", "FAIL", "ERROR", "TIMEOUT", "CRASH", "INFRA"):
+                for strict in (False, True):
+                    with self.subTest(jobs=jobs, outcome=outcome, strict=strict):
+                        def run(case, *_args):
+                            return runner.CaseResult(
+                                case, outcome, outcome == "PASS",
+                                infrastructure_error="broken session" if outcome == "INFRA" else None,
+                            )
+
+                        with (
+                            mock.patch.object(runner, "_run_testharness", side_effect=run),
+                            mock.patch.object(runner, "_run_reftest", side_effect=run),
+                            mock.patch.object(runner, "_run_crashtest", side_effect=run),
+                        ):
+                            status, stdout, stderr = self.run_main(
+                                manifest, "unused", mode="all", jobs=jobs,
+                                report=report, checkpoint_every=1,
+                                fail_on_unexpected=strict,
+                            )
+                        self.assertEqual(int(strict and outcome != "PASS"), status)
+                        self.assertEqual("", stderr)
+                        self.assertIn("WPT complete: 3/3 cases", stdout)
+                        payload = json.loads(report.read_text(encoding="utf-8"))
+                        self.assertTrue(payload["complete"])
+                        self.assertEqual(3, payload["expected_cases"])
+                        self.assertEqual(3, payload["summary"][outcome.lower()])
+                        self.assertEqual(outcome != "PASS", payload["summary"]["suite_failed"])
+                        self.assertEqual([outcome] * 3, [item["status"] for item in payload["tests"]])
+
+    def test_collection_still_fails_for_invalid_manifest(self):
+        manifest = self.write_manifest()
+        manifest.write_text("{broken", encoding="utf-8")
+        status, stdout, stderr = self.run_main(manifest, "unused")
+        self.assertEqual(2, status)
+        self.assertIn("Failed to load WPT manifest", stderr)
+        self.assertNotIn("WPT complete:", stdout)
+
+    def test_collection_still_fails_without_checkout(self):
+        manifest = self.write_manifest()
+        self.upstream = self.root / "missing-checkout"
+        status, stdout, stderr = self.run_main(manifest, "unused")
+        self.assertEqual(2, status)
+        self.assertIn("WPT checkout missing", stderr)
+        self.assertNotIn("WPT complete:", stdout)
+
+    def test_collection_still_fails_when_server_cannot_start(self):
+        manifest = self.write_manifest()
+        report = self.root / "server-failure.json"
+        (self.upstream / "wpt").touch()
+        with mock.patch.object(runner, "WptServer") as server:
+            server.return_value.__enter__.side_effect = RuntimeError("cannot start")
+            status, stdout, stderr = self.run_main(manifest, "unused", report=report)
+        self.assertEqual(1, status)
+        self.assertIn("WPT server failed: cannot start", stderr)
+        self.assertNotIn("WPT complete:", stdout)
+        server.return_value.__exit__.assert_called_once()
+        payload = json.loads(report.read_text(encoding="utf-8"))
+        self.assertFalse(payload["complete"])
+        self.assertEqual(1, payload["expected_cases"])
+
+    def test_collection_does_not_swallow_report_write_failure(self):
+        manifest = self.write_manifest()
+        with (
+            mock.patch.object(runner, "_run_testharness", side_effect=lambda case, *_: runner.CaseResult(case, "PASS", True)),
+            mock.patch.object(runner, "write_run_report", side_effect=OSError("report disk full")),
+            self.assertRaisesRegex(OSError, "report disk full"),
+        ):
+            self.run_main(manifest, "unused", report=self.root / "report.json")
+
+    def test_interrupted_collection_preserves_incomplete_report_and_propagates(self):
+        manifest = self.mixed_allowlist()
+        report = self.root / "interrupted.json"
+        with (
+            mock.patch.object(runner, "_run_testharness", side_effect=lambda case, *_: runner.CaseResult(case, "FAIL", False)),
+            mock.patch.object(runner, "_run_reftest", side_effect=KeyboardInterrupt),
+            self.assertRaises(KeyboardInterrupt),
+        ):
+            self.run_main(manifest, "unused", mode="all", report=report)
+        payload = json.loads(report.read_text(encoding="utf-8"))
+        self.assertFalse(payload["complete"])
+        self.assertEqual(3, payload["expected_cases"])
+        self.assertEqual(1, payload["summary"]["fail"])
 
     def test_expectation_mismatch_preserves_raw_stdout_and_stderr(self):
         manifest = self.write_manifest(expectation="pass")
@@ -895,7 +990,7 @@ print("assertion detail", file=sys.stderr)
 
         status, stdout, stderr = self.run_main(manifest, browser, verbose=True)
 
-        self.assertEqual(1, status)
+        self.assertEqual(0, status)
         self.assertIn("FAIL (expected PASS)", stdout)
         self.assertIn('"status": "FAIL"', stderr)
         self.assertIn("assertion detail", stderr)
@@ -921,7 +1016,7 @@ raise SystemExit(7)
 
         status, stdout, stderr = self.run_main(manifest, browser, verbose=True)
 
-        self.assertEqual(1, status)
+        self.assertEqual(0, status)
         self.assertIn("INFRA", stdout)
         self.assertIn("browser exited with status 7", stderr)
         self.assertIn('"status": "FAIL"', stderr)
@@ -939,7 +1034,7 @@ print("parse detail", file=sys.stderr)
 
         status, stdout, stderr = self.run_main(manifest, browser, verbose=True)
 
-        self.assertEqual(1, status)
+        self.assertEqual(0, status)
         self.assertIn("INFRA", stdout)
         self.assertIn("invalid JSON result", stderr)
         self.assertIn("not JSON", stderr)
@@ -982,7 +1077,7 @@ print("parse detail", file=sys.stderr)
             manifest, browser, grace_seconds=0.0, verbose=True
         )
 
-        self.assertEqual(1, status)
+        self.assertEqual(0, status)
         self.assertIn("INFRA", stdout)
         self.assertIn("browser watchdog expired", stderr)
         self.assertNotIn(f"ok {self.case_path}: TIMEOUT", stdout)

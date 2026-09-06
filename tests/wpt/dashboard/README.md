@@ -29,7 +29,13 @@ for coverage, so omitted directories appear as `0/N` and the run is visibly
 failing. The history chart includes only full-suite-scored runs, so focused
 manifests cannot make the long-term percentage look artificially better.
 The directory table defaults to descending pass percentage, with path and
-ascending-percentage alternatives.
+ascending-percentage alternatives. Choose **Assertion count ↓** in the Sort
+menu to put the largest suites first, or **Assertion count ↑** for the
+smallest. This uses each directory score's total (the denominator): reported
+subtests where available, otherwise one check per case, including skipped
+cases. It is not a count of undiscovered assertions in tests that did not run.
+Equal counts sort by path; the selected sort also applies while searching or
+switching runs.
 
 The host-side `tests/wpt/results` directory is the local history store. It is
 mounted read-only into the container, survives `docker compose down`, and is
@@ -39,3 +45,13 @@ back up that directory when you want history across machines or checkouts.
 Each report also carries the Zibra revision under test. `task latest-results`
 populates it from the current checkout; direct runner invocations can set
 `ZIBRA_GIT_SHA` explicitly.
+
+## Verification
+
+From the repository root, run the API tests and the frontend sorting/event
+regressions (Node.js required for the latter; no npm dependencies):
+
+```sh
+python3 -m unittest tests/wpt/dashboard/test_server.py
+node --test tests/wpt/dashboard/test_app.cjs
+```
