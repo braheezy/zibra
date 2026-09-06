@@ -73,9 +73,17 @@ missing features, incorrect behavior, and harness/infrastructure failures.
 
 Each compatibility chunk should identify the motivating failure, add focused
 upstream and engine-level coverage, include a page-level regression where
-appropriate, and state its remaining limitations. Broad WPT sweeps are periodic
-health checks, not the default iteration loop. Performance benchmarks come
-after correctness gates prove that the measured work actually happens. See the
+appropriate, and state its remaining limitations. New or substantially expanded
+engine features (including HTML, CSS, and SVG) must include a review of relevant
+WPT suites and the [default allowlist](tests/wpt/manifest.yaml). Enable newly
+meaningful suites or bounded subsets, considering testharness, reftest, and
+crashtest coverage rather than only JavaScript assertions. The handoff must
+state what coverage was enabled, or why no additions were appropriate; local
+unit tests and demos alone do not discharge this review.
+
+Broad WPT sweeps are periodic health checks, not the default iteration loop.
+Performance benchmarks come after correctness gates prove that the measured
+work actually happens. See the
 [testing guide](docs/testing.md#compatibility-driven-development) for the workflow.
 
 ## Verification

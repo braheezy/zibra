@@ -860,6 +860,54 @@ deviations:
             [(case.path, case.mode, case.expectation) for case in cases],
         )
 
+    def test_default_allowlist_keeps_html_css_and_svg_capability_coverage(self):
+        config = runner._load_yaml_config(runner.DEFAULT_MANIFEST)
+        representatives = {
+            "tests": (
+                "html/syntax/serializing-html-fragments/outerHTML.html",
+                "html/dom/documents/dom-tree-accessors/document.forms.html",
+                "css/css-variables/variable-substitution-basic.html",
+                "css/css-values/rem-unit-root-element.html",
+                "svg/coordinate-systems/outer-svg-intrinsic-size-001.html",
+            ),
+            "reftests": (
+                "css/css-variables/variable-declaration-48.html",
+                "css/css-variables/variable-reference-39.html",
+                "svg/linking/reftests/href-gradient-element.html",
+                "svg/linking/reftests/use-nested-symbol-001.html",
+                "svg/painting/subpixel-clip-path-transform.html",
+                "css/filter-effects/svg-unknown-input-001.html",
+            ),
+            "crashtests": (
+                "svg/embedded/svg-zero-size-crash.html",
+                "css/css-variables/whitespace-in-fallback-crash.html",
+            ),
+        }
+        for section, paths in representatives.items():
+            for path in paths:
+                with self.subTest(section=section, path=path):
+                    self.assertIn(path, config[section])
+                    self.assertNotIn(path, config.get("deviations", {}))
+        for section in ("tests", "reftests", "crashtests", "probes"):
+            paths = config.get(section, [])
+            self.assertEqual(len(paths), len(set(paths)), section)
+
+    def test_default_allowlist_includes_promoted_focused_reftests(self):
+        # These regressions must not silently remain opt-in after their engine
+        # features have shipped. Parsing config needs no upstream checkout.
+        config = runner._load_yaml_config(runner.DEFAULT_MANIFEST)
+        default_reftests = set(config["reftests"])
+        for name in (
+            "manifest-html-tables.yaml",
+            "manifest-replaced-sizing.yaml",
+            "manifest-svg-images.yaml",
+            "manifest-media-ranges.yaml",
+        ):
+            with self.subTest(manifest=name):
+                focused = runner._load_yaml_config(runner.DEFAULT_MANIFEST.with_name(name))
+                missing = set(focused["reftests"]) - default_reftests
+                self.assertFalse(missing, sorted(missing))
+
     def test_testharness_invocation_accepts_an_exact_expected_timeout(self):
         manifest = self.write_manifest(expectation="timeout", timeout_ms=17)
         browser = self.write_browser(

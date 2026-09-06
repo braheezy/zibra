@@ -16,6 +16,29 @@ directories:
   - uievents
 tests:
   - dom/nodes/Element-firstElementChild.html
+  # HTML document accessors, collections, metadata, parsing and serialization.
+  # These exercise existing behavior even where individual assertions fail.
+  - html/dom/documents/dom-tree-accessors/Document.body.html
+  - html/dom/documents/dom-tree-accessors/document.head-01.html
+  - html/dom/documents/dom-tree-accessors/document.head-02.html
+  - html/dom/documents/dom-tree-accessors/document.title-01.html
+  - html/dom/documents/dom-tree-accessors/document.forms.html
+  - html/dom/documents/dom-tree-accessors/document.images.html
+  - html/dom/documents/dom-tree-accessors/document.links.html
+  - html/dom/documents/dom-tree-accessors/document.scripts.html
+  - html/semantics/document-metadata/the-title-element/title.text-01.html
+  - html/semantics/document-metadata/the-title-element/title.text-03.html
+  - html/semantics/document-metadata/the-title-element/title-multiple-elements.html
+  - html/syntax/parsing/adoption_agency_check_the_end_tag_name.html
+  - html/syntax/serializing-html-fragments/initial-linefeed-pre.html
+  - html/syntax/serializing-html-fragments/outerHTML.html
+  - html/syntax/serializing-html-fragments/serializing.html
+  # Computed custom properties, substitution and root-relative units.
+  - css/css-variables/variable-definition-cascading.html
+  - css/css-variables/variable-substitution-basic.html
+  - css/css-values/rem-unit-root-element.html
+  # SVG root geometry uses the existing live DOM/rectangle API, not SVG IDL.
+  - svg/coordinate-systems/outer-svg-intrinsic-size-001.html
   # Element rectangles and box metrics; do not opt into all of CSSOM View yet.
   - css/cssom-view/cssom-getBoundingClientRect-001.html
   - css/cssom-view/cssom-getBoundingClientRect-002.html
@@ -35,8 +58,62 @@ tests:
   - css/cssom-view/offsetTopLeft-leading-space-inline.html
 reftests:
   - css/CSS2/backgrounds/background-color-174.xht
+  # Promote the focused table/image sizing regressions into normal runs.
+  - html/rendering/non-replaced-elements/tables/table-width.html
+  - html/rendering/non-replaced-elements/tables/table-cell-width.html
+  - html/rendering/non-replaced-elements/tables/table-width-150percent.html
+  - html/rendering/non-replaced-elements/tables/table-cell-nowrap-with-fixed-width.html
+  - css/css-sizing/image-max-width-and-height-behaves-as-auto.html
+  - css/css-sizing/image-percentage-max-height-in-anonymous-block.html
+  - css/css-sizing/block-image-percentage-max-height-inside-inline.html
+  # Static variable substitution: whitespace, references and empty fallbacks.
+  - css/css-variables/variable-declaration-01.html
+  - css/css-variables/variable-declaration-02.html
+  - css/css-variables/variable-declaration-03.html
+  - css/css-variables/variable-declaration-04.html
+  - css/css-variables/variable-declaration-05.html
+  - css/css-variables/variable-declaration-06.html
+  - css/css-variables/variable-declaration-07.html
+  - css/css-variables/variable-declaration-08.html
+  - css/css-variables/variable-declaration-09.html
+  - css/css-variables/variable-declaration-10.html
+  # Cycles and dependents are checked visually: variable-cycles.html needs
+  # window-global ID lookup before it can exercise variable resolution.
+  - css/css-variables/variable-declaration-48.html
+  - css/css-variables/variable-declaration-49.html
+  - css/css-variables/variable-reference-01.html
+  - css/css-variables/variable-reference-39.html
+  - css/css-values/rem-root-font-size-restyle-1.html
+  # Keep the monolithic media-query harness opt-in: it needs additional CSSOM
+  # and iframe APIs. These render the supported range/condition grammar.
+  - css/mediaqueries/mq-range-001.html
+  - css/mediaqueries/negation-001.html
+  # SVG image decoding and inline paint; avoid broad SVG IDL/SMIL suites.
+  - css/css-images/object-fit-contain-svg-001i.html
+  - css/css-images/object-fit-fill-svg-001i.html
+  - svg/pservers/reftests/percent-encoded-fragment-fill-stroke.html
+  - svg/painting/reftests/small-nested-viewbox.html
+  - svg/linking/reftests/href-gradient-element.html
+  - svg/linking/reftests/href-image-element.html
+  - svg/linking/reftests/use-nested-symbol-001.html
+  - svg/linking/reftests/use-symbol-rendered-001.html
+  - svg/linking/reftests/use-descendant-combinator-001.html
+  - svg/linking/reftests/use-descendant-combinator-002.html
+  - svg/painting/reftests/large-transform-001.html
+  - svg/painting/subpixel-clip-path-transform.html
+  - svg/embedded/image-embedding-svg-with-near-integral-width.html
+  - svg/coordinate-systems/outer-svg-intrinsic-size-003.html
+  - svg/coordinate-systems/viewBox-change-repaint-001.html
+  # SVG filter primitives and empty-shape suppression, not general CSS filters.
+  - css/filter-effects/svg-unknown-input-001.html
+  - css/filter-effects/svg-empty-element-with-filter-001.html
 crashtests:
   - css/css-flexbox/flex-shrink-large-value-crash.html
+  # Static inputs reach the implemented parser/renderer without SVG IDL,
+  # custom elements, testdriver or a script-based completion handshake.
+  - svg/embedded/svg-zero-size-crash.html
+  - css/css-variables/missing-closing-nested-fallback-crash.html
+  - css/css-variables/whitespace-in-fallback-crash.html
 probes:
   - html/semantics/text-level-semantics/the-b-element/b-usage.html
 

@@ -63,6 +63,12 @@ the result-collection tasks (`wpt`, `wpt-all`, `latest-results`, category runs,
 
 ### Focused compatibility manifests
 
+The reftests in the table, replaced-sizing, SVG-image, and media-range
+manifests below also run in the default [allowlist](manifest.yaml). Their
+focused manifests remain useful for narrow iteration; they are no longer
+the only way to exercise that coverage. The media-query harness and CSP
+manifests still have the separate prerequisites described below.
+
 For the bounded HTML table sizing work, run the unchanged upstream reftests
 in `manifest-html-tables.yaml`:
 
@@ -203,6 +209,59 @@ to `directories`, individual semantic cases to `tests`, individual visual
 cases to `reftests`, crash cases to `crashtests`, and fetch/parse smoke tests to
 `probes`; keep unsupported
 areas out of execution and record only intentional expected deviations.
+
+## Default capability coverage
+
+The default allowlist includes bounded HTML, CSS, and SVG coverage alongside
+the broad DOM/event directories. The 2026-09-06 expansion adds 63 cases:
+19 testharness, 41 reftests, and 3 crashtests. This is a coverage baseline, not
+a claim of complete support for these WPT domains.
+
+The serial macOS ReleaseSafe baseline completed all 63 cases: 43 PASS and
+20 FAIL, with no ERROR, TIMEOUT, CRASH, or INFRA results. By upstream directory,
+HTML was 8/19 passing, CSS 21/29, and SVG 14/15. These are results for the
+selected subset, not whole-domain scores. The local report is
+`tests/wpt/results/capabilities-expanded-20260906.json`.
+
+| Area | Selected behavior |
+| --- | --- |
+| HTML | Document head/body/title and live collections; title text; nested-tag parsing; fragment serialization; table/cell sizing and nowrap. |
+| CSS | Computed custom properties, substitution/cycles and fallback token handling; root-relative units and restyling; media ranges/negation; constrained image sizing. |
+| SVG | Live root sizing; SVG-backed images; linear/radial gradient references; local use/symbol inheritance and selectors; nested viewBox/transforms; clipping; image href; dynamic viewBox repaint; filter inputs and empty shapes. |
+| Process health | Static zero-size SVG geometry and malformed/whitespace custom-property fallbacks, without script-only prerequisite APIs. |
+
+SVG image sizing and filters also have tests under `css/`; WPT directory
+names do not map one-to-one to Zibra subsystems. The unchanged cases keep PASS
+expectations, including semantic failures. Known GIF/XHTML-reference limitations
+remain visible rather than being relabeled as passes.
+
+The selection does not enable all of `html/`, `svg/`, or `css/`. SVG path
+measurement/animated-value IDL, script-controlled SMIL seeking, cross-root use
+references, masks/patterns/markers, and tests requiring unsupported automation
+are not implied by the existing renderer. In particular, crash cases whose
+setup aborts on an unavailable API cannot establish that their intended crash
+condition was exercised.
+
+The larger `css/css-variables/variable-cycles.html` harness is not selected:
+its cases fail on missing window-global ID lookup before testing resolution.
+Static cycle/dependent/fallback reftests cover that implemented capability
+without the unrelated prerequisite.
+
+To rerun just this expansion against an already built executable:
+
+```sh
+python3 tests/wpt/run.py tests/wpt/manifest.yaml --mode all --jobs 1 \
+  --directory html --directory svg \
+  --directory css/css-variables --directory css/css-values \
+  --directory css/css-sizing --directory css/mediaqueries \
+  --directory css/css-images --directory css/filter-effects \
+  --browser ./zig-out/bin/zibra --report /tmp/wpt-capabilities.json
+```
+
+These filters select the expansion as of the date above; future allowlist
+additions under those prefixes will also run. Manifest-runner unit tests guard
+representative coverage and promotion of the focused reftests without requiring
+an upstream checkout.
 
 ## Small real-browser smoke run
 

@@ -25,7 +25,20 @@ For each coherent compatibility chunk:
 4. Implement the capability with focused unit/lifetime coverage and a
    page-level regression. Re-run the same upstream cases and report limitations
    explicitly; do not change test expectations to conceal incorrect behavior.
-5. Expand to the relevant broader checks. Full WPT sweeps are periodic health
+5. Review related WPT suites when adding or substantially expanding an engine
+   feature, including HTML parsing and SVG/layout/paint work. Update the
+   [default allowlist](../tests/wpt/manifest.yaml) with newly meaningful
+   directory prefixes or bounded explicit cases, considering all three runnable
+   categories: testharness, reftest, and crashtest. Run the selected additions
+   and record their baseline. Prefer a coherent subset over enabling an entire
+   large domain with unsupported prerequisites. Do not select only passing
+   cases: semantic failures in implemented behavior are useful coverage, while
+   unsupported automation or infrastructure must be identified separately.
+   In the handoff, name the enabled coverage or explain why existing coverage
+   is sufficient or which prerequisites prevent additions. A fetch/parse probe
+   does not replace a conformance test. See the [WPT guide](../tests/wpt/README.md)
+   for manifest and adapter details.
+6. Expand to the relevant broader checks. Full WPT sweeps are periodic health
    checks, not the default loop for each edit.
 
 Run native build/test jobs serially during agent work, with an outer
