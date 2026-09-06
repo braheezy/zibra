@@ -3198,16 +3198,15 @@ fn handleImageElement(self: *Layout, node: Node, node_ptr: ?*Node, line_buffer: 
         .width = @intCast(data.image.width),
         .height = @intCast(data.image.height),
     } else null;
-    const box = replaced_sizing.imageSizeWithContext(&element, intrinsic_size, .{
-        .font_size = self.font_size_css,
-        .percentage_width = self.containingBlockCssDimension(false),
-        .percentage_height = self.containingBlockCssDimension(true),
-    });
-    const layout_width = self.scaleActiveCssPixel(box.width);
-    const layout_height = self.scaleActiveCssPixel(box.height);
     const intrinsic_width = self.scaleActiveCssPixel(if (intrinsic_size) |size| size.width else 0);
     const intrinsic_height = self.scaleActiveCssPixel(if (intrinsic_size) |size| size.height else 0);
-    const edges = if (style_map) |styles|
+    const own_block: ?*BlockLayout = if (self.inline_block) |block|
+        if (block.inline_nodes == null and block.node_ptr == node_ptr) block else null
+    else
+        null;
+    const edges = if (own_block) |block|
+        BoxModelEdges{ .margin = block.margin, .padding = block.padding, .border = block.border }
+    else if (style_map) |styles|
         resolveBoxEdges(
             styles,
             self.font_size_css,
@@ -3217,6 +3216,17 @@ fn handleImageElement(self: *Layout, node: Node, node_ptr: ?*Node, line_buffer: 
         )
     else
         BoxModelEdges{ .margin = .{}, .padding = .{}, .border = .{} };
+    const box = if (own_block == null) replaced_sizing.imageSizeWithContext(&element, intrinsic_size, .{
+        .font_size = self.font_size_css,
+        .percentage_width = self.containingBlockCssDimension(false),
+        .percentage_height = self.containingBlockCssDimension(true),
+        .insets = .{
+            .width = @intFromFloat(cssPixelsFromLayout(edges.padding.horizontal() + edges.border.horizontal(), self.effectiveZoom(), self.zoom())),
+            .height = @intFromFloat(cssPixelsFromLayout(edges.padding.vertical() + edges.border.vertical(), self.effectiveZoom(), self.zoom())),
+        },
+    }) else replaced_sizing.Size{ .width = 0, .height = 0 };
+    const layout_width = if (own_block) |block| block.content_width else self.scaleActiveCssPixel(box.width);
+    const layout_height = if (own_block) |block| block.content_height else self.scaleActiveCssPixel(box.height);
 
     if (layout_width < 0 or layout_height < 0 or
         (layout_width == 0 and layout_height == 0))
@@ -3249,6 +3259,21 @@ fn handleImageElement(self: *Layout, node: Node, node_ptr: ?*Node, line_buffer: 
         edges,
         self.scaleActiveCssFloat(1.0),
     );
+    if (own_block) |block| {
+        // A blockified image is the box itself, not a second inline box
+        // inside it. Reuse its allocation for pixels, links and geometry.
+        const x = block.x.get().*;
+        const y = block.y.get().*;
+        try image_layout.paintAt(self.current_display_target, self, x, y, displaySource(block, node_ptr));
+        if (self.collect_hit_test_bounds) if (node_ptr) |ptr| {
+            const bounds = Bounds{ .x = x + self.transform_offset_x, .y = y + self.transform_offset_y, .width = image_layout.embed.width, .height = image_layout.embed.height };
+            try self.image_bounds.put(ptr, bounds);
+            try self.recordLinkBounds(ptr, bounds.x, bounds.y, bounds.width, bounds.height);
+            if (findAccessibleNode(ptr)) |accessible| try self.accessibility_bounds.append(self.allocator, .{ .node = accessible, .bounds = bounds });
+        };
+        self.cursor_y += layout_height;
+        return;
+    }
     try image_layout.embed.appendImagePlaceholder(self, line_buffer, node_ptr, .{
         .image = image_layout,
     }, vertical_align);
@@ -3511,7 +3536,8 @@ fn registerIntrinsicDependencies(node: *Node, target: *ProtectedField(i32)) void
             if (std.mem.startsWith(u8, name, "font-") or std.mem.startsWith(u8, name, "padding-") or
                 std.mem.startsWith(u8, name, "margin-") or
                 (std.mem.startsWith(u8, name, "border-") and (std.mem.endsWith(u8, name, "-width") or std.mem.endsWith(u8, name, "-style"))) or
-                std.mem.eql(u8, name, "display") or std.mem.eql(u8, name, "width") or
+                std.mem.eql(u8, name, "display") or std.mem.eql(u8, name, "width") or std.mem.eql(u8, name, "height") or
+                std.mem.startsWith(u8, name, "min-") or std.mem.startsWith(u8, name, "max-") or std.mem.eql(u8, name, "aspect-ratio") or
                 std.mem.eql(u8, name, "white-space") or std.mem.eql(u8, name, "zoom") or
                 std.mem.eql(u8, name, "position") or std.mem.eql(u8, name, "box-sizing"))
                 target.addDependency(entry.value_ptr, map.allocator);
@@ -3540,6 +3566,11 @@ fn registerReplacedSizeDependencies(self: *Layout, style_map: *const parser.Styl
         block.temporary_dependency_target orelse return;
     _ = styleValueRead(style_map, "width", target);
     _ = styleValueRead(style_map, "height", target);
+    _ = styleValueRead(style_map, "min-width", target);
+    _ = styleValueRead(style_map, "max-width", target);
+    _ = styleValueRead(style_map, "min-height", target);
+    _ = styleValueRead(style_map, "max-height", target);
+    _ = styleValueRead(style_map, "box-sizing", target);
     _ = styleValueRead(style_map, "aspect-ratio", target);
     _ = styleValueRead(style_map, "vertical-align", target);
 }
@@ -8552,6 +8583,52 @@ const BlockLayout = struct {
         const sizing_border_box = flex_format.eq(self.formatStyle("box-sizing", "content-box"), "border-box");
         const sizing_width_edges = if (sizing_border_box) self.padding.horizontal() + self.border.horizontal() else 0;
         const sizing_height_edges = if (sizing_border_box) self.padding.vertical() + self.border.vertical() else 0;
+        const image_box: ?replaced_sizing.Size = if (self.inline_nodes == null and self.node == .element and elementUsesImageLayout(&self.node.element)) blk: {
+            const element = &self.node.element;
+            if (self.persistent_dependencies) if (element.style) |*styles| {
+                for ([_][]const u8{ "width", "height", "min-width", "max-width", "min-height", "max-height", "aspect-ratio", "box-sizing" }) |name| {
+                    if (styles.getPtr(name)) |field| {
+                        self.width.addDependency(field, styles.allocator);
+                        self.height.addDependency(field, styles.allocator);
+                    }
+                }
+            };
+            const intrinsic: ?replaced_sizing.Size = if (element.image_data) |data|
+                if (!data.is_broken or image_loader.shouldShowBrokenImage(element)) .{ .width = @intCast(data.image.width), .height = @intCast(data.image.height) } else null
+            else
+                null;
+            const x_edges = self.padding.horizontal() + self.border.horizontal();
+            const y_edges = self.padding.vertical() + self.border.vertical();
+            var image_height_base = containing_height_css;
+            if (image_height_base == null and allocated_box == null) {
+                // A structural box for an inline ancestor with block children
+                // is not a CSS containing block. Stop at the first real block,
+                // even when its height is auto (never borrow a distant height).
+                var containing = self.parent_block;
+                while (containing) |ancestor| {
+                    if (ancestor.inline_nodes == null and !flex_format.eq(ancestor.formatStyle("display", "inline"), "inline")) break;
+                    containing = ancestor.parent_block;
+                }
+                if (containing) |ancestor| {
+                    if (ancestor.content_height_definite and (ancestor.in_layout or !ancestor.height.dirty))
+                        image_height_base = cssPixelsFromLayout(ancestor.content_height, ancestor.zoom.get().*, engine.zoom());
+                }
+            }
+            const used = replaced_sizing.imageSizeWithContext(element, intrinsic, .{
+                .font_size = self.computedFontSizeCss(),
+                .percentage_width = containing_width_css,
+                .percentage_height = image_height_base,
+                .insets = .{
+                    .width = @intFromFloat(cssPixelsFromLayout(x_edges, zoom_value, engine.zoom())),
+                    .height = @intFromFloat(cssPixelsFromLayout(y_edges, zoom_value, engine.zoom())),
+                },
+                .allocated = if (allocated_box) |box| .{
+                    .width = @intFromFloat(cssPixelsFromLayout(@max(box.width -| x_edges, 0), zoom_value, engine.zoom())),
+                    .height = if (box.height) |h| @as(i32, @intFromFloat(cssPixelsFromLayout(@max(h -| y_edges, 0), zoom_value, engine.zoom()))) else null,
+                } else .{},
+            });
+            break :blk .{ .width = scaleCssPixel(used.width, zoom_value, engine.zoom()), .height = scaleCssPixel(used.height, zoom_value, engine.zoom()) };
+        } else null;
         const unconstrained_width: ?i32 = if (self.embedded_box == null)
             if (self.specifiedPixelDimension("width", &self.width, width_context)) |width|
                 @max(scaleCssPixel(width, zoom_value, engine.zoom()) -| sizing_width_edges, 0)
@@ -8580,7 +8657,9 @@ const BlockLayout = struct {
         const native_text_control = self.inline_nodes == null and self.node == .element and
             (std.ascii.eqlIgnoreCase(self.node.element.tag, "textarea") or
                 (std.ascii.eqlIgnoreCase(self.node.element.tag, "input") and !self.node.element.isCheckbox() and !self.node.element.isInputType("radio")));
-        const specified_width = if (self.tableRole() == .table and allocated_box == null)
+        const specified_width = if (image_box) |box|
+            box.width
+        else if (self.tableRole() == .table and allocated_box == null)
             try self.preferredTableWidth(engine, zoom_value, engine.zoom(), containing_width_css, style_specified_width)
         else
             style_specified_width orelse
@@ -8630,7 +8709,9 @@ const BlockLayout = struct {
             constrainDimension(height, min_height, max_height)
         else
             null;
-        const specified_height = if (allocated_box) |box|
+        const specified_height = if (image_box) |box|
+            box.height
+        else if (allocated_box) |box|
             if (box.height) |height|
                 @max(height -| self.padding.vertical() -| self.border.vertical(), 0)
             else
@@ -8874,7 +8955,9 @@ const BlockLayout = struct {
         // Publish a definite block height before laying out descendants so a
         // percentage height can resolve against this containing block. Auto
         // heights remain unavailable until children have been measured.
-        if (is_block) {
+        if (image_box) |box| {
+            self.content_height = box.height;
+        } else {
             self.content_height_definite = specified_height != null;
             if (specified_height) |height| {
                 self.content_height = height;
@@ -9564,6 +9647,8 @@ const BlockLayout = struct {
             .y = origin_y +| formatCoordinate(y),
             .width = @max(formatCoordinate(x + width) -| formatCoordinate(x), 0),
             .height = if (height) |h| @max(formatCoordinate(y + h) -| formatCoordinate(y), 0) else null,
+            .containing_width_css = @as(f64, @floatFromInt(self.content_width)) / item.scale,
+            .containing_height_css = if (self.content_height_definite) @as(f64, @floatFromInt(self.content_height)) / item.scale else null,
         });
         item.width = @floatFromInt(item.block.width.get().*);
         item.height = @floatFromInt(item.block.height.get().*);

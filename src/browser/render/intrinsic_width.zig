@@ -7,6 +7,7 @@ const font = @import("font.zig");
 const grapheme = @import("grapheme");
 const box_model = @import("box_model.zig");
 const inline_format = @import("inline_format.zig");
+const replaced_sizing = @import("replaced_sizing.zig");
 
 pub const Width = struct {
     min: f64 = 0,
@@ -98,16 +99,24 @@ fn measureImpl(node: *const dom.Node, fonts: *font.FontManager, scale: f64, incl
             const position = value(element.style, "position", "static");
             if (std.ascii.eqlIgnoreCase(position, "absolute") or std.ascii.eqlIgnoreCase(position, "fixed")) break :blk .{};
             const size = length.parsePixel(value(element.style, "font-size", "16px")) orelse 16;
+            if (std.ascii.eqlIgnoreCase(element.tag, "img") or element.image_data != null) {
+                const edges = if (element.style) |styles| box_model.resolveBoxEdges(&styles, size, null, 1, 1) else box_model.BoxModelEdges{ .margin = .{}, .padding = .{}, .border = .{} };
+                const natural: ?replaced_sizing.Size = if (element.image_data) |data| .{ .width = @intCast(data.image.width), .height = @intCast(data.image.height) } else null;
+                // Cyclic percentages have no basis during intrinsic sizing.
+                // Definite caps on either axis still transfer through the
+                // image's ratio before flex/table measure their contents.
+                const used = replaced_sizing.imageSizeWithContext(&element, natural, .{
+                    .font_size = size,
+                    .insets = .{ .width = edges.padding.horizontal() + edges.border.horizontal(), .height = edges.padding.vertical() + edges.border.vertical() },
+                });
+                const width = @as(f64, @floatFromInt(used.width)) * scale;
+                break :blk .{ .min = width, .max = width };
+            }
             if (include_specified) if (length.resolve(value(element.style, "width", "auto"), .{ .font_size = size })) |width| break :blk .{ .min = width * scale, .max = width * scale };
             if (std.ascii.eqlIgnoreCase(element.tag, "input") or std.ascii.eqlIgnoreCase(element.tag, "textarea")) {
                 const width = if (element.isCheckbox() or element.isInputType("radio")) size * scale else try inputNaturalWidth(element, fonts, scale);
                 break :blk .{ .min = width, .max = width };
             }
-            if (std.ascii.eqlIgnoreCase(element.tag, "img")) if (element.attributes) |attrs| if (attrs.get("width")) |raw| {
-                const width = std.fmt.parseFloat(f64, raw) catch 0;
-                if (std.math.isFinite(width) and width > 0) break :blk .{ .min = width * scale, .max = width * scale };
-            };
-            if (element.image_data) |image| break :blk .{ .min = @as(f64, @floatFromInt(image.image.width)) * scale, .max = @as(f64, @floatFromInt(image.image.width)) * scale };
             var result: Width = .{};
             var inline_run: f64 = 0;
             var pending_space: f64 = 0;
@@ -131,7 +140,8 @@ fn measureImpl(node: *const dom.Node, fonts: *font.FontManager, scale: f64, incl
                         const edges = box_model.resolveBoxEdges(&styles, child_size, null, @floatCast(child_scale), 1);
                         const border_box = std.ascii.eqlIgnoreCase(value(child.element.style, "box-sizing", "content-box"), "border-box");
                         const specified = length.resolve(value(child.element.style, "width", "auto"), .{ .font_size = child_size }) != null;
-                        const extra: f64 = @floatFromInt(edges.margin.horizontal() + if (border_box and specified) @as(i32, 0) else edges.padding.horizontal() + edges.border.horizontal());
+                        const replaced = std.ascii.eqlIgnoreCase(child.element.tag, "img") or child.element.image_data != null;
+                        const extra: f64 = @floatFromInt(edges.margin.horizontal() + if (border_box and specified and !replaced) @as(i32, 0) else edges.padding.horizontal() + edges.border.horizontal());
                         measured.min = @max(measured.min + extra, 0);
                         measured.max = @max(measured.max + extra, measured.min);
                     }

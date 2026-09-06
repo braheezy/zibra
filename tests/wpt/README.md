@@ -54,6 +54,16 @@ This targets content-sized and percentage table/cell widths and `nowrap`,
 including the live parser's implicit row groups, not spanning cells or
 collapsed-border conformance.
 
+For constrained image sizing, use `manifest-replaced-sizing.yaml` with the
+same serial reftest command. It targets `max-width`, ratio transfer after
+height constraints, and definite versus indefinite percentage heights,
+including images inside anonymous blocks and inline ancestors. It does not
+claim SVG sizing, grid spanning, or intrinsic-size keyword support.
+The two GIF/XHTML-reference cases remain expected-PASS failures: the image
+geometry has local assertions, but transparent GIF painting and CDATA styles
+in navigated XHTML references remain unsupported. Do not count those local
+geometry assertions as upstream reftest passes.
+
 `testharness` runs each selected file in a real headless browser session. When
 the upstream checkout is initialized, the runner starts WPT's `wptserve` on a
 temporary loopback port so root-relative resources such as

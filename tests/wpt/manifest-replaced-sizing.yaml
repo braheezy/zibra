@@ -1,0 +1,5 @@
+# Replaced image constraints and definite/indefinite percentage heights.
+reftests:
+  - css/css-sizing/image-max-width-and-height-behaves-as-auto.html
+  - css/css-sizing/image-percentage-max-height-in-anonymous-block.html
+  - css/css-sizing/block-image-percentage-max-height-inside-inline.html

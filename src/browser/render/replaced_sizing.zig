@@ -26,6 +26,27 @@ pub const SizeContext = struct {
     font_size: f64 = 16.0,
     percentage_width: ?f64 = null,
     percentage_height: ?f64 = null,
+    /// Padding plus borders, in unscaled CSS pixels. Used only when CSS
+    /// sizing targets the border box; natural image ratios remain content-box.
+    insets: Size = .{ .width = 0, .height = 0 },
+    /// A formatting context's final content-box allocation supersedes the
+    /// preferred dimension. An unallocated auto axis still follows the ratio.
+    allocated: SpecifiedSize = .{},
+};
+
+pub const Constraints = struct {
+    min_width: i32 = 0,
+    max_width: i32 = std.math.maxInt(i32),
+    min_height: i32 = 0,
+    max_height: i32 = std.math.maxInt(i32),
+
+    fn width(self: Constraints, value: i32) i32 {
+        return @max(self.min_width, @min(value, self.max_width));
+    }
+
+    fn height(self: Constraints, value: i32) i32 {
+        return @max(self.min_height, @min(value, self.max_height));
+    }
 };
 
 /// The supported `aspect-ratio` grammar is `auto || <ratio>`, where a ratio is
@@ -123,9 +144,9 @@ fn cssPixelDimension(
 ) ?i32 {
     if (animatedPixelDimension(element, property)) |pixels| return pixels;
     const value = styleValue(element, property) orelse return null;
-    const percentage_base = if (std.mem.eql(u8, property, "width"))
+    const percentage_base = if (std.mem.endsWith(u8, property, "width"))
         context.percentage_width
-    else if (std.mem.eql(u8, property, "height"))
+    else if (std.mem.endsWith(u8, property, "height"))
         context.percentage_height
     else
         null;
@@ -239,7 +260,7 @@ pub fn resolve(
 }
 
 pub fn imageSize(element: *const parser.Element, intrinsic: ?Size) Size {
-    return resolve(.image, specifiedSize(element), intrinsic, aspectRatio(element));
+    return imageSizeWithContext(element, intrinsic, .{});
 }
 
 pub fn imageSizeWithContext(
@@ -247,15 +268,94 @@ pub fn imageSizeWithContext(
     intrinsic: ?Size,
     context: SizeContext,
 ) Size {
-    return resolve(.image, specifiedSizeWithContext(element, context), intrinsic, aspectRatio(element));
+    return sizeWithContext(.image, element, intrinsic, context);
 }
 
 pub fn iframeSize(element: *const parser.Element) Size {
-    return resolve(.iframe, specifiedSize(element), null, aspectRatio(element));
+    return iframeSizeWithContext(element, .{});
 }
 
 pub fn iframeSizeWithContext(element: *const parser.Element, context: SizeContext) Size {
-    return resolve(.iframe, specifiedSizeWithContext(element, context), null, aspectRatio(element));
+    return sizeWithContext(.iframe, element, null, context);
+}
+
+/// CSS 2.2 section 10.4: constrain both auto axes together, preserving the
+/// natural ratio where the limits permit it. A fixed axis is constrained
+/// before deriving its auto counterpart; constraints on that auto counterpart
+/// do not resize the fixed axis. Minimums win over conflicting maximums.
+pub fn resolveConstrained(kind: Kind, specified: SpecifiedSize, intrinsic: ?Size, ratio: AspectRatio, limits: Constraints) Size {
+    var preferred = specified;
+    if (preferred.width) |w| preferred.width = limits.width(w);
+    if (preferred.height) |h| preferred.height = limits.height(h);
+    var result = resolve(kind, preferred, intrinsic, ratio);
+    if (preferred.width == null and preferred.height == null and effectiveRatio(ratio, intrinsic) != null and result.width > 0 and result.height > 0) {
+        const w: f64 = @floatFromInt(result.width);
+        const h: f64 = @floatFromInt(result.height);
+        const x = @as(f64, @floatFromInt(limits.width(result.width))) / w;
+        const y = @as(f64, @floatFromInt(limits.height(result.height))) / h;
+        // Opposing constraints necessarily break the ratio. Otherwise use
+        // the stronger shrink/grow factor and clamp any resulting conflict.
+        if (!((x < 1 and y > 1) or (x > 1 and y < 1))) {
+            const factor = if (x < 1 or y < 1) @min(x, y) else @max(x, y);
+            result.width = scaledDimension(result.width, factor);
+            result.height = scaledDimension(result.height, factor);
+        }
+    }
+    return .{ .width = limits.width(result.width), .height = limits.height(result.height) };
+}
+
+fn sizeWithContext(kind: Kind, element: *const parser.Element, intrinsic: ?Size, context: SizeContext) Size {
+    const border_box = std.ascii.eqlIgnoreCase(styleValue(element, "box-sizing") orelse "content-box", "border-box");
+    const x = if (border_box) context.insets.width else 0;
+    const y = if (border_box) context.insets.height else 0;
+    var specified = specifiedSizeWithContext(element, context);
+    if (specified.width) |w| specified.width = @max(w -| x, 0);
+    if (specified.height) |h| specified.height = @max(h -| y, 0);
+    const limits = Constraints{
+        .min_width = @max((cssPixelDimension(element, "min-width", context) orelse 0) -| x, 0),
+        .max_width = @max((cssPixelDimension(element, "max-width", context) orelse std.math.maxInt(i32)) -| x, 0),
+        .min_height = @max((cssPixelDimension(element, "min-height", context) orelse 0) -| y, 0),
+        .max_height = @max((cssPixelDimension(element, "max-height", context) orelse std.math.maxInt(i32)) -| y, 0),
+    };
+    const ratio = aspectRatio(element);
+    const preferred = resolveConstrained(kind, specified, intrinsic, ratio, limits);
+    // A no-op allocation must not round-trip a truncated auto dimension
+    // through the ratio and lose another pixel on every flex measurement.
+    if ((context.allocated.width == null or context.allocated.width.? == preferred.width) and
+        (context.allocated.height == null or context.allocated.height.? == preferred.height)) return preferred;
+    if (context.allocated.width) |w| specified.width = w;
+    if (context.allocated.height) |h| specified.height = h;
+    return resolveConstrained(kind, specified, intrinsic, ratio, limits);
+}
+
+test "replaced constraints preserve natural ratio with single and combined limits" {
+    const natural = Size{ .width = 1920, .height = 461 };
+    try std.testing.expectEqual(Size{ .width = 580, .height = 139 }, resolveConstrained(.image, .{}, natural, .auto, .{ .max_width = 580, .max_height = 250 }));
+    const square = Size{ .width = 100, .height = 100 };
+    const cases = [_]struct { limits: Constraints, expected: Size }{
+        .{ .limits = .{ .max_width = 50 }, .expected = .{ .width = 50, .height = 50 } },
+        .{ .limits = .{ .max_height = 50 }, .expected = .{ .width = 50, .height = 50 } },
+        .{ .limits = .{ .min_width = 200 }, .expected = .{ .width = 200, .height = 200 } },
+        .{ .limits = .{ .min_height = 200 }, .expected = .{ .width = 200, .height = 200 } },
+        .{ .limits = .{ .max_width = 60, .max_height = 50 }, .expected = .{ .width = 50, .height = 50 } },
+        .{ .limits = .{ .max_width = 50, .max_height = 60 }, .expected = .{ .width = 50, .height = 50 } },
+        .{ .limits = .{ .min_width = 200, .min_height = 150 }, .expected = .{ .width = 200, .height = 200 } },
+        .{ .limits = .{ .min_width = 150, .min_height = 200 }, .expected = .{ .width = 200, .height = 200 } },
+        .{ .limits = .{ .min_width = 200, .max_height = 50 }, .expected = .{ .width = 200, .height = 50 } },
+        .{ .limits = .{ .max_width = 50, .min_height = 200 }, .expected = .{ .width = 50, .height = 200 } },
+        .{ .limits = .{ .min_width = 150, .max_width = 50 }, .expected = .{ .width = 150, .height = 150 } },
+        .{ .limits = .{ .max_width = 0 }, .expected = .{ .width = 0, .height = 0 } },
+    };
+    for (cases) |case| try std.testing.expectEqual(case.expected, resolveConstrained(.image, .{}, square, .auto, case.limits));
+}
+
+test "replaced constraints derive auto axis after clamping authored size" {
+    const natural = Size{ .width = 200, .height = 100 };
+    try std.testing.expectEqual(Size{ .width = 80, .height = 40 }, resolveConstrained(.image, .{ .width = 1000 }, natural, .auto, .{ .max_width = 80 }));
+    try std.testing.expectEqual(Size{ .width = 100, .height = 100 }, resolveConstrained(.image, .{ .height = 1000 }, natural, .auto, .{ .max_height = 100, .max_width = 100 }));
+    try std.testing.expectEqual(Size{ .width = 200, .height = 30 }, resolveConstrained(.image, .{ .width = 200 }, natural, .auto, .{ .max_height = 30 }));
+    try std.testing.expectEqual(Size{ .width = 80, .height = 70 }, resolveConstrained(.image, .{ .width = 1000, .height = 70 }, natural, .auto, .{ .max_width = 80 }));
+    try std.testing.expectEqual(Size{ .width = 0, .height = 0 }, resolveConstrained(.image, .{}, null, .auto, .{ .max_width = 80 }));
 }
 
 test "aspect-ratio parses auto, ratios, and the replaced fallback syntax" {

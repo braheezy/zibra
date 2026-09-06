@@ -447,6 +447,21 @@ unless a preferred ratio can derive it. `object-fit` keeps the element box
 separate from the visible bitmap destination and preserves fractional source
 crops through clone/snapshot boundaries.
 
+Replaced min/max constraints are resolved before zoom, using independent
+containing-block percentage bases. Auto/auto natural dimensions are constrained
+together to preserve their ratio where the limits permit it; an authored axis
+is clamped before deriving its auto counterpart. Minimums win conflicts.
+Border-box limits subtract padding/borders before content sizing. Intrinsic
+image measurement uses the same resolver with indefinite percentage bases.
+Blockified images paint their allocated content box directly, without an extra
+inline strut or duplicate box edges; flex allocations can resize an auto axis
+through the ratio. Layout, image hit bounds, and CSSOM use that same box.
+Dimension/ratio style dependencies belong to the persistent layout owner, not
+temporary image records. Definite containing heights are published before both
+block-child and inline-child layout so percentage image limits see a valid base.
+Structural inline-ancestor boxes do not establish that height base for a block
+image; resolution skips them but stops at a real auto-height block.
+
 Pure layout leaves are intentionally separated from retained object state:
 
 - `render/box_model.zig` resolves box edges, dimensions, positioning values,

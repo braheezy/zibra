@@ -60,6 +60,9 @@ boundaries.
   `layout.zig` owns item boxes, subscriptions, and final hit-test collection.
   Native input natural widths must agree between intrinsic and final layout;
   table measurements subscribe through persistent owners, not temporary cells.
+  Image min/max constraints share `replaced_sizing.zig` across intrinsic and
+  final layout. Blockified image paint must reuse the allocated box, not
+  independently recover natural dimensions or create another inline strut.
 - `control_geometry.zig` computes input/button leaf geometry and password
   display text. Its pointer-free text-editor used box and client insets must
   agree across border-box paint, editable-content clips, and CSSOM snapshots.

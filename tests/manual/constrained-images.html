@@ -1,0 +1,39 @@
+<!doctype html>
+<!--
+How to verify:
+1. Open this file in Zibra at widths above and below 900px.
+2. Each color-chart image fits inside its white card, remains twice as wide as
+   tall, and leaves the green following marker below it, without overlap.
+3. Wide view: the first content box is 320x160; the second is 200x100.
+   Narrow view: both content boxes become 160x80. Resize repeatedly.
+4. The outlined image has a 120x70 border box (100x50 content plus edges).
+   These dimensions must scale together when browser zoom changes.
+-->
+<style>
+  body { margin: 0; background: #e8edf2; font-family: sans-serif; }
+  main { display: block; max-width: 1000px; margin: 0 auto; padding: 20px; }
+  h1, p { display: block; }
+  .cards { display: grid; grid-template-columns: 1fr 1fr; gap: 20px; }
+  .card { display: block; background: white; }
+  picture { display: flex; justify-content: center; padding: 25px; }
+  img { object-fit: contain; max-width: 320px; max-height: 160px; }
+  .wide { width: 1600px; }
+  .short { height: 1000px; max-height: 100px; }
+  .marker { display: block; height: 12px; background: #16803c; }
+  .outlined { display: block; width: 1000px; max-width: 120px; max-height: none;
+    box-sizing: border-box; padding: 5px; border: 5px solid #17233b; }
+  @media (max-width: 900px) {
+    .cards { display: flex; flex-direction: column; }
+    .card img { width: auto; height: 80px; max-width: 100%; }
+  }
+</style>
+<main>
+  <h1>Constrained images in sponsor-style cards</h1>
+  <p>Large preferred images must fit their cards and preserve their natural ratio.</p>
+  <div class=cards>
+    <div class=card><picture><img class=wide src=background-image-pattern.ppm></picture><div class=marker></div></div>
+    <div class=card><picture><img class=short src=background-image-pattern.ppm></picture><div class=marker></div></div>
+  </div>
+  <p>Border-box sizing counts padding and borders once:</p>
+  <img class=outlined src=background-image-pattern.ppm>
+</main>

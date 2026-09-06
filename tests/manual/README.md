@@ -147,6 +147,7 @@ tiers and baseline policy.
 | [`object-fit.html`](object-fit.html) | Fill, contain, and fractional cover crop within a replaced box |
 | [`lazy-loading.html`](lazy-loading.html) | Eager/near/far requests and post-decode layout change without refetch |
 | [`aspect-ratio.html`](aspect-ratio.html) | Derived image/iframe axes and lazy fallback-to-natural ratio |
+| [`constrained-images.html`](constrained-images.html) | Ratio-preserving image limits, flex-in-grid card sizing, responsive reflow, and border-box image edges |
 | [`image-placeholders.html`](image-placeholders.html) | Zero/one-axis placeholders, reflow, and alt-dependent broken icon |
 | [`blur-filter.html`](blur-filter.html) | Blur order with clipping, opacity, and translation |
 | [`interest-region.html`](interest-region.html) | Bounded four-window-height raster cache across long-page scrolling/resizing |
