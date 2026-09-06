@@ -201,8 +201,10 @@ classification with fake browsers; `test-wpt` runs local headless synchronous
 PASS, Promise-job PASS, and TIMEOUT fixtures through the real executable and
 validates its JSON transport. It also exercises partial progress, uncaught and
 parse errors, caught exceptions, and Unicode framing. Captures run serially
-under the same process-group watchdog as upstream cases. Those local fixtures are protocol regressions,
-not WPT conformance claims.
+under the same process-group watchdog as upstream cases. It also checks live
+body replacement/layout and title mutation in the document-accessor page.
+Those local fixtures are protocol/engine regressions, not WPT conformance
+claims.
 
 The YAML file is the compatibility allowlist. Add supported directory prefixes
 to `directories`, individual semantic cases to `tests`, individual visual
@@ -222,6 +224,21 @@ The serial macOS ReleaseSafe baseline completed all 63 cases: 43 PASS and
 HTML was 8/19 passing, CSS 21/29, and SVG 14/15. These are results for the
 selected subset, not whole-domain scores. The local report is
 `tests/wpt/results/capabilities-expanded-20260906.json`.
+
+The document-accessor implementation additionally enables seven HTML
+testharness cases for title normalization, empty-title creation, detached HTML
+documents, direct text children, SVG titles, and inert XML title setters.
+The paired XHTML cases remain outside this slice: top-level XML document
+loading and namespace-aware XML parsing are separate prerequisites. These
+accessor suites contain semantic harness tests, not visual/crash cases; no
+new reftest or crashtest is implied by this API-only chunk.
+
+The paired 18-case accessor run improved from 4 PASS / 14 FAIL to
+15 PASS / 3 FAIL (41 to 101 passing subtests out of 115), with no timeouts,
+crashes, or infrastructure failures. All 14 selected head/body/title cases
+pass; the remaining failures are forms/images/scripts collection APIs.
+Reports: `tests/wpt/results/document-accessors-before-20260906.json` and
+`tests/wpt/results/document-accessors-after-20260906.json`.
 
 | Area | Selected behavior |
 | --- | --- |

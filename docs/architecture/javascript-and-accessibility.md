@@ -247,8 +247,21 @@ teardown, and final machine-readable result wrapper.
 
 - `Node.children` returns a Realm-local live `HTMLCollection` of immediate
   Element wrappers in DOM order, excluding Text and deeper descendants.
-- Read-only tree bindings provide `document.documentElement`, `document.body`,
-  `getElementById`, document/Element `getElementsByTagName`, and authored Node
+- `runtime/document_accessors.js` implements `documentElement`, `head`, `body`,
+  and `title` on Document's prototype for both live and detached documents.
+  The document child list is authoritative for the root: a getter must not
+  create a missing element or return a removed one. Head/body match direct
+  HTML children by namespace and local name; title uses child text content,
+  ASCII whitespace normalization, and the separate SVG-root algorithm.
+  `HTMLTitleElement.text` preserves whitespace and excludes descendant element
+  text. Title/body writes use existing Node mutations and their synchronous
+  invalidation/handle-rebind boundaries, not independent native pointers.
+  `createElementNS` preserves local-name case; namespace metadata on these
+  wrappers does not imply namespace-aware XML parsing or full element IDL.
+  Live Document-level root replacement still has the bootstrap's limited
+  logical topology and is not a native navigation/root-installation API.
+- Read-only tree bindings provide the initial native root, `getElementById`,
+  document/Element `getElementsByTagName`, and authored Node
   parent/sibling/child/text traversal. `getElementsByTagName`,
   `getElementsByClassName`, and `getElementsByTagNameNS` expose live
   `HTMLCollection` views whose indexed and named properties are virtual;

@@ -37,7 +37,7 @@ Focused steps are `test-document`, `test-render`, `test-network`,
 - `zig build test-csp` — loopback HTTP CSP loading, destination-specific denials,
   and repeated response-header intersection;
 - `zig build test-wpt` — serial, watchdog-bounded local WPT protocol and
-  startup/error/progress diagnostics plus script geometry/parser-boundary fixtures;
+  startup/error/progress diagnostics plus DOM, geometry, and parser-boundary fixtures;
 - `task wpt-smoke` — one upstream testharness, reftest, and crashtest run
   serially; requires the WPT checkout and server dependencies described in the
   [WPT guide](wpt/README.md);

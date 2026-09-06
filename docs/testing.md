@@ -105,7 +105,8 @@ Run from the repository root:
   same bounded browser-process supervisor;
 - `zig build test-wpt` for local headless synchronous PASS, Promise-job PASS,
   TIMEOUT, startup/error diagnostics, partial results, and Unicode JSONL
-  fixtures, plus live JavaScript rectangles, client/offset box metrics,
+  fixtures, plus live body replacement/title accessors, JavaScript rectangles,
+  client/offset box metrics,
   measure-to-position interaction, native-editor client clips, empty inline
   insertion points, and parser-boundary regressions.
   Captures are serial and process-watchdog bounded.

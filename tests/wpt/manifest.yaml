@@ -22,6 +22,13 @@ tests:
   - html/dom/documents/dom-tree-accessors/document.head-01.html
   - html/dom/documents/dom-tree-accessors/document.head-02.html
   - html/dom/documents/dom-tree-accessors/document.title-01.html
+  - html/dom/documents/dom-tree-accessors/document.title-03.html
+  - html/dom/documents/dom-tree-accessors/document.title-05.html
+  - html/dom/documents/dom-tree-accessors/document.title-06.html
+  - html/dom/documents/dom-tree-accessors/document.title-07.html
+  - html/dom/documents/dom-tree-accessors/document.title-08.html
+  - html/dom/documents/dom-tree-accessors/document.title-09.html
+  - html/dom/documents/dom-tree-accessors/document.title-not-in-html-svg.html
   - html/dom/documents/dom-tree-accessors/document.forms.html
   - html/dom/documents/dom-tree-accessors/document.images.html
   - html/dom/documents/dom-tree-accessors/document.links.html

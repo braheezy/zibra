@@ -27,6 +27,10 @@ queued work and shutdown are documented in
   the Node wrapper's attribute APIs. It preserves unrelated declarations and
   custom-property case; native computed-style readback flushes pending ancestor
   style work and copies values before returning to Kiesel.
+- `runtime/document_accessors.js` owns shared live/detached Document root,
+  head/body/title accessors and HTMLTitleElement text semantics. Getters follow
+  current wrapper topology; setters use existing mutation APIs. Do not cache
+  element pointers or manufacture a root when reading an empty document.
 - `runtime/geometry.js` owns static DOMRect/DOMRectList values and Element
   geometry entry points. `geometry_bindings.zig` copies numeric rectangles,
   used box metrics, and optional offset-parent handles through a typed,

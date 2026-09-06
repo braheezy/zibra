@@ -55,13 +55,14 @@ globalThis.NamedNodeMap = NamedNodeMap;
 globalThis.Attr = Attr;
 Attr.prototype = Object.create(Node.prototype);
 Attr.prototype.constructor = Attr;
-['HTMLHtmlElement', 'HTMLHeadElement', 'HTMLBodyElement', 'HTMLParagraphElement',
+['HTMLHtmlElement', 'HTMLHeadElement', 'HTMLBodyElement', 'HTMLFrameSetElement', 'HTMLParagraphElement',
  'HTMLDivElement', 'HTMLSpanElement', 'HTMLFormElement', 'HTMLInputElement',
  'HTMLButtonElement', 'HTMLSelectElement', 'HTMLOptionElement', 'HTMLTableElement',
  'HTMLTableSectionElement', 'HTMLTableRowElement', 'HTMLTableCellElement',
  'HTMLCanvasElement', 'HTMLImageElement', 'HTMLIFrameElement', 'HTMLObjectElement',
  'HTMLScriptElement', 'HTMLStyleElement', 'HTMLLinkElement', 'HTMLMetaElement']
   .forEach(function(name) { globalThis[name] = Node; });
+initializeDocumentAccessors();
 function DOMException(message, name) {
   this.message = message == null ? '' : String(message);
   this.name = name == null || name === '' ? 'Error' : String(name);
@@ -125,6 +126,7 @@ DOMParser.prototype.parseFromString = function(source, mimeType) {
       Object.defineProperty(node, 'localName', {
         value: xmlName, enumerable: true, configurable: true
       });
+      updateTitleElementInterface(node);
       var children = node.childNodes || [];
       for (var i = 0; i < children.length; i++) markXml(children[i]);
     }
@@ -194,6 +196,7 @@ function wrapNode(handle) {
   if (node) return node;
   node = new Node(handle);
   NODE_WRAPPERS[handle] = node;
+  if (__native.tagName(handle) === 'TITLE') updateTitleElementInterface(node);
   return node;
 }
 
@@ -1906,21 +1909,6 @@ function makeDetachedDocument(root) {
   doc.__styleSheets = null;
   adoptOwnerDocument(root);
   if (root) { root.__rangeParent = doc; root.parentNode = doc; }
-  Object.defineProperty(doc, 'documentElement', {
-    get: function() {
-      // A null-qualified createDocument is still useful as a detached HTML
-      // document in this browser: expose a lazily-created root so callers can
-      // build a subtree through documentElement before attaching it.
-      if (!root) {
-        root = document.createElement('html');
-        adoptOwnerDocument(root);
-        root.__rangeParent = doc;
-        root.parentNode = doc;
-        doc.__documentChildren.push(root);
-      }
-      return root;
-    }, enumerable: true
-  });
   doc.nodeType = Node.DOCUMENT_NODE;
   doc.nodeName = '#document';
   doc.nodeValue = null;
@@ -1932,7 +1920,6 @@ function makeDetachedDocument(root) {
     if (child.parentNode && child.parentNode.removeChild) child.parentNode.removeChild(child);
     doc.__documentChildren.push(child); child.__rangeParent = doc; child.parentNode = doc;
     adoptOwnerDocument(child);
-    root = child.nodeType === Node.ELEMENT_NODE ? child : root;
     if (doc.__childNodeList) refreshNodeList(doc.__childNodeList, doc.__documentChildren);
     return child;
   };
@@ -1958,42 +1945,11 @@ function makeDetachedDocument(root) {
   doc.hasChildNodes = function() { return doc.__documentChildren.length !== 0; };
   Object.defineProperty(doc, 'firstChild', { get: function() { return doc.__documentChildren[0] || null; }, enumerable: true });
   Object.defineProperty(doc, 'lastChild', { get: function() { return doc.__documentChildren[doc.__documentChildren.length - 1] || null; }, enumerable: true });
-  Object.defineProperty(doc, 'body', {
-    get: function() {
-      if (!root) return null;
-      var bodies = root.getElementsByTagName('body');
-      if (bodies.length) return bodies[0];
-      var nodes = [], tag = (root.tagName || '').toLowerCase();
-      walkSnapshot(root, nodes);
-      for (var i = 0; i < nodes.length; i++) {
-        if ((nodes[i].tagName || '').toLowerCase() === 'body') return nodes[i];
-      }
-      return tag === 'body' ? root : null;
-    }, enumerable: true
-  });
-  Object.defineProperty(doc, 'head', {
-    get: function() {
-      var heads = root ? root.getElementsByTagName('head') : [];
-      return heads.length ? heads[0] : null;
-    }, enumerable: true
-  });
-  Object.defineProperty(doc, 'title', {
-    get: function() {
-      if (!root) return '';
-      var titles = root.getElementsByTagName('title');
-      return titles.length ? (titles[0].textContent || '') : '';
-    },
-    set: function(value) {
-      if (!root) return;
-      var titles = root.getElementsByTagName('title');
-      if (titles.length) titles[0].textContent = value == null ? '' : value.toString();
-    }, enumerable: true
-  });
   Object.defineProperty(doc, 'forms', {
-    get: function() { return root ? root.getElementsByTagName('form') : makeLiveCollection(function() { return []; }, 'html', doc); }, enumerable: true
+    get: function() { return doc.getElementsByTagName('form'); }, enumerable: true
   });
   Object.defineProperty(doc, 'images', {
-    get: function() { return root ? root.getElementsByTagName('img') : makeLiveCollection(function() { return []; }, 'html', doc); }, enumerable: true
+    get: function() { return doc.getElementsByTagName('img'); }, enumerable: true
   });
   doc.createElement = function(name) { var node = document.createElement(name); adoptOwnerDocument(node); return node; };
   doc.createElementNS = function(ns, name) { var node = document.createElementNS(ns, name); adoptOwnerDocument(node); return node; };
@@ -2029,6 +1985,7 @@ function makeDetachedDocument(root) {
     var text = name == null ? '' : String(name);
     return makeLiveCollection(function() {
       var all = [], result = [];
+      var root = doc.documentElement;
       if (root) walkSnapshot(root, all);
       for (var i = 0; i < all.length; i++) {
         var candidate = all[i];
@@ -2041,6 +1998,7 @@ function makeDetachedDocument(root) {
   doc.getElementsByClassName = Node.prototype.getElementsByClassName;
   doc.getElementsByTagNameNS = Node.prototype.getElementsByTagNameNS;
   doc.querySelectorAll = function(selector) {
+    var root = doc.documentElement;
     if (!root) return wrapNodeList([]);
     var text = selector == null ? '' : String(selector), matches;
     if (/^[A-Za-z][A-Za-z0-9:-]*$/.test(text)) {
@@ -2061,6 +2019,7 @@ function makeDetachedDocument(root) {
   };
   doc.querySelector = function(selector) { var matches = doc.querySelectorAll(selector); return matches.length ? matches[0] : null; };
   doc.getElementById = function(id) {
+    var root = doc.documentElement;
     if (!root) return null;
     var nodes = root.getElementsByTagName('*');
     for (var i = 0; i < nodes.length; i++) if (nodes[i].id === id) return nodes[i];
@@ -2072,6 +2031,7 @@ function makeDetachedDocument(root) {
     get: function() {
       if (doc.__styleSheets) return doc.__styleSheets;
       var sheets = [];
+      var root = doc.documentElement;
       var styles = root ? root.getElementsByTagName('style') : [];
       for (var i = 0; i < styles.length; i++) {
         (function(owner) {
@@ -2098,7 +2058,12 @@ function makeDetachedDocument(root) {
   // The old Acid3 DOM tests exercise document.open/write/close on an iframe
   // document. Keep this intentionally bounded parser local to detached
   // documents; normal page parsing remains owned by the native HTML parser.
-  doc.open = function() { doc.__writeBuffer = ''; doc.__documentChildren = []; root = null; doc.__styleSheets = null; return doc; };
+  doc.open = function() {
+    doc.__writeBuffer = '';
+    while (doc.firstChild) doc.removeChild(doc.firstChild);
+    doc.__styleSheets = null;
+    return doc;
+  };
   doc.write = function(value) { doc.__writeBuffer += value == null ? '' : String(value); };
   doc.close = function() {
     var source = doc.__writeBuffer, doctype = null;
@@ -2107,7 +2072,7 @@ function makeDetachedDocument(root) {
       doctype = document.implementation.createDocumentType('html', dt[1] || '', dt[2] || '');
       source = source.slice(dt[0].length);
     }
-    root = doc.createElement('html');
+    var root = doc.createElement('html');
     var head = doc.createElement('head'), body = doc.createElement('body');
     root.appendChild(head); root.appendChild(body);
     var stack = [body], cursor = 0, token;
@@ -3006,6 +2971,7 @@ document.createEvent = function(type) {
     var qualified = tagName == null ? '' : tagName.toString();
     var colon = qualified.indexOf(':');
     var namespaceURI = ns == null ? null : ns.toString();
+    if (namespaceURI === '') namespaceURI = null;
     if (colon < 0) {
       if (invalidQualifiedName(qualified)) throw { code: 5, INVALID_CHARACTER_ERR: 5 };
     } else if (invalidNamespaceName(namespaceURI, qualified)) {
@@ -3018,10 +2984,11 @@ document.createEvent = function(type) {
     var prefix = colon < 0 ? null : qualified.slice(0, colon);
     var local = colon < 0 ? qualified : qualified.slice(colon + 1);
     Object.defineProperty(element, 'prefix', { value: prefix, enumerable: true, configurable: true });
-    Object.defineProperty(element, 'localName', { value: local.toLowerCase(), enumerable: true, configurable: true });
+    Object.defineProperty(element, 'localName', { value: local, enumerable: true, configurable: true });
     Object.defineProperty(element, 'namespaceURI', { value: namespaceURI, enumerable: true, configurable: true });
     Object.defineProperty(element, 'tagName', { value: qualified, enumerable: true, configurable: true });
     Object.defineProperty(element, 'nodeName', { value: qualified, enumerable: true, configurable: true });
+    updateTitleElementInterface(element);
     if (local.toLowerCase() === 'rect') Object.defineProperty(element, 'width', {
       get: function() { var value = parseFloat(this.getAttribute('width') || '0'); return isNaN(value) ? 0 : value; },
       enumerable: true, configurable: true
@@ -3147,22 +3114,6 @@ document.createEvent = function(type) {
       }, 'html', document);
     },
     enumerable: true, configurable: true
-  });
-  Object.defineProperty(document, "documentElement", {
-    get: function() { return wrapNode(__native.getDocumentElement()); },
-    enumerable: true,
-    configurable: true
-  });
-  Object.defineProperty(document, "body", {
-    get: function() { return wrapNode(__native.getDocumentBody()); },
-    enumerable: true,
-    configurable: true
-  });
-  Object.defineProperty(document, "head", {
-    get: function() {
-      var heads = document.getElementsByTagName('head');
-      return heads.length ? heads[0] : null;
-    }, enumerable: true, configurable: true
   });
   Object.defineProperty(document, "doctype", {
     get: function() {

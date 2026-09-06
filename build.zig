@@ -177,6 +177,12 @@ const WptFixture = struct {
 
 const wpt_fixtures = [_]WptFixture{
     .{
+        .fixture = "tests/manual/document-accessors.html",
+        .status = "PASS",
+        .timeout_ms = 10_000,
+        .output_basename = "wpt-document-accessors.jsonl",
+    },
+    .{
         .fixture = "tests/manual/js-control-inline-geometry.html",
         .status = "PASS",
         .timeout_ms = 10_000,

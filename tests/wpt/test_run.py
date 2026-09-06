@@ -866,6 +866,9 @@ deviations:
             "tests": (
                 "html/syntax/serializing-html-fragments/outerHTML.html",
                 "html/dom/documents/dom-tree-accessors/document.forms.html",
+                "html/dom/documents/dom-tree-accessors/document.title-03.html",
+                "html/dom/documents/dom-tree-accessors/document.title-09.html",
+                "html/dom/documents/dom-tree-accessors/document.title-not-in-html-svg.html",
                 "css/css-variables/variable-substitution-basic.html",
                 "css/css-values/rem-unit-root-element.html",
                 "svg/coordinate-systems/outer-svg-intrinsic-size-001.html",

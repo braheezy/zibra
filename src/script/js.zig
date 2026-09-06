@@ -674,6 +674,7 @@ fn ensureRuntimeInitializedLocked(
     if (window.runtime_initialized) return;
 
     const runtime_code = @embedFile("runtime/bootstrap.js") ++ "\n" ++
+        @embedFile("runtime/document_accessors.js") ++ "\n" ++
         @embedFile("runtime/range.js") ++ "\n" ++ @embedFile("runtime/css_style.js") ++ "\n" ++ @embedFile("runtime/geometry.js");
     const runtime_script = try Script.parse(
         runtime_code,
@@ -2266,6 +2267,7 @@ test "DOM Range supports boundaries, fragments, and extraction" {
 
     const result = try js.evaluate(0,
         \\var doc = document.implementation.createDocument(null, null, null);
+        \\doc.appendChild(doc.createElement('root'));
         \\var p = doc.createElement('p');
         \\var t = doc.createTextNode('hello world');
         \\p.appendChild(t); doc.documentElement.appendChild(p);
