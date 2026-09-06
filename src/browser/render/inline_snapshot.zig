@@ -12,6 +12,7 @@ pub const FragmentTarget = struct { node: *Node, y: i32 };
 pub const Snapshot = struct {
     allocator: std.mem.Allocator,
     commands: std.ArrayList(DisplayItem) = .empty,
+    geometry_fragments: std.ArrayList(@import("element_geometry.zig").Fragment) = .empty,
     input_bounds: std.AutoHashMap(*Node, Bounds),
     image_bounds: std.AutoHashMap(*Node, Bounds),
     link_bounds: std.ArrayList(BoundEntry) = .empty,
@@ -31,6 +32,7 @@ pub const Snapshot = struct {
     pub fn deinit(self: *Snapshot) void {
         DisplayItem.freeItems(self.allocator, self.commands.items);
         self.commands.deinit(self.allocator);
+        self.geometry_fragments.deinit(self.allocator);
         self.input_bounds.deinit();
         self.image_bounds.deinit();
         self.link_bounds.deinit(self.allocator);

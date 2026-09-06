@@ -23,6 +23,10 @@ queued work and shutdown are documented in
   the Node wrapper's attribute APIs. It preserves unrelated declarations and
   custom-property case; native computed-style readback flushes pending ancestor
   style work and copies values before returning to Kiesel.
+- `runtime/geometry.js` owns static DOMRect/DOMRectList values and Element
+  geometry entry points. `geometry_bindings.zig` copies numeric rectangles
+  through a generation-scoped browser callback; never derive geometry from
+  authored style strings or retain a native rectangle buffer in JavaScript.
 - `dom_handles.zig` owns the two-way Node pointer/numeric identity maps for one
   window generation.
 - `runtime/range.js` owns live Range state, boundary validation/comparison,

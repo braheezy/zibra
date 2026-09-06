@@ -1145,6 +1145,7 @@ pub fn prepareForDomMutation(self: *Tab, b: *Browser, frame: *Frame, mutation_ro
     self.needs_paint = true;
     self.pending_hover = true;
     frame.resources_dirty = true;
+    frame.stylesheets_dirty = true;
     frame.markDocumentStyleDirty();
 
     frame.retireDomMutationBorrows(mutation_root);
@@ -1192,6 +1193,7 @@ pub fn prepareForDomInsert(self: *Tab, b: *Browser, frame: *Frame, mutation_root
     self.needs_paint = true;
     self.pending_hover = true;
     frame.resources_dirty = true;
+    frame.stylesheets_dirty = true;
     frame.markDocumentStyleDirty();
 
     frame.retireDomMutationBorrows(mutation_root);

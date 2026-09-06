@@ -80,7 +80,7 @@ function createInlineStyleDeclaration(owner) {
     'fontWeight', 'fontStyle', 'lineHeight', 'width', 'height', 'minWidth', 'maxWidth', 'minHeight', 'maxHeight',
     'margin', 'marginTop', 'marginRight', 'marginBottom', 'marginLeft', 'padding', 'paddingTop', 'paddingRight',
     'paddingBottom', 'paddingLeft', 'border', 'boxSizing', 'position', 'top', 'right', 'bottom', 'left',
-    'opacity', 'visibility', 'overflow', 'transform', 'flex', 'flexBasis', 'flexGrow', 'flexShrink',
+    'opacity', 'visibility', 'overflow', 'transform', 'zoom', 'flex', 'flexBasis', 'flexGrow', 'flexShrink',
     'flexDirection', 'flexWrap', 'gap', 'rowGap', 'columnGap', 'alignItems', 'justifyContent',
     'gridTemplateColumns', 'gridTemplateRows', 'cssFloat'];
   for (var i = 0; i < properties.length; i++) {

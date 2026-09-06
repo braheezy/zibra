@@ -15,6 +15,35 @@ fn value(node: *document.Node, property: []const u8) []const u8 {
     return node.element.style.?.getPtr(property).?.get().*;
 }
 
+test "computed values survive stylesheet source retirement before geometry restyle" {
+    const allocator = std.testing.allocator;
+    var root = try parsed("<main><span>inherited</span></main>");
+    defer root.deinit(allocator);
+    document.fixParentPointers(&root, null);
+    {
+        const source = try allocator.dupe(u8, "main { width:137px; color:purple; font-family:Georgia; }");
+        defer allocator.free(source);
+        var css = try @import("../document/css_parser.zig").CSSParser.init(allocator, source, false);
+        defer css.deinit(allocator);
+        const rules = try css.parse(allocator);
+        defer {
+            for (rules) |*rule| rule.deinit(allocator);
+            allocator.free(rules);
+        }
+        try document.style(allocator, &root, rules);
+        // Poison the old rule backing before freeing it, making borrowed
+        // computed strings fail deterministically even with a retaining heap.
+        @memset(source, '?');
+    }
+    try std.testing.expectEqualStrings("137px", value(&root, "width"));
+    try std.testing.expectEqualStrings("purple", value(&root.element.children.items[0], "color"));
+    try std.testing.expectEqualStrings("Georgia", value(&root, "font-family"));
+    dom.dirtyStyleSubtree(&root);
+    try document.style(allocator, &root, &.{});
+    try std.testing.expectEqualStrings("auto", value(&root, "width"));
+    try std.testing.expectEqualStrings("black", value(&root.element.children.items[0], "color"));
+}
+
 test "user agent sheet hides closed dialogs and emphasizes strong text" {
     const allocator = std.testing.allocator;
     var css = try @import("../document/css_parser.zig").CSSParser.init(allocator, @embedFile("../browser/browser.css"), false);

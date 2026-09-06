@@ -227,11 +227,9 @@ pub fn ProtectedField(comptime T: type) type {
             // Only notify dependents if the value actually changed (for comparable types)
             // Check type at comptime and decide whether to compare
             if (comptime T == []const u8) {
-                // Computed CSS values are borrowed slices, and the prior
-                // stylesheet generation may already be retired when this is
-                // called. Comparing bytes could therefore dereference stale
-                // storage. Treat only the exact same slice as unchanged;
-                // values from new backing storage notify conservatively.
+                // The generic field does not own slice backing. Compare only
+                // identity, without dereferencing an old generation. Computed
+                // style interns equal values to avoid needless notifications.
                 if (self.value.ptr != value.ptr or self.value.len != value.len) {
                     self.notify();
                 }

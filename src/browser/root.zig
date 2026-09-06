@@ -335,6 +335,23 @@ const LiveDocumentLoadContext = struct {
             return;
         }
 
+        // A script sees the styles parsed before its own token, not just the
+        // styles installed after EOF. Loading remains lazy until a style or
+        // geometry read needs it, and never evaluates nested documents.
+        self.frame.stylesheets_dirty = true;
+        self.frame.markDocumentStyleDirty();
+        defer {
+            if (self.frame.current_node) |*root| {
+                // Measurements may have installed raw layout and inherited
+                // style subscribers. Retire them while Node addresses are
+                // still valid, before the parser grows its child arrays.
+                if (root.element.style != null) {
+                    parser.clearStyleInvalidations(root);
+                    self.tab.prepareForDomMutation(self.browser, self.frame, root);
+                }
+            }
+        }
+
         // Both temporary callbacks borrow the stack-bound live parser. Clear
         // them before `document_loader` resumes tokenization or navigation can
         // retire the current document Realm.
@@ -2608,6 +2625,7 @@ pub const Browser = struct {
         }
         js_context.setRenderCallback(frame.window_id, jsRenderCallback, @ptrCast(render_context));
         js_context.setStyleFlushCallback(frame.window_id, jsStyleFlushCallback, @ptrCast(render_context));
+        js_context.setGeometryCallback(frame.window_id, @import("script_geometry.zig").Callbacks(Browser).measure, @ptrCast(render_context));
         js_context.setDocumentReadyStateCallback(
             frame.window_id,
             jsDocumentReadyStateCallback,
@@ -2927,6 +2945,7 @@ pub const Browser = struct {
             all_keyframes = .empty;
             frame.css_texts = new_css_texts;
             new_css_texts = .empty;
+            frame.stylesheets_dirty = false;
 
             // Apply all stylesheet rules and inline styles (sorted by cascade order)
             try parser.styleWithKeyframes(
@@ -3100,6 +3119,7 @@ pub const Browser = struct {
         frame.certificate_error = false;
         frame.referrer_policy = .default;
         frame.resources_dirty = false;
+        frame.stylesheets_dirty = true;
         frame.content_height = 0;
         frame.scroll = 0;
         frame.publishViewportScrollbarVisibility(true);
@@ -3322,6 +3342,7 @@ pub const Browser = struct {
         all_keyframes = .empty;
         frame.css_texts = new_css_texts;
         new_css_texts = .empty;
+        frame.stylesheets_dirty = false;
 
         try parser.styleWithKeyframes(
             self.allocator,
@@ -3800,6 +3821,7 @@ pub const Browser = struct {
         all_keyframes = .empty;
         frame.css_texts = new_css_texts;
         new_css_texts = .empty;
+        frame.stylesheets_dirty = false;
 
         try parser.styleWithKeyframes(
             self.allocator,
@@ -4153,6 +4175,33 @@ pub const Browser = struct {
         new_keyframes = .empty;
         frame.css_texts = new_css_texts;
         new_css_texts = .empty;
+        frame.stylesheets_dirty = false;
+        if (frame.current_node) |*root| parser.dirtyStyleSubtree(root);
+        frame.markDocumentStyleDirty();
+    }
+
+    /// Serialized worker, including native callbacks under JsLock. Only
+    /// stylesheet resources are eligible here: script scheduling and iframe
+    /// loading belong to the ordinary post-callback resource pass.
+    pub fn refreshFrameStylesheets(self: *Browser, frame: *Frame) !void {
+        if (!frame.stylesheets_dirty) return;
+        const root = if (frame.current_node) |*node| node else return;
+        const page_url = frame.current_url orelse return;
+        var nodes = std.ArrayList(*Node).empty;
+        defer nodes.deinit(self.allocator);
+        try parser.treeToList(self.allocator, root, &nodes);
+        var count: usize = 0;
+        for (nodes.items) |node| {
+            if (node.* != .element) continue;
+            const tag = node.element.tag;
+            if (!std.mem.eql(u8, tag, "style") and !std.mem.eql(u8, tag, "link")) continue;
+            nodes.items[count] = node;
+            count += 1;
+        }
+        nodes.items.len = count;
+        var resources = try self.fetchDocumentResources(frame, page_url, nodes.items);
+        defer resources.deinit();
+        try self.replaceFrameStylesheets(frame, nodes.items, &resources);
     }
 
     /// Refresh resources after an attached structural DOM mutation. This is

@@ -427,6 +427,49 @@ current. Custom values are copied from the Element's computed environment into
 Kiesel strings; no environment-backed slice crosses the callback. This is not
 a complete stylesheet CSSOM or native declaration-normalization API.
 
+## JavaScript element geometry
+
+`runtime/geometry.js` supplies `getBoundingClientRect`, `getClientRects`,
+`offsetWidth`, and `offsetHeight`, plus DOMRectReadOnly/DOMRect/DOMRectList
+snapshot values. `geometry_bindings.zig` retains only a narrow Host embedded
+in `Js`. Each WindowRealm has a synchronous geometry callback installed after
+document creation and cleared on replacement or retirement, like computed
+style readback. The callback receives a numeric Node handle, not a Node or
+layout pointer.
+
+`browser/script_geometry.zig` validates the Frame generation, reconciles the
+latest native viewport request, and brings ancestor/target Frames through
+stylesheet, style, and required layout work on the serialized Tab worker. This
+runs under JsLock and must not evaluate script, call a lock-taking Js API,
+commit/present, or retain the callback's output. The existing frame layout path
+also refreshes its coupled retained-paint and interaction products; this is
+not yet a layout-only performance boundary. Ordinary composition/presentation
+remains pending for the normal render task.
+
+Only the stylesheet-specific resource pass may run here or in computed-style
+readback. The general pass can load/evaluate iframe documents and would
+re-enter JsLock. Parser-blocking scripts can measure the partial styled DOM;
+their completion retires style subscribers and layout/display borrows before
+the parser resumes moving child-array storage.
+
+After the flush, the adapter resolves the handle again and queries clean
+layout through `render/element_geometry.zig`. Detached nodes and elements
+without boxes return empty geometry. Visibility-hidden boxes retain geometry.
+Client rectangles use the owning Frame's CSS viewport, including authored zoom
+and supported translations and subtracting ancestor/document scroll; fixed
+boxes do not subtract document scroll. Offset dimensions ignore transforms and
+remove the target's accumulated authored zoom. Neither API includes native
+chrome or raster/accessibility scale. Temporary native results are copied to
+Kiesel numbers before the callback buffer is freed; returned rectangle/list
+objects never update when the DOM changes.
+
+This is an initial HTML box-geometry slice, not complete CSSOM View. Geometry
+inherits layout's integer precision, bounded formatting, and translation-only
+transform support. Empty-inline/complex fragmentation, SVG boxes, Range text
+rectangles, and the remaining offset/client/scroll APIs need separate coverage.
+Do not claim meaningful rendering benchmark scores from merely exposing the
+property names: verify the layout work and supported workload first.
+
 ## Accessibility tree and speech
 
 Accessibility-tree strings belong to their tree generation. During rebuild,

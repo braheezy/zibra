@@ -153,7 +153,11 @@ A successful root navigation transaction follows this order:
    Realm, then drive the live parser. Each parser-inserted classic script runs
    synchronously in source order; `document.write` chunks are copied into the
    Frame source store ahead of unread input. Fetch/evaluation failures are
-   page errors and parsing continues;
+   page errors and parsing continues. Synchronous style/geometry reads install
+   the stylesheets discovered so far. Before parsing resumes, any style
+   subscriptions and layout/display borrows created by the script retire
+   while their Node endpoints are still alive; numeric JS handles rebind
+   through the existing parser relocation observer;
 9. after EOF, discover deferred resources, build stylesheet/rule generations,
    and build style/layout/paint;
 10. apply a final fragment after layout and clamp scroll;
@@ -237,6 +241,13 @@ again. Scripts parsed as an `innerHTML` fragment are intentionally inert, even
 when the source came from serializing a previously executed script; only an
 explicitly created-and-attached script remains eligible for this deferred path.
 Removing a link retires its stylesheet rules.
+
+`Frame.stylesheets_dirty` separately tracks the stylesheet-only refresh used
+by synchronous computed-style and geometry reads under JsLock. This pass may
+fetch stylesheets but must not queue scripts or load iframe documents; the
+general resource-dirty flag remains pending for the post-callback worker pass.
+Every replacement dirties computed style and the Frame phase guard. Computed
+Element strings are interned independently of the replaced CSS generation.
 
 ## Images and background images
 

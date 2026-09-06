@@ -5,6 +5,39 @@ then expand verification in proportion to its ownership and visual risk. The
 complete check does not replace a focused regression, and a screenshot does
 not replace parser/layout assertions that explain a failure.
 
+## Compatibility-driven development
+
+Use representative-page failures and engine dependencies to select work; use
+WPT to validate the selected capability. Raw pass counts are not a priority
+score: a large parameterized suite can outweigh a missing API that prevents
+whole applications from initializing.
+
+For each coherent compatibility chunk:
+
+1. Capture the first blocking script error or a concrete incorrect page
+   behavior, preferably as a small deterministic fixture.
+2. Identify the shared engine capability and its owner/invalidation contracts.
+   Favor broad user-visible reach and dependency-unblocking value over isolated
+   assertion gains.
+3. Select relevant unchanged upstream WPT cases and record a bounded baseline.
+   Distinguish unsupported features, semantic failures, page errors, semantic
+   timeouts, and external watchdog/infrastructure failures.
+4. Implement the capability with focused unit/lifetime coverage and a
+   page-level regression. Re-run the same upstream cases and report limitations
+   explicitly; do not change test expectations to conceal incorrect behavior.
+5. Expand to the relevant broader checks. Full WPT sweeps are periodic health
+   checks, not the default loop for each edit.
+
+Run native build/test jobs serially during agent work, with an outer
+process-group watchdog and cleanup/reaping on success, timeout, and interrupt.
+Do not leave background builds, watchers, servers, or browser children running.
+Reuse the WPT runner's process supervision for upstream cases.
+
+Defer performance scoring until correctness checks demonstrate that the
+operation does real work. In particular, a geometry read must synchronously
+update layout before a mutation-and-measure benchmark can measure that layout.
+Unsupported or failed workloads are missing data, never zero-time successes.
+
 ## Check tiers
 
 ### Fast focused checks
@@ -45,7 +78,8 @@ Run from the repository root:
   protocol, expectation, diagnostic, and infrastructure-failure handling;
 - `zig build test-wpt` for local headless synchronous PASS, Promise-job PASS,
   TIMEOUT, startup/error diagnostics, partial results, and Unicode JSONL
-  fixtures. Captures are serial and process-watchdog bounded.
+  fixtures, plus live JavaScript geometry and parser-boundary regressions.
+  Captures are serial and process-watchdog bounded.
   This step uses no upstream WPT checkout
   or network access;
 - `task wpt-all` for a long-running local compatibility sweep. It builds once,

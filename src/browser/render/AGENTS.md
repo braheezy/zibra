@@ -22,6 +22,11 @@ boundaries.
   coordinate conversion, rounded clips, scroll/transform localization, and
   reverse-child ordering over a synchronously borrowed committed paint
   permutation. It never owns or traverses layout objects.
+- `element_geometry.zig` queries clean layout boxes and retains per-line
+  inline fragments with their layout/snapshot owner. Its public query returns
+  copied numeric rectangles; unlike painted hit bounds it includes invisible
+  boxes and does not clip away offscreen geometry. Retire/rebind fragment Node
+  borrows at the same structural boundary as the containing layout.
 - `paint_order.zig` owns allocation-free scalar classification and stable
   ordering for the bounded direct-child paint phases. It receives no DOM or
   layout pointers; `layout.zig` retains the phase entries and permutations.

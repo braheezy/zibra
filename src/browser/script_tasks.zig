@@ -705,9 +705,11 @@ pub fn Contexts(comptime Browser: type, comptime DocumentHandle: type) type {
             if (frame.document_generation == 0 or !ctx.matchesGeneration(frame.document_generation)) return;
             // A synchronous computed-style read after script inserts a
             // stylesheet must observe that sheet immediately, just as a
-            // navigation render would. Resource refresh is idempotent and
-            // remains generation-bound to this frame.
-            try browser.refreshFrameResources(frame);
+            // navigation render would. Do not run the general resource pass
+            // under JsLock: loading an iframe can evaluate child JavaScript.
+            _ = tab.applyRequestedViewport();
+            try browser.refreshFrameStylesheets(frame);
+            if (tab.media_environment_dirty) try browser.rebuildFrameStyleRules(frame);
             try frame.renderStyle(browser);
         }
 

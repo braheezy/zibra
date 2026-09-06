@@ -63,6 +63,21 @@ an architecture document or fixture catalog in them.
 - Use `rg`/`rg --files` for repository searches. Preserve unrelated work in a
   dirty workspace.
 
+## Choosing compatibility work
+
+Prioritize usable, correct engine behavior over aggregate WPT assertion counts.
+Choose a coherent capability from representative-page failures and shared
+engine dependencies, then use targeted WPT cases to specify and verify it.
+Prefer work that unblocks multiple pages or other capabilities; separate
+missing features, incorrect behavior, and harness/infrastructure failures.
+
+Each compatibility chunk should identify the motivating failure, add focused
+upstream and engine-level coverage, include a page-level regression where
+appropriate, and state its remaining limitations. Broad WPT sweeps are periodic
+health checks, not the default iteration loop. Performance benchmarks come
+after correctness gates prove that the measured work actually happens. See the
+[testing guide](docs/testing.md#compatibility-driven-development) for the workflow.
+
 ## Verification
 
 Use the narrowest relevant step while iterating:

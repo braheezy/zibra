@@ -77,8 +77,10 @@ behavior. Navigation-owned stylesheet/resource generations are documented in
 - Shorthand expansion happens in source order and preserves declaration-local
   `!important`. Add precedence tests in both shorthand/longhand directions.
 - Keep computed-property defaults and inheritance policy synchronized with
-  parser support. Non-inherited properties retain their borrowed computed
-  string; used-value validation belongs in the focused helper/layout owner.
+  parser support. Element computed values are static defaults or interned in
+  the Element's string owner, never borrowed from replaceable rule/attribute
+  text. Inherited Text values borrow stable ancestor computed storage;
+  used-value validation belongs in the focused helper/layout owner.
 - Conditional parsing receives an explicit media environment. Root and iframe
   callers must rebuild source-backed rule/keyframe generations when width,
   height, zoom, or forced-colors environment changes.

@@ -35,7 +35,7 @@ Focused steps are `test-document`, `test-render`, `test-network`,
 - `zig build test-dump-dom` — DOM CLI output;
 - `zig build test-wpt-runner` — WPT manifest-runner protocol and failure paths;
 - `zig build test-wpt` — serial, watchdog-bounded local WPT protocol and
-  startup/error/progress diagnostic fixtures;
+  startup/error/progress diagnostics plus script geometry/parser-boundary fixtures;
 - `task wpt-smoke` — one upstream testharness, reftest, and crashtest run
   serially; requires the WPT checkout and server dependencies described in the
   [WPT guide](wpt/README.md);

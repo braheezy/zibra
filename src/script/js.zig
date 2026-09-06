@@ -24,6 +24,9 @@ const wpt_bindings = @import("wpt_bindings.zig");
 
 const bdwgc = @import("bdwgc");
 const kiesel = @import("kiesel");
+const geometry_bindings = @import("geometry_bindings.zig");
+pub const GeometryCallbackFn = geometry_bindings.Callback;
+pub const GeometryRect = geometry_bindings.Rect;
 const Agent = kiesel.execution.Agent;
 const Script = kiesel.language.Script;
 const Realm = kiesel.execution.Realm;
@@ -244,6 +247,10 @@ const WindowRealm = struct {
     pending_messages: std.ArrayList(PendingMessage),
     render_callback: RenderCallback,
     style_flush_callback: RenderCallback,
+    geometry_callback: struct {
+        function: ?GeometryCallbackFn = null,
+        context: ?*anyopaque = null,
+    } = .{},
     focus_callback: FocusCallback,
     dom_mutation_callback: DomMutationCallback,
     dom_mutation_complete_callback: DomMutationCompleteCallback,
@@ -288,6 +295,7 @@ storage_allocator: std.mem.Allocator,
 // shared realm. `Js` itself is heap-stable and outlives every native function.
 canvas_host: canvas_bindings.Host,
 dom_tree_host: dom_tree_bindings.Host,
+geometry_host: geometry_bindings.Host,
 event_focus_host: event_focus_bindings.Host,
 network_host: network_bindings.Host,
 timer_host: timer_bindings.Host,
@@ -352,6 +360,7 @@ pub fn init(
         .context = self,
         .active_window = activeEventFocusWindow,
     };
+    self.geometry_host = .{ .context = self, .allocator = allocator, .measure = measureBindingGeometry };
     self.network_host = .{
         .context = self,
         .allocator = allocator,
@@ -461,6 +470,7 @@ fn retireWindowRealmLocked(self: *Js, window: *WindowRealm) void {
     window.named_globals_synced = false;
     window.render_callback = .{};
     window.style_flush_callback = .{};
+    window.geometry_callback = .{};
     window.focus_callback = .{};
     window.dom_mutation_callback = .{};
     window.dom_mutation_complete_callback = .{};
@@ -660,7 +670,7 @@ fn ensureRuntimeInitializedLocked(
     if (window.runtime_initialized) return;
 
     const runtime_code = @embedFile("runtime/bootstrap.js") ++ "\n" ++
-        @embedFile("runtime/range.js") ++ "\n" ++ @embedFile("runtime/css_style.js");
+        @embedFile("runtime/range.js") ++ "\n" ++ @embedFile("runtime/css_style.js") ++ "\n" ++ @embedFile("runtime/geometry.js");
     const runtime_script = try Script.parse(
         runtime_code,
         window.realm,
@@ -792,6 +802,14 @@ pub fn setFocusCallback(self: *Js, window_id: u32, callback: ?FocusCallbackFn, c
         .function = callback,
         .context = context,
     };
+}
+
+/// Install a synchronous geometry reader for the current document generation.
+/// Called by the serialized owner; replacement/null-root retirement clears it.
+pub fn setGeometryCallback(self: *Js, window_id: u32, callback: ?GeometryCallbackFn, context: ?*anyopaque) void {
+    const window = self.getWindowContext(window_id) catch return;
+    if (window.retired) return;
+    window.geometry_callback = .{ .function = callback, .context = context };
 }
 
 pub fn setDomMutationCallback(self: *Js, window_id: u32, callback: ?DomMutationCallbackFn, context: ?*anyopaque) void {
@@ -1218,6 +1236,18 @@ fn flushBindingStyle(context: ?*anyopaque) anyerror!void {
     if (window.style_flush_callback.function) |callback| {
         try callback(window.style_flush_callback.context);
     }
+}
+
+fn measureBindingGeometry(context: ?*anyopaque, handle: u32, unscaled: bool, allocator: std.mem.Allocator, rects: *std.ArrayList(GeometryRect)) anyerror!void {
+    const self = hostFromBindingContext(context);
+    const window = self.windows.get(self.current_window_id orelse return) orelse return;
+    if (window.retired) return;
+    const node = window.handles.resolve(handle) orelse return;
+    if (node.* != .element or !dom_mutation.isAttachedToCurrentDocument(window.current_nodes, node)) return;
+    // Only the numeric identity crosses the flush: layout/resource work may
+    // invalidate earlier borrows. The browser resolves it again afterward.
+    if (window.geometry_callback.function) |callback|
+        try callback(window.geometry_callback.context, handle, unscaled, allocator, rects);
 }
 
 fn currentBindingWindowId(context: ?*anyopaque) ?u32 {
@@ -2134,6 +2164,55 @@ test "Promise job interruption escapes a swallowed Kiesel job error" {
         ),
     );
     try std.testing.expect(probe.armed);
+}
+
+test "geometry bindings return static rectangle objects and retire callbacks" {
+    const allocator = std.testing.allocator;
+    var html_parser = try parser.HTMLParser.init(allocator, "<html><head></head><body><div id=box></div></body></html>");
+    defer html_parser.deinit(allocator);
+    var root = try html_parser.parse();
+    defer root.deinit(allocator);
+    parser.fixParentPointers(&root, null);
+    var environ = std.process.Environ.Map.init(allocator);
+    defer environ.deinit();
+    var js = try Js.init(allocator, std.testing.io, &environ);
+    defer js.deinit(allocator);
+    js.setNodes(0, &root);
+    defer js.setNodes(0, null);
+    const Probe = struct {
+        calls: usize = 0,
+        fn measure(ctx: ?*anyopaque, _: u32, unscaled: bool, alloc: std.mem.Allocator, output: *std.ArrayList(GeometryRect)) !void {
+            const self: *@This() = @ptrCast(@alignCast(ctx.?));
+            self.calls += 1;
+            try output.append(alloc, .{ .x = 10, .y = 20, .width = if (unscaled) 30.5 else 61, .height = 40 });
+        }
+    };
+    var probe = Probe{};
+    js.setGeometryCallback(0, Probe.measure, &probe);
+    const result = try js.evaluate(0,
+        \\var box = document.getElementById('box');
+        \\var r = box.getBoundingClientRect(), list = box.getClientRects();
+        \\var negative = new DOMRect(10, 20, -3, -4);
+        \\var ro = DOMRectReadOnly.fromRect({x: 2, width: 3});
+        \\var passed = r instanceof DOMRect && r instanceof DOMRectReadOnly &&
+        \\  r.x === 10 && r.right === 71 && r.bottom === 60 &&
+        \\  list instanceof DOMRectList && list.length === 1 && list.item(0) === list[0] &&
+        \\  list.item(1) === null && Array.from(list).length === 1 &&
+        \\  negative.left === 7 && negative.top === 16 && negative.right === 10 &&
+        \\  ro.x === 2 && ro.height === 0 && ro.toJSON().right === 5 && box.offsetWidth === 31;
+        \\r.width = 99;
+        \\passed = passed && r.right === 109 && box.getBoundingClientRect().width === 61;
+        \\var detached = document.createElement('div');
+        \\passed = passed && detached.offsetWidth === 0 && detached.getClientRects().length === 0;
+        \\try { Node.prototype.getBoundingClientRect.call({nodeType: 1}); passed = false; } catch(e) { passed = passed && e instanceof TypeError; }
+        \\passed;
+    );
+    try std.testing.expect(result.toBoolean());
+    try std.testing.expectEqual(@as(usize, 4), probe.calls);
+    js.setNodes(0, &root);
+    const retired = try js.evaluate(0, "document.getElementById('box').getBoundingClientRect().width === 0");
+    try std.testing.expect(retired.toBoolean());
+    try std.testing.expectEqual(@as(usize, 4), probe.calls);
 }
 
 test "DOM Range boundary ordering validation queries and selection roots" {
@@ -4868,6 +4947,7 @@ fn setupDocument(self: *Js, realm: *Realm) !void {
         &self.dom_tree_host,
         &dom_tree_bindings.bindings,
     );
+    try native_bindings.installFunctions(&self.agent, realm, native, &self.geometry_host, &geometry_bindings.bindings);
     try native_bindings.installFunctions(
         &self.agent,
         realm,

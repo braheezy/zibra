@@ -28,8 +28,7 @@ source-backed and escaped because layout decodes it exactly once. Preserve:
   the navigation owner.
 
 1. decoded HTML until the complete DOM retires;
-2. stylesheet text until every rule, keyframe, and computed value borrowing it
-   retires;
+2. stylesheet text until every rule and keyframe borrowing it retires;
 3. Element-owned decoded strings until that Element retires;
 4. decoded image data until every display generation borrowing its pixels
    retires.
@@ -114,6 +113,12 @@ stylesheet string may outlive the stylesheet generation that supplied it.
 At stylesheet top level, invalid qualified-rule starts recover through the
 matching block terminator; a stray semicolon is not silently discarded ahead
 of a later rule.
+
+Element computed fields contain static defaults or Element-interned strings.
+They must survive stylesheet/inline-attribute replacement until the next style
+pass compares old and new values. Text inheritance borrows its ancestor's
+stable computed storage. Interned values retire with the Element, not after
+each style pass; repeated equal values reuse the same allocation.
 
 `custom_properties.zig` owns one immutable, heap-stable computed environment
 per styled Element. Inherited entries copy their parent's already-computed
@@ -462,6 +467,30 @@ to the embedded Surface. Canvas drawing runs on the serialized tab worker.
 Every pixel-changing command dirties the nearest retained paint owner. Paint
 copies live canvas pixels into an immutable owning command; committed state
 never borrows the mutable backing surface.
+
+## Element geometry snapshots
+
+`render/element_geometry.zig` borrows a clean DocumentLayout synchronously and
+returns scalar rectangles. Persistent block border boxes come from protected
+used geometry; inline fragments are recorded in content order at final line
+placement and retained in the owning BlockLayout. Ordinary inline ancestors
+coalesce once per line, while the containing block keeps its own border box.
+Paint-only regeneration preserves these records instead of appending duplicate
+geometry. Hidden/offscreen paint suppression must not erase layout boxes.
+
+Temporary subtree placement invalidation stops at its persistent containing
+block boundary. Recreating an atomic subtree during paint must not mark the
+document's retained geometry dirty; live style subscriptions independently
+target the persistent outer owner when a real relayout is required.
+
+Atomic inline layout captures its temporary subtree's fragment records into
+`inline_snapshot.Snapshot` before retiring the temporary layout. Final line
+placement translates those local records into the persistent outer block.
+These records borrow Nodes, not layout objects, and retire with their existing
+layout/snapshot owner at the structural mutation boundary. No raw pointer
+crosses the JavaScript result boundary; `core/rect.zig` supplies only scalar
+rectangle math. The host flush/readback contract is in
+[JavaScript element geometry](javascript-and-accessibility.md#javascript-element-geometry).
 
 ## Retained paint
 

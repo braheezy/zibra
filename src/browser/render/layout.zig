@@ -5,6 +5,7 @@
 //! the display items consumed by the browser compositor.
 
 const std = @import("std");
+const element_geometry = @import("element_geometry.zig");
 const font = @import("font.zig");
 const forced_colors = @import("forced_colors.zig");
 const browser = @import("../root.zig");
@@ -3420,6 +3421,7 @@ fn measureInlineBlock(self: *Layout, node: *Node, element: *const parser.Element
         result.snapshot.swapCollectors(self);
         defer result.snapshot.swapCollectors(self);
         try root.layout(self);
+        try element_geometry.captureBlock(root, null, 0, 0, self.allocator, &result.snapshot.geometry_fragments);
         try paintBlockTreeRecursive(&result.snapshot.commands, self, root);
         rebaseDisplaySources(result.snapshot.commands.items, parent);
     }
@@ -4010,6 +4012,7 @@ fn flushLine(self: *Layout, line_buffer: *std.ArrayList(LineItem)) !void {
     defer focus_map.deinit();
     var accessibility_map = std.AutoHashMap(*Node, Bounds).init(self.allocator);
     defer accessibility_map.deinit();
+    const geometry_line_start = if (self.inline_block) |block| block.geometry_fragments.items.len else 0;
 
     // === PASS 2: Position glyphs ===
     for (line_buffer.items) |*item| {
@@ -4038,6 +4041,19 @@ fn flushLine(self: *Layout, line_buffer: *std.ArrayList(LineItem)) !void {
         const bounds_x = item.x + item.hit_offset_x;
         const bounds_y = final_y + item.hit_offset_y;
         const line_bounds_y = line_top + item.hit_offset_y;
+
+        if (self.collect_hit_test_bounds) {
+            if (self.inline_block) |block| {
+                if (item.node_ptr) |node| {
+                    const own = element_geometry.box(item.x, final_y, item.width, item.height);
+                    const ancestor = if (item.payload == .glyph) own else if (self.inline_strut) |strut|
+                        element_geometry.box(item.x, baseline - strut.ascent, item.width, strut.ascent + strut.descent)
+                    else
+                        own;
+                    try element_geometry.recordInline(self.allocator, &block.geometry_fragments, geometry_line_start, node, block.node_ptr, own, ancestor, item.payload != .inline_block);
+                }
+            }
+        }
 
         if (item.node_ptr) |ptr| {
             if (self.collect_hit_test_bounds) {
@@ -4100,6 +4116,12 @@ fn flushLine(self: *Layout, line_buffer: *std.ArrayList(LineItem)) !void {
                 const x = item.x;
                 const y = final_y +| box.margin.top;
                 if (self.collect_hit_test_bounds) try box.snapshot.mergeBounds(self, x, y);
+                if (self.collect_hit_test_bounds) if (self.inline_block) |block| {
+                    for (box.snapshot.geometry_fragments.items) |entry| try block.geometry_fragments.append(self.allocator, .{
+                        .node = entry.node,
+                        .rect = entry.rect.translated(@floatFromInt(x), @floatFromInt(y)),
+                    });
+                };
                 try box.snapshot.paintAt(self.current_display_target, x, y, source);
             },
             .input => |input_payload| {
@@ -6783,6 +6805,7 @@ const BlockLayout = struct {
     /// effects, while cached_subtree edges keep both lists independently
     /// reusable.
     display_list: std.ArrayList(DisplayItem),
+    geometry_fragments: std.ArrayList(element_geometry.Fragment) = .empty,
     paint_cache: std.ArrayList(DisplayItem) = .empty,
     paint_dirty: bool = true,
     inline_paint_dirty: bool = false,
@@ -7662,6 +7685,7 @@ const BlockLayout = struct {
         if (self.inline_nodes) |nodes| self.allocator.free(nodes);
         DisplayItem.freeItems(self.allocator, self.display_list.items);
         self.display_list.deinit(self.allocator);
+        self.geometry_fragments.deinit(self.allocator);
         DisplayItem.freeItems(self.allocator, self.paint_cache.items);
         self.paint_cache.deinit(self.allocator);
         self.floats.deinit(self.allocator);
@@ -7684,22 +7708,17 @@ const BlockLayout = struct {
         self.width.markNoOwner();
         self.height.markNoOwner();
         self.zoom.markNoOwner();
-        // Mark ancestors' has_dirty_descendants by walking up the parent chain
-        if (self.parent_block) |parent| {
-            if (parent.has_dirty_descendants) return;
+        // Temporary atomic subtrees also rebuild during paint-only refresh.
+        // Their local placement changes must not dirty the persistent layout
+        // they merely borrow as a containing block. Live style dependencies
+        // already target that persistent owner explicitly.
+        var current = self.parent_block;
+        while (current) |parent| : (current = parent.parent_block) {
+            if (!self.persistent_dependencies and parent.persistent_dependencies) return;
+            if (parent.has_dirty_descendants) break;
             parent.has_dirty_descendants = true;
-            var current: ?*BlockLayout = parent.parent_block;
-            while (current) |bp| {
-                if (bp.has_dirty_descendants) break;
-                bp.has_dirty_descendants = true;
-                current = bp.parent_block;
-            }
-            if (parent.document.has_dirty_descendants) return;
-            parent.document.has_dirty_descendants = true;
-        } else {
-            if (self.document.has_dirty_descendants) return;
-            self.document.has_dirty_descendants = true;
         }
+        if (self.persistent_dependencies) self.document.has_dirty_descendants = true;
     }
 
     fn markPaint(self: *BlockLayout, inline_commands_dirty: bool) void {
@@ -8658,6 +8677,8 @@ const BlockLayout = struct {
         // Reset any cached inline commands
         DisplayItem.freeItems(self.allocator, self.display_list.items);
         self.display_list.clearRetainingCapacity();
+
+        self.geometry_fragments.clearRetainingCapacity();
 
         const owns_float_context = self.establishesFloatContext();
         if (owns_float_context) {

@@ -167,6 +167,18 @@ const WptFixture = struct {
 
 const wpt_fixtures = [_]WptFixture{
     .{
+        .fixture = "tests/manual/js-geometry.html",
+        .status = "PASS",
+        .timeout_ms = 10_000,
+        .output_basename = "wpt-js-geometry.jsonl",
+    },
+    .{
+        .fixture = "tests/wpt/fixtures/geometry-parser-boundaries.html",
+        .status = "PASS",
+        .timeout_ms = 10_000,
+        .output_basename = "wpt-geometry-parser-boundaries.jsonl",
+    },
+    .{
         .fixture = "tests/wpt/fixtures/harness-pass.html",
         .status = "PASS",
         .timeout_ms = 10_000,

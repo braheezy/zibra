@@ -1,0 +1,103 @@
+<!doctype html>
+<!-- How to verify: open this page and expect PASS. Click Resize target:
+     its measurement and outlined marker must update immediately. Resize the
+     native window and scroll: re-measuring must keep the marker below target.
+     The same assertions run through the bounded local WPT result bridge. -->
+<html><head><title>JavaScript geometry</title>
+<style>
+  body { font: 16px sans-serif; }
+  #target { display: block; width: 180px; height: 40px; padding: 5px; border: 2px solid blue; }
+  #marker { position: fixed; width: 80px; height: 12px; border: 2px solid green; }
+</style></head><body>
+<h1>JavaScript geometry</h1>
+<p id="result">Running…</p>
+<button id="resize">Resize target / re-measure</button>
+<p id="measurement"></p>
+<div id="target">Measured target</div>
+<div id="marker"></div>
+<script>
+(function() {
+  var results = [];
+  function check(name, run) {
+    try { run(); results.push({name:name, status:0}); }
+    catch(e) { results.push({name:name, status:1, message:String(e)}); }
+  }
+  function equal(actual, expected) {
+    if (actual !== expected) throw new Error(actual + ' !== ' + expected);
+  }
+  var target = document.getElementById('target');
+  check('Border boxes and rectangle values', function() {
+    var r = target.getBoundingClientRect();
+    equal(r instanceof DOMRect, true);
+    equal(r.width, 194); equal(r.height, 54);
+    equal(target.offsetWidth, 194); equal(target.offsetHeight, 54);
+    equal(r.right - r.left, r.width);
+    equal(target.getClientRects().item(0).width, 194);
+  });
+  check('Mutation then measure, with static earlier snapshots', function() {
+    var old = target.getBoundingClientRect();
+    target.style.width = '240px';
+    equal(target.offsetWidth, 254);
+    equal(target.getBoundingClientRect().width, 254);
+    equal(old.width, 194);
+  });
+  check('Ancestor resize and custom-property changes flush synchronously', function() {
+    var parent = document.createElement('div');
+    parent.style.cssText = 'display:block;width:200px;--size:30px';
+    var child = document.createElement('div');
+    child.style.cssText = 'display:block;width:50%;height:var(--size)';
+    parent.appendChild(child); document.body.appendChild(parent);
+    equal(child.offsetWidth, 100); equal(child.offsetHeight, 30);
+    parent.style.width = '300px'; parent.style.setProperty('--size', '60px');
+    equal(child.offsetWidth, 150); equal(child.offsetHeight, 60);
+    parent.remove();
+  });
+  check('Hidden and detached boxes disappear; visibility hidden retains geometry', function() {
+    target.style.display = 'none'; equal(target.offsetWidth, 0);
+    equal(target.getClientRects().length, 0);
+    equal(target.getBoundingClientRect().x, 0);
+    target.style.display = 'block'; target.style.visibility = 'hidden';
+    equal(target.offsetWidth, 254);
+    target.style.visibility = 'visible';
+    var parent = target.parentNode;
+    target.remove(); equal(target.offsetHeight, 0);
+    parent.appendChild(target); equal(target.offsetHeight, 54);
+  });
+  check('Inline fragments and temporary inline-block descendants', function() {
+    var host = document.createElement('div');
+    host.style.cssText = 'display:block;width:400px';
+    host.innerHTML = '<span id="wrapped">one<br>two</span><span style="display:inline-block;width:80px;height:50px"><div id="nested" style="display:block;width:30px;height:20px"></div></span>';
+    document.body.appendChild(host);
+    equal(document.getElementById('wrapped').getClientRects().length, 2);
+    equal(document.getElementById('nested').getBoundingClientRect().width, 30);
+    host.remove();
+  });
+  check('CSS zoom affects client rectangles but not offset sizes', function() {
+    target.style.zoom = '2';
+    equal(target.offsetWidth, 254); equal(target.getBoundingClientRect().width, 508);
+    target.style.zoom = '1';
+  });
+  check('Translations change client position without changing offset size', function() {
+    var before = target.getBoundingClientRect();
+    target.style.transform = 'translate(15px,20px)';
+    var after = target.getBoundingClientRect();
+    equal(after.x, before.x + 15); equal(after.y, before.y + 20);
+    equal(target.offsetWidth, 254);
+    target.style.transform = 'none';
+  });
+  function measure() {
+    document.getElementById('measurement').textContent = 'Target: ' + target.offsetWidth + ' × ' + target.offsetHeight + ' CSS pixels';
+    var r = target.getBoundingClientRect();
+    var marker = document.getElementById('marker');
+    marker.style.left = r.left + 'px'; marker.style.top = (r.bottom + 4) + 'px';
+  }
+  document.getElementById('resize').onclick = function() {
+    target.style.width = target.offsetWidth > 200 ? '180px' : '240px'; measure();
+  };
+  var failed = results.filter(function(r) { return r.status !== 0; });
+  document.getElementById('result').textContent = failed.length ?
+    'FAIL: ' + failed.map(function(r) { return r.name + ': ' + r.message; }).join('; ') : 'PASS (' + results.length + ' checks)';
+  measure();
+  if (typeof completion_callback === 'function') completion_callback(results, {status:0});
+})();
+</script></body></html>

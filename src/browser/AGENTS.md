@@ -38,6 +38,7 @@ The nested [`render/AGENTS.md`](render/AGENTS.md) adds rendering-specific rules.
 | `tab_tasks.zig` | Owned payloads transferred from UI/Browser to a Tab runner |
 | `js_context.zig` | Stable synchronous generation-stamped host-callback identity embedded in a Frame |
 | `script_tasks.zig` | Detached/queued timer, animation, XHR, cookie, and message adapters |
+| `script_geometry.zig` | Synchronous generation-checked layout flush and scalar JavaScript geometry readback |
 | `chrome.zig` | UI-thread-only internal chrome widgets, font/display generation, and address-entry state |
 | `navigation.zig` | Generated warning pages and transport-security classification |
 | `image_loader.zig` | Eager/lazy HTML-image selection, fetch/decode ownership, fallback state |

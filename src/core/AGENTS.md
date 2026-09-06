@@ -27,6 +27,8 @@ dependency registration or destruction behavior.
   only for ordered retirement; style must republish the field before layout or
   hit testing uses `get`.
 - Keep core primitives independent of Browser, SDL, Kiesel, and URL layers.
+- `rect.zig` supplies pointer-free floating-point rectangle math. Coordinate
+  spaces, CSSOM semantics, and snapshot allocation belong to its consumers.
 - `relocatable_identity.zig` is the non-owning bidirectional map for values
   stored at addresses that may move. Its caller owns the pointees and issuer,
   reserves before a mutation, unpublishes old addresses, and rebinds the same

@@ -234,6 +234,9 @@ pub fn FrameType(
         // rebuilds deferred resources from the final attached DOM generation;
         // iframe removal itself completes synchronously at the mutation boundary.
         resources_dirty: bool = false,
+        /// Independent from script/iframe discovery: synchronous style/layout
+        /// reads may load stylesheets, but must never evaluate another Realm.
+        stylesheets_dirty: bool = true,
         allowed_origins: ?std.ArrayList([]const u8) = null,
         children: std.ArrayList(*Frame),
 

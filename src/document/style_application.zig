@@ -132,6 +132,19 @@ pub fn Application(
             return owned;
         }
 
+        /// Computed fields survive replacement of their source stylesheet or
+        /// inline attribute. Intern non-default values in the Element owner;
+        /// inherited Text fields borrow that stable ancestor storage.
+        fn retainComputedValue(element: *Element, allocator: std.mem.Allocator, value: []const u8, default_value: []const u8) ![]const u8 {
+            if (std.mem.eql(u8, value, default_value)) return default_value;
+            if (element.owned_strings) |strings| {
+                for (strings.items) |existing| {
+                    if (std.mem.eql(u8, value, existing)) return existing;
+                }
+            }
+            return retainComputed(element, allocator, try allocator.dupe(u8, value));
+        }
+
         fn rootFontSize(allocator: std.mem.Allocator, ancestors: []const *Node, field: *ProtectedField([]const u8)) f64 {
             if (ancestors.len == 0) return 16;
             const root_style = &ancestors[0].element.style.?;
@@ -970,7 +983,7 @@ pub fn Application(
                         for (CSS_PROPERTIES) |prop| {
                             if (style_map.getPtr(prop.name)) |field| {
                                 const value = new_style.get(prop.name) orelse prop.default_value;
-                                field.set(value);
+                                field.set(try retainComputedValue(e, allocator, value, prop.default_value));
                             }
                         }
                         try syncCssAnimation(
