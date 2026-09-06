@@ -23,6 +23,7 @@ const timer_bindings = @import("timer_bindings.zig");
 const wpt_bindings = @import("wpt_bindings.zig");
 
 const bdwgc = @import("bdwgc");
+const gc_threads = @import("gc_threads.zig");
 const kiesel = @import("kiesel");
 const geometry_bindings = @import("geometry_bindings.zig");
 pub const GeometryCallbackFn = geometry_bindings.Callback;
@@ -167,6 +168,7 @@ const JsLock = struct {
     }
 
     fn lock(self: *JsLock) void {
+        gc_threads.ensureCurrentThread(self.mutex.io);
         const tid = std.Thread.getCurrentId();
         if (self.owner != null and self.owner.? == tid) {
             self.depth += 1;
@@ -327,7 +329,7 @@ pub fn init(
     // Agent is embedded in Js, so Js must live in memory scanned by Kiesel's
     // collector. The caller's arena is not a GC root and previously allowed
     // Agent-owned realms and string-cache storage to be reclaimed.
-    if (kiesel.build_options.enable_libgc) kiesel.gc.init();
+    gc_threads.ensureCurrentThread(io);
     const storage_allocator = if (kiesel.build_options.enable_libgc)
         bdwgc.allocator_uncollectable
     else
@@ -3668,9 +3670,13 @@ test "Node.children returns immediate element children in source order" {
         \\var target = document.querySelectorAll('section')[0];
         \\var children = target.children;
         \\var empty = document.querySelectorAll('aside')[0];
-        \\typeof children.map === 'function' &&
-        \\children !== target.children &&
+        \\children instanceof HTMLCollection &&
+        \\typeof children.map === 'undefined' &&
+        \\children === target.children &&
         \\children.length === 2 &&
+        \\children.item(0) === children[0] &&
+        \\children.namedItem('second') === children[1] &&
+        \\children.item(2) === null &&
         \\children[0].getAttribute('id') === 'first' &&
         \\children[1].getAttribute('id') === 'second' &&
         \\children[0].children.length === 0 &&
@@ -3748,9 +3754,11 @@ test "Node.children reflects a later innerHTML generation" {
     const result = try js.evaluate(0,
         \\var target = document.querySelectorAll('section')[0];
         \\var before = target.children;
+        \\var snapshot = Array.from(before);
         \\target.innerHTML = 'text<i id="replacement">new</i>more text';
         \\var after = target.children;
-        \\before.length === 2 &&
+        \\snapshot.length === 2 &&
+        \\before === after && before.length === 1 &&
         \\after.length === 1 &&
         \\after[0].getAttribute('id') === 'replacement'
     );

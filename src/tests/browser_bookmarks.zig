@@ -195,10 +195,10 @@ test "bookmark chrome button toggles the active URL and selected color" {
     test_browser.active_tab_committed_url = try allocator.dupe(u8, "https://example.com/current");
     defer allocator.free(test_browser.active_tab_committed_url.?);
 
-    var chrome = Chrome{
-        .address_bar = std.ArrayList(u8).empty,
-        .allocator = allocator,
-    };
+    var environ = std.process.Environ.Map.init(allocator);
+    defer environ.deinit();
+    try environ.put("HOME", "/tmp");
+    var chrome = try Chrome.init(std.testing.io, &environ, 800, allocator, false);
     defer chrome.deinit();
     chrome.newtab_rect = .{ .left = 0, .top = 0, .right = 10, .bottom = 10 };
     chrome.back_rect = .{ .left = 10, .top = 0, .right = 20, .bottom = 10 };

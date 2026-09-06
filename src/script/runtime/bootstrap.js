@@ -244,6 +244,7 @@ function childNodeList(node) {
 // own storage while still giving Object.getOwnPropertyNames and assignment the
 // Web IDL surface expected by page code.
 var COLLECTION_STATES = new WeakMap();
+var CHILDREN_COLLECTIONS = new WeakMap();
 var HTML_NAMESPACE = 'http://www.w3.org/1999/xhtml';
 
 function collectionIndex(property) {
@@ -1204,7 +1205,9 @@ Object.defineProperty(Node.prototype, 'height', {
 Object.defineProperty(Node.prototype, "children", {
   get: function() {
     var node = this;
-    return makeLiveCollection(function() {
+    var collection = CHILDREN_COLLECTIONS.get(node);
+    if (collection) return collection;
+    collection = makeLiveCollection(function() {
       if (node.handle !== undefined) return wrapNodes(__native.children(node.handle));
       var result = [], children = node.childNodes || [];
       for (var i = 0; i < children.length; i++) {
@@ -1212,6 +1215,8 @@ Object.defineProperty(Node.prototype, "children", {
       }
       return result;
     }, 'html', node);
+    CHILDREN_COLLECTIONS.set(node, collection);
+    return collection;
   }
 });
 Object.defineProperty(Node.prototype, "attributes", {

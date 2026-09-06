@@ -9,11 +9,9 @@ const parser_module = @import("../document/parser.zig");
 const Js = @import("../script/js.zig");
 const Url = @import("../network/url.zig").Url;
 
-fn initTestChrome(allocator: std.mem.Allocator) Chrome {
-    return .{
-        .address_bar = std.ArrayList(u8).empty,
-        .allocator = allocator,
-    };
+fn initTestChrome(allocator: std.mem.Allocator, environ: *std.process.Environ.Map) !Chrome {
+    try environ.put("HOME", "/tmp");
+    return Chrome.init(std.testing.io, environ, 800, allocator, false);
 }
 
 fn enterOnFirstInput(html: []const u8) !bool {
@@ -105,7 +103,9 @@ test "address bar preserves URLs and turns ordinary text into a search" {
 }
 
 test "address cursor movement is focused and clamped to the input boundaries" {
-    var chrome = initTestChrome(std.testing.allocator);
+    var environ = std.process.Environ.Map.init(std.testing.allocator);
+    defer environ.deinit();
+    var chrome = try initTestChrome(std.testing.allocator, &environ);
     defer chrome.deinit();
 
     try std.testing.expect(!chrome.isAddressBarFocused());
@@ -152,7 +152,9 @@ test "address focus consumes editing keys despite stale document focus" {
     try std.testing.expect(!browser.shouldRouteContentEditing(false, null, false));
     try std.testing.expect(!browser.shouldRouteContentEditing(false, "chrome", true));
 
-    var chrome = initTestChrome(std.testing.allocator);
+    var environ = std.process.Environ.Map.init(std.testing.allocator);
+    defer environ.deinit();
+    var chrome = try initTestChrome(std.testing.allocator, &environ);
     defer chrome.deinit();
     chrome.focusAddressBar();
     try std.testing.expect(!chrome.backspace());
@@ -560,7 +562,9 @@ test "nested element scrolling clamps and bubbles at container boundaries" {
 }
 
 test "address input inserts at the cursor and backspace deletes before it" {
-    var chrome = initTestChrome(std.testing.allocator);
+    var environ = std.process.Environ.Map.init(std.testing.allocator);
+    defer environ.deinit();
+    var chrome = try initTestChrome(std.testing.allocator, &environ);
     defer chrome.deinit();
     chrome.focusAddressBar();
 
@@ -589,7 +593,9 @@ test "address input inserts at the cursor and backspace deletes before it" {
 
 test "address cursor resets on focus blur and successful enter" {
     const allocator = std.testing.allocator;
-    var chrome = initTestChrome(allocator);
+    var environ = std.process.Environ.Map.init(allocator);
+    defer environ.deinit();
+    var chrome = try initTestChrome(allocator, &environ);
     defer chrome.deinit();
 
     chrome.focusAddressBar();

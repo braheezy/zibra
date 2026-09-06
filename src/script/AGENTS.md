@@ -16,6 +16,10 @@ queued work and shutdown are documented in
 - `js.zig` owns the Agent, its neutral host Realm, heap-stable per-document
   `WindowRealm` owners, callback registries, active-window switching,
   evaluation, and public locked entry points.
+- `gc_threads.zig` serializes process collector initialization and owns native
+  thread registrations through pthread exit. Enter it before GC allocation or
+  host-lock acquisition; a registration must outlive returned Kiesel values,
+  not merely the evaluation callback. See the thread-lifetime contract below.
 - `runtime/bootstrap.js` defines the page-visible DOM, traversal, event, timer,
   canvas, XHR, cookie, and messaging shims over `__native`; Zig loads it with
   `@embedFile` before evaluating page code.
@@ -62,6 +66,11 @@ queued work and shutdown are documented in
 - Preserve Kiesel's traced allocation, GC-root, and `JsLock` assumptions. A
   native callback entered with the lock held uses lock-aware helpers; do not
   add an unlocked cross-thread host mutation.
+- `Js.init` and `JsLock.lock` register their calling native thread through
+  `gc_threads.ensureCurrentThread`. Never initialize the collector separately
+  on a worker, unregister at host destruction, or assume Zig's thread creation
+  passes through Boehm's pthread wrappers. Registration does not substitute for
+  locking or rooting values retained in ordinary Zig heap memory.
 - Each outer Browser-to-JavaScript turn drains the Agent Promise-job queue to
   a fixed point before its active-window guard and `JsLock` are released.
   Evaluation, lifecycle/inline/browser event delivery, postMessage, timers,
@@ -146,7 +155,9 @@ queued work and shutdown are documented in
   Selector results are static `NodeList` snapshots; `Node.childNodes` is a
   cached live `NodeList` refreshed at the JavaScript mutation boundaries.
   `HTMLCollection` is a Realm-local live Proxy view over fresh native
-  snapshots. The current `attributes` records remain lightweight snapshots
+  snapshots; `children` caches one such view per Node wrapper, preserving
+  identity across mutations without caching the result elements.
+  The current `attributes` records remain lightweight snapshots
   until native Attr identity and ordering are complete. These views expose
   authored children only and never generated pseudo boxes.
 - Asynchronous callbacks carry copied generation-stamped document handles and

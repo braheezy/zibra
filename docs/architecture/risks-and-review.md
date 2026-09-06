@@ -56,6 +56,21 @@ Evaluation and many callbacks use `JsLock`; some callback setters and parent
 realm operations do not. Their safety may depend on serialized ownership, but
 that rule is not asserted at the API boundary.
 
+### The pinned Kiesel parser is not safe across concurrent Agents
+
+Kiesel's `language/tokenizer.zig` stores the active tokenizer in process-global
+mutable state. Simultaneous `Js.evaluate` calls on separate hosts can crash in
+`hashbangCommentMatcher`; per-host `JsLock` and GC thread registration do not
+protect that state. A two-worker barrier followed by fresh-host bootstrap on
+each worker reproduces this in Debug. The default Platform and pretty-printer
+also contain process-global mutable state that needs an embedding/thread audit.
+
+Fix this at the pinned Kiesel fork's parser/platform ownership boundary. A
+coarse process-wide host lock is not a safe substitute: a worker blocked behind
+an unrelated infinite script cannot reach its own shutdown interrupt. Collector
+regressions exercise concurrent registration/collection separately from serial
+host parsing so they do not confuse these two independent defects.
+
 ### Async HTTP cannot be cancelled
 
 XHR helpers retain owners safely and are included in shutdown accounting, but

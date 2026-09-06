@@ -64,6 +64,16 @@ test close to the owner or in the matching `src/tests/` module. Tests should
 force the state transition under review rather than depend on process exit,
 arena behavior, or arbitrary sleeps.
 
+Collector/thread lifetime regressions live in `src/tests/js_gc_threads.zig`.
+Run `zig build test-script '-Dtest-filter=collector thread lifetime'` in a fresh
+process to exercise concurrent first-use registration, first GC initialization
+on a temporary JS worker, collection after worker exit, cross-thread host
+destruction, and stack-only results while another thread collects. These are
+also part of the unfiltered
+script and unified suites. Tests that construct owning Chrome state must use
+its constructor and keep its environment map alive through `deinit`; a partial
+struct literal with an uninitialized FontManager is not a valid input fixture.
+
 ### Portable complete checks
 
 Run from the repository root:

@@ -120,10 +120,11 @@ test "postMessage JavaScript binding forwards explicit and same-origin default t
         "https://child.example/path",
         capture.target_origin[0..capture.target_origin_len],
     );
-    try std.testing.expectEqualStrings("hello", capture.message[0..capture.message_len]);
+    try std.testing.expectEqualStrings("\"hello\"", capture.message[0..capture.message_len]);
 
-    _ = try js.evaluate(7, "window.postMessage('default', 11);");
+    _ = try js.evaluate(7, "window.postMessage('default');");
     try std.testing.expectEqual(@as(usize, 2), capture.calls);
+    try std.testing.expectEqual(@as(u32, 7), capture.target_window_id);
     try std.testing.expectEqualStrings("/", capture.target_origin[0..capture.target_origin_len]);
 
     _ = try js.evaluate(7, "window.postMessage({kind: 'acid3', value: 7}, 12, '*');");
@@ -140,7 +141,12 @@ test "postMessage JavaScript binding forwards explicit and same-origin default t
     try std.testing.expectEqual(@as(usize, 4), capture.calls);
     try std.testing.expectEqual(@as(u32, 41), capture.target_window_id);
     try std.testing.expectEqualStrings("*", capture.target_origin[0..capture.target_origin_len]);
-    try std.testing.expectEqualStrings("to parent", capture.message[0..capture.message_len]);
+    try std.testing.expectEqualStrings("\"to parent\"", capture.message[0..capture.message_len]);
+
+    _ = try js.evaluate(7, "window.postMessage('self', '*');");
+    try std.testing.expectEqual(@as(usize, 5), capture.calls);
+    try std.testing.expectEqual(@as(u32, 7), capture.target_window_id);
+    try std.testing.expectEqualStrings("*", capture.target_origin[0..capture.target_origin_len]);
 
     capture.reject_origin = true;
     const caught = try js.evaluate(
@@ -151,6 +157,25 @@ test "postMessage JavaScript binding forwards explicit and same-origin default t
             "targetSyntaxError;",
     );
     try std.testing.expect(caught.toBoolean());
+}
+
+test "postMessage round trips JSON-shaped strings without changing their type" {
+    const allocator = std.testing.allocator;
+    var environ = std.process.Environ.Map.init(allocator);
+    defer environ.deinit();
+    const js = try Js.init(allocator, std.testing.io, &environ);
+    defer js.deinit(allocator);
+    var capture = PostMessageCapture{};
+    js.setPostMessageCallback(0, PostMessageCapture.callback, &capture);
+    _ = try js.evaluate(
+        0,
+        "var received; window.addEventListener('message', function(e) { received = e.data; });",
+    );
+    inline for (.{ "'null'", "'42'", "'true'", "'{\"kind\":\"text\"}'" }) |source| {
+        _ = try js.evaluate(0, "window.postMessage(" ++ source ++ ", '*');");
+        try js.dispatchPostMessage(0, capture.message[0..capture.message_len], "https://source.example", 0);
+        try std.testing.expect((try js.evaluate(0, "typeof received === 'string' && received === " ++ source)).toBoolean());
+    }
 }
 
 test "postMessage restores JSON-shaped event data" {

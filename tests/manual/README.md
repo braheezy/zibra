@@ -69,7 +69,7 @@ tiers and baseline policy.
 | [`form-get.html`](form-get.html) | GET form encoding in the query with no POST body |
 | [`checkboxes.html`](checkboxes.html) | Attribute-backed toggle state and successful-control encoding |
 | [`new-input-types.html`](new-input-types.html) | Hidden layout/focus suppression and password masking with real submission value |
-| [`node-children.html`](node-children.html) | Fresh immediate Element-only `Node.children` arrays |
+| [`node-children.html`](node-children.html) | Stable live Element-only `children` collections across replacement and emptying |
 | [`dom-range-boundaries.html`](dom-range-boundaries.html) | Range ordering, containment, atomic validation, detached roots, and Selection document membership |
 | [`js-geometry.html`](js-geometry.html) | Synchronous layout readback, rectangle snapshots, hidden/detached boxes, CSS zoom, inline fragments, and measure-to-position interaction |
 | [`js-control-inline-geometry.html`](js-control-inline-geometry.html) | Native editor border/client boxes, clipping, zero sizes, zoom, and empty/whitespace-only inline insertion points |

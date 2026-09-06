@@ -13,6 +13,23 @@ is allocated from scanned uncollectable storage so the embedded Kiesel Agent is
 a collector root. Any Kiesel value reachable only from ordinary Zig memory
 still needs deliberate rooting.
 
+`src/script/gc_threads.zig` is the process collector-initialization boundary.
+Both `Js.init` and lock-taking host entry register the calling native thread
+before accessing Kiesel. Registration belongs to that OS thread until pthread
+exit, not to the host, realm, lock, or callback: an evaluated Value can remain
+live on the caller's stack after evaluation returns. Hosts may be destroyed on
+a different thread after their workers join; that thread must register too.
+The pthread destructor unregisters exactly the registrations Zibra owns,
+including GC's implicit initial registration when the first caller is a
+short-lived worker. Existing foreign registrations are borrowed. Initialization
+is serialized so multiple first-use callers cannot race Kiesel's init guard.
+This uses the same linked collector and allocation options as Kiesel, with no
+global collection disable or additional collector instance. Inability to
+establish safe tracing is fatal, like collector initialization itself.
+
+Thread registration only makes stacks visible; it does not serialize Agents,
+retain ordinary Zig heap containers, or permit asynchronous raw Value borrows.
+
 `JsLock` serializes evaluation and many callbacks. Preserve Kiesel GC-root and
 locking assumptions. A native callback entered while the lock is already held
 must use the explicit native-callback helpers rather than recursively entering
@@ -120,6 +137,12 @@ publishes an ID only during its synchronous callback and then passes that ID
 through the cache. Thus a node reached through document lookup, traversal,
 events, named ID globals, canvas, or a mutation result compares by JavaScript
 object identity. The cache is never shared across document Realms.
+
+The Realm also weakly caches one live `children` HTMLCollection per Node
+wrapper. Repeated reads return that same collection before and after mutation;
+each indexed/named/length query resolves the current child snapshot, never a
+retained native Node slice. `Array.from(collection)` remains an explicit static
+snapshot. The cache follows Realm retirement, not document-global identity.
 
 `dom_mutation.Context` is a synchronous borrow of one window's handle and
 detached-root stores. Its structural transactions stage allocations before

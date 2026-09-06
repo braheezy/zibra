@@ -3,6 +3,8 @@ How to verify:
 Open this page normally. The result below must become a green PASS message.
 The fixture deliberately interleaves text with two element children and nests
 a third element more deeply; Node.children must return only the first two.
+It then replaces those children: the same cached HTMLCollection must update,
+while an explicit Array.from snapshot keeps its original length.
 -->
 <!doctype html>
 <title>Node.children</title>
@@ -14,16 +16,26 @@ a third element more deeply; Node.children must return only the first two.
   <em id="second">second</em>
   trailing text
 </div>
-<p class="pass" style="display: none; color: green">PASS: immediate element children only</p>
+<p class="result" style="color: red">FAIL: live children collection checks did not finish</p>
 <script>
   var target = document.querySelectorAll(".fixture")[0];
   var elements = target.children;
-  var passed = elements.length === 2 &&
+  var snapshot = Array.from(elements);
+  var passed = elements instanceof HTMLCollection && elements === target.children &&
+    elements.length === 2 &&
     elements[0].getAttribute("id") === "first" &&
     elements[1].getAttribute("id") === "second" &&
     elements[0].children.length === 1 &&
     elements[0].children[0].getAttribute("id") === "nested";
+  target.innerHTML = 'text<i id="replacement">replacement</i>more text';
+  passed = passed && elements === target.children && elements.length === 1 &&
+    elements.item(0) === target.children[0] &&
+    elements.namedItem("replacement") === elements[0] && snapshot.length === 2;
+  target.innerHTML = '';
+  passed = passed && elements.length === 0 && elements.item(0) === null;
   if (passed) {
-    document.querySelectorAll(".pass")[0].setAttribute("style", "color: green");
+    var result = document.querySelectorAll(".result")[0];
+    result.textContent = "PASS: stable live element-only children collection";
+    result.setAttribute("style", "color: green");
   }
 </script>

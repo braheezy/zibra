@@ -44,6 +44,21 @@ arriving during a failed navigation also schedules reflow of the surviving
 page. Equal dimensions are a no-op; width and height changes invalidate media
 selection and retained layout through the existing resize boundary.
 
+### Collector registrations
+
+Zig-created workers do not pass through Boehm's pthread creation wrappers.
+`script/gc_threads.zig` registers every native thread entering a `Js` constructor
+or host lock and unregisters owned registrations via a pthread destructor before
+native exit. The first collector caller may itself be a temporary Tab worker;
+its implicit registration needs the same exit cleanup. Otherwise a later
+collection can attempt to suspend an already-dead native thread.
+
+Registration spans the OS-thread lifetime, including idle time after an
+evaluation returns, so caller-stack Values remain traceable. It is independent
+of Tab/Agent lifetime and does not replace the task-runner join or stable heap
+root contracts. A worker join also completes its registration destructor.
+Rendering/network helpers that never enter Kiesel need no registration.
+
 ### Raster-and-draw worker
 
 Every Browser embeds one `presentation_worker.Worker`, which owns the named
