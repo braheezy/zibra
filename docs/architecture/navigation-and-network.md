@@ -293,6 +293,34 @@ XHR `onerror` event. Same-origin XHR needs neither Origin nor response opt-in.
 CSP remains a request-side gate and may reject before transport. It applies to
 both requested and final iframe destinations and to all supported subresources.
 
+`browser/content_security_policy.zig` owns a copy of the response policy list
+and a cloned protected document URL. Its parsed source-list slices borrow that
+copy, not response/cache bytes or the document's mutable base URL. Frame
+replacement is transactional; navigation propagates allocation failure rather
+than loading an unprotected document. Navigation reset and Frame destruction
+retire the owner. Repeated HTTP headers are comma-joined before caching and
+enforced as an intersection; duplicate directives within one policy retain
+their first occurrence, including empty deny-all lists.
+
+Every request gate names a destination: parser/queued scripts use
+`script-src-elem` → `script-src` → `default-src`; linked stylesheets use
+`style-src-elem` → `style-src` → `default-src`; HTML/background images use
+`img-src`, XHR uses `connect-src`, and frames use `frame-src` → `child-src` →
+`default-src`. A present directive replaces its fallback, not unions with it.
+Same-origin and hostless URLs are not automatic exceptions. Source matching
+handles quoted `self`, deny-only lists, schemes, schemeless hosts, wildcard
+subdomains/ports, and case-sensitive percent-decoded path segments. Redirected
+frame checks retain scheme/host/port checks but omit the source path restriction.
+
+This remains a URL-request subset: meta-delivered policies, inline/attribute
+style and script checks, nonce/hash trust, violation events/reporting,
+`base-uri`, and `frame-ancestors` are not implemented. Script requests with
+`strict-dynamic` fail closed until trust metadata exists. Ordinary subresource
+redirect hops do not yet have CSP callbacks; do not claim full CSP enforcement.
+`test-csp` covers real loopback HTTP loading, blocked-request non-observation,
+and repeated-header intersection; the browser unit suite covers pure matching
+and owner replacement/failure cleanup.
+
 ## Cookies
 
 The `BrowserSession` tutorial jar owns one entry per normalized host. The jar

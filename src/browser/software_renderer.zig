@@ -138,6 +138,47 @@ test "straight-alpha web images preserve premultiplied surface invariants" {
     try std.testing.expect(over_opaque.b <= over_opaque.a);
 }
 
+test "translucent CSS primitives preserve alpha in direct transformed and layer raster" {
+    const allocator = std.testing.allocator;
+    var bounds = DisplayCompositor.init(allocator);
+    defer bounds.deinit();
+    var renderer = Renderer.init(allocator, allocator, std.testing.io, &bounds);
+    const color = display_commands.Color{ .r = 255, .g = 64, .b = 0, .a = 128 };
+    const items = [_]DisplayItem{
+        .{ .rect = .{ .x1 = 4, .y1 = 4, .x2 = 20, .y2 = 20, .color = color } },
+        .{ .rounded_rect = .{ .x1 = 4, .y1 = 4, .x2 = 20, .y2 = 20, .radius = 4, .color = color } },
+        .{ .quad = .{ .x1 = 4, .y1 = 4, .x2 = 20, .y2 = 4, .x3 = 20, .y3 = 20, .x4 = 4, .y4 = 20, .color = color } },
+        .{ .line = .{ .x1 = 4, .y1 = 12, .x2 = 20, .y2 = 12, .thickness = 4, .color = color } },
+        .{ .outline = .{ .rect = .{ .left = 4, .top = 4, .right = 20, .bottom = 20 }, .thickness = 4, .color = color } },
+    };
+    var surface = try z2d.Surface.init(.image_surface_rgba, allocator, 24, 24);
+    defer surface.deinit(allocator);
+    const pixels = try imageSurfacePixels(&surface);
+    for (0..3) |route| {
+        for (items) |item| {
+            @memset(pixels, .{ .r = 0, .g = 0, .b = 0, .a = 0 });
+            var context = z2d.Context.init(std.testing.io, allocator, &surface);
+            defer context.deinit();
+            switch (route) {
+                0 => try renderer.drawDisplayItemZ2dContext(&context, item, 0, 1),
+                1 => try renderer.drawDisplayItemZ2dContextWithTransform(&context, item, 0, 0, 1),
+                2 => try renderer.drawDisplayItemZ2dContextForLayer(&context, item, 0, 0, 1),
+                else => unreachable,
+            }
+            var painted = false;
+            for (pixels) |pixel| {
+                painted = painted or pixel.a > 0;
+                try std.testing.expect(pixel.r <= pixel.a and pixel.g <= pixel.a and pixel.b <= pixel.a);
+            }
+            try std.testing.expect(painted);
+            if (item == .rect) try std.testing.expectEqual(
+                z2d.pixel.RGBA{ .r = 128, .g = 32, .b = 0, .a = 128 },
+                pixels[12 * 24 + 12],
+            );
+        }
+    }
+}
+
 const RasterImageSource = struct {
     left: f64,
     top: f64,
@@ -802,12 +843,12 @@ pub const Renderer = struct {
                 if (alpha == 0) continue;
 
                 context.resetPath();
-                context.setSource(.{ .opaque_pattern = .{ .pixel = .{ .rgba = .{
+                context.setSource(.{ .opaque_pattern = .{ .pixel = .{ .rgba = (z2d.pixel.RGBA{
                     .r = pixels[src_idx + 0],
                     .g = pixels[src_idx + 1],
                     .b = pixels[src_idx + 2],
                     .a = @intCast(alpha),
-                } } } });
+                }).multiply() } } });
                 context.moveTo(@floatFromInt(x), @floatFromInt(y)) catch continue;
                 context.lineTo(@floatFromInt(x + 1), @floatFromInt(y)) catch continue;
                 context.lineTo(@floatFromInt(x + 1), @floatFromInt(y + 1)) catch continue;
@@ -1542,12 +1583,7 @@ pub const Renderer = struct {
 
                 if (width > 1 and height > 1 and bottom > 0 and top < context.surface.getHeight()) {
                     context.resetPath();
-                    context.setSource(.{ .opaque_pattern = .{ .pixel = .{ .rgba = .{
-                        .r = rect_item.color.r,
-                        .g = rect_item.color.g,
-                        .b = rect_item.color.b,
-                        .a = rect_item.color.a,
-                    } } } });
+                    context.setSource(.{ .opaque_pattern = .{ .pixel = .{ .rgba = rect_item.color.toZ2dRgba() } } });
                     try context.moveTo(@floatFromInt(left), @floatFromInt(top));
                     try context.lineTo(@floatFromInt(right), @floatFromInt(top));
                     try context.lineTo(@floatFromInt(right), @floatFromInt(bottom));
@@ -1648,12 +1684,7 @@ pub const Renderer = struct {
                 const x1 = self.scalePxWithZoom(l.x1, zoom) + x_offset;
                 const x2 = self.scalePxWithZoom(l.x2, zoom) + x_offset;
                 context.resetPath();
-                context.setSource(.{ .opaque_pattern = .{ .pixel = .{ .rgba = .{
-                    .r = l.color.r,
-                    .g = l.color.g,
-                    .b = l.color.b,
-                    .a = l.color.a,
-                } } } });
+                context.setSource(.{ .opaque_pattern = .{ .pixel = .{ .rgba = l.color.toZ2dRgba() } } });
                 context.setLineWidth(@floatFromInt(@max(1, self.scalePxWithZoom(l.thickness, zoom))));
                 try context.moveTo(@floatFromInt(x1), @floatFromInt(y1));
                 try context.lineTo(@floatFromInt(x2), @floatFromInt(y2));
@@ -1665,12 +1696,7 @@ pub const Renderer = struct {
                 const left = self.scalePxWithZoom(o.rect.left, zoom) + x_offset;
                 const right = self.scalePxWithZoom(o.rect.right, zoom) + x_offset;
                 context.resetPath();
-                context.setSource(.{ .opaque_pattern = .{ .pixel = .{ .rgba = .{
-                    .r = o.color.r,
-                    .g = o.color.g,
-                    .b = o.color.b,
-                    .a = o.color.a,
-                } } } });
+                context.setSource(.{ .opaque_pattern = .{ .pixel = .{ .rgba = o.color.toZ2dRgba() } } });
                 context.setLineWidth(@floatFromInt(@max(1, self.scalePxWithZoom(o.thickness, zoom))));
                 try context.moveTo(@floatFromInt(left), @floatFromInt(top));
                 try context.lineTo(@floatFromInt(right), @floatFromInt(top));

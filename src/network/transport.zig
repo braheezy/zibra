@@ -331,13 +331,16 @@ fn httpRequest(
                         );
                     };
                 } else if (std.ascii.eqlIgnoreCase(header.name, "content-security-policy")) {
+                    const trimmed = std.mem.trim(u8, header.value, " \t");
                     if (csp_header) |existing| {
+                        // Repeated enforced headers form an intersection, not
+                        // a last-header-wins replacement. Copy before retiring.
+                        const combined = try std.fmt.allocPrint(al, "{s}, {s}", .{ existing, trimmed });
                         al.free(existing);
+                        csp_header = combined;
+                    } else {
+                        csp_header = try al.dupe(u8, trimmed);
                     }
-                    const trimmed = std.mem.trim(u8, header.value, " ");
-                    const copy = try al.alloc(u8, trimmed.len);
-                    @memcpy(copy, trimmed);
-                    csp_header = copy;
                 } else if (request_origin != null and
                     std.ascii.eqlIgnoreCase(header.name, "access-control-allow-origin"))
                 {

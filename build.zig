@@ -564,6 +564,13 @@ pub fn build(b: *std.Build) !void {
     );
     wpt_runner_test_step.dependOn(&wpt_runner_tests.step);
 
+    const csp_loading_tests = b.addSystemCommand(&.{ "python3", "tests/test_csp_loading.py" });
+    csp_loading_tests.addArtifactArg(exe);
+    // Keep native fixture sessions serial with the other browser protocol tests.
+    if (previous_wpt_validation) |previous| csp_loading_tests.step.dependOn(previous);
+    const csp_test_step = b.step("test-csp", "Run loopback HTTP CSP loading and blocking regressions");
+    csp_test_step.dependOn(&csp_loading_tests.step);
+
     const docs_tests = b.addSystemCommand(&.{
         "python3",
         "tests/check_markdown_links.py",
@@ -600,5 +607,6 @@ pub fn build(b: *std.Build) !void {
     verify_step.dependOn(server_test_step);
     verify_step.dependOn(wpt_runner_test_step);
     verify_step.dependOn(wpt_test_step);
+    verify_step.dependOn(csp_test_step);
     verify_step.dependOn(docs_test_step);
 }

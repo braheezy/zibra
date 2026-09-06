@@ -57,6 +57,9 @@ before changing networking dispatch or teardown.
   an owned `access_control_allow_origin`; scalar policy/status fields own no
   storage. Preserve or improve this boundary—do not free by guesswork at a
   distant caller.
+- Repeated CSP response headers form a comma-separated policy list. Preserve
+  every policy through transport and cache; the Frame enforces their
+  intersection using destination-specific source directives.
 - The `Url.fetchBody*` compatibility boundary is browser-independent. Keep it
   free of SDL, tabs, and renderer concerns so inspection commands can reuse it.
   Caching and synchronization are explicitly supplied dependencies;

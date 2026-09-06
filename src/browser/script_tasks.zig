@@ -885,7 +885,7 @@ pub fn Contexts(comptime Browser: type, comptime DocumentHandle: type) type {
 
             defer resolved_url.free(allocator);
 
-            if (!frame.allowedRequest(resolved_url, frame.current_url)) {
+            if (!frame.allowedRequest(&resolved_url, .connect)) {
                 const target_host = resolved_url.host orelse "";
                 std.log.warn(
                     "Blocked XHR to {s}://{s}:{d} due to CSP",

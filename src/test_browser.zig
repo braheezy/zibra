@@ -2,6 +2,7 @@
 
 comptime {
     _ = @import("kiesel").builtins.reg_exp;
+    _ = @import("browser/root.zig");
     _ = @import("browser/document_lifecycle.zig");
     _ = @import("browser/wpt_session.zig");
     _ = @import("tests/browser_lifecycle.zig");
@@ -25,6 +26,7 @@ comptime {
     _ = @import("tests/browser_dynamic_resources.zig");
     _ = @import("tests/browser_networking.zig");
     _ = @import("tests/browser_security.zig");
+    _ = @import("tests/browser_csp.zig");
     _ = @import("tests/browser_cookies.zig");
     _ = @import("tests/browser_cors.zig");
     _ = @import("tests/browser_post_message.zig");

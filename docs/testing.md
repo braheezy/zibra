@@ -86,6 +86,10 @@ Run from the repository root:
   phases, and adjoining-margin/clearance flow under SDL dummy mode;
 - `zig build test-wpt-runner` for the dependency-free WPT manifest runner's
   protocol, expectation, diagnostic, and infrastructure-failure handling;
+- `zig build test-csp` for loopback HTTP destination-specific CSP checks,
+  allowed stylesheet/script/image/frame/XHR loading, and denied-request
+  non-observation. It runs after the local WPT protocol fixtures and uses the
+  same bounded browser-process supervisor;
 - `zig build test-wpt` for local headless synchronous PASS, Promise-job PASS,
   TIMEOUT, startup/error diagnostics, partial results, and Unicode JSONL
   fixtures, plus live JavaScript rectangles, client/offset box metrics,
@@ -116,8 +120,8 @@ Run from the repository root:
 
 `zig build verify` is the agent-oriented portable aggregate: build/install,
 format checking, the unified unit suite, focused-root compilation, DOM and
-pipeline goldens, local WPT runner/protocol checks, server tests, and Markdown
-links. Native visual goldens remain separate because they are
+pipeline goldens, local WPT runner/protocol and loopback CSP checks, server
+tests, and Markdown links. Native visual goldens remain separate because they are
 platform-dependent.
 
 The aggregate is intentionally not named `check`: language servers may run

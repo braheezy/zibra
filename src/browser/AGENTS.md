@@ -32,6 +32,7 @@ The nested [`render/AGENTS.md`](render/AGENTS.md) adds rendering-specific rules.
 | `presentation_worker.zig` | Raster runner, worker-only surfaces/cache, completed-result transfer, and joined teardown |
 | `tab.zig` | Serialized page work, render-phase orchestration, focus/accessibility state, and Frame-tree coordination |
 | `frame.zig` | One document generation: DOM/style/layout/display ownership, child Frames, hit testing, and default actions |
+| `content_security_policy.zig` | Frame-owned response policy list, source parsing, and destination-specific URL checks |
 | `history.zig` | Pointer-free owning joint root/iframe session history and traversal preparation |
 | `tab_animation.zig` | Transition/keyframe advancement and compositor-versus-layout/paint phase classification |
 | `session_state.zig` | Window-independent HTTP/cookie/cache and visited/bookmark state plus networking runner |
@@ -110,6 +111,9 @@ into either leaf module.
 - Each Frame owns its URL, decoded HTML, stylesheet source/rule/keyframe
   generation, layout pointer, display list, and child Frames. Raw parent,
   frame-element, focus/hover, and layout pointers borrow that generation.
+- Resource gates must name their CSP destination. Keep response policy sources
+  and the protected origin in the Frame's independent policy owner; never infer
+  permissions from a mutable base URL or automatically allow same-origin loads.
 - `frame.zig` is instantiated through a narrow comptime boundary so it can own
   Frame invariants without importing the Tab coordinator back through a cycle.
   Keep Frame-to-Tab calls synchronous and explicit; do not widen that boundary

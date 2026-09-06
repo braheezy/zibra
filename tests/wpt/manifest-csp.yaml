@@ -1,0 +1,5 @@
+# External stylesheet source matching. Upstream cases also require meta-delivered
+# CSP, getComputedStyle, and violation events; retain PASS expectations.
+tests:
+  - content-security-policy/style-src/style-src-star-allowed.html
+  - content-security-policy/style-src/style-src-none-blocked.html

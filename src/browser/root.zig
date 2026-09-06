@@ -243,7 +243,7 @@ const LiveDocumentLoadContext = struct {
         };
         defer script_url.free(self.browser.allocator);
 
-        if (!self.frame.allowedRequest(script_url, self.page_url)) {
+        if (!self.frame.allowedRequest(&script_url, .script)) {
             std.log.warn("Blocked parser script {s} due to CSP", .{src});
             return;
         }
@@ -402,7 +402,8 @@ const BackgroundImageLoadContext = struct {
 
 const BackgroundImageLoadCallbacks = struct {
     pub fn allowed(context: *BackgroundImageLoadContext, target: Url, base: *const Url) bool {
-        return context.frame.allowedRequest(target, base);
+        _ = base;
+        return context.frame.allowedRequest(&target, .image);
     }
 
     pub fn fetch(
@@ -427,7 +428,8 @@ const ImageLoadContext = struct {
 
 const ImageLoadCallbacks = struct {
     pub fn allowed(context: *ImageLoadContext, target: Url, base: *const Url) bool {
-        return context.frame.allowedRequest(target, base);
+        _ = base;
+        return context.frame.allowedRequest(&target, .image);
     }
 
     pub fn fetch(
@@ -2767,11 +2769,9 @@ pub const Browser = struct {
         frame.scroll = 0;
         tab.scroll_changed_in_tab = true;
 
-        frame.clearAllowedOrigins();
+        frame.clearContentSecurityPolicy();
         if (response.csp_header) |hdr| {
-            frame.applyContentSecurityPolicy(hdr, url.*) catch |err| {
-                std.log.warn("Failed to apply Content-Security-Policy: {}", .{err});
-            };
+            try frame.applyContentSecurityPolicy(hdr, url.*);
         }
 
         // Free previous HTML source if it exists
@@ -3127,7 +3127,7 @@ pub const Browser = struct {
         frame.focus = null;
         frame.scroll_focus = null;
 
-        frame.clearAllowedOrigins();
+        frame.clearContentSecurityPolicy();
     }
 
     pub fn loadInFrame(
@@ -3230,11 +3230,9 @@ pub const Browser = struct {
         frame.certificate_error = document.certificate_error;
         frame.referrer_policy = response.referrer_policy;
 
-        frame.clearAllowedOrigins();
+        frame.clearContentSecurityPolicy();
         if (response.csp_header) |hdr| {
-            frame.applyContentSecurityPolicy(hdr, url.*) catch |err| {
-                std.log.warn("Failed to apply Content-Security-Policy: {}", .{err});
-            };
+            try frame.applyContentSecurityPolicy(hdr, url.*);
         }
 
         try frame.html_sources.ensureUnusedCapacity(1);
@@ -3553,7 +3551,8 @@ pub const Browser = struct {
         final_destination: ?*const Url,
     ) bool {
         const destination = final_destination orelse return true;
-        return parent.allowedRequest(destination.*, page_url);
+        _ = page_url;
+        return parent.allowedFrameRedirect(destination);
     }
 
     /// Check both the authored target and any final redirect before an iframe
@@ -3565,7 +3564,7 @@ pub const Browser = struct {
         requested_destination: *const Url,
         final_destination: ?*const Url,
     ) bool {
-        return parent.allowedRequest(requested_destination.*, page_url) and
+        return parent.allowedRequest(requested_destination, .frame) and
             iframeRedirectAllowed(parent, page_url, final_destination);
     }
 
@@ -3690,11 +3689,9 @@ pub const Browser = struct {
         frame.current_url_owned = true;
         url_owned = false;
 
-        frame.clearAllowedOrigins();
+        frame.clearContentSecurityPolicy();
         if (response.csp_header) |hdr| {
-            frame.applyContentSecurityPolicy(hdr, iframe_url) catch |err| {
-                std.log.warn("Failed to apply iframe CSP: {}", .{err});
-            };
+            try frame.applyContentSecurityPolicy(hdr, iframe_url);
         }
 
         const raw_body = response.body;
@@ -3958,7 +3955,10 @@ pub const Browser = struct {
             var resource_url_owned = true;
             defer if (resource_url_owned) resource_url.free(self.allocator);
 
-            if (!frame.allowedRequest(resource_url, page_url)) {
+            if (!frame.allowedRequest(&resource_url, switch (kind) {
+                .script => .script,
+                .stylesheet => .stylesheet,
+            })) {
                 std.log.warn("Blocked {s} {s} due to CSP", .{ @tagName(kind), reference });
                 continue;
             }
@@ -5417,8 +5417,7 @@ pub const Browser = struct {
             },
             .rect, .quad, .rounded_rect, .line, .outline => {
                 const opacity = std.math.clamp(inherited_opacity, 0.0, 1.0);
-                var modified = item.withOpacity(opacity);
-                premultiplyDirectCommandColor(&modified);
+                const modified = item.withOpacity(opacity);
                 try self.software_renderer.drawDisplayItemZ2dContextWithTransform(
                     context,
                     modified,
@@ -5428,32 +5427,6 @@ pub const Browser = struct {
                 );
             },
             else => return error.UnsupportedDirectDisplayItem,
-        }
-    }
-
-    fn premultiplyDirectCommandColor(item: *DisplayItem) void {
-        const color = switch (item.*) {
-            .rect => |payload| payload.color,
-            .quad => |payload| payload.color,
-            .rounded_rect => |payload| payload.color,
-            .line => |payload| payload.color,
-            .outline => |payload| payload.color,
-            else => return,
-        };
-        const premultiplied = color.toZ2dRgba().multiply();
-        const replacement = Color{
-            .r = premultiplied.r,
-            .g = premultiplied.g,
-            .b = premultiplied.b,
-            .a = premultiplied.a,
-        };
-        switch (item.*) {
-            .rect => |*payload| payload.color = replacement,
-            .quad => |*payload| payload.color = replacement,
-            .rounded_rect => |*payload| payload.color = replacement,
-            .line => |*payload| payload.color = replacement,
-            .outline => |*payload| payload.color = replacement,
-            else => unreachable,
         }
     }
 

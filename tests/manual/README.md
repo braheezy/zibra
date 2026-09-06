@@ -152,6 +152,7 @@ tiers and baseline policy.
 | [`blur-filter.html`](blur-filter.html) | Blur order with clipping, opacity, and translation |
 | [`interest-region.html`](interest-region.html) | Bounded four-window-height raster cache across long-page scrolling/resizing |
 | [`background-color-transition.html`](background-color-transition.html) | RGBA interpolation and deterministic terminal state |
+| [`translucent-css.html`](translucent-css.html) | Straight CSS color to premultiplied raster conversion for plain, rounded, and transformed boxes |
 | [`easing-functions.html`](easing-functions.html) | Default ease and keyword timing differences |
 | [`composited-animations.html`](composited-animations.html) | Simultaneous opacity/translation and draw-only scrolling |
 | [`width-height-animations.html`](width-height-animations.html) | Layout-inducing dimensions and continuous line reflow |

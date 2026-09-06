@@ -64,6 +64,13 @@ geometry has local assertions, but transparent GIF painting and CDATA styles
 in navigated XHTML references remain unsupported. Do not count those local
 geometry assertions as upstream reftest passes.
 
+`manifest-csp.yaml` tracks external-style CSP tests. The response-header URL
+gate has deterministic coverage in `zig build test-csp`; these unchanged
+upstream cases also require meta-delivered policies and violation events.
+The wildcard case passes even without meta enforcement, while the deny case
+still times out waiting for a violation event. Do not interpret that partial
+result as full CSP conformance.
+
 `testharness` runs each selected file in a real headless browser session. When
 the upstream checkout is initialized, the runner starts WPT's `wptserve` on a
 temporary loopback port so root-relative resources such as

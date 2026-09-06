@@ -18,6 +18,7 @@ const JsRenderContext = @import("js_context.zig").JsRenderContext;
 const DisplayItem = @import("render/display_list.zig").DisplayItem;
 const ProtectedField = @import("../core/protected_field.zig").ProtectedField;
 const history = @import("history.zig");
+const csp = @import("content_security_policy.zig");
 
 const Url = url_module.Url;
 const Node = parser.Node;
@@ -237,7 +238,7 @@ pub fn FrameType(
         /// Independent from script/iframe discovery: synchronous style/layout
         /// reads may load stylesheets, but must never evaluate another Realm.
         stylesheets_dirty: bool = true,
-        allowed_origins: ?std.ArrayList([]const u8) = null,
+        content_security_policy: ?csp.Policy = null,
         children: std.ArrayList(*Frame),
 
         pub fn init(
@@ -477,7 +478,7 @@ pub fn FrameType(
             }
             self.css_texts.deinit(self.allocator);
 
-            self.clearAllowedOrigins();
+            self.clearContentSecurityPolicy();
 
             if (self.current_url_owned) {
                 if (self.current_url) |url_ptr| {
@@ -1192,120 +1193,29 @@ pub fn FrameType(
             }
         }
 
-        pub fn clearAllowedOrigins(self: *Frame) void {
-            if (self.allowed_origins) |*origins| {
-                for (origins.items) |origin| {
-                    self.allocator.free(origin);
-                }
-                origins.deinit(self.allocator);
-                self.allowed_origins = null;
-            }
+        pub fn clearContentSecurityPolicy(self: *Frame) void {
+            if (self.content_security_policy) |*policy| policy.deinit(self.allocator);
+            self.content_security_policy = null;
         }
 
-        fn allocLowercase(self: *Frame, text: []const u8) ![]const u8 {
-            const copy = try self.allocator.alloc(u8, text.len);
-            for (copy, 0..) |*ch, idx| {
-                ch.* = std.ascii.toLower(text[idx]);
-            }
-            return copy;
+        /// The target is a synchronous borrow. Permissions depend on request
+        /// destination, never on same-origin status alone or a mutable base URL.
+        pub fn allowedRequest(self: *const Frame, target: *const Url, destination: csp.Destination) bool {
+            const policy = if (self.content_security_policy) |*value| value else return true;
+            return policy.allows(target, destination, false);
         }
 
-        pub fn allowedRequest(self: *Frame, target_url: Url, base_url: ?*const Url) bool {
-            var page_url: ?Url = null;
-            if (base_url) |base| {
-                page_url = base.*;
-            } else if (self.current_url) |url_ptr| {
-                page_url = url_ptr.*;
-            }
-            if (page_url) |current| {
-                if (current.sameOrigin(target_url)) {
-                    return true;
-                }
-            }
-
-            const origins = self.allowed_origins orelse return true;
-
-            var origin_buffer: [256]u8 = undefined;
-            const host = target_url.host orelse return true;
-            const origin_str = std.fmt.bufPrint(&origin_buffer, "{s}://{s}:{d}", .{ target_url.scheme, host, target_url.port }) catch return false;
-
-            var lower_buffer: [256]u8 = undefined;
-            if (origin_str.len > lower_buffer.len) return false;
-            for (origin_str, 0..) |ch, idx| {
-                lower_buffer[idx] = std.ascii.toLower(ch);
-            }
-            const normalized = lower_buffer[0..origin_str.len];
-
-            for (origins.items) |allowed| {
-                if (allowed.len == normalized.len and std.mem.eql(u8, allowed, normalized)) {
-                    return true;
-                }
-            }
-
-            return false;
+        pub fn allowedFrameRedirect(self: *const Frame, target: *const Url) bool {
+            const policy = if (self.content_security_policy) |*value| value else return true;
+            return policy.allows(target, .frame, true);
         }
 
+        /// Transactional replacement: allocation failure preserves the previous
+        /// owner. Navigation must propagate failure before running the document.
         pub fn applyContentSecurityPolicy(self: *Frame, header: []const u8, base_url: Url) !void {
-            const whitespace = " \t\r\n";
-            var directives = std.mem.tokenizeScalar(u8, header, ';');
-            while (directives.next()) |directive_raw| {
-                const trimmed = std.mem.trim(u8, directive_raw, whitespace);
-                if (trimmed.len == 0) continue;
-
-                var tokens = std.mem.tokenizeScalar(u8, trimmed, ' ');
-                const directive_name = tokens.next() orelse continue;
-                if (!std.ascii.eqlIgnoreCase(directive_name, "default-src")) continue;
-
-                var origins_list = std.ArrayList([]const u8).empty;
-                var assigned = false;
-                errdefer {
-                    if (!assigned) {
-                        for (origins_list.items) |origin| self.allocator.free(origin);
-                        origins_list.deinit(self.allocator);
-                    }
-                }
-
-                while (tokens.next()) |origin_token| {
-                    const semicolon_trimmed = std.mem.trimEnd(u8, origin_token, ";\r\n \t");
-                    const trimmed_origin = std.mem.trim(u8, semicolon_trimmed, whitespace);
-                    if (trimmed_origin.len == 0) continue;
-
-                    if (std.ascii.eqlIgnoreCase(trimmed_origin, "'self'") or
-                        std.ascii.eqlIgnoreCase(trimmed_origin, "self"))
-                    {
-                        if (base_url.host) |host| {
-                            const normalized = try std.fmt.allocPrint(self.allocator, "{s}://{s}:{d}", .{
-                                base_url.scheme,
-                                host,
-                                base_url.port,
-                            });
-                            defer self.allocator.free(normalized);
-
-                            const lowered = try self.allocLowercase(normalized);
-                            try origins_list.append(self.allocator, lowered);
-                        }
-                        continue;
-                    }
-
-                    const origin_url = url_module.Url.init(self.allocator, trimmed_origin) catch |err| {
-                        std.log.warn("Failed to parse CSP origin {s}: {}", .{ trimmed_origin, err });
-                        continue;
-                    };
-                    defer origin_url.free(self.allocator);
-
-                    const host = origin_url.host orelse continue;
-
-                    const normalized = try std.fmt.allocPrint(self.allocator, "{s}://{s}:{d}", .{ origin_url.scheme, host, origin_url.port });
-                    defer self.allocator.free(normalized);
-
-                    const lowered = try self.allocLowercase(normalized);
-                    try origins_list.append(self.allocator, lowered);
-                }
-
-                self.allowed_origins = origins_list;
-                assigned = true;
-                return;
-            }
+            const replacement = try csp.Policy.init(self.allocator, header, &base_url);
+            self.clearContentSecurityPolicy();
+            self.content_security_policy = replacement;
         }
     };
 }

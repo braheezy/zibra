@@ -18,8 +18,10 @@ pub const Color = struct {
     b: u8,
     a: u8 = 255,
 
+    /// Commands store straight CSS colors; z2d sources require premultiplied
+    /// components. Convert exactly once at the raster boundary.
     pub fn toZ2dRgba(self: Color) z2d.pixel.RGBA {
-        return .{ .r = self.r, .g = self.g, .b = self.b, .a = self.a };
+        return (z2d.pixel.RGBA{ .r = self.r, .g = self.g, .b = self.b, .a = self.a }).multiply();
     }
 };
 

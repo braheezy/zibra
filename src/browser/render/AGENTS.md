@@ -141,6 +141,8 @@ modules over forwarding wrappers.
   owned slice before calling `paint_effects.wrapOwned`. When transferring the
   returned owning items into another list, reserve its capacity first and free
   only the now-empty top-level container after the transfer.
+- Commands keep straight CSS colors. `Color.toZ2dRgba` premultiplies exactly
+  once for z2d sources; direct, transformed, and layer paint must share it.
 - A direct child context that contains a float or positioned child may flatten
   one retained cache into the bounded phase sequence: negative positioned,
   static block backgrounds/borders, floats, inline/content, positioned

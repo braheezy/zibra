@@ -76,8 +76,8 @@ test "iframe CSP validates requested and final navigation destinations" {
     var parent: Tab.Frame = undefined;
     parent.allocator = allocator;
     parent.current_url = null;
-    parent.allowed_origins = null;
-    defer parent.clearAllowedOrigins();
+    parent.content_security_policy = null;
+    defer parent.clearContentSecurityPolicy();
     try parent.applyContentSecurityPolicy("default-src 'self'", page);
 
     try std.testing.expect(browser.Browser.iframeNavigationAllowed(

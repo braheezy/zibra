@@ -656,6 +656,13 @@ pure bounds calculator, but owns no SDL handle, thread, or command tree.
 Browser and presentation-worker code provide the surface lifetime and explicit
 zoom/offset inputs.
 
+Display-command colors and decoded web-image buffers use straight alpha;
+z2d source pixels and surfaces use premultiplied alpha. `Color.toZ2dRgba`
+converts at every primitive raster boundary, including transformed and layer
+paths. Do not premultiply those converted colors twice. Image/glyph sampling
+performs its own one-time conversion before source-over; effect surfaces stay
+premultiplied throughout composition.
+
 The worker keeps either a bounded assembled page surface or ordered compositor
 planes. The interest region is at most four native window heights. A viewport
 fully inside the published region can scroll by drawing cached pixels; crossing

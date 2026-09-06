@@ -555,9 +555,9 @@ pub fn deinit(self: *Tab) void {
     self.accessibility_polite_queue.deinit(self.allocator);
 }
 
-pub fn clearAllowedOrigins(self: *Tab) void {
+pub fn clearContentSecurityPolicy(self: *Tab) void {
     if (self.root_frame) |frame| {
-        frame.clearAllowedOrigins();
+        frame.clearContentSecurityPolicy();
     }
 }
 
