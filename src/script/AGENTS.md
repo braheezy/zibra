@@ -32,6 +32,11 @@ queued work and shutdown are documented in
   Preserve removed wrappers and refresh logical child/range views only after
   native replacement succeeds. Fragment source belongs to the Realm, not to
   a temporary parsing container or the former parent of a moved child.
+- `runtime/character_data.js` owns DOMString conversions, shared data replacement,
+  Text interfaces, splitting, and normalization. `character_data_bindings.zig`
+  stages native data and commits it inside the Realm mutation boundary. Keep
+  UTF-16 data independent of the UTF-8 rendering projection; repair live Range
+  points only after a successful native commit.
 - `runtime/document_accessors.js` owns shared live/detached Document root,
   head/body/title/referrer accessors, referrer-policy reflection, and
   HTMLTitleElement text semantics. Getters follow
@@ -194,7 +199,7 @@ queued work and shutdown are documented in
   `undefined`.
 - Range boundary points are synchronous Realm borrows. Detached fragments and
   comments are JavaScript-owned; extraction transfers fully selected native
-  nodes and uses `setNodeData` only for text splitting.
+  nodes and routes partial text edits through the shared CharacterData algorithm.
 
 `js.zig` remains large because it owns the realm/window lifecycle and several
 DOM bindings. Continue extracting cohesive binding domains behind narrow host

@@ -21,7 +21,9 @@ behavior. Navigation-owned stylesheet/resource generations are documented in
   resources are explicit owners. Do not retire backing text first.
 - Script-created text nodes duplicate their payload and mark it as owned so
   detached-node teardown can release it without confusing parser-borrowed
-  source slices for allocations.
+  source slices for allocations. Non-ASCII script text additionally owns exact
+  UTF-16 units; its UTF-8 bytes are a scalar projection, not the authoritative
+  DOMString. Move both owners together and retire layout before replacing them.
 - Children are Node values in resizable arrays. Never retain a child `*Node`
   across structural mutation unless the synchronous mutation transaction
   invalidates or rebinds every consumer before control escapes.

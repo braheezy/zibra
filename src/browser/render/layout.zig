@@ -4889,7 +4889,8 @@ fn handlePreformattedText(
         }
 
         var entity_buffer: [4]u8 = undefined;
-        if (lexEntityAt(content, position, &entity_buffer)) |entity| {
+        const encoded = if (node_ptr) |node| node.* != .text or node.text.character_references else true;
+        if (if (encoded) lexEntityAt(content, position, &entity_buffer) else null) |entity| {
             try self.processGrapheme(entity.replacement, line_buffer, node_ptr, .{
                 .is_superscript = self.is_superscript,
                 .is_small_caps = self.is_small_caps,
@@ -4980,7 +4981,8 @@ fn handleTextToken(
     while (i < content.len) {
         if (content[i] == '&') {
             var entity_buffer: [4]u8 = undefined;
-            if (lexEntityAt(content, i, &entity_buffer)) |entity| {
+            const encoded = if (node_ptr) |node| node.* != .text or node.text.character_references else true;
+            if (if (encoded) lexEntityAt(content, i, &entity_buffer) else null) |entity| {
                 try self.processNormalGrapheme(entity.replacement, line_buffer, node_ptr);
 
                 i += entity.len;
@@ -5179,6 +5181,7 @@ const InputLayout = struct {
     embed: EmbedLayout = .{},
     box: control_geometry.TextBox = .{},
     is_multiline: bool = false,
+    text_character_references: bool = false,
     text_ascent: i32 = 0,
     text_line_height: i32 = 0,
     font_size: i32 = 16,
@@ -5240,6 +5243,7 @@ const InputLayout = struct {
         } else if (self.is_multiline) {
             for (element.children.items) |child| if (child == .text) {
                 self.text = child.text.text;
+                self.text_character_references = child.text.character_references;
                 break;
             };
         } else if (std.mem.eql(u8, element.tag, "input")) {
@@ -5506,7 +5510,7 @@ const InputLayout = struct {
         const content_y = y + self.box.border.top + self.box.padding.top;
         var text_x = content_x;
         var text_y = content_y + if (self.is_multiline) @as(i32, 0) else @max(@divTrunc(self.box.content_height - self.text_line_height, 2), 0);
-        const decoded = if (self.is_multiline) try inline_format.decodeTextForDisplay(engine.allocator, self.text) else null;
+        const decoded = if (self.is_multiline and self.text_character_references) try inline_format.decodeTextForDisplay(engine.allocator, self.text) else null;
         defer if (decoded) |value| engine.allocator.free(value);
         const text = decoded orelse self.text;
         if (text.len > 0) {

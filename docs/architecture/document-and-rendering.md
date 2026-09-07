@@ -13,7 +13,13 @@ character references move into `Element.owned_strings`; DOM text stays
 source-backed and escaped because layout decodes it exactly once. Text's
 `character_references` flag distinguishes this representation from literal
 XML/script data independently of `owned_text`; DOM readback decodes only the
-former. Normalized fragment RCDATA can own encoded bytes. Preserve:
+former. Normalized fragment RCDATA can own encoded bytes. Script-created or
+mutated non-ASCII Text additionally owns `utf16_data`, preserving lone surrogates
+and UTF-16 offsets without feeding invalid UTF-8 to native rendering. Its `text`
+bytes are a scalar projection (unpaired surrogates become replacement characters
+for display). Both allocations move with the Text and retire together. DOM
+readback copies the authoritative units into traced Kiesel storage; element
+textContent concatenates DOMStrings without a lossy UTF-8 round trip. Preserve:
 
 - A navigated Frame owns parser input through `html_source.Store`. Its initial
   decoded response and any future parser-inserted chunks are independently
@@ -46,7 +52,10 @@ former. Normalized fragment RCDATA can own encoded bytes. Preserve:
 Live HTML serialization reads the current tree and attributes. Attribute names
 are emitted deterministically, values are quoted and escaped, ordinary closing
 tags are recursive, void elements omit children and closing tags, and
-source-backed DOM text is copied verbatim to avoid double escaping.
+source-backed DOM text is copied verbatim to avoid double escaping. Literal
+script-mutated text is escaped except under raw-text elements. Ordinary,
+preformatted, intrinsic-width, and textarea rendering consult the independent
+character-reference flag so literal `&amp;` is not decoded again.
 
 CSS `:before`/`:after` nodes are private, heap-stable Nodes owned by their
 host Element. They never enter authored child arrays, serialization, ID lookup,
@@ -211,6 +220,13 @@ Consumers must resolve it against the current Tab registry. A detached iframe
 may carry a stale ID.
 
 ## Structural mutation transaction
+
+CharacterData writes stage the entire new UTF-16/UTF-8 pair before invoking
+this boundary. They preserve every Node address and handle, but conservatively
+retire the existing layout/display borrowers before freeing old text slices.
+Completion sees the new data and dirty parent style (including `:empty`);
+detached writes do not notify the live Frame. This currently uses the full
+structural invalidation path, not a retained text-layout optimization.
 
 General structural mutation is a document-generation boundary, not ordinary
 style invalidation. Before child storage can move or retire:

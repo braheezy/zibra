@@ -1,0 +1,18 @@
+# Leaf text mutation coverage; dom/ is already default-allowlisted.
+tests:
+  - dom/nodes/CharacterData-data.html
+  - dom/nodes/CharacterData-appendData.html
+  - dom/nodes/CharacterData-insertData.html
+  - dom/nodes/CharacterData-deleteData.html
+  - dom/nodes/CharacterData-replaceData.html
+  - dom/nodes/CharacterData-substringData.html
+  - dom/nodes/CharacterData-surrogates.html
+  - dom/nodes/CharacterData-appendChild.html
+  - dom/nodes/CharacterData-remove.html
+  - dom/nodes/Text-constructor.html
+  - dom/nodes/Text-splitText.html
+  - dom/nodes/Text-wholeText.html
+  - dom/nodes/Node-normalize.html
+  - dom/ranges/Range-mutations-normalize.html
+crashtests:
+  - dom/crashtests/normalize-crash.html

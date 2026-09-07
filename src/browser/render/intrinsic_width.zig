@@ -72,9 +72,9 @@ fn measureImpl(node: *const dom.Node, fonts: *font.FontManager, scale: f64, incl
             const family = font.familyFromCss(value(text.style, "font-family", "sans-serif"));
             const raster_size = font.rasterSizeForCssPixels(size * scale);
             const space = try fonts.getStyledGlyph(" ", weight, slant, raster_size, family);
-            const decoded = try inline_format.decodeTextForDisplay(fonts.allocator, text.text);
-            defer fonts.allocator.free(decoded);
-            var words = std.mem.tokenizeAny(u8, decoded, " \t\r\n\x0c");
+            const decoded = try text.decoded(fonts.allocator);
+            defer if (decoded) |bytes| fonts.allocator.free(bytes);
+            var words = std.mem.tokenizeAny(u8, decoded orelse text.text, " \t\r\n\x0c");
             var result: Width = .{};
             if (std.ascii.isWhitespace(text.text[0])) result.leading_space = @floatFromInt(space.w);
             if (std.ascii.isWhitespace(text.text[text.text.len - 1])) result.trailing_space = @floatFromInt(space.w);

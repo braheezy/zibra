@@ -112,6 +112,7 @@ Run from the repository root:
   fixtures, plus live body replacement/title accessors, JavaScript rectangles,
   client/offset box metrics,
   context-sensitive HTML fragments and retained dynamic-markup identities,
+  CharacterData edits with live Range repair and synchronous text reflow,
   measure-to-position interaction, native-editor client clips, empty inline
   insertion points, and parser-boundary regressions.
   Captures are serial and process-watchdog bounded.

@@ -1,0 +1,53 @@
+<!-- How to verify: open this page. Expect green PASS, an expanded blue text
+     box, and literal &amp; in both rows below. Click Edit again: the text box
+     must grow and reflow without losing its Text node or live Range. -->
+<!doctype html>
+<html><head><title>CharacterData mutation</title>
+<style>
+body { font: 18px sans-serif; margin: 30px; }
+#box { display: inline-block; background: lightblue; }
+.literal { display: inline-block; font: 20px monospace; }
+</style></head><body>
+<h1 id="status">Running text mutation checks</h1>
+<p><span id="box">a</span></p>
+<p><span id="literal" class="literal"></span></p>
+<p><span id="reference" class="literal">&amp;amp;</span></p>
+<button id="edit">Edit again</button>
+<script>
+document.addEventListener('DOMContentLoaded', function() {
+  var results = [];
+  function check(name, callback) {
+    try { callback(); results.push({name:name,status:0}); }
+    catch (e) { results.push({name:name,status:1,message:String(e)}); }
+  }
+  function equal(a,b) { if (a !== b) throw Error(String(a)+' != '+String(b)); }
+  var box=document.getElementById('box'), text=box.firstChild, range=document.createRange();
+  range.selectNodeContents(text);
+  check('data mutation updates retained layout before synchronous measurement', function() {
+    var before=box.getBoundingClientRect().width;
+    text.appendData(' much longer text');
+    if (box.getBoundingClientRect().width <= before) throw Error('stale width');
+    equal(box.firstChild,text); equal(range.endOffset,1);
+  });
+  check('script text remains literal during layout and measurement', function() {
+    var literal=document.getElementById('literal'); literal.appendChild(new Text('&amp;'));
+    equal(literal.textContent,'&amp;');
+    equal(literal.getBoundingClientRect().width,document.getElementById('reference').getBoundingClientRect().width);
+  });
+  check('split and normalize preserve identity and range endpoints', function() {
+    range.setEnd(text,text.length);
+    var tail=text.splitText(2);
+    equal(range.endContainer,tail);
+    box.normalize();
+    equal(box.firstChild,text); equal(box.childNodes.length,1);
+    equal(range.endContainer,text); equal(range.endOffset,text.length);
+    equal(tail.parentNode,null);
+    if (!box.getBoundingClientRect().width) throw Error('missing final layout');
+  });
+  document.getElementById('edit').addEventListener('click',function() { text.appendData(' + edited'); });
+  var failures=results.filter(function(r){return r.status !== 0;}), status=document.getElementById('status');
+  status.textContent=failures.length ? 'FAIL: '+failures[0].name+': '+failures[0].message : 'PASS: CharacterData mutation';
+  status.style.color=failures.length ? 'red' : 'green';
+  if (typeof completion_callback === 'function') completion_callback(results,{status:0});
+});
+</script></body></html>

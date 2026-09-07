@@ -190,6 +190,10 @@ pub const Text = struct {
     /// independent of allocation ownership: XML and script-created text are
     /// already literal, while normalized RCDATA may own encoded storage.
     character_references: bool = false,
+    /// Authoritative script DOMString for non-ASCII data, including lone
+    /// surrogates. `text` remains a valid UTF-8 projection for native consumers.
+    /// Both allocations belong to this Text and move with its Node identity.
+    utf16_data: ?[]const u16 = null,
 
     pub fn init(text: []const u8, parent: ?*Node) Text {
         return .{
@@ -215,7 +219,13 @@ pub const Text = struct {
 
     pub fn deinit(self: *Text, allocator: std.mem.Allocator) void {
         if (self.style) |*styles| style_application.deinitStyleMap(StyleMap, styles, allocator);
+        self.deinitData(allocator);
+    }
+
+    /// Retire data only, after any layout borrowers have been invalidated.
+    pub fn deinitData(self: *Text, allocator: std.mem.Allocator) void {
         if (self.owned_text) allocator.free(self.text);
+        if (self.utf16_data) |units| allocator.free(units);
     }
 };
 

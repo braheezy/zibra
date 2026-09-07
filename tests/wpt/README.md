@@ -63,6 +63,34 @@ the result-collection tasks (`wpt`, `wpt-all`, `latest-results`, category runs,
 
 ### Focused compatibility manifests
 
+[`manifest-character-data.yaml`](manifest-character-data.yaml) checks Text and
+CharacterData mutations, DOMString conversions, surrogate splitting/rejoining,
+constructors, and normalization. The 2026-09-07 testharness comparison improved
+from 1/14 to 13/14 passing files and 34/188 to 187/188 assertions. The remaining failure
+is the iframe-global Text constructor, not data mutation. There were no errors,
+timeouts, crashes, or infrastructure failures in this focused run. The manifest
+also selects the existing `dom/crashtests/normalize-crash.html` case for
+`--mode all` or `--mode crashtest` runs. The final all-category run passed that
+crashtest too: 14/15 files passed, with the same one constructor assertion failing.
+
+[`manifest-character-data-ranges.yaml`](manifest-character-data-ranges.yaml)
+adds the generated live-Range mutation matrices. Run it with
+`--timeout-ms 60000`: upstream marks the setter matrix `timeout=long`, and the
+default 10-second cap interrupted progressing work. With the longer bounded
+budget, all six files and 5,400 assertions passed; the setter matrix completed
+in 46 seconds. These older tests catch mutation exceptions, so they can pass
+without an implemented method: always pair them with the direct mutation
+manifest and native/in-page regressions, not use them alone as feature proof.
+
+Both manifests are already covered by the default `dom` directory across all
+runnable categories; no duplicate default entries are needed. Reftests cannot
+establish DOMString identity or live Range positions. The local
+[`character-data.html`](../manual/character-data.html) fixture additionally
+checks real layout invalidation and literal-text measurement. Remaining limits
+include synthetic-only comments/CDATA/processing instructions, MutationObserver
+records, cross-Realm constructor semantics, and the full-layout invalidation
+cost of attached text writes. This is not a whole-domain dashboard score.
+
 [`manifest-html-fragments.yaml`](manifest-html-fragments.yaml) selects dynamic
 HTML insertion, replacement, conversion, and retained-child checks. All selected
 cases are already covered by the default `domparsing` directory or the explicit

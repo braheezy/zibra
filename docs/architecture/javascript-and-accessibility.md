@@ -287,10 +287,18 @@ teardown, and final machine-readable result wrapper.
 - TreeWalker keeps currentNode stable until a navigation method succeeds;
   child/sibling/parent navigation honors filter accept, reject, and skip
   results, while nextNode and previousNode traverse only within root.
-- Text topology is readable through `childNodes`, `nodeType`, `nodeName`,
-  `nodeValue`, `data`, and `textContent`. Text mutation and creation remain a
-  separate ownership/invalidation boundary because parser-created text borrows
-  document source storage.
+- `runtime/character_data.js` supplies CharacterData/Text/Comment prototypes,
+  data/length accessors, substring/append/insert/delete/replace methods,
+  `Text.splitText`, `wholeText`, and `Node.normalize`. String/unsigned-long
+  conversions precede the algorithm, which reads current data after possible
+  conversion side effects. Node's nullable nodeValue/textContent setters and
+  CharacterData's LegacyNullToEmptyString data setter share replacement but
+  differ for undefined. All offsets are UTF-16 code units.
+- `character_data_bindings.zig` stages independently owned data, retires live
+  layout borrowers through the existing mutation hooks, and replaces only the
+  native Text payload. Creation and mutation preserve exact non-ASCII UTF-16
+  units alongside a scalar UTF-8 rendering projection. Parser-backed readback
+  decodes supported character references once; literal DOM data never does.
 - `document.createElement` creates a lowercase-tagged, window-owned,
   heap-stable detached root.
 - `appendChild` and `insertBefore` transfer an eligible detached root, preserve
@@ -322,6 +330,12 @@ Range contextual fragments need a separate scripting-mode implementation.
 Text readback distinguishes HTML character-reference source from literal XML,
 raw script/style, and script-created data; it decodes the existing supported
 reference set into copied strings without changing renderer source storage.
+Comments, processing instructions, and CDATA remain synthetic wrapper-owned
+data, not first-class native parser/render nodes. They share CharacterData
+methods and Range repair, but this does not implement native comment/CDATA
+parsing, mutation-observer records, PI pseudo-attributes, or complete cross-Realm
+constructor/IDL semantics. Native HTML serialization still uses the scalar
+UTF-8 projection for unpaired surrogates.
 
 The complete structural transaction is documented in
 [`document-and-rendering.md`](document-and-rendering.md). Named ID globals are
@@ -448,11 +462,15 @@ their current parent/child relationships, so a range never retains a native
 DOM pointer across a callback. `DocumentFragment` and comment nodes are
 Realm-owned detached values; appending a fragment transfers its children, and
 extracting content preserves fully selected native node identities while
-cloning only partially selected structure. Text splitting uses the synchronous
-`setNodeData` binding and therefore stays within the active DOM mutation
-phase. Active ranges are adjusted when a containing subtree is removed, and
-text insertion remaps split-text offsets so boundary points continue to denote
-the same content. Structural mutation dirties sibling-sensitive selectors;
+cloning only partially selected structure. Partial extraction and Range
+insertion use the shared CharacterData replacement/split algorithms. Replacement
+clamps endpoints inside removed text and shifts later endpoints. Attached
+splits transfer later text endpoints to the new node and advance the exact
+parent boundary after the original; detached splits clamp in the original.
+Normalization merges only exclusive Text nodes, maps endpoints in merged nodes
+and parent child-index boundaries, and preserves removed wrappers. CDATA and
+comments are merge barriers; wholeText includes adjacent CDATA. Structural
+mutation dirties sibling-sensitive selectors;
 `getComputedStyle` readback invokes a Realm-scoped style-flush callback so a
 script observes the new computed value synchronously, while layout and paint
 remain scheduled work.
@@ -466,7 +484,7 @@ use the same strict ordering. `detach()` is inert and does not stop live
 removal adjustment. The current active-range list retains ranges until Realm
 retirement; it is not yet a weak live-range registry. Selection accepts only
 ranges rooted in its current document. This is still bounded Range support:
-complete CharacterData mutation repair, shadow trees, editing algorithms, and
+shadow trees, editing algorithms, and
 the full Web IDL interface surface remain separate work.
 
 The native DOM begins at an Element; bootstrap publishes that Element's

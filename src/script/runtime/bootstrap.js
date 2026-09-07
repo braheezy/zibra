@@ -15,14 +15,12 @@ function domException(name, message) {
 globalThis.Node = Node;
 globalThis.Element = Node;
 globalThis.HTMLElement = Node;
-globalThis.Text = Node;
-globalThis.Comment = Node;
 globalThis.Document = function Document() { return makeDetachedDocument(null); };
 globalThis.HTMLDocument = Document;
 globalThis.XMLDocument = function XMLDocument() {};
 globalThis.DocumentFragment = Node;
 globalThis.DocumentType = Node;
-globalThis.ProcessingInstruction = Node;
+initializeCharacterData();
 // NodeList uses an Array-shaped backing object so the JavaScript engine can
 // provide the standard indexed storage and iterator implementations.  The
 // prototype is distinct from Array.prototype, which makes selector results
@@ -196,6 +194,7 @@ function wrapNode(handle) {
   if (node) return node;
   node = new Node(handle);
   NODE_WRAPPERS[handle] = node;
+  initializeCharacterDataNode(node, __native.nodeType(handle));
   updateElementInterfaces(node);
   return node;
 }
@@ -949,7 +948,7 @@ Node.prototype.appendChild = function(child) {
   if (!child || (typeof child.handle !== 'number' && typeof child.nodeType !== 'number')) {
     throw new TypeError('appendChild requires a Node');
   }
-  if (this.nodeType === Node.TEXT_NODE || this.nodeType === Node.COMMENT_NODE || this.nodeType === Node.DOCUMENT_TYPE_NODE)
+  if (CHARACTER_DATA_BRAND.has(this) || this.nodeType === Node.DOCUMENT_TYPE_NODE)
     throw domException('HierarchyRequestError', 'This node type cannot have children');
   if (child.nodeType === Node.DOCUMENT_NODE)
     throw domException('HierarchyRequestError');
@@ -997,7 +996,7 @@ Node.prototype.insertBefore = function(child, reference) {
     }
     throw new TypeError('insertBefore requires a Node');
   }
-  if (this.nodeType === Node.TEXT_NODE || this.nodeType === Node.COMMENT_NODE || this.nodeType === Node.DOCUMENT_TYPE_NODE)
+  if (CHARACTER_DATA_BRAND.has(this) || this.nodeType === Node.DOCUMENT_TYPE_NODE)
     throw domException('HierarchyRequestError');
   if (child.nodeType === Node.ATTRIBUTE_NODE)
     throw domException('HierarchyRequestError');
@@ -1009,20 +1008,26 @@ Node.prototype.insertBefore = function(child, reference) {
   // Validate the reference while the source tree is still intact. The native
   // mutation boundary rejects a foreign reference, but detaching first would
   // otherwise turn a failed insertBefore into an observable partial move.
-  if (reference !== null && (!reference || typeof reference.handle !== 'number' || reference.parentNode !== this)) {
-    if (reference !== null && typeof reference.handle !== 'number') throw new TypeError('reference child must be a Node');
+  if (reference !== null && (!reference || !DOM_NODE_BRAND.has(reference) || reference.parentNode !== this)) {
+    if (!reference || !DOM_NODE_BRAND.has(reference)) throw new TypeError('reference child must be a Node');
     throw domException('NotFoundError');
   }
   if (child.parentNode && child.parentNode.removeChild) child.parentNode.removeChild(child);
-  var referenceHandle = reference === null ? null : reference && reference.handle;
-  __native.insertBefore(this.handle, child && child.handle, referenceHandle);
+  var index = reference === null ? this.childNodes.length : this.childNodes.indexOf(reference);
+  if (child.__synthetic && !this.__logicalChildren) this.__logicalChildren = this.childNodes.slice();
+  var nativeReference = reference;
+  while (nativeReference && nativeReference.__synthetic) nativeReference = nativeReference.nextSibling;
+  if (!child.__synthetic) __native.insertBefore(this.handle, child.handle, nativeReference ? nativeReference.handle : null);
   if (this.__logicalChildren) {
     var logicalIndex = reference ? this.__logicalChildren.indexOf(reference) : -1;
     if (logicalIndex < 0) this.__logicalChildren.push(child);
     else this.__logicalChildren.splice(logicalIndex, 0, child);
   }
   child.__rangeParent = this;
+  child.__ownerDocument = this.ownerDocument || document;
+  if (child.__synthetic) child.parentNode = this;
   if (this.__childNodeList) refreshNodeList(this.__childNodeList, childNodeValues(this));
+  adjustRangesForInsertion(this, index, 1);
   queueEmbeddedLoad(child);
   return child;
 };
@@ -1056,8 +1061,8 @@ Node.prototype.removeChild = function(child) {
   }
   if (child.parentNode !== this) throw domException('NotFoundError');
   var childIndex = this.childNodes.indexOf(child);
-  if (childIndex >= 0) adjustRangesForRemoval(this, child, childIndex);
   __native.removeChild(this.handle, child && child.handle);
+  if (childIndex >= 0) adjustRangesForRemoval(this, child, childIndex);
   if (this.__logicalChildren) {
     var logicalIndex = this.__logicalChildren.indexOf(child);
     if (logicalIndex >= 0) this.__logicalChildren.splice(logicalIndex, 1);
@@ -1314,11 +1319,16 @@ Object.defineProperty(Node.prototype, "namespaceURI", {
   get: function() { return 'http://www.w3.org/1999/xhtml'; }, enumerable: true, configurable: true
 });
 Object.defineProperty(Node.prototype, "nodeValue", {
-  get: function() { return __native.nodeValue(this.handle); }
+  get: function() { return CHARACTER_DATA_BRAND.has(this) ? characterDataValue(this) : __native.nodeValue(this.handle); },
+  set: function(value) {
+    checkedRangeNode(this);
+    var text = value == null ? '' : domDataString(value);
+    if (CHARACTER_DATA_BRAND.has(this)) replaceCharacterData(this, 0, characterDataValue(this).length, text);
+  }, enumerable: true, configurable: true
 });
 Object.defineProperty(Node.prototype, "data", {
   get: function() {
-    if (this.nodeType === Node.TEXT_NODE) return __native.nodeData(this.handle);
+    if (CHARACTER_DATA_BRAND.has(this)) return characterDataValue(this);
     var value = this.getAttribute ? (this.getAttribute('data') || '') : '';
     if ((this.tagName || '').toLowerCase() === 'object' && value &&
         !/^[A-Za-z][A-Za-z0-9+.-]*:/.test(value)) {
@@ -1330,17 +1340,22 @@ Object.defineProperty(Node.prototype, "data", {
     return value;
   },
   set: function(value) {
+    if (CHARACTER_DATA_BRAND.has(this)) {
+      var data = domDataString(value === null ? '' : value);
+      replaceCharacterData(this, 0, characterDataValue(this).length, data);
+      return;
+    }
     var text = value == null ? '' : value.toString();
-    if (this.nodeType === Node.TEXT_NODE) __native.setNodeData(this.handle, text);
-    else if (this.setAttribute) { this.setAttribute('data', text); queueEmbeddedLoad(this); }
+    if (this.setAttribute) { this.setAttribute('data', text); queueEmbeddedLoad(this); }
   }
 });
 Object.defineProperty(Node.prototype, "textContent", {
-  get: function() { return __native.textContent(this.handle); },
+  get: function() { return CHARACTER_DATA_BRAND.has(this) ? characterDataValue(this) : __native.textContent(this.handle); },
   set: function(value) {
-    var text = value == null ? '' : value.toString();
-    if (this.nodeType === Node.TEXT_NODE) {
-      this.data = text;
+    checkedRangeNode(this);
+    var text = value == null ? '' : domDataString(value);
+    if (CHARACTER_DATA_BRAND.has(this)) {
+      replaceCharacterData(this, 0, characterDataValue(this).length, text);
       return;
     }
     var children = this.childNodes.slice();
@@ -1669,9 +1684,6 @@ function makeSyntheticNode(type, name, value) {
     textContent: type === Node.COMMENT_NODE ? '' : (value || ''), childNodes: wrapNodeList([]), children: []
   };
   DOM_NODE_BRAND.add(node);
-  if (type === 3 || type === 4 || type === 7 || type === 8) {
-    Object.defineProperty(node, 'length', { get: function() { return this.data.length; }, enumerable: true });
-  }
   if (type === 7) Object.defineProperty(node, 'target', { value: name, enumerable: true });
   node.firstChild = null; node.lastChild = null; node.parentNode = null;
   Object.defineProperty(node, 'previousSibling', { get: function() {
@@ -1688,9 +1700,11 @@ function makeSyntheticNode(type, name, value) {
   node.cloneNode = Node.prototype.cloneNode;
   node.remove = Node.prototype.remove;
   node.hasChildNodes = Node.prototype.hasChildNodes;
+  node.normalize = Node.prototype.normalize;
   node.contains = Node.prototype.contains;
   node.compareDocumentPosition = Node.prototype.compareDocumentPosition;
   Object.defineProperty(node, 'ownerDocument', { get: function() { return this.__ownerDocument || document; }, enumerable: true });
+  initializeCharacterDataNode(node, type, value || '');
   return node;
 }
 
@@ -1736,6 +1750,7 @@ function makeDocumentFragment() {
     if (child.parentNode && child.parentNode.removeChild) child.parentNode.removeChild(child);
     index = fragment.childNodes.indexOf(reference);
     fragment.childNodes.splice(index, 0, child); child.__rangeParent = fragment; child.parentNode = fragment;
+    adjustRangesForInsertion(fragment, index, 1);
     fragment.firstChild = fragment.childNodes[0] || null;
     fragment.lastChild = fragment.childNodes[fragment.childNodes.length - 1] || null;
     fragment.children = fragment.childNodes.filter(function(n) { return n.nodeType === Node.ELEMENT_NODE; });
@@ -1752,7 +1767,10 @@ function makeDocumentFragment() {
     return child;
   };
   Object.defineProperty(fragment, 'textContent', { get: function() {
-    var result = ''; for (var i = 0; i < fragment.childNodes.length; i++) result += fragment.childNodes[i].textContent || '';
+    var result = ''; for (var i = 0; i < fragment.childNodes.length; i++) {
+      var child = fragment.childNodes[i];
+      if (child.nodeType === 1 || child.nodeType === 3 || child.nodeType === 4) result += child.textContent || '';
+    }
     return result;
   }});
   return fragment;
@@ -1914,6 +1932,7 @@ function makeDetachedDocument(root) {
   adoptOwnerDocument(root);
   if (root) { root.__rangeParent = doc; root.parentNode = doc; }
   doc.nodeType = Node.DOCUMENT_NODE;
+  doc.normalize = Node.prototype.normalize;
   doc.nodeName = '#document';
   doc.nodeValue = null;
   doc.textContent = null;
@@ -3034,7 +3053,8 @@ document.createEvent = function(type) {
     }
   };
   document.createTextNode = function(text) {
-    return wrapNode(__native.createTextNode(text == null ? '' : text.toString()));
+    requireDataArguments(arguments, 1);
+    return wrapNode(__native.createTextNode(domDataString(text)));
   };
   document.createAttribute = function(name) {
     var text = name == null ? '' : name.toString();
@@ -3042,7 +3062,8 @@ document.createEvent = function(type) {
     return makeAttribute(text, '', null);
   };
   document.createComment = function(text) {
-    return makeSyntheticNode(Node.COMMENT_NODE, '#comment', text == null ? '' : text.toString());
+    requireDataArguments(arguments, 1);
+    return makeSyntheticNode(Node.COMMENT_NODE, '#comment', domDataString(text));
   };
   if (!document.styleSheets) Object.defineProperty(document, 'styleSheets', {
     get: function() {
@@ -3059,6 +3080,7 @@ document.createEvent = function(type) {
   };
   document.createDocumentFragment = function() { return makeDocumentFragment(); };
   document.createRange = function() { return new Range(); };
+  document.normalize = Node.prototype.normalize;
   document.contains = Node.prototype.contains;
   document.compareDocumentPosition = Node.prototype.compareDocumentPosition;
   document.getSelection = function() { return selectionForWindow(window.__id); };

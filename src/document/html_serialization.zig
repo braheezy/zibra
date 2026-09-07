@@ -81,9 +81,29 @@ fn appendSerializedNode(
     node: anytype,
 ) !void {
     switch (node.*) {
-        // DOM text remains source-backed and escaped in this browser; copying
-        // it preserves the source spelling without double-escaping entities.
-        .text => |text| try output.appendSlice(allocator, text.text),
+        .text => |text| {
+            const raw = if (text.parent) |parent| parent.* == .element and isLiteralTextElementTag(parent.element.tag) else false;
+            if (text.character_references or raw) {
+                try output.appendSlice(allocator, text.text);
+            } else {
+                // Script mutations install literal text, not HTML source.
+                // Escaping here must not rewrite the stored DOMString.
+                var i: usize = 0;
+                while (i < text.text.len) : (i += 1) {
+                    if (std.mem.startsWith(u8, text.text[i..], "\xc2\xa0")) {
+                        try output.appendSlice(allocator, "&nbsp;");
+                        i += 1;
+                        continue;
+                    }
+                    switch (text.text[i]) {
+                        '&' => try output.appendSlice(allocator, "&amp;"),
+                        '<' => try output.appendSlice(allocator, "&lt;"),
+                        '>' => try output.appendSlice(allocator, "&gt;"),
+                        else => |byte| try output.append(allocator, byte),
+                    }
+                }
+            }
+        },
         .element => |element| {
             try output.append(allocator, '<');
             try output.appendSlice(allocator, element.tag);

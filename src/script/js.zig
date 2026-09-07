@@ -11,6 +11,7 @@ const dom_handles = @import("dom_handles.zig");
 const DomHandles = dom_handles.Store;
 const IdIssuer = dom_handles.IdIssuer;
 const dom_tree_bindings = @import("dom_tree_bindings.zig");
+const character_data_bindings = @import("character_data_bindings.zig");
 const dom_mutation = @import("dom_mutation.zig");
 const relocatable_identity = @import("../core/relocatable_identity.zig");
 const native_bindings = @import("native_bindings.zig");
@@ -301,6 +302,7 @@ storage_allocator: std.mem.Allocator,
 // shared realm. `Js` itself is heap-stable and outlives every native function.
 canvas_host: canvas_bindings.Host,
 dom_tree_host: dom_tree_bindings.Host,
+character_data_host: character_data_bindings.Host,
 geometry_host: geometry_bindings.Host,
 event_focus_host: event_focus_bindings.Host,
 network_host: network_bindings.Host,
@@ -362,6 +364,7 @@ pub fn init(
         .active_window = activeDomTreeWindow,
         .style_flush = flushBindingStyle,
     };
+    self.character_data_host = .{ .context = self, .active_mutation = activeCharacterDataMutation };
     self.event_focus_host = .{
         .context = self,
         .active_window = activeEventFocusWindow,
@@ -680,6 +683,7 @@ fn ensureRuntimeInitializedLocked(
     const runtime_code = @embedFile("runtime/bootstrap.js") ++ "\n" ++
         @embedFile("runtime/html_fragments.js") ++ "\n" ++
         @embedFile("runtime/document_accessors.js") ++ "\n" ++
+        @embedFile("runtime/character_data.js") ++ "\n" ++
         @embedFile("runtime/range.js") ++ "\n" ++ @embedFile("runtime/css_style.js") ++ "\n" ++ @embedFile("runtime/geometry.js");
     const runtime_script = try Script.parse(
         runtime_code,
@@ -1452,6 +1456,13 @@ fn domMutationContext(
             .request_render = requestDomMutationRender,
         },
     };
+}
+
+fn activeCharacterDataMutation(context: ?*anyopaque) ?dom_mutation.Context {
+    const self = hostFromMutationContext(context);
+    const window_id = self.current_window_id orelse return null;
+    const window = self.windows.get(window_id) orelse return null;
+    return self.domMutationContext(window_id, window);
 }
 
 fn hostFromMutationContext(context: ?*anyopaque) *Js {
@@ -4987,6 +4998,7 @@ fn setupDocument(self: *Js, realm: *Realm) !void {
         &dom_tree_bindings.bindings,
     );
     try native_bindings.installFunctions(&self.agent, realm, native, &self.geometry_host, &geometry_bindings.bindings);
+    try native_bindings.installFunctions(&self.agent, realm, native, &self.character_data_host, &character_data_bindings.bindings);
     try native_bindings.installFunctions(
         &self.agent,
         realm,
@@ -5625,24 +5637,23 @@ fn createTextNode(agent: *Agent, this_value: Value, arguments: kiesel.types.Argu
     const window = js_instance.windows.get(window_id) orelse return agent.throwException(.internal_error, "Missing window context", .{});
     _ = this_value;
     const arg = arguments.get(0);
-    const text = if (arg.isString())
-        try arg.asString().toUtf8(js_instance.allocator)
+    var staged = if (arg.isString())
+        try character_data_bindings.stageText(js_instance.allocator, arg.asString())
     else
         return agent.throwException(.type_error, "createTextNode requires a string", .{});
-    defer js_instance.allocator.free(text);
-    const owned = try js_instance.allocator.dupe(u8, text);
     var owned_live = true;
-    errdefer if (owned_live) js_instance.allocator.free(owned);
+    errdefer if (owned_live) staged.deinit(js_instance.allocator);
     const node = try js_instance.allocator.create(Node);
     var node_owned = true;
     errdefer if (node_owned) {
         node.deinit(js_instance.allocator);
         js_instance.allocator.destroy(node);
     };
-    node.* = .{ .text = .{ .text = owned, .parent = null, .owned_text = true } };
+    node.* = .{ .text = staged };
     owned_live = false;
+    try window.detached_nodes.ensureUnusedCapacity(1);
     const handle = try js_instance.getHandle(window, node);
-    try window.detached_nodes.put(node, {});
+    window.detached_nodes.putAssumeCapacity(node, {});
     node_owned = false;
     return Value.from(@as(f64, @floatFromInt(handle)));
 }

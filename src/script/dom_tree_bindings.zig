@@ -110,7 +110,6 @@ pub const bindings = [_]native_bindings.Binding{
     .{ .name = "tagName", .length = 1, .function = tagName },
     .{ .name = "nodeValue", .length = 1, .function = nodeValue },
     .{ .name = "nodeData", .length = 1, .function = nodeData },
-    .{ .name = "setNodeData", .length = 2, .function = setNodeData },
     .{ .name = "setChecked", .length = 2, .function = setChecked },
     .{ .name = "getChecked", .length = 1, .function = getChecked },
     .{ .name = "textContent", .length = 1, .function = textContent },
@@ -521,34 +520,7 @@ fn nodeData(agent: *Agent, this_value: Value, arguments: Arguments) Agent.Error!
 }
 
 fn copiedText(agent: *Agent, text: parser.Text) Agent.Error!Value {
-    const decoded = try text.decoded(agent.gc_allocator);
-    defer if (decoded) |bytes| agent.gc_allocator.free(bytes);
-    return copiedString(agent, decoded orelse text.text);
-}
-
-/// Replace the bytes of a script-created or parser text node.  Range
-/// extraction uses this to split text nodes without rebuilding their parent
-/// (which would invalidate every handle in the subtree).
-fn setNodeData(agent: *Agent, this_value: Value, arguments: Arguments) Agent.Error!Value {
-    _ = this_value;
-    const host = activeHost(agent);
-    const window = try requireWindow(agent);
-    const node = try requireNode(agent, window, arguments.get(0));
-    const value = arguments.get(1);
-    if (!value.isString()) return agent.throwException(.type_error, "setNodeData requires a string", .{});
-    const bytes = try value.asString().toUtf8(host.allocator);
-    defer host.allocator.free(bytes);
-    switch (node.*) {
-        .element => return agent.throwException(.type_error, "setNodeData requires a text node", .{}),
-        .text => |*text| {
-            const owned = try host.allocator.dupe(u8, bytes);
-            if (text.owned_text) host.allocator.free(text.text);
-            text.text = owned;
-            text.owned_text = true;
-            text.character_references = false;
-        },
-    }
-    return .undefined;
+    return Value.from(try @import("character_data_bindings.zig").copyText(agent, text));
 }
 
 /// Set live checkbox/radio state without changing the content attribute.
@@ -586,11 +558,17 @@ fn textContent(agent: *Agent, this_value: Value, arguments: Arguments) Agent.Err
     _ = this_value;
     const window = try requireWindow(agent);
     const node = try requireNode(agent, window, arguments.get(0));
-    var text = std.ArrayList(u8).empty;
+    var text = kiesel.types.String.Builder.empty;
     defer text.deinit(agent.gc_allocator);
-    try appendTextContent(node, &text, agent.gc_allocator);
-    const owned = try text.toOwnedSlice(agent.gc_allocator);
-    return Value.from(try kiesel.types.String.fromUtf8(agent, owned));
+    try appendDomString(agent, node, &text);
+    return Value.from(try text.build(agent));
+}
+
+fn appendDomString(agent: *Agent, node: *const Node, output: *kiesel.types.String.Builder) Agent.Error!void {
+    switch (node.*) {
+        .text => |text| try output.appendString(agent.gc_allocator, try @import("character_data_bindings.zig").copyText(agent, text)),
+        .element => |element| for (element.children.items) |*child| try appendDomString(agent, child, output),
+    }
 }
 
 /// Return the last published CSS value for an element.  The style phase owns

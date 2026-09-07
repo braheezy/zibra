@@ -1,0 +1,11 @@
+# Additional live-Range coverage. Pair with manifest-character-data.yaml:
+# these older tests catch mutation exceptions and alone cannot prove support.
+tests:
+  - dom/ranges/Range-mutations-appendData.html
+  - dom/ranges/Range-mutations-insertData.html
+  - dom/ranges/Range-mutations-deleteData.html
+  - dom/ranges/Range-mutations-replaceData.html
+  # Upstream marks this generated setter matrix timeout=long. Run this
+  # focused manifest with --timeout-ms 60000; the default cap is 10 seconds.
+  - dom/ranges/Range-mutations-dataChange.html
+  - dom/ranges/Range-mutations-splitText.html

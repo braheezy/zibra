@@ -3,6 +3,43 @@
 // native DOM storage and its mutation transactions remain owned by __native.
 
 var ACTIVE_RANGES = [];
+function forEachRangePoint(callback) {
+  for (var i = 0; i < ACTIVE_RANGES.length; i++) {
+    callback(ACTIVE_RANGES[i], 'start'); callback(ACTIVE_RANGES[i], 'end');
+  }
+}
+function adjustRangesForData(node, offset, count, added) {
+  forEachRangePoint(function(range, side) {
+    if (range[side + 'Container'] !== node) return;
+    var position = range[side + 'Offset'];
+    if (position > offset && position <= offset + count) range[side + 'Offset'] = offset;
+    else if (position > offset + count) range[side + 'Offset'] += added - count;
+  });
+}
+function adjustRangesForInsertion(parent, index, count) {
+  forEachRangePoint(function(range, side) {
+    if (range[side + 'Container'] === parent && range[side + 'Offset'] > index)
+      range[side + 'Offset'] += count;
+  });
+}
+function adjustRangesForSplit(node, tail, offset, parent, index) {
+  forEachRangePoint(function(range, side) {
+    var container = range[side + 'Container'], position = range[side + 'Offset'];
+    if (container === node && position > offset) {
+      range[side + 'Container'] = tail; range[side + 'Offset'] = position - offset;
+    } else if (container === parent && position === index + 1) range[side + 'Offset']++;
+  });
+}
+function adjustRangesForMerge(node, sibling, parent, index, length) {
+  forEachRangePoint(function(range, side) {
+    var container = range[side + 'Container'];
+    if (container === sibling) {
+      range[side + 'Container'] = node; range[side + 'Offset'] += length;
+    } else if (container === parent && range[side + 'Offset'] === index) {
+      range[side + 'Container'] = node; range[side + 'Offset'] = length;
+    }
+  });
+}
 function adjustRangesForRemoval(parent, child, index) {
   for (var rangeIndex = 0; rangeIndex < ACTIVE_RANGES.length; rangeIndex++) {
     var range = ACTIVE_RANGES[rangeIndex];
@@ -164,7 +201,7 @@ function cloneRangeNode(range, node, extract, fragment) {
     } else if (extract && child.nodeType === Node.TEXT_NODE && selected && child.parentNode) {
       var from = range.startContainer === child ? range.startOffset : 0;
       var to = range.endContainer === child ? range.endOffset : (child.data || '').length;
-      __native.setNodeData(child.handle, (child.data || '').slice(0, from) + (child.data || '').slice(to));
+      child.deleteData(from, to - from);
     }
   }
   return clone.childNodes.length ? clone : (rangeIntersects(range, node) ? clone : null);
@@ -185,8 +222,7 @@ function extractRangeNode(range, node) {
     var end = range.endContainer === node ? range.endOffset : (node.data || '').length;
     if (end <= start) return null;
     var selected = (node.data || '').slice(start, end);
-    if (node.handle) __native.setNodeData(node.handle, (node.data || '').slice(0, start) + (node.data || '').slice(end));
-    else { node.data = (node.data || '').slice(0, start) + (node.data || '').slice(end); node.textContent = node.data; }
+    node.deleteData(start, end - start);
     return document.createTextNode(selected);
   }
   var clone = shallowCloneNode(node);
@@ -254,9 +290,25 @@ Range.prototype.cloneRange = function() { var r = new Range(); r.startContainer 
 // Legacy no-op: detach must not stop mutation adjustment or disable queries.
 Range.prototype.detach = function() { checkedRange(this); };
 Range.prototype.cloneContents = function() { var f = makeDocumentFragment(); var root = this.commonAncestorContainer; if (root.nodeType === Node.TEXT_NODE) { var start = this.startContainer === root ? this.startOffset : 0; var end = this.endContainer === root ? this.endOffset : (root.data || '').length; if (end > start) f.appendChild(document.createTextNode((root.data || '').slice(start, end))); return f; } var children = nodeChildrenForRange(root); for (var i = 0; i < children.length; i++) { var c = cloneRangeNode(this, children[i], false, f); if (c) f.appendChild(c); } return f; };
-Range.prototype.extractContents = function() { var f = makeDocumentFragment(); var root = this.commonAncestorContainer; if (root.nodeType === Node.TEXT_NODE) { var start = this.startContainer === root ? this.startOffset : 0; var end = this.endContainer === root ? this.endOffset : (root.data || '').length; if (end > start) { f.appendChild(document.createTextNode((root.data || '').slice(start, end))); if (root.handle) __native.setNodeData(root.handle, (root.data || '').slice(0, start) + (root.data || '').slice(end)); } this.collapse(true); return f; } var children = nodeChildrenForRange(root).slice(); for (var i = 0; i < children.length; i++) { var extracted = extractRangeNode(this, children[i]); if (extracted) f.appendChild(extracted); } this.collapse(true); return f; };
+Range.prototype.extractContents = function() { var f = makeDocumentFragment(); var root = this.commonAncestorContainer; if (root.nodeType === Node.TEXT_NODE) { var start = this.startContainer === root ? this.startOffset : 0; var end = this.endContainer === root ? this.endOffset : (root.data || '').length; if (end > start) { f.appendChild(document.createTextNode((root.data || '').slice(start, end))); root.deleteData(start, end - start); } this.collapse(true); return f; } var children = nodeChildrenForRange(root).slice(); for (var i = 0; i < children.length; i++) { var extracted = extractRangeNode(this, children[i]); if (extracted) f.appendChild(extracted); } this.collapse(true); return f; };
 Range.prototype.deleteContents = function() { this.extractContents(); };
-Range.prototype.insertNode = function(node) { var container = this.startContainer; if (container.nodeType === Node.TEXT_NODE) { var parent = nodeParentForRange(container); if (!parent) return; var splitOffset = this.startOffset, before = container.data.slice(0, splitOffset), after = container.data.slice(splitOffset); __native.setNodeData(container.handle, before); var tail = document.createTextNode(after); var reference = container.nextSibling; if (node !== reference) parent.insertBefore(node, reference); var afterNode = node.nextSibling; if (afterNode) parent.insertBefore(tail, afterNode); else parent.appendChild(tail); if (this.startContainer === container) { if (this.startOffset === splitOffset) { this.startContainer = node; this.startOffset = 0; } else if (this.startOffset > splitOffset) { this.startContainer = tail; this.startOffset -= splitOffset; } } if (this.endContainer === container) { if (this.endOffset > splitOffset) { this.endContainer = tail; this.endOffset -= splitOffset; } else if (this.endOffset === splitOffset) { this.endContainer = node; this.endOffset = 0; } } return; } var children = nodeChildrenForRange(container), reference = children[this.startOffset] || null; if (reference) container.insertBefore(node, reference); else container.appendChild(node); };
+Range.prototype.insertNode = function(node) {
+  checkedRange(this); checkedRangeNode(node);
+  var container = this.startContainer, text = isTextNode(container);
+  if (container.nodeType === 7 || container.nodeType === 8 || node === container ||
+      (text && !nodeParentForRange(container))) throw domException('HierarchyRequestError');
+  var parent = text ? nodeParentForRange(container) : container;
+  if (isAncestorNode(node, parent) || node.nodeType === 2 || node.nodeType === 9)
+    throw domException('HierarchyRequestError');
+  var wasCollapsed = this.collapsed;
+  var reference = text ? container.splitText(this.startOffset) : nodeChildrenForRange(container)[this.startOffset] || null;
+  if (reference === node) reference = reference.nextSibling;
+  if (node.parentNode) node.parentNode.removeChild(node);
+  var newOffset = reference ? nodeIndexInParent(reference) : nodeChildrenForRange(parent).length;
+  newOffset += node.nodeType === 11 ? node.childNodes.length : 1;
+  parent.insertBefore(node, reference);
+  if (wasCollapsed) { this.endContainer = parent; this.endOffset = newOffset; }
+};
 Range.prototype.surroundContents = function(node) {
   if (this.startContainer && this.startContainer.nodeType === Node.COMMENT_NODE || this.endContainer && this.endContainer.nodeType === Node.COMMENT_NODE) throw { code: 1 };
   if (this.commonAncestorContainer && this.commonAncestorContainer.nodeType === Node.DOCUMENT_NODE && !this.collapsed) throw { code: 3, HIERARCHY_REQUEST_ERR: 3 };

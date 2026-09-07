@@ -160,8 +160,9 @@ pub fn lexEntityAt(text: []const u8, pos: usize, buffer: *[4]u8) ?Entity {
     return .{ .replacement = buffer[0..encoded_len], .len = reference.len };
 }
 
-/// Decode text exactly as the layout text walkers do. DOM text intentionally
-/// remains source-backed and escaped; the returned bytes are allocator-owned.
+/// Decode encoded HTML source text into allocator-owned bytes. Callers holding
+/// a DOM Text must consult its character_references flag before using this on
+/// literal script/XML data.
 pub fn decodeTextForDisplay(allocator: std.mem.Allocator, text: []const u8) ![]u8 {
     var output = std.ArrayList(u8).empty;
     errdefer output.deinit(allocator);
