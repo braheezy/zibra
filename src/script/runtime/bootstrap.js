@@ -15,7 +15,7 @@ function domException(name, message) {
 globalThis.Node = Node;
 globalThis.Element = Node;
 globalThis.HTMLElement = Node;
-globalThis.Document = function Document() { return makeDetachedDocument(null); };
+globalThis.Document = function Document() { return makeDetachedDocument(null, 'application/xml'); };
 globalThis.HTMLDocument = Document;
 globalThis.XMLDocument = function XMLDocument() {};
 globalThis.DocumentFragment = Node;
@@ -60,6 +60,7 @@ Attr.prototype.constructor = Attr;
  'HTMLCanvasElement', 'HTMLImageElement', 'HTMLIFrameElement', 'HTMLObjectElement',
  'HTMLScriptElement', 'HTMLStyleElement', 'HTMLLinkElement', 'HTMLMetaElement']
   .forEach(function(name) { globalThis[name] = Node; });
+initializeDataset();
 initializeDocumentAccessors();
 function DOMException(message, name) {
   this.message = message == null ? '' : String(message);
@@ -896,21 +897,31 @@ globalThis.__dispatchInlineEventHandler = function(handle, type, handler, bubble
 
 // Add getAttribute method to Node prototype
 Node.prototype.getAttribute = function(name) {
-  return __native.getAttribute(this.handle, name);
+  checkedRangeNode(this);
+  if (!arguments.length) throw new TypeError('Missing attribute name');
+  return __native.getAttribute(this.handle, attributeName(this, name));
 };
 
 // Add setAttribute method to Node prototype
 Node.prototype.setAttribute = function(name, value) {
-  var text = value == null ? "" : value.toString();
+  checkedRangeNode(this);
+  if (arguments.length < 2) throw new TypeError('Missing attribute name or value');
+  name = domDataString(name);
+  var text = domDataString(value);
+  validateAttributeName(name);
+  name = attributeName(this, name);
   if (__native.setAttribute(this.handle, name, text)) {
     resetCanvasContextState(this.handle);
   }
 };
 Node.prototype.hasAttribute = function(name) {
+  if (!arguments.length) throw new TypeError('Missing attribute name');
   return this.getAttribute(name) !== null;
 };
 Node.prototype.removeAttribute = function(name) {
-  __native.removeAttribute(this.handle, name == null ? '' : name.toString());
+  checkedRangeNode(this);
+  if (!arguments.length) throw new TypeError('Missing attribute name');
+  __native.removeAttribute(this.handle, attributeName(this, name));
 };
 Node.prototype.hasChildNodes = function() {
   return this.childNodes.length !== 0;
@@ -1916,8 +1927,9 @@ Selection.prototype.toString = function() { return this.__range ? this.__range.t
 globalThis.Selection = Selection;
 globalThis.getSelection = function() { return selectionForWindow(window.__id); };
 
-function makeDetachedDocument(root) {
+function makeDetachedDocument(root, contentType) {
   var doc = {};
+  doc.contentType = contentType || 'text/html';
   DOM_NODE_BRAND.add(doc);
   if (Object.setPrototypeOf) Object.setPrototypeOf(doc, Document.prototype);
   function adoptOwnerDocument(node) {
@@ -2864,6 +2876,7 @@ globalThis.__runXHROnload = function(body, handle) {
   DOM_NODE_BRAND.add(document);
   Object.setPrototypeOf(document, Document.prototype);
   document.nodeType = Node.DOCUMENT_NODE;
+  document.contentType = 'text/html';
   document.nodeName = '#document';
   document.nodeValue = null;
   document.textContent = null;
@@ -3004,7 +3017,7 @@ document.createEvent = function(type) {
   document.implementation = {
     createDocument: function(ns, qualifiedName, doctype) {
       var root = qualifiedName ? document.createElementNS(ns, qualifiedName) : null;
-      var result = makeDetachedDocument(root);
+      var result = makeDetachedDocument(root, 'application/xml');
       if (doctype) {
         if (doctype.parentNode && doctype.parentNode.removeChild) doctype.parentNode.removeChild(doctype);
         result.__documentChildren.unshift(doctype);

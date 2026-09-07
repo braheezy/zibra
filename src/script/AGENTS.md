@@ -37,6 +37,10 @@ queued work and shutdown are documented in
   stages native data and commits it inside the Realm mutation boundary. Keep
   UTF-16 data independent of the UTF-8 rendering projection; repair live Range
   points only after a successful native commit.
+- `runtime/dataset.js` owns live, cached `DOMStringMap` views and attribute-name
+  conversion/validation. Proxies retain canonical wrappers, not attribute
+  snapshots or native pointers. Writes/deletes use the existing native
+  attribute mutation path so selector invalidation cannot be bypassed.
 - `runtime/document_accessors.js` owns shared live/detached Document root,
   head/body/title/referrer accessors, referrer-policy reflection, and
   HTMLTitleElement text semantics. Getters follow
@@ -173,7 +177,8 @@ queued work and shutdown are documented in
   snapshots; `children` caches one such view per Node wrapper, preserving
   identity across mutations without caching the result elements.
   The current `attributes` records remain lightweight snapshots
-  until native Attr identity and ordering are complete. These views expose
+  until native Attr identity is complete. Attribute order comes from the
+  Element's ordered map, not from the wrapper. These views expose
   authored children only and never generated pseudo boxes.
 - Asynchronous callbacks carry copied generation-stamped document handles and
   own every URL, message, policy, body, and string they retain. Never queue a

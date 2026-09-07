@@ -195,7 +195,7 @@ test "SVG timeline shares nested time, invalidates viewport size and clears remo
     var raster = try svg.render(allocator, std.testing.io, icon, .{});
     defer raster.deinit(allocator);
     try std.testing.expectEqualSlices(u8, &.{ 0, 0, 255, 255 }, raster.rawBytes()[(10 * 80 + 10) * 4 ..][0..4]);
-    try std.testing.expect(find(&root, "grow").?.element.attributes.?.remove("attributename"));
+    try std.testing.expect(find(&root, "grow").?.element.attributes.?.orderedRemove("attributename"));
     try std.testing.expect(!tab_animation.advance(sink, &root));
     try std.testing.expectEqual(@as(i32, 40), svg_inline.size(icon, .{}).width);
     try std.testing.expectEqual(@as(usize, 4), effects.layouts);

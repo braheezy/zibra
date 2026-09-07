@@ -684,6 +684,7 @@ fn ensureRuntimeInitializedLocked(
         @embedFile("runtime/html_fragments.js") ++ "\n" ++
         @embedFile("runtime/document_accessors.js") ++ "\n" ++
         @embedFile("runtime/character_data.js") ++ "\n" ++
+        @embedFile("runtime/dataset.js") ++ "\n" ++
         @embedFile("runtime/range.js") ++ "\n" ++ @embedFile("runtime/css_style.js") ++ "\n" ++ @embedFile("runtime/geometry.js");
     const runtime_script = try Script.parse(
         runtime_code,
@@ -5286,8 +5287,7 @@ fn getAttribute(agent: *Agent, this_value: Value, arguments: kiesel.types.Argume
         .element => |e| {
             if (e.attributes) |attrs| {
                 if (attrs.get(attr_name)) |value| {
-                    // Convert the attribute value to a JavaScript string
-                    const js_string = try kiesel.types.String.fromUtf8(agent, value);
+                    const js_string = try kiesel.types.String.fromUtf8(agent, try agent.gc_allocator.dupe(u8, value));
                     return Value.from(js_string);
                 }
             }
@@ -5301,10 +5301,8 @@ fn getAttribute(agent: *Agent, this_value: Value, arguments: kiesel.types.Argume
     }
 }
 
-/// Return a snapshot of an element's NamedNodeMap-compatible attribute
-/// Return a snapshot of an element's NamedNodeMap-compatible attribute
-/// entries. The page shim adds the live collection facade; this host function
-/// keeps attribute storage and string ownership on the native DOM side.
+/// Return ordered attribute snapshots with strings copied into traced storage.
+/// Callers may retain them independently of later Element mutation/retirement.
 fn getAttributes(agent: *Agent, this_value: Value, arguments: kiesel.types.Arguments) Agent.Error!Value {
     const function_obj = agent.activeFunctionObject();
     const builtin_fn = function_obj.as(kiesel.builtins.BuiltinFunction);
@@ -5332,8 +5330,8 @@ fn getAttributes(agent: *Agent, this_value: Value, arguments: kiesel.types.Argum
             var iterator = attrs.iterator();
             while (iterator.next()) |entry| : (index += 1) {
                 const attr = try kiesel.builtins.ordinaryObjectCreate(agent, null);
-                const name = try kiesel.types.String.fromUtf8(agent, entry.key_ptr.*);
-                const value = try kiesel.types.String.fromUtf8(agent, entry.value_ptr.*);
+                const name = try kiesel.types.String.fromUtf8(agent, try agent.gc_allocator.dupe(u8, entry.key_ptr.*));
+                const value = try kiesel.types.String.fromUtf8(agent, try agent.gc_allocator.dupe(u8, entry.value_ptr.*));
                 try attr.createDataPropertyDirect(agent, kiesel.types.PropertyKey.from("name"), Value.from(name));
                 try attr.createDataPropertyDirect(agent, kiesel.types.PropertyKey.from("nodeName"), Value.from(name));
                 try attr.createDataPropertyDirect(agent, kiesel.types.PropertyKey.from("value"), Value.from(value));
@@ -5955,7 +5953,7 @@ fn setAttribute(agent: *Agent, this_value: Value, arguments: kiesel.types.Argume
     switch (node.*) {
         .element => |*e| {
             if (e.attributes == null) {
-                e.attributes = std.StringHashMap([]const u8).init(js_instance.allocator);
+                e.attributes = @import("../document/attributes.zig").Map.init(js_instance.allocator);
             }
             if (e.owned_strings == null) {
                 e.owned_strings = std.ArrayList([]const u8).empty;
@@ -6063,7 +6061,7 @@ fn removeAttribute(agent: *Agent, this_value: Value, arguments: kiesel.types.Arg
             if (!attrs.contains(name)) return .undefined;
             const refresh_id_globals = std.ascii.eqlIgnoreCase(name, "id") and dom_mutation.isAttachedToCurrentDocument(window.current_nodes, node);
             if (refresh_id_globals) try js_instance.clearNamedIdGlobals(window_id, window);
-            _ = element.attributes.?.remove(name);
+            _ = element.attributes.?.orderedRemove(name);
             @import("../document/referrer.zig").resourceAttributeChanged(element, name);
             parser.dirtyStyleForElement(element);
             if (@import("../document/svg.zig").contains(element)) {
@@ -6229,7 +6227,7 @@ fn styleSet(agent: *Agent, this_value: Value, arguments: kiesel.types.Arguments)
     switch (node.*) {
         .element => |*e| {
             if (e.attributes == null) {
-                e.attributes = std.StringHashMap([]const u8).init(js_instance.allocator);
+                e.attributes = @import("../document/attributes.zig").Map.init(js_instance.allocator);
             }
 
             // Capture current computed values before replacing the inline

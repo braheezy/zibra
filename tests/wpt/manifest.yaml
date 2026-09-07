@@ -37,6 +37,13 @@ tests:
   - html/dom/documents/dom-tree-accessors/document.images.html
   - html/dom/documents/dom-tree-accessors/document.links.html
   - html/dom/documents/dom-tree-accessors/document.scripts.html
+  # Live data-* reflection; no fetch, iframe, custom-element, or input driver prerequisites.
+  - html/dom/elements/global-attributes/dataset.html
+  - html/dom/elements/global-attributes/dataset-get.html
+  - html/dom/elements/global-attributes/dataset-set.html
+  - html/dom/elements/global-attributes/dataset-delete.html
+  - html/dom/elements/global-attributes/dataset-enumeration.html
+  - html/dom/elements/global-attributes/dataset-prototype.html
   - html/semantics/document-metadata/the-title-element/title.text-01.html
   - html/semantics/document-metadata/the-title-element/title.text-03.html
   - html/semantics/document-metadata/the-title-element/title-multiple-elements.html

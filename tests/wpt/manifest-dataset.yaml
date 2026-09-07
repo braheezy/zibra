@@ -1,0 +1,10 @@
+# Live HTML/SVG/MathML data-* reflection and DOMStringMap property semantics.
+tests:
+  - html/dom/elements/global-attributes/dataset.html
+  - html/dom/elements/global-attributes/dataset-get.html
+  - html/dom/elements/global-attributes/dataset-set.html
+  - html/dom/elements/global-attributes/dataset-delete.html
+  - html/dom/elements/global-attributes/dataset-enumeration.html
+  - html/dom/elements/global-attributes/dataset-prototype.html
+# dataset-binding.window.js needs generated entry-URL resolution for explicit
+# testharness allowlist cases. Its property checks are also covered locally.

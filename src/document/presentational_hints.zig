@@ -24,7 +24,7 @@ pub fn dimension(allocator: std.mem.Allocator, raw: []const u8) !?[]const u8 {
 }
 
 /// Populate a temporary declaration map; owns neither the DOM nor attributes.
-pub fn collect(allocator: std.mem.Allocator, tag: []const u8, attributes: ?std.StringHashMap([]const u8), hints: *std.StringHashMap([]const u8)) !void {
+pub fn collect(allocator: std.mem.Allocator, tag: []const u8, attributes: ?@import("attributes.zig").Map, hints: *std.StringHashMap([]const u8)) !void {
     const attrs = attributes orelse return;
     const cell = oneOf(tag, &.{ "td", "th" });
     const table = std.ascii.eqlIgnoreCase(tag, "table");

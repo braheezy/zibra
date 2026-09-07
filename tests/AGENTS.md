@@ -9,6 +9,10 @@ changing coverage. The complete primary-page inventory lives in the
 - Put deterministic unit coverage in the matching `src/tests/` module or next
   to a pure owner. Force the transition, interleaving, cleanup, or ownership
   boundary being tested; do not use process exit or arbitrary sleeps as proof.
+- Parser fixtures must call `fixParentPointers(&root, null)` after the returned
+  root reaches its final variable, before style/layout or ancestry reads. See
+  the [root-move contract](../docs/architecture/document-and-rendering.md#dom-and-source-buffers);
+  compiler inlining must not be relied on to preserve parser-local addresses.
 - `tests/golden/` contains committed exact output. Inspect and justify a golden
   difference before updating it. Never regenerate a golden merely to make a
   failure pass.

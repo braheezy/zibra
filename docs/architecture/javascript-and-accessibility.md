@@ -277,6 +277,23 @@ teardown, and final machine-readable result wrapper.
   is a cached live `NodeList` refreshed by JavaScript mutation boundaries.
   The current lightweight `attributes` records remain snapshots. Generated
   pseudo boxes remain private.
+- `runtime/dataset.js` caches a live `DOMStringMap` per eligible HTML/SVG/MathML
+  wrapper. It derives named properties in native attribute-list order, applies
+  ASCII-only `data-*`/camel-case conversion, and supports enumeration,
+  descriptors, prototype-name overrides, symbols, and removal. Direct writes
+  perform DOMString conversion before validating names and call the existing
+  native attribute mutation/invalidation path. No map snapshot or native
+  attribute pointer survives a callback.
+  Attribute methods use DOMString/arity checks, current DOM name validation,
+  and ASCII lowercasing only for HTML elements in HTML documents. Detached
+  document factories set their HTML/XML content type for this distinction.
+  The current interface installation is per-wrapper, like title/referrer
+  interfaces, not complete HTMLElement/SVGElement/MathMLElement prototype IDL.
+  A JavaScript Proxy cannot emulate an explicit non-configurable named-property
+  definition while reporting Web IDL's configurable virtual descriptor; these
+  definitions are rejected before mutation pending native exotic-object support.
+  Custom-element reactions, MutationObserver delivery, full XML namespace
+  resolution, and lone-surrogate attribute DOMStrings remain outside this slice.
 - Element selector results exclude the receiver. Native subtree lookup also
   serves detached Documents, which include their root; the Element wrapper
   filters that root without changing selector ancestry or Document semantics.

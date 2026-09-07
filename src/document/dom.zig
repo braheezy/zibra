@@ -231,7 +231,10 @@ pub const Text = struct {
 
 pub const Element = struct {
     tag: []const u8,
-    attributes: ?std.StringHashMap([]const u8) = null,
+    /// Attribute-list order is observable through DOM views. Replacements
+    /// keep their slot; removals must use orderedRemove, never swapRemove.
+    /// Keys/values still borrow source or this Element's owned_strings.
+    attributes: ?@import("attributes.zig").Map = null,
     style: ?StyleMap = null,
     custom_properties: ?*@import("custom_properties.zig").Environment = null,
     /// One stable publisher for the entire immutable variable environment.
@@ -416,7 +419,7 @@ pub const Element = struct {
         const owned_value = try allocator.dupe(u8, value);
         errdefer allocator.free(owned_value);
 
-        if (self.attributes == null) self.attributes = std.StringHashMap([]const u8).init(allocator);
+        if (self.attributes == null) self.attributes = @import("attributes.zig").Map.init(allocator);
         if (self.owned_strings == null) self.owned_strings = std.ArrayList([]const u8).empty;
         // Reserve both containers before transferring either string; a map
         // growth failure must not pop a value whose cleanup already moved.
@@ -783,7 +786,7 @@ pub const Element = struct {
             if (next) {
                 try attributes.put("checked", "");
             } else {
-                _ = attributes.remove("checked");
+                _ = attributes.orderedRemove("checked");
             }
             return next;
         }
@@ -803,8 +806,7 @@ pub const Element = struct {
         // Early return if no attributes
         if (idx >= raw.len) return;
 
-        // Initialize attributes hashmap
-        self.attributes = std.StringHashMap([]const u8).init(al);
+        self.attributes = @import("attributes.zig").Map.init(al);
 
         // Parse attributes (if any)
         while (idx < raw.len) {
@@ -822,7 +824,7 @@ pub const Element = struct {
 
             // Handle boolean attributes (no value)
             if (idx >= raw.len or raw[idx] != '=') {
-                try self.attributes.?.put(attr_name_slice, "");
+                if (!self.attributes.?.contains(attr_name_slice)) try self.attributes.?.put(attr_name_slice, "");
                 continue;
             }
 
@@ -879,7 +881,8 @@ pub const Element = struct {
                 attribute_value = decoded;
             }
 
-            try self.attributes.?.put(attr_name_slice, attribute_value);
+            // HTML keeps the first occurrence of a duplicate attribute.
+            if (!self.attributes.?.contains(attr_name_slice)) try self.attributes.?.put(attr_name_slice, attribute_value);
         }
     }
 };

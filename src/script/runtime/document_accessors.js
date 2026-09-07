@@ -45,6 +45,7 @@ function svgDocumentTitle(root) {
 // Called only when a wrapper is created or its namespace metadata is installed.
 // Foreign title elements must not acquire HTMLTitleElement's .text interface.
 function updateElementInterfaces(node) {
+  updateDatasetInterface(node);
   if (documentElementMatches(node, 'http://www.w3.org/1999/xhtml', 'meta')) {
     Object.defineProperty(node, 'content', {
       get: function() { return this.getAttribute('content') || ''; },

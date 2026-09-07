@@ -49,6 +49,16 @@ textContent concatenates DOMStrings without a lossy UTF-8 round trip. Preserve:
 4. decoded image data until every display generation borrowing its pixels
    retires.
 
+`Element.attributes` owns an `attributes.Map`: an allocator-bound ordered
+index/list with borrowed names/values. HTML parsing preserves the first
+duplicate attribute; script replacement keeps the old list position and
+ordered deletion followed by reinsertion appends. XML duplicate rejection
+remains the XML parser's responsibility. Iterate synchronously and never
+retain entry pointers across growth/removal. Existing Element-owned strings
+remain retained through Element retirement because styles can still borrow
+older attribute values. JavaScript attribute snapshots/readback copy strings
+into traced storage before returning; dataset views retain wrappers only.
+
 Live HTML serialization reads the current tree and attributes. Attribute names
 are emitted deterministically, values are quoted and escaped, ordinary closing
 tags are recursive, void elements omit children and closing tags, and

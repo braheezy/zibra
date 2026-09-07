@@ -579,6 +579,7 @@ test "box model edges resolve relative lengths against the containing block" {
     defer html_parser.deinit(allocator);
     var root = try html_parser.parse();
     defer root.deinit(allocator);
+    parser.fixParentPointers(&root, null);
     try parser.style(allocator, &root, &.{});
 
     const edges = resolveBoxEdges(&root.element.style.?, 16.0, 400.0, 1.0, 1.0);
@@ -599,6 +600,7 @@ test "none and hidden border styles have no used width" {
     defer html_parser.deinit(allocator);
     var root = try html_parser.parse();
     defer root.deinit(allocator);
+    parser.fixParentPointers(&root, null);
     try parser.style(allocator, &root, &.{});
 
     const edges = resolveBoxEdges(&root.element.style.?, 16.0, 400.0, 1.0, 1.0);
@@ -618,6 +620,7 @@ test "horizontal auto margins survive edge resolution for block distribution" {
     defer html_parser.deinit(allocator);
     var root = try html_parser.parse();
     defer root.deinit(allocator);
+    parser.fixParentPointers(&root, null);
     try parser.style(allocator, &root, &.{});
 
     const styles = &root.element.style.?;
@@ -675,6 +678,7 @@ test "shrink-to-fit measurement uses definite descendant outer widths" {
     defer html_parser.deinit(allocator);
     var root = try html_parser.parse();
     defer root.deinit(allocator);
+    parser.fixParentPointers(&root, null);
     try parser.style(allocator, &root, &.{});
 
     try std.testing.expectEqual(
@@ -693,6 +697,7 @@ test "shrink-to-fit measurement includes direct text content" {
     defer html_parser.deinit(allocator);
     var root = try html_parser.parse();
     defer root.deinit(allocator);
+    parser.fixParentPointers(&root, null);
     try parser.style(allocator, &root, &.{});
 
     // Seven characters at the inherited 16px font produce a non-zero

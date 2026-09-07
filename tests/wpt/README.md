@@ -63,6 +63,22 @@ the result-collection tasks (`wpt`, `wpt-all`, `latest-results`, category runs,
 
 ### Focused compatibility manifests
 
+[`manifest-dataset.yaml`](manifest-dataset.yaml) selects six HTML `dataset`
+files covering live data-* reflection, name conversion, deletion, enumeration,
+and prototype behavior. These six cases are also in the default allowlist.
+The 2026-09-07 comparison improved from 0/6 to 6/6 passing files and from
+1/42 to 42/42 passing assertions, with no errors, timeouts, crashes, or
+infrastructure failures in either six-file run.
+The generated `dataset-binding.window.js` case is not yet enabled: explicit
+testharness entries currently lose generated source/entry URL metadata. Its
+descriptor/prototype-setter checks are covered by native-host regressions.
+The local [`dataset.html`](../manual/dataset.html) fixture additionally checks
+attribute-selector restyling before geometry reads. There are no dedicated
+dataset reftests/crashtests in this checkout; the in-page checks exercise real
+native storage and rendering without adding unrelated suites. The interface
+does not claim full prototype IDL, explicit non-configurable property
+definitions, custom-element reactions, or MutationObserver delivery.
+
 [`manifest-character-data.yaml`](manifest-character-data.yaml) checks Text and
 CharacterData mutations, DOMString conversions, surrogate splitting/rejoining,
 constructors, and normalization. The 2026-09-07 testharness comparison improved

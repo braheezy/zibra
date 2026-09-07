@@ -177,6 +177,12 @@ const WptFixture = struct {
 
 const wpt_fixtures = [_]WptFixture{
     .{
+        .fixture = "tests/manual/dataset.html",
+        .status = "PASS",
+        .timeout_ms = 10_000,
+        .output_basename = "wpt-dataset.jsonl",
+    },
+    .{
         .fixture = "tests/manual/character-data.html",
         .status = "PASS",
         .timeout_ms = 10_000,

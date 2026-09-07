@@ -43,8 +43,8 @@ test "HTML hints cascade between user agent and author rules and survive attribu
     try std.testing.expectEqualStrings("80px", value(&root, "width"));
     try std.testing.expectEqualStrings("left", value(&root, "text-align"));
     try std.testing.expectEqualStrings("normal", value(&root, "white-space"));
-    _ = root.element.attributes.?.remove("style");
-    _ = root.element.attributes.?.remove("nowrap");
+    _ = root.element.attributes.?.orderedRemove("style");
+    _ = root.element.attributes.?.orderedRemove("nowrap");
     dom.dirtyStyleForElement(&root.element);
     try document.style(allocator, &root, &.{});
     try std.testing.expectEqual(@as(?f64, 160), lengths.parsePixel(value(&root, "width")));

@@ -24,6 +24,10 @@ behavior. Navigation-owned stylesheet/resource generations are documented in
   source slices for allocations. Non-ASCII script text additionally owns exact
   UTF-16 units; its UTF-8 bytes are a scalar projection, not the authoritative
   DOMString. Move both owners together and retire layout before replacing them.
+- `attributes.zig` owns an ordered attribute map whose strings borrow source
+  or `Element.owned_strings`. Updating a name keeps its slot; deleting uses
+  `orderedRemove`, and reinserting appends. Do not cache entry pointers across
+  mutation or reintroduce hash iteration order in JavaScript views.
 - Children are Node values in resizable arrays. Never retain a child `*Node`
   across structural mutation unless the synchronous mutation transaction
   invalidates or rebinds every consumer before control escapes.

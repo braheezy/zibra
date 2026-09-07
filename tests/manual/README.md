@@ -75,6 +75,7 @@ tiers and baseline policy.
 | [`new-input-types.html`](new-input-types.html) | Hidden layout/focus suppression and password masking with real submission value |
 | [`node-children.html`](node-children.html) | Stable live Element-only `children` collections across replacement and emptying |
 | [`document-accessors.html`](document-accessors.html) | Live body replacement and layout, title mutation and tab chrome, and independent detached-document accessors |
+| [`dataset.html`](dataset.html) | Live `data-*` configuration, `DOMStringMap` writes/deletes, and attribute-selector restyling before geometry reads |
 | [`dom-range-boundaries.html`](dom-range-boundaries.html) | Range ordering, containment, atomic validation, detached roots, and Selection document membership |
 | [`js-geometry.html`](js-geometry.html) | Synchronous layout readback, rectangle snapshots, hidden/detached boxes, CSS zoom, inline fragments, and measure-to-position interaction |
 | [`js-control-inline-geometry.html`](js-control-inline-geometry.html) | Native editor border/client boxes, clipping, zero sizes, zoom, and empty/whitespace-only inline insertion points |

@@ -60,7 +60,7 @@ test "SVG external image references refresh href, remove pixels and respect poli
     try image_loader.loadSvgTree(allocator, std.testing.io, &root, &page_url, .default, &context, TestCallbacks);
     try std.testing.expectEqual(@as(usize, 2), context.fetch_count);
     try std.testing.expect(element.image_data.?.is_broken);
-    _ = element.attributes.?.remove("href");
+    _ = element.attributes.?.orderedRemove("href");
     try image_loader.loadSvgTree(allocator, std.testing.io, &root, &page_url, .default, &context, TestCallbacks);
     try std.testing.expect(element.image_data == null);
     try std.testing.expect(element.svg_image_source == null);

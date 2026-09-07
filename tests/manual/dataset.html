@@ -1,0 +1,47 @@
+<!-- How to verify: open this page. Expect green PASS and a wide green card.
+     Toggle must alternate between narrow blue and wide green without reload.
+     The button reads data-* configuration and writes dataset.state; CSS and
+     synchronous geometry must see the same native attribute mutation. -->
+<!doctype html>
+<html><head><title>Live dataset attributes</title>
+<style>
+body { margin: 30px; font: 18px sans-serif; }
+#card { width: 100px; background: lightblue; }
+#card[data-state="expanded"] { width: 260px; background: lightgreen; }
+</style></head><body>
+<h1 id="status">Running dataset checks</h1>
+<div id="card" data-item-id="42">A card controlled through data attributes.</div>
+<button id="toggle" data-target="card">Toggle</button>
+<script>
+document.addEventListener('DOMContentLoaded', function() {
+  var results=[], card=document.getElementById('card'), data=card.dataset;
+  function equal(a,b) { if(a!==b) throw Error(String(a)+' != '+String(b)); }
+  function check(name,callback) {
+    try { callback(); results.push({name:name,status:0}); }
+    catch(e) { results.push({name:name,status:1,message:String(e)}); }
+  }
+  check('dataset reads parsed configuration and stays live',function() {
+    equal(data.itemId,'42'); equal(card.dataset,data);
+    card.setAttribute('data-item-id','43'); equal(data.itemId,'43');
+  });
+  check('dataset write invalidates attribute selectors and synchronous layout',function() {
+    equal(card.getBoundingClientRect().width,100);
+    data.state='expanded'; equal(card.getAttribute('data-state'),'expanded');
+    equal(card.getBoundingClientRect().width,260);
+  });
+  check('dataset deletion removes the native attribute and restyles',function() {
+    delete data.state; equal(card.hasAttribute('data-state'),false);
+    equal(card.getBoundingClientRect().width,100);
+    data.state='expanded'; equal(card.getBoundingClientRect().width,260);
+  });
+  document.getElementById('toggle').addEventListener('click',function() {
+    var target=document.getElementById(this.dataset.target);
+    if(target.dataset.state==='expanded') delete target.dataset.state;
+    else target.dataset.state='expanded';
+  });
+  var failures=results.filter(function(r){return r.status!==0;}), status=document.getElementById('status');
+  status.textContent=failures.length ? 'FAIL: '+failures[0].name+': '+failures[0].message : 'PASS: live dataset and CSS';
+  status.style.color=failures.length ? 'red' : 'green';
+  if(typeof completion_callback==='function') completion_callback(results,{status:0});
+});
+</script></body></html>

@@ -137,6 +137,7 @@ test "style element text can be collected and parsed as CSS" {
     defer html_parser.deinit(allocator);
     var root = try html_parser.parse();
     defer root.deinit(allocator);
+    document_parser.fixParentPointers(&root, null);
 
     var nodes = std.ArrayList(*document_parser.Node).empty;
     defer nodes.deinit(allocator);
@@ -906,6 +907,7 @@ test "Apply tag and class CSS selectors" {
     defer html_parser.deinit(allocator);
     var root = try html_parser.parse();
     defer root.deinit(allocator);
+    document_parser.fixParentPointers(&root, null);
 
     var css_parser = try CSSParser.init(allocator, css, false);
     defer css_parser.deinit(allocator);
@@ -928,6 +930,7 @@ test "text-shadow is retained as a paint-only computed property" {
     defer html_parser.deinit(allocator);
     var root = try html_parser.parse();
     defer root.deinit(allocator);
+    document_parser.fixParentPointers(&root, null);
 
     var css_parser = try CSSParser.init(allocator, ".title { text-shadow: rgba(192, 192, 192, 1) 3px 3px; }", false);
     defer css_parser.deinit(allocator);
@@ -1032,6 +1035,7 @@ test "selector sequences require every member and sum priorities" {
     defer html_parser.deinit(allocator);
     var root = try html_parser.parse();
     defer root.deinit(allocator);
+    document_parser.fixParentPointers(&root, null);
 
     var css_parser = try CSSParser.init(allocator, css, false);
     defer css_parser.deinit(allocator);
@@ -1099,6 +1103,7 @@ test "attribute selectors match presence exact and whitespace-token values" {
     defer html_parser.deinit(allocator);
     var root = try html_parser.parse();
     defer root.deinit(allocator);
+    document_parser.fixParentPointers(&root, null);
 
     var css_parser = try CSSParser.init(allocator, css, false);
     defer css_parser.deinit(allocator);
@@ -1147,6 +1152,7 @@ test "child and adjacent-sibling combinators match local structure" {
     defer html_parser.deinit(allocator);
     var root = try html_parser.parse();
     defer root.deinit(allocator);
+    document_parser.fixParentPointers(&root, null);
 
     var css_parser = try CSSParser.init(allocator, css, false);
     defer css_parser.deinit(allocator);
@@ -1194,6 +1200,7 @@ test "CSS comments ID selectors and background shorthand preserve cascade data" 
     defer html_parser.deinit(allocator);
     var root = try html_parser.parse();
     defer root.deinit(allocator);
+    document_parser.fixParentPointers(&root, null);
 
     var css_parser = try CSSParser.init(allocator, css, false);
     defer css_parser.deinit(allocator);
@@ -1278,6 +1285,7 @@ test "top-level semicolon recovery drops the following malformed qualified rule"
     defer html_parser.deinit(allocator);
     var root = try html_parser.parse();
     defer root.deinit(allocator);
+    document_parser.fixParentPointers(&root, null);
     try document_parser.style(allocator, &root, rules);
 
     try std.testing.expectEqualStrings("1em", root.element.style.?.getPtr("height").?.get().*);
@@ -1305,6 +1313,7 @@ test "list-style none inherits marker suppression" {
     defer html_parser.deinit(allocator);
     var root = try html_parser.parse();
     defer root.deinit(allocator);
+    document_parser.fixParentPointers(&root, null);
     try document_parser.style(allocator, &root, rules);
 
     const item = &root.element.children.items[0].element;
@@ -1481,6 +1490,7 @@ test "descendant selectors are flat and match ordered ancestor chains" {
     defer html_parser.deinit(allocator);
     var root = try html_parser.parse();
     defer root.deinit(allocator);
+    document_parser.fixParentPointers(&root, null);
 
     var css_parser = try CSSParser.init(allocator, css, false);
     defer css_parser.deinit(allocator);
@@ -1747,6 +1757,7 @@ test "important declarations cascade per property" {
     defer html_parser.deinit(allocator);
     var root = try html_parser.parse();
     defer root.deinit(allocator);
+    document_parser.fixParentPointers(&root, null);
 
     var css_parser = try CSSParser.init(allocator, css, false);
     defer css_parser.deinit(allocator);
@@ -1780,6 +1791,7 @@ test "font-family is inherited and code uses the user-agent monospace family" {
     defer html_parser.deinit(allocator);
     var root = try html_parser.parse();
     defer root.deinit(allocator);
+    document_parser.fixParentPointers(&root, null);
 
     var css_parser = try CSSParser.init(allocator, browser_css, false);
     defer css_parser.deinit(allocator);
@@ -1953,6 +1965,7 @@ test "box model longhands survive style computation" {
     defer html_parser.deinit(allocator);
     var root = try html_parser.parse();
     defer root.deinit(allocator);
+    document_parser.fixParentPointers(&root, null);
 
     var css_parser = try CSSParser.init(allocator, css, false);
     defer css_parser.deinit(allocator);
@@ -1982,6 +1995,7 @@ test "float and clear survive style computation" {
     defer html_parser.deinit(allocator);
     var root = try html_parser.parse();
     defer root.deinit(allocator);
+    document_parser.fixParentPointers(&root, null);
 
     var css_parser = try CSSParser.init(allocator, css, false);
     defer css_parser.deinit(allocator);
@@ -2013,6 +2027,7 @@ test "CSS-wide keywords resolve for inherited and non-inherited properties" {
     defer html_parser.deinit(allocator);
     var root = try html_parser.parse();
     defer root.deinit(allocator);
+    document_parser.fixParentPointers(&root, null);
     try document_parser.style(allocator, &root, &.{});
 
     const child = root.element.children.items[0].element.style.?;
@@ -2032,6 +2047,7 @@ test "text alignment inherits through inline descendants" {
     defer html_parser.deinit(allocator);
     var root = try html_parser.parse();
     defer root.deinit(allocator);
+    document_parser.fixParentPointers(&root, null);
 
     try document_parser.style(allocator, &root, &.{});
     try std.testing.expectEqualStrings(
@@ -2054,6 +2070,7 @@ test "font shorthand produces inherited computed longhands" {
     defer html_parser.deinit(allocator);
     var root = try html_parser.parse();
     defer root.deinit(allocator);
+    document_parser.fixParentPointers(&root, null);
 
     var css_parser = try CSSParser.init(allocator, css, false);
     defer css_parser.deinit(allocator);
@@ -2094,6 +2111,7 @@ test "font shorthand accepts em sizes and resolves them against the parent" {
     defer html_parser.deinit(allocator);
     var root = try html_parser.parse();
     defer root.deinit(allocator);
+    document_parser.fixParentPointers(&root, null);
 
     try document_parser.style(allocator, &root, &.{});
     const child = &root.element.children.items[0].element;
@@ -2110,6 +2128,7 @@ test "line-height computes lengths and inherits unitless multipliers" {
     defer html_parser.deinit(allocator);
     var root = try html_parser.parse();
     defer root.deinit(allocator);
+    document_parser.fixParentPointers(&root, null);
 
     try document_parser.style(allocator, &root, &.{});
     const parent = &root.element;
@@ -2123,6 +2142,7 @@ test "line-height computes lengths and inherits unitless multipliers" {
     defer shorthand_parser.deinit(allocator);
     var shorthand_root = try shorthand_parser.parse();
     defer shorthand_root.deinit(allocator);
+    document_parser.fixParentPointers(&shorthand_root, null);
     try document_parser.style(allocator, &shorthand_root, &.{});
     try std.testing.expectEqualStrings(
         "1",
@@ -2143,6 +2163,7 @@ test "width and height are computed without inheriting" {
     defer html_parser.deinit(allocator);
     var root = try html_parser.parse();
     defer root.deinit(allocator);
+    document_parser.fixParentPointers(&root, null);
 
     const rules = &[_]CSSParser.CSSRule{};
     try document_parser.style(allocator, &root, rules);
@@ -2178,6 +2199,7 @@ test "object-fit is computed per element and defaults to fill" {
     defer html_parser.deinit(allocator);
     var root = try html_parser.parse();
     defer root.deinit(allocator);
+    document_parser.fixParentPointers(&root, null);
 
     const rules = &[_]CSSParser.CSSRule{};
     try document_parser.style(allocator, &root, rules);
@@ -2201,6 +2223,7 @@ test "aspect-ratio is computed per element and defaults to auto" {
     defer html_parser.deinit(allocator);
     var root = try html_parser.parse();
     defer root.deinit(allocator);
+    document_parser.fixParentPointers(&root, null);
 
     const rules = &[_]CSSParser.CSSRule{};
     try document_parser.style(allocator, &root, rules);
@@ -2224,6 +2247,7 @@ test "zoom is computed per element without inheriting" {
     defer html_parser.deinit(allocator);
     var root = try html_parser.parse();
     defer root.deinit(allocator);
+    document_parser.fixParentPointers(&root, null);
 
     const rules = &[_]CSSParser.CSSRule{};
     try document_parser.style(allocator, &root, rules);
@@ -2254,6 +2278,7 @@ test "computed animation starts typed keyframe tracks without restarting on rest
     defer html_parser.deinit(allocator);
     var root = try html_parser.parse();
     defer root.deinit(allocator);
+    document_parser.fixParentPointers(&root, null);
 
     var css_parser = try CSSParser.init(allocator, css, false);
     defer css_parser.deinit(allocator);
@@ -2312,6 +2337,7 @@ test "display defaults to inline and browser rules define block elements" {
     defer html_parser.deinit(allocator);
     var root = try html_parser.parse();
     defer root.deinit(allocator);
+    document_parser.fixParentPointers(&root, null);
 
     var css_parser = try CSSParser.init(allocator, browser_css, false);
     defer css_parser.deinit(allocator);
@@ -2348,6 +2374,7 @@ test "display defaults to inline and browser rules define block elements" {
     defer list_parser.deinit(allocator);
     var list_root = try list_parser.parse();
     defer list_root.deinit(allocator);
+    document_parser.fixParentPointers(&list_root, null);
     try document_parser.style(allocator, &list_root, rules);
     try std.testing.expectEqualStrings(
         "list-item",
@@ -2371,6 +2398,7 @@ test "position and z-index are computed non-inherited properties" {
     defer html_parser.deinit(allocator);
     var root = try html_parser.parse();
     defer root.deinit(allocator);
+    document_parser.fixParentPointers(&root, null);
 
     try document_parser.style(allocator, &root, &.{});
     const positioned = &root.element.children.items[0].element;
@@ -2454,6 +2482,7 @@ test "scroll behavior is computed and does not inherit" {
     defer html_parser.deinit(allocator);
     var root = try html_parser.parse();
     defer root.deinit(allocator);
+    document_parser.fixParentPointers(&root, null);
 
     try document_parser.style(allocator, &root, &.{});
     const main = &root.element.children.items[0].element;
