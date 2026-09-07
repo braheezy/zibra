@@ -5,13 +5,16 @@ const kiesel = @import("kiesel");
 const native = @import("native_bindings.zig");
 const Agent = kiesel.execution.Agent;
 const Value = kiesel.types.Value;
-pub const Command = enum { snapshot, source, poll, load, play, pause, seek, volume, muted };
+pub const Command = enum { snapshot, source, played, poll, load, play, pause, seek, seek_complete, volume, muted };
 pub const Result = struct {
     values: [10]f64 = .{ std.math.nan(f64), 0, 1, 0, 0, 0, 0, 1, 0, 0 },
     source: []const u8 = "",
     events: []const u8 = "",
     failure: []const u8 = "",
     revision: u64 = 0,
+    ranges: ?[]const f64 = null,
+    seeking: bool = false,
+    seek_revision: u64 = 0,
 };
 pub const Callback = *const fn (?*anyopaque, u32, Command, f64, std.mem.Allocator, *Result) anyerror!void;
 pub const Host = struct { context: ?*anyopaque, allocator: std.mem.Allocator, call: Callback };
@@ -35,12 +38,20 @@ fn media(agent: *Agent, _: Value, args: kiesel.types.Arguments) Agent.Error!Valu
         if (err == error.OutOfMemory) return error.OutOfMemory;
         result.failure = @errorName(err);
     };
-    const array = try kiesel.builtins.arrayCreate(agent, 14, null);
+    const array = try kiesel.builtins.arrayCreate(agent, 17, null);
     for (result.values, 0..) |item, i| try array.object.createDataPropertyDirect(agent, kiesel.types.PropertyKey.from(@as(kiesel.types.PropertyKey.IntegerIndex, @intCast(i))), Value.from(item));
     for ([_][]const u8{ result.source, result.events, result.failure }, 10..) |item, i| {
         const string = try kiesel.types.String.fromUtf8(agent, item);
         try array.object.createDataPropertyDirect(agent, kiesel.types.PropertyKey.from(@as(kiesel.types.PropertyKey.IntegerIndex, @intCast(i))), Value.from(string));
     }
     try array.object.createDataPropertyDirect(agent, kiesel.types.PropertyKey.from(@as(kiesel.types.PropertyKey.IntegerIndex, 13)), Value.from(@as(f64, @floatFromInt(result.revision))));
+    try array.object.createDataPropertyDirect(agent, kiesel.types.PropertyKey.from(@as(kiesel.types.PropertyKey.IntegerIndex, 15)), Value.from(result.seeking));
+    try array.object.createDataPropertyDirect(agent, kiesel.types.PropertyKey.from(@as(kiesel.types.PropertyKey.IntegerIndex, 16)), Value.from(@as(f64, @floatFromInt(result.seek_revision))));
+    if (result.ranges) |ranges| {
+        const copy = try kiesel.builtins.arrayCreate(agent, @intCast(ranges.len), null);
+        for (ranges, 0..) |endpoint, index|
+            try copy.object.createDataPropertyDirect(agent, kiesel.types.PropertyKey.from(@as(kiesel.types.PropertyKey.IntegerIndex, @intCast(index))), Value.from(endpoint));
+        try array.object.createDataPropertyDirect(agent, kiesel.types.PropertyKey.from(@as(kiesel.types.PropertyKey.IntegerIndex, 14)), Value.from(&copy.object));
+    }
     return Value.from(&array.object);
 }

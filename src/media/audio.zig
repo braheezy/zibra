@@ -62,8 +62,11 @@ pub const Snapshot = struct {
     submitted_frames: u64 = 0,
 };
 
+const time_ranges = @import("time_ranges.zig");
+
 const Voice = struct {
     clip: Clip,
+    played: time_ranges.Ranges = .{},
     submitted_frames: u64 = 0,
     position: f64 = 0,
     playing: bool = false,
@@ -95,7 +98,10 @@ pub const Engine = struct {
     pub fn deinit(self: *Engine) void {
         if (self.device) |device| device.deinit(self.allocator);
         var it = self.voices.valueIterator();
-        while (it.next()) |voice| voice.clip.deinit(self.allocator);
+        while (it.next()) |voice| {
+            voice.played.deinit(self.allocator);
+            voice.clip.deinit(self.allocator);
+        }
         self.voices.deinit();
         std.debug.assert(self.budget.used.load(.acquire) == 0);
     }
@@ -127,6 +133,8 @@ pub const Engine = struct {
         defer self.mutex.unlock(std.Options.debug_io);
         if (self.voices.fetchRemove(id)) |entry| {
             var clip = entry.value.clip;
+            var played_ranges = entry.value.played;
+            played_ranges.deinit(self.allocator);
             self.bytes -= clip.samples.len * @sizeOf(f32);
             clip.deinit(self.allocator);
         }
@@ -144,7 +152,8 @@ pub const Engine = struct {
         self.mutex.lockUncancelable(std.Options.debug_io);
         defer self.mutex.unlock(std.Options.debug_io);
         const voice = self.voices.getPtr(id) orelse return error.UnknownVoice;
-        if (voice.ended) voice.position = 0;
+        try voice.played.reserve(self.allocator);
+        if (voice.ended or voice.position >= @as(f64, @floatFromInt(voice.clip.frames()))) voice.position = 0;
         voice.ended = false;
         voice.playing = true;
     }
@@ -158,8 +167,18 @@ pub const Engine = struct {
         self.mutex.lockUncancelable(std.Options.debug_io);
         defer self.mutex.unlock(std.Options.debug_io);
         const voice = self.voices.getPtr(id) orelse return error.UnknownVoice;
+        try voice.played.reserve(self.allocator);
         voice.position = @min(seconds * @as(f64, @floatFromInt(voice.clip.sample_rate)), @as(f64, @floatFromInt(voice.clip.frames())));
         voice.ended = false;
+    }
+
+    /// Returns an independently owned normalized snapshot of submitted media
+    /// intervals. Seeking alone never adds an interval; muted playback does.
+    pub fn played(self: *Engine, id: VoiceId, allocator: std.mem.Allocator) ![]time_ranges.Range {
+        self.mutex.lockUncancelable(std.Options.debug_io);
+        defer self.mutex.unlock(std.Options.debug_io);
+        const voice = self.voices.getPtr(id) orelse return allocator.alloc(time_ranges.Range, 0);
+        return allocator.dupe(time_ranges.Range, voice.played.items.items);
     }
     pub fn configure(self: *Engine, id: VoiceId, volume: f64, muted: bool, loop: bool) void {
         self.mutex.lockUncancelable(std.Options.debug_io);
@@ -190,10 +209,16 @@ pub const Engine = struct {
             }
             const end: f64 = @floatFromInt(frames);
             const step = @as(f64, @floatFromInt(voice.clip.sample_rate)) / output_rate;
+            const first_position = if (voice.loop) @mod(voice.position, end) else @min(voice.position, end);
+            const first_submission = voice.submitted_frames;
+            var wrapped = false;
             const gain: f32 = if (voice.muted) 0 else @floatCast(voice.volume);
             for (0..output.len / 2) |out_frame| {
                 if (voice.position >= end) {
-                    if (voice.loop) voice.position = @mod(voice.position, end) else {
+                    if (voice.loop) {
+                        wrapped = true;
+                        voice.position = @mod(voice.position, end);
+                    } else {
                         voice.position = end;
                         voice.playing = false;
                         voice.ended = true;
@@ -212,6 +237,16 @@ pub const Engine = struct {
                 }
                 voice.position += step;
                 voice.submitted_frames += 1;
+            }
+            const advance = @as(f64, @floatFromInt(voice.submitted_frames - first_submission)) * step;
+            const rate: f64 = @floatFromInt(voice.clip.sample_rate);
+            if (voice.loop and advance >= end) {
+                voice.played.add(0, end / rate);
+            } else {
+                if (voice.loop and (wrapped or voice.position >= end)) {
+                    voice.played.add(first_position / rate, end / rate);
+                    voice.played.add(0, @mod(voice.position, end) / rate);
+                } else voice.played.add(first_position / rate, @min(voice.position, end) / rate);
             }
             if (!voice.loop and voice.position >= end) {
                 voice.position = end;
@@ -400,6 +435,57 @@ test "audio PCM reader preserves stereo samples across unaligned byte reads" {
         cursor = end;
     }
     try std.testing.expectEqualSlices(u8, std.mem.sliceAsBytes(&expected), &actual);
+}
+
+test "audio played ranges track muted output and preserve disjoint seeks" {
+    var engine = Engine.init(std.testing.allocator);
+    engine.output = .manual;
+    defer engine.deinit();
+    const samples = try std.testing.allocator.alloc(f32, 48000);
+    @memset(samples, 0);
+    const id = try engine.add(.{ .samples = samples, .sample_rate = 48000, .channels = 1 });
+    engine.configure(id, 1, true, false);
+    try engine.play(id);
+    var output: [9600]f32 = undefined;
+    engine.mix(&output);
+    try engine.seek(id, 0.5);
+    engine.mix(&output);
+    const first = try engine.played(id, std.testing.allocator);
+    defer std.testing.allocator.free(first);
+    try std.testing.expectEqual(@as(usize, 2), first.len);
+    try std.testing.expectApproxEqAbs(@as(f64, 0.1), first[0].end, 1e-9);
+    try std.testing.expectApproxEqAbs(@as(f64, 0.5), first[1].start, 1e-9);
+    try std.testing.expectApproxEqAbs(@as(f64, 0.6), first[1].end, 1e-9);
+    engine.pause(id);
+    try engine.seek(id, 0.8);
+    engine.mix(&output);
+    const paused = try engine.played(id, std.testing.allocator);
+    defer std.testing.allocator.free(paused);
+    try std.testing.expectEqualSlices(time_ranges.Range, first, paused);
+    try engine.play(id);
+    engine.mix(&output);
+    // Copies held by a caller remain static as the voice advances.
+    try std.testing.expectEqual(@as(usize, 2), first.len);
+    const later = try engine.played(id, std.testing.allocator);
+    defer std.testing.allocator.free(later);
+    try std.testing.expectEqual(@as(usize, 3), later.len);
+}
+
+test "audio played ranges remain normalized across resampled loop boundaries" {
+    var engine = Engine.init(std.testing.allocator);
+    engine.output = .manual;
+    defer engine.deinit();
+    const samples = try std.testing.allocator.alloc(f32, 44100);
+    @memset(samples, 0);
+    const id = try engine.add(.{ .samples = samples, .sample_rate = 44100, .channels = 1 });
+    engine.configure(id, 1, false, true);
+    try engine.seek(id, 0.8);
+    try engine.play(id);
+    var output: [1234]f32 = undefined;
+    for (0..300) |_| engine.mix(&output);
+    const ranges = try engine.played(id, std.testing.allocator);
+    defer std.testing.allocator.free(ranges);
+    try std.testing.expectEqualSlices(time_ranges.Range, &.{.{ .start = 0, .end = 1 }}, ranges);
 }
 
 test "audio zoto buffering survives a full device refill burst" {

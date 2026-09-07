@@ -2,6 +2,7 @@
 
 comptime {
     _ = @import("tests/browser_audio.zig");
+    _ = @import("tests/browser_audio_controls.zig");
     _ = @import("media/audio.zig");
     _ = @import("media/element.zig");
     _ = @import("media/decode.zig");

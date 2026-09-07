@@ -16,6 +16,8 @@ Audio processing does not depend on DOM, JavaScript, layout, or SDL.
 | `Frame.audio_elements` (`src/media/element.zig`) | State, source revisions, cancellation tokens, source URLs and a voice ID per stable element handle |
 | `src/browser/media.zig` | Source selection, policy, loading, numeric result delivery, controls and DOM reconciliation on the Tab worker |
 | `src/script/media_bindings.zig` and `runtime/media.js` | Synchronous commands, copied snapshots, realm-local promises and event delivery |
+| `src/media/time_ranges.zig` | Normalized played intervals owned by each mixer voice |
+| `src/media/controls.zig` and `src/browser/render/audio_controls.zig` | Pointer-free UI state, internal focus parts, used geometry and native paint |
 
 The session and mixer must remain at stable addresses from first use through
 shutdown. Interactive windows share their session's mixer. Standalone headless
@@ -36,6 +38,13 @@ allocates nothing and accesses voices under the mixer mutex. Removing a voice
 synchronizes with rendering before freeing PCM. Device initialization has its
 own mutex and never happens while the mixer mutex is held. Device teardown
 removes the reader's player, joins/disposes zoto's context, then frees voices.
+
+Each voice records the media intervals actually submitted by the mixer,
+including muted output and loop wraps, without counting gaps skipped by seek.
+Play/seek reserve interval capacity under the voice lock before allowing a new
+segment. Mixing only merges into that capacity and remains allocation-free.
+The `played` getter copies this history under the lock; JavaScript receives an
+independent static `TimeRanges`, as it does for `buffered` and `seekable`.
 
 The native queue holds 32 ms of stereo PCM, and zoto's source buffer reserves
 64 ms. The source reserve must cover a complete device-queue refill burst plus
@@ -87,17 +96,32 @@ may outlive the allocators, measurement service or session that it borrows.
   activation pauses it. Autoplay uses the same gate and does not undo a pause.
 - `currentTime`, duration, paused/ended, volume/muted/defaultMuted, loop, preload,
   autoplay, controls, currentSrc, error, network/ready states, `canPlayType`, and
-  complete-resource buffered/seekable ranges are exposed.
-- Metadata/readiness, play/playing/pause, seek, timeupdate, ended, volumechange,
+  complete-resource buffered/seekable ranges and submitted played ranges are exposed.
+- Durationchange precedes loadedmetadata. Metadata/readiness, play/playing/pause, seek, timeupdate, ended, volumechange,
   load/reset/error events are dispatched through existing node listeners and
   authored event handlers. Realm timers poll active state at 50 ms; ordinary
   timeupdate events are coalesced at roughly 250 ms of playback progress.
   Navigation retires these timers. Revision checks stop delivery after a
-  listener changes the resource.
-- Native controls are a focusable play/pause button, including Space/Enter
-  activation and an accessible play/pause label. Other controls can use the
-  JavaScript API. Audio without controls and audio fallback children occupy no
-  rendered space.
+  listener changes the resource. A separate seek revision prevents an older
+  seeked event from clearing `seeking` after a listener starts another seek.
+- Native controls provide play/pause, seek, elapsed/duration text, mute and
+  volume. Tab/Shift-Tab visit play, seek, mute and volume within one DOM focus
+  owner. Space/Enter activate buttons, Left/Right seek by five seconds (or
+  adjust the focused volume slider), Up/Down adjust volume, Home/End select
+  slider endpoints, and M toggles mute. Accessible labels identify the current
+  action or slider value and retain an authored aria-label.
+- Native UI actions share the DOM media transitions and resulting media
+  events; their mouse/keyboard interaction does not dispatch author clicks.
+  Audio without controls and audio fallback children occupy no rendered space.
+
+Control input runs on the Tab worker. Drag capture contains only window,
+document, element and source identities plus numeric pointer geometry. Motion
+re-resolves those identities; source replacement, detachment, focus loss and
+browser zoom changes cancel capture. Drag deltas use the initial device-space
+slider width, including browser/CSS zoom and frame translation. No Node or
+layout pointer survives the input task. The Element holds only a copied UI
+snapshot; progress changes invalidate paint at most every 50 ms, retaining
+layout and its normal provenance-retirement contract.
 
 ## Resource and policy limits
 
@@ -131,8 +155,10 @@ sound producers can reuse its voice/output lifetime without adopting DOM state.
 Streaming should replace the complete clip with a bounded producer queue while
 preserving numeric voice identity, cancellation, and submission ownership.
 Web Audio, video, MediaSource, MediaStream, tracks, playback-rate changes,
-`played` ranges, progress/stall semantics, permissions-policy autoplay delegation,
+progress/stall semantics, permissions-policy autoplay delegation,
 and full HTML media conformance are not implemented.
+Event delivery still uses a bounded coalesced notification queue and polling,
+rather than the complete HTML media task/event-ordering model.
 
 Linear resampling is a basic converter, not a high-quality band-limited filter.
 Current time and ended measure submitted PCM, which can lead audible output by
@@ -148,6 +174,9 @@ scratch, already-mixed audio can lead presentation by roughly 170 ms.
 
 Run `zig build test-browser -Dtest-filter=audio` for deterministic mixer,
 codec, budget, policy, DOM/realm, source replacement and retirement coverage.
+The native control test exercises transformed and zoomed hit targets, drag
+capture, internal keyboard focus, event isolation and paint-only progress with
+manual PCM output on the real Tab worker. Render tests cover narrow geometry.
 The PCM tests also check unaligned byte reads and device refill bursts through
 the actual zoto mixer without a device or timing-dependent producer thread.
 Run `zig build test-network -Dtest-filter=bounded` for body limits and redirect
@@ -162,3 +191,6 @@ startup/consumption/shutdown cycles using silence. This is separate from the
 portable suite. Open [the audio fixture](../../tests/manual/audio.html) for
 listening, controls, concurrent voices, seeking, and navigation checks. Broader
 handoff checks follow [the testing guide](../testing.md).
+The [native controls fixture](../../tests/manual/audio-controls.html) provides
+an eight-second stereo sample, zoomed controls, keyboard instructions and a
+media event log.

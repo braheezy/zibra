@@ -18,6 +18,24 @@ function __mediaCall(node, command, value) {
   return __native.media(node.handle, command, value === undefined ? 0 : value);
 }
 function __mediaError(name) { var error = new DOMException(name, name); if (name === "AbortError") error.code = 20; return error; }
+function TimeRanges() { throw new TypeError('Illegal constructor'); }
+var __mediaRangeData = new WeakMap();
+Object.defineProperty(TimeRanges.prototype, 'length', {enumerable: true, configurable: true,
+  get: function() { var ranges = __mediaRangeData.get(this); if (!ranges) throw new TypeError('Invalid TimeRanges'); return ranges.length / 2; }});
+['start','end'].forEach(function(name, offset) {
+  TimeRanges.prototype[name] = function(index) {
+    var ranges = __mediaRangeData.get(this);
+    if (!ranges || !arguments.length) throw new TypeError('Invalid TimeRanges call');
+    index = Number(index) >>> 0;
+    if (index >= ranges.length / 2) throw __mediaError('IndexSizeError');
+    return ranges[index * 2 + offset];
+  };
+});
+function __mediaRanges(values) {
+  var ranges = Object.create(TimeRanges.prototype);
+  __mediaRangeData.set(ranges, values);
+  return ranges;
+}
 function __mediaSettle(node, name, exceptRevision) {
   var pending = node.__mediaPromises || [];
   node.__mediaPromises = [];
@@ -40,7 +58,12 @@ function __mediaWatch(handle) {
       if (type === 'error') __mediaSettle(node, 'NotSupportedError');
       if (type === 'abort' || type === 'emptied') __mediaSettle(node, 'AbortError', state[13]);
       if (type === 'pause' && state[2]) __mediaSettle(node, 'AbortError');
-      if (type === 'seeked') node.__mediaSeeking = false;
+      if (type === 'seeking' || type === 'seeked') {
+        // A seeking listener can start a new seek without changing src. The
+        // old completion must neither clear its flag nor dispatch seeked.
+        if (__mediaCall(node, 'snapshot')[16] !== state[16]) continue;
+        if (type === 'seeked') __mediaCall(node, 'seek_complete', state[16]);
+      }
       var event = new Event(type, {bubbles: false, cancelable: false});
       event.bubbles = false;
       var inline = node.getAttribute('on' + type);
@@ -99,10 +122,9 @@ HTMLMediaElement.prototype.canPlayType = function(type) {
       if (!isFinite(value)) throw new TypeError('currentTime must be finite');
       var state = __mediaCall(this, 'seek', Math.max(0, value));
       if (state[12]) throw __mediaError(state[12]);
-      this.__mediaSeeking = state[5] > 0;
       __mediaWatch(this.handle);
     }});
-  Object.defineProperty(proto, 'seeking', {get: function() { return !!this.__mediaSeeking; }});
+  Object.defineProperty(proto, 'seeking', {get: function() { return !!__mediaCall(this, 'snapshot')[15]; }});
   Object.defineProperty(proto, 'volume', {enumerable: true, configurable: true,
     get: function() { return __mediaCall(this, 'snapshot')[7]; },
     set: function(value) {
@@ -131,13 +153,12 @@ HTMLMediaElement.prototype.canPlayType = function(type) {
     var code = __mediaCall(this, 'snapshot')[6];
     return code ? Object.assign(Object.create(MediaError.prototype), {code: code, message: 'Audio could not be loaded or played'}) : null;
   }});
-  ['buffered','seekable'].forEach(function(name) {
+  ['buffered','seekable','played'].forEach(function(name) {
     Object.defineProperty(proto, name, {get: function() {
+      if (name === 'played') return __mediaRanges(__mediaCall(this, 'played')[14] || []);
       var state = __mediaCall(this, 'snapshot');
       var end = state[5] >= 1 ? state[0] : 0;
-      return {length: end > 0 ? 1 : 0,
-        start: function(index) { if (index !== 0 || !(end > 0)) throw __mediaError('IndexSizeError'); return 0; },
-        end: function(index) { if (index !== 0 || !(end > 0)) throw __mediaError('IndexSizeError'); return end; }};
+      return __mediaRanges(end > 0 ? [0, end] : []);
     }});
   });
   ['NETWORK_EMPTY','NETWORK_IDLE','NETWORK_LOADING','NETWORK_NO_SOURCE'].forEach(function(name, value) {

@@ -6,6 +6,8 @@
 <script>
 var audioElement = document.getElementById('media');
 var mediaReported = false;
+var durationChanged = false;
+var emptyPlayed = audioElement.played;
 function mediaReport(error) {
   if (mediaReported) return;
   mediaReported = true;
@@ -14,18 +16,27 @@ function mediaReport(error) {
 }
 function mediaCheck(value, message) { if (!value) throw new Error(message); }
 audioElement.addEventListener('error', function() { mediaReport('Loading failed'); });
+audioElement.addEventListener('durationchange', function() { durationChanged = true; });
 audioElement.addEventListener('loadedmetadata', function() {
   try {
+    mediaCheck(durationChanged, 'loadedmetadata preceded durationchange');
     mediaCheck(audioElement.duration === 2 && audioElement.readyState === 4, 'Incorrect metadata');
     mediaCheck(audioElement.buffered.end(0) === 2 && audioElement.seekable.end(0) === 2, 'Incorrect ranges');
+    mediaCheck(audioElement.buffered instanceof TimeRanges && audioElement.buffered !== audioElement.buffered, 'Ranges are not independent TimeRanges');
+    mediaCheck(audioElement.buffered.start('0') === 0 && emptyPlayed.length === 0 && audioElement.played.length === 0, 'Incorrect initial ranges');
+    var invalidIndex = false;
+    try { audioElement.buffered.end(-1); } catch(error) { invalidIndex = error.name === 'IndexSizeError'; }
+    mediaCheck(invalidIndex, 'Missing TimeRanges index validation');
     mediaCheck(audioElement.getBoundingClientRect().width > 0, 'Missing control geometry');
     mediaCheck(document.getElementById('hidden').getBoundingClientRect().width === 0, 'Hidden audio has geometry');
     audioElement.currentTime = 1;
+    mediaCheck(audioElement.seeking, 'Seeking flag was not set');
   } catch (error) { mediaReport(String(error)); }
 });
 audioElement.addEventListener('seeked', function() {
   try {
     mediaCheck(audioElement.currentTime === 1 && audioElement.paused && !audioElement.seeking, 'Seek did not settle');
+    mediaCheck(audioElement.played.length === 0 && emptyPlayed.length === 0, 'Seeking added unplayed ranges');
     audioElement.play().then(function() { mediaReport('Audible autoplay was allowed'); }, function(error) {
       mediaReport(error.name === 'NotAllowedError' ? null : 'Wrong playback error: ' + error.name);
     });

@@ -304,8 +304,8 @@ pub const Element = struct {
     // not move until the element is destroyed.
     canvas: ?*Canvas = null,
     // Scalar control presentation; the Frame owns all audio resources.
-    audio_paused: bool = true,
-    audio_error: bool = false,
+    audio_state: @import("../media/controls.zig").State = .{},
+    audio_part: @import("../media/controls.zig").Part = .play,
     opacity_anim_value: [32]u8 = undefined,
 
     pub fn init(allocator: std.mem.Allocator, tag: []const u8, parent: ?*Node) !Element {

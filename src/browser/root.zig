@@ -1898,8 +1898,9 @@ pub const Browser = struct {
             },
             .mouse_button_up => |button_event| {
                 if (touch_input.isSyntheticMouse(button_event.mouse_instance_id)) return false;
-                if (button_event.button == .left and self.chrome.pointerUp()) {
-                    self.setNeedsRasterDraw();
+                if (button_event.button == .left) {
+                    if (self.chrome.pointerUp()) self.setNeedsRasterDraw();
+                    if (self.activeTab()) |tab| self.scheduleTabAction(tab, .{ .media_pointer_up = button_event.x }, "task:media_pointer_up");
                 }
             },
             .mouse_motion => |motion_event| {
@@ -2159,9 +2160,7 @@ pub const Browser = struct {
                 self.lock.unlock();
                 if (tab) |active_tab| {
                     const reverse = modifiers.get(.left_shift) or modifiers.get(.right_shift);
-                    active_tab.cycleFocus(self, reverse) catch |err| {
-                        std.log.warn("Failed to cycle focus: {}", .{err});
-                    };
+                    self.scheduleTabAction(active_tab, .{ .cycle_focus = reverse }, "task:cycle_focus");
                 }
                 return;
             },
@@ -2190,10 +2189,7 @@ pub const Browser = struct {
                 self.lock.unlock();
                 if (should_activate) {
                     if (tab) |active_tab| {
-                        _ = active_tab.enter(self) catch |err| {
-                            std.log.warn("Failed to handle Enter for focused element: {}", .{err});
-                            return;
-                        };
+                        self.scheduleTabAction(active_tab, .enter, "task:enter");
                     }
                 }
                 return;
@@ -2216,9 +2212,7 @@ pub const Browser = struct {
                 self.lock.unlock();
                 if (should_activate) {
                     if (tab) |active_tab| {
-                        active_tab.activateFocusedElement(self) catch |err| {
-                            std.log.warn("Failed to activate focused element: {}", .{err});
-                        };
+                        self.scheduleTabAction(active_tab, .activate, "task:activate");
                     }
                 }
                 return;
@@ -2280,6 +2274,7 @@ pub const Browser = struct {
                     // Chrome-only update (address cursor); avoid recomposite if the display list is unchanged.
                     self.setNeedsRasterDraw();
                 }
+                if (!self.chrome.isAddressBarFocused()) if (self.activeTab()) |tab| self.scheduleTabAction(tab, .{ .media_key = .left }, "task:media_key");
                 return;
             },
             .right => {
@@ -2287,14 +2282,19 @@ pub const Browser = struct {
                     // Chrome-only update (address cursor); avoid recomposite if the display list is unchanged.
                     self.setNeedsRasterDraw();
                 }
+                if (!self.chrome.isAddressBarFocused()) if (self.activeTab()) |tab| self.scheduleTabAction(tab, .{ .media_key = .right }, "task:media_key");
                 return;
             },
             .down => {
-                if (self.activeTab()) |tab| self.scheduleTabScrollTask(tab, scroll_step);
+                if (self.activeTab()) |tab| self.scheduleTabAction(tab, .{ .media_key = .down }, "task:media_key");
                 return;
             },
             .up => {
-                if (self.activeTab()) |tab| self.scheduleTabScrollTask(tab, -scroll_step);
+                if (self.activeTab()) |tab| self.scheduleTabAction(tab, .{ .media_key = .up }, "task:media_key");
+                return;
+            },
+            .home, .end => {
+                if (!self.chrome.isAddressBarFocused()) if (self.activeTab()) |tab| self.scheduleTabAction(tab, .{ .media_key = if (key == .home) .home else .end }, "task:media_key");
                 return;
             },
             else => {},

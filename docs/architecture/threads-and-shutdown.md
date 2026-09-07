@@ -37,6 +37,11 @@ there. Queued work that can cross a document replacement carries a copied
 `DocumentHandle` `(window_id, document_generation)`, not a `*Frame`, `*Node`,
 or callback-context pointer.
 
+Native media pointer motion/release, media keys, sequential focus and button
+activation are queued Tab actions. Slider capture stores scalar identities and
+initial pointer geometry, never a borrowed Node or display command. Each motion
+validates document and source identity before invoking the media controller.
+
 Viewport requests belong to the Tab lifetime, not a document generation.
 The worker reconciles them before constructing a replacement root Frame,
 before the animation-frame dirty gate, and before a direct render. A request

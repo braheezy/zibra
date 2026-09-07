@@ -1088,6 +1088,29 @@ pub fn FrameType(
                 _ = self.dispatchEvent("click", target);
                 return true;
             };
+            if (candidate.kind == .audio) {
+                // Copy scalar hit data before focus listeners can retire paint.
+                const part = hit.source.audio_part;
+                const rect = if (hit.item.* == .rect) hit.item.rect else null;
+                const left = if (rect) |r| DisplayItem.scaleLayoutPx(r.x1, zoom) else 0;
+                const right = if (rect) |r| DisplayItem.scaleLayoutPx(r.x2, zoom) else 0;
+                const value = @import("../media/controls.zig").fraction(hit.device_x, left, right);
+                const focused = try self.focusPrimaryClickTarget(b, candidate.node) orelse return true;
+                if (focused.* != .element or !std.ascii.eqlIgnoreCase(focused.element.tag, "audio") or focused.element.isHiddenAudio()) return true;
+                if (part) |p| {
+                    focused.element.audio_part = p;
+                    parser.markPaintForNode(focused);
+                    self.tab.setNeedsPaint();
+                    if (p == .seek or p == .volume) if (self.js_context) |js| {
+                        const handle = try js.captureNodeHandle(self.window_id, focused);
+                        if (self.audio_elements.get(handle)) |state| {
+                            self.tab.audio_drag = .{ .window = self.window_id, .generation = self.document_generation, .handle = handle, .revision = state.revision, .part = p, .pointer_x = self.tab.audio_pointer_x, .value = value, .width = right -| left, .zoom = zoom };
+                        }
+                    };
+                    try @import("media.zig").Integration(Browser).control(b, self, focused, p, value);
+                }
+                return true;
+            }
             const live_node = self.dispatchEventForDefault("click", target, candidate.node) orelse return true;
             const element = switch (live_node.*) {
                 .element => |*value| value,
@@ -1096,10 +1119,7 @@ pub fn FrameType(
 
             switch (candidate.kind) {
                 .iframe => unreachable,
-                .audio => {
-                    const focused_node = try self.focusPrimaryClickTarget(b, live_node) orelse return true;
-                    try @import("media.zig").Integration(Browser).toggle(b, self, focused_node);
-                },
+                .audio => unreachable,
                 .link => {
                     const focused_node = try self.focusPrimaryClickTarget(b, live_node) orelse return true;
                     const focused_element = switch (focused_node.*) {

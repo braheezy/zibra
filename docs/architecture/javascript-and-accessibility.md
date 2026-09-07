@@ -341,6 +341,13 @@ and descendant Frames in preorder, exhausts each document's DOM-order focus
 stops before entering child Frames, skips empty Frames, and wraps only after the
 complete frame tree. Shift-Tab is the reverse.
 
+Audio controls add four internal focus parts (play, seek, mute and volume)
+before traversal leaves the element. They share the audio DOM focus owner,
+while native paint and accessibility use the selected part's action/slider
+label. Native interaction does not dispatch author clicks. Accessibility-tree
+rebuilds retain the previous tree until comparison completes and avoid speaking
+an unchanged focused node/role/name on every media repaint.
+
 The Tab records pointer or keyboard modality. Pointer-focused links/buttons do
 not show the native ring; visible text inputs/contenteditable targets do.
 Keyboard interaction promotes existing and future focus to visible. Store that

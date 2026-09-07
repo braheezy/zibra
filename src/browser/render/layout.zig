@@ -5130,6 +5130,7 @@ const InputLayout = struct {
     is_radio: bool = false,
     is_checked: bool = false,
     is_password: bool = false,
+    is_audio: bool = false,
 
     fn clientInsets(self: *const InputLayout) BoxEdges {
         return control_geometry.clientInsets(self.box.border, self.box.padding, !self.is_multiline and !self.is_checkbox and !self.is_radio);
@@ -5151,6 +5152,7 @@ const InputLayout = struct {
             element.isChecked();
         self.is_password = element.isPasswordInput();
         self.is_multiline = std.ascii.eqlIgnoreCase(element.tag, "textarea");
+        self.is_audio = std.ascii.eqlIgnoreCase(element.tag, "audio");
         const is_choice = self.is_checkbox or self.is_radio;
         if (is_choice) {
             self.bgcolor = .{ .r = 255, .g = 255, .b = 255, .a = 255 };
@@ -5173,8 +5175,8 @@ const InputLayout = struct {
 
         if (is_choice) {
             self.text = "";
-        } else if (std.ascii.eqlIgnoreCase(element.tag, "audio")) {
-            self.text = if (element.audio_error) "Audio unavailable" else if (element.audio_paused) "Play audio" else "Pause audio";
+        } else if (self.is_audio) {
+            self.text = "";
         } else if (self.is_multiline) {
             for (element.children.items) |child| if (child == .text) {
                 self.text = child.text.text;
@@ -5229,7 +5231,8 @@ const InputLayout = struct {
                 }
             }
             const natural_width: i32 = @intFromFloat(try intrinsic_measure.inputNaturalWidth(element, &engine.font_manager, @as(f64, engine.effectiveZoom()) / engine.zoom()));
-            self.box = control_geometry.textBox(natural_width, if (self.is_multiline) self.text_line_height * 2 else natural_height, horizontal, vertical, edges.padding, edges.border, border_box);
+            const control_height = if (self.is_audio) engine.scaleActiveCssPixel(@import("../../media/controls.zig").natural_height) else if (self.is_multiline) self.text_line_height * 2 else natural_height;
+            self.box = control_geometry.textBox(natural_width, control_height, horizontal, vertical, edges.padding, edges.border, border_box);
             if (own_block) |block| self.box.content_width = block.content_width;
             const baseline = if (self.is_multiline) self.box.height() else self.box.border.top + self.box.padding.top + @max(@divTrunc(self.box.content_height - self.text_line_height, 2), 0) + self.text_ascent;
             self.embed.setMetrics(self.box.width(), self.box.height(), baseline, @max(self.box.height() - baseline, 0), engine.effectiveZoom());
@@ -5434,6 +5437,26 @@ const InputLayout = struct {
             if (node.element.style) |*styles|
                 try appendBorderBoxes(engine, target, x, y, width_value, height_value, self.box.border, styles, &node.element, source);
         };
+
+        if (self.is_audio) {
+            const node = if (source) |s| s.originatingNode() else null;
+            const state: @import("../../media/controls.zig").State = if (node) |n| if (n.* == .element) n.element.audio_state else .{} else .{};
+            const focused: ?@import("../../media/controls.zig").Part = if (node) |n| if (n.* == .element and n.element.is_focused and n.element.is_focus_visible) n.element.audio_part else null else null;
+            const content_x = x + self.box.border.left + self.box.padding.left;
+            const content_y = y + self.box.border.top + self.box.padding.top;
+            try (@import("audio_controls.zig").Painter{
+                .allocator = engine.allocator,
+                .fonts = &engine.font_manager,
+                .commands = target,
+                .scale = @as(f64, self.embed.zoom) / engine.zoom(),
+                .page_zoom = engine.zoom(),
+                .ink = engine.remapColor(self.color, .control_text),
+                .background = remapped_bg,
+                .accent = engine.remapColor(.{ .r = 30, .g = 100, .b = 210 }, .accent),
+            }).paint(.{ .left = content_x, .top = content_y, .right = content_x + self.box.content_width, .bottom = content_y + self.box.content_height }, state, focused, source);
+            if (self.border_radius > 0) try appendRoundedControlGroup(commands, engine.allocator, &rounded_items, x, y, width_value, height_value, self.border_radius, source);
+            return;
+        }
 
         var editor_items = std.ArrayList(DisplayItem).empty;
         defer {

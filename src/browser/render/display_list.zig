@@ -307,6 +307,9 @@ pub const DisplayItemSource = struct {
     layout: *const anyopaque,
     node: ?*Node,
     layout_node_resolver: ?*const fn (*const anyopaque, ?*Node) ?*Node = null,
+    /// Native-control hit identity only. Position comes from the hit rectangle,
+    /// so ordinary command translation and authored/browser zoom stay valid.
+    audio_part: ?@import("../../media/controls.zig").Part = null,
 
     pub fn originatingNode(self: DisplayItemSource) ?*Node {
         return if (self.layout_node_resolver) |resolve|

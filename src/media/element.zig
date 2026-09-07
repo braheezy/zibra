@@ -2,7 +2,7 @@
 //! A source revision cancels old work; the result owner must still release it.
 const std = @import("std");
 const audio = @import("audio.zig");
-pub const Event = enum(u8) { emptied, abort, loadstart, loadedmetadata, loadeddata, canplay, canplaythrough, play, playing, pause, seeking, seeked, timeupdate, ended, volumechange, error_event, suspend_event };
+pub const Event = enum(u8) { emptied, abort, loadstart, durationchange, loadedmetadata, loadeddata, canplay, canplaythrough, play, playing, pause, seeking, seeked, timeupdate, ended, volumechange, error_event, suspend_event };
 pub fn eventName(event: Event) []const u8 {
     return switch (event) {
         .error_event => "error",
@@ -37,6 +37,8 @@ pub const State = struct {
     error_code: u8 = 0,
     paused: bool = true,
     ended: bool = false,
+    seeking: bool = false,
+    seek_revision: u64 = 0,
     wanted: bool = false,
     volume: f64 = 1,
     muted: bool = false,
@@ -87,6 +89,8 @@ pub const State = struct {
         self.error_code = 0;
         self.paused = true;
         self.ended = false;
+        self.seeking = false;
+        self.seek_revision += 1;
         self.wanted = false;
         self.position = 0;
         self.duration = std.math.nan(f64);
@@ -117,6 +121,22 @@ pub const State = struct {
     pub fn configure(self: *State) void {
         if (self.voice) |voice| self.engine.configure(voice, self.volume, self.muted, self.loop);
     }
+    pub fn setVolume(self: *State, value: f64) !void {
+        if (!std.math.isFinite(value) or value < 0 or value > 1) return error.IndexSizeError;
+        if (self.volume != value) {
+            self.volume = value;
+            self.queue(.volumechange);
+        }
+        self.configure();
+    }
+    pub fn setMuted(self: *State, value: bool) void {
+        self.muted_set = true;
+        if (self.muted != value) {
+            self.muted = value;
+            self.queue(.volumechange);
+        }
+        self.configure();
+    }
     pub fn start(self: *State) !void {
         self.wanted = true;
         if (self.paused) {
@@ -130,6 +150,7 @@ pub const State = struct {
                 return err;
             };
             self.ended = false;
+            self.position = self.engine.snapshot(voice).position;
             self.queue(.playing);
         }
     }
@@ -149,6 +170,8 @@ pub const State = struct {
             try self.engine.seek(voice, seconds);
             self.position = @min(seconds, self.duration);
             self.ended = false;
+            self.seeking = true;
+            self.seek_revision += 1;
             self.queue(.seeking);
             self.queue(.timeupdate);
             self.queue(.seeked);
@@ -162,6 +185,7 @@ pub const State = struct {
         self.network = 1;
         self.error_code = 0;
         self.configure();
+        self.queue(.durationchange);
         self.queue(.loadedmetadata);
         self.queue(.loadeddata);
         self.queue(.canplay);
@@ -169,7 +193,12 @@ pub const State = struct {
         self.queue(.suspend_event);
         if (self.default_position) |seconds| {
             self.default_position = null;
-            self.seek(seconds) catch unreachable;
+            // Adoption has already transferred clip ownership. A failure to
+            // reserve seek history retires it here rather than returning it.
+            self.seek(seconds) catch {
+                self.fail(4);
+                return;
+            };
         }
         if (self.wanted) self.start() catch {};
     }
@@ -209,10 +238,10 @@ test "audio element reset cancels revisions and releases clip ownership" {
     defer token.release();
     state.token = token;
     try state.start();
-    try state.seek(0.5);
+    try state.seek(0.00002);
     try state.accept(.{ .samples = try std.testing.allocator.dupe(f32, &.{ 0, 1 }), .sample_rate = 48000, .channels = 1 });
     try std.testing.expect(!state.paused);
-    try std.testing.expectEqual(state.duration, state.position);
+    try std.testing.expectApproxEqAbs(@as(f64, 0.00002), state.position, 1e-12);
     const revision = state.revision;
     state.reset();
     try std.testing.expect(state.revision != revision);

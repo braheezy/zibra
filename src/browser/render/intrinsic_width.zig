@@ -24,7 +24,7 @@ fn value(styles: ?dom.StyleMap, name: []const u8, default: []const u8) []const u
 /// Native input natural content width, shared with final control layout.
 /// CSS preferred/min/max sizes and box edges are applied by the caller.
 pub fn inputNaturalWidth(element: dom.Element, fonts: *font.FontManager, scale: f64) !f64 {
-    if (std.ascii.eqlIgnoreCase(element.tag, "audio")) return 180 * scale;
+    if (std.ascii.eqlIgnoreCase(element.tag, "audio")) return @import("../../media/controls.zig").natural_width * scale;
     const size = length.parsePixel(value(element.style, "font-size", "16px")) orelse 16;
     const weight: font.FontWeight = if (font.isBoldWeight(value(element.style, "font-weight", "normal"))) .Bold else .Normal;
     const slant: font.FontSlant = if (std.ascii.eqlIgnoreCase(value(element.style, "font-style", "normal"), "italic")) .Italic else .Roman;

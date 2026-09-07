@@ -153,6 +153,39 @@ test "audio load replacement discards queued results and document retirement fre
     try std.testing.expectEqual(@as(usize, 0), h.session.audio.budget.used.load(.acquire));
 }
 
+test "audio DOM durationchange precedes metadata and TimeRanges are static snapshots" {
+    const h = try Harness.init();
+    defer h.deinit();
+    try h.setSource();
+    try h.eval("var events=[]; a.ondurationchange=function(){events.push('duration')}; a.onloadedmetadata=function(){events.push('metadata')}; var empty=a.played; empty instanceof TimeRanges && empty.length===0");
+    try h.eval("a.muted=true; a.play(); true");
+    try h.deliverLoads();
+    try h.tick();
+    try h.eval("events.join(',')==='duration,metadata' && a.played.length===0 && a.buffered instanceof TimeRanges && a.buffered!==a.buffered && a.buffered.end('0')===0.01");
+    var output: [240]f32 = undefined;
+    h.session.audio.mix(&output);
+    try h.eval("var played=a.played; played.length===1 && played.start(0)===0 && Math.abs(played.end(0)-0.0025)<1e-10 && empty.length===0");
+    try h.eval("a.currentTime=0.0075; true");
+    h.session.audio.mix(&output);
+    try h.eval("a.played.length===2 && a.played.start(1)===0.0075 && played.length===1 && Math.abs(played.end(0)-0.0025)<1e-10");
+    try h.eval("var bad=false; try { played.end(-1) } catch(e) { bad=e.name==='IndexSizeError' }; bad");
+    try h.eval("a.load(); a.played.length===0 && played.length===1");
+}
+
+test "audio native and scripted seeks expose seeking and discard superseded completion" {
+    const h = try Harness.init();
+    defer h.deinit();
+    try h.setSource();
+    try h.eval("a.load(); true");
+    try h.deliverLoads();
+    try h.tick();
+    try h.eval("var events=[]; a.onseeking=function(){events.push('seeking:'+a.seeking); if(a.currentTime===0.0025) a.currentTime=0.005;}; a.onseeked=function(){events.push('seeked:'+a.seeking)}; a.currentTime=0.0025; a.seeking");
+    try h.tick();
+    try h.eval("a.seeking && a.currentTime===0.005 && events.join(',')==='seeking:true'");
+    try h.tick();
+    try h.eval("!a.seeking && events.join(',')==='seeking:true,seeking:true,seeked:false'");
+}
+
 test "audio survives DOM relocation and supports detached Audio objects" {
     const h = try Harness.init();
     defer h.deinit();

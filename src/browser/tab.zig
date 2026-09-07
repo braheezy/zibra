@@ -22,6 +22,7 @@ const AccessibilitySpeech = @import("accessibility_speech.zig").Worker;
 const MeasureTime = @import("../runtime/measure_time.zig").MeasureTime;
 const js_module = @import("../script/js.zig");
 const ProtectedField = @import("../core/protected_field.zig").ProtectedField;
+const audio_controls = @import("../media/controls.zig");
 
 const Url = url_module.Url;
 const Browser = browser_mod.Browser;
@@ -120,6 +121,8 @@ focused_frame: ?*Frame = null,
 // Modality inherited by synchronous JavaScript focus() calls. The focused
 // Element stores the resulting visibility bit for selectors and paint.
 focus_modality: dom_focus.Modality = .keyboard,
+audio_drag: ?audio_controls.Drag = null,
+audio_pointer_x: i32 = 0,
 frames_by_id: std.AutoHashMap(u32, *Frame),
 parent_window_ids: std.AutoHashMap(u32, u32),
 next_window_id: u32 = 1,
@@ -2285,6 +2288,8 @@ pub fn clickDevice(
     zoom: f32,
 ) !void {
     const frame = self.root_frame orelse return;
+    self.audio_drag = null;
+    self.audio_pointer_x = device_x;
 
     if (button == .primary) {
         // Record pointer modality before click/focus listeners run so a
@@ -2882,7 +2887,8 @@ fn promoteFocusedIndicatorForKeyboard(self: *Tab) bool {
     return true;
 }
 
-fn noteKeyboardInteraction(self: *Tab) void {
+/// Tab-worker input boundary shared by page and native-control actions.
+pub fn noteKeyboardInteraction(self: *Tab) void {
     if (self.promoteFocusedIndicatorForKeyboard()) self.setNeedsRender();
 }
 
@@ -3009,6 +3015,16 @@ pub fn focusElementFromScript(
 pub fn cycleFocus(self: *Tab, b: *Browser, reverse: bool) !void {
     self.noteKeyboardInteraction();
     const root = self.root_frame orelse return;
+    if (self.focused_frame) |frame| if (frame.focus) |node| {
+        if (node.* == .element and std.ascii.eqlIgnoreCase(node.element.tag, "audio") and !node.element.isHiddenAudio()) {
+            if (audio_controls.next(node.element.audio_part, reverse)) |part| {
+                node.element.audio_part = part;
+                parser.markPaintForNode(node);
+                self.setNeedsPaint();
+                return;
+            }
+        }
+    };
 
     var frames = std.ArrayList(*Frame).empty;
     defer frames.deinit(self.allocator);
@@ -3042,16 +3058,16 @@ pub fn cycleFocus(self: *Tab, b: *Browser, reverse: bool) !void {
     if (found_index) |i| {
         if (reverse) {
             if (i > 0) {
-                _ = try self.focusElement(b, frame, focusables.items[i - 1]);
+                try self.focusCycleTarget(b, frame, focusables.items[i - 1], reverse);
                 return;
             }
         } else if (i + 1 < focusables.items.len) {
-            _ = try self.focusElement(b, frame, focusables.items[i + 1]);
+            try self.focusCycleTarget(b, frame, focusables.items[i + 1], reverse);
             return;
         }
     } else if (focusables.items.len > 0) {
         const edge = if (reverse) focusables.items.len - 1 else 0;
-        _ = try self.focusElement(b, frame, focusables.items[edge]);
+        try self.focusCycleTarget(b, frame, focusables.items[edge], reverse);
         return;
     }
 
@@ -3074,13 +3090,19 @@ pub fn cycleFocus(self: *Tab, b: *Browser, reverse: bool) !void {
         if (candidates.items.len == 0) continue;
 
         const edge = if (reverse) candidates.items.len - 1 else 0;
-        _ = try self.focusElement(b, candidate_frame, candidates.items[edge]);
+        try self.focusCycleTarget(b, candidate_frame, candidates.items[edge], reverse);
         return;
     }
 }
 
+fn focusCycleTarget(self: *Tab, b: *Browser, frame: *Frame, node: *Node, reverse: bool) !void {
+    if (node.* == .element and std.ascii.eqlIgnoreCase(node.element.tag, "audio")) node.element.audio_part = if (reverse) .volume else .play;
+    _ = try self.focusElement(b, frame, node);
+}
+
 pub fn activateFocusedElement(self: *Tab, b: *Browser) !void {
     self.noteKeyboardInteraction();
+    if (try @import("media.zig").Integration(Browser).key(b, self, .activate)) return;
     const frame = self.focused_frame orelse self.root_frame orelse return;
     if (frame.focus == null) return;
     const node_ptr = frame.focus.?;
@@ -3118,11 +3140,6 @@ pub fn activateFocusedElement(self: *Tab, b: *Browser) !void {
                 return;
             }
 
-            if (std.mem.eql(u8, e.tag, "audio") and !e.isHiddenAudio()) {
-                const live_node = frame.dispatchEventForDefault("click", node_ptr, node_ptr) orelse return;
-                try @import("media.zig").Integration(Browser).toggle(b, frame, live_node);
-                return;
-            }
             if (std.mem.eql(u8, e.tag, "button")) {
                 const live_node = frame.dispatchEventForDefault(
                     "click",
@@ -3254,6 +3271,7 @@ fn clearFrameFocus(
 /// Remove every DOM focus in this tab before another focus owner is selected.
 /// Returns whether a focused element changed and therefore needs repainting.
 pub fn blur(self: *Tab) bool {
+    self.audio_drag = null;
     return self.blurWithAccess(.acquire_lock);
 }
 
@@ -3390,6 +3408,12 @@ pub fn keypress(self: *Tab, b: *Browser, char: u8) !void {
     self.noteKeyboardInteraction();
     const frame = self.focused_frame orelse self.root_frame orelse return;
     frame.media_user_activated = true;
+    if (frame.focus) |node| if (node.* == .element and std.ascii.eqlIgnoreCase(node.element.tag, "audio") and !node.element.isHiddenAudio()) {
+        // Space arrives as both SDL key-down and text input; activation belongs
+        // to key-down so one press cannot toggle playback twice.
+        if (char == 'm' or char == 'M') _ = try @import("media.zig").Integration(Browser).key(b, self, .mute);
+        return;
+    };
     if (frame.focus) |focus_node| {
         const live_focus_node = frame.dispatchEventForDefault(
             "keydown",
@@ -3401,9 +3425,7 @@ pub fn keypress(self: *Tab, b: *Browser, char: u8) !void {
         };
         switch (live_focus_node.*) {
             .element => |*e| {
-                if (std.mem.eql(u8, e.tag, "audio") and !e.isHiddenAudio()) {
-                    if (char == ' ') try @import("media.zig").Integration(Browser).toggle(b, frame, live_focus_node);
-                } else if (std.mem.eql(u8, e.tag, "input")) {
+                if (std.mem.eql(u8, e.tag, "input")) {
                     if (!isTextEntryInput(e)) return;
                     if (e.attributes) |*attrs| {
                         const old_value = attrs.get("value") orelse "";
@@ -3537,6 +3559,7 @@ pub fn backspace(self: *Tab, b: *Browser) !void {
 
 pub fn buildAccessibilityTree(self: *Tab) !void {
     const previous_root = self.accessibility_root;
+    const previous_focus = self.accessibility_focused;
     const previous_reading_dom = if (self.accessibility_reading) |node|
         node.dom_node
     else
@@ -3621,8 +3644,12 @@ pub fn buildAccessibilityTree(self: *Tab) !void {
     if (previous_root) |old_root| {
         self.handleLiveRegionUpdates(old_root, root);
     }
-    if (self.accessibility_focused != null and self.accessibility.screen_reader) {
-        self.speakAccessibilityNode(self.accessibility_focused.?, "focus");
+    if (self.accessibility_focused) |focused| {
+        // Paint-only media progress rebuilds this tree frequently. Announce
+        // focus changes, not every repaint of an unchanged focused control.
+        const changed = if (previous_focus) |old| old.dom_node != focused.dom_node or
+            !std.mem.eql(u8, old.role, focused.role) or !std.mem.eql(u8, old.name, focused.name) else true;
+        if (changed and self.accessibility.screen_reader) self.speakAccessibilityNode(focused, "focus");
     }
 }
 
@@ -3714,7 +3741,8 @@ fn isAriaHidden(element: *const parser.Element) bool {
 
 fn accessibilityRole(element: *const parser.Element) []const u8 {
     if (std.mem.eql(u8, element.tag, "a")) return "link";
-    if (std.mem.eql(u8, element.tag, "button") or (std.ascii.eqlIgnoreCase(element.tag, "audio") and !element.isHiddenAudio())) return "button";
+    if (std.mem.eql(u8, element.tag, "button")) return "button";
+    if (std.ascii.eqlIgnoreCase(element.tag, "audio") and !element.isHiddenAudio()) return if (element.audio_part == .seek or element.audio_part == .volume) "slider" else "button";
     if (std.mem.eql(u8, element.tag, "input")) {
         if (element.isCheckbox()) return "checkbox";
         if (element.attributes) |attrs| {
@@ -3762,13 +3790,24 @@ fn frameOffsetToRoot(self: *Tab, frame: *Frame) struct { x: i32, y: i32 } {
 }
 
 fn accessibilityName(self: *Tab, node_ptr: *Node, element: *const parser.Element) ![]const u8 {
+    if (std.ascii.eqlIgnoreCase(element.tag, "audio")) {
+        var buffer: [128]u8 = undefined;
+        const action = audio_controls.label(&buffer, element.audio_state, element.audio_part);
+        if (element.attributes) |attrs| {
+            if (attrs.get("aria-label")) |label| {
+                const combined = try std.fmt.allocPrint(self.allocator, "{s}, {s}", .{ label, action });
+                errdefer self.allocator.free(combined);
+                try self.accessibility_strings.append(self.allocator, combined);
+                return combined;
+            }
+        }
+        return self.copyAccessibilityString(action);
+    }
     if (element.attributes) |attrs| {
         if (attrs.get("aria-label")) |label| {
             return self.copyAccessibilityString(label);
         }
     }
-
-    if (std.ascii.eqlIgnoreCase(element.tag, "audio")) return self.copyAccessibilityString(if (element.audio_error) "Audio unavailable" else if (element.audio_paused) "Play audio" else "Pause audio");
 
     if (std.mem.eql(u8, element.tag, "input")) {
         if (element.attributes) |attrs| {

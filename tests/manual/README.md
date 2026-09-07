@@ -67,6 +67,7 @@ tiers and baseline policy.
 | Primary fixture | Focus |
 | --- | --- |
 | [`audio.html`](audio.html) | Native audio controls, smooth playback, status updates without page flashing, multiple voices, promises/events, seek, mute, loop and navigation cleanup; uses `audio-tone.wav` |
+| [`audio-controls.html`](audio-controls.html) | Seek/volume dragging, keyboard control focus, event isolation, media event ordering, narrow and zoomed controls; uses an eight-second stereo `audio-controls.wav` and `audio-tone.wav` |
 
 ## DOM, JavaScript, forms, and dynamic resources
 

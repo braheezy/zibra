@@ -69,6 +69,10 @@ boundaries.
   interaction bounds shared by buttons and inline-blocks. Materialize and
   rebase all commands before retiring the temporary layout tree; nested
   temporary trees subscribe only through the persistent containing block.
+- `audio_controls.zig` derives native media part rectangles and appends their
+  paint commands from copied state. InputLayout owns its DOM/style borrows;
+  part hit provenance retires with the ordinary command generation. Playback
+  changes dirty paint only, without remeasuring the control.
 - `replaced_paint.zig` appends background-image and rounded-control command
   leaves/groups and owning editor clips without owning layout objects. Background attachment selects
   an element-local or viewport-local tile phase while the command rectangle

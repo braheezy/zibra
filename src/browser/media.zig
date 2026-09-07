@@ -4,6 +4,7 @@ const std = @import("std");
 const parser = @import("../document/parser.zig");
 const bindings = @import("../script/media_bindings.zig");
 const audio = @import("../media/audio.zig");
+const controls = @import("../media/controls.zig");
 const decoding = @import("../media/decode.zig");
 const model = @import("../media/element.zig");
 const JsRenderContext = @import("js_context.zig").JsRenderContext;
@@ -43,6 +44,19 @@ pub fn Integration(comptime Browser: type) type {
             const state = try ensure(browser, frame, node, handle, op == .load);
             switch (op) {
                 .snapshot, .source, .poll, .load => {},
+                .played => {
+                    result.ranges = &.{};
+                    if (state.voice) |voice| {
+                        const ranges = try state.engine.played(voice, allocator);
+                        defer allocator.free(ranges);
+                        const values = try allocator.alloc(f64, ranges.len * 2);
+                        for (ranges, 0..) |range, i| {
+                            values[2 * i] = range.start;
+                            values[2 * i + 1] = range.end;
+                        }
+                        result.ranges = values;
+                    }
+                },
                 .play => {
                     if (!frame.media_user_activated and !state.muted and state.volume != 0) {
                         result.failure = "NotAllowedError";
@@ -57,23 +71,16 @@ pub fn Integration(comptime Browser: type) type {
                 },
                 .pause => state.pause(),
                 .seek => try state.seek(value),
+                .seek_complete => {
+                    if (@as(f64, @floatFromInt(state.seek_revision)) == value) state.seeking = false;
+                },
                 .volume => {
-                    if (!std.math.isFinite(value) or value < 0 or value > 1) return error.IndexSizeError;
-                    if (state.volume != value) {
-                        state.volume = value;
-                        state.queue(.volumechange);
-                    }
-                    state.configure();
+                    try state.setVolume(value);
                     if (value > 0 and !state.muted and !frame.media_user_activated) state.pause();
                 },
                 .muted => {
                     const muted = value != 0;
-                    state.muted_set = true;
-                    if (state.muted != muted) {
-                        state.muted = muted;
-                        state.queue(.volumechange);
-                    }
-                    state.configure();
+                    state.setMuted(muted);
                     if (!muted and state.volume > 0 and !frame.media_user_activated) state.pause();
                 },
             }
@@ -84,6 +91,8 @@ pub fn Integration(comptime Browser: type) type {
 
         fn snapshot(state: *model.State, take_events: bool, include_source: bool, allocator: std.mem.Allocator, result: *bindings.Result) !void {
             result.revision = state.revision;
+            result.seeking = state.seeking;
+            result.seek_revision = state.seek_revision;
             result.values = .{ state.duration, state.default_position orelse state.position, @floatFromInt(@intFromBool(state.paused)), @floatFromInt(@intFromBool(state.ended)), @floatFromInt(state.network), @floatFromInt(state.ready), @floatFromInt(state.error_code), state.volume, @floatFromInt(@intFromBool(state.muted)), @floatFromInt(@intFromBool(state.loop)) };
             // Data URLs can be large; polling/time getters need only scalars.
             if (include_source) result.source = try allocator.dupe(u8, state.currentSrc());
@@ -304,10 +313,20 @@ pub fn Integration(comptime Browser: type) type {
         };
 
         fn updateControl(browser: *Browser, frame: *Frame, node: *parser.Node, state: *model.State) void {
-            if (node.element.audio_paused != state.paused or node.element.audio_error != (state.error_code != 0)) {
-                node.element.audio_paused = state.paused;
-                node.element.audio_error = state.error_code != 0;
-                parser.markLayoutForNode(node);
+            const copy = controls.State{
+                .paused = state.paused,
+                .failed = state.error_code != 0,
+                .loading = state.network == 2,
+                .ready = state.ready != 0,
+                .muted = state.muted,
+                .volume = state.volume,
+                .duration = if (std.math.isFinite(state.duration)) state.duration else 0,
+                .position = @floor(state.position * 20) / 20,
+            };
+            if (!std.meta.eql(node.element.audio_state, copy)) {
+                node.element.audio_state = copy;
+                if (node.element.isHiddenAudio()) return;
+                parser.markPaintForNode(node);
                 frame.tab.needs_paint = true;
                 browser.setNeedsAnimationFrame(frame.tab);
                 browser.scheduleAnimationFrame();
@@ -355,16 +374,96 @@ pub fn Integration(comptime Browser: type) type {
             if (std.ascii.eqlIgnoreCase(node.element.tag, "audio")) try out.append(allocator, node);
             for (node.element.children.items) |*child| try collect(child, allocator, out);
         }
-        pub fn toggle(browser: *Browser, frame: *Frame, node: *parser.Node) !void {
+        /// Native UI actions run on the Tab worker, consume no author click
+        /// event, and use the same media state transitions as the DOM API.
+        pub fn control(browser: *Browser, frame: *Frame, node: *parser.Node, part: controls.Part, value: ?f64) !void {
+            if (node.* != .element or !std.ascii.eqlIgnoreCase(node.element.tag, "audio") or node.element.isHiddenAudio()) return;
             const js = frame.js_context orelse return;
             const handle = try js.captureNodeHandle(frame.window_id, node);
             const state = try ensure(browser, frame, node, handle, false);
             frame.media_user_activated = true;
-            if (state.paused) {
-                try state.start();
-                if (state.network == 0) try begin(browser, frame, handle, state);
-            } else state.pause();
+            state.update();
+            switch (part) {
+                .play => if (state.paused) {
+                    if (state.error_code == 0) {
+                        try state.start();
+                        if (state.network == 0) try begin(browser, frame, handle, state);
+                    }
+                } else state.pause(),
+                .seek => if (state.ready != 0 and value != null) try state.seek(std.math.clamp(value.?, 0, 1) * state.duration),
+                .mute => state.setMuted(!state.muted),
+                .volume => if (value) |volume| try state.setVolume(std.math.clamp(volume, 0, 1)),
+            }
             updateControl(browser, frame, node, state);
+            // No Node or state borrow is consulted after entering JavaScript.
+            var buffer: [80]u8 = undefined;
+            _ = try js.evaluate(frame.window_id, try std.fmt.bufPrint(&buffer, "__mediaWatch({d});", .{handle}));
+        }
+
+        /// Consumes native media keys on the Tab worker. Relative adjustments
+        /// read the current voice position, independent of painted progress.
+        pub fn key(browser: *Browser, tab: *Tab, keycode: controls.Key) !bool {
+            const frame = tab.focused_frame orelse tab.root_frame orelse return false;
+            const node = frame.focus orelse return false;
+            if (node.* != .element or !std.ascii.eqlIgnoreCase(node.element.tag, "audio") or node.element.isHiddenAudio()) return false;
+            tab.noteKeyboardInteraction();
+            const part = node.element.audio_part;
+            const js = frame.js_context orelse return false;
+            const state = try ensure(browser, frame, node, try js.captureNodeHandle(frame.window_id, node), false);
+            state.update();
+            switch (keycode) {
+                .activate => if (part == .play or part == .mute) try control(browser, frame, node, part, null),
+                .mute => try control(browser, frame, node, .mute, null),
+                .left, .right, .up, .down, .home, .end => {
+                    const volume = part == .volume or keycode == .up or keycode == .down;
+                    const old = if (volume) state.volume else if (state.duration > 0) state.position / state.duration else 0;
+                    const step = if (volume) @as(f64, 0.05) else if (state.duration > 0) 5 / state.duration else 0;
+                    const value = switch (keycode) {
+                        .home => @as(f64, 0),
+                        .end => @as(f64, 1),
+                        .left, .down => old - step,
+                        else => old + step,
+                    };
+                    try control(browser, frame, node, if (volume) .volume else .seek, value);
+                },
+            }
+            return true;
+        }
+
+        /// Re-resolve capture identity on each motion; detached/replaced media
+        /// and zoom changes cancel capture without touching an old Node.
+        pub fn pointer(browser: *Browser, tab: *Tab, pointer_x: ?i32, release: bool) !bool {
+            const drag = tab.audio_drag orelse return false;
+            if (release or pointer_x == null) tab.audio_drag = null;
+            const x = pointer_x orelse return false;
+            const frame = tab.frameForWindowId(drag.window) orelse {
+                tab.audio_drag = null;
+                return false;
+            };
+            if (frame.document_generation != drag.generation or tab.accessibility.zoom != drag.zoom) {
+                tab.audio_drag = null;
+                return false;
+            }
+            const js = frame.js_context orelse {
+                tab.audio_drag = null;
+                return false;
+            };
+            const node = js.resolveAttachedNode(drag.window, drag.handle) orelse {
+                tab.audio_drag = null;
+                return false;
+            };
+            const state = frame.audio_elements.get(drag.handle) orelse {
+                tab.audio_drag = null;
+                return false;
+            };
+            // DOM source mutation can precede reconciliation of its revision.
+            if (state.revision != drag.revision or node.* != .element or node.element.isHiddenAudio() or state.fingerprint != sourceFingerprint(&node.element)) {
+                tab.audio_drag = null;
+                return false;
+            }
+            const value = drag.value + @as(f64, @floatFromInt(@as(i64, x) - drag.pointer_x)) / @as(f64, @floatFromInt(@max(1, drag.width)));
+            try control(browser, frame, node, drag.part, value);
+            return true;
         }
     };
 }

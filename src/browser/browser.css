@@ -78,6 +78,6 @@ button {
     background-color: orange;
 }
 
-/* Native audio controls are one focusable replaced box. */
+/* Native audio controls share one replaced box and DOM focus owner. */
 audio { display: inline; }
 audio[controls] { background-color: #eeeeee; color: #111111; padding: 8px; border: 1px solid #888888; border-radius: 4px; }
