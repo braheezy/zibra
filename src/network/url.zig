@@ -17,6 +17,7 @@ const Mutex = @import("../runtime/sync.zig").Mutex;
 pub const CacheControl = cache_module.CacheControl;
 pub const HttpCache = cache_module.HttpCache;
 pub const ReferrerPolicy = cache_module.ReferrerPolicy;
+pub const Referrer = @import("referrer_policy.zig");
 pub const XFrameOptions = cache_module.XFrameOptions;
 
 const user_agent = transport.user_agent;
@@ -659,7 +660,6 @@ pub const Url = struct {
         return transport.fetchBodyInternal(
             Url,
             inheritFragment,
-            refererHeaderValue,
             allocator,
             io,
             http_client,
@@ -668,12 +668,31 @@ pub const Url = struct {
             network_lock,
             url,
             referrer,
+            referrer,
             payload,
             final_url,
             request_origin,
             referrer_policy,
         );
     }
+    /// Fetch a stylesheet-initiated resource while keeping the document's
+    /// cookie context distinct from the sheet URL used to generate Referer.
+    /// All inputs borrow the waiting caller; response ownership is unchanged.
+    pub fn fetchBodyWithSourceContextSynchronized(
+        allocator: std.mem.Allocator,
+        io: std.Io,
+        client: *std.http.Client,
+        jar: *std.StringHashMap(CookieEntry),
+        cache: ?*HttpCache,
+        lock: *Mutex,
+        url: Url,
+        referrer: ?Url,
+        cookie_source: ?Url,
+        policy: ReferrerPolicy,
+    ) !HttpResponse {
+        return transport.fetchBodyInternal(Url, inheritFragment, allocator, io, client, jar, cache, lock, url, referrer, cookie_source, null, null, null, policy);
+    }
+
     pub fn fileRequest(self: Url, al: std.mem.Allocator, io: std.Io) ![]const u8 {
         const html_file = try std.Io.Dir.cwd().openFile(io, self.path, .{});
 
@@ -718,23 +737,15 @@ pub const Url = struct {
     }
 };
 
-/// Return the borrowed Referer request-header value for an outgoing request.
-/// Fragments never cross the network, and policy suppression affects only this
-/// header—not the source URL used for SameSite cookie decisions.
+/// Allocate the Referer request header, or return null for no disclosure.
+/// The caller owns the result; the cookie source context remains unmodified.
 pub fn refererHeaderValue(
+    allocator: std.mem.Allocator,
     referrer: ?Url,
     target: Url,
     policy: ReferrerPolicy,
-) ?[]const u8 {
-    const source = referrer orelse return null;
-    switch (policy) {
-        .default => {},
-        .no_referrer => return null,
-        .same_origin => if (!source.sameOrigin(target)) return null,
-    }
-    const href = source.ada_url.getHref();
-    const fragment = std.mem.indexOfScalar(u8, href, '#') orelse return href;
-    return href[0..fragment];
+) !?[]u8 {
+    return @import("referrer_policy.zig").serialize(allocator, referrer, @import("referrer_policy.zig").determine(referrer, target, policy, .full));
 }
 
 fn inheritFragment(allocator: std.mem.Allocator, source: Url, destination: *Url) !void {
@@ -1176,7 +1187,7 @@ test "HTTP fetch retains CORS, referrer, and frame response policies" {
                 } else if (std.ascii.eqlIgnoreCase(name, "cookie")) {
                     self.saw_cookie = std.mem.eql(u8, value, "token=secret");
                 } else if (std.ascii.eqlIgnoreCase(name, "referer")) {
-                    self.saw_referer = std.mem.eql(u8, value, "http://source.example:8080/page");
+                    self.saw_referer = std.mem.eql(u8, value, "http://source.example:8080/");
                 }
             }
 
@@ -1477,9 +1488,10 @@ test "HTTP cache reuses only cacheable GET 200 responses" {
         no_store_requests: usize = 0,
         unknown_requests: usize = 0,
         not_found_requests: usize = 0,
+        vary_requests: usize = 0,
         err: ?anyerror = null,
 
-        const Route = enum { default, max_age, no_store, unknown, not_found };
+        const Route = enum { default, max_age, no_store, unknown, not_found, vary };
 
         fn run(self: *@This()) void {
             self.serve() catch |err| {
@@ -1515,6 +1527,8 @@ test "HTTP cache reuses only cacheable GET 200 responses" {
                     .unknown
                 else if (std.mem.eql(u8, request_path, "/not-found"))
                     .not_found
+                else if (std.mem.eql(u8, request_path, "/vary"))
+                    .vary
                 else
                     return error.UnexpectedRequestTarget;
                 switch (route) {
@@ -1523,6 +1537,7 @@ test "HTTP cache reuses only cacheable GET 200 responses" {
                     .no_store => self.no_store_requests += 1,
                     .unknown => self.unknown_requests += 1,
                     .not_found => self.not_found_requests += 1,
+                    .vary => self.vary_requests += 1,
                 }
 
                 while (true) {
@@ -1545,6 +1560,7 @@ test "HTTP cache reuses only cacheable GET 200 responses" {
                         .no_store => .{ "/no-store", "Cache-Control: no-store\r\n" },
                         .unknown => .{ "/unknown", "Cache-Control: max-age=60, public\r\n" },
                         .not_found => unreachable,
+                        .vary => .{ "/vary", "Cache-Control: max-age=60\r\nVary: ReFeReR\r\n" },
                     };
                     try writer.interface.print(
                         "HTTP/1.1 200 OK\r\n" ++
@@ -1577,7 +1593,7 @@ test "HTTP cache reuses only cacheable GET 200 responses" {
     var cache = HttpCache.init(std.testing.allocator);
     defer cache.deinit();
 
-    const paths = [_][]const u8{ "/default", "/max-age", "/no-store", "/unknown", "/not-found" };
+    const paths = [_][]const u8{ "/default", "/max-age", "/no-store", "/unknown", "/not-found", "/vary" };
     var responses_valid = true;
     for (paths) |path| {
         const url_text = try std.fmt.allocPrint(
@@ -1589,18 +1605,26 @@ test "HTTP cache reuses only cacheable GET 200 responses" {
         const url = try Url.init(std.testing.allocator, url_text);
         defer url.free(std.testing.allocator);
 
-        for (0..2) |_| {
-            const response = try Url.fetchBody(
+        for (0..2) |index| {
+            const requested = try url.resolve(std.testing.allocator, if (index == 0) "#first" else "#second");
+            defer requested.free(std.testing.allocator);
+            var final_url: ?Url = null;
+            defer if (final_url) |resolved| resolved.free(std.testing.allocator);
+            const response = try Url.fetchBodyWithFinalUrlAndReferrerPolicy(
                 std.testing.allocator,
                 std.testing.io,
                 &http_client,
                 &cookie_jar,
                 &cache,
+                requested,
                 url,
                 null,
-                null,
+                &final_url,
+                if (index == 0) .default else .no_referrer,
             );
             defer if (response.csp_header) |header| std.testing.allocator.free(header);
+            responses_valid = responses_valid and response.request_referrer == (if (index == 0) Referrer.Disclosure.full else .none);
+            responses_valid = responses_valid and std.mem.eql(u8, final_url.?.ada_url.getHref(), requested.ada_url.getHref());
             if (std.mem.eql(u8, path, "/not-found")) {
                 responses_valid = responses_valid and response.status == .not_found;
                 responses_valid = responses_valid and std.mem.eql(u8, "not-found", response.body);
@@ -1618,12 +1642,13 @@ test "HTTP cache reuses only cacheable GET 200 responses" {
     thread_joined = true;
     if (context.err) |err| return err;
     try expect(responses_valid);
-    try std.testing.expectEqual(@as(usize, 8), context.handled_requests);
+    try std.testing.expectEqual(@as(usize, 10), context.handled_requests);
     try std.testing.expectEqual(@as(usize, 1), context.default_requests);
     try std.testing.expectEqual(@as(usize, 1), context.max_age_requests);
     try std.testing.expectEqual(@as(usize, 2), context.no_store_requests);
     try std.testing.expectEqual(@as(usize, 2), context.unknown_requests);
     try std.testing.expectEqual(@as(usize, 2), context.not_found_requests);
+    try std.testing.expectEqual(@as(usize, 2), context.vary_requests);
 }
 
 test "HTTP redirects follow relative and absolute locations and report the final URL" {
@@ -1657,17 +1682,26 @@ test "HTTP redirects follow relative and absolute locations and report the final
                 const request_path = request_parts.next() orelse return error.InvalidRequest;
                 if (!std.mem.eql(u8, request_path, expected_path)) return error.UnexpectedRedirectTarget;
 
+                var saw_referer = false;
                 while (true) {
                     const header = try readTestHttpLine(&reader.interface);
                     if (header.len == 0) break;
+                    if (std.ascii.startsWithIgnoreCase(header, "referer:")) {
+                        saw_referer = true;
+                        const value = std.mem.trim(u8, header[8..], " \t");
+                        const expected = if (index == 0) "https://source.example/private?q=secret" else "https://source.example/";
+                        if (!std.mem.eql(u8, value, expected)) return error.IncorrectRedirectReferrer;
+                    }
                 }
+
+                if (!saw_referer) return error.MissingRedirectReferrer;
 
                 switch (index) {
                     0 => try writer.interface.writeAll(
-                        "HTTP/1.1 302 Found\r\nContent-Length: 0\r\nLocation: /middle\r\nConnection: keep-alive\r\n\r\n",
+                        "HTTP/1.1 302 Found\r\nContent-Length: 0\r\nLocation: /middle#redirect\r\nReferrer-Policy: unsafe-url, origin, unknown\r\nReferrer-Policy: invalid\r\nConnection: keep-alive\r\n\r\n",
                     ),
                     1 => try writer.interface.print(
-                        "HTTP/1.1 301 Moved Permanently\r\nContent-Length: 0\r\nLocation: http://127.0.0.1:{d}/final\r\nConnection: keep-alive\r\n\r\n",
+                        "HTTP/1.1 301 Moved Permanently\r\nContent-Length: 0\r\nLocation: http://127.0.0.1:{d}/final\r\nReferrer-Policy: unsafe-url\r\nConnection: keep-alive\r\n\r\n",
                         .{self.port},
                     ),
                     2 => try writer.interface.writeAll(
@@ -1708,16 +1742,19 @@ test "HTTP redirects follow relative and absolute locations and report the final
 
     var final_url: ?Url = null;
     defer if (final_url) |resolved| resolved.free(std.testing.allocator);
-    const response = try Url.fetchBodyWithFinalUrl(
+    const source = try Url.init(std.testing.allocator, "https://user:pass@source.example/private?q=secret#fragment");
+    defer source.free(std.testing.allocator);
+    const response = try Url.fetchBodyWithFinalUrlAndReferrerPolicy(
         std.testing.allocator,
         std.testing.io,
         &http_client,
         &cookie_jar,
         null,
         initial_url,
-        null,
+        source,
         null,
         &final_url,
+        .unsafe_url,
     );
     defer std.testing.allocator.free(response.body);
 
@@ -1726,10 +1763,12 @@ test "HTTP redirects follow relative and absolute locations and report the final
     try std.testing.expectEqual(@as(usize, 3), context.handled_requests);
     try expect(std.mem.eql(u8, response.body, "final"));
     try expect(final_url != null);
+    try std.testing.expectEqual(Referrer.Disclosure.origin, response.request_referrer);
+    try std.testing.expectEqual(ReferrerPolicy.default, response.referrer_policy);
 
     const expected_final_url = try std.fmt.allocPrint(
         std.testing.allocator,
-        "http://127.0.0.1:{d}/final#target",
+        "http://127.0.0.1:{d}/final#redirect",
         .{port},
     );
     defer std.testing.allocator.free(expected_final_url);

@@ -28,7 +28,7 @@ The implementation behind that facade is split by ownership:
 
 The facade imports and re-exports the leaf types and delegates to transport.
 Transport imports the response, cookie, and cache leaves, but receives `Url`
-and the URL-specific fragment/referrer operations as comptime parameters; it
+and the URL-specific fragment operation as comptime parameters; it
 does not import the facade back and therefore does not create a cycle.
 `transport.fetchBodyInternal` is an internal seam. Preserve the facade when
 adding a fetch mode so inspection, Browser, and tests retain one ownership
@@ -298,22 +298,75 @@ CSS background resources are discovered only after final cascade. Do not fetch
 an overridden, unmatched, `display:none`, hidden-input, unsupported, or
 forced-colors-suppressed image. The Element owns attempted-source identity and
 optional decoded pixels. Before replacing pixels, retire frame and Browser
-display borrowers. Resolve against the document and apply its CSP and referrer
-policy.
+display borrowers. Resolve against the winning external stylesheet's final URL
+and use its response referrer policy; inline CSS uses the document URL and
+current policy. CSP always belongs to the containing Frame, not the stylesheet.
+The Loader also keeps the document's cookie source separate from the sheet's
+referrer URL: using a cross-site sheet must not turn its background fetch into
+a same-site cookie request.
+Each external CSSRule owns its source URL; the winning computed background
+provenance is interned into Element storage before the stylesheet can retire.
+Background resource identity includes the source base as well as the authored
+URL, so moving the same relative declaration between sheets reloads correctly.
 
 ## Referrer policy
 
-Every Frame stores the Referrer-Policy of its current response generation.
-Navigation, images, iframes, scripts, styles, backgrounds, and XHR pass that
-policy plus the source URL:
+The scalar policy/disclosure algorithm lives in `network/referrer_policy.zig`.
+It implements all eight policies with strict-origin-when-cross-origin as the
+empty-policy default. HTTP fields are comma-separated, case-sensitive token
+lists: the last recognized token across repeated fields wins. HTML enumerated
+attributes are case-insensitive single tokens, without whitespace trimming;
+meta delivery additionally recognizes HTML's legacy aliases.
 
-- Referer omits the fragment;
-- `no-referrer` always suppresses it;
-- `same-origin` suppresses it when scheme, host, or effective port differs.
+Referer serialization owns its output and excludes credentials and fragments.
+Non-HTTP(S) sources disclose nothing; serialized values above 4096 bytes reduce
+to an origin. Downgrade checks include trustworthy loopback/localhost origins,
+not merely the HTTPS scheme. Redirects apply each response's policy before the
+next request and can only reduce the already-disclosed URL. Intermediate
+Set-Cookie fields apply to their responding host and every hop regenerates its
+target-host Cookie header. Location is copied/resolved before body consumption
+invalidates response-header slices. HTTP redirect traversal is bounded to 20
+hops, with POST-to-GET handling for 301/302/303 and replay for 307/308.
 
-Policy suppression does not erase the initiator from the synchronous request
-context because SameSite cookie selection still needs it. Async XHR clones the
-source URL and copies policy before leaving its document generation.
+The cache retains response policy but not incoming provenance. A direct cache
+hit recomputes disclosure for the new request. Redirected results are not stored
+as final-response aliases under the initial URL: doing so would skip policy
+changes and could resurrect a suppressed referrer.
+Responses varying on Referer (or `*`) also bypass storage until variant keys
+are supported. Direct cached URLs exclude the first request's fragment.
+
+Each Frame owns a mutable outgoing policy and an immutable allocated incoming
+`document_referrer`. The latter is copied before the initiating document can
+retire, using the transport's final scalar disclosure. `document.referrer` is
+read-only and remains unchanged by later meta mutations; detached Documents
+return the empty string. A WindowRealm borrows these Frame fields synchronously
+and clears both borrows on retirement before Frame storage is freed.
+
+`document/referrer.zig` handles HTML delivery. The live parser updates the
+Frame's policy at each meta insertion and captures resource request policies
+before subsequent tokens/scripts can change them. Native insertion and
+name/content attribute mutation update only the affected attached meta or
+inserted subtree. Removal, detached parsing, and template contents do not
+restore or change policy. Resource `referrerpolicy` attributes override the
+document policy; link/form `rel=noreferrer` takes precedence. Requests initiated
+by script use the document policy, not the policy on the script element.
+
+Queued link/form/new-tab navigations own a cloned `navigation.ReferrerSource`;
+policy changes or source retirement cannot change the queued request. Browser
+chrome navigation has no document initiator. Async XHR similarly clones its
+source and scalar policy. Suppression never removes the original source URL
+from SameSite cookie context.
+
+Remaining limits: Fetch/Request and worker APIs, full special-document policy
+container inheritance (about:blank/srcdoc/blob), history-entry provenance
+restoration, and CSS import/font-loading pipelines are not implemented here.
+CSS custom-property URL definition-site provenance remains part of the broader
+typed CSS value work; ordinary background declarations track their source.
+Native namespace identity remains incomplete for script-created foreign nodes.
+Element reflection follows the existing wrapper-interface model, not complete
+Web IDL prototype hierarchies. These limitations are not hidden by enabling the
+large generated WPT referrer matrix; use the focused manifest and wire-level
+`test-referrer` fixture until its prerequisites are available.
 
 ## CORS and CSP
 

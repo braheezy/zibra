@@ -33,6 +33,7 @@ pub const Context = struct {
     allocator: std.mem.Allocator,
     window_id: u32,
     current_nodes: ?*Node,
+    referrer_policy: ?*@import("../document/referrer.zig").Policy = null,
     handles: *DomHandles,
     /// An optional parser- or embedder-owned identity registry. Its callbacks
     /// are synchronous, type-erased, and must never enter JavaScript.
@@ -320,6 +321,7 @@ pub fn insertDetachedChild(
     }
 
     if (parent_is_attached) {
+        if (self.referrer_policy) |policy| @import("../document/referrer.zig").inserted(installed_child, policy);
         self.hooks.complete(self.host_context, parent);
         if (refresh_named) try self.hooks.sync_named(self.host_context, self.window_id);
         self.hooks.request_render(self.host_context);
@@ -902,6 +904,11 @@ pub fn transferElementChildren(
     parser.fixParentPointers(installed_target, nodeParent(installed_target));
 
     if (mutates_document) {
+        if (target_was_attached) {
+            if (self.referrer_policy) |policy| {
+                for (installed_target.element.children.items) |*child| @import("../document/referrer.zig").inserted(child, policy);
+            }
+        }
         const completion_root = if (target_was_attached)
             installed_target
         else

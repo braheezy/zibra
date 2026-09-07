@@ -121,6 +121,13 @@ pass compares old and new values. Text inheritance borrows its ancestor's
 stable computed storage. Interned values retire with the Element, not after
 each style pass; repeated equal values reuse the same allocation.
 
+External CSS rules additionally own their final source URL and retain the
+stylesheet's scalar referrer policy. The winning background declaration's
+source URL is interned into the Element before rules retire. Resource loading
+uses this provenance for relative URL resolution and Referer, while retaining
+the containing document's CSP and cookie context; see
+[referrer policy](navigation-and-network.md#referrer-policy).
+
 Stylesheet rules carry their cascade origin independently of source ownership.
 Browser and isolated inspection mark their default sheet as user-agent rules;
 document sheets remain author rules. `presentational_hints.zig` maps supported

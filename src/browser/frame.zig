@@ -184,9 +184,11 @@ pub fn FrameType(
         // certificate navigation. Root-frame commits use this to suppress the
         // HTTPS padlock while retaining the requested URL in chrome and history.
         certificate_error: bool = false,
-        /// Policy received with this document generation. Every navigation and
-        /// subresource request originating here consults it before adding Referer.
+        /// Outgoing document policy, initialized from the response and updated
+        /// by live meta delivery. Resource attributes may override it per request.
         referrer_policy: url_module.ReferrerPolicy = .default,
+        /// Owned incoming navigation referrer, immutable for this generation.
+        document_referrer: ?[]u8 = null,
         /// Stable decoded source chunks borrowed by parser-created DOM strings.
         /// DOM must retire before these chunks on navigation or teardown.
         html_sources: HtmlSourceStore,
@@ -480,6 +482,9 @@ pub fn FrameType(
 
             self.clearContentSecurityPolicy();
 
+            if (self.document_referrer) |value| self.allocator.free(value);
+            self.document_referrer = null;
+
             if (self.current_url_owned) {
                 if (self.current_url) |url_ptr| {
                     url_ptr.*.free(self.allocator);
@@ -699,11 +704,17 @@ pub fn FrameType(
         }
 
         pub fn followLink(self: *Frame, b: *Browser, href: []const u8, button: ClickButton) !void {
+            return self.followLinkWithReferrerPolicy(b, href, button, self.referrer_policy);
+        }
+
+        /// Synchronously borrows href; queued navigation clones the source URL
+        /// and selected policy before returning. Resolve the element after events.
+        pub fn followLinkWithReferrerPolicy(self: *Frame, b: *Browser, href: []const u8, button: ClickButton, policy: url_module.ReferrerPolicy) !void {
             const current_url_ptr = self.current_url orelse return;
             var resolved_url = try current_url_ptr.*.resolveForNavigation(self.allocator, href);
 
             if (button == .middle) {
-                b.queueNewTab(resolved_url) catch |err| {
+                b.queueNewTabWithReferrer(resolved_url, current_url_ptr.*, policy) catch |err| {
                     resolved_url.free(self.allocator);
                     std.log.err("Failed to queue new tab for {s}: {any}", .{ href, err });
                 };
@@ -728,12 +739,12 @@ pub fn FrameType(
             };
 
             if (self.parent != null) {
-                b.scheduleFrameLoad(self, new_url_ptr, null) catch |err| {
+                b.scheduleFrameLoadWithReferrer(self, new_url_ptr, null, current_url_ptr.*, policy) catch |err| {
                     std.log.err("Failed to schedule iframe load for {s}: {any}", .{ href, err });
                     return;
                 };
             } else {
-                b.scheduleLoad(self.tab, new_url_ptr, null) catch |err| {
+                b.scheduleLoadWithReferrer(self.tab, new_url_ptr, null, current_url_ptr.*, policy) catch |err| {
                     std.log.err("Failed to schedule load for {s}: {any}", .{ href, err });
                     return;
                 };
@@ -1060,7 +1071,7 @@ pub fn FrameType(
                 if (element.attributes) |attributes| {
                     if (attributes.get("href")) |href| {
                         std.log.info("Link click in window_id={d}: {s}", .{ self.window_id, href });
-                        try self.followLink(b, href, button);
+                        try self.followLinkWithReferrerPolicy(b, href, button, @import("../document/referrer.zig").forElement(element, self.referrer_policy));
                     }
                 }
                 return true;
@@ -1087,7 +1098,7 @@ pub fn FrameType(
                     if (focused_element.attributes) |attributes| {
                         if (attributes.get("href")) |href| {
                             std.log.info("Link click in window_id={d}: {s}", .{ self.window_id, href });
-                            try self.followLink(b, href, button);
+                            try self.followLinkWithReferrerPolicy(b, href, button, @import("../document/referrer.zig").forElement(focused_element, self.referrer_policy));
                         }
                     }
                 },

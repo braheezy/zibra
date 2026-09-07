@@ -274,6 +274,12 @@ pub const Element = struct {
     // an inert fragment (such as innerHTML). Reattachment never resets that
     // state, while an explicitly created Element starts eligible.
     script_started: bool = false,
+    /// Request policy captured when a live parser inserts a resource element.
+    parser_referrer_policy: ?@import("referrer.zig").Policy = null,
+    /// Winning background declaration provenance; URL is Element-interned,
+    /// never borrowed from a replaceable stylesheet generation.
+    background_source_url: ?[]const u8 = null,
+    background_referrer_policy: ?@import("referrer.zig").Policy = null,
     /// The live checkedness of checkbox/radio controls. A null value means
     /// that no activation has overridden the markup default, so selectors
     /// still fall back to the presence of the `checked` content attribute.
@@ -868,10 +874,13 @@ pub const ImageData = struct {
 };
 
 pub const BackgroundImageData = struct {
+    /// Independently owned sheet base, used in resource identity comparisons.
+    source_base: ?[]u8 = null,
     source: []u8,
     data: ?ImageData = null,
 
     pub fn deinit(self: *BackgroundImageData, allocator: std.mem.Allocator) void {
+        if (self.source_base) |base| allocator.free(base);
         if (self.data) |*data| data.deinit(allocator);
         allocator.free(self.source);
     }

@@ -44,7 +44,33 @@ function svgDocumentTitle(root) {
 
 // Called only when a wrapper is created or its namespace metadata is installed.
 // Foreign title elements must not acquire HTMLTitleElement's .text interface.
-function updateTitleElementInterface(node) {
+function updateElementInterfaces(node) {
+  if (documentElementMatches(node, 'http://www.w3.org/1999/xhtml', 'meta')) {
+    Object.defineProperty(node, 'content', {
+      get: function() { return this.getAttribute('content') || ''; },
+      set: function(value) {
+        if (typeof value === 'symbol') throw new TypeError('Cannot convert a Symbol to DOMString');
+        this.setAttribute('content', String(value));
+      }, enumerable: true, configurable: true
+    });
+  }
+  if (node.nodeType === Node.ELEMENT_NODE && node.namespaceURI === 'http://www.w3.org/1999/xhtml' &&
+      ['a', 'area', 'iframe', 'img', 'link', 'script'].indexOf(node.localName) >= 0) {
+    Object.defineProperty(node, 'referrerPolicy', {
+      get: function() {
+        var value = (this.getAttribute('referrerpolicy') || '').replace(/[A-Z]/g, function(c) { return c.toLowerCase(); });
+        return ['no-referrer', 'no-referrer-when-downgrade', 'same-origin', 'origin',
+          'strict-origin', 'origin-when-cross-origin', 'strict-origin-when-cross-origin', 'unsafe-url'].indexOf(value) >= 0 ? value : '';
+      },
+      set: function(value) {
+        if (typeof value === 'symbol') throw new TypeError('Cannot convert a Symbol to DOMString');
+        this.setAttribute('referrerpolicy', String(value));
+      },
+      enumerable: true, configurable: true
+    });
+  } else {
+    delete node.referrerPolicy;
+  }
   if (documentElementMatches(node, 'http://www.w3.org/1999/xhtml', 'title')) {
     Object.setPrototypeOf(node, HTMLTitleElement.prototype);
   } else if (Object.getPrototypeOf(node) === HTMLTitleElement.prototype) {
@@ -68,6 +94,12 @@ function initializeDocumentAccessors() {
     });
   }
   Object.defineProperties(Document.prototype, {
+    referrer: {
+      get: function() {
+        requireDocument(this);
+        return this === document ? __native.documentReferrer() : '';
+      }, enumerable: true, configurable: true
+    },
     documentElement: {
       get: function() {
         requireDocument(this);

@@ -2,4 +2,5 @@
 
 comptime {
     _ = @import("network/url.zig");
+    _ = @import("tests/browser_referrer.zig");
 }

@@ -9,6 +9,62 @@ const parser_module = @import("../document/parser.zig");
 const Js = @import("../script/js.zig");
 const Url = @import("../network/url.zig").Url;
 
+test "Referrer keyboard link activation snapshots element overrides and noreferrer" {
+    const a = std.testing.allocator;
+    const network = @import("../network/url.zig");
+    const parser = @import("../document/parser.zig");
+    const MeasureTime = @import("../runtime/measure_time.zig").MeasureTime;
+    const LoadContext = @import("../browser/tab_tasks.zig").Contexts(browser.Browser).LoadTaskContext;
+    var environ = std.process.Environ.Map.init(a);
+    defer environ.deinit();
+    var measure = try MeasureTime.init(a, std.testing.io, &environ);
+    defer measure.finish();
+    var source = try Url.init(a, "https://source.example/private#hidden");
+    defer source.free(a);
+    const cases = .{
+        .{ "<a href='/next' referrerpolicy=unsafe-url>link</a>", network.ReferrerPolicy.unsafe_url },
+        .{ "<a href='/next' referrerpolicy=unsafe-url rel='external NOREFERRER'>link</a>", network.ReferrerPolicy.no_referrer },
+        .{ "<a href='/next' referrerpolicy=invalid>link</a>", network.ReferrerPolicy.origin },
+    };
+    inline for (cases) |case| {
+        var html = try parser.HTMLParser.init(a, case[0]);
+        defer html.deinit(a);
+        var tab = tab_module.Tab.init(a, 800, 600, &measure);
+        defer tab.deinit();
+        const frame = try a.create(tab_module.Frame);
+        frame.* = tab_module.Frame.init(a, &tab, null, null);
+        tab.root_frame = frame;
+        tab.focused_frame = frame;
+        frame.current_url = &source;
+        frame.referrer_policy = .origin;
+        frame.current_node = try html.parse();
+        parser.fixParentPointers(&frame.current_node.?, null);
+        var nodes = std.ArrayList(*parser.Node).empty;
+        defer nodes.deinit(a);
+        try parser.treeToList(a, &frame.current_node.?, &nodes);
+        for (nodes.items) |node| {
+            if (node.* == .element and std.mem.eql(u8, node.element.tag, "a")) {
+                frame.focus = node;
+                node.element.is_focused = true;
+                node.element.is_focus_visible = true;
+                break;
+            }
+        }
+        try std.testing.expect(frame.focus != null);
+        var test_browser: browser.Browser = undefined;
+        test_browser.allocator = a;
+        // Do not start the runner: inspect the owned handoff without networking
+        // or timing races, then let Tab teardown cancel and free the task.
+        try tab.activateFocusedElement(&test_browser);
+        try std.testing.expectEqual(@as(usize, 1), tab.task_runner.tasks.items.len);
+        const context: *LoadContext = @ptrCast(@alignCast(tab.task_runner.tasks.items[0].context));
+        frame.referrer_policy = .no_referrer;
+        try std.testing.expectEqual(case[1], context.referrer.policy);
+        try std.testing.expectEqualStrings("/private", context.referrer.url.?.path);
+        try std.testing.expect(context.referrer.url.?.path.ptr != source.path.ptr);
+    }
+}
+
 fn initTestChrome(allocator: std.mem.Allocator, environ: *std.process.Environ.Map) !Chrome {
     try environ.put("HOME", "/tmp");
     return Chrome.init(std.testing.io, environ, 800, allocator, false);
@@ -849,7 +905,7 @@ test "middle-clicking a link queues its resolved URL for a new tab" {
     test_browser.needs_animation_frame = false;
     test_browser.pending_new_tabs = .empty;
     defer {
-        for (test_browser.pending_new_tabs.items) |*url| url.free(allocator);
+        for (test_browser.pending_new_tabs.items) |*pending| pending.deinit(allocator);
         test_browser.pending_new_tabs.deinit(allocator);
     }
 
@@ -887,9 +943,10 @@ test "middle-clicking a link queues its resolved URL for a new tab" {
     try std.testing.expectEqual(@as(usize, 1), test_browser.pending_new_tabs.items.len);
     try std.testing.expectEqualStrings(
         "/docs/next.html",
-        test_browser.pending_new_tabs.items[0].path,
+        test_browser.pending_new_tabs.items[0].url.path,
     );
-    try std.testing.expect(try session.isVisited(&test_browser.pending_new_tabs.items[0]));
+    try std.testing.expect(try session.isVisited(&test_browser.pending_new_tabs.items[0].url));
+    try std.testing.expectEqualStrings("/docs/page.html", test_browser.pending_new_tabs.items[0].referrer.url.?.path);
     try std.testing.expect(test_browser.needs_animation_frame);
     try test_browser.annotateVisitedLinks(&root, &current_url);
     try std.testing.expect(link_node.?.element.is_visited);

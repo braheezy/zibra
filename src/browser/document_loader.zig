@@ -16,6 +16,7 @@ const Pin = @import("../document/node_pins.zig").Pin;
 /// Synchronous Browser-owned operations around one initial live parse.
 pub const Hooks = struct {
     context: ?*anyopaque,
+    referrer_policy: ?*@import("../document/referrer.zig").Policy = null,
     /// Publish the caller-owned final root before any source token or script
     /// can observe it. This is where a Browser installs a document Realm and
     /// generation-bound callbacks.
@@ -66,6 +67,7 @@ pub fn runIntoSlot(
 }
 
 fn drive(live: *LiveParser, root: *Node, hooks: Hooks) !void {
+    live.referrer_policy = hooks.referrer_policy;
     // A Realm-owned handle observer can be borrowed for the remainder of this
     // synchronous parse after its first script. Do not leave that borrowed
     // callback installed through a loader error or Frame/Realm retirement.

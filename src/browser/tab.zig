@@ -2683,12 +2683,12 @@ fn submitFormData(
     };
 
     if (frame.parent != null) {
-        b.scheduleFrameLoad(frame, form_url_ptr, submission.payload) catch |err| {
+        b.scheduleFrameLoadWithReferrer(frame, form_url_ptr, submission.payload, frame.current_url.?.*, @import("../document/referrer.zig").forElement(&form_node.element, frame.referrer_policy)) catch |err| {
             std.log.err("Failed to submit iframe form: {any}", .{err});
             return;
         };
     } else {
-        b.scheduleLoad(self, form_url_ptr, submission.payload) catch |err| {
+        b.scheduleLoadWithReferrer(self, form_url_ptr, submission.payload, frame.current_url.?.*, @import("../document/referrer.zig").forElement(&form_node.element, frame.referrer_policy)) catch |err| {
             std.log.err("Failed to submit form: {any}", .{err});
             return;
         };
@@ -3136,7 +3136,7 @@ pub fn activateFocusedElement(self: *Tab, b: *Browser) !void {
                 };
                 if (live_element.attributes) |attrs| {
                     if (attrs.get("href")) |href| {
-                        try frame.followLink(b, href, .primary);
+                        try frame.followLinkWithReferrerPolicy(b, href, .primary, @import("../document/referrer.zig").forElement(live_element, frame.referrer_policy));
                         return;
                     }
                 }

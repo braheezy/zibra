@@ -28,7 +28,8 @@ queued work and shutdown are documented in
   custom-property case; native computed-style readback flushes pending ancestor
   style work and copies values before returning to Kiesel.
 - `runtime/document_accessors.js` owns shared live/detached Document root,
-  head/body/title accessors and HTMLTitleElement text semantics. Getters follow
+  head/body/title/referrer accessors, referrer-policy reflection, and
+  HTMLTitleElement text semantics. Getters follow
   current wrapper topology; setters use existing mutation APIs. Do not cache
   element pointers or manufacture a root when reading an empty document.
 - `runtime/geometry.js` owns static DOMRect/DOMRectList values and Element
@@ -167,6 +168,9 @@ queued work and shutdown are documented in
 - Asynchronous callbacks carry copied generation-stamped document handles and
   own every URL, message, policy, body, and string they retain. Never queue a
   Frame, Node, or `JsRenderContext` pointer.
+- A Realm's referrer metadata borrows generation-owned Frame storage until
+  retirement. Native insertions and meta name/content mutations may update
+  the policy slot synchronously; detached parsing must never receive it.
 - Strings returned to JavaScript from serialization, DOM topology, cookies,
   XHR, or messages move into Kiesel's traced allocator before temporary or
   source-backed native storage retires.

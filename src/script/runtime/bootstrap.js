@@ -126,7 +126,7 @@ DOMParser.prototype.parseFromString = function(source, mimeType) {
       Object.defineProperty(node, 'localName', {
         value: xmlName, enumerable: true, configurable: true
       });
-      updateTitleElementInterface(node);
+      updateElementInterfaces(node);
       var children = node.childNodes || [];
       for (var i = 0; i < children.length; i++) markXml(children[i]);
     }
@@ -196,7 +196,7 @@ function wrapNode(handle) {
   if (node) return node;
   node = new Node(handle);
   NODE_WRAPPERS[handle] = node;
-  if (__native.tagName(handle) === 'TITLE') updateTitleElementInterface(node);
+  updateElementInterfaces(node);
   return node;
 }
 
@@ -2988,7 +2988,7 @@ document.createEvent = function(type) {
     Object.defineProperty(element, 'namespaceURI', { value: namespaceURI, enumerable: true, configurable: true });
     Object.defineProperty(element, 'tagName', { value: qualified, enumerable: true, configurable: true });
     Object.defineProperty(element, 'nodeName', { value: qualified, enumerable: true, configurable: true });
-    updateTitleElementInterface(element);
+    updateElementInterfaces(element);
     if (local.toLowerCase() === 'rect') Object.defineProperty(element, 'width', {
       get: function() { var value = parseFloat(this.getAttribute('width') || '0'); return isNaN(value) ? 0 : value; },
       enumerable: true, configurable: true

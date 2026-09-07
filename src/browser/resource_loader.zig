@@ -35,14 +35,16 @@ pub const Fetch = struct {
     referrer_url: Url,
     referrer_policy: url_module.ReferrerPolicy,
     response: ?url_module.HttpResponse = null,
+    final_url: ?Url = null,
     fetch_error: ?anyerror = null,
 
     fn runOpaque(raw: *anyopaque) void {
         const self: *@This() = @ptrCast(@alignCast(raw));
-        self.response = self.loader.fetchBodyDirect(
+        self.response = self.loader.fetchBodyForNavigationDirect(
             self.resource_url,
             self.referrer_url,
             null,
+            &self.final_url,
             self.referrer_policy,
         ) catch |err| {
             self.fetch_error = err;
@@ -59,6 +61,7 @@ pub const Fetch = struct {
             if (response.access_control_allow_origin) |header| allocator.free(header);
         }
         self.resource_url.free(allocator);
+        if (self.final_url) |url| url.free(allocator);
         self.referrer_url.free(allocator);
         self.* = undefined;
     }
@@ -98,6 +101,7 @@ pub const Batch = struct {
 
 const FetchMode = enum {
     ordinary,
+    stylesheet_resource,
     cors,
     navigation,
 };
@@ -116,11 +120,24 @@ const FetchContext = struct {
     response: ?url_module.HttpResponse = null,
     final_url: ?Url = null,
     fetch_error: ?anyerror = error.NetworkTaskCancelled,
+    cookie_source: ?Url = null,
     completed: std.Io.Semaphore = .{},
 
     fn runOpaque(raw: *anyopaque) anyerror!void {
         const self: *@This() = @ptrCast(@alignCast(raw));
         self.response = switch (self.mode) {
+            .stylesheet_resource => url_module.Url.fetchBodyWithSourceContextSynchronized(
+                self.loader.allocator,
+                self.loader.io,
+                &self.loader.session.http_client,
+                &self.loader.session.cookie_jar,
+                &self.loader.session.http_cache,
+                &self.loader.session.network_lock,
+                self.url,
+                self.referrer,
+                self.cookie_source,
+                self.referrer_policy,
+            ),
             .ordinary => self.loader.fetchBodyDirect(
                 self.url,
                 self.referrer,
@@ -239,6 +256,21 @@ pub const Loader = struct {
         );
     }
 
+    /// Synchronous source/initiator split for stylesheet-owned image requests.
+    pub fn fetchStylesheetResource(self: *Loader, url: Url, sheet: Url, document: ?Url, policy: url_module.ReferrerPolicy) !url_module.HttpResponse {
+        var context = FetchContext{
+            .loader = self,
+            .mode = .stylesheet_resource,
+            .url = url,
+            .referrer = sheet,
+            .cookie_source = document,
+            .payload = null,
+            .request_origin = null,
+            .referrer_policy = policy,
+        };
+        return self.runFetchContext(&context, .normal, "task:network_stylesheet_resource", null);
+    }
+
     fn fetchBodyDirect(
         self: *Loader,
         url: Url,
@@ -349,10 +381,14 @@ pub const Loader = struct {
             .request_origin = request_origin,
             .referrer_policy = referrer_policy,
         };
+        return self.runFetchContext(&context, priority, trace_name, final_url_output);
+    }
+
+    fn runFetchContext(self: *Loader, context: *FetchContext, priority: Task.Priority, trace_name: []const u8, final_url_output: ?*?Url) !url_module.HttpResponse {
         try self.session.scheduleNetworkTask(Task.init(
             priority,
             trace_name,
-            &context,
+            context,
             FetchContext.runOpaque,
             FetchContext.cleanupOpaque,
         ));

@@ -8,6 +8,15 @@
 //! only to software surfaces.
 
 const std = @import("std");
+const PendingNavigation = struct {
+    url: Url,
+    referrer: navigation.ReferrerSource,
+
+    pub fn deinit(self: *PendingNavigation, allocator: std.mem.Allocator) void {
+        self.url.free(allocator);
+        self.referrer.deinit(allocator);
+    }
+};
 const Mutex = @import("../runtime/sync.zig").Mutex;
 const sdl2 = @import("sdl");
 const z2d = @import("z2d");
@@ -221,7 +230,7 @@ const LiveDocumentLoadContext = struct {
 
         if (element.attributes) |attrs| {
             if (attrs.get("src")) |src| {
-                self.executeExternalScript(js_context, live, src);
+                self.executeExternalScript(js_context, live, src, @import("../document/referrer.zig").forResource(element, self.frame.referrer_policy));
                 return;
             }
         }
@@ -236,6 +245,7 @@ const LiveDocumentLoadContext = struct {
         js_context: *js_module,
         live: *parser.LiveParser,
         src: []const u8,
+        referrer_policy: url_module.ReferrerPolicy,
     ) void {
         var script_url = self.page_url.*.resolve(self.browser.allocator, src) catch |err| {
             std.log.warn("Failed to resolve parser script {s}: {}", .{ src, err });
@@ -252,7 +262,7 @@ const LiveDocumentLoadContext = struct {
             script_url,
             self.page_url.*,
             null,
-            self.frame.referrer_policy,
+            referrer_policy,
         ) catch |err| {
             std.log.warn("Failed to load parser script {s}: {}", .{ src, err });
             return;
@@ -412,7 +422,7 @@ const BackgroundImageLoadCallbacks = struct {
         referrer: Url,
         policy: url_module.ReferrerPolicy,
     ) !url_module.HttpResponse {
-        return context.browser.fetchBodyWithReferrerPolicy(target, referrer, null, policy);
+        return context.browser.resource_loader.fetchStylesheetResource(target, referrer, if (context.frame.current_url) |url| url.* else null, policy);
     }
 
     pub fn retire(context: *BackgroundImageLoadContext) void {
@@ -692,7 +702,8 @@ pub const Browser = struct {
     tabs: std.ArrayList(*Tab),
     // Owned link targets requested by tab workers. The browser thread drains
     // this queue because it exclusively creates tabs and updates chrome.
-    pending_new_tabs: std.ArrayList(Url),
+    pending_new_tabs: std.ArrayList(PendingNavigation),
+
     // A tab worker publishes only stable tab identity plus history indexes.
     // The native confirmation dialog is consumed on the SDL/UI thread.
     pending_post_resubmission: ?PendingPostResubmission = null,
@@ -973,7 +984,7 @@ pub const Browser = struct {
             .layout_engine = layout_engine,
             .default_style_sheet_rules = default_rules,
             .tabs = std.ArrayList(*Tab).empty,
-            .pending_new_tabs = std.ArrayList(Url).empty,
+            .pending_new_tabs = std.ArrayList(PendingNavigation).empty,
             .chrome = chrome,
             .measure = measure,
             .lock = .init(io),
@@ -1521,6 +1532,10 @@ pub const Browser = struct {
     // Create a new tab and load a URL into it
     /// Takes ownership of `url`, including on failure.
     pub fn newTab(self: *Browser, url: Url) !void {
+        return self.newTabWithReferrer(url, .{});
+    }
+
+    fn newTabWithReferrer(self: *Browser, url: Url, referrer: navigation.ReferrerSource) !void {
         var owned_url = url;
         var owns_url = true;
         defer if (owns_url) owned_url.free(self.allocator);
@@ -1551,13 +1566,19 @@ pub const Browser = struct {
             self.allocator.destroy(url_ptr);
         };
 
-        try self.scheduleLoad(tab, url_ptr, null);
+        try self.scheduleLoadWithReferrer(tab, url_ptr, null, referrer.url, referrer.policy);
         url_owned = false;
     }
 
     /// Transfer an owned URL from a tab worker to the browser thread.
     /// Ownership moves into the queue only when this function succeeds.
     pub fn queueNewTab(self: *Browser, url: Url) !void {
+        return self.queueNewTabWithReferrer(url, null, .default);
+    }
+
+    pub fn queueNewTabWithReferrer(self: *Browser, url: Url, source: ?Url, policy: url_module.ReferrerPolicy) !void {
+        var referrer = try navigation.ReferrerSource.clone(self.allocator, source, policy);
+        errdefer referrer.deinit(self.allocator);
         self.lock.lock();
         if (self.shutting_down) {
             self.lock.unlock();
@@ -1575,7 +1596,7 @@ pub const Browser = struct {
             self.lock.unlock();
             return err;
         };
-        self.pending_new_tabs.appendAssumeCapacity(url);
+        self.pending_new_tabs.appendAssumeCapacity(.{ .url = url, .referrer = referrer });
         if (inserted) self.needs_animation_frame = true;
         self.lock.unlock();
 
@@ -1589,10 +1610,11 @@ pub const Browser = struct {
                 self.lock.unlock();
                 return;
             }
-            const url = self.pending_new_tabs.orderedRemove(0);
+            var pending = self.pending_new_tabs.orderedRemove(0);
             self.lock.unlock();
 
-            self.newTab(url) catch |err| {
+            defer pending.referrer.deinit(self.allocator);
+            self.newTabWithReferrer(pending.url, pending.referrer) catch |err| {
                 std.log.err("Failed to open queued tab: {any}", .{err});
             };
         }
@@ -2614,6 +2636,7 @@ pub const Browser = struct {
 
         frame.js_render_context_initialized = true;
         js_context.setNodes(frame.window_id, &frame.current_node.?);
+        js_context.setDocumentReferrer(frame.window_id, frame.document_referrer orelse "", &frame.referrer_policy);
         // `setNodes` installs this document's fresh WindowRealm. Notify the
         // top-level observer immediately afterward, before the live parser can
         // reach its first script. Child Frames keep their own Realm lifecycle.
@@ -2682,20 +2705,17 @@ pub const Browser = struct {
         payload: ?[]const u8,
         history_navigation: HistoryNavigation,
     ) !void {
+        const frame = tab.root_frame;
+        return self.loadInTabWithReferrer(tab, url, payload, history_navigation, if (frame) |f| if (f.current_url) |source| source.* else null else null, if (frame) |f| f.referrer_policy else .default);
+    }
+
+    /// Referrer inputs borrow the caller through fetch and provenance copying.
+    pub fn loadInTabWithReferrer(self: *Browser, tab: *Tab, url: *Url, payload: ?[]const u8, history_navigation: HistoryNavigation, referrer_value: ?Url, referrer_policy: url_module.ReferrerPolicy) !void {
         // Scheduling or committing navigation may discard a resize wake-up.
         // On failure, reflow the surviving page; on success, catch any request
         // published after the navigation's final render.
         defer if (tab.applyRequestedViewport()) tab.setNeedsRender();
         std.log.info("Loading: {s}", .{url.*.path});
-
-        var referrer_value: ?Url = null;
-        var referrer_policy: url_module.ReferrerPolicy = .default;
-        if (tab.root_frame) |old_frame| {
-            referrer_policy = old_frame.referrer_policy;
-            if (old_frame.current_url) |ref_ptr| {
-                referrer_value = ref_ptr.*;
-            }
-        }
 
         // Fetch and decode while the old document still owns the referrer and
         // remains usable if navigation fails before commit.
@@ -2710,6 +2730,9 @@ pub const Browser = struct {
         );
         defer document.deinit(self.allocator);
         const response = document.response;
+
+        var incoming_referrer = try url_module.Referrer.serialize(self.allocator, referrer_value, response.request_referrer);
+        defer if (incoming_referrer) |value| self.allocator.free(value);
 
         // The requested link and its final redirect destination are distinct
         // visits. A certificate warning is browser UI, not a successful visit
@@ -2764,6 +2787,8 @@ pub const Browser = struct {
         frame.viewport_height = tab.tab_height;
         frame.certificate_error = document.certificate_error;
         frame.referrer_policy = response.referrer_policy;
+        frame.document_referrer = incoming_referrer;
+        incoming_referrer = null;
         tab.focused_frame = frame;
 
         frame.scroll = 0;
@@ -2829,6 +2854,7 @@ pub const Browser = struct {
             try document_loader.runIntoSlot(self.allocator, &frame.html_sources, &frame.current_node, .{
                 .context = &live_context,
                 .install_root = LiveDocumentLoadContext.installRoot,
+                .referrer_policy = &frame.referrer_policy,
                 .execute_script = LiveDocumentLoadContext.executeScript,
             });
             document_title = try parser.collectDocumentTitle(
@@ -2989,6 +3015,13 @@ pub const Browser = struct {
         url: *Url,
         payload: ?[]const u8,
     ) !void {
+        // Browser-chrome navigation has no initiating document.
+        return self.scheduleLoadWithReferrer(tab, url, payload, null, .default);
+    }
+
+    pub fn scheduleLoadWithReferrer(self: *Browser, tab: *Tab, url: *Url, payload: ?[]const u8, source: ?Url, policy: url_module.ReferrerPolicy) !void {
+        var referrer = try navigation.ReferrerSource.clone(self.allocator, source, policy);
+        errdefer referrer.deinit(self.allocator);
         const ctx = try LoadTaskContext.create(
             self.allocator,
             self,
@@ -2996,6 +3029,8 @@ pub const Browser = struct {
             url,
             payload,
         );
+        ctx.referrer = referrer;
+        referrer = .{};
         tab.task_runner.clear();
         const task_instance = Task.init(
             .normal,
@@ -3005,6 +3040,9 @@ pub const Browser = struct {
             LoadTaskContext.cleanupOpaque,
         );
         tab.task_runner.schedule(task_instance) catch |err| {
+            // Scheduling failure does not transfer the caller's URL/payload.
+            ctx.url = null;
+            ctx.payload = null;
             ctx.destroy();
             return err;
         };
@@ -3016,6 +3054,12 @@ pub const Browser = struct {
         url: *Url,
         payload: ?[]const u8,
     ) !void {
+        return self.scheduleFrameLoadWithReferrer(frame, url, payload, if (frame.current_url) |source| source.* else null, frame.referrer_policy);
+    }
+
+    pub fn scheduleFrameLoadWithReferrer(self: *Browser, frame: *Frame, url: *Url, payload: ?[]const u8, source: ?Url, policy: url_module.ReferrerPolicy) !void {
+        var referrer = try navigation.ReferrerSource.clone(self.allocator, source, policy);
+        errdefer referrer.deinit(self.allocator);
         std.log.info("Scheduling iframe load for window_id={d}: {s}", .{ frame.window_id, url.*.path });
         const ctx = try FrameLoadTaskContext.create(
             self.allocator,
@@ -3024,6 +3068,8 @@ pub const Browser = struct {
             url,
             payload,
         );
+        ctx.referrer = referrer;
+        referrer = .{};
         const task_instance = Task.init(
             .normal,
             "task:frame_navigate",
@@ -3032,6 +3078,8 @@ pub const Browser = struct {
             FrameLoadTaskContext.cleanupOpaque,
         );
         frame.tab.task_runner.schedule(task_instance) catch |err| {
+            ctx.url = null;
+            ctx.payload = null;
             ctx.destroy();
             return err;
         };
@@ -3119,6 +3167,8 @@ pub const Browser = struct {
         frame.current_url_owned = false;
         frame.certificate_error = false;
         frame.referrer_policy = .default;
+        if (frame.document_referrer) |value| self.allocator.free(value);
+        frame.document_referrer = null;
         frame.resources_dirty = false;
         frame.stylesheets_dirty = true;
         frame.content_height = 0;
@@ -3137,6 +3187,10 @@ pub const Browser = struct {
         payload: ?[]const u8,
         history_navigation: HistoryNavigation,
     ) !void {
+        return self.loadInFrameWithReferrer(frame, url, payload, history_navigation, if (frame.current_url) |source| source.* else null, frame.referrer_policy);
+    }
+
+    pub fn loadInFrameWithReferrer(self: *Browser, frame: *Frame, url: *Url, payload: ?[]const u8, history_navigation: HistoryNavigation, referrer_value: ?Url, referrer_policy: url_module.ReferrerPolicy) !void {
         std.log.info("Loading iframe: {s}", .{url.*.path});
 
         if (frame.parent) |parent| {
@@ -3146,12 +3200,6 @@ pub const Browser = struct {
                     return error.IframeNavigationBlockedByCsp;
                 }
             }
-        }
-
-        var referrer_value: ?Url = null;
-        const referrer_policy = frame.referrer_policy;
-        if (frame.current_url) |ref_ptr| {
-            referrer_value = ref_ptr.*;
         }
 
         var final_url: ?Url = null;
@@ -3166,6 +3214,8 @@ pub const Browser = struct {
         defer document.deinit(self.allocator);
         const response = document.response;
 
+        var incoming_referrer = try url_module.Referrer.serialize(self.allocator, referrer_value, response.request_referrer);
+        defer if (incoming_referrer) |value| self.allocator.free(value);
         const final_destination: ?*const Url = if (final_url) |*resolved| resolved else null;
         if (frame.parent) |parent| {
             if (parent.current_url) |page_url| {
@@ -3229,6 +3279,8 @@ pub const Browser = struct {
         errdefer self.resetFrameForNavigation(frame);
         frame.certificate_error = document.certificate_error;
         frame.referrer_policy = response.referrer_policy;
+        frame.document_referrer = incoming_referrer;
+        incoming_referrer = null;
 
         frame.clearContentSecurityPolicy();
         if (response.csp_header) |hdr| {
@@ -3256,6 +3308,7 @@ pub const Browser = struct {
         try document_loader.runIntoSlot(self.allocator, &frame.html_sources, &frame.current_node, .{
             .context = &live_context,
             .install_root = LiveDocumentLoadContext.installRoot,
+            .referrer_policy = &frame.referrer_policy,
             .execute_script = LiveDocumentLoadContext.executeScript,
         });
         parser.fixParentPointers(&frame.current_node.?, null);
@@ -3629,7 +3682,7 @@ pub const Browser = struct {
             page_url.*,
             null,
             &final_url,
-            parent.referrer_policy,
+            @import("../document/referrer.zig").forResource(&iframe_node.element, parent.referrer_policy),
         );
         defer document.deinit(self.allocator);
         const response = document.response;
@@ -3676,6 +3729,7 @@ pub const Browser = struct {
             frame.deinit();
             parent.allocator.destroy(frame);
         }
+        frame.document_referrer = try url_module.Referrer.serialize(self.allocator, @as(?Url, page_url.*), response.request_referrer);
         parent.tab.registerFrame(frame);
         if (iframeViewportFromNode(iframe_node)) |viewport| {
             frame.viewport_width = Layout.scaleCssPixelByFactor(
@@ -3742,6 +3796,7 @@ pub const Browser = struct {
             try document_loader.runIntoSlot(self.allocator, &frame.html_sources, &frame.current_node, .{
                 .context = &live_context,
                 .install_root = LiveDocumentLoadContext.installRoot,
+                .referrer_policy = &frame.referrer_policy,
                 .execute_script = LiveDocumentLoadContext.executeScript,
             });
         }
@@ -3978,7 +4033,7 @@ pub const Browser = struct {
                 .kind = kind,
                 .resource_url = resource_url,
                 .referrer_url = referrer_url,
-                .referrer_policy = frame.referrer_policy,
+                .referrer_policy = @import("../document/referrer.zig").forResource(&node.element, frame.referrer_policy),
             });
             resource_url_owned = false;
             referrer_url_owned = false;
@@ -4266,6 +4321,8 @@ pub const Browser = struct {
     fn appendDocumentStylesheetRules(
         self: *Browser,
         css_text: []const u8,
+        source_url: ?Url,
+        referrer_policy: url_module.ReferrerPolicy,
         media: CSSParser.MediaEnvironment,
         css_texts: *std.ArrayList([]const u8),
         rules: *std.ArrayList(CSSParser.CSSRule),
@@ -4290,6 +4347,12 @@ pub const Browser = struct {
                 for (parsed_rules) |*rule| rule.deinit(self.allocator);
             }
             self.allocator.free(parsed_rules);
+        }
+        if (source_url) |url| {
+            for (parsed_rules) |*rule| {
+                rule.source_url = try url.toOwnedString(self.allocator);
+                rule.referrer_policy = referrer_policy;
+            }
         }
 
         // Reserve both destinations before transferring either half of the
@@ -4329,6 +4392,8 @@ pub const Browser = struct {
 
                 self.appendDocumentStylesheetRules(
                     css_text,
+                    null,
+                    .default,
                     frameMediaEnvironment(frame),
                     css_texts,
                     rules,
@@ -4373,6 +4438,8 @@ pub const Browser = struct {
 
             self.appendDocumentStylesheetRules(
                 css_text,
+                completed.final_url orelse completed.resource_url,
+                css_response.referrer_policy,
                 frameMediaEnvironment(frame),
                 css_texts,
                 rules,
@@ -6354,7 +6421,7 @@ pub const Browser = struct {
         }
         self.tabs.deinit(self.allocator);
 
-        for (self.pending_new_tabs.items) |*url| url.free(self.allocator);
+        for (self.pending_new_tabs.items) |*pending| pending.deinit(self.allocator);
         self.pending_new_tabs.deinit(self.allocator);
         self.touch_tracker.deinit();
 

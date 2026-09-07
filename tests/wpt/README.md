@@ -63,6 +63,15 @@ the result-collection tasks (`wpt`, `wpt-all`, `latest-results`, category runs,
 
 ### Focused compatibility manifests
 
+`manifest-referrer.yaml` probes referrer-policy reflection and two network
+prerequisite cases. The invalid-value and script-IDL tests are enabled in the
+default allowlist. The XHR messaging helper currently requires working WPT
+security-feature substitutions and Location; the detached-meta test requires
+Fetch/Response (and one case needs `Document.parseHTMLUnsafe`). They remain
+focused probes, not default coverage. Wire behavior is independently checked
+by `zig build test-referrer`; reftests/crashtests cannot establish which Referer
+header was sent.
+
 The reftests in the table, replaced-sizing, SVG-image, and media-range
 manifests below also run in the default [allowlist](manifest.yaml). Their
 focused manifests remain useful for narrow iteration; they are no longer

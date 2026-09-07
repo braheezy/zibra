@@ -15,6 +15,7 @@ const Frame = tab_module.Frame;
 const ClickButton = tab_module.ClickButton;
 const HoverPosition = tab_module.HoverPosition;
 const HistoryDirection = tab_module.HistoryDirection;
+const ReferrerSource = @import("navigation.zig").ReferrerSource;
 
 /// Locate the document's first body Element without retaining a Node beyond
 /// the synchronous lifecycle dispatch that uses it. The parser guarantees a
@@ -59,6 +60,7 @@ pub fn Contexts(comptime Browser: type) type {
             tab: *Tab,
             url: ?*Url,
             payload: ?[]const u8,
+            referrer: ReferrerSource = .{},
 
             pub fn create(
                 allocator: std.mem.Allocator,
@@ -79,6 +81,7 @@ pub fn Contexts(comptime Browser: type) type {
             }
 
             pub fn destroy(self: *@This()) void {
+                self.referrer.deinit(self.allocator);
                 self.consumePayload();
                 if (self.url) |url| {
                     url.free(self.allocator);
@@ -96,7 +99,7 @@ pub fn Contexts(comptime Browser: type) type {
 
             fn run(self: *@This()) !void {
                 defer self.consumePayload();
-                try self.browser.loadInTab(self.tab, self.url.?, self.payload, .push);
+                try self.browser.loadInTabWithReferrer(self.tab, self.url.?, self.payload, .push, self.referrer.url, self.referrer.policy);
                 self.url = null;
             }
 
@@ -125,6 +128,7 @@ pub fn Contexts(comptime Browser: type) type {
             document: DocumentHandle,
             url: ?*Url,
             payload: ?[]const u8,
+            referrer: ReferrerSource = .{},
 
             pub fn create(
                 allocator: std.mem.Allocator,
@@ -146,6 +150,7 @@ pub fn Contexts(comptime Browser: type) type {
             }
 
             pub fn destroy(self: *@This()) void {
+                self.referrer.deinit(self.allocator);
                 self.consumePayload();
                 if (self.url) |url| {
                     url.free(self.allocator);
@@ -164,7 +169,7 @@ pub fn Contexts(comptime Browser: type) type {
             fn run(self: *@This()) !void {
                 defer self.consumePayload();
                 const frame = self.document.resolve(self.tab) orelse return;
-                try self.browser.loadInFrame(frame, self.url.?, self.payload, .push);
+                try self.browser.loadInFrameWithReferrer(frame, self.url.?, self.payload, .push, self.referrer.url, self.referrer.policy);
             }
 
             pub fn toOpaque(self: *@This()) *anyopaque {

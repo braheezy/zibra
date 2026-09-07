@@ -8,6 +8,9 @@ instead of coupling itself to the implementation leaves.
 
 The implementation leaves have separate ownership responsibilities:
 
+- `referrer_policy.zig` owns scalar policy parsing, disclosure reduction, and
+  credential/fragment-free serialization. HTML attribute/meta parsing and HTTP
+  list parsing deliberately have different token rules.
 - `response.zig` defines response metadata plus Referrer-Policy,
   X-Frame-Options, CORS, MIME classification, and UTF-8 decoding helpers. A response value does not
   by itself identify which of its slices are owned.
@@ -18,7 +21,7 @@ The implementation leaves have separate ownership responsibilities:
   retained metadata, and the supported `Cache-Control` policy parser.
 - `transport.zig` performs browser-independent scheme dispatch, HTTP, redirect,
   cache, and cookie coordination. It borrows the supplied client/jar/cache and
-  is parameterized by the URL type and URL-policy callbacks so it never imports
+  is parameterized by the URL type and fragment-inheritance callback so it never imports
   `url.zig` back into itself.
 
 Keep the dependency direction acyclic: the facade delegates to transport;
@@ -89,13 +92,21 @@ before changing networking dispatch or teardown.
   complete round trip or parallel subresources become serialized. The
   cookie-layer request selection is borrowed; copy its header value while
   locked before giving it to a request.
-- Referer generation borrows the source URL only for the synchronous request,
-  omits its fragment, and applies the source document's `no-referrer` or
-  `same-origin` policy. Policy suppression must not erase the request context:
-  SameSite cookie checks still receive the unsuppressed source URL.
+- Referer generation borrows the initiating URL and returns an independently
+  allocated header. All eight policies are supported; empty policy means
+  strict-origin-when-cross-origin. Strip credentials/fragments, suppress local
+  sources, and reduce serialized values above 4096 bytes to their origin.
+  Policy suppression must not erase the context used for SameSite checks.
+  Transport follows redirects explicitly, regenerates target cookies and
+  Referer per hop, and never restores information removed by an earlier hop.
+  Copy Location while response headers are live, before reading the body.
+  Final-response cache aliases for redirects are disabled until the cache can
+  replay intermediate policy transitions. Cache hits recompute incoming
+  disclosure from the current request, never a cached initiator.
 - A computed CSS background URL is an ordinary image subresource: resolve it
-  strictly against the containing document, apply that Frame's CSP and
-  Referrer-Policy, and preserve the same HTTP/file versus data/about body
+  against the winning stylesheet's final URL (or the document for inline CSS),
+  apply the Frame's CSP and the corresponding sheet/document referrer policy,
+  and preserve the same HTTP/file versus data/about body
   ownership split as `<img>`. Discovery belongs after cascade, outside the URL
   layer, so an unused declaration never reaches transport.
 - Cross-origin XHR uses the explicit Origin-bearing fetch path. That path

@@ -16,6 +16,10 @@ directories:
   - uievents
 tests:
   - dom/nodes/Element-firstElementChild.html
+  # Referrer policy reflection. Network-heavy generators currently require
+  # Fetch/Location and a working security-features substitution server.
+  - referrer-policy/generic/subresource-test/attr-referrer-invalid-value.html
+  - html/semantics/scripting-1/the-script-element/script-referrerpolicy-idl.html
   # HTML document accessors, collections, metadata, parsing and serialization.
   # These exercise existing behavior even where individual assertions fail.
   - html/dom/documents/dom-tree-accessors/Document.body.html

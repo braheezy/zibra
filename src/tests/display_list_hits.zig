@@ -539,7 +539,7 @@ fn initQueueBrowser(
 }
 
 fn deinitQueueBrowser(test_browser: *browser.Browser) void {
-    for (test_browser.pending_new_tabs.items) |*url| url.free(test_browser.allocator);
+    for (test_browser.pending_new_tabs.items) |*pending| pending.deinit(test_browser.allocator);
     test_browser.pending_new_tabs.deinit(test_browser.allocator);
     test_browser.tabs.deinit(test_browser.allocator);
 }
@@ -911,7 +911,7 @@ test "frame clicks use painted link fragments when link bounds are empty" {
 
     try std.testing.expect(try frame.click(&test_browser, 15, 25, .middle));
     try std.testing.expectEqual(@as(usize, 1), test_browser.pending_new_tabs.items.len);
-    try std.testing.expectEqualStrings("/docs/next.html", test_browser.pending_new_tabs.items[0].path);
+    try std.testing.expectEqualStrings("/docs/next.html", test_browser.pending_new_tabs.items[0].url.path);
 }
 
 test "primary painted click focuses the innermost scroll container" {
@@ -1158,7 +1158,7 @@ test "iframe display hit translates into the child frame list" {
     // Parent (25,35) -> child (15,22) after iframe origin and child scroll.
     try std.testing.expect(try parent.click(&test_browser, 25, 35, .middle));
     try std.testing.expectEqual(@as(usize, 1), test_browser.pending_new_tabs.items.len);
-    try std.testing.expectEqualStrings("/frame/target.html", test_browser.pending_new_tabs.items[0].path);
+    try std.testing.expectEqualStrings("/frame/target.html", test_browser.pending_new_tabs.items[0].url.path);
 
     // At .75x, scaling top and scroll separately would map this device point
     // to child y=0. The compositor scales their combined translation

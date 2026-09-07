@@ -1715,6 +1715,9 @@ pub const CSSRule = struct {
     properties: DeclarationMap,
     owned: bool = true,
     origin: enum { user_agent, author } = .author,
+    /// Independent source URL owner for external-sheet resource provenance.
+    source_url: ?[]u8 = null,
+    referrer_policy: @import("referrer.zig").Policy = .default,
 
     /// Origin precedes specificity; important UA rules precede author rules.
     pub fn declarationPriorityBase(self: CSSRule, important: bool) u32 {
@@ -1725,6 +1728,7 @@ pub const CSSRule = struct {
     }
 
     pub fn deinit(self: *CSSRule, allocator: std.mem.Allocator) void {
+        if (self.source_url) |url| allocator.free(url);
         // Free the selector's allocated memory (pass pointer since deinit expects *Selector)
         Selector.deinit(&self.selector, allocator);
 

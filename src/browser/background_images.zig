@@ -71,6 +71,7 @@ fn loadOne(
     allocator: std.mem.Allocator,
     io: std.Io,
     page_url: *const Url,
+    source_base: ?[]const u8,
     referrer_policy: url_module.ReferrerPolicy,
     source: []const u8,
     cache: *std.StringHashMap(CacheEntry),
@@ -81,8 +82,12 @@ fn loadOne(
         .source = try allocator.dupe(u8, source),
     };
     errdefer result.deinit(allocator);
+    if (source_base) |base| result.source_base = try allocator.dupe(u8, base);
+    var sheet_url: ?Url = if (source_base) |base| try Url.init(allocator, base) else null;
+    defer if (sheet_url) |url| url.free(allocator);
+    const referrer_url: *const Url = if (sheet_url) |*url| url else page_url;
 
-    var image_url = page_url.*.resolve(allocator, source) catch |err| {
+    var image_url = referrer_url.*.resolve(allocator, source) catch |err| {
         if (err == error.OutOfMemory) return err;
         std.log.warn("Failed to resolve CSS background image {s}: {}", .{ source, err });
         return result;
@@ -102,7 +107,7 @@ fn loadOne(
         return result;
     }
 
-    const response = callbacks.fetch(context, image_url, page_url.*, referrer_policy) catch |err| {
+    const response = callbacks.fetch(context, image_url, referrer_url.*, referrer_policy) catch |err| {
         if (err == error.OutOfMemory) return err;
         std.log.warn("Failed to load CSS background image {s}: {}", .{ source, err });
         return result;
@@ -187,14 +192,16 @@ pub fn loadUsed(
             }
 
             if (element.background_image) |*installed| {
-                if (std.mem.eql(u8, installed.source, source.?)) continue;
+                if (std.mem.eql(u8, installed.source, source.?) and
+                    std.mem.eql(u8, installed.source_base orelse "", element.background_source_url orelse "")) continue;
             }
 
             var replacement = try loadOne(
                 allocator,
                 io,
                 page_url,
-                referrer_policy,
+                element.background_source_url,
+                element.background_referrer_policy orelse referrer_policy,
                 source.?,
                 &cache,
                 context,

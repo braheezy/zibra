@@ -701,6 +701,8 @@ pub fn Application(
                         defer cascade_priorities.deinit();
                         var pending_shorthands = std.StringHashMap([]const u8).init(allocator);
                         defer pending_shorthands.deinit();
+                        var background_source_url: ?[]const u8 = null;
+                        var background_referrer_policy: ?@import("referrer.zig").Policy = null;
 
                         for (CSS_PROPERTIES) |prop| {
                             try new_style.put(prop.name, prop.default_value);
@@ -747,6 +749,13 @@ pub fn Application(
                             {
                                 var it = rule.properties.iterator();
                                 while (it.next()) |entry| {
+                                    if (std.mem.eql(u8, entry.key_ptr.*, "background-image") and
+                                        entry.value_ptr.priority(rule.declarationPriorityBase(entry.value_ptr.important)) >=
+                                            (cascade_priorities.get("background-image") orelse 0))
+                                    {
+                                        background_source_url = rule.source_url;
+                                        background_referrer_policy = if (rule.source_url != null) rule.referrer_policy else null;
+                                    }
                                     try applyCascadedDeclaration(
                                         &new_style,
                                         &cascade_priorities,
@@ -771,6 +780,13 @@ pub fn Application(
 
                                 var it = parsed_styles.iterator();
                                 while (it.next()) |entry| {
+                                    if (std.mem.eql(u8, entry.key_ptr.*, "background-image") and
+                                        entry.value_ptr.priority(CSSParser.AUTHOR_ORIGIN_PRIORITY + CSSParser.INLINE_STYLE_PRIORITY) >=
+                                            (cascade_priorities.get("background-image") orelse 0))
+                                    {
+                                        background_source_url = null;
+                                        background_referrer_policy = null;
+                                    }
                                     try applyCascadedDeclaration(
                                         &new_style,
                                         &cascade_priorities,
@@ -828,6 +844,13 @@ pub fn Application(
 
                         // Resolve CSS-wide keywords for every supported
                         // property before focused computed-value transforms.
+                        if (std.ascii.eqlIgnoreCase(std.mem.trim(u8, new_style.get("background-image") orelse "", " \t\r\n"), "inherit") and ancestor_chain.len > 0) {
+                            const parent = &ancestor_chain[ancestor_chain.len - 1].element;
+                            background_source_url = parent.background_source_url;
+                            background_referrer_policy = parent.background_referrer_policy;
+                        }
+                        e.background_source_url = if (background_source_url) |url| try retainComputedValue(e, allocator, url, "") else null;
+                        e.background_referrer_policy = background_referrer_policy;
                         e.svg_specified_properties = 0;
                         inline for (@import("svg.zig").instance_properties, 0..) |name, i| {
                             if (cascade_priorities.contains(name)) e.svg_specified_properties |= @as(u16, 1) << i;

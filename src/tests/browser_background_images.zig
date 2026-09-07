@@ -36,6 +36,9 @@ const TestLoadContext = struct {
     allowed_count: usize = 0,
     retire_count: usize = 0,
     allow: bool = true,
+    expected_source: ?[]const u8 = null,
+    expected_target: ?[]const u8 = null,
+    expected_policy: ?url_module.ReferrerPolicy = null,
 };
 
 const TestLoadCallbacks = struct {
@@ -47,10 +50,13 @@ const TestLoadCallbacks = struct {
     pub fn fetch(
         context: *TestLoadContext,
         target: Url,
-        _: Url,
-        _: url_module.ReferrerPolicy,
+        source: Url,
+        policy: url_module.ReferrerPolicy,
     ) !url_module.HttpResponse {
         context.fetch_count += 1;
+        if (context.expected_source) |expected| try std.testing.expectEqualStrings(expected, source.ada_url.getHref());
+        if (context.expected_target) |expected| try std.testing.expectEqualStrings(expected, target.ada_url.getHref());
+        if (context.expected_policy) |expected| try std.testing.expectEqual(expected, policy);
         if (std.mem.eql(u8, target.scheme, "data")) return .{ .body = target.path };
         return .{ .body = try context.allocator.dupe(u8, ppm_image) };
     }
@@ -64,6 +70,35 @@ fn parseRules(allocator: std.mem.Allocator, css: []const u8) ![]CSSParser.CSSRul
     var css_parser = try CSSParser.init(allocator, css, false);
     defer css_parser.deinit(allocator);
     return css_parser.parse(allocator);
+}
+
+test "Referrer background provenance follows cascade and outlives the stylesheet generation" {
+    const a = std.testing.allocator;
+    var html = try document.HTMLParser.init(a, "<body><div id=target></div></body>");
+    defer html.deinit(a);
+    var root = try html.parse();
+    defer root.deinit(a);
+    document.fixParentPointers(&root, null);
+    const rules = try parseRules(a, "#target {background-image:url(pixel.ppm);width:20px;height:20px}");
+    rules[0].source_url = try a.dupe(u8, "https://cdn.example/assets/site.css");
+    rules[0].referrer_policy = .origin;
+    document.style(a, &root, rules) catch |err| {
+        freeRules(a, rules);
+        return err;
+    };
+    freeRules(a, rules);
+    const target = findById(&root, "target").?;
+    try std.testing.expectEqualStrings("https://cdn.example/assets/site.css", target.background_source_url.?);
+    const page = try Url.init(a, "https://page.example/index.html");
+    defer page.free(a);
+    var context = TestLoadContext{
+        .allocator = a,
+        .expected_source = "https://cdn.example/assets/site.css",
+        .expected_target = "https://cdn.example/assets/pixel.ppm",
+        .expected_policy = .origin,
+    };
+    try background_images.loadUsed(a, std.testing.io, &root, &page, .no_referrer, true, &context, TestLoadCallbacks);
+    try std.testing.expectEqual(@as(usize, 1), context.fetch_count);
 }
 
 test "SVG data URL backgrounds own cached pixels and retire before source replacement" {

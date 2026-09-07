@@ -41,7 +41,7 @@ The nested [`render/AGENTS.md`](render/AGENTS.md) adds rendering-specific rules.
 | `script_tasks.zig` | Detached/queued timer, animation, XHR, cookie, and message adapters |
 | `script_geometry.zig` | Synchronous generation-checked layout flush and scalar JavaScript geometry readback |
 | `chrome.zig` | UI-thread-only internal chrome widgets, font/display generation, and address-entry state |
-| `navigation.zig` | Generated warning pages and transport-security classification |
+| `navigation.zig` | Generated warning pages, transport-security classification, and owned navigation-referrer snapshots |
 | `image_loader.zig` | HTML/SVG image selection, fetch/decode ownership, fallback state, and SVG href refresh |
 | `image_decoder.zig` | Shared SVG/z2d and raster/zigimg decode into owned straight-alpha RGBA |
 | `background_images.zig` | Post-cascade CSS background discovery and resource retirement |

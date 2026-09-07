@@ -27,6 +27,7 @@ pub const WindowBorrow = struct {
     handles: *DomHandles,
     handle_issuer: *IdIssuer,
     id_cache: *IdCache,
+    document_referrer: []const u8 = "",
 };
 
 /// A small document-local lookup cache for repeated ID queries. Entries keep
@@ -92,6 +93,7 @@ pub const Host = struct {
 
 /// Native functions installed on the private `__native` object.
 pub const bindings = [_]native_bindings.Binding{
+    .{ .name = "documentReferrer", .length = 0, .function = documentReferrer },
     .{ .name = "getDocumentElement", .length = 0, .function = getDocumentElement },
     .{ .name = "getDocumentBody", .length = 0, .function = getDocumentBody },
     .{ .name = "getElementById", .length = 1, .function = getElementById },
@@ -333,6 +335,11 @@ fn appendTextContent(node: *const Node, output: *std.ArrayList(u8), allocator: s
             }
         },
     }
+}
+
+fn documentReferrer(agent: *Agent, _: Value, _: Arguments) Agent.Error!Value {
+    const window = try requireWindow(agent);
+    return copiedString(agent, window.document_referrer);
 }
 
 fn getDocumentElement(agent: *Agent, this_value: Value, _: Arguments) Agent.Error!Value {

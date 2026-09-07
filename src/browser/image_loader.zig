@@ -283,7 +283,7 @@ pub fn loadCandidates(
             allocator,
             io,
             page_url,
-            referrer_policy,
+            @import("../document/referrer.zig").forResource(candidate.element, referrer_policy),
             source,
             &cache,
             context,

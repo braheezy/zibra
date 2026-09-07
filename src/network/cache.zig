@@ -17,13 +17,8 @@ pub const ContentType = enum {
     image,
 };
 
-/// The Referrer-Policy values understood by Zibra. `default` preserves the
-/// tutorial's behavior of sending the source URL to any HTTP(S) destination.
-pub const ReferrerPolicy = enum {
-    default,
-    no_referrer,
-    same_origin,
-};
+/// Empty policy uses the modern strict-origin-when-cross-origin default.
+pub const ReferrerPolicy = @import("referrer_policy.zig").Policy;
 
 /// The supported X-Frame-Options response policies. Unknown and obsolete
 /// directives are represented as `none` and therefore do not affect framing.

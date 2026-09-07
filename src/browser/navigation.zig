@@ -6,6 +6,22 @@ const url_module = @import("../network/url.zig");
 
 const Url = url_module.Url;
 
+/// An owned initiating context for a queued navigation. Suppressing Referer
+/// changes policy only: the source URL still supplies SameSite context.
+pub const ReferrerSource = struct {
+    url: ?Url = null,
+    policy: url_module.ReferrerPolicy = .default,
+
+    pub fn clone(allocator: std.mem.Allocator, source: ?Url, policy: url_module.ReferrerPolicy) !ReferrerSource {
+        return .{ .url = if (source) |url| try url.clone(allocator) else null, .policy = policy };
+    }
+
+    pub fn deinit(self: *ReferrerSource, allocator: std.mem.Allocator) void {
+        if (self.url) |url| url.free(allocator);
+        self.* = .{};
+    }
+};
+
 /// Apply an HTTP response's framing policy to the complete ancestor chain.
 /// The URL pointers are synchronous borrows from live Frames; this function
 /// does not retain or take ownership of them. Missing ancestor identity is

@@ -17,9 +17,10 @@ const XFrameOptions = cache_module.XFrameOptions;
 const ContentType = cache_module.ContentType;
 const HttpResponse = response_module.Response;
 const CookieEntry = cookie.Entry;
+const referrer_rules = @import("referrer_policy.zig");
 
 pub const user_agent = "Zibra/0.0.0";
-const redirect_limit: u16 = 3;
+const redirect_limit: u16 = 20;
 
 pub fn requestOptions(
     redirect_behavior: std.http.Client.Request.RedirectBehavior,
@@ -40,7 +41,6 @@ pub fn requestOptions(
 pub fn fetchBodyInternal(
     comptime Url: type,
     comptime inheritFragment: anytype,
-    comptime refererHeaderValue: anytype,
     allocator: std.mem.Allocator,
     io: std.Io,
     http_client: *std.http.Client,
@@ -49,6 +49,7 @@ pub fn fetchBodyInternal(
     network_lock: ?*Mutex,
     url: Url,
     referrer: ?Url,
+    cookie_source: ?Url,
     payload: ?[]const u8,
     final_url: ?*?Url,
     request_origin: ?[]const u8,
@@ -103,6 +104,7 @@ pub fn fetchBodyInternal(
                     .status = .ok,
                     .cache_control = entry.policy,
                     .referrer_policy = entry.referrer_policy,
+                    .request_referrer = referrer_rules.determine(referrer, url, referrer_policy, .full),
                     .x_frame_options = entry.x_frame_options,
                 };
             }
@@ -116,21 +118,30 @@ pub fn fetchBodyInternal(
     const final_url_output = if (use_cache or final_url != null) &fetched_final_url else null;
     const fetched = try httpRequest(
         Url,
-        refererHeaderValue,
+        inheritFragment,
         url,
         allocator,
         http_client,
         cookie_jar,
         network_lock,
         referrer,
+        cookie_source,
         payload,
         final_url_output,
         request_origin,
         referrer_policy,
     );
+    errdefer {
+        allocator.free(fetched.body);
+        if (fetched.csp_header) |value| allocator.free(value);
+        if (fetched.access_control_allow_origin) |value| allocator.free(value);
+    }
 
-    if (use_cache and fetched.status == .ok and fetched.cache_control.isCacheable()) {
-        const final_url_text = if (fetched_final_url) |resolved| resolved.ada_url.getHref() else null;
+    // A final-response alias cannot reproduce the intervening redirect policy
+    // transitions. Until the cache stores redirects as responses, don't cache
+    // their result under the initial URL.
+    if (use_cache and !fetched.redirected and fetched.status == .ok and fetched.cache_control.isCacheable()) {
+        const final_url_text = cache_key;
         if (network_lock) |lock| lock.lock();
         cache.?.store(
             cache_key,
@@ -158,286 +169,322 @@ pub fn fetchBodyInternal(
 
 fn httpRequest(
     comptime Url: type,
-    comptime refererHeaderValue: anytype,
-    self: Url,
+    comptime inheritFragment: anytype,
+    initial_url: Url,
     al: std.mem.Allocator,
     http_client: *std.http.Client,
     cookie_jar: *std.StringHashMap(CookieEntry),
     network_lock: ?*Mutex,
     referrer: ?Url,
-    payload: ?[]const u8,
+    cookie_source: ?Url,
+    initial_payload: ?[]const u8,
     final_url: ?*?Url,
     request_origin: ?[]const u8,
     referrer_policy: ReferrerPolicy,
 ) !HttpResponse {
-    // Build full URL for std.http.Client
-    var url_builder = std.ArrayList(u8).empty;
-    defer url_builder.deinit(al);
-    try url_builder.appendSlice(al, self.scheme);
-    try url_builder.appendSlice(al, "://");
-    const host_str = self.host.?;
-    try url_builder.appendSlice(al, host_str);
-    if (!Url.hostHasExplicitPort(host_str) and self.port != 80 and self.port != 443) {
-        try url_builder.append(al, ':');
-        const port_str = try std.fmt.allocPrint(al, "{d}", .{self.port});
-        defer al.free(port_str);
-        try url_builder.appendSlice(al, port_str);
-    }
-    try url_builder.appendSlice(al, self.path);
-    if (self.ada_url.getSearch()) |search| {
-        try url_builder.appendSlice(al, search);
-    }
-    const url_str = try url_builder.toOwnedSlice(al);
-    defer al.free(url_str);
+    var self = try initial_url.clone(al);
+    defer self.free(al);
+    var payload = initial_payload;
+    var policy = referrer_policy;
+    var disclosure: referrer_rules.Disclosure = .full;
+    var redirect_count: u16 = 0;
+    redirects: while (true) {
+        // Build full URL for std.http.Client
+        var url_builder = std.ArrayList(u8).empty;
+        defer url_builder.deinit(al);
+        try url_builder.appendSlice(al, self.scheme);
+        try url_builder.appendSlice(al, "://");
+        const host_str = self.host.?;
+        try url_builder.appendSlice(al, host_str);
+        if (!Url.hostHasExplicitPort(host_str) and self.port != 80 and self.port != 443) {
+            try url_builder.append(al, ':');
+            const port_str = try std.fmt.allocPrint(al, "{d}", .{self.port});
+            defer al.free(port_str);
+            try url_builder.appendSlice(al, port_str);
+        }
+        try url_builder.appendSlice(al, self.path);
+        if (self.ada_url.getSearch()) |search| {
+            try url_builder.appendSlice(al, search);
+        }
+        const url_str = try url_builder.toOwnedSlice(al);
+        defer al.free(url_str);
 
-    const uri = try std.Uri.parse(url_str);
+        const uri = try std.Uri.parse(url_str);
 
-    const method_str = if (payload != null) "POST" else "GET";
-    std.log.info("{s} {s}", .{ method_str, url_str });
+        const method_str = if (payload != null) "POST" else "GET";
+        std.log.info("{s} {s}", .{ method_str, url_str });
 
-    // Keep optional headers in a growable list so adding another request
-    // header does not require resizing and manually indexing fixed storage.
-    var extra_headers: std.ArrayList(std.http.Header) = .empty;
-    defer extra_headers.deinit(al);
-    const method: std.http.Method = if (payload != null) .POST else .GET;
+        // Keep optional headers in a growable list so adding another request
+        // header does not require resizing and manually indexing fixed storage.
+        var extra_headers: std.ArrayList(std.http.Header) = .empty;
+        defer extra_headers.deinit(al);
+        const method: std.http.Method = if (payload != null) .POST else .GET;
 
-    if (request_origin) |origin| {
-        try extra_headers.append(al, .{
-            .name = "Origin",
-            .value = origin,
-        });
-    }
-
-    if (refererHeaderValue(referrer, self, referrer_policy)) |referer| {
-        try extra_headers.append(al, .{
-            .name = "Referer",
-            .value = referer,
-        });
-    }
-
-    var cookie_header_value: ?[]u8 = null;
-    defer if (cookie_header_value) |value| al.free(value);
-    if (self.host) |host_slice| {
-        cookie_header_value = cookie_snapshot: {
-            if (network_lock) |lock| lock.lock();
-            defer if (network_lock) |lock| lock.unlock();
-            const value = cookie.cookieForRequest(
-                al,
-                cookie_jar,
-                host_slice,
-                method,
-                if (referrer) |source| source.host else null,
-                std.Io.Clock.real.now(http_client.io).toSeconds(),
-            ) orelse break :cookie_snapshot null;
-            break :cookie_snapshot try al.dupe(u8, value);
-        };
-        if (cookie_header_value) |cookie_value| {
+        if (request_origin) |origin| {
             try extra_headers.append(al, .{
-                .name = "Cookie",
-                .value = cookie_value,
+                .name = "Origin",
+                .value = origin,
             });
         }
-    }
 
-    if (payload != null) {
-        try extra_headers.append(al, .{
-            .name = "Content-Type",
-            .value = "application/x-www-form-urlencoded",
-        });
-    }
-
-    const RedirectBehavior = std.http.Client.Request.RedirectBehavior;
-    const redirect_behavior: RedirectBehavior = if (payload == null)
-        RedirectBehavior.init(redirect_limit)
-    else
-        .unhandled;
-
-    var csp_header: ?[]u8 = null;
-    var csp_header_cleanup = true;
-    defer if (csp_header_cleanup) if (csp_header) |hdr| al.free(hdr);
-    var access_control_allow_origin: ?[]u8 = null;
-    var access_control_allow_origin_cleanup = true;
-    defer if (access_control_allow_origin_cleanup) if (access_control_allow_origin) |hdr| al.free(hdr);
-    var cache_control: CacheControl = .default;
-    var response_referrer_policy: ReferrerPolicy = .default;
-    var response_x_frame_options: XFrameOptions = .none;
-    var response_content_type: ContentType = .unknown;
-
-    const max_attempts: usize = 2;
-    var attempt: usize = 0;
-    var redirect_buffer: [8 * 1024]u8 = undefined;
-
-    request_loop: while (attempt < max_attempts) : (attempt += 1) {
-        var req = try http_client.request(
-            method,
-            uri,
-            requestOptions(redirect_behavior, extra_headers.items),
-        );
-        defer req.deinit();
-
-        if (payload) |body_payload| {
-            req.transfer_encoding = .{ .content_length = body_payload.len };
-            var body_writer = req.sendBody(&.{}) catch |err| {
-                if (err == error.WriteFailed and attempt + 1 < max_attempts) {
-                    continue :request_loop;
-                }
-                return err;
-            };
-
-            body_writer.writer.writeAll(body_payload) catch |err| {
-                if (err == error.WriteFailed and attempt + 1 < max_attempts) {
-                    continue :request_loop;
-                }
-                return err;
-            };
-
-            body_writer.end() catch |err| {
-                if (err == error.WriteFailed and attempt + 1 < max_attempts) {
-                    continue :request_loop;
-                }
-                return err;
-            };
-        } else {
-            req.sendBodiless() catch |err| {
-                if (err == error.WriteFailed and attempt + 1 < max_attempts) {
-                    continue :request_loop;
-                }
-                return err;
-            };
+        disclosure = referrer_rules.determine(referrer, self, policy, disclosure);
+        const referer_value = try referrer_rules.serialize(al, referrer, disclosure);
+        defer if (referer_value) |value| al.free(value);
+        if (referer_value) |referer| {
+            try extra_headers.append(al, .{
+                .name = "Referer",
+                .value = referer,
+            });
         }
 
-        var response = req.receiveHead(redirect_buffer[0..]) catch |err| {
-            if (err == error.HttpConnectionClosing and attempt + 1 < max_attempts) {
-                continue :request_loop;
-            }
-            return err;
-        };
-
+        var cookie_header_value: ?[]u8 = null;
+        defer if (cookie_header_value) |value| al.free(value);
         if (self.host) |host_slice| {
-            const cookie_host = host_slice;
-            var header_it = response.head.iterateHeaders();
-            while (header_it.next()) |header| {
-                if (std.ascii.eqlIgnoreCase(header.name, "set-cookie")) {
-                    _ = set_cookie: {
-                        if (network_lock) |lock| lock.lock();
-                        defer if (network_lock) |lock| lock.unlock();
-                        break :set_cookie try cookie.applySetCookie(
-                            al,
-                            cookie_jar,
-                            cookie_host,
-                            header.value,
-                            .http,
-                            std.Io.Clock.real.now(http_client.io).toSeconds(),
-                        );
-                    };
-                } else if (std.ascii.eqlIgnoreCase(header.name, "content-security-policy")) {
-                    const trimmed = std.mem.trim(u8, header.value, " \t");
-                    if (csp_header) |existing| {
-                        // Repeated enforced headers form an intersection, not
-                        // a last-header-wins replacement. Copy before retiring.
-                        const combined = try std.fmt.allocPrint(al, "{s}, {s}", .{ existing, trimmed });
-                        al.free(existing);
-                        csp_header = combined;
-                    } else {
-                        csp_header = try al.dupe(u8, trimmed);
-                    }
-                } else if (request_origin != null and
-                    std.ascii.eqlIgnoreCase(header.name, "access-control-allow-origin"))
-                {
-                    if (access_control_allow_origin) |existing| al.free(existing);
-                    const trimmed = std.mem.trim(u8, header.value, " \t");
-                    access_control_allow_origin = try al.dupe(u8, trimmed);
-                } else if (std.ascii.eqlIgnoreCase(header.name, "cache-control")) {
-                    cache_control.apply(header.value);
-                } else if (std.ascii.eqlIgnoreCase(header.name, "referrer-policy")) {
-                    if (response_module.parseReferrerPolicy(header.value)) |parsed| {
-                        response_referrer_policy = parsed;
-                    }
-                } else if (std.ascii.eqlIgnoreCase(header.name, "x-frame-options")) {
-                    if (response_module.parseXFrameOptions(header.value)) |parsed| {
-                        response_x_frame_options = response_module.mergeXFrameOptions(
-                            response_x_frame_options,
-                            parsed,
-                        );
-                    }
-                } else if (std.ascii.eqlIgnoreCase(header.name, "content-type")) {
-                    response_content_type = response_module.classifyContentType(header.value);
-                }
+            cookie_header_value = cookie_snapshot: {
+                if (network_lock) |lock| lock.lock();
+                defer if (network_lock) |lock| lock.unlock();
+                const value = cookie.cookieForRequest(
+                    al,
+                    cookie_jar,
+                    host_slice,
+                    method,
+                    if (cookie_source) |source| source.host else null,
+                    std.Io.Clock.real.now(http_client.io).toSeconds(),
+                ) orelse break :cookie_snapshot null;
+                break :cookie_snapshot try al.dupe(u8, value);
+            };
+            if (cookie_header_value) |cookie_value| {
+                try extra_headers.append(al, .{
+                    .name = "Cookie",
+                    .value = cookie_value,
+                });
             }
         }
 
-        var allocating_writer = std.Io.Writer.Allocating.init(al);
-        defer allocating_writer.deinit();
-
-        var owned_decompress_buffer: ?[]u8 = null;
-        const decompress_buffer: []u8 = switch (response.head.content_encoding) {
-            .identity => &.{},
-            .zstd => blk: {
-                const buf = try al.alloc(u8, std.compress.zstd.default_window_len);
-                owned_decompress_buffer = buf;
-                break :blk buf;
-            },
-            .deflate, .gzip => blk: {
-                const buf = try al.alloc(u8, std.compress.flate.max_window_len);
-                owned_decompress_buffer = buf;
-                break :blk buf;
-            },
-            .compress => return error.UnsupportedCompressionMethod,
-        };
-        defer if (owned_decompress_buffer) |buf| al.free(buf);
-
-        var transfer_buffer: [64]u8 = undefined;
-        var decompress_state: std.http.Decompress = undefined;
-        const reader = response.readerDecompressing(&transfer_buffer, &decompress_state, decompress_buffer);
-
-        const response_writer: *std.Io.Writer = &allocating_writer.writer;
-        _ = reader.streamRemaining(response_writer) catch |err| switch (err) {
-            error.ReadFailed => blk: {
-                if (response.bodyErr()) |inner_err| {
-                    std.log.warn("response.bodyErr for {s}: {}", .{ url_str, inner_err });
-                    return inner_err;
-                }
-                break :blk;
-            },
-            else => |e| {
-                std.log.warn("streamRemaining failed for {s}: {}", .{ url_str, e });
-                return e;
-            },
-        };
-
-        const body = try allocating_writer.toOwnedSlice();
-        errdefer al.free(body);
-        std.log.info("Received {d} bytes, status: {d}", .{
-            body.len,
-            @intFromEnum(response.head.status),
-        });
-
-        if (final_url) |output| {
-            var final_url_writer = std.Io.Writer.Allocating.init(al);
-            defer final_url_writer.deinit();
-            try req.uri.writeToStream(&final_url_writer.writer, .all);
-            const final_url_text = try final_url_writer.toOwnedSlice();
-            defer al.free(final_url_text);
-
-            var resolved = try Url.init(al, final_url_text);
-            resolved.view_source = self.view_source;
-            output.* = resolved;
+        if (payload != null) {
+            try extra_headers.append(al, .{
+                .name = "Content-Type",
+                .value = "application/x-www-form-urlencoded",
+            });
         }
 
-        const result = HttpResponse{
-            .body = body,
-            .content_type = response_content_type,
-            .csp_header = csp_header,
-            .access_control_allow_origin = access_control_allow_origin,
-            .status = response.head.status,
-            .cache_control = cache_control,
-            .referrer_policy = response_referrer_policy,
-            .x_frame_options = response_x_frame_options,
-        };
-        csp_header_cleanup = false;
-        access_control_allow_origin_cleanup = false;
-        return result;
-    }
+        var csp_header: ?[]u8 = null;
+        var csp_header_cleanup = true;
+        defer if (csp_header_cleanup) if (csp_header) |hdr| al.free(hdr);
+        var access_control_allow_origin: ?[]u8 = null;
+        var access_control_allow_origin_cleanup = true;
+        defer if (access_control_allow_origin_cleanup) if (access_control_allow_origin) |hdr| al.free(hdr);
+        var cache_control: CacheControl = .default;
+        var response_referrer_policy: ReferrerPolicy = .default;
+        var response_x_frame_options: XFrameOptions = .none;
+        var response_content_type: ContentType = .unknown;
+        var redirect_target: ?Url = null;
+        defer if (redirect_target) |target| target.free(al);
 
-    unreachable;
+        const max_attempts: usize = 2;
+        var attempt: usize = 0;
+        var redirect_buffer: [8 * 1024]u8 = undefined;
+
+        request_loop: while (attempt < max_attempts) : (attempt += 1) {
+            var req = try http_client.request(
+                method,
+                uri,
+                requestOptions(.unhandled, extra_headers.items),
+            );
+            defer req.deinit();
+
+            if (payload) |body_payload| {
+                req.transfer_encoding = .{ .content_length = body_payload.len };
+                var body_writer = req.sendBody(&.{}) catch |err| {
+                    if (err == error.WriteFailed and attempt + 1 < max_attempts) {
+                        continue :request_loop;
+                    }
+                    return err;
+                };
+
+                body_writer.writer.writeAll(body_payload) catch |err| {
+                    if (err == error.WriteFailed and attempt + 1 < max_attempts) {
+                        continue :request_loop;
+                    }
+                    return err;
+                };
+
+                body_writer.end() catch |err| {
+                    if (err == error.WriteFailed and attempt + 1 < max_attempts) {
+                        continue :request_loop;
+                    }
+                    return err;
+                };
+            } else {
+                req.sendBodiless() catch |err| {
+                    if (err == error.WriteFailed and attempt + 1 < max_attempts) {
+                        continue :request_loop;
+                    }
+                    return err;
+                };
+            }
+
+            var response = req.receiveHead(redirect_buffer[0..]) catch |err| {
+                if (err == error.HttpConnectionClosing and attempt + 1 < max_attempts) {
+                    continue :request_loop;
+                }
+                return err;
+            };
+            const is_redirect = switch (@intFromEnum(response.head.status)) {
+                301, 302, 303, 307, 308 => true,
+                else => false,
+            };
+
+            if (self.host) |host_slice| {
+                const cookie_host = host_slice;
+                var header_it = response.head.iterateHeaders();
+                while (header_it.next()) |header| {
+                    // Header slices retire as soon as body reading starts.
+                    if (is_redirect and redirect_target == null and std.ascii.eqlIgnoreCase(header.name, "location")) {
+                        if (redirect_count == redirect_limit) return error.TooManyHttpRedirects;
+                        redirect_target = try self.resolve(al, header.value);
+                        if (!std.mem.eql(u8, redirect_target.?.scheme, "http") and !std.mem.eql(u8, redirect_target.?.scheme, "https"))
+                            return error.UnsupportedRedirectScheme;
+                        try inheritFragment(al, self, &redirect_target.?);
+                    }
+                    if (std.ascii.eqlIgnoreCase(header.name, "set-cookie")) {
+                        _ = set_cookie: {
+                            if (network_lock) |lock| lock.lock();
+                            defer if (network_lock) |lock| lock.unlock();
+                            break :set_cookie try cookie.applySetCookie(
+                                al,
+                                cookie_jar,
+                                cookie_host,
+                                header.value,
+                                .http,
+                                std.Io.Clock.real.now(http_client.io).toSeconds(),
+                            );
+                        };
+                    } else if (std.ascii.eqlIgnoreCase(header.name, "content-security-policy")) {
+                        const trimmed = std.mem.trim(u8, header.value, " \t");
+                        if (csp_header) |existing| {
+                            // Repeated enforced headers form an intersection, not
+                            // a last-header-wins replacement. Copy before retiring.
+                            const combined = try std.fmt.allocPrint(al, "{s}, {s}", .{ existing, trimmed });
+                            al.free(existing);
+                            csp_header = combined;
+                        } else {
+                            csp_header = try al.dupe(u8, trimmed);
+                        }
+                    } else if (request_origin != null and
+                        std.ascii.eqlIgnoreCase(header.name, "access-control-allow-origin"))
+                    {
+                        if (access_control_allow_origin) |existing| al.free(existing);
+                        const trimmed = std.mem.trim(u8, header.value, " \t");
+                        access_control_allow_origin = try al.dupe(u8, trimmed);
+                    } else if (std.ascii.eqlIgnoreCase(header.name, "cache-control")) {
+                        cache_control.apply(header.value);
+                    } else if (std.ascii.eqlIgnoreCase(header.name, "vary")) {
+                        var names = std.mem.tokenizeAny(u8, header.value, ", \t");
+                        while (names.next()) |name| {
+                            // The session cache has no variant-key storage.
+                            // Don't reuse a referrer-dependent representation.
+                            if (std.ascii.eqlIgnoreCase(name, "referer") or std.mem.eql(u8, name, "*")) cache_control = .unsupported;
+                        }
+                    } else if (std.ascii.eqlIgnoreCase(header.name, "referrer-policy")) {
+                        if (response_module.parseReferrerPolicy(header.value)) |parsed| {
+                            response_referrer_policy = parsed;
+                        }
+                    } else if (std.ascii.eqlIgnoreCase(header.name, "x-frame-options")) {
+                        if (response_module.parseXFrameOptions(header.value)) |parsed| {
+                            response_x_frame_options = response_module.mergeXFrameOptions(
+                                response_x_frame_options,
+                                parsed,
+                            );
+                        }
+                    } else if (std.ascii.eqlIgnoreCase(header.name, "content-type")) {
+                        response_content_type = response_module.classifyContentType(header.value);
+                    }
+                }
+            }
+
+            var allocating_writer = std.Io.Writer.Allocating.init(al);
+            defer allocating_writer.deinit();
+
+            var owned_decompress_buffer: ?[]u8 = null;
+            const decompress_buffer: []u8 = switch (response.head.content_encoding) {
+                .identity => &.{},
+                .zstd => blk: {
+                    const buf = try al.alloc(u8, std.compress.zstd.default_window_len);
+                    owned_decompress_buffer = buf;
+                    break :blk buf;
+                },
+                .deflate, .gzip => blk: {
+                    const buf = try al.alloc(u8, std.compress.flate.max_window_len);
+                    owned_decompress_buffer = buf;
+                    break :blk buf;
+                },
+                .compress => return error.UnsupportedCompressionMethod,
+            };
+            defer if (owned_decompress_buffer) |buf| al.free(buf);
+
+            var transfer_buffer: [64]u8 = undefined;
+            var decompress_state: std.http.Decompress = undefined;
+            const reader = response.readerDecompressing(&transfer_buffer, &decompress_state, decompress_buffer);
+
+            const response_writer: *std.Io.Writer = &allocating_writer.writer;
+            _ = reader.streamRemaining(response_writer) catch |err| switch (err) {
+                error.ReadFailed => blk: {
+                    if (response.bodyErr()) |inner_err| {
+                        std.log.warn("response.bodyErr for {s}: {}", .{ url_str, inner_err });
+                        return inner_err;
+                    }
+                    break :blk;
+                },
+                else => |e| {
+                    std.log.warn("streamRemaining failed for {s}: {}", .{ url_str, e });
+                    return e;
+                },
+            };
+
+            const body = try allocating_writer.toOwnedSlice();
+            errdefer al.free(body);
+            std.log.info("Received {d} bytes, status: {d}", .{
+                body.len,
+                @intFromEnum(response.head.status),
+            });
+
+            if (redirect_target) |next| {
+                if (response_referrer_policy != .default) policy = response_referrer_policy;
+                if (@intFromEnum(response.head.status) == 303 or
+                    (@intFromEnum(response.head.status) == 301 or @intFromEnum(response.head.status) == 302) and payload != null)
+                    payload = null;
+                self.free(al);
+                self = next;
+                redirect_target = null;
+                redirect_count += 1;
+                al.free(body);
+                continue :redirects;
+            }
+
+            if (final_url) |output| {
+                var resolved = try self.clone(al);
+                resolved.view_source = initial_url.view_source;
+                output.* = resolved;
+            }
+
+            const result = HttpResponse{
+                .body = body,
+                .content_type = response_content_type,
+                .csp_header = csp_header,
+                .access_control_allow_origin = access_control_allow_origin,
+                .status = response.head.status,
+                .cache_control = cache_control,
+                .referrer_policy = response_referrer_policy,
+                .request_referrer = disclosure,
+                .redirected = redirect_count != 0,
+                .x_frame_options = response_x_frame_options,
+            };
+            csp_header_cleanup = false;
+            access_control_allow_origin_cleanup = false;
+            return result;
+        }
+
+        unreachable;
+    }
 }

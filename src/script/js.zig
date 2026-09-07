@@ -268,6 +268,8 @@ const WindowRealm = struct {
     cookie_callback: CookieCallback,
     animation_frame_callback: AnimationFrameCallback,
     document_ready_state_callback: DocumentReadyStateCallback,
+    document_referrer: []const u8 = "",
+    referrer_policy: ?*@import("../document/referrer.zig").Policy = null,
     document_write_callback: DocumentWriteCallback,
     wpt_report_callback: WptReportCallback,
     wpt_diagnostics: wpt_bindings.DiagnosticLog = .{},
@@ -485,6 +487,8 @@ fn retireWindowRealmLocked(self: *Js, window: *WindowRealm) void {
     window.cookie_callback = .{};
     window.animation_frame_callback = .{};
     window.document_ready_state_callback = .{};
+    window.document_referrer = "";
+    window.referrer_policy = null;
     window.document_write_callback = .{};
     window.wpt_report_callback = .{};
     window.retired = true;
@@ -914,6 +918,16 @@ pub fn setDocumentReadyStateCallback(
     };
 }
 
+/// Borrow the Frame's generation-owned incoming referrer and outgoing policy.
+/// Both remain live until setNodes(null) retires this Realm; native callbacks
+/// use them synchronously under the host lock and never retain them in tasks.
+pub fn setDocumentReferrer(self: *Js, window_id: u32, incoming: []const u8, policy: *@import("../document/referrer.zig").Policy) void {
+    const window = self.getWindowContext(window_id) catch return;
+    if (window.retired) return;
+    window.document_referrer = incoming;
+    window.referrer_policy = policy;
+}
+
 /// Install or clear one synchronous parser-active `document.write` sink for a
 /// live document Realm. Callers install it around direct parser-script
 /// evaluation and clear it before returning to the event loop; the context
@@ -1226,6 +1240,7 @@ fn activeDomTreeWindow(context: ?*anyopaque) ?dom_tree_bindings.WindowBorrow {
         .handles = &window.handles,
         .handle_issuer = &self.handle_issuer,
         .id_cache = &window.id_cache,
+        .document_referrer = window.document_referrer,
     };
 }
 
@@ -1426,6 +1441,7 @@ fn domMutationContext(
         .relocation_observer = window.node_relocation_observer,
         .detached_nodes = &window.detached_nodes,
         .can_retain_layout_insert = window.dom_mutation_callback.function != null,
+        .referrer_policy = window.referrer_policy,
         .host_context = self,
         .hooks = .{
             .prepare = prepareDomMutation,
@@ -5954,6 +5970,12 @@ fn setAttribute(agent: *Agent, this_value: Value, arguments: kiesel.types.Argume
             e.owned_strings.?.appendAssumeCapacity(owned_value);
             value_owned = false;
             e.attributes.?.putAssumeCapacity(owned_name, owned_value);
+            @import("../document/referrer.zig").resourceAttributeChanged(e, attr_name);
+            if ((std.mem.eql(u8, attr_name, "name") or std.mem.eql(u8, attr_name, "content")) and
+                dom_mutation.isAttachedToCurrentDocument(window.current_nodes, node))
+            {
+                if (window.referrer_policy) |policy| @import("../document/referrer.zig").applyMeta(node, policy);
+            }
             parser.dirtyStyleForElement(e);
 
             if (@import("../document/svg.zig").contains(e)) {
@@ -6030,6 +6052,7 @@ fn removeAttribute(agent: *Agent, this_value: Value, arguments: kiesel.types.Arg
             const refresh_id_globals = std.ascii.eqlIgnoreCase(name, "id") and dom_mutation.isAttachedToCurrentDocument(window.current_nodes, node);
             if (refresh_id_globals) try js_instance.clearNamedIdGlobals(window_id, window);
             _ = element.attributes.?.remove(name);
+            @import("../document/referrer.zig").resourceAttributeChanged(element, name);
             parser.dirtyStyleForElement(element);
             if (@import("../document/svg.zig").contains(element)) {
                 dom_mutation.markElementLayoutDirty(element);
@@ -6274,6 +6297,9 @@ fn innerHTML(agent: *Agent, this_value: Value, arguments: kiesel.types.Arguments
             parser.fixParentPointers(node, e.parent);
 
             if (is_attached) {
+                if (window.referrer_policy) |policy| {
+                    for (e.children.items) |*child| @import("../document/referrer.zig").inserted(child, policy);
+                }
                 completeDomMutation(js_instance, node);
                 try js_instance.syncNamedIdGlobals(window_id, window);
             }

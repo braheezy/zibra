@@ -103,6 +103,10 @@ Run from the repository root:
   allowed stylesheet/script/image/frame/XHR loading, and denied-request
   non-observation. It runs after the local WPT protocol fixtures and uses the
   same bounded browser-process supervisor;
+- `zig build test-referrer` for loopback HTTP policy headers, parser/meta
+  delivery order, per-resource overrides, redirect suppression, stylesheet
+  provenance, and incoming document referrers. It follows the CSP/local WPT
+  fixtures serially with the same process supervisor;
 - `zig build test-wpt` for local headless synchronous PASS, Promise-job PASS,
   TIMEOUT, startup/error diagnostics, partial results, and Unicode JSONL
   fixtures, plus live body replacement/title accessors, JavaScript rectangles,

@@ -46,18 +46,13 @@ pub const Response = struct {
     status: ?std.http.Status = null,
     cache_control: CacheControl = .default,
     referrer_policy: ReferrerPolicy = .default,
+    /// Actual incoming disclosure after all redirects; no response-owned URL.
+    request_referrer: @import("referrer_policy.zig").Disclosure = .none,
+    redirected: bool = false,
     x_frame_options: XFrameOptions = .none,
 };
 
-/// Parse the two response policy tokens supported by this exercise. Unknown
-/// values are ignored so they do not accidentally become more permissive than
-/// a recognized policy from another header line.
-pub fn parseReferrerPolicy(value: []const u8) ?ReferrerPolicy {
-    const trimmed = std.mem.trim(u8, value, " \t\r\n");
-    if (std.ascii.eqlIgnoreCase(trimmed, "no-referrer")) return .no_referrer;
-    if (std.ascii.eqlIgnoreCase(trimmed, "same-origin")) return .same_origin;
-    return null;
-}
+pub const parseReferrerPolicy = @import("referrer_policy.zig").parseHeader;
 
 /// Parse the supported framing directives. Header field values are
 /// case-insensitive, and repeated field lines may arrive comma-combined.

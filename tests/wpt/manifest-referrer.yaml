@@ -1,0 +1,7 @@
+# Bounded delivery/reflection coverage. Fetch/worker/popup-heavy generators
+# remain opt-in until their prerequisites are implemented.
+tests:
+  - referrer-policy/generic/subresource-test/attr-referrer-invalid-value.html
+  - html/semantics/scripting-1/the-script-element/script-referrerpolicy-idl.html
+  - referrer-policy/generic/subresource-test/xhr-messaging.html
+  - referrer-policy/generic/meta-referrer-domparser.html

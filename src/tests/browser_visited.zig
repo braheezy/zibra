@@ -176,9 +176,9 @@ test "visited anchors are annotated and override descendant text at paint" {
     test_browser.io = std.testing.io;
     test_browser.lock = .init(std.testing.io);
     test_browser.tabs = std.ArrayList(*Tab).empty;
-    test_browser.pending_new_tabs = std.ArrayList(Url).empty;
+    test_browser.pending_new_tabs = .empty;
     defer {
-        for (test_browser.pending_new_tabs.items) |*url| url.free(allocator);
+        for (test_browser.pending_new_tabs.items) |*pending| pending.deinit(allocator);
         test_browser.pending_new_tabs.deinit(allocator);
         test_browser.tabs.deinit(allocator);
     }

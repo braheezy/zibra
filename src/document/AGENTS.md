@@ -135,6 +135,9 @@ The document pipeline is split by ownership and algorithm boundaries:
   parsing and carries only parser-local node pins across its pause boundary;
   its caller owns direct script evaluation and the temporary document.write
   sink.
+- `referrer.zig` applies HTML meta/element policy rules over synchronous DOM
+  borrows. Call insertion hooks only for the inserted subtree, never rescan
+  the document on removal: policy follows mutation order, not tree order.
 - `html_parser.zig` is the stateful tokenizer/tree builder. It borrows one
   stable decoded HTML chunk and receives DOM types plus final parent-pointer
   repair through a comptime boundary, so it does not import the compatibility

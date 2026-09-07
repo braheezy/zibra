@@ -23,6 +23,42 @@ const Node = dom.Node;
 const Element = dom.Element;
 const Text = dom.Text;
 
+test "Referrer HTML noreferrer overrides attributes and forms ignore referrerpolicy" {
+    const a = std.testing.allocator;
+    const rules = @import("referrer.zig");
+    var link = try Element.init(a, "a referrerpolicy=unsafe-url rel='external NoReFeRrEr'", null);
+    defer link.deinit(a);
+    try std.testing.expectEqual(rules.Policy.no_referrer, rules.forElement(&link, .origin));
+    var area = try Element.init(a, "area referrerpolicy=STRICT-ORIGIN", null);
+    defer area.deinit(a);
+    try std.testing.expectEqual(rules.Policy.strict_origin, rules.forElement(&area, .unsafe_url));
+    var form = try Element.init(a, "form referrerpolicy=unsafe-url", null);
+    defer form.deinit(a);
+    try std.testing.expectEqual(rules.Policy.origin, rules.forElement(&form, .origin));
+}
+
+test "Referrer parser policy is captured per resource before later meta delivery" {
+    const a = std.testing.allocator;
+    var source = html_source.Store.init(a);
+    defer source.deinit();
+    _ = try source.adopt(try a.dupe(u8, "<body><img src=first><meta name=referrer content=no-referrer><img src=second>" ++
+        "<template><meta name=referrer content=unsafe-url></template>" ++
+        "<img src=third referrerpolicy=origin></body>"));
+    var root: Node = undefined;
+    var live = try LiveParser.init(a, &source, &root);
+    defer root.deinit(a);
+    defer live.deinit();
+    var policy: @import("referrer.zig").Policy = .default;
+    live.referrer_policy = &policy;
+    live.finishInput();
+    try std.testing.expect(try live.advance() == .eof);
+    try std.testing.expectEqual(@import("referrer.zig").Policy.no_referrer, policy);
+    const body = &root.element.children.items[1].element;
+    try std.testing.expectEqual(@import("referrer.zig").Policy.default, body.children.items[0].element.parser_referrer_policy.?);
+    try std.testing.expectEqual(@import("referrer.zig").Policy.no_referrer, body.children.items[2].element.parser_referrer_policy.?);
+    try std.testing.expectEqual(@import("referrer.zig").Policy.origin, body.children.items[4].element.parser_referrer_policy.?);
+}
+
 /// One externally visible parser transition.
 pub const Advance = union(enum) {
     /// More network/source chunks are necessary before a complete lexical
@@ -68,6 +104,9 @@ pub const LiveParser = struct {
     saw_explicit_html: bool = false,
     paused_at_script: bool = false,
     reached_eof: bool = false,
+    /// Borrowed only for the synchronous driver lifetime; detached parsers
+    /// never receive a live document policy container.
+    referrer_policy: ?*@import("referrer.zig").Policy = null,
 
     /// Initialize a parser over the first stable source chunk. The root is
     /// initialized immediately as an implicit html element in its final
@@ -390,6 +429,7 @@ pub const LiveParser = struct {
             self.pins.rebindAfterRelocation(installed, relocation);
         }
         dom.fixParentPointers(parent, parent_parent);
+        if (self.referrer_policy) |policy| @import("referrer.zig").parserInserted(installed, policy);
         return installed;
     }
 

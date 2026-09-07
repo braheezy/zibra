@@ -78,6 +78,14 @@ bindings are installed; bootstrap and page execution each push their own
 temporary Script context. Only the neutral host realm remains installed
 between evaluations.
 
+WindowRealm also borrows its Frame's immutable incoming referrer string and
+mutable outgoing policy slot. Native readback copies the string into Kiesel
+storage; metadata mutation uses the policy pointer only synchronously under
+the host lock. Realm retirement clears both before Frame teardown. See the
+[referrer contract](navigation-and-network.md#referrer-policy) for parsing,
+request snapshots, and delivery order. Detached parsing receives no live
+policy slot and cannot modify its creator's policy.
+
 The Browser owns document lifecycle eligibility and invokes
 `Js.dispatchLifecycleEvent` only through a generation-stamped task. The JS
 host looks up an existing Realm before activation, so missing, retired, or
