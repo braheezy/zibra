@@ -277,6 +277,9 @@ teardown, and final machine-readable result wrapper.
   is a cached live `NodeList` refreshed by JavaScript mutation boundaries.
   The current lightweight `attributes` records remain snapshots. Generated
   pseudo boxes remain private.
+- Element selector results exclude the receiver. Native subtree lookup also
+  serves detached Documents, which include their root; the Element wrapper
+  filters that root without changing selector ancestry or Document semantics.
 - NodeIterator keeps a reference node plus its before/after pointer state,
   applies whatToShow and filters in document order, forwards filter exceptions
   without advancing, and retains the last traversal order so a mutation
@@ -300,11 +303,25 @@ teardown, and final machine-readable result wrapper.
   only the last occurrence of a repeated root, and installs argument order in
   one mutation generation. Published removed subtrees remain detached and
   reattachable. Unsupported non-Element arguments throw before mutation.
-- `innerHTML` removes handles recursively before old children retire; its read
-  path serializes the live DOM. Its replacement parser creates an inert HTML
-  fragment: scripts in that fragment are marked started before installation,
-  so a later resource refresh cannot execute scripts resurrected by
-  serialization/reparse. `outerHTML` additionally serializes the element.
+- `innerHTML` stages a context-sensitive fragment, then replaces children in
+  one structural transaction. Published removed subtrees remain detached and
+  usable; wrappers, live child lists, and Range removal positions are repaired
+  after native success. Fragment source is retained by the Realm independently
+  of former parents. Parsed scripts are marked started before installation, so
+  later resource refresh cannot execute them. `runtime/html_fragments.js`
+  additionally implements writable `outerHTML` and all four adjacent-HTML
+  positions using existing node-transfer APIs; surrounding nodes/listeners are
+  never serialized and recreated. These multi-node transfers are synchronous
+  sequences, not yet one batch mutation-observer record.
+
+The bounded HTML fragment parser handles flow/list/paragraph recovery, implied
+table sections/rows and sibling cells, and initial RCDATA/raw-text contexts.
+It does not yet implement all insertion modes, foster parenting, comments,
+foreign/XML fragment parsing, templates/shadow roots, or Trusted Types.
+Range contextual fragments need a separate scripting-mode implementation.
+Text readback distinguishes HTML character-reference source from literal XML,
+raw script/style, and script-created data; it decodes the existing supported
+reference set into copied strings without changing renderer source storage.
 
 The complete structural transaction is documented in
 [`document-and-rendering.md`](document-and-rendering.md). Named ID globals are

@@ -476,6 +476,8 @@ pub const LiveParser = struct {
         if (!self.body_found and !self.head_found) try self.ensureBody();
         const parent = try self.current();
         var node = Node{ .text = Text.init(text, null) };
+        if (@import("html_serialization.zig").isLiteralTextElementTag(parent.element.tag))
+            node.text.character_references = false;
         var node_owned = true;
         errdefer if (node_owned) node.deinit(self.allocator);
         _ = try self.appendOwnedNode(parent, &node, null);

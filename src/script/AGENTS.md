@@ -27,6 +27,11 @@ queued work and shutdown are documented in
   the Node wrapper's attribute APIs. It preserves unrelated declarations and
   custom-property case; native computed-style readback flushes pending ancestor
   style work and copies values before returning to Kiesel.
+- `runtime/html_fragments.js` owns inner/outerHTML and adjacent-HTML wrapper
+  semantics over the native fragment parser and existing mutation APIs.
+  Preserve removed wrappers and refresh logical child/range views only after
+  native replacement succeeds. Fragment source belongs to the Realm, not to
+  a temporary parsing container or the former parent of a moved child.
 - `runtime/document_accessors.js` owns shared live/detached Document root,
   head/body/title/referrer accessors, referrer-policy reflection, and
   HTMLTitleElement text semantics. Getters follow

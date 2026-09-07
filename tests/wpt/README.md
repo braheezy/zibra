@@ -63,6 +63,19 @@ the result-collection tasks (`wpt`, `wpt-all`, `latest-results`, category runs,
 
 ### Focused compatibility manifests
 
+[`manifest-html-fragments.yaml`](manifest-html-fragments.yaml) selects dynamic
+HTML insertion, replacement, conversion, and retained-child checks. All selected
+cases are already covered by the default `domparsing` directory or the explicit
+HTML serialization allowlist, so this expansion needs no duplicate allowlist
+entries. That directory also already includes its insertion crashtests; reftests
+cannot establish JavaScript node identity or script inertness. HTML comments,
+foreign/XML fragments, templates, and full table recovery remain limitations.
+The 2026-09-06 focused comparison improved from 3/11 to 10/11 passing files
+and 127/179 to 177/179 subtests, with no errors, timeouts, crashes, or
+infrastructure failures. `innerhtml-08.html` remains expected-PASS but fails
+its two HTML-root structure/comment checks. This is a focused score, not the
+whole `domparsing` dashboard score.
+
 `manifest-referrer.yaml` probes referrer-policy reflection and two network
 prerequisite cases. The invalid-value and script-IDL tests are enabled in the
 default allowlist. The XHR messaging helper currently requires working WPT

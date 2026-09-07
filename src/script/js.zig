@@ -678,6 +678,7 @@ fn ensureRuntimeInitializedLocked(
     if (window.runtime_initialized) return;
 
     const runtime_code = @embedFile("runtime/bootstrap.js") ++ "\n" ++
+        @embedFile("runtime/html_fragments.js") ++ "\n" ++
         @embedFile("runtime/document_accessors.js") ++ "\n" ++
         @embedFile("runtime/range.js") ++ "\n" ++ @embedFile("runtime/css_style.js") ++ "\n" ++ @embedFile("runtime/geometry.js");
     const runtime_script = try Script.parse(
@@ -6135,187 +6136,36 @@ fn getOuterHTML(agent: *Agent, this_value: Value, arguments: kiesel.types.Argume
     return serializeHTMLProperty(agent, arguments, true);
 }
 
-/// HTML parsed for an `innerHTML` replacement does not participate in the
-/// document parser's execution pipeline. In particular, scripts in a parsed
-/// fragment are inert—even if that fragment was produced by serializing
-/// already-executed document content—and a later resource refresh must not
-/// treat them as newly attached executable scripts.
-fn markFragmentScriptsInert(node: *Node) void {
-    switch (node.*) {
-        .text => {},
-        .element => |*element| {
-            if (std.ascii.eqlIgnoreCase(element.tag, "script")) {
-                element.script_started = true;
-            }
-            for (element.children.items) |*child| markFragmentScriptsInert(child);
-        },
-    }
-}
-
-/// __native.innerHTML setter implementation.
+/// Parse and install a context-sensitive inert fragment under the active lock.
+/// Source retention belongs to the Realm, so detached descendants do not borrow
+/// storage from a former parent that could be destroyed independently.
 fn innerHTML(agent: *Agent, this_value: Value, arguments: kiesel.types.Arguments) Agent.Error!Value {
-    // Get the Js instance from the function's additional_fields
-    const function_obj = agent.activeFunctionObject();
-    const builtin_fn = function_obj.as(kiesel.builtins.BuiltinFunction);
-    const js_instance = builtin_fn.fields.additionalFieldsAs(Js);
-    const window_id = js_instance.current_window_id orelse return agent.throwException(
-        .internal_error,
-        "Missing active window",
-        .{},
-    );
-    const window = js_instance.windows.get(window_id) orelse return agent.throwException(
-        .internal_error,
-        "Missing window context",
-        .{},
-    );
-
     _ = this_value;
-
-    // Get the handle from the first argument
+    const js = agent.activeFunctionObject().as(kiesel.builtins.BuiltinFunction).fields.additionalFieldsAs(Js);
+    const window_id = js.current_window_id orelse return agent.throwException(.internal_error, "Missing active window", .{});
+    const window = js.windows.get(window_id) orelse return agent.throwException(.internal_error, "Missing window context", .{});
     const handle_arg = arguments.get(0);
-    if (!handle_arg.isNumber()) {
-        return agent.throwException(
-            .type_error,
-            "innerHTML requires a numeric handle as first argument",
-            .{},
-        );
-    }
-
-    const handle: u32 = @intFromFloat(handle_arg.asNumber().asFloat());
-
-    // Get the node from the handle
-    const node = js_instance.getNode(window, handle) orelse return agent.throwException(
-        .internal_error,
-        "Invalid node handle",
-        .{},
-    );
-
-    // Get the HTML string argument (second argument)
     const html_arg = arguments.get(1);
-    if (!html_arg.isString()) {
-        return agent.throwException(
-            .type_error,
-            "innerHTML requires a string as second argument",
-            .{},
-        );
-    }
-
-    const html_str = try html_arg.asString().toUtf8(js_instance.allocator);
-    defer js_instance.allocator.free(html_str);
-
-    var builder = std.ArrayList(u8).empty;
-    defer builder.deinit(js_instance.allocator);
-
-    try builder.appendSlice(js_instance.allocator, "<html><body>");
-    try builder.appendSlice(js_instance.allocator, html_str);
-    try builder.appendSlice(js_instance.allocator, "</body></html>");
-
-    const wrapped_html = try builder.toOwnedSlice(js_instance.allocator);
-    var wrapped_cleanup = true;
-    defer if (wrapped_cleanup) js_instance.allocator.free(wrapped_html);
-
-    var html_parser = parser.HTMLParser.init(js_instance.allocator, wrapped_html) catch |err| {
-        std.log.err("Failed to init HTML parser: {}", .{err});
-        return agent.throwException(
-            .syntax_error,
-            "Invalid HTML",
-            .{},
-        );
+    if (!handle_arg.isNumber() or !html_arg.isString())
+        return agent.throwException(.type_error, "innerHTML requires a node handle and string", .{});
+    const handle: u32 = @intFromFloat(handle_arg.asNumber().asFloat());
+    const node = js.getNode(window, handle) orelse return agent.throwException(.internal_error, "Invalid node handle", .{});
+    if (node.* != .element) return agent.throwException(.type_error, "innerHTML requires an Element", .{});
+    const input = try html_arg.asString().toUtf8(js.allocator);
+    defer js.allocator.free(input);
+    var fragment = @import("../document/html_fragment.zig").parse(js.allocator, input, node.element.tag) catch |err| {
+        if (err == error.OutOfMemory) return error.OutOfMemory;
+        return agent.throwException(.syntax_error, "Could not parse HTML fragment", .{});
     };
-    defer html_parser.deinit(js_instance.allocator);
-
-    html_parser.use_implicit_tags = false;
-
-    var parsed_node = html_parser.parse() catch |err| {
-        std.log.err("Failed to parse HTML: {}", .{err});
-        return agent.throwException(
-            .syntax_error,
-            "Invalid HTML",
-            .{},
-        );
-    };
-    defer parsed_node.deinit(js_instance.allocator);
-    markFragmentScriptsInert(&parsed_node);
-
-    var body_children = std.ArrayList(Node).empty;
-
-    switch (parsed_node) {
-        .element => |*html_elem| {
-            var idx: usize = 0;
-            body_search: while (idx < html_elem.children.items.len) : (idx += 1) {
-                const child = &html_elem.children.items[idx];
-                switch (child.*) {
-                    .element => |*child_elem| {
-                        if (std.mem.eql(u8, child_elem.tag, "body")) {
-                            body_children = child_elem.children;
-                            child_elem.children = std.ArrayList(Node).empty;
-                            break :body_search;
-                        }
-                    },
-                    else => {},
-                }
-            }
-        },
-        .text => {},
-    }
-    defer body_children.deinit(js_instance.allocator);
-
-    // Parse the HTML and replace the node's children
-    switch (node.*) {
-        .element => |*e| {
-            var mutation = js_instance.domMutationContext(window_id, window);
-            // Stage the only allocation needed by the installed replacement
-            // before exposing any of its source-backed nodes through the DOM.
-            if (e.owned_strings == null) {
-                e.owned_strings = std.ArrayList([]const u8).empty;
-            }
-            try e.owned_strings.?.ensureUnusedCapacity(js_instance.allocator, 1);
-            const is_attached = dom_mutation.isAttachedToCurrentDocument(window.current_nodes, node);
-            if (is_attached) {
-                try js_instance.clearNamedIdGlobals(window_id, window);
-            }
-
-            // Child arrays store Nodes by value. Retire every browser-side
-            // borrower before destroying the old nodes or replacing their
-            // backing array. Dirty state and repaint scheduling are published
-            // before this point, so any later failure remains recoverable.
-            e.markChildrenDirty();
-            dom_mutation.markElementLayoutDirty(e);
-            if (is_attached) prepareDomMutation(js_instance, node, .structural);
-
-            for (e.children.items) |*child| {
-                dom_mutation.retireIdentitiesForSubtree(&mutation, child);
-                child.deinit(js_instance.allocator);
-            }
-            e.children.deinit(js_instance.allocator);
-            e.children = body_children;
-            body_children = std.ArrayList(Node).empty;
-
-            e.owned_strings.?.appendAssumeCapacity(wrapped_html);
-            wrapped_cleanup = false;
-
-            parser.fixParentPointers(node, e.parent);
-
-            if (is_attached) {
-                if (window.referrer_policy) |policy| {
-                    for (e.children.items) |*child| @import("../document/referrer.zig").inserted(child, policy);
-                }
-                completeDomMutation(js_instance, node);
-                try js_instance.syncNamedIdGlobals(window_id, window);
-            }
-            js_instance.requestRender();
-
-            return .undefined;
-        },
-        .text => {
-            // Text nodes can't have innerHTML
-            return agent.throwException(
-                .type_error,
-                "Text nodes do not support innerHTML",
-                .{},
-            );
-        },
-    }
+    var source_retained = false;
+    defer if (!source_retained) js.allocator.free(fragment.source);
+    defer fragment.root.deinit(js.allocator);
+    try window.detached_sources.append(js.allocator, fragment.source);
+    source_retained = true;
+    var mutation = js.domMutationContext(window_id, window);
+    try dom_mutation.replaceWithParsedChildren(&mutation, node, &fragment.root.element.children);
+    js.requestRender();
+    return .undefined;
 }
 
 /// __native.style_set implementation

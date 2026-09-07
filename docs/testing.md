@@ -111,6 +111,7 @@ Run from the repository root:
   TIMEOUT, startup/error diagnostics, partial results, and Unicode JSONL
   fixtures, plus live body replacement/title accessors, JavaScript rectangles,
   client/offset box metrics,
+  context-sensitive HTML fragments and retained dynamic-markup identities,
   measure-to-position interaction, native-editor client clips, empty inline
   insertion points, and parser-boundary regressions.
   Captures are serial and process-watchdog bounded.

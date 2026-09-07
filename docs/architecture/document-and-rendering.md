@@ -10,7 +10,10 @@ display lists, or DOM-backed interaction state.
 Most parser-created tag names, DOM text, undecoded attribute values, CSS names,
 and CSS values are borrowed slices. Attribute values containing supported
 character references move into `Element.owned_strings`; DOM text stays
-source-backed and escaped because layout decodes it exactly once. Preserve:
+source-backed and escaped because layout decodes it exactly once. Text's
+`character_references` flag distinguishes this representation from literal
+XML/script data independently of `owned_text`; DOM readback decodes only the
+former. Normalized fragment RCDATA can own encoded bytes. Preserve:
 
 - A navigated Frame owns parser input through `html_source.Store`. Its initial
   decoded response and any future parser-inserted chunks are independently
@@ -20,6 +23,13 @@ source-backed and escaped because layout decodes it exactly once. Preserve:
   `WindowRealm.detached_sources` list. Both the HTML tree builder and the
   bounded XML tree builder borrow that buffer, so detached nodes are retired
   before the source list is cleared with the Realm.
+- Dynamic HTML fragments also retain their duplicated source in that Realm
+  list. Children transferred out of a temporary parsing container must not
+  borrow its lifetime. `html_fragment.zig` stages source/tree ownership and
+  marks scripts inert over `HTMLParser.parseFragment`; it is not a separate
+  tokenizer or tree builder.
+  This is Realm-lifetime source retention, not per-node garbage collection;
+  repeated fragment replacement can retain buffers until Realm retirement.
 - `html_live_parser.zig` drives initial navigation directly into the Frame's
   final root slot. It may publish that partial tree to the new document Realm
   at a parser-blocking script boundary, but only through parser-local pins;
@@ -227,7 +237,7 @@ remain; focus on a removed strict descendant must be cleared.
 `createElement` returns a window-owned, heap-stable detached root.
 `appendChild`, `insertBefore`, and `removeChild` transfer ownership rather than
 copying a subtree. `replaceChildren` stages all attached/detached sources and
-runs one mutation transaction. Repeated roots retain only their last
+  runs one mutation transaction. Repeated roots retain only their last
 occurrence. A removed subtree with a published JavaScript handle moves to
 heap-stable detached ownership; an unobserved removed subtree can be reclaimed.
 

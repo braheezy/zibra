@@ -34,6 +34,7 @@ pub fn Parser(
         // Track if <head> tag has been found
         head_found: bool = false,
         use_implicit_tags: bool = true,
+        fragment_context: ?[]const u8 = null,
         // Track parser state for HTML raw-text elements. CSS and JavaScript
         // must remain text until their matching end tag; otherwise a '<' in
         // either language can be mistaken for an HTML tag.
@@ -58,6 +59,83 @@ pub fn Parser(
             }
             self.unfinished.deinit(self.allocator);
             allocator.destroy(self);
+        }
+
+        /// Parse children in an HTML element context, not a fabricated document.
+        /// The returned synthetic root owns the children; input remains borrowed.
+        /// Context is a synchronous borrow and never appears in the output tree.
+        pub fn parseFragment(self: *HTMLParser, context: []const u8) !Node {
+            self.fragment_context = context;
+            self.use_implicit_tags = false;
+            try self.createHtmlElement();
+            const rcdata = tagIn(context, &.{ "title", "textarea" });
+            if (rcdata or tagIn(context, &.{ "style", "script", "xmp", "iframe", "noembed", "noframes", "noscript", "plaintext" })) {
+                // No start tag was emitted, so no end tag can be appropriate
+                // in an initial fragment RCDATA/RAWTEXT tokenizer state.
+                if (rcdata and self.body.len != 0) {
+                    var escaped = std.ArrayList(u8).empty;
+                    defer escaped.deinit(self.allocator);
+                    for (self.body) |byte| switch (byte) {
+                        '<' => try escaped.appendSlice(self.allocator, "&lt;"),
+                        '>' => try escaped.appendSlice(self.allocator, "&gt;"),
+                        else => try escaped.append(self.allocator, byte),
+                    };
+                    var text = Text.init(try escaped.toOwnedSlice(self.allocator), null);
+                    text.owned_text = true;
+                    errdefer text.deinit(self.allocator);
+                    try self.unfinished.items[0].appendChild(self.allocator, .{ .text = text });
+                } else {
+                    try self.addText(self.body);
+                    if (self.unfinished.items[0].element.children.items.len != 0)
+                        self.unfinished.items[0].element.children.items[0].text.character_references = false;
+                }
+                return self.finish();
+            }
+            return self.parse();
+        }
+
+        fn tagIn(tag: []const u8, choices: []const []const u8) bool {
+            for (choices) |choice| if (std.ascii.eqlIgnoreCase(tag, choice)) return true;
+            return false;
+        }
+
+        fn adjustedCurrentTag(self: *const HTMLParser) []const u8 {
+            if (self.unfinished.items.len == 1) {
+                if (self.fragment_context) |context| return context;
+            }
+            return self.unfinished.items[self.unfinished.items.len - 1].element.tag;
+        }
+
+        /// Bounded table fragment insertion modes: implied sections/rows and
+        /// sibling cells. Foster parenting and foreign content remain separate.
+        fn prepareFragmentTag(self: *HTMLParser, tag: []const u8, closing: bool) !bool {
+            const context = self.fragment_context orelse return false;
+            if (tagIn(tag, &.{ "html", "body" })) return true;
+            if (std.ascii.eqlIgnoreCase(tag, "head") and !std.ascii.eqlIgnoreCase(context, "html")) return true;
+            if (closing) return false;
+            const section = tagIn(tag, &.{ "tbody", "thead", "tfoot" });
+            const row = std.ascii.eqlIgnoreCase(tag, "tr");
+            const cell = tagIn(tag, &.{ "td", "th" });
+            if (!section and !row and !cell and !tagIn(tag, &.{ "caption", "colgroup", "col" })) return false;
+            const table_context = tagIn(context, &.{ "table", "tbody", "thead", "tfoot", "tr", "td", "th", "caption", "colgroup" });
+            if (!table_context and !self.hasOpenElement("table")) return true;
+            if (section or row or cell) {
+                var i = self.unfinished.items.len;
+                while (i > 1) {
+                    i -= 1;
+                    const open = self.unfinished.items[i].element.tag;
+                    if (std.ascii.eqlIgnoreCase(open, "table")) break;
+                    if (tagIn(open, &.{ "td", "th" }) or
+                        ((section or row) and std.ascii.eqlIgnoreCase(open, "tr")) or
+                        (section and tagIn(open, &.{ "tbody", "thead", "tfoot" })))
+                        try self.closeNodesUpTo(i);
+                }
+            }
+            if ((row or cell) and std.ascii.eqlIgnoreCase(self.adjustedCurrentTag(), "table"))
+                try self.handleOpeningTag("tbody", "tbody");
+            if (cell and tagIn(self.adjustedCurrentTag(), &.{ "tbody", "thead", "tfoot" }))
+                try self.handleOpeningTag("tr", "tr");
+            return false;
         }
 
         /// Parse the source into an owning root Node returned by value.
@@ -201,10 +279,11 @@ pub fn Parser(
             const parent = &self.unfinished.items[self.unfinished.items.len - 1];
 
             // Parent pointers are repaired after the tree reaches stable storage.
-            const text_node = Text.init(
+            var text_node = Text.init(
                 text_slice,
                 null,
             );
+            if (html_serialization.isLiteralTextElementTag(parent.element.tag)) text_node.character_references = false;
 
             const node = Node{ .text = text_node };
             try parent.appendChild(self.allocator, node);
@@ -218,6 +297,7 @@ pub fn Parser(
 
             // Parse tag information
             const tag_info = parseTagInfo(tag_slice);
+            if (try self.prepareFragmentTag(tag_info.name, tag_info.is_closing)) return;
 
             // Explicit structural start tags supply the nodes that the implicit
             // algorithm would otherwise synthesize. Consume them here so normal
@@ -333,7 +413,8 @@ pub fn Parser(
         // Create a top-level element when no implicit tags are used
         fn createTopLevelElement(self: *HTMLParser, tag_slice: []const u8) !void {
             const element = try Element.init(self.allocator, tag_slice, null);
-            const node = Node{ .element = element };
+            var node = Node{ .element = element };
+            errdefer node.deinit(self.allocator);
             try self.unfinished.append(self.allocator, node);
         }
 
@@ -344,7 +425,7 @@ pub fn Parser(
 
             // Find the matching opening tag in the unfinished stack
             var i: usize = self.unfinished.items.len;
-            while (i > 0) {
+            while (i > 1) {
                 i -= 1;
                 const current = &self.unfinished.items[i];
 
@@ -406,17 +487,13 @@ pub fn Parser(
         // Close all nodes from the current position up to and including the specified index
         // This is used to properly close nested elements when a closing tag is encountered
         fn closeNodesUpTo(self: *HTMLParser, index: usize) !void {
-            // Close all nested tags up to the target
-            while (self.unfinished.items.len - 1 > index) {
+            std.debug.assert(index > 0);
+            while (self.unfinished.items.len > index) {
+                const parent_index = self.unfinished.items.len - 2;
+                try self.unfinished.items[parent_index].element.children.ensureUnusedCapacity(self.allocator, 1);
                 const node = self.unfinished.pop() orelse unreachable;
-                const parent = &self.unfinished.items[self.unfinished.items.len - 1];
-                try parent.appendChild(self.allocator, node);
+                self.unfinished.items[parent_index].element.children.appendAssumeCapacity(node);
             }
-
-            // Now close the target tag itself
-            const node = self.unfinished.pop() orelse unreachable;
-            const parent = &self.unfinished.items[self.unfinished.items.len - 1];
-            try parent.appendChild(self.allocator, node);
         }
 
         // Handle a self-closing tag by creating it and appending it to its parent
@@ -450,7 +527,8 @@ pub fn Parser(
                 null,
             );
 
-            const node = Node{ .element = element };
+            var node = Node{ .element = element };
+            errdefer node.deinit(self.allocator);
             try self.unfinished.append(self.allocator, node);
 
             // Mark when we've found a head tag
@@ -462,11 +540,9 @@ pub fn Parser(
         // Handle implicit tags according to the algorithm from browser.engineering
         // Browsers automatically insert missing structural elements like html, head, body
         fn implicitTags(self: *HTMLParser, tag_name: []const u8, is_closing: bool) !void {
-            // Skip implicit tag handling if disabled
-            if (!self.use_implicit_tags) return;
-
-            // Ensure HTML structure is in place
-            try self.ensureHtmlStructure(tag_name, is_closing);
+            // Document scaffolding and in-body recovery are independent:
+            // fragment parsing still performs implied paragraph/list closures.
+            if (self.use_implicit_tags) try self.ensureHtmlStructure(tag_name, is_closing);
 
             // Handle special cases for elements that can't contain themselves
             if (!is_closing and self.unfinished.items.len > 0) {
@@ -495,7 +571,7 @@ pub fn Parser(
         /// unrelated ancestor.
         fn closeOpenParagraph(self: *HTMLParser) !void {
             var i = self.unfinished.items.len;
-            while (i > 0) {
+            while (i > 1) {
                 i -= 1;
                 const current = &self.unfinished.items[i];
                 if (current.* != .element) continue;
@@ -551,13 +627,7 @@ pub fn Parser(
 
         // Create the HTML root element
         fn createHtmlElement(self: *HTMLParser) !void {
-            const html_element = try Element.init(
-                self.allocator,
-                "html",
-                null,
-            );
-            const html_node = Node{ .element = html_element };
-            try self.unfinished.append(self.allocator, html_node);
+            try self.createTopLevelElement("html");
         }
 
         // Ensure a HEAD element exists if needed
@@ -643,7 +713,7 @@ pub fn Parser(
         fn handleSelfClosingElement(self: *HTMLParser, tag_name: []const u8) !void {
             // For each element in the stack from top to bottom
             var i: usize = self.unfinished.items.len;
-            while (i > 0) {
+            while (i > 1) {
                 i -= 1;
                 const current = &self.unfinished.items[i];
 
@@ -689,11 +759,7 @@ pub fn Parser(
             }
 
             // If there are multiple top-level elements, ensure they are connected
-            while (self.unfinished.items.len > 1) {
-                const node = self.unfinished.pop() orelse unreachable;
-                const parent = &self.unfinished.items[self.unfinished.items.len - 1];
-                try parent.appendChild(self.allocator, node);
-            }
+            if (self.unfinished.items.len > 1) try self.closeNodesUpTo(1);
 
             // Return the root node
             var root = self.unfinished.pop() orelse unreachable;

@@ -34,6 +34,10 @@ behavior. Navigation-owned stylesheet/resource generations are documented in
   then call `fixParentPointers(&root, null)` before style, layout, DOM
   ancestry, or JavaScript uses it; the parser cannot repair pointers after
   that return-value move.
+- `html_fragment.zig` stages an inert fragment with the same parser. Transfer
+  its source to the Realm before publishing or moving its children; a temporary
+  parsing container must not own the only copy of their source. Text allocation
+  ownership and character-reference encoding are independent flags.
 - `xml_parser.zig` builds detached DOMParser and temporary SVG image trees. Its successful tree
   borrows the caller-owned source buffer, preserves XML name case, and must be
   retired before that source buffer is released. Image callers set explicit

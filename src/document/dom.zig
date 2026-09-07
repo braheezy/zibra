@@ -186,6 +186,10 @@ pub const Text = struct {
     /// Parser text borrows the document source; script-created text owns its
     /// duplicated bytes and releases them when its detached subtree dies.
     owned_text: bool = false,
+    /// HTML tokenizer text still contains character references. This is
+    /// independent of allocation ownership: XML and script-created text are
+    /// already literal, while normalized RCDATA may own encoded storage.
+    character_references: bool = false,
 
     pub fn init(text: []const u8, parent: ?*Node) Text {
         return .{
@@ -193,6 +197,19 @@ pub const Text = struct {
             .parent = parent,
             .style = null,
             .owned_text = false,
+            .character_references = true,
+        };
+    }
+
+    /// Return an owned decoded readback, or null when the stored bytes already
+    /// represent the DOM string. The renderer's source representation is intact.
+    pub fn decoded(self: Text, allocator: std.mem.Allocator) !?[]u8 {
+        if (!self.character_references) return null;
+        return decodeAttributeCharacterReferences(allocator, self.text) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            // characterReferenceAt replaces invalid numeric scalars and its
+            // named-reference table contains only Unicode scalar values.
+            error.Utf8CannotEncodeSurrogateHalf, error.CodepointTooLarge => unreachable,
         };
     }
 

@@ -501,11 +501,24 @@ pub fn emptyElementChildren(
     self: *Context,
     node: *Node,
 ) !void {
+    var empty = std.ArrayList(Node).empty;
+    try replaceWithParsedChildren(self, node, &empty);
+}
+
+/// Replace children with unpublished parsed nodes. Source storage must already
+/// have a document/Realm owner independent of the target. Consumes `children`
+/// at installation (including if the later named-global refresh fails).
+/// Published removed descendants survive as detached roots in this transaction.
+pub fn replaceWithParsedChildren(
+    self: *Context,
+    node: *Node,
+    children: *std.ArrayList(Node),
+) !void {
     const element = switch (node.*) {
         .element => |*value| value,
         .text => unreachable,
     };
-    if (element.children.items.len == 0) return;
+    if (element.children.items.len == 0 and children.items.len == 0) return;
 
     var bindings = try snapshotDirectChildIdentities(self, node);
     defer bindings.deinit(self.allocator);
@@ -568,10 +581,15 @@ pub fn emptyElementChildren(
     }
     std.debug.assert(retained_index == retained.items.len);
     element.children.deinit(self.allocator);
-    element.children = std.ArrayList(Node).empty;
+    element.children = children.*;
+    children.* = std.ArrayList(Node).empty;
+    parser.fixParentPointers(node, element.parent);
     stable_roots_owned = false;
 
     if (is_attached) {
+        if (self.referrer_policy) |policy| {
+            for (element.children.items) |*child| @import("../document/referrer.zig").inserted(child, policy);
+        }
         self.hooks.complete(self.host_context, node);
         // The pre-mutation callback already publishes a replacement frame;
         // keep the ordinary render callback observable even if rebuilding ID

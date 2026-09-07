@@ -67,7 +67,7 @@ function DOMException(message, name) {
   this.message = message == null ? '' : String(message);
   this.name = name == null || name === '' ? 'Error' : String(name);
   var codes = { IndexSizeError: 1, HierarchyRequestError: 3, WrongDocumentError: 4,
-    NotSupportedError: 9, NotFoundError: 8,
+    NotSupportedError: 9, NotFoundError: 8, NoModificationAllowedError: 7,
     InvalidCharacterError: 5, NamespaceError: 14, InvalidNodeTypeError: 24, SyntaxError: 12 };
   this.code = codes[this.name] || 0;
 }
@@ -1645,7 +1645,11 @@ Node.prototype.getElementsByTagNameNS = function(namespaceURI, localName) {
   }, 'html', node);
 };
 Node.prototype.querySelectorAll = function(selector) {
-  return wrapNodeList(__native.querySelectorAllFrom(this.handle, selector == null ? '' : selector.toString()));
+  var receiver = this;
+  // Native subtree lookup also serves detached Documents, which include their
+  // root. Element queries return only descendants, even if the receiver matches.
+  var handles = __native.querySelectorAllFrom(this.handle, selector == null ? '' : selector.toString());
+  return wrapNodeList(handles.filter(function(handle) { return handle !== receiver.handle; }));
 };
 Node.prototype.querySelector = function(selector) {
   var matches = this.querySelectorAll(selector);
@@ -2472,23 +2476,6 @@ function computedStyleObject(node) {
   }
   return style;
 }
-
-// Serialize or replace an element's child HTML.
-Object.defineProperty(Node.prototype, "innerHTML", {
-  get: function() {
-    return __native.getInnerHTML(this.handle);
-  },
-  set: function(value) {
-    var text = value == null ? "" : value.toString();
-    __native.innerHTML(this.handle, text);
-  }
-});
-
-Object.defineProperty(Node.prototype, "outerHTML", {
-  get: function() {
-    return __native.getOuterHTML(this.handle);
-  }
-});
 
 // Add style setter to Node prototype
 Object.defineProperty(Node.prototype, "style", {

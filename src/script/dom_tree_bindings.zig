@@ -328,7 +328,11 @@ fn elementHandleArray(
 
 fn appendTextContent(node: *const Node, output: *std.ArrayList(u8), allocator: std.mem.Allocator) !void {
     switch (node.*) {
-        .text => |text| try output.appendSlice(allocator, text.text),
+        .text => |text| {
+            const decoded = try text.decoded(allocator);
+            defer if (decoded) |bytes| allocator.free(bytes);
+            try output.appendSlice(allocator, decoded orelse text.text);
+        },
         .element => |element| {
             for (element.children.items) |*child| {
                 try appendTextContent(child, output, allocator);
@@ -502,7 +506,7 @@ fn nodeValue(agent: *Agent, this_value: Value, arguments: Arguments) Agent.Error
     const node = try requireNode(agent, window, arguments.get(0));
     return switch (node.*) {
         .element => .null,
-        .text => |text| copiedString(agent, text.text),
+        .text => |text| copiedText(agent, text),
     };
 }
 
@@ -512,8 +516,14 @@ fn nodeData(agent: *Agent, this_value: Value, arguments: Arguments) Agent.Error!
     const node = try requireNode(agent, window, arguments.get(0));
     return switch (node.*) {
         .element => .null,
-        .text => |text| copiedString(agent, text.text),
+        .text => |text| copiedText(agent, text),
     };
+}
+
+fn copiedText(agent: *Agent, text: parser.Text) Agent.Error!Value {
+    const decoded = try text.decoded(agent.gc_allocator);
+    defer if (decoded) |bytes| agent.gc_allocator.free(bytes);
+    return copiedString(agent, decoded orelse text.text);
 }
 
 /// Replace the bytes of a script-created or parser text node.  Range
@@ -535,6 +545,7 @@ fn setNodeData(agent: *Agent, this_value: Value, arguments: Arguments) Agent.Err
             if (text.owned_text) host.allocator.free(text.text);
             text.text = owned;
             text.owned_text = true;
+            text.character_references = false;
         },
     }
     return .undefined;

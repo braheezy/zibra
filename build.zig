@@ -177,6 +177,12 @@ const WptFixture = struct {
 
 const wpt_fixtures = [_]WptFixture{
     .{
+        .fixture = "tests/manual/html-fragments.html",
+        .status = "PASS",
+        .timeout_ms = 10_000,
+        .output_basename = "wpt-html-fragments.jsonl",
+    },
+    .{
         .fixture = "tests/manual/document-accessors.html",
         .status = "PASS",
         .timeout_ms = 10_000,

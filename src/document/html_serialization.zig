@@ -39,6 +39,15 @@ pub fn isVoidElementTag(tag: []const u8) bool {
     } else false;
 }
 
+/// Elements whose text never interprets character references. Noscript depends
+/// on the parser scripting mode and is deliberately not in this unconditional set.
+pub fn isLiteralTextElementTag(tag: []const u8) bool {
+    for ([_][]const u8{ "script", "style", "xmp", "iframe", "noembed", "noframes", "plaintext" }) |candidate| {
+        if (std.ascii.eqlIgnoreCase(tag, candidate)) return true;
+    }
+    return false;
+}
+
 fn appendSerializedAttributes(
     allocator: std.mem.Allocator,
     output: *std.ArrayList(u8),

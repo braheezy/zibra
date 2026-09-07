@@ -1,0 +1,56 @@
+<!-- How to verify: open this page. Expect a green PASS heading, three list
+     items, and two table rows. Click Keep me: its original listener must still
+     update the count after surrounding markup was inserted and replaced. -->
+<!doctype html>
+<html><head><title>HTML fragment insertion</title>
+<style>body { font: 18px sans-serif; margin: 30px; } td { padding: 12px; border: 1px solid black; }</style>
+</head><body>
+<h1 id="status">Running fragment checks</h1>
+<div id="controls"><button id="keep">Keep me</button></div>
+<p id="clicks">Clicks: 0</p>
+<ul id="items"></ul><table id="rows"></table>
+<script>
+var fragmentScriptRan = false;
+document.addEventListener('DOMContentLoaded', function() {
+  var results = [];
+  function check(name, fn) {
+    try { fn(); results.push({name: name, status: 0}); }
+    catch (error) { results.push({name: name, status: 1, message: String(error)}); }
+  }
+  function equal(actual, expected) { if (actual !== expected) throw Error(String(actual) + ' != ' + String(expected)); }
+  check('surrounding markup preserves the button and listener', function() {
+    var keep = document.getElementById('keep'), count = 0;
+    keep.addEventListener('click', function() { document.getElementById('clicks').textContent = 'Clicks: ' + (++count); });
+    keep.insertAdjacentHTML('beforebegin', '<span>Before </span>');
+    keep.insertAdjacentHTML('afterend', '<span> After</span>');
+    equal(document.getElementById('keep'), keep);
+    keep.previousSibling.outerHTML = '<strong>Still before </strong>';
+    equal(keep.previousSibling.localName, 'strong');
+  });
+  check('list and table fragment contexts', function() {
+    document.getElementById('items').innerHTML = '<li>First<li>Second<li>Third';
+    equal(document.getElementById('items').children.length, 3);
+    var table = document.getElementById('rows');
+    table.innerHTML = '<tr><td>One<td>Two';
+    table.firstChild.insertAdjacentHTML('beforeend', '<tr><td>Three<td>Four');
+    equal(table.firstChild.localName, 'tbody');
+    equal(table.firstChild.children.length, 2);
+  });
+  check('removed children survive replacement', function() {
+    var box = document.createElement('div');
+    box.innerHTML = '<b>Survives</b>';
+    var old = box.firstChild, text = old.firstChild;
+    box.innerHTML = '';
+    equal(old.parentNode, null); equal(old.firstChild, text); equal(text.data, 'Survives');
+  });
+  check('fragment scripts remain inert when attached', function() {
+    document.getElementById('controls').insertAdjacentHTML('beforeend', '<script>fragmentScriptRan = true;<' + '/script>');
+    equal(fragmentScriptRan, false);
+  });
+  var failures = results.filter(function(result) { return result.status !== 0; });
+  var status = document.getElementById('status');
+  status.textContent = failures.length ? 'FAIL: ' + failures[0].name + ': ' + failures[0].message : 'PASS: HTML fragment insertion';
+  status.style.color = failures.length ? 'red' : 'green';
+  if (typeof completion_callback === 'function') completion_callback(results, {status: 0});
+});
+</script></body></html>

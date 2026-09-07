@@ -18,6 +18,7 @@ tiers and baseline policy.
 | [`acid1-box-model.html`](acid1-box-model.html) | Acid1-inspired nested box spacing, borders, backgrounds, and visual compatibility baseline |
 | [`dump-pipeline.html`](dump-pipeline.html) | Shared style, layout, and display-list inspection input |
 | [`dump-dom.html`](dump-dom.html) | Isolated HTML parser/DOM dump input |
+| [`html-fragments.html`](html-fragments.html) | Context-sensitive dynamic markup, inert scripts, removed-node retention, and listener identity across adjacent/outer insertion |
 | [`anonymous-block-boxes.html`](anonymous-block-boxes.html) | Anonymous inline/block grouping |
 | [`block-dimensions.html`](block-dimensions.html) | CSS block width/height and surrounding box edges |
 | [`border-geometry.html`](border-geometry.html) | Asymmetric mitered solid-border joins and zero-content border triangles |

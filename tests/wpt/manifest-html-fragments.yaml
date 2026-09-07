@@ -1,0 +1,13 @@
+# Bounded dynamic markup checks; domparsing is already default-allowlisted.
+tests:
+  - domparsing/innerhtml-li-autoclosing.html
+  - domparsing/innerhtml-04.html
+  - domparsing/innerhtml-06.html
+  - domparsing/innerhtml-07.html
+  - domparsing/innerhtml-08.html
+  - domparsing/insert_adjacent_html.html
+  - domparsing/insert-adjacent.html
+  - domparsing/outerhtml-01.html
+  - domparsing/outerhtml-02.html
+  - domparsing/DOMParser-parseFromString-html.html
+  - html/syntax/serializing-html-fragments/outerHTML.html
