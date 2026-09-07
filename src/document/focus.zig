@@ -53,6 +53,7 @@ pub fn isProgrammaticallyFocusable(element: *const parser.Element) bool {
 
     if (std.ascii.eqlIgnoreCase(element.tag, "input") or
         std.ascii.eqlIgnoreCase(element.tag, "button")) return true;
+    if (std.ascii.eqlIgnoreCase(element.tag, "audio") and !element.isHiddenAudio()) return true;
     if (isContentEditable(element)) return true;
 
     if (std.ascii.eqlIgnoreCase(element.tag, "a")) {

@@ -100,6 +100,7 @@ const FetchMode = enum {
     ordinary,
     cors,
     navigation,
+    limited,
 };
 
 /// One synchronous bridge through the session networking runner. All request
@@ -117,10 +118,12 @@ const FetchContext = struct {
     final_url: ?Url = null,
     fetch_error: ?anyerror = error.NetworkTaskCancelled,
     completed: std.Io.Semaphore = .{},
+    limits: ?url_module.FetchOptions = null,
 
     fn runOpaque(raw: *anyopaque) anyerror!void {
         const self: *@This() = @ptrCast(@alignCast(raw));
         self.response = switch (self.mode) {
+            .limited => Url.fetchBodyLimitedSynchronized(self.loader.allocator, self.loader.io, &self.loader.session.http_client, &self.loader.session.cookie_jar, &self.loader.session.network_lock, self.url, self.referrer, self.referrer_policy, self.limits.?),
             .ordinary => self.loader.fetchBodyDirect(
                 self.url,
                 self.referrer,
@@ -216,6 +219,16 @@ pub const Loader = struct {
             null,
             referrer_policy,
         );
+    }
+
+    /// Bounded complete-resource fetch through the shared networking owner.
+    /// The waiting caller keeps options.context alive until this returns.
+    pub fn fetchBodyLimited(self: *Loader, url: Url, referrer: ?Url, policy: url_module.ReferrerPolicy, limits: url_module.FetchOptions) !url_module.HttpResponse {
+        var context = FetchContext{ .loader = self, .mode = .limited, .url = url, .referrer = referrer, .payload = null, .request_origin = null, .referrer_policy = policy, .limits = limits };
+        try self.session.scheduleNetworkTask(Task.init(.normal, "task:network_media", &context, FetchContext.runOpaque, FetchContext.cleanupOpaque));
+        context.completed.waitUncancelable(self.io);
+        if (context.fetch_error) |err| return err;
+        return context.response orelse error.NetworkTaskMissingResponse;
     }
 
     pub fn fetchBodyForXhr(

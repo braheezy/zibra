@@ -618,6 +618,14 @@ before rebuilding/destroying layout or DOM. `Tab.composeDisplayList`
 materializes cache edges, recursively owns containers, and clears provenance.
 `Browser.commit` installs the Browser generation under its lock.
 
+Retiring active Browser commands marks the tab as awaiting a replacement
+display-list commit. The UI keeps the last completed, independently owned
+pixels while the Tab rebuilds; it must not raster the temporary missing list
+as an empty page. A scalar-only commit does not finish this wait. An owned
+replacement list (including an empty list), tab activation, or closing the
+active tab clears it. Borrowed commands still retire synchronously before DOM,
+layout, or resource storage can change.
+
 `RasterSnapshot` is the actual worker-transfer boundary. It must deep-copy
 every resource-backed leaf, clear DOM/layout provenance, and reject
 browser-owned layer pointers. Numeric compositor IDs may cross; raw pointers
@@ -720,3 +728,12 @@ Browser render state
 The reverse direction constructs borrowers from stable owners. Any new API
 that replaces an intermediate owner must retire every downstream borrower
 first.
+
+## Audio controls
+
+Audio with `controls` is an atomic, focusable play/pause control using the
+existing InputLayout geometry and hit-test path. Audio without controls and
+fallback descendants do not participate in layout or intrinsic width.
+Document media state copies only paused/error flags into the Element for its
+label; a change marks the retained layout owner before repaint. The Element
+never owns a decoder, voice or asynchronous callback. See [audio](audio.md).

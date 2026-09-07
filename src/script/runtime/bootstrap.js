@@ -191,9 +191,12 @@ var IFRAME_DOCUMENTS = {};
 function wrapNode(handle) {
   if (handle === null || handle === undefined) return null;
   var node = NODE_WRAPPERS[handle];
+  // Cached wrappers also preserve event targets after a listener retires the
+  // native handle. Specialization must not re-read native state on that path.
   if (node) return node;
   node = new Node(handle);
   NODE_WRAPPERS[handle] = node;
+  if (typeof __specializeMediaNode === "function") __specializeMediaNode(node);
   return node;
 }
 

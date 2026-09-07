@@ -33,6 +33,7 @@ an architecture document or fixture catalog in them.
 | Shared focusability policy | `src/document/focus.zig` |
 | Kiesel host integration | `src/script/` |
 | URLs, HTTP, cookies, caching | `src/network/` |
+| Audio core and media elements | `src/media/`, `src/browser/media.zig` |
 | Tasks and synchronization | `src/runtime/` |
 | Shared low-level primitives | `src/core/` |
 | Tutorial message-board server | `server.py` |

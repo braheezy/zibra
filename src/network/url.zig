@@ -14,6 +14,7 @@ const response_module = @import("response.zig");
 const transport = @import("transport.zig");
 const Mutex = @import("../runtime/sync.zig").Mutex;
 
+pub const FetchOptions = transport.FetchOptions;
 pub const CacheControl = cache_module.CacheControl;
 pub const HttpCache = cache_module.HttpCache;
 pub const ReferrerPolicy = cache_module.ReferrerPolicy;
@@ -672,8 +673,25 @@ pub const Url = struct {
             final_url,
             request_origin,
             referrer_policy,
+            null,
         );
     }
+    /// Fetch a complete resource with a decompressed byte limit and optional
+    /// redirect policy. Response ownership follows fetchBody; options are borrowed.
+    pub fn fetchBodyLimitedSynchronized(
+        allocator: std.mem.Allocator,
+        io: std.Io,
+        client: *std.http.Client,
+        jar: *std.StringHashMap(CookieEntry),
+        lock: *Mutex,
+        url: Url,
+        referrer: ?Url,
+        referrer_policy: ReferrerPolicy,
+        options: FetchOptions,
+    ) !HttpResponse {
+        return transport.fetchBodyInternal(Url, inheritFragment, refererHeaderValue, allocator, io, client, jar, null, lock, url, referrer, null, null, null, referrer_policy, options);
+    }
+
     pub fn fileRequest(self: Url, al: std.mem.Allocator, io: std.Io) ![]const u8 {
         const html_file = try std.Io.Dir.cwd().openFile(io, self.path, .{});
 
@@ -1735,4 +1753,85 @@ test "HTTP redirects follow relative and absolute locations and report the final
     defer std.testing.allocator.free(expected_final_url);
     var final_url_buffer: [256]u8 = undefined;
     try expect(std.mem.eql(u8, try final_url.?.toString(&final_url_buffer), expected_final_url));
+}
+
+test "bounded media fetch rejects large data and file bodies" {
+    const allocator = std.testing.allocator;
+    var client: std.http.Client = .{ .allocator = allocator, .io = std.testing.io };
+    defer client.deinit();
+    var jar = std.StringHashMap(CookieEntry).init(allocator);
+    defer jar.deinit();
+    var lock = Mutex.init(std.testing.io);
+    const data = try Url.init(allocator, "data:audio/wav,12345");
+    defer data.free(allocator);
+    try std.testing.expectError(error.StreamTooLong, Url.fetchBodyLimitedSynchronized(allocator, std.testing.io, &client, &jar, &lock, data, null, .default, .{ .max_body_bytes = 4 }));
+    const path = try std.Io.Dir.cwd().realPathFileAlloc(std.testing.io, "src/tests/fixtures/audio.wav", allocator);
+    defer allocator.free(path);
+    const text = try std.fmt.allocPrint(allocator, "file://{s}", .{path});
+    defer allocator.free(text);
+    const file = try Url.init(allocator, text);
+    defer file.free(allocator);
+    try std.testing.expectError(error.StreamTooLong, Url.fetchBodyLimitedSynchronized(allocator, std.testing.io, &client, &jar, &lock, file, null, .default, .{ .max_body_bytes = 4 }));
+}
+
+test "bounded media HTTP fetch checks redirects before requesting and limits bodies" {
+    const Server = struct {
+        listener: std.Io.net.Server,
+        responses: []const []const u8,
+        err: ?anyerror = null,
+        fn run(self: *@This()) void {
+            self.serve() catch |err| {
+                self.err = err;
+            };
+        }
+        fn serve(self: *@This()) !void {
+            for (self.responses) |response| {
+                var stream = try self.listener.accept(std.testing.io);
+                defer stream.socket.close(std.testing.io);
+                var read_buffer: [2048]u8 = undefined;
+                var reader = stream.reader(std.testing.io, &read_buffer);
+                while ((try readTestHttpLine(&reader.interface)).len != 0) {}
+                var write_buffer: [2048]u8 = undefined;
+                var writer = stream.writer(std.testing.io, &write_buffer);
+                try writer.interface.writeAll(response);
+                try writer.interface.flush();
+            }
+        }
+        fn allows(_: ?*anyopaque, href: []const u8) bool {
+            return std.mem.indexOf(u8, href, "/forbidden") == null;
+        }
+    };
+    const allocator = std.testing.allocator;
+    const cases = [_][]const []const u8{
+        &.{"HTTP/1.1 200 OK\r\nContent-Length: 5\r\nConnection: close\r\n\r\n12345"},
+        &.{"HTTP/1.1 302 Found\r\nLocation: /forbidden\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"},
+        &.{ "HTTP/1.1 302 Found\r\nLocation: /allowed\r\nContent-Length: 0\r\nConnection: close\r\n\r\n", "HTTP/1.1 200 OK\r\nContent-Length: 4\r\nConnection: close\r\n\r\n1234" },
+    };
+    for (cases, 0..) |responses, index| {
+        const address = try std.Io.net.IpAddress.parse("127.0.0.1", 0);
+        var listener = try address.listen(std.testing.io, .{});
+        defer listener.deinit(std.testing.io);
+        var server = Server{ .listener = listener, .responses = responses };
+        var client: std.http.Client = .{ .allocator = allocator, .io = std.testing.io };
+        defer client.deinit();
+        var jar = std.StringHashMap(CookieEntry).init(allocator);
+        defer jar.deinit();
+        var lock = Mutex.init(std.testing.io);
+        const text = try std.fmt.allocPrint(allocator, "http://127.0.0.1:{d}/start", .{listener.socket.address.getPort()});
+        defer allocator.free(text);
+        const url = try Url.init(allocator, text);
+        defer url.free(allocator);
+        const thread = try std.Thread.spawn(.{}, Server.run, .{&server});
+        defer thread.join();
+        const result = Url.fetchBodyLimitedSynchronized(allocator, std.testing.io, &client, &jar, &lock, url, null, .default, .{ .max_body_bytes = 4, .allows_url = Server.allows });
+        if (index == 0) {
+            try std.testing.expectError(error.StreamTooLong, result);
+        } else if (index == 1) {
+            try std.testing.expectError(error.ResourcePolicyBlocked, result);
+        } else {
+            const response = try result;
+            defer allocator.free(response.body);
+            try std.testing.expectEqualStrings("1234", response.body);
+        }
+    }
 }

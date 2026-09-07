@@ -340,3 +340,11 @@ optimistic text and warning pages must not inherit stale security UI.
 Tests for ownership changes should prefer data/file URLs and reclaiming
 allocators. Use a local deterministic server for redirects, cookies,
 compression, caching, CORS, CSP, X-Frame-Options, or concurrency.
+
+## Bounded complete media resources
+
+[Audio loading](audio.md) uses a separate session loader queue and the shared
+networking bridge. Its limited fetch API bounds file/data and decompressed HTTP
+bodies and applies copied source policy before each redirect. These requests
+bypass the ordinary response cache. Existing navigation and ordinary-resource
+fetch APIs retain their ownership and cache behavior.

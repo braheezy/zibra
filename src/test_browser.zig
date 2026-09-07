@@ -1,6 +1,11 @@
 //! Focused unit-test root for browser, tab, frame, input, and worker behavior.
 
 comptime {
+    _ = @import("tests/browser_audio.zig");
+    _ = @import("media/audio.zig");
+    _ = @import("media/element.zig");
+    _ = @import("media/decode.zig");
+    _ = @import("media/policy.zig");
     _ = @import("kiesel").builtins.reg_exp;
     _ = @import("browser/document_lifecycle.zig");
     _ = @import("browser/wpt_session.zig");

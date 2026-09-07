@@ -1,0 +1,6 @@
+Audio fixtures are synthesized 440 Hz tones, not recordings:
+- audio.wav: 80 mono s16 frames at 8 kHz, generated with Python wave/math.
+- audio.mp3: 100 ms at 44.1 kHz stereo, generated with FFmpeg/libmp3lame:
+  ffmpeg -f lavfi -i sine=frequency=440:duration=0.1:sample_rate=44100 -ac 2 -codec:a libmp3lame -q:a 6 audio.mp3
+The longer manual/audio-tone.wav fixture uses the same generator, 48 kHz,
+two seconds, amplitude 3000/32768 and a 10 ms fade at each end.

@@ -3025,6 +3025,7 @@ fn recurseNode(self: *Layout, node: Node, node_ptr: ?*Node, line_buffer: *std.Ar
                 if (isInlineBlockDisplay(styles) and !elementUsesImageLayout(&e) and
                     !std.ascii.eqlIgnoreCase(e.tag, "input") and
                     !std.ascii.eqlIgnoreCase(e.tag, "textarea") and
+                    !std.ascii.eqlIgnoreCase(e.tag, "audio") and
                     !std.ascii.eqlIgnoreCase(e.tag, "button") and
                     !std.ascii.eqlIgnoreCase(e.tag, "canvas") and
                     !std.ascii.eqlIgnoreCase(e.tag, "iframe"))
@@ -3038,7 +3039,7 @@ fn recurseNode(self: *Layout, node: Node, node_ptr: ?*Node, line_buffer: *std.Ar
             // Handle br tag for line breaks
             if (std.mem.eql(u8, e.tag, "br")) {
                 try self.breakExplicitLine(line_buffer);
-            } else if (std.mem.eql(u8, e.tag, "input") or std.mem.eql(u8, e.tag, "textarea")) {
+            } else if (std.mem.eql(u8, e.tag, "input") or std.mem.eql(u8, e.tag, "textarea") or std.mem.eql(u8, e.tag, "audio")) {
                 try self.handleInputElement(node, node_ptr, line_buffer);
             } else if (std.mem.eql(u8, e.tag, "button")) {
                 try self.handleButtonElement(node, node_ptr, line_buffer);
@@ -3117,7 +3118,7 @@ fn isNonRenderTag(tag: []const u8) bool {
 }
 
 fn isNonRenderedElement(element: *const parser.Element, dependency_target: ?*ProtectedField(u64)) bool {
-    if (isNonRenderTag(element.tag) or element.isHiddenInput()) return true;
+    if (isNonRenderTag(element.tag) or element.isHiddenInput() or element.isHiddenAudio()) return true;
     const styles = if (element.style) |*map| map else return false;
     const field = @constCast(styles).getPtr("display") orelse return false;
     if (dependency_target) |target| target.addDependency(field, styles.allocator);
@@ -5172,6 +5173,8 @@ const InputLayout = struct {
 
         if (is_choice) {
             self.text = "";
+        } else if (std.ascii.eqlIgnoreCase(element.tag, "audio")) {
+            self.text = if (element.audio_error) "Audio unavailable" else if (element.audio_paused) "Play audio" else "Pause audio";
         } else if (self.is_multiline) {
             for (element.children.items) |child| if (child == .text) {
                 self.text = child.text.text;
@@ -5230,7 +5233,7 @@ const InputLayout = struct {
             if (own_block) |block| self.box.content_width = block.content_width;
             const baseline = if (self.is_multiline) self.box.height() else self.box.border.top + self.box.padding.top + @max(@divTrunc(self.box.content_height - self.text_line_height, 2), 0) + self.text_ascent;
             self.embed.setMetrics(self.box.width(), self.box.height(), baseline, @max(self.box.height() - baseline, 0), engine.effectiveZoom());
-            self.is_focused = element.is_focused;
+            self.is_focused = element.is_focused and !std.ascii.eqlIgnoreCase(element.tag, "audio");
             return;
         }
         const metrics = control_geometry.choiceBoxMetrics(
@@ -7982,7 +7985,7 @@ const BlockLayout = struct {
                 const is_float = nodeFloatSide(self.node, null) != .none;
                 // Replaced controls are atomic in their surrounding line. A
                 // rich button's temporary root is the contained exception.
-                if (std.ascii.eqlIgnoreCase(e.tag, "input") or
+                if (std.ascii.eqlIgnoreCase(e.tag, "input") or std.ascii.eqlIgnoreCase(e.tag, "audio") or
                     (std.ascii.eqlIgnoreCase(e.tag, "button") and !self.rich_button_root) or
                     elementUsesImageLayout(&e) or
                     std.ascii.eqlIgnoreCase(e.tag, "canvas") or
@@ -8578,7 +8581,7 @@ const BlockLayout = struct {
         else
             null;
         const native_text_control = self.inline_nodes == null and self.node == .element and
-            (std.ascii.eqlIgnoreCase(self.node.element.tag, "textarea") or
+            (std.ascii.eqlIgnoreCase(self.node.element.tag, "textarea") or std.ascii.eqlIgnoreCase(self.node.element.tag, "audio") or
                 (std.ascii.eqlIgnoreCase(self.node.element.tag, "input") and !self.node.element.isCheckbox() and !self.node.element.isInputType("radio")));
         const specified_width = if (self.tableRole() == .table and allocated_box == null)
             try self.preferredTableWidth(engine, zoom_value, engine.zoom(), containing_width_css, style_specified_width)
@@ -8665,7 +8668,7 @@ const BlockLayout = struct {
         if (self.node == .element) {
             const element = &self.node.element;
             const tag = element.tag;
-            if (std.ascii.eqlIgnoreCase(tag, "input") or
+            if (std.ascii.eqlIgnoreCase(tag, "input") or std.ascii.eqlIgnoreCase(tag, "audio") or
                 std.ascii.eqlIgnoreCase(tag, "textarea") or
                 (std.ascii.eqlIgnoreCase(tag, "button") and !self.rich_button_root) or
                 elementUsesImageLayout(element) or
@@ -11006,7 +11009,7 @@ fn layoutInlineBlock(self: *Layout, block: *BlockLayout, publish_geometry: bool)
                 try self.breakExplicitLine(&line_buffer);
             }
 
-            if ((std.ascii.eqlIgnoreCase(e.tag, "input") and !e.isCheckbox() and !e.isInputType("radio")) or std.ascii.eqlIgnoreCase(e.tag, "textarea")) {
+            if ((std.ascii.eqlIgnoreCase(e.tag, "input") and !e.isCheckbox() and !e.isInputType("radio")) or std.ascii.eqlIgnoreCase(e.tag, "textarea") or std.ascii.eqlIgnoreCase(e.tag, "audio")) {
                 // This block is the control itself, not an anonymous line.
                 // Paint its used border box once, without a second line box
                 // adding padding, border, or font leading to its dimensions.
@@ -12215,7 +12218,7 @@ fn addBackgroundIfNeededToList(self: *Layout, commands: *std.ArrayList(DisplayIt
     const element = liveBlockElement(block) orelse return;
     // A control's inline payload paints its shell. Suppress only the redundant
     // outer background, never the block's complete retained content subtree.
-    if (std.ascii.eqlIgnoreCase(element.tag, "input") or std.ascii.eqlIgnoreCase(element.tag, "textarea") or std.ascii.eqlIgnoreCase(element.tag, "button")) return;
+    if (std.ascii.eqlIgnoreCase(element.tag, "input") or std.ascii.eqlIgnoreCase(element.tag, "textarea") or std.ascii.eqlIgnoreCase(element.tag, "button") or std.ascii.eqlIgnoreCase(element.tag, "audio")) return;
     const block_width = block.width.get().*;
     const block_height = block.height.get().*;
     if (block_width <= 0 or block_height <= 0) return;

@@ -167,6 +167,12 @@ const WptFixture = struct {
 
 const wpt_fixtures = [_]WptFixture{
     .{
+        .fixture = "tests/wpt/fixtures/audio-loading.html",
+        .status = "PASS",
+        .timeout_ms = 10_000,
+        .output_basename = "wpt-audio-loading.jsonl",
+    },
+    .{
         .fixture = "tests/manual/js-control-inline-geometry.html",
         .status = "PASS",
         .timeout_ms = 10_000,
@@ -324,6 +330,10 @@ pub fn build(b: *std.Build) !void {
         .optimize = optimize,
     });
     source_module.addImport("zigimg", zigimg_dep.module("zigimg"));
+    const zigaudio_dep = b.dependency("zigaudio", .{ .target = target, .optimize = optimize });
+    const zoto_dep = b.dependency("zoto", .{ .target = target, .optimize = optimize });
+    source_module.addImport("zigaudio", zigaudio_dep.module("zigaudio"));
+    source_module.addImport("zoto", zoto_dep.module("zoto"));
 
     const run_cmd = b.addRunArtifact(exe);
     run_cmd.step.dependOn(b.getInstallStep());
@@ -344,6 +354,8 @@ pub fn build(b: *std.Build) !void {
             .target = target,
             .optimize = optimize,
         });
+        test_module.addImport("zigaudio", zigaudio_dep.module("zigaudio"));
+        test_module.addImport("zoto", zoto_dep.module("zoto"));
         switch (suite.dependencies) {
             .document => {
                 test_module.addImport("z2d", z2d_dep.module("z2d"));

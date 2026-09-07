@@ -62,6 +62,12 @@ tiers and baseline policy.
 | [`width-media-iframes.html`](width-media-iframes.html) | Exact iframe media width and parent-driven viewport changes |
 | [`css-zoom.html`](css-zoom.html) | Authored subtree zoom composed with accessibility zoom, frames, focus, and hit testing |
 
+## Audio
+
+| Primary fixture | Focus |
+| --- | --- |
+| [`audio.html`](audio.html) | Native audio controls, smooth playback, status updates without page flashing, multiple voices, promises/events, seek, mute, loop and navigation cleanup; uses `audio-tone.wav` |
+
 ## DOM, JavaScript, forms, and dynamic resources
 
 | Primary fixture | Contract exercised |

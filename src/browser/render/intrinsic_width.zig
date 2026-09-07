@@ -24,6 +24,7 @@ fn value(styles: ?dom.StyleMap, name: []const u8, default: []const u8) []const u
 /// Native input natural content width, shared with final control layout.
 /// CSS preferred/min/max sizes and box edges are applied by the caller.
 pub fn inputNaturalWidth(element: dom.Element, fonts: *font.FontManager, scale: f64) !f64 {
+    if (std.ascii.eqlIgnoreCase(element.tag, "audio")) return 180 * scale;
     const size = length.parsePixel(value(element.style, "font-size", "16px")) orelse 16;
     const weight: font.FontWeight = if (font.isBoldWeight(value(element.style, "font-weight", "normal"))) .Bold else .Normal;
     const slant: font.FontSlant = if (std.ascii.eqlIgnoreCase(value(element.style, "font-style", "normal"), "italic")) .Italic else .Roman;
@@ -94,12 +95,12 @@ fn measureImpl(node: *const dom.Node, fonts: *font.FontManager, scale: f64, incl
             break :blk result;
         },
         .element => |element| blk: {
-            if (element.isHiddenInput() or std.ascii.eqlIgnoreCase(value(element.style, "display", "inline"), "none")) break :blk .{};
+            if (element.isHiddenInput() or element.isHiddenAudio() or std.ascii.eqlIgnoreCase(value(element.style, "display", "inline"), "none")) break :blk .{};
             const position = value(element.style, "position", "static");
             if (std.ascii.eqlIgnoreCase(position, "absolute") or std.ascii.eqlIgnoreCase(position, "fixed")) break :blk .{};
             const size = length.parsePixel(value(element.style, "font-size", "16px")) orelse 16;
             if (include_specified) if (length.resolve(value(element.style, "width", "auto"), .{ .font_size = size })) |width| break :blk .{ .min = width * scale, .max = width * scale };
-            if (std.ascii.eqlIgnoreCase(element.tag, "input") or std.ascii.eqlIgnoreCase(element.tag, "textarea")) {
+            if (std.ascii.eqlIgnoreCase(element.tag, "input") or std.ascii.eqlIgnoreCase(element.tag, "textarea") or std.ascii.eqlIgnoreCase(element.tag, "audio")) {
                 const width = if (element.isCheckbox() or element.isInputType("radio")) size * scale else try inputNaturalWidth(element, fonts, scale);
                 break :blk .{ .min = width, .max = width };
             }

@@ -36,10 +36,15 @@
             .url = "git+https://github.com/braheezy/SDL.zig#b2226e206877bd643be1340ec9497b1a7cd06d03",
             .hash = "SDL2-0.0.0-yMCQiveoBACTGOzL4uzZcbiVwkP2Xp2AjB1bkE2TKslj",
         },
+        // For image decoding
         .zigimg = .{
             .url = "git+https://github.com/zigimg/zigimg.git#096115a3eeae1a4c477496d575f1f1f74865387c",
             .hash = "zigimg-0.1.0-8_eo2mHBFwDLhWjXriR17_b7VF6qML1f98Xokp7ZZbop",
         },
+        // For audio decoding
+        .zigaudio = .{ .path = "../../../zigaudio" },
+        // For audio playing
+        .zoto = .{ .path = "../../../zoto" },
     },
     .fingerprint = 0x5f81e20e918f49dc,
     .paths = .{

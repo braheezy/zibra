@@ -16,6 +16,7 @@ the domain documents relevant to the change.
 | [Threads and shutdown](architecture/threads-and-shutdown.md) | Task runners, helper threads, locks, networking dispatch, raster/accessibility workers, SDL affinity, partial initialization, or teardown |
 | [Navigation and network](architecture/navigation-and-network.md) | URL/response ownership, document replacement, iframe loading/history, styles/scripts/images, redirects, cache, cookies, CORS, CSP, Referer, X-Frame-Options, or certificate UI |
 | [JavaScript and accessibility](architecture/javascript-and-accessibility.md) | Kiesel roots/locking, WindowContexts, Node handles, DOM APIs, events, timers, XHR callbacks, postMessage, focus, accessibility, or canvas bindings |
+| [Audio](architecture/audio.md) | PCM voices, codecs, output devices, media elements, loading, playback events and retirement |
 | [Risks and review](architecture/risks-and-review.md) | Any ownership or cross-thread review; unresolved gaps, forbidden patterns, and the lifetime checklist live here |
 | [Testing guide](testing.md) | Choosing focused, portable, native visual, and manual verification |
 

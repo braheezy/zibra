@@ -195,3 +195,7 @@ Run `zig build test-script` while iterating and the relevant
 `zig build verify` before handoff. Add a deterministic in-page result and update
 the [manual fixture catalog](../../tests/manual/README.md) for interactive
 JavaScript behavior.
+
+Media commands and copied snapshots use `media_bindings.zig`; realm-local audio
+prototypes, promises and event polling use `runtime/media.js`. Read the
+[audio contract](../../docs/architecture/audio.md) before changing that boundary.

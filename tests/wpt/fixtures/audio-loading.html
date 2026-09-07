@@ -1,0 +1,34 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>Audio loading and seek integration</title>
+<audio id="media" controls src="../../manual/audio-tone.wav"></audio>
+<audio id="hidden">Hidden fallback text</audio>
+<script>
+var audioElement = document.getElementById('media');
+var mediaReported = false;
+function mediaReport(error) {
+  if (mediaReported) return;
+  mediaReported = true;
+  completion_callback([{name: 'Audio loads, exposes metadata and controls, seeks and enforces autoplay',
+    status: error ? 1 : 0, message: error || null, stack: null}], {status: 0, message: null, stack: null});
+}
+function mediaCheck(value, message) { if (!value) throw new Error(message); }
+audioElement.addEventListener('error', function() { mediaReport('Loading failed'); });
+audioElement.addEventListener('loadedmetadata', function() {
+  try {
+    mediaCheck(audioElement.duration === 2 && audioElement.readyState === 4, 'Incorrect metadata');
+    mediaCheck(audioElement.buffered.end(0) === 2 && audioElement.seekable.end(0) === 2, 'Incorrect ranges');
+    mediaCheck(audioElement.getBoundingClientRect().width > 0, 'Missing control geometry');
+    mediaCheck(document.getElementById('hidden').getBoundingClientRect().width === 0, 'Hidden audio has geometry');
+    audioElement.currentTime = 1;
+  } catch (error) { mediaReport(String(error)); }
+});
+audioElement.addEventListener('seeked', function() {
+  try {
+    mediaCheck(audioElement.currentTime === 1 && audioElement.paused && !audioElement.seeking, 'Seek did not settle');
+    audioElement.play().then(function() { mediaReport('Audible autoplay was allowed'); }, function(error) {
+      mediaReport(error.name === 'NotAllowedError' ? null : 'Wrong playback error: ' + error.name);
+    });
+  } catch (error) { mediaReport(String(error)); }
+});
+</script>

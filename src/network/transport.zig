@@ -18,6 +18,15 @@ const ContentType = cache_module.ContentType;
 const HttpResponse = response_module.Response;
 const CookieEntry = cookie.Entry;
 
+/// Optional limits for consumers of complete resources. The callback borrows
+/// its context for the synchronous fetch and runs before each HTTP redirect.
+/// Constrained requests bypass the ordinary unbounded response cache.
+pub const FetchOptions = struct {
+    max_body_bytes: usize,
+    context: ?*anyopaque = null,
+    allows_url: ?*const fn (?*anyopaque, []const u8) bool = null,
+};
+
 pub const user_agent = "Zibra/0.0.0";
 const redirect_limit: u16 = 3;
 
@@ -53,11 +62,23 @@ pub fn fetchBodyInternal(
     final_url: ?*?Url,
     request_origin: ?[]const u8,
     referrer_policy: ReferrerPolicy,
+    options: ?FetchOptions,
 ) !HttpResponse {
+    if (options) |limits| if (limits.allows_url) |allows| {
+        if (!allows(limits.context, url.ada_url.getHref())) return error.ResourcePolicyBlocked;
+    };
     if (std.mem.eql(u8, url.scheme, "file")) {
+        if (options) |limits| {
+            const file = try std.Io.Dir.cwd().openFile(io, url.path, .{});
+            defer file.close(io);
+            var buffer: [8192]u8 = undefined;
+            var reader = file.reader(io, &buffer);
+            return .{ .body = try reader.interface.allocRemaining(allocator, .limited(limits.max_body_bytes +| 1)) };
+        }
         return .{ .body = try url.fileRequest(allocator, io) };
     }
     if (std.mem.eql(u8, url.scheme, "data")) {
+        if (options) |limits| if (url.path.len > limits.max_body_bytes) return error.StreamTooLong;
         return .{ .body = url.path };
     }
     if (std.mem.eql(u8, url.scheme, "about")) {
@@ -66,7 +87,7 @@ pub fn fetchBodyInternal(
 
     const is_http = std.mem.eql(u8, url.scheme, "http") or std.mem.eql(u8, url.scheme, "https");
     if (!is_http) return error.UnsupportedScheme;
-    const use_cache = is_http and payload == null and cache != null and request_origin == null;
+    const use_cache = options == null and is_http and payload == null and cache != null and request_origin == null;
     const href = url.ada_url.getHref();
     const cache_key = if (std.mem.indexOfScalar(u8, href, '#')) |fragment_index| href[0..fragment_index] else href;
 
@@ -127,6 +148,8 @@ pub fn fetchBodyInternal(
         final_url_output,
         request_origin,
         referrer_policy,
+        options,
+        0,
     );
 
     if (use_cache and fetched.status == .ok and fetched.cache_control.isCacheable()) {
@@ -169,6 +192,8 @@ fn httpRequest(
     final_url: ?*?Url,
     request_origin: ?[]const u8,
     referrer_policy: ReferrerPolicy,
+    options: ?FetchOptions,
+    redirect_depth: usize,
 ) !HttpResponse {
     // Build full URL for std.http.Client
     var url_builder = std.ArrayList(u8).empty;
@@ -247,7 +272,7 @@ fn httpRequest(
     }
 
     const RedirectBehavior = std.http.Client.Request.RedirectBehavior;
-    const redirect_behavior: RedirectBehavior = if (payload == null)
+    const redirect_behavior: RedirectBehavior = if (payload == null and options == null)
         RedirectBehavior.init(redirect_limit)
     else
         .unhandled;
@@ -363,6 +388,23 @@ fn httpRequest(
             }
         }
 
+        if (options) |limits| {
+            const status = @intFromEnum(response.head.status);
+            if (status == 301 or status == 302 or status == 303 or status == 307 or status == 308) {
+                if (redirect_depth >= redirect_limit) return error.TooManyRedirects;
+                var headers = response.head.iterateHeaders();
+                while (headers.next()) |header| {
+                    if (!std.ascii.eqlIgnoreCase(header.name, "location")) continue;
+                    const next = try self.resolve(al, header.value);
+                    defer next.free(al);
+                    if (limits.allows_url) |allows| if (!allows(limits.context, next.ada_url.getHref())) return error.ResourcePolicyBlocked;
+                    if (!std.mem.eql(u8, next.scheme, "http") and !std.mem.eql(u8, next.scheme, "https")) return error.UnsupportedScheme;
+                    return httpRequest(Url, refererHeaderValue, next, al, http_client, cookie_jar, network_lock, referrer, payload, final_url, request_origin, referrer_policy, options, redirect_depth + 1);
+                }
+                return error.RedirectLocationMissing;
+            }
+        }
+
         var allocating_writer = std.Io.Writer.Allocating.init(al);
         defer allocating_writer.deinit();
 
@@ -388,21 +430,18 @@ fn httpRequest(
         const reader = response.readerDecompressing(&transfer_buffer, &decompress_state, decompress_buffer);
 
         const response_writer: *std.Io.Writer = &allocating_writer.writer;
-        _ = reader.streamRemaining(response_writer) catch |err| switch (err) {
-            error.ReadFailed => blk: {
-                if (response.bodyErr()) |inner_err| {
-                    std.log.warn("response.bodyErr for {s}: {}", .{ url_str, inner_err });
-                    return inner_err;
-                }
-                break :blk;
-            },
-            else => |e| {
-                std.log.warn("streamRemaining failed for {s}: {}", .{ url_str, e });
-                return e;
-            },
+        const body = if (options) |limits|
+            // The limit applies after decompression, without an extra body copy.
+            try reader.allocRemaining(al, .limited(limits.max_body_bytes +| 1))
+        else body: {
+            _ = reader.streamRemaining(response_writer) catch |err| switch (err) {
+                error.ReadFailed => {
+                    if (response.bodyErr()) |inner_err| return inner_err;
+                },
+                else => |e| return e,
+            };
+            break :body try allocating_writer.toOwnedSlice();
         };
-
-        const body = try allocating_writer.toOwnedSlice();
         errdefer al.free(body);
         std.log.info("Received {d} bytes, status: {d}", .{
             body.len,

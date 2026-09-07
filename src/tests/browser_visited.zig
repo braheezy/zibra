@@ -77,6 +77,7 @@ test "iframe CSP validates requested and final navigation destinations" {
     parent.allocator = allocator;
     parent.current_url = null;
     parent.allowed_origins = null;
+    parent.media_source_list = null;
     defer parent.clearAllowedOrigins();
     try parent.applyContentSecurityPolicy("default-src 'self'", page);
 

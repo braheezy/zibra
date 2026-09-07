@@ -3,6 +3,107 @@ const browser = @import("../browser/root.zig");
 
 const DisplayItem = browser.DisplayItem;
 const RasterSnapshot = browser.RasterSnapshot;
+const tasks = @import("../runtime/task.zig");
+
+// Queue behind the submitted raster, then pump its result on the UI thread.
+// The barrier also works when there is deliberately no raster to submit.
+fn flushPresentation(b: *browser.Browser) !void {
+    const Barrier = struct {
+        returned: std.Io.Semaphore = .{},
+        fn run(_: *anyopaque) !void {}
+        fn cleanup(raw: *anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.returned.post(std.testing.io);
+        }
+    };
+    var barrier: Barrier = .{};
+    _ = try b.tick();
+    try b.presentation_worker.runner.schedule(tasks.Task.init(
+        .rendering,
+        "task:test_presentation_barrier",
+        &barrier,
+        Barrier.run,
+        Barrier.cleanup,
+    ));
+    barrier.returned.waitUncancelable(std.testing.io);
+    _ = try b.tick();
+}
+
+test "presentation retains completed pixels between retirement and replacement commit" {
+    const allocator = std.testing.allocator;
+    var environ = std.process.Environ.Map.init(allocator);
+    defer environ.deinit();
+    try environ.put("HOME", "/tmp");
+    const b = try browser.Browser.init(allocator, std.testing.io, &environ, false, true);
+    defer {
+        b.deinit();
+        allocator.destroy(b);
+    }
+
+    // An empty window must still present chrome before it has a document.
+    try flushPresentation(b);
+    try std.testing.expect(!b.needs_raster);
+
+    // Keep the Tab producer under test control to force the gap that a DOM
+    // text replacement opens before layout/paint publishes its next list.
+    const Tab = @import("../browser/tab.zig").Tab;
+    const tab = try allocator.create(Tab);
+    tab.* = Tab.init(allocator, b.window_width, b.window_height - b.chrome.bottom, b.measure);
+    tab.browser = b;
+    b.tabs.append(allocator, tab) catch |err| {
+        tab.deinit();
+        allocator.destroy(tab);
+        return err;
+    };
+    b.active_tab_index = 0;
+    const list = try allocator.dupe(DisplayItem, &.{.{ .rect = .{
+        .x1 = 0,
+        .y1 = 0,
+        .x2 = 200,
+        .y2 = 100,
+        .color = .{ .r = 255, .g = 0, .b = 0 },
+    } }});
+    var commit = browser.CommitData{
+        .url = null,
+        .display_list = list,
+        .scroll = 0,
+        .height = 100,
+        .zoom = 1,
+        .prefers_dark = false,
+    };
+    b.commit(tab, commit);
+    try flushPresentation(b);
+    const original = try allocator.dupe(u8, std.mem.sliceAsBytes(b.root_surface.image_surface_rgba.buf));
+    defer allocator.free(original);
+    const sample: usize = @intCast((b.chrome.bottom + 20) * b.window_width + 20);
+    try std.testing.expectEqual(@as(u8, 255), b.root_surface.image_surface_rgba.buf[sample].r);
+    try std.testing.expectEqual(@as(u8, 0), b.root_surface.image_surface_rgba.buf[sample].g);
+
+    b.retireRenderStateForTab(tab);
+    try std.testing.expect(b.active_tab_display_list == null);
+    try flushPresentation(b);
+    try std.testing.expectEqualSlices(u8, original, std.mem.sliceAsBytes(b.root_surface.image_surface_rgba.buf));
+    try std.testing.expect(b.needs_raster);
+
+    // A scalar-only commit cannot finish the missing display generation.
+    commit.display_list = null;
+    b.commit(tab, commit);
+    try flushPresentation(b);
+    try std.testing.expectEqualSlices(u8, original, std.mem.sliceAsBytes(b.root_surface.image_surface_rgba.buf));
+
+    // An owned, empty replacement is a real blank page and must be presented.
+    commit.display_list = try allocator.alloc(DisplayItem, 0);
+    b.commit(tab, commit);
+    try flushPresentation(b);
+    try std.testing.expect(!b.needs_raster);
+    try std.testing.expectEqual(@as(u8, 255), b.root_surface.image_surface_rgba.buf[sample].g);
+
+    // Closing a tab during retirement must release the wait for its commit.
+    b.retireRenderStateForTab(tab);
+    try std.testing.expect(b.closeTab(0));
+    try flushPresentation(b);
+    try std.testing.expect(!b.needs_raster);
+}
 
 test "raster snapshot owns nested glyph and image pixels" {
     var glyph_pixels = [_]u8{ 1, 2, 3, 4 };

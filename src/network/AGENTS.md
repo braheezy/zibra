@@ -112,3 +112,8 @@ before changing networking dispatch or teardown.
 - Add data/file tests for ownership changes; use a local fixture/server for
   HTTP, redirects, cookies, compression, or CSP behavior. Run
   `zig build test-network` while iterating and `zig build verify` before handoff.
+
+Complete media resources use `Url.fetchBodyLimitedSynchronized` through Loader.
+It bounds decompressed bodies, bypasses the response cache, and checks a borrowed
+policy callback before every redirect; see the
+[audio contract](../../docs/architecture/audio.md).

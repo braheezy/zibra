@@ -77,3 +77,7 @@ button {
     font-size: 16px; font-weight: normal; font-style: normal;
     background-color: orange;
 }
+
+/* Native audio controls are one focusable replaced box. */
+audio { display: inline; }
+audio[controls] { background-color: #eeeeee; color: #111111; padding: 8px; border: 1px solid #888888; border-radius: 4px; }

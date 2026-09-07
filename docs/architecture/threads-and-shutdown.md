@@ -76,6 +76,14 @@ They carry only numeric tab identity; a dirty newer generation, identity/window
 mismatch, or shutdown discards them. Accepted surface ownership moves to the UI
 thread together with its allocator. Browser alone uploads it and presents.
 
+### Audio workers
+
+The session also owns a serialized media loader and one lazy native output
+context. Their payload ownership, mixer lock, Tab accounting and teardown order
+are defined in [the audio contract](audio.md). The media loader waits for the
+networking runner; join it before networking. After joining the Tab producer,
+remove its audio voices before waiting for outstanding transport helpers.
+
 ### Networking worker
 
 `BrowserSession` owns one heap-stable named networking runner. Ordinary Browser

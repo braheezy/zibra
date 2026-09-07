@@ -74,6 +74,11 @@ script and unified suites. Tests that construct owning Chrome state must use
 its constructor and keep its environment map alive through `deinit`; a partial
 struct literal with an uninitialized FontManager is not a valid input fixture.
 
+Audio core/controller tests use `zig build test-browser -Dtest-filter=audio`;
+resource limits use `zig build test-network -Dtest-filter=bounded`. Regular tests
+never open an audio device. The opt-in macOS silent native smoke test is described
+in [audio verification](architecture/audio.md#verification).
+
 ### Portable complete checks
 
 Run from the repository root:

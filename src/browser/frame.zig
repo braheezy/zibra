@@ -238,7 +238,10 @@ pub fn FrameType(
         /// reads may load stylesheets, but must never evaluate another Realm.
         stylesheets_dirty: bool = true,
         allowed_origins: ?std.ArrayList([]const u8) = null,
+        media_source_list: ?[]u8 = null,
         children: std.ArrayList(*Frame),
+        audio_elements: std.AutoHashMap(u32, *@import("../media/element.zig").State),
+        media_user_activated: bool = false,
 
         pub fn init(
             allocator: std.mem.Allocator,
@@ -255,6 +258,7 @@ pub fn FrameType(
                 .keyframes = std.ArrayList(CSSParser.KeyframesRule).empty,
                 .css_texts = std.ArrayList([]const u8).empty,
                 .children = std.ArrayList(*Frame).empty,
+                .audio_elements = .init(allocator),
                 .input_bounds = std.AutoHashMap(*Node, Bounds).init(allocator),
                 .image_bounds = std.AutoHashMap(*Node, Bounds).init(allocator),
                 .link_bounds = std.ArrayList(FrameBoundEntry).empty,
@@ -416,7 +420,19 @@ pub fn FrameType(
             return change;
         }
 
+        /// Called only after document producers stop or on the serialized tab worker.
+        pub fn retireAudio(self: *Frame) void {
+            var audio_it = self.audio_elements.valueIterator();
+            while (audio_it.next()) |state| {
+                state.*.deinit();
+                self.allocator.destroy(state.*);
+            }
+            self.audio_elements.clearRetainingCapacity();
+        }
+
         pub fn deinit(self: *Frame) void {
+            self.retireAudio();
+            self.audio_elements.deinit();
             // A zero generation has never hosted a live JavaScript document. This
             // guard also keeps lightweight Frame-only tests from needing to
             // initialize the Tab-owned interval registry.
@@ -813,6 +829,7 @@ pub fn FrameType(
             input,
             button,
             contenteditable,
+            audio,
         };
 
         const ClickAction = struct {
@@ -842,6 +859,7 @@ pub fn FrameType(
                         if (std.ascii.eqlIgnoreCase(element.tag, "a")) {
                             return .{ .node = node, .kind = .link };
                         }
+                        if (button == .primary and std.ascii.eqlIgnoreCase(element.tag, "audio") and !element.isHiddenAudio()) return .{ .node = node, .kind = .audio };
                         if (button == .primary and std.ascii.eqlIgnoreCase(element.tag, "input")) {
                             return .{ .node = node, .kind = .input };
                         }
@@ -1065,6 +1083,7 @@ pub fn FrameType(
                 return true;
             }
 
+            self.media_user_activated = true;
             const candidate = action orelse {
                 _ = self.dispatchEvent("click", target);
                 return true;
@@ -1077,6 +1096,10 @@ pub fn FrameType(
 
             switch (candidate.kind) {
                 .iframe => unreachable,
+                .audio => {
+                    const focused_node = try self.focusPrimaryClickTarget(b, live_node) orelse return true;
+                    try @import("media.zig").Integration(Browser).toggle(b, self, focused_node);
+                },
                 .link => {
                     const focused_node = try self.focusPrimaryClickTarget(b, live_node) orelse return true;
                     const focused_element = switch (focused_node.*) {
@@ -1193,6 +1216,8 @@ pub fn FrameType(
         }
 
         pub fn clearAllowedOrigins(self: *Frame) void {
+            if (self.media_source_list) |list| self.allocator.free(list);
+            self.media_source_list = null;
             if (self.allowed_origins) |*origins| {
                 for (origins.items) |origin| {
                     self.allocator.free(origin);
@@ -1246,6 +1271,10 @@ pub fn FrameType(
         }
 
         pub fn applyContentSecurityPolicy(self: *Frame, header: []const u8, base_url: Url) !void {
+            const list = @import("../media/policy.zig").sourceList(header);
+            const copied = if (list) |value| try self.allocator.dupe(u8, value) else null;
+            if (self.media_source_list) |old| self.allocator.free(old);
+            self.media_source_list = copied;
             const whitespace = " \t\r\n";
             var directives = std.mem.tokenizeScalar(u8, header, ';');
             while (directives.next()) |directive_raw| {

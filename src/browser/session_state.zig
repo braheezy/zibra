@@ -1,4 +1,4 @@
-//! Browser-session networking and navigation state shared independently of
+//! Browser-session networking, audio and navigation state shared independently of
 //! any one tab or native window.
 //!
 //! URL sets own canonical serialized URL strings. A `BrowserSession` may be
@@ -17,6 +17,7 @@ const Url = url_module.Url;
 const HttpCache = url_module.HttpCache;
 
 pub const BrowserSession = struct {
+    audio: @import("../media/audio.zig").Engine,
     allocator: std.mem.Allocator,
     io: std.Io,
     /// Navigation metadata uses `lock`; network transport/cache/cookie state
@@ -30,6 +31,10 @@ pub const BrowserSession = struct {
     /// Heap-stable because the worker retains its runner address. It is
     /// started only after the owning Browser/App has created MeasureTime.
     network_runner: ?*TaskRunner,
+    /// Serial fetch/decode work on a separate queue, because media loading
+    /// synchronously waits for the networking dispatcher.
+    media_runner: ?*TaskRunner,
+    media_jobs: std.atomic.Value(usize) = .init(0),
     visited_urls: std.StringHashMap(void),
     bookmarked_urls: std.StringHashMap(void),
     visited_generation: std.atomic.Value(u64),
@@ -47,6 +52,7 @@ pub const BrowserSession = struct {
 
     pub fn init(allocator: std.mem.Allocator, io: std.Io) BrowserSession {
         return .{
+            .audio = .init(std.heap.smp_allocator),
             .allocator = allocator,
             .io = io,
             .lock = .init(io),
@@ -55,6 +61,7 @@ pub const BrowserSession = struct {
             .cookie_jar = std.StringHashMap(url_module.CookieEntry).init(allocator),
             .http_cache = HttpCache.init(allocator),
             .network_runner = null,
+            .media_runner = null,
             .visited_urls = std.StringHashMap(void).init(allocator),
             .bookmarked_urls = std.StringHashMap(void).init(allocator),
             .visited_generation = std.atomic.Value(u64).init(0),
@@ -67,6 +74,7 @@ pub const BrowserSession = struct {
     /// supplied them.
     pub fn deinit(self: *BrowserSession) void {
         self.stopNetworking();
+        self.audio.deinit();
 
         self.http_client.deinit();
         self.http_cache.deinit();
@@ -86,8 +94,8 @@ pub const BrowserSession = struct {
         self.bookmarked_urls.deinit();
     }
 
-    /// Start the session's single networking dispatcher after both this
-    /// session and the shared measurement service are at stable addresses.
+    /// Start the networking and media dispatchers after both the session and
+    /// shared measurement service are at stable addresses.
     pub fn startNetworking(self: *BrowserSession, measure: *MeasureTime) !void {
         if (self.network_runner != null) return error.NetworkRunnerAlreadyStarted;
 
@@ -96,12 +104,23 @@ pub const BrowserSession = struct {
         runner.* = TaskRunner.initNamed(self.allocator, measure, "Networking thread");
         errdefer runner.deinit();
         try runner.start();
+        const media_runner = try self.allocator.create(TaskRunner);
+        errdefer self.allocator.destroy(media_runner);
+        media_runner.* = TaskRunner.initNamed(self.allocator, measure, "Media loader thread");
+        errdefer media_runner.deinit();
+        try media_runner.start();
         self.network_runner = runner;
+        self.media_runner = media_runner;
     }
 
-    /// Join the dispatcher before its borrowed MeasureTime or the transport
-    /// state below can be destroyed. Safe to call repeatedly during rollback.
+    /// Join media before networking because media may be waiting for a fetch.
+    /// Both runners retire before MeasureTime/transport; safe during rollback.
     pub fn stopNetworking(self: *BrowserSession) void {
+        if (self.media_runner) |runner| {
+            runner.deinit();
+            self.allocator.destroy(runner);
+            self.media_runner = null;
+        }
         if (self.network_runner) |runner| {
             runner.deinit();
             self.allocator.destroy(runner);

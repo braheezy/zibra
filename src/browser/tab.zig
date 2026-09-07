@@ -507,6 +507,10 @@ pub fn shutdown(self: *Tab) void {
     // Joining the serialized worker first prevents an active task from
     // launching a new helper or speech request after its producer boundary.
     self.task_runner.shutdown();
+    // Media jobs own their request data; after the producer joins, cancelling
+    // voices promptly is safe even while a transport read is still returning.
+    var media_frames = self.frames_by_id.valueIterator();
+    while (media_frames.next()) |frame| frame.*.retireAudio();
     self.accessibility_speech.shutdown();
     self.waitForAsyncThreads();
     self.invalidateJsContext();
@@ -673,6 +677,7 @@ pub fn invalidateJsContext(self: *Tab) void {
             frame_ptr.*.window_id,
             frame_ptr.*.document_generation,
         );
+        frame_ptr.*.retireAudio();
         frame_ptr.*.document_generation = 0;
         frame_ptr.*.js_render_context.setGeneration(0);
         frame_ptr.*.js_render_context.setPointers(null, null, null, 0);
@@ -1672,6 +1677,7 @@ pub fn render(self: *Tab, b: *Browser) !void {
     }
     for (resource_frames.items) |resource_frame| {
         try b.refreshFrameResources(resource_frame);
+        try @import("media.zig").Integration(Browser).refresh(b, resource_frame);
     }
     if (rebuild_media_rules) {
         for (resource_frames.items) |resource_frame| {
@@ -3112,6 +3118,11 @@ pub fn activateFocusedElement(self: *Tab, b: *Browser) !void {
                 return;
             }
 
+            if (std.mem.eql(u8, e.tag, "audio") and !e.isHiddenAudio()) {
+                const live_node = frame.dispatchEventForDefault("click", node_ptr, node_ptr) orelse return;
+                try @import("media.zig").Integration(Browser).toggle(b, frame, live_node);
+                return;
+            }
             if (std.mem.eql(u8, e.tag, "button")) {
                 const live_node = frame.dispatchEventForDefault(
                     "click",
@@ -3169,6 +3180,7 @@ fn isTextEntryInput(element: *const parser.Element) bool {
 pub fn enter(self: *Tab, b: *Browser) !bool {
     self.noteKeyboardInteraction();
     const frame = self.focused_frame orelse self.root_frame orelse return false;
+    frame.media_user_activated = true;
     const focus_node = frame.focus orelse return false;
 
     switch (focus_node.*) {
@@ -3377,6 +3389,7 @@ pub fn scrollImmediate(self: *Tab, b: *Browser, delta: i32) void {
 pub fn keypress(self: *Tab, b: *Browser, char: u8) !void {
     self.noteKeyboardInteraction();
     const frame = self.focused_frame orelse self.root_frame orelse return;
+    frame.media_user_activated = true;
     if (frame.focus) |focus_node| {
         const live_focus_node = frame.dispatchEventForDefault(
             "keydown",
@@ -3388,7 +3401,9 @@ pub fn keypress(self: *Tab, b: *Browser, char: u8) !void {
         };
         switch (live_focus_node.*) {
             .element => |*e| {
-                if (std.mem.eql(u8, e.tag, "input")) {
+                if (std.mem.eql(u8, e.tag, "audio") and !e.isHiddenAudio()) {
+                    if (char == ' ') try @import("media.zig").Integration(Browser).toggle(b, frame, live_focus_node);
+                } else if (std.mem.eql(u8, e.tag, "input")) {
                     if (!isTextEntryInput(e)) return;
                     if (e.attributes) |*attrs| {
                         const old_value = attrs.get("value") orelse "";
@@ -3493,7 +3508,9 @@ pub fn backspace(self: *Tab, b: *Browser) !void {
     if (frame.focus) |focus_node| {
         switch (focus_node.*) {
             .element => |*e| {
-                if (std.mem.eql(u8, e.tag, "input")) {
+                if (std.mem.eql(u8, e.tag, "audio") and !e.isHiddenAudio()) {
+                    return;
+                } else if (std.mem.eql(u8, e.tag, "input")) {
                     if (!isTextEntryInput(e)) return;
                     if (e.attributes) |*attrs| {
                         const old_value = attrs.get("value") orelse "";
@@ -3638,7 +3655,7 @@ fn appendAccessibilityNodes(
         .text => {},
         .element => |*e| {
             if (isAriaHidden(e)) return;
-            if (e.isHiddenInput()) return;
+            if (e.isHiddenInput() or e.isHiddenAudio()) return;
             if (isPresentationalTag(e.tag)) {
                 for (e.children.items) |*child| {
                     try self.appendAccessibilityNodes(out, child, bounds_map);
@@ -3660,7 +3677,7 @@ fn appendAccessibilityNodes(
                         }
                     }
                 }
-            } else {
+            } else if (!std.ascii.eqlIgnoreCase(e.tag, "audio")) {
                 for (e.children.items) |*child| {
                     try self.appendAccessibilityNodes(&children, child, bounds_map);
                 }
@@ -3697,7 +3714,7 @@ fn isAriaHidden(element: *const parser.Element) bool {
 
 fn accessibilityRole(element: *const parser.Element) []const u8 {
     if (std.mem.eql(u8, element.tag, "a")) return "link";
-    if (std.mem.eql(u8, element.tag, "button")) return "button";
+    if (std.mem.eql(u8, element.tag, "button") or (std.ascii.eqlIgnoreCase(element.tag, "audio") and !element.isHiddenAudio())) return "button";
     if (std.mem.eql(u8, element.tag, "input")) {
         if (element.isCheckbox()) return "checkbox";
         if (element.attributes) |attrs| {
@@ -3750,6 +3767,8 @@ fn accessibilityName(self: *Tab, node_ptr: *Node, element: *const parser.Element
             return self.copyAccessibilityString(label);
         }
     }
+
+    if (std.ascii.eqlIgnoreCase(element.tag, "audio")) return self.copyAccessibilityString(if (element.audio_error) "Audio unavailable" else if (element.audio_paused) "Play audio" else "Pause audio");
 
     if (std.mem.eql(u8, element.tag, "input")) {
         if (element.attributes) |attrs| {
