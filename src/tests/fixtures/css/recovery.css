@@ -1,0 +1,15 @@
+/* Invalid nodes must be retained for diagnostics, never executed. */
+@unknown data(foo; [bar]) { .nested { color: red; } }
+.recovery {
+  color: green;
+  broken declaration;
+  color: red;
+  background-image: url(bad"url);
+  content: "bad
+  ; color: blue;
+  width: 1px];
+  --empty: !important;
+  --literal: "a;b}c";
+}
+.after { color: green; }
+.eof { width: calc(1px + (2px

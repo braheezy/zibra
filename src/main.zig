@@ -258,10 +258,14 @@ fn dumpPipeline(
     mode: DumpMode,
     rtl_text: bool,
     viewport: Viewport,
+    css_backend: inspection.CssBackend,
 ) !void {
-    var page = try inspection.Page.loadWithMedia(init, allocator, url, .{
-        .viewport_width_css = @floatFromInt(viewport.width),
-        .viewport_height_css = @floatFromInt(viewport.height),
+    var page = try inspection.Page.loadWithOptions(init, allocator, url, .{
+        .css_backend = css_backend,
+        .media = .{
+            .viewport_width_css = @floatFromInt(viewport.width),
+            .viewport_height_css = @floatFromInt(viewport.height),
+        },
     });
     defer page.deinit();
     // Page.load returns the DOM by value. Repair parent pointers after the
@@ -317,6 +321,7 @@ fn zibra(init: std.process.Init) !void {
     var screenshot_path: ?[]const u8 = null;
     var screenshot_after_ms: ?u64 = null;
     var viewport: ?Viewport = null;
+    var css_backend: ?inspection.CssBackend = null;
     var wpt_test = false;
     var wpt_test_url: ?[]const u8 = null;
     var wpt_timeout_ms = default_wpt_timeout_ms;
@@ -325,6 +330,19 @@ fn zibra(init: std.process.Init) !void {
     var arg_index: usize = 1;
     while (arg_index < args.len) : (arg_index += 1) {
         const arg = args[arg_index];
+        if (std.mem.eql(u8, arg, "--css-parser") or std.mem.startsWith(u8, arg, "--css-parser=")) {
+            if (css_backend != null) return error.BadArguments;
+            const value = if (std.mem.startsWith(u8, arg, "--css-parser=")) arg["--css-parser=".len..] else blk: {
+                if (arg_index + 1 >= args.len) return error.BadArguments;
+                arg_index += 1;
+                break :blk args[arg_index];
+            };
+            css_backend = std.meta.stringToEnum(inspection.CssBackend, value) orelse {
+                std.log.err("--css-parser requires legacy or terence.", .{});
+                return error.BadArguments;
+            };
+            continue;
+        }
         if (std.mem.eql(u8, arg, "--viewport") or std.mem.startsWith(u8, arg, "--viewport=")) {
             if (viewport != null) return error.BadArguments;
             const value = if (std.mem.startsWith(u8, arg, "--viewport=")) arg["--viewport=".len..] else blk: {
@@ -498,6 +516,10 @@ fn zibra(init: std.process.Init) !void {
         std.log.err("--viewport requires a dump or screenshot mode.", .{});
         return error.BadArguments;
     }
+    if (css_backend != null and (dump_mode == null or dump_mode.? == .dom or screenshot_path != null or wpt_test)) {
+        std.log.err("--css-parser requires --dump-style, --dump-layout, or --dump-display-list.", .{});
+        return error.BadArguments;
+    }
 
     if (wpt_test) {
         const test_url = wpt_test_url orelse return error.BadArguments;
@@ -528,7 +550,7 @@ fn zibra(init: std.process.Init) !void {
         if (mode == .dom) {
             try dumpDom(init, allocator, url);
         } else {
-            try dumpPipeline(init, allocator, url, mode, rtl_flag, viewport orelse .{});
+            try dumpPipeline(init, allocator, url, mode, rtl_flag, viewport orelse .{}, css_backend orelse .legacy);
         }
         return;
     }

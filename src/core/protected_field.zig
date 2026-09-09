@@ -122,6 +122,18 @@ pub fn ProtectedField(comptime T: type) type {
             dependency.addInvalidation(self, allocator);
         }
 
+        /// Register a complete source-owned edge or return OutOfMemory before
+        /// either endpoint publishes it. Use in fallible computations before
+        /// reading a frozen dependency or publishing a clean computed value.
+        /// Both endpoints must remain stable; allocator belongs to the source.
+        pub inline fn tryAddDependency(
+            self: *@This(),
+            dependency: anytype,
+            allocator: std.mem.Allocator,
+        ) std.mem.Allocator.Error!void {
+            try dependency.ensureInvalidation(self, allocator);
+        }
+
         pub inline fn freezeDependencies(self: *@This()) void {
             self.frozen_dependencies = true;
         }
@@ -151,6 +163,14 @@ pub fn ProtectedField(comptime T: type) type {
             target: anytype,
             allocator: std.mem.Allocator,
         ) void {
+            self.ensureInvalidation(target, allocator) catch {};
+        }
+
+        fn ensureInvalidation(
+            self: *@This(),
+            target: anytype,
+            allocator: std.mem.Allocator,
+        ) std.mem.Allocator.Error!void {
             const notify_ptr: *anyopaque = @ptrCast(@alignCast(@constCast(target)));
             const self_ptr: *anyopaque = @ptrCast(@alignCast(self));
             if (notify_ptr == self_ptr) return;
@@ -165,8 +185,8 @@ pub fn ProtectedField(comptime T: type) type {
 
             // Reserve before publishing either endpoint so allocation failure
             // cannot leave a half-edge in the graph.
-            self.invalidations.ensureUnusedCapacity(allocator, 1) catch return;
-            const edge = allocator.create(Edge) catch return;
+            try self.invalidations.ensureUnusedCapacity(allocator, 1);
+            const edge = try allocator.create(Edge);
             edge.* = .{
                 .allocator = allocator,
                 .source = self_ptr,
@@ -343,4 +363,36 @@ test "comptime fields use compact unmanaged dependency storage" {
     var field = Field.init(7);
     defer field.deinit(std.testing.allocator);
     try std.testing.expectEqual(@as(usize, 0), field.invalidations.capacity());
+}
+
+test "fallible dependency registration preserves both endpoints on allocation failure" {
+    // The publisher table and the edge are separate allocations. Failure at
+    // either boundary must be visible to a style pass before a frozen read.
+    for (0..2) |allocation| {
+        var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = allocation });
+        const allocator = failing.allocator();
+        var source = ProtectedField(i32).init(1);
+        defer source.deinit(allocator);
+        var subscriber = ProtectedField(u64).init(0);
+        defer subscriber.deinit(allocator);
+        source.set(1);
+        subscriber.set(0);
+        subscriber.freezeDependencies();
+
+        try std.testing.expectError(error.OutOfMemory, subscriber.tryAddDependency(&source, allocator));
+        try std.testing.expectEqual(@as(usize, 0), source.invalidations.count());
+        try std.testing.expect(subscriber.dependencies_head == null);
+
+        failing.fail_index = std.math.maxInt(usize);
+        try subscriber.tryAddDependency(&source, allocator);
+        try std.testing.expectEqual(@as(i32, 1), source.read(&subscriber, allocator).*);
+        // Re-registering an installed dependency must never need allocation.
+        failing.fail_index = failing.alloc_index;
+        try subscriber.tryAddDependency(&source, allocator);
+        try std.testing.expectEqual(@as(usize, 1), source.invalidations.count());
+        source.set(2);
+        try std.testing.expect(subscriber.dirty);
+        source.clearInvalidations();
+        try std.testing.expect(subscriber.dependencies_head == null);
+    }
 }

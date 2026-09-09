@@ -1,7 +1,8 @@
 //! CSS selector representation, specificity, and DOM matching.
 //!
-//! Selectors own their normalized tag storage and borrow DOM nodes only for
-//! the duration of matching.
+//! Selectors own their normalized names, arguments, component trees and
+//! combinators. Clones own independent storage. DOM nodes are borrowed only
+//! for the duration of matching.
 
 const std = @import("std");
 const parser = @import("parser.zig");
@@ -58,6 +59,13 @@ pub const Selector = union(enum) {
     has: HasSelector,
     descendant: DescendantSelector,
     complex: ComplexSelector,
+
+    /// Deep-copy every owned name, argument, component and combinator. The
+    /// returned selector owns independent storage; no matching cache or DOM
+    /// borrow is retained. On allocation failure the original is unchanged.
+    pub fn clone(self: Selector, allocator: std.mem.Allocator) std.mem.Allocator.Error!Selector {
+        return cloneSelectorUnion(Selector, self, allocator);
+    }
 
     /// Check if this selector matches the given node. `ancestor_chain` must be
     /// ordered from the root element to the node's immediate parent.
@@ -1200,6 +1208,80 @@ pub const ComplexSelector = struct {
     }
 };
 
+// The three selector unions share payload owners. Keep cloning alongside
+// deinitialization so adding an owning payload cannot silently shallow-copy it.
+fn cloneSelectorUnion(comptime T: type, original: T, allocator: std.mem.Allocator) std.mem.Allocator.Error!T {
+    return switch (original) {
+        inline else => |payload, tag| @unionInit(T, @tagName(tag), try cloneSelectorPayload(payload, allocator)),
+    };
+}
+
+fn cloneSelectorPayload(original: anytype, allocator: std.mem.Allocator) std.mem.Allocator.Error!@TypeOf(original) {
+    const T = @TypeOf(original);
+    if (T == UniversalSelector or T == FocusVisibleSelector or T == HoverSelector or T == StateSelector or T == PseudoElementSelector) {
+        return original;
+    } else if (T == TagSelector) {
+        return .{ .tag = try allocator.dupe(u8, original.tag) };
+    } else if (T == ClassSelector) {
+        return .{ .class = try allocator.dupe(u8, original.class) };
+    } else if (T == IdSelector) {
+        return .{ .id = try allocator.dupe(u8, original.id) };
+    } else if (T == AttributeSelector) {
+        const name = try allocator.dupe(u8, original.name);
+        errdefer allocator.free(name);
+        const value = if (original.value) |text| try allocator.dupe(u8, text) else null;
+        return .{ .name = name, .value = value, .matcher = original.matcher };
+    } else if (T == StructuralSelector) {
+        return .{
+            .kind = original.kind,
+            .argument = if (original.argument) |text| try allocator.dupe(u8, text) else null,
+        };
+    } else if (T == NotSelector) {
+        return .{ .selector = try cloneSimplePointer(original.selector.*, allocator) };
+    } else if (T == HasSelector) {
+        const ancestor = try cloneSimplePointer(original.ancestor.*, allocator);
+        errdefer {
+            ancestor.deinit(allocator);
+            allocator.destroy(ancestor);
+        }
+        return .{ .ancestor = ancestor, .descendant = try cloneSimplePointer(original.descendant.*, allocator) };
+    } else if (T == SelectorSequence) {
+        return .{ .selectors = try cloneSelectorComponents(SequenceSelector, original.selectors.items, allocator) };
+    } else if (T == DescendantSelector) {
+        return .{ .selectors = try cloneSelectorComponents(SimpleSelector, original.selectors.items, allocator) };
+    } else if (T == ComplexSelector) {
+        var selectors = try cloneSelectorComponents(SimpleSelector, original.selectors.items, allocator);
+        errdefer {
+            for (selectors.items) |*selector| selector.deinit(allocator);
+            selectors.deinit(allocator);
+        }
+        var combinators = std.ArrayList(Combinator).empty;
+        errdefer combinators.deinit(allocator);
+        try combinators.appendSlice(allocator, original.combinators.items);
+        return .{ .selectors = selectors, .combinators = combinators };
+    } else {
+        @compileError("New selector payload needs an explicit ownership-preserving clone: " ++ @typeName(T));
+    }
+}
+
+fn cloneSimplePointer(original: SimpleSelector, allocator: std.mem.Allocator) std.mem.Allocator.Error!*SimpleSelector {
+    const result = try allocator.create(SimpleSelector);
+    errdefer allocator.destroy(result);
+    result.* = try cloneSelectorUnion(SimpleSelector, original, allocator);
+    return result;
+}
+
+fn cloneSelectorComponents(comptime T: type, original: []const T, allocator: std.mem.Allocator) std.mem.Allocator.Error!std.ArrayList(T) {
+    var result = std.ArrayList(T).empty;
+    errdefer {
+        for (result.items) |*part| part.deinit(allocator);
+        result.deinit(allocator);
+    }
+    try result.ensureTotalCapacity(allocator, original.len);
+    for (original) |part| result.appendAssumeCapacity(try cloneSelectorUnion(T, part, allocator));
+    return result;
+}
+
 test "structural selector matching follows element siblings and inherited language" {
     const allocator = std.testing.allocator;
     var root = Node{ .element = try parser.Element.init(allocator, "html lang=en-GB", null) };
@@ -1246,4 +1328,68 @@ test "state selectors observe live link and form attributes" {
     try std.testing.expect(checked_state.matches(input));
     try input.element.attributes.?.put("disabled", "");
     try std.testing.expect(!enabled_state.matches(input));
+}
+
+const clone_test_source = "*,div,.a,#id,[data-name='x'],:focus-visible,:hover,:nth-child(2n)," ++
+    ":not(.excluded),:enabled,::before,div.a:focus-visible,div:has(span.a),main div.a," ++
+    "main > div[data-name='x']:not(:hover)::before";
+
+test "selector clones retain matches and specificity after original owners retire" {
+    const allocator = std.testing.allocator;
+    var root = Node{ .element = try parser.Element.init(allocator, "div id=id class=a data-name=x", null) };
+    defer root.deinit(allocator);
+    try root.element.children.append(allocator, .{ .element = try parser.Element.init(allocator, "span class=a", null) });
+    parser.fixParentPointers(&root, null);
+
+    const original = try @import("css_parser.zig").parseSelectorList(allocator, clone_test_source);
+    var originals_alive = true;
+    defer if (originals_alive) {
+        for (original) |*selector| selector.deinit(allocator);
+        allocator.free(original);
+    };
+    var clones = std.ArrayList(Selector).empty;
+    defer {
+        for (clones.items) |*selector| selector.deinit(allocator);
+        clones.deinit(allocator);
+    }
+    try clones.ensureTotalCapacity(allocator, original.len);
+    var priorities: [15]u32 = undefined;
+    var matches: [15]bool = undefined;
+    try std.testing.expectEqual(priorities.len, original.len);
+    for (original, 0..) |selector, index| {
+        priorities[index] = selector.priority();
+        matches[index] = selector.matches(&root, &.{});
+        clones.appendAssumeCapacity(try selector.clone(allocator));
+    }
+    try std.testing.expect(original[1].tag.tag.ptr != clones.items[1].tag.tag.ptr);
+    try std.testing.expect(original[8].not.selector != clones.items[8].not.selector);
+    try std.testing.expect(original[12].has.descendant != clones.items[12].has.descendant);
+    try std.testing.expect(original[14].complex.combinators.items.ptr != clones.items[14].complex.combinators.items.ptr);
+    for (original) |*selector| selector.deinit(allocator);
+    allocator.free(original);
+    originals_alive = false;
+    for (clones.items, 0..) |selector, index| {
+        try std.testing.expectEqual(priorities[index], selector.priority());
+        try std.testing.expectEqual(matches[index], selector.matches(&root, &.{}));
+    }
+    try std.testing.expectEqualStrings("x", clones.items[4].attribute.value.?);
+    try std.testing.expectEqualStrings("2n", clones.items[7].structural.argument.?);
+}
+
+fn selectorCloneAllocationTrial(allocator: std.mem.Allocator, original: []const Selector) !void {
+    for (original) |selector| {
+        var cloned = try selector.clone(allocator);
+        defer cloned.deinit(allocator);
+        try std.testing.expectEqual(selector.priority(), cloned.priority());
+    }
+}
+
+test "selector cloning reclaims every partial allocation without changing originals" {
+    const allocator = std.testing.allocator;
+    const original = try @import("css_parser.zig").parseSelectorList(allocator, clone_test_source);
+    defer {
+        for (original) |*selector| selector.deinit(allocator);
+        allocator.free(original);
+    }
+    try std.testing.checkAllAllocationFailures(allocator, selectorCloneAllocationTrial, .{original});
 }

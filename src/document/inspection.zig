@@ -6,11 +6,44 @@
 const std = @import("std");
 const parser = @import("parser.zig");
 const CSSParser = @import("css_parser.zig").CSSParser;
+const stylesheet = @import("css_stylesheet.zig");
+const inline_styles = @import("css_inline_styles.zig");
+const style = @import("style.zig");
 const url_module = @import("../network/url.zig");
 const Url = url_module.Url;
 
 const default_html = @embedFile("../assets/default.html");
 const default_style_sheet = @embedFile("../browser/browser.css");
+
+pub const CssBackend = enum { legacy, terence };
+pub const Options = struct {
+    css_backend: CssBackend = .legacy,
+    media: CSSParser.MediaEnvironment = .{ .viewport_width_css = 800, .viewport_height_css = 600 },
+};
+
+const SelectedRules = struct {
+    allocator: std.mem.Allocator,
+    rules: std.ArrayList(CSSParser.CSSRule) = .empty,
+    keyframes: std.ArrayList(CSSParser.KeyframesRule) = .empty,
+
+    fn deinit(self: *SelectedRules) void {
+        for (self.rules.items) |*rule| rule.deinit(self.allocator);
+        self.rules.deinit(self.allocator);
+        for (self.keyframes.items) |*rule| rule.deinit(self.allocator);
+        self.keyframes.deinit(self.allocator);
+    }
+
+    fn append(self: *SelectedRules, sheet: stylesheet.Sheet, media: CSSParser.MediaEnvironment) !void {
+        var selection = try sheet.select(self.allocator, media);
+        errdefer selection.deinit();
+        try self.rules.ensureUnusedCapacity(self.allocator, selection.rules.len);
+        try self.keyframes.ensureUnusedCapacity(self.allocator, selection.keyframes.len);
+        self.rules.appendSliceAssumeCapacity(selection.rules);
+        self.keyframes.appendSliceAssumeCapacity(selection.keyframes);
+        self.allocator.free(selection.rules);
+        self.allocator.free(selection.keyframes);
+    }
+};
 
 pub const Page = struct {
     allocator: std.mem.Allocator,
@@ -19,6 +52,9 @@ pub const Page = struct {
     rules: std.ArrayList(CSSParser.CSSRule),
     keyframes: std.ArrayList(CSSParser.KeyframesRule),
     css_texts: std.ArrayList([]u8),
+    css_backend: CssBackend = .legacy,
+    sheets: std.ArrayList(stylesheet.Sheet) = .empty,
+    inline_cache: ?inline_styles.Cache = null,
     media: CSSParser.MediaEnvironment = .{ .viewport_width_css = 800, .viewport_height_css = 600 },
 
     pub fn load(init: std.process.Init, allocator: std.mem.Allocator, source_url: ?Url) !Page {
@@ -28,58 +64,94 @@ pub const Page = struct {
     /// Load a browser-free inspection generation using the caller's viewport
     /// for conditional stylesheet selection. The returned root moves by value.
     pub fn loadWithMedia(init: std.process.Init, allocator: std.mem.Allocator, source_url: ?Url, media: CSSParser.MediaEnvironment) !Page {
+        return loadWithOptions(init, allocator, source_url, .{ .media = media });
+    }
+
+    /// Owns one inspection generation. Terence is opt-in and never changes the
+    /// interactive Browser parser. The caller repairs the returned root move.
+    pub fn loadWithOptions(init: std.process.Init, allocator: std.mem.Allocator, source_url: ?Url, options: Options) !Page {
         const body = if (source_url) |url|
             try fetchDecoded(init, allocator, url, null, null)
         else
             try allocator.dupe(u8, default_html);
+        var page = try initOwned(allocator, body, options);
+        errdefer page.deinit();
+        page.repairParentPointers();
+        try page.appendRules(default_style_sheet, false, .{ .origin = .user_agent });
+        try page.loadDocumentStylesheets(init, source_url);
+        try page.finish();
+        return page;
+    }
+
+    /// Copies HTML and loads embedded style elements/attributes without any
+    /// network or native state. Link resources require loadWithOptions instead.
+    pub fn fromHtml(allocator: std.mem.Allocator, html: []const u8, options: Options) !Page {
+        var page = try initOwned(allocator, try allocator.dupe(u8, html), options);
+        errdefer page.deinit();
+        page.repairParentPointers();
+        try page.appendRules(default_style_sheet, false, .{ .origin = .user_agent });
+        var nodes = std.ArrayList(*parser.Node).empty;
+        defer nodes.deinit(allocator);
+        try parser.treeToList(allocator, &page.root, &nodes);
+        for (nodes.items) |node| {
+            if (node.* != .element or !std.mem.eql(u8, node.element.tag, "style")) continue;
+            const css_text = (try parser.collectInlineStyleText(allocator, node)) orelse continue;
+            errdefer allocator.free(css_text);
+            try page.appendRules(css_text, true, .{});
+        }
+        try page.finish();
+        return page;
+    }
+
+    // Consumes body on success and failure. The Page owns root/body together
+    // after this return, avoiding overlapping cleanup of moved HTML owners.
+    fn initOwned(allocator: std.mem.Allocator, body: []u8, options: Options) !Page {
         errdefer allocator.free(body);
 
         var html_parser = try parser.HTMLParser.init(allocator, body);
         defer html_parser.deinit(allocator);
-        var root = try html_parser.parse();
-        errdefer root.deinit(allocator);
-
-        var page = Page{
+        return Page{
             .allocator = allocator,
             .body = body,
-            .root = root,
+            .root = try html_parser.parse(),
             .rules = std.ArrayList(CSSParser.CSSRule).empty,
             .keyframes = std.ArrayList(CSSParser.KeyframesRule).empty,
             .css_texts = std.ArrayList([]u8).empty,
-            .media = media,
+            .media = options.media,
+            .css_backend = options.css_backend,
         };
-        errdefer page.deinit();
-        // `root` moved into `page.root`; selectors may walk ancestors while
-        // Page.load styles below, so repair once at this intermediate stable
-        // address. The caller repairs again after the by-value return.
-        page.repairParentPointers();
+    }
 
-        try page.appendRules(default_style_sheet, false);
-        for (page.rules.items) |*rule| rule.origin = .user_agent;
-        try page.loadDocumentStylesheets(init, source_url);
-
-        std.mem.sort(CSSParser.CSSRule, page.rules.items, {}, struct {
+    fn sortRules(self: *Page) void {
+        std.mem.sort(CSSParser.CSSRule, self.rules.items, {}, struct {
             fn lessThan(_: void, a: CSSParser.CSSRule, b: CSSParser.CSSRule) bool {
                 return a.cascadePriority() < b.cascadePriority();
             }
         }.lessThan);
-        try parser.styleWithKeyframes(
-            allocator,
-            &page.root,
-            page.rules.items,
-            page.keyframes.items,
-        );
-        return page;
+    }
+
+    fn finish(self: *Page) !void {
+        if (self.css_backend == .terence) {
+            self.inline_cache = try inline_styles.Cache.init(self.allocator, &self.root);
+            const selection = try self.selectSheets(self.media, null, null);
+            self.rules = selection.rules;
+            self.keyframes = selection.keyframes;
+        }
+        self.sortRules();
+        try self.restyle();
     }
 
     pub fn deinit(self: *Page) void {
+        self.root.deinit(self.allocator);
+        if (self.inline_cache) |*cache| cache.deinit();
         for (self.rules.items) |*rule| rule.deinit(self.allocator);
         self.rules.deinit(self.allocator);
         for (self.keyframes.items) |*rule| rule.deinit(self.allocator);
         self.keyframes.deinit(self.allocator);
+        for (self.sheets.items) |*sheet| sheet.deinit();
+        self.sheets.deinit(self.allocator);
         for (self.css_texts.items) |text| self.allocator.free(text);
         self.css_texts.deinit(self.allocator);
-        self.root.deinit(self.allocator);
         self.allocator.free(self.body);
     }
 
@@ -90,10 +162,80 @@ pub const Page = struct {
         parser.fixParentPointers(&self.root, null);
     }
 
-    fn appendRules(self: *Page, stylesheet: []const u8, keep_text: bool) !void {
+    pub fn sheetCount(self: *const Page) usize {
+        return self.sheets.items.len;
+    }
+
+    /// Generation-bound source borrow. Media reselection preserves its identity;
+    /// successful replacement invalidates borrows of the replaced sheet.
+    /// Requires index < sheetCount().
+    pub fn sheetSource(self: *const Page, index: usize) []const u8 {
+        return self.sheets.items[index].source();
+    }
+
+    /// Requires a final-address DOM and retired layout/display consumers.
+    /// Stages all fallible selections before invalidating the styled tree;
+    /// failure leaves the installed generation unchanged. Call restyle afterward.
+    pub fn reselectMedia(self: *Page, media: CSSParser.MediaEnvironment) !void {
+        if (self.css_backend != .terence) return error.UnsupportedCssBackend;
+        const selection = try self.selectSheets(media, null, null);
+        self.installSelection(selection);
+        self.media = media;
+    }
+
+    /// Requires retired layout/display consumers. Parse and selection failures
+    /// publish nothing. Success installs a dirty generation, retires old rule
+    /// owners before their source, and requires restyle before layout/paint.
+    pub fn replaceStylesheet(self: *Page, index: usize, source: []const u8) !void {
+        if (self.css_backend != .terence) return error.UnsupportedCssBackend;
+        if (index >= self.sheets.items.len) return error.InvalidStylesheetIndex;
+        var replacement = try stylesheet.Sheet.parse(self.allocator, source, self.sheets.items[index].options());
+        errdefer replacement.deinit();
+        const selection = try self.selectSheets(self.media, index, replacement);
+        self.installSelection(selection);
+        self.sheets.items[index].deinit();
+        self.sheets.items[index] = replacement;
+    }
+
+    /// Styling is a separate fallible phase: on OOM the installed generation
+    /// remains valid and dirty work can be retried. Inline attributes must still
+    /// match the cache built at load; this is not a live CSSOM mutation API.
+    pub fn restyle(self: *Page) !void {
+        const provider = if (self.inline_cache) |*cache| cache.provider() else null;
+        try style.styleWithInputs(self.allocator, &self.root, self.rules.items, self.keyframes.items, provider);
+    }
+
+    fn selectSheets(self: *Page, media: CSSParser.MediaEnvironment, replacement_index: ?usize, replacement: ?stylesheet.Sheet) !SelectedRules {
+        var selected = SelectedRules{ .allocator = self.allocator };
+        errdefer selected.deinit();
+        for (self.sheets.items, 0..) |sheet, index| {
+            const current = if (replacement_index != null and replacement_index.? == index) replacement.? else sheet;
+            try selected.append(current, media);
+        }
+        return selected;
+    }
+
+    fn installSelection(self: *Page, selection: SelectedRules) void {
+        parser.clearStyleInvalidations(&self.root);
+        parser.dirtyStyleSubtree(&self.root);
+        var previous = SelectedRules{ .allocator = self.allocator, .rules = self.rules, .keyframes = self.keyframes };
+        self.rules = selection.rules;
+        self.keyframes = selection.keyframes;
+        self.sortRules();
+        previous.deinit();
+    }
+
+    fn appendRules(self: *Page, source: []const u8, keep_text: bool, options: stylesheet.Options) !void {
+        if (self.css_backend == .terence) {
+            var sheet = try stylesheet.Sheet.parse(self.allocator, source, options);
+            errdefer sheet.deinit();
+            try self.sheets.append(self.allocator, sheet);
+            if (keep_text) self.allocator.free(source);
+            return;
+        }
         var css_parser = try CSSParser.initWithMedia(
             self.allocator,
-            stylesheet,
+            source,
             self.media,
         );
         defer css_parser.deinit(self.allocator);
@@ -111,6 +253,11 @@ pub const Page = struct {
             for (rules) |*rule| rule.deinit(self.allocator);
             self.allocator.free(rules);
         };
+        for (rules) |*rule| {
+            rule.origin = options.origin;
+            rule.referrer_policy = options.referrer_policy;
+            rule.source_url = if (options.base_url) |base| try self.allocator.dupe(u8, base) else null;
+        }
 
         // Reserve both destinations before transferring either the rules or
         // their backing text. After these calls there are no fallible steps in
@@ -119,8 +266,8 @@ pub const Page = struct {
         try self.rules.ensureUnusedCapacity(self.allocator, rules.len);
         try self.keyframes.ensureUnusedCapacity(self.allocator, keyframes.items.len);
         if (keep_text) {
-            // `stylesheet` is an owned allocation supplied by the caller.
-            self.css_texts.appendAssumeCapacity(@constCast(stylesheet));
+            // `source` is an owned allocation supplied by the caller.
+            self.css_texts.appendAssumeCapacity(@constCast(source));
         }
         for (rules) |rule| self.rules.appendAssumeCapacity(rule);
         for (keyframes.items) |rule| self.keyframes.appendAssumeCapacity(rule);
@@ -130,6 +277,8 @@ pub const Page = struct {
     }
 
     fn loadDocumentStylesheets(self: *Page, init: std.process.Init, page_url: ?Url) !void {
+        const document_base = if (page_url) |url| try url.toOwnedString(self.allocator) else null;
+        defer if (document_base) |base| self.allocator.free(base);
         var nodes = std.ArrayList(*parser.Node).empty;
         defer nodes.deinit(self.allocator);
         try parser.treeToList(self.allocator, &self.root, &nodes);
@@ -149,7 +298,7 @@ pub const Page = struct {
                 const css_text = (try parser.collectInlineStyleText(self.allocator, node)) orelse continue;
                 var text_owned = true;
                 errdefer if (text_owned) self.allocator.free(css_text);
-                try self.appendRules(css_text, true);
+                try self.appendRules(css_text, true, .{ .base_url = document_base });
                 text_owned = false;
                 continue;
             }
@@ -165,17 +314,50 @@ pub const Page = struct {
                 continue;
             };
             defer stylesheet_url.free(self.allocator);
-            const css_text = fetchDecoded(init, self.allocator, stylesheet_url, &http_client, &cookie_jar) catch |err| {
+            const fetched = fetchDecodedSheet(init, self.allocator, stylesheet_url, &http_client, &cookie_jar) catch |err| {
                 std.log.warn("Ignoring stylesheet {s}: {}", .{ href, err });
                 continue;
             };
+            defer self.allocator.free(fetched.source_url);
             var text_owned = true;
-            errdefer if (text_owned) self.allocator.free(css_text);
-            try self.appendRules(css_text, true);
+            errdefer if (text_owned) self.allocator.free(fetched.text);
+            try self.appendRules(fetched.text, true, .{
+                .base_url = fetched.source_url,
+                .referrer_policy = fetched.referrer_policy,
+            });
             text_owned = false;
         }
     }
 };
+
+const FetchedSheet = struct {
+    text: []u8,
+    source_url: []u8,
+    referrer_policy: url_module.ReferrerPolicy,
+};
+
+// Owns both returned strings. Sheet construction clones the source URL and
+// consumes text only after all fallible publication work has succeeded.
+fn fetchDecodedSheet(
+    init: std.process.Init,
+    allocator: std.mem.Allocator,
+    url: Url,
+    client: *std.http.Client,
+    cookie_jar: *std.StringHashMap(url_module.CookieEntry),
+) !FetchedSheet {
+    var final_url: ?Url = null;
+    defer if (final_url) |resolved| resolved.free(allocator);
+    const response = try Url.fetchBodyWithFinalUrl(allocator, init.io, client, cookie_jar, null, url, null, null, &final_url);
+    defer if (response.csp_header) |header| allocator.free(header);
+    defer if (!std.mem.eql(u8, url.scheme, "data") and !std.mem.eql(u8, url.scheme, "about")) allocator.free(response.body);
+    const source_url = if (final_url) |resolved| try resolved.toOwnedString(allocator) else try url.toOwnedString(allocator);
+    errdefer allocator.free(source_url);
+    return .{
+        .text = try url_module.decodeUtf8Replace(allocator, response.body),
+        .source_url = source_url,
+        .referrer_policy = response.referrer_policy,
+    };
+}
 
 fn deinitCookieJar(allocator: std.mem.Allocator, cookie_jar: *std.StringHashMap(url_module.CookieEntry)) void {
     var it = cookie_jar.iterator();

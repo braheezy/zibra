@@ -28,6 +28,14 @@ const parseTranslate = animation.parseTranslate;
 const cssAnimationPropertyBit = animation.cssAnimationPropertyBit;
 const css_animation_properties = animation.css_animation_properties;
 
+/// Synchronous lookup of previously parsed inline declarations. Context, maps,
+/// and their source strings remain alive and immutable for the entire style
+/// pass. Computed winners are interned in their Element before the pass returns.
+pub const InlineStyleProvider = struct {
+    context: *const anyopaque,
+    get: *const fn (*const anyopaque, []const u8) ?*const CSSParser.DeclarationMap,
+};
+
 const InheritedProperty = struct {
     name: []const u8,
     default_value: []const u8,
@@ -85,7 +93,7 @@ pub fn initStyleMap(comptime StyleMap: type, allocator: std.mem.Allocator, obj_n
         if (map.getPtr(prop.name)) |child_field| {
             if (parent_style != null and isInheritedProperty(prop.name)) {
                 if (parent_style.?.getPtr(prop.name)) |parent_field| {
-                    child_field.addDependency(parent_field, allocator);
+                    try child_field.tryAddDependency(parent_field, allocator);
                 }
             }
             child_field.freezeDependencies();
@@ -152,11 +160,11 @@ pub fn Application(
             return retainComputed(element, allocator, try allocator.dupe(u8, value));
         }
 
-        fn rootFontSize(allocator: std.mem.Allocator, ancestors: []const *Node, field: *ProtectedField([]const u8)) f64 {
+        fn rootFontSize(allocator: std.mem.Allocator, ancestors: []const *Node, field: *ProtectedField([]const u8)) !f64 {
             if (ancestors.len == 0) return 16;
             const root_style = &ancestors[0].element.style.?;
             const root_field = root_style.getPtr("font-size").?;
-            field.addDependency(root_field, allocator);
+            try field.tryAddDependency(root_field, allocator);
             return css_length.parsePixel(root_field.read(field, allocator).*) orelse 16;
         }
 
@@ -271,7 +279,7 @@ pub fn Application(
                 const root_size = if (ancestors.len == 0)
                     css_length.parsePixel(styles.getPtr("font-size").?.get().*) orelse 16
                 else
-                    rootFontSize(styles.allocator, ancestors, styles.getPtr("animation").?);
+                    try rootFontSize(styles.allocator, ancestors, styles.getPtr("animation").?);
                 value = (try value_tokens.resolveRem(values_allocator, value, root_size)) orelse value;
             }
             if (css_length.isMath(value) and (std.mem.eql(u8, property, "width") or std.mem.eql(u8, property, "height"))) {
@@ -429,9 +437,10 @@ pub fn Application(
             skipped_subtrees: usize = 0,
         };
 
-        // Parse inline styles from the style attribute and apply CSS rules to the node tree.
+        /// Apply rules and parse authored inline styles during this synchronous
+        /// pass. Rules and their source strings borrow the caller's generation.
         pub fn style(allocator: std.mem.Allocator, node: *Node, rules: []const CSSParser.CSSRule) !void {
-            return styleWithKeyframesInternal(allocator, node, rules, &.{}, null);
+            return styleWithKeyframesInternal(allocator, node, rules, &.{}, null, null);
         }
 
         /// Instrumented style entry point used by invalidation regressions and
@@ -444,7 +453,7 @@ pub fn Application(
             stats: *StylePassStats,
         ) !void {
             stats.* = .{};
-            return styleWithKeyframesInternal(allocator, node, rules, &.{}, stats);
+            return styleWithKeyframesInternal(allocator, node, rules, &.{}, null, stats);
         }
 
         pub fn styleWithKeyframes(
@@ -453,7 +462,22 @@ pub fn Application(
             rules: []const CSSParser.CSSRule,
             keyframes: []const CSSParser.KeyframesRule,
         ) !void {
-            return styleWithKeyframesInternal(allocator, node, rules, keyframes, null);
+            return styleWithKeyframesInternal(allocator, node, rules, keyframes, null, null);
+        }
+
+        /// Apply a caller-owned stylesheet/keyframe generation with optional
+        /// pre-parsed inline inputs. The provider is borrowed only during this
+        /// call and must cover each authored inline value that needs restyling;
+        /// an absent entry returns MissingInlineDeclarations. Computed strings
+        /// retain Element ownership independently of these replaceable inputs.
+        pub fn styleWithInputs(
+            allocator: std.mem.Allocator,
+            node: *Node,
+            rules: []const CSSParser.CSSRule,
+            keyframes: []const CSSParser.KeyframesRule,
+            provider: ?InlineStyleProvider,
+        ) !void {
+            return styleWithKeyframesInternal(allocator, node, rules, keyframes, provider, null);
         }
 
         fn styleWithKeyframesInternal(
@@ -461,6 +485,7 @@ pub fn Application(
             node: *Node,
             rules: []const CSSParser.CSSRule,
             keyframes: []const CSSParser.KeyframesRule,
+            provider: ?InlineStyleProvider,
             stats: ?*StylePassStats,
         ) !void {
             if (!styleTreeNeedsUpdateFn(node)) {
@@ -480,6 +505,7 @@ pub fn Application(
                 node,
                 rules,
                 keyframes,
+                provider,
                 &default_parent,
                 empty_ancestors,
                 .{ .has_cache = &has_cache },
@@ -514,7 +540,7 @@ pub fn Application(
             child_field: *ProtectedField([]const u8),
             parent_is_ephemeral_default: bool,
             allocator: std.mem.Allocator,
-        ) []const u8 {
+        ) ![]const u8 {
             // The synthetic root parent is destroyed at the end of every style pass,
             // so root fields may read it but must never register a dependency on it.
             if (parent_is_ephemeral_default) return parent_field.get().*;
@@ -522,7 +548,7 @@ pub fn Application(
             // A retained style map can move between parents through removeChild.
             // Register the current edge before a frozen dependency read; the
             // structural mutation boundary cleared the old publisher edges.
-            child_field.addDependency(parent_field, allocator);
+            try child_field.tryAddDependency(parent_field, allocator);
             return parent_field.read(child_field, allocator).*;
         }
 
@@ -561,6 +587,7 @@ pub fn Application(
             element: *Element,
             rules: []const CSSParser.CSSRule,
             keyframes: []const CSSParser.KeyframesRule,
+            provider: ?InlineStyleProvider,
             parent_style: *StyleMap,
             ancestor_chain: []const *Node,
             match_context: CSSParser.MatchContext,
@@ -579,6 +606,13 @@ pub fn Application(
                 {
                     continue;
                 }
+                // A failed pass can publish content/display before finishing
+                // this generated subtree. Preserve the host's layout rebuild
+                // even if a retry observes that activation as its old value.
+                errdefer {
+                    element.markChildrenDirty();
+                    markLayoutForNodeFn(node);
+                }
                 const generated = try element.ensureGeneratedPseudo(allocator, node, kind);
                 const was_active = generated.element.generatedPseudoLastActive();
                 try styleWithParent(
@@ -586,6 +620,7 @@ pub fn Application(
                     generated,
                     rules,
                     keyframes,
+                    provider,
                     parent_style,
                     ancestor_chain,
                     match_context,
@@ -608,6 +643,7 @@ pub fn Application(
             node: *Node,
             rules: []const CSSParser.CSSRule,
             keyframes: []const CSSParser.KeyframesRule,
+            provider: ?InlineStyleProvider,
             parent_style: *StyleMap,
             ancestor_chain: []const *Node,
             match_context: CSSParser.MatchContext,
@@ -651,7 +687,7 @@ pub fn Application(
                     for (INHERITED_PROPERTIES) |prop| {
                         if (style_map.getPtr(prop.name)) |child_field| {
                             if (parent_style.getPtr(prop.name)) |parent_field| {
-                                const parent_value = inheritedValue(
+                                const parent_value = try inheritedValue(
                                     parent_field,
                                     child_field,
                                     parent_is_ephemeral_default,
@@ -673,6 +709,10 @@ pub fn Application(
                     return;
                 },
                 .element => |*e| {
+                    // A leaf can finish its own fields before allocating the
+                    // ancestry chain or a new pseudo box. Keep unfinished work
+                    // discoverable even when there is no child owner to dirty.
+                    errdefer e.has_dirty_style_descendants = true;
                     const had_style = e.style != null;
                     if (e.custom_version == null) {
                         const version = try allocator.create(ProtectedField(u64));
@@ -712,7 +752,7 @@ pub fn Application(
                         for (INHERITED_PROPERTIES) |prop| {
                             if (style_map.getPtr(prop.name)) |child_field| {
                                 if (parent_style.getPtr(prop.name)) |parent_field| {
-                                    const parent_value = inheritedValue(
+                                    const parent_value = try inheritedValue(
                                         parent_field,
                                         child_field,
                                         parent_is_ephemeral_default,
@@ -772,11 +812,16 @@ pub fn Application(
                         // specificity. Author !important still beats normal inline.
                         if (e.attributes) |attrs| {
                             if (attrs.get("style")) |style_attr| {
-                                var css_parser = try CSSParser.init(allocator, style_attr, false);
-                                defer css_parser.deinit(allocator);
-
-                                var parsed_styles = try css_parser.body(allocator);
-                                defer parsed_styles.deinit();
+                                var owned_styles: ?CSSParser.DeclarationMap = null;
+                                defer if (owned_styles) |*declarations| declarations.deinit();
+                                const parsed_styles = if (provider) |inputs|
+                                    inputs.get(inputs.context, style_attr) orelse return error.MissingInlineDeclarations
+                                else parsed: {
+                                    const css_parser = try CSSParser.init(allocator, style_attr, false);
+                                    defer css_parser.deinit(allocator);
+                                    owned_styles = try css_parser.body(allocator);
+                                    break :parsed &owned_styles.?;
+                                };
 
                                 var it = parsed_styles.iterator();
                                 while (it.next()) |entry| {
@@ -803,7 +848,7 @@ pub fn Application(
                             const parent = &ancestor_chain[ancestor_chain.len - 1].element;
                             // Any environment change recomputes this element,
                             // even when a previously missing name is introduced.
-                            style_map.getPtr("color").?.addDependency(parent.custom_version.?, allocator);
+                            try style_map.getPtr("color").?.tryAddDependency(parent.custom_version.?, allocator);
                             break :blk parent.custom_properties;
                         } else null;
                         const environment = try custom_properties.Environment.create(allocator, parent_environment, &new_style);
@@ -867,7 +912,7 @@ pub fn Application(
                             if (wants_inherited) {
                                 const child_field = style_map.getPtr(prop.name).?;
                                 const inherited = if (parent_style.getPtr(prop.name)) |parent_field|
-                                    inheritedValue(
+                                    try inheritedValue(
                                         parent_field,
                                         child_field,
                                         parent_is_ephemeral_default,
@@ -889,7 +934,7 @@ pub fn Application(
                         if (new_style.get("font-family")) |font_family| {
                             const child_field = style_map.getPtr("font-family").?;
                             const inherited_family = if (parent_style.getPtr("font-family")) |parent_field|
-                                inheritedValue(parent_field, child_field, parent_is_ephemeral_default, allocator)
+                                try inheritedValue(parent_field, child_field, parent_is_ephemeral_default, allocator)
                             else
                                 "sans-serif";
                             try new_style.put(
@@ -913,7 +958,7 @@ pub fn Application(
                             if (new_style.get(prop.name)) |value| {
                                 const child_field = style_map.getPtr(prop.name).?;
                                 const inherited_value = if (parent_style.getPtr(prop.name)) |parent_field|
-                                    inheritedValue(parent_field, child_field, parent_is_ephemeral_default, allocator)
+                                    try inheritedValue(parent_field, child_field, parent_is_ephemeral_default, allocator)
                                 else
                                     prop.initial;
                                 try new_style.put(
@@ -928,14 +973,14 @@ pub fn Application(
                         // descendants can use them as the base for their own `em`
                         // and percentage lengths.
                         if (new_style.get("font-size")) |authored_font_size| {
-                            const rem_size = if (value_tokens.hasRem(authored_font_size)) rootFontSize(allocator, ancestor_chain, style_map.getPtr("font-size").?) else 16;
+                            const rem_size = if (value_tokens.hasRem(authored_font_size)) try rootFontSize(allocator, ancestor_chain, style_map.getPtr("font-size").?) else 16;
                             var font_size = if (try value_tokens.resolveRem(allocator, authored_font_size, rem_size)) |owned|
                                 try retainComputed(e, allocator, owned)
                             else
                                 authored_font_size;
                             if (css_length.isMath(font_size)) {
                                 const parent_field = parent_style.getPtr("font-size").?;
-                                const parent_value = inheritedValue(parent_field, style_map.getPtr("font-size").?, parent_is_ephemeral_default, allocator);
+                                const parent_value = try inheritedValue(parent_field, style_map.getPtr("font-size").?, parent_is_ephemeral_default, allocator);
                                 const base = css_length.parsePixel(parent_value) orelse 16;
                                 if (css_length.resolve(font_size, .{ .font_size = base, .percentage_base = base, .root_font_size = rem_size })) |size| {
                                     font_size = try retainComputed(e, allocator, try std.fmt.allocPrint(allocator, "{d:.6}px", .{size}));
@@ -946,7 +991,7 @@ pub fn Application(
                             if (font_size_length) |length| {
                                 const child_field = style_map.getPtr("font-size").?;
                                 const parent_font_size = if (parent_style.getPtr("font-size")) |parent_field|
-                                    inheritedValue(parent_field, child_field, parent_is_ephemeral_default, allocator)
+                                    try inheritedValue(parent_field, child_field, parent_is_ephemeral_default, allocator)
                                 else
                                     "16px";
 
@@ -986,7 +1031,7 @@ pub fn Application(
                             const root_size = if (ancestor_chain.len == 0)
                                 css_length.parsePixel(new_style.get("font-size").?) orelse 16
                             else
-                                rootFontSize(allocator, ancestor_chain, style_map.getPtr(prop.name).?);
+                                try rootFontSize(allocator, ancestor_chain, style_map.getPtr(prop.name).?);
                             if (try value_tokens.resolveRem(allocator, authored, root_size)) |owned| {
                                 try new_style.put(prop.name, try retainComputed(e, allocator, owned));
                             }
@@ -1065,6 +1110,7 @@ pub fn Application(
                             child,
                             rules,
                             keyframes,
+                            provider,
                             style_map,
                             new_ancestors,
                             match_context,
@@ -1078,6 +1124,7 @@ pub fn Application(
                         e,
                         rules,
                         keyframes,
+                        provider,
                         style_map,
                         new_ancestors,
                         match_context,

@@ -1,7 +1,12 @@
 # CSS engine plan
 
-Status: proposed direction; no library adoption or engine migration is implied
-by this document. Library evaluation snapshot: 2026-09-06.
+Status: Phase 0 is implemented and Phase 2 has an experimental inspection
+integration. Terence-derived sheets and inline declarations now feed Zibra's
+style/layout/display-list dumps with `--css-parser=terence`. Interactive Browser
+and WPT adapters retain the legacy frontend. The decision remains **adapt
+before production adoption**; the [acceptance report](docs/css-frontend-acceptance.md)
+records the integration, verification and remaining gates. Initial library
+evaluation: 2026-09-06; interop verification: 2026-09-08.
 
 ## Direction
 
@@ -18,7 +23,7 @@ Migrate one boundary at a time. Preserve working page behavior while replacing
 the foundations that make further compatibility work difficult. A parser
 replacement must not become a prerequisite for every unrelated rendering fix.
 
-This document describes future work. The
+This document describes the migration direction and phase status. The
 [architecture index](docs/architecture-and-lifetimes.md), especially the
 [document and rendering contracts](docs/architecture/document-and-rendering.md),
 remains authoritative for current ownership and invalidation behavior. Update
@@ -37,11 +42,11 @@ Zibra already has a substantial homegrown CSS implementation:
 
 | Current area | Entry points | Architectural pressure |
 | --- | --- | --- |
-| Syntax and declarations | [css_syntax.zig](src/document/css_syntax.zig), [css_value_tokens.zig](src/document/css_value_tokens.zig), [css_parser.zig](src/document/css_parser.zig) | Character scanning and a limited value-token interface coexist with property validation, selector parsing, and rule processing. |
+| Syntax and declarations | [css_parser.zig](src/document/css_parser.zig), [css_declarations.zig](src/document/css_declarations.zig), [css_frontend.zig](src/document/css_frontend.zig) | Legacy and experimental syntax frontends share property validation, shorthand expansion and declaration precedence; token normalization remains a transitional boundary. |
 | Selectors | [selector.zig](src/document/selector.zig) | Existing combinators, attributes, state/structural selectors, `:not()`, and `:has()` need a foundation for further grammar and specificity support. |
 | Cascade and computed style | [css_properties.zig](src/document/css_properties.zig), [style_application.zig](src/document/style_application.zig) | String-backed computed fields, per-rule declaration maps, and numeric priority offsets make richer semantics harder to represent. |
 | Values | [custom_properties.zig](src/document/custom_properties.zig), [length.zig](src/document/length.zig), [color.zig](src/document/color.zig) | Existing variable substitution, root-relative lengths, and bounded math must survive migration; value coverage is still incomplete. |
-| Conditional rules | [media_query.zig](src/document/media_query.zig), [css_parser.zig](src/document/css_parser.zig) | Media queries and keyframes have bounded support; viewport-dependent rules currently rebuild from source rather than retaining a general conditional rule tree. |
+| Conditional rules | [media_query.zig](src/document/media_query.zig), [css_stylesheet.zig](src/document/css_stylesheet.zig) | Experimental inspection retains media conditions and executable rules for reselection; interactive frames still rebuild source-backed generations. |
 | JavaScript and rendering | [script runtime](src/script/runtime/css_style.js), [render subsystem](src/browser/render/) | CSSOM must ultimately expose real engine state; layout and paint need explicit computed/used-value contracts. |
 
 Known gaps motivating the design include modern selector functions such as
@@ -76,8 +81,9 @@ The evaluation ran these pinned revisions' own tests with local Zig 0.16.0,
 | [Color parser `4750318549a914cf6f1529d16e5f252888691e08`](https://github.com/sorairolake/csscolorparser-zig/tree/4750318549a914cf6f1529d16e5f252888691e08) | 0.2.0 | 86/86 tests passed |
 
 These are upstream unit/integration results, not WPT results, a security audit,
-or Zibra integration results. No dependencies were added during the evaluation.
-Revalidate the exact revision and toolchain before adoption.
+or Zibra integration results. No dependencies were added during the initial
+evaluation. Terence is now pinned in `build.zig.zon` and exercised behind the
+acceptance adapter and opt-in inspection path; production adoption remains gated.
 
 Terence owns its AST containers but borrows its input source. Its indexed AST
 retains invalid input separately from usable syntax. An adapter must respect
@@ -225,6 +231,12 @@ implement intrinsic sizing, track placement, or other layout algorithms.
 
 ### Phase 0: bounded frontend acceptance spike
 
+Implementation and decision: [CSS frontend acceptance](docs/css-frontend-acceptance.md).
+The source owner, three syntax entry modes, resource admission gates, recovery
+corpus and failure-injection tests are implemented. Native parser work limits
+and efficient declaration/rule recovery are required before Phase 2 switches
+production consumers. No compatibility gain is claimed from this spike alone.
+
 1. Pin Terence and document its public API, license, toolchain, dependencies,
    source lifetime, and upstream-update policy. Keep the experiment isolated
    from the production path until the decision is made.
@@ -258,6 +270,27 @@ have focused upstream and engine coverage, and serialization/conversion
 limitations are explicit. This phase does not depend on adopting Terence.
 
 ### Phase 2: syntax and stylesheet ownership migration
+
+Implemented experimentally: `css_declarations.zig` supplies shared validation,
+shorthand expansion and explicit declaration priority. `css_stylesheet.zig`
+retains source, syntax, normalized values, selectors, keyframes and media
+conditions. `css_inline_styles.zig` supplies retained inline declarations to
+the existing cascade. These owners use the unchanged pinned dependency.
+
+Inspection can select from an existing sheet after a viewport change without
+syntax or selector reparsing, and stage a stylesheet replacement against a
+styled DOM. Publication and the later fallible restyle are separate phases;
+the authoritative [lifetime contract](docs/architecture/document-and-rendering.md#experimental-css-syntax-owner)
+defines their preconditions. Pipeline coverage compares both frontends and
+includes narrow/wide geometry and recovery after nested unknown rules and EOF.
+Escaped normal property names are parity coverage already supported by the
+legacy parser. This work does not add CSSOM, layers or CSS nesting semantics.
+
+Still required for the phase exit gate: resolve the frontend resource/recovery
+limits, migrate interactive Frame consumers and their invalidation boundaries,
+verify applicable WPT paths, and remove the replaced parsing paths. The
+inspection switch is temporary migration/diagnostic scaffolding, with removal
+gated on equivalent production coverage.
 
 Introduce the accepted frontend adapter and source-owning rule store, then
 route stylesheet and inline declaration parsing through it in bounded steps.
@@ -351,6 +384,9 @@ contract:
 - Which relative-resource, color-conversion, and conditional-rule semantics
   are required by the first adopted feature rather than merely representable?
 
-The next implementation task is Phase 0, with Phase 1 available independently.
-Update this plan with the adoption decision and completed gates as evidence
-arrives; do not turn proposals or upstream test counts into support claims.
+The next production gate is Terence parser limits/recovery and the remaining
+token-value/serialization contract, followed by interactive Frame integration.
+The Zibra interop work can be reviewed independently of a future frontend fork;
+no Terence source changes are carried here. Phase 1 remains available
+independently. Update completed gates as evidence arrives; proposals and
+upstream unit counts are not browser support claims.

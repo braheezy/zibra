@@ -1,0 +1,15 @@
+rect x1=0 y1=0 x2=800 y2=600 color=#ffffffff
+rect x1=13 y1=18 x2=269 y2=174 color=#ffffffff
+quad x1=21 y1=26 x2=213 y2=26 x3=211 y3=28 x4=23 y4=28 color=#222222ff
+quad x1=213 y1=26 x2=213 y2=166 x3=211 y3=164 x4=211 y4=28 color=#222222ff
+quad x1=213 y1=166 x2=21 y2=166 x3=23 y3=164 x4=211 y4=164 color=#222222ff
+quad x1=21 y1=166 x2=21 y2=26 x3=23 y3=28 x4=23 y4=164 color=#222222ff
+rect x1=27 y1=32 x2=83 y2=44 color=#008800ff
+rect x1=27 y1=48 x2=99 y2=68 color=#008800ff
+quad x1=27 y1=48 x2=99 y2=48 x3=97 y3=50 x4=29 y4=50 color=#004400ff
+quad x1=99 y1=48 x2=99 y2=68 x3=97 y3=66 x4=97 y4=50 color=#004400ff
+quad x1=99 y1=68 x2=27 y2=68 x3=29 y3=66 x4=97 y4=66 color=#004400ff
+quad x1=27 y1=68 x2=27 y2=48 x3=29 y3=50 x4=29 y4=66 color=#004400ff
+rect x1=27 y1=72 x2=99 y2=84 color=#008800ff
+rect x1=27 y1=88 x2=147 y2=112 color=#0044ccff
+rect x1=27 y1=116 x2=115 y2=126 color=#cc8800ff

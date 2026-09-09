@@ -313,6 +313,24 @@ pub fn build(b: *std.Build) !void {
     source_module.addImport("emoji", zg.module("Emoji"));
     source_module.addImport("code_point", zg.module("code_point"));
 
+    // Experimental inspection frontend. Copy the pinned source into one generated
+    // module so its non-exported tokenizer and Ast share the same Zig types.
+    // No upstream source is patched; remove this bridge when Terence exports
+    // its tokenizer alongside Ast (see docs/css-frontend-acceptance.md).
+    const terence_dep = b.dependency("terence_css", .{});
+    const frontend_sources = b.addWriteFiles();
+    for ([_][]const u8{ "ast.zig", "parser.zig", "tokenizer.zig" }) |name| {
+        _ = frontend_sources.addCopyFile(terence_dep.path(b.fmt("src/{s}", .{name})), name);
+    }
+    _ = frontend_sources.addCopyFile(terence_dep.path("LICENSE"), "LICENSE");
+    const frontend_backend = b.createModule(.{
+        .root_source_file = frontend_sources.add("backend.zig",
+            \\pub const Ast = @import("ast.zig").Ast;
+            \\pub const tokenizer = @import("tokenizer.zig");
+        ),
+    });
+    source_module.addImport("css_frontend_backend", frontend_backend);
+
     const ada_dep = b.dependency("adazig", .{
         .target = target,
         .optimize = optimize,
@@ -378,6 +396,7 @@ pub fn build(b: *std.Build) !void {
             .target = target,
             .optimize = optimize,
         });
+        test_module.addImport("css_frontend_backend", frontend_backend);
         switch (suite.dependencies) {
             .document => {
                 test_module.addImport("z2d", z2d_dep.module("z2d"));
@@ -468,6 +487,8 @@ pub fn build(b: *std.Build) !void {
         const capture = b.addRunArtifact(exe);
         if (previous_pipeline_comparison) |previous| capture.step.dependOn(previous);
         capture.addArg(case.mode.cliFlag());
+        if (case.css_parser) |css_parser| capture.addArg(b.fmt("--css-parser={s}", .{css_parser}));
+        if (case.viewport) |viewport| capture.addArg(b.fmt("--viewport={s}", .{viewport}));
         capture.addPrefixedFileArg("file://", b.path(case.fixture));
         if (case.mode != .style) {
             capture.setEnvironmentVariable("SDL_VIDEODRIVER", "dummy");

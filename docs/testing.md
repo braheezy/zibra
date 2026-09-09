@@ -96,7 +96,8 @@ Run from the repository root:
 - `zig build test-dump-dom` for the isolated HTML/DOM CLI contract;
 - `zig build test-pipeline` for exact text-free style/layout/display-list
   goldens covering the box model, nested CSS zoom, bounded tables, float paint
-  phases, and adjoining-margin/clearance flow under SDL dummy mode;
+  phases, and adjoining-margin/clearance flow under SDL dummy mode, plus
+  experimental Terence parity and syntax-recovery cases;
 - `zig build test-wpt-runner` for the dependency-free WPT manifest runner's
   protocol, expectation, diagnostic, and infrastructure-failure handling;
 - `zig build test-csp` for loopback HTTP destination-specific CSP checks,
@@ -164,6 +165,32 @@ browser chrome subtracted from the document's height, just like a native
 window. For example:
 `zig build run -- --viewport 2560x1440 --screenshot /tmp/wide.png URL`.
 Always verify a wide viewport when diagnosing content stuck in a narrow window.
+
+For CSS frontend interoperability, add `--css-parser=legacy` or
+`--css-parser=terence` to `--dump-style`, `--dump-layout`, or
+`--dump-display-list`. The default is legacy. These flags are rejected for
+DOM-only dumps, interactive Browser, screenshots and WPT sessions. For example:
+
+```sh
+zig build run -- --dump-layout --css-parser=terence --viewport=320x300 \
+  file://"$PWD/tests/pipeline/css-terence-parity.html"
+zig build run -- --dump-display-list --css-parser=terence --viewport=800x600 \
+  file://"$PWD/tests/pipeline/css-terence-recovery.html"
+```
+
+The [pipeline manifest](../tests/pipeline/manifest.zig) compares existing
+goldens under both frontends. The new parity fixture shares narrow/wide
+goldens across parsers and exercises cascade order, shorthand expansion,
+custom properties, inline declarations and nested media conditions. The
+recovery fixture expects two 120px green bars with Terence: a declaration after
+an unknown nested at-rule and a final rule closed by EOF. Inspect and explain
+any difference before changing a shared golden.
+
+The focused [WPT interop manifest](../tests/wpt/manifest-css-interop.yaml)
+reviews testharness, reftest and crashtest coverage, but native WPT adapters
+still run legacy CSS. A successful inspection capture is not an upstream WPT
+pass. Current scope, known prerequisites and results are maintained in the
+[acceptance report](css-frontend-acceptance.md).
 
 ### Native macOS visual checks
 

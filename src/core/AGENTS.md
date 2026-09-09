@@ -14,10 +14,15 @@ dependency registration or destruction behavior.
   its coarse pre-mutation clear and full style/layout recomputation boundary.
 - `ProtectedField(T)` is a comptime-generated inline value, not a heap object.
   Its dependency table is unmanaged: `init` is allocation-free, while
-  `addDependency`/`read` receive the dependency source's allocator and
+  dependency registration/reads receive the dependency source's allocator and
   `deinit` must receive that same allocator. Release builds erase diagnostic
   object/property names. Do not put a managed allocator back into every field
   or allocate merely to construct a clean dependency graph.
+- Fallible style computations use `tryAddDependency` and propagate allocation
+  failure before frozen reads or clean-value publication. It installs both
+  edge endpoints together. Existing `addDependency`/dynamic `read` callers
+  retain their best-effort behavior; they do not provide a recoverable OOM
+  contract for new callers.
 - `ProtectedField.lastValue` is an explicit non-subscribing historical read.
   It may be used while dirty only when the consumer needs the last published
   state, such as the visual baseline for an interrupted CSS transition; it is

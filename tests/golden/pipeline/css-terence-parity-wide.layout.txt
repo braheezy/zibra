@@ -1,0 +1,10 @@
+document x=13 y=18 width=764 height=156
+  block x=13 y=18 width=764 height=156
+    block x=13 y=18 width=764 height=0
+    block x=13 y=18 width=256 height=156
+      block x=21 y=26 width=192 height=140
+        block x=27 y=32 width=56 height=12
+        block x=27 y=48 width=72 height=20
+        block x=27 y=72 width=72 height=12
+        block x=27 y=88 width=120 height=24
+        block x=27 y=116 width=88 height=10

@@ -1,0 +1,11 @@
+# Phase-0 baseline: these run the CURRENT browser engine, not the experimental
+# Terence adapter. CSSOM requirements and results are recorded in
+# docs/css-frontend-acceptance.md. Keep upstream PASS expectations unchanged.
+tests:
+  - css/css-syntax/escaped-eof.html
+  - css/css-syntax/unclosed-url-at-eof.html
+  - css/css-syntax/at-rule-in-declaration-list.html
+reftests:
+  - css/css-syntax/missing-semicolon.html
+crashtests:
+  - css/css-syntax/crashtests/unclosed-open-brackets.html

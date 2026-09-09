@@ -22,9 +22,11 @@ pub const Case = struct {
     mode: Mode,
     fixture: []const u8,
     golden: []const u8,
+    css_parser: ?[]const u8 = null,
+    viewport: ?[]const u8 = null,
 };
 
-pub const cases = [_]Case{
+const existing_cases = [_]Case{
     .{
         .name = "box-model-style",
         .mode = .style,
@@ -116,3 +118,96 @@ pub const cases = [_]Case{
         .golden = "tests/golden/pipeline/generated-pseudo.display-list.txt",
     },
 };
+
+/// The same goldens cover both frontends. A difference remains a regression
+/// until it has been diagnosed and justified against the fixture's semantics.
+fn withTerence(comptime source: []const Case) [source.len]Case {
+    var result: [source.len]Case = undefined;
+    inline for (source, 0..) |case, index| {
+        result[index] = case;
+        result[index].name = "terence-" ++ case.name;
+        result[index].css_parser = "terence";
+    }
+    return result;
+}
+
+const parity_cases = [_]Case{
+    .{
+        .name = "css-terence-parity-narrow-style",
+        .mode = .style,
+        .fixture = "tests/pipeline/css-terence-parity.html",
+        .golden = "tests/golden/pipeline/css-terence-parity-narrow.style.txt",
+        .css_parser = "legacy",
+        .viewport = "320x300",
+    },
+    .{
+        .name = "css-terence-parity-narrow-layout",
+        .mode = .layout,
+        .fixture = "tests/pipeline/css-terence-parity.html",
+        .golden = "tests/golden/pipeline/css-terence-parity-narrow.layout.txt",
+        .css_parser = "legacy",
+        .viewport = "320x300",
+    },
+    .{
+        .name = "css-terence-parity-narrow-display-list",
+        .mode = .display_list,
+        .fixture = "tests/pipeline/css-terence-parity.html",
+        .golden = "tests/golden/pipeline/css-terence-parity-narrow.display-list.txt",
+        .css_parser = "legacy",
+        .viewport = "320x300",
+    },
+    .{
+        .name = "css-terence-parity-wide-style",
+        .mode = .style,
+        .fixture = "tests/pipeline/css-terence-parity.html",
+        .golden = "tests/golden/pipeline/css-terence-parity-wide.style.txt",
+        .css_parser = "legacy",
+        .viewport = "800x600",
+    },
+    .{
+        .name = "css-terence-parity-wide-layout",
+        .mode = .layout,
+        .fixture = "tests/pipeline/css-terence-parity.html",
+        .golden = "tests/golden/pipeline/css-terence-parity-wide.layout.txt",
+        .css_parser = "legacy",
+        .viewport = "800x600",
+    },
+    .{
+        .name = "css-terence-parity-wide-display-list",
+        .mode = .display_list,
+        .fixture = "tests/pipeline/css-terence-parity.html",
+        .golden = "tests/golden/pipeline/css-terence-parity-wide.display-list.txt",
+        .css_parser = "legacy",
+        .viewport = "800x600",
+    },
+};
+
+const recovery_cases = [_]Case{
+    .{
+        .name = "css-terence-recovery-style",
+        .mode = .style,
+        .fixture = "tests/pipeline/css-terence-recovery.html",
+        .golden = "tests/golden/pipeline/css-terence-recovery.style.txt",
+        .css_parser = "terence",
+        .viewport = "800x600",
+    },
+    .{
+        .name = "css-terence-recovery-layout",
+        .mode = .layout,
+        .fixture = "tests/pipeline/css-terence-recovery.html",
+        .golden = "tests/golden/pipeline/css-terence-recovery.layout.txt",
+        .css_parser = "terence",
+        .viewport = "800x600",
+    },
+    .{
+        .name = "css-terence-recovery-display-list",
+        .mode = .display_list,
+        .fixture = "tests/pipeline/css-terence-recovery.html",
+        .golden = "tests/golden/pipeline/css-terence-recovery.display-list.txt",
+        .css_parser = "terence",
+        .viewport = "800x600",
+    },
+};
+
+pub const cases = existing_cases ++ withTerence(&existing_cases) ++
+    parity_cases ++ withTerence(&parity_cases) ++ recovery_cases;

@@ -1,0 +1,42 @@
+/* The Terence path paints two 120px green bars. The existing parser loses
+   width after the nested at-rule and drops the unterminated final rule. */
+html,
+body {
+  margin: 0;
+  padding: 0;
+  border: 0;
+}
+
+head {
+  display: none;
+}
+
+body {
+  padding: 8px;
+  background-color: #ffffff;
+}
+
+main {
+  display: block;
+  width: 160px;
+}
+
+.box {
+  display: block;
+  width: 24px;
+  height: 16px;
+  margin: 0 0 4px;
+  background-color: #cc0000;
+}
+
+#at-rule {
+  background-color: #008800;
+  @unsupported { ignored: "semicolon; brace}"; }
+  width: 120px;
+}
+
+/* Deliberately omit the final closing brace to exercise EOF recovery. */
+#eof {
+  w\69 dth: 120px !important;
+  width: 24px;
+  background-color: #008800;

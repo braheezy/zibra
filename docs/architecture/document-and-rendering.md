@@ -117,6 +117,9 @@ split across acyclic modules:
 - `css_properties.zig` owns the static set of published computed longhands and
   their initial source slices, shared by declaration-name recognition and
   style-map initialization;
+- `css_declarations.zig` owns property validation, shorthand expansion and
+  declaration-block precedence shared by both CSS syntax frontends. Its maps
+  own tables only; names and values borrow their source/normalized-string owner;
 - `pseudo.zig` owns only the shared before/after identity used by DOM,
   selector, and style owners; it owns neither a Node nor a stylesheet value;
 - `animation.zig` defines pure transition/keyframe interpolation values that
@@ -193,6 +196,68 @@ version field, not additional entries in the fixed StyleMap. Descendants
 subscribe to their parent's version so newly introduced names also invalidate
 them. Heap storage keeps this publisher stable when its owning Node moves;
 structural mutation still clears the graph before moving Node storage.
+
+## Experimental CSS syntax owner
+
+`css_frontend.Syntax` is the source owner behind opt-in Terence inspection.
+Interactive Frames, screenshots and WPT adapters retain the legacy parser.
+The owner duplicates source and optional serialized base-URL metadata,
+owns the Terence AST and diagnostic storage, and releases those borrowers
+before their source. The heap holder keeps its budget allocator context stable
+when the outer owner moves. Do not shallow-copy it into a second owner.
+
+Node IDs, ranges, views and iterators borrow exactly one immutable syntax
+generation. They must retire before successful replacement/deinit; they do not
+provide stable CSSOM identity. Raw source ranges preserve escapes and EOF
+spelling, rather than representing normalized token values. Its offline
+replacement helper requires all external borrowers to retire before success;
+consumers with installed styles use staged publication instead.
+
+`css_stylesheet.Sheet` owns that syntax, normalized strings, translated
+selectors/declarations/keyframes and parent-linked media conditions. Parsing
+adapts these once. `Sheet.select` evaluates retained conditions and returns
+independently owned selector/map/URL/frame containers whose declaration strings
+borrow the Sheet. Retire every selection before its Sheet. Unknown rules and
+CSS nesting remain syntax only; the adapter executes ordinary rules, supported
+media conditions and keyframes using Zibra's existing semantics.
+Sheet and inline-block budgets cover their retained syntax and semantic
+allocations; selections use their caller's allocator and explicit OOM cleanup.
+
+`css_normalize.zig` converts supported identifier/function/unit spellings into
+property-grammar inputs without changing token classes or reparsing a sheet.
+Its outputs are owned by the Sheet or `DeclarationBlock`; string/URL payloads
+retain authored spelling. This is not CSSOM serialization. Both syntax paths
+feed `css_declarations.zig`, including declaration-local importance and source
+order before shorthand expansion and invalid-value fallback.
+
+`css_inline_styles.Cache` owns copied `DeclarationBlock` inputs for authored
+style attributes, deduplicated by text. `styleWithInputs` borrows its provider,
+maps and source strings synchronously. A supplied provider must cover every
+inline value needing restyling; missing entries fail explicitly rather than
+falling back to the legacy parser. Rebuild the cache before styling changed
+inline attributes. Computed winners are Element-interned as described above.
+
+An experimental `inspection.Page` owns sheets, their active selections and the
+inline cache with its DOM. `reselectMedia` and `replaceStylesheet` require a
+final-address DOM and retired layout/display consumers. They stage every
+fallible parse/selection allocation before clearing style dependencies,
+dirtying the DOM and installing the new generation. Staging failure leaves the
+installed rules, media and computed values unchanged. Successful replacement
+retires old executable containers before their source Sheet.
+
+Call `Page.restyle` after successful publication and before rebuilding layout
+or painting. Restyle is a separate fallible phase: failure preserves the new
+valid generation and dirty work for retry, rather than rolling publication
+back. Existing computed strings remain valid across source retirement. These
+APIs neither schedule Browser frames nor expose a live CSSOM mutation model.
+
+All three syntax entry modes share preflight and allocation limits. They keep
+unknown rules and duplicate declarations for later semantic consumers; syntax
+acceptance must never imply supported selectors, properties or at-rules.
+The CLI enables this path only for style/layout/display-list dumps with
+`--css-parser=terence`; the default is `legacy`. Production adoption gates,
+verification fixtures and the temporary backend-import bridge are in the
+[acceptance decision](../css-frontend-acceptance.md).
 
 ## Address-unstable Node storage
 
@@ -292,6 +357,14 @@ subscriber table allocates only when a dependency is added. Pass the source
 field owner's allocator to `read`/`addDependency` and the same allocator to
 `deinit`; do not embed a managed allocator in every property.
 
+Fallible style computation uses `tryAddDependency`: it reserves the publisher
+table and allocates the edge before linking either endpoint, and propagates
+allocation failure before a frozen read or computed-value publication. This
+includes inherited fields, root-relative values and custom-property versions.
+The existing non-fallible registration/read APIs retain their best-effort
+behavior for older consumers; a fallible style pass must use checked
+registration to preserve its retry contract.
+
 A dependency is a source-allocated edge indexed by its publisher and linked
 into its subscriber. Destruction unlinks both endpoints: destroying a layout
 subscriber removes it from every surviving style publisher, and destroying a
@@ -311,6 +384,13 @@ field notifications raise this bit along the parent chain. Since Nodes move by
 value, `fixParentPointers` must also rebind field owner callbacks. Clear a
 summary only after all requested child passes succeed; a clean summary permits
 the complete subtree to be skipped.
+
+An error keeps the Element summary set even if its own fields were already
+published and it has no authored children: ancestry allocation and generated
+pseudo creation can still be pending. Failed pseudo styling also dirties the
+host's logical child sequence/layout, because partial publication can change
+activation before retry records its previous value. Partially computed maps
+remain dirty; published strings keep their existing Element ownership.
 
 `:has(...)` matching additionally builds a synchronous ephemeral post-order
 cache. It borrows both DOM and selector pointers and cannot cross a DOM or rule

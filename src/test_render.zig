@@ -9,6 +9,7 @@ comptime {
     _ = @import("tests/responsive_layout.zig");
     _ = @import("tests/replaced_image_layout.zig");
     _ = @import("tests/element_geometry.zig");
+    _ = @import("tests/css_inspection_render.zig");
     _ = @import("browser/render/display_list.zig");
     _ = @import("browser/software_renderer.zig");
     _ = @import("browser/render/focus_ring.zig");
