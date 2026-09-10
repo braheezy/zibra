@@ -26,6 +26,10 @@ const wpt_bindings = @import("wpt_bindings.zig");
 const bdwgc = @import("bdwgc");
 const gc_threads = @import("gc_threads.zig");
 const kiesel = @import("kiesel");
+const media_bindings = @import("media_bindings.zig");
+pub const MediaCommand = media_bindings.Command;
+pub const MediaResult = media_bindings.Result;
+pub const MediaCallbackFn = media_bindings.Callback;
 const geometry_bindings = @import("geometry_bindings.zig");
 pub const GeometryCallbackFn = geometry_bindings.Callback;
 pub const GeometryRect = geometry_bindings.Rect;
@@ -252,6 +256,7 @@ const WindowRealm = struct {
     pending_messages: std.ArrayList(PendingMessage),
     render_callback: RenderCallback,
     style_flush_callback: RenderCallback,
+    media_callback: struct { function: ?MediaCallbackFn = null, context: ?*anyopaque = null } = .{},
     geometry_callback: struct {
         function: ?GeometryCallbackFn = null,
         context: ?*anyopaque = null,
@@ -304,6 +309,7 @@ canvas_host: canvas_bindings.Host,
 dom_tree_host: dom_tree_bindings.Host,
 character_data_host: character_data_bindings.Host,
 geometry_host: geometry_bindings.Host,
+media_host: media_bindings.Host,
 event_focus_host: event_focus_bindings.Host,
 network_host: network_bindings.Host,
 timer_host: timer_bindings.Host,
@@ -369,6 +375,7 @@ pub fn init(
         .context = self,
         .active_window = activeEventFocusWindow,
     };
+    self.media_host = .{ .context = self, .allocator = allocator, .call = callBindingMedia };
     self.geometry_host = .{ .context = self, .allocator = allocator, .measure = measureBindingGeometry };
     self.network_host = .{
         .context = self,
@@ -480,6 +487,7 @@ fn retireWindowRealmLocked(self: *Js, window: *WindowRealm) void {
     window.render_callback = .{};
     window.style_flush_callback = .{};
     window.geometry_callback = .{};
+    window.media_callback = .{};
     window.focus_callback = .{};
     window.dom_mutation_callback = .{};
     window.dom_mutation_complete_callback = .{};
@@ -685,7 +693,7 @@ fn ensureRuntimeInitializedLocked(
         @embedFile("runtime/document_accessors.js") ++ "\n" ++
         @embedFile("runtime/character_data.js") ++ "\n" ++
         @embedFile("runtime/dataset.js") ++ "\n" ++
-        @embedFile("runtime/range.js") ++ "\n" ++ @embedFile("runtime/css_style.js") ++ "\n" ++ @embedFile("runtime/geometry.js");
+        @embedFile("runtime/range.js") ++ "\n" ++ @embedFile("runtime/css_style.js") ++ "\n" ++ @embedFile("runtime/geometry.js") ++ "\n" ++ @embedFile("runtime/media.js");
     const runtime_script = try Script.parse(
         runtime_code,
         window.realm,
@@ -819,8 +827,16 @@ pub fn setFocusCallback(self: *Js, window_id: u32, callback: ?FocusCallbackFn, c
     };
 }
 
-/// Install a synchronous geometry reader for the current document generation.
+/// Install synchronous media commands for the current document generation.
 /// Called by the serialized owner; replacement/null-root retirement clears it.
+pub fn setMediaCallback(self: *Js, window_id: u32, callback: ?MediaCallbackFn, context: ?*anyopaque) void {
+    self.lock.lock();
+    defer self.lock.unlock();
+    const window = self.windows.get(window_id) orelse return;
+    window.media_callback = .{ .function = callback, .context = context };
+}
+
+/// Install a synchronous geometry reader; document retirement clears it.
 pub fn setGeometryCallback(self: *Js, window_id: u32, callback: ?GeometryCallbackFn, context: ?*anyopaque) void {
     const window = self.getWindowContext(window_id) catch return;
     if (window.retired) return;
@@ -1262,6 +1278,23 @@ fn flushBindingStyle(context: ?*anyopaque) anyerror!void {
     if (window.style_flush_callback.function) |callback| {
         try callback(window.style_flush_callback.context);
     }
+}
+
+fn callBindingMedia(context: ?*anyopaque, handle: u32, command: MediaCommand, value: f64, allocator: std.mem.Allocator, out: *MediaResult) anyerror!void {
+    const self = hostFromBindingContext(context);
+    const window = self.windows.get(self.current_window_id orelse return) orelse return;
+    if (window.retired) return;
+    const node = window.handles.resolve(handle) orelse return;
+    if (node.* != .element or !std.ascii.eqlIgnoreCase(node.element.tag, "audio")) return error.InvalidMediaElement;
+    if (window.media_callback.function) |callback| try callback(window.media_callback.context, handle, command, value, allocator, out);
+}
+
+/// Callback-scoped resolution, including script-owned detached audio elements.
+pub fn resolveMediaNodeFromNativeCallback(self: *Js, window_id: u32, handle: u32) ?*Node {
+    if (self.current_window_id != window_id) return null;
+    const window = self.windows.get(window_id) orelse return null;
+    if (window.retired) return null;
+    return window.handles.resolve(handle);
 }
 
 fn measureBindingGeometry(context: ?*anyopaque, handle: u32, query: GeometryQuery, allocator: std.mem.Allocator, output: *GeometryResult) anyerror!void {
@@ -5000,6 +5033,7 @@ fn setupDocument(self: *Js, realm: *Realm) !void {
     );
     try native_bindings.installFunctions(&self.agent, realm, native, &self.geometry_host, &geometry_bindings.bindings);
     try native_bindings.installFunctions(&self.agent, realm, native, &self.character_data_host, &character_data_bindings.bindings);
+    try native_bindings.installFunctions(&self.agent, realm, native, &self.media_host, &media_bindings.bindings);
     try native_bindings.installFunctions(
         &self.agent,
         realm,

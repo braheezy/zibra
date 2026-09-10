@@ -492,3 +492,9 @@ window when invoking `run.py` directly.
 The runner records `ZIBRA_GIT_SHA` in each report. The Taskfile fills it from
 the current checkout automatically (or uses `working-tree` when no Git
 revision is available), and the dashboard displays it as the browser column.
+
+The first audio-element pass has a small audio-only allowlist in
+`manifest-audio.yaml`: constructor identity, volume, the empty constructor's
+resource state, and hidden fallback-content reftests. Run it with the same
+`--jobs 1 --browser ./zig-out/bin/zibra` options. It does not claim video,
+streaming, autoplay/testdriver, or complete media-event conformance.

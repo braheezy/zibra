@@ -178,3 +178,10 @@ requires an explicit JavaScript harness completion report, emits one JSONL
 record on stdout after normal teardown, and reports its per-test deadline as a
 semantic `TIMEOUT`. Process crashes or an outer runner watchdog remain
 infrastructure failures rather than browser-authored test results.
+
+## Audio
+
+The shared BrowserSession owns PCM voices and one lazy zoto output device. A
+separate media runner decodes bounded complete resources through zigaudio; each
+Frame owns its media-element state. See [audio ownership](audio.md) for the
+thread, transfer, policy and retirement contracts.

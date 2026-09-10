@@ -762,6 +762,9 @@ pub const Browser = struct {
     active_tab_zoom: f32 = 1.0,
     active_tab_prefers_dark: bool = false,
     active_tab_display_list: ?[]DisplayItem = null,
+    /// Borrowed render commands have retired, but replacement paint has not
+    /// committed. Keep the independently owned presented pixels in this gap.
+    awaiting_tab_commit: bool = false,
     pending_composited_updates: std.ArrayList(CompositorUpdate),
     // Retained composited layers and the draw commands that borrow them.
     display_compositor: DisplayCompositor,
@@ -787,6 +790,7 @@ pub const Browser = struct {
         const session_state = try al.create(BrowserSession);
         errdefer al.destroy(session_state);
         session_state.* = BrowserSession.init(al, io);
+        session_state.audio.output = if (headless) .disabled else .native;
         errdefer session_state.deinit();
 
         const measure = try al.create(MeasureTime);
@@ -1499,6 +1503,7 @@ pub const Browser = struct {
     /// Retire derived draw state before the committed display list it borrows.
     /// Caller must hold `self.lock`.
     fn retireActiveRenderStateLocked(self: *Browser) void {
+        self.awaiting_tab_commit = false;
         self.invalidateInterestRegion();
         self.pending_composited_updates.clearRetainingCapacity();
         self.display_compositor.clear();
@@ -1508,13 +1513,15 @@ pub const Browser = struct {
         }
     }
 
-    /// Wait for any in-progress raster/draw and release browser-side borrows of
-    /// a tab before that tab retires a document generation.
+    /// Release browser-side borrows before a tab retires document resources.
+    /// Owned raster snapshots can finish independently; replacement raster
+    /// waits for a display-list commit so retirement never presents a blank.
     pub fn retireRenderStateForTab(self: *Browser, tab: *Tab) void {
         self.lock.lock();
         defer self.lock.unlock();
         if (self.activeTab() != tab) return;
         self.retireActiveRenderStateLocked();
+        self.awaiting_tab_commit = true;
         self.needs_composite = true;
         self.needs_raster = true;
         self.needs_draw = true;
@@ -1915,8 +1922,9 @@ pub const Browser = struct {
             },
             .mouse_button_up => |button_event| {
                 if (touch_input.isSyntheticMouse(button_event.mouse_instance_id)) return false;
-                if (button_event.button == .left and self.chrome.pointerUp()) {
-                    self.setNeedsRasterDraw();
+                if (button_event.button == .left) {
+                    if (self.chrome.pointerUp()) self.setNeedsRasterDraw();
+                    if (self.activeTab()) |tab| self.scheduleTabAction(tab, .{ .media_pointer_up = button_event.x }, "task:media_pointer_up");
                 }
             },
             .mouse_motion => |motion_event| {
@@ -2176,9 +2184,7 @@ pub const Browser = struct {
                 self.lock.unlock();
                 if (tab) |active_tab| {
                     const reverse = modifiers.get(.left_shift) or modifiers.get(.right_shift);
-                    active_tab.cycleFocus(self, reverse) catch |err| {
-                        std.log.warn("Failed to cycle focus: {}", .{err});
-                    };
+                    self.scheduleTabAction(active_tab, .{ .cycle_focus = reverse }, "task:cycle_focus");
                 }
                 return;
             },
@@ -2207,10 +2213,7 @@ pub const Browser = struct {
                 self.lock.unlock();
                 if (should_activate) {
                     if (tab) |active_tab| {
-                        _ = active_tab.enter(self) catch |err| {
-                            std.log.warn("Failed to handle Enter for focused element: {}", .{err});
-                            return;
-                        };
+                        self.scheduleTabAction(active_tab, .enter, "task:enter");
                     }
                 }
                 return;
@@ -2233,9 +2236,7 @@ pub const Browser = struct {
                 self.lock.unlock();
                 if (should_activate) {
                     if (tab) |active_tab| {
-                        active_tab.activateFocusedElement(self) catch |err| {
-                            std.log.warn("Failed to activate focused element: {}", .{err});
-                        };
+                        self.scheduleTabAction(active_tab, .activate, "task:activate");
                     }
                 }
                 return;
@@ -2297,6 +2298,7 @@ pub const Browser = struct {
                     // Chrome-only update (address cursor); avoid recomposite if the display list is unchanged.
                     self.setNeedsRasterDraw();
                 }
+                if (!self.chrome.isAddressBarFocused()) if (self.activeTab()) |tab| self.scheduleTabAction(tab, .{ .media_key = .left }, "task:media_key");
                 return;
             },
             .right => {
@@ -2304,14 +2306,19 @@ pub const Browser = struct {
                     // Chrome-only update (address cursor); avoid recomposite if the display list is unchanged.
                     self.setNeedsRasterDraw();
                 }
+                if (!self.chrome.isAddressBarFocused()) if (self.activeTab()) |tab| self.scheduleTabAction(tab, .{ .media_key = .right }, "task:media_key");
                 return;
             },
             .down => {
-                if (self.activeTab()) |tab| self.scheduleTabScrollTask(tab, scroll_step);
+                if (self.activeTab()) |tab| self.scheduleTabAction(tab, .{ .media_key = .down }, "task:media_key");
                 return;
             },
             .up => {
-                if (self.activeTab()) |tab| self.scheduleTabScrollTask(tab, -scroll_step);
+                if (self.activeTab()) |tab| self.scheduleTabAction(tab, .{ .media_key = .up }, "task:media_key");
+                return;
+            },
+            .home, .end => {
+                if (!self.chrome.isAddressBarFocused()) if (self.activeTab()) |tab| self.scheduleTabAction(tab, .{ .media_key = if (key == .home) .home else .end }, "task:media_key");
                 return;
             },
             else => {},
@@ -2651,6 +2658,7 @@ pub const Browser = struct {
         }
         js_context.setRenderCallback(frame.window_id, jsRenderCallback, @ptrCast(render_context));
         js_context.setStyleFlushCallback(frame.window_id, jsStyleFlushCallback, @ptrCast(render_context));
+        js_context.setMediaCallback(frame.window_id, @import("media.zig").Integration(Browser).command, @ptrCast(render_context));
         js_context.setGeometryCallback(frame.window_id, @import("script_geometry.zig").Callbacks(Browser).measure, @ptrCast(render_context));
         js_context.setDocumentReadyStateCallback(
             frame.window_id,
@@ -3086,6 +3094,8 @@ pub const Browser = struct {
     }
 
     fn resetFrameForNavigation(self: *Browser, frame: *Frame) void {
+        frame.retireAudio();
+        frame.media_user_activated = false;
         if (frame.tab.focused_frame) |focused| {
             var focus_owner: ?*Frame = focused;
             while (focus_owner) |candidate| : (focus_owner = candidate.parent) {
@@ -5764,7 +5774,7 @@ pub const Browser = struct {
 
     fn scheduleRasterTask(self: *Browser) !void {
         self.lock.lock();
-        if (self.shutting_down or self.presentation_worker.task_active or
+        if (self.shutting_down or self.awaiting_tab_commit or self.presentation_worker.task_active or
             (!self.needs_composite and !self.needs_raster and !self.needs_draw))
         {
             self.lock.unlock();

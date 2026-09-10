@@ -348,6 +348,9 @@ pub const Element = struct {
     // values may relocate when DOM child arrays grow, but this pointee does
     // not move until the element is destroyed.
     canvas: ?*Canvas = null,
+    // Scalar control presentation; the Frame owns all audio resources.
+    audio_state: @import("../media/controls.zig").State = .{},
+    audio_part: @import("../media/controls.zig").Part = .play,
     opacity_anim_value: [32]u8 = undefined,
 
     pub fn init(allocator: std.mem.Allocator, tag: []const u8, parent: ?*Node) !Element {
@@ -736,6 +739,12 @@ pub const Element = struct {
     /// and form submission all observe the same source of truth.
     pub fn isCheckbox(self: *const Element) bool {
         return self.isInputType("checkbox");
+    }
+
+    /// Audio fallback children are never rendered; only controls create a box.
+    pub fn isHiddenAudio(self: *const Element) bool {
+        if (!std.ascii.eqlIgnoreCase(self.tag, "audio")) return false;
+        return if (self.attributes) |attrs| attrs.get("controls") == null else true;
     }
 
     pub fn isHiddenInput(self: *const Element) bool {

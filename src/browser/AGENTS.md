@@ -13,6 +13,8 @@ Read the architecture pages for the boundary being changed:
   for document generations, history, loading, and session state;
 - [document and rendering](../../docs/architecture/document-and-rendering.md)
   for phase guards, layout/display lifetimes, and DOM mutation;
+- [audio](../../docs/architecture/audio.md) for media element loading, voice
+  ownership, device output and cancellation;
 - [JavaScript and accessibility](../../docs/architecture/javascript-and-accessibility.md)
   for host callbacks, focus, timers, and speech.
 
@@ -25,6 +27,7 @@ The nested [`render/AGENTS.md`](render/AGENTS.md) adds rendering-specific rules.
 | `app.zig` | Sole interactive SDL poller, shared session/measurement, heap-stable Browser registry |
 | `root.zig` | One native window, tab/chrome coordination, committed-frame acceptance, raster scheduling, native presentation |
 | `wpt_session.zig` | One-test headless Browser owner, monotonic deadline, two-stage report mailbox, and owner-thread teardown |
+| `media.zig` | Document media controller, source revisions, bounded loading and shared PCM voice integration |
 | `resource_loader.zig` | Per-window navigation/resource bridge over the shared session runner and joined source-order batches |
 | `document_loader.zig` | Stack-owned live-parser driver with synchronous root/script hooks; it owns no Frame or JS Realm |
 | `display_compositor.zig` | Browser-allocator owner of retained composited layers and their borrowing draw list |

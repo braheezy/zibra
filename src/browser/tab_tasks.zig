@@ -200,6 +200,11 @@ pub fn Contexts(comptime Browser: type) type {
                 },
                 hover: ?HoverPosition,
                 keypress: u8,
+                media_key: @import("../media/controls.zig").Key,
+                media_pointer_up: i32,
+                cycle_focus: bool,
+                activate,
+                enter,
                 backspace,
                 scroll: i32,
                 immediate_scroll: i32,
@@ -249,8 +254,23 @@ pub fn Contexts(comptime Browser: type) type {
                         click.button,
                         click.zoom,
                     ),
-                    .hover => |position| self.tab.hover(position),
+                    .hover => |position| {
+                        if (!try @import("media.zig").Integration(Browser).pointer(self.browser, self.tab, if (position) |p| p.device_x else null, false)) self.tab.hover(position);
+                    },
                     .keypress => |char| try self.tab.keypress(self.browser, char),
+                    .media_key => |key| {
+                        if (!try @import("media.zig").Integration(Browser).key(self.browser, self.tab, key)) {
+                            if (key == .up or key == .down) self.tab.scrollFocused(self.browser, if (key == .up) -100 else 100);
+                        }
+                    },
+                    .media_pointer_up => |x| {
+                        _ = try @import("media.zig").Integration(Browser).pointer(self.browser, self.tab, x, true);
+                    },
+                    .cycle_focus => |reverse| try self.tab.cycleFocus(self.browser, reverse),
+                    .activate => try self.tab.activateFocusedElement(self.browser),
+                    .enter => {
+                        _ = try self.tab.enter(self.browser);
+                    },
                     .backspace => try self.tab.backspace(self.browser),
                     .scroll => |delta| self.tab.scrollFocused(self.browser, delta),
                     .immediate_scroll => |delta| self.tab.scrollImmediate(self.browser, delta),

@@ -5,7 +5,7 @@ const std = @import("std");
 const Url = @import("../network/url.zig").Url;
 const whitespace = " \t\n\r\x0c";
 
-pub const Destination = enum { script, stylesheet, image, connect, frame, font };
+pub const Destination = enum { script, stylesheet, image, connect, frame, font, media };
 
 const Directive = enum {
     @"default-src",
@@ -18,6 +18,7 @@ const Directive = enum {
     @"frame-src",
     @"child-src",
     @"font-src",
+    @"media-src",
 };
 
 const Parsed = struct {
@@ -50,6 +51,7 @@ const Parsed = struct {
             .image => &.{ .@"img-src", .@"default-src" },
             .connect => &.{ .@"connect-src", .@"default-src" },
             .font => &.{ .@"font-src", .@"default-src" },
+            .media => &.{ .@"media-src", .@"default-src" },
         };
         for (fallback) |directive| if (self.sources.get(directive)) |value| return value;
         return null;
@@ -83,7 +85,7 @@ pub const Policy = struct {
     }
 
     /// Synchronous URL borrow. Every policy must allow the request. Redirected
-    /// iframe destinations skip path matching, but still check scheme/host/port.
+    /// frame and media destinations skip path matching, but still check scheme/host/port.
     pub fn allows(self: *const Policy, target: *const Url, destination: Destination, redirected: bool) bool {
         for (self.policies.items) |*policy| {
             const sources = policy.list(destination) orelse continue;

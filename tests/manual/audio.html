@@ -1,0 +1,65 @@
+<!doctype html>
+<!-- How to verify: Open in native macOS Zibra. Two audio control strips should
+     appear; the hidden element's fallback text must not appear. Click a native
+     control (or focus it with Tab and press Space/Enter): hear a quiet 2-second
+     tone and see a pause icon, then a play icon at the end. Use the buttons to
+     loop the first player: its time/status updates must not flash the page.
+     Both players should sound smooth. Also test seek, mute and play both voices.
+     Navigate away or close while playing:
+     sound must stop. Reload should not play until an action. -->
+<html>
+<head><title>Audio fundamentals</title>
+<style>
+body { font-family: sans-serif; margin: 24px; max-width: 780px; }
+h1 { font-size: 28px; }
+p { margin: 12px 0; }
+button { margin: 4px; padding: 6px; }
+#status { background: #eef4ff; padding: 12px; }
+#events { font-family: monospace; font-size: 14px; }
+</style>
+</head>
+<body>
+<h1>Audio fundamentals</h1>
+<p>A quiet, two-second tone. Playback starts with your action.</p>
+<p><audio id="first" controls preload="metadata" src="audio-tone.wav">FAIL: audio fallback rendered.</audio></p>
+<p><audio id="second" controls preload="none"><source src="audio-tone.wav" type="audio/wav"></audio></p>
+<audio preload="none" src="audio-tone.wav">FAIL: hidden audio occupies layout.</audio>
+<p>
+<button id="play">Play both</button><button id="pause">Pause both</button>
+<button id="seek">Seek to 1 second</button><button id="mute">Toggle mute</button>
+<button id="loop">Toggle loop</button><button id="reload">Reload first</button>
+</p>
+<p id="status">Loading metadata…</p>
+<p id="events">Events:</p>
+<p><a href="about:blank">Navigate away while playing</a></p>
+<script>
+var first = document.getElementById('first');
+var second = document.getElementById('second');
+var log = [];
+function status() {
+  document.getElementById('status').textContent =
+    'First: ' + (first.paused ? 'paused' : 'playing') +
+    ' | ' + first.currentTime.toFixed(2) + ' / ' + first.duration.toFixed(2) + ' seconds' +
+    ' | muted: ' + first.muted + ' | loop: ' + first.loop;
+}
+['loadedmetadata','playing','pause','seeking','seeked','ended','volumechange','error'].forEach(function(type) {
+  first.addEventListener(type, function() {
+    log.push(type); if (log.length > 12) log.shift();
+    document.getElementById('events').textContent = 'Events: ' + log.join(', ');
+    status();
+  });
+});
+first.addEventListener('timeupdate', status);
+function play(media) {
+  media.play().catch(function(error) {
+    document.getElementById('status').textContent = 'Playback rejected: ' + error.name;
+  });
+}
+document.getElementById('play').onclick = function() { play(first); play(second); };
+document.getElementById('pause').onclick = function() { first.pause(); second.pause(); };
+document.getElementById('seek').onclick = function() { first.currentTime = 1; };
+document.getElementById('mute').onclick = function() { first.muted = !first.muted; };
+document.getElementById('loop').onclick = function() { first.loop = !first.loop; status(); };
+document.getElementById('reload').onclick = function() { first.load(); };
+</script>
+</body></html>

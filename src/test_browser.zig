@@ -3,6 +3,12 @@
 comptime {
     _ = @import("tests/svg_inline.zig");
     _ = @import("browser/render/svg.zig");
+    _ = @import("tests/browser_audio.zig");
+    _ = @import("tests/browser_audio_controls.zig");
+    _ = @import("media/audio.zig");
+    _ = @import("media/element.zig");
+    _ = @import("media/decode.zig");
+    _ = @import("media/policy.zig");
     _ = @import("kiesel").builtins.reg_exp;
     _ = @import("browser/root.zig");
     _ = @import("browser/document_lifecycle.zig");

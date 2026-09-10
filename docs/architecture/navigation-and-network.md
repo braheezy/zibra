@@ -393,18 +393,20 @@ their first occurrence, including empty deny-all lists.
 Every request gate names a destination: parser/queued scripts use
 `script-src-elem` → `script-src` → `default-src`; linked stylesheets use
 `style-src-elem` → `style-src` → `default-src`; HTML/background images use
-`img-src`, XHR uses `connect-src`, and frames use `frame-src` → `child-src` →
+`img-src`, XHR uses `connect-src`, media uses `media-src` → `default-src`,
+and frames use `frame-src` → `child-src` →
 `default-src`. A present directive replaces its fallback, not unions with it.
 Same-origin and hostless URLs are not automatic exceptions. Source matching
 handles quoted `self`, deny-only lists, schemes, schemeless hosts, wildcard
 subdomains/ports, and case-sensitive percent-decoded path segments. Redirected
-frame checks retain scheme/host/port checks but omit the source path restriction.
+frame and media checks retain scheme/host/port checks but omit the source path restriction.
 
 This remains a URL-request subset: meta-delivered policies, inline/attribute
 style and script checks, nonce/hash trust, violation events/reporting,
 `base-uri`, and `frame-ancestors` are not implemented. Script requests with
 `strict-dynamic` fail closed until trust metadata exists. Ordinary subresource
-redirect hops do not yet have CSP callbacks; do not claim full CSP enforcement.
+redirect hops do not yet have CSP callbacks, except bounded media loads whose
+jobs own policy snapshots; do not claim full CSP enforcement.
 `test-csp` covers real loopback HTTP loading, blocked-request non-observation,
 and repeated-header intersection; the browser unit suite covers pure matching
 and owner replacement/failure cleanup.
@@ -456,3 +458,11 @@ optimistic text and warning pages must not inherit stale security UI.
 Tests for ownership changes should prefer data/file URLs and reclaiming
 allocators. Use a local deterministic server for redirects, cookies,
 compression, caching, CORS, CSP, X-Frame-Options, or concurrency.
+
+## Bounded complete media resources
+
+[Audio loading](audio.md) uses a separate session loader queue and the shared
+networking bridge. Its limited fetch API bounds file/data and decompressed HTTP
+bodies and applies copied source policy before each redirect. These requests
+bypass the ordinary response cache. Existing navigation and ordinary-resource
+fetch APIs retain their ownership and cache behavior.

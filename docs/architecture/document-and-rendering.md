@@ -772,6 +772,14 @@ before rebuilding/destroying layout or DOM. `Tab.composeDisplayList`
 materializes cache edges, recursively owns containers, and clears provenance.
 `Browser.commit` installs the Browser generation under its lock.
 
+Retiring active Browser commands marks the tab as awaiting a replacement
+display-list commit. The UI keeps the last completed, independently owned
+pixels while the Tab rebuilds; it must not raster the temporary missing list
+as an empty page. A scalar-only commit does not finish this wait. An owned
+replacement list (including an empty list), tab activation, or closing the
+active tab clears it. Borrowed commands still retire synchronously before DOM,
+layout, or resource storage can change.
+
 `RasterSnapshot` is the actual worker-transfer boundary. It must deep-copy
 every resource-backed leaf, clear DOM/layout provenance, and reject
 browser-owned layer pointers. Numeric compositor IDs may cross; raw pointers
@@ -954,3 +962,22 @@ Browser render state
 The reverse direction constructs borrowers from stable owners. Any new API
 that replaces an intermediate owner must retire every downstream borrower
 first.
+
+## Audio controls
+
+Audio with `controls` is an atomic InputLayout leaf with a 300 by 40 CSS-pixel
+natural content box. `render/audio_controls.zig` derives the play, seek, mute,
+volume and time rectangles from its used content box and paints from a copied
+Element UI snapshot. Audio without controls and fallback descendants do not
+participate in layout or intrinsic width.
+
+Full part-background rectangles carry `DisplayItemSource.audio_part` for hit
+testing. Decorative commands carry no provenance, so glyphs and slider thumbs
+cannot fragment the authoritative slider rectangle. These identities retire
+and are cleared from raster snapshots with ordinary DOM provenance. CSS/browser
+zoom, clipping and transforms use the ordinary command and hit-test paths.
+
+Progress/volume/play state changes mark retained paint, not layout. Paint reads
+the live copied UI snapshot instead of caching playback text during measure.
+The Element owns no decoder, voice or asynchronous callback; scalar drag
+capture belongs to the Tab. See [audio](audio.md).

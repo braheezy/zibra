@@ -1,0 +1,8 @@
+# Initial audio-only surface; no video, testdriver activation, or live streaming.
+tests:
+  - html/semantics/embedded-content/the-audio-element/audio_constructor.html
+  - html/semantics/embedded-content/media-elements/audio_volume_check.html
+  - html/semantics/embedded-content/media-elements/loading-the-media-resource/resource-selection-invoke-audio-constructor-no-src.html
+reftests:
+  - html/semantics/embedded-content/the-audio-element/audio_001.htm
+  - html/semantics/embedded-content/the-audio-element/audio_002.htm

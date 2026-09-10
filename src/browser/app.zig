@@ -263,6 +263,7 @@ pub const BrowserApp = struct {
         const session = try allocator.create(BrowserSession);
         errdefer allocator.destroy(session);
         session.* = BrowserSession.init(allocator, io);
+        session.audio.output = .native;
         errdefer session.deinit();
 
         const measure = try allocator.create(MeasureTime);

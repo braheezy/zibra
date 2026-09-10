@@ -35,7 +35,7 @@ test "CSP GitHub-shaped policy uses explicit destination sources over default no
 
 test "CSP none empty and missing source lists are distinct even for same origin" {
     const origin = "https://page.example/index";
-    for ([_]csp.Destination{ .script, .stylesheet, .image, .connect, .frame, .font }) |destination| {
+    for ([_]csp.Destination{ .script, .stylesheet, .image, .connect, .frame, .font, .media }) |destination| {
         try expectAllowed("default-src 'none'", origin, origin, destination, false);
         try expectAllowed("default-src", origin, origin, destination, false);
         try expectAllowed("", origin, origin, destination, true);
@@ -168,4 +168,13 @@ test "CSP Frame replacement owns source and origin and resets on navigation" {
     try std.testing.expect(!frame.allowedRequest(&target, .stylesheet));
     frame.clearContentSecurityPolicy();
     try std.testing.expect(frame.allowedRequest(&target, .stylesheet));
+}
+
+test "audio CSP uses media destination fallback and intersected response policies" {
+    const origin = "https://page.example/";
+    try expectAllowed("default-src 'none'; media-src 'self'", origin, origin, .media, true);
+    try expectAllowed("default-src 'self'; media-src 'none'", origin, origin, .media, false);
+    try expectAllowed("media-src; media-src *", origin, origin, .media, false);
+    try expectAllowed("media-src *, media-src 'none'", origin, origin, .media, false);
+    try expectAllowed("media-src data:", origin, "data:audio/wav,1234", .media, true);
 }

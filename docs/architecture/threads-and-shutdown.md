@@ -37,6 +37,11 @@ there. Queued work that can cross a document replacement carries a copied
 `DocumentHandle` `(window_id, document_generation)`, not a `*Frame`, `*Node`,
 or callback-context pointer.
 
+Native media pointer motion/release, media keys, sequential focus and button
+activation are queued Tab actions. Slider capture stores scalar identities and
+initial pointer geometry, never a borrowed Node or display command. Each motion
+validates document and source identity before invoking the media controller.
+
 Viewport requests belong to the Tab lifetime, not a document generation.
 The worker reconciles them before constructing a replacement root Frame,
 before the animation-frame dirty gate, and before a direct render. A request
@@ -75,6 +80,14 @@ Completed results publish into the presentation owner under `Browser.lock`.
 They carry only numeric tab identity; a dirty newer generation, identity/window
 mismatch, or shutdown discards them. Accepted surface ownership moves to the UI
 thread together with its allocator. Browser alone uploads it and presents.
+
+### Audio workers
+
+The session also owns a serialized media loader and one lazy native output
+context. Their payload ownership, mixer lock, Tab accounting and teardown order
+are defined in [the audio contract](audio.md). The media loader waits for the
+networking runner; join it before networking. After joining the Tab producer,
+remove its audio voices before waiting for outstanding transport helpers.
 
 ### Networking worker
 

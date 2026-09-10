@@ -1,0 +1,53 @@
+<!doctype html>
+<!-- How to verify: Open in native Zibra. The first player is an 8-second,
+     44.1 kHz stereo tone (440 Hz left, 660 Hz right). Play/pause, click and drag
+     the seek and volume bars, and toggle the speaker button. Tab/Shift-Tab
+     visits play, seek, mute and volume; Space/Enter activates a button, arrows
+     seek 5 seconds or change volume 5%, Home/End sets a slider's limits, and M
+     toggles mute. Drag outside a slider, then release: later motion must not
+     change it. Native interactions must never increment the page click count.
+     Try browser zoom and the narrow, CSS-zoomed second player. Controls must
+     remain aligned, time must advance smoothly, and no content may flash. -->
+<html>
+<head><meta charset="utf-8"><title>Native audio controls</title>
+<style>
+body { font-family: sans-serif; margin: 24px; max-width: 780px; }
+h1 { font-size: 26px; }
+p { margin: 16px 0; }
+#narrow { width: 220px; }
+#scaled { zoom: 1.25; transform: translate(12px, 0); }
+#events { padding: 12px; background: #eef4ff; }
+</style></head>
+<body>
+<h1>Native audio controls</h1>
+<p>A quiet eight-second stereo tone. Playback starts with your action.</p>
+<button>Focus before the player</button>
+<p><audio id="player" aria-label="Stereo tone" controls preload="metadata" src="audio-controls.wav"></audio></p>
+<button>Focus after the player</button>
+<p>Use the top bar to seek and the lower bar to adjust volume. The speaker button mutes.</p>
+<p>Tab visits each control. Left/Right seeks; Up/Down changes volume. On the volume bar, all arrows adjust volume. Home/End moves the focused slider to its limits.</p>
+<p id="scaled"><audio id="narrow" aria-label="Zoomed tone" controls preload="none" src="audio-tone.wav"></audio></p>
+<p id="events">Waiting for metadata.</p>
+<p id="clicks">Native control clicks reaching the page: 0 (expected)</p>
+<p><a href="about:blank">Navigate away during playback</a></p>
+<script>
+var player = document.getElementById('player');
+var events = [];
+['durationchange','loadedmetadata','play','playing','pause','seeking','seeked','volumechange','ended','error'].forEach(function(type) {
+  player.addEventListener(type, function() {
+    var message = type;
+    if (type === 'seeking' && !player.seeking) message = 'FAIL: seeking flag is false';
+    if (type === 'seeked' && player.seeking) message = 'FAIL: seeking flag is true';
+    events.push(message);
+    if (events.length > 8) events.shift();
+    document.getElementById('events').textContent = events.join(', ');
+  });
+});
+var leakedClicks = 0;
+document.body.addEventListener('click', function(event) {
+  if (event.target.tagName !== 'AUDIO') return;
+  leakedClicks++;
+  document.getElementById('clicks').textContent = 'FAIL: ' + leakedClicks + ' native control clicks reached the page';
+});
+</script>
+</body></html>
