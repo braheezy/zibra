@@ -94,9 +94,9 @@ behavior. Navigation-owned stylesheet/resource generations are documented in
   used-value validation belongs in the focused helper/layout owner.
 - Conditional parsing receives an explicit media environment. Root and iframe
   callers must rebuild source-backed rule/keyframe generations when width,
-  height, zoom, or forced-colors environment changes. Experimental inspection
-  reselects retained Terence rules; see the
-  [inspection publication contract](../../docs/architecture/document-and-rendering.md#experimental-css-syntax-owner)
+  height, zoom, or forced-colors environment changes. Inspection reparses its
+  retained sources before publication; see the
+  [inspection publication contract](../../docs/architecture/document-and-rendering.md#inspection-stylesheet-ownership)
   before changing its separate publication/restyle phases.
 - Descendant selectors receive ancestors in document-root-to-parent order.
   `:has` caches are ephemeral synchronous borrows and selector-relevant
@@ -161,16 +161,12 @@ The document pipeline is split by ownership and algorithm boundaries:
 - `css_syntax.zig` is a pure source-buffer scanner for CSS comments, escapes,
   strings, and structural delimiters; `css_properties.zig` is the shared
   static registry of computed longhand names and defaults.
-- `css_declarations.zig` owns shared property validation, shorthand expansion
-  and declaration precedence. Both syntax frontends use it; do not add a
-  separate property grammar to an adapter.
-- `css_frontend.zig` and `css_frontend_limits.zig` are the isolated Terence
-  source owner and resource gates. `css_stylesheet.zig` retains translated
-  semantic rules and conditions; `css_normalize.zig` bridges supported token
-  spellings; `css_inline_styles.zig` owns inspection's inline declaration cache.
-  They feed opt-in inspection, while interactive Browser/WPT remain legacy.
-  See the [acceptance decision](../../docs/css-frontend-acceptance.md) before
-  adding consumers; raw ranges are not CSSOM identities or normalized values.
+- `css_declarations.zig` owns property validation, shorthand expansion and
+  declaration precedence. Keep one property grammar shared by stylesheet and
+  inline-style parsing.
+- `css_stylesheet.zig` owns inspection's source and provenance snapshots.
+  Selections use the native parser and borrow those snapshots. Retire selected
+  rules/keyframes before replacing their source; this is not live CSSOM identity.
 - `media_query.zig` owns allocation-free media condition/range evaluation over
   borrowed preludes and an explicit environment. Keep it independent of DOM,
   native windows, and stylesheet storage; callers own environment invalidation.
@@ -206,7 +202,7 @@ the returned page reaches its final address before any ancestry-dependent
 style/layout/paint operation.
 `loadWithMedia` takes an explicit viewport environment for inspection; its
 conditional rules and the caller's layout dimensions must describe the same
-viewport. `loadWithOptions` selects the experimental frontend explicitly.
+viewport. Every inspection entry point uses the same native CSS parser.
 Inspection entry points construct neither Browser nor native state. Retire
 layout/display consumers before `reselectMedia` or `replaceStylesheet`; after
 successful publication, finish the separate `restyle` before rebuilding them.

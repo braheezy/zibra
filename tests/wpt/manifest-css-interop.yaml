@@ -1,8 +1,5 @@
-# Bounded source-to-style baselines for the experimental Terence integration.
-# The WPT harness, screenshot and crash adapters still use the production
-# frontend: their results are NOT Terence compatibility results. Inspection
-# parity/recovery goldens and owner tests exercise Terence independently.
-# Leave upstream PASS expectations unchanged, including EOF recovery failures.
+# Native source-to-style baseline across testharness, reftest and crashtest.
+# Keep upstream PASS expectations unchanged, including EOF recovery failures.
 tests:
   # Computed custom values and !important trimming; no stylesheet CSSOM needed.
   - css/css-syntax/declarations-trim-whitespace.html
@@ -10,7 +7,7 @@ reftests:
   # Complete ordinary declarations and escaped names establish parity.
   - css/css-syntax/missing-semicolon.html
   - css/CSS2/syntax/escaped-ident-char-001.xht
-  # Ordinary and nested @media EOF recovery motivate the frontend migration.
+  # Ordinary and nested @media EOF recovery track known native-parser gaps.
   - css/CSS2/syntax/eof-001.xht
   - css/CSS2/syntax/eof-004.xht
 crashtests:

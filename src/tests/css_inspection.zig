@@ -1,4 +1,4 @@
-//! Browser-free Terence integration, responsive selection and stylesheet
+//! Browser-free native CSS integration, responsive selection and stylesheet
 //! publication regressions against a styled DOM with reclaiming allocators.
 
 const std = @import("std");
@@ -37,30 +37,21 @@ fn previousValue(node: *dom.Node, property: []const u8) []const u8 {
 const narrow: CSSParser.MediaEnvironment = .{ .viewport_width_css = 400, .viewport_height_css = 600 };
 const wide: CSSParser.MediaEnvironment = .{ .viewport_width_css = 800, .viewport_height_css = 600 };
 
-test "Terence inspection uses its frontend for stylesheet and inline declaration values" {
+test "Native CSS inspection shares stylesheet and inline declaration precedence" {
     const html =
-        "<style>#target { color:r\\65 d; width:23px; width:unsupported; margin:2px; }</style>" ++
-        "<div id=target style='color:g\\72 een; color:unsupported; " ++
-        "background-color:b\\6c ue; margin:3px !/**/important; margin-left:9px'></div>";
-    var terence = try Page.fromHtml(allocator, html, .{ .css_backend = .terence, .media = narrow });
-    defer terence.deinit();
-    terence.repairParentPointers();
-    const target = findById(&terence.root, "target").?;
-    try std.testing.expectEqual(@as(usize, 2), terence.sheetCount());
+        "<style>#target { color:red; width:23px; width:unsupported; margin:2px; }</style>" ++
+        "<div id=target style='color:green; color:unsupported; " ++
+        "background-color:blue; margin:3px !important; margin-left:9px'></div>";
+    var page = try Page.fromHtml(allocator, html, .{ .media = narrow });
+    defer page.deinit();
+    page.repairParentPointers();
+    const target = findById(&page.root, "target").?;
+    try std.testing.expectEqual(@as(usize, 2), page.sheetCount());
     try std.testing.expectEqualStrings("green", value(target, "color"));
     try std.testing.expectEqualStrings("blue", value(target, "background-color"));
     try std.testing.expectEqualStrings("23px", value(target, "width"));
     try std.testing.expectEqualStrings("3px", value(target, "margin-left"));
-    try std.testing.expect(!dom.styleTreeNeedsUpdate(&terence.root));
-
-    var legacy = try Page.fromHtml(allocator, html, .{ .css_backend = .legacy, .media = narrow });
-    defer legacy.deinit();
-    legacy.repairParentPointers();
-    const legacy_target = findById(&legacy.root, "target").?;
-    // Legacy color-value parsing does not decode escaped identifier tokens.
-    try std.testing.expectEqualStrings("black", value(legacy_target, "color"));
-    try std.testing.expectEqualStrings("transparent", value(legacy_target, "background-color"));
-    try std.testing.expectEqualStrings("9px", value(legacy_target, "margin-left"));
+    try std.testing.expect(!dom.styleTreeNeedsUpdate(&page.root));
 }
 
 const responsive_html =
@@ -70,8 +61,8 @@ const responsive_html =
     "@keyframes pulse { from { opacity:0.4 } to { opacity:1 } } }</style>" ++
     "<main id=target><span id=child>inherited</span></main>";
 
-test "Terence inspection reselects media from stable retained syntax and restyles descendants" {
-    var page = try Page.fromHtml(allocator, responsive_html, .{ .css_backend = .terence, .media = narrow });
+test "Native CSS inspection reselects media from retained source and restyles descendants" {
+    var page = try Page.fromHtml(allocator, responsive_html, .{ .media = narrow });
     defer page.deinit();
     page.repairParentPointers();
     const target = findById(&page.root, "target").?;
@@ -102,8 +93,8 @@ test "Terence inspection reselects media from stable retained syntax and restyle
     try std.testing.expectEqual(@as(usize, 1), page.keyframes.items.len);
 }
 
-test "Terence stylesheet replacement retires source while historical computed strings remain valid" {
-    var page = try Page.fromHtml(allocator, responsive_html, .{ .css_backend = .terence, .media = narrow });
+test "Native CSS stylesheet replacement retires source while historical computed strings remain valid" {
+    var page = try Page.fromHtml(allocator, responsive_html, .{ .media = narrow });
     defer page.deinit();
     page.repairParentPointers();
     const target = findById(&page.root, "target").?;
@@ -116,7 +107,7 @@ test "Terence stylesheet replacement retires source while historical computed st
     try std.testing.expect(@intFromPtr(old_width.ptr) < old_start or @intFromPtr(old_width.ptr) >= old_end);
     try std.testing.expect(@intFromPtr(old_color.ptr) < old_start or @intFromPtr(old_color.ptr) >= old_end);
 
-    const replacement = try allocator.dupe(u8, "#target { width:73px; color:purple; padding:7px !/**/important; }");
+    const replacement = try allocator.dupe(u8, "#target { width:73px; color:purple; padding:7px !important; }");
     page.replaceStylesheet(1, replacement) catch |err| {
         allocator.free(replacement);
         return err;
@@ -130,7 +121,7 @@ test "Terence stylesheet replacement retires source while historical computed st
     try std.testing.expectEqualStrings("green", old_color);
     try std.testing.expectEqualStrings("41px", previousValue(target, "width"));
     try std.testing.expectEqualStrings("green", previousValue(child, "color"));
-    try std.testing.expectEqualStrings("#target { width:73px; color:purple; padding:7px !/**/important; }", page.sheetSource(1));
+    try std.testing.expectEqualStrings("#target { width:73px; color:purple; padding:7px !important; }", page.sheetSource(1));
     try page.restyle();
     try std.testing.expectEqualStrings("73px", value(target, "width"));
     try std.testing.expectEqualStrings("purple", value(child, "color"));
@@ -146,7 +137,7 @@ fn publicationAllocationFailures(operation: Publication) !void {
     // Keep the allocator context at one address throughout Page construction,
     // retries and destruction; every nested stylesheet/map allocator borrows it.
     var failing = std.testing.FailingAllocator.init(allocator, .{});
-    var page = try Page.fromHtml(failing.allocator(), responsive_html, .{ .css_backend = .terence, .media = narrow });
+    var page = try Page.fromHtml(failing.allocator(), responsive_html, .{ .media = narrow });
     defer page.deinit();
     page.repairParentPointers();
     const target = findById(&page.root, "target").?;
@@ -195,17 +186,17 @@ fn publicationAllocationFailures(operation: Publication) !void {
     return error.PublicationAllocationTrialsExceeded;
 }
 
-test "Terence inspection stylesheet publication preserves the styled generation at every allocation failure" {
+test "Native CSS inspection stylesheet publication preserves the styled generation at every allocation failure" {
     try publicationAllocationFailures(.replace);
 }
 
-test "Terence inspection media publication preserves the styled generation at every allocation failure" {
+test "Native CSS inspection media publication preserves the styled generation at every allocation failure" {
     try publicationAllocationFailures(.reselect);
 }
 
-test "Terence inspection can retry styling after a published replacement runs out of memory" {
+test "Native CSS inspection can retry styling after a published replacement runs out of memory" {
     var failing = std.testing.FailingAllocator.init(allocator, .{});
-    var page = try Page.fromHtml(failing.allocator(), responsive_html, .{ .css_backend = .terence, .media = narrow });
+    var page = try Page.fromHtml(failing.allocator(), responsive_html, .{ .media = narrow });
     defer page.deinit();
     page.repairParentPointers();
     const target = findById(&page.root, "target").?;
@@ -285,7 +276,7 @@ fn expectRetriedDependencies(page: *Page) !void {
     }
 }
 
-test "Terence inspection retries every restyle allocation failure with inherited values and new generated boxes" {
+test "Native CSS inspection retries every restyle allocation failure with inherited values and new generated boxes" {
     // Each trial rebuilds a fresh DOM, UA sheet and dependency graph. Keep
     // reclaiming/leak checks, but omit allocation stack capture across those
     // repeated owners so exhaustive failure coverage stays practical in Debug.
@@ -296,7 +287,7 @@ test "Terence inspection retries every restyle allocation failure with inherited
         // A fresh page prevents earlier retries from reserving capacity and
         // hiding later failure sites. All owners borrow this stable allocator.
         var failing = std.testing.FailingAllocator.init(backing.allocator(), .{});
-        var page = try Page.fromHtml(failing.allocator(), retry_html, .{ .css_backend = .terence, .media = narrow });
+        var page = try Page.fromHtml(failing.allocator(), retry_html, .{ .media = narrow });
         defer page.deinit();
         page.repairParentPointers();
         const child = findById(&page.root, "child").?;

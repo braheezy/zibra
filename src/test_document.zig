@@ -2,9 +2,8 @@
 
 comptime {
     _ = @import("document/css_stylesheet.zig");
-    _ = @import("tests/css_frontend.zig");
     _ = @import("tests/css_inspection.zig");
-    _ = @import("tests/css_stylesheet_admission.zig");
+    _ = @import("tests/css_stylesheet.zig");
     _ = @import("document/media_query.zig");
     _ = @import("tests/css_computed_values.zig");
     _ = @import("document/canvas.zig");

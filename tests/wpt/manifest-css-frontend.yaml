@@ -1,6 +1,5 @@
-# Phase-0 baseline: these run the CURRENT browser engine, not the experimental
-# Terence adapter. CSSOM requirements and results are recorded in
-# docs/css-frontend-acceptance.md. Keep upstream PASS expectations unchanged.
+# Native CSS syntax baseline; some assertions require additional CSSOM APIs.
+# Keep upstream PASS expectations unchanged. See CSS_PLAN.md.
 tests:
   - css/css-syntax/escaped-eof.html
   - css/css-syntax/unclosed-url-at-eof.html

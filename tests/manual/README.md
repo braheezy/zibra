@@ -201,3 +201,5 @@ logging, or X-Frame-Options must be served over the deterministic local server
 described by their `How to verify` comment. `threaded-loading.html` uses
 `threaded-loading-server.py` so equal-latency resources visibly overlap while
 consumption remains in source order.
+
+- [CSS recovery](css-recovery.html): known native-parser gaps after nested unknown at-rules and at stylesheet EOF; correct output is two 120px green bars.

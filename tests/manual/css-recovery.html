@@ -1,0 +1,13 @@
+<!--
+How to verify:
+  Open this page in Zibra and compare with a browser implementing CSS Syntax.
+  Correct recovery produces two 120px green bars. Zibra currently produces
+  two 24px bars, with the second red: this fixture tracks known native-parser
+  gaps for declarations after nested unknown at-rules and a rule closed by EOF.
+-->
+<!doctype html>
+<link rel="stylesheet" href="css-recovery.css">
+<main>
+  <div id="at-rule" class="box"></div>
+  <div id="eof" class="box"></div>
+</main>

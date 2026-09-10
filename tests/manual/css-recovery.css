@@ -1,5 +1,3 @@
-/* The Terence path paints two 120px green bars. The existing parser loses
-   width after the nested at-rule and drops the unterminated final rule. */
 html,
 body {
   margin: 0;

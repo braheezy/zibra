@@ -43,9 +43,6 @@ zig build run -- --dump-dom https://example.com
 zig build run -- --dump-style https://example.com
 zig build run -- --dump-layout https://example.com
 zig build run -- --dump-display-list https://example.com
-# Exercise experimental Terence CSS through the real style/layout pipeline
-zig build run -- --dump-layout --css-parser=terence --viewport=800x600 \
-  file://"$PWD/tests/pipeline/css-terence-parity.html"
 # Run tests
 zig build test
 # Run a focused subsystem while iterating
@@ -69,11 +66,9 @@ zig build run -- --screenshot /tmp/acid3-slice.png --screenshot-after-ms 3000 \
 
 See [Architecture and lifetimes](docs/architecture-and-lifetimes.md) for the source map, ownership contracts, threading model, and known lifetime risks.
 
-`--css-parser=legacy|terence` is available only with style, layout and
-display-list dumps; legacy remains the default. Interactive browsing,
-screenshots and WPT sessions use the existing frontend. See the
-[CSS acceptance report](docs/css-frontend-acceptance.md) for migration scope
-and remaining limits.
+CSS parsing is owned by Zibra. Inspection, interactive browsing, screenshots
+and WPT use the same native parser. See the [CSS plan](CSS_PLAN.md) for the
+remaining syntax, stylesheet API and rendering work.
 
 ## [Acid Tests](https://www.acidtests.org/)
 

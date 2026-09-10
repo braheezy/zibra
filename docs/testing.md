@@ -105,7 +105,7 @@ Run from the repository root:
 - `zig build test-pipeline` for exact text-free style/layout/display-list
   goldens covering the box model, nested CSS zoom, bounded tables, float paint
   phases, and adjoining-margin/clearance flow under SDL dummy mode, plus
-  experimental Terence parity and syntax-recovery cases;
+  narrow/wide cascade and inline-style cases;
 - `zig build test-wpt-runner` for the dependency-free WPT manifest runner's
   protocol, expectation, diagnostic, and infrastructure-failure handling;
 - `zig build test-csp` for loopback HTTP destination-specific CSP checks,
@@ -174,31 +174,24 @@ window. For example:
 `zig build run -- --viewport 2560x1440 --screenshot /tmp/wide.png URL`.
 Always verify a wide viewport when diagnosing content stuck in a narrow window.
 
-For CSS frontend interoperability, add `--css-parser=legacy` or
-`--css-parser=terence` to `--dump-style`, `--dump-layout`, or
-`--dump-display-list`. The default is legacy. These flags are rejected for
-DOM-only dumps, interactive Browser, screenshots and WPT sessions. For example:
+All inspection and browser modes use Zibra's native CSS parser. The
+[pipeline manifest](../tests/pipeline/manifest.zig) includes narrow/wide
+[cascade fixtures](../tests/pipeline/css-cascade.html) for declaration order,
+escaped property names, shorthand expansion, variables, inline declarations and
+nested media conditions. Keep their exact goldens when refactoring CSS owners.
 
-```sh
-zig build run -- --dump-layout --css-parser=terence --viewport=320x300 \
-  file://"$PWD/tests/pipeline/css-terence-parity.html"
-zig build run -- --dump-display-list --css-parser=terence --viewport=800x600 \
-  file://"$PWD/tests/pipeline/css-terence-recovery.html"
-```
+`zig build test-document` includes native stylesheet replacement and restyle
+allocation-failure regressions. The render suite's `Native CSS inspection` test
+checks real geometry, paint and software pixels across viewport/source changes.
+The [CSS recovery fixture](../tests/manual/css-recovery.html) records known
+native-parser gaps after nested unknown at-rules and at EOF; it is not a passing
+pipeline golden.
 
-The [pipeline manifest](../tests/pipeline/manifest.zig) compares existing
-goldens under both frontends. The new parity fixture shares narrow/wide
-goldens across parsers and exercises cascade order, shorthand expansion,
-custom properties, inline declarations and nested media conditions. The
-recovery fixture expects two 120px green bars with Terence: a declaration after
-an unknown nested at-rule and a final rule closed by EOF. Inspect and explain
-any difference before changing a shared golden.
-
-The focused [WPT interop manifest](../tests/wpt/manifest-css-interop.yaml)
-reviews testharness, reftest and crashtest coverage, but native WPT adapters
-still run legacy CSS. A successful inspection capture is not an upstream WPT
-pass. Current scope, known prerequisites and results are maintained in the
-[acceptance report](css-frontend-acceptance.md).
+The focused [syntax](../tests/wpt/manifest-css-frontend.yaml) and
+[interop](../tests/wpt/manifest-css-interop.yaml) WPT manifests retain their
+upstream cases and PASS expectations. They exercise the native browser; a
+successful inspection capture does not establish an upstream WPT pass. The
+[CSS plan](../CSS_PLAN.md) describes the remaining syntax and CSSOM work.
 
 ### Native macOS visual checks
 

@@ -1,4 +1,4 @@
-//! Legacy CSS syntax and shared selector parser for Zibra's supported subset.
+//! Native CSS syntax and shared selector parser for Zibra's supported subset.
 //! Declaration validation and shorthand expansion belong to css_declarations.
 //!
 //! Property names and declared values in returned rules normally borrow the
@@ -938,7 +938,8 @@ pub fn parseWithKeyframes(
             if (self.startsWithKeyframesRule()) {
                 const brace_idx = std.mem.indexOfScalarPos(u8, self.string, self.pos, '{') orelse break;
                 const block_end = self.findMatchingBrace(brace_idx) orelse break;
-                var keyframes_rule = self.parseKeyframesRule(allocator) catch {
+                var keyframes_rule = self.parseKeyframesRule(allocator) catch |err| {
+                    if (err == error.OutOfMemory) return err;
                     self.pos = block_end + 1;
                     continue;
                 };

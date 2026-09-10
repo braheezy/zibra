@@ -118,8 +118,8 @@ split across acyclic modules:
   their initial source slices, shared by declaration-name recognition and
   style-map initialization;
 - `css_declarations.zig` owns property validation, shorthand expansion and
-  declaration-block precedence shared by both CSS syntax frontends. Its maps
-  own tables only; names and values borrow their source/normalized-string owner;
+  declaration-block precedence shared by stylesheet and inline-style parsing.
+  Its maps own tables only; names and values borrow their source owner;
 - `pseudo.zig` owns only the shared before/after identity used by DOM,
   selector, and style owners; it owns neither a Node nor a stylesheet value;
 - `animation.zig` defines pure transition/keyframe interpolation values that
@@ -197,67 +197,31 @@ subscribe to their parent's version so newly introduced names also invalidate
 them. Heap storage keeps this publisher stable when its owning Node moves;
 structural mutation still clears the graph before moving Node storage.
 
-## Experimental CSS syntax owner
+## Inspection stylesheet ownership
 
-`css_frontend.Syntax` is the source owner behind opt-in Terence inspection.
-Interactive Frames, screenshots and WPT adapters retain the legacy parser.
-The owner duplicates source and optional serialized base-URL metadata,
-owns the Terence AST and diagnostic storage, and releases those borrowers
-before their source. The heap holder keeps its budget allocator context stable
-when the outer owner moves. Do not shallow-copy it into a second owner.
+`css_stylesheet.Sheet` owns copies of CSS source and optional serialized base URL,
+plus cascade origin and referrer policy. It uses Zibra's native CSS parser.
+`Sheet.init` copies inputs; `Sheet.select` parses them for an explicit media
+context and returns owning rule/keyframe containers. Declaration strings borrow
+that Sheet, and each rule owns its copied URL provenance. Retire all selections
+before their source Sheet. Media reselection currently reparses retained source;
+there is no persistent syntax tree or stable CSSOM rule identity.
 
-Node IDs, ranges, views and iterators borrow exactly one immutable syntax
-generation. They must retire before successful replacement/deinit; they do not
-provide stable CSSOM identity. Raw source ranges preserve escapes and EOF
-spelling, rather than representing normalized token values. Its offline
-replacement helper requires all external borrowers to retire before success;
-consumers with installed styles use staged publication instead.
+`inspection.Page` owns these sheets, their active selections and its DOM.
+`reselectMedia` and `replaceStylesheet` require a final-address DOM and retired
+layout/display consumers. They stage every fallible parse/selection allocation
+before clearing style dependencies, dirtying the DOM and installing the new
+generation. Staging failure leaves installed rules, media and computed values
+unchanged. Replacement retires old executable containers before their source.
 
-`css_stylesheet.Sheet` owns that syntax, normalized strings, translated
-selectors/declarations/keyframes and parent-linked media conditions. Parsing
-adapts these once. `Sheet.select` evaluates retained conditions and returns
-independently owned selector/map/URL/frame containers whose declaration strings
-borrow the Sheet. Retire every selection before its Sheet. Unknown rules and
-CSS nesting remain syntax only; the adapter executes ordinary rules, supported
-media conditions and keyframes using Zibra's existing semantics.
-Sheet and inline-block budgets cover their retained syntax and semantic
-allocations; selections use their caller's allocator and explicit OOM cleanup.
-
-`css_normalize.zig` converts supported identifier/function/unit spellings into
-property-grammar inputs without changing token classes or reparsing a sheet.
-Its outputs are owned by the Sheet or `DeclarationBlock`; string/URL payloads
-retain authored spelling. This is not CSSOM serialization. Both syntax paths
-feed `css_declarations.zig`, including declaration-local importance and source
-order before shorthand expansion and invalid-value fallback.
-
-`css_inline_styles.Cache` owns copied `DeclarationBlock` inputs for authored
-style attributes, deduplicated by text. `styleWithInputs` borrows its provider,
-maps and source strings synchronously. A supplied provider must cover every
-inline value needing restyling; missing entries fail explicitly rather than
-falling back to the legacy parser. Rebuild the cache before styling changed
-inline attributes. Computed winners are Element-interned as described above.
-
-An experimental `inspection.Page` owns sheets, their active selections and the
-inline cache with its DOM. `reselectMedia` and `replaceStylesheet` require a
-final-address DOM and retired layout/display consumers. They stage every
-fallible parse/selection allocation before clearing style dependencies,
-dirtying the DOM and installing the new generation. Staging failure leaves the
-installed rules, media and computed values unchanged. Successful replacement
-retires old executable containers before their source Sheet.
-
-Call `Page.restyle` after successful publication and before rebuilding layout
-or painting. Restyle is a separate fallible phase: failure preserves the new
-valid generation and dirty work for retry, rather than rolling publication
-back. Existing computed strings remain valid across source retirement. These
-APIs neither schedule Browser frames nor expose a live CSSOM mutation model.
-
-All three syntax entry modes share preflight and allocation limits. They keep
-unknown rules and duplicate declarations for later semantic consumers; syntax
-acceptance must never imply supported selectors, properties or at-rules.
-The CLI enables this path only for style/layout/display-list dumps with
-`--css-parser=terence`; the default is `legacy`. Production adoption gates,
-verification fixtures and the temporary backend-import bridge are in the
-[acceptance decision](../css-frontend-acceptance.md).
+Call `Page.restyle` after publication and before rebuilding layout or painting.
+Restyle is separately fallible: failure preserves the new generation and dirty
+work for retry. Existing computed strings remain valid across source retirement.
+Inline declarations are parsed from current attributes by the ordinary style
+pass. These APIs neither schedule Browser frames nor expose live CSSOM objects.
+The document tests exercise publication failures, source retirement, retrying
+restyle, inherited dependencies and generated boxes; the render test checks
+geometry, paint and software pixels across replacement and viewport changes.
 
 ## Address-unstable Node storage
 

@@ -7,7 +7,6 @@ const std = @import("std");
 const parser = @import("parser.zig");
 const CSSParser = @import("css_parser.zig").CSSParser;
 const stylesheet = @import("css_stylesheet.zig");
-const inline_styles = @import("css_inline_styles.zig");
 const style = @import("style.zig");
 const url_module = @import("../network/url.zig");
 const Url = url_module.Url;
@@ -15,9 +14,7 @@ const Url = url_module.Url;
 const default_html = @embedFile("../assets/default.html");
 const default_style_sheet = @embedFile("../browser/browser.css");
 
-pub const CssBackend = enum { legacy, terence };
 pub const Options = struct {
-    css_backend: CssBackend = .legacy,
     media: CSSParser.MediaEnvironment = .{ .viewport_width_css = 800, .viewport_height_css = 600 },
 };
 
@@ -51,10 +48,7 @@ pub const Page = struct {
     root: parser.Node,
     rules: std.ArrayList(CSSParser.CSSRule),
     keyframes: std.ArrayList(CSSParser.KeyframesRule),
-    css_texts: std.ArrayList([]u8),
-    css_backend: CssBackend = .legacy,
     sheets: std.ArrayList(stylesheet.Sheet) = .empty,
-    inline_cache: ?inline_styles.Cache = null,
     media: CSSParser.MediaEnvironment = .{ .viewport_width_css = 800, .viewport_height_css = 600 },
 
     pub fn load(init: std.process.Init, allocator: std.mem.Allocator, source_url: ?Url) !Page {
@@ -67,8 +61,8 @@ pub const Page = struct {
         return loadWithOptions(init, allocator, source_url, .{ .media = media });
     }
 
-    /// Owns one inspection generation. Terence is opt-in and never changes the
-    /// interactive Browser parser. The caller repairs the returned root move.
+    /// Owns one inspection generation using the native CSS parser.
+    /// The caller repairs the returned root move.
     pub fn loadWithOptions(init: std.process.Init, allocator: std.mem.Allocator, source_url: ?Url, options: Options) !Page {
         const body = if (source_url) |url|
             try fetchDecoded(init, allocator, url, null, null)
@@ -116,9 +110,7 @@ pub const Page = struct {
             .root = try html_parser.parse(),
             .rules = std.ArrayList(CSSParser.CSSRule).empty,
             .keyframes = std.ArrayList(CSSParser.KeyframesRule).empty,
-            .css_texts = std.ArrayList([]u8).empty,
             .media = options.media,
-            .css_backend = options.css_backend,
         };
     }
 
@@ -131,27 +123,21 @@ pub const Page = struct {
     }
 
     fn finish(self: *Page) !void {
-        if (self.css_backend == .terence) {
-            self.inline_cache = try inline_styles.Cache.init(self.allocator, &self.root);
-            const selection = try self.selectSheets(self.media, null, null);
-            self.rules = selection.rules;
-            self.keyframes = selection.keyframes;
-        }
+        const selection = try self.selectSheets(self.media, null, null);
+        self.rules = selection.rules;
+        self.keyframes = selection.keyframes;
         self.sortRules();
         try self.restyle();
     }
 
     pub fn deinit(self: *Page) void {
         self.root.deinit(self.allocator);
-        if (self.inline_cache) |*cache| cache.deinit();
         for (self.rules.items) |*rule| rule.deinit(self.allocator);
         self.rules.deinit(self.allocator);
         for (self.keyframes.items) |*rule| rule.deinit(self.allocator);
         self.keyframes.deinit(self.allocator);
         for (self.sheets.items) |*sheet| sheet.deinit();
         self.sheets.deinit(self.allocator);
-        for (self.css_texts.items) |text| self.allocator.free(text);
-        self.css_texts.deinit(self.allocator);
         self.allocator.free(self.body);
     }
 
@@ -177,7 +163,6 @@ pub const Page = struct {
     /// Stages all fallible selections before invalidating the styled tree;
     /// failure leaves the installed generation unchanged. Call restyle afterward.
     pub fn reselectMedia(self: *Page, media: CSSParser.MediaEnvironment) !void {
-        if (self.css_backend != .terence) return error.UnsupportedCssBackend;
         const selection = try self.selectSheets(media, null, null);
         self.installSelection(selection);
         self.media = media;
@@ -187,9 +172,8 @@ pub const Page = struct {
     /// publish nothing. Success installs a dirty generation, retires old rule
     /// owners before their source, and requires restyle before layout/paint.
     pub fn replaceStylesheet(self: *Page, index: usize, source: []const u8) !void {
-        if (self.css_backend != .terence) return error.UnsupportedCssBackend;
         if (index >= self.sheets.items.len) return error.InvalidStylesheetIndex;
-        var replacement = try stylesheet.Sheet.parse(self.allocator, source, self.sheets.items[index].options());
+        var replacement = try stylesheet.Sheet.init(self.allocator, source, self.sheets.items[index].options());
         errdefer replacement.deinit();
         const selection = try self.selectSheets(self.media, index, replacement);
         self.installSelection(selection);
@@ -198,11 +182,10 @@ pub const Page = struct {
     }
 
     /// Styling is a separate fallible phase: on OOM the installed generation
-    /// remains valid and dirty work can be retried. Inline attributes must still
-    /// match the cache built at load; this is not a live CSSOM mutation API.
+    /// remains valid and dirty work can be retried. Current inline attributes
+    /// are parsed during styling; this is not a live CSSOM mutation API.
     pub fn restyle(self: *Page) !void {
-        const provider = if (self.inline_cache) |*cache| cache.provider() else null;
-        try style.styleWithInputs(self.allocator, &self.root, self.rules.items, self.keyframes.items, provider);
+        try style.styleWithKeyframes(self.allocator, &self.root, self.rules.items, self.keyframes.items);
     }
 
     fn selectSheets(self: *Page, media: CSSParser.MediaEnvironment, replacement_index: ?usize, replacement: ?stylesheet.Sheet) !SelectedRules {
@@ -226,54 +209,10 @@ pub const Page = struct {
     }
 
     fn appendRules(self: *Page, source: []const u8, keep_text: bool, options: stylesheet.Options) !void {
-        if (self.css_backend == .terence) {
-            var sheet = try stylesheet.Sheet.parse(self.allocator, source, options);
-            errdefer sheet.deinit();
-            try self.sheets.append(self.allocator, sheet);
-            if (keep_text) self.allocator.free(source);
-            return;
-        }
-        var css_parser = try CSSParser.initWithMedia(
-            self.allocator,
-            source,
-            self.media,
-        );
-        defer css_parser.deinit(self.allocator);
-        var keyframes = std.ArrayList(CSSParser.KeyframesRule).empty;
-        var keyframes_owned = true;
-        defer {
-            if (keyframes_owned) {
-                for (keyframes.items) |*rule| rule.deinit(self.allocator);
-            }
-            keyframes.deinit(self.allocator);
-        }
-        const rules = try css_parser.parseWithKeyframes(self.allocator, &keyframes);
-        var rules_owned = true;
-        defer if (rules_owned) {
-            for (rules) |*rule| rule.deinit(self.allocator);
-            self.allocator.free(rules);
-        };
-        for (rules) |*rule| {
-            rule.origin = options.origin;
-            rule.referrer_policy = options.referrer_policy;
-            rule.source_url = if (options.base_url) |base| try self.allocator.dupe(u8, base) else null;
-        }
-
-        // Reserve both destinations before transferring either the rules or
-        // their backing text. After these calls there are no fallible steps in
-        // the ownership transfer.
-        if (keep_text) try self.css_texts.ensureUnusedCapacity(self.allocator, 1);
-        try self.rules.ensureUnusedCapacity(self.allocator, rules.len);
-        try self.keyframes.ensureUnusedCapacity(self.allocator, keyframes.items.len);
-        if (keep_text) {
-            // `source` is an owned allocation supplied by the caller.
-            self.css_texts.appendAssumeCapacity(@constCast(source));
-        }
-        for (rules) |rule| self.rules.appendAssumeCapacity(rule);
-        for (keyframes.items) |rule| self.keyframes.appendAssumeCapacity(rule);
-        rules_owned = false;
-        keyframes_owned = false;
-        self.allocator.free(rules);
+        var sheet = try stylesheet.Sheet.init(self.allocator, source, options);
+        errdefer sheet.deinit();
+        try self.sheets.append(self.allocator, sheet);
+        if (keep_text) self.allocator.free(source);
     }
 
     fn loadDocumentStylesheets(self: *Page, init: std.process.Init, page_url: ?Url) !void {

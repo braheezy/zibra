@@ -28,14 +28,6 @@ const parseTranslate = animation.parseTranslate;
 const cssAnimationPropertyBit = animation.cssAnimationPropertyBit;
 const css_animation_properties = animation.css_animation_properties;
 
-/// Synchronous lookup of previously parsed inline declarations. Context, maps,
-/// and their source strings remain alive and immutable for the entire style
-/// pass. Computed winners are interned in their Element before the pass returns.
-pub const InlineStyleProvider = struct {
-    context: *const anyopaque,
-    get: *const fn (*const anyopaque, []const u8) ?*const CSSParser.DeclarationMap,
-};
-
 const InheritedProperty = struct {
     name: []const u8,
     default_value: []const u8,
@@ -440,7 +432,7 @@ pub fn Application(
         /// Apply rules and parse authored inline styles during this synchronous
         /// pass. Rules and their source strings borrow the caller's generation.
         pub fn style(allocator: std.mem.Allocator, node: *Node, rules: []const CSSParser.CSSRule) !void {
-            return styleWithKeyframesInternal(allocator, node, rules, &.{}, null, null);
+            return styleWithKeyframesInternal(allocator, node, rules, &.{}, null);
         }
 
         /// Instrumented style entry point used by invalidation regressions and
@@ -453,7 +445,7 @@ pub fn Application(
             stats: *StylePassStats,
         ) !void {
             stats.* = .{};
-            return styleWithKeyframesInternal(allocator, node, rules, &.{}, null, stats);
+            return styleWithKeyframesInternal(allocator, node, rules, &.{}, stats);
         }
 
         pub fn styleWithKeyframes(
@@ -462,22 +454,7 @@ pub fn Application(
             rules: []const CSSParser.CSSRule,
             keyframes: []const CSSParser.KeyframesRule,
         ) !void {
-            return styleWithKeyframesInternal(allocator, node, rules, keyframes, null, null);
-        }
-
-        /// Apply a caller-owned stylesheet/keyframe generation with optional
-        /// pre-parsed inline inputs. The provider is borrowed only during this
-        /// call and must cover each authored inline value that needs restyling;
-        /// an absent entry returns MissingInlineDeclarations. Computed strings
-        /// retain Element ownership independently of these replaceable inputs.
-        pub fn styleWithInputs(
-            allocator: std.mem.Allocator,
-            node: *Node,
-            rules: []const CSSParser.CSSRule,
-            keyframes: []const CSSParser.KeyframesRule,
-            provider: ?InlineStyleProvider,
-        ) !void {
-            return styleWithKeyframesInternal(allocator, node, rules, keyframes, provider, null);
+            return styleWithKeyframesInternal(allocator, node, rules, keyframes, null);
         }
 
         fn styleWithKeyframesInternal(
@@ -485,7 +462,6 @@ pub fn Application(
             node: *Node,
             rules: []const CSSParser.CSSRule,
             keyframes: []const CSSParser.KeyframesRule,
-            provider: ?InlineStyleProvider,
             stats: ?*StylePassStats,
         ) !void {
             if (!styleTreeNeedsUpdateFn(node)) {
@@ -505,7 +481,6 @@ pub fn Application(
                 node,
                 rules,
                 keyframes,
-                provider,
                 &default_parent,
                 empty_ancestors,
                 .{ .has_cache = &has_cache },
@@ -587,7 +562,6 @@ pub fn Application(
             element: *Element,
             rules: []const CSSParser.CSSRule,
             keyframes: []const CSSParser.KeyframesRule,
-            provider: ?InlineStyleProvider,
             parent_style: *StyleMap,
             ancestor_chain: []const *Node,
             match_context: CSSParser.MatchContext,
@@ -620,7 +594,6 @@ pub fn Application(
                     generated,
                     rules,
                     keyframes,
-                    provider,
                     parent_style,
                     ancestor_chain,
                     match_context,
@@ -643,7 +616,6 @@ pub fn Application(
             node: *Node,
             rules: []const CSSParser.CSSRule,
             keyframes: []const CSSParser.KeyframesRule,
-            provider: ?InlineStyleProvider,
             parent_style: *StyleMap,
             ancestor_chain: []const *Node,
             match_context: CSSParser.MatchContext,
@@ -812,16 +784,10 @@ pub fn Application(
                         // specificity. Author !important still beats normal inline.
                         if (e.attributes) |attrs| {
                             if (attrs.get("style")) |style_attr| {
-                                var owned_styles: ?CSSParser.DeclarationMap = null;
-                                defer if (owned_styles) |*declarations| declarations.deinit();
-                                const parsed_styles = if (provider) |inputs|
-                                    inputs.get(inputs.context, style_attr) orelse return error.MissingInlineDeclarations
-                                else parsed: {
-                                    const css_parser = try CSSParser.init(allocator, style_attr, false);
-                                    defer css_parser.deinit(allocator);
-                                    owned_styles = try css_parser.body(allocator);
-                                    break :parsed &owned_styles.?;
-                                };
+                                const css_parser = try CSSParser.init(allocator, style_attr, false);
+                                defer css_parser.deinit(allocator);
+                                var parsed_styles = try css_parser.body(allocator);
+                                defer parsed_styles.deinit();
 
                                 var it = parsed_styles.iterator();
                                 while (it.next()) |entry| {
@@ -1110,7 +1076,6 @@ pub fn Application(
                             child,
                             rules,
                             keyframes,
-                            provider,
                             style_map,
                             new_ancestors,
                             match_context,
@@ -1124,7 +1089,6 @@ pub fn Application(
                         e,
                         rules,
                         keyframes,
-                        provider,
                         style_map,
                         new_ancestors,
                         match_context,

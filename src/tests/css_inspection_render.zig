@@ -1,4 +1,4 @@
-//! Terence inspection through retained layout, display commands and software
+//! Native CSS inspection through retained layout, display commands and software
 //! raster, retiring rendering borrowers before each stylesheet publication.
 
 const std = @import("std");
@@ -93,12 +93,11 @@ fn expectRenderedBox(page: *inspection.Page, engine: *Layout, width: i32, height
     try std.testing.expect(!document.layoutNeeded());
 }
 
-test "Terence inspection repaints real geometry and pixels after responsive selection and source replacement" {
-    const html = "<style>#target { display:block; width:40px; height:20px; background-color:g\\72 een; }" ++
-        "@media (min-width:600px) { #target { width:80px; height:30px; background-color:b\\6c ue; } }</style>" ++
+test "Native CSS inspection repaints real geometry and pixels after responsive selection and source replacement" {
+    const html = "<style>#target { display:block; width:40px; height:20px; background-color:green; }" ++
+        "@media (min-width:600px) { #target { width:80px; height:30px; background-color:blue; } }</style>" ++
         "<div id=target></div>";
     var page = try inspection.Page.fromHtml(allocator, html, .{
-        .css_backend = .terence,
         .media = .{ .viewport_width_css = 400, .viewport_height_css = 600 },
     });
     defer page.deinit();
@@ -117,7 +116,7 @@ test "Terence inspection repaints real geometry and pixels after responsive sele
     engine.window_width = 800;
     try expectRenderedBox(&page, engine, 80, 30, .{ .r = 0, .g = 0, .b = 255 });
 
-    try page.replaceStylesheet(1, "#target { display:block; width:55px; height:25px; background-color:r\\65 d; }");
+    try page.replaceStylesheet(1, "#target { display:block; width:55px; height:25px; background-color:red; }");
     try page.restyle();
     try expectRenderedBox(&page, engine, 55, 25, .{ .r = 255, .g = 0, .b = 0 });
 }

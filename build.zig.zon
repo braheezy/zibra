@@ -41,10 +41,6 @@
             .url = "git+https://github.com/zigimg/zigimg.git#096115a3eeae1a4c477496d575f1f1f74865387c",
             .hash = "zigimg-0.1.0-8_eo2mHBFwDLhWjXriR17_b7VF6qML1f98Xokp7ZZbop",
         },
-        .terence_css = .{
-            .url = "git+https://github.com/nickshiro/terence-css#92c73631ad4928051b7d8eee8a01c015aea3516b",
-            .hash = "terence_css-0.1.4-4N-xb2JSBAAOJ9m8EPJQe2TKUcRpflVQAeRrnhet-e6Z",
-        },
         // For audio decoding
         .zigaudio = .{ .path = "../zigaudio" },
         // For audio playing

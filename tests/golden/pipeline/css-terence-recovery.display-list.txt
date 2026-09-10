@@ -1,4 +1,0 @@
-rect x1=0 y1=0 x2=800 y2=600 color=#ffffffff
-rect x1=13 y1=18 x2=777 y2=74 color=#ffffffff
-rect x1=21 y1=26 x2=141 y2=42 color=#008800ff
-rect x1=21 y1=46 x2=141 y2=62 color=#008800ff
